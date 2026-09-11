@@ -29,7 +29,7 @@ impl PgDb {
             .bind(&conn, &id, &task_run_id, &iteration, &prompt, &context_json)
             .one()
             .await
-            .map_err(|e| format!("PG insert_approval_gate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_approval_gate", &e))?;
         Ok(())
     }
 
@@ -50,7 +50,7 @@ impl PgDb {
             .bind(&conn, &action, &comment, &status, &id)
             .opt()
             .await
-            .map_err(|e| format!("PG resolve_approval_gate: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG resolve_approval_gate", &e))?;
         Ok(())
     }
 
@@ -68,7 +68,7 @@ impl PgDb {
             .bind(&conn, &task_run_id)
             .all()
             .await
-            .map_err(|e| format!("PG get_approval_gates_for_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_approval_gates_for_task_run", &e))?;
 
         Ok(rows.into_iter().map(|r| {
             serde_json::json!({

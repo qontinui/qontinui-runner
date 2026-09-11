@@ -3,17 +3,31 @@
 //!
 //! Runs the SAME ordered checks as the in-app `coord_doctor` Tauri command
 //! (both delegate to `qontinui_runner_lib::coord_doctor`, whose `CHECK_SPECS`
-//! is the roster), STOPS the blocking chain at the first red, and prints the
-//! link + its fix. Green on all of them ⇒ "this runner can set gates."
+//! is the single source of truth for how many there are and which of them
+//! block), stops the BLOCKING chain at the first red, and prints the link +
+//! its fix. Green on every blocking check ⇒ "this runner can set gates."
 //!
-//! ## Bound-port caveat
+//! ## Bound-port caveat — and why it is no longer terminal
 //!
 //! This headless bin has no running Tauri runtime, so it cannot observe the
-//! runner's ACTUALLY-BOUND loopback API port (check 6 needs it to compare
-//! against the `.mcp.json` URL). It passes `bound_api_port: None`, and the
-//! `mcp_json_valid` check reports the port as unverifiable — run the in-app
-//! command (Settings → coord doctor) for the authoritative `.mcp.json` port
-//! verdict. Every other check is fully authoritative headless.
+//! runner's ACTUALLY-BOUND loopback API port, which `mcp_json_valid` needs to
+//! compare against the `.mcp.json` URL. It passes `bound_api_port: None`, and
+//! EVERY arm of that check is red in that case — so while the check was
+//! BLOCKING, this bin was structurally incapable of ever printing OK, on any
+//! machine, in any credential state, and the first-red-stops driver meant
+//! `coord_reachable` never ran either.
+//!
+//! `mcp_json_valid` is now ADVISORY (its subject is one optional transport
+//! artifact, not the report's question) and `coord_reachable` is `always_run`,
+//! so the direct coord `/mcp` round-trip executes and decides the verdict here.
+//! Run the in-app command (Settings → coord doctor) when you want the
+//! authoritative `.mcp.json` PORT verdict; every other check is fully
+//! authoritative headless.
+//!
+//! Do not restate the check count or the numbering in this comment: it drifted
+//! twice (it claimed "eight" against a nine- and then a ten-entry table, and
+//! numbered the port check 6 when it was 7). `CHECK_SPECS` and the generated
+//! `docs/runner-onboarding.md` are the answer.
 //!
 //! ## Usage
 //!

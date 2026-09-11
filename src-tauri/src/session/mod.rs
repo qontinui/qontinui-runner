@@ -296,6 +296,17 @@ pub enum SessionEventKind {
     /// with a 400 when they appear in a body — so a producer must never
     /// record them either. Best-effort, same posture as above.
     FindingPosted,
+    /// Session FINISHED marker (plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume`, Phase 2).
+    /// Drained to `PATCH /sessions/:id {progress:{session_status:"finished"}}`
+    /// — the same door `Progress` uses, so the target is the URL path and the
+    /// peer-clobber trap in `coord_report_status` (which resolves an omitted
+    /// `claude_code_session_id` to the device's most-recently-started session)
+    /// does not apply to this rung.
+    ///
+    /// The WORK axis, orthogonal to the liveness `Heartbeat` and to `Closed`:
+    /// a live session can be finished, and a closed one is usually not.
+    Finished,
 }
 
 impl SessionEventKind {
@@ -316,6 +327,7 @@ impl SessionEventKind {
             SessionEventKind::MemoryRecord => "memory_record",
             SessionEventKind::GateRegistration => "gate_registration",
             SessionEventKind::FindingPosted => "finding_posted",
+            SessionEventKind::Finished => "finished",
         }
     }
 }

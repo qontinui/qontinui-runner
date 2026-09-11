@@ -164,6 +164,7 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
 
     let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let api_base = session_briefing::runner_api_base(api_port);
+    let web_base = session_briefing::web_api_base();
 
     let block = if supervisor_available {
         session_briefing::resolve_requiring(
@@ -171,6 +172,7 @@ pub(crate) fn runner_rules_prefix(supervisor_available: bool, api_port: u16) -> 
             AI_SESSION_RULES_SUPERVISOR_AVAILABLE,
             &api_base,
             &coord_url,
+            &web_base,
             &[AI_SESSION_RULES_REQUIRED_PROHIBITION],
         )
     } else {

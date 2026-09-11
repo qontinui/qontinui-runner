@@ -106,6 +106,21 @@ pub mod mcp_spill;
 pub mod embedded_pg;
 pub mod env_agent;
 
+// THE `source()`-chain renderer, shared by the lib and the bin.
+//
+// Declared INLINE so the nested `error_chain` resolves to `src/util/error_chain.rs`
+// — the very file the bin crate's own `mod util;` (main.rs) compiles. One
+// source of truth, one spelling (`crate::util::error_chain::error_chain`) on
+// both sides, which is what stops a fourth private copy appearing the next
+// time a call site needs a cause.
+//
+// Only `error_chain` is lifted: `util::path_extraction` depends on
+// `crate::executor::file_registry`, which exists in the BIN alone, so
+// declaring the whole `util` directory here would not compile.
+pub mod util {
+    pub mod error_chain;
+}
+
 // Device-pairing flow (headless + browser-mediated). Lifted out of
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
@@ -162,6 +177,18 @@ pub mod env_generations;
 // module tree is silently skipped by `--lib`); the impure glue that spawns
 // visible tabs lives in the bin at `src/looping_agent_supervisor.rs`.
 pub mod looping_agent;
+
+// "Did the server evaluate this request and refuse it, or did the transport
+// blip?" — the ONE structural-vs-transient HTTP classifier, plus the denial
+// tags a server names on the refusal. In the lib for the same reason as
+// `fs_atomic` and `instance_env`: it was sole-sited in the BIN crate
+// (`ci_node::reporting`), `plan_workunit_adapter` below needs the identical
+// judgement on its coord writes, and a lib module cannot import from the runner
+// bin's module tree. So the classifier MOVED here rather than being copied —
+// two consumers in two crates must not be able to drift on this judgement. The
+// bin reaches it as `qontinui_runner_lib::http_disposition`. Plan
+// `2026-08-31-plan-adapter-retry-classification-unified`, Phase 2.
+pub mod http_disposition;
 
 // Harness markdown -> work-unit adapter (plan
 // `2026-06-18-harness-markdown-to-workunit-adapter`, P2 of the plan-decoupling

@@ -99,11 +99,11 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 /// The config filename holding per-project trust, inside a `CLAUDE_CONFIG_DIR`.
-const CONFIG_FILE: &str = ".claude.json";
+pub(crate) const CONFIG_FILE: &str = ".claude.json";
 
 /// The `projects` map key, and the trust flag within one project's entry.
-const PROJECTS_KEY: &str = "projects";
-const TRUST_FLAG: &str = "hasTrustDialogAccepted";
+pub(crate) const PROJECTS_KEY: &str = "projects";
+pub(crate) const TRUST_FLAG: &str = "hasTrustDialogAccepted";
 
 /// Which account configs a pre-trust should reach.
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +158,7 @@ fn to_key_string(path: &Path) -> String {
 /// treating it as a root is exactly what makes each agent worktree its own
 /// trust key. Returns `None` when no ancestor has one — the "not in a git repo"
 /// case, where the key is the directory itself.
-fn git_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn git_root(start: &Path) -> Option<PathBuf> {
     let mut cur = Some(start);
     while let Some(dir) = cur {
         if dir.join(".git").exists() {

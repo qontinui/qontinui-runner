@@ -42,7 +42,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG save_reasoning_trace: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG save_reasoning_trace", &e))?;
 
         Ok(row.get::<_, i64>("id"))
     }
@@ -69,7 +69,7 @@ impl PgDb {
                 &[&dreamer_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_traces_by_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_traces_by_run", &e))?;
 
         Ok(rows.iter().map(|r| row_to_trace(r)).collect())
     }
@@ -98,7 +98,7 @@ impl PgDb {
                 &[&rt, &limit],
             )
             .await
-            .map_err(|e| format!("PG get_recent_traces (filtered): {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_traces (filtered)", &e))?
         } else {
             conn.query(
                 "SELECT id, reasoning_type, premise_ids, conclusion, confidence,
@@ -110,7 +110,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_recent_traces: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_recent_traces", &e))?
         };
 
         Ok(rows.iter().map(|r| row_to_trace(r)).collect())
@@ -136,7 +136,7 @@ impl PgDb {
                 &[&trace_id, &invalidated_by],
             )
             .await
-            .map_err(|e| format!("PG invalidate_trace: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG invalidate_trace", &e))?;
 
         Ok(modified > 0)
     }
@@ -161,7 +161,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG insert_dreamer_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG insert_dreamer_log", &e))?;
 
         Ok(row.get::<_, i64>("id"))
     }
@@ -196,7 +196,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG complete_dreamer_log: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_dreamer_log", &e))?;
 
         Ok(())
     }
@@ -223,7 +223,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_last_dreamer_time: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_last_dreamer_time", &e))?;
 
         let last_run: Option<chrono::DateTime<chrono::Utc>> = row.get("last_run");
         Ok(last_run)
@@ -252,7 +252,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_dreamer_log: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_dreamer_log", &e))?;
 
         Ok(rows
             .iter()

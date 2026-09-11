@@ -144,6 +144,82 @@ pub fn headless_claude_pids() -> HashSet<u32> {
 // Health-check report
 // ---------------------------------------------------------------------------
 
+/// The coord WORK axis for one session — `coord.sessions.session_status`,
+/// mirrored runner-side.
+///
+/// **Orthogonal to liveness by construction.** coord's own definition
+/// (`qontinui-coord` `crates/coord/src/sessions.rs`) calls it *"a SECOND,
+/// orthogonal axis ALONGSIDE"* [`crate::session::session_lifecycle_store`]'s
+/// `state`, noting that a row can be `state=active` AND
+/// `session_status=stalled`. The same holds here: a `Finished` session's
+/// `claude` PROCESS IS STILL RUNNING — finishing is metadata and never
+/// terminates anything (`/finish-session`: *"This never touches the
+/// process"*).
+///
+/// [`Unrecognised`](Self::Unrecognised) exists so a status coord starts
+/// serving tomorrow reaches an operator VERBATIM instead of being silently
+/// dropped — and, crucially, still BLOCKS. A vocabulary that grows must never
+/// be able to grow a new way to say "safe to restart".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionWorkStatus {
+    Working,
+    Blocked,
+    Stalled,
+    WaitingHuman,
+    /// The agent declared its work complete. **The only value that discounts
+    /// a live process from the restart verdict.**
+    Finished,
+    /// A value coord served that this build does not know. Carried onto the
+    /// wire as-is; treated as blocking.
+    Unrecognised(String),
+}
+
+impl SessionWorkStatus {
+    /// Total — never fails. Mirrors coord's `SessionStatus::parse`, including
+    /// its legacy `"done"` alias for `Finished` (parse-only there too);
+    /// anything else becomes [`Self::Unrecognised`] rather than `None`, so the
+    /// raw word survives to the response.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "working" => Self::Working,
+            "blocked" => Self::Blocked,
+            "stalled" => Self::Stalled,
+            "waiting_human" => Self::WaitingHuman,
+            "finished" => Self::Finished,
+            // Legacy alias, accepted by coord's own parser.
+            "done" => Self::Finished,
+            _ => Self::Unrecognised(raw.trim().to_string()),
+        }
+    }
+
+    /// The wire word, for the response body.
+    pub fn as_wire(&self) -> String {
+        match self {
+            Self::Working => "working".to_string(),
+            Self::Blocked => "blocked".to_string(),
+            Self::Stalled => "stalled".to_string(),
+            Self::WaitingHuman => "waiting_human".to_string(),
+            Self::Finished => "finished".to_string(),
+            Self::Unrecognised(raw) => raw.clone(),
+        }
+    }
+}
+
+/// **The whole safety argument, in one total function. FAIL CLOSED.**
+///
+/// The ONLY input that yields `false` is a status that resolved to
+/// [`SessionWorkStatus::Finished`]. Absent (no coord row, coord unreachable,
+/// the work axis unset), unrecognised, unattributed (nothing claims the
+/// process), ambiguous (two records claim it) and every non-terminal status
+/// all yield `true`.
+///
+/// Absence is never "finished". A permissive default here would let a restart
+/// destroy live work while the endpoint said it was safe — which is the exact
+/// failure `GET /restart-readiness` exists to prevent.
+pub fn blocks_restart(status: Option<&SessionWorkStatus>) -> bool {
+    !matches!(status, Some(SessionWorkStatus::Finished))
+}
+
 /// One live `claude` process in the runner's inclusive subtree, with every
 /// fact about it that the SNAPSHOT already carries.
 ///
@@ -195,6 +271,30 @@ pub struct LiveClaudeProcess {
     /// of PROCESSES, and on this fleet one agent session routinely fans out
     /// into several, so "N sessions" over the raw total is wrong by a factor.
     pub nested_under_claude: bool,
+    /// The `claude_session_id` this process is attributed to — the key coord
+    /// addresses a session by (`claude_code_session_id`). `None` for every
+    /// non-terminal-hosted class (nothing attributes them), and `None` where
+    /// two different open records claim the same pid: an AMBIGUOUS attribution
+    /// is an unknown, and unknowns block. Never a guess.
+    pub session_id: Option<String>,
+    /// The coord WORK axis for [`Self::session_id`], verbatim as coord served
+    /// it. `None` = not resolved — which is UNKNOWN, not "not finished".
+    ///
+    /// **Always `None` for a nested subagent** ([`Self::nested_under_claude`]),
+    /// even when its ancestor's session reads `finished`: nobody declared THIS
+    /// process complete, and an inherited declaration is not an observation
+    /// about it.
+    pub session_status: Option<String>,
+    /// Does this process count as work in flight? `true` for every process
+    /// except one whose [`Self::session_status`] resolved to exactly
+    /// `finished`. See [`blocks_restart`] — this field IS that function's
+    /// answer, recorded per process so an operator can see which sessions were
+    /// discounted and why.
+    ///
+    /// ⚠ `false` does NOT mean the process is gone. It is still running, still
+    /// holding memory, and a restart will still kill it. It means only that
+    /// its session declared its work complete.
+    pub blocks_restart: bool,
 }
 
 /// An open lifecycle record whose terminal is gone or whose subtree contains
@@ -281,6 +381,19 @@ impl TrackingHealthReport {
     /// "how many sessions".
     pub fn root_count(list: &[LiveClaudeProcess]) -> usize {
         list.iter().filter(|p| !p.nested_under_claude).count()
+    }
+
+    /// Count of entries in `list` that count as WORK IN FLIGHT — everything
+    /// except a process whose coord session row reads `finished`.
+    pub fn blocking_count(list: &[LiveClaudeProcess]) -> usize {
+        list.iter().filter(|p| p.blocks_restart).count()
+    }
+
+    /// Count of entries in `list` DISCOUNTED because their session declared
+    /// its work finished. The complement of [`Self::blocking_count`], reported
+    /// separately so no consumer ever sees one number that hides the other.
+    pub fn finished_count(list: &[LiveClaudeProcess]) -> usize {
+        list.iter().filter(|p| !p.blocks_restart).count()
     }
 }
 
@@ -419,6 +532,20 @@ pub fn health_json() -> serde_json::Value {
 ///   `process_tree::working_directories_for_pids`) so this stays a pure
 ///   function — it performs no I/O of its own. An absent pid yields
 ///   `cwd: None`, never a guess.
+/// - `session_status_by_id` is injected the SAME way and for the SAME reason:
+///   the coord WORK axis keyed by `claude_session_id`, resolved by the caller
+///   (`GET /restart-readiness` → `crate::mcp::session_work_status::fetch`)
+///   over a bounded network read this function must never perform. Pass an
+///   EMPTY map wherever no status source was consulted — the periodic census
+///   does exactly that — and every process then blocks, which is today's
+///   behaviour bit-for-bit.
+///
+/// **The work axis is TERMINAL-HOSTED ONLY.** Only a terminal-hosted process
+/// has an open lifecycle record, so only it has a `claude_session_id` coord can
+/// be asked about. AI-plane, headless-exempt and unclassified processes get
+/// `session_id: None` and therefore block regardless of what the map contains.
+/// A pid claimed by two DIFFERENT records is ambiguous and also gets `None` —
+/// fail-closed, per [`blocks_restart`].
 ///
 /// **Precedence is fixed and total**: terminal → AI plane → agent-runtime
 /// headless → unclassified. A pid claimed by more than one root lands in the
@@ -436,6 +563,7 @@ pub fn evaluate(
     agent_runtime_root_pids: &HashSet<u32>,
     ai_plane_root_pids: &HashSet<u32>,
     cwd_by_pid: &HashMap<u32, String>,
+    session_status_by_id: &HashMap<String, SessionWorkStatus>,
     primary_boot_unix_millis: i64,
     now_ms: i64,
 ) -> TrackingHealthReport {
@@ -461,6 +589,12 @@ pub fn evaluate(
     }
 
     let mut terminal_claimed: HashSet<u32> = HashSet::new();
+    // Which open record claims each terminal-hosted pid — the join key for the
+    // coord work axis. A pid claimed by a SECOND, DIFFERENT record is recorded
+    // as ambiguous and reports no session id at all: two records disagreeing
+    // about who owns a process is an unknown, and unknowns block.
+    let mut claim_by_pid: HashMap<u32, String> = HashMap::new();
+    let mut ambiguous_pids: HashSet<u32> = HashSet::new();
     let mut tracked_dead: Vec<TrackedDeadRecord> = Vec::new();
 
     for rec in open_records {
@@ -468,12 +602,39 @@ pub fn evaluate(
             Some(&pid) => {
                 let present =
                     claude_present_in_inclusive_subtree(pid, snapshot, primary_boot_unix_millis);
-                if present {
-                    terminal_claimed.extend(claude_pids_in_inclusive_subtree(pid, snapshot));
+                // ⚠ The CLAIM is registered whether or not the record is
+                // `present`, while `terminal_claimed` (the classification set)
+                // stays gated on `present` exactly as before.
+                //
+                // Why: `present` is `false` for a record whose terminal PID
+                // fails the PID-reuse guard, yet that terminal's subtree can
+                // still hold a live `claude`. If that pid ALSO sits inside a
+                // present record's subtree, gating the claim on `present`
+                // would attribute it solely to the present record — and if
+                // THAT record reads `finished`, a process belonging to a
+                // different session would be silently discounted. Registering
+                // the claim unconditionally makes the pid AMBIGUOUS instead,
+                // which blocks. Fail-closed beats tidy.
+                for claimed in claude_pids_in_inclusive_subtree(pid, snapshot) {
+                    if present {
+                        terminal_claimed.insert(claimed);
+                    }
+                    match claim_by_pid.get(&claimed) {
+                        Some(existing) if existing != &rec.claude_session_id => {
+                            ambiguous_pids.insert(claimed);
+                        }
+                        Some(_) => {}
+                        None => {
+                            claim_by_pid.insert(claimed, rec.claude_session_id.clone());
+                        }
+                    }
                 }
                 present
             }
-            // No live terminal hosts this record at all.
+            // No live terminal hosts this record at all. Nothing to walk, so
+            // no claim can be registered — and a live `claude` belonging to
+            // such a record is, by construction, invisible to this join. See
+            // `BOUNDARY`.
             None => false,
         };
         if !alive {
@@ -485,8 +646,35 @@ pub fn evaluate(
         }
     }
 
-    let describe = |pid: u32| -> LiveClaudeProcess {
+    // `session_id` is `None` for every class but terminal-hosted, and `None`
+    // for an ambiguously-claimed pid — so `status` is `None` there too and
+    // `blocks_restart` is `true`. Fail-closed falls out of the types.
+    let describe = |pid: u32, terminal_hosted: bool| -> LiveClaudeProcess {
         let parent_pid = parent_of.get(&pid).copied();
+        let nested_under_claude = parent_pid.map(|p| live_set.contains(&p)).unwrap_or(false);
+        let session_id = if terminal_hosted && !ambiguous_pids.contains(&pid) {
+            claim_by_pid.get(&pid).cloned()
+        } else {
+            None
+        };
+        // ⚠ **A NESTED process is never discounted by its ancestor's
+        // declaration.** The claim walk is subtree-wide, so every `claude`
+        // under a terminal inherits that terminal's record id — but a nested
+        // subagent has no coord row of its own and nobody declared IT
+        // finished. `/finish-session` explicitly does not touch the process,
+        // so a parent marked finished while a nested `claude` is mid-write
+        // must NOT flip the verdict to safe. The attribution is still
+        // reported (`session_id` says which session it belongs to); only the
+        // DISCOUNT is withheld, so an inherited status reads as UNKNOWN and
+        // blocks. Fail-closed: absence of a declaration about THIS process is
+        // never "finished".
+        let status = if nested_under_claude {
+            None
+        } else {
+            session_id
+                .as_deref()
+                .and_then(|id| session_status_by_id.get(id))
+        };
         LiveClaudeProcess {
             pid,
             parent_pid,
@@ -498,7 +686,10 @@ pub fn evaluate(
                 .get(&pid)
                 .map(|kids| !kids.is_empty())
                 .unwrap_or(false),
-            nested_under_claude: parent_pid.map(|p| live_set.contains(&p)).unwrap_or(false),
+            nested_under_claude,
+            session_status: status.map(|s| s.as_wire()),
+            session_id,
+            blocks_restart: blocks_restart(status),
         }
     };
 
@@ -510,8 +701,9 @@ pub fn evaluate(
     // Iterate `live_claude` (deterministic BFS order) so the emitted arrays are
     // stable across passes with an unchanged process table.
     for &pid in &live_claude {
-        let entry = describe(pid);
-        if terminal_claimed.contains(&pid) {
+        let is_terminal_hosted = terminal_claimed.contains(&pid);
+        let entry = describe(pid, is_terminal_hosted);
+        if is_terminal_hosted {
             terminal_hosted.push(entry);
         } else if ai_claimed.contains(&pid) {
             ai_plane.push(entry);
@@ -577,11 +769,19 @@ fn age_s_from_creation(created_secs: Option<i64>, now_ms: i64) -> Option<i64> {
 /// owns the posture for that: the periodic task skips the pass (fail-open,
 /// keeping the previous result — same as the liveness poll's
 /// `tick_snapshot_ok`), while the readiness endpoint MUST fail closed.
+///
+/// `session_status_by_id` is passed straight through to [`evaluate`] and is
+/// the ONLY way the coord work axis enters a pass. **[`run_periodic`] passes
+/// an empty map deliberately**: the background census runs every
+/// [`CHECK_INTERVAL`] whether anyone is asking or not, and it must never do
+/// network I/O. Only the on-demand `/restart-readiness` path resolves statuses,
+/// and it resolves them before calling this.
 pub async fn compute(
     terminal_manager: &Arc<TerminalManager>,
     store: &Arc<SessionLifecycleStore>,
     session_manager: &Arc<crate::claude_session::SessionManager>,
     primary_boot_unix_millis: i64,
+    session_status_by_id: &HashMap<String, SessionWorkStatus>,
 ) -> Option<TrackingHealthPass> {
     let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
     if snap.parent_map.is_empty() {
@@ -630,6 +830,7 @@ pub async fn compute(
         &agent_runtime_roots,
         &ai_plane_roots,
         &cwd_by_pid,
+        session_status_by_id,
         primary_boot_unix_millis,
         chrono::Utc::now().timestamp_millis(),
     );
@@ -655,6 +856,11 @@ async fn run_once(
         store,
         session_manager,
         primary_boot_unix_millis,
+        // The periodic census never consults coord: an EMPTY map means every
+        // live process blocks, which is exactly what this task reported before
+        // the work axis existed. `/health`'s numbers are unchanged, and this
+        // 600 s task does no network I/O.
+        &HashMap::new(),
     )
     .await
     else {
@@ -776,6 +982,9 @@ mod tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
@@ -789,6 +998,9 @@ mod tests {
             cwd: None,
             has_live_children: false,
             nested_under_claude: false,
+            session_id: None,
+            session_status: None,
+            blocks_restart: true,
         }
     }
 
@@ -835,6 +1047,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -873,6 +1086,7 @@ mod tests {
             &terminal_pids,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -920,6 +1134,7 @@ mod tests {
             &HashSet::new(),
             &HashSet::new(),
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -954,6 +1169,7 @@ mod tests {
             &HashMap::new(),
             &exempt,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -993,6 +1209,7 @@ mod tests {
             &terminal_pids,
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             primary_boot_ms,
             now_ms,
@@ -1037,6 +1254,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -1120,6 +1338,7 @@ mod tests {
             &HashMap::new(),
             &agent_runtime,
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -1222,6 +1441,7 @@ mod tests {
             &agent_runtime,
             &ai_roots,
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1256,6 +1476,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             now_ms,
             now_ms,
@@ -1300,6 +1521,7 @@ mod tests {
             &agent_runtime,
             &HashSet::new(),
             &cwds,
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1372,6 +1594,7 @@ mod tests {
             &agent_runtime,
             &ai_roots,
             &HashMap::new(),
+            &HashMap::new(),
             now_ms,
             now_ms,
         );
@@ -1418,5 +1641,218 @@ mod tests {
         assert_eq!(v["aiPlaneTotal"], 0);
         assert_eq!(v["headlessExemptTotal"], 1);
         assert_eq!(v["headlessExemptDetail"][0]["pid"], 77);
+    }
+
+    // ── The WORK axis (plan 2026-09-10) ─────────────────────────────────────
+
+    /// [`SessionWorkStatus::parse`] is TOTAL and mirrors coord's own parser,
+    /// including its legacy `"done"` alias. Nothing round-trips to `None`.
+    #[test]
+    fn work_status_parse_mirrors_coords_vocabulary() {
+        use SessionWorkStatus::*;
+        assert_eq!(SessionWorkStatus::parse("working"), Working);
+        assert_eq!(SessionWorkStatus::parse("blocked"), Blocked);
+        assert_eq!(SessionWorkStatus::parse("stalled"), Stalled);
+        assert_eq!(SessionWorkStatus::parse("waiting_human"), WaitingHuman);
+        assert_eq!(SessionWorkStatus::parse("finished"), Finished);
+        // Legacy wire word — coord still PARSES it, so this mirror must too.
+        assert_eq!(SessionWorkStatus::parse("done"), Finished);
+        // Case and surrounding whitespace are normalized.
+        assert_eq!(SessionWorkStatus::parse("  FINISHED "), Finished);
+        // Anything else survives verbatim rather than vanishing.
+        assert_eq!(
+            SessionWorkStatus::parse("vacationing"),
+            Unrecognised("vacationing".to_string())
+        );
+        assert_eq!(
+            SessionWorkStatus::parse("vacationing").as_wire(),
+            "vacationing"
+        );
+    }
+
+    /// **The fail-closed core.** `finished` is the ONLY input that stops a
+    /// process counting as work in flight.
+    #[test]
+    fn only_finished_stops_a_process_blocking() {
+        use SessionWorkStatus::*;
+        assert!(!blocks_restart(Some(&Finished)));
+        for s in [
+            Working,
+            Blocked,
+            Stalled,
+            WaitingHuman,
+            Unrecognised("something-new".to_string()),
+        ] {
+            assert!(blocks_restart(Some(&s)), "{s:?} must block");
+        }
+        // Absence is never "finished".
+        assert!(blocks_restart(None));
+    }
+
+    /// A terminal-hosted process is joined to the record that claims it, and
+    /// its status comes from the injected map — the same injection posture as
+    /// `cwd_by_pid`.
+    #[test]
+    fn terminal_hosted_processes_carry_their_session_id_and_status() {
+        let now_ms = 1_800_000_000_000;
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[6]), (6, &[7])],
+            &[],
+            &[(6, "claude"), (7, "claude")],
+        );
+        let records = vec![record("sess-x", "t-5", now_ms - 60_000)];
+        let terminal_pids: HashMap<String, u32> = [("t-5".to_string(), 5u32)].into_iter().collect();
+        let statuses: HashMap<String, SessionWorkStatus> =
+            [("sess-x".to_string(), SessionWorkStatus::Finished)]
+                .into_iter()
+                .collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            now_ms - 3_600_000,
+            now_ms,
+        );
+        assert_eq!(
+            report.terminal_hosted.len(),
+            2,
+            "the nested subagent counts too"
+        );
+        // Both processes are ATTRIBUTED to the record that claims them...
+        for p in &report.terminal_hosted {
+            assert_eq!(p.session_id.as_deref(), Some("sess-x"));
+        }
+        // ...but only the ROOT is discounted. The nested subagent inherits the
+        // attribution, NOT the declaration: nobody declared it finished, and
+        // `/finish-session` does not touch the process, so a parent marked
+        // finished while a nested `claude` is mid-write must not read as safe.
+        let root = report
+            .terminal_hosted
+            .iter()
+            .find(|p| !p.nested_under_claude)
+            .expect("root process");
+        assert_eq!(root.session_status.as_deref(), Some("finished"));
+        assert!(!root.blocks_restart);
+
+        let nested = report
+            .terminal_hosted
+            .iter()
+            .find(|p| p.nested_under_claude)
+            .expect("nested process");
+        assert_eq!(
+            nested.session_status, None,
+            "an INHERITED status is not an observation about this process"
+        );
+        assert!(
+            nested.blocks_restart,
+            "a nested subagent is never discounted by its ancestor's declaration"
+        );
+
+        assert_eq!(
+            TrackingHealthReport::blocking_count(&report.terminal_hosted),
+            1
+        );
+        assert_eq!(
+            TrackingHealthReport::finished_count(&report.terminal_hosted),
+            1
+        );
+        assert!(report.partition_covers_total());
+    }
+
+    /// **F2 regression.** A record whose terminal fails the PID-reuse guard
+    /// (`present == false`, so it is `tracked_dead`) still REGISTERS its claim,
+    /// so a live `claude` that also sits inside a present record's subtree
+    /// becomes AMBIGUOUS and blocks — instead of being silently discounted on
+    /// the present record's `finished`.
+    #[test]
+    fn a_dead_records_claim_still_makes_a_shared_pid_ambiguous() {
+        let now_ms = 1_800_000_000_000;
+        // 1 -> 5 (terminal A) -> 20 (terminal B) -> 21 (claude).
+        // Terminal B's pid predates the primary-boot reference, so the
+        // PID-reuse guard reports B as not present.
+        let snap = snap_with(
+            &[(1, &[5]), (5, &[20]), (20, &[21])],
+            &[(20, 1_000), (21, now_ms / 1000 - 600)],
+            &[(21, "claude")],
+        );
+        let records = vec![
+            record("sess-a", "t-a", now_ms - 60_000),
+            record("sess-b", "t-b", now_ms - 60_000),
+        ];
+        let terminal_pids: HashMap<String, u32> =
+            [("t-a".to_string(), 5u32), ("t-b".to_string(), 20u32)]
+                .into_iter()
+                .collect();
+        let statuses: HashMap<String, SessionWorkStatus> =
+            [("sess-a".to_string(), SessionWorkStatus::Finished)]
+                .into_iter()
+                .collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &statuses,
+            // Primary boot AFTER terminal B's creation time, so B fails the
+            // PID-reuse guard while A (no creation time recorded) does not.
+            2_000_000,
+            now_ms,
+        );
+        assert_eq!(report.terminal_hosted.len(), 1);
+        let p = &report.terminal_hosted[0];
+        assert_eq!(
+            p.session_id, None,
+            "two records claim this pid — the attribution is ambiguous"
+        );
+        assert_eq!(p.session_status, None);
+        assert!(
+            p.blocks_restart,
+            "an ambiguous claim must never be discounted on one claimant's `finished`"
+        );
+    }
+
+    /// With no status source at all, every live process blocks — the
+    /// pre-2026-09-10 behaviour, which is what a coord outage must reproduce.
+    #[test]
+    fn an_empty_status_map_leaves_every_process_blocking() {
+        let now_ms = 1_800_000_000_000;
+        let snap = snap_with(&[(1, &[5]), (5, &[6])], &[], &[(6, "claude")]);
+        let records = vec![record("sess-x", "t-5", now_ms - 60_000)];
+        let terminal_pids: HashMap<String, u32> = [("t-5".to_string(), 5u32)].into_iter().collect();
+        let report = evaluate(
+            &snap,
+            1,
+            &records,
+            &terminal_pids,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms - 3_600_000,
+            now_ms,
+        );
+        assert_eq!(report.terminal_hosted.len(), 1);
+        let p = &report.terminal_hosted[0];
+        assert_eq!(
+            p.session_id.as_deref(),
+            Some("sess-x"),
+            "the JOIN still happens"
+        );
+        assert_eq!(p.session_status, None, "but no status was resolved");
+        assert!(p.blocks_restart);
+        assert_eq!(
+            TrackingHealthReport::blocking_count(&report.terminal_hosted),
+            1
+        );
     }
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { deliverApprovals } from "./approveAll";
+import { evaluateTransitions } from "./transitionAutomation";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { SessionState } from "./useZoneLayout";
 import { playNeedsInputChime, playCompletionChime, playErrorAlert } from "./notificationSound";
@@ -149,80 +150,79 @@ export function useStateTransitionEffects(
   }, [autoApprovePatterns]);
 
   // ── Main state transition effect ──────────────────────────────────────────
+  //
+  // The DECISION half lives in `transitionAutomation.ts` — a pure, tested
+  // module (`evaluateTransitions`). What stays here is the EFFECT half: dwell
+  // timing, history logging, the restart countdown, delivery, and the
+  // notification surfaces. The split is what makes the decision testable at
+  // all, since `vitest.config.ts` is `environment: "node"` and a hook cannot be
+  // rendered.
+  //
+  // `evaluateTransitions` deliberately does NOT advance `prevSessionStatesRef`
+  // — this effect does, on the line marked below, and it must remain the only
+  // place that does. See the module header for why a second advancer silently
+  // kills flashing, auto-focus and the window-title counts.
 
   useEffect(() => {
-    const prev = prevSessionStatesRef.current;
     const now = Date.now();
-    const newFlashing: string[] = [];
-    const newErrors: string[] = [];
-    const newCompleted: string[] = [];
+    const outcome = evaluateTransitions({
+      prev: prevSessionStatesRef.current,
+      next: sessionStates,
+      tabs,
+      assignments,
+      autoApprovePatterns,
+      autoRestart,
+      getLastOutputLines,
+    });
 
-    for (const [tabId, state] of Object.entries(sessionStates)) {
-      // Track entry time for any state change
-      if (prev[tabId] !== state) {
-        // Accumulate time in previous state
-        const prevState = prev[tabId];
-        if (prevState && stateEntryTimeRef.current[tabId]) {
-          const elapsed = now - stateEntryTimeRef.current[tabId];
-          stateTimeAccumRef.current[prevState] += elapsed;
-        }
-        stateEntryTimeRef.current[tabId] = now;
+    const {
+      newNeedsInput: newFlashing,
+      newErrors,
+      newCompleted,
+      approvals,
+      restarts,
+      stateChanges,
+    } = outcome;
 
-        // Log state transitions to history
-        const tab = tabs.find((t) => t.id === tabId);
-        const zone = Object.entries(assignments).find(([, id]) => id === tabId);
-        const zoneNum = zone ? Number(zone[0]) : undefined;
-
-        if (state === "needs-input") {
-          addHistoryEvent("Needs input", tab?.title ?? tabId, zoneNum, "#e0af68");
-        } else if (state === "error" && prev[tabId] !== "error") {
-          addHistoryEvent("Error", tab?.title ?? tabId, zoneNum, "#f7768e");
-        } else if (state === "completed" && prev[tabId] !== "completed") {
-          addHistoryEvent("Completed", tab?.title ?? tabId, zoneNum, "#9ece6a");
-
-          // Auto-restart: schedule restart for completed sessions (exit 0) after 2s
-          if (autoRestart && zoneNum !== undefined) {
-            const completedTab = tabs.find((t) => t.id === tabId);
-            if (
-              completedTab &&
-              (completedTab.exitCode === 0 ||
-                completedTab.exitCode === null ||
-                completedTab.exitCode === undefined)
-            ) {
-              const capturedZoneNum = zoneNum;
-              const capturedTitle = completedTab.title ?? tabId;
-              const restartAt = Date.now() + 2000;
-              // eslint-disable-next-line react-hooks/set-state-in-effect -- schedule pending restart countdown
-              setPendingRestarts((prev) => ({ ...prev, [capturedZoneNum]: restartAt }));
-
-              const timer = setTimeout(() => {
-                handleRestartInZoneRef.current(capturedZoneNum);
-                setAutoRestartCount((c) => c + 1);
-                addHistoryEvent("Auto-restarted", capturedTitle, capturedZoneNum, "#7dcfff");
-                setPendingRestarts((prev) => {
-                  const next = { ...prev };
-                  delete next[capturedZoneNum];
-                  return next;
-                });
-                delete pendingRestartTimersRef.current[capturedZoneNum];
-              }, 2000);
-
-              pendingRestartTimersRef.current[capturedZoneNum] = timer;
-            }
-          }
-        }
+    // Dwell-time accounting + history, in observation order.
+    for (const change of stateChanges) {
+      if (change.from && stateEntryTimeRef.current[change.tabId]) {
+        stateTimeAccumRef.current[change.from] +=
+          now - stateEntryTimeRef.current[change.tabId];
       }
-      if (state === "needs-input" && prev[tabId] !== "needs-input") {
-        newFlashing.push(tabId);
-      }
-      if (state === "error" && prev[tabId] !== "error") {
-        newErrors.push(tabId);
-      }
-      if (state === "completed" && prev[tabId] !== "completed") {
-        newCompleted.push(tabId);
+      stateEntryTimeRef.current[change.tabId] = now;
+
+      if (change.to === "needs-input") {
+        addHistoryEvent("Needs input", change.title, change.zoneIdx, "#e0af68");
+      } else if (change.to === "error") {
+        addHistoryEvent("Error", change.title, change.zoneIdx, "#f7768e");
+      } else if (change.to === "completed") {
+        addHistoryEvent("Completed", change.title, change.zoneIdx, "#9ece6a");
       }
     }
 
+    // Auto-restart: schedule the 2s countdown for each eligible completed zone.
+    for (const restart of restarts) {
+      const { zoneIdx, title } = restart;
+      const restartAt = Date.now() + 2000;
+      setPendingRestarts((prev) => ({ ...prev, [zoneIdx]: restartAt }));
+
+      const timer = setTimeout(() => {
+        handleRestartInZoneRef.current(zoneIdx);
+        setAutoRestartCount((c) => c + 1);
+        addHistoryEvent("Auto-restarted", title, zoneIdx, "#7dcfff");
+        setPendingRestarts((prev) => {
+          const next = { ...prev };
+          delete next[zoneIdx];
+          return next;
+        });
+        delete pendingRestartTimersRef.current[zoneIdx];
+      }, 2000);
+
+      pendingRestartTimersRef.current[zoneIdx] = timer;
+    }
+
+    // THE SINGLE ADVANCE. Nothing else may write this ref.
     prevSessionStatesRef.current = sessionStates;
 
     // Track unseen needs-input
@@ -234,41 +234,30 @@ export function useStateTransitionEffects(
       });
     }
 
-    // Auto-approve: check last output lines against patterns
-    if (newFlashing.length > 0 && autoApprovePatterns.length > 0) {
-      for (const tabId of newFlashing) {
-        const lines = getLastOutputLines(tabId);
-        const lastFew = lines.slice(-5).join("\n");
-        const matched = autoApprovePatterns.some((pattern) => {
-          try {
-            return new RegExp(pattern, "i").test(lastFew);
-          } catch {
-            return false;
-          }
-        });
-        if (matched) {
-          // The same delivery path `/approve-all`, Ctrl+Shift+Enter and the
-          // overlay buttons use, and the reason this one matters most: an
-          // auto-approve rule answers `y` on the operator's behalf with no
-          // one watching. `ref?.current?.writeToTerminal("y\r")` is a silent
-          // no-op for any pane without a mounted `TerminalInstance` — which
-          // for a headless polling workflow, the exact case this feature
-          // exists for, is the COMMON state — and the counter and history
-          // event fired regardless. So the page recorded auto-approvals that
-          // reached no process, and `/metrics` renders that counter.
-          //
-          // Fire-and-forget by construction (this is a state-transition
-          // effect, not a command), but the count and the log entry now wait
-          // on the envelope. A write that did not land leaves no trace,
-          // which is the honest record: the prompt is still waiting.
-          const tab = tabs.find((t) => t.id === tabId);
-          void deliverApprovals([tabId], terminalRefs, "y\r").then((report) => {
-            if (report.delivered === 0) return;
-            setAutoApproveCount((c) => c + report.delivered);
-            addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
-          });
-        }
-      }
+    // Auto-approve delivery. `approvals` is an INTENT; only the envelope that
+    // comes back may be counted.
+    //
+    // The same delivery path `/approve-all`, Ctrl+Shift+Enter and the overlay
+    // buttons use, and the reason this one matters most: an auto-approve rule
+    // answers `y` on the operator's behalf with no one watching.
+    // `ref?.current?.writeToTerminal("y\r")` is a silent no-op for any pane
+    // without a mounted `TerminalInstance` — which for a headless polling
+    // workflow, the exact case this feature exists for, is the COMMON state —
+    // and the counter and history event fired regardless. So the page recorded
+    // auto-approvals that reached no process, and `/metrics` renders that
+    // counter.
+    //
+    // Fire-and-forget by construction (this is a state-transition effect, not a
+    // command), but the count and the log entry wait on the envelope. A write
+    // that did not land leaves no trace, which is the honest record: the prompt
+    // is still waiting.
+    for (const tabId of approvals) {
+      const tab = tabs.find((t) => t.id === tabId);
+      void deliverApprovals([tabId], terminalRefs, "y\r").then((report) => {
+        if (report.delivered === 0) return;
+        setAutoApproveCount((c) => c + report.delivered);
+        addHistoryEvent("Auto-approved", tab?.title ?? tabId, undefined, "#9ece6a");
+      });
     }
 
     if (newFlashing.length > 0) {

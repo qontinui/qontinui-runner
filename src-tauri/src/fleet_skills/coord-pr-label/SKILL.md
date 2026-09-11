@@ -1,6 +1,6 @@
 ---
 name: coord-pr-label
-description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, blocked/experimental flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); tenant resolved automatically from your agent's worktree.
+description: Set coord:* labels on a pull request — declare intent (upstream-of/downstream-of/stacked-on dependency edges, requires-tag, merge-strategy, credibility-override/migrate-repair flags) so the PR Merge Orchestrator can schedule the auto-merge correctly. All three dep labels work cross-repo with the [<owner>/]<repo>#<n> grammar; no label holds a PR. Validates against the namespace and GitHub's 50-character label-name ceiling before sending (--dry-run checks a label without sending anything, and a failing label add is diagnosed rather than relayed; a missing dynamic-value label is created on demand); tenant resolved automatically from your agent's worktree.
 user-invocable: true
 ---
 
@@ -67,12 +67,16 @@ fires, so invalid labels never make it to GitHub or coord.
 
 > **No label holds a PR** (holds retired 2026-06-20). To hold a PR:
 > **convert it to draft**, or **register a coord gate with a `MergePr`
-> continuation**. `coord:blocked` / `coord:experimental` are still
-> accepted — they route dequeue-time merge-class as flag labels — but
-> they do NOT block merge; applying one via GitHub triggers a one-time
-> PR comment stating it is inert as a hold. `coord:operator-review` and
-> `coord:version-bump=*` are retired outright and REJECTED by the
-> validator.
+> continuation**. **`coord:blocked` and `coord:experimental` are RETIRED
+> hold labels and this skill REFUSES them**, the same way it refuses
+> `coord:operator-review` and `coord:version-bump=*`. coord treats all four
+> as inert hold-shaped labels: `data/repo_branches.rs` `inert_hold_labels`
+> matches them, and `render_inert_hold_label_comment` posts a one-time PR
+> comment saying they do **not** hold the PR. The PR still auto-merges once
+> green. `blocked` and `experimental` only downgrade dequeue routing
+> (Contending, no fast-land), which is not what an author reaching for them
+> wants. A PR that must not land yet is a **draft**:
+> `gh pr ready --undo <n> --repo <owner/repo>`.
 
 > **Do NOT use `coord:stacked-on` / `coord:upstream-of` /
 > `coord:downstream-of` to order a *migration* stack.** When a PR's
@@ -190,8 +194,7 @@ The skill enforces the namespace before sending — this table mirrors
 | `coord:stacked-on=#<n>` or `=[<owner>/]<repo>#<n>` | Contains `#`; `<n>` parses as a Rust **`i32`** (same domain as upstream-of — `#2147483648` is rejected); empty repo part = same repo, a **non-empty** one gets the same both-segments check. **Code stacks only — never for migration ordering (coord derives that from `down_revision`).** |
 | `coord:requires-tag=<pattern>`                     | Any non-empty value                                         |
 | `coord:merge-strategy=squash\|rebase\|merge`       | One of the three exact strings                              |
-| `coord:blocked`                                    | Flag (no value) — accepted, but **NOT a hold**              |
-| `coord:experimental`                               | Flag — accepted, but **NOT a hold**                         |
+| `coord:blocked` / `coord:experimental`             | REJECTED — retired hold labels (2026-06-20); coord treats them as inert (`inert_hold_labels`). To hold a PR, convert it to draft (`gh pr ready --undo <n>`) |
 | `coord:credibility-override`                       | Flag — Tier-7 credibility-gate escape hatch                 |
 | `coord:migrate-repair`                             | Flag — accepted. **The one flag here that RELEASES a hold** rather than restricting: it can make a land happen that otherwise would not. coord bounds it at the *consuming* end, not the validator — `merge_scheduler::migrate_self_blocking` refuses to honour it unless the land is genuinely self-blocking, **and is further scoped to `EXPECTED_WEB_REPO` and the `PendingHead` escalation arm only**. Setting it is cheap and auditable; acting on it is not, and coord keeps those two decisions apart |
 | `coord:priority` / `coord:priority=*`              | REJECTED — set it on the PR itself with `gh pr edit --add-label coord:priority`. A skill-set row writes `source='coord_skill'` and the merge scheduler only honours `source='github'`, so it would be inert (and invisible on GitHub). **Both spellings hit a bespoke error that names that fix** (coord's `PRIORITY_LABEL_ERR`); the parameterised form is caught deliberately, because the lever is ONE BIT and an author writing `=1` is reaching for numeric levels that do not exist |
@@ -351,7 +354,7 @@ note: NOT checked -- whether "coord:downstream-of=qontinui-dev-notes#167" exists
 The `gh label create` half appears only for an **open-valued key** —
 `upstream-of`, `downstream-of`, `stacked-on`, `requires-tag`. It is deliberately
 keyed rather than triggered by the presence of `=`: a flag label
-(`coord:blocked` and friends) **and `coord:merge-strategy=`**, whose value is one
+(`coord:credibility-override` and friends) **and `coord:merge-strategy=`**, whose value is one
 of exactly three strings, are both repo-wide labels somebody creates once, so
 both get the caveat without a pointer to a repo-wide mutation nobody needs. A
 `carries a value` test would sweep `merge-strategy` in with the dep labels and

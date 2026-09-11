@@ -67,7 +67,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG create_comparison_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG create_comparison_run", &e))?;
         Ok(())
     }
 
@@ -99,7 +99,7 @@ impl PgDb {
             &[&entries_json, &status, &computed_axis, &drift_class, &id],
         )
         .await
-        .map_err(|e| format!("PG update_comparison_run_entries: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_comparison_run_entries", &e))?;
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_comparison_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_comparison_run", &e))?;
 
         Ok(row.map(|r| ComparisonRunRow::from_row(&r)))
     }
@@ -148,7 +148,7 @@ impl PgDb {
             &[&entries_json, &computed_axis, &drift_class, &id],
         )
         .await
-        .map_err(|e| format!("PG complete_comparison_run: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG complete_comparison_run", &e))?;
         Ok(())
     }
 
@@ -170,7 +170,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG list_comparison_runs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_comparison_runs", &e))?;
 
         Ok(rows.iter().map(ComparisonRunRow::from_row).collect())
     }

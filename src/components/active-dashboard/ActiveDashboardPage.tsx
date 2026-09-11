@@ -89,6 +89,19 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
       {
         id: "start-run",
         label: "Start Run",
+        // A fourth description added by Phase 2 beyond the three the plan named,
+        // for the same reason: the label asserts an effect the handler does not
+        // have, and a session establishing this action's effect from the
+        // registry would have been misled. Same class as the three mislabelled
+        // Session Manager controls recorded in
+        // [policy: what-makes-an-action-destructive].
+        description:
+          "Navigate to the Execute page, where a run can be started. Does NOT start a " +
+          "run — nothing is executed by invoking this.",
+        // `read` — NAVIGATES to the Execute page (`onGoToExecute()`); it starts nothing.
+        // The label says otherwise, which is exactly the label-is-not-a-specification
+        // case [policy: what-makes-an-action-destructive]; hence the description above.
+        effect: "read",
         handler: async () => {
           handleStartRun();
         },
@@ -96,6 +109,10 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
       {
         id: "stop-run",
         label: "Stop Run",
+        // `destructive` — aborts an in-flight GUI automation run (`stop_execution`).
+        // Dim 1: restarting does not undo what the run already clicked, and its partial
+        // progress is not reconstructible. Dim 2: the run's state is not this view's.
+        effect: "destructive",
         handler: async () => {
           await handleStopRun();
         },
@@ -103,6 +120,8 @@ export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
       {
         id: "refresh",
         label: "Refresh",
+        // `read` — a GET against `/status`. Query, no state change.
+        effect: "read",
         handler: async () => {
           await handleRefresh();
         },

@@ -44,7 +44,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_or_update_canvas_panel: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_or_update_canvas_panel", &e))?;
 
         Ok(())
     }
@@ -76,7 +76,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_canvas_panels_for_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_canvas_panels_for_task_run", &e))?;
 
         Ok(rows
             .iter()
@@ -109,7 +109,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM canvas_panels WHERE id = $1", &[&panel_id])
             .await
-            .map_err(|e| format!("PG delete_canvas_panel: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_canvas_panel", &e))?;
 
         Ok(affected > 0)
     }
@@ -128,7 +128,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG clear_canvas_panels: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG clear_canvas_panels", &e))?;
 
         Ok(affected)
     }

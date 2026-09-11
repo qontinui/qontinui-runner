@@ -50,7 +50,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_workflow_version: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_workflow_version", &e))?;
         Ok(id)
     }
 
@@ -83,7 +83,7 @@ impl PgDb {
                 &[&workflow_id_uuid],
             )
             .await
-            .map_err(|e| format!("PG get_workflow_versions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_workflow_versions", &e))?;
         Ok(rows
             .iter()
             .map(|r| WorkflowVersion {
@@ -136,7 +136,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_step_finding_link: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_step_finding_link", &e))?;
         Ok(id)
     }
 
@@ -170,7 +170,7 @@ impl PgDb {
                 &[&task_run_id, &step_started_at, &step_completed_at],
             )
             .await
-            .map_err(|e| format!("PG find unlinked findings: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG find unlinked findings", &e))?;
 
         let mut count = 0u32;
         for row in &rows {
@@ -246,7 +246,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_step_provenance: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_step_provenance", &e))?;
         Ok(id)
     }
 
@@ -295,7 +295,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_pipeline_event: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_pipeline_event", &e))?;
         Ok(id)
     }
 
@@ -324,7 +324,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_pipeline_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_pipeline_events", &e))?;
         Ok(rows
             .iter()
             .map(|r| PipelineEvent {
@@ -379,7 +379,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG insert_rule_influence: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_rule_influence", &e))?;
         Ok(id)
     }
 
@@ -415,7 +415,7 @@ impl PgDb {
                 &[&wn],
             )
             .await
-            .map_err(|e| format!("PG get_active_patterns: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_active_patterns", &e))?
         } else {
             conn.query(
                 r#"SELECT id, pattern_type, signature_hash, workflow_name,
@@ -429,7 +429,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_active_patterns: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_active_patterns", &e))?
         };
 
         Ok(rows
@@ -483,7 +483,7 @@ impl PgDb {
                 &[&workflow_id_uuid],
             )
             .await
-            .map_err(|e| format!("PG get_provenance_for_workflow: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_provenance_for_workflow", &e))?;
 
         Ok(rows
             .iter()
@@ -529,7 +529,7 @@ impl PgDb {
                 &[&rule_id],
             )
             .await
-            .map_err(|e| format!("PG get_rule_influences: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_rule_influences", &e))?;
 
         Ok(rows
             .iter()
@@ -576,7 +576,7 @@ impl PgDb {
                 &[&min_no_effect_count],
             )
             .await
-            .map_err(|e| format!("PG get_ineffective_rules: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ineffective_rules", &e))?;
 
         Ok(rows
             .iter()
@@ -632,7 +632,7 @@ impl PgDb {
                 &[&workflow_id_uuid],
             )
             .await
-            .map_err(|e| format!("PG get_phase_stats: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_phase_stats", &e))?;
 
         Ok(rows
             .iter()
@@ -673,7 +673,7 @@ impl PgDb {
                 &[&limit],
             )
             .await
-            .map_err(|e| format!("PG get_fix_effectiveness_scores: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_fix_effectiveness_scores", &e))?;
 
         Ok(rows
             .iter()

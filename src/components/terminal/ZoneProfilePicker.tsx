@@ -227,6 +227,12 @@ export function ZoneProfilePicker({
         label: "Load Profile",
         description: "Apply a saved zone profile (layout, labels, sessions) by name.",
         paramSchema: { name: "string" },
+        // `destructive` — `useApplyZoneProfile` REPLACES the live layout, labels, notes,
+        // pins and `autoApprovePatterns` (an agent auto-approval allow-list) with the
+        // profile's, spawns terminals to fill its zones, and queues `claude --resume` into
+        // them. Dim 1: the arrangement it overwrites was never saved anywhere. Dim 3: it
+        // widens or narrows auto-approval silently, which is the worst quadrant.
+        effect: "destructive",
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("load-profile requires { name: string }");
@@ -241,8 +247,24 @@ export function ZoneProfilePicker({
       {
         id: "save-profile",
         label: "Save Profile",
-        description: "Capture current layout + zone assignments as a named profile.",
+        // The old text ("Capture current layout + zone assignments as a named
+        // profile.") was INCOMPLETE rather than wrong: it disclosed neither the
+        // full capture set nor the two side effects — an existing profile of the
+        // same name is overwritten, and the profile becomes the page's ACTIVE
+        // one (`setActiveProfileName` + `saveActiveProfileToDb` below), which a
+        // later boot then auto-applies. Undisclosed side effects are exactly
+        // what an effect classification has to be established from
+        // [policy: the-ui-bridge-is-the-instrument].
+        description:
+          "Capture the current layout, zone assignments, labels, notes, pins, " +
+          "auto-approve patterns and Claude session bindings as a named profile, and " +
+          "make it the page's ACTIVE profile (a later boot re-applies it). " +
+          "OVERWRITES an existing profile of the same name without confirmation.",
         paramSchema: { name: "string" },
+        // `destructive` — writing to an EXISTING name overwrites that profile with no
+        // confirmation and no copy of what it replaced (dim 1 + dim 3), and it also makes
+        // the profile active — see the description above, which used to omit that.
+        effect: "destructive",
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("save-profile requires { name: string }");
@@ -284,6 +306,9 @@ export function ZoneProfilePicker({
         label: "Delete Profile",
         description: "Remove a saved profile by name. Clears active-profile if it matches.",
         paramSchema: { name: "string" },
+        // `destructive` — removes a saved profile from the page's persisted settings.
+        // There is no undo and no recycle bin.
+        effect: "destructive",
         handler: (params?: unknown) => {
           const { name } = (params ?? {}) as { name?: string };
           if (!name) throw new Error("delete-profile requires { name: string }");
@@ -294,6 +319,8 @@ export function ZoneProfilePicker({
       {
         id: "list-profiles",
         label: "List Profiles",
+        // `read` — returns the profile names and the active one. A query.
+        effect: "read",
         handler: () => ({
           profiles: profileNames,
           active: activeProfileName,

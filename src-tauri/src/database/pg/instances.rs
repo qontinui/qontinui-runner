@@ -64,7 +64,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_runner_instance (port cleanup): {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_runner_instance (port cleanup)", &e))?;
 
         conn.execute(
             r#"
@@ -90,7 +90,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG upsert_runner_instance: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_runner_instance", &e))?;
 
         Ok(())
     }
@@ -118,7 +118,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_all_runner_instances: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_all_runner_instances", &e))?;
 
         Ok(rows
             .iter()
@@ -148,7 +148,7 @@ impl PgDb {
         let count = conn
             .execute("DELETE FROM project.runner_instances WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG remove_runner_instance: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG remove_runner_instance", &e))?;
 
         Ok(count > 0)
     }
@@ -183,7 +183,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG update_runner_instance_heartbeat: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_runner_instance_heartbeat", &e))?;
 
         Ok(count > 0)
     }
@@ -212,7 +212,7 @@ impl PgDb {
                 &[&stale_threshold_secs],
             )
             .await
-            .map_err(|e| format!("PG mark_stale_runner_instances: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG mark_stale_runner_instances", &e))?;
 
         Ok(count)
     }
@@ -239,7 +239,7 @@ impl PgDb {
                 &[&dead_threshold_secs],
             )
             .await
-            .map_err(|e| format!("PG cleanup_dead_runner_instances: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG cleanup_dead_runner_instances", &e))?;
 
         Ok(count)
     }

@@ -49,6 +49,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,11 +59,14 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
+use crate::claude_session::spawn_preconditions::{SpawnPreconditions, SpawnStalledBody};
 /// The runner's connected-vs-isolated decision, imported (not re-wrapped) from
 /// its single definition in `profiles`. Every coord surface in this module
 /// no-ops when it is `None` (the runner is standalone).
 use qontinui_runner_lib::profiles::connected_coord_base;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+
+use crate::capability_manifest::{self, ProvisionReport};
 
 // =============================================================================
 // Wire shapes (mirror of qontinui-coord/src/agents_spawn.rs)
@@ -253,6 +257,226 @@ pub struct GateContinuationPayload {
     /// [`continuation_addressed_to_self`] for the matching rule.
     #[serde(default)]
     pub target_instance_name: Option<String>,
+    /// The dispatch-time brief coord assembles from what it already holds — the
+    /// plan stem behind the work-unit link, the PR the gate predicate names,
+    /// that PR's `block_reason_*` history, and live findings on the resulting
+    /// resource keys (coord plan
+    /// `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-a-fifo-queue-and-a-gate-that-cannot-be-re-armed`,
+    /// Phase 1b). Reaches the spawned session through
+    /// `compose_continuation_system_prompt` on the TERMINAL path and
+    /// `compose_continuation_headless_prompt` on the HEADLESS one.
+    ///
+    /// **This field is the OTHER HALF of a two-repo seam, and without it the
+    /// coord key is a silent no-op.** This struct has no
+    /// `#[serde(deny_unknown_fields)]`, so serde discards every key it does not
+    /// name with no error and no log line — `delivery`, `allocation` and
+    /// `required_capabilities` are dropped from coord's own frame that way
+    /// today. A coord-side additive key therefore reaches the agent as NOTHING
+    /// unless a field here reads it.
+    ///
+    /// Optional and lenient on purpose, in two stages — see
+    /// [`deserialize_lenient_brief`]. Absent on every coord that predates the
+    /// key. A shape this build cannot fully parse degrades to its `text` with
+    /// defaulted metadata; only one with no readable `text` degrades to `None`.
+    /// Neither ever fails the frame: a brief the runner cannot read is a brief,
+    /// not a reason to drop the whole continuation.
+    #[serde(default, deserialize_with = "deserialize_lenient_brief")]
+    pub brief: Option<ContinuationBrief>,
+}
+
+/// Coord's assembled continuation brief, as published on the spawn frame.
+///
+/// Every field defaults, so a coord that grows or drops a key here can never
+/// fail the whole payload parse. `truncated` + `cap_chars` are carried rather
+/// than inferred, because a bound that silently drops context is the failure
+/// mode the flag exists to prevent.
+///
+/// **The bound is coord's, and argv is only HALF the reason for it.** On
+/// `Presentation::Terminal` the text lands in `--append-system-prompt`, i.e. in
+/// a process command line (under `CreateProcessW`'s 32767-character ceiling on
+/// Windows). On `Presentation::Headless` it lands on the prompt, which
+/// [`spawn_claude_child`] writes to the child's STDIN and never passes as argv
+/// at all — no argv ceiling applies there. What holds on BOTH carriers is the
+/// context budget: the same 2000 the registration-side rule writes to, so the
+/// registrant's half and coord's half of one brief agree about "over budget".
+/// The runner re-caps on neither path; it only reports.
+#[derive(Debug, Clone, Deserialize, Default, PartialEq, Eq)]
+pub struct ContinuationBrief {
+    /// The labelled-line brief itself. Empty ⇒ nothing to append.
+    #[serde(default)]
+    pub text: String,
+    /// Whether coord had to cut. When true the text already carries the
+    /// `[brief truncated at N chars -- full context: ...]` marker; this flag is
+    /// the machine-readable twin of it, and `append_continuation_brief` re-adds
+    /// the marker if a future coord ever sets the flag without writing one.
+    #[serde(default)]
+    pub truncated: bool,
+    /// The character cap coord rendered against.
+    #[serde(default)]
+    pub cap_chars: Option<usize>,
+    /// The rendered length coord measured.
+    #[serde(default)]
+    pub chars: Option<usize>,
+    /// Provenance — `"coord_dispatch"` for the brief coord builds itself.
+    #[serde(default)]
+    pub assembled_by: Option<String>,
+}
+
+/// Deserialize `GateContinuationPayload::brief` WITHOUT letting a shape this
+/// build does not understand fail the whole frame — and without letting ONE
+/// unreadable field cost the whole brief.
+///
+/// The `brief` key is a two-repo contract, and the two repos ship on
+/// independent cadences. Two distinct degradations, because they are two
+/// distinct losses:
+///
+/// 1. **Whole-frame.** A plain `Option<ContinuationBrief>` would turn any future
+///    coord-side shape change (a bare string, an array, a renamed discriminator)
+///    into a hard parse error for the ENTIRE `GateContinuationPayload` — a
+///    dropped CONTINUATION, strictly worse than a dropped brief. So: parse to a
+///    `Value` first, then try the struct.
+/// 2. **Whole-brief.** `#[serde(default)]` covers a MISSING key, never a
+///    wrongly-typed one, so `serde_json::from_value` is all-or-nothing: a coord
+///    sending `"chars": "199"` or `"truncated": null` would drop the brief's
+///    TEXT along with the metadata field that was actually broken. The text is
+///    the only part that reaches the model, so it is salvaged out of the `Value`
+///    independently and the unreadable metadata is defaulted around it.
+///
+/// Only a shape with no readable `text` degrades to `None`.
+///
+/// One asymmetry in the salvage, and it is deliberate: an unreadable
+/// `truncated` is read as `true`, not as the field's `false` default. `false`
+/// is a claim that the brief is COMPLETE, and this arm is reached precisely
+/// when coord said something this build could not parse — so the salvage
+/// declines to make that claim, and
+/// [`append_continuation_brief`]'s no-marker notice fires. An ABSENT
+/// `truncated` is still `false`: a coord that never sets the key is not
+/// asserting a cut.
+fn deserialize_lenient_brief<'de, D>(d: D) -> Result<Option<ContinuationBrief>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    match serde_json::from_value::<ContinuationBrief>(value.clone()) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) => match salvage_brief_text(&value) {
+            Some(brief) => {
+                tracing::warn!(
+                    "gate continuation: `brief` key is not a shape this runner fully \
+                     understands ({e}) — spawning with its TEXT and defaulted metadata"
+                );
+                Ok(Some(brief))
+            }
+            None => {
+                tracing::warn!(
+                    "gate continuation: `brief` key present, unreadable and carries no \
+                     usable `text` — spawning WITHOUT it: {e}"
+                );
+                Ok(None)
+            }
+        },
+    }
+}
+
+/// Pull the one field that reaches the model out of a `brief` object the struct
+/// could not parse. `None` when there is no non-blank string `text` to carry —
+/// there is then nothing to append and the brief is genuinely absent.
+fn salvage_brief_text(value: &serde_json::Value) -> Option<ContinuationBrief> {
+    let text = value.get("text")?.as_str()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(ContinuationBrief {
+        text: text.to_string(),
+        // Present-but-unreadable ⇒ assume a cut (never claim completeness);
+        // absent ⇒ the field's own default.
+        truncated: match value.get("truncated") {
+            None => false,
+            Some(v) => v.as_bool().unwrap_or(true),
+        },
+        cap_chars: value
+            .get("cap_chars")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok()),
+        chars: value
+            .get("chars")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok()),
+        assembled_by: value
+            .get("assembled_by")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+/// Append coord's brief to the runner-context system prompt that every
+/// continuation spawn already carries.
+///
+/// This is the `Presentation::Terminal` half of the seam; its sibling
+/// `compose_continuation_headless_prompt` is the `Presentation::Headless` half.
+/// BOTH exist because a brief appended at only one of them reaches only one of
+/// the two spawn paths a gate continuation can take.
+///
+/// It is deliberately NOT wired into `run_condition_check_terminal`, the other
+/// `build_continuation_claude_command` call site: that frame is a
+/// `ConditionCheckPayload` with its own `source` discriminator and no `brief`
+/// key at all.
+///
+/// The runner never re-caps: coord owns the bound and states it on the frame.
+/// What the runner DOES guarantee is that a cut is never silent — if coord
+/// flags `truncated` and its text carries no marker, one is appended here.
+pub(crate) fn compose_continuation_system_prompt(
+    runner_context: String,
+    brief: Option<&ContinuationBrief>,
+) -> String {
+    append_continuation_brief(runner_context, brief)
+}
+
+/// The HEADLESS half of the same seam.
+///
+/// `Presentation::Headless` reaches `run_continuation_headless` ->
+/// `spawn_claude_child`, which renders the runner briefing into the child's
+/// ENVIRONMENT (`QONTINUI_RUNNER_CONTEXT`) and passes no
+/// `--append-system-prompt` at all — so there is no system-prompt argv here to
+/// extend. The brief rides on the PROMPT instead, appended after a blank line,
+/// which is byte-for-byte how coord delivers a registrant's `hint`
+/// (`ParsedContinuation::initial_prompt` on the coord side). Same helper, same
+/// truncation guarantee; only the carrier differs.
+pub(crate) fn compose_continuation_headless_prompt(
+    initial_prompt: &str,
+    brief: Option<&ContinuationBrief>,
+) -> String {
+    append_continuation_brief(initial_prompt.to_string(), brief)
+}
+
+/// Append `brief.text` to `base` after a blank line, and make a cut LOUD.
+///
+/// Absent brief, or one whose text is blank ⇒ `base` unchanged, so a runner
+/// talking to a coord that predates the key behaves exactly as it does today.
+fn append_continuation_brief(base: String, brief: Option<&ContinuationBrief>) -> String {
+    let Some(brief) = brief else {
+        return base;
+    };
+    let text = brief.text.trim();
+    if text.is_empty() {
+        return base;
+    }
+    let mut out = base;
+    out.push_str("\n\n");
+    out.push_str(text);
+    // The runner never re-caps — coord owns the bound and states it on the
+    // frame. What it does guarantee is that a cut is never SILENT: if coord
+    // flags `truncated` and its text carries no marker, say so here.
+    if brief.truncated && !text.contains("[brief truncated") {
+        out.push_str(
+            "\n[brief truncated by coord -- it carried no marker; treat the context above as \
+             INCOMPLETE and re-read the references it names]",
+        );
+    }
+    out
 }
 
 /// The `source` discriminator coord stamps on a gate-continuation spawn frame.
@@ -281,7 +505,9 @@ const CONDITION_CHECK_SOURCE: &str = "condition_check";
 /// A `source` of `"condition_check"` is the wire discriminator that routes a
 /// frame into [`dispatch_condition_check`] instead of the gate / `LaunchPayload`
 /// arms.
-#[derive(Debug, Clone, Deserialize)]
+/// `Debug` is HAND-WRITTEN, not derived — see the impl below. This struct holds
+/// a credential in two places.
+#[derive(Clone, Deserialize)]
 pub struct ConditionCheckPayload {
     /// The coord run id this check belongs to (used for the terminal title and
     /// correlation logging). A UUID string.
@@ -308,6 +534,55 @@ pub struct ConditionCheckPayload {
     /// only deserializes a frame here after confirming this value.
     #[serde(default)]
     pub source: String,
+    /// The per-run capability token that authenticates
+    /// `POST /coord/condition-runs/{run_id}/report` — the ONLY credential that
+    /// route accepts (it is public; a device JWT 403s there).
+    ///
+    /// `Option` because coord does not put it in the frame today: it embeds the
+    /// token in [`Self::initial_prompt`] for the spawned agent to curl with. The
+    /// runner needs it too, so that a spawn which never happens can still report
+    /// the run terminal instead of leaving it `running` forever — see
+    /// [`report_condition_run_failed`]. Until coord promotes it to a field,
+    /// [`condition_report_token`] recovers it from the prompt; when coord does,
+    /// this field wins with no further change here.
+    #[serde(default)]
+    pub report_token: Option<String>,
+}
+
+/// Redacting `Debug`, deliberately not derived.
+///
+/// TWO fields carry the per-run report credential: `report_token` directly, and
+/// `initial_prompt`, which is where coord actually ships it today (see
+/// [`condition_report_token`]) — and which additionally embeds the operator's
+/// `auth_setup` recipe, i.e. whatever login secret the tenant stored for the
+/// target app. Nothing formats this struct today; a derive would make the next
+/// `{:?}` in a log line leak both without anyone noticing. `initial_prompt` is
+/// reported as a LENGTH so it stays diagnosable without being quotable.
+impl std::fmt::Debug for ConditionCheckPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConditionCheckPayload")
+            .field("run_id", &self.run_id)
+            .field("target_device_id", &self.target_device_id)
+            .field("target_url", &self.target_url)
+            .field(
+                "initial_prompt",
+                &format_args!("<{} bytes>", self.initial_prompt.len()),
+            )
+            .field("presentation", &self.presentation)
+            .field("source", &self.source)
+            .field(
+                "report_token",
+                &format_args!(
+                    "{}",
+                    if self.report_token.is_some() {
+                        "<redacted>"
+                    } else {
+                        "None"
+                    }
+                ),
+            )
+            .finish()
+    }
 }
 
 /// Typed spawn lifecycle phase coord keys an outcome to. The runner emits ONLY
@@ -316,13 +591,52 @@ pub struct ConditionCheckPayload {
 ///
 /// `launched` accompanies a `spawn-complete` (the child process started);
 /// `exited` accompanies a `spawn-failed` (the child failed to start, exited
-/// non-zero, or a dispatch was refused). Serialized snake_case so coord's
-/// ingest can match a string discriminator.
+/// non-zero, or a dispatch was refused); `blocked` accompanies a `spawn-failed`
+/// that the trust gate refused BEFORE a child existed, and is separate from
+/// `exited` because saying `exited` there would tell coord a process ran and
+/// stopped. Serialized snake_case so coord's ingest can match a string
+/// discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SpawnPhase {
     Launched,
     Exited,
+    /// The spawn was REFUSED before a child existed, because workspace trust
+    /// could not be derived for the target and the tenant's autonomy dial
+    /// forbids minting it. Phase 2 of
+    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`.
+    Blocked,
+}
+
+/// The typed refusal `spawn_claude_child` returns when the trust gate blocks.
+///
+/// A distinct error TYPE rather than a formatted string, so a caller can post the
+/// typed `spawn_blocked` lifecycle status with the full derivation attached
+/// instead of losing it into a `spawn failure: <text>` reason. Recovered with
+/// `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct SpawnBlocked {
+    pub report: crate::claude_session::trust_gate::TrustGateReport,
+    refusal: String,
+}
+
+impl std::fmt::Display for SpawnBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.refusal)
+    }
+}
+
+impl std::error::Error for SpawnBlocked {}
+
+/// The typed `spawn_blocked` report body — flat, so a consumer needs no second
+/// lookup to see which conjunct refused and how it was decided.
+#[derive(Debug, Clone, Serialize)]
+struct SpawnBlockedBody {
+    /// Fixed discriminator, matching `SpawnStalledBody::phase`'s idiom.
+    phase: &'static str,
+    reason: String,
+    #[serde(flatten)]
+    gate: crate::claude_session::trust_gate::TrustGateReport,
 }
 
 /// PR/head context coord uses to key a spawn outcome to a specific change.
@@ -3631,7 +3945,18 @@ async fn run_gate_continuation_inner(
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
             // `ctx` is held until this `.await` resolves (the subprocess exits),
             // matching the agent-spawn path's heartbeat-then-release lifecycle.
-            let res = run_continuation_headless(agent_id, &workdir, &payload.initial_prompt).await;
+            // Phase 1b, the headless half of the brief seam. This arm reaches
+            // `spawn_claude_child`, which renders the runner briefing into the
+            // child's ENV rather than into `--append-system-prompt`, so there
+            // is no system-prompt argv to extend here. The brief therefore
+            // rides on the PROMPT — byte-for-byte how coord itself delivers a
+            // registrant's `hint` (appended to `initial_prompt` after a blank
+            // line), so the two halves of one brief arrive the same way.
+            let headless_prompt = compose_continuation_headless_prompt(
+                &payload.initial_prompt,
+                payload.brief.as_ref(),
+            );
+            let res = run_continuation_headless(agent_id, &workdir, &headless_prompt).await;
             drop(ctx);
             res
         }
@@ -4055,9 +4380,15 @@ async fn run_continuation_terminal(
         &pinned_session_id,
         add_dir_args,
         payload.initial_prompt.clone(),
-        Some(crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-            coord_mcp,
+        // Phase 1b: the generic runner context PLUS coord's dispatch-time
+        // brief. This is the TERMINAL presentation arm; the HEADLESS arm is the
+        // other half of the same seam and composes the brief into its prompt in
+        // `run_gate_continuation_inner` (it has no `--append-system-prompt`
+        // seam of its own). A brief appended at only one of them reaches only
+        // one spawn path.
+        Some(compose_continuation_system_prompt(
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+            payload.brief.as_ref(),
         )),
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
@@ -4163,6 +4494,221 @@ fn dispatch_condition_check(payload: ConditionCheckPayload, device_id: uuid::Uui
     });
 }
 
+// ---------------------------------------------------------------------------
+// Condition-check spawn-failure reporting
+//
+// The gate-continuation path reports a spawn that never happened TWICE — once
+// on the agent lifecycle channel (`report_spawn_failed` →
+// `POST /agents/{agent_id}/spawn-failed`) and once as the continuation OUTCOME
+// (`post_continuation_outcome` → `coord.gates.continuation_consumed_outcome`).
+// The condition-check path can do NEITHER of those verbatim: it allocates no
+// worktree, so there is no `agent_id` to key an agent-lifecycle post to, and it
+// has no gate, so there is no `continuation_consumed_outcome` column to write.
+// Both call sites 404/no-op on a condition check by construction.
+//
+// Its equivalent durable per-dispatch record is `coord.condition_runs`, which
+// `conditions::dispatch::dispatch_group_run` inserts as `status='running'`
+// before publishing the spawn frame. That module's own comment says a runner
+// that never spawns "simply leaves the run in `running` until it ages out" —
+// which is exactly the silence plan
+// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 1
+// exists to close. So the faithful equivalent of `report_spawn_failed` here is
+// to drive that row terminal, with the reason, through the run's own report
+// route.
+// ---------------------------------------------------------------------------
+
+/// Wire body for `POST /coord/condition-runs/{run_id}/report` (coord's
+/// `conditions::routes::ReportRequest`). `results` is omitted deliberately: no
+/// condition was evaluated, and coord's `derive_status` would read an empty
+/// verdict list as `pass`, so the explicit `status` is load-bearing.
+#[derive(Debug, Clone, Serialize)]
+struct ConditionRunReportBody {
+    /// `"error"` — the same terminal status coord's own `insert_error_run` uses
+    /// for a dispatch that could not be placed on a device.
+    status: &'static str,
+    summary: String,
+}
+
+/// The literal coord's prompt builder uses to hand the per-run report token to
+/// the spawned agent (`qontinui-coord`
+/// `crates/coord/src/conditions/prompt.rs`, `build_initial_prompt`).
+const CONDITION_REPORT_BEARER_MARKER: &str = "Authorization: Bearer ";
+
+/// Resolve the per-run report token for a condition check.
+///
+/// Two rungs, in order:
+///
+/// 1. [`ConditionCheckPayload::report_token`] — the explicit wire field. Coord
+///    does not send it today; when it does, nothing else here changes.
+/// 2. The token coord embedded in `initial_prompt`. The prompt builder writes
+///    it as `Authorization: Bearer <token>`, twice — once as a header
+///    instruction, once inside the example curl.
+///
+/// **The prompt is NOT a controlled string, and taking the first marker hit was
+/// a defect.** `build_initial_prompt`
+/// (`qontinui-coord/crates/coord/src/conditions/prompt.rs`) appends the report
+/// block LAST, after two OPERATOR-AUTHORED regions that can each contain the
+/// same literal: the pretty-printed `auth_setup` JSON recipe, and the free-text
+/// condition list. A first-hit scan on a tenant that stores an API credential in
+/// its auth recipe extracts THAT — which then (a) 403s at
+/// `post_report`'s `WHERE run_id = $1 AND report_token = $2`, silently
+/// re-creating the very failure class this function exists to close, and (b)
+/// puts an unrelated customer secret in an `Authorization` header.
+///
+/// Two defences, both needed:
+///
+/// * **Shape.** The token is `Uuid::new_v4().simple().to_string()`
+///   (`conditions/dispatch.rs`) — EXACTLY 32 lowercase hex characters. Anything
+///   else is rejected outright, so a mis-extraction becomes the `None` arm
+///   below rather than a wrong POST.
+/// * **Position.** Every occurrence is scanned and the LAST shape-valid one
+///   wins, because coord appends the report block after the operator regions.
+///   A 32-hex string in an auth recipe therefore cannot outrank the real token.
+///
+/// Returns `None` when neither rung resolves — a coord whose prompt wording
+/// moved, or a prompt whose only marker hits are operator text. That is
+/// fail-closed: the caller logs the unreported reason rather than POSTing a
+/// guess at a credential.
+fn condition_report_token(payload: &ConditionCheckPayload) -> Option<String> {
+    if let Some(explicit) = payload.report_token.as_deref() {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            return Some(explicit.to_string());
+        }
+    }
+    payload
+        .initial_prompt
+        .match_indices(CONDITION_REPORT_BEARER_MARKER)
+        .filter_map(|(i, _)| {
+            let candidate: String = payload.initial_prompt
+                [i + CONDITION_REPORT_BEARER_MARKER.len()..]
+                .chars()
+                .take_while(is_simple_uuid_char)
+                .collect();
+            // `take_while` stops at the first non-hex char, so a LONGER hex run
+            // yields >32 and is rejected too — the length test is exact, not a
+            // prefix test.
+            (candidate.len() == SIMPLE_UUID_LEN).then_some(candidate)
+        })
+        // `.last()`, not `.next_back()`: `MatchIndices<'_, &str>` is not a
+        // `DoubleEndedIterator`. The bound that fails is `DoubleEndedSearcher`,
+        // NOT `ReverseSearcher` — `StrSearcher` does implement the latter,
+        // which is exactly what makes `str::rmatch_indices` work, so reaching
+        // for that as the fix is a dead end. rustc 1.95 spells it
+        // "`StrSearcher<'_, '_>: DoubleEndedSearcher<'_>` which is required by
+        // `MatchIndices<'_, &str>: DoubleEndedIterator`". A forward drain to
+        // the final element is the same answer over a prompt of this size.
+        .last()
+}
+
+/// Rendered length of a `Uuid::simple()` — 32 hex characters, no dashes.
+const SIMPLE_UUID_LEN: usize = 32;
+
+/// One character of a `Uuid::simple()` rendering: an ASCII digit or a LOWERCASE
+/// `a`-`f`. Deliberately narrower than `is_ascii_hexdigit`, which would also
+/// accept uppercase; `uuid`'s `simple` formatter emits lowercase only, so
+/// admitting uppercase would only widen the set of operator strings that can
+/// impersonate a token.
+fn is_simple_uuid_char(c: &char) -> bool {
+    c.is_ascii_digit() || matches!(c, 'a'..='f')
+}
+
+/// Drive this condition run's `coord.condition_runs` row terminal with the
+/// reason its session never started.
+///
+/// Best-effort with a 5s timeout, exactly like [`post_continuation_outcome`]: a
+/// failure `warn!`s once and is swallowed, never propagated — a missed report
+/// must not turn a spawn failure into a panic on the WS-detached task.
+///
+/// The route is PUBLIC and the per-run token is the ONLY credential it accepts
+/// (coord's `conditions::routes::post_report` matches `(run_id, report_token)`
+/// and 403s everything else), so this deliberately does NOT go through
+/// `crate::auth::attach_device_auth` the way every other coord POST in this
+/// file does.
+///
+/// The token is SINGLE-SHOT — coord clears it on this UPDATE. That is safe here
+/// and only here: every call site is a path on which the session definitively
+/// did not spawn, so there is no agent left that could have wanted to report.
+/// Never call this after a successful `create_tracked_terminal_session_backend`.
+async fn report_condition_run_failed(payload: &ConditionCheckPayload, summary: String) {
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let run_id = match uuid::Uuid::parse_str(&payload.run_id) {
+        Ok(id) => id,
+        Err(e) => {
+            warn!(
+                "agent_runtime: condition-check report: run_id={} is not a UUID ({e}) — \
+                 cannot address the report route; unreported reason: {summary}",
+                payload.run_id
+            );
+            return;
+        }
+    };
+    let Some(token) = condition_report_token(payload) else {
+        warn!(
+            "agent_runtime: condition-check report: no per-run report token resolved for \
+             run_id={run_id} (absent from the frame AND from the prompt) — coord.condition_runs \
+             stays `running`; unreported reason: {summary}"
+        );
+        return;
+    };
+    let Some(client) = crate::coord_http::coord_client() else {
+        warn!(
+            "agent_runtime: condition-check report: no shared coord client run_id={run_id}; \
+             unreported reason: {summary}"
+        );
+        return;
+    };
+    let url = format!("{base}/coord/condition-runs/{run_id}/report");
+    let body = ConditionRunReportBody {
+        status: "error",
+        summary,
+    };
+    // coord-tenant-scope(session-noop): the route derives tenant + group from
+    // the (run_id, report_token) row it matches, never from this body. Nothing
+    // to thread. Terminal.
+    //
+    // coord-auth-exempt(capability-token): coord's `conditions::routes::post_report`
+    // is PUBLIC and matches on `(run_id, report_token)`, 403ing everything else — so
+    // the per-run token below is the ONLY credential it accepts. Routing this through
+    // `auth::attach_device_auth` would not merely be redundant, it would send a
+    // credential the route rejects. See this function's doc comment for why the
+    // single-shot token is safe on this path and only this path.
+    match client
+        .post(&url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        // info!, not warn!: the FAILURE this reports was already warned about at
+        // its own call site, so a warn here would log every spawn failure twice
+        // and make a successful report indistinguishable from a failed one at a
+        // glance. warn! is reserved for the arms below, where the report itself
+        // did not land.
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                "agent_runtime: condition-check report posted run_id={run_id} status=error \
+                 summary={}",
+                body.summary
+            );
+        }
+        Ok(resp) => warn!(
+            "agent_runtime: condition-check report POST run_id={run_id} returned {} \
+             (continuing); unreported reason: {}",
+            resp.status(),
+            body.summary
+        ),
+        Err(e) => warn!(
+            "agent_runtime: condition-check report POST run_id={run_id} failed (continuing): \
+             {e:#}; unreported reason: {}",
+            body.summary
+        ),
+    }
+}
+
 /// Run a condition check as a VISIBLE terminal session.
 ///
 /// Mirrors [`run_continuation_terminal`] — opens a docked, operator-visible
@@ -4174,8 +4720,22 @@ fn dispatch_condition_check(payload: ConditionCheckPayload, device_id: uuid::Uui
 ///   a report back; it does not edit code, so it runs from `QONTINUI_ROOT` with
 ///   no `IsolatedEditContext` / `--add-dir` and no `.mcp.json`/fleet-command
 ///   provisioning (which would write into the shared canonical checkout).
-/// - **No coord ack.** There is no gate/dispatch id, so no consume claim and no
-///   outcome POST — the WS publish + spawn is the contract.
+/// - **No coord ack on the HAPPY path.** There is no gate/dispatch id, so no
+///   consume claim and no outcome POST — the WS publish + spawn is the
+///   contract, and the spawned agent reports its own verdicts.
+/// - **Every FAILING path DOES report** (plan
+///   `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
+///   Phase 1). This function used to return `Err` on six arms with no report at
+///   all, so a condition check that never started was not merely unread but
+///   unrecorded: its `coord.condition_runs` row sat at `status='running'`
+///   forever. Each of those arms now calls [`report_condition_run_failed`],
+///   which drives the row terminal with the reason — the closest faithful
+///   equivalent of the gate path's `report_spawn_failed`, which cannot be
+///   called here (no `agent_id`; see that function's header).
+/// - **A registry VETO is not one of those arms and reports nothing**, matching
+///   both the gate path's step-1b refusal and coord's own pre-flight. See the
+///   comment at that arm for the evidence and for the coord-side gap it leaves
+///   open.
 /// - **Host git identity.** No autonomous-agent git author is injected (no
 ///   commits happen), so the PTY keeps the ambient host identity.
 ///
@@ -4226,6 +4786,74 @@ async fn run_condition_check_terminal(
             authz.label(),
             authz.reason().unwrap_or("no reason recorded")
         );
+        // Deliberately NO report. A registry veto is a standing POLICY state,
+        // not a spawn fault, and both precedents keep it off the RUN record:
+        //
+        //  * the gate path's own step-1b refusal (this file, the
+        //    `StandingContinuation` check in `run_gate_continuation_inner`)
+        //    posts no lifecycle spawn-failure because "an authorization refusal
+        //    is a standing decision, not a spawn fault" and fake spawn failures
+        //    pollute the lifecycle channel;
+        //  * coord's pre-flight for this very dispatch
+        //    (`conditions::dispatch::dispatch_group_run` step 0) writes no
+        //    `condition_runs` row for a veto, because an error row per schedule
+        //    tick would be "unbounded, and pin the group red in the dashboard
+        //    for as long as the operator leaves the agent off".
+        //
+        // Read that second precedent precisely: it is "keep it off the run row
+        // and put it on the ALERTS surface", NOT "record nothing". The same
+        // pre-flight writes a durable operator-visible row —
+        // `preflight_vetoing` -> `note_veto` -> `record_spawn_veto`
+        // (`spawn_authorization.rs`) INSERTs into `coord.alerts` with
+        // `kind = 'spawn_vetoed'` and
+        // `alert_key = spawn_vetoed:{tenant_id}:{spawn_kind}` under
+        // `ON CONFLICT (alert_key) WHERE resolved_at IS NULL DO NOTHING`, so it
+        // is ONE open row per tenant and spawn kind however many ticks fire.
+        // Coord's own comment names that deduped row as the durable trace. So
+        // this arm matches coord on where a veto must NOT go; it does not yet
+        // match coord on where a veto SHOULD go — see the KNOWN GAP below.
+        //
+        // The dashboard harm is not hypothetical here, it is the DEFAULT case.
+        // The two gates key on different rows with OPPOSITE no-row defaults:
+        // coord's pre-flight asks `condition_autodispatch` and allows when no
+        // row exists (`spawn_authorization::decide`, "legacy default"), while
+        // this gate asks `SpawnPath::StandingContinuation`, which is
+        // "Default OFF for a fresh user". So on any tenant with no
+        // `standing_continuation` row, coord dispatches EVERY scheduled run and
+        // this arm refuses every one. Reporting would drive
+        // `post_report` -> `stamp_group_status(.., "error", true)` and write
+        // `last_status='error'` onto the group card every tick — the app's
+        // regression checks rendered as failing because an agent is switched
+        // off.
+        //
+        // A distinct non-failure status was considered and rejected: coord's
+        // status vocabulary here is `running`/`pass`/`fail`/`error`, the column
+        // is free text with no CHECK, and `stamp_group_status` writes whatever
+        // it is given straight onto `condition_groups.last_status` (bumping
+        // `last_run_at` with it). Minting a term from the runner side would put
+        // an unrecognised value on a surface qontinui-web renders, and would
+        // still overwrite a real prior verdict every tick.
+        //
+        // KNOWN GAP, and it belongs to coord: this leaves the run row at
+        // `running`. TWO surfaces exist for "delivered and correctly refused",
+        // and a RUNNER-side veto reaches neither:
+        //
+        //  * `POST /coord/gates/{id}/continuation-deferred` — the gate path's
+        //    purpose-built route, which exists precisely so a refusal is
+        //    recordable WITHOUT looking like a failure. The condition-run
+        //    surface has no equivalent route at all.
+        //  * the `spawn_vetoed` alert above — written only by coord's OWN
+        //    pre-flight, on coord's own decision. Nothing carries a veto
+        //    decided HERE, on the runner, back to that surface.
+        //
+        // Closing either is a coord change, not a status string invented here.
+        //
+        // Until then the trace is local and there are two of it: the
+        // UNCONDITIONAL `warn!` immediately above, which carries this run's
+        // `run_id`, and `agent_authorization::log_verdict`'s own line, which is
+        // edge-triggered (full volume when the verdict CHANGES for an
+        // (agent, class), `debug!` while it repeats) and so is the weaker of
+        // the two for per-run attribution.
         return Ok(());
     }
 
@@ -4241,12 +4869,23 @@ async fn run_condition_check_terminal(
 
     // Reach the managed Tauri state via the process-global AppHandle. No webview
     // runtime (headless/unit-test) → cannot open a visible terminal.
+    //
+    // The heartbeat now advertises `runtime:webview` exactly when this same
+    // handle resolves (`fleet.rs`, `webview_runtime_available`), which supplies
+    // the vocabulary term a dispatch would need to exclude a device in this
+    // state. It does NOT by itself stop the dispatch: `required_capabilities` is
+    // entirely caller-supplied, coord derives nothing from `presentation`, and
+    // an empty slice is a tautology — so until a registration names the token,
+    // every continuation still reaches a headless runner exactly as before, and
+    // this arm is the only thing standing between that and silence. It must
+    // REPORT, or the run row sits at `running`.
     let app = match crate::tauri_app_handle::current() {
         Some(a) => a,
         None => {
             let reason = "no Tauri AppHandle (runner has no webview runtime) — \
                           cannot open a visible condition-check terminal";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4257,6 +4896,7 @@ async fn run_condition_check_terminal(
         None => {
             let reason = "TerminalManager state not managed — cannot create terminal session";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4265,6 +4905,7 @@ async fn run_condition_check_terminal(
         None => {
             let reason = "SessionRegistry state not managed — cannot register terminal session";
             warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             return Err(anyhow::anyhow!(reason));
         }
     };
@@ -4277,9 +4918,15 @@ async fn run_condition_check_terminal(
     // QONTINUI_ROOT. We intentionally do NOT provision `.mcp.json`/fleet commands
     // here (the gate path writes those into its per-continuation worktree; doing
     // so against the shared canonical root would clobber the operator's files).
-    let workdir = qontinui_root_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .ok_or_else(|| anyhow::anyhow!("condition-check: no QONTINUI_ROOT resolved"))?;
+    let workdir = match qontinui_root_dir() {
+        Some(p) => p.to_string_lossy().to_string(),
+        None => {
+            let reason = "no QONTINUI_ROOT resolved — nowhere to run the check from";
+            warn!("agent_runtime: condition-check: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+            return Err(anyhow::anyhow!("condition-check: {reason}"));
+        }
+    };
 
     // Resolve `claude` to an ABSOLUTE launchable path (not the bare name a
     // shell-wrapped spawn could get away with): this terminal spawns
@@ -4316,6 +4963,12 @@ async fn run_condition_check_terminal(
         // built and cannot report back into it. The seam's own render of
         // `QONTINUI_RUNNER_CONTEXT` for the same child DOES carry the settled
         // verdict; this argv copy asserts no liveness rather than guessing one.
+        // NOT a brief seam, deliberately — see
+        // `compose_continuation_system_prompt`. This is
+        // `run_condition_check_terminal`, whose frame is a
+        // `ConditionCheckPayload`: a different `source` discriminator, published
+        // by a different coord path, carrying no `brief` key at all. The gate
+        // continuation's second spawn path is the HEADLESS arm below.
         Some(crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
@@ -4335,6 +4988,7 @@ async fn run_condition_check_terminal(
             "no authenticated Claude account on this runner — run /login (instance={instance})"
         );
         warn!("agent_runtime: condition-check aborted — {reason}");
+        report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
         return Err(anyhow::anyhow!(reason));
     }
 
@@ -4403,9 +5057,12 @@ async fn run_condition_check_terminal(
             emit_terminal_focus_request(&app, &terminal_id);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!(
-            "condition-check terminal session create failed: {e}"
-        )),
+        Err(e) => {
+            let reason = format!("condition-check terminal session create failed: {e}");
+            warn!("agent_runtime: {reason}");
+            report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
+            Err(anyhow::anyhow!(reason))
+        }
     }
 }
 
@@ -4501,19 +5158,72 @@ async fn acquire_continuation_workdir(
         }
     }
 
-    // Fallback: canonical checkout of the first repo, else QONTINUI_ROOT.
-    let workdir = repos
-        .first()
-        .and_then(|r| {
-            crate::agent_worktree::canonical_paths::default_canonical_path(r)
-                .ok()
-                .map(|p| p.to_string_lossy().to_string())
-        })
-        .or_else(|| qontinui_root_dir().map(|p| p.to_string_lossy().to_string()))
-        .ok_or_else(|| {
-            anyhow::anyhow!("gate-continuation: no canonical checkout or QONTINUI_ROOT resolved")
-        })?;
+    // Fallback: the WORKSPACE ROOT, and only then a canonical checkout.
+    //
+    // Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`
+    // flips this priority. It used to be "canonical checkout of the first repo,
+    // else QONTINUI_ROOT", and both halves of that were wrong:
+    //
+    // * **Trust.** The workspace root is the directory this fleet's accounts
+    //   already vouch for; a canonical checkout beneath it is a SEPARATE trust
+    //   key, because the CLI's ancestor walk stops at the git root
+    //   (`claude_session::workspace_trust`, "Trust inheritance stops at that git
+    //   root", with the measured `D:/qontinui-root` trusted / `.../ui-bridge`
+    //   still prompting case). So the root is the highest-confidence cwd and a
+    //   checkout is not.
+    //
+    //   Phase 2 landing in between makes this argument STRONGER, not weaker,
+    //   which is worth stating because the naive reading is the opposite. Phase
+    //   2 pre-trusts a cwd only when trust can be DERIVED, and BOTH fallbacks
+    //   here are non-worktrees, so conjunct 1 fails for both: at any dial
+    //   setting above `proceed` neither gets a mint, and whether the target is
+    //   ALREADY trusted becomes the only thing that decides. Even at `proceed`,
+    //   where the mint still happens, it is best-effort and has four documented
+    //   ways to decline (absent config, unparseable config, a Windows sharing
+    //   violation, a stale-document abort), so a cwd that needs no mint is
+    //   strictly more reliable than one that does.
+    //
+    // * **Isolation, independent of trust.** A canonical checkout is a SHARED
+    //   resource that routinely holds other sessions' uncommitted WIP. Dropping
+    //   an autonomous continuation into it is a coordination hazard whatever the
+    //   trust state — served policy `git-operations` `shared-checkout-route-
+    //   around` is about exactly that tree.
+    //
+    // This is a DEFAULT, not a pin: the `acquire` arm above already wins
+    // whenever worktree mode resolves one, and that is the explicit-cwd path.
+    // The canonical checkout stays as the last resort rather than being deleted,
+    // because on a box where the workspace root does not resolve it is still
+    // better than refusing the continuation outright.
+    //
+    // Extracted into a pure resolver for the reason `headless_continuation_bound_port`
+    // right below states: a priority order expressed as a literal at a call site
+    // is untestable, and this one is a behaviour change worth pinning.
+    let workdir = continuation_fallback_workdir(
+        qontinui_root_dir(),
+        repos,
+        crate::agent_worktree::canonical_paths::default_canonical_path,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!("gate-continuation: no QONTINUI_ROOT or canonical checkout resolved")
+    })?;
     Ok((workdir, None, uuid::Uuid::now_v7()))
+}
+
+/// Pure core of the Phase-3 fallback order: the workspace root, else the
+/// canonical checkout of the first repo, else nothing.
+///
+/// Both resolvers are INJECTED so the order is asserted against synthetic paths
+/// rather than against whatever this machine happens to have on disk.
+fn continuation_fallback_workdir(
+    root: Option<std::path::PathBuf>,
+    repos: &[String],
+    canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
+) -> Option<String> {
+    root.map(|p| p.to_string_lossy().to_string()).or_else(|| {
+        repos
+            .first()
+            .and_then(|r| canonical(r).ok().map(|p| p.to_string_lossy().to_string()))
+    })
 }
 
 /// The `bound_port` argument the headless gate continuation hands to coord-mcp
@@ -4575,7 +5285,7 @@ async fn run_continuation_headless(
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
-        Ok(mut child) => {
+        Ok((mut child, preconditions)) => {
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
             // check for its lifetime — it legitimately has no lifecycle
@@ -4585,7 +5295,13 @@ async fn run_continuation_headless(
                 crate::session::tracking_health::register_headless_claude_pid(p);
             }
             report_spawn_complete(agent_id, pid, Some("gate continuation"), None).await;
-            let exit = pump_subprocess(agent_id, &mut child, log_path.as_deref()).await;
+            let exit = pump_subprocess(
+                agent_id,
+                &mut child,
+                log_path.as_deref(),
+                Some(&preconditions),
+            )
+            .await;
             if let Some(p) = health_pid {
                 crate::session::tracking_health::unregister_headless_claude_pid(p);
             }
@@ -4616,7 +5332,10 @@ async fn run_continuation_headless(
             }
         }
         Err(e) => {
-            report_spawn_failed(agent_id, &format!("spawn failure: {e}"), None, 0, None).await;
+            // A trust-gate refusal posts its own typed `spawn_blocked` with the
+            // derivation, and hands back the typed reason for the lifecycle post.
+            let (reason, phase) = classify_spawn_error(agent_id, &e).await;
+            report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(e)
         }
     }
@@ -4868,6 +5587,8 @@ async fn run_agent_subprocess(
                 crate::coord_mcp::write_degraded_breadcrumb(
                     &primary_wt,
                     "bound API port unresolvable — agent proxy config NOT written (would point at a dead port)",
+                    crate::coord_mcp::BREADCRUMB_VERDICT_PORT_UNRESOLVABLE,
+                    None,
                 );
                 crate::coord_mcp::CoordMcpDelivery::Unprovisioned
             }
@@ -4896,8 +5617,24 @@ async fn run_agent_subprocess(
     // headless `claude` can resolve subagents the spawn prompt references
     // (merge-specialist, repo-auditor, ...). Fail-soft: a copy error here must
     // not abort an otherwise-launchable spawn — the agent just lacks subagents.
-    if let Err(e) = provision_agent_definitions(&primary_wt) {
-        warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
+    match provision_agent_definitions(&primary_wt) {
+        Ok(report) => capability_manifest::record_provision(&primary_wt, report),
+        Err(e) => {
+            warn!("agent_runtime: agent-def provisioning errored (continuing spawn): {e:#}");
+            // Still a ROW: an errored pass that leaves no record is exactly the
+            // invisible degradation this ledger exists to end.
+            let mut report = ProvisionReport::new(
+                "agent_definitions",
+                0,
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(primary_wt.clone());
+            report.skip(
+                primary_wt.clone(),
+                capability_manifest::SkipReason::WriteFailed(format!("{e:#}")),
+            );
+            capability_manifest::record_provision(&primary_wt, report);
+        }
     }
     // Bundle /vet-plan and /implement-plan into the spawned worktree cwd so they
     // resolve as project slash commands regardless of the device's ~/.claude.
@@ -4917,6 +5654,10 @@ async fn run_agent_subprocess(
     let mut restarts = 0u32;
     let mut final_exit_code: Option<i64> = None;
     let mut final_reason: Option<String> = None;
+    // The lifecycle phase the terminal `spawn-failed` post reports. `Exited` for
+    // every arm that had a child; a trust-gate refusal never started one, and
+    // saying `exited` there would tell coord a process ran and stopped.
+    let mut final_phase = SpawnPhase::Exited;
 
     // Select the most-available account once before the (re)spawn loop. On a
     // mid-run rate-limit the inference path rotates via
@@ -4946,7 +5687,7 @@ async fn run_agent_subprocess(
         )
         .await
         {
-            Ok(mut child) => {
+            Ok((mut child, preconditions)) => {
                 let pid = child.id().map(|p| p as i64);
                 // Exempt this headless child from the session-tracking health
                 // check for its lifetime — WS agent spawns legitimately have
@@ -4972,7 +5713,12 @@ async fn run_agent_subprocess(
                 tokio::select! {
                     biased;
                     _ = stop.cancelled() => {}
-                    e = pump_subprocess(payload.agent_id, &mut child, log_path.as_deref()) => {
+                    e = pump_subprocess(
+                        payload.agent_id,
+                        &mut child,
+                        log_path.as_deref(),
+                        Some(&preconditions),
+                    ) => {
                         pump_exit = Some(e);
                     }
                 }
@@ -5027,7 +5773,18 @@ async fn run_agent_subprocess(
                     "agent_runtime: spawn_claude_child failed agent_id={} attempt={}: {e:#}",
                     payload.agent_id, restarts
                 );
-                final_reason = Some(format!("spawn failure: {e}"));
+                let (reason, phase) = classify_spawn_error(payload.agent_id, &e).await;
+                let blocked = matches!(phase, SpawnPhase::Blocked);
+                final_reason = Some(reason);
+                final_phase = phase;
+                if blocked {
+                    // A trust-gate refusal is DETERMINISTIC — the conjuncts and
+                    // the dial do not change between two attempts two seconds
+                    // apart, so retrying would only re-post the same refusal
+                    // `MAX_RESTARTS` times. Break straight to the terminal
+                    // lifecycle post.
+                    break;
+                }
             }
         }
 
@@ -5048,7 +5805,7 @@ async fn run_agent_subprocess(
         return Ok(());
     }
 
-    report_spawn_failed(
+    report_spawn_failed_in_phase(
         payload.agent_id,
         final_reason
             .as_deref()
@@ -5056,6 +5813,7 @@ async fn run_agent_subprocess(
         final_exit_code,
         restarts,
         primary_push_ref.as_deref(),
+        final_phase,
     )
     .await;
     Ok(())
@@ -5138,13 +5896,30 @@ async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
 /// (`include_str!`) so non-operator devices without a `qontinui-claude-config`
 /// checkout still get them; this copy-from-checkout path unblocks the current
 /// operator fleet.
-fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
+///
+/// Returns a [`ProvisionReport`] for the CHECKOUT layer (`agent_definitions`).
+/// The no-root arm below used to be a bare `warn!` and an `Ok(())` — an
+/// unresolved checkout stated only in a log file — and is now a
+/// [`capability_manifest::Rung::Unresolved`] row naming what was skipped and
+/// why. The control flow is unchanged: it still returns `Ok` and the spawn
+/// still proceeds.
+fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<ProvisionReport> {
     let Some(root) = qontinui_root_dir() else {
         warn!(
             "agent_runtime: no qontinui-root resolved; skipping .claude/agents \
              provisioning for {worktree_cwd} (auto-spawned subagents will not resolve)"
         );
-        return Ok(());
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            Path::new(worktree_cwd)
+                .join(".claude")
+                .join("agents")
+                .display()
+                .to_string(),
+            "no qontinui-root resolved, so <root>/qontinui-claude-config/.claude/agents \
+             cannot be located — the normal state on a published install",
+        ));
     };
     provision_agent_definitions_from_root(&root, worktree_cwd)
 }
@@ -5152,7 +5927,15 @@ fn provision_agent_definitions(worktree_cwd: &str) -> anyhow::Result<()> {
 /// Core of [`provision_agent_definitions`] with the qontinui-root passed in
 /// explicitly (so tests can drive it deterministically without mutating the
 /// process-global `QONTINUI_ROOT` env). See that wrapper for full rationale.
-fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> anyhow::Result<()> {
+///
+/// Reports BOTH layers: the returned [`ProvisionReport`] is the checkout overlay
+/// (`agent_definitions`), and the embedded floor's own report (`fleet_agents`)
+/// is recorded into the session ledger from here, because this is the only
+/// caller that can see it.
+fn provision_agent_definitions_from_root(
+    root: &Path,
+    worktree_cwd: &str,
+) -> anyhow::Result<ProvisionReport> {
     let src_dir = root
         .join("qontinui-claude-config")
         .join(".claude")
@@ -5167,16 +5950,28 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
     // Deliberately NOT fatal: if the embedded write fails we warn and continue
     // to the checkout overlay, because a checkout present on this device is a
     // complete answer on its own.
-    let embedded = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
-        Ok(n) => n,
+    let embedded_report = match crate::fleet_agents::provision_fleet_agents_into(&dst_dir) {
+        Ok(report) => report,
         Err(e) => {
             warn!(
                 "agent_runtime: embedded agent-def write into {} failed; using checkout only: {e}",
                 dst_dir.display()
             );
-            0
+            let mut report = ProvisionReport::new(
+                "fleet_agents",
+                crate::fleet_agents::embedded_agent_count(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(dst_dir.display().to_string());
+            report.skip(
+                dst_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
+            report
         }
     };
+    let embedded = embedded_report.written;
+    capability_manifest::record_provision(worktree_cwd, embedded_report);
 
     // CHECKOUT WINS: the operator's live copies are overlaid on top below, so
     // editing qontinui-claude-config/.claude/agents behaves exactly as before.
@@ -5187,7 +5982,16 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             src_dir.display(),
             dst_dir.display()
         );
-        return Ok(());
+        return Ok(ProvisionReport::unresolved(
+            "agent_definitions",
+            0,
+            src_dir.display().to_string(),
+            format!(
+                "no claude-config agents dir on this device; the {embedded} embedded \
+                 default(s) stand in"
+            ),
+        )
+        .with_destination(dst_dir.display().to_string()));
     }
     std::fs::create_dir_all(&dst_dir).map_err(|e| {
         anyhow::anyhow!(
@@ -5195,6 +5999,14 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             dst_dir.display()
         )
     })?;
+    // The checkout roster is only knowable by walking it, so `expected` is
+    // filled in below rather than up front.
+    let mut report = ProvisionReport::new(
+        "agent_definitions",
+        0,
+        capability_manifest::Rung::OperatorCheckout,
+    )
+    .with_destination(dst_dir.display().to_string());
     let mut copied = 0usize;
     for entry in std::fs::read_dir(&src_dir)
         .map_err(|e| anyhow::anyhow!("read agents dir {}: {e}", src_dir.display()))?
@@ -5203,6 +6015,11 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             Ok(e) => e,
             Err(e) => {
                 warn!("agent_runtime: skipping unreadable agents entry: {e}");
+                report.expected += 1;
+                report.skip(
+                    "<unreadable directory entry>",
+                    capability_manifest::SkipReason::WriteFailed(e.to_string()),
+                );
                 continue;
             }
         };
@@ -5215,6 +6032,7 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
             continue;
         };
         let dst = dst_dir.join(name);
+        report.expected += 1;
         // Idempotent: overwrite is fine (std::fs::copy truncates the target).
         if let Err(e) = std::fs::copy(&path, &dst) {
             warn!(
@@ -5222,15 +6040,29 @@ fn provision_agent_definitions_from_root(root: &Path, worktree_cwd: &str) -> any
                 path.display(),
                 dst.display()
             );
+            report.skip(
+                name.to_string_lossy().into_owned(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
             continue;
         }
+        report.record_written();
         copied += 1;
     }
     info!(
         "agent_runtime: overlaid {copied} checkout subagent def(s) onto {embedded} embedded default(s) in {}",
         dst_dir.display()
     );
-    Ok(())
+    report = report.with_detail(format!(
+        "overlaid onto {embedded} embedded default(s) from {}",
+        src_dir.display()
+    ));
+    if report.written == 0 {
+        // The checkout was present but supplied nothing usable — `unresolved`
+        // rather than `operator_checkout`, which would claim it answered.
+        report.set_rung(capability_manifest::Rung::Unresolved);
+    }
+    Ok(report)
 }
 
 /// The workspace root holding the runner's canonical checkouts.
@@ -5443,6 +6275,17 @@ pub(crate) fn finalize_headless_child_env(
 /// Spawn `claude` CLI as a tokio child. `initial_prompt` is piped to
 /// stdin. stdout/stderr are inherited as pipes so the caller can stream
 /// them.
+///
+/// Returns the child **and** this spawn's typed
+/// [`SpawnPreconditions`](crate::claude_session::spawn_preconditions::SpawnPreconditions),
+/// so `pump_subprocess` can attribute a stalled spawn to the account and cwd it
+/// was actually computed for.
+///
+/// **This function ACTS on the trust verdict** (Phases 2 + 4 of the same plan):
+/// [`crate::claude_session::trust_gate`] derives the pre-accept from the three
+/// conjuncts instead of minting it, and at a conservative dial setting a spawn
+/// whose trust cannot be derived returns [`SpawnBlocked`] rather than starting a
+/// child that will hang on a dialog no one can answer.
 async fn spawn_claude_child(
     workdir: &str,
     initial_prompt: &str,
@@ -5452,24 +6295,38 @@ async fn spawn_claude_child(
     // Threaded through to `finalize_headless_child_env`, which renders the
     // briefing whose memory clause it gates.
     coord_mcp: crate::coord_mcp::CoordMcpDelivery,
-) -> anyhow::Result<Child> {
+) -> anyhow::Result<(Child, SpawnPreconditions)> {
     let bin = claude_bin_path();
 
-    // Pre-accept the workspace-trust dialog for `workdir`. An autonomous worker
-    // has no one to answer it, and in this non-interactive mode an untrusted
-    // workspace does not prompt — it silently drops the workspace's hooks and
-    // MCP servers, which would strip a worker of its coord tooling.
-    {
-        let ai = crate::settings::get_ai_settings();
-        let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        let trust_dir = account_config_dir_override
-            .map(|s| s.to_string())
-            .or(trust_dir);
-        crate::claude_session::workspace_trust::ensure_workspace_trusted(
-            workdir,
-            crate::claude_session::workspace_trust::TrustTargets::Account(trust_dir.as_deref()),
+    // ONE account resolution, feeding all three consumers below: the
+    // precondition verdict, the trust pre-accept, and the `CLAUDE_CONFIG_DIR`
+    // pin. It used to be resolved twice — `get_effective_config_dir(..).or(
+    // override)` for the pre-accept and `get_effective_config_dir_with_override`
+    // for the pin. The two are equal by construction (an override wins in both),
+    // but a verdict computed against a SECOND resolution is precisely the silent
+    // no-op this phase exists to remove: it would make the log claim trust for
+    // an account the child never runs under. One resolution cannot drift.
+    let ai = crate::settings::get_ai_settings();
+    let (resolved_config_dir, config_dir_source) =
+        crate::ai_provider::get_effective_config_dir_with_override(
+            &ai.claude_cli,
+            account_config_dir_override,
         );
-    }
+
+    // Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    // the pre-spawn verdicts, computed for the account this spawn RESOLVED.
+    //
+    // Taken BEFORE the pre-accept write below, deliberately. Taken after, the
+    // trust verdict would read `trusted` on every spawn by construction and
+    // answer nothing; taken here it answers "would this spawn have faced the
+    // dialog?", which is the observable. Report-only — the pre-accept and the
+    // spawn both proceed exactly as before.
+    let preconditions = SpawnPreconditions::evaluate(
+        workdir,
+        account_config_dir_override,
+        resolved_config_dir.as_deref(),
+        config_dir_source.as_str(),
+    );
 
     let mut cmd = crate::process_helpers::tokio_no_window(&bin);
     cmd.current_dir(workdir)
@@ -5494,15 +6351,10 @@ async fn spawn_claude_child(
     // credentials by `resolve_spawn_account`). When present it wins over
     // `account_selection_mode` entirely, for this child only — nothing global
     // is mutated, so a sibling session on the same box is unaffected.
-    let ai = crate::settings::get_ai_settings();
-    let (resolved_config_dir, _config_dir_source) =
-        crate::ai_provider::get_effective_config_dir_with_override(
-            &ai.claude_cli,
-            account_config_dir_override,
-        );
-    match resolved_config_dir {
+    let pinned_config_dir: Option<String> = match resolved_config_dir.as_deref() {
         Some(dir) => {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
+            Some(dir.to_string())
         }
         None => {
             if !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials() {
@@ -5514,8 +6366,44 @@ async fn spawn_claude_child(
             }
             // None + ambient default has live creds → inherit it (single-account
             // / unset-CLAUDE_CONFIG_DIR default — unchanged behavior).
+            None
         }
+    };
+
+    // Phases 2 + 4 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    // DERIVE the workspace-trust pre-accept instead of minting it, at a strength
+    // the tenant's `implement_tier` dial sets.
+    //
+    // This replaces the unconditional `ensure_workspace_trusted` that used to sit
+    // above. That call returned `Trusted` — i.e. it WROTE — precisely when the
+    // flag was absent or `false`, so its normal path created trust for a
+    // directory nobody had vouched for. The gate writes only when all three
+    // conjuncts hold (coord-allocated target, parent repo ALREADY trusted for
+    // this account, the write landing on the config dir the child will read) and
+    // otherwise withholds or refuses, per the dial.
+    //
+    // `child_config_dir` is read back off the pin that was JUST applied to `cmd`,
+    // not off `resolved_config_dir` again: conjunct 3 is only a real check if its
+    // two sides come from genuinely different places, and re-reading one value
+    // twice would make it vacuous.
+    let trust_gate = crate::claude_session::trust_gate::pre_accept_for_spawn(
+        workdir,
+        preconditions.trust_verdict(),
+        resolved_config_dir.as_deref(),
+        pinned_config_dir.as_deref(),
+    )
+    .await;
+    if let Some(refusal) = trust_gate.decision.refusal() {
+        // Fail closed: never a spawn that will hang on a dialog no one can
+        // answer, and never an ambient trust grant to get around it. The callers
+        // downcast this to `SpawnBlocked` and post `report_spawn_blocked`, which
+        // carries the whole derivation.
+        return Err(anyhow::Error::new(SpawnBlocked {
+            report: trust_gate,
+            refusal,
+        }));
     }
+
     // Pin the autonomous-agent git author/committer for this headless worker so
     // its commits land with a meaningful name/email instead of the ambient host
     // placeholder (`x <x@x>`). Scoped to this child process — the operator's own
@@ -5551,19 +6439,44 @@ async fn spawn_claude_child(
             drop(stdin);
         });
     }
-    Ok(child)
+    Ok((child, preconditions))
 }
 
 /// Pump stdout + stderr to the per-agent log file AND POST each line to
 /// `/agents/:agent_id/log` (Phase 5 endpoint). Returns the child's exit
 /// code on clean exit; Err on pump failure.
+///
+/// `preconditions` arms the **stall watch**: this is the one place a child's
+/// first output is observable, so it is where "produced no output within a
+/// bounded window" can be decided. The watch reports and does nothing else — it
+/// never kills, signals or alters the child, and a `None` here simply means the
+/// caller has no verdicts to attribute a stall to.
 async fn pump_subprocess(
     agent_id: uuid::Uuid,
     child: &mut Child,
     log_path: Option<&Path>,
+    preconditions: Option<&SpawnPreconditions>,
 ) -> anyhow::Result<i64> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+
+    // Flipped by whichever stream produces a line first. `Relaxed` is right: the
+    // only consumer is a timer that reads it once, long after any ordering
+    // question could matter.
+    let saw_output = Arc::new(AtomicBool::new(false));
+    let stall_task = preconditions.and_then(|pre| {
+        let window = crate::claude_session::spawn_preconditions::stall_window()?;
+        let pre = pre.clone();
+        let flag = saw_output.clone();
+        let pid = child.id().map(|p| p as i64);
+        Some(tokio::spawn(async move {
+            tokio::time::sleep(window).await;
+            if flag.load(Ordering::Relaxed) {
+                return;
+            }
+            report_spawn_stalled(agent_id, &pre, window, pid).await;
+        }))
+    });
 
     // Lazy-create the per-agent log file.
     if let Some(p) = log_path {
@@ -5585,17 +6498,19 @@ async fn pump_subprocess(
 
     let q_out = queue.clone();
     let f_out = log_file.clone();
+    let seen_out = saw_output.clone();
     let out_task = tokio::spawn(async move {
         if let Some(stream) = stdout {
-            forward_stream("stdout", stream, agent_id, q_out, f_out).await;
+            forward_stream("stdout", stream, agent_id, q_out, f_out, seen_out).await;
         }
     });
 
     let q_err = queue.clone();
     let f_err = log_file.clone();
+    let seen_err = saw_output.clone();
     let err_task = tokio::spawn(async move {
         if let Some(stream) = stderr {
-            forward_stream("stderr", stream, agent_id, q_err, f_err).await;
+            forward_stream("stderr", stream, agent_id, q_err, f_err, seen_err).await;
         }
     });
 
@@ -5612,6 +6527,11 @@ async fn pump_subprocess(
     let _ = out_task.await;
     let _ = err_task.await;
     flush_task.abort();
+    // The watch is a timer, not a supervisor: once the child is gone there is
+    // nothing left to be stalled about, whether or not the window had expired.
+    if let Some(t) = stall_task {
+        t.abort();
+    }
     // One final flush after the child exits.
     flush_log_queue(agent_id, &queue).await;
     Ok(status.code().map(|c| c as i64).unwrap_or(-1))
@@ -5623,9 +6543,14 @@ async fn forward_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     agent_id: uuid::Uuid,
     queue: Arc<Mutex<VecDeque<LogLine>>>,
     log_file: Option<Arc<Mutex<std::fs::File>>>,
+    saw_output: Arc<AtomicBool>,
 ) {
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // The stall watch's ONLY input. Set before anything that can fail or
+        // block, so a child that spoke is never reported silent because its log
+        // forwarding was slow.
+        saw_output.store(true, Ordering::Relaxed);
         let log = LogLine {
             stream: stream_name.to_string(),
             line: line.clone(),
@@ -5790,6 +6715,178 @@ async fn report_spawn_complete(
     }
 }
 
+/// Report a spawn that produced **no output at all** inside the bounded window,
+/// carrying the cwd, the account config dir, and both preconditions.
+///
+/// Phase 1 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Two
+/// deliberate properties:
+///
+/// * **It reports; it does not act.** No kill, no signal, no restart, no change
+///   to the child. A stalled spawn stays exactly as stalled as it was.
+/// * **The `warn!` is the deliverable, not the POST.** A local structured log
+///   line answers the question on any box, including one with no coord. The POST
+///   is best-effort on top: coord may not have learned this route yet, so a
+///   `404`/`405` is debug-level — a route that does not exist is not a fault
+///   here, and must not read as one.
+///
+/// Gated by [`spawn_outcome_enrichment_enabled`] for the POST only, matching the
+/// clean-revert idiom the other two lifecycle reporters use.
+async fn report_spawn_stalled(
+    agent_id: uuid::Uuid,
+    preconditions: &SpawnPreconditions,
+    window: Duration,
+    pid: Option<i64>,
+) {
+    let body = SpawnStalledBody::new(preconditions, window, pid);
+    warn!(
+        agent_id = %agent_id,
+        silent_secs = body.silent_secs,
+        pid = ?pid,
+        cwd = %body.preconditions.cwd,
+        project_key = body.preconditions.project_key.as_deref().unwrap_or("<underivable>"),
+        account_config_dir = body.preconditions.account_config_dir.as_deref().unwrap_or("<ambient>"),
+        config_dir_source = %body.preconditions.config_dir_source,
+        trust = body.preconditions.trust.label(),
+        trust_detail = ?body.preconditions.trust,
+        credential = ?body.preconditions.credential,
+        "agent_runtime: spawn_stalled — the child has produced no output; reported only, \
+         the child is untouched"
+    );
+
+    if !spawn_outcome_enrichment_enabled() {
+        return;
+    }
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-stalled");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    // coord-tenant-scope(session-noop): agent_id is the fn's first parameter and
+    // sits in the path; like its `spawn-complete` / `spawn-failed` siblings this
+    // route keys the row by agent_id and persists no tenant, so there is nothing
+    // for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: spawn-stalled posted agent_id={agent_id}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no spawn-stalled route yet ({}); the local \
+                 warn! above is the record",
+                resp.status()
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: spawn-stalled POST agent_id={agent_id} returned {}",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: spawn-stalled POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// Report a spawn REFUSED by the trust gate, with the full derivation attached.
+///
+/// Phase 2 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`. Same
+/// two properties as [`report_spawn_stalled`], for the same reasons:
+///
+/// * **The `warn!` is the deliverable, not the POST.** The derivation must be
+///   readable on a box with no coord — a security control's audit trail cannot
+///   depend on the network.
+/// * The POST is best-effort. coord may not have learned this route, so a
+///   `404`/`405` is debug-level.
+///
+/// Called IN ADDITION to `report_spawn_failed`, not instead of it: the existing
+/// lifecycle contract says a spawn that did not start posts `spawn-failed`, and
+/// silently changing which status a refusal produces would make it invisible to
+/// every shipped reader.
+async fn report_spawn_blocked(agent_id: uuid::Uuid, blocked: &SpawnBlocked) {
+    let body = SpawnBlockedBody {
+        phase: "spawn_blocked",
+        reason: blocked.refusal.clone(),
+        gate: blocked.report.clone(),
+    };
+    warn!(
+        agent_id = %agent_id,
+        cwd = %body.gate.cwd,
+        project_key = body.gate.project_key.as_deref().unwrap_or("<underivable>"),
+        parent_repo = body.gate.parent_repo.as_deref().unwrap_or("<none>"),
+        account_config_file = body.gate.account_config_file.as_deref().unwrap_or("<none>"),
+        decision = body.gate.decision.label(),
+        rule = body.gate.decision.rule(),
+        dial = ?body.gate.dial,
+        posture = ?body.gate.posture,
+        derivation = %body.gate.conjuncts.derivation(),
+        "agent_runtime: spawn_blocked — workspace trust could not be DERIVED for this target \
+         and the tenant's autonomy dial forbids minting it; no child was started and no trust \
+         was written"
+    );
+
+    if !spawn_outcome_enrichment_enabled() {
+        return;
+    }
+    let Some(base) = connected_coord_base() else {
+        return;
+    };
+    let url = format!("{base}/agents/{agent_id}/spawn-blocked");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return;
+    };
+    // coord-tenant-scope(session-noop): `agent_id` is the fn's first parameter
+    // and sits in the path; like its `spawn-complete` / `spawn-failed` /
+    // `spawn-stalled` siblings this route keys the row by agent_id and persists
+    // no tenant, so there is nothing for a credential choice to move. Terminal.
+    match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(5))
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            debug!("agent_runtime: spawn-blocked posted agent_id={agent_id}");
+        }
+        Ok(resp) if resp.status() == 404 || resp.status() == 405 => {
+            debug!(
+                "agent_runtime: coord has no spawn-blocked route yet ({}); the local warn! \
+                 above is the record",
+                resp.status()
+            );
+        }
+        Ok(resp) => {
+            warn!(
+                "agent_runtime: spawn-blocked POST agent_id={agent_id} returned {}",
+                resp.status()
+            );
+        }
+        Err(e) => warn!("agent_runtime: spawn-blocked POST agent_id={agent_id} failed: {e:#}"),
+    }
+}
+
+/// Post the typed `spawn_blocked` status when `e` carries one. Returns the
+/// reason a caller should hand to `report_spawn_failed` — the gate's own typed
+/// refusal when it blocked, and the ordinary `spawn failure: …` text otherwise.
+///
+/// One helper because there are two spawn funnels and a refusal must be reported
+/// identically from both; a per-call-site `downcast_ref` is exactly the kind of
+/// literal that drifts.
+async fn classify_spawn_error(agent_id: uuid::Uuid, e: &anyhow::Error) -> (String, SpawnPhase) {
+    match e.downcast_ref::<SpawnBlocked>() {
+        Some(blocked) => {
+            report_spawn_blocked(agent_id, blocked).await;
+            (blocked.refusal.clone(), SpawnPhase::Blocked)
+        }
+        None => (format!("spawn failure: {e}"), SpawnPhase::Exited),
+    }
+}
+
 async fn report_spawn_failed(
     agent_id: uuid::Uuid,
     reason: &str,
@@ -5797,14 +6894,37 @@ async fn report_spawn_failed(
     restarts_attempted: u32,
     push_ref: Option<&str>,
 ) {
+    report_spawn_failed_in_phase(
+        agent_id,
+        reason,
+        exit_code,
+        restarts_attempted,
+        push_ref,
+        SpawnPhase::Exited,
+    )
+    .await
+}
+
+/// [`report_spawn_failed`] with the lifecycle `phase` stated rather than
+/// assumed.
+///
+/// The default arm assumes [`SpawnPhase::Exited`], which is true for every
+/// caller that had a child. A trust-gate refusal never started one, and
+/// reporting it as `exited` would tell coord a process ran and stopped — so that
+/// one call site says [`SpawnPhase::Blocked`] instead.
+async fn report_spawn_failed_in_phase(
+    agent_id: uuid::Uuid,
+    reason: &str,
+    exit_code: Option<i64>,
+    restarts_attempted: u32,
+    push_ref: Option<&str>,
+    spawn_phase: SpawnPhase,
+) {
     let Some(base) = connected_coord_base() else {
         return;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
-        (
-            Some(SpawnPhase::Exited),
-            SpawnPrContext::from_push_ref(push_ref),
-        )
+        (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
     } else {
         (None, SpawnPrContext::default())
     };
@@ -5848,6 +6968,318 @@ mod tests {
     use super::*;
 
     use crate::test_env::env_lock;
+
+    // =======================================================================
+    // Condition-check spawn-failure reporting (plan
+    // `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
+    // Phase 1).
+    //
+    // The reporting POST itself is not unit-testable without a coord (it is
+    // best-effort and swallows every transport outcome by design), so what is
+    // pinned here is the part that decides whether a report can happen at all:
+    // resolving the per-run token the public report route is the sole consumer
+    // of. When this resolver returns `None` the failure goes UNREPORTED, which
+    // is the exact defect the phase exists to close.
+    // =======================================================================
+
+    /// Coord's `conditions::prompt::build_initial_prompt` tail, verbatim in
+    /// shape: the header instruction, then the example curl, both carrying the
+    /// same 32-hex `Uuid::new_v4().simple()` token. Rendered here rather than
+    /// abbreviated so a change to coord's wording that breaks extraction is
+    /// visible as a diff against a realistic string.
+    fn coord_prompt_with_token(token: &str) -> String {
+        format!(
+            "=== REPORT YOUR VERDICTS (required final step) ===\n\
+             When every condition has a verdict, POST to:\n  \
+             https://coord.qontinui.io/coord/condition-runs/\
+             018f0000-0000-7000-8000-000000000000/report\n\n\
+             You MUST include this authorization header — a one-time token \
+             scoped to THIS run, and the ONLY credential this endpoint \
+             accepts:\n  \
+             Authorization: Bearer {token}\n\n\
+             Example:\n  \
+             curl -sS -X POST https://coord.qontinui.io/coord/condition-runs/\
+             018f0000-0000-7000-8000-000000000000/report \\\n    \
+             -H 'Authorization: Bearer {token}' \\\n    \
+             -H 'Content-Type: application/json' \\\n    \
+             -d '<the JSON body below>'\n"
+        )
+    }
+
+    fn condition_payload(report_token: Option<&str>, prompt: String) -> ConditionCheckPayload {
+        ConditionCheckPayload {
+            run_id: "018f0000-0000-7000-8000-000000000000".to_string(),
+            target_device_id: None,
+            target_url: "http://localhost:3001".to_string(),
+            initial_prompt: prompt,
+            presentation: Presentation::Terminal,
+            source: CONDITION_CHECK_SOURCE.to_string(),
+            report_token: report_token.map(|s| s.to_string()),
+        }
+    }
+
+    /// The rung that exists today: coord ships the token only inside the
+    /// prompt, so the runner recovers it from there.
+    #[test]
+    fn condition_report_token_recovers_from_the_prompt() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(None, coord_prompt_with_token(token));
+        assert_eq!(condition_report_token(&payload).as_deref(), Some(token));
+    }
+
+    /// Quoting must not bleed into the token: coord's example curl spells the
+    /// same header inside single quotes, and a naive take-to-whitespace would
+    /// capture the trailing `'`. Nothing excludes that quote by listing it —
+    /// there is no terminator set. `is_simple_uuid_char` admits only
+    /// `0-9`/`a-f`, so the quote (like every other non-hex byte) simply ends
+    /// the run, and the exact 32-character length test then decides. This
+    /// prompt carries ONE occurrence; the last-wins ordering is pinned by
+    /// `condition_report_token_takes_the_last_shape_valid_occurrence`.
+    #[test]
+    fn condition_report_token_stops_at_quotes_and_whitespace() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let quoted_only = format!("  -H 'Authorization: Bearer {token}' \\\n");
+        let payload = condition_payload(None, quoted_only);
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some(token),
+            "a quoted header occurrence must still yield the bare token"
+        );
+    }
+
+    /// The forward rung: when coord promotes the token to a wire field it wins,
+    /// and nothing else in the runner has to change.
+    #[test]
+    fn condition_report_token_prefers_the_explicit_field() {
+        let payload = condition_payload(
+            Some("ffffffffffffffffffffffffffffffff"),
+            coord_prompt_with_token("9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09"),
+        );
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some("ffffffffffffffffffffffffffffffff")
+        );
+    }
+
+    /// An empty or whitespace-only field falls THROUGH to the prompt rather
+    /// than resolving to a blank credential the route would 403.
+    #[test]
+    fn condition_report_token_empty_field_falls_through() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(Some("   "), coord_prompt_with_token(token));
+        assert_eq!(condition_report_token(&payload).as_deref(), Some(token));
+    }
+
+    /// Fail-closed: a prompt whose wording moved yields `None`, and the caller
+    /// logs the reason as unreported rather than POSTing a guess.
+    #[test]
+    fn condition_report_token_absent_is_none_not_a_guess() {
+        let payload = condition_payload(None, "no header here at all".to_string());
+        assert!(condition_report_token(&payload).is_none());
+        // Marker present but nothing after it — still None, never Some("").
+        let payload = condition_payload(None, "Authorization: Bearer ".to_string());
+        assert!(condition_report_token(&payload).is_none());
+    }
+
+    /// Assemble a prompt in coord's REAL order: the operator-authored regions
+    /// FIRST (`auth_setup` recipe, then the free-text condition list), and the
+    /// report block LAST — the order `build_initial_prompt` actually emits.
+    ///
+    /// This is the shape a first-hit scan gets wrong, and the reason the two
+    /// operator regions are parameters rather than fixed text: both are
+    /// tenant-authored and can contain the `Authorization: Bearer ` literal.
+    fn coord_prompt_in_real_order(auth_recipe: &str, conditions: &str, token: &str) -> String {
+        format!(
+            "=== TARGET APP ===\nhttp://localhost:3001\n\n\
+             === AUTH RECIPE (log in FIRST) ===\n{auth_recipe}\n\n\
+             === CONDITIONS TO CHECK ===\n{conditions}\n\n{}",
+            coord_prompt_with_token(token)
+        )
+    }
+
+    /// The CRITICAL regression: an operator auth recipe that stores an API
+    /// credential as a bearer header sits BEFORE the report block, so a
+    /// first-hit scan extracted the customer's secret — which then 403s at
+    /// coord's `WHERE run_id = $1 AND report_token = $2` (re-creating the exact
+    /// silent failure this change exists to close) *and* puts an unrelated app
+    /// secret in an outbound `Authorization` header.
+    #[test]
+    fn condition_report_token_ignores_a_secret_in_the_auth_recipe() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let prompt = coord_prompt_in_real_order(
+            "{\n  \"headers\": {\n    \"Authorization: Bearer sk-live-CUSTOMER-SECRET\"\n  }\n}",
+            "1. [condition_id: 018f0000-0000-7000-8000-000000000002] no duplicate menu items",
+            token,
+        );
+        let got = condition_report_token(&condition_payload(None, prompt));
+        assert_eq!(
+            got.as_deref(),
+            Some(token),
+            "the report token must win over an operator-authored bearer"
+        );
+        assert!(
+            !got.unwrap().contains("CUSTOMER"),
+            "a customer secret must never be selected as the report token"
+        );
+    }
+
+    /// The same defect via the other operator-authored region: condition texts
+    /// are free text and are also emitted before the report block.
+    #[test]
+    fn condition_report_token_ignores_a_marker_in_a_condition_text() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let prompt = coord_prompt_in_real_order(
+            "{}",
+            "1. [condition_id: 018f0000-0000-7000-8000-000000000002] the API docs page \
+             shows the example `Authorization: Bearer abc123` verbatim",
+            token,
+        );
+        assert_eq!(
+            condition_report_token(&condition_payload(None, prompt)).as_deref(),
+            Some(token)
+        );
+    }
+
+    /// Shape alone is not enough — an operator string CAN be 32 hex characters.
+    /// Position decides: coord appends the report block last, so the LAST
+    /// shape-valid occurrence is the token.
+    #[test]
+    fn condition_report_token_takes_the_last_shape_valid_occurrence() {
+        let decoy = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let prompt = coord_prompt_in_real_order(
+            &format!("{{\"h\": \"Authorization: Bearer {decoy}\"}}"),
+            "1. check the header",
+            token,
+        );
+        assert_eq!(
+            condition_report_token(&condition_payload(None, prompt)).as_deref(),
+            Some(token),
+            "a 32-hex decoy in an EARLIER region must not outrank the report token"
+        );
+    }
+
+    /// Every non-`Uuid::simple()` shape is rejected, so a mis-extraction lands
+    /// in the fail-closed `None` arm instead of becoming a wrong POST: too
+    /// short, too long, uppercase (the `simple` formatter emits lowercase), and
+    /// non-hex.
+    #[test]
+    fn condition_report_token_rejects_every_non_simple_uuid_shape() {
+        for bad in [
+            "abc123",                            // too short
+            "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b0",   // 31
+            "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09a", // 33
+            "9F1C4B2AD0E34F7A8B6C5D4E3F2A1B09",  // uppercase
+            "sk-live-CUSTOMER-SECRET",           // not hex at all
+        ] {
+            let payload = condition_payload(None, format!("Authorization: Bearer {bad}\nrest\n"));
+            assert!(
+                condition_report_token(&payload).is_none(),
+                "{bad:?} is not a Uuid::simple() rendering and must be rejected"
+            );
+        }
+    }
+
+    /// A prompt whose ONLY marker hits are operator text yields `None` — the
+    /// caller then logs the reason as unreported. Fail-closed beats a wrong
+    /// credential on the wire.
+    #[test]
+    fn condition_report_token_is_none_when_only_operator_text_matches() {
+        let payload = condition_payload(
+            None,
+            "=== AUTH RECIPE ===\nAuthorization: Bearer sk-live-CUSTOMER-SECRET\n\n\
+             === CONDITIONS ===\n1. nothing else here\n"
+                .to_string(),
+        );
+        assert!(condition_report_token(&payload).is_none());
+    }
+
+    /// The struct holds the credential in TWO fields — `report_token`, and
+    /// `initial_prompt`, which is where coord actually ships it today and which
+    /// also embeds the operator's `auth_setup` secret. A derived `Debug` would
+    /// put both in the next log line that formats a payload.
+    #[test]
+    fn condition_check_payload_debug_redacts_both_credential_carriers() {
+        let token = "9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09";
+        let payload = condition_payload(
+            Some(token),
+            coord_prompt_in_real_order(
+                "{\"h\": \"Authorization: Bearer sk-live-CUSTOMER-SECRET\"}",
+                "1. check",
+                token,
+            ),
+        );
+        let rendered = format!("{payload:?}");
+        assert!(
+            !rendered.contains(token),
+            "the report token must not appear in Debug output, got {rendered}"
+        );
+        assert!(
+            !rendered.contains("CUSTOMER-SECRET"),
+            "the operator auth recipe rides in initial_prompt and must not appear \
+             in Debug output, got {rendered}"
+        );
+        assert!(
+            rendered.contains("<redacted>") && rendered.contains(" bytes>"),
+            "Debug must still be diagnosable (a redaction marker and a prompt \
+             length), got {rendered}"
+        );
+        // And with no explicit field the token is absent rather than redacted,
+        // so the two states stay distinguishable in a log.
+        let none_payload = condition_payload(None, "prompt".to_string());
+        assert!(format!("{none_payload:?}").contains("report_token: None"));
+    }
+
+    /// The wire body coord's `ReportRequest` ingests. `status` must be sent
+    /// EXPLICITLY: coord's `derive_status` reads an empty verdict list as
+    /// `"pass"`, so an omitted status would record a spawn that never happened
+    /// as a passing regression check — the loudest possible version of the
+    /// silent-failure defect this phase closes.
+    #[test]
+    fn condition_run_report_body_is_an_explicit_error_status() {
+        let body = ConditionRunReportBody {
+            status: "error",
+            summary: "spawn_failed: no Tauri AppHandle (runner has no webview \
+                      runtime) — cannot open a visible condition-check terminal"
+                .to_string(),
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("error"));
+        assert!(
+            json.get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .starts_with("spawn_failed: "),
+            "the summary must carry the same `spawn_failed` vocabulary the gate \
+             path writes into continuation_consumed_outcome, got {json}"
+        );
+        assert!(
+            json.get("results").is_none(),
+            "no condition was evaluated — results must be omitted, not []"
+        );
+    }
+
+    /// A condition-check frame from a coord that does not send `report_token`
+    /// must still deserialize (the field is `#[serde(default)]`), and the frame
+    /// coord sends today must land with `report_token: None` so the prompt rung
+    /// is the one that runs.
+    #[test]
+    fn condition_check_payload_tolerates_a_coord_without_the_token_field() {
+        let frame = serde_json::json!({
+            "source": "condition_check",
+            "run_id": "018f0000-0000-7000-8000-000000000000",
+            "target_device_id": "018f0000-0000-7000-8000-000000000001",
+            "target_url": "http://localhost:3001",
+            "initial_prompt": "Authorization: Bearer deadbeefdeadbeefdeadbeefdeadbeef\n",
+            "presentation": "terminal",
+        });
+        let payload: ConditionCheckPayload = serde_json::from_value(frame).unwrap();
+        assert!(payload.report_token.is_none());
+        assert_eq!(
+            condition_report_token(&payload).as_deref(),
+            Some("deadbeefdeadbeefdeadbeefdeadbeef")
+        );
+    }
 
     // =======================================================================
     // Headless spawn seam — production call-site coverage for the credential
@@ -7014,6 +8446,272 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The dispatch-time continuation brief — the runner half of the two-repo
+    // seam (coord plan
+    // `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-...`, Phase 1b)
+    // -----------------------------------------------------------------------
+
+    /// The EXACT object coord's `build_continuation_spawn_payload` attaches
+    /// under `"brief"`.
+    fn coord_brief_frame(truncated: bool) -> serde_json::Value {
+        serde_json::json!({
+            "text": "Continuation brief (coord-assembled at dispatch; references, not bodies \
+                     -- open them with coord_pr_status, coord_recent_findings and the \
+                     plan-library door):\nPlan: 2026-09-09-pr-fix-autodispatch\nPR: \
+                     qontinui/qontinui-coord#2034",
+            "chars": 199,
+            "cap_chars": 2000,
+            "truncated": truncated,
+            "assembled_by": "coord_dispatch",
+        })
+    }
+
+    fn continuation_envelope(
+        device: uuid::Uuid,
+        brief: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut inner = serde_json::json!({
+            "target_device_id": device,
+            "initial_prompt": "run /babysit-prs",
+            "repos": [],
+            "presentation": "terminal",
+            "delivery": "spawn",
+            "source": "gate_continuation",
+            "anchor_key": "claim:pr:qontinui/qontinui-coord#2034",
+        });
+        if let Some(b) = brief {
+            inner
+                .as_object_mut()
+                .unwrap()
+                .insert("brief".to_string(), b);
+        }
+        serde_json::json!({
+            "channel": format!("events.agent.spawn_requested.{device}"),
+            "payload": serde_json::to_string(&inner).unwrap(),
+        })
+    }
+
+    /// **The load-bearing half of the seam.** `GateContinuationPayload` has no
+    /// `#[serde(deny_unknown_fields)]`, so coord's `brief` key would be
+    /// discarded here with no error and no log line — exactly as `delivery`,
+    /// `allocation` and `required_capabilities` still are — unless a field
+    /// NAMES it. A coord-side test alone cannot catch that; this one can. Its
+    /// coord-side twin is
+    /// `gates::tests::spawn_payload_brief_key_shape_matches_the_runner_field`.
+    #[test]
+    fn gate_continuation_payload_parses_coords_brief() {
+        let device = uuid::Uuid::now_v7();
+        let p = parse_gate_continuation_payload(&continuation_envelope(
+            device,
+            Some(coord_brief_frame(false)),
+        ))
+        .expect("frame with a brief must parse");
+        let brief = p.brief.expect("the brief key must not be silently dropped");
+        assert!(brief.text.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        assert!(brief.text.contains("PR: qontinui/qontinui-coord#2034"));
+        assert!(!brief.truncated);
+        assert_eq!(brief.cap_chars, Some(2000));
+        assert_eq!(brief.assembled_by.as_deref(), Some("coord_dispatch"));
+    }
+
+    /// Back-compat: every coord that predates the key, and every dispatch coord
+    /// could build no brief for, omits it entirely. Absent ⇒ `None` ⇒ the
+    /// spawned session's system prompt is byte-identical to today's.
+    #[test]
+    fn gate_continuation_payload_without_a_brief_parses_to_none() {
+        let device = uuid::Uuid::now_v7();
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, None))
+            .expect("frame without a brief must parse");
+        assert!(p.brief.is_none());
+        assert_eq!(
+            compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), p.brief.as_ref()),
+            "RUNNER CONTEXT"
+        );
+    }
+
+    /// A `brief` shape this build cannot read AND cannot salvage a `text` from
+    /// degrades to `None` and keeps the CONTINUATION — dropping a brief is
+    /// strictly better than dropping the dispatch, and a plain
+    /// `Option<ContinuationBrief>` would have done the latter.
+    #[test]
+    fn gate_continuation_payload_survives_a_brief_shape_it_cannot_read() {
+        let device = uuid::Uuid::now_v7();
+        for weird in [
+            serde_json::json!("just a string"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!(null),
+            // An object of the right SHAPE whose `text` is unusable: nothing to
+            // append, so this is genuinely no brief rather than a salvage.
+            serde_json::json!({"text": 7, "chars": 199}),
+            serde_json::json!({"text": "   ", "chars": "199"}),
+        ] {
+            let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(weird)))
+                .expect("an unreadable brief must not fail the whole frame");
+            assert!(p.brief.is_none());
+            assert_eq!(p.initial_prompt, "run /babysit-prs");
+        }
+    }
+
+    /// **One wrongly-typed METADATA field must not cost the text.**
+    /// `#[serde(default)]` covers a missing key, never a mistyped one, so
+    /// `from_value` is all-or-nothing: without the salvage arm a future coord
+    /// sending `"chars": "199"` would drop the whole brief — text included —
+    /// while every field it got right was sitting in the frame.
+    #[test]
+    fn a_brief_with_one_unreadable_metadata_field_still_carries_its_text() {
+        let device = uuid::Uuid::now_v7();
+        let mut frame = coord_brief_frame(false);
+        frame["chars"] = serde_json::json!("199");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(frame)))
+            .expect("frame must parse");
+        let brief = p
+            .brief
+            .clone()
+            .expect("the TEXT must survive a mistyped sibling");
+        assert!(brief.text.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        // The broken field defaults; the readable ones are still carried.
+        assert_eq!(brief.chars, None);
+        assert_eq!(brief.cap_chars, Some(2000));
+        assert_eq!(brief.assembled_by.as_deref(), Some("coord_dispatch"));
+        assert!(!brief.truncated);
+        // And it actually reaches both carriers.
+        assert!(
+            compose_continuation_system_prompt("CTX".to_string(), p.brief.as_ref())
+                .contains("Plan: 2026-09-09-pr-fix-autodispatch")
+        );
+    }
+
+    /// An UNREADABLE `truncated` is read as a cut, not as the field's `false`
+    /// default: `false` is a claim the brief is complete, and this arm is
+    /// reached exactly when coord said something this build could not parse.
+    /// An ABSENT `truncated` stays `false` — a coord that never sets the key is
+    /// not asserting a cut.
+    #[test]
+    fn an_unreadable_truncated_flag_never_claims_the_brief_is_complete() {
+        let device = uuid::Uuid::now_v7();
+
+        let mut broken = coord_brief_frame(false);
+        broken["truncated"] = serde_json::json!("yes");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(broken)))
+            .expect("frame must parse");
+        let brief = p.brief.expect("the text must survive");
+        assert!(
+            brief.truncated,
+            "unreadable `truncated` must degrade to a cut"
+        );
+        // ... and the cut is therefore LOUD, because coord's text carried no
+        // marker of its own.
+        assert!(compose_continuation_headless_prompt("go", Some(&brief))
+            .contains("[brief truncated by coord -- it carried no marker"));
+
+        let mut absent = coord_brief_frame(false);
+        absent.as_object_mut().unwrap().remove("truncated");
+        // Force the salvage arm with an unrelated mistyped field.
+        absent["cap_chars"] = serde_json::json!("2000");
+        let p = parse_gate_continuation_payload(&continuation_envelope(device, Some(absent)))
+            .expect("frame must parse");
+        let brief = p.brief.expect("the text must survive");
+        assert!(
+            !brief.truncated,
+            "an ABSENT `truncated` is not an assertion"
+        );
+        assert_eq!(brief.cap_chars, None);
+    }
+
+    /// Both spawn paths carry the brief. The TERMINAL arm appends it to the
+    /// `--append-system-prompt` text; the HEADLESS arm has no system-prompt
+    /// argv at all (`spawn_claude_child` renders the briefing into the child's
+    /// env) and appends it to the prompt instead — the same way coord itself
+    /// delivers a registrant's `hint`.
+    #[test]
+    fn the_brief_reaches_both_continuation_spawn_paths() {
+        let brief: ContinuationBrief = serde_json::from_value(coord_brief_frame(false)).unwrap();
+
+        let sys = compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), Some(&brief));
+        assert!(sys.starts_with("RUNNER CONTEXT\n\n"));
+        assert!(sys.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+
+        let prompt = compose_continuation_headless_prompt("run /babysit-prs", Some(&brief));
+        assert!(prompt.starts_with("run /babysit-prs\n\n"));
+        assert!(prompt.contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+    }
+
+    /// A blank brief is a no-op on both carriers — never a stray blank-line
+    /// suffix on the prompt or the system prompt.
+    #[test]
+    fn an_empty_brief_changes_neither_carrier() {
+        let brief = ContinuationBrief {
+            text: "   \n ".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            compose_continuation_system_prompt("CTX".to_string(), Some(&brief)),
+            "CTX"
+        );
+        assert_eq!(
+            compose_continuation_headless_prompt("go", Some(&brief)),
+            "go"
+        );
+    }
+
+    /// A truncation is never SILENT. Coord writes the marker into the text, and
+    /// the runner does not duplicate it; but a coord that flags the cut without
+    /// writing one gets a marker added here, because a brief that stops
+    /// mid-sentence leaves the reader unable to tell withheld from never-written.
+    #[test]
+    fn a_truncated_brief_always_says_so() {
+        // (a) coord's own marker present → carried verbatim, not doubled.
+        let with_marker = ContinuationBrief {
+            text: "Plan: p\n[brief truncated at 2000 chars -- full context: p]".to_string(),
+            truncated: true,
+            ..Default::default()
+        };
+        let out = compose_continuation_system_prompt("CTX".to_string(), Some(&with_marker));
+        assert_eq!(out.matches("[brief truncated").count(), 1);
+        assert!(!out.contains("it carried no marker"));
+
+        // (b) flag set, marker missing → the runner says so itself.
+        let no_marker = ContinuationBrief {
+            text: "Plan: p".to_string(),
+            truncated: true,
+            ..Default::default()
+        };
+        let out = compose_continuation_headless_prompt("go", Some(&no_marker));
+        assert!(
+            out.contains("[brief truncated by coord -- it carried no marker"),
+            "{out}"
+        );
+    }
+
+    /// End of the terminal path: the composed system prompt lands as the
+    /// `--append-system-prompt` VALUE, still ahead of the `--` terminator and
+    /// the trailing positional prompt.
+    #[test]
+    fn the_brief_lands_in_append_system_prompt_argv() {
+        let brief: ContinuationBrief = serde_json::from_value(coord_brief_frame(false)).unwrap();
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            Vec::new(),
+            "run /babysit-prs".to_string(),
+            Some(compose_continuation_system_prompt(
+                "RUNNER CONTEXT".to_string(),
+                Some(&brief),
+            )),
+            Vec::new(),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        let flag = cmd
+            .iter()
+            .position(|a| a == "--append-system-prompt")
+            .expect("the system prompt flag");
+        assert!(cmd[flag + 1].contains("Plan: 2026-09-09-pr-fix-autodispatch"));
+        let term = cmd.iter().position(|a| a == "--").expect("the terminator");
+        assert!(flag + 1 < term, "the brief must precede the `--`");
+        assert_eq!(cmd.last().unwrap(), "run /babysit-prs");
+    }
+
     /// Source-routing: only a `source == "gate_continuation"` frame is claimed
     /// by the gate-continuation arm. An agent-spawn (`LaunchPayload`) frame and
     /// a frame with no/other source must NOT route here, so the existing
@@ -7112,7 +8810,19 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_cwd = wt.path().to_string_lossy().into_owned();
 
-        provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        let report = provision_agent_definitions_from_root(root.path(), &wt_cwd).unwrap();
+        // The checkout answered, and the report says so — two `*.md` copied,
+        // `settings.json` not counted (it is not a definition).
+        assert_eq!(
+            report.rung,
+            crate::capability_manifest::Rung::OperatorCheckout
+        );
+        assert_eq!(report.written, 2);
+        assert_eq!(report.expected, 2);
+        assert!(
+            report.is_complete(),
+            "a clean overlay must not read as degraded"
+        );
 
         let dst = wt.path().join(".claude").join("agents");
         assert!(
@@ -7155,6 +8865,24 @@ mod tests {
 
         let res = provision_agent_definitions_from_root(root.path(), &wt_cwd);
         assert!(res.is_ok(), "missing source dir must still fail soft (Ok)");
+
+        // Phase 3: the degradation is now a VALUE, not only a `warn!`. The
+        // CHECKOUT layer is `unresolved` and says why; the embedded floor that
+        // stood in for it is asserted below, exactly as before.
+        let report = res.expect("fail-soft Ok");
+        assert_eq!(report.capability, "agent_definitions");
+        assert_eq!(report.rung, crate::capability_manifest::Rung::Unresolved);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].reason.wire(), "unresolved");
+        assert!(
+            report.skipped[0]
+                .reason
+                .describe()
+                .contains("no claude-config agents dir"),
+            "the skip must NAME the missing rung, not merely count it: {:?}",
+            report.skipped[0].reason
+        );
 
         let dst = wt.path().join(".claude").join("agents");
         let written = std::fs::read_dir(&dst)
@@ -7267,8 +8995,56 @@ mod tests {
             c.spawn().unwrap()
         };
         let agent_id = uuid::Uuid::now_v7();
-        let exit = pump_subprocess(agent_id, &mut child, None).await.unwrap();
+        let exit = pump_subprocess(agent_id, &mut child, None, None)
+            .await
+            .unwrap();
         assert_eq!(exit, 0);
+    }
+
+    /// The stall watch is REPORT-ONLY. A child that stays silent past the window
+    /// must still be pumped to its own exit code, untouched — the phase's hard
+    /// constraint, asserted rather than asserted-in-prose.
+    ///
+    /// The window is forced to 1s and the child sleeps ~3s producing nothing, so
+    /// the watcher genuinely fires (its coord POST no-ops here — no `coord_url`
+    /// profile is configured in the test env). If the watcher ever grew a kill,
+    /// this assertion is what would catch it: the exit code would stop being 0.
+    #[tokio::test]
+    async fn a_stalled_child_is_reported_but_never_touched() {
+        let _env_lock = env_lock();
+        let prev = std::env::var("QONTINUI_SPAWN_STALL_SECS").ok();
+        std::env::set_var("QONTINUI_SPAWN_STALL_SECS", "1");
+
+        let tmp = std::env::temp_dir();
+        let mut child = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            // `timeout` needs a console; `ping` is the portable no-console sleep.
+            c.args(["/c", "ping -n 4 127.0.0.1 > NUL"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", "sleep 3"]);
+            c.current_dir(&tmp);
+            c.stdout(Stdio::piped()).stderr(Stdio::piped());
+            c.spawn().unwrap()
+        };
+
+        let tmp_s = tmp.to_string_lossy().into_owned();
+        let pre = SpawnPreconditions::evaluate(&tmp_s, None, Some(tmp_s.as_str()), "test");
+        let exit = pump_subprocess(uuid::Uuid::now_v7(), &mut child, None, Some(&pre))
+            .await
+            .unwrap();
+        assert_eq!(
+            exit, 0,
+            "the stall watch reports; it must never kill or alter the child"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("QONTINUI_SPAWN_STALL_SECS", v),
+            None => std::env::remove_var("QONTINUI_SPAWN_STALL_SECS"),
+        }
     }
 
     /// The terminal arm launches the `claude` CLI with the prompt as a single
@@ -7304,6 +9080,43 @@ mod tests {
         }
     }
 
+    /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
+    /// a non-worktree continuation with no cwd argument lands at the WORKSPACE
+    /// ROOT, not at the canonical checkout of its first repo. That is the
+    /// phase's whole gate, and before this the order was the other way round.
+    #[test]
+    fn a_non_worktree_continuation_defaults_to_the_workspace_root() {
+        let root = std::path::PathBuf::from("D:/qontinui-root");
+        let repos = vec!["qontinui-runner".to_string()];
+        let canonical = |r: &str| Ok(std::path::PathBuf::from(format!("D:/qontinui-root/{r}")));
+
+        assert_eq!(
+            continuation_fallback_workdir(Some(root.clone()), &repos, canonical),
+            Some("D:/qontinui-root".to_string()),
+            "the root wins over the first repo's canonical checkout"
+        );
+        // With no repos at all it is still the root — the previous order could
+        // only reach the root through an `or_else`, so this arm used to depend
+        // on the canonical resolver failing.
+        assert_eq!(
+            continuation_fallback_workdir(Some(root), &[], canonical),
+            Some("D:/qontinui-root".to_string())
+        );
+        // The canonical checkout survives as the LAST resort, not as the first
+        // choice: on a box where the workspace root does not resolve it still
+        // beats refusing the continuation.
+        assert_eq!(
+            continuation_fallback_workdir(None, &repos, canonical),
+            Some("D:/qontinui-root/qontinui-runner".to_string())
+        );
+        // Neither resolves → the caller raises, rather than inventing a cwd.
+        assert_eq!(
+            continuation_fallback_workdir(None, &repos, |_: &str| Err("no root".to_string())),
+            None
+        );
+        assert_eq!(continuation_fallback_workdir(None, &[], canonical), None);
+    }
+
     #[test]
     fn continuation_session_id_is_stable_for_same_anchor_and_device() {
         // Phase 1b: the synthesized owner-token discriminator must be STABLE
@@ -7320,6 +9133,7 @@ mod tests {
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
+            brief: None,
         };
 
         let a1 = continuation_session_id(&mk(Some("gate-7f2358d5")));
@@ -7363,6 +9177,7 @@ mod tests {
             gate_id: None,
             dispatch_id: None,
             target_instance_name: None,
+            brief: None,
         };
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
         let res = run_continuation_terminal(
@@ -7461,9 +9276,21 @@ mod tests {
         // Unix, `sh` reads stdin commands then exits. Either way the child
         // spawns and the pump observes a clean exit.
         let workdir = std::env::temp_dir().to_string_lossy().to_string();
+        // The temp dir is neither already-trusted nor a coord-allocated
+        // worktree, so the Phase-2 trust gate would REFUSE this spawn at any
+        // posture above `report` — which is the gate working, not a defect. Pin
+        // the dial to `proceed` (today's live tenant value) so this test keeps
+        // asserting the SPAWN path rather than the gate. The env override is the
+        // same injectable seam the dial-flip tests use.
+        let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
+        std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
         let res =
             run_continuation_headless(agent_id, &workdir, "echo gate-continuation-proof").await;
+        match prev_tier {
+            Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
+            None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
+        }
         assert!(
             res.is_ok(),
             "gate-continuation headless dispatch must spawn + return Ok: {res:?}"

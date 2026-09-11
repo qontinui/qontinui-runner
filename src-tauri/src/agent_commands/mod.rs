@@ -92,22 +92,43 @@ const CACHE_VERSION: u32 = 1;
 // Resolved commands
 // ---------------------------------------------------------------------------
 
-/// Where a resolved command's body came from. Mirrors the `source` provenance
-/// field `SkillDefinition` carries (`skills/mod.rs`), narrowed to the two
-/// layers that exist here.
+/// Where a resolved command's body came from — **one variant per arm of
+/// [`resolve_registry`]'s resolution order**, which is the property that makes
+/// this type usable as provenance rather than merely as a label.
+///
+/// It used to carry two variants (`Builtin` / `Account`) against a resolver
+/// with three arms, so a body that came off the wire and a body that came out
+/// of `agent-commands-cache.json` were indistinguishable. That collapse is
+/// exactly the parity difference plan
+/// `2026-08-31-published-build-parity-check` measures: **a published install
+/// with no network resolves cached-or-embedded where a dev box resolves
+/// served**, and one `Account` variant reports both as the same fact.
+/// The old `Account` variant is therefore gone rather than deprecated — a third variant
+/// added alongside it would have left the ambiguous one still constructible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandSource {
-    /// Embedded in this binary via `include_str!`.
+    /// Embedded in this binary via `include_str!` — the floor, present wherever
+    /// the binary is.
     Builtin,
-    /// Fetched from (or cached from) the signed-in account.
-    Account,
+    /// Fetched over the network from the signed-in account THIS RUN
+    /// (`FetchOutcome::Fresh`).
+    Served,
+    /// Read from this device's own `agent-commands-cache.json`, written by an
+    /// earlier successful fetch. Never carried by the build, and reached only
+    /// when the fetch was `FetchOutcome::Unavailable`.
+    DiskCache,
 }
 
 impl CommandSource {
+    /// The stable wire string. Consumed by
+    /// [`crate::capability_manifest::CapabilityObservation::from_command_source`]
+    /// and by log lines; the retired `"account"` string was consumed by nothing
+    /// that pinned it.
     pub fn as_str(self) -> &'static str {
         match self {
             CommandSource::Builtin => "builtin",
-            CommandSource::Account => "account",
+            CommandSource::Served => "served",
+            CommandSource::DiskCache => "disk_cache",
         }
     }
 }
@@ -156,7 +177,12 @@ fn validate_name(name: &str) -> Result<(), String> {
 
 /// Validate one fetched override into a [`ResolvedCommand`], or explain why it
 /// is unusable. A rejected override falls back to the embedded default.
-fn validate_override(cmd: &AgentCommand) -> Result<ResolvedCommand, String> {
+///
+/// `source` is the arm that supplied `cmd` — [`CommandSource::Served`] for a
+/// live fetch, [`CommandSource::DiskCache`] for a cache replay. It is passed in
+/// rather than assumed because this function cannot tell them apart and the
+/// difference is the measurement.
+fn validate_override(cmd: &AgentCommand, source: CommandSource) -> Result<ResolvedCommand, String> {
     let name = cmd.name.trim();
     validate_name(name)?;
     if cmd.body.trim().is_empty() {
@@ -171,7 +197,7 @@ fn validate_override(cmd: &AgentCommand) -> Result<ResolvedCommand, String> {
     Ok(ResolvedCommand {
         name: name.to_string(),
         body: cmd.body.clone(),
-        source: CommandSource::Account,
+        source,
     })
 }
 
@@ -189,6 +215,9 @@ fn validate_override(cmd: &AgentCommand) -> Result<ResolvedCommand, String> {
 pub struct AgentCommandRegistry {
     builtin: Vec<ResolvedCommand>,
     overrides: Vec<ResolvedCommand>,
+    /// Which arm of [`resolve_registry`]'s three-rung order actually answered.
+    /// See [`AgentCommandRegistry::resolution_arm`].
+    resolution_arm: CommandSource,
 }
 
 impl Default for AgentCommandRegistry {
@@ -211,19 +240,39 @@ impl AgentCommandRegistry {
                 })
                 .collect(),
             overrides: Vec::new(),
+            // Nothing has been layered on yet, so the embedded floor is what
+            // answered. `set_overrides` moves this up when an arm supplies one.
+            resolution_arm: CommandSource::Builtin,
         }
     }
 
     /// Install the account layer, dropping (and warning about) any entry that
     /// fails validation. Returns the number of overrides accepted.
     ///
+    /// `source` names the arm that supplied `commands` —
+    /// [`CommandSource::Served`] for a live fetch, [`CommandSource::DiskCache`]
+    /// for a cache replay. It is a required argument rather than a default
+    /// because the two are the parity difference this type exists to report,
+    /// and a default would silently pick one of them.
+    ///
+    /// It is recorded as the registry's [`resolution_arm`](Self::resolution_arm)
+    /// even when zero overrides survive validation: an arm that answered and
+    /// supplied nothing usable is a different (and more interesting) fact than
+    /// an arm that was never reached, and collapsing them would re-create the
+    /// blindness this signature change removed.
+    ///
     /// Never fails: a wholly malformed payload yields zero overrides, which is
-    /// the embedded-default state.
-    pub fn set_overrides(&mut self, commands: Vec<AgentCommand>) -> usize {
+    /// the embedded-default state for the BODIES while still recording which
+    /// arm produced them.
+    pub fn set_overrides(&mut self, commands: Vec<AgentCommand>, source: CommandSource) -> usize {
+        debug_assert!(
+            source != CommandSource::Builtin,
+            "the embedded floor is not an override layer; pass Served or DiskCache"
+        );
         let mut accepted: Vec<ResolvedCommand> = Vec::with_capacity(commands.len());
         let mut seen: HashSet<String> = HashSet::new();
         for cmd in &commands {
-            match validate_override(cmd) {
+            match validate_override(cmd, source) {
                 Ok(resolved) => {
                     if !seen.insert(resolved.name.clone()) {
                         warn!(
@@ -245,7 +294,23 @@ impl AgentCommandRegistry {
             }
         }
         self.overrides = accepted;
+        self.resolution_arm = source;
         self.overrides.len()
+    }
+
+    /// Which arm of [`resolve_registry`]'s `fresh fetch → disk cache → embedded
+    /// default` order answered for this registry.
+    ///
+    /// This is the value the capability manifest carries for
+    /// `agent_commands_registry`, and the three arms map to three DISTINCT
+    /// rungs — `served`, `disk_cache`, `embedded`. Read it together with
+    /// [`override_count`](Self::override_count): a [`CommandSource::Served`]
+    /// arm with zero overrides means the account authoritatively has none, so
+    /// every BODY is still the embedded default even though the served arm is
+    /// what established that.
+    #[must_use]
+    pub fn resolution_arm(&self) -> CommandSource {
+        self.resolution_arm
     }
 
     /// The resolved command set, in a stable order: every embedded default (in
@@ -519,7 +584,7 @@ pub(crate) fn resolve_with(
     let mut registry = AgentCommandRegistry::new();
     match outcome {
         FetchOutcome::Fresh(commands) => {
-            let n = registry.set_overrides(commands.clone());
+            let n = registry.set_overrides(commands.clone(), CommandSource::Served);
             debug!("agent_commands: fetched {n} account override(s)");
             (registry, CacheAction::Store(commands))
         }
@@ -531,7 +596,7 @@ pub(crate) fn resolve_with(
         FetchOutcome::Unavailable(why) => {
             match cached {
                 Some(commands) => {
-                    let n = registry.set_overrides(commands);
+                    let n = registry.set_overrides(commands, CommandSource::DiskCache);
                     warn!(
                         "agent_commands: account overrides unavailable ({why}) — serving \
                          {n} cached override(s)"
@@ -567,6 +632,15 @@ pub(crate) enum CacheAction {
 /// Never fails and never panics. Every layer degrades to the next one; the
 /// floor is the embedded defaults, which is byte-identically what a device
 /// with no account has always received.
+///
+/// **Which of the three arms answered is now a value**, not just a log line:
+/// read it off the returned registry with
+/// [`AgentCommandRegistry::resolution_arm`]. The caller
+/// (`fleet_commands::provision_fleet_commands_for_session`) turns it into the
+/// capability manifest's `agent_commands_registry` row. Before plan
+/// `2026-08-31-published-build-parity-check` Phase 3 nothing reported it at
+/// all, so a published install falling back to its cache and a dev box
+/// resolving off the network were indistinguishable from outside.
 pub fn resolve_registry() -> AgentCommandRegistry {
     let base_url = crate::api_config::get_api_base_url();
     let path = cache_path();
@@ -577,6 +651,12 @@ pub fn resolve_registry() -> AgentCommandRegistry {
         _ => None,
     };
     let (registry, action) = resolve_with(outcome, cached);
+    info!(
+        "agent_commands: resolved via the {} arm ({} override(s) over {} embedded default(s))",
+        registry.resolution_arm().as_str(),
+        registry.override_count(),
+        registry.builtin_count(),
+    );
     if let Some(p) = &path {
         match action {
             CacheAction::Store(commands) => write_cache_at(p, &base_url, &commands),
@@ -644,7 +724,10 @@ mod tests {
         );
         let hit = registry.get(first).expect("override resolves by name");
         assert_eq!(hit.body, "# mine\n");
-        assert_eq!(hit.source, CommandSource::Account);
+        // A LIVE fetch, so the body is `served` — not the same fact as the
+        // cached arm below, which the retired `Account` variant could not say.
+        assert_eq!(hit.source, CommandSource::Served);
+        assert_eq!(registry.resolution_arm(), CommandSource::Served);
         assert_eq!(hit.file_name(), format!("{first}.md"));
 
         // Exactly one entry carries that name.
@@ -678,7 +761,13 @@ mod tests {
         );
         assert_eq!(action, CacheAction::Keep);
         assert_eq!(registry.get(first).unwrap().body, "# cached\n");
-        assert_eq!(registry.get(first).unwrap().source, CommandSource::Account);
+        // The DISK CACHE answered, not the network — the distinction a
+        // published install with no backend depends on being able to state.
+        assert_eq!(
+            registry.get(first).unwrap().source,
+            CommandSource::DiskCache
+        );
+        assert_eq!(registry.resolution_arm(), CommandSource::DiskCache);
     }
 
     /// Unavailable with nothing cached is the embedded-default floor.
@@ -827,6 +916,108 @@ mod tests {
     fn missing_cache_is_a_miss() {
         let tmp = tempfile::tempdir().expect("tempdir");
         assert!(read_cache_at(&tmp.path().join("absent.json"), "https://api.example").is_none());
+    }
+
+    /// Gate for plan `2026-08-31-published-build-parity-check` Phase 3: the
+    /// THREE arms of `resolve_registry` report THREE distinct sources, and the
+    /// capability manifest turns each into a distinct rung.
+    ///
+    /// This is the whole point of retiring `CommandSource::Account`: before it,
+    /// the first two arms below were the same value, so "a published install
+    /// with no network resolved from its cache" and "a dev box resolved from
+    /// the network" were the same reading.
+    #[test]
+    fn the_three_resolution_arms_report_three_distinct_sources() {
+        use crate::capability_manifest::Rung;
+
+        let first = crate::fleet_commands::FLEET_COMMANDS[0].0;
+
+        // Arm 1 — a live fetch answered.
+        let (served, _) = resolve_with(FetchOutcome::Fresh(vec![cmd(first, "# wire\n")]), None);
+        // Arm 2 — the fetch failed and the on-disk cache answered.
+        let (cached, _) = resolve_with(
+            FetchOutcome::Unavailable("connection refused".to_string()),
+            Some(vec![cmd(first, "# cached\n")]),
+        );
+        // Arm 3 — nothing above answered; the embedded floor did.
+        let (embedded, _) = resolve_with(FetchOutcome::NoAccount, None);
+
+        let arms = [
+            served.resolution_arm(),
+            cached.resolution_arm(),
+            embedded.resolution_arm(),
+        ];
+        assert_eq!(
+            arms,
+            [
+                CommandSource::Served,
+                CommandSource::DiskCache,
+                CommandSource::Builtin
+            ]
+        );
+
+        let rungs: Vec<Rung> = arms.iter().map(|s| Rung::from(*s)).collect();
+        assert_eq!(rungs, vec![Rung::Served, Rung::DiskCache, Rung::Embedded]);
+        let distinct: HashSet<&'static str> = rungs.iter().map(|r| r.wire()).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the three arms must not collapse onto one rung — that collapse IS \
+             the parity blindness this phase removed"
+        );
+    }
+
+    /// An `Unavailable` fetch with NO usable cache falls all the way to the
+    /// embedded floor, and says so — it must not be reported as `disk_cache`
+    /// merely because the cache was the arm that was tried.
+    #[test]
+    fn unavailable_with_no_cache_reports_the_embedded_arm() {
+        let (registry, _) =
+            resolve_with(FetchOutcome::Unavailable("dns failure".to_string()), None);
+        assert_eq!(registry.resolution_arm(), CommandSource::Builtin);
+    }
+
+    /// An authoritative `Fresh(vec![])` records the SERVED arm even though every
+    /// resolved body is the embedded default — "the account has no overrides"
+    /// is a network reading, not an absence of one.
+    #[test]
+    fn an_empty_fresh_fetch_still_records_the_served_arm() {
+        let (registry, _) = resolve_with(FetchOutcome::Fresh(vec![]), None);
+        assert_eq!(registry.override_count(), 0);
+        assert_eq!(registry.resolution_arm(), CommandSource::Served);
+        // ...and the BODIES are still stated, per command, as embedded.
+        let first = crate::fleet_commands::FLEET_COMMANDS[0].0;
+        assert_eq!(registry.get(first).unwrap().source, CommandSource::Builtin);
+    }
+
+    /// Every `CommandSource` round-trips its wire string, and the three strings
+    /// are distinct. The wire values are read by the capability manifest, so a
+    /// silent rename would diff two builds as different when they are not.
+    #[test]
+    fn command_source_round_trips_its_wire_strings() {
+        let all = [
+            CommandSource::Builtin,
+            CommandSource::Served,
+            CommandSource::DiskCache,
+        ];
+        let wires: Vec<&'static str> = all.iter().map(|s| s.as_str()).collect();
+        assert_eq!(wires, vec!["builtin", "served", "disk_cache"]);
+        assert_eq!(
+            wires.iter().collect::<HashSet<_>>().len(),
+            all.len(),
+            "two variants sharing a wire string would be indistinguishable on the wire"
+        );
+        for source in all {
+            // Exhaustive by construction: a new variant fails to compile here
+            // rather than silently escaping the round-trip.
+            let round_tripped = match source.as_str() {
+                "builtin" => CommandSource::Builtin,
+                "served" => CommandSource::Served,
+                "disk_cache" => CommandSource::DiskCache,
+                other => panic!("unmapped CommandSource wire string {other:?}"),
+            };
+            assert_eq!(round_tripped, source);
+        }
     }
 
     /// Nothing in the resolved set may assume the bundle is two commands.

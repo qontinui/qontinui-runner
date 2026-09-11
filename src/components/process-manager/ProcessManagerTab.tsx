@@ -583,6 +583,10 @@ Be concise and actionable.`;
       {
         id: "start-process",
         label: "Start Process",
+        // `destructive` — `start_managed_process` spawns a real OS process (dev servers,
+        // builds) that writes to disk and binds ports. Dim 2: the state is the machine's,
+        // not this view's; dim 1: what the process wrote is not undone by stopping it.
+        effect: "destructive",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot start: no process selected");
@@ -595,6 +599,10 @@ Be concise and actionable.`;
       {
         id: "stop-process",
         label: "Stop Process",
+        // `destructive` — kills a live OS process. Dim 1: restoring the CONTAINER (start
+        // it again) does not restore its CONTENTS — in-flight work, buffers, uptime.
+        // Dim 2: other sessions and surfaces may be depending on it right now.
+        effect: "destructive",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot stop: no process selected");
@@ -607,6 +615,8 @@ Be concise and actionable.`;
       {
         id: "restart-process",
         label: "Restart Process",
+        // `destructive` — the stop half above, with the same losses, plus a start.
+        effect: "destructive",
         handler: async () => {
           if (!selectedId) {
             console.warn("[ProcessManager] Cannot restart: no process selected");

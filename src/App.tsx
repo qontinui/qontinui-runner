@@ -212,6 +212,10 @@ function AppContent() {
           "Mark setup complete and dismiss the wizard. Persists via the same " +
           "`complete_setup` Tauri command the user-driven 'Finish' button uses. " +
           "Does NOT save process configs — a programmatic caller has picked none.",
+        // `write` — persists `setup_completed` through the same `complete_setup` Tauri
+        // command the Finish button uses. Dim 1: the prior value is a known boolean and
+        // `go-to-step` reopens the wizard, so nothing becomes unreconstructible.
+        effect: "write",
         handler: async () => {
           await completeWizard();
           return { success: true };
@@ -226,6 +230,10 @@ function AppContent() {
           "NON-DESTRUCTIVE: opening flips in-memory view state only; the persisted " +
           "`setup_completed` setting is untouched.",
         paramSchema: { step: "number (0-6)" },
+        // `read` — in-memory VIEW state only; the persisted `setup_completed` setting is
+        // untouched (the description above already says so). The rubric's view-toggle
+        // case: it mutates something, but nothing persistent, so dim 1 risks nothing.
+        effect: "read",
         handler: (params?: unknown) => {
           const { step } = (params ?? {}) as { step?: number };
           if (

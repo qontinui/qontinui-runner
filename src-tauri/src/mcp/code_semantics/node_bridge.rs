@@ -36,7 +36,12 @@ pub enum HelperAvailability {
 /// The helper script's location relative to the crate root — the same relative
 /// path in the shipped bundle (`bundle.resources` preserves it) and in a
 /// checkout, so one constant serves both rungs.
-fn helper_script_relpath() -> PathBuf {
+///
+/// `pub(crate)` because [`crate::bundled_resources::runtime_assets`] probes it
+/// for the capability manifest's `bundled_resources` row. The manifest asks the
+/// OWNER for the relative path rather than re-spelling the literal, so a rename
+/// here cannot leave the manifest reporting a rung for a file nothing reads.
+pub(crate) fn helper_script_relpath() -> PathBuf {
     Path::new("resources")
         .join("code-semantics")
         .join("ts-language-service.mjs")

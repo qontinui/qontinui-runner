@@ -73,6 +73,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::capability_manifest::{CapabilityObservation, Rung};
+
 /// This repo's checkout directory name, for the dev rung's
 /// `<workspace-root>/qontinui-runner/src-tauri/...` join.
 const RUNNER_REPO_DIR: &str = "qontinui-runner";
@@ -129,9 +131,22 @@ fn dev_checkout_in(
     workspace_root: Option<&Path>,
     relative: &Path,
 ) -> Option<PathBuf> {
-    exe_relative_checkout(exe, relative).or_else(|| {
-        workspace_root.map(|root| root.join(RUNNER_REPO_DIR).join("src-tauri").join(relative))
-    })
+    exe_relative_checkout(exe, relative)
+        .or_else(|| workspace_root_checkout(workspace_root, relative))
+}
+
+/// The copy of `relative` under the resolved workspace root's checkout of THIS
+/// repo: `<root>/qontinui-runner/src-tauri/<relative>`.
+///
+/// Deliberately **not** existence-checked — [`first_existing`] owns that for
+/// every rung alike, and `dev_checkout`'s contract has always been that this
+/// rung hands back a plausible path rather than a verified one. Split out of
+/// [`dev_checkout_in`] so [`resolve_with_rung_in`] can name this rung
+/// separately from the exe-relative one **without owning a second copy of the
+/// join**: one join, two callers, so the two can never drift into disagreeing
+/// about where the dev copy lives.
+fn workspace_root_checkout(workspace_root: Option<&Path>, relative: &Path) -> Option<PathBuf> {
+    workspace_root.map(|root| root.join(RUNNER_REPO_DIR).join("src-tauri").join(relative))
 }
 
 /// The copy of `relative` inside the checkout the running executable was built
@@ -160,11 +175,401 @@ fn exe_relative_checkout(exe: Option<&Path>, relative: &Path) -> Option<PathBuf>
 /// but does not exist on disk (a stale env override, an uninstalled bundle)
 /// falls through rather than winning.
 pub fn first_existing<const N: usize>(candidates: [Option<&Path>; N]) -> Option<PathBuf> {
-    candidates
+    first_existing_indexed(candidates).path
+}
+
+// ===========================================================================
+// Rung reporting — plan `2026-08-31-published-build-parity-check`, Phase 2.
+//
+// Purely additive. `resolve`, `dev_checkout` and `first_existing` keep their
+// signatures and their behaviour to the byte; what is new is that the SAME walk
+// can now say WHICH candidate answered and what it stepped over on the way.
+//
+// The reason that matters is this module's own opening principle: *"a file
+// shipped inside the installer and a file that exists only in a developer
+// checkout are different things, and resolving one as the other is a wrong
+// answer that looks right on the author's machine."* Until now the return type
+// was a `PathBuf` that looked identical either way, so the wrong answer and the
+// right one were indistinguishable from outside. A rung makes them different
+// values.
+// ===========================================================================
+
+/// Why one candidate in a rung-ordered list did not answer.
+///
+/// The two are different findings and are never collapsed. `Absent` says the
+/// rung's own resolver produced nothing to try — no `AppHandle`, no readable
+/// `current_exe()`, no resolved workspace root — so the rung was not *reached*.
+/// `NotOnDisk` says the rung DID produce a candidate and the file is not there,
+/// which on the bundle rung is a bundle defect: an installer that shipped a path
+/// it does not carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateMiss {
+    /// The rung offered no candidate at all.
+    Absent,
+    /// The rung named a path, and that path is not on disk.
+    NotOnDisk(PathBuf),
+}
+
+impl CandidateMiss {
+    /// One sentence fragment, to compose after a rung's wire name.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            CandidateMiss::Absent => {
+                "offered no candidate (the rung's own resolver returned nothing)".to_string()
+            }
+            CandidateMiss::NotOnDisk(path) => format!("{} is not on disk", path.display()),
+        }
+    }
+}
+
+/// [`first_existing`]'s answer plus **which candidate produced it**, and what
+/// every higher-priority candidate did instead.
+///
+/// `index` is the position in the caller's own array, so the caller — which owns
+/// the rung ordering — maps it back to a rung. This type deliberately knows
+/// nothing about rungs: it is the existence rule, and inventing a second copy of
+/// somebody else's precedence order here is exactly what
+/// [`crate::capability_manifest`]'s discipline (3) forbids.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FirstExisting {
+    /// The path that answered, or `None` when no candidate existed.
+    pub path: Option<PathBuf>,
+    /// The index of the candidate that answered, `None` when none did. Always
+    /// `Some` exactly when [`path`](Self::path) is `Some`.
+    pub index: Option<usize>,
+    /// Every candidate ahead of the winner, in priority order, and why it did
+    /// not answer. When nothing answered this covers the whole list.
+    ///
+    /// **Populated even on success** — that is the point. A resolution that fell
+    /// through the bundle rung to a dev checkout and one that had no bundle rung
+    /// to try are the same `path` and completely different findings.
+    pub misses: Vec<(usize, CandidateMiss)>,
+}
+
+/// [`first_existing`], reporting which candidate index answered.
+///
+/// Same walk, same rules: absent candidates are skipped rather than
+/// short-circuiting, and a candidate that is present but not on disk falls
+/// through rather than winning. The only difference is that the skips are
+/// recorded instead of discarded.
+pub fn first_existing_indexed<const N: usize>(candidates: [Option<&Path>; N]) -> FirstExisting {
+    let mut misses: Vec<(usize, CandidateMiss)> = Vec::new();
+    for (index, candidate) in candidates.into_iter().enumerate() {
+        match candidate {
+            Some(path) if path.exists() => {
+                return FirstExisting {
+                    path: Some(path.to_path_buf()),
+                    index: Some(index),
+                    misses,
+                };
+            }
+            Some(path) => misses.push((index, CandidateMiss::NotOnDisk(path.to_path_buf()))),
+            None => misses.push((index, CandidateMiss::Absent)),
+        }
+    }
+    FirstExisting {
+        path: None,
+        index: None,
+        misses,
+    }
+}
+
+/// The rungs [`resolve_with_rung`] walks, best first. Index `i` of the
+/// [`FirstExisting`] it builds is `CANDIDATE_RUNGS[i]`, which is the whole
+/// mapping — there is no second table and no re-derived ordering.
+///
+/// The three are the module's own three, in the order the module already
+/// resolved them:
+///
+/// 1. [`resolve`] — Tauri's `BaseDirectory::Resource`, i.e. the installer's
+///    unpacked `bundle.resources` → [`Rung::BundleResource`].
+/// 2. [`exe_relative_checkout`] — the checkout this binary was built in →
+///    [`Rung::ExeRelativeCheckout`].
+/// 3. [`workspace_root_checkout`] — `<workspace-root>/qontinui-runner/src-tauri`
+///    → [`Rung::DevCheckout`].
+///
+/// Rungs 2 and 3 are the two halves [`dev_checkout`] returns as ONE
+/// `Option<PathBuf>`. They are reported apart here because the module header
+/// says they answer for different reasons — 2 is the tree the exe was built in
+/// (an agent worktree, in this fleet's normal dev loop), 3 is whatever the
+/// resolved workspace root points at, which for a temp runner is a DIFFERENT
+/// and possibly hundreds-of-commits-stale checkout. A manifest that reported
+/// both as one rung would erase precisely the distinction this module exists to
+/// make.
+const CANDIDATE_RUNGS: [Rung; 3] = [
+    Rung::BundleResource,
+    Rung::ExeRelativeCheckout,
+    Rung::DevCheckout,
+];
+
+/// One bundled-asset resolution, with the rung that answered.
+///
+/// A struct rather than the `(Option<PathBuf>, Rung)` pair the plan sketched,
+/// because [`rejected`](Self::rejected) does not fit in a pair and is the most
+/// diagnostic field of the three: it is what separates *"the dev checkout
+/// answered"* from *"the bundle was there, was rejected, and then the dev
+/// checkout answered"*. Those look identical in the rung alone, and the second
+/// is a bundle defect a published install would hit as `unresolved`. Widening
+/// the pair rather than adding a second function keeps one shape for one
+/// question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundledResourceResolution {
+    /// The path that answered, `None` when nothing did.
+    pub path: Option<PathBuf>,
+    /// Which rung answered, or [`Rung::Unresolved`] when every rung missed.
+    /// Never [`Rung::Unknown`]: this function LOOKED, so an absence here is a
+    /// finding about the machine and not about the observer.
+    pub rung: Rung,
+    /// Every higher-priority rung that did not answer, and why — rendered as
+    /// `"<rung>: <reason>"`, joined by `"; "` in priority order. `None` only
+    /// when the best rung answered outright.
+    ///
+    /// Carried **on success**, which is the entire reason it exists.
+    pub rejected: Option<String>,
+}
+
+impl BundledResourceResolution {
+    /// Build the report from a walk over [`CANDIDATE_RUNGS`]-ordered
+    /// candidates.
+    fn from_outcome(outcome: FirstExisting) -> Self {
+        let rung = match outcome.index {
+            Some(index) => CANDIDATE_RUNGS[index],
+            None => Rung::Unresolved,
+        };
+        let rejected = if outcome.misses.is_empty() {
+            None
+        } else {
+            Some(
+                outcome
+                    .misses
+                    .iter()
+                    .map(|(index, miss)| {
+                        format!("{}: {}", CANDIDATE_RUNGS[*index].wire(), miss.describe())
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        };
+        BundledResourceResolution {
+            path: outcome.path,
+            rung,
+            rejected,
+        }
+    }
+
+    /// The `bundled_resources` row of the capability manifest.
+    #[must_use]
+    pub fn observation(&self) -> CapabilityObservation {
+        let mut obs = CapabilityObservation::new(self.rung);
+        if let Some(path) = &self.path {
+            obs = obs.with_resolved_path(path.display().to_string());
+        }
+        if let Some(rejected) = &self.rejected {
+            obs = obs.with_rejected(rejected.clone());
+        }
+        obs
+    }
+}
+
+/// Resolve `relative` the way this module's callers do, and report WHICH RUNG
+/// answered.
+///
+/// The reporting twin of `resolve(…)` + `dev_checkout(…)` + [`first_existing`],
+/// walking the same three candidates in the same order — see
+/// [`CANDIDATE_RUNGS`]. It is a pure observation: it opens nothing, writes
+/// nothing, and changes no caller's behaviour.
+///
+/// # Why the workspace root comes from the READ-ONLY door
+///
+/// [`dev_checkout`] resolves it through
+/// [`crate::workspace_paths::workspace_root`], which reads the setting via
+/// `config_facade::get_setting` → `settings::load_settings_full` — and that door
+/// runs the `claude-accounts.json` migration, can mint a `local_user_id` UUID
+/// and `save_settings` the operator's real `settings.json`, and reaches the OS
+/// keyring. That is fine for a runtime resolution, and disqualifying for a
+/// DIAGNOSTIC: a manifest that mutates settings as a side effect of reporting
+/// has changed the answer by asking the question. So this door uses
+/// [`crate::workspace_paths::workspace_root_readonly`], which resolves the same
+/// value from a non-mutating read. `dev_checkout` is untouched.
+#[must_use]
+pub fn resolve_with_rung(relative: &Path) -> BundledResourceResolution {
+    let bundled = resolve(relative);
+    let exe = std::env::current_exe().ok();
+    let root = crate::workspace_paths::workspace_root_readonly();
+    resolve_with_rung_in(
+        bundled.as_deref(),
+        exe.as_deref(),
+        root.as_deref(),
+        relative,
+    )
+}
+
+/// Pure core of [`resolve_with_rung`] with every anchor injected, so the rung
+/// mapping is unit-testable against a synthetic tree — no env read, no Tauri
+/// runtime, no settings door, no dependency on how the machine running the suite
+/// is laid out.
+fn resolve_with_rung_in(
+    bundled: Option<&Path>,
+    exe: Option<&Path>,
+    workspace_root: Option<&Path>,
+    relative: &Path,
+) -> BundledResourceResolution {
+    let exe_relative = exe_relative_checkout(exe, relative);
+    let dev = workspace_root_checkout(workspace_root, relative);
+    BundledResourceResolution::from_outcome(first_existing_indexed([
+        bundled,
+        exe_relative.as_deref(),
+        dev.as_deref(),
+    ]))
+}
+
+// ===========================================================================
+// The `bundled_resources` manifest row — plan
+// `2026-08-31-published-build-parity-check`, Phase 4.
+//
+// The row's subject is plural ("crate-bundled assets resolved at run time"),
+// but a row carries ONE rung. So the observation probes every asset this binary
+// actually resolves through this module, states each one's rung in `detail`,
+// and reports the WORST as the row's rung. Reporting the first, or the best,
+// would let a `data/**` asset that only exists in a checkout hide behind a
+// `resources/**` asset the installer carries — the exact shape of defect this
+// manifest exists to expose.
+// ===========================================================================
+
+/// One runtime-resolved bundled asset and what [`resolve_with_rung`] said about
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetProbe {
+    /// The asset's path relative to the crate root, taken from the module that
+    /// resolves it at run time.
+    pub relative: PathBuf,
+    /// Which rung answered, plus the rejections above it.
+    pub resolution: BundledResourceResolution,
+}
+
+/// Every asset this binary resolves through this module at run time.
+///
+/// **Each relative path is asked of the module that OWNS it** — the code
+/// semantics helper from [`crate::mcp::code_semantics::node_bridge`], the two
+/// planner artifacts from [`crate::unified_workflow_executor::types`]. Copying
+/// the literals here would compile, agree on the day it was written, and start
+/// lying the first time an owner renamed its file, which is
+/// [`crate::capability_manifest`]'s discipline (3) applied to a path instead of
+/// to an ordering.
+///
+/// The list is the module header's own roster of runtime-resolved assets and
+/// nothing else: the eleven files under `resources/` that are `include_str!`'d
+/// are on [`Rung::Embedded`] by construction and are not resolved through here.
+#[must_use]
+pub fn runtime_assets() -> Vec<PathBuf> {
+    vec![
+        crate::mcp::code_semantics::node_bridge::helper_script_relpath(),
+        crate::unified_workflow_executor::types::state_machine_relpath(),
+        crate::unified_workflow_executor::types::htn_methods_relpath(),
+    ]
+}
+
+/// Probe every [`runtime_assets`] entry. Pure observation: opens nothing,
+/// writes nothing, changes no caller's behaviour.
+#[must_use]
+pub fn probe_runtime_assets() -> Vec<AssetProbe> {
+    runtime_assets()
         .into_iter()
-        .flatten()
-        .find(|p| p.exists())
-        .map(Path::to_path_buf)
+        .map(|relative| {
+            let resolution = resolve_with_rung(&relative);
+            AssetProbe {
+                relative,
+                resolution,
+            }
+        })
+        .collect()
+}
+
+/// The `bundled_resources` row of the capability manifest.
+///
+/// # Why a pre-GUI caller gets [`Rung::Unknown`] and not the rung a checkout
+/// answered
+///
+/// [`resolve`] — the `bundle_resource` rung, and the TOP one — needs a Tauri
+/// `AppHandle` from [`crate::tauri_app_handle::current`]. The headless
+/// `--capability-manifest` door runs before the Tauri builder, so that rung
+/// offers no candidate there and the walk falls through to the checkout rungs.
+/// Reporting what the checkout said would be a claim this door did not observe:
+/// *"the bundle rung missed"*, when the truth is *"the bundle rung was never
+/// reached"*. On a published install those two produce opposite verdicts, and
+/// the second is the one the parity check must not fabricate.
+///
+/// So the pre-GUI reading is `Unknown` — a finding about the OBSERVER, per
+/// [`crate::capability_manifest`]'s discipline (1) — with the checkout findings
+/// preserved verbatim in `detail` and the owning symbol named in the note. A
+/// running instance asked through `GET /capability-manifest` holds the handle
+/// and reports the real rung.
+#[must_use]
+pub fn bundled_resources_observation() -> CapabilityObservation {
+    let probes = probe_runtime_assets();
+    let bundle_rung_reachable = crate::tauri_app_handle::current().is_some();
+
+    let detail = probes
+        .iter()
+        .map(|p| format!("{} → {}", p.relative.display(), p.resolution.rung.wire()))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let detail = format!("{} asset(s) probed: {detail}", probes.len());
+
+    let rejected = probes
+        .iter()
+        .filter_map(|p| {
+            p.resolution
+                .rejected
+                .as_ref()
+                .map(|r| format!("{}: {r}", p.relative.display()))
+        })
+        .collect::<Vec<_>>();
+    let rejected = if rejected.is_empty() {
+        None
+    } else {
+        Some(rejected.join(" | "))
+    };
+
+    if !bundle_rung_reachable {
+        let mut obs = CapabilityObservation::new(Rung::Unknown)
+            .with_detail(detail)
+            .with_note(
+                "not observed here — the `bundle_resource` rung was NOT REACHED: \
+                 `bundled_resources::resolve_with_rung` locates it through Tauri's \
+                 `BaseDirectory::Resource`, which needs an `AppHandle`, and this door \
+                 runs before the Tauri runtime exists. The checkout rungs WERE probed \
+                 and are stated in `detail`; promoting one of them to this row's rung \
+                 would assert that the bundle rung missed, which nothing here observed. \
+                 Ask a running instance (`GET /capability-manifest`) for the resolved \
+                 reading."
+                    .to_string(),
+            );
+        if let Some(rejected) = rejected {
+            obs = obs.with_rejected(rejected);
+        }
+        return obs;
+    }
+
+    // The worst rung across the probed assets, and the asset that produced it.
+    // `probe_runtime_assets` is never empty (`runtime_assets` is a literal
+    // roster), but an empty roster must not panic a diagnostic — it reports
+    // `Unresolved`, i.e. "nothing answered", which is exactly true of no assets.
+    let worst = probes
+        .iter()
+        .max_by_key(|p| p.resolution.rung.rank())
+        .map(|p| (p.resolution.rung, p.resolution.path.clone()));
+    let (rung, path) = worst.unwrap_or((Rung::Unresolved, None));
+
+    let mut obs = CapabilityObservation::new(rung).with_detail(detail);
+    if let Some(path) = path {
+        obs = obs.with_resolved_path(path.display().to_string());
+    }
+    if let Some(rejected) = rejected {
+        obs = obs.with_rejected(rejected);
+    }
+    obs
 }
 
 #[cfg(test)]
@@ -352,6 +757,278 @@ mod tests {
         assert_eq!(dev_checkout_in(None, None, &asset_relpath()), None);
     }
 
+    // -----------------------------------------------------------------
+    // Phase 2 of `2026-08-31-published-build-parity-check` — which rung
+    // answered, and what it stepped over.
+    // -----------------------------------------------------------------
+
+    /// The index the existence walk reports is the winner's, and the candidates
+    /// it stepped over are recorded rather than discarded — on a SUCCESSFUL
+    /// resolution.
+    #[test]
+    fn first_existing_indexed_reports_the_winning_index_and_the_misses_before_it() {
+        let f = fixture();
+        let missing = f.root.join("missing");
+        let winner = touch(&f.root, "winner");
+        let later = touch(&f.root, "later");
+
+        let got = first_existing_indexed([
+            None,
+            Some(missing.as_path()),
+            Some(winner.as_path()),
+            Some(later.as_path()),
+        ]);
+
+        assert_eq!(got.path.as_deref(), Some(winner.as_path()));
+        assert_eq!(got.index, Some(2));
+        assert_eq!(
+            got.misses,
+            vec![
+                (0, CandidateMiss::Absent),
+                (1, CandidateMiss::NotOnDisk(missing)),
+            ],
+            "candidates AFTER the winner are not misses — they were never tried"
+        );
+    }
+
+    /// The indexed walk is the same walk: [`first_existing`] delegates to it, so
+    /// the two can never disagree about which file answers.
+    #[test]
+    fn first_existing_delegates_to_the_indexed_walk() {
+        let f = fixture();
+        let missing = f.root.join("missing");
+        let winner = touch(&f.root, "winner");
+
+        let candidates = [None, Some(missing.as_path()), Some(winner.as_path())];
+        assert_eq!(
+            first_existing(candidates),
+            first_existing_indexed(candidates).path
+        );
+    }
+
+    /// Nothing on disk means no index at all — never a guess at candidate 0.
+    #[test]
+    fn first_existing_indexed_reports_no_index_when_nothing_answers() {
+        let f = fixture();
+        let a = f.root.join("a");
+
+        let got = first_existing_indexed([Some(a.as_path()), None]);
+
+        assert_eq!(got.path, None);
+        assert_eq!(got.index, None);
+        assert_eq!(
+            got.misses,
+            vec![(0, CandidateMiss::NotOnDisk(a)), (1, CandidateMiss::Absent)],
+            "with no winner every candidate is a miss, so the walk is fully described"
+        );
+    }
+
+    /// The bundle rung is the top rung, and a published install is expected to
+    /// answer here — a `bundle_resource` reading on a dev box and on an
+    /// operator's box is the same reading, which is the point of the rung.
+    #[test]
+    fn the_bundle_rung_is_reported_when_the_unpacked_resource_answers() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let bundle_dir = f.root.join("install").join("resources");
+        std::fs::create_dir_all(bundle_dir.join(relative.parent().unwrap())).unwrap();
+        let bundled = bundle_dir.join(&relative);
+        std::fs::write(&bundled, b"x").unwrap();
+
+        // A dev checkout is ALSO present, so this is a preference between two
+        // existing files rather than the only answer available.
+        let canonical = f.root.join("canonical");
+        checkout_with_asset(&canonical, &relative);
+
+        let got = resolve_with_rung_in(
+            Some(&bundled),
+            Some(&dev_exe_in(&canonical)),
+            Some(&canonical),
+            &relative,
+        );
+
+        assert_eq!(got.rung, Rung::BundleResource);
+        assert_eq!(got.path.as_deref(), Some(bundled.as_path()));
+        assert_eq!(
+            got.rejected, None,
+            "the best rung answered outright, so nothing was stepped over"
+        );
+    }
+
+    /// The exe-relative rung is reported apart from the workspace-root one, even
+    /// though `dev_checkout` returns them as a single `Option<PathBuf>`. In this
+    /// fleet's normal dev loop these two are DIFFERENT checkouts, so collapsing
+    /// them would erase the distinction the module exists to make.
+    #[test]
+    fn the_exe_relative_rung_is_reported_separately_from_the_workspace_root_rung() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let canonical = f.root.join("canonical");
+        checkout_with_asset(&canonical, &relative);
+        let worktree = f.root.join("_wt").join("some-tag");
+        let worktree_asset = checkout_with_asset(&worktree, &relative);
+
+        let got = resolve_with_rung_in(
+            None,
+            Some(&dev_exe_in(&worktree)),
+            Some(&canonical),
+            &relative,
+        );
+
+        assert_eq!(got.rung, Rung::ExeRelativeCheckout);
+        assert_eq!(got.path.as_deref(), Some(worktree_asset.as_path()));
+    }
+
+    /// **The rejection survives a successful resolution.** An installed binary
+    /// with no useful ancestry falls to the workspace-root rung, and the row
+    /// says so — reporting only `dev_checkout` would hide that the bundle rung
+    /// was never even offered, which on a published install is the defect.
+    #[test]
+    fn the_workspace_root_rung_answers_and_the_skipped_rungs_are_still_reported() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let canonical = f.root.join("canonical");
+        let canonical_asset = checkout_with_asset(&canonical, &relative);
+        let installed_exe = f.root.join("program-files").join("qontinui-runner.exe");
+
+        let got = resolve_with_rung_in(None, Some(&installed_exe), Some(&canonical), &relative);
+
+        assert_eq!(got.rung, Rung::DevCheckout);
+        assert_eq!(got.path.as_deref(), Some(canonical_asset.as_path()));
+        let rejected = got
+            .rejected
+            .as_deref()
+            .expect("two rungs were stepped over, so the fall-through must be reported");
+        assert!(
+            rejected.starts_with("bundle_resource: "),
+            "the highest-priority miss comes first: {rejected}"
+        );
+        assert!(
+            rejected.contains("exe_relative_checkout: "),
+            "no miss is dropped for being second: {rejected}"
+        );
+    }
+
+    /// A bundle rung that NAMED a path which is not on disk is a different
+    /// finding from one that offered nothing — the first is a bundle defect
+    /// (an installer that ships a path it does not carry), the second is just
+    /// a process with no `AppHandle`.
+    #[test]
+    fn a_present_but_missing_bundle_candidate_is_reported_as_not_on_disk() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let canonical = f.root.join("canonical");
+        checkout_with_asset(&canonical, &relative);
+        let uninstalled = f.root.join("install").join("resources").join(&relative);
+
+        let got = resolve_with_rung_in(
+            Some(&uninstalled),
+            Some(&dev_exe_in(&canonical)),
+            Some(&canonical),
+            &relative,
+        );
+
+        assert_eq!(got.rung, Rung::ExeRelativeCheckout);
+        let rejected = got.rejected.as_deref().expect("the bundle rung was tried");
+        assert!(
+            rejected.contains("is not on disk"),
+            "a bundle that named a path it does not carry must not read as \
+             'offered no candidate': {rejected}"
+        );
+    }
+
+    /// Every rung missed is `unresolved` — a stated finding about the machine.
+    /// It must never be `unknown` (a finding about the observer) and never a
+    /// guess at the rung the code would have used.
+    #[test]
+    fn nothing_anywhere_is_reported_as_unresolved_rather_than_guessed() {
+        let got = resolve_with_rung_in(None, None, None, &asset_relpath());
+
+        assert_eq!(got.rung, Rung::Unresolved);
+        assert_ne!(
+            got.rung,
+            Rung::Unknown,
+            "this function LOOKED — an absence here is about the machine"
+        );
+        assert_eq!(got.path, None);
+        let rejected = got
+            .rejected
+            .as_deref()
+            .expect("every rung missed, so every rung is named");
+        for rung in CANDIDATE_RUNGS {
+            assert!(
+                rejected.contains(rung.wire()),
+                "{} must appear in the rejection: {rejected}",
+                rung.wire()
+            );
+        }
+    }
+
+    /// The reporting walk and the shipped walk agree on the PATH for every
+    /// input the callers use. `resolve_with_rung` is an observation of the
+    /// existing resolution, not a second one — if these ever disagree, the
+    /// manifest is describing a resolution that does not happen.
+    #[test]
+    fn the_rung_report_never_disagrees_with_dev_checkout_about_the_path() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let canonical = f.root.join("canonical");
+        checkout_with_asset(&canonical, &relative);
+        let worktree = f.root.join("_wt").join("some-tag");
+        checkout_with_asset(&worktree, &relative);
+        let bare = f.root.join("bare");
+        std::fs::create_dir_all(bare.join(RUNNER_REPO_DIR).join("src-tauri")).unwrap();
+        let installed_exe = f.root.join("program-files").join("qontinui-runner.exe");
+
+        for (exe, root) in [
+            (Some(dev_exe_in(&worktree)), Some(canonical.clone())),
+            (Some(dev_exe_in(&bare)), Some(canonical.clone())),
+            (Some(installed_exe.clone()), Some(canonical.clone())),
+            (Some(installed_exe.clone()), None),
+            (None, Some(canonical.clone())),
+            (None, None),
+        ] {
+            let shipped = dev_checkout_in(exe.as_deref(), root.as_deref(), &relative);
+            let reported = resolve_with_rung_in(None, exe.as_deref(), root.as_deref(), &relative);
+            // The shipped walk is not existence-checked on its last rung; the
+            // report is (that check lives in `first_existing` for both). So the
+            // agreement asserted is the one that matters: whenever the report
+            // resolves, it resolves to the SAME path the callers would use.
+            if let Some(path) = &reported.path {
+                assert_eq!(
+                    shipped.as_deref(),
+                    Some(path.as_path()),
+                    "the report and the shipped resolution must not diverge \
+                     (exe={exe:?}, root={root:?})"
+                );
+            }
+        }
+    }
+
+    /// The observation carries all three of the resolution's fields into the
+    /// manifest row, rejection included.
+    #[test]
+    fn the_observation_carries_the_rung_the_path_and_the_rejection() {
+        let f = fixture();
+        let relative = asset_relpath();
+        let canonical = f.root.join("canonical");
+        let canonical_asset = checkout_with_asset(&canonical, &relative);
+        let installed_exe = f.root.join("program-files").join("qontinui-runner.exe");
+
+        let obs = resolve_with_rung_in(None, Some(&installed_exe), Some(&canonical), &relative)
+            .observation();
+
+        assert_eq!(obs.rung, Rung::DevCheckout);
+        assert_eq!(
+            obs.resolved_path.as_deref(),
+            Some(canonical_asset.display().to_string().as_str())
+        );
+        assert!(
+            obs.rejected.is_some(),
+            "a fall-through that is not shown is a fall-through nobody knows happened"
+        );
+    }
+
     /// **The guard that makes this whole module's premise falsifiable.**
     ///
     /// [`resolve`] is only correct if `bundle.resources` actually ships the
@@ -471,6 +1148,106 @@ mod tests {
                 covered,
                 "{required} exists but no bundle.resources glob reaches it, so it ships in no installer"
             );
+        }
+    }
+    // ------------------------------------------------------------------
+    // The `bundled_resources` manifest row (Phase 4).
+    // ------------------------------------------------------------------
+
+    /// The probed roster is the OWNERS' relative paths, not literals re-spelled
+    /// here — so a rename in either owning module moves this row with it
+    /// instead of leaving the manifest reporting a rung for a file nothing
+    /// reads. Asserted against the checkout, which is where the module's own
+    /// `bundle.resources` test already proves these three exist.
+    #[test]
+    fn runtime_assets_are_the_owners_own_relative_paths() {
+        let assets = runtime_assets();
+        assert_eq!(
+            assets.len(),
+            3,
+            "the runtime-resolved roster is three assets"
+        );
+        assert_eq!(
+            assets[0],
+            crate::mcp::code_semantics::node_bridge::helper_script_relpath()
+        );
+        assert_eq!(
+            assets[1],
+            crate::unified_workflow_executor::types::state_machine_relpath()
+        );
+        assert_eq!(
+            assets[2],
+            crate::unified_workflow_executor::types::htn_methods_relpath()
+        );
+        // Every one of them is genuinely relative: an absolute path here would
+        // resolve to itself on every rung and make the row meaningless.
+        for asset in &assets {
+            assert!(asset.is_relative(), "{} must be relative", asset.display());
+        }
+    }
+
+    /// **The Phase 4 honesty gate for this row.** A caller with no Tauri
+    /// `AppHandle` — the pre-GUI `--capability-manifest` door, and this test
+    /// process — gets `Unknown`, NOT the rung a checkout happened to answer on.
+    ///
+    /// Promoting the checkout reading would assert "the bundle rung missed",
+    /// which nothing here observed; on a published install that is the opposite
+    /// of the truth. The checkout findings are still reported, in `detail`.
+    #[test]
+    fn a_pre_gui_caller_reports_unknown_rather_than_the_checkout_rung() {
+        assert!(
+            crate::tauri_app_handle::current().is_none(),
+            "a unit-test process has no Tauri AppHandle; this test's premise is gone"
+        );
+        let obs = bundled_resources_observation();
+        assert_eq!(obs.rung, Rung::Unknown);
+
+        let note = obs.note.expect("an unknown row must name why");
+        assert!(
+            note.contains("bundled_resources::resolve_with_rung"),
+            "{note}"
+        );
+        assert!(note.contains("NOT REACHED"), "{note}");
+        assert!(note.contains("GET /capability-manifest"), "{note}");
+
+        // The probes are still reported — an unobservable TOP rung does not
+        // erase what the lower rungs said.
+        let detail = obs.detail.expect("the probes are stated");
+        assert!(detail.starts_with("3 asset(s) probed:"), "{detail}");
+        for asset in runtime_assets() {
+            assert!(
+                detail.contains(&asset.display().to_string()),
+                "{detail} is missing {}",
+                asset.display()
+            );
+        }
+        // ...and no invented resolution is attached to an unknown row.
+        assert!(obs.resolved_path.is_none());
+    }
+
+    /// The row reports the WORST rung across the probed assets, so one asset
+    /// that only exists in a checkout cannot hide behind another the installer
+    /// carries. Asserted against the pure aggregation, since a test process
+    /// cannot reach the bundle rung.
+    #[test]
+    fn the_worst_probed_rung_is_the_one_a_row_would_report() {
+        let probes = probe_runtime_assets();
+        assert_eq!(probes.len(), runtime_assets().len());
+        let worst = probes
+            .iter()
+            .max_by_key(|p| p.resolution.rung.rank())
+            .expect("the roster is non-empty");
+        for probe in &probes {
+            assert!(
+                probe.resolution.rung.rank() <= worst.resolution.rung.rank(),
+                "{} ranks worse than the reported worst",
+                probe.relative.display()
+            );
+        }
+        // `resolve_with_rung` LOOKED, so it never reports `Unknown` — that rung
+        // is a statement about an observer, and this one observed.
+        for probe in &probes {
+            assert_ne!(probe.resolution.rung, Rung::Unknown);
         }
     }
 }

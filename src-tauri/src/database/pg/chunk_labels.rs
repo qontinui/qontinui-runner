@@ -37,7 +37,7 @@ impl PgDb {
                 &[&config_id],
             )
             .await
-            .map_err(|e| format!("PG list_chunk_labels: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_chunk_labels", &e))?;
 
         Ok(rows
             .iter()
@@ -72,7 +72,7 @@ impl PgDb {
             &[&config_id, &chunk_id, &label],
         )
         .await
-        .map_err(|e| format!("PG upsert_chunk_label: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG upsert_chunk_label", &e))?;
 
         Ok(())
     }
@@ -90,7 +90,7 @@ impl PgDb {
             &[&config_id, &chunk_id],
         )
         .await
-        .map_err(|e| format!("PG delete_chunk_label: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG delete_chunk_label", &e))?;
 
         Ok(())
     }
