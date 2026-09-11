@@ -1257,15 +1257,30 @@ pub fn resolve_create_working_dir(
 /// too; what differs from [`resolve_create_working_dir`] is only the
 /// no-preference arm:
 ///
-/// * neither `working_dir_key` nor `working_dir` → `Ok(None)`, meaning "the
-///   runner's own default", when this device offers no roots at all, and the
-///   default root otherwise. The mobile client sends no working dir today
-///   (`createSession()` takes none), so this is the arm it actually uses.
+/// * neither `working_dir_key` nor `working_dir` → **`Ok(None)`, always**,
+///   meaning "the runner's own default". The caller asked for nothing, so
+///   nothing about this device's remote-create configuration is applied to it:
+///   the mobile client (`createSession()` takes no working dir) lands exactly
+///   where it landed before any of this existed.
 /// * a NAMED directory → exactly [`resolve_create_working_dir`]'s rule: it
 ///   must be one this device offers, and the ROOT's spelling is what is
 ///   returned. With no roots configured that is
 ///   [`CreateRefusal::NoTargetDirectory`] — a caller naming a directory on a
 ///   device that offers none is refused rather than obeyed.
+///
+/// **The no-preference arm returned the first configured root for one review
+/// round, and that was a regression, not a hardening** (review round 2,
+/// finding 2). Two things followed from substituting a directory nobody asked
+/// for. `backend_relay`'s blockless arm derives `intent_repo` FROM
+/// `working_dir`, and `canonical_paths::repo_slug_for_path` matches any path
+/// under `<workspace-root>/<repo>` — so an operator whose first
+/// `remote_create.allowed_working_dirs` entry is a checkout (the natural
+/// config) silently allocated a worktree and took a coord claim for every
+/// mobile terminal anyone opened, under `QONTINUI_AGENT_WORKTREE_MODE`. And
+/// unconditionally, the mobile terminal's cwd moved off this runner's own
+/// default onto remote-create config it has nothing to do with. A blockless
+/// frame still cannot CHOOSE a directory — that is the named arm's job, and it
+/// is unchanged.
 pub fn resolve_relay_working_dir(
     targets: &CreateTargets,
     requested_key: Option<&str>,
@@ -1274,7 +1289,7 @@ pub fn resolve_relay_working_dir(
     let named = requested_key.map(str::trim).is_some_and(|k| !k.is_empty())
         || requested_dir.map(str::trim).is_some_and(|d| !d.is_empty());
     if !named {
-        return Ok(targets.roots.first().map(|r| r.path.clone()));
+        return Ok(None);
     }
     resolve_create_working_dir(targets, requested_key, requested_dir).map(Some)
 }
@@ -5190,13 +5205,94 @@ mod relay_create_tests {
     }
 
     /// The mobile arm, which is what this must not break: it sends title, cols
-    /// and rows and NO working dir, and gets this device's default root.
+    /// and rows and NO working dir, and gets **the runner's own default** —
+    /// `None`, not a directory read out of `remote_create.allowed_working_dirs`.
+    ///
+    /// Review round 2, finding 2. Round 1 made this arm return
+    /// `targets.roots.first()`, which silently relocated every mobile terminal
+    /// onto remote-create config it never asked about. A test asserting
+    /// `Some(ROOT)` pinned that change without surfacing it as one.
     #[test]
-    fn the_mobile_arm_still_works_and_gets_this_devices_default() {
+    fn the_mobile_arm_still_works_and_gets_this_runners_own_default() {
         let frame = json!({ "type": "terminal_create", "title": "headless", "cols": 80 });
         let relay = resolve_relay_create(&targets(), &frame).expect("admitted");
-        assert_eq!(relay.working_dir.as_deref(), Some(ROOT));
+        assert_eq!(
+            relay.working_dir, None,
+            "a frame that names no directory gets the runner's own default, not a configured root"
+        );
         assert_eq!(relay.intent_repo, None);
+    }
+
+    /// Review round 2, finding 2 — the regression this closes, stated as the
+    /// mechanism rather than as the symptom.
+    ///
+    /// `backend_relay`'s blockless arm derives `intent_repo` from
+    /// `working_dir` via `canonical_paths::repo_slug_for_path`, which matches
+    /// **any path under** `<workspace-root>/<repo>`. So substituting the first
+    /// configured root — which an operator will naturally point at a checkout —
+    /// handed every blockless mobile create a worktree allocation and a coord
+    /// claim it never asked for, under `QONTINUI_AGENT_WORKTREE_MODE`.
+    ///
+    /// The predicate: a blockless frame naming nothing must yield a
+    /// `working_dir` from which NO repo slug can be derived. `None` is the
+    /// only such value, so this fails the moment any root is substituted —
+    /// including a root this test never named.
+    #[test]
+    fn a_blockless_frame_acquires_no_worktree_from_a_directory_it_did_not_name() {
+        // A root that IS a checkout under a workspace root, i.e. the
+        // configuration the derivation fires on.
+        let checkout_targets = CreateTargets {
+            roots: vec![CreateRoot {
+                key: "runner".to_string(),
+                path: format!("{ROOT}/qontinui-runner"),
+            }],
+            repos: vec![],
+        };
+        let relay = resolve_relay_create(
+            &checkout_targets,
+            &json!({ "type": "terminal_create", "title": "t", "cols": 80 }),
+        )
+        .expect("admitted");
+
+        assert_eq!(relay.intent_repo, None, "the frame declared no repo");
+        let derived = relay.working_dir.as_deref().and_then(|wd| {
+            crate::agent_worktree::canonical_paths::repo_slug_for_path(std::path::Path::new(wd))
+        });
+        assert_eq!(
+            derived, None,
+            "a blockless create that named no directory must not have an intent_repo derived for \
+             it — that allocates a worktree and takes a coord claim nobody asked for"
+        );
+    }
+
+    /// …while a frame that DOES name a directory is still confined to this
+    /// device's own roots. The fix above must not have reopened the choice.
+    #[test]
+    fn a_blockless_frame_still_cannot_choose_a_directory() {
+        for dir in [
+            "/",
+            "/etc",
+            "/home/agent",
+            "../../",
+            "/home/agent/qontinui-root/sub",
+        ] {
+            let err = resolve_relay_create(
+                &targets(),
+                &json!({ "type": "terminal_create", "working_dir": dir }),
+            )
+            .expect_err("a directory this device does not offer");
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "{dir}"
+            );
+        }
+        // An offered one still resolves — to the DEVICE's spelling.
+        let relay = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir": ROOT }),
+        )
+        .expect("an offered root");
+        assert_eq!(relay.working_dir.as_deref(), Some(ROOT));
     }
 
     /// A device offering NO roots keeps the runner's own default for a frame

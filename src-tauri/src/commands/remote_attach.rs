@@ -552,17 +552,29 @@ pub async fn terminal_remote_history_load(
 /// arrived over the untrusted relay (review finding 3). One predicate now, so
 /// the two cannot drift again.
 ///
-/// `coord_placed == None` is TRUE: an older coord that does not report the
-/// placement leaves the question unanswered, and there is nothing to disagree
-/// with. That is a deliberate asymmetry with the rest of this module's
-/// fail-closed posture — refusing there would break every attach against such a
-/// coord — and it is safe only because the mint itself is device-authenticated.
-/// `asked` empty is TRUE for the same reason: nothing was claimed.
+/// **Every arm fails CLOSED.** An unreported placement is not an agreement: the
+/// question this predicate asks is *which session may this caller address*, and
+/// device authentication answers *who is asking* — a different question, so it
+/// is no justification for taking silence as a yes. Against a coord that omits
+/// `target_device_id`, create-then-attach is exactly as unbound as it was
+/// before the check existed, which is the whole defect (review round 2, finding
+/// 5). Coord's `AttachGrantResponse.target_device_id` is a non-`Option` `Uuid`
+/// today, so nothing reaches the permissive arm — and the field being
+/// `Option<String>` here is only wire tolerance, not a supported coord that
+/// omits it. An `asked` this device could not name is refused for the same
+/// reason: nothing was claimed, so nothing is confirmed.
+///
+/// Both refusals surface as the caller's existing `target_mismatch`, which
+/// names `<unreported>` when coord said nothing — so the operator sees the
+/// unanswered question rather than a silent bind.
 pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -> bool {
     let asked = asked.trim();
+    if asked.is_empty() {
+        return false;
+    }
     match coord_placed.map(str::trim).filter(|p| !p.is_empty()) {
-        None => true,
-        Some(placed) => asked.is_empty() || placed.eq_ignore_ascii_case(asked),
+        None => false,
+        Some(placed) => placed.eq_ignore_ascii_case(asked),
     }
 }
 
@@ -589,13 +601,20 @@ mod placement_tests {
         assert!(coord_places_session_on("device-b", Some("  DEVICE-B ")));
     }
 
-    /// An unanswered question is not a disagreement. Refusing here would break
-    /// every attach against a coord that does not report the placement.
+    /// Review round 2, finding 5. An unanswered question is not a yes.
+    ///
+    /// The permissive arm was justified as "safe because the mint is
+    /// device-authenticated" — but device auth establishes WHO is asking, not
+    /// WHICH session they may address. Against a coord that omits the field,
+    /// create-then-attach was exactly as unbound as before the check.
     #[test]
-    fn an_unreported_placement_is_not_a_mismatch() {
-        assert!(coord_places_session_on("device-b", None));
-        assert!(coord_places_session_on("device-b", Some("")));
-        assert!(coord_places_session_on("device-b", Some("   ")));
-        assert!(coord_places_session_on("", Some("device-c")));
+    fn an_unreported_placement_is_refused() {
+        assert!(!coord_places_session_on("device-b", None));
+        assert!(!coord_places_session_on("device-b", Some("")));
+        assert!(!coord_places_session_on("device-b", Some("   ")));
+        // …and a caller that named no device confirms nothing either.
+        assert!(!coord_places_session_on("", Some("device-c")));
+        assert!(!coord_places_session_on("   ", Some("device-c")));
+        assert!(!coord_places_session_on("", None));
     }
 }

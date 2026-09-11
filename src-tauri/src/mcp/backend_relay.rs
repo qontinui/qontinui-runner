@@ -2827,11 +2827,30 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         }
     };
 
-    let path = data
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let raw_path = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+    // The path policy, BEFORE anything else is decoded or sent. `http_request`
+    // is otherwise an unrestricted loopback proxy — caller-chosen method, path,
+    // headers and body against an API that "binds the IPv4 loopback only and
+    // these routes carry no further gate" — so the typed `terminal_create`
+    // gate in `mcp::remote_terminal` was worth nothing while the sibling arm of
+    // this same `match` reached `POST /terminals` with `working_dir`,
+    // `intent_repo` and `agent_session_id` verbatim (review round 2, finding
+    // 1). The refusal is decided on a NORMALISED path and the request is
+    // forwarded verbatim; see `mcp::relay_path_policy` for what is closed and
+    // why nothing legitimate reaches it this way.
+    let verdict = crate::mcp::relay_path_policy::relay_path_verdict(&method_str, raw_path);
+    if verdict.is_refusal() {
+        warn!(
+            code = verdict.code(),
+            method = %method_str,
+            path = %raw_path,
+            "http_request relay: refused a path that is not reachable over this arm"
+        );
+        return http_relay_error(&request_id, 403, verdict.message());
+    }
+
+    let path = raw_path.trim_start_matches('/');
     let query = data.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
     // Decode the request body (base64). Empty / absent => no body.
@@ -5140,6 +5159,164 @@ mod tests {
         assert_eq!(reply["status"], 502);
     }
 
+    // ------------------------------------------------------------------
+    // The `http_request` PATH POLICY — review round 2, finding 1.
+    //
+    // Round 1 hardened the typed `terminal_create` frame. `http_request` is
+    // the sibling arm of the same `match` in `handle_relay_command`, and it is
+    // an unrestricted loopback proxy onto the runner's own API — so
+    // `POST /terminals` with `working_dir` / `intent_repo` /
+    // `agent_session_id` reached the SAME create handler with none of the
+    // gate. These tests exercise the DISPATCH, not a predicate: a real local
+    // server stands in for the runner's API and COUNTS what actually arrived,
+    // because round 1's lesson was that a predicate-only test passes while the
+    // routing property is false.
+    // ------------------------------------------------------------------
+
+    /// A router that records every path it is asked for and answers 200. Any
+    /// hit at all is a failure for a guarded route.
+    fn recording_router() -> (Router, Arc<std::sync::Mutex<Vec<String>>>) {
+        let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = hits.clone();
+        let router = Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(req.uri().to_string());
+                (AxumStatus::OK, "reached")
+            }
+        });
+        (router, hits)
+    }
+
+    /// The reviewer's exact frame: a create with a caller-chosen working dir,
+    /// intent repo and agent session id, relayed at the local API. It must be
+    /// refused BEFORE the socket is touched.
+    #[tokio::test]
+    async fn the_http_relay_never_reaches_the_terminal_create_route() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        let body = serde_json::to_string(&json!({
+            "working_dir": "/",
+            "intent_repo": "qontinui-runner",
+            "agent_session_id": "0192a1b2-0000-7000-8000-0000000000ff",
+        }))
+        .unwrap();
+        let env = json!({
+            "type": "http_request",
+            "request_id": "x",
+            "method": "POST",
+            "path": "/terminals",
+            "body_b64": STANDARD.encode(body.as_bytes()),
+        });
+
+        let reply = relay_http_to_base(&base, &env).await;
+
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "x");
+        assert_eq!(reply["status"], 403, "reply: {reply}");
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// Every route `mcp::terminals` registers, in its registered spelling and
+    /// in a concrete one — plus the tauri-invoke proxy, whose safelist carries
+    /// `terminal_create` / `terminal_write` / `terminal_close`, and the two
+    /// steward routes that spawn and kill a PTY. None of them may be reached,
+    /// whatever the method.
+    #[tokio::test]
+    async fn no_terminal_mutating_route_is_reachable_over_the_http_relay() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        let mut cases: Vec<(String, String)> = Vec::new();
+        for (method, path) in crate::mcp::terminals::route_entries() {
+            cases.push((method.to_string(), path.to_string()));
+            cases.push((
+                method.to_string(),
+                path.replace("{id}", "11111111-2222-3333-4444-555555555555"),
+            ));
+        }
+        for path in [
+            "/ui-bridge/tauri/invoke",
+            "/steward/dev-ops/start",
+            "/steward/dev-ops/stop",
+            // The evasions: leading doubles, a dot segment, case, percent
+            // encoding, a backslash separator, and a query hiding the route.
+            "//terminals",
+            "/./terminals",
+            "/TERMINALS",
+            "%2fterminals",
+            "/ter%6Dinals",
+            "\\terminals",
+            "/terminals?workingDir=/",
+            "/terminals/abc/write",
+            "/x/../terminals",
+            "/x/%252e%252e/terminals",
+        ] {
+            for method in ["GET", "POST", "DELETE"] {
+                cases.push((method.to_string(), path.to_string()));
+            }
+        }
+
+        for (method, path) in &cases {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// The other half of the property: the generic relay still works. Without
+    /// this, a policy that refused everything would pass the tests above.
+    #[tokio::test]
+    async fn the_http_relay_still_reaches_everything_else() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        for (method, path) in [
+            ("GET", "/health"),
+            ("GET", "/status"),
+            ("GET", "/ui-bridge/control/page/state"),
+            ("GET", "/ui-bridge/control/terminal-sessions"),
+            ("POST", "/hitl/q-1/respond"),
+            ("POST", "/worktrees/merge"),
+        ] {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(reply["status"], 200, "{method} {path} was refused: {reply}");
+        }
+
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            6,
+            "every non-guarded call must have reached the local API"
+        );
+    }
+
     #[test]
     fn http_relay_error_builds_command_response_with_json_body() {
         let reply = http_relay_error(&json!("rid-7"), 400, "invalid HTTP method");
@@ -6018,6 +6195,14 @@ mod remote_admission_tests {
     /// so the target decides on both arms. The tests that pin THAT are in
     /// `remote_terminal`, and this one is deliberately narrowed to the claim it
     /// can actually make.
+    ///
+    /// The same reading governs `http_request` in the list below, and for a
+    /// second round it was the harder half: this predicate admits it, and what
+    /// stops it self-calling `POST /terminals` with those same three fields is
+    /// `mcp::relay_path_policy`, applied inside `relay_http_to_base` (review
+    /// round 2, finding 1). The tests that pin THAT are
+    /// `no_terminal_mutating_route_is_reachable_over_the_http_relay` and its
+    /// two neighbours, which count what reached a real local server.
     #[test]
     fn a_frame_with_no_remote_block_is_not_a_remote_frame_which_is_not_the_same_as_ungated() {
         for t in ["terminal_create", "terminal_list", "http_request"] {
