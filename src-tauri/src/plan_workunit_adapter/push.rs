@@ -417,7 +417,15 @@ pub fn is_coord_derived_status(status: &str) -> bool {
 /// ([`super::trigger::reconcile_once`]), which is the general rule rather than a
 /// second client-side special case. Changing the transition arm would also
 /// silently redefine an edge the adapter's own test corpus pins as a real
-/// transition, which is a separate design decision.
+/// transition, which is a separate design decision. That retirement is keyed on
+/// the `(slug, attempted status)` PAIR — the scope coord's own
+/// `DenialTerminality::Permanent` asserts — so editing the plan file's stamp
+/// off the derived word re-arms the slug on the very next cycle.
+///
+/// **What the caller must not do with a withdrawn status:** record it as
+/// applied. The upsert SUCCEEDS with the status omitted, and a caller that
+/// remembers `u.status` anyway is remembering something coord was never told —
+/// see [`PushOutcome::applied_status`], which exists to make that impossible.
 fn settable_status(parsed_status: &str) -> Option<String> {
     if is_coord_derived_status(parsed_status) {
         None
@@ -456,6 +464,28 @@ pub struct PushOutcome {
     pub slug: String,
     pub kind: PushOutcomeKind,
     pub conflict: bool,
+    /// **The status coord is now known to hold because of this push** — and
+    /// the ONLY value a caller may record as last-applied.
+    ///
+    /// It is `Some` on exactly two grounds, and they are the two grounds a
+    /// client-side memory of "what coord holds" can honestly rest on:
+    ///
+    /// - the status went **on the wire** and the write was accepted (the
+    ///   `UpsertWithStatus` body's `status` field, or a `Transition`'s
+    ///   `to_status`); or
+    /// - the status was **read back off coord** in this same push and matched
+    ///   the file (the convergence check that downgrades a deferral to a
+    ///   refresh, and the plain `RefreshOnly` whose `prev` already equals it).
+    ///
+    /// `None` means this push applied NOTHING: a deferral (suppressed on
+    /// purpose), or an upsert whose status [`settable_status`] withdrew because
+    /// coord derives it. Recording the PARSED status in that second case is a
+    /// lie with teeth — it arms [`push_work_unit_with_remote`]'s conflict check
+    /// (one extra `current_status` GET per slug per cycle) and then makes it
+    /// report `file wins (loud override)` forever for a word the adapter has
+    /// decided never to send. `last_applied` must be what went on the wire,
+    /// never what was parsed-but-filtered.
+    pub applied_status: Option<String>,
 }
 
 /// Outcome of a [`WorkUnitSink::set_deps`] call. Distinguishes the benign
@@ -506,7 +536,8 @@ pub trait WorkUnitSink: Send + Sync {
 ///
 /// `last_applied` is the status this adapter last applied for `u.slug` (its
 /// client-side memory). Returns the [`PushOutcome`]; the caller updates its
-/// last-applied memory to `u.status` on success.
+/// last-applied memory from [`PushOutcome::applied_status`] — **never** from
+/// `u.status`, which may have been withdrawn from the wire.
 pub async fn push_work_unit<S: WorkUnitSink + ?Sized>(
     sink: &S,
     u: &ParsedWorkUnit,
@@ -613,6 +644,8 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                             wanted: u.status.clone(),
                         },
                         conflict: false,
+                        // A deferral is a write that did NOT happen.
+                        applied_status: None,
                     });
                 }
             }
@@ -621,8 +654,26 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
 
     // Conflict detection: did the remote status diverge from what we last
     // applied? (A direct transition by someone else.) File wins, but loudly.
+    //
+    // ...except for a status this adapter has WITHDRAWN from writing. The
+    // conflict verdict says "the remote moved and the FILE WINS" — a claim
+    // about a race this writer is in. For a coord-DERIVED status on any arm
+    // that puts no status on the wire ([`settable_status`] filters the upsert),
+    // the adapter is not in that race at all: it has decided never to send the
+    // word, so it can neither win nor be overridden, and announcing itself the
+    // winner every cycle is false on its face and poisons `conflicts_total` as
+    // a divergence signal. Skipping the verdict also skips the
+    // `current_status` GET that arms it — the request this slug does not need.
+    //
+    // A `Transition` is deliberately NOT withdrawn: it DOES put the word on the
+    // wire (the adapter's own test corpus pins `vetted -> shipped` as a real
+    // edge), and what retires it is coord's `terminality: permanent` on the
+    // denial, scoped to that `(slug, status)` pair — see
+    // [`super::trigger::reconcile_once`].
+    let status_write_withdrawn =
+        !matches!(action, PushAction::Transition { .. }) && is_coord_derived_status(&u.status);
     let mut conflict = false;
-    if let Some(prev) = last_applied {
+    if let Some(prev) = last_applied.filter(|_| !status_write_withdrawn) {
         if matches!(remote, RemoteStatus::Unread) {
             remote = read_remote_status(sink, &u.slug, "conflict check").await;
         }
@@ -666,21 +717,24 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
         }
     }
 
-    let kind = match &action {
+    let (kind, applied_status) = match &action {
         PushAction::UpsertWithStatus => {
+            // `None` for a coord-DERIVED status — see [`settable_status`].
+            // The write degrades to the metadata-only shape rather than
+            // being 422'd whole.
+            let sent = settable_status(&u.status);
             sink.upsert(&UpsertBody {
                 slug: u.slug.clone(),
                 title: u.title.clone(),
-                // `None` for a coord-DERIVED status — see [`settable_status`].
-                // The write degrades to the metadata-only shape rather than
-                // being 422'd whole.
-                status: settable_status(&u.status),
+                status: sent.clone(),
                 metadata: Some(metadata),
                 by_actor: Some(ADAPTER_ACTOR.to_string()),
                 authored_at,
             })
             .await?;
-            PushOutcomeKind::Created
+            // Exactly what went on the wire: `None` when the status was
+            // withdrawn, so the caller records no status it did not apply.
+            (PushOutcomeKind::Created, sent)
         }
         PushAction::RefreshOnly => {
             sink.upsert(&UpsertBody {
@@ -692,7 +746,14 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 authored_at,
             })
             .await?;
-            PushOutcomeKind::Refreshed
+            // No status went on the wire — but this arm is reached only when
+            // coord is KNOWN to already hold `u.status`: either `prev` equals
+            // it (plain edge-trigger) or the convergence check READ it back off
+            // coord and downgraded a transition to this refresh. Both are
+            // grounds a last-applied memory may honestly rest on, and the
+            // second is load-bearing: without it the deferral would re-fire,
+            // and be re-counted, on every future cycle.
+            (PushOutcomeKind::Refreshed, Some(u.status.clone()))
         }
         PushAction::Transition { from, to } => {
             // Refresh title/metadata first (no status change), then transition
@@ -719,10 +780,16 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
                 },
             )
             .await?;
-            PushOutcomeKind::Transitioned {
-                from: from.clone(),
-                to: to.clone(),
-            }
+            (
+                PushOutcomeKind::Transitioned {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+                // The transition's `to_status` is what went on the wire, and
+                // coord accepted it. (A REFUSED transition never reaches here —
+                // the `?` above propagates the denial.)
+                Some(to.clone()),
+            )
         }
     };
 
@@ -730,6 +797,7 @@ pub async fn push_work_unit_with_remote<S: WorkUnitSink + ?Sized>(
         slug: u.slug.clone(),
         kind,
         conflict,
+        applied_status,
     })
 }
 
@@ -1226,7 +1294,13 @@ mod tests {
         for derived in ["shipped", "ready"] {
             let sink = FakeSink::default();
             let u = unit("2026-01-01-p", derived);
-            push_work_unit(&sink, &u, None).await.unwrap();
+            let out = push_work_unit(&sink, &u, None).await.unwrap();
+            // ...and the push REPORTS that it applied nothing, which is what
+            // stops the caller recording a word coord was never sent.
+            assert_eq!(
+                out.applied_status, None,
+                "{derived} was withdrawn from the wire, so nothing was applied"
+            );
 
             let ups = sink.upserts.lock().unwrap();
             assert_eq!(ups.len(), 1, "{derived}: exactly one upsert");
@@ -1267,6 +1341,93 @@ mod tests {
             Some("vetted".to_string()),
             "an Attested status is settable and must still be carried"
         );
+    }
+
+    /// The complement of the filter, at the level the caller's memory lives:
+    /// what a push reports as APPLIED is what went on the wire.
+    ///
+    /// A settable status is applied and reported; a withdrawn one is neither.
+    /// Recording the parsed status for the second case is the defect that armed
+    /// a `current_status` GET per slug per cycle and then made the conflict
+    /// check announce `file wins (loud override)` forever for a word this
+    /// writer had decided never to send.
+    #[tokio::test]
+    async fn applied_status_is_what_went_on_the_wire_never_what_was_parsed() {
+        let settable = FakeSink::default();
+        let out = push_work_unit(&settable, &unit("s", "vetted"), None)
+            .await
+            .unwrap();
+        assert_eq!(out.applied_status.as_deref(), Some("vetted"));
+
+        let withdrawn = FakeSink::default();
+        let out = push_work_unit(&withdrawn, &unit("s", "shipped"), None)
+            .await
+            .unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Created, "the upsert SUCCEEDS...");
+        assert_eq!(
+            out.applied_status, None,
+            "...with the status withdrawn, so nothing was applied"
+        );
+
+        // A transition DOES put the word on the wire, so an accepted one is
+        // applied — `to`, not the `from` and not the file's earlier stamp.
+        let edge = FakeSink {
+            remote: Some("vetted".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&edge, &unit("s", "shipped"), Some("vetted"))
+            .await
+            .unwrap();
+        assert_eq!(out.applied_status.as_deref(), Some("shipped"));
+
+        // A deferral wrote nothing at all.
+        let deferred = FakeSink {
+            remote: Some("draft".to_string()),
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&deferred, &unit("s", "in_progress"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(matches!(out.kind, PushOutcomeKind::Deferred { .. }));
+        assert_eq!(out.applied_status, None);
+    }
+
+    /// The conflict verdict is WITHDRAWN along with the status write. On a
+    /// refresh of a coord-derived status the adapter will never send the word,
+    /// so it is not in the race at all: claiming `file wins (loud override)`
+    /// would be false, and paying a `current_status` GET to reach that claim is
+    /// the traffic this change exists to remove.
+    #[tokio::test]
+    async fn a_refresh_of_a_derived_status_reads_no_remote_and_claims_no_conflict() {
+        let sink = FakeSink {
+            // coord holds something else — the divergence that WOULD be
+            // reported for a status the adapter still writes.
+            remote: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("shipped"))
+            .await
+            .unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Refreshed);
+        assert!(!out.conflict, "the adapter withdrew from this race");
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            0,
+            "and the read that arms the verdict is not made at all"
+        );
+
+        // The same divergence on a SETTABLE status is still reported: this is a
+        // narrow withdrawal, not a mute.
+        let settable = FakeSink {
+            remote: Some("in_progress".to_string()),
+            ..Default::default()
+        };
+        let out = push_work_unit(&settable, &unit("s", "vetted"), Some("vetted"))
+            .await
+            .unwrap();
+        assert!(out.conflict, "a real divergence on a word we DO write still surfaces");
+        assert_eq!(*settable.status_reads.lock().unwrap(), 1);
     }
 
     /// The filter is byte-exact, mirroring coord: a case or whitespace variant
