@@ -1354,7 +1354,8 @@ pub struct ScanRootReport {
     pub repo_root: Option<String>,
     /// [`derive_source_repo`] of `plans_dir` — the same `<repo>/<dir>` key the
     /// plan-library rows this dir produces carry, so a reader can join the
-    /// reading to the artifacts it qualifies.
+    /// reading to the artifacts it qualifies. Resolved when the reading was
+    /// measured, not here.
     pub source_repo: Option<String>,
     pub default_ref: Option<String>,
     pub ref_sha: Option<String>,
@@ -1364,13 +1365,38 @@ pub struct ScanRootReport {
     pub ref_age_secs: Option<u64>,
     pub counts_are_floors: bool,
     pub detail: Option<String>,
-    /// When the reading was taken, RFC 3339 UTC with a `Z` suffix.
+    /// When the reading was MEASURED, RFC 3339 UTC with a `Z` suffix — not
+    /// when it was posted. A heartbeat re-post of an unchanged reading sends
+    /// the latest tick's measurement, so this ages honestly either way.
     pub observed_at: String,
 }
 
+/// Where [`super::trigger::BodySync`] sends a scan-root report.
+///
+/// A trait rather than the concrete [`HttpArtifactSink`] call so the body
+/// sync's ordering rules — the report goes out even on a paused or empty
+/// cycle, and its failure never feeds the body-push breaker — are tests over
+/// a fake that records what it was sent, not claims in a comment.
+#[async_trait::async_trait]
+pub trait ScanRootReporter: Send + Sync {
+    async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String>;
+}
+
+#[async_trait::async_trait]
+impl ScanRootReporter for HttpArtifactSink {
+    async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String> {
+        HttpArtifactSink::report_scan_root(self, report).await
+    }
+}
+
 impl ScanRootReport {
-    /// Project a reading for the wire. `observed_at` is a parameter so the
-    /// projection is pure apart from [`derive_source_repo`]'s `.git` probe.
+    /// Project a reading for the wire. Pure: `source_repo` is copied from the
+    /// reading (resolved on the blocking pool beside the git probes, never
+    /// here), and `observed_at` is the reading's own measurement time
+    /// ([`super::trigger::ScanDivergence::observed_at_unix`]).
+    /// `forwarded_at` is used ONLY for a reading no tick stamped — which the
+    /// reconcile loop never produces — so the report cannot claim a
+    /// measurement is newer than it is.
     ///
     /// The web door validates the state/field pairing and REFUSES a report
     /// that breaks it, so the projection enforces each rule itself rather
@@ -1392,7 +1418,7 @@ impl ScanRootReport {
     /// shape itself.
     pub fn from_divergence(
         d: &super::trigger::ScanDivergence,
-        observed_at: chrono::DateTime<chrono::Utc>,
+        forwarded_at: chrono::DateTime<chrono::Utc>,
     ) -> Self {
         use super::trigger::ScanDivergenceState as State;
         let measured_counts = match (d.state, d.behind, d.ahead) {
@@ -1426,10 +1452,7 @@ impl ScanRootReport {
             state: state.as_str().to_string(),
             plans_dir: d.plans_dir.clone(),
             repo_root: d.repo_root.clone(),
-            source_repo: d
-                .plans_dir
-                .as_deref()
-                .and_then(|dir| derive_source_repo(Path::new(dir))),
+            source_repo: d.source_repo.clone(),
             default_ref: d.default_ref.clone(),
             ref_sha: d.ref_sha.clone(),
             head_sha: d.head_sha.clone(),
@@ -1438,7 +1461,11 @@ impl ScanRootReport {
             ref_age_secs: measured_counts.and(d.ref_age_secs),
             counts_are_floors: measured_counts.is_some() && d.counts_are_floors(),
             detail,
-            observed_at: observed_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            observed_at: d
+                .observed_at_unix
+                .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
+                .unwrap_or(forwarded_at)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         }
     }
 }
@@ -1550,8 +1577,14 @@ mod tests {
 
     // ---- the scan-root report (plan 2026-09-11-…-its-own-drift, Revised P2) ----
 
+    /// The fixture's MEASUREMENT time: 2026-09-11T12:34:56Z.
+    const MEASURED_AT: i64 = 1_789_130_096;
+
+    /// A FORWARDING time well after the measurement — what `Utc::now()` reads
+    /// when the body sync posts. The report must not use it for a stamped
+    /// reading; tests pass it so a projection that did would show 13:00:00.
     fn observed() -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::parse_from_rfc3339("2026-09-11T12:34:56Z")
+        chrono::DateTime::parse_from_rfc3339("2026-09-11T13:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc)
     }
@@ -1572,6 +1605,8 @@ mod tests {
             ahead: Some(ahead),
             ref_age_secs,
             detail: None,
+            source_repo: Some("qontinui-dev-notes/plans".to_string()),
+            observed_at_unix: Some(MEASURED_AT),
         }
     }
 
@@ -1589,7 +1624,7 @@ mod tests {
                 "state": "measured",
                 "plans_dir": "/no/such/qontinui-dev-notes/plans",
                 "repo_root": "/no/such/qontinui-dev-notes",
-                // No `.git` on this path, so the two-component fallback.
+                // Copied from the reading, which resolved it when measured.
                 "source_repo": "qontinui-dev-notes/plans",
                 "default_ref": "origin/main",
                 "ref_sha": "a".repeat(40),
@@ -1656,19 +1691,45 @@ mod tests {
     /// `source_repo` is the same key the plan-library rows this dir produces
     /// carry — resolved through the `.git` walk when there is one.
     #[test]
-    fn scan_root_report_source_repo_matches_the_artifact_key() {
+    fn scan_root_report_copies_source_repo_and_touches_no_filesystem() {
+        // A plans dir that DOES exist under a `.git` — if the projection still
+        // derived the key itself it would answer `qontinui-dev-notes/plans`;
+        // it must instead carry exactly what the reading holds.
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("qontinui-dev-notes");
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::create_dir_all(repo.join("plans")).unwrap();
-        let plans = repo.join("plans");
         let d = super::super::trigger::ScanDivergence {
-            plans_dir: Some(plans.display().to_string()),
+            plans_dir: Some(repo.join("plans").display().to_string()),
+            source_repo: Some("as-measured/plans".to_string()),
             ..measured(Some(60), 0, 0)
         };
         let r = ScanRootReport::from_divergence(&d, observed());
-        assert_eq!(r.source_repo.as_deref(), Some("qontinui-dev-notes/plans"));
-        assert_eq!(r.source_repo, derive_source_repo(&plans));
+        assert_eq!(r.source_repo.as_deref(), Some("as-measured/plans"));
+        let unresolved = super::super::trigger::ScanDivergence {
+            source_repo: None,
+            ..d
+        };
+        assert_eq!(
+            ScanRootReport::from_divergence(&unresolved, observed()).source_repo,
+            None
+        );
+    }
+
+    /// `observed_at` is when the reading was MEASURED, not when it was
+    /// posted; only a reading nothing stamped falls back to the post time.
+    #[test]
+    fn scan_root_report_observed_at_is_the_measurement_time() {
+        let r = ScanRootReport::from_divergence(&measured(Some(60), 0, 0), observed());
+        assert_eq!(r.observed_at, "2026-09-11T12:34:56Z");
+        let unstamped = super::super::trigger::ScanDivergence {
+            observed_at_unix: None,
+            ..measured(Some(60), 0, 0)
+        };
+        assert_eq!(
+            ScanRootReport::from_divergence(&unstamped, observed()).observed_at,
+            "2026-09-11T13:00:00Z"
+        );
     }
 
     /// The web door's validation, restated as a predicate over the JSON the
@@ -1707,10 +1768,26 @@ mod tests {
             // (1) both counts, non-null.
             assert!(v["behind"].is_u64(), "measured needs behind: {v}");
             assert!(v["ahead"].is_u64(), "measured needs ahead: {v}");
+            // (6) an age-less measurement must declare its counts floors.
+            if v["ref_age_secs"].is_null() {
+                assert_eq!(
+                    v["counts_are_floors"], true,
+                    "measured with no ref_age_secs must be floors: {v}"
+                );
+            }
         } else {
             // (2) neither count.
             assert!(v["behind"].is_null(), "{state} must not carry behind: {v}");
             assert!(v["ahead"].is_null(), "{state} must not carry ahead: {v}");
+            // (7) nor an age, nor a floor flag.
+            assert!(
+                v["ref_age_secs"].is_null(),
+                "{state} must not carry ref_age_secs: {v}"
+            );
+            assert_eq!(
+                v["counts_are_floors"], false,
+                "{state} cannot be floors: {v}"
+            );
         }
         // (3) unknown / not_a_git_work_tree explain themselves.
         if state == "unknown" || state == "not_a_git_work_tree" {

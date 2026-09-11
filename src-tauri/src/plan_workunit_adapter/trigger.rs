@@ -331,6 +331,17 @@ pub struct ScanDivergence {
     /// as the silence this type replaces. On `Measured` it is `None` unless
     /// `ref_age_secs` is absent, in which case it names why the age is unknown.
     pub detail: Option<String>,
+    /// The plan-library `source_repo` key of `plans_dir` — the same
+    /// `<repo>/<dir>` identity the artifacts this dir produces carry
+    /// (`body_push::derive_source_repo`). Resolved beside the git probes, on
+    /// the blocking pool, because it walks the filesystem for a `.git`; the
+    /// scan-root report only copies it. `None` when nothing is scanned, or
+    /// when the reading was not produced by the tick's measurement.
+    pub source_repo: Option<String>,
+    /// When this reading was taken, as unix seconds — the clock the tick read
+    /// for the measurement itself, NOT the time anything later forwarded it.
+    /// `None` only for a reading no tick stamped (a hand-built one).
+    pub observed_at_unix: Option<i64>,
 }
 
 /// How recently `default_ref` must have been refreshed for a `Measured`
@@ -359,6 +370,17 @@ impl ScanDivergence {
             ahead: None,
             ref_age_secs: None,
             detail: None,
+            source_repo: None,
+            observed_at_unix: None,
+        }
+    }
+
+    /// This reading, stamped as taken at `unix` seconds — see
+    /// [`Self::observed_at_unix`].
+    pub fn observed_at(self, unix: i64) -> Self {
+        Self {
+            observed_at_unix: Some(unix),
+            ..self
         }
     }
 
@@ -431,17 +453,22 @@ impl ScanDivergence {
     }
 
     /// Whether `other` says the same thing as `self` — every field equal
-    /// except the raw `ref_age_secs`, which is compared only through its
-    /// freshness verdict ([`Self::ref_is_fresh`]).
+    /// except the two that move with the clock: the raw `ref_age_secs`, which
+    /// is compared only through its freshness verdict ([`Self::ref_is_fresh`]),
+    /// and `observed_at_unix`, which is when, not what.
     ///
-    /// The age grows by one tick every tick, so plain equality would make
-    /// every reading "new": the edge-triggered log would fire every minute
-    /// and the scan-root report would post every cycle. What a reader acts on
-    /// is whether the counts are current or floors, so a crossing of the
+    /// Both grow every tick, so plain equality would make every reading
+    /// "new": the edge-triggered log would fire every minute and the
+    /// scan-root report would post every cycle. What a reader acts on is
+    /// whether the counts are current or floors, so a crossing of the
     /// freshness window IS a change and a clock advancing inside it is not.
+    /// (`detail` is compared verbatim, which is why every probe failure it
+    /// quotes is worded without per-run noise such as a pid — see
+    /// [`ProcessGit::describe`].)
     pub fn is_same_reading(&self, other: &ScanDivergence) -> bool {
         let strip = |d: &ScanDivergence| ScanDivergence {
             ref_age_secs: None,
+            observed_at_unix: None,
             ..d.clone()
         };
         strip(self) == strip(other) && self.ref_is_fresh() == other.ref_is_fresh()
@@ -523,6 +550,31 @@ pub trait GitRefReader: Send + Sync {
 /// reader, which is what makes the four states testable without a repo on
 /// disk, and `now_unix` is a parameter so the ref's age is too.
 pub fn measure_scan_divergence(
+    plans_dir: Option<&Path>,
+    git: &dyn GitRefReader,
+    now_unix: i64,
+) -> ScanDivergence {
+    measure_unstamped(plans_dir, git, now_unix).observed_at(now_unix)
+}
+
+/// The tick's measurement: [`measure_scan_divergence`] plus the reading's
+/// plan-library `source_repo` key.
+///
+/// Run on the blocking pool with the git probes because
+/// [`super::body_push::derive_source_repo`] walks the filesystem for a `.git`
+/// — work that does not belong on the single-worker runtime the scan-root
+/// report is later posted from. Kept out of [`measure_scan_divergence`] so
+/// that stays pure over its fake reader.
+fn measure_scan_source(dir: &Path, git: &dyn GitRefReader, now_unix: i64) -> ScanDivergence {
+    ScanDivergence {
+        source_repo: super::body_push::derive_source_repo(dir),
+        ..measure_scan_divergence(Some(dir), git, now_unix)
+    }
+}
+
+/// [`measure_scan_divergence`] without the `observed_at` stamp, so the stamp
+/// is applied in ONE place and no arm can return a reading without it.
+fn measure_unstamped(
     plans_dir: Option<&Path>,
     git: &dyn GitRefReader,
     now_unix: i64,
@@ -615,6 +667,20 @@ pub fn measure_scan_divergence(
             // numbers — and says why in `detail`, while `ref_age_secs: None`
             // makes `counts_are_floors()` true.
             let (ref_age_secs, detail) = match git.ref_refreshed_at(&root, &default_ref, &ref_sha) {
+                Ok(Some(refreshed_at))
+                    if refreshed_at.saturating_sub(now_unix) > SCAN_REF_FUTURE_TOLERANCE_SECS =>
+                {
+                    (
+                        None,
+                        Some(format!(
+                            "the newest refresh record for `{default_ref}` in `{root_str}` is \
+                             dated {}s in the FUTURE (a clock correction, or a restored \
+                             file's mtime), so it proves nothing about when the ref was last \
+                             refreshed — its age is unknown and the counts are lower bounds",
+                            refreshed_at.saturating_sub(now_unix)
+                        )),
+                    )
+                }
                 Ok(Some(refreshed_at)) => (Some(ref_age_from(now_unix, refreshed_at)), None),
                 Ok(None) => (
                     None,
@@ -688,11 +754,23 @@ fn parse_left_right_count(raw: &str) -> Result<(u64, u64), String> {
     Ok((behind, ahead))
 }
 
+/// How far in the future a refresh timestamp may sit and still be read as
+/// "just now" (age 0).
+///
+/// Five minutes of skew between the file clock and the process clock is
+/// ordinary (a network filesystem, an NTP step). Beyond it the timestamp is
+/// not a small skew but a record that cannot be trusted — a clock corrected
+/// backwards after a fetch, a checkout restored from a backup with future
+/// mtimes — and reading it as age 0 would be a FALSE "fresh", the one outcome
+/// the floor rule exists to prevent. So a further-future stamp is an UNKNOWN
+/// age instead ([`measure_scan_divergence`]).
+const SCAN_REF_FUTURE_TOLERANCE_SECS: i64 = 300;
+
 /// `now - refreshed_at` in whole seconds, saturating at zero.
 ///
-/// A refresh stamped in the future (clock skew, a restored backup's mtime)
-/// reads as age 0 rather than wrapping to an astronomically old ref — which
-/// would be the wrong direction for a skew of seconds.
+/// A refresh stamped slightly in the future (within
+/// [`SCAN_REF_FUTURE_TOLERANCE_SECS`]) reads as age 0 rather than wrapping to
+/// an astronomically old ref; a stamp further out never reaches here.
 fn ref_age_from(now_unix: i64, refreshed_at: i64) -> u64 {
     u64::try_from(now_unix.saturating_sub(refreshed_at)).unwrap_or(0)
 }
@@ -777,6 +855,38 @@ fn fresher_refresh(
     }
 }
 
+/// One `FETCH_HEAD` file's contribution: its mtime when it records a fetch of
+/// `branch` at `ref_sha` ([`fetch_head_names_ref`]), `Ok(None)` when it is
+/// absent or names something else.
+fn fetch_head_file_refreshed_at(
+    path: &Path,
+    branch: &str,
+    ref_sha: &str,
+) -> Result<Option<i64>, String> {
+    // Stat BEFORE reading. A fetch landing between the two then pairs an
+    // OLDER mtime with newer contents — an overstated age — where the
+    // opposite order could pair a fresh mtime from a fetch of some other
+    // branch with contents that still named this one: a false "fresh".
+    let modified = match std::fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot stat `{}`: {e}", path.display())),
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read `{}`: {e}", path.display())),
+    };
+    if !fetch_head_names_ref(&contents, branch, ref_sha) {
+        return Ok(None);
+    }
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("`{}` has an mtime before the epoch: {e}", path.display()))?
+        .as_secs();
+    Ok(Some(i64::try_from(secs).unwrap_or(i64::MAX)))
+}
+
 /// Budget for every `git` invocation the detector makes.
 ///
 /// All of them are LOCAL plumbing reads, so a healthy call is milliseconds; the
@@ -823,18 +933,44 @@ impl ProcessGit {
         Self::probe(dir, args, label).map_err(|reason| Self::describe(args, &reason))
     }
 
+    /// One sentence for a probe that did not answer — worded WITHOUT per-run
+    /// noise. `DegradeReason`'s `Debug` form carries the killed child's pid
+    /// (`TimedOut { pid: 41873, .. }`), and this text reaches
+    /// [`ScanDivergence::detail`], which [`ScanDivergence::is_same_reading`]
+    /// compares verbatim: a pid in it made a probe that times out every tick
+    /// a NEW reading every tick — a WARN and a scan-root POST per minute for
+    /// what is one unchanging fault.
     fn describe(args: &[&str], reason: &crate::process_helpers::DegradeReason) -> String {
-        format!("`git {}` did not answer ({reason:?})", args.join(" "))
+        use crate::process_helpers::DegradeReason;
+        let why = match reason {
+            DegradeReason::Status => "it exited non-zero".to_string(),
+            DegradeReason::SpawnError => "it could not be spawned (SpawnError)".to_string(),
+            DegradeReason::TimedOut { reaped, .. } => format!(
+                "it overran its {}s budget and was killed (TimedOut{})",
+                SCAN_DIVERGENCE_GIT_TIMEOUT.as_secs(),
+                if *reaped { "" } else { ", not reaped" }
+            ),
+            DegradeReason::Truncated(t) => format!("its output was truncated ({t:?})"),
+        };
+        format!("`git {}` did not answer: {why}", args.join(" "))
     }
 
-    /// The `FETCH_HEAD` source of [`GitRefReader::ref_refreshed_at`]: its
-    /// mtime, when it records a fetch of the default branch at `ref_sha`.
+    /// The `FETCH_HEAD` source of [`GitRefReader::ref_refreshed_at`]: the
+    /// fresher mtime of the two `FETCH_HEAD` files a checkout can have, each
+    /// counted only when it records a fetch of the default branch at
+    /// `ref_sha`.
     ///
-    /// The path comes from `rev-parse --git-path`, never a hardcoded
-    /// `.git/FETCH_HEAD`: in a linked worktree `.git` is a FILE and the real
-    /// git dir is elsewhere. Git prints it relative to the `-C` dir (or
-    /// absolute), so it is joined onto `repo_root` — an absolute path replaces
-    /// the base on join, which covers both.
+    /// Two files because `FETCH_HEAD` is PER-WORKTREE while the tracking ref
+    /// and its reflog are shared. In a linked worktree `--git-path FETCH_HEAD`
+    /// names that worktree's own file — which the worktree census's fetch,
+    /// run in the PRIMARY checkout, never writes — so reading it alone would
+    /// miss the refresh that actually updated the shared ref. The primary's
+    /// file is `<git-common-dir>/FETCH_HEAD`. In a primary checkout both paths
+    /// are the same file and reading it twice changes nothing.
+    ///
+    /// Both paths come from `rev-parse`, never a hardcoded `.git/…`: git
+    /// prints them relative to the `-C` dir (or absolute), so each is joined
+    /// onto `repo_root` — an absolute path replaces the base on join.
     fn fetch_head_refreshed_at(
         repo_root: &Path,
         default_ref: &str,
@@ -848,29 +984,23 @@ impl ProcessGit {
         if located.is_empty() {
             return Err("`git rev-parse --git-path FETCH_HEAD` returned nothing".to_string());
         }
-        let path = repo_root.join(located);
-        // Stat BEFORE reading. A fetch landing between the two then pairs an
-        // OLDER mtime with newer contents — an overstated age — where the
-        // opposite order could pair a fresh mtime from a fetch of some other
-        // branch with contents that still named this one: a false "fresh".
-        let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("cannot stat `{}`: {e}", path.display())),
-        };
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(format!("cannot read `{}`: {e}", path.display())),
-        };
-        if !fetch_head_names_ref(&contents, default_branch_name(default_ref), ref_sha) {
-            return Ok(None);
+        let common = Self::run(
+            repo_root,
+            &["rev-parse", "--git-common-dir"],
+            "plan adapter: scan-divergence git-common-dir probe",
+        )?;
+        if common.is_empty() {
+            return Err("`git rev-parse --git-common-dir` returned nothing".to_string());
         }
-        let secs = modified
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("`{}` has an mtime before the epoch: {e}", path.display()))?
-            .as_secs();
-        Ok(Some(i64::try_from(secs).unwrap_or(i64::MAX)))
+        let branch = default_branch_name(default_ref);
+        fresher_refresh(
+            fetch_head_file_refreshed_at(&repo_root.join(located), branch, ref_sha),
+            fetch_head_file_refreshed_at(
+                &repo_root.join(common).join("FETCH_HEAD"),
+                branch,
+                ref_sha,
+            ),
+        )
     }
 
     /// The reflog source of [`GitRefReader::ref_refreshed_at`]: the ENTRY time
@@ -1051,6 +1181,15 @@ fn scan_divergence_message(d: &ScanDivergence) -> (bool, String) {
     )
 }
 
+/// Whether [`record_scan_divergence`] logs `new` — i.e. whether it differs
+/// from the reading it replaces by [`ScanDivergence::is_same_reading`], never
+/// by plain equality: `observed_at_unix` is re-stamped every tick and
+/// `ref_age_secs` grows every tick, so plain equality would log every minute.
+/// The first reading after start (no previous) always logs.
+fn scan_divergence_changed(previous: Option<&ScanDivergence>, new: &ScanDivergence) -> bool {
+    !previous.is_some_and(|previous| previous.is_same_reading(new))
+}
+
 /// Publish this cycle's reading, and log it **only when it changed**.
 ///
 /// Every cycle records; only a transition logs. A per-cycle line for a
@@ -1066,10 +1205,7 @@ fn record_scan_divergence(divergence: ScanDivergence, metrics: &AdapterMetrics) 
         .scan_divergence
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let changed = !slot
-        .as_ref()
-        .is_some_and(|previous| previous.is_same_reading(&divergence));
-    if changed {
+    if scan_divergence_changed(slot.as_ref(), &divergence) {
         let (at_warn, message) = scan_divergence_message(&divergence);
         if at_warn {
             tracing::warn!(
@@ -1757,6 +1893,10 @@ struct LoopState {
     /// active plans dir moves, because that clears `last_applied` and the
     /// per-slug fallback would otherwise cost one round-trip per plan again.
     bulk_seeded: bool,
+    /// Test-only: the scan-root reporter every rebuilt [`BodySync`] gets
+    /// instead of its sink, so a tick-level test can observe reports.
+    #[cfg(test)]
+    scan_reporter: Option<std::sync::Arc<dyn super::body_push::ScanRootReporter>>,
 }
 
 impl LoopState {
@@ -1779,7 +1919,20 @@ impl LoopState {
             forbidden: HashSet::new(),
             forbidden_deps: HashSet::new(),
             bulk_seeded: false,
+            #[cfg(test)]
+            scan_reporter: None,
         }
+    }
+
+    /// Route every rebuilt [`BodySync`]'s scan-root reports to `reporter`.
+    /// Test-only, like [`Self::with_git`].
+    #[cfg(test)]
+    fn with_scan_reporter(
+        mut self,
+        reporter: std::sync::Arc<dyn super::body_push::ScanRootReporter>,
+    ) -> Self {
+        self.scan_reporter = Some(reporter);
+        self
     }
 
     /// Swap in a different [`GitRefReader`]. Test-only: production always
@@ -1821,6 +1974,10 @@ impl LoopState {
             .body_sync_sink
             .as_ref()
             .map(|sink| BodySync::new(roots, sink.clone(), self.capture_gate.clone()));
+        #[cfg(test)]
+        if let Some(reporter) = self.scan_reporter.clone() {
+            self.body_sync = self.body_sync.take().map(|bs| bs.with_reporter(reporter));
+        }
 
         let first_tick = previous.is_none();
         let previous_plans = previous.and_then(|p| p.plans);
@@ -1976,15 +2133,16 @@ impl LoopState {
             // git at all, so it is computed INLINE. Hopping an unarmed tick to
             // the blocking pool would buy nothing and cost every idle runner a
             // pool round-trip per minute.
-            None => ScanDivergence::not_scanning(),
+            None => ScanDivergence::not_scanning().observed_at(chrono::Utc::now().timestamp()),
             Some(dir) => {
                 let git = std::sync::Arc::clone(&self.git);
                 match tokio::task::spawn_blocking(move || {
                     // The clock is read HERE, beside the probes, so the ref's
-                    // age is as of the measurement rather than of the tick's
-                    // start; the function itself stays pure over it.
-                    measure_scan_divergence(
-                        Some(Path::new(&dir)),
+                    // age — and the reading's `observed_at` — are as of the
+                    // measurement rather than of the tick's start; the
+                    // function itself stays pure over it.
+                    measure_scan_source(
+                        Path::new(&dir),
                         git.as_ref(),
                         chrono::Utc::now().timestamp(),
                     )
@@ -1995,13 +2153,21 @@ impl LoopState {
                     Err(e) => ScanDivergence::unknown(
                         resolved.plans.clone(),
                         format!("the scan-divergence probe task failed to run: {e}"),
-                    ),
+                    )
+                    .observed_at(chrono::Utc::now().timestamp()),
                 }
             }
         };
         record_scan_divergence(divergence, metrics);
 
         let Some(dir) = resolved.plans.map(PathBuf::from) else {
+            // Nothing is scanned — but a device whose plans dir was just
+            // cleared must SAY so to the read side, or its last `measured` row
+            // keeps being quoted until it ages out. The body sync's library
+            // scan stays off here (unchanged); only its scan-root report runs.
+            if let Some(bs) = self.body_sync.as_mut() {
+                bs.report_while_idle(metrics).await;
+            }
             return;
         };
         let archive_dir = resolved.archive.map(PathBuf::from);
@@ -2413,6 +2579,10 @@ pub struct BodySync {
     /// retry backoff, the text makes the failure WARN edge-triggered (a
     /// repeat of the same error drops to DEBUG). Cleared by a success.
     last_scan_report_failure: Option<(String, std::time::Instant)>,
+    /// Where scan-root reports go: the same web sink as the body pushes in
+    /// production; a recording fake in tests (see
+    /// [`super::body_push::ScanRootReporter`]).
+    reporter: std::sync::Arc<dyn super::body_push::ScanRootReporter>,
 }
 
 impl BodySync {
@@ -2423,6 +2593,7 @@ impl BodySync {
     ) -> Self {
         Self {
             roots,
+            reporter: std::sync::Arc::new(sink.clone()),
             sink,
             state: super::body_push::ArtifactSyncState::new(),
             capture_gate,
@@ -2431,6 +2602,41 @@ impl BodySync {
             last_scan_report: None,
             last_scan_report_failure: None,
         }
+    }
+
+    /// Swap in a different scan-root reporter. Test-only, for the same reason
+    /// as [`LoopState::with_git`]: production always reports through its own
+    /// sink.
+    #[cfg(test)]
+    fn with_reporter(
+        mut self,
+        reporter: std::sync::Arc<dyn super::body_push::ScanRootReporter>,
+    ) -> Self {
+        self.reporter = reporter;
+        self
+    }
+
+    /// The reading the reconcile tick just recorded in `metrics`.
+    fn current_reading(metrics: &AdapterMetrics) -> Option<ScanDivergence> {
+        metrics
+            .scan_divergence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The idle tick's share of a body-sync cycle: no plans dir is configured,
+    /// so nothing is scanned or pushed — but the scan-root reading
+    /// (`not_scanning`) is still reported, under the same capture gate and
+    /// posting policy as an armed cycle. Without it a device whose plans dir
+    /// was cleared goes silent and its last `measured` row is quoted until it
+    /// ages out.
+    pub async fn report_while_idle(&mut self, metrics: &AdapterMetrics) {
+        if !(self.capture_gate)() {
+            return;
+        }
+        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
+            .await;
     }
 
     /// Publish this device's scan-root reading to the web read side
@@ -2460,7 +2666,7 @@ impl BodySync {
         };
         let report =
             super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now());
-        match self.sink.report_scan_root(&report).await {
+        match self.reporter.report_scan_root(&report).await {
             Ok(()) => {
                 if self.last_scan_report_failure.take().is_some() {
                     tracing::info!(
@@ -2530,12 +2736,7 @@ impl BodySync {
         // Those two are exactly the cycles whose corpus is NOT being refreshed
         // — a paused sync, an empty scan — so they are the last ones that
         // should go quiet about the scan source.
-        let current = metrics
-            .scan_divergence
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        self.report_scan_root_if_due(current, std::time::Instant::now())
+        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
             .await;
         if self.breaker.should_skip_cycle() {
             return;
@@ -3242,6 +3443,36 @@ mod tests {
         assert_eq!(d.ref_age_secs, Some(0));
         assert_eq!(ref_age_from(NOW, NOW + 120), 0);
         assert_eq!(ref_age_from(NOW, NOW - 5), 5);
+        // The tolerance's edge is still ordinary skew.
+        let edge = measured_with(Ok(Some(NOW + SCAN_REF_FUTURE_TOLERANCE_SECS)), 0, 0);
+        assert_eq!(edge.ref_age_secs, Some(0));
+    }
+
+    /// A refresh record dated FAR in the future — a clock corrected backwards
+    /// after a fetch, a checkout restored with future mtimes — proves nothing
+    /// about when the ref was refreshed. Clamping it to age 0 would be a false
+    /// "fresh"; it is an UNKNOWN age instead, so the counts are floors, and
+    /// the detail says why.
+    #[test]
+    fn a_far_future_refresh_is_an_unknown_age_not_fresh() {
+        let d = measured_with(Ok(Some(NOW + SCAN_REF_FUTURE_TOLERANCE_SECS + 1)), 0, 0);
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_age_secs, None);
+        assert_eq!(d.ref_is_fresh(), None);
+        assert!(d.counts_are_floors());
+        let detail = d.detail.expect("an unknown age is explained");
+        assert!(
+            detail.contains("FUTURE") && detail.contains("301s"),
+            "{detail}"
+        );
+
+        let a_day_ahead = measured_with(Ok(Some(NOW + 24 * HOUR)), 7, 0);
+        assert!(a_day_ahead.counts_are_floors());
+        assert_eq!(
+            a_day_ahead.behind,
+            Some(7),
+            "the counts themselves are kept"
+        );
     }
 
     /// The three non-`Measured` states have no counts, so there is nothing
@@ -3613,17 +3844,169 @@ mod tests {
         );
     }
 
+    /// A LINKED worktree whose primary checkout did the fetch — the census's
+    /// shape: it fetches in the canonical checkout, while the plans dir may be
+    /// a worktree of it. `FETCH_HEAD` is per-worktree, so the linked tree's
+    /// own `--git-path FETCH_HEAD` does not exist; the refresh is recorded
+    /// only in the common dir's file. Reading the per-worktree file alone
+    /// would fall back to the (2020) reflog and call a just-fetched ref six
+    /// years old.
+    #[test]
+    fn process_git_reads_the_primary_fetch_head_from_a_linked_worktree() {
+        let (tmp, primary, sha) = origin_and_old_reflog_reader();
+        let wt = tmp.path().join("linked");
+        real_git(
+            &primary,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wtb",
+                wt.to_str().unwrap(),
+                "origin/main",
+            ],
+            None,
+        );
+        let own = wt.join(real_git(
+            &wt,
+            &["rev-parse", "--git-path", "FETCH_HEAD"],
+            None,
+        ));
+        assert!(
+            !own.exists(),
+            "the linked tree has no FETCH_HEAD of its own: {}",
+            own.display()
+        );
+        assert_eq!(
+            fetch_head_file_refreshed_at(&own, "main", &sha),
+            Ok(None),
+            "the per-worktree file alone establishes nothing"
+        );
+
+        let now = chrono::Utc::now().timestamp();
+        let at = ProcessGit
+            .ref_refreshed_at(&wt, "origin/main", &sha)
+            .unwrap()
+            .expect("the primary's FETCH_HEAD answers");
+        assert!(
+            (now - at).abs() <= 10,
+            "the common dir's FETCH_HEAD should win over the 2020 reflog: {at} vs now {now}"
+        );
+    }
+
+    /// A probe that times out every tick is ONE unchanging fault, not a new
+    /// reading every tick. The killed child's pid used to reach `detail`
+    /// through `DegradeReason`'s `Debug` form, and `detail` is compared
+    /// verbatim — so each tick WARNed and re-posted.
+    #[test]
+    fn a_timed_out_probe_is_the_same_reading_whatever_the_pid() {
+        use crate::process_helpers::DegradeReason;
+        let args = ["reflog", "show"];
+        let first = ProcessGit::describe(
+            &args,
+            &DegradeReason::TimedOut {
+                pid: 41_873,
+                reaped: true,
+            },
+        );
+        let second = ProcessGit::describe(
+            &args,
+            &DegradeReason::TimedOut {
+                pid: 52_004,
+                reaped: true,
+            },
+        );
+        assert_eq!(first, second);
+        assert!(
+            !first.contains("41873") && !first.contains("pid"),
+            "{first}"
+        );
+        assert!(
+            first.contains("TimedOut"),
+            "the failure stays named: {first}"
+        );
+
+        let a = measured_with(Err(first), 5, 0);
+        let b = measured_with(Err(second), 5, 0);
+        assert!(a.is_same_reading(&b));
+        // An unreaped kill IS a different fault, and still says so.
+        let unreaped = ProcessGit::describe(
+            &args,
+            &DegradeReason::TimedOut {
+                pid: 1,
+                reaped: false,
+            },
+        );
+        assert!(unreaped.contains("not reaped"), "{unreaped}");
+    }
+
+    /// Every reading the measurement returns carries the time it was taken,
+    /// and that time is not part of what the reading SAYS.
+    #[test]
+    fn a_reading_is_stamped_with_its_measurement_time() {
+        let d = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        assert_eq!(d.observed_at_unix, Some(NOW));
+        for other in [
+            measure_scan_divergence(None, &FakeGit::healthy(0, 0), NOW),
+            measure_scan_divergence(
+                Some(Path::new("/repo/plans")),
+                &FakeGit {
+                    default_ref: Err("no origin/HEAD".to_string()),
+                    ..FakeGit::healthy(0, 0)
+                },
+                NOW,
+            ),
+        ] {
+            assert_eq!(other.observed_at_unix, Some(NOW), "{:?}", other.state);
+        }
+        let later = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::refreshed(5, 0, Ok(Some(NOW - 60))),
+            NOW + 60,
+        );
+        assert_eq!(later.observed_at_unix, Some(NOW + 60));
+        assert!(
+            d.is_same_reading(&later),
+            "a later measurement of the same state is the same reading"
+        );
+    }
+
+    /// The tick's measurement resolves the reading's `source_repo` — the
+    /// filesystem walk runs there, on the blocking pool, so the scan-root
+    /// report only copies it.
+    #[test]
+    fn the_tick_measurement_resolves_source_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("qontinui-dev-notes");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("plans")).unwrap();
+        let plans = repo.join("plans");
+        let d = measure_scan_source(&plans, &FakeGit::healthy(0, 0), NOW);
+        assert_eq!(d.source_repo.as_deref(), Some("qontinui-dev-notes/plans"));
+        assert_eq!(
+            d.source_repo,
+            super::super::body_push::derive_source_repo(&plans)
+        );
+        assert_eq!(d.observed_at_unix, Some(NOW));
+    }
+
     /// Live check against this box's own plans checkout — machine-specific, so
     /// ignored. Run with `--ignored` and compare against
     /// `git reflog show -n1 --date=unix --format=%gd refs/remotes/origin/main`
-    /// and `stat -c %Y .git/FETCH_HEAD` in the same repo. Point it elsewhere
-    /// with `SCAN_DIVERGENCE_LIVE_REPO`.
+    /// and `stat -c %Y .git/FETCH_HEAD` in the same repo. The checkout is
+    /// named by `QONTINUI_LIVE_PLANS_REPO` (the repo root holding `plans/`);
+    /// unset, the test says so and skips.
     #[test]
-    #[ignore = "reads a machine-specific checkout"]
+    #[ignore = "reads a machine-specific checkout named by QONTINUI_LIVE_PLANS_REPO"]
     fn live_ref_refreshed_at_matches_the_shell() {
-        let repo = std::env::var("SCAN_DIVERGENCE_LIVE_REPO").unwrap_or_else(|_| {
-            "/home/spinak/Projects/qontinui-root/qontinui-dev-notes".to_string()
-        });
+        let Ok(repo) = std::env::var("QONTINUI_LIVE_PLANS_REPO") else {
+            println!(
+                "SKIPPED: set QONTINUI_LIVE_PLANS_REPO to a checkout's root (the repo holding \
+                 plans/) to compare ProcessGit's refresh read against the shell"
+            );
+            return;
+        };
         let repo = Path::new(&repo);
         let default_ref = ProcessGit.default_ref(repo).unwrap();
         let sha = ProcessGit.rev_parse(repo, &default_ref).unwrap();
@@ -3754,6 +4137,282 @@ mod tests {
         assert!(
             backoff < SCAN_REPORT_HEARTBEAT.as_secs(),
             "a recovered backend is caught up faster than a heartbeat"
+        );
+    }
+
+    // ---- BodySync's ordering rules, over a recording reporter ----
+
+    /// Records every scan-root report it is handed; answers as configured.
+    #[derive(Default)]
+    struct FakeReporter {
+        sent: Mutex<Vec<super::super::body_push::ScanRootReport>>,
+        fail: bool,
+    }
+
+    impl FakeReporter {
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::default()
+            }
+        }
+        fn states(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.state.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::body_push::ScanRootReporter for FakeReporter {
+        async fn report_scan_root(
+            &self,
+            report: &super::super::body_push::ScanRootReport,
+        ) -> Result<(), String> {
+            self.sent.lock().unwrap().push(report.clone());
+            if self.fail {
+                Err("POST …/scan-roots -> 404 Not Found".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A body sync over NO scan roots (so a cycle's scan is empty and never
+    /// reaches the network) whose reports go to `reporter`.
+    fn body_sync_reporting_to(reporter: std::sync::Arc<FakeReporter>, gate_open: bool) -> BodySync {
+        BodySync::new(
+            Vec::new(),
+            super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
+            std::sync::Arc::new(move || gate_open) as CaptureGate,
+        )
+        .with_reporter(reporter)
+    }
+
+    fn metrics_with(reading: ScanDivergence) -> AdapterMetrics {
+        let metrics = AdapterMetrics::default();
+        record_scan_divergence(reading, &metrics);
+        metrics
+    }
+
+    /// A PAUSED body sync still reports its scan root: a paused sync is
+    /// exactly when the corpus stops being refreshed, so it is the last cycle
+    /// that should go quiet about the scan source.
+    ///
+    /// Neuter check: move the `report_scan_root_if_due` call in `run_cycle`
+    /// below `if self.breaker.should_skip_cycle() { return; }` and this fails.
+    #[tokio::test]
+    async fn a_paused_body_sync_still_reports_its_scan_root() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+        bs.breaker = FailureBreaker {
+            consecutive_total_failures: 0,
+            pause_cycles_remaining: 3,
+        };
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 2153, 11));
+
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+
+        assert_eq!(reporter.states(), vec!["measured"]);
+        assert_eq!(
+            bs.breaker.pause_cycles_remaining, 2,
+            "the cycle WAS a paused one — the pause was consumed"
+        );
+    }
+
+    /// An EMPTY scan still reports: the `artifacts.is_empty()` early return
+    /// comes after the report.
+    #[tokio::test]
+    async fn an_empty_scan_still_reports_its_scan_root() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 0, 0));
+
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        assert_eq!(reporter.states(), vec!["measured"]);
+
+        // And the posting policy holds across cycles: the same reading is not
+        // re-sent inside the heartbeat.
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        assert_eq!(reporter.states().len(), 1);
+    }
+
+    /// A report that fails, cycle after cycle, never feeds the body-push
+    /// breaker: a backend that does not serve the scan-roots route yet must
+    /// not pause plan-body capture. The breaker starts one failure short of
+    /// tripping, so a single counted report failure would pause it.
+    #[tokio::test]
+    async fn a_failed_scan_root_report_never_touches_the_breaker() {
+        let reporter = std::sync::Arc::new(FakeReporter::failing());
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+        let armed = FailureBreaker {
+            consecutive_total_failures: TOTAL_FAILURE_CYCLES_BEFORE_PAUSE - 1,
+            pause_cycles_remaining: 0,
+        };
+        bs.breaker = armed;
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+
+        for _ in 0..(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE + 2) {
+            // Skip the retry backoff so every cycle really attempts a post.
+            bs.last_scan_report_failure = None;
+            bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+                .await;
+        }
+
+        assert_eq!(
+            reporter.states().len(),
+            usize::try_from(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE + 2).unwrap(),
+            "every cycle attempted a report"
+        );
+        assert!(
+            bs.last_scan_report_failure.is_some(),
+            "the failure is remembered"
+        );
+        assert!(bs.last_scan_report.is_none(), "nothing was accepted");
+        assert_eq!(bs.breaker, armed, "the breaker never saw a report failure");
+        assert!(!bs.breaker.is_paused());
+    }
+
+    /// Two readings identical except for WHEN they were taken (and the ref
+    /// age that grows with it) are the same reading at every change-detection
+    /// point — no log transition, not report-due inside the heartbeat — yet
+    /// the store keeps the NEWER instant, and the heartbeat re-post carries it.
+    /// The web ages a row from `observed_at` and reads one past 2700 s as
+    /// unknown, so a heartbeat carrying the first measurement's time would make
+    /// a live device read stale.
+    #[tokio::test]
+    async fn only_the_measurement_instant_differs_so_nothing_changes_but_the_post_is_current() {
+        let first = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        let second = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::refreshed(5, 0, Ok(Some(NOW - 60))),
+            NOW + 600,
+        );
+        assert_eq!(first.observed_at_unix, Some(NOW));
+        assert_eq!(second.observed_at_unix, Some(NOW + 600));
+        assert_ne!(first, second, "the instant (and the age) did move");
+        assert!(first.is_same_reading(&second));
+        assert!(
+            !scan_divergence_changed(Some(&first), &second),
+            "no log transition"
+        );
+        assert!(
+            scan_divergence_changed(None, &second),
+            "the first reading always logs"
+        );
+
+        let t0 = std::time::Instant::now();
+        assert!(
+            !scan_report_due(
+                Some((&first, t0)),
+                None,
+                Some(&second),
+                instant_plus(t0, 600)
+            ),
+            "not report-due inside the heartbeat"
+        );
+
+        let metrics = AdapterMetrics::default();
+        record_scan_divergence(first.clone(), &metrics);
+        record_scan_divergence(second.clone(), &metrics);
+        assert_eq!(
+            metrics.snapshot().scan_divergence.unwrap().observed_at_unix,
+            Some(NOW + 600),
+            "the store holds the latest tick's instant"
+        );
+
+        // Through the body sync: post the first, then let the heartbeat
+        // elapse — the re-post carries the SECOND reading's instant.
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics_with(first))
+            .await;
+        let later = metrics_with(second);
+        bs.run_cycle(&PlanConvention::operator_default(), &later)
+            .await;
+        assert_eq!(
+            reporter.states().len(),
+            1,
+            "same reading inside the heartbeat"
+        );
+        let (posted, _) = bs.last_scan_report.take().unwrap();
+        bs.last_scan_report = Some((
+            posted,
+            std::time::Instant::now() - SCAN_REPORT_HEARTBEAT - Duration::from_secs(1),
+        ));
+        bs.run_cycle(&PlanConvention::operator_default(), &later)
+            .await;
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "the heartbeat re-posted");
+        let want = chrono::DateTime::<chrono::Utc>::from_timestamp(NOW + 600, 0)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        assert_eq!(
+            sent[1].observed_at, want,
+            "the re-post carries the newer instant"
+        );
+        assert_ne!(sent[0].observed_at, sent[1].observed_at);
+    }
+
+    /// A tenant at `plan_capture = off` publishes nothing about its plans dir.
+    #[tokio::test]
+    async fn a_closed_capture_gate_reports_nothing() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_reporting_to(reporter.clone(), false);
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        bs.report_while_idle(&metrics).await;
+        assert!(reporter.states().is_empty());
+    }
+
+    /// A device with NO plans dir still reports `not_scanning` when it has a
+    /// body sync — through the idle tick, which never reaches `run_cycle` —
+    /// and under the same posting policy: once, not every tick.
+    #[tokio::test]
+    async fn an_idle_tick_reports_not_scanning_through_the_body_sync() {
+        let (_cell, reader) = switchable_paths();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
+        .with_scan_reporter(reporter.clone());
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(reporter.states(), vec!["not_scanning"]);
+        assert!(
+            metrics
+                .snapshot()
+                .scan_divergence
+                .unwrap()
+                .observed_at_unix
+                .is_some(),
+            "the idle reading is stamped with the tick's clock too"
+        );
+        let sent = reporter.sent.lock().unwrap()[0].clone();
+        assert_eq!(
+            (sent.behind, sent.ahead, sent.counts_are_floors),
+            (None, None, false)
+        );
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            reporter.states().len(),
+            1,
+            "the unchanged reading is not re-posted inside the heartbeat"
         );
     }
 

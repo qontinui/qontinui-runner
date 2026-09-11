@@ -86,6 +86,7 @@ pub struct ScanDivergenceView {
     /// unknown age. A UI must render a floor as "at least N behind", and a
     /// floor of `0/0` as "unknown", never as "in step". Always `false` off the
     /// `measured` state, which has no counts to qualify.
+    #[serde(default)]
     pub counts_are_floors: bool,
     /// Why the state is `unknown` or `not_a_git_work_tree`. Never empty on
     /// those two. On `measured`, names why `ref_age_secs` is absent when it is.
@@ -272,6 +273,8 @@ mod tests {
             ahead: Some(11),
             ref_age_secs: Some(300),
             detail: None,
+            source_repo: Some("notes/plans".to_string()),
+            observed_at_unix: Some(1_789_000_000),
         }
     }
 
