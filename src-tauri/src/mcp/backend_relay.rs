@@ -849,17 +849,50 @@ async fn relay_loop(
             }
         };
 
-        // After many consecutive quick disconnects, the backend is
-        // persistently rejecting us (e.g. revoked device-JWT, coord
-        // un-paired this device). Back off aggressively to avoid
-        // hammering the server.
+        // After many consecutive quick disconnects, back off aggressively to
+        // avoid hammering the server — and say WHICH fault this is, because
+        // the two have opposite remedies and the message used to name only
+        // one of them.
+        //
+        // `last_connected_at_ms()` is the discriminator, and it is exactly the
+        // distinction its own doc-comment says a 503 leaves ambiguous:
+        //
+        //  * NEVER ACKed in this process's lifetime -> we have not reached a
+        //    backend at all. A credential cannot be the lead cause of a
+        //    connection that was never established; the URL almost always is.
+        //    Measured on merytshost 2026-09-11: a debug build with no
+        //    QONTINUI_WEB_BACKEND_URL fell through `api_config` rung 4 to
+        //    `http://127.0.0.1:8000`, a dev stack that was not running, and
+        //    every attempt was `Connection refused`. The old wording sent the
+        //    reader hunting a device-JWT that was perfectly valid.
+        //  * ACKed earlier and dropping now -> we DID reach the backend and it
+        //    is refusing or dropping us, which is where a revoked device-JWT or
+        //    an un-paired device belongs.
+        //
+        // The URL is named unconditionally: a relay pointed at the wrong host
+        // is otherwise invisible in this warning, which is the single line an
+        // operator reads when the relay will not come up.
         if quick_disconnects() >= 5 {
             let extended_backoff = max_backoff_ms.max(120_000);
+            let diagnosis = if last_connected_at_ms().is_none() {
+                "This relay has NEVER completed a handshake in this process's \
+                 lifetime, so this is a reachability problem, not a credential \
+                 one: check that the URL above is the backend you mean \
+                 (QONTINUI_WEB_BACKEND_URL, else QONTINUI_API_URL, else the \
+                 persisted paired backend, else the build default — which is \
+                 http://127.0.0.1:8000 on a DEBUG build) and that it is up."
+            } else {
+                "This relay connected successfully earlier in this process's \
+                 lifetime and is being dropped now, so the backend IS reachable \
+                 — check device-JWT validity (sign-in state) and whether coord \
+                 has un-paired this device."
+            };
             warn!(
-                "Backend relay: {} consecutive quick disconnects. \
-                 Check device-JWT validity (sign-in state) and backend \
-                 connectivity. Backing off for {}s (send kick to retry sooner).",
+                "Backend relay: {} consecutive quick disconnects against {}. {} \
+                 Backing off for {}s (send kick to retry sooner).",
                 quick_disconnects(),
+                ws_url,
+                diagnosis,
                 extended_backoff / 1000
             );
             tokio::select! {
