@@ -1,13 +1,26 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
+  EMPTY_FLEET_WALK,
+  FLEET_CURSOR_STALLED_MESSAGE,
   FLEET_DEFAULT_LIMIT,
+  fleetCursorStalled,
+  fleetErrorCode,
+  fleetErrorInvalidatesCursor,
+  fleetErrorIsRestart,
+  fleetErrorMessage,
+  fleetWalkAccept,
+  fleetWalkDropCursor,
   mergeDeviceCatalog,
   mergeStateCatalog,
+  normalizeFleetCursor,
   statesSeenIn,
   type FleetDeviceOption,
+  type FleetErrorCode,
   type FleetServerFilter,
+  type FleetWalk,
+  type FleetWalkMode,
 } from "./fleetDiscovery";
 
 /**
@@ -80,16 +93,40 @@ export interface FleetSession {
  * coord's response envelope. The three `*Present` flags are load-bearing and
  * must not be dropped: each says whether the corresponding field was OBSERVED
  * or merely absent, and the UI is required to render that difference.
+ *
+ * `truncated` is GONE (plan
+ * `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 5a): the
+ * route does keyset pagination now and completeness is `nextCursor`. Declaring
+ * a field the wire no longer carries is what produced the defect this phase
+ * repaired — `!response.truncated` reads `!undefined` as "complete" and the
+ * picker silently claims a full list — so the field is not kept around as
+ * optional, it is deleted.
  */
 export interface FleetSessionsResponse {
   tenantId: string;
   /** The device coord authenticated this runner as. Null for an operator. */
   callerDeviceId: string | null;
   sessions: FleetSession[];
-  /** Rows returned. NOT a tenant total — see `truncated`. */
+  /** Rows returned on THIS page. NOT a tenant total, and not a completeness
+   * signal — `nextCursor` is the only one of those. */
   count: number;
-  /** True when more rows matched than were served. */
-  truncated: boolean;
+  /**
+   * The EFFECTIVE, post-clamp page size coord served this page under (it
+   * clamps to `MAX_LIMIT`). A statement about the REQUEST — `nextCursor` is
+   * the statement about the DATA, and the two can never contradict.
+   */
+  limit: number;
+  /**
+   * The cursor for the next page, or `null` on the last page.
+   *
+   * Always present as a KEY, so `"nextCursor" in body` must never be read as a
+   * server-version probe: only the value decides. OPAQUE by contract — re-send
+   * it verbatim, never construct, parse, inspect or reinterpret it.
+   *
+   * `null` means "last page AS OF NOW". Sessions that start after a walk
+   * completes need a fresh walk.
+   */
+  nextCursor: string | null;
   sessionBridgeColumnPresent: boolean;
   workAxisColumnsPresent: boolean;
   deviceIdentityColumnsPresent: boolean;
@@ -99,6 +136,7 @@ export interface FleetSessionsQuery {
   deviceId?: string;
   state?: string;
   includeClosed?: boolean;
+  /** Page size for each page of the walk, NOT a reachability control. */
   limit?: number;
 }
 
@@ -113,11 +151,33 @@ export type FleetEmptyReason =
   | "observed-empty"; // coord answered, with zero rows and no degradation
 
 export interface UseFleetSessionsResult {
+  /**
+   * Every row the walk has served for the CURRENT scope, accumulated across
+   * pages and deduplicated by `sessionId`. A restart replaces this wholesale —
+   * carrying rows across a scope change would build a list no filter set
+   * describes.
+   */
   sessions: FleetSession[];
-  /** The full envelope of the last successful read, or null. */
+  /** The full envelope of the last successful page, or null. */
   response: FleetSessionsResponse | null;
+  /** A page-ONE read is in flight — the list may be blank or stale. */
   loading: boolean;
+  /** A SUBSEQUENT page is in flight — the rows on screen stay valid. */
+  loadingMore: boolean;
   error: string | null;
+  /**
+   * coord's stable machine code for the last failed read, or null when the
+   * failure carried none (a transport error) or there was no failure.
+   * `cursor_scope_mismatch` never reaches here: it is a restart, not an error.
+   */
+  errorCode: FleetErrorCode | null;
+  /**
+   * True when `error` describes a walk that cannot ADVANCE rather than a read
+   * that FAILED — coord answered, the rows are current, and only the next page
+   * is out of reach. The two must not share a banner: "last refresh failed" over
+   * a successful read is a false claim in the other direction.
+   */
+  walkStalled: boolean;
   /**
    * Set when `sessions` is empty, saying WHY. `observed-empty` is the only
    * value that licenses the words "no sessions"; the others are UNKNOWN.
@@ -159,16 +219,19 @@ export interface UseFleetSessionsResult {
    * this, never with the caller's pending filters.
    */
   appliedQuery: FleetServerFilter | null;
+  /** Pages accepted since the last restart. 0 before any read completes. */
+  pagesLoaded: number;
+  /**
+   * True when coord handed back a cursor on the last page — i.e. more rows are
+   * genuinely REACHABLE, not merely unserved. False is only ever "complete as
+   * of that read".
+   */
+  hasMore: boolean;
+  /** Restart the walk from coord's first page, with no cursor. */
   refresh: () => Promise<void>;
+  /** Fetch the next page with the cursor. A no-op when there is none. */
+  loadMore: () => Promise<void>;
 }
-
-/**
- * Stable empty list for the no-response case.
- *
- * A fresh `[]` per render would give `sessions` a new identity every time and
- * silently defeat every `useMemo` a consumer keys on it.
- */
-const NO_SESSIONS: FleetSession[] = [];
 
 /**
  * The distinct devices a page of rows came from, labelled.
@@ -286,85 +349,184 @@ export function deviceLabel(s: FleetSession): string {
 }
 
 /**
- * Read-only discovery of the fleet's sessions. No attach, no keystrokes — those
- * are Phases 3-5 and are gated on the authorization-grain work this phase does
- * not touch.
+ * Read-only discovery of the fleet's sessions, walked page by page with coord's
+ * keyset cursor. No attach, no keystrokes — those are Phases 3-5 and are gated
+ * on the authorization-grain work this phase does not touch.
+ *
+ * ## The walk
+ *
+ * A read either RESTARTS the walk (no cursor, page one, accumulation replaced)
+ * or ADVANCES it (`nextCursor` re-sent verbatim, page appended). A restart is
+ * what happens on mount, on `refresh`, and whenever the SCOPE changes —
+ * `deviceId` / `state` / `includeClosed`, the three coord validates a cursor
+ * against. `limit` is deliberately not one of them: coord's cursor survives a
+ * changed page size, so resizing a page must not throw away pages already
+ * loaded.
+ *
+ * Two things keep the accumulation honest. A monotonic generation stamps every
+ * request, and a response whose generation has been superseded is DISCARDED
+ * rather than merged — otherwise a page from the previous scope lands in the
+ * new scope's list. And `cursor_scope_mismatch`, which coord answers when a
+ * page in flight carries a cursor from a scope the caller has since changed, is
+ * handled by restarting rather than by showing an error: changing a filter
+ * mid-walk is ordinary use, not a fault the operator should read about.
  */
 export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsResult {
+  const [walk, setWalk] = useState<FleetWalk>(EMPTY_FLEET_WALK);
   const [response, setResponse] = useState<FleetSessionsResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorCode, setErrorCode] = useState<FleetErrorCode | null>(null);
+  const [walkStalled, setWalkStalled] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [deviceCatalog, setDeviceCatalog] = useState<FleetDeviceOption[]>([]);
   const [stateCatalog, setStateCatalog] = useState<string[]>([]);
   const [appliedQuery, setAppliedQuery] = useState<FleetServerFilter | null>(null);
+  /** Bumped to re-run the walk without a scope change — the scope-mismatch restart. */
+  const [restartToken, setRestartToken] = useState(0);
 
-  const fetchSessions = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      // The Rust command returns coord's body directly (no CommandResponse
-      // envelope) and rejects on transport or non-2xx, so a thrown value here
-      // is the honest failure — including 401/403, which means "this runner is
-      // not paired", NOT "the fleet is empty".
-      const query = {
-        deviceId: opts?.deviceId ?? null,
-        state: opts?.state ?? null,
-        includeClosed: opts?.includeClosed ?? false,
-        limit: opts?.limit ?? null,
-      };
-      const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
-        args: query,
-      });
-      setResponse(result);
-      setLoaded(true);
-      // Recorded in the SAME tick as the response it belongs to, so no consumer
-      // can pair these rows with a filter set they were not served for. The
-      // limit is resolved rather than passed through: coord applies its own
-      // default when the caller names none, and a null here would leave a
-      // consumer guessing what "more" means.
-      setAppliedQuery({
-        deviceId: query.deviceId,
-        state: query.state,
-        includeClosed: query.includeClosed,
-        limit: query.limit ?? FLEET_DEFAULT_LIMIT,
-      });
-      // Accumulate here — in the fetch, which is an event — rather than in an
-      // effect over `response`: an effect that calls setState costs a cascading
-      // render per read, and the catalogues are a property of the read SEQUENCE,
-      // which is this hook's to own.
-      const rows = result.sessions ?? [];
-      const seen = devicesSeenIn(rows);
-      if (seen.length > 0) setDeviceCatalog((prev) => mergeDeviceCatalog(prev, seen));
-      const states = statesSeenIn(rows);
-      if (states.length > 0) setStateCatalog((prev) => mergeStateCatalog(prev, states));
-    } catch (err) {
-      // Keep the previous response rather than clearing it: a failed refresh
-      // must not silently empty a list the operator is reading.
-      setError(`Failed to load fleet sessions: ${err}`);
-    } finally {
-      setLoading(false);
-    }
-  }, [opts?.deviceId, opts?.state, opts?.includeClosed, opts?.limit]);
+  /**
+   * The cursor the next page must carry.
+   *
+   * Held in a ref as well as in `walk` because `loadMore` has to read the value
+   * as of the CLICK, not as of the render that created the callback — a stale
+   * closure here would re-request a page already accumulated.
+   */
+  const cursorRef = useRef<string | null>(null);
+  /**
+   * Monotonic request id. Only the newest request may write state: a response
+   * that lost the race belongs to a superseded scope, and merging it would mix
+   * two queries' rows into one list.
+   */
+  const generationRef = useRef(0);
 
-  // Runs on mount and again whenever the filter set changes identity — the
-  // hook advertises `opts` as an input, so a new deviceId/state must refetch.
+  const deviceId = opts?.deviceId ?? null;
+  const state = opts?.state ?? null;
+  const includeClosed = opts?.includeClosed ?? false;
+  const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
+
+  const fetchPage = useCallback(
+    async (mode: FleetWalkMode) => {
+      const cursor = mode === "more" ? cursorRef.current : null;
+      // Nothing to walk. Not an error and not a read: coord said this was the
+      // last page, and asking again with no cursor would silently restart.
+      if (mode === "more" && cursor === null) return;
+      const generation = generationRef.current + 1;
+      generationRef.current = generation;
+      if (mode === "restart") cursorRef.current = null;
+      setLoading(mode === "restart");
+      setLoadingMore(mode === "more");
+      setError(null);
+      setErrorCode(null);
+      setWalkStalled(false);
+      try {
+        // The Rust command returns coord's body directly (no CommandResponse
+        // envelope) and rejects on transport or non-2xx, so a thrown value here
+        // is the honest failure — including 401/403, which means "this runner is
+        // not paired", NOT "the fleet is empty".
+        const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
+          args: { deviceId, state, includeClosed, limit, cursor },
+        });
+        if (generationRef.current !== generation) return;
+
+        const next = normalizeFleetCursor(result.nextCursor);
+        // A keyset cursor encodes the page just served, so coord handing back
+        // the cursor it was GIVEN means the parameter never reached it. Stop
+        // rather than re-serve page one for ever, and say so.
+        const stalled = fleetCursorStalled(cursor, next);
+        cursorRef.current = stalled ? null : next;
+
+        setWalk((prev) => {
+          const accepted = fleetWalkAccept(prev, result, mode);
+          return stalled ? fleetWalkDropCursor(accepted) : accepted;
+        });
+        setResponse(result);
+        setLoaded(true);
+        // Recorded in the SAME tick as the response it belongs to, so no
+        // consumer can pair these rows with a filter set they were not served
+        // for. The limit is coord's OWN effective, post-clamp value where it
+        // served one — the requested number is only the fallback, and a null
+        // would leave a consumer guessing what a page is.
+        setAppliedQuery({
+          deviceId,
+          state,
+          includeClosed,
+          limit: typeof result.limit === "number" && result.limit > 0 ? result.limit : limit,
+        });
+        if (stalled) {
+          // coord ANSWERED — the rows below are current and the read did not
+          // fail. Only the next page is out of reach, and the banner has to say
+          // that rather than borrow the failed-read wording.
+          setError(FLEET_CURSOR_STALLED_MESSAGE);
+          setWalkStalled(true);
+        }
+        // Accumulate here — in the fetch, which is an event — rather than in an
+        // effect over `response`: an effect that calls setState costs a cascading
+        // render per read, and the catalogues are a property of the read SEQUENCE,
+        // which is this hook's to own.
+        const rows = result.sessions ?? [];
+        const seen = devicesSeenIn(rows);
+        if (seen.length > 0) setDeviceCatalog((prev) => mergeDeviceCatalog(prev, seen));
+        const states = statesSeenIn(rows);
+        if (states.length > 0) setStateCatalog((prev) => mergeStateCatalog(prev, states));
+      } catch (err) {
+        if (generationRef.current !== generation) return;
+        const code = fleetErrorCode(err);
+        if (fleetErrorIsRestart(code)) {
+          // The scope moved under a page already in flight. Ordinary use — walk
+          // again from page one and show the operator nothing.
+          cursorRef.current = null;
+          setRestartToken((t) => t + 1);
+          return;
+        }
+        if (fleetErrorInvalidatesCursor(code)) {
+          // The cursor is unusable. Keep the pages already accumulated, but stop
+          // offering a control that can only fail again — the message below is
+          // what stops that from reading as a complete list.
+          cursorRef.current = null;
+          setWalk(fleetWalkDropCursor);
+        }
+        // Keep the previous rows rather than clearing them: a failed page must
+        // not silently empty a list the operator is reading.
+        setErrorCode(code);
+        setError(fleetErrorMessage(code, err));
+      } finally {
+        if (generationRef.current === generation) {
+          setLoading(false);
+          setLoadingMore(false);
+        }
+      }
+    },
+    [deviceId, state, includeClosed, limit],
+  );
+
+  // Runs on mount, whenever the query identity changes (a new device/state must
+  // restart the walk — a cursor is only valid within its scope), and when a
+  // scope-mismatch restart bumps the token.
   useEffect(() => {
-    void fetchSessions();
-  }, [fetchSessions]);
+    void fetchPage("restart");
+  }, [fetchPage, restartToken]);
 
-  const sessions = response?.sessions ?? NO_SESSIONS;
+  const refresh = useCallback(() => fetchPage("restart"), [fetchPage]);
+  const loadMore = useCallback(() => fetchPage("more"), [fetchPage]);
 
   return {
-    sessions,
+    sessions: walk.sessions,
     response,
     loading,
+    loadingMore,
     error,
-    emptyReason: emptyReasonFor(loaded, error, sessions),
+    errorCode,
+    walkStalled,
+    emptyReason: emptyReasonFor(loaded, error, walk.sessions),
     degraded: isDegraded(response),
     deviceCatalog,
     stateCatalog,
     appliedQuery,
-    refresh: fetchSessions,
+    pagesLoaded: walk.pages,
+    hasMore: walk.nextCursor !== null,
+    refresh,
+    loadMore,
   };
 }
