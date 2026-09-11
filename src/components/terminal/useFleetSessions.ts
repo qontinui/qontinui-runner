@@ -1,7 +1,14 @@
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-import { mergeDeviceCatalog, type FleetDeviceOption } from "./fleetDiscovery";
+import {
+  FLEET_DEFAULT_LIMIT,
+  mergeDeviceCatalog,
+  mergeStateCatalog,
+  statesSeenIn,
+  type FleetDeviceOption,
+  type FleetServerFilter,
+} from "./fleetDiscovery";
 
 /**
  * One session somewhere on the fleet, as coord's `GET /coord/sessions/fleet`
@@ -132,8 +139,36 @@ export interface UseFleetSessionsResult {
    * offer no way back to the others.
    */
   deviceCatalog: FleetDeviceOption[];
+  /**
+   * Every distinct `state` value seen across those reads. Accumulated for the
+   * same reason as `deviceCatalog`: a `state`-narrowed read carries only the
+   * selected value.
+   */
+  stateCatalog: string[];
+  /**
+   * The query `response` was actually served for, or null before any read
+   * completed.
+   *
+   * This exists because the caller's filter state and the last response are
+   * INDEPENDENT: the moment a filter changes, the component's own filter object
+   * describes a request in flight while `response` still holds the previous
+   * one. A caller that reported "coord truncated this read at {its own limit}"
+   * would then be stating something false — and a failed refetch makes that
+   * permanent, since the old `response` is deliberately kept and `loading`
+   * returns to false. Anything said ABOUT the served rows must be said with
+   * this, never with the caller's pending filters.
+   */
+  appliedQuery: FleetServerFilter | null;
   refresh: () => Promise<void>;
 }
+
+/**
+ * Stable empty list for the no-response case.
+ *
+ * A fresh `[]` per render would give `sessions` a new identity every time and
+ * silently defeat every `useMemo` a consumer keys on it.
+ */
+const NO_SESSIONS: FleetSession[] = [];
 
 /**
  * The distinct devices a page of rows came from, labelled.
@@ -146,10 +181,14 @@ export function devicesSeenIn(sessions: FleetSession[]): FleetDeviceOption[] {
   const byId = new Map<string, FleetDeviceOption>();
   for (const s of sessions) {
     if (byId.has(s.deviceId)) continue;
+    // Whether the label is the id placeholder is decided HERE, where the two
+    // identity fields are in hand — not later by sniffing the label's text.
+    const named = s.deviceDisplayName?.trim() || s.deviceHostname?.trim();
     byId.set(s.deviceId, {
       deviceId: s.deviceId,
       label: deviceLabel(s),
       isCallerDevice: s.isCallerDevice,
+      labelIsFallback: !named,
     });
   }
   return [...byId.values()];
@@ -257,6 +296,8 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [deviceCatalog, setDeviceCatalog] = useState<FleetDeviceOption[]>([]);
+  const [stateCatalog, setStateCatalog] = useState<string[]>([]);
+  const [appliedQuery, setAppliedQuery] = useState<FleetServerFilter | null>(null);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -266,22 +307,37 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
       // envelope) and rejects on transport or non-2xx, so a thrown value here
       // is the honest failure — including 401/403, which means "this runner is
       // not paired", NOT "the fleet is empty".
+      const query = {
+        deviceId: opts?.deviceId ?? null,
+        state: opts?.state ?? null,
+        includeClosed: opts?.includeClosed ?? false,
+        limit: opts?.limit ?? null,
+      };
       const result = await invoke<FleetSessionsResponse>("fleet_sessions_list", {
-        args: {
-          deviceId: opts?.deviceId ?? null,
-          state: opts?.state ?? null,
-          includeClosed: opts?.includeClosed ?? false,
-          limit: opts?.limit ?? null,
-        },
+        args: query,
       });
       setResponse(result);
       setLoaded(true);
+      // Recorded in the SAME tick as the response it belongs to, so no consumer
+      // can pair these rows with a filter set they were not served for. The
+      // limit is resolved rather than passed through: coord applies its own
+      // default when the caller names none, and a null here would leave a
+      // consumer guessing what "more" means.
+      setAppliedQuery({
+        deviceId: query.deviceId,
+        state: query.state,
+        includeClosed: query.includeClosed,
+        limit: query.limit ?? FLEET_DEFAULT_LIMIT,
+      });
       // Accumulate here — in the fetch, which is an event — rather than in an
       // effect over `response`: an effect that calls setState costs a cascading
-      // render per read, and the catalogue is a property of the read SEQUENCE,
+      // render per read, and the catalogues are a property of the read SEQUENCE,
       // which is this hook's to own.
-      const seen = devicesSeenIn(result.sessions ?? []);
+      const rows = result.sessions ?? [];
+      const seen = devicesSeenIn(rows);
       if (seen.length > 0) setDeviceCatalog((prev) => mergeDeviceCatalog(prev, seen));
+      const states = statesSeenIn(rows);
+      if (states.length > 0) setStateCatalog((prev) => mergeStateCatalog(prev, states));
     } catch (err) {
       // Keep the previous response rather than clearing it: a failed refresh
       // must not silently empty a list the operator is reading.
@@ -297,7 +353,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
     void fetchSessions();
   }, [fetchSessions]);
 
-  const sessions = response?.sessions ?? [];
+  const sessions = response?.sessions ?? NO_SESSIONS;
 
   return {
     sessions,
@@ -307,6 +363,8 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
     emptyReason: emptyReasonFor(loaded, error, sessions),
     degraded: isDegraded(response),
     deviceCatalog,
+    stateCatalog,
+    appliedQuery,
     refresh: fetchSessions,
   };
 }
