@@ -1483,6 +1483,12 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
+        // The last `tools/list` drift observation the coord-mcp proxy made
+        // (see `observed_coord_mcp_drift_json`): `null` = no `tools/list` has
+        // passed through this process since boot — UNKNOWN, not zero;
+        // `{driftedTools: [], …}` = observed clean. Same producer as
+        // `/coord-mcp/tool-policy`'s field, never re-derived.
+        "coordMcpDrift": observed_coord_mcp_drift_json(),
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
@@ -3216,6 +3222,18 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names would
 /// answer `-32601` from inside the product — the supersede would keep losing its
 /// arm silently, which is the defect the verb exists to end.
+/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+/// Phase 3). This list is compiled into the binary, so a PR that edits it is
+/// NOT in effect on any box until that box rebuilds from a sha containing the
+/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
+/// primary still served a build 101 commits behind on the 28th, refusing all
+/// nine tools it had added. The session that lands such a PR therefore
+/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
+/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
+/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
+/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
+/// clears, a `-32601` for the tool on that box carries `data.cause:
+/// "stale_binary"`, which is the refusal saying the same thing.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
@@ -3352,6 +3370,19 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// remains the sole gate. Membership here only changes how a withholding is
 /// REPORTED.
 ///
+/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+/// Phase 3). This list is compiled into the binary, so a PR that edits it is
+/// NOT in effect on any box until that box rebuilds from a sha containing the
+/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
+/// primary still served a build 101 commits behind on the 28th, refusing all
+/// nine tools it had added. The session that lands such a PR therefore
+/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
+/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
+/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
+/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
+/// clears, a `-32601` for the tool on that box carries `data.cause:
+/// "stale_binary"`, which is the refusal saying the same thing.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
     "coord_attest_escalate_override",
@@ -3442,6 +3473,12 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         "buildId": env!("RUNNER_BUILD_ID"),
         "mainSha": main_sha,
         "buildDrift": build_drift,
+        // The drift WARN's reader (plan
+        // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 2): the last
+        // `tools/list` observation this process made, from the SAME producer
+        // as `/health`'s `coordMcpDrift`. `null` = no `tools/list` observed
+        // since boot (UNKNOWN, not zero); `{driftedTools: [], …}` = clean.
+        "coordMcpDrift": observed_coord_mcp_drift_json(),
         // Say what the numbers mean, in the response, because a reader who has
         // to go find the rule will assume the wrong one.
         "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
@@ -3630,10 +3667,363 @@ fn coord_mcp_filter_tools_list_response(
 }
 
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
-/// human-actionable message.
+/// human-actionable message, and — for a refused `tools/call` — the tool name,
+/// so the refusal can diagnose its own cause ([`coord_mcp_refusal_data`]).
 struct CoordMcpBodyRejection {
     id: serde_json::Value,
     message: String,
+    /// `Some` only when a `tools/call` named a tool this door does not
+    /// forward; `None` for a refused METHOD or an unparseable body.
+    tool: Option<String>,
+}
+
+// ===========================================================================
+// The refusal names its own cause (plan
+// `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 1; dossier
+// `coord-mcp-403-has-three-causes`, memory 76c18e3f).
+//
+// A `-32601` from this door has three causes and used to name none:
+//   stale_binary — trunk's `COORD_MCP_ALLOWED_TOOLS` has the name, this
+//                  binary predates it. Remedy: rebuild.
+//   drift        — trunk allows it nowhere and does not name it as deliberate.
+//                  Remedy: add it to the allowlist, or name it as deliberate.
+//   deliberate   — in `COORD_MCP_DELIBERATE_EXCLUSIONS` (here or on trunk).
+//                  Remedy: none; do not "fix" it.
+// Every input already existed server-side — `/coord-mcp/tool-policy` returns
+// the two lists beside `buildDrift` — and the refusal did not use them, so
+// the session read a bare code at the one moment it was about to guess. The
+// trunk half comes from `build_drift::trunk_tool_policy()`, read on the drift
+// tick at the same SHA as `commitsBehind`; when that read is absent the cause
+// is `unknown` with a reason, never a confident default (served policy
+// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+//
+// DISCLOSURE BOUND (security-and-autonomy content trigger 6). The fields say
+// only what THIS binary's compiled lists and TRUNK's compiled lists hold for
+// the name, plus the drift between the two — all of it already public through
+// the un-gated `/coord-mcp/tool-policy` plus a read of trunk. Nothing here says
+// whether coord grants the tool upstream; the -32601 code, message and HTTP
+// status are unchanged.
+// ===========================================================================
+
+/// Why this door refused a `tools/call`. The wire string is the snake_case
+/// name; the numeric order is meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordMcpRefusalCause {
+    StaleBinary,
+    Drift,
+    Deliberate,
+    Unknown,
+}
+
+impl CoordMcpRefusalCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            CoordMcpRefusalCause::StaleBinary => "stale_binary",
+            CoordMcpRefusalCause::Drift => "drift",
+            CoordMcpRefusalCause::Deliberate => "deliberate",
+            CoordMcpRefusalCause::Unknown => "unknown",
+        }
+    }
+}
+
+/// The diagnosis behind one refusal — pure data, built by
+/// [`coord_mcp_refusal_cause`] and rendered by [`coord_mcp_refusal_data`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoordMcpRefusalDiagnosis {
+    cause: CoordMcpRefusalCause,
+    /// `None` = trunk's list was not readable (UNKNOWN), never "no".
+    in_allowlist_on_trunk: Option<bool>,
+    /// THIS binary's `COORD_MCP_DELIBERATE_EXCLUSIONS` verdict.
+    in_deliberate_exclusions: bool,
+    /// The trunk commit the verdict was measured against, when one was read.
+    trunk_sha: Option<String>,
+    /// How trunk's source was obtained (`fetched` / `local-ref`), when read.
+    trunk_source: Option<&'static str>,
+    /// One sentence naming the exact action.
+    remedy: String,
+}
+
+/// Decide the cause of refusing `tool`, given trunk's tool policy when one is
+/// cached. Evaluation order: THIS binary's deliberate list first (a decision
+/// recorded here needs no trunk read), then trunk's two lists, then drift.
+fn coord_mcp_refusal_cause(
+    tool: &str,
+    trunk: Option<&crate::build_drift::TrunkToolPolicy>,
+) -> CoordMcpRefusalDiagnosis {
+    let in_deliberate_exclusions = coord_mcp_withholding_is_deliberate(tool);
+    if in_deliberate_exclusions {
+        return CoordMcpRefusalDiagnosis {
+            cause: CoordMcpRefusalCause::Deliberate,
+            in_allowlist_on_trunk: trunk.map(|t| t.policy.allows(tool)),
+            in_deliberate_exclusions,
+            trunk_sha: trunk.map(|t| t.trunk_sha.clone()),
+            trunk_source: trunk.map(|t| t.source),
+            remedy: format!(
+                "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                 not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
+                 is genuinely yours to make."
+            ),
+        };
+    }
+    let Some(trunk) = trunk else {
+        return CoordMcpRefusalDiagnosis {
+            cause: CoordMcpRefusalCause::Unknown,
+            in_allowlist_on_trunk: None,
+            in_deliberate_exclusions,
+            trunk_sha: None,
+            trunk_source: None,
+            remedy: format!(
+                "unknown — this runner has no readable copy of trunk's allowlist (no source \
+                 checkout, no network, or the first drift tick has not run). Read GET \
+                 /coord-mcp/tool-policy for THIS binary's lists and buildDrift, then check \
+                 whether origin/main's COORD_MCP_ALLOWED_TOOLS names {tool}: present means \
+                 rebuild, absent means add it there or name it in \
+                 COORD_MCP_DELIBERATE_EXCLUSIONS."
+            ),
+        };
+    };
+    let on_trunk = trunk.policy.allows(tool);
+    let (cause, remedy) = if on_trunk {
+        (
+            CoordMcpRefusalCause::StaleBinary,
+            format!(
+                "rebuild this runner — trunk ({}) already allows {tool}; the running binary \
+                 predates that change.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    } else if trunk.policy.deliberately_excludes(tool) {
+        (
+            CoordMcpRefusalCause::Deliberate,
+            format!(
+                "none — trunk ({}) records {tool} as deliberately excluded; a rebuild will \
+                 report it as such. Do not \"fix\" it.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    } else {
+        (
+            CoordMcpRefusalCause::Drift,
+            format!(
+                "add {tool} to COORD_MCP_ALLOWED_TOOLS in src-tauri/src/mcp_api.rs (trunk {} \
+                 neither allows it nor names it in COORD_MCP_DELIBERATE_EXCLUSIONS), or name \
+                 it there if withholding it is the decision — then register a \
+                 runner_served_sha gate for the landed sha, because a landed allowlist change \
+                 is not delivered until this box rebuilds.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    };
+    CoordMcpRefusalDiagnosis {
+        cause,
+        in_allowlist_on_trunk: Some(on_trunk),
+        in_deliberate_exclusions,
+        trunk_sha: Some(trunk.trunk_sha.clone()),
+        trunk_source: Some(trunk.source),
+        remedy,
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// The `error.data` object for a `-32601` refusal. The `code` is unchanged
+/// (`COORD_MCP_PROXY_METHOD_NOT_ALLOWED`) so every consumer matching on it
+/// keeps working; everything else is additive. A refused METHOD carries only
+/// `cause: "method_not_allowed"` — there is no tool to diagnose.
+///
+/// `buildDrift` is [`crate::build_drift::health_fields`] verbatim — the same
+/// producer as `/health` and `/coord-mcp/tool-policy`, never re-derived — and
+/// `probed_at` is the wall-clock of THIS refusal, so a durable artifact quoting
+/// it carries the time it learned this (dossier `stale-capability-floor`).
+fn coord_mcp_refusal_data(rejection: &CoordMcpBodyRejection) -> serde_json::Value {
+    const CODE: &str = "COORD_MCP_PROXY_METHOD_NOT_ALLOWED";
+    const NEXT_DOOR: &str = "GET /coord-mcp/tool-policy";
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let Some(tool) = rejection.tool.as_deref() else {
+        return serde_json::json!({
+            "code": CODE,
+            "cause": "method_not_allowed",
+            "next_door": NEXT_DOOR,
+            "probed_at": probed_at,
+        });
+    };
+    let trunk = crate::build_drift::trunk_tool_policy();
+    let diagnosis = coord_mcp_refusal_cause(tool, trunk.as_ref());
+    let (_, build_drift) = crate::build_drift::health_fields();
+    let commits_behind = crate::build_drift::latest().and_then(|s| s.commits_behind);
+    serde_json::json!({
+        "code": CODE,
+        "tool": tool,
+        "cause": diagnosis.cause.as_str(),
+        "remedy": diagnosis.remedy,
+        "inAllowlistOnTrunk": diagnosis.in_allowlist_on_trunk,
+        "inDeliberateExclusions": diagnosis.in_deliberate_exclusions,
+        "trunkSha": diagnosis.trunk_sha,
+        "trunkSource": diagnosis.trunk_source,
+        "buildDrift": build_drift,
+        "commitsBehind": commits_behind,
+        "next_door": NEXT_DOOR,
+        "probed_at": probed_at,
+    })
+}
+
+// ===========================================================================
+// The drift WARN gets a reader (same plan, Phase 2).
+//
+// `coord_mcp_filter_tools_list_response`'s caller partitions the withheld
+// names into deliberate and DRIFTED on every `tools/list`, and until now the
+// drifted half went to a `warn!` nobody greps — measured 2026-08-28 firing
+// with `drifted_count=9` for days, unread. The last observation is kept here
+// so `/health` and `/coord-mcp/tool-policy` can serve it, and a NEW non-empty
+// set posts one coord finding per (binary, set) — a reader that pulls by
+// relevance, instead of a log that waits to be read.
+// ===========================================================================
+
+/// The last `tools/list` drift observation this process made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedCoordMcpDrift {
+    /// Withheld-but-not-deliberate names, sorted. Empty = observed clean.
+    drifted: Vec<String>,
+    /// Unix millis of the `tools/list` that produced it.
+    observed_at: i64,
+}
+
+static LAST_OBSERVED_COORD_MCP_DRIFT: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedCoordMcpDrift>>,
+> = std::sync::OnceLock::new();
+
+/// The sets this process has already posted a finding for, so a runner posts
+/// at most once per distinct drifted set per process lifetime.
+static POSTED_COORD_MCP_DRIFT_SETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+fn observed_drift_cell() -> &'static std::sync::Mutex<Option<ObservedCoordMcpDrift>> {
+    LAST_OBSERVED_COORD_MCP_DRIFT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn posted_drift_sets_cell() -> &'static std::sync::Mutex<std::collections::HashSet<Vec<String>>> {
+    POSTED_COORD_MCP_DRIFT_SETS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record one `tools/list` observation. Returns `true` when `drifted` is
+/// non-empty AND this process has not yet posted a finding for exactly this
+/// set — i.e. when the caller should post one. Recording never fails the
+/// request: a poisoned lock just skips the bookkeeping.
+fn record_observed_coord_mcp_drift(drifted: &[&str]) -> bool {
+    record_observed_coord_mcp_drift_in(observed_drift_cell(), posted_drift_sets_cell(), drifted)
+}
+
+/// [`record_observed_coord_mcp_drift`] over EXPLICIT cells — the whole
+/// decision, with the process-wide globals passed in rather than reached for,
+/// so the dedup can be tested on private cells without racing another test
+/// that touches the globals.
+fn record_observed_coord_mcp_drift_in(
+    observed: &std::sync::Mutex<Option<ObservedCoordMcpDrift>>,
+    posted: &std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+    drifted: &[&str],
+) -> bool {
+    let mut set: Vec<String> = drifted.iter().map(|s| s.to_string()).collect();
+    set.sort();
+    set.dedup();
+    if let Ok(mut g) = observed.lock() {
+        *g = Some(ObservedCoordMcpDrift {
+            drifted: set.clone(),
+            observed_at: chrono::Utc::now().timestamp_millis(),
+        });
+    }
+    if set.is_empty() {
+        return false;
+    }
+    posted
+        .lock()
+        .map(|mut posted| posted.insert(set))
+        .unwrap_or(false)
+}
+
+/// The drift observation as served on `/health` and `/coord-mcp/tool-policy`.
+/// `null` means no `tools/list` has passed through this process yet — UNKNOWN,
+/// not zero; `{driftedTools: [], …}` is an observed-clean answer.
+fn observed_coord_mcp_drift_json() -> serde_json::Value {
+    render_observed_coord_mcp_drift(
+        observed_drift_cell()
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .as_ref(),
+    )
+}
+
+/// The wire shape of one observation — pure, so null-vs-observed can be
+/// pinned without depending on what the process-wide cell holds.
+fn render_observed_coord_mcp_drift(observed: Option<&ObservedCoordMcpDrift>) -> serde_json::Value {
+    match observed {
+        Some(o) => serde_json::json!({
+            "driftedTools": o.drifted,
+            "driftedCount": o.drifted.len(),
+            "observedAt": o.observed_at,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Post the one-per-set drift finding to coord's device-authed findings door.
+/// Body shape pinned to `qontinui-coord` `findings.rs` `PostFindingBody`
+/// (`deny_unknown_fields`; identity fields are a 400, so none are sent).
+/// Best-effort and bounded: one attempt, 10 s, a failure is logged once —
+/// this is bookkeeping and must never block or retry inside a `tools/list`.
+async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifted: Vec<String>) {
+    let git_sha = env!("QONTINUI_GIT_SHA");
+    let body = serde_json::json!({
+        "title": format!(
+            "coord-mcp allowlist drift on runner build {git_sha}: {} tool(s) coord grants \
+             are withheld and not recorded as deliberate",
+            drifted.len()
+        ),
+        "body": format!(
+            "This runner's compiled COORD_MCP_ALLOWED_TOOLS neither allows nor names as \
+             deliberate these tools coord grants its principal: {}. Either the allowlist \
+             fell behind coord's grant (add them in src-tauri/src/mcp_api.rs) or the \
+             exclusion is real and unrecorded (name them in COORD_MCP_DELIBERATE_EXCLUSIONS). \
+             A -32601 on any of them from this build carries `data.cause` naming which. \
+             Posted once per (build, set) by the runner itself; GET /coord-mcp/tool-policy \
+             on this box serves the live observation.",
+            drifted.join(", ")
+        ),
+        "kind": "caveat",
+        "topic": "coord-mcp",
+        "resource_keys": ["qontinui-runner/src-tauri/src/mcp_api.rs"],
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "coord-mcp drift finding: reqwest client build failed; not posted");
+            return;
+        }
+    };
+    let url = format!("{}/coord/agent-findings", coord_base.trim_end_matches('/'));
+    match client
+        .post(&url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(drifted = %drifted.join(","), "coord-mcp drift finding posted to coord");
+        }
+        Ok(resp) => warn!(
+            status = %resp.status(),
+            "coord-mcp drift finding: coord refused the post; not retried"
+        ),
+        Err(e) => warn!(error = %e, "coord-mcp drift finding: post failed; not retried"),
+    }
 }
 
 /// Allowlist gate over the `/coord-mcp` proxy's JSON-RPC body (credential-
@@ -3649,6 +4039,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
             return Err(CoordMcpBodyRejection {
                 id: serde_json::Value::Null,
                 message: format!("request body is not valid JSON-RPC: {e}"),
+                tool: None,
             });
         }
     };
@@ -3658,6 +4049,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
                 return Err(CoordMcpBodyRejection {
                     id: serde_json::Value::Null,
                     message: "empty JSON-RPC batch".to_string(),
+                    tool: None,
                 });
             }
             for elem in elems {
@@ -3672,31 +4064,40 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
 /// Gate ONE JSON-RPC request object. See [`coord_mcp_body_gate`].
 fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBodyRejection> {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let reject = |message: String| {
+    // `tool` is `Some` ONLY for a `tools/call` naming a tool this door does
+    // not forward — the one rejection whose cause can be diagnosed
+    // ([`coord_mcp_refusal_data`]). Every other rejection is about the body
+    // or the method, and carries no tool.
+    let reject = |message: String, tool: Option<String>| {
         Err(CoordMcpBodyRejection {
             id: id.clone(),
             message,
+            tool,
         })
     };
     let method = match req.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
-        None => return reject("JSON-RPC request has no string `method`".to_string()),
+        None => return reject("JSON-RPC request has no string `method`".to_string(), None),
     };
     if COORD_MCP_ALLOWED_METHODS.binary_search(&method).is_err() {
-        return reject(format!(
-            "JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"
-        ));
+        return reject(
+            format!("JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"),
+            None,
+        );
     }
     if method == "tools/call" {
         let tool = match req.pointer("/params/name").and_then(|n| n.as_str()) {
             Some(t) => t,
-            None => return reject("tools/call has no string `params.name`".to_string()),
+            None => return reject("tools/call has no string `params.name`".to_string(), None),
         };
         if !coord_mcp_tool_is_allowed(tool) {
-            return reject(format!(
-                "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
-                 device/agent sessions"
-            ));
+            return reject(
+                format!(
+                    "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
+                     device/agent sessions"
+                ),
+                Some(tool.to_string()),
+            );
         }
     }
     Ok(())
@@ -4357,7 +4758,20 @@ async fn coord_mcp_proxy_handler(
     // ("method not found") deliberately does not disclose whether the tool
     // exists upstream.
     if let Err(reject) = coord_mcp_body_gate(&body) {
+        // The refusal names its own cause (plan
+        // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 1): `data`
+        // says whether THIS binary is stale against trunk, the allowlist has
+        // drifted, or the withholding is deliberate — and `unknown` when
+        // trunk could not be read. Same `-32601`, same message, same 403;
+        // the `code` inside `data` is unchanged. See
+        // [`coord_mcp_refusal_data`] for the disclosure bound.
+        let data = coord_mcp_refusal_data(&reject);
         warn!(
+            cause = data
+                .get("cause")
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown"),
+            tool = reject.tool.as_deref().unwrap_or("-"),
             "coord-mcp proxy: refused non-allowlisted JSON-RPC request: {}",
             reject.message
         );
@@ -4369,7 +4783,7 @@ async fn coord_mcp_proxy_handler(
                 "error": {
                     "code": -32601,
                     "message": reject.message,
-                    "data": { "code": "COORD_MCP_PROXY_METHOD_NOT_ALLOWED" },
+                    "data": data,
                 },
             })),
         )
@@ -5114,7 +5528,12 @@ async fn coord_mcp_proxy_handler(
     // rewrites anything; the other three forward the upstream bytes untouched,
     // and they are kept distinct because one of them is a failure to check.
     let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::Unchanged => {
+        CoordMcpToolsListFilter::NotApplicable => axum::body::Body::from(bytes),
+        CoordMcpToolsListFilter::Unchanged => {
+            // A `tools/list` that withheld nothing is an OBSERVED-CLEAN
+            // answer, and recording it is what lets `/health`'s
+            // `coordMcpDrift` distinguish "clean" from "never looked".
+            record_observed_coord_mcp_drift(&[]);
             axum::body::Body::from(bytes)
         }
         CoordMcpToolsListFilter::Filtered {
@@ -5156,6 +5575,24 @@ async fn coord_mcp_proxy_handler(
                      exclusions — COORD_MCP_ALLOWED_TOOLS has drifted from coord's grant; \
                      add them there, or name them in COORD_MCP_DELIBERATE_EXCLUSIONS"
                 );
+            }
+            // The WARN above gets a reader (plan
+            // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 2): the
+            // observation is kept for `/health` + `/coord-mcp/tool-policy`
+            // (empty = observed clean), and the FIRST time this process sees a
+            // given non-empty set it posts one coord finding with the bearer
+            // this request already selected — spawned off the request path,
+            // so a slow or refused post can neither delay nor fail this
+            // `tools/list`.
+            if record_observed_coord_mcp_drift(&drifted) {
+                let (coord_base, _coord_base_source) =
+                    crate::coord_mcp::coord_base_url_with_source();
+                let set: Vec<String> = drifted.iter().map(|s| s.to_string()).collect();
+                tokio::spawn(post_coord_mcp_drift_finding(
+                    coord_base,
+                    bearer.clone(),
+                    set,
+                ));
             }
             axum::body::Body::from(filtered)
         }
@@ -12538,6 +12975,268 @@ mod coord_mcp_body_gate_tests {
             "the offending element's id is echoed"
         );
         assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
+    }
+
+    // -- the refusal names its own cause (plan
+    // 2026-09-03-coord-mcp-403-names-its-own-cause, Phases 1 + 2) --
+
+    fn trunk_with(allowed: &[&str], deliberate: &[&str]) -> crate::build_drift::TrunkToolPolicy {
+        crate::build_drift::TrunkToolPolicy {
+            trunk_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            read_at: 0,
+            source: "fetched",
+            policy: crate::build_drift::ParsedToolPolicy {
+                allowed: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_prefixes: vec![],
+                deliberate: deliberate.iter().map(|s| s.to_string()).collect(),
+                deliberate_prefixes: vec![],
+            },
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The parser reads THIS file's four consts back exactly as they compiled.
+    /// A reformat that breaks the parser breaks this test, not production
+    /// (production degrades to `cause: "unknown"`), so the parser cannot rot
+    /// silently against the one file it exists to read.
+    #[test]
+    fn trunk_policy_parser_round_trips_this_files_consts() {
+        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
+        assert_eq!(
+            p.allowed_prefixes,
+            strings(super::COORD_MCP_ALLOWED_TOOL_PREFIXES)
+        );
+        assert_eq!(p.deliberate, strings(COORD_MCP_DELIBERATE_EXCLUSIONS));
+        assert_eq!(
+            p.deliberate_prefixes,
+            strings(super::COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES)
+        );
+        assert!(!p.allowed.is_empty() && !p.deliberate.is_empty());
+    }
+
+    /// (a) THIS binary's deliberate list decides without any trunk read.
+    #[test]
+    fn refusal_cause_deliberate_needs_no_trunk_read() {
+        let d = super::coord_mcp_refusal_cause("coord_create_pr", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert!(d.in_deliberate_exclusions);
+        assert_eq!(d.in_allowlist_on_trunk, None);
+        assert!(d.trunk_sha.is_none());
+        assert!(d.remedy.starts_with("none"), "{}", d.remedy);
+        // The prefix family counts as deliberate too.
+        let d = super::coord_mcp_refusal_cause("coord_onboarding_doctor", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+    }
+
+    /// (b) No trunk read ⇒ `unknown` with a reason, never a confident default.
+    #[test]
+    fn refusal_cause_is_unknown_when_trunk_was_not_read() {
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Unknown);
+        assert_eq!(d.in_allowlist_on_trunk, None);
+        assert!(!d.in_deliberate_exclusions);
+        assert!(d.trunk_sha.is_none() && d.trunk_source.is_none());
+        assert!(d.remedy.contains("/coord-mcp/tool-policy"), "{}", d.remedy);
+    }
+
+    /// (c) Trunk allows it, this binary does not ⇒ `stale_binary`, remedy rebuild.
+    #[test]
+    fn refusal_cause_is_stale_binary_when_trunk_allows_the_tool() {
+        let t = trunk_with(&["coord_definitely_not_a_tool"], &[]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::StaleBinary);
+        assert_eq!(d.in_allowlist_on_trunk, Some(true));
+        assert_eq!(d.trunk_sha.as_deref(), Some(t.trunk_sha.as_str()));
+        assert_eq!(d.trunk_source, Some("fetched"));
+        assert!(d.remedy.starts_with("rebuild"), "{}", d.remedy);
+    }
+
+    /// (d) Trunk records it as deliberate although this binary does not yet.
+    #[test]
+    fn refusal_cause_is_deliberate_when_only_trunk_names_it() {
+        let t = trunk_with(&[], &["coord_definitely_not_a_tool"]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert_eq!(d.in_allowlist_on_trunk, Some(false));
+        assert!(!d.in_deliberate_exclusions);
+        assert!(d.remedy.contains("rebuild will"), "{}", d.remedy);
+    }
+
+    /// (e) Neither list on trunk knows the name ⇒ `drift`, and the remedy names
+    /// the delivery gate the Phase 3 convention requires.
+    #[test]
+    fn refusal_cause_is_drift_when_trunk_knows_nothing_of_the_tool() {
+        let t = trunk_with(&[], &[]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Drift);
+        assert_eq!(d.in_allowlist_on_trunk, Some(false));
+        assert!(d.remedy.contains("COORD_MCP_ALLOWED_TOOLS"), "{}", d.remedy);
+        assert!(d.remedy.contains("runner_served_sha"), "{}", d.remedy);
+    }
+
+    /// The `data` object for a refused TOOL: the unchanged `code`, the cause,
+    /// the remedy, and NOTHING that names coord's upstream grant — the key set
+    /// is pinned exactly so a field cannot be added without editing this test.
+    #[test]
+    fn refusal_data_for_a_tool_carries_cause_and_only_the_bounded_fields() {
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some("coord_create_pr".to_string()),
+        };
+        let d = super::coord_mcp_refusal_data(&rej);
+        assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
+        assert_eq!(d["tool"], "coord_create_pr");
+        assert_eq!(d["cause"], "deliberate");
+        assert_eq!(d["inDeliberateExclusions"], true);
+        assert!(d["remedy"].as_str().unwrap().starts_with("none"));
+        assert_eq!(d["next_door"], "GET /coord-mcp/tool-policy");
+        assert!(
+            d["probed_at"].as_str().unwrap().ends_with('Z')
+                || d["probed_at"].as_str().unwrap().contains('+')
+        );
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "buildDrift",
+                "cause",
+                "code",
+                "commitsBehind",
+                "inAllowlistOnTrunk",
+                "inDeliberateExclusions",
+                "next_door",
+                "probed_at",
+                "remedy",
+                "tool",
+                "trunkSha",
+                "trunkSource",
+            ]
+        );
+        let lower = d.to_string().to_ascii_lowercase();
+        for forbidden in ["upstream", "granted", "coord grants", "allowedupstream"] {
+            assert!(
+                !lower.contains(forbidden),
+                "data must not name an upstream grant: {forbidden}"
+            );
+        }
+    }
+
+    /// The `unknown` arm renders `inAllowlistOnTrunk: null`, never a bool.
+    #[test]
+    fn refusal_data_unknown_arm_renders_null_not_false() {
+        // No drift tick has run in a test process, so the trunk cache is
+        // `None` and a non-deliberate name must land on the unknown arm.
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some("coord_definitely_not_a_tool".to_string()),
+        };
+        let d = super::coord_mcp_refusal_data(&rej);
+        assert_eq!(d["cause"], "unknown");
+        assert!(d["inAllowlistOnTrunk"].is_null());
+        assert!(d["trunkSha"].is_null());
+        assert_eq!(d["inDeliberateExclusions"], false);
+    }
+
+    /// A refused METHOD has no tool to diagnose: `method_not_allowed`, no
+    /// `tool`, no cause fields at all.
+    #[test]
+    fn refusal_data_for_a_method_says_method_not_allowed_and_carries_no_tool() {
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: None,
+        };
+        let d = super::coord_mcp_refusal_data(&rej);
+        assert_eq!(d["cause"], "method_not_allowed");
+        assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["cause", "code", "next_door", "probed_at"]);
+    }
+
+    /// The gate hands the refused tool's NAME to the refusal, and only for a
+    /// `tools/call` — a refused method carries none.
+    #[test]
+    fn body_gate_names_the_refused_tool_and_not_a_refused_method() {
+        let e = coord_mcp_body_gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"coord_create_pr"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(e.tool.as_deref(), Some("coord_create_pr"));
+        let e = coord_mcp_body_gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.tool.is_none());
+        let e = coord_mcp_body_gate(b"not json").unwrap_err();
+        assert!(e.tool.is_none());
+    }
+
+    /// Phase 2: one finding per distinct drifted set per process; a clean
+    /// `tools/list` is RECORDED (so `/health` can say "observed clean") and
+    /// never posts.
+    #[test]
+    fn drift_observation_posts_once_per_set_and_records_clean() {
+        let observed = std::sync::Mutex::new(None);
+        let posted = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert!(super::record_observed_coord_mcp_drift_in(
+            &observed,
+            &posted,
+            &["coord_b", "coord_a"]
+        ));
+        assert!(
+            !super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_a", "coord_b"]),
+            "the same set (any order) posts once"
+        );
+        assert!(
+            super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_c"]),
+            "a changed set posts again"
+        );
+        assert!(
+            !super::record_observed_coord_mcp_drift_in(&observed, &posted, &[]),
+            "clean never posts"
+        );
+        let o = observed.lock().unwrap().clone().expect("recorded");
+        assert!(
+            o.drifted.is_empty(),
+            "the LAST observation wins, and it was clean"
+        );
+        assert!(o.observed_at > 0);
+    }
+
+    /// `null` until a `tools/list` has been observed, then a count — UNKNOWN
+    /// and zero are different answers.
+    #[test]
+    fn drift_json_is_null_until_observed_then_a_count() {
+        assert!(super::render_observed_coord_mcp_drift(None).is_null());
+        let o = super::ObservedCoordMcpDrift {
+            drifted: vec!["coord_x".to_string()],
+            observed_at: 7,
+        };
+        let v = super::render_observed_coord_mcp_drift(Some(&o));
+        assert_eq!(v["driftedCount"], 1);
+        assert_eq!(v["driftedTools"][0], "coord_x");
+        assert_eq!(v["observedAt"], 7);
+        let clean = super::ObservedCoordMcpDrift {
+            drifted: vec![],
+            observed_at: 8,
+        };
+        let v = super::render_observed_coord_mcp_drift(Some(&clean));
+        assert_eq!(v["driftedCount"], 0);
+        assert!(v["driftedTools"].as_array().unwrap().is_empty());
     }
 }
 
