@@ -60,6 +60,7 @@ Cascade — stops at the first LIVE door:
 | L3 | `coord-acting-bearer.sh` → direct coord MCP over HTTPS | Independent of the whole `.mcp.json` family; needs `$COORD_AGENT_JWT` |
 | L4 | **Device-JWT bearer**, three sources in the fleet's documented order — `$COORD_DEVICE_JWT`, then `~/.qontinui/coord-device-jwt`, then a **mint** from the runner: its **in-process invoke door first** — `POST /ui-bridge/invoke/get_coord_device_token` (no tier gate; `Dispatch::InProcess`, so it answers headless), then `POST /ui-bridge/invoke/get_access_token_for_websocket` for a build carrying only the older entry — and the WebView eval mint (`/ui-bridge/control/page/evaluate`) **only** when the build answers the allowlist 400 for *both*. The eval door is refused outright on a CSP-enforcing build (see `RUNNER_EVAL_CSP_BLOCKED`), so it is a legacy rung, not a safety net. All against the same public coord MCP door; the door name says which answered (`source=runner-invoke:<command>` / `source=runner-eval`) | Independent of BOTH: none of them cares that every proxy key rotated, and none needs `$COORD_AGENT_JWT` (unset on this fleet) |
 | L5 | **Bootstrap credential** — an anonymous `POST $COORD_HTTP_URL/agents/credential` carrying a `device_id` read from a static local file, then a **control read** to prove the token before it is called LIVE. ✅ **Measured LIVE 2026-09-04** — `200` with a device-subject agent JWT | The only rung that needs **no runner at all** — every rung above it either IS the runner (L1/L2) or spends a credential the runner minted (L4 source 3/4), and L3 needs `$COORD_AGENT_JWT`, unset on this fleet. On 2026-09-04 it was the **only** live rung on merytshost: static device JWT `401`, invoke mint `400`, eval mint `400` |
+| L6 | **The WEB host** — `GET $QONTINUI_WEB_HTTP_URL/api/v1/plan-library?kind=plan&limit=1` (default `https://api.qontinui.io`), first anonymously (is a program answering?), then with a **`user_id`-bearing device JWT** from `$COORD_DEVICE_JWT` / `~/.qontinui/coord-device-jwt` — the same two static sources as L4 sources 1-2, shape-tested and sent; the host's `401` is the freshness gate, exactly as at L4 (no local `exp` decode). Emits **typed faults on the credential axis** (`WEB_HOST_NO_USER_JWT`, `WEB_HOST_JWT_UNAUTHORIZED`) and a host-level one only for a transport failure (`WEB_HOST_UNREACHABLE`) | It is a **different program on a different host**: plan-library and memory live there, behind `get_audit_actor_user`, which wants a `user_id` claim the agent-minted tokens (L5, `/agents/allocate`) never carry. Measured 2026-09-06: the same device JWT `coord.qontinui.io` answered `200` to also answered `200`/`422` here — one credential, two hosts, two capabilities — and this file named `api.qontinui.io` nowhere. A `LIVE` here is `PARTIAL`: it proves the host axis, not a coord door |
 
 **L4 is the rung that was missing.** On 2026-08-08 all 14 probeable doors
 answered 401 — every config's key had been superseded — and L3
@@ -87,6 +88,33 @@ false-`DEAD` class L4 was created to close, reached by a different route.
 Because those two sources are *static* while device JWTs live ~4h, **a 401 from
 one of them is expected and is NOT terminal** — it is recorded and the cascade
 falls through to the next source. Only the runner mint's 401 ends L4.
+
+### The AXES table: every verdict names what it did not ask
+
+The terminal line is emitted **from a table**, never beside one. Every rung is a
+row over **host × prefix × credential**, marked `LIVE`, `PROBED` (with the
+verdict tokens recorded for it in brackets — one per sub-source, so #785's four
+`RUNNER_EVAL_*` sub-verdicts read as L4 sub-rows), `SKIPPED` (a skip was
+recorded: the sweep budget, an env opt-out such as `COORD_REVIVE_NO_WEB_HOST=1`),
+`UNPROBED` (never reached — a `LIVE` door above it short-circuited the sweep) or
+`NOT APPLICABLE` (the session's own native `coord_*` tools, a transport this
+script cannot reach). Under it comes the machine-readable roster:
+
+```
+axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=<keys>
+```
+
+**`DEAD` is structurally unprintable while a probeable row is not `PROBED`.** A
+sweep that skipped an axis prints `VERDICT: UNKNOWN - … unprobed=<keys>` with the
+axis named — the `BUDGET_EXCEEDED` posture, generalised from the budget case to
+every unprobed axis. The native-tools row is the one standing exclusion (the
+`SCOPE:` epilogue) and does not by itself withhold `DEAD`. The rows are
+**derived** from the recorded outcomes, so a rung that grows a sub-source is in
+the table with no edit. Ten recorded occurrences reached "coord is unreachable"
+honestly by walking this cascade to its end while a live door answered on a host
+the cascade never named; the table is what stops the eleventh (plan
+`2026-09-06-coord-reachability-verdicts-omit-the-host-axis`, Phases 2–3;
+check #58 pins that every terminal emission sits beside this roster).
 
 ### Executing over the door — `call` and `tools`
 
@@ -215,10 +243,13 @@ of token today. Three shipped documents forbid carrying a coord rung on that doo
 (`/gate` and `/policy` both carry it on their **generic remote MCP** rung, and
 `knowledge-base/qontinui-specific/coord-gates-and-access.md` restates it), and
 whether it may
-ever be used this way is an **open operator ruling**, escalated as coord gate
-**`ece99898-30c6-4f8c-be8e-1de5f09abebc`** (`operator_approval`, `gate_class:
-security-surface`, currently **open**). An agent does not pre-empt a ruling that
-has just been asked for.
+ever be used this way is **UNKNOWN — neither gated nor cleared**. It was escalated
+as coord gate **`ece99898-30c6-4f8c-be8e-1de5f09abebc`** (`operator_approval`,
+`gate_class: security-surface`), which reads **`withdrawn`** — re-verify with
+`coord_gate_inspect` before citing it; its successor
+`3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` is withdrawn too (read 2026-09-11:
+*"DECIDED, not escalated: do NOT clamp"*) and names allocate's anonymity as the
+residual for the narrower MintCaller route. UNKNOWN is not permission.
 
 **So what IS the honest outcome when the cascade is exhausted?** With L5 live,
 an exhausted cascade should now be rare — L5 answering `LIVE` *is* the outcome
@@ -335,6 +366,11 @@ client's mask):
 | `BOOTSTRAP_NO_TOKEN_IN_RESPONSE` | L5: the route answered `2xx` but the body carried no JWT-shaped token (3 dot-separated base64url parts) | The route's response shape changed, or something else answers on that host. NOT sent onward — an unshaped bearer would draw a 401 this script would then report against coord |
 | `BOOTSTRAP_TOKEN_UNVERIFIED` | L5: a token WAS minted, and the control read `GET /coord/agent-findings?limit=1` did not answer `200`. **The whole point of the rung's verification half** | Never report LIVE on this. A mint is not an authentication: say the mint succeeded AND the credential did not verify, and name the control read's status — the two facts together are the diagnosis |
 | `BOOTSTRAP_UNREACHABLE` | L5: the mint POST never completed — connect refused, DNS, TLS, or a timeout on `$COORD_HTTP_URL`. Carries curl's own `[curl: …]` line | The one L5 verdict that IS about coord (or this box's network). Every other L5 verdict is about a local file, the device, or the token |
+| `WEB_HOST_UNREACHABLE` | L6: the anonymous (or the credentialed) `GET` on the web host never completed — connect refused, DNS, TLS, or a timeout on `$QONTINUI_WEB_HTTP_URL` | The **one** L6 verdict that is about the host. Nothing was learned about any credential |
+| `WEB_HOST_NO_USER_JWT` | L6: the host is **UP** (it answered) and either no `user_id`-bearing credential resolved from the two static sources, or the one sent was refused for **lacking the claim** (`401 Device token missing user_id claim.`) | A **credential** fact about this box, never a host verdict. Pair the device (a fresh `~/.qontinui/coord-device-jwt`); an agent-minted token (L5, `/agents/allocate`) can never open this axis |
+| `WEB_HOST_JWT_UNAUTHORIZED` | L6: the host is UP and refused the bearer with a `401` that does not name `user_id` — expired is the normal cause (device JWTs live ~4h); the same shape-test-then-`401` freshness gate L4 applies | Refresh the device JWT. A credential fact, never a host verdict |
+| `WEB_HOST_HTTP_<code>` | L6: served, and answered something else to the credentialed read (a `403`, a `5xx`) | Read the code: a `403` is an authorization fact, a `5xx` is the host's |
+| `UNKNOWN` (terminal, not per-door) | No door answered among the axes this run asked **and at least one probeable axis was not asked** — the `axes: … unprobed=` line names it | **Not `DEAD`.** Probe the unprobed axis (drop the opt-out, raise the budget, or probe it by hand) before writing "coord is unreachable" anywhere |
 
 **Why the last five rows exist: `RUNNER_SIGNED_OUT` used to absorb all of them.**
 The response reader returns the **empty string** for every body it cannot parse
@@ -409,7 +445,7 @@ against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Three of the eight call sites return BEFORE that
+our own `coord-mcp` config. Three of the fourteen call sites return BEFORE that
 guard is consulted at all and the rest are reached after it; either way none
 deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
@@ -873,7 +909,10 @@ evicted by a runner restart, no `$COORD_AGENT_JWT` — while the native tools
 answer normally, because they never went through any of it. Observed 2026-08-08:
 `VERDICT: DEAD` and a successful `coord_gate_inspect` in the same minute.
 
-So `DEAD` is honest blocked-evidence only *together with* a failed native call.
+So `DEAD` is honest blocked-evidence only *together with* a failed native call —
+and, since Phases 2–3 of the host-axis plan, only when every other row of the
+AXES table reads `PROBED`: the native-tools row is the *one* axis `DEAD` may
+leave unprobed, and it says so on the `axes: … unprobed=` line every time.
 Before applying the lost-write doctrine, issue one cheap native read
 (`coord_gate_inspect` on any known gate_id). If it answers, coord is REACHABLE —
 re-issue over the native tools and verify by read, rather than presuming the
@@ -1181,8 +1220,10 @@ evict a live peer and will not unlatch your client. Use
   only after L1–L4 have each been probed and failed; `COORD_REVIVE_NO_BOOTSTRAP=1`
   turns it off. The script probes the dedicated credential route and **nothing
   else** — it never substitutes `/agents/allocate`, which three shipped documents
-  forbid and which is the subject of open operator ruling
-  `ece99898-30c6-4f8c-be8e-1de5f09abebc`.
+  forbid and whose status is UNKNOWN — the gate that carried the question,
+  `ece99898-30c6-4f8c-be8e-1de5f09abebc`, reads withdrawn (re-verify with
+  `coord_gate_inspect`), and so does its successor `3c9b18ca`; UNKNOWN is not
+  permission.
 - **Reaching L5 is COUNTED, and the counter is local.** Two `guard_decide`
   records per run into `~/.qontinui/logs/guard-decisions.log` (see the L5
   section's table). A counter that had to reach coord would be missing in
