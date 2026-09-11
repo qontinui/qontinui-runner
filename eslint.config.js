@@ -66,6 +66,38 @@ export default [
       // so a 'warn' setting (1355 unannotated sites) breaks CI for unrelated
       // PRs. Flip this to 'warn' once the per-page annotation pass lands.
       "@qontinui/ui-bridge/require-state-annotation": "off",
+      // Plan `2026-09-04-effect-calculus-joins-the-component-action-registry`,
+      // Phase 3 — the ratchet, shipped ON.
+      //
+      // Every component action registered through `useUIComponent({ actions })`
+      // must declare an `effect` (`read` | `write` | `destructive`). An absent
+      // effect is UNCLASSIFIED, never `read`: the serializer forwards the field
+      // undefaulted on purpose and no verb in the SDK's consumer-side
+      // `STANDARD_ACTION_EFFECTS` map can yield `destructive`, so an
+      // unannotated action is indistinguishable — to an agent deciding whether
+      // it is safe to invoke — from a harmless one.
+      //
+      // `error`, NOT `warn`, and deliberately unlike the line above. Phase 2
+      // annotated all 64 registered actions FIRST, so this rule starts green;
+      // it is a ratchet on a clean corpus rather than a promise to clean one
+      // up later. `require-state-annotation` shipped "off until the codebase is
+      // progressively annotated" and has stayed off ever since across 1355
+      // sites — a capability nobody switched on is a capability the product
+      // does not have [policy: `capability-ships-enabled`]. Note also that
+      // `lint` does NOT pass `--max-warnings 0`, so a `warn` here would be
+      // invisible to CI: `error` is the only severity that gates anything.
+      //
+      // The enumerated-coverage test
+      // (`src/lib/ui-bridge/action-effect-coverage.test.ts`) and this rule are
+      // complements, not duplicates: the test proves the corpus is annotated
+      // today and cannot silently shrink, while the rule refuses the next
+      // unannotated action at the moment it is written.
+      //
+      // `importAliases` lets the rule follow an action factory imported through
+      // the tsconfig `@/*` path (see tsconfig.json `compilerOptions.paths`) —
+      // resolution configuration, not a suppression list. An import it cannot
+      // follow is REPORTED as unresolved, never assumed annotated.
+      "@qontinui/ui-bridge/require-action-effect": ["error", { importAliases: { "@/": "src" } }],
     },
   },
   {
