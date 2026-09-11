@@ -1290,35 +1290,90 @@ impl HttpArtifactSink {
 
     /// Publish this device's scan-root reading — see [`ScanRootReport`].
     ///
-    /// Success is any 2xx; everything else, transport failures included, is
-    /// an `Err` carrying one line for the caller's log. The error is a
-    /// `String` rather than an `anyhow::Error` because the caller only logs it
-    /// and compares it with the previous failure to keep the WARN
-    /// edge-triggered.
-    pub async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String> {
+    /// Any 2xx is DELIVERED (201 on a device's first report, 200 after), and
+    /// its `applied` flag is passed back: the web answers `{created, applied,
+    /// row}` and declines to overwrite a stored reading NEWER than this one
+    /// (`applied: false`), which usually means this device's clock stepped
+    /// back. Everything else, transport failures included, is a
+    /// [`ScanRootFailure`] whose `kind` is stable (the status code, or
+    /// `transport`) and whose `message` carries the response body, capped at
+    /// [`SCAN_ROOT_ERROR_BODY_CAP`] bytes — a 422's body names the field it
+    /// refused.
+    pub async fn report_scan_root(
+        &self,
+        report: &ScanRootReport,
+    ) -> Result<ScanRootAck, ScanRootFailure> {
         let url = self.scan_roots_url();
         // coord-tenant-scope(work-owed): the reading describes the plans dir that feeds this org's corpus, so it must land in the SAME org as the artifacts that dir produces — this file's artifact upsert, whose tenant is the plan's repo (E3). qontinui-web derives organization_id AND device_id from the verified bearer, never this body. Phase 6.
         let resp = crate::auth::attach_device_auth(self.client.post(&url).json(report))
             .send()
             .await
-            .map_err(|e| format!("POST {url}: {e}"))?;
+            .map_err(|e| ScanRootFailure {
+                kind: "transport".to_string(),
+                message: format!("POST {url}: {e}"),
+            })?;
         let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
         if status.is_success() {
-            return Ok(());
+            return Ok(ScanRootAck::from_body(&text));
         }
-        let mut text = resp.text().await.unwrap_or_default();
-        // A backend that does not serve the route answers with whatever its
-        // 404 page is; the log needs the status, not a page of HTML.
-        if text.len() > SCAN_ROOT_ERROR_BODY_CAP {
-            let mut cut = SCAN_ROOT_ERROR_BODY_CAP;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            text.truncate(cut);
-            text.push('…');
-        }
-        Err(upstream_error("report scan root", status, text).to_string())
+        Err(ScanRootFailure {
+            kind: format!("HTTP {}", status.as_u16()),
+            // A backend that does not serve the route answers with whatever
+            // its 404 page is; the log needs the status and the start of the
+            // body, not a page of HTML.
+            message: upstream_error(
+                "report scan root",
+                status,
+                cap_bytes(text, SCAN_ROOT_ERROR_BODY_CAP),
+            )
+            .to_string(),
+        })
     }
+}
+
+/// `text` cut to at most `cap` BYTES on a char boundary, with `…` appended
+/// when anything was cut.
+fn cap_bytes(mut text: String, cap: usize) -> String {
+    if text.len() > cap {
+        let mut cut = cap;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push('…');
+    }
+    text
+}
+
+/// What the web said to a DELIVERED (2xx) scan-root report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRootAck {
+    /// `Some(false)`: the web already holds a NEWER reading for this device
+    /// and kept it — this report was delivered but not stored. `None`: the
+    /// body did not say (an older web build, or an unparseable body).
+    pub applied: Option<bool>,
+}
+
+impl ScanRootAck {
+    /// Read `applied` out of the web's `{created, applied, row}` answer.
+    pub fn from_body(body: &str) -> Self {
+        let applied = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("applied").and_then(serde_json::Value::as_bool));
+        Self { applied }
+    }
+}
+
+/// A scan-root report that was NOT delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRootFailure {
+    /// A STABLE class — `HTTP 422`, `HTTP 404`, `transport` — that keeps the
+    /// failure WARN edge-triggered. The message cannot: a 422 body echoes the
+    /// refused input, which (an `observed_at`, say) differs on every attempt.
+    pub kind: String,
+    /// The full line for the log, response-body snippet included.
+    pub message: String,
 }
 
 /// How much of a refused scan-root report's response body reaches the log.
@@ -1371,6 +1426,37 @@ pub struct ScanRootReport {
     pub observed_at: String,
 }
 
+// The web door's field limits (`app/schemas/plan_library_scan_roots.py`,
+// pydantic `max_length`, which counts CHARACTERS). A value over its limit is a
+// 422 for the whole report — and since the value comes from this device's
+// configuration, it would be refused on every attempt, forever. So the
+// projection fits every field inside its limit rather than let one long path
+// silence the device.
+const SCAN_ROOT_PATH_MAX_CHARS: usize = 4096;
+const SCAN_ROOT_KEY_MAX_CHARS: usize = 255;
+const SCAN_ROOT_DETAIL_MAX_CHARS: usize = 4096;
+const SCAN_ROOT_SHA_MAX_CHARS: usize = 64;
+/// PostgreSQL BIGINT ceiling — the web's range for every count.
+const SCAN_ROOT_COUNT_MAX: u64 = i64::MAX as u64;
+
+/// The marker a capped field ends with, inside its limit.
+const SCAN_ROOT_TRUNCATED_MARKER: &str = "…[truncated]";
+
+/// `value` fitted inside `max` CHARACTERS: unchanged when it fits, otherwise
+/// cut on a char boundary with [`SCAN_ROOT_TRUNCATED_MARKER`] appended, the
+/// whole still `max` chars at most — so a reader sees that it was cut.
+fn cap_chars(value: Option<String>, max: usize) -> Option<String> {
+    value.map(|v| {
+        if v.chars().count() <= max {
+            return v;
+        }
+        let keep = max.saturating_sub(SCAN_ROOT_TRUNCATED_MARKER.chars().count());
+        let mut out: String = v.chars().take(keep).collect();
+        out.push_str(SCAN_ROOT_TRUNCATED_MARKER);
+        out
+    })
+}
+
 /// Where [`super::trigger::BodySync`] sends a scan-root report.
 ///
 /// A trait rather than the concrete [`HttpArtifactSink`] call so the body
@@ -1379,12 +1465,18 @@ pub struct ScanRootReport {
 /// a fake that records what it was sent, not claims in a comment.
 #[async_trait::async_trait]
 pub trait ScanRootReporter: Send + Sync {
-    async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String>;
+    async fn report_scan_root(
+        &self,
+        report: &ScanRootReport,
+    ) -> Result<ScanRootAck, ScanRootFailure>;
 }
 
 #[async_trait::async_trait]
 impl ScanRootReporter for HttpArtifactSink {
-    async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String> {
+    async fn report_scan_root(
+        &self,
+        report: &ScanRootReport,
+    ) -> Result<ScanRootAck, ScanRootFailure> {
         HttpArtifactSink::report_scan_root(self, report).await
     }
 }
@@ -1450,17 +1542,28 @@ impl ScanRootReport {
         };
         Self {
             state: state.as_str().to_string(),
-            plans_dir: d.plans_dir.clone(),
-            repo_root: d.repo_root.clone(),
-            source_repo: d.source_repo.clone(),
-            default_ref: d.default_ref.clone(),
-            ref_sha: d.ref_sha.clone(),
-            head_sha: d.head_sha.clone(),
-            behind: measured_counts.map(|(behind, _)| behind),
-            ahead: measured_counts.map(|(_, ahead)| ahead),
-            ref_age_secs: measured_counts.and(d.ref_age_secs),
+            plans_dir: cap_chars(d.plans_dir.clone(), SCAN_ROOT_PATH_MAX_CHARS),
+            repo_root: cap_chars(d.repo_root.clone(), SCAN_ROOT_PATH_MAX_CHARS),
+            source_repo: cap_chars(d.source_repo.clone(), SCAN_ROOT_KEY_MAX_CHARS),
+            default_ref: cap_chars(d.default_ref.clone(), SCAN_ROOT_KEY_MAX_CHARS),
+            // An object id is 40 or 64 hex chars; anything longer is not one,
+            // and a truncated sha would be a DIFFERENT (wrong) id — so it is
+            // sent as unknown instead.
+            ref_sha: d
+                .ref_sha
+                .clone()
+                .filter(|sha| sha.chars().count() <= SCAN_ROOT_SHA_MAX_CHARS),
+            head_sha: d
+                .head_sha
+                .clone()
+                .filter(|sha| sha.chars().count() <= SCAN_ROOT_SHA_MAX_CHARS),
+            behind: measured_counts.map(|(behind, _)| behind.min(SCAN_ROOT_COUNT_MAX)),
+            ahead: measured_counts.map(|(_, ahead)| ahead.min(SCAN_ROOT_COUNT_MAX)),
+            ref_age_secs: measured_counts
+                .and(d.ref_age_secs)
+                .map(|age| age.min(SCAN_ROOT_COUNT_MAX)),
             counts_are_floors: measured_counts.is_some() && d.counts_are_floors(),
-            detail,
+            detail: cap_chars(detail, SCAN_ROOT_DETAIL_MAX_CHARS),
             observed_at: d
                 .observed_at_unix
                 .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
@@ -1794,6 +1897,28 @@ mod tests {
             let detail = v["detail"].as_str().unwrap_or("");
             assert!(!detail.trim().is_empty(), "{state} needs a detail: {v}");
         }
+        // (8) every field inside the web's length / range limits.
+        let chars = |key: &str| v[key].as_str().map_or(0, |t| t.chars().count());
+        for (key, max) in [
+            ("plans_dir", 4096),
+            ("repo_root", 4096),
+            ("source_repo", 255),
+            ("default_ref", 255),
+            ("ref_sha", 64),
+            ("head_sha", 64),
+            ("detail", 4096),
+        ] {
+            assert!(
+                chars(key) <= max,
+                "{key} is {} chars, over {max}",
+                chars(key)
+            );
+        }
+        for key in ["behind", "ahead", "ref_age_secs"] {
+            if let Some(n) = v[key].as_u64() {
+                assert!(n <= i64::MAX as u64, "{key} {n} exceeds BIGINT");
+            }
+        }
         // (4) an RFC 3339 timestamp WITH a timezone.
         let observed = v["observed_at"].as_str().expect("observed_at is a string");
         chrono::DateTime::parse_from_rfc3339(observed)
@@ -1862,6 +1987,27 @@ mod tests {
                 },
                 "unknown",
             ),
+            // Over every length / range limit at once: a device configured
+            // with a very long path must still be reportable, not refused on
+            // every attempt forever.
+            (
+                ScanDivergence {
+                    plans_dir: Some(format!("/{}", "é".repeat(5000))),
+                    repo_root: Some("r".repeat(9000)),
+                    source_repo: Some("s".repeat(300)),
+                    default_ref: Some(format!("origin/{}", "b".repeat(300))),
+                    ref_sha: Some("a".repeat(65)),
+                    behind: Some(u64::MAX),
+                    ahead: Some(u64::MAX),
+                    ref_age_secs: Some(u64::MAX),
+                    ..measured(Some(60), 5, 5)
+                },
+                "measured",
+            ),
+            (
+                ScanDivergence::unknown(Some("/p".to_string()), "why ".repeat(2000)),
+                "unknown",
+            ),
         ];
         for (reading, want_state) in cases {
             let r = ScanRootReport::from_divergence(&reading, observed());
@@ -1879,6 +2025,44 @@ mod tests {
             observed(),
         );
         assert_eq!(r.detail.as_deref(), Some("origin/HEAD is not set"));
+    }
+
+    /// A capped field ends with the marker, inside its limit, cut on a char
+    /// boundary; a field that fits is untouched.
+    #[test]
+    fn cap_chars_fits_inside_the_limit_with_a_marker() {
+        assert_eq!(
+            cap_chars(Some("short".to_string()), 255).as_deref(),
+            Some("short")
+        );
+        assert_eq!(cap_chars(None, 255), None);
+        let capped = cap_chars(Some("é".repeat(300)), 255).unwrap();
+        assert_eq!(capped.chars().count(), 255);
+        assert!(capped.ends_with(SCAN_ROOT_TRUNCATED_MARKER));
+        assert!(capped.starts_with('é'));
+        let exact = "x".repeat(255);
+        assert_eq!(cap_chars(Some(exact.clone()), 255), Some(exact));
+        // A refused report's log snippet is byte-capped on a char boundary.
+        let snippet = cap_bytes("é".repeat(600), SCAN_ROOT_ERROR_BODY_CAP);
+        assert!(snippet.len() <= SCAN_ROOT_ERROR_BODY_CAP + '…'.len_utf8());
+        assert!(snippet.ends_with('…'));
+    }
+
+    /// The web answers `{created, applied, row}`; `applied` is passed back,
+    /// and a body that does not say is `None` rather than a guess.
+    #[test]
+    fn scan_root_ack_reads_applied_from_the_web_answer() {
+        assert_eq!(
+            ScanRootAck::from_body(r#"{"created": true, "applied": true, "row": {}}"#).applied,
+            Some(true)
+        );
+        assert_eq!(
+            ScanRootAck::from_body(r#"{"created": false, "applied": false, "row": {}}"#).applied,
+            Some(false)
+        );
+        assert_eq!(ScanRootAck::from_body(r#"{"created": true}"#).applied, None);
+        assert_eq!(ScanRootAck::from_body("<html>ok</html>").applied, None);
+        assert_eq!(ScanRootAck::from_body("").applied, None);
     }
 
     #[test]

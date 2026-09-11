@@ -47,7 +47,7 @@ pub use body_push::{
     backfill_once, build_artifact, build_report, classify_kind, extract_repos, push_artifact,
     render_report, scan_all_roots, scan_roots, ArtifactKind, ArtifactSink, ArtifactSyncState,
     ArtifactUpsert, BackfillReport, BackfillSummary, BodyPushOutcome, HttpArtifactSink, ScanRoot,
-    ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
+    ScanRootAck, ScanRootFailure, ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
 };
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
