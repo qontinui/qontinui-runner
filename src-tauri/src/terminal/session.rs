@@ -17,10 +17,11 @@ use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
 use tracing::{debug, info, warn};
 
+use super::exit_notice::{ExitNoticeSink, TauriExitSink};
 use super::grid::{Grid, GridPerformer};
 use super::interceptor::OutputInterceptor;
 use super::pane_io::{LocalPty, PaneIo, ScrubbedCommand};
-use super::types::{TerminalExitEvent, TerminalId, TerminalInfo};
+use super::types::{TerminalId, TerminalInfo};
 use super::visibility::{
     ActivityDigestState, BackgroundHold, TerminalActivityWire, VisibilityState, VisibilityTier,
     ACTIVITY_DIGEST_LINES, ACTIVITY_EVENT,
@@ -1880,26 +1881,12 @@ impl TerminalSession {
 
                 info!(terminal_id = %waiter_id, exit_code = ?code, "Terminal process exited");
 
-                let event = TerminalExitEvent {
-                    terminal_id: waiter_id.clone(),
-                    exit_code: code,
-                };
-                if let Err(e) = waiter_app.emit("terminal-exit", &event) {
-                    warn!(
-                        terminal_id = %waiter_id,
-                        error = %e,
-                        "Failed to emit terminal exit event"
-                    );
-                }
-                // Broadcast to backend relay for remote mobile access
-                crate::event_system::broadcast_ws_notification(
-                    &waiter_app,
-                    "terminal-exit",
-                    &serde_json::json!({
-                        "terminal_id": &waiter_id,
-                        "exit_code": code,
-                    }),
-                );
+                // "The child process ended" — the Tauri event plus its WS
+                // re-broadcast. NOT the only notice a pane sends: the
+                // tear-down path sends a second one when the SESSION goes
+                // away, which is a different fact and the one that makes the
+                // webview drop the tab. See `terminal::exit_notice`.
+                TauriExitSink { app: &waiter_app }.emit_exit(&waiter_id, code);
 
                 // Push notification for mobile (fire-and-forget)
                 crate::commands::workflow_events::emit_terminal_exited(
@@ -3813,7 +3800,48 @@ impl TerminalSession {
             );
         }
 
+        // Tell the webview the SESSION is gone — not merely that a child
+        // exited. This is the notice an out-of-band `terminal_close` (the
+        // Tauri command, the MCP/HTTP `tauri_proxy` door, or the backend
+        // relay — and on a headless runner that door is the only one there
+        // is) used to send nowhere at all, leaving the tab rendered forever
+        // against a torn-down session. The waiter thread's own notice cannot
+        // stand in for it: for a pane whose child had already exited the
+        // waiter is long gone by now, and even when it did just fire, it
+        // fired while `terminal_list` still listed this terminal — so the
+        // re-sync it triggered had no reason to drop the tab.
+        //
+        // It runs LAST on purpose. `TerminalManager::close` has already
+        // removed the session from its map and the pane's handles are
+        // released above, so the re-sync this notice triggers reads a
+        // `terminal_list` the terminal is genuinely absent from.
+        self.notify_exit_on_teardown(self.app_handle.as_ref().map(|app| TauriExitSink { app }));
+
         info!(terminal_id = %self.id, "Terminal session closed");
+    }
+
+    /// Send the pane's tear-down exit notice. Returns `true` when one was sent.
+    ///
+    /// Split out of [`Self::close_with_deadline`] so the behaviour is testable
+    /// without a Tauri `AppHandle`: a test passes its own sink, and `None` is
+    /// the unit-fixture case (no app to emit on).
+    ///
+    /// Deliberately unconditional — it does not check whether the waiter
+    /// thread already announced an exit. The receiver is idempotent
+    /// (`TerminalInstance` records the first exit it sees for a pane and
+    /// ignores repeats), and suppressing this one whenever the waiter had
+    /// spoken would re-open the exact hole it closes: the waiter speaks while
+    /// the session is still listed, this notice speaks after it is not.
+    fn notify_exit_on_teardown<S: ExitNoticeSink>(&self, sink: Option<S>) -> bool {
+        let Some(sink) = sink else {
+            return false;
+        };
+        debug!(
+            terminal_id = %self.id,
+            "Announcing terminal-exit for a torn-down session"
+        );
+        sink.emit_exit(&self.id, self.exit_code());
+        true
     }
 
     /// Kill the PTY child tree and nothing else.
@@ -6327,6 +6355,131 @@ mod tests {
         );
         // ...and once scanned, the session settles back to skipping.
         assert!(!gen_gate.should_scan("t", session.grid_generation()));
+    }
+
+    // =======================================================================
+    // Tear-down exit notice (plan
+    // 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 1).
+    //
+    // An out-of-band close — the HTTP/MCP `terminal_close` door, the only
+    // close door a headless runner has — removes the session from
+    // `TerminalManager` and then runs `close_with_deadline`. Before this, the
+    // ONLY `terminal-exit` emitter was the waiter thread, which for a pane
+    // whose child had already exited was long dead, so that removal notified
+    // nothing and the webview kept rendering a tab for a session that no
+    // longer existed.
+    //
+    // These assert the SOURCE-side effect only. In particular they do NOT
+    // assert anything about a remote pane's TARGET: a local kill detaches, it
+    // never terminates the remote process (`remote_pane_io::kill`).
+    // =======================================================================
+
+    /// The tear-down path announces the pane's exit, carrying the terminal id
+    /// and whatever exit code the session recorded.
+    #[test]
+    fn teardown_announces_the_exit() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        *session.exit_code.lock().unwrap() = Some(7);
+
+        let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+        assert!(session.notify_exit_on_teardown(Some(&sink)));
+
+        assert_eq!(sink.notices(), vec![("test".to_string(), Some(7))]);
+    }
+
+    /// THE BUG, stated as a test: a pane whose child exited long ago has no
+    /// waiter thread left to speak for it, so the tear-down notice is the only
+    /// one the webview will ever get. It must be sent regardless of what the
+    /// waiter did or did not do earlier — the `terminal-exit` the waiter sent
+    /// at exit time fired while `terminal_list` still listed this terminal,
+    /// so the re-sync it triggered had no reason to drop the tab.
+    #[test]
+    fn teardown_announces_even_after_the_waiter_already_exited() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        // The fixture is already in the post-exit shape a closed-out-of-band
+        // pane has: dead, no waiter join handle left to wait on.
+        assert!(!session.is_alive.load(Ordering::Relaxed));
+        assert!(session.waiter_join.lock().unwrap().is_none());
+
+        let sink = crate::terminal::exit_notice::RecordingExitSink::default();
+        // Stand in for the waiter's own earlier announcement.
+        sink.emit_exit(&session.id, Some(0));
+
+        assert!(session.notify_exit_on_teardown(Some(&sink)));
+        assert_eq!(
+            sink.notices().len(),
+            2,
+            "the tear-down notice must not be suppressed by the waiter's"
+        );
+    }
+
+    /// No app handle (unit fixtures, and any session built without one) means
+    /// nowhere to announce it — reported honestly rather than pretended.
+    #[test]
+    fn teardown_without_an_app_handle_announces_nothing() {
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        assert!(session.app_handle.is_none());
+        assert!(!session.notify_exit_on_teardown(
+            Option::<&crate::terminal::exit_notice::RecordingExitSink>::None
+        ));
+    }
+
+    /// `close_with_deadline` must RELEASE the pane as well as announce it —
+    /// for a remote pane that release is the detach frame the target needs.
+    #[test]
+    fn close_releases_the_pane() {
+        use crate::terminal::pane_io::{CredentialScrub, PaneIo};
+
+        #[derive(Default)]
+        struct CountingPane {
+            released: AtomicU64,
+            killed: AtomicU64,
+        }
+        impl PaneIo for CountingPane {
+            fn reader(&self) -> Result<Box<dyn std::io::Read + Send>, String> {
+                Ok(Box::new(std::io::empty()))
+            }
+            fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+                Ok(Box::new(std::io::sink()))
+            }
+            fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+                Ok(())
+            }
+            fn wait(&self) -> Result<i32, String> {
+                Ok(0)
+            }
+            fn kill(&self, _budget: std::time::Duration) -> Result<(), String> {
+                self.killed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn set_paused(&self, _paused: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                None
+            }
+            fn credential_scrub(&self) -> CredentialScrub {
+                CredentialScrub::NoChildEnv
+            }
+            fn release(&self, _budget: std::time::Duration) -> Result<(), String> {
+                self.released.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let pane = Arc::new(CountingPane::default());
+        let mut session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        session.io = pane.clone();
+        session.wire_flow = Arc::new(WireFlow::new(pane.clone()));
+
+        session.close();
+
+        assert_eq!(pane.killed.load(Ordering::SeqCst), 1, "the pane is killed");
+        assert_eq!(
+            pane.released.load(Ordering::SeqCst),
+            1,
+            "and its handles released — the remote detach frame rides on this"
+        );
     }
 
     /// A resize rewrites rendered text without any byte reaching the parser, so
