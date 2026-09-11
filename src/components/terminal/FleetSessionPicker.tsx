@@ -18,15 +18,17 @@ import {
 } from "./useFleetSessions";
 import {
   DEFAULT_FLEET_SERVER_FILTER,
+  FLEET_DEFAULT_LIMIT,
   FLEET_MAX_LIMIT,
   fleetCountSummary,
+  fleetEmptyReadMessage,
   fleetFilterConflict,
   fleetFilteredOutMessage,
   fleetStateOptions,
   fleetTruncation,
   filterFleetSessions,
   hasActiveFleetFilter,
-  hasNarrowingFleetFilter,
+  isLikelyDeviceId,
   type FleetServerFilter,
 } from "./fleetDiscovery";
 import {
@@ -81,6 +83,9 @@ export const FLEET_PICKER_CLEAR_FILTERS_ID = "terminal.fleet-picker-clear-filter
  * control ambiguous to a driver. */
 export const FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID = "terminal.fleet-picker-clear-filters-empty";
 export const FLEET_PICKER_CLEAR_FILTERS_NOMATCH_ID = "terminal.fleet-picker-clear-filters-no-match";
+export const FLEET_PICKER_DEVICE_ID_ENTRY_ID = "terminal.fleet-picker-device-id-entry";
+export const FLEET_PICKER_DEVICE_ID_MODE_ID = "terminal.fleet-picker-device-id-mode";
+export const FLEET_PICKER_DEVICE_ID_INVALID_ID = "terminal.fleet-picker-device-id-invalid";
 export const FLEET_PICKER_REREADING_ID = "terminal.fleet-picker-rereading";
 export const FLEET_PICKER_CONFLICT_ID = "terminal.fleet-picker-filter-conflict";
 export const FLEET_PICKER_TRUNCATION_ID = "terminal.fleet-picker-truncation";
@@ -164,21 +169,45 @@ export function FleetSessionPicker() {
   /** Client-side text filter over the loaded page. Says so in the UI. */
   const [text, setText] = useState("");
 
-  const { sessions, response, loading, error, emptyReason, deviceCatalog, refresh } =
-    useFleetSessions({
-      deviceId: server.deviceId ?? undefined,
-      state: server.state ?? undefined,
-      includeClosed: server.includeClosed,
-      limit: server.limit,
-    });
+  /**
+   * Paste-a-device-id mode. The dropdown can only offer devices some loaded
+   * page contained, and coord has no device-listing route — so on a truncated
+   * tenant the one control that reaches past truncation cannot name the device
+   * that truncation hid. This is the way out: coord takes a raw uuid.
+   */
+  const [deviceIdEntry, setDeviceIdEntry] = useState(false);
+
+  const {
+    sessions,
+    response,
+    loading,
+    error,
+    emptyReason,
+    deviceCatalog,
+    stateCatalog,
+    appliedQuery,
+    refresh,
+  } = useFleetSessions({
+    deviceId: server.deviceId ?? undefined,
+    state: server.state ?? undefined,
+    includeClosed: server.includeClosed,
+    limit: server.limit,
+  });
 
   const visible = useMemo(() => filterFleetSessions(sessions, text), [sessions, text]);
   const groups = useMemo(() => groupByDevice(visible), [visible]);
-  const stateOptions = useMemo(() => fleetStateOptions(sessions), [sessions]);
-  const truncation = fleetTruncation(response, server.limit);
+  const stateOptions = useMemo(
+    () => fleetStateOptions(stateCatalog, server.state),
+    [stateCatalog, server.state],
+  );
+  // Said WITH the query the rows were served for, never with the pending one:
+  // between a filter change and its response — and permanently, if that
+  // response never arrives — they are different queries.
+  const truncation = fleetTruncation(response, appliedQuery?.limit ?? FLEET_DEFAULT_LIMIT);
   const notice = degradedNotice(response);
   const filtersActive = hasActiveFleetFilter(server, text);
-  const narrowed = hasNarrowingFleetFilter(server, text);
+  const emptyRead = fleetEmptyReadMessage(appliedQuery ?? server, text);
+  const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);
   const filteredOut = fleetFilteredOutMessage(sessions.length, visible.length, text);
   const conflict = fleetFilterConflict(server);
 
@@ -188,7 +217,22 @@ export function FleetSessionPicker() {
   const clearFilters = useCallback(() => {
     setServer(DEFAULT_FLEET_SERVER_FILTER);
     setText("");
+    setDeviceIdEntry(false);
   }, []);
+
+  /**
+   * Ask for the next page size. When that size has ALREADY been requested — the
+   * read failed and the banner is still describing the older, smaller response
+   * — nothing about `server` changes, so a plain `setServer` would leave the
+   * click doing nothing at all. Retry the read instead.
+   */
+  const loadMore = useCallback(
+    (nextLimit: number) => {
+      if (server.limit >= nextLimit) void refresh();
+      else setServer((s) => ({ ...s, limit: nextLimit }));
+    },
+    [server.limit, refresh],
+  );
 
   const attach = useCallback(
     async (s: FleetSession, deviceLabel: string) => {
@@ -229,13 +273,24 @@ export function FleetSessionPicker() {
       data-page-element={FLEET_SESSION_PICKER_ELEMENT}
       // The discovery state, projected for a UI Bridge driver in one read
       // rather than scraped off control labels.
-      data-fleet-limit={server.limit}
+      //
+      // Split into APPLIED and PENDING because they diverge: everything under
+      // `data-fleet-*` describes the query the loaded rows were served for, so
+      // a driver reading the whole set in one pass gets a filter set and a row
+      // count that belong together. The controls' own state — which may be a
+      // request still in flight, or one that failed — is under
+      // `data-fleet-pending-*`.
+      data-fleet-limit={appliedQuery?.limit ?? ""}
       data-fleet-loaded={sessions.length}
       data-fleet-matched={visible.length}
       data-fleet-truncation={truncation.kind}
-      data-fleet-device-filter={server.deviceId ?? ""}
-      data-fleet-state-filter={server.state ?? ""}
-      data-fleet-include-closed={server.includeClosed ? "true" : "false"}
+      data-fleet-device-filter={appliedQuery?.deviceId ?? ""}
+      data-fleet-state-filter={appliedQuery?.state ?? ""}
+      data-fleet-include-closed={appliedQuery ? String(appliedQuery.includeClosed) : ""}
+      data-fleet-pending-limit={server.limit}
+      data-fleet-pending-device-filter={server.deviceId ?? ""}
+      data-fleet-pending-state-filter={server.state ?? ""}
+      data-fleet-pending-include-closed={server.includeClosed ? "true" : "false"}
       className="flex-1 flex flex-col min-h-0"
     >
       {/* Sub-header: counts + refresh */}
@@ -246,6 +301,7 @@ export function FleetSessionPicker() {
             matched: visible.length,
             loaded: sessions.length,
             devices: groups.length,
+            devicesLoaded,
             remote: remoteCount,
           })}
         </span>
@@ -292,24 +348,54 @@ export function FleetSessionPicker() {
 
       {/* Server-side narrowing: these two reach past a truncated page. */}
       <div className="flex items-center gap-1.5 px-3 py-1.5 border-b border-[#2a2d3d]">
-        <select
-          data-ui-bridge-id={FLEET_PICKER_DEVICE_FILTER_ID}
-          aria-label="Filter fleet sessions by device"
-          value={server.deviceId ?? ""}
-          onChange={(e) =>
-            setServer((s) => ({ ...s, deviceId: e.target.value === "" ? null : e.target.value }))
-          }
-          title="Asks coord for one device only — applied in SQL, so it reaches sessions this page did not show"
-          className={SELECT_CLASS}
+        {deviceIdEntry ? (
+          <input
+            data-ui-bridge-id={FLEET_PICKER_DEVICE_ID_ENTRY_ID}
+            aria-label="Filter fleet sessions by device id"
+            type="text"
+            value={server.deviceId ?? ""}
+            onChange={(e) => {
+              const v = e.target.value.trim();
+              setServer((s) => ({ ...s, deviceId: v === "" ? null : v }));
+            }}
+            placeholder="device uuid"
+            title="A device whose sessions all fall past a truncated page never reaches the dropdown — coord serves no device list. Paste its uuid here instead."
+            className={SELECT_CLASS + " placeholder-[#414868]"}
+          />
+        ) : (
+          <select
+            data-ui-bridge-id={FLEET_PICKER_DEVICE_FILTER_ID}
+            aria-label="Filter fleet sessions by device"
+            value={server.deviceId ?? ""}
+            onChange={(e) =>
+              setServer((s) => ({ ...s, deviceId: e.target.value === "" ? null : e.target.value }))
+            }
+            title="Asks coord for one device only — applied in SQL, so it reaches sessions this page did not show. Lists only devices seen in the pages loaded so far; use “id” for one that is not here."
+            className={SELECT_CLASS}
+          >
+            <option value="">All devices</option>
+            {deviceCatalog.map((d) => (
+              <option key={d.deviceId} value={d.deviceId}>
+                {d.label}
+                {d.isCallerDevice ? " (this machine)" : ""}
+              </option>
+            ))}
+          </select>
+        )}
+        <button
+          data-ui-bridge-id={FLEET_PICKER_DEVICE_ID_MODE_ID}
+          aria-label="Enter a device id directly"
+          aria-pressed={deviceIdEntry}
+          onClick={() => setDeviceIdEntry((v) => !v)}
+          title="Type a device uuid instead of picking from the list — the list holds only devices seen in the pages loaded so far"
+          className={`shrink-0 px-1 py-0.5 rounded text-[10px] transition-colors ${
+            deviceIdEntry
+              ? "bg-[#7aa2f7]/15 text-[#7aa2f7]"
+              : "text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d]"
+          }`}
         >
-          <option value="">All devices</option>
-          {deviceCatalog.map((d) => (
-            <option key={d.deviceId} value={d.deviceId}>
-              {d.label}
-              {d.isCallerDevice ? " (this machine)" : ""}
-            </option>
-          ))}
-        </select>
+          id
+        </button>
         <select
           data-ui-bridge-id={FLEET_PICKER_STATE_FILTER_ID}
           aria-label="Filter fleet sessions by state"
@@ -359,7 +445,7 @@ export function FleetSessionPicker() {
             <button
               data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}
               aria-label={`Load up to ${truncation.nextLimit} fleet sessions`}
-              onClick={() => setServer((s) => ({ ...s, limit: truncation.nextLimit }))}
+              onClick={() => loadMore(truncation.nextLimit)}
               disabled={loading}
               className="ml-auto shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#e0af68]/20 text-[#e0af68] hover:bg-[#e0af68]/35 transition-colors disabled:opacity-50"
               title={`Re-read with limit=${truncation.nextLimit} (coord's ceiling is ${FLEET_MAX_LIMIT})`}
@@ -368,6 +454,23 @@ export function FleetSessionPicker() {
               Load {truncation.nextLimit}
             </button>
           )}
+        </div>
+      )}
+
+      {/*
+        coord deserializes `device_id` into a Uuid, so a non-uuid is a 400 from
+        the extractor. Say so here rather than letting the read fail.
+      */}
+      {server.deviceId !== null && !isLikelyDeviceId(server.deviceId) && (
+        <div
+          data-ui-bridge-id={FLEET_PICKER_DEVICE_ID_INVALID_ID}
+          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#f7768e] border-b border-[#2a2d3d]"
+        >
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <span>
+            “{server.deviceId}” is not a device uuid — coord rejects the read rather than returning
+            no sessions.
+          </span>
         </div>
       )}
 
@@ -413,20 +516,19 @@ export function FleetSessionPicker() {
           <div className="px-3 py-8 text-center text-[#565f89] text-xs">
             {emptyReason !== "observed-empty" ? (
               "Fleet sessions are unknown — no successful read yet."
-            ) : narrowed ? (
-              <>
-                No session matches these filters. This is what COORD returned for them — not
-                necessarily an empty fleet.
-                <button
-                  data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID}
-                  onClick={clearFilters}
-                  className="block mx-auto mt-2 px-2 py-1 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
-                >
-                  Clear filters
-                </button>
-              </>
             ) : (
-              "No open sessions anywhere on the fleet."
+              <>
+                {emptyRead.message}
+                {emptyRead.offerClear && (
+                  <button
+                    data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID}
+                    onClick={clearFilters}
+                    className="block mx-auto mt-2 px-2 py-1 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+                  >
+                    Clear filters
+                  </button>
+                )}
+              </>
             )}
           </div>
         ) : (

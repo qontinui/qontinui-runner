@@ -16,6 +16,7 @@ import {
   FLEET_MAX_LIMIT,
   FLEET_STATE_VOCABULARY,
   fleetCountSummary,
+  fleetEmptyReadMessage,
   fleetFilterConflict,
   fleetFilteredOutMessage,
   fleetSearchTerms,
@@ -26,8 +27,12 @@ import {
   filterFleetSessions,
   hasActiveFleetFilter,
   hasNarrowingFleetFilter,
+  hasNarrowingServerFilter,
+  isLikelyDeviceId,
   mergeDeviceCatalog,
+  mergeStateCatalog,
   nextFleetLimit,
+  statesSeenIn,
   type FleetDeviceOption,
 } from "./fleetDiscovery";
 import { devicesSeenIn, type FleetSession, type FleetSessionsResponse } from "./useFleetSessions";
@@ -92,10 +97,12 @@ describe("nextFleetLimit — the page ladder ends at coord's ceiling", () => {
     expect(nextFleetLimit(499)).toBe(FLEET_MAX_LIMIT);
   });
 
-  it("never proposes a limit coord would clamp", () => {
-    for (const rung of FLEET_LIMIT_LADDER) {
-      expect(rung).toBeLessThanOrEqual(FLEET_MAX_LIMIT);
-    }
+  it("never proposes a limit coord would clamp, and always converges", () => {
+    // The convergence is the property: from ANY starting limit the ladder walk
+    // terminates at exactly the ceiling, never above it and never in a loop.
+    // (Asserting each declared rung is <= the declared ceiling was dropped —
+    // both are constants two lines apart in the same file, so it could only
+    // fail if someone edited both.)
     let at = 1;
     for (let i = 0; i < 20; i += 1) {
       const next = nextFleetLimit(at);
@@ -105,6 +112,7 @@ describe("nextFleetLimit — the page ladder ends at coord's ceiling", () => {
       at = next;
     }
     expect(at).toBe(FLEET_MAX_LIMIT);
+    expect(FLEET_LIMIT_LADDER.length).toBeGreaterThan(1);
   });
 });
 
@@ -222,8 +230,18 @@ describe("text filtering — AND over every searchable field", () => {
 });
 
 describe("mergeDeviceCatalog — the device list only ever grows", () => {
-  const a: FleetDeviceOption = { deviceId: "a", label: "alpha", isCallerDevice: false };
-  const b: FleetDeviceOption = { deviceId: "b", label: "bravo", isCallerDevice: true };
+  const a: FleetDeviceOption = {
+    deviceId: "a",
+    label: "alpha",
+    isCallerDevice: false,
+    labelIsFallback: false,
+  };
+  const b: FleetDeviceOption = {
+    deviceId: "b",
+    label: "bravo",
+    isCallerDevice: true,
+    labelIsFallback: false,
+  };
 
   it("keeps devices a narrowed read no longer returns", () => {
     // This is the trap the merge exists for: after selecting device `a`, coord's
@@ -235,7 +253,7 @@ describe("mergeDeviceCatalog — the device list only ever grows", () => {
   it("puts the caller's own device first, then sorts by label", () => {
     const merged = mergeDeviceCatalog(
       [],
-      [{ deviceId: "z", label: "zulu", isCallerDevice: false }, a, b],
+      [{ deviceId: "z", label: "zulu", isCallerDevice: false, labelIsFallback: false }, a, b],
     );
     expect(merged.map((d) => d.deviceId)).toEqual(["b", "a", "z"]);
   });
@@ -245,9 +263,37 @@ describe("mergeDeviceCatalog — the device list only ever grows", () => {
       deviceId: "a",
       label: "device abcd1234",
       isCallerDevice: false,
+      labelIsFallback: true,
     };
     const merged = mergeDeviceCatalog([placeholder], [a]);
     expect(merged[0]?.label).toBe("alpha");
+    expect(merged[0]?.labelIsFallback).toBe(false);
+  });
+
+  it("decides by the FLAG, not by the label's text", () => {
+    // An operator may legitimately name a device "device farm 2", which a
+    // startsWith("device ") sniff would misread as the id placeholder and
+    // happily overwrite.
+    const namedLikeAPlaceholder: FleetDeviceOption = {
+      deviceId: "a",
+      label: "device farm 2",
+      isCallerDevice: false,
+      labelIsFallback: false,
+    };
+    const realPlaceholder: FleetDeviceOption = {
+      deviceId: "a",
+      label: "device abcd1234",
+      isCallerDevice: false,
+      labelIsFallback: true,
+    };
+    expect(mergeDeviceCatalog([namedLikeAPlaceholder], [realPlaceholder])[0]?.label).toBe(
+      "device farm 2",
+    );
+  });
+
+  it("returns the SAME array when a read adds nothing", () => {
+    const once = mergeDeviceCatalog([], [a, b]);
+    expect(mergeDeviceCatalog(once, [a, b])).toBe(once);
   });
 
   it("does not let a placeholder overwrite a real label", () => {
@@ -255,6 +301,7 @@ describe("mergeDeviceCatalog — the device list only ever grows", () => {
       deviceId: "a",
       label: "device abcd1234",
       isCallerDevice: false,
+      labelIsFallback: true,
     };
     const merged = mergeDeviceCatalog([a], [placeholder]);
     expect(merged[0]?.label).toBe("alpha");
@@ -274,8 +321,8 @@ describe("devicesSeenIn — the filter options a page of rows supports", () => {
       session({ deviceId: "b", deviceHostname: "bravo-host", isCallerDevice: true }),
     ]);
     expect(seen).toEqual([
-      { deviceId: "a", label: "alpha", isCallerDevice: false },
-      { deviceId: "b", label: "bravo-host", isCallerDevice: true },
+      { deviceId: "a", label: "alpha", isCallerDevice: false, labelIsFallback: false },
+      { deviceId: "b", label: "bravo-host", isCallerDevice: true, labelIsFallback: false },
     ]);
   });
 
@@ -297,21 +344,29 @@ describe("devicesSeenIn — the filter options a page of rows supports", () => {
 });
 
 describe("fleetStateOptions — the known vocabulary, plus whatever coord served", () => {
-  it("offers coord's whole vocabulary even when no row carries a value", () => {
-    expect(fleetStateOptions([])).toEqual([...FLEET_STATE_VOCABULARY]);
+  it("offers coord's whole vocabulary even when nothing has been seen", () => {
+    expect(fleetStateOptions([], null)).toEqual([...FLEET_STATE_VOCABULARY]);
   });
 
   it("appends a state coord emitted that this build does not know about", () => {
     // The vocabulary is enforced in Rust, not by a DB constraint, so it can
     // evolve without a migration — a pinned list would silently hide the new
     // value, which is the same quiet omission this phase is fixing.
-    const opts = fleetStateOptions([session({ state: "quiescing" }), session({ state: "active" })]);
+    const opts = fleetStateOptions(["quiescing", "active"], null);
     expect(opts).toContain("quiescing");
     expect(opts.filter((v) => v === "active")).toHaveLength(1);
   });
 
-  it("ignores blank states rather than offering an unselectable option", () => {
-    expect(fleetStateOptions([session({ state: "  " })])).toEqual([...FLEET_STATE_VOCABULARY]);
+  it("ALWAYS offers the selected value, even when no row carries it", () => {
+    // Otherwise a controlled <select> whose value matches no <option> renders
+    // as the first one — "Any state" — while the request in flight still
+    // carries the filter: the control showing one query, coord answering
+    // another.
+    expect(fleetStateOptions([], "quiescing")).toContain("quiescing");
+  });
+
+  it("ignores blank values rather than offering an unselectable option", () => {
+    expect(fleetStateOptions(["  "], null)).toEqual([...FLEET_STATE_VOCABULARY]);
   });
 });
 
@@ -337,27 +392,27 @@ describe("hasActiveFleetFilter — drives whether a reset is offered at all", ()
 
 describe("fleetCountSummary — a filtered subset is never shown as a total", () => {
   it("reports a plain count when nothing is filtered out", () => {
-    expect(fleetCountSummary({ matched: 3, loaded: 3, devices: 2, remote: 1 })).toBe(
-      "3 sessions on 2 devices · 1 remote",
-    );
+    expect(
+      fleetCountSummary({ matched: 3, loaded: 3, devices: 2, devicesLoaded: 2, remote: 1 }),
+    ).toBe("3 sessions on 2 devices · 1 remote");
   });
 
   it("says 'of N loaded' the moment a filter hides anything", () => {
-    expect(fleetCountSummary({ matched: 2, loaded: 47, devices: 1, remote: 0 })).toBe(
-      "2 of 47 loaded on 1 device",
-    );
+    expect(
+      fleetCountSummary({ matched: 2, loaded: 47, devices: 1, devicesLoaded: 5, remote: 0 }),
+    ).toBe("2 of 47 loaded on 1 of 5 devices");
   });
 
   it("gets the singular right", () => {
-    expect(fleetCountSummary({ matched: 1, loaded: 1, devices: 1, remote: 0 })).toBe(
-      "1 session on 1 device",
-    );
+    expect(
+      fleetCountSummary({ matched: 1, loaded: 1, devices: 1, devicesLoaded: 1, remote: 0 }),
+    ).toBe("1 session on 1 device");
   });
 
   it("omits the remote clause when every row is local", () => {
-    expect(fleetCountSummary({ matched: 2, loaded: 2, devices: 1, remote: 0 })).not.toContain(
-      "remote",
-    );
+    expect(
+      fleetCountSummary({ matched: 2, loaded: 2, devices: 1, devicesLoaded: 1, remote: 0 }),
+    ).not.toContain("remote");
   });
 });
 
@@ -435,5 +490,132 @@ describe("hasNarrowingFleetFilter — only a narrowing filter can explain an emp
     // false explanation of an honest zero.
     expect(hasNarrowingFleetFilter(server, "")).toBe(false);
     expect(hasActiveFleetFilter(server, "")).toBe(true);
+  });
+});
+
+describe("a term never spans two haystack fields", () => {
+  it("does not match across the join between repo and branch", () => {
+    // The haystack is a space-joined string, so a naive reader might expect
+    // "web feat" to match repo="qontinui-web" branch="feat/x" as one run. It
+    // must not: each TERM has to land inside some field, or the box would
+    // match on an artefact of field ORDER, which nothing guarantees. The
+    // newline join in `fleetSessionHaystack` is what makes it impossible.
+    const s = session({ repo: "qontinui-web", branch: "feat/picker" });
+    expect(fleetSessionMatchesTerms(s, ["web feat"])).toBe(false);
+    // The same two words as separate terms DO match, because each lands in a
+    // field of its own.
+    expect(fleetSessionMatchesTerms(s, ["web", "feat"])).toBe(true);
+  });
+
+  it("no term the search box produces can contain whitespace at all", () => {
+    // Which is why the newline join above closes the hole for every query a
+    // user can actually type.
+    for (const term of fleetSearchTerms("  qontinui-web   feat/picker\tmain ")) {
+      expect(term).not.toMatch(/\s/);
+    }
+  });
+});
+
+describe("statesSeenIn / mergeStateCatalog — the state list accumulates too", () => {
+  it("collects distinct non-blank states", () => {
+    expect(
+      statesSeenIn([
+        session({ state: "active" }),
+        session({ state: "active" }),
+        session({ state: " " }),
+        session({ state: null }),
+        session({ state: "quiescing" }),
+      ]).sort(),
+    ).toEqual(["active", "quiescing"]);
+  });
+
+  it("keeps a state a narrowed read no longer returns", () => {
+    // Same trap as the device catalogue: filtering to state=active makes
+    // coord's next response carry only that state.
+    const merged = mergeStateCatalog(["active", "quiescing"], ["active"]);
+    expect(merged).toEqual(["active", "quiescing"]);
+  });
+
+  it("returns the SAME array when nothing is new", () => {
+    const once = mergeStateCatalog([], ["active"]);
+    expect(mergeStateCatalog(once, ["active"])).toBe(once);
+  });
+});
+
+describe("hasNarrowingServerFilter — only what coord SAW can explain coord's zero", () => {
+  it("is false for the default filter", () => {
+    expect(hasNarrowingServerFilter(DEFAULT_FLEET_SERVER_FILTER)).toBe(false);
+  });
+
+  it("is false for a text query, which is never sent to coord", () => {
+    // The distinction finding 3 turned on: `hasNarrowingFleetFilter` counts the
+    // text box (correct for the client-side plane), and using THAT to explain a
+    // zero-row RESPONSE would conceal a genuinely empty fleet behind an
+    // invented cause.
+    expect(hasNarrowingFleetFilter(DEFAULT_FLEET_SERVER_FILTER, "foo")).toBe(true);
+    expect(hasNarrowingServerFilter(DEFAULT_FLEET_SERVER_FILTER)).toBe(false);
+  });
+
+  it.each([
+    ["device", { ...DEFAULT_FLEET_SERVER_FILTER, deviceId: "a" }],
+    ["state", { ...DEFAULT_FLEET_SERVER_FILTER, state: "active" }],
+  ])("is true for a %s filter", (_name, server) => {
+    expect(hasNarrowingServerFilter(server)).toBe(true);
+  });
+});
+
+describe("fleetEmptyReadMessage — three different facts, never merged", () => {
+  it("blames the filters only when coord actually had some", () => {
+    const r = fleetEmptyReadMessage({ ...DEFAULT_FLEET_SERVER_FILTER, state: "active" }, "");
+    expect(r.message).toMatch(/what coord returned for them/i);
+    expect(r.offerClear).toBe(true);
+  });
+
+  it("reports a real empty fleet when coord was asked with no narrowing filter", () => {
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "");
+    expect(r.message).toBe("No open sessions anywhere on the fleet.");
+    expect(r.offerClear).toBe(false);
+  });
+
+  it("clears the text box of suspicion instead of blaming it", () => {
+    const r = fleetEmptyReadMessage(DEFAULT_FLEET_SERVER_FILTER, "foo");
+    expect(r.message).toMatch(/No open sessions anywhere on the fleet/);
+    expect(r.message).toMatch(/not sent to coord/i);
+    expect(r.message).not.toMatch(/what coord returned for them/i);
+  });
+
+  it("a raised limit alone never makes the list read as filtered", () => {
+    const r = fleetEmptyReadMessage({ ...DEFAULT_FLEET_SERVER_FILTER, limit: 500 }, "");
+    expect(r.message).toBe("No open sessions anywhere on the fleet.");
+  });
+});
+
+describe("isLikelyDeviceId — a value coord's Uuid extractor will accept", () => {
+  it("accepts a uuid, trimmed and in either case", () => {
+    expect(isLikelyDeviceId("22222222-2222-2222-2222-222222222222")).toBe(true);
+    expect(isLikelyDeviceId("  AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE  ")).toBe(true);
+  });
+
+  it("rejects what coord would 400 on", () => {
+    for (const bad of ["", "merytshost", "2222", "22222222-2222-2222-2222-22222222222", "zzzz"]) {
+      expect(isLikelyDeviceId(bad)).toBe(false);
+    }
+  });
+});
+
+describe("truncation copy states the real limits of 'narrow instead'", () => {
+  it("at the ceiling, admits the device list is partial and that 500 in one bucket is a dead end", () => {
+    const rows = Array.from({ length: FLEET_MAX_LIMIT }, (_, i) =>
+      session({ sessionId: `s-${i}` }),
+    );
+    const t = fleetTruncation(response({ sessions: rows, truncated: true }), FLEET_MAX_LIMIT);
+    if (t.kind !== "at-ceiling") throw new Error("expected at-ceiling");
+    // coord serves no device-listing route, so the dropdown can only hold
+    // devices some loaded page contained — including, possibly, not the one
+    // truncation hid.
+    expect(t.message).toMatch(/loaded so far/i);
+    // And with no offset or cursor, one device in one state over the ceiling is
+    // unreachable by ANY combination of the four parameters.
+    expect(t.message).toMatch(/cannot be paged further/i);
   });
 });

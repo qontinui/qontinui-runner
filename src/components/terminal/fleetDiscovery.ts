@@ -60,6 +60,9 @@ export function nextFleetLimit(current: number): number | null {
   for (const step of FLEET_LIMIT_LADDER) {
     if (step > current) return step;
   }
+  // Unreachable while the ladder ends at the ceiling, and kept deliberately:
+  // it is the clause that keeps this function correct if a rung is ever removed
+  // from `FLEET_LIMIT_LADDER` without the ceiling moving with it.
   return current < FLEET_MAX_LIMIT ? FLEET_MAX_LIMIT : null;
 }
 
@@ -105,8 +108,11 @@ export function fleetTruncation(
       limit,
       message:
         `Showing ${shown} sessions — coord's per-read ceiling of ${FLEET_MAX_LIMIT}. ` +
-        `More sessions matched than can be served in one read. Narrow by device or state ` +
-        `to reach them; the text box only filters rows already loaded.`,
+        `More matched than one read can serve. Narrow by device or state to reach them — ` +
+        `but the device list holds only devices seen in the pages loaded so far (paste an id ` +
+        `to reach another), and coord takes no offset, so one device in one state with more ` +
+        `than ${FLEET_MAX_LIMIT} sessions cannot be paged further at all. The text box only ` +
+        `filters rows already loaded.`,
     };
   }
   return {
@@ -137,6 +143,13 @@ export function fleetSearchTerms(query: string): string[] {
  *
  * A `null` field contributes nothing — coord's nulls are UNKNOWN, and matching
  * the literal string "null" would invent a value for them.
+ *
+ * Fields are joined on a NEWLINE, not a space. `fleetSearchTerms` splits the
+ * query on whitespace, so no term it produces can contain one — which makes a
+ * match straddling two fields structurally impossible rather than merely
+ * unlikely. A space join let `"web feat"` match `repo="qontinui-web"` +
+ * `branch="feat/picker"` as one run, i.e. match on the ORDER of the fields in
+ * this array, which nothing guarantees and no caller could predict.
  */
 export function fleetSessionHaystack(s: FleetSession): string {
   return [
@@ -156,7 +169,7 @@ export function fleetSessionHaystack(s: FleetSession): string {
     s.correlationTopic,
   ]
     .filter((v): v is string => typeof v === "string" && v.length > 0)
-    .join(" ")
+    .join("\n")
     .toLowerCase();
 }
 
@@ -184,6 +197,18 @@ export interface FleetDeviceOption {
   deviceId: string;
   label: string;
   isCallerDevice: boolean;
+  /**
+   * True when `label` is the id-derived placeholder rather than a name coord
+   * served — i.e. the identity columns were degraded on the read this option
+   * came from.
+   *
+   * Carried as a FLAG because the merge below has to know, and the alternative
+   * was sniffing the label for the `device ` prefix: that misreads an
+   * operator-chosen name like "device farm 2" in both directions, and a change
+   * to the placeholder's format would break the merge with every test still
+   * green.
+   */
+  labelIsFallback: boolean;
 }
 
 /**
@@ -195,33 +220,61 @@ export interface FleetDeviceOption {
  * entry and no way back to the others. The catalogue therefore only ever grows
  * within a mounted picker.
  *
- * A better label wins over a worse one: `deviceLabel` falls back to a truncated
- * id when coord served the identity columns degraded, and a later
- * non-degraded read must be allowed to replace that placeholder.
+ * A better label wins over a worse one: the label falls back to a truncated id
+ * when coord served the identity columns degraded, and a later non-degraded
+ * read must be allowed to replace that placeholder. `labelIsFallback` is what
+ * decides, never the label's own text.
+ *
+ * Returns `prev` UNCHANGED when the merge adds nothing, so a refresh that sees
+ * the same devices does not re-render the dropdown for no reason.
  */
 export function mergeDeviceCatalog(
   prev: FleetDeviceOption[],
   seen: FleetDeviceOption[],
 ): FleetDeviceOption[] {
   const byId = new Map(prev.map((d) => [d.deviceId, d]));
+  let changed = false;
   for (const d of seen) {
     const existing = byId.get(d.deviceId);
     if (!existing) {
       byId.set(d.deviceId, d);
+      changed = true;
       continue;
     }
-    const existingIsFallback = existing.label.startsWith("device ");
-    const incomingIsFallback = d.label.startsWith("device ");
-    byId.set(d.deviceId, {
+    const takeIncomingLabel = existing.labelIsFallback && !d.labelIsFallback;
+    const merged: FleetDeviceOption = {
       deviceId: d.deviceId,
-      label: existingIsFallback && !incomingIsFallback ? d.label : existing.label,
+      label: takeIncomingLabel ? d.label : existing.label,
       isCallerDevice: existing.isCallerDevice || d.isCallerDevice,
-    });
+      labelIsFallback: takeIncomingLabel ? d.labelIsFallback : existing.labelIsFallback,
+    };
+    if (
+      merged.label !== existing.label ||
+      merged.isCallerDevice !== existing.isCallerDevice ||
+      merged.labelIsFallback !== existing.labelIsFallback
+    ) {
+      byId.set(d.deviceId, merged);
+      changed = true;
+    }
   }
+  if (!changed) return prev;
   return [...byId.values()].sort((a, b) => {
     if (a.isCallerDevice !== b.isCallerDevice) return a.isCallerDevice ? -1 : 1;
     return a.label.localeCompare(b.label);
   });
+}
+
+/**
+ * A value that coord's fleet route will accept as `device_id`.
+ *
+ * The route deserializes it into a `Uuid`, so a non-uuid is a 400 from axum's
+ * `Query` extractor before any handler code runs. The picker's paste-an-id
+ * escape hatch checks this and SAYS so rather than firing a request that can
+ * only fail — an error the operator would otherwise have to decode from a
+ * status code.
+ */
+export function isLikelyDeviceId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.trim());
 }
 
 /**
@@ -242,20 +295,57 @@ export const FLEET_STATE_VOCABULARY: readonly string[] = [
   "closed",
 ];
 
-/**
- * The states to offer: the known vocabulary, plus anything coord actually
- * served that is not in it.
- *
- * The union matters because the vocabulary is enforced in Rust rather than by a
- * DB constraint precisely so it can evolve without a migration — a runner
- * pinned to a stale list would silently hide a state coord had started
- * emitting, which is the same class of quiet omission this phase is fixing.
- */
-export function fleetStateOptions(sessions: FleetSession[]): string[] {
-  const extra = new Set<string>();
+/** The distinct non-blank `state` values a page of rows carried. */
+export function statesSeenIn(sessions: FleetSession[]): string[] {
+  const seen = new Set<string>();
   for (const s of sessions) {
     const v = s.state?.trim();
-    if (v && !FLEET_STATE_VOCABULARY.includes(v)) extra.add(v);
+    if (v) seen.add(v);
+  }
+  return [...seen];
+}
+
+/**
+ * Accumulate the states seen across reads, for the same reason the device
+ * catalogue accumulates: filtering to `state=active` makes coord's next
+ * response carry only that state, and a dropdown rebuilt from it would drop
+ * every other value it had just offered.
+ *
+ * Returns `prev` unchanged when nothing is new.
+ */
+export function mergeStateCatalog(prev: string[], seen: string[]): string[] {
+  const set = new Set(prev);
+  let changed = false;
+  for (const v of seen) {
+    if (!set.has(v)) {
+      set.add(v);
+      changed = true;
+    }
+  }
+  return changed ? [...set].sort() : prev;
+}
+
+/**
+ * The states to offer: the known vocabulary, plus everything coord has actually
+ * served, plus whatever is SELECTED right now.
+ *
+ * The vocabulary union matters because the vocabulary is enforced in Rust
+ * rather than by a DB constraint precisely so it can evolve without a migration
+ * — a runner pinned to a stale list would silently hide a state coord had
+ * started emitting, which is the same class of quiet omission this phase is
+ * fixing.
+ *
+ * The SELECTED union closes a sharper hole: a controlled `<select>` whose value
+ * matches no `<option>` renders as the first option — "Any state" — while the
+ * request in flight still carries the filter. The control would then be showing
+ * one query and coord answering another, which is the exact confusion this
+ * phase exists to remove.
+ */
+export function fleetStateOptions(seen: string[], selected: string | null): string[] {
+  const extra = new Set<string>();
+  for (const v of [...seen, ...(selected ? [selected] : [])]) {
+    const t = v.trim();
+    if (t && !FLEET_STATE_VOCABULARY.includes(t)) extra.add(t);
   }
   return [...FLEET_STATE_VOCABULARY, ...[...extra].sort()];
 }
@@ -305,6 +395,48 @@ export function hasNarrowingFleetFilter(server: FleetServerFilter, text: string)
 }
 
 /**
+ * True when a filter coord ACTUALLY SAW is narrowing the read.
+ *
+ * Distinct from `hasNarrowingFleetFilter`, which also counts the text box: the
+ * text box is client-side and never reaches coord, so it cannot explain a read
+ * that came back with zero rows. Blaming it for one would conceal a genuine
+ * observed-empty fleet behind an invented cause.
+ */
+export function hasNarrowingServerFilter(server: FleetServerFilter): boolean {
+  return server.deviceId !== null || server.state !== null;
+}
+
+/**
+ * What to say when coord's read itself returned no rows.
+ *
+ * Three different facts, never merged: coord was asked with narrowing filters
+ * and answered zero; coord was asked WITHOUT them and answered zero (a real
+ * empty fleet, whatever the text box holds); or the text box is set and is
+ * being wrongly suspected, which is worth saying out loud since it is on screen
+ * and looks like a cause.
+ */
+export function fleetEmptyReadMessage(
+  server: FleetServerFilter,
+  text: string,
+): { message: string; offerClear: boolean } {
+  if (hasNarrowingServerFilter(server)) {
+    return {
+      message:
+        "No session matches these filters. This is what coord returned for them — not necessarily an empty fleet.",
+      offerClear: true,
+    };
+  }
+  if (fleetSearchTerms(text).length > 0) {
+    return {
+      message:
+        "No open sessions anywhere on the fleet. Your text filter is not sent to coord, so it is not what emptied this list.",
+      offerClear: true,
+    };
+  }
+  return { message: "No open sessions anywhere on the fleet.", offerClear: false };
+}
+
+/**
  * The one-line count summary, which must never present a filtered subset as a
  * total.
  *
@@ -316,15 +448,24 @@ export function hasNarrowingFleetFilter(server: FleetServerFilter, text: string)
 export function fleetCountSummary(args: {
   matched: number;
   loaded: number;
+  /** Devices spanned by the rows ON SCREEN. */
   devices: number;
+  /** Devices spanned by everything coord served. */
+  devicesLoaded: number;
   remote: number;
 }): string {
-  const { matched, loaded, devices, remote } = args;
+  const { matched, loaded, devices, devicesLoaded, remote } = args;
   const head =
     matched === loaded
       ? `${loaded} session${loaded === 1 ? "" : "s"}`
       : `${matched} of ${loaded} loaded`;
-  const parts = [`${head} on ${devices} device${devices === 1 ? "" : "s"}`];
+  // The device half has to be as honest as the session half: "2 of 47 loaded on
+  // 1 device" reads as a claim about the fleet when the 47 may span five.
+  const devicePart =
+    devices === devicesLoaded
+      ? `${devices} device${devices === 1 ? "" : "s"}`
+      : `${devices} of ${devicesLoaded} devices`;
+  const parts = [`${head} on ${devicePart}`];
   if (remote > 0) parts.push(`${remote} remote`);
   return parts.join(" · ");
 }
