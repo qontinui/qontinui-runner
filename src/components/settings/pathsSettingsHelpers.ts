@@ -311,10 +311,12 @@ export function scanSourceStatus(
       "The adapter has not completed a cycle since the runner started, so how far the scanned directory has drifted is unknown.",
     );
   }
-  if (
-    view.state === "not_scanning" ||
-    (view.plans_dir !== null && resolvedDiffers(view.plans_dir, inEffect.plans_dir))
-  ) {
+  if (view.state === "not_scanning") {
+    return notYet(
+      "Plan scanning was just turned on; the adapter picks the directory up within one scan interval. Reopen this panel after the next interval.",
+    );
+  }
+  if (view.plans_dir !== null && resolvedDiffers(view.plans_dir, inEffect.plans_dir)) {
     return notYet(
       "The adapter re-reads the plans directory once per scan interval, and its last reading is for a different directory. Reopen this panel after the next interval.",
     );

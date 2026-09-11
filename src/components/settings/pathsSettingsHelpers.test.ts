@@ -369,6 +369,7 @@ describe("scanSourceStatus — a reading for another directory is not this one's
     });
     expect(s.tone).toBe("unknown");
     expect(s.headline).toBe("Scan source: not measured yet for this directory");
+    expect(s.detail).toContain("different directory");
   });
 
   it("compares the directories as paths, not strings", () => {
@@ -391,6 +392,8 @@ describe("scanSourceStatus — a reading for another directory is not this one's
     );
     expect(s.tone).toBe("unknown");
     expect(s.headline).toBe("Scan source: not measured yet for this directory");
+    expect(s.detail).toContain("just turned on");
+    expect(s.detail).not.toContain("different directory");
   });
 
   it("says nothing is scanned when the tier is off, whatever the last reading was", () => {
