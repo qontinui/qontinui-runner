@@ -1282,6 +1282,165 @@ impl HttpArtifactSink {
     pub fn base(&self) -> &str {
         &self.base
     }
+
+    /// The scan-root report door: `{base}/api/v1/plan-library/scan-roots`.
+    pub fn scan_roots_url(&self) -> String {
+        format!("{}/api/v1/plan-library/scan-roots", self.base)
+    }
+
+    /// Publish this device's scan-root reading — see [`ScanRootReport`].
+    ///
+    /// Success is any 2xx; everything else, transport failures included, is
+    /// an `Err` carrying one line for the caller's log. The error is a
+    /// `String` rather than an `anyhow::Error` because the caller only logs it
+    /// and compares it with the previous failure to keep the WARN
+    /// edge-triggered.
+    pub async fn report_scan_root(&self, report: &ScanRootReport) -> Result<(), String> {
+        let url = self.scan_roots_url();
+        // coord-tenant-scope(work-owed): the reading describes the plans dir that feeds this org's corpus, so it must land in the SAME org as the artifacts that dir produces — this file's artifact upsert, whose tenant is the plan's repo (E3). qontinui-web derives organization_id AND device_id from the verified bearer, never this body. Phase 6.
+        let resp = crate::auth::attach_device_auth(self.client.post(&url).json(report))
+            .send()
+            .await
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let mut text = resp.text().await.unwrap_or_default();
+        // A backend that does not serve the route answers with whatever its
+        // 404 page is; the log needs the status, not a page of HTML.
+        if text.len() > SCAN_ROOT_ERROR_BODY_CAP {
+            let mut cut = SCAN_ROOT_ERROR_BODY_CAP;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push('…');
+        }
+        Err(upstream_error("report scan root", status, text).to_string())
+    }
+}
+
+/// How much of a refused scan-root report's response body reaches the log.
+const SCAN_ROOT_ERROR_BODY_CAP: usize = 512;
+
+// ============================================================================
+// The scan-root report — plan
+// `2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift`,
+// Revised Phase 2 (runner half)
+// ============================================================================
+
+/// `POST {backend}/api/v1/plan-library/scan-roots` body: one device's
+/// reading of how far the plans dir it scans has drifted from its default
+/// branch, projected from [`super::trigger::ScanDivergence`].
+///
+/// The web half keeps one row per `(organization_id, device_id)` and takes
+/// BOTH from the verified device token — so, as with [`ArtifactUpsert`], there
+/// is deliberately no identity field here for a caller to fill in.
+///
+/// Every optional field serializes as an explicit `null` rather than being
+/// omitted: an absent number is UNKNOWN on the source type, and the wire keeps
+/// that — `behind: null` is "not measured", never a defaulted `0`.
+/// `counts_are_floors` travels beside the counts because a `0/0` against a
+/// stale ref is a lower bound, not agreement, and a reader of the row cannot
+/// recompute that without the rule. The field names ARE the contract with the
+/// web half; `scan_root_report_wire_shape_is_the_contract` pins them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScanRootReport {
+    /// `ScanDivergenceState::as_str()`: `measured` | `not_scanning` |
+    /// `not_a_git_work_tree` | `unknown`.
+    pub state: String,
+    pub plans_dir: Option<String>,
+    pub repo_root: Option<String>,
+    /// [`derive_source_repo`] of `plans_dir` — the same `<repo>/<dir>` key the
+    /// plan-library rows this dir produces carry, so a reader can join the
+    /// reading to the artifacts it qualifies.
+    pub source_repo: Option<String>,
+    pub default_ref: Option<String>,
+    pub ref_sha: Option<String>,
+    pub head_sha: Option<String>,
+    pub behind: Option<u64>,
+    pub ahead: Option<u64>,
+    pub ref_age_secs: Option<u64>,
+    pub counts_are_floors: bool,
+    pub detail: Option<String>,
+    /// When the reading was taken, RFC 3339 UTC with a `Z` suffix.
+    pub observed_at: String,
+}
+
+impl ScanRootReport {
+    /// Project a reading for the wire. `observed_at` is a parameter so the
+    /// projection is pure apart from [`derive_source_repo`]'s `.git` probe.
+    ///
+    /// The web door validates the state/field pairing and REFUSES a report
+    /// that breaks it, so the projection enforces each rule itself rather
+    /// than trusting the source type's constructors to have kept it:
+    ///
+    /// 1. `measured` carries BOTH `behind` and `ahead`. A `Measured` reading
+    ///    missing either cannot happen by construction; if it ever does, it
+    ///    is sent as `unknown` with a detail saying so — a count the device
+    ///    does not have must not be invented, and a refused report publishes
+    ///    nothing at all.
+    /// 2. Every other state carries NEITHER count (nor `ref_age_secs`, which
+    ///    only qualifies counts), and `counts_are_floors` is `false`.
+    /// 3. `unknown` and `not_a_git_work_tree` carry a non-empty `detail`; a
+    ///    blank one is replaced by a sentence naming the gap rather than
+    ///    left for the server to refuse.
+    /// 4. `observed_at` is RFC 3339 UTC with a `Z` suffix.
+    ///
+    /// Rule 5 — exactly the contract's fields, no identity — is the struct's
+    /// shape itself.
+    pub fn from_divergence(
+        d: &super::trigger::ScanDivergence,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        use super::trigger::ScanDivergenceState as State;
+        let measured_counts = match (d.state, d.behind, d.ahead) {
+            (State::Measured, Some(behind), Some(ahead)) => Some((behind, ahead)),
+            _ => None,
+        };
+        let (state, detail) = match (d.state, measured_counts) {
+            (State::Measured, None) => (
+                State::Unknown,
+                Some(format!(
+                    "the runner recorded a `measured` reading without both counts \
+                     (behind={:?}, ahead={:?}); reported as unknown rather than inventing one",
+                    d.behind, d.ahead
+                )),
+            ),
+            (state, _) => (state, d.detail.clone()),
+        };
+        let detail = match state {
+            State::Unknown | State::NotAGitWorkTree
+                if detail.as_deref().is_none_or(|t| t.trim().is_empty()) =>
+            {
+                Some(format!(
+                    "the runner recorded state `{}` without saying why (no detail was \
+                     captured for this reading)",
+                    state.as_str()
+                ))
+            }
+            _ => detail,
+        };
+        Self {
+            state: state.as_str().to_string(),
+            plans_dir: d.plans_dir.clone(),
+            repo_root: d.repo_root.clone(),
+            source_repo: d
+                .plans_dir
+                .as_deref()
+                .and_then(|dir| derive_source_repo(Path::new(dir))),
+            default_ref: d.default_ref.clone(),
+            ref_sha: d.ref_sha.clone(),
+            head_sha: d.head_sha.clone(),
+            behind: measured_counts.map(|(behind, _)| behind),
+            ahead: measured_counts.map(|(_, ahead)| ahead),
+            ref_age_secs: measured_counts.and(d.ref_age_secs),
+            counts_are_floors: measured_counts.is_some() && d.counts_are_floors(),
+            detail,
+            observed_at: observed_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }
+    }
 }
 
 /// Turn a non-2xx web response into an error that carries the upstream body
@@ -1388,6 +1547,271 @@ impl ArtifactSink for HttpArtifactSink {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    // ---- the scan-root report (plan 2026-09-11-…-its-own-drift, Revised P2) ----
+
+    fn observed() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-11T12:34:56Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn measured(
+        ref_age_secs: Option<u64>,
+        behind: u64,
+        ahead: u64,
+    ) -> super::super::trigger::ScanDivergence {
+        super::super::trigger::ScanDivergence {
+            state: super::super::trigger::ScanDivergenceState::Measured,
+            plans_dir: Some("/no/such/qontinui-dev-notes/plans".to_string()),
+            repo_root: Some("/no/such/qontinui-dev-notes".to_string()),
+            default_ref: Some("origin/main".to_string()),
+            ref_sha: Some("a".repeat(40)),
+            head_sha: Some("b".repeat(40)),
+            behind: Some(behind),
+            ahead: Some(ahead),
+            ref_age_secs,
+            detail: None,
+        }
+    }
+
+    /// The field names and value shapes ARE the contract with the web half,
+    /// so they are written here as LITERALS: exactly these thirteen keys, no
+    /// identity field (the server takes the device and org from the token),
+    /// `state` as the enum's snake_case tag, `observed_at` as RFC 3339 UTC.
+    #[test]
+    fn scan_root_report_wire_shape_is_the_contract() {
+        let r = ScanRootReport::from_divergence(&measured(Some(300), 2153, 11), observed());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "state": "measured",
+                "plans_dir": "/no/such/qontinui-dev-notes/plans",
+                "repo_root": "/no/such/qontinui-dev-notes",
+                // No `.git` on this path, so the two-component fallback.
+                "source_repo": "qontinui-dev-notes/plans",
+                "default_ref": "origin/main",
+                "ref_sha": "a".repeat(40),
+                "head_sha": "b".repeat(40),
+                "behind": 2153,
+                "ahead": 11,
+                "ref_age_secs": 300,
+                "counts_are_floors": false,
+                "detail": null,
+                "observed_at": "2026-09-11T12:34:56Z",
+            })
+        );
+        for forbidden in ["device_id", "organization_id", "tenant_id"] {
+            assert!(
+                v.get(forbidden).is_none(),
+                "{forbidden} must come from the token"
+            );
+        }
+    }
+
+    /// UNKNOWN stays UNKNOWN on the wire: every absent field is an explicit
+    /// `null` (never omitted, never a defaulted zero), and a `not_scanning`
+    /// device carries no counts and no floor flag.
+    #[test]
+    fn scan_root_report_sends_unknowns_as_null_not_zero() {
+        let r = ScanRootReport::from_divergence(
+            &super::super::trigger::ScanDivergence::not_scanning(),
+            observed(),
+        );
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["state"], "not_scanning");
+        for key in [
+            "plans_dir",
+            "repo_root",
+            "source_repo",
+            "default_ref",
+            "ref_sha",
+            "head_sha",
+            "behind",
+            "ahead",
+            "ref_age_secs",
+            "detail",
+        ] {
+            assert_eq!(v.get(key), Some(&serde_json::Value::Null), "{key}");
+        }
+        assert_eq!(v["counts_are_floors"], false);
+    }
+
+    /// A `0/0` against a ref of unknown age — or a stale one — travels with
+    /// `counts_are_floors: true`, so the read side can never render it as a
+    /// device in step.
+    #[test]
+    fn scan_root_report_carries_the_floor_rule() {
+        let unknown_age = ScanRootReport::from_divergence(&measured(None, 0, 0), observed());
+        assert!(unknown_age.counts_are_floors);
+        assert_eq!(unknown_age.ref_age_secs, None);
+        let stale = ScanRootReport::from_divergence(&measured(Some(7 * 3600), 0, 0), observed());
+        assert!(stale.counts_are_floors);
+        assert_eq!((stale.behind, stale.ahead), (Some(0), Some(0)));
+        let fresh = ScanRootReport::from_divergence(&measured(Some(60), 0, 0), observed());
+        assert!(!fresh.counts_are_floors);
+    }
+
+    /// `source_repo` is the same key the plan-library rows this dir produces
+    /// carry — resolved through the `.git` walk when there is one.
+    #[test]
+    fn scan_root_report_source_repo_matches_the_artifact_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("qontinui-dev-notes");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("plans")).unwrap();
+        let plans = repo.join("plans");
+        let d = super::super::trigger::ScanDivergence {
+            plans_dir: Some(plans.display().to_string()),
+            ..measured(Some(60), 0, 0)
+        };
+        let r = ScanRootReport::from_divergence(&d, observed());
+        assert_eq!(r.source_repo.as_deref(), Some("qontinui-dev-notes/plans"));
+        assert_eq!(r.source_repo, derive_source_repo(&plans));
+    }
+
+    /// The web door's validation, restated as a predicate over the JSON the
+    /// runner actually sends. Written from the server's rules, not from this
+    /// module's code, so a projection that drifts from them fails here rather
+    /// than as a refused report in production.
+    fn assert_web_accepts(v: &serde_json::Value) {
+        const CONTRACT: [&str; 13] = [
+            "state",
+            "plans_dir",
+            "repo_root",
+            "source_repo",
+            "default_ref",
+            "ref_sha",
+            "head_sha",
+            "behind",
+            "ahead",
+            "ref_age_secs",
+            "counts_are_floors",
+            "detail",
+            "observed_at",
+        ];
+        let obj = v.as_object().expect("the body is a JSON object");
+        // (5) exactly the contract's fields — an unknown key is refused.
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut want = CONTRACT.to_vec();
+        want.sort_unstable();
+        assert_eq!(keys, want, "exactly the contract fields: {v}");
+        let state = v["state"].as_str().expect("state is a string");
+        assert!(
+            ["measured", "not_scanning", "not_a_git_work_tree", "unknown"].contains(&state),
+            "{state}"
+        );
+        if state == "measured" {
+            // (1) both counts, non-null.
+            assert!(v["behind"].is_u64(), "measured needs behind: {v}");
+            assert!(v["ahead"].is_u64(), "measured needs ahead: {v}");
+        } else {
+            // (2) neither count.
+            assert!(v["behind"].is_null(), "{state} must not carry behind: {v}");
+            assert!(v["ahead"].is_null(), "{state} must not carry ahead: {v}");
+        }
+        // (3) unknown / not_a_git_work_tree explain themselves.
+        if state == "unknown" || state == "not_a_git_work_tree" {
+            let detail = v["detail"].as_str().unwrap_or("");
+            assert!(!detail.trim().is_empty(), "{state} needs a detail: {v}");
+        }
+        // (4) an RFC 3339 timestamp WITH a timezone.
+        let observed = v["observed_at"].as_str().expect("observed_at is a string");
+        chrono::DateTime::parse_from_rfc3339(observed)
+            .unwrap_or_else(|e| panic!("observed_at {observed:?} is not RFC 3339: {e}"));
+        assert!(observed.ends_with('Z'), "UTC with a Z suffix: {observed}");
+        assert!(v["counts_are_floors"].is_boolean());
+    }
+
+    /// Every state the runner can report satisfies the web door's rules —
+    /// the readings `measure_scan_divergence` actually produces, AND
+    /// hand-broken ones that violate the source type's own invariants (a
+    /// non-measured reading carrying counts, an unexplained UNKNOWN, a
+    /// `measured` missing a count), which the projection must repair rather
+    /// than forward to be refused.
+    #[test]
+    fn every_scan_root_report_state_satisfies_the_web_contract() {
+        use super::super::trigger::{ScanDivergence, ScanDivergenceState as State};
+        let unknown_blank = ScanDivergence::unknown(Some("/p".to_string()), "   ");
+        let cases: Vec<(ScanDivergence, &str)> = vec![
+            (measured(Some(300), 2153, 11), "measured"),
+            (measured(Some(7 * 3600), 0, 0), "measured"),
+            (measured(None, 0, 0), "measured"),
+            (ScanDivergence::not_scanning(), "not_scanning"),
+            (
+                ScanDivergence::unknown(Some("/p".to_string()), "origin/HEAD is not set"),
+                "unknown",
+            ),
+            (
+                ScanDivergence {
+                    state: State::NotAGitWorkTree,
+                    plans_dir: Some("/plain/plans".to_string()),
+                    detail: Some("not inside a git work tree".to_string()),
+                    ..ScanDivergence::not_scanning()
+                },
+                "not_a_git_work_tree",
+            ),
+            // Broken inputs the projection must repair.
+            (unknown_blank, "unknown"),
+            (
+                ScanDivergence {
+                    state: State::NotAGitWorkTree,
+                    detail: None,
+                    ..ScanDivergence::not_scanning()
+                },
+                "not_a_git_work_tree",
+            ),
+            (
+                ScanDivergence {
+                    state: State::Unknown,
+                    detail: Some("count failed".to_string()),
+                    ..measured(Some(60), 5, 5)
+                },
+                "unknown",
+            ),
+            (
+                ScanDivergence {
+                    state: State::NotScanning,
+                    ..measured(Some(60), 5, 5)
+                },
+                "not_scanning",
+            ),
+            (
+                ScanDivergence {
+                    ahead: None,
+                    ..measured(Some(60), 5, 5)
+                },
+                "unknown",
+            ),
+        ];
+        for (reading, want_state) in cases {
+            let r = ScanRootReport::from_divergence(&reading, observed());
+            let v = serde_json::to_value(&r).unwrap();
+            assert_web_accepts(&v);
+            assert_eq!(v["state"], want_state, "{reading:?}");
+            if want_state != "measured" {
+                assert_eq!(v["ref_age_secs"], serde_json::Value::Null, "{reading:?}");
+                assert_eq!(v["counts_are_floors"], false, "{reading:?}");
+            }
+        }
+        // A real reading's own detail survives untouched.
+        let r = ScanRootReport::from_divergence(
+            &ScanDivergence::unknown(Some("/p".to_string()), "origin/HEAD is not set"),
+            observed(),
+        );
+        assert_eq!(r.detail.as_deref(), Some("origin/HEAD is not set"));
+    }
+
+    #[test]
+    fn scan_root_report_door_is_under_the_plan_library() {
+        let sink = HttpArtifactSink::new("https://api.example.test/");
+        assert_eq!(
+            sink.scan_roots_url(),
+            "https://api.example.test/api/v1/plan-library/scan-roots"
+        );
+    }
 
     // ---- the kind vocabulary -------------------------------------------
 

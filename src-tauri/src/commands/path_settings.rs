@@ -77,8 +77,18 @@ pub struct ScanDivergenceView {
     pub behind: Option<u64>,
     /// Commits the scanned tree has that `default_ref` does not.
     pub ahead: Option<u64>,
+    /// Seconds since `default_ref` was last known to be refreshed in that
+    /// clone. `None` is UNKNOWN (no readable source, or not `measured`) —
+    /// never "just now".
+    pub ref_age_secs: Option<u64>,
+    /// `true` when `behind`/`ahead` are LOWER BOUNDS rather than current
+    /// numbers: the ref is older than the adapter's freshness window or of
+    /// unknown age. A UI must render a floor as "at least N behind", and a
+    /// floor of `0/0` as "unknown", never as "in step". Always `false` off the
+    /// `measured` state, which has no counts to qualify.
+    pub counts_are_floors: bool,
     /// Why the state is `unknown` or `not_a_git_work_tree`. Never empty on
-    /// those two.
+    /// those two. On `measured`, names why `ref_age_secs` is absent when it is.
     pub detail: Option<String>,
 }
 
@@ -93,6 +103,8 @@ impl From<&ScanDivergence> for ScanDivergenceView {
             head_sha: d.head_sha.clone(),
             behind: d.behind,
             ahead: d.ahead,
+            ref_age_secs: d.ref_age_secs,
+            counts_are_floors: d.counts_are_floors(),
             detail: d.detail.clone(),
         }
     }
@@ -246,7 +258,8 @@ mod tests {
         }
     }
 
-    /// A `Measured` reading with the operator box's own numbers.
+    /// A `Measured` reading with the operator box's own numbers, against a
+    /// ref refreshed five minutes ago (the census's cadence) — so fresh.
     fn parked_reading() -> ScanDivergence {
         ScanDivergence {
             state: ScanDivergenceState::Measured,
@@ -257,6 +270,7 @@ mod tests {
             head_sha: Some("b".repeat(40)),
             behind: Some(2153),
             ahead: Some(11),
+            ref_age_secs: Some(300),
             detail: None,
         }
     }
@@ -377,7 +391,48 @@ mod tests {
         assert_eq!(d.head_sha.as_deref(), Some("b".repeat(40).as_str()));
         assert_eq!(d.behind, Some(2153));
         assert_eq!(d.ahead, Some(11));
+        assert_eq!(d.ref_age_secs, Some(300));
+        assert!(!d.counts_are_floors, "a five-minute-old ref is current");
         assert_eq!(d.detail, None);
+    }
+
+    /// The floor rule crosses the boundary. A `0/0` taken against a ref seven
+    /// hours old — or of unknown age — must reach the UI flagged as a lower
+    /// bound, and must not serialize the same as a `0/0` against a fresh ref:
+    /// otherwise the one reading that LOOKS like agreement is exactly the one
+    /// a UI would show as "in step".
+    #[test]
+    fn a_zero_against_a_stale_or_unknown_age_ref_crosses_as_a_floor() {
+        let fresh_zero = ScanDivergence {
+            behind: Some(0),
+            ahead: Some(0),
+            ..parked_reading()
+        };
+        let fresh = ScanDivergenceView::from(&fresh_zero);
+        assert!(!fresh.counts_are_floors);
+
+        let stale = ScanDivergenceView::from(&ScanDivergence {
+            ref_age_secs: Some(7 * 3600),
+            ..fresh_zero.clone()
+        });
+        assert!(stale.counts_are_floors, "a 7h-old ref makes 0/0 a floor");
+        assert_eq!((stale.behind, stale.ahead), (Some(0), Some(0)));
+        assert_eq!(stale.ref_age_secs, Some(7 * 3600));
+
+        let unknown_age = ScanDivergenceView::from(&ScanDivergence {
+            ref_age_secs: None,
+            ..fresh_zero
+        });
+        assert!(
+            unknown_age.counts_are_floors,
+            "an unknown age is never taken as fresh"
+        );
+        assert_eq!(unknown_age.ref_age_secs, None);
+
+        let wire = |v: &ScanDivergenceView| serde_json::to_value(v).unwrap();
+        assert_ne!(wire(&fresh), wire(&stale));
+        assert_eq!(wire(&stale)["counts_are_floors"], serde_json::json!(true));
+        assert_eq!(wire(&unknown_age)["ref_age_secs"], serde_json::Value::Null);
     }
 
     /// A tier-OFF machine is a READING, not a silence: `not_scanning` with no
@@ -398,6 +453,11 @@ mod tests {
         assert_eq!(d.state, "not_scanning");
         assert_eq!((d.behind, d.ahead), (None, None));
         assert_eq!(d.repo_root, None);
+        assert_eq!(d.ref_age_secs, None);
+        assert!(
+            !d.counts_are_floors,
+            "there are no counts to be floors of — the state already says so"
+        );
 
         // And it is distinguishable on the wire from a measured zero.
         let measured_zero = ScanDivergenceView::from(&ScanDivergence {

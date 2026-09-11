@@ -303,6 +303,7 @@ pub struct ScanDivergence {
     /// What `default_ref` points at in this clone, **as of its last fetch**.
     /// Phase 1 never fetches, so a long-unfetched clone reports a stale ref
     /// and a small divergence honestly rather than a fresh one it did not earn.
+    /// How long ago that fetch was is [`Self::ref_age_secs`].
     pub ref_sha: Option<String>,
     /// What the scanned work tree's `HEAD` points at.
     pub head_sha: Option<String>,
@@ -313,11 +314,35 @@ pub struct ScanDivergence {
     /// content the scan is publishing that no ref carries. This is the number
     /// that read 11.
     pub ahead: Option<u64>,
+    /// Seconds since `default_ref` was last known to be refreshed in this
+    /// clone — the fresher of a `FETCH_HEAD` that names the default branch at
+    /// the sha the ref now holds, and the ref's newest reflog entry (see
+    /// [`GitRefReader::ref_refreshed_at`]).
+    ///
+    /// This is what turns `behind` from a number into a claim. `behind` counts
+    /// against the ref AS THIS CLONE LAST SAW IT, so a clone unfetched for a
+    /// week reads a confidently low `behind` — the counts are then LOWER
+    /// BOUNDS, and [`Self::counts_are_floors`] says so. `None` is UNKNOWN (no
+    /// readable source, or the probe failed) and is treated as a floor too,
+    /// never as fresh. Read on the `Measured` arm only; `None` elsewhere.
+    pub ref_age_secs: Option<u64>,
     /// One line naming why the state is `Unknown` or `NotAGitWorkTree`. Never
     /// empty on those two states: an unexplained UNKNOWN is the same dead end
-    /// as the silence this type replaces.
+    /// as the silence this type replaces. On `Measured` it is `None` unless
+    /// `ref_age_secs` is absent, in which case it names why the age is unknown.
     pub detail: Option<String>,
 }
+
+/// How recently `default_ref` must have been refreshed for a `Measured`
+/// reading's counts to be taken as current rather than as lower bounds.
+///
+/// Six hours: on a runner box the worktree census refreshes each canonical
+/// repo's trunk every 300 s (`agent_worktree::census::fetch_trunk`), so a
+/// healthy ref is minutes old and six hours of silence means the refresh
+/// itself is not happening. It is deliberately not tighter — a laptop that
+/// slept over lunch is not a fault — and not looser, because at the measured
+/// ~64 commits/day a six-hour-old ref can already hide a dozen plans.
+pub const SCAN_REF_FRESH_WITHIN: Duration = Duration::from_secs(6 * 60 * 60);
 
 impl ScanDivergence {
     /// All-`None` reading in `state`. Private: every public constructor below
@@ -332,6 +357,7 @@ impl ScanDivergence {
             head_sha: None,
             behind: None,
             ahead: None,
+            ref_age_secs: None,
             detail: None,
         }
     }
@@ -364,6 +390,61 @@ impl ScanDivergence {
     pub fn is_stale(&self) -> bool {
         self.state == ScanDivergenceState::Measured
             && (self.behind.unwrap_or(0) > 0 || self.ahead.unwrap_or(0) > 0)
+    }
+
+    /// Whether the ref the counts were taken against is known to be current
+    /// — refreshed within [`SCAN_REF_FRESH_WITHIN`].
+    ///
+    /// `None` when there is nothing to judge: the reading is not `Measured`
+    /// (no counts exist), or the ref's age is unknown. Deliberately three-way —
+    /// an unknown age is not a stale one, but neither is it a fresh one, and
+    /// [`Self::counts_are_floors`] is where the two unknowns meet.
+    pub fn ref_is_fresh(&self) -> Option<bool> {
+        if self.state != ScanDivergenceState::Measured {
+            return None;
+        }
+        self.ref_age_secs
+            .map(|age| age <= SCAN_REF_FRESH_WITHIN.as_secs())
+    }
+
+    /// `true` when the `Measured` counts are LOWER BOUNDS rather than current
+    /// numbers: the ref is older than [`SCAN_REF_FRESH_WITHIN`] or of unknown
+    /// age.
+    ///
+    /// The floor rule. `behind` compares HEAD against the ref as this clone
+    /// last saw it, so every commit the remote gained since that refresh is
+    /// missing from the count — the true divergence is at least the reported
+    /// one. That makes a floor of `0/0` the dangerous reading: it LOOKS like
+    /// agreement and proves nothing, so every read surface (the log line, the
+    /// IPC view, the published scan-root row) carries this flag beside the
+    /// counts. Only an age PROVEN fresh lifts it; an unknown age never does.
+    ///
+    /// Strictly it is `behind` that is the floor: the remote gaining commits
+    /// can only raise it. `ahead` moves the other way — commits of HEAD's that
+    /// have since landed on the remote stop counting once the ref catches up —
+    /// so a stale `ahead` may OVERSTATE. Either way the pair is not current,
+    /// which is the one thing the flag asserts.
+    ///
+    /// `false` on every non-`Measured` state, which has no counts to qualify.
+    pub fn counts_are_floors(&self) -> bool {
+        self.state == ScanDivergenceState::Measured && self.ref_is_fresh() != Some(true)
+    }
+
+    /// Whether `other` says the same thing as `self` — every field equal
+    /// except the raw `ref_age_secs`, which is compared only through its
+    /// freshness verdict ([`Self::ref_is_fresh`]).
+    ///
+    /// The age grows by one tick every tick, so plain equality would make
+    /// every reading "new": the edge-triggered log would fire every minute
+    /// and the scan-root report would post every cycle. What a reader acts on
+    /// is whether the counts are current or floors, so a crossing of the
+    /// freshness window IS a change and a clock advancing inside it is not.
+    pub fn is_same_reading(&self, other: &ScanDivergence) -> bool {
+        let strip = |d: &ScanDivergence| ScanDivergence {
+            ref_age_secs: None,
+            ..d.clone()
+        };
+        strip(self) == strip(other) && self.ref_is_fresh() == other.ref_is_fresh()
     }
 }
 
@@ -402,13 +483,50 @@ pub trait GitRefReader: Send + Sync {
         reference: &str,
         head: &str,
     ) -> Result<(u64, u64), String>;
+    /// When `default_ref` (e.g. `origin/main`, currently at `ref_sha`) was
+    /// last known to be refreshed in this clone, as unix seconds.
+    ///
+    /// The FRESHER of two sources, because each misses a case the other
+    /// catches: a fetch that finds the branch unchanged writes no reflog entry
+    /// but does rewrite `FETCH_HEAD`, while a push updates the tracking ref
+    /// (and its reflog) without any fetch at all.
+    ///
+    /// - `FETCH_HEAD`'s mtime — counted ONLY when it carries a line naming the
+    ///   default branch (`branch '<name>' of …`) at exactly `ref_sha`. A fetch
+    ///   of some other branch refreshes nothing this reading compares against,
+    ///   and a `FETCH_HEAD` whose sha disagrees with the tracking ref (a
+    ///   rejected non-fast-forward, a fetch by URL that updates no tracking
+    ///   ref) proves nothing about it either.
+    /// - The ENTRY time of the newest reflog record for
+    ///   `refs/remotes/<default_ref>` — when the ref last moved. Not the tip
+    ///   commit's committer time, which says when someone authored a commit,
+    ///   not when this clone learned of it.
+    ///
+    /// `Ok(None)` means neither source exists — an ANSWER (nothing records a
+    /// refresh), which the caller reports as an unknown age. `Err` means a
+    /// probe failed and nothing was established. Partial failure resolves
+    /// toward the OLDER claim: one source's timestamp with the other's probe
+    /// failed is still returned, because a missed fresher source can only make
+    /// the ref look older than it is — an overstated age, never a false
+    /// "fresh".
+    fn ref_refreshed_at(
+        &self,
+        repo_root: &Path,
+        default_ref: &str,
+        ref_sha: &str,
+    ) -> Result<Option<i64>, String>;
 }
 
 /// Measure the scan source against the ref it should be reading.
 ///
-/// Pure over `git`: every branch is reachable from a fake reader, which is
-/// what makes the four states testable without a repo on disk.
-pub fn measure_scan_divergence(plans_dir: Option<&Path>, git: &dyn GitRefReader) -> ScanDivergence {
+/// Pure over `git` and the clock: every branch is reachable from a fake
+/// reader, which is what makes the four states testable without a repo on
+/// disk, and `now_unix` is a parameter so the ref's age is too.
+pub fn measure_scan_divergence(
+    plans_dir: Option<&Path>,
+    git: &dyn GitRefReader,
+    now_unix: i64,
+) -> ScanDivergence {
     let Some(dir) = plans_dir else {
         return ScanDivergence::not_scanning();
     };
@@ -484,18 +602,46 @@ pub fn measure_scan_divergence(plans_dir: Option<&Path>, git: &dyn GitRefReader)
         }
     };
     let base = ScanDivergence {
-        ref_sha: Some(ref_sha),
+        ref_sha: Some(ref_sha.clone()),
         head_sha: Some(head_sha),
         ..base
     };
 
     match git.count_behind_ahead(&root, &default_ref, "HEAD") {
-        Ok((behind, ahead)) => ScanDivergence {
-            state: ScanDivergenceState::Measured,
-            behind: Some(behind),
-            ahead: Some(ahead),
-            ..base
-        },
+        Ok((behind, ahead)) => {
+            // The counts are real either way; the age decides only whether
+            // they are current or floors. So an age that cannot be read keeps
+            // `Measured` — dropping to `Unknown` would throw away two true
+            // numbers — and says why in `detail`, while `ref_age_secs: None`
+            // makes `counts_are_floors()` true.
+            let (ref_age_secs, detail) = match git.ref_refreshed_at(&root, &default_ref, &ref_sha) {
+                Ok(Some(refreshed_at)) => (Some(ref_age_from(now_unix, refreshed_at)), None),
+                Ok(None) => (
+                    None,
+                    Some(format!(
+                        "neither a `FETCH_HEAD` naming `{default_ref}` at its current sha \
+                             nor a reflog entry for `refs/remotes/{default_ref}` exists in \
+                             `{root_str}`, so when the ref was last refreshed is unknown — the \
+                             counts are lower bounds"
+                    )),
+                ),
+                Err(e) => (
+                    None,
+                    Some(format!(
+                        "cannot read when `{default_ref}` was last refreshed in \
+                             `{root_str}`, so the counts are lower bounds: {e}"
+                    )),
+                ),
+            };
+            ScanDivergence {
+                state: ScanDivergenceState::Measured,
+                behind: Some(behind),
+                ahead: Some(ahead),
+                ref_age_secs,
+                detail,
+                ..base
+            }
+        }
         Err(e) => ScanDivergence {
             detail: Some(format!(
                 "cannot count `{default_ref}`...`HEAD` in `{root_str}`: {e}"
@@ -542,9 +688,98 @@ fn parse_left_right_count(raw: &str) -> Result<(u64, u64), String> {
     Ok((behind, ahead))
 }
 
+/// `now - refreshed_at` in whole seconds, saturating at zero.
+///
+/// A refresh stamped in the future (clock skew, a restored backup's mtime)
+/// reads as age 0 rather than wrapping to an astronomically old ref — which
+/// would be the wrong direction for a skew of seconds.
+fn ref_age_from(now_unix: i64, refreshed_at: i64) -> u64 {
+    u64::try_from(now_unix.saturating_sub(refreshed_at)).unwrap_or(0)
+}
+
+/// The branch name a remote-tracking ref stands for: `origin/main` → `main`,
+/// `origin/release/x` → `release/x`. This is the spelling `FETCH_HEAD` uses in
+/// its `branch '<name>' of <url>` descriptions.
+fn default_branch_name(default_ref: &str) -> &str {
+    default_ref
+        .strip_prefix("origin/")
+        .or_else(|| default_ref.split_once('/').map(|(_, branch)| branch))
+        .unwrap_or(default_ref)
+}
+
+/// Whether `FETCH_HEAD` `contents` record a fetch of `branch` at `ref_sha`.
+///
+/// Each line is `<sha>\t<"" | "not-for-merge">\t<description>`, and a branch
+/// fetch's description is `branch '<name>' of <url>`. Both halves must match:
+/// the NAME, because a fetch of some other branch refreshes nothing this
+/// reading compares against; and the SHA, because a `FETCH_HEAD` line whose
+/// sha is not what the tracking ref now holds did not land in it — a
+/// non-fast-forward the refspec refused, or a fetch by URL that updates no
+/// tracking ref — so its mtime says nothing about the ref's freshness.
+fn fetch_head_names_ref(contents: &str, branch: &str, ref_sha: &str) -> bool {
+    let wanted = format!("branch '{branch}' of ");
+    contents.lines().any(|line| {
+        let mut fields = line.split('\t');
+        let (Some(sha), Some(_merge_marker), Some(description)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        sha.trim() == ref_sha && description.starts_with(&wanted)
+    })
+}
+
+/// Parse `git reflog show -n1 --date=unix --format=%gd <ref>` output — e.g.
+/// `origin/main@{1789129011}` — into the entry's unix time.
+///
+/// Empty output is `Ok(None)`: the ref exists (it was just resolved) but has no
+/// reflog (`core.logAllRefUpdates` off, or expired) — an absent source, not a
+/// failure. Anything else that is not a plausible unix time is an error rather
+/// than a guess: in particular `@{0}`, which is what `%gd` prints if the date
+/// format is not applied, must not parse as "refreshed in 1970".
+fn parse_reflog_entry_time(raw: &str) -> Result<Option<i64>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let inner = raw
+        .rsplit_once("@{")
+        .and_then(|(_, rest)| rest.strip_suffix('}'))
+        .ok_or_else(|| format!("expected `<ref>@{{<unix time>}}` from the reflog, got {raw:?}"))?;
+    let secs = inner
+        .parse::<i64>()
+        .map_err(|e| format!("reflog selector {inner:?} is not a unix time: {e}"))?;
+    // 2001-09-09: anything earlier is a selector index, not a timestamp.
+    if secs < 1_000_000_000 {
+        return Err(format!(
+            "reflog selector {raw:?} is not a unix time (was `--date=unix` ignored?)"
+        ));
+    }
+    Ok(Some(secs))
+}
+
+/// Combine the two refresh sources into one answer — the FRESHER wins.
+///
+/// Partial failure resolves toward the older claim: a known timestamp beside
+/// a failed probe is returned as-is, because the probe that failed could only
+/// have made the ref look FRESHER — so the result is at worst an overstated
+/// age, which reads as a floor, never a false "fresh". A failed probe beside
+/// an absent source is an error: nothing at all was established.
+fn fresher_refresh(
+    a: Result<Option<i64>, String>,
+    b: Result<Option<i64>, String>,
+) -> Result<Option<i64>, String> {
+    match (a, b) {
+        (Ok(x), Ok(y)) => Ok(x.max(y)),
+        (Ok(Some(x)), Err(_)) | (Err(_), Ok(Some(x))) => Ok(Some(x)),
+        (Ok(None), Err(e)) | (Err(e), Ok(None)) => Err(e),
+        (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+    }
+}
+
 /// Budget for every `git` invocation the detector makes.
 ///
-/// All four are LOCAL plumbing reads, so a healthy call is milliseconds; the
+/// All of them are LOCAL plumbing reads, so a healthy call is milliseconds; the
 /// bound exists for a concurrent `index.lock` or a repo on a stalled mount.
 /// They run on the blocking pool (see the reconcile loop's tick), but an unbounded
 /// hang there still leaks a pool thread per cycle, so every one is capped —
@@ -590,6 +825,78 @@ impl ProcessGit {
 
     fn describe(args: &[&str], reason: &crate::process_helpers::DegradeReason) -> String {
         format!("`git {}` did not answer ({reason:?})", args.join(" "))
+    }
+
+    /// The `FETCH_HEAD` source of [`GitRefReader::ref_refreshed_at`]: its
+    /// mtime, when it records a fetch of the default branch at `ref_sha`.
+    ///
+    /// The path comes from `rev-parse --git-path`, never a hardcoded
+    /// `.git/FETCH_HEAD`: in a linked worktree `.git` is a FILE and the real
+    /// git dir is elsewhere. Git prints it relative to the `-C` dir (or
+    /// absolute), so it is joined onto `repo_root` — an absolute path replaces
+    /// the base on join, which covers both.
+    fn fetch_head_refreshed_at(
+        repo_root: &Path,
+        default_ref: &str,
+        ref_sha: &str,
+    ) -> Result<Option<i64>, String> {
+        let located = Self::run(
+            repo_root,
+            &["rev-parse", "--git-path", "FETCH_HEAD"],
+            "plan adapter: scan-divergence FETCH_HEAD path probe",
+        )?;
+        if located.is_empty() {
+            return Err("`git rev-parse --git-path FETCH_HEAD` returned nothing".to_string());
+        }
+        let path = repo_root.join(located);
+        // Stat BEFORE reading. A fetch landing between the two then pairs an
+        // OLDER mtime with newer contents — an overstated age — where the
+        // opposite order could pair a fresh mtime from a fetch of some other
+        // branch with contents that still named this one: a false "fresh".
+        let modified = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot stat `{}`: {e}", path.display())),
+        };
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("cannot read `{}`: {e}", path.display())),
+        };
+        if !fetch_head_names_ref(&contents, default_branch_name(default_ref), ref_sha) {
+            return Ok(None);
+        }
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("`{}` has an mtime before the epoch: {e}", path.display()))?
+            .as_secs();
+        Ok(Some(i64::try_from(secs).unwrap_or(i64::MAX)))
+    }
+
+    /// The reflog source of [`GitRefReader::ref_refreshed_at`]: the ENTRY time
+    /// of the newest reflog record for `refs/remotes/<default_ref>`.
+    ///
+    /// `%gd` with `--date=unix` renders the selector as `<ref>@{<entry time>}`
+    /// — the time the ref was written. `%ct` would be the tip COMMIT's
+    /// committer time, which says when a commit was authored upstream, not
+    /// when this clone received it: a week-old commit fetched a minute ago
+    /// would read a week stale, and a fresh commit on a clone unfetched since
+    /// would read as refreshed at authoring time.
+    fn reflog_refreshed_at(repo_root: &Path, default_ref: &str) -> Result<Option<i64>, String> {
+        let tracking = format!("refs/remotes/{default_ref}");
+        let out = Self::run(
+            repo_root,
+            &[
+                "reflog",
+                "show",
+                "-n1",
+                "--date=unix",
+                "--format=%gd",
+                &tracking,
+            ],
+            "plan adapter: scan-divergence reflog probe",
+        )?;
+        parse_reflog_entry_time(&out)
     }
 }
 
@@ -664,22 +971,107 @@ impl GitRefReader for ProcessGit {
         )?;
         parse_left_right_count(&out)
     }
+
+    fn ref_refreshed_at(
+        &self,
+        repo_root: &Path,
+        default_ref: &str,
+        ref_sha: &str,
+    ) -> Result<Option<i64>, String> {
+        fresher_refresh(
+            Self::fetch_head_refreshed_at(repo_root, default_ref, ref_sha),
+            Self::reflog_refreshed_at(repo_root, default_ref),
+        )
+    }
+}
+
+/// What [`record_scan_divergence`] says about a changed reading: `(at_warn,
+/// message)`. A pure function so the wording — which is the whole point of
+/// the floor rule — is pinned by test rather than asserted in a comment.
+///
+/// Three shapes:
+/// - **floors** ([`ScanDivergence::counts_are_floors`]) — WARN, and the text
+///   says the counts are LOWER BOUNDS and names the ref's age (or that it is
+///   unknown). This covers a floor of `0/0`: it must never reach the log as
+///   the benign "reading changed" line, because a reader skimming for WARNs
+///   would take it for agreement with a ref it was never compared against.
+/// - **stale against a fresh ref** — WARN, the parked-tree text, with the age.
+/// - everything else — INFO, a plain transition note.
+fn scan_divergence_message(d: &ScanDivergence) -> (bool, String) {
+    let default_ref = d.default_ref.as_deref().unwrap_or("the default branch");
+    let window_hours = SCAN_REF_FRESH_WITHIN.as_secs() / 3600;
+    if d.counts_are_floors() {
+        let as_of = match d.ref_age_secs {
+            Some(age) => format!(
+                "as of a refresh {age}s (~{}h) ago, older than the {window_hours}h freshness \
+                 window",
+                age / 3600
+            ),
+            None => format!(
+                "as of a refresh of UNKNOWN age (nothing proves it happened within the \
+                 {window_hours}h freshness window)"
+            ),
+        };
+        let message = if d.is_stale() {
+            format!(
+                "plan adapter: the scanned plans dir is a WORKING TREE that has diverged from \
+                 its own default branch, and the counts are LOWER BOUNDS: they were taken \
+                 against `{default_ref}` {as_of}, so the true `behind` can only be larger (and \
+                 `ahead` may overstate). Every work unit and plan body pushed from this machine \
+                 reflects that parked tree, not the ref (the adapter never fetches)"
+            )
+        } else {
+            format!(
+                "plan adapter: the scanned plans dir's HEAD reads 0 behind / 0 ahead of \
+                 `{default_ref}`, but that is a LOWER BOUND, not agreement: the ref was compared \
+                 {as_of}, so how far the scan source has fallen behind is UNKNOWN until the ref \
+                 is refreshed (the adapter never fetches)"
+            )
+        };
+        return (true, message);
+    }
+    if d.is_stale() {
+        let as_of = d
+            .ref_age_secs
+            .map(|age| format!("a refresh {age}s ago"))
+            .unwrap_or_else(|| "this clone's last fetch".to_string());
+        return (
+            true,
+            format!(
+                "plan adapter: the scanned plans dir is a WORKING TREE that is behind its own \
+                 default branch — every work unit and plan body pushed from this machine \
+                 reflects that parked tree, not the ref. Counts are as of {as_of} (the adapter \
+                 never fetches)"
+            ),
+        );
+    }
+    (
+        false,
+        "plan adapter: scan-source divergence reading changed".to_string(),
+    )
 }
 
 /// Publish this cycle's reading, and log it **only when it changed**.
 ///
 /// Every cycle records; only a transition logs. A per-cycle line for a
 /// steady-state reading is pure volume at a 60s tick, and volume is how the
-/// one line that matters gets missed. A stale scan source
-/// ([`ScanDivergence::is_stale`]) logs at WARN — it is a live correctness
-/// problem, not a status note.
+/// one line that matters gets missed. "Changed" is
+/// [`ScanDivergence::is_same_reading`], not plain equality: the ref's age
+/// grows every tick, and only its crossing of the freshness window is news. A
+/// stale scan source ([`ScanDivergence::is_stale`]) or a floor reading
+/// ([`ScanDivergence::counts_are_floors`]) logs at WARN — see
+/// [`scan_divergence_message`].
 fn record_scan_divergence(divergence: ScanDivergence, metrics: &AdapterMetrics) {
     let mut slot = metrics
         .scan_divergence
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    if slot.as_ref() != Some(&divergence) {
-        if divergence.is_stale() {
+    let changed = !slot
+        .as_ref()
+        .is_some_and(|previous| previous.is_same_reading(&divergence));
+    if changed {
+        let (at_warn, message) = scan_divergence_message(&divergence);
+        if at_warn {
             tracing::warn!(
                 state = divergence.state.as_str(),
                 plans_dir = ?divergence.plans_dir,
@@ -687,10 +1079,10 @@ fn record_scan_divergence(divergence: ScanDivergence, metrics: &AdapterMetrics) 
                 default_ref = ?divergence.default_ref,
                 behind = ?divergence.behind,
                 ahead = ?divergence.ahead,
-                "plan adapter: the scanned plans dir is a WORKING TREE that is behind its own \
-                 default branch — every work unit and plan body pushed from this machine \
-                 reflects that parked tree, not the ref. Counts are as of this clone's last \
-                 fetch (the adapter never fetches)"
+                ref_age_secs = ?divergence.ref_age_secs,
+                counts_are_floors = divergence.counts_are_floors(),
+                detail = ?divergence.detail,
+                "{message}"
             );
         } else {
             tracing::info!(
@@ -700,8 +1092,10 @@ fn record_scan_divergence(divergence: ScanDivergence, metrics: &AdapterMetrics) 
                 default_ref = ?divergence.default_ref,
                 behind = ?divergence.behind,
                 ahead = ?divergence.ahead,
+                ref_age_secs = ?divergence.ref_age_secs,
+                counts_are_floors = divergence.counts_are_floors(),
                 detail = ?divergence.detail,
-                "plan adapter: scan-source divergence reading changed"
+                "{message}"
             );
         }
     }
@@ -1586,7 +1980,14 @@ impl LoopState {
             Some(dir) => {
                 let git = std::sync::Arc::clone(&self.git);
                 match tokio::task::spawn_blocking(move || {
-                    measure_scan_divergence(Some(Path::new(&dir)), git.as_ref())
+                    // The clock is read HERE, beside the probes, so the ref's
+                    // age is as of the measurement rather than of the tick's
+                    // start; the function itself stays pure over it.
+                    measure_scan_divergence(
+                        Some(Path::new(&dir)),
+                        git.as_ref(),
+                        chrono::Utc::now().timestamp(),
+                    )
                 })
                 .await
                 {
@@ -1692,7 +2093,7 @@ impl LoopState {
         }
         // Plan & prompt library body sync — opt-in, see `BodySync`.
         if let Some(bs) = self.body_sync.as_mut() {
-            bs.run_cycle(&self.conv).await;
+            bs.run_cycle(&self.conv, metrics).await;
         }
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
@@ -1922,6 +2323,58 @@ impl FailureBreaker {
     }
 }
 
+/// How often an UNCHANGED scan-root reading is re-posted to the web read side.
+///
+/// A heartbeat, so the row's `observed_at` ages honestly: the web side reads a
+/// row older than three of these (45 min) as `unknown` / `observation_stale`,
+/// which is how a device that stopped reporting — killed, offline, its sync
+/// switched off — stops being quoted as current. Without it an in-step device
+/// would post once and then look dead.
+pub const SCAN_REPORT_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
+
+/// After a failed scan-root post, how long before the next attempt.
+///
+/// The report rides the reconcile tick (60 s), and a backend that does not
+/// serve the route yet — the web half ships separately — would otherwise take
+/// one doomed request a minute from every runner. Five minutes keeps a
+/// recovered backend current well inside the 45-minute staleness horizon.
+const SCAN_REPORT_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5 * 60);
+
+/// Whether [`BodySync`] should post the current scan-root reading this cycle.
+///
+/// Pure over its inputs so the posting policy is a unit test:
+/// - no reading yet (`current` is `None` — the reconcile loop has not ticked)
+///   → nothing to post;
+/// - inside the retry backoff after a failed post → wait;
+/// - never posted → due;
+/// - the reading CHANGED ([`ScanDivergence::is_same_reading`], so a ref age
+///   advancing inside its freshness window is not a change) → due;
+/// - unchanged, but [`SCAN_REPORT_HEARTBEAT`] has elapsed since the last
+///   successful post → due;
+/// - otherwise → not due.
+pub fn scan_report_due(
+    last_posted: Option<(&ScanDivergence, std::time::Instant)>,
+    last_failed_at: Option<std::time::Instant>,
+    current: Option<&ScanDivergence>,
+    now: std::time::Instant,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    if last_failed_at.is_some_and(|failed| {
+        now.saturating_duration_since(failed) < SCAN_REPORT_RETRY_AFTER_FAILURE
+    }) {
+        return false;
+    }
+    match last_posted {
+        None => true,
+        Some((previous, posted_at)) => {
+            !previous.is_same_reading(current)
+                || now.saturating_duration_since(posted_at) >= SCAN_REPORT_HEARTBEAT
+        }
+    }
+}
+
 /// The library body-sync half of a reconcile cycle: re-scan the three roots and
 /// push any artifact whose body digest moved.
 ///
@@ -1952,6 +2405,14 @@ pub struct BodySync {
     /// Last gate verdict observed, so a flip is logged ONCE rather than every
     /// tick. `None` until the first cycle.
     last_gate_open: Option<bool>,
+    /// The scan-root reading last ACCEPTED by the web read side, and when —
+    /// see [`scan_report_due`]. Reset with the rest of this struct when the
+    /// path settings move, so a new plans dir is reported on its first cycle.
+    last_scan_report: Option<(ScanDivergence, std::time::Instant)>,
+    /// The last failed scan-root post's error and time: the time drives the
+    /// retry backoff, the text makes the failure WARN edge-triggered (a
+    /// repeat of the same error drops to DEBUG). Cleared by a success.
+    last_scan_report_failure: Option<(String, std::time::Instant)>,
 }
 
 impl BodySync {
@@ -1967,10 +2428,94 @@ impl BodySync {
             capture_gate,
             breaker: FailureBreaker::new(),
             last_gate_open: None,
+            last_scan_report: None,
+            last_scan_report_failure: None,
         }
     }
 
-    pub async fn run_cycle(&mut self, conv: &PlanConvention) {
+    /// Publish this device's scan-root reading to the web read side
+    /// (`POST /api/v1/plan-library/scan-roots`) when [`scan_report_due`] says
+    /// so — plan `2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift`
+    /// Revised Phase 2.
+    ///
+    /// Without this, the reading that says "this corpus is fed from a tree N
+    /// commits behind" exists only in this process and its local UI, while the
+    /// corpus it qualifies is read fleet-wide. A failure is logged and dropped:
+    /// it never counts toward the body-push breaker (a backend that does not
+    /// serve this route yet must not pause plan-body capture) and never
+    /// affects the rest of the cycle.
+    async fn report_scan_root_if_due(
+        &mut self,
+        current: Option<ScanDivergence>,
+        now: std::time::Instant,
+    ) {
+        let due = scan_report_due(
+            self.last_scan_report.as_ref().map(|(d, at)| (d, *at)),
+            self.last_scan_report_failure.as_ref().map(|(_, at)| *at),
+            current.as_ref(),
+            now,
+        );
+        let Some(current) = current.filter(|_| due) else {
+            return;
+        };
+        let report =
+            super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now());
+        match self.sink.report_scan_root(&report).await {
+            Ok(()) => {
+                if self.last_scan_report_failure.take().is_some() {
+                    tracing::info!(
+                        state = %report.state,
+                        counts_are_floors = report.counts_are_floors,
+                        "plan library: scan-root reading accepted again by the web read side"
+                    );
+                } else if self.last_scan_report.is_none() {
+                    tracing::info!(
+                        state = %report.state,
+                        source_repo = ?report.source_repo,
+                        behind = ?report.behind,
+                        ahead = ?report.ahead,
+                        ref_age_secs = ?report.ref_age_secs,
+                        counts_are_floors = report.counts_are_floors,
+                        "plan library: published this device's scan-root reading (re-posted on \
+                         change, and at least every 15 min)"
+                    );
+                } else {
+                    tracing::debug!(
+                        state = %report.state,
+                        "plan library: scan-root reading re-posted"
+                    );
+                }
+                self.last_scan_report = Some((current, now));
+            }
+            Err(error) => {
+                let repeat = self
+                    .last_scan_report_failure
+                    .as_ref()
+                    .is_some_and(|(previous, _)| *previous == error);
+                if repeat {
+                    tracing::debug!(
+                        error = %error,
+                        "plan library: scan-root report still failing (same error)"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %error,
+                        retry_after_secs = SCAN_REPORT_RETRY_AFTER_FAILURE.as_secs(),
+                        "plan library: could not publish this device's scan-root reading to the \
+                         web read side — readers of the corpus cannot see how far this device's \
+                         plans dir has drifted. Plan-body capture is unaffected and this does \
+                         not count toward its breaker; retrying after the backoff"
+                    );
+                }
+                self.last_scan_report_failure = Some((error, now));
+            }
+        }
+    }
+
+    /// One body-sync cycle. `metrics` is the reconcile loop's own — the tick
+    /// that calls this has just recorded its scan-divergence reading there,
+    /// and that reading is what the scan-root report publishes.
+    pub async fn run_cycle(&mut self, conv: &PlanConvention, metrics: &AdapterMetrics) {
         let gate_open = (self.capture_gate)();
         if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
             tracing::info!(capture_enabled = gate_open, "{message}");
@@ -1979,6 +2524,19 @@ impl BodySync {
         if !gate_open {
             return;
         }
+        // The scan-root report goes AFTER the capture gate (a tenant at
+        // `plan_capture = off` publishes nothing from its plans dir) and BEFORE
+        // both the breaker's pause and the `artifacts.is_empty()` return below.
+        // Those two are exactly the cycles whose corpus is NOT being refreshed
+        // — a paused sync, an empty scan — so they are the last ones that
+        // should go quiet about the scan source.
+        let current = metrics
+            .scan_divergence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        self.report_scan_root_if_due(current, std::time::Instant::now())
+            .await;
         if self.breaker.should_skip_cycle() {
             return;
         }
@@ -2228,11 +2786,17 @@ mod tests {
         /// rev -> resolved oid, or an error for that rev.
         revs: HashMap<String, Result<String, String>>,
         counts: Result<(u64, u64), String>,
+        /// The canned answer to `ref_refreshed_at`.
+        refreshed_at: Result<Option<i64>, String>,
     }
+
+    /// The fixed "now" every pure measurement in this module is taken at.
+    const NOW: i64 = 1_789_000_000;
 
     impl FakeGit {
         /// A healthy clone: in a work tree, `origin/main` resolvable, both
-        /// revs resolvable, and `(behind, ahead)` as given.
+        /// revs resolvable, `(behind, ahead)` as given, and the ref refreshed
+        /// a minute before [`NOW`] — fresh.
         fn healthy(behind: u64, ahead: u64) -> Self {
             Self {
                 root: Ok(Some(PathBuf::from("/repo"))),
@@ -2244,6 +2808,15 @@ mod tests {
                 .into_iter()
                 .collect(),
                 counts: Ok((behind, ahead)),
+                refreshed_at: Ok(Some(NOW - 60)),
+            }
+        }
+
+        /// [`Self::healthy`] with the ref last refreshed as given.
+        fn refreshed(behind: u64, ahead: u64, refreshed_at: Result<Option<i64>, String>) -> Self {
+            Self {
+                refreshed_at,
+                ..Self::healthy(behind, ahead)
             }
         }
     }
@@ -2269,6 +2842,14 @@ mod tests {
         ) -> Result<(u64, u64), String> {
             self.counts.clone()
         }
+        fn ref_refreshed_at(
+            &self,
+            _repo_root: &Path,
+            _default_ref: &str,
+            _ref_sha: &str,
+        ) -> Result<Option<i64>, String> {
+            self.refreshed_at.clone()
+        }
     }
 
     /// State 1 of 4. A machine with no `paths.plans_dir` scans NOTHING, and
@@ -2277,7 +2858,7 @@ mod tests {
     /// is in step" looks like.
     #[test]
     fn scan_divergence_reports_not_scanning_when_no_plans_dir_is_configured() {
-        let d = measure_scan_divergence(None, &FakeGit::healthy(0, 0));
+        let d = measure_scan_divergence(None, &FakeGit::healthy(0, 0), NOW);
         assert_eq!(d.state, ScanDivergenceState::NotScanning);
         assert_eq!(d.state.as_str(), "not_scanning");
         assert_eq!(d.plans_dir, None);
@@ -2301,7 +2882,7 @@ mod tests {
             root: Ok(None),
             ..FakeGit::healthy(0, 0)
         };
-        let d = measure_scan_divergence(Some(Path::new("/plain/plans")), &git);
+        let d = measure_scan_divergence(Some(Path::new("/plain/plans")), &git, NOW);
         assert_eq!(d.state, ScanDivergenceState::NotAGitWorkTree);
         assert_eq!(d.state.as_str(), "not_a_git_work_tree");
         assert_eq!(d.plans_dir.as_deref(), Some("/plain/plans"));
@@ -2320,8 +2901,11 @@ mod tests {
     /// that, with both shas and the resolved ref carried.
     #[test]
     fn scan_divergence_measures_a_parked_working_tree() {
-        let d =
-            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 11));
+        let d = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::healthy(2153, 11),
+            NOW,
+        );
         assert_eq!(d.state, ScanDivergenceState::Measured);
         assert_eq!(d.state.as_str(), "measured");
         assert_eq!(d.plans_dir.as_deref(), Some("/repo/plans"));
@@ -2345,7 +2929,8 @@ mod tests {
     /// more than was measured.
     #[test]
     fn scan_divergence_measured_zero_means_head_is_in_step_not_the_working_tree() {
-        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0));
+        let d =
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0), NOW);
         assert_eq!(d.state, ScanDivergenceState::Measured);
         assert_eq!((d.behind, d.ahead), (Some(0), Some(0)));
         assert!(!d.is_stale());
@@ -2362,7 +2947,7 @@ mod tests {
             root: Err("`git rev-parse --show-toplevel` did not answer (SpawnError)".to_string()),
             ..FakeGit::healthy(0, 0)
         };
-        let d = measure_scan_divergence(Some(Path::new("/maybe/plans")), &git);
+        let d = measure_scan_divergence(Some(Path::new("/maybe/plans")), &git, NOW);
         assert_eq!(
             d.state,
             ScanDivergenceState::Unknown,
@@ -2386,7 +2971,7 @@ mod tests {
             default_ref: Err("`origin/HEAD` is not set in this clone".to_string()),
             ..FakeGit::healthy(5, 5)
         };
-        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git, NOW);
         assert_eq!(d.state, ScanDivergenceState::Unknown);
         assert_eq!(d.state.as_str(), "unknown");
         assert_eq!(d.repo_root.as_deref(), Some("/repo"));
@@ -2411,7 +2996,7 @@ mod tests {
             counts: Err("bad revision".to_string()),
             ..FakeGit::healthy(1, 1)
         };
-        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git, NOW);
         assert_eq!(d.state, ScanDivergenceState::Unknown);
         assert_eq!(d.default_ref.as_deref(), Some("origin/main"));
         assert_eq!(d.ref_sha.as_deref(), Some("a".repeat(40).as_str()));
@@ -2429,7 +3014,7 @@ mod tests {
             "HEAD".to_string(),
             Err("ambiguous argument 'HEAD': unknown revision".to_string()),
         );
-        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git);
+        let d = measure_scan_divergence(Some(Path::new("/repo/plans")), &git, NOW);
         assert_eq!(d.state, ScanDivergenceState::Unknown);
         assert_eq!(d.head_sha, None);
         assert_eq!((d.behind, d.ahead), (None, None));
@@ -2441,17 +3026,23 @@ mod tests {
     /// that must reach the log at WARN, not INFO.
     #[test]
     fn ahead_only_divergence_counts_as_stale() {
-        let ahead_only =
-            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 11));
+        let ahead_only = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::healthy(0, 11),
+            NOW,
+        );
         assert!(
             ahead_only.is_stale(),
             "0 behind / 11 ahead is not agreement"
         );
-        let behind_only =
-            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 0));
+        let behind_only = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::healthy(2153, 0),
+            NOW,
+        );
         assert!(behind_only.is_stale());
         let in_step =
-            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0));
+            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(0, 0), NOW);
         assert!(!in_step.is_stale());
         // The three non-Measured states never claim staleness — they have no
         // counts to claim it from.
@@ -2521,8 +3112,11 @@ mod tests {
             "before the first tick the reading is UNKNOWN, not 'no divergence'"
         );
 
-        let measured =
-            measure_scan_divergence(Some(Path::new("/repo/plans")), &FakeGit::healthy(2153, 11));
+        let measured = measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::healthy(2153, 11),
+            NOW,
+        );
         record_scan_divergence(measured.clone(), &metrics);
         assert_eq!(metrics.snapshot().scan_divergence, Some(measured));
 
@@ -2546,6 +3140,621 @@ mod tests {
         assert_eq!(d.plans_dir.as_deref(), Some("/repo/plans"));
         assert_eq!(d.detail.as_deref(), Some("task join failed"));
         assert_eq!((d.behind, d.ahead), (None, None));
+    }
+
+    // ---- ref freshness + the floor rule (plan 2026-09-11-…-its-own-drift, Revised P1) ----
+
+    const HOUR: i64 = 3600;
+
+    fn measured_with(
+        refreshed_at: Result<Option<i64>, String>,
+        behind: u64,
+        ahead: u64,
+    ) -> ScanDivergence {
+        measure_scan_divergence(
+            Some(Path::new("/repo/plans")),
+            &FakeGit::refreshed(behind, ahead, refreshed_at),
+            NOW,
+        )
+    }
+
+    /// A ref refreshed five minutes ago — the census's own cadence — is
+    /// current: the counts are real numbers, not floors, and a clean
+    /// measurement still explains nothing.
+    #[test]
+    fn a_fresh_ref_makes_the_counts_current_not_floors() {
+        let d = measured_with(Ok(Some(NOW - 300)), 2153, 11);
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_age_secs, Some(300));
+        assert_eq!(d.ref_is_fresh(), Some(true));
+        assert!(!d.counts_are_floors());
+        assert_eq!(d.detail, None);
+        assert!(
+            d.is_stale(),
+            "is_stale keeps its meaning: measured non-zero counts"
+        );
+    }
+
+    /// A ref seven hours old is past the window: the counts become LOWER
+    /// BOUNDS, and the measured numbers themselves are preserved — a floor is
+    /// a qualification of the counts, not a reason to drop them.
+    #[test]
+    fn a_seven_hour_old_ref_makes_the_counts_floors_and_keeps_them() {
+        let d = measured_with(Ok(Some(NOW - 7 * HOUR)), 2153, 11);
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_age_secs, Some(7 * 3600));
+        assert_eq!(d.ref_is_fresh(), Some(false));
+        assert!(d.counts_are_floors());
+        assert_eq!((d.behind, d.ahead), (Some(2153), Some(11)));
+        assert!(d.is_stale());
+    }
+
+    /// The window's edge: exactly six hours is still fresh, one second more
+    /// is a floor.
+    #[test]
+    fn the_freshness_window_is_inclusive_at_six_hours() {
+        let window = i64::try_from(SCAN_REF_FRESH_WITHIN.as_secs()).unwrap();
+        assert_eq!(window, 6 * HOUR);
+        assert!(!measured_with(Ok(Some(NOW - window)), 0, 0).counts_are_floors());
+        assert!(measured_with(Ok(Some(NOW - window - 1)), 0, 0).counts_are_floors());
+    }
+
+    /// No source records a refresh at all: the age is UNKNOWN, and unknown is
+    /// a floor — never taken as fresh. The state stays `Measured` (the counts
+    /// are real) and the detail says why the age is missing.
+    #[test]
+    fn an_unknown_ref_age_is_a_floor_never_fresh() {
+        let d = measured_with(Ok(None), 0, 0);
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_age_secs, None);
+        assert_eq!(d.ref_is_fresh(), None);
+        assert!(
+            d.counts_are_floors(),
+            "a 0/0 against a ref of unknown age proves nothing and must not read as in step"
+        );
+        assert_eq!((d.behind, d.ahead), (Some(0), Some(0)));
+        let detail = d.detail.expect("an absent age is explained");
+        assert!(detail.contains("unknown"), "{detail}");
+    }
+
+    /// The age PROBE failing is not the measurement failing: `Measured` is
+    /// kept with the real counts, `ref_age_secs` is `None`, the counts are
+    /// floors, and the probe's own words reach the detail.
+    #[test]
+    fn a_failed_age_probe_keeps_measured_with_no_age() {
+        let d = measured_with(
+            Err("`git reflog show` did not answer (Timeout)".to_string()),
+            40,
+            2,
+        );
+        assert_eq!(d.state, ScanDivergenceState::Measured);
+        assert_eq!(d.ref_age_secs, None);
+        assert_eq!((d.behind, d.ahead), (Some(40), Some(2)));
+        assert!(d.counts_are_floors());
+        assert!(d.detail.unwrap().contains("Timeout"));
+    }
+
+    /// A refresh stamped in the future (clock skew) saturates at age 0 rather
+    /// than wrapping into an astronomically old ref.
+    #[test]
+    fn a_future_refresh_saturates_at_age_zero() {
+        let d = measured_with(Ok(Some(NOW + 120)), 0, 0);
+        assert_eq!(d.ref_age_secs, Some(0));
+        assert_eq!(ref_age_from(NOW, NOW + 120), 0);
+        assert_eq!(ref_age_from(NOW, NOW - 5), 5);
+    }
+
+    /// The three non-`Measured` states have no counts, so there is nothing
+    /// for the floor rule to qualify — and nothing to call fresh either.
+    #[test]
+    fn non_measured_states_have_no_freshness_and_no_floors() {
+        for d in [
+            ScanDivergence::not_scanning(),
+            ScanDivergence::unknown(None, "x"),
+            measure_scan_divergence(
+                Some(Path::new("/plain/plans")),
+                &FakeGit {
+                    root: Ok(None),
+                    ..FakeGit::healthy(0, 0)
+                },
+                NOW,
+            ),
+        ] {
+            assert_eq!(d.ref_is_fresh(), None, "{:?}", d.state);
+            assert!(!d.counts_are_floors(), "{:?}", d.state);
+            assert_eq!(d.ref_age_secs, None);
+        }
+    }
+
+    /// The log wording IS the floor rule's read surface. A `0/0` floor must
+    /// never produce the benign "reading changed" line a fresh `0/0` produces:
+    /// it logs at WARN and says the counts are a lower bound, naming the age —
+    /// or naming that the age is unknown.
+    #[test]
+    fn a_floor_of_zero_never_logs_as_in_step() {
+        let (fresh_warn, fresh_text) =
+            scan_divergence_message(&measured_with(Ok(Some(NOW - 60)), 0, 0));
+        assert!(!fresh_warn, "a proven-current 0/0 is the benign reading");
+        assert_eq!(
+            fresh_text,
+            "plan adapter: scan-source divergence reading changed"
+        );
+
+        let (warn, text) = scan_divergence_message(&measured_with(Ok(Some(NOW - 7 * HOUR)), 0, 0));
+        assert!(warn);
+        assert_ne!(text, fresh_text);
+        assert!(text.contains("LOWER BOUND"), "{text}");
+        assert!(text.contains("25200s"), "names the age: {text}");
+
+        let (warn, text) = scan_divergence_message(&measured_with(Ok(None), 0, 0));
+        assert!(warn);
+        assert!(
+            text.contains("LOWER BOUND") && text.contains("UNKNOWN age"),
+            "{text}"
+        );
+
+        // A stale floor says both things: diverged, and at least this much.
+        let (warn, text) =
+            scan_divergence_message(&measured_with(Ok(Some(NOW - 7 * HOUR)), 2153, 11));
+        assert!(warn);
+        assert!(
+            text.contains("LOWER BOUNDS") && text.contains("WORKING TREE"),
+            "{text}"
+        );
+
+        // A stale reading against a FRESH ref keeps the parked-tree text and
+        // names how old the ref it counted against is.
+        let (warn, text) = scan_divergence_message(&measured_with(Ok(Some(NOW - 300)), 2153, 11));
+        assert!(warn);
+        assert!(!text.contains("LOWER BOUND"), "{text}");
+        assert!(text.contains("300s ago"), "{text}");
+    }
+
+    /// The ref's age grows every tick; only its CROSSING of the window is a
+    /// change. Plain equality would re-log the reading every minute and
+    /// re-post it every cycle.
+    #[test]
+    fn a_reading_is_the_same_while_its_age_advances_inside_the_window() {
+        let a = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        let b = measured_with(Ok(Some(NOW - 120)), 5, 0);
+        assert_ne!(a, b, "the raw ages differ");
+        assert!(a.is_same_reading(&b));
+
+        let crossed = measured_with(Ok(Some(NOW - 7 * HOUR)), 5, 0);
+        assert!(!a.is_same_reading(&crossed), "fresh -> floors is news");
+        let unknown = measured_with(Ok(None), 5, 0);
+        assert!(!a.is_same_reading(&unknown), "fresh -> unknown age is news");
+
+        let moved = measured_with(Ok(Some(NOW - 60)), 6, 0);
+        assert!(!a.is_same_reading(&moved), "a count change is news");
+    }
+
+    /// The store always keeps the LATEST reading, age included, even when the
+    /// change detector (and so the log) treats it as the same reading.
+    #[test]
+    fn recording_keeps_the_latest_age_even_when_the_reading_is_the_same() {
+        let metrics = AdapterMetrics::default();
+        record_scan_divergence(measured_with(Ok(Some(NOW - 60)), 5, 0), &metrics);
+        record_scan_divergence(measured_with(Ok(Some(NOW - 120)), 5, 0), &metrics);
+        assert_eq!(
+            metrics.snapshot().scan_divergence.unwrap().ref_age_secs,
+            Some(120)
+        );
+    }
+
+    // ---- the two refresh sources, parsed and combined ----
+
+    #[test]
+    fn default_branch_name_strips_the_remote() {
+        assert_eq!(default_branch_name("origin/main"), "main");
+        assert_eq!(default_branch_name("origin/release/2026"), "release/2026");
+        assert_eq!(default_branch_name("upstream/trunk"), "trunk");
+        assert_eq!(default_branch_name("main"), "main");
+    }
+
+    /// `FETCH_HEAD` counts only when it names the default branch AT the sha
+    /// the tracking ref now holds.
+    #[test]
+    fn fetch_head_counts_only_the_default_branch_at_the_current_sha() {
+        let sha = "a".repeat(40);
+        let other = "c".repeat(40);
+        let url = "https://github.com/qontinui/qontinui-dev-notes";
+        // A single-branch fetch (the census's refspec shape).
+        assert!(fetch_head_names_ref(
+            &format!("{sha}\t\tbranch 'main' of {url}\n"),
+            "main",
+            &sha
+        ));
+        // A full `git fetch origin`: main marked not-for-merge among others.
+        let all = format!(
+            "{other}\t\tbranch 'feature' of {url}\n{sha}\tnot-for-merge\tbranch 'main' of {url}\n"
+        );
+        assert!(fetch_head_names_ref(&all, "main", &sha));
+        // Another branch only: refreshes nothing we compare against.
+        assert!(!fetch_head_names_ref(
+            &format!("{other}\t\tbranch 'feature' of {url}\n"),
+            "main",
+            &other
+        ));
+        // A prefix of the name is a different branch.
+        assert!(!fetch_head_names_ref(
+            &format!("{sha}\t\tbranch 'main-old' of {url}\n"),
+            "main",
+            &sha
+        ));
+        // Right name, wrong sha: the fetch did not land in the tracking ref.
+        assert!(!fetch_head_names_ref(
+            &format!("{other}\t\tbranch 'main' of {url}\n"),
+            "main",
+            &sha
+        ));
+        // Tags and garbage.
+        assert!(!fetch_head_names_ref(
+            &format!("{sha}\tnot-for-merge\ttag 'main' of {url}\n"),
+            "main",
+            &sha
+        ));
+        assert!(!fetch_head_names_ref("", "main", &sha));
+        assert!(!fetch_head_names_ref("not a fetch head", "main", &sha));
+    }
+
+    /// The reflog selector's number is the ENTRY time. Empty is an absent
+    /// source; `@{0}` (an index, not a date) must not parse as 1970.
+    #[test]
+    fn reflog_entry_time_parses_the_selector_and_refuses_an_index() {
+        assert_eq!(
+            parse_reflog_entry_time("origin/main@{1789129011}"),
+            Ok(Some(1_789_129_011))
+        );
+        assert_eq!(
+            parse_reflog_entry_time("refs/remotes/origin/main@{1789129011}\n"),
+            Ok(Some(1_789_129_011))
+        );
+        assert_eq!(parse_reflog_entry_time(""), Ok(None));
+        assert_eq!(parse_reflog_entry_time("  \n"), Ok(None));
+        for raw in [
+            "origin/main@{0}",
+            "origin/main@{3}",
+            "origin/main",
+            "origin/main@{soon}",
+        ] {
+            assert!(parse_reflog_entry_time(raw).is_err(), "{raw:?}");
+        }
+    }
+
+    /// The fresher source wins; a failed probe beside a known timestamp keeps
+    /// the timestamp (an overstated age at worst), and beside nothing is an
+    /// error.
+    #[test]
+    fn the_fresher_refresh_source_wins_and_partial_failure_leans_old() {
+        let err = || Err::<Option<i64>, String>("probe failed".to_string());
+        assert_eq!(fresher_refresh(Ok(Some(10)), Ok(Some(20))), Ok(Some(20)));
+        assert_eq!(fresher_refresh(Ok(Some(30)), Ok(Some(20))), Ok(Some(30)));
+        assert_eq!(fresher_refresh(Ok(None), Ok(Some(20))), Ok(Some(20)));
+        assert_eq!(fresher_refresh(Ok(None), Ok(None)), Ok(None));
+        assert_eq!(fresher_refresh(Ok(Some(10)), err()), Ok(Some(10)));
+        assert_eq!(fresher_refresh(err(), Ok(Some(10))), Ok(Some(10)));
+        assert!(fresher_refresh(Ok(None), err()).is_err());
+        assert!(fresher_refresh(err(), Ok(None)).is_err());
+        assert!(fresher_refresh(err(), err()).is_err());
+    }
+
+    // ---- ProcessGit against real repos ----
+
+    /// Run `git` in `dir` with an isolated identity and no signing, optionally
+    /// pinning the committer date (which is also the REFLOG entry time).
+    fn real_git(dir: &Path, args: &[&str], committer_date: Option<&str>) -> String {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=CI",
+                "-c",
+                "user.email=ci@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args);
+        if let Some(date) = committer_date {
+            cmd.env("GIT_COMMITTER_DATE", date);
+        }
+        let out = cmd.output().expect("git spawns");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A bare `origin` carrying `main` and `feature`, and a `reader` clone
+    /// that has fetched `main` with its REFLOG entry pinned to 2020 — so the
+    /// reflog alone would read the ref as six years old.
+    fn origin_and_old_reflog_reader() -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let writer = tmp.path().join("writer");
+        let reader = tmp.path().join("reader");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&writer).unwrap();
+        std::fs::create_dir_all(&reader).unwrap();
+        real_git(&origin, &["init", "-q", "--bare", "-b", "main"], None);
+        real_git(&writer, &["init", "-q", "-b", "main"], None);
+        real_git(
+            &writer,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+            None,
+        );
+        real_git(
+            &writer,
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+            None,
+        );
+        real_git(&writer, &["push", "-q", "origin", "main"], None);
+        real_git(&writer, &["checkout", "-q", "-b", "feature"], None);
+        real_git(&writer, &["commit", "-q", "--allow-empty", "-m", "f"], None);
+        real_git(&writer, &["push", "-q", "origin", "feature"], None);
+        real_git(&reader, &["init", "-q", "-b", "main"], None);
+        real_git(
+            &reader,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+            None,
+        );
+        real_git(
+            &reader,
+            &["fetch", "-q", "origin", "main"],
+            Some("@1600000000 +0000"),
+        );
+        let sha = real_git(&reader, &["rev-parse", "refs/remotes/origin/main"], None);
+        (tmp, reader, sha)
+    }
+
+    /// The plain case on real git output: a clone that has just fetched reads
+    /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
+    #[test]
+    fn process_git_reads_a_just_fetched_ref_as_refreshed_now() {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        real_git(&origin, &["init", "-q", "--bare", "-b", "main"], None);
+        real_git(&clone, &["init", "-q", "-b", "main"], None);
+        real_git(
+            &clone,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+            None,
+        );
+        real_git(
+            &clone,
+            &["commit", "-q", "--allow-empty", "-m", "one"],
+            None,
+        );
+        real_git(&clone, &["push", "-q", "origin", "main"], None);
+        real_git(&clone, &["fetch", "-q", "origin"], None);
+        let sha = real_git(&clone, &["rev-parse", "refs/remotes/origin/main"], None);
+
+        let now = chrono::Utc::now().timestamp();
+        let at = ProcessGit
+            .ref_refreshed_at(&clone, "origin/main", &sha)
+            .expect("the probes answer")
+            .expect("a just-fetched ref has a refresh time");
+        assert!((now - at).abs() <= 10, "refreshed at {at}, now {now}");
+        // Each source on its own agrees.
+        assert!(ProcessGit::reflog_refreshed_at(&clone, "origin/main")
+            .unwrap()
+            .is_some());
+        let fetch_head = ProcessGit::fetch_head_refreshed_at(&clone, "origin/main", &sha)
+            .unwrap()
+            .expect("FETCH_HEAD names main at the tracking sha");
+        assert!((now - fetch_head).abs() <= 10);
+    }
+
+    /// `FETCH_HEAD` fresher than the reflog WINS: a fetch that found `main`
+    /// unchanged writes no reflog entry, so the reflog alone would call a
+    /// just-verified ref six years old.
+    #[test]
+    fn process_git_prefers_a_fresher_fetch_head_over_an_old_reflog() {
+        let (_tmp, reader, sha) = origin_and_old_reflog_reader();
+        assert_eq!(
+            ProcessGit::reflog_refreshed_at(&reader, "origin/main"),
+            Ok(Some(1_600_000_000)),
+            "the reflog entry time is the pinned committer date, not the commit's"
+        );
+        let now = chrono::Utc::now().timestamp();
+        let at = ProcessGit
+            .ref_refreshed_at(&reader, "origin/main", &sha)
+            .unwrap()
+            .unwrap();
+        assert!(
+            (now - at).abs() <= 10,
+            "FETCH_HEAD's mtime should win: {at} vs now {now}"
+        );
+    }
+
+    /// A `FETCH_HEAD` naming only ANOTHER branch refreshes nothing this
+    /// reading compares against, so the (old) reflog answers — even though
+    /// that `FETCH_HEAD` was written seconds ago.
+    #[test]
+    fn process_git_ignores_a_fetch_head_that_names_only_another_branch() {
+        let (_tmp, reader, sha) = origin_and_old_reflog_reader();
+        real_git(&reader, &["fetch", "-q", "origin", "feature"], None);
+        let fetch_head_path = reader.join(real_git(
+            &reader,
+            &["rev-parse", "--git-path", "FETCH_HEAD"],
+            None,
+        ));
+        let contents = std::fs::read_to_string(&fetch_head_path).unwrap();
+        assert!(contents.contains("branch 'feature' of") && !contents.contains("branch 'main' of"));
+
+        assert_eq!(
+            ProcessGit::fetch_head_refreshed_at(&reader, "origin/main", &sha),
+            Ok(None)
+        );
+        assert_eq!(
+            ProcessGit.ref_refreshed_at(&reader, "origin/main", &sha),
+            Ok(Some(1_600_000_000)),
+            "the reflog answers, not the fresh FETCH_HEAD of another branch"
+        );
+    }
+
+    /// Neither source: a clone whose tracking ref has no reflog and no
+    /// `FETCH_HEAD` answers `Ok(None)` — an unknown age, not an error.
+    #[test]
+    fn process_git_answers_none_when_neither_source_exists() {
+        let (_tmp, reader, sha) = origin_and_old_reflog_reader();
+        let git_dir = reader.join(real_git(&reader, &["rev-parse", "--git-dir"], None));
+        std::fs::remove_file(git_dir.join("FETCH_HEAD")).unwrap();
+        std::fs::remove_file(git_dir.join("logs/refs/remotes/origin/main")).unwrap();
+        assert_eq!(
+            ProcessGit.ref_refreshed_at(&reader, "origin/main", &sha),
+            Ok(None)
+        );
+    }
+
+    /// Live check against this box's own plans checkout — machine-specific, so
+    /// ignored. Run with `--ignored` and compare against
+    /// `git reflog show -n1 --date=unix --format=%gd refs/remotes/origin/main`
+    /// and `stat -c %Y .git/FETCH_HEAD` in the same repo. Point it elsewhere
+    /// with `SCAN_DIVERGENCE_LIVE_REPO`.
+    #[test]
+    #[ignore = "reads a machine-specific checkout"]
+    fn live_ref_refreshed_at_matches_the_shell() {
+        let repo = std::env::var("SCAN_DIVERGENCE_LIVE_REPO").unwrap_or_else(|_| {
+            "/home/spinak/Projects/qontinui-root/qontinui-dev-notes".to_string()
+        });
+        let repo = Path::new(&repo);
+        let default_ref = ProcessGit.default_ref(repo).unwrap();
+        let sha = ProcessGit.rev_parse(repo, &default_ref).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let fetch_head = ProcessGit::fetch_head_refreshed_at(repo, &default_ref, &sha);
+        let reflog = ProcessGit::reflog_refreshed_at(repo, &default_ref);
+        let combined = ProcessGit.ref_refreshed_at(repo, &default_ref, &sha);
+        println!(
+            "LIVE repo={} default_ref={default_ref} sha={sha} now={now} fetch_head={fetch_head:?} \
+             reflog={reflog:?} combined={combined:?}",
+            repo.display()
+        );
+        let d = measure_scan_divergence(Some(repo.join("plans").as_path()), &ProcessGit, now);
+        println!(
+            "LIVE reading state={} behind={:?} ahead={:?} ref_age_secs={:?} counts_are_floors={} detail={:?}",
+            d.state.as_str(),
+            d.behind,
+            d.ahead,
+            d.ref_age_secs,
+            d.counts_are_floors(),
+            d.detail
+        );
+        assert!(combined.unwrap().is_some());
+    }
+
+    // ---- the scan-root report's posting policy (Revised P2, runner half) ----
+
+    fn instant_plus(base: std::time::Instant, secs: u64) -> std::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn scan_report_is_due_on_first_reading_and_never_before_one() {
+        let t0 = std::time::Instant::now();
+        let reading = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        assert!(
+            scan_report_due(None, None, Some(&reading), t0),
+            "never posted -> due"
+        );
+        assert!(
+            !scan_report_due(None, None, None, t0),
+            "no reading yet (the loop has not ticked) -> nothing to post"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_reading_is_not_reposted_inside_the_heartbeat() {
+        let t0 = std::time::Instant::now();
+        let posted = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        // Same reading one tick later: its ref age advanced, nothing else.
+        let now = measured_with(Ok(Some(NOW - 120)), 5, 0);
+        let heartbeat = SCAN_REPORT_HEARTBEAT.as_secs();
+        assert!(!scan_report_due(
+            Some((&posted, t0)),
+            None,
+            Some(&now),
+            instant_plus(t0, 60)
+        ));
+        assert!(!scan_report_due(
+            Some((&posted, t0)),
+            None,
+            Some(&now),
+            instant_plus(t0, heartbeat - 1)
+        ));
+        assert!(
+            scan_report_due(
+                Some((&posted, t0)),
+                None,
+                Some(&now),
+                instant_plus(t0, heartbeat)
+            ),
+            "the heartbeat re-posts an unchanged reading so observed_at ages honestly"
+        );
+    }
+
+    #[test]
+    fn a_changed_reading_is_posted_at_once() {
+        let t0 = std::time::Instant::now();
+        let posted = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        let moved = measured_with(Ok(Some(NOW - 60)), 9, 0);
+        assert!(scan_report_due(
+            Some((&posted, t0)),
+            None,
+            Some(&moved),
+            instant_plus(t0, 60)
+        ));
+        let went_floor = measured_with(Ok(Some(NOW - 7 * HOUR)), 5, 0);
+        assert!(
+            scan_report_due(
+                Some((&posted, t0)),
+                None,
+                Some(&went_floor),
+                instant_plus(t0, 60)
+            ),
+            "crossing into floors is a change the read side must see"
+        );
+        assert!(scan_report_due(
+            Some((&posted, t0)),
+            None,
+            Some(&ScanDivergence::not_scanning()),
+            instant_plus(t0, 60)
+        ));
+    }
+
+    #[test]
+    fn a_failed_post_backs_off_before_retrying() {
+        let t0 = std::time::Instant::now();
+        let reading = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        let backoff = SCAN_REPORT_RETRY_AFTER_FAILURE.as_secs();
+        assert!(!scan_report_due(
+            None,
+            Some(t0),
+            Some(&reading),
+            instant_plus(t0, 60)
+        ));
+        assert!(!scan_report_due(
+            None,
+            Some(t0),
+            Some(&reading),
+            instant_plus(t0, backoff - 1)
+        ));
+        assert!(scan_report_due(
+            None,
+            Some(t0),
+            Some(&reading),
+            instant_plus(t0, backoff)
+        ));
+        assert!(
+            backoff < SCAN_REPORT_HEARTBEAT.as_secs(),
+            "a recovered backend is caught up faster than a heartbeat"
+        );
     }
 
     // ---- body-sync kill switch (plan 2026-09-03-…-on-by-default Phase 3) ----
@@ -4446,6 +5655,10 @@ mod tests {
         assert_eq!(d.state, ScanDivergenceState::Measured);
         assert_eq!((d.behind, d.ahead), (Some(2153), Some(11)));
         assert!(d.is_stale());
+        assert!(
+            d.ref_age_secs.is_some(),
+            "the tick hands the measurement a clock, so an answered age probe yields an age"
+        );
         assert_eq!(
             d.plans_dir.as_deref(),
             Some(dir.path().display().to_string().as_str()),

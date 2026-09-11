@@ -815,7 +815,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("looping_agent_coord.rs", "device", 5),
     ("mcp/plan_library.rs", "work-owed", 3),
     ("mcp/probe_executor.rs", "device", 1),
-    ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
+    ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("plan_workunit_adapter/push.rs", "work-owed", 6),
     ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
@@ -870,11 +870,20 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// periodic plan scan holds only `self.base` + `self.client`, so there is no
 /// session to ask and the plan's repo is the only tenancy signal. So
 /// `work-owed` 15 -> 16.
+///
+/// Plan `2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift`
+/// Revised Phase 2 adds one more: `body_push.rs::report_scan_root`, the body
+/// sync's post of this device's scan-root reading to qontinui-web. It is
+/// `work-owed`, not `device`, although the web row is keyed per device: the
+/// reading qualifies the corpus the plans dir FEEDS, so it has to land in the
+/// same org as the artifacts that dir produces — and those are the upsert's,
+/// whose tenant is the plan's repo. When Phase 6 resolves that upsert's
+/// tenant, this site moves with it. So `work-owed` 16 -> 17.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 21),
     ("session-noop", 9),
     ("session-owed", 0),
-    ("work-owed", 16),
+    ("work-owed", 17),
     ("escalated", 2),
 ];
 
@@ -1029,8 +1038,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 48,
-        "expected 48 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 49,
+        "expected 49 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1048,7 +1057,10 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          agent_runtime's spawn-blocked lifecycle post (session-noop); 45 to 47. Adopting \
          qontinui-runner#1278 then added the plan adapter's cold-start bulk seed \
          (plan_workunit_adapter/push.rs::list_statuses, work-owed, the same door and the \
-         same debt as current_status beside it); 47 to 48. Found {sites}. A change here \
+         same debt as current_status beside it); 47 to 48. Plan \
+         2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift then added \
+         plan_workunit_adapter/body_push.rs::report_scan_root (work-owed, the same web base and \
+         the same debt as the artifact upsert beside it); 48 to 49. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
