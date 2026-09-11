@@ -1958,6 +1958,9 @@ struct LoopState {
     /// instead of its sink, so a tick-level test can observe reports.
     #[cfg(test)]
     scan_reporter: Option<std::sync::Arc<dyn super::body_push::ScanRootReporter>>,
+    /// Handed to every rebuilt [`BodySync`] — see [`ScanReportGate`]. Closed
+    /// until [`Self::with_scan_report_gate`] supplies the binary's predicate.
+    scan_report_gate: ScanReportGate,
 }
 
 impl LoopState {
@@ -1982,7 +1985,15 @@ impl LoopState {
             bulk_seeded: false,
             #[cfg(test)]
             scan_reporter: None,
+            scan_report_gate: scan_report_gate_closed(),
         }
+    }
+
+    /// Supply the instance-ownership predicate every rebuilt [`BodySync`]
+    /// gates its scan-root reports on — see [`ScanReportGate`].
+    fn with_scan_report_gate(mut self, gate: ScanReportGate) -> Self {
+        self.scan_report_gate = gate;
+        self
     }
 
     /// Route every rebuilt [`BodySync`]'s scan-root reports to `reporter`.
@@ -2031,10 +2042,10 @@ impl LoopState {
         // same posture as a supervised restart: nothing is replayed, the next
         // cycle re-reads what is on disk and pushes only what differs from
         // what the backend already holds.
-        self.body_sync = self
-            .body_sync_sink
-            .as_ref()
-            .map(|sink| BodySync::new(roots, sink.clone(), self.capture_gate.clone()));
+        self.body_sync = self.body_sync_sink.as_ref().map(|sink| {
+            BodySync::new(roots, sink.clone(), self.capture_gate.clone())
+                .with_scan_report_gate(self.scan_report_gate.clone())
+        });
         #[cfg(test)]
         if let Some(reporter) = self.scan_reporter.clone() {
             self.body_sync = self.body_sync.take().map(|bs| bs.with_reporter(reporter));
@@ -2361,10 +2372,12 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
     paths: PathReader,
     body_sync_sink: Option<super::body_push::HttpArtifactSink>,
     capture_gate: CaptureGate,
+    scan_report_gate: ScanReportGate,
     sink: &S,
     interval_secs: u64,
 ) {
-    let mut state = LoopState::new(paths, body_sync_sink, capture_gate);
+    let mut state =
+        LoopState::new(paths, body_sync_sink, capture_gate).with_scan_report_gate(scan_report_gate);
     let metrics = adapter_metrics();
     let mut tick = tokio::time::interval(Duration::from_secs(interval_secs.max(1)));
     // A cycle can legitimately outrun the interval (the first one walks and
@@ -2475,6 +2488,27 @@ pub fn capture_gate_message(previous: Option<bool>, gate_open: bool) -> Option<&
 /// at spawn time; the lib stays free of the poller.
 pub type CaptureGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Whether THIS runner instance may publish the machine's scan-root reading.
+///
+/// Every runner instance on a machine reports under the same device token, and
+/// the web keeps ONE row per device — so a supervisor-spawned temp runner with
+/// a different (or no) plans dir would flip the machine's row back and forth
+/// against the primary's. The reading is machine-scoped state, and only the
+/// instance that owns shared root state may publish it: the binary supplies
+/// `fleet::machine_state_publish_allowed(instance::owns_shared_root_state())`,
+/// the same predicate every other device-keyed writer is gated on. A callback
+/// for the same reason as [`CaptureGate`] — that predicate lives in the runner
+/// binary, which this lib crate cannot see — and read per report, so it is
+/// never a stale snapshot.
+pub type ScanReportGate = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The gate a loop or body sync has until one is supplied: CLOSED. A
+/// machine-scoped writer that was never told it owns the machine must not
+/// assume it does.
+fn scan_report_gate_closed() -> ScanReportGate {
+    std::sync::Arc::new(|| false)
+}
+
 /// How many **consecutive** entirely-failed cycles pause the sync.
 ///
 /// The axis is consecutive cycles, not a sample-size floor on one cycle. A
@@ -2564,11 +2598,15 @@ impl FailureBreaker {
 
 /// How often an UNCHANGED scan-root reading is re-posted to the web read side.
 ///
-/// A heartbeat, so the row's `observed_at` ages honestly: the web side reads a
-/// row older than three of these (45 min) as `unknown` / `observation_stale`,
-/// which is how a device that stopped reporting — killed, offline, its sync
-/// switched off — stops being quoted as current. Without it an in-step device
-/// would post once and then look dead.
+/// A heartbeat, so the row's age stays honest: the web side ages a row by when
+/// it last RECEIVED a report (its own clock, not this runner's `observed_at`)
+/// and reads a row older than three of these (45 min) as `unknown` /
+/// `observation_stale` — which is how a device that stopped reporting
+/// (killed, offline, its sync switched off) stops being quoted as current.
+/// Without it an in-step device would post once and then look dead. A row
+/// whose latest report the web DECLINED (`applied: false`, a newer reading
+/// already stored) reads `reading_superseded`; that case re-posts on the
+/// shorter [`SCAN_REPORT_RETRY_AFTER_FAILURE`] cadence instead.
 pub const SCAN_REPORT_HEARTBEAT: Duration = Duration::from_secs(15 * 60);
 
 /// After a failed scan-root post, how long before the next attempt.
@@ -2589,13 +2627,20 @@ const SCAN_REPORT_RETRY_AFTER_FAILURE: Duration = Duration::from_secs(5 * 60);
 /// - the reading CHANGED ([`ScanDivergence::is_same_reading`], so a ref age
 ///   advancing inside its freshness window is not a change) → due;
 /// - unchanged, but [`SCAN_REPORT_HEARTBEAT`] has elapsed since the last
-///   successful post → due;
+///   delivered post → due;
+/// - unchanged, and the last delivered post came back `applied: false`
+///   (`last_unapplied`) — the web kept a newer reading, almost always because
+///   this machine's clock stepped back — then re-posted every
+///   [`SCAN_REPORT_RETRY_AFTER_FAILURE`] instead, so the web picks up the
+///   device's current reading soon after its clock catches up rather than a
+///   whole heartbeat later;
 /// - otherwise → not due.
 pub fn scan_report_due(
     last_posted: Option<(&ScanDivergence, std::time::Instant)>,
     last_failed_at: Option<std::time::Instant>,
     current: Option<&ScanDivergence>,
     now: std::time::Instant,
+    last_unapplied: bool,
 ) -> bool {
     let Some(current) = current else {
         return false;
@@ -2608,8 +2653,13 @@ pub fn scan_report_due(
     match last_posted {
         None => true,
         Some((previous, posted_at)) => {
+            let repost_every = if last_unapplied {
+                SCAN_REPORT_RETRY_AFTER_FAILURE
+            } else {
+                SCAN_REPORT_HEARTBEAT
+            };
             !previous.is_same_reading(current)
-                || now.saturating_duration_since(posted_at) >= SCAN_REPORT_HEARTBEAT
+                || now.saturating_duration_since(posted_at) >= repost_every
         }
     }
 }
@@ -2662,6 +2712,12 @@ pub struct BodySync {
     /// production; a recording fake in tests (see
     /// [`super::body_push::ScanRootReporter`]).
     reporter: std::sync::Arc<dyn super::body_push::ScanRootReporter>,
+    /// Whether this instance may publish the machine's reading at all — see
+    /// [`ScanReportGate`]. Closed unless supplied.
+    scan_report_gate: ScanReportGate,
+    /// Whether the closed gate has been announced, so it is said once per
+    /// body sync rather than every cycle.
+    scan_report_gate_announced: bool,
 }
 
 impl BodySync {
@@ -2681,7 +2737,16 @@ impl BodySync {
             last_scan_report: None,
             last_scan_report_failure: None,
             last_scan_report_unapplied: false,
+            scan_report_gate: scan_report_gate_closed(),
+            scan_report_gate_announced: false,
         }
+    }
+
+    /// Supply the instance-ownership predicate scan-root reports are gated on
+    /// — see [`ScanReportGate`]. Without it this body sync reports nothing.
+    pub fn with_scan_report_gate(mut self, gate: ScanReportGate) -> Self {
+        self.scan_report_gate = gate;
+        self
     }
 
     /// Swap in a different scan-root reporter. Test-only, for the same reason
@@ -2735,11 +2800,26 @@ impl BodySync {
         current: Option<ScanDivergence>,
         now: std::time::Instant,
     ) {
+        // Machine-scoped state: only the instance that owns shared root state
+        // publishes it (see `ScanReportGate`). Checked first, on BOTH paths
+        // that reach here — the armed cycle and the idle tick.
+        if !(self.scan_report_gate)() {
+            if !self.scan_report_gate_announced {
+                self.scan_report_gate_announced = true;
+                tracing::info!(
+                    "plan library: this runner instance does not own the machine's shared \
+                     state (a secondary / temp runner), so it does NOT publish the scan-root \
+                     reading — the primary instance reports for this device"
+                );
+            }
+            return;
+        }
         let due = scan_report_due(
             self.last_scan_report.as_ref().map(|(d, at)| (d, *at)),
             self.last_scan_report_failure.as_ref().map(|(_, at)| *at),
             current.as_ref(),
             now,
+            self.last_scan_report_unapplied,
         );
         let Some(current) = current.filter(|_| due) else {
             return;
@@ -2978,10 +3058,16 @@ pub fn resolve_prompts_dir(configured: Option<String>) -> Option<String> {
 /// `capture_gate` reads the tenant's `plan_capture` fleet dial — see
 /// [`CaptureGate`]. It is consulted every cycle, so flipping the dial takes
 /// effect without a restart.
+///
+/// `scan_report_gate` says whether this instance may publish the machine's
+/// scan-root reading — see [`ScanReportGate`]. Required here, the one
+/// production entry point, so the binary cannot forget it; everything behind
+/// it defaults to closed.
 pub fn spawn_if_configured(
     paths: PathReader,
     configured_backend_url: Option<String>,
     capture_gate: CaptureGate,
+    scan_report_gate: ScanReportGate,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let sink = match super::push::HttpWorkUnitSink::from_profile() {
         Some(s) => s,
@@ -3020,9 +3106,18 @@ pub fn spawn_if_configured(
             let paths = paths.clone();
             let body_sync_sink = body_sync_sink.clone();
             let capture_gate = capture_gate.clone();
+            let scan_report_gate = scan_report_gate.clone();
             let sink = sink.clone();
             async move {
-                run_loop(paths, body_sync_sink, capture_gate, &*sink, interval_secs).await;
+                run_loop(
+                    paths,
+                    body_sync_sink,
+                    capture_gate,
+                    scan_report_gate,
+                    &*sink,
+                    interval_secs,
+                )
+                .await;
             }
         },
     ))
@@ -4287,11 +4382,11 @@ mod tests {
         let t0 = std::time::Instant::now();
         let reading = measured_with(Ok(Some(NOW - 60)), 5, 0);
         assert!(
-            scan_report_due(None, None, Some(&reading), t0),
+            scan_report_due(None, None, Some(&reading), t0, false),
             "never posted -> due"
         );
         assert!(
-            !scan_report_due(None, None, None, t0),
+            !scan_report_due(None, None, None, t0, false),
             "no reading yet (the loop has not ticked) -> nothing to post"
         );
     }
@@ -4307,20 +4402,23 @@ mod tests {
             Some((&posted, t0)),
             None,
             Some(&now),
-            instant_plus(t0, 60)
+            instant_plus(t0, 60),
+            false
         ));
         assert!(!scan_report_due(
             Some((&posted, t0)),
             None,
             Some(&now),
-            instant_plus(t0, heartbeat - 1)
+            instant_plus(t0, heartbeat - 1),
+            false
         ));
         assert!(
             scan_report_due(
                 Some((&posted, t0)),
                 None,
                 Some(&now),
-                instant_plus(t0, heartbeat)
+                instant_plus(t0, heartbeat),
+                false
             ),
             "the heartbeat re-posts an unchanged reading so observed_at ages honestly"
         );
@@ -4335,7 +4433,8 @@ mod tests {
             Some((&posted, t0)),
             None,
             Some(&moved),
-            instant_plus(t0, 60)
+            instant_plus(t0, 60),
+            false
         ));
         let went_floor = measured_with(Ok(Some(NOW - 7 * HOUR)), 5, 0);
         assert!(
@@ -4343,7 +4442,8 @@ mod tests {
                 Some((&posted, t0)),
                 None,
                 Some(&went_floor),
-                instant_plus(t0, 60)
+                instant_plus(t0, 60),
+                false
             ),
             "crossing into floors is a change the read side must see"
         );
@@ -4351,7 +4451,8 @@ mod tests {
             Some((&posted, t0)),
             None,
             Some(&ScanDivergence::not_scanning()),
-            instant_plus(t0, 60)
+            instant_plus(t0, 60),
+            false
         ));
     }
 
@@ -4364,19 +4465,22 @@ mod tests {
             None,
             Some(t0),
             Some(&reading),
-            instant_plus(t0, 60)
+            instant_plus(t0, 60),
+            false
         ));
         assert!(!scan_report_due(
             None,
             Some(t0),
             Some(&reading),
-            instant_plus(t0, backoff - 1)
+            instant_plus(t0, backoff - 1),
+            false
         ));
         assert!(scan_report_due(
             None,
             Some(t0),
             Some(&reading),
-            instant_plus(t0, backoff)
+            instant_plus(t0, backoff),
+            false
         ));
         assert!(
             backoff < SCAN_REPORT_HEARTBEAT.as_secs(),
@@ -4444,6 +4548,12 @@ mod tests {
             std::sync::Arc::new(move || gate_open) as CaptureGate,
         )
         .with_reporter(reporter)
+        .with_scan_report_gate(owns_the_machine())
+    }
+
+    /// The scan-report gate of the instance that owns shared root state.
+    fn owns_the_machine() -> ScanReportGate {
+        std::sync::Arc::new(|| true)
     }
 
     fn metrics_with(reading: ScanDivergence) -> AdapterMetrics {
@@ -4571,7 +4681,8 @@ mod tests {
                 Some((&first, t0)),
                 None,
                 Some(&second),
-                instant_plus(t0, 600)
+                instant_plus(t0, 600),
+                false
             ),
             "not report-due inside the heartbeat"
         );
@@ -4655,6 +4766,127 @@ mod tests {
         assert!(!bs.last_scan_report_unapplied);
     }
 
+    /// Only the instance that owns the machine's shared state publishes its
+    /// scan-root reading — one web row per device, so a secondary or temp
+    /// runner reporting too would flip the machine's row. The gate is checked
+    /// on BOTH report paths, defaults CLOSED (a body sync never told it owns
+    /// the machine reports nothing), and is read per report.
+    #[tokio::test]
+    async fn only_the_instance_that_owns_the_machine_reports() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let owns = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = {
+            let owns = owns.clone();
+            std::sync::Arc::new(move || owns.load(Ordering::SeqCst)) as ScanReportGate
+        };
+        let mut bs = body_sync_reporting_to(reporter.clone(), true).with_scan_report_gate(gate);
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        bs.report_while_idle(&metrics).await;
+        assert!(
+            reporter.states().is_empty(),
+            "a secondary publishes nothing, on either path"
+        );
+        assert!(bs.scan_report_gate_announced, "and says why, once");
+
+        owns.store(true, Ordering::SeqCst);
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        assert_eq!(
+            reporter.states(),
+            vec!["measured"],
+            "the gate is read per report"
+        );
+
+        // Closed by default: a body sync never handed the predicate.
+        let silent = std::sync::Arc::new(FakeReporter::default());
+        let mut unconfigured = BodySync::new(
+            Vec::new(),
+            super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_reporter(silent.clone());
+        unconfigured
+            .run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        unconfigured.report_while_idle(&metrics).await;
+        assert!(silent.states().is_empty());
+    }
+
+    /// The loop's default is closed too: an idle tick on a loop that was
+    /// never handed the ownership predicate publishes nothing.
+    #[tokio::test]
+    async fn a_loop_without_the_ownership_predicate_reports_nothing() {
+        let (_cell, reader) = switchable_paths();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
+        .with_scan_reporter(reporter.clone());
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+        assert!(reporter.states().is_empty());
+    }
+
+    /// While the web keeps declining (`applied: false`), an unchanged reading
+    /// is re-posted every retry interval (5 min), not every heartbeat (15
+    /// min), so the device's current reading lands soon after its clock
+    /// catches up.
+    #[test]
+    fn an_unapplied_reading_is_reposted_on_the_retry_cadence() {
+        let t0 = std::time::Instant::now();
+        let posted = measured_with(Ok(Some(NOW - 60)), 5, 0);
+        let now = measured_with(Ok(Some(NOW - 120)), 5, 0);
+        let retry = SCAN_REPORT_RETRY_AFTER_FAILURE.as_secs();
+        assert!(retry < SCAN_REPORT_HEARTBEAT.as_secs());
+        let due = |unapplied, secs| {
+            scan_report_due(
+                Some((&posted, t0)),
+                None,
+                Some(&now),
+                instant_plus(t0, secs),
+                unapplied,
+            )
+        };
+        assert!(!due(true, retry - 1));
+        assert!(
+            due(true, retry),
+            "unapplied: due again after the retry interval"
+        );
+        assert!(!due(false, retry), "applied: waits for the full heartbeat");
+        assert!(due(false, SCAN_REPORT_HEARTBEAT.as_secs()));
+    }
+
+    /// The same, through the body sync: an unapplied report is re-sent once
+    /// the retry interval has passed.
+    #[tokio::test]
+    async fn the_body_sync_reposts_an_unapplied_reading_after_the_retry_interval() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        *reporter.applied.lock().unwrap() = Some(false);
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        assert_eq!(reporter.states().len(), 1);
+        let (posted, _) = bs.last_scan_report.take().unwrap();
+        bs.last_scan_report = Some((
+            posted,
+            std::time::Instant::now() - SCAN_REPORT_RETRY_AFTER_FAILURE - Duration::from_secs(1),
+        ));
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            .await;
+        assert_eq!(reporter.states().len(), 2, "re-posted on the 5-min cadence");
+    }
+
     /// A tenant at `plan_capture = off` publishes nothing about its plans dir.
     #[tokio::test]
     async fn a_closed_capture_gate_reports_nothing() {
@@ -4684,7 +4916,8 @@ mod tests {
             std::sync::Arc::new(|| true) as CaptureGate,
         )
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
-        .with_scan_reporter(reporter.clone());
+        .with_scan_reporter(reporter.clone())
+        .with_scan_report_gate(owns_the_machine());
 
         state.tick(&sink, &metrics).await;
         assert_eq!(reporter.states(), vec!["not_scanning"]);

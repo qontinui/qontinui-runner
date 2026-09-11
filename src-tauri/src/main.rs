@@ -2005,10 +2005,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                             mcp::fleet_policy_poller::effective_plan_capture_level()
                                 == mcp::fleet_policy_poller::PLAN_CAPTURE_RECORD
                         });
+                    // The scan-root reading is machine-scoped (one row per
+                    // device on the web), so only the instance that owns shared
+                    // root state publishes it — the same predicate as every
+                    // other device-keyed writer. Read per report.
+                    let scan_report_gate: qontinui_runner_lib::plan_workunit_adapter::trigger::ScanReportGate =
+                        std::sync::Arc::new(|| {
+                            fleet::machine_state_publish_allowed(crate::instance::owns_shared_root_state())
+                        });
                     qontinui_runner_lib::plan_workunit_adapter::trigger::spawn_if_configured(
                         paths,
                         persisted_backend_url,
                         capture_gate,
+                        scan_report_gate,
                     );
                 }
                 // Park this thread's runtime forever so the spawned

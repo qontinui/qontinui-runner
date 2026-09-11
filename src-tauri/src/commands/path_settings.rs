@@ -83,9 +83,10 @@ pub struct ScanDivergenceView {
     pub ref_age_secs: Option<u64>,
     /// `true` when `behind`/`ahead` are LOWER BOUNDS rather than current
     /// numbers: the ref is older than the adapter's freshness window or of
-    /// unknown age. A UI must render a floor as "at least N behind", and a
-    /// floor of `0/0` as "unknown", never as "in step". Always `false` off the
-    /// `measured` state, which has no counts to qualify.
+    /// unknown age. A UI must render a floor as "at least N behind", and ANY
+    /// floor with `behind == 0` (whatever `ahead` is) as "unknown", never as
+    /// "in step" — the same reading the web read side gives it. Always `false`
+    /// off the `measured` state, which has no counts to qualify.
     #[serde(default)]
     pub counts_are_floors: bool,
     /// Why the state is `unknown` or `not_a_git_work_tree`. Never empty on

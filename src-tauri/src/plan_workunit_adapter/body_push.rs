@@ -1318,7 +1318,7 @@ impl HttpArtifactSink {
             return Ok(ScanRootAck::from_body(&text));
         }
         Err(ScanRootFailure {
-            kind: format!("HTTP {}", status.as_u16()),
+            kind: scan_root_failure_kind(status.as_u16(), &text),
             // A backend that does not serve the route answers with whatever
             // its 404 page is; the log needs the status and the start of the
             // body, not a page of HTML.
@@ -1329,6 +1329,49 @@ impl HttpArtifactSink {
             )
             .to_string(),
         })
+    }
+}
+
+/// The stable class of a refused scan-root report — what keys the failure
+/// WARN's edge trigger.
+///
+/// `HTTP <status>`, and for a 422 also the FIRST validation error's `loc`
+/// (`HTTP 422 body.observed_at`): a 422 whose cause changes — the clock-ahead
+/// `observed_at` refusal fixed, a `detail` length refusal appearing — is a
+/// different fault and re-arms the WARN, while the same cause repeating (with
+/// a body that echoes different input every attempt) stays one. Parsed
+/// defensively from FastAPI's `{"detail": [{"loc": [...], ...}]}`: anything
+/// else — no JSON, no `detail` list, an empty `loc` — falls back to plain
+/// `HTTP 422`.
+fn scan_root_failure_kind(status: u16, body: &str) -> String {
+    let plain = format!("HTTP {status}");
+    if status != 422 {
+        return plain;
+    }
+    let loc = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            let first = v
+                .get("detail")?
+                .as_array()?
+                .first()?
+                .get("loc")?
+                .as_array()?
+                .clone();
+            let parts: Vec<String> = first
+                .iter()
+                .filter_map(|part| match part {
+                    serde_json::Value::String(s) => Some(s.clone()),
+                    serde_json::Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("."))
+        });
+    match loc {
+        // Bounded: the loc is field names, but it is still server input.
+        Some(loc) => format!("{plain} {}", loc.chars().take(120).collect::<String>()),
+        None => plain,
     }
 }
 
@@ -2046,6 +2089,51 @@ mod tests {
         let snippet = cap_bytes("é".repeat(600), SCAN_ROOT_ERROR_BODY_CAP);
         assert!(snippet.len() <= SCAN_ROOT_ERROR_BODY_CAP + '…'.len_utf8());
         assert!(snippet.ends_with('…'));
+    }
+
+    /// A 422's failure kind names the first refused field, so a change of
+    /// cause re-arms the WARN; anything unparseable falls back to the status.
+    #[test]
+    fn a_422_failure_kind_names_the_refused_field() {
+        let observed_at = r#"{"detail": [{"type": "value_error", "loc": ["body", "observed_at"],
+            "msg": "observed_at is more than 300 s ahead", "input": "2026-09-11T16:00:00Z"}]}"#;
+        assert_eq!(
+            scan_root_failure_kind(422, observed_at),
+            "HTTP 422 body.observed_at"
+        );
+        let two = r#"{"detail": [{"loc": ["body", "detail"], "msg": "too long"},
+            {"loc": ["body", "observed_at"], "msg": "x"}]}"#;
+        assert_eq!(
+            scan_root_failure_kind(422, two),
+            "HTTP 422 body.detail",
+            "the FIRST error"
+        );
+        assert_eq!(
+            scan_root_failure_kind(422, r#"{"detail": [{"loc": ["body", "rows", 3]}]}"#),
+            "HTTP 422 body.rows.3"
+        );
+        // The same cause with different echoed input is the SAME kind.
+        let later = observed_at.replace("16:00:00Z", "16:05:00Z");
+        assert_eq!(
+            scan_root_failure_kind(422, observed_at),
+            scan_root_failure_kind(422, &later)
+        );
+        // Defensive fallbacks.
+        for body in [
+            "",
+            "<html>422</html>",
+            r#"{"detail": "a string, not a list"}"#,
+            r#"{"detail": []}"#,
+            r#"{"detail": [{"msg": "no loc"}]}"#,
+            r#"{"detail": [{"loc": []}]}"#,
+        ] {
+            assert_eq!(scan_root_failure_kind(422, body), "HTTP 422", "{body:?}");
+        }
+        assert_eq!(
+            scan_root_failure_kind(404, observed_at),
+            "HTTP 404",
+            "only a 422 is parsed"
+        );
     }
 
     /// The web answers `{created, applied, row}`; `applied` is passed back,

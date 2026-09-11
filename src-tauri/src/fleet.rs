@@ -5675,6 +5675,14 @@ mod tests {",
                 "the canonical-drift tick, which scans the shared canonical checkouts and \
                  POSTs device-keyed",
             ),
+            (
+                "main.rs",
+                include_str!("main.rs"),
+                1,
+                "the plan adapter's `ScanReportGate`, handed to `spawn_if_configured` — the \
+                 scan-root reading is one web row per device, so a secondary's report would \
+                 flip the machine's row (the lib crate cannot call the guard itself)",
+            ),
         ];
 
         for (name, src, want, what) in modules {
