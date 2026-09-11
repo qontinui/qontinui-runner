@@ -342,10 +342,26 @@ impl RemoteAttachGrants {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateGrant {
     pub grant_jti: String,
-    /// The source device coord minted the grant for. Empty when the feed did
-    /// not carry one (an older coord) — the cross-check then skips, exactly as
-    /// the attach table's does.
+    /// The source device coord minted the grant for. **Never empty** — a feed
+    /// row that carries no source device is DROPPED at
+    /// [`crate::session::create::PendingCreate::into_grant`] rather than
+    /// recorded with an empty binding.
+    ///
+    /// It used to be "empty when the feed did not carry one", and the
+    /// cross-check in [`RemoteCreateGrants::resolve`] skips on empty — so a
+    /// coord that stopped sending the field, or a feed row a proxy stripped it
+    /// from, silently disabled the source binding for that grant. An
+    /// unreadable `expires_at` was already fail-closed; this is the same rule
+    /// applied to the other half of the row.
     pub source_device_id: String,
+    /// The USER coord minted the grant for, empty when the feed carried none.
+    ///
+    /// Read only by the `same_user` arm of this device's own
+    /// `accept_remote_create` dial, and empty there is a REFUSAL rather than a
+    /// skip: the local dial is the half coord cannot enforce for us, so it
+    /// fails closed. It is deliberately not part of the identity cross-check —
+    /// the device binding is what a replay has to beat.
+    pub source_user_id: String,
     /// Unix seconds.
     pub expires_at: u64,
 }
@@ -410,6 +426,9 @@ impl RemoteCreateGrants {
             existing.expires_at = grant.expires_at;
             if existing.source_device_id.trim().is_empty() {
                 existing.source_device_id = grant.source_device_id;
+            }
+            if existing.source_user_id.trim().is_empty() {
+                existing.source_user_id = grant.source_user_id;
             }
             return true;
         }
@@ -505,20 +524,25 @@ impl RemoteCreateGrants {
         // its directive always carries the field, so a grant whose row names a
         // source can only meet a frame that names one too — unless something
         // stripped it.
+        //
+        // And a row that names NO source is refused as well, rather than
+        // skipping the check: the feed drops such a row at
+        // [`crate::session::create::PendingCreate::into_grant`], so one
+        // reaching here at all means something built a grant by hand. Skipping
+        // on empty is how a stripped field turns a required binding into no
+        // binding (review finding 9); the second reader of the same rule.
         let expected = grant.source_device_id.trim();
-        if !expected.is_empty() {
-            match source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
-                Some(claimed) if expected.eq_ignore_ascii_case(claimed) => {}
-                claimed => {
-                    warn!(
-                        grant_jti,
-                        granted_source = expected,
-                        frame_source = claimed.unwrap_or("<absent>"),
-                        "remote create: the frame's source device is not the one the grant was \
-                         minted for (or names none at all) — refused as unknown"
-                    );
-                    return Err(CreateRefusal::GrantUnknown);
-                }
+        match source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(claimed) if !expected.is_empty() && expected.eq_ignore_ascii_case(claimed) => {}
+            claimed => {
+                warn!(
+                    grant_jti,
+                    granted_source = expected,
+                    frame_source = claimed.unwrap_or("<absent>"),
+                    "remote create: the frame's source device is not the one the grant was \
+                     minted for (or either side names none at all) — refused as unknown"
+                );
+                return Err(CreateRefusal::GrantUnknown);
             }
         }
         if grant.expires_at <= now {
@@ -1104,6 +1128,13 @@ pub enum CreateRefusal {
     NoTargetDirectory,
     WorkingDirNotAllowed,
     IntentRepoNotAllowed,
+    /// The device's own `accept_remote_create` dial reads `same_user`, and the
+    /// grant's source user is not this device's paired user — or is not
+    /// knowable at all. The LOCAL half of a three-valued dial coord also
+    /// enforces at the mint: without this the target could only tell `off`
+    /// from not-`off`, so an operator narrowing `tenant` -> `same_user` while
+    /// coord was unreachable changed nothing this device enforced.
+    SourceUserNotAllowed,
 }
 
 impl CreateRefusal {
@@ -1116,6 +1147,7 @@ impl CreateRefusal {
             CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
             CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
             CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
+            CreateRefusal::SourceUserNotAllowed => "remote_create_source_user_not_allowed",
         }
     }
 
@@ -1150,6 +1182,11 @@ impl CreateRefusal {
             CreateRefusal::IntentRepoNotAllowed => {
                 "the requested intent_repo is not one this device offers for remote creation — \
                  list it in `remote_create.allowed_intent_repos`"
+            }
+            CreateRefusal::SourceUserNotAllowed => {
+                "this device accepts remote terminal creation only from its OWN user \
+                 (`remote_create.accept_remote_create` is `same_user`), and the grant behind \
+                 this frame was not minted for that user — or names no user at all"
             }
         }
     }
@@ -1208,6 +1245,119 @@ pub fn resolve_create_working_dir(
             .ok_or(CreateRefusal::WorkingDirNotAllowed);
     }
     Ok(default_root.path.clone())
+}
+
+/// Resolve the directory a RELAY-delivered create with **no grant** spawns in.
+///
+/// The operator-web / mobile arm of `terminal_create` reaches the same relay
+/// socket as a remote create and used to honour `data["working_dir"]`
+/// VERBATIM — so the entire grant gate was opt-in by a marker the untrusted
+/// party stamps: omit the `remote` block and a relay frame bought a PTY at any
+/// path on the box (review finding 1, scenario A). The target decides here
+/// too; what differs from [`resolve_create_working_dir`] is only the
+/// no-preference arm:
+///
+/// * neither `working_dir_key` nor `working_dir` → `Ok(None)`, meaning "the
+///   runner's own default", when this device offers no roots at all, and the
+///   default root otherwise. The mobile client sends no working dir today
+///   (`createSession()` takes none), so this is the arm it actually uses.
+/// * a NAMED directory → exactly [`resolve_create_working_dir`]'s rule: it
+///   must be one this device offers, and the ROOT's spelling is what is
+///   returned. With no roots configured that is
+///   [`CreateRefusal::NoTargetDirectory`] — a caller naming a directory on a
+///   device that offers none is refused rather than obeyed.
+pub fn resolve_relay_working_dir(
+    targets: &CreateTargets,
+    requested_key: Option<&str>,
+    requested_dir: Option<&str>,
+) -> Result<Option<String>, CreateRefusal> {
+    let named = requested_key.map(str::trim).is_some_and(|k| !k.is_empty())
+        || requested_dir.map(str::trim).is_some_and(|d| !d.is_empty());
+    if !named {
+        return Ok(targets.roots.first().map(|r| r.path.clone()));
+    }
+    resolve_create_working_dir(targets, requested_key, requested_dir).map(Some)
+}
+
+/// The spawn parameters a RELAY-delivered `terminal_create` with **no grant**
+/// is allowed to choose — which is: none of them, freely.
+///
+/// The twin of [`AdmittedCreate`] for the ungated arm. Same shape for the same
+/// reason: the handler must have no second source for any of these, or the
+/// resolution here becomes advisory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelayCreate {
+    /// `None` = the runner's own default (this device offers no roots).
+    pub working_dir: Option<String>,
+    pub intent_repo: Option<String>,
+    /// **Always `None`, and it is a field rather than an omission so a test can
+    /// pin it.**
+    ///
+    /// `agent_session_id` is folded into a coord claim's OWNER TOKEN, so
+    /// honouring the frame's copy let a relay take a claim in a named agent
+    /// session's name (review finding 1, scenario A). Nothing on the web side
+    /// has ever sent the key on a `terminal_create` — neither
+    /// `runner_terminal_ws.py` nor the mobile client — so what it bought was
+    /// exactly the impersonation. The local Tauri command and the loopback HTTP
+    /// route, whose callers ARE the initiator, still read it.
+    pub agent_session_id: Option<Uuid>,
+}
+
+/// Gate one inbound `terminal_create` that carries **no `remote` block**.
+///
+/// This is the arm review finding 1 (scenario A) is about. `terminal_create`
+/// reaches the runner only over the backend relay, and the gate in
+/// [`admit_terminal_create`] engages only when the caller volunteers a block —
+/// so the relay could simply omit it and reach a path that honoured
+/// `working_dir`, `intent_repo` (worktree + coord claim) and
+/// `agent_session_id` (claim owner token) VERBATIM: no grant, no preference
+/// check, no allowlist, a PTY at `/`.
+///
+/// The gate cannot be made unconditional without deleting the mobile terminal
+/// feature, which reaches this same socket and cannot present a grant (coord
+/// mints create grants for DEVICES, and a mobile client is not one). So what
+/// this restores instead is the property the grant gate exists for — **the
+/// target decides the spawn parameters, not the caller** — on both arms:
+///
+/// * `working_dir` / `working_dir_key` resolve through the device's own roots
+///   ([`resolve_relay_working_dir`]), so a frame can only ask for a directory
+///   this device offers. The mobile client sends none, which is the arm that
+///   still gets this device's default.
+/// * `intent_repo` resolves through the device's own `allowed_intent_repos`,
+///   empty by default — so declaring one, which allocates a worktree AND takes
+///   a coord claim, is opt-in per device rather than per frame.
+/// * `agent_session_id` is not read at all. See [`RelayCreate`].
+pub fn resolve_relay_create(targets: &CreateTargets, data: &Value) -> Result<RelayCreate, Value> {
+    let requested_key = data.get("working_dir_key").and_then(|v| v.as_str());
+    let requested_dir = data.get("working_dir").and_then(|v| v.as_str());
+    let working_dir =
+        resolve_relay_working_dir(targets, requested_key, requested_dir).map_err(|refusal| {
+            warn!(
+                code = refusal.code(),
+                requested_key = requested_key.unwrap_or(""),
+                requested_dir = requested_dir.unwrap_or(""),
+                "relay create: refused the requested working directory — a frame with no grant \
+                 may only name a directory this device offers"
+            );
+            create_refusal_frame(refusal, data, Some(targets))
+        })?;
+
+    let requested_repo = data.get("intent_repo").and_then(|v| v.as_str());
+    let intent_repo = resolve_create_intent_repo(targets, requested_repo).map_err(|refusal| {
+        warn!(
+            code = refusal.code(),
+            requested_repo = requested_repo.unwrap_or(""),
+            "relay create: refused the requested intent_repo — a frame with no grant may only \
+             name a repo this device offers"
+        );
+        create_refusal_frame(refusal, data, Some(targets))
+    })?;
+
+    Ok(RelayCreate {
+        working_dir,
+        intent_repo,
+        agent_session_id: None,
+    })
 }
 
 /// Resolve a remote create's `intent_repo` against this device's allowlist.
@@ -1290,16 +1440,18 @@ pub fn create_refusal_frame(
 /// It is ALSO where the grant is spent — but at the END, not at that lookup:
 /// see the two comments in the body. One grant buys one spawn, and no refusal
 /// burns one.
-pub fn admit_terminal_create<P, T>(
+pub fn admit_terminal_create<P, T, U>(
     attach_grants: &RemoteAttachGrants,
     create_grants: &RemoteCreateGrants,
     preference: P,
+    local_user_id: U,
     targets: T,
     data: &Value,
     now: u64,
 ) -> Result<Option<AdmittedCreate>, Value>
 where
     P: FnOnce() -> AcceptRemoteCreate,
+    U: FnOnce() -> Option<String>,
     T: FnOnce() -> CreateTargets,
 {
     let block = match parse_remote_block(data) {
@@ -1327,7 +1479,11 @@ where
         ));
     }
 
-    if preference() == AcceptRemoteCreate::Off {
+    // Read ONCE: the `same_user` arm below needs the same value, and a dial
+    // that could change between the two reads would be enforced as `tenant` by
+    // one check and `same_user` by the other.
+    let preference = preference();
+    if preference == AcceptRemoteCreate::Off {
         warn!(
             grant_jti = %block.grant_jti,
             "remote create: refused — accept_remote_create is off on this device"
@@ -1361,18 +1517,50 @@ where
     // resolution below on purpose: the refusal frames from there echo this
     // device's `allowed_working_dir_keys` and `allowed_intent_repos`, and an
     // unauthorised caller must not be able to enumerate them by guessing.
-    if let Err(refusal) =
-        create_grants.lookup(&block.grant_jti, block.source_device_id.as_deref(), now)
+    let grant = match create_grants.lookup(&block.grant_jti, block.source_device_id.as_deref(), now)
     {
-        warn!(
-            grant_jti = %block.grant_jti,
-            code = refusal.code(),
-            known_grants = create_grants.len(),
-            "remote create: refused — this device holds no live create grant with that jti \
-             (the relay's word is not evidence of one)"
-        );
-        // `None` targets: no allowlist in the body. See above.
-        return Err(create_refusal_frame(refusal, data, None));
+        Ok(grant) => grant,
+        Err(refusal) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                code = refusal.code(),
+                known_grants = create_grants.len(),
+                "remote create: refused — this device holds no live create grant with that jti \
+                 (the relay's word is not evidence of one)"
+            );
+            // `None` targets: no allowlist in the body. See above.
+            return Err(create_refusal_frame(refusal, data, None));
+        }
+    };
+
+    // THE LOCAL HALF OF THE DIAL. `accept_remote_create` is three-valued and
+    // coord enforces it at the MINT — but coord's copy of the column and this
+    // device's `settings.json` are two stores, and only one of them is the one
+    // the operator just edited. Until this check existed the target could only
+    // tell `off` from not-`off`, so narrowing `tenant` -> `same_user` while
+    // coord was unreachable changed nothing here and coord kept minting under
+    // the old value (review finding 6).
+    //
+    // Fail CLOSED on every unknown: a grant whose feed row named no user, and a
+    // device that cannot say which user it is paired to, are both refusals
+    // rather than skips — an unknowable identity is not a matching one.
+    if preference == AcceptRemoteCreate::SameUser {
+        let granted = grant.source_user_id.trim().to_string();
+        let local = local_user_id().unwrap_or_default();
+        let local = local.trim();
+        if granted.is_empty() || local.is_empty() || !granted.eq_ignore_ascii_case(local) {
+            warn!(
+                grant_jti = %block.grant_jti,
+                granted_user = %if granted.is_empty() { "<absent>" } else { granted.as_str() },
+                local_user = %if local.is_empty() { "<unknown>" } else { local },
+                "remote create: refused — this device accepts creates only from its own user"
+            );
+            return Err(create_refusal_frame(
+                CreateRefusal::SourceUserNotAllowed,
+                data,
+                None,
+            ));
+        }
     }
 
     let targets = targets();
@@ -1525,6 +1713,31 @@ pub fn clear_create_reread(grant_jti: &str) {
         state.1.remove(grant_jti);
     }
 }
+
+/// Re-stamp the cooldown clock when a re-read FINISHES. Call it once, after
+/// the coord round-trip, on every arm.
+///
+/// [`claim_create_reread`] stamps the clock at CLAIM time, which bounds how
+/// often a re-read starts and not how much of the relay's serial read loop it
+/// occupies: a round-trip that takes as long as the cooldown ends with
+/// `now - last >= COOLDOWN` already true, so the next unknown jti claims
+/// immediately and the stalls run back to back (review finding 5). Stamping
+/// again here makes the cooldown a gap BETWEEN stalls, which is what it was
+/// described as.
+pub fn finish_create_reread(now: u64) {
+    if let Ok(mut state) = create_reread_state().lock() {
+        state.0 = now;
+    }
+}
+
+/// How long the ON-DEMAND re-read may hold the relay's serial read loop.
+///
+/// Not the 10 s the catch-up GET otherwise allows. What this re-read races is
+/// the gap between coord publishing the `create_request` directive and the
+/// relay's frame arriving — milliseconds — so a second is already generous for
+/// the legitimate case, while the 10 s timeout was a ten-second freeze of every
+/// terminal on the socket for each forged jti that won the throttle.
+pub const CREATE_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
 /// tested against a recorder that proves a refused frame never reaches it.
@@ -3973,6 +4186,7 @@ mod create_gate_tests {
             CreateGrant {
                 grant_jti: "jti-create-1".to_string(),
                 source_device_id: "dev-source".to_string(),
+                source_user_id: PAIRED_USER.to_string(),
                 expires_at: NOW + 900,
             },
             NOW,
@@ -3980,11 +4194,16 @@ mod create_gate_tests {
         table
     }
 
+    /// The user this device is paired to, and (in the fixture grant above) the
+    /// user coord minted the grant for — so the `same_user` dial admits.
+    const PAIRED_USER: &str = "11111111-1111-4111-8111-111111111111";
+
     fn admit(data: &Value) -> Result<Option<AdmittedCreate>, Value> {
         admit_terminal_create(
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
             targets,
             data,
             NOW,
@@ -4083,6 +4302,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
             CreateTargets::default,
             &create_frame(json!({})),
             NOW,
@@ -4132,6 +4352,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
             no_repos,
             &create_frame(json!({ "intent_repo": "qontinui-runner" })),
             NOW,
@@ -4144,6 +4365,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
             no_repos,
             &create_frame(json!({})),
             NOW,
@@ -4166,6 +4388,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             AcceptRemoteCreate::default,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             NOW,
@@ -4223,6 +4446,7 @@ mod create_gate_tests {
             &grants,
             &known_create_grants(),
             || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             NOW,
@@ -4262,6 +4486,7 @@ mod create_gate_tests {
             &empty_grants(),
             &unknown,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &frame,
             NOW,
@@ -4291,6 +4516,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &frame,
             NOW,
@@ -4333,6 +4559,7 @@ mod create_gate_tests {
                 &empty_grants(),
                 &table,
                 || AcceptRemoteCreate::Tenant,
+                || Some(PAIRED_USER.to_string()),
                 targets,
                 &frame,
                 NOW,
@@ -4352,6 +4579,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &frame,
             NOW,
@@ -4374,6 +4602,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             NOW,
@@ -4389,6 +4618,7 @@ mod create_gate_tests {
                 CreateGrant {
                     grant_jti: "jti-create-1".to_string(),
                     source_device_id: "dev-source".to_string(),
+                    source_user_id: PAIRED_USER.to_string(),
                     expires_at: NOW + 900,
                 },
                 NOW,
@@ -4401,6 +4631,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             NOW,
@@ -4423,6 +4654,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             0,
@@ -4440,6 +4672,7 @@ mod create_gate_tests {
             &empty_grants(),
             &known_create_grants(),
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({})),
             NOW + 901,
@@ -4485,6 +4718,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &frame,
             NOW,
@@ -4497,6 +4731,7 @@ mod create_gate_tests {
             &empty_grants(),
             &table,
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &frame,
             NOW,
@@ -4530,8 +4765,16 @@ mod create_gate_tests {
         ] {
             let table = known_create_grants();
             assert!(
-                admit_terminal_create(&empty_grants(), &table, move || pref, targets, &frame, NOW,)
-                    .is_err(),
+                admit_terminal_create(
+                    &empty_grants(),
+                    &table,
+                    move || pref,
+                    || Some(PAIRED_USER.to_string()),
+                    targets,
+                    &frame,
+                    NOW,
+                )
+                .is_err(),
                 "{label} must refuse"
             );
             assert!(
@@ -4616,6 +4859,38 @@ mod create_gate_tests {
         // The cooldown is sized against the directive race (milliseconds), not
         // against the grant's 900 s life.
         assert!(CREATE_REREAD_COOLDOWN_SECS > 0 && CREATE_REREAD_COOLDOWN_SECS < 60);
+
+        // --- and the cooldown must bound the STALL, not merely how often one
+        // --- STARTS (review finding 5). In the SAME test, not a second one:
+        // --- the throttle is one process-global and cargo runs `#[test]`s on
+        // --- parallel threads, so a separate test asserting on it races this
+        // --- one — which is exactly how this pair first went red.
+        //
+        // `claim_create_reread` stamps the clock at CLAIM time, and the re-read
+        // is awaited inline on the relay's serial read loop. A round-trip that
+        // takes as long as the cooldown therefore ends with
+        // `now - last >= COOLDOWN` already true, and the next unknown jti
+        // claims immediately: the stalls run BACK TO BACK and every terminal on
+        // the socket freezes for the duration. `finish_create_reread` re-stamps
+        // on COMPLETION, which is what makes the cooldown a gap BETWEEN stalls.
+        //
+        // Fails against a build without that call: the second claim succeeds
+        // there, because `finished - stall` is exactly one cooldown.
+        let stall = base + 100_000;
+        assert!(claim_create_reread(&format!("{tag}-stall-a"), stall));
+        let finished = stall + CREATE_REREAD_COOLDOWN_SECS;
+        finish_create_reread(finished);
+        assert!(
+            !claim_create_reread(&format!("{tag}-stall-b"), finished),
+            "a second stall must not begin the instant the first one ends"
+        );
+        assert!(
+            claim_create_reread(
+                &format!("{tag}-stall-b"),
+                finished + CREATE_REREAD_COOLDOWN_SECS
+            ),
+            "…and the window reopens a cooldown AFTER the previous one finished"
+        );
     }
 
     /// An unauthorised caller must not learn this device's directory and repo
@@ -4627,6 +4902,7 @@ mod create_gate_tests {
             &empty_grants(),
             &RemoteCreateGrants::new(),
             || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
             targets,
             &create_frame(json!({ "working_dir_key": "wherever" })),
             NOW,
@@ -4813,6 +5089,302 @@ mod created_reply_tests {
             assert_eq!(
                 reply.coord_session_id, None,
                 "a missing or blank coord session must not be guessed: {body}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_create_tests {
+    //! The UNGATED arm of `terminal_create` — review finding 1, scenario A.
+    //!
+    //! `terminal_create` reaches this runner only over the backend relay, and
+    //! `admit_terminal_create` answers `Ok(None)` for any frame with no
+    //! `remote` block, routing it to a path that honoured `working_dir`,
+    //! `intent_repo` and `agent_session_id` VERBATIM. So the entire grant gate
+    //! was opt-in by a marker the untrusted party stamps: the relay could send
+    //! `{"type":"terminal_create","working_dir":"/","intent_repo":"…",
+    //! "agent_session_id":"…"}` and get a PTY at `/`, a worktree, and a coord
+    //! claim under a named session's owner token.
+    //!
+    //! [`resolve_relay_create`] is the whole of what that arm may now choose,
+    //! and `handle_terminal_create` has no second source for any of the three —
+    //! so these tests pin the dispatch's behaviour, not an advisory helper.
+
+    use super::*;
+    use serde_json::json;
+
+    const ROOT: &str = "/home/agent/qontinui-root";
+    const SCRATCH: &str = "/home/agent/scratch";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![
+                CreateRoot {
+                    key: "workspace_root".to_string(),
+                    path: ROOT.to_string(),
+                },
+                CreateRoot {
+                    key: "scratch".to_string(),
+                    path: SCRATCH.to_string(),
+                },
+            ],
+            repos: vec!["qontinui-runner".to_string()],
+        }
+    }
+
+    /// **THE discriminating test.** The literal scenario-A frame, with no
+    /// `remote` block at all. Against the unfixed code this returned a
+    /// `RelayCreate` naming `/`.
+    #[test]
+    fn a_blockless_relay_frame_may_not_choose_the_directory() {
+        for requested in [
+            "/",
+            "/etc",
+            "/home/agent",
+            "/home/agent/qontinui-root/secret",
+        ] {
+            let frame = json!({ "type": "terminal_create", "working_dir": requested });
+            let err = resolve_relay_create(&targets(), &frame)
+                .expect_err("a frame with no grant may not name any directory it likes");
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "{requested}"
+            );
+        }
+    }
+
+    /// …and it may not take a worktree + coord claim either.
+    #[test]
+    fn a_blockless_relay_frame_may_not_declare_an_unlisted_intent_repo() {
+        let frame = json!({ "type": "terminal_create", "intent_repo": "qontinui-coord" });
+        let err = resolve_relay_create(&targets(), &frame).expect_err("not on this device's list");
+        assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+
+        // With an EMPTY allowlist — the default — nothing is declarable.
+        let none = CreateTargets {
+            roots: targets().roots,
+            repos: vec![],
+        };
+        assert!(resolve_relay_create(
+            &none,
+            &json!({ "type": "terminal_create", "intent_repo": "qontinui-runner" })
+        )
+        .is_err());
+    }
+
+    /// …and above all it may not name whose claim it takes. This is the field
+    /// that made the escalation an IMPERSONATION rather than merely an
+    /// over-broad spawn.
+    #[test]
+    fn a_blockless_relay_frame_never_names_the_claim_owner() {
+        let frame = json!({
+            "type": "terminal_create",
+            "agent_session_id": "0192a1b2-0000-7000-8000-0000000000ff",
+        });
+        let relay = resolve_relay_create(&targets(), &frame).expect("no dir, no repo — admitted");
+        assert_eq!(
+            relay.agent_session_id, None,
+            "the claim owner token is never chosen by a relay frame"
+        );
+    }
+
+    /// The mobile arm, which is what this must not break: it sends title, cols
+    /// and rows and NO working dir, and gets this device's default root.
+    #[test]
+    fn the_mobile_arm_still_works_and_gets_this_devices_default() {
+        let frame = json!({ "type": "terminal_create", "title": "headless", "cols": 80 });
+        let relay = resolve_relay_create(&targets(), &frame).expect("admitted");
+        assert_eq!(relay.working_dir.as_deref(), Some(ROOT));
+        assert_eq!(relay.intent_repo, None);
+    }
+
+    /// A device offering NO roots keeps the runner's own default for a frame
+    /// that names none — the pre-existing behaviour — and refuses one that
+    /// names a directory. Without the first half, a box with no resolvable
+    /// workspace root would refuse every mobile terminal.
+    #[test]
+    fn a_device_with_no_roots_defaults_rather_than_refusing_an_unasked_frame() {
+        let none = CreateTargets {
+            roots: vec![],
+            repos: vec![],
+        };
+        let relay = resolve_relay_create(&none, &json!({ "type": "terminal_create" }))
+            .expect("naming nothing is always allowed");
+        assert_eq!(relay.working_dir, None, "the runner's own default");
+
+        let err = resolve_relay_create(
+            &none,
+            &json!({ "type": "terminal_create", "working_dir": "/tmp" }),
+        )
+        .expect_err("naming one on a device that offers none is refused");
+        assert_eq!(err["code"], "remote_create_no_target_directory");
+    }
+
+    /// A named KEY resolves to that root's own spelling, same as a remote
+    /// create's — so the relay arm is not a second, looser vocabulary.
+    #[test]
+    fn a_named_key_resolves_to_the_devices_own_spelling() {
+        let relay = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir_key": "scratch" }),
+        )
+        .expect("an offered key");
+        assert_eq!(relay.working_dir.as_deref(), Some(SCRATCH));
+
+        assert!(resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir_key": "nope" })
+        )
+        .is_err());
+    }
+
+    /// The refusal carries the remedy, so a caller can be told what it MAY ask
+    /// for instead of guessing.
+    #[test]
+    fn a_relay_refusal_names_what_this_device_offers() {
+        let err = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir": "/" }),
+        )
+        .expect_err("refused");
+        assert_eq!(
+            err["allowed_working_dir_keys"],
+            json!(["workspace_root", "scratch"])
+        );
+        assert_eq!(err["allowed_intent_repos"], json!(["qontinui-runner"]));
+    }
+}
+
+#[cfg(test)]
+mod same_user_dial_tests {
+    //! Review finding 6 — the LOCAL half of `accept_remote_create`.
+    //!
+    //! The dial is three-valued and the target enforced only `off` vs
+    //! not-`off`, because `CreateGrant` dropped `source_user_id` entirely. So
+    //! an operator narrowing `tenant` -> `same_user` while coord was
+    //! unreachable changed nothing this device enforced: coord's column still
+    //! said `tenant` and it kept minting, and the target admitted every one.
+
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 1_700_000_000;
+    const MINE: &str = "11111111-1111-4111-8111-111111111111";
+    const THEIRS: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![CreateRoot {
+                key: "workspace_root".to_string(),
+                path: "/home/agent/qontinui-root".to_string(),
+            }],
+            repos: vec![],
+        }
+    }
+
+    fn table(source_user_id: &str) -> RemoteCreateGrants {
+        let t = RemoteCreateGrants::new();
+        assert!(t.insert(
+            CreateGrant {
+                grant_jti: "jti-c".to_string(),
+                source_device_id: "dev-source".to_string(),
+                source_user_id: source_user_id.to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        t
+    }
+
+    fn frame() -> Value {
+        json!({
+            "type": "terminal_create",
+            "remote": {
+                "grant_jti": "jti-c",
+                "source_device_id": "dev-source",
+                "kind": "create",
+            },
+        })
+    }
+
+    fn admit(
+        grants: &RemoteCreateGrants,
+        pref: AcceptRemoteCreate,
+        local: Option<&str>,
+    ) -> Result<Option<AdmittedCreate>, Value> {
+        let local = local.map(str::to_string);
+        admit_terminal_create(
+            &RemoteAttachGrants::new(),
+            grants,
+            move || pref,
+            move || local,
+            targets,
+            &frame(),
+            NOW,
+        )
+    }
+
+    /// **THE discriminating test.** Under `same_user`, a grant minted for
+    /// ANOTHER user is refused — and the grant is not burned by the refusal.
+    /// Against the unfixed code this was admitted, because the only test the
+    /// target ran was `!= Off`.
+    #[test]
+    fn same_user_refuses_a_grant_minted_for_another_user() {
+        let grants = table(THEIRS);
+        let err = admit(&grants, AcceptRemoteCreate::SameUser, Some(MINE))
+            .expect_err("another user's grant must not spawn here");
+        assert_eq!(err["code"], "remote_create_source_user_not_allowed");
+        assert!(
+            grants.contains("jti-c"),
+            "a refusal must not burn someone else's grant"
+        );
+    }
+
+    /// The same grant IS admitted under `tenant` — which is what makes the
+    /// test above about the dial rather than about the grant.
+    #[test]
+    fn tenant_admits_what_same_user_refuses() {
+        assert!(
+            admit(&table(THEIRS), AcceptRemoteCreate::Tenant, Some(MINE))
+                .expect("tenant admits any user in the tenant")
+                .is_some()
+        );
+    }
+
+    /// The matching case, case-insensitively on the uuid's hex.
+    #[test]
+    fn same_user_admits_this_devices_own_user() {
+        assert!(
+            admit(&table(MINE), AcceptRemoteCreate::SameUser, Some(MINE))
+                .expect("my own grant")
+                .is_some()
+        );
+        assert!(admit(
+            &table(&MINE.to_uppercase()),
+            AcceptRemoteCreate::SameUser,
+            Some(MINE)
+        )
+        .expect("hex case is not identity")
+        .is_some());
+    }
+
+    /// Both unknowns fail CLOSED: a grant whose feed row named no user, and a
+    /// device that cannot say which user it is paired to. An unknowable
+    /// identity is not a matching one — and `same_user` is precisely the arm an
+    /// operator picks when they do not trust the rest of the tenant.
+    #[test]
+    fn an_unknowable_identity_is_refused_not_skipped() {
+        for (label, granted, local) in [
+            ("the feed named no user", "", Some(MINE)),
+            ("this device is not paired", MINE, None),
+            ("neither", "", None),
+            ("a blank local id", MINE, Some("   ")),
+        ] {
+            let err = admit(&table(granted), AcceptRemoteCreate::SameUser, local).expect_err(label);
+            assert_eq!(
+                err["code"], "remote_create_source_user_not_allowed",
+                "{label}"
             );
         }
     }

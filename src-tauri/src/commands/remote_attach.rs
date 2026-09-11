@@ -285,14 +285,13 @@ pub async fn terminal_attach_remote(
 
     let base = coord_base_for(&app_handle);
     let minted = mint_attach_grant(&base, session_uuid).await?;
-    if let Some(target) = minted.target_device_id.as_deref() {
+    if !coord_places_session_on(&device_id, minted.target_device_id.as_deref()) {
+        let target = minted.target_device_id.as_deref().unwrap_or("<unreported>");
         let asked = device_id.trim();
-        if !asked.is_empty() && !target.eq_ignore_ascii_case(asked) {
-            return Err(format!(
-                "remote_attach:target_mismatch: coord places session {session_uuid} on device \
-                 {target}, not {asked} — refresh the fleet list"
-            ));
-        }
+        return Err(format!(
+            "remote_attach:target_mismatch: coord places session {session_uuid} on device \
+             {target}, not {asked} — refresh the fleet list"
+        ));
     }
     info!(
         session = %session_uuid,
@@ -542,4 +541,61 @@ pub async fn terminal_remote_history_load(
             "requestedTo": to,
         })),
     })
+}
+
+/// Does coord place this session on the device the operator addressed?
+///
+/// **The authority for WHERE a session lives is coord's answer to the mint, not
+/// the device id the caller carried.** `terminal_attach_remote` has always
+/// refused a disagreement; the create-then-attach path called the same mint,
+/// read the same field, and DISCARDED it — on the path where the session id
+/// arrived over the untrusted relay (review finding 3). One predicate now, so
+/// the two cannot drift again.
+///
+/// `coord_placed == None` is TRUE: an older coord that does not report the
+/// placement leaves the question unanswered, and there is nothing to disagree
+/// with. That is a deliberate asymmetry with the rest of this module's
+/// fail-closed posture — refusing there would break every attach against such a
+/// coord — and it is safe only because the mint itself is device-authenticated.
+/// `asked` empty is TRUE for the same reason: nothing was claimed.
+pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -> bool {
+    let asked = asked.trim();
+    match coord_placed.map(str::trim).filter(|p| !p.is_empty()) {
+        None => true,
+        Some(placed) => asked.is_empty() || placed.eq_ignore_ascii_case(asked),
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::coord_places_session_on;
+
+    /// Review finding 3. The scenario: the operator clicks New terminal on B, a
+    /// relay rewrites `coord_session_id` on `remote_terminal_created` to a
+    /// session living on C, and the source mints an attach grant for C's
+    /// session while labelling the tab B — so the operator types into C's live
+    /// agent session. Coord's placement is the only thing that catches it, and
+    /// the create path was throwing it away.
+    #[test]
+    fn a_session_coord_places_elsewhere_is_refused() {
+        assert!(!coord_places_session_on("device-b", Some("device-c")));
+        assert!(!coord_places_session_on("  device-b  ", Some("device-c")));
+    }
+
+    /// Hex case is not identity.
+    #[test]
+    fn the_matching_case_is_case_insensitive_and_trimmed() {
+        assert!(coord_places_session_on("DEVICE-B", Some("device-b")));
+        assert!(coord_places_session_on("device-b", Some("  DEVICE-B ")));
+    }
+
+    /// An unanswered question is not a disagreement. Refusing here would break
+    /// every attach against a coord that does not report the placement.
+    #[test]
+    fn an_unreported_placement_is_not_a_mismatch() {
+        assert!(coord_places_session_on("device-b", None));
+        assert!(coord_places_session_on("device-b", Some("")));
+        assert!(coord_places_session_on("device-b", Some("   ")));
+        assert!(coord_places_session_on("", Some("device-c")));
+    }
 }

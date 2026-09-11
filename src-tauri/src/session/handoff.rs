@@ -389,7 +389,7 @@ async fn connect_and_pump(
     // Without this the target has no source for the create grants coord
     // minted while it was down, and a `terminal_create` arriving under one of
     // them is refused — which is correct, but avoidable.
-    super::create::run_catchup(http, coord_url, device_id).await;
+    super::create::run_catchup(http, coord_url, device_id, super::create::CATCHUP_TIMEOUT).await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;

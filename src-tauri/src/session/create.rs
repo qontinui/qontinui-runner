@@ -89,12 +89,28 @@ impl PendingCreate {
     }
 
     /// The table row this request becomes.
+    ///
+    /// `None` — the row is DROPPED — when `expires_at` is unreadable OR when
+    /// the feed named no `source_device_id`.
+    ///
+    /// The second arm is not symmetry for its own sake. The source binding in
+    /// [`crate::mcp::remote_terminal::RemoteCreateGrants::resolve`] is what
+    /// stops the relay replaying a jti from a device coord never minted it
+    /// for, and it compares against THIS string — so an absent field became an
+    /// empty string, an empty string skipped the comparison, and a grant with
+    /// no source binding at all was recorded (review finding 9). `#[serde(default)]`
+    /// makes that a silent one-key edit on the wire rather than a parse error,
+    /// which is exactly the shape that has to fail closed. Coord's column is
+    /// `UUID NOT NULL`, so a row missing it is malformed, not merely partial —
+    /// the same reading an unreadable `expires_at` already got.
     pub fn into_grant(self) -> Option<CreateGrant> {
         let expires_at = self.expires_at_secs()?;
+        let source_device_id = self.source_device_id?.to_string();
         Some(CreateGrant {
             grant_jti: self.grant_jti,
-            source_device_id: self
-                .source_device_id
+            source_device_id,
+            source_user_id: self
+                .source_user_id
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
             expires_at,
@@ -161,17 +177,17 @@ pub(super) fn parse_create_push(text: &str, device_id: Uuid) -> Option<PendingCr
 /// the ones a silent drop would hide.
 pub fn record(pending: PendingCreate) -> bool {
     let jti = pending.grant_jti.clone();
-    let source_user = pending.source_user_id;
     match pending.into_grant() {
         Some(grant) => {
             let source_device = grant.source_device_id.clone();
+            let source_user = grant.source_user_id.clone();
             let expires_at = grant.expires_at;
             let recorded = create_grants().insert(grant, now_epoch_secs());
             if recorded {
                 tracing::info!(
                     grant_jti = %jti,
                     source_device = %source_device,
-                    source_user = ?source_user,
+                    source_user = %source_user,
                     expires_at,
                     "remote create: grant recorded"
                 );
@@ -188,12 +204,33 @@ pub fn record(pending: PendingCreate) -> bool {
         None => {
             tracing::warn!(
                 grant_jti = %jti,
-                "remote create: request carries an unreadable expires_at — skipped"
+                "remote create: request carries an unreadable expires_at, or no \
+                 source_device_id — skipped (both are fail-closed: a grant with no source \
+                 binding would be replayable from any device)"
             );
             false
         }
     }
 }
+
+/// How long to keep re-trying `notify_consumed`, and how long to wait between
+/// tries. Six attempts over ~2 minutes, inside a create grant's 15-minute life.
+///
+/// **The retry is the durable half of single-use, not a nicety.** The local
+/// tombstone dies with the process, and the relay's Redis claim is released the
+/// moment the create completes, so coord's `consumed_at` is the ONLY barrier
+/// that survives a target restart. A single no-retry POST made that barrier
+/// conditional on one 10-second window being healthy: a coord blip during it
+/// left the row `consumed_at IS NULL`, the restarted runner's catch-up listed
+/// the grant again, and the identical frame replayed into a second PTY — once
+/// per restart, for the rest of the grant's TTL (review finding 4).
+const CONSUME_BACKOFF: &[Duration] = &[
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(8),
+    Duration::from_secs(20),
+    Duration::from_secs(45),
+];
 
 /// Tell coord a grant is SPENT — `POST /sessions/create-requests/{jti}/consume`.
 ///
@@ -201,8 +238,14 @@ pub fn record(pending: PendingCreate) -> bool {
 /// a grant in `GET /sessions/create-requests` until its `consumed_at` is set, so
 /// without this call the row outlives its one use: this process refuses it (the
 /// tombstone), but a restarted runner — or a second runner on the same device —
-/// reads it back as pending. Best-effort and logged: a failure costs the
-/// durable half of single-use, never the local half.
+/// reads it back as pending.
+///
+/// Retried — see [`CONSUME_BACKOFF`]. A 4xx other than 408/429 is FINAL (coord
+/// understood us and said no; retrying cannot change that, and a 404 from a
+/// coord whose route has not landed would otherwise retry for two minutes per
+/// spend). A transport error, a 5xx, a 408 and a 429 are all retried. Still
+/// best-effort in the end: exhausting the schedule is logged loudly, because
+/// what is lost is precisely the barrier a restart depends on.
 pub async fn notify_consumed(registry: &Arc<SessionRegistry>, grant_jti: &str) {
     let http = registry.coord_sync().http_client();
     let coord_url = registry.coord_sync().coord_url().to_string();
@@ -211,31 +254,61 @@ pub async fn notify_consumed(registry: &Arc<SessionRegistry>, grant_jti: &str) {
         coord_url.trim_end_matches('/'),
         grant_jti
     );
-    let resp = crate::coord_http::coord_post(&http, &url)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-    match resp {
-        Ok(r) if r.status().is_success() => {
-            tracing::debug!(grant_jti, "remote create: coord marked the grant consumed");
+    let mut last = String::new();
+    for attempt in 0..=CONSUME_BACKOFF.len() {
+        let resp = crate::coord_http::coord_post(&http, &url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                tracing::debug!(
+                    grant_jti,
+                    attempt,
+                    "remote create: coord marked the grant consumed"
+                );
+                return;
+            }
+            Ok(r) => {
+                let status = r.status();
+                last = format!("HTTP {}", status.as_u16());
+                let retryable = status.is_server_error()
+                    || status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                if !retryable {
+                    tracing::warn!(
+                        grant_jti,
+                        status = status.as_u16(),
+                        "remote create: coord REFUSED to mark the grant consumed — final, not \
+                         retried; the row stays in the pending list until it expires and this \
+                         device refuses it locally in the meantime"
+                    );
+                    return;
+                }
+            }
+            Err(e) => last = e.to_string(),
         }
-        Ok(r) => {
-            tracing::warn!(
-                grant_jti,
-                status = r.status().as_u16(),
-                "remote create: coord did not mark the grant consumed — it stays in the pending \
-                 list until it expires; this device still refuses it locally"
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                grant_jti,
-                error = %e,
-                "remote create: could not reach coord to mark the grant consumed — it stays in \
-                 the pending list until it expires; this device still refuses it locally"
-            );
+        match CONSUME_BACKOFF.get(attempt) {
+            Some(delay) => {
+                tracing::debug!(
+                    grant_jti,
+                    attempt,
+                    error = %last,
+                    "remote create: consume notice failed — retrying"
+                );
+                tokio::time::sleep(*delay).await;
+            }
+            None => break,
         }
     }
+    tracing::warn!(
+        grant_jti,
+        attempts = CONSUME_BACKOFF.len() + 1,
+        error = %last,
+        "remote create: coord never marked the grant consumed — the DURABLE half of single-use \
+         is gone for this jti: this process still refuses it, but a runner restart inside the \
+         grant's remaining life would read it back as pending"
+    );
 }
 
 /// Handle one inbound `/ws` frame on the create arm. Not a create request for
@@ -251,6 +324,7 @@ pub(super) async fn fetch_pending(
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
+    timeout: Duration,
 ) -> Result<CreateListResponse, HandoffError> {
     let url = format!(
         "{}/sessions/create-requests?device_id={}",
@@ -258,7 +332,7 @@ pub(super) async fn fetch_pending(
         device_id
     );
     let resp = crate::coord_http::coord_get(http, &url)
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("GET {url}: {e}")))?;
@@ -279,8 +353,13 @@ pub(super) async fn fetch_pending(
 /// posture as the attach catch-up — one WARN line on a 401/403 (pre-pairing
 /// window), debug otherwise. A failure costs reachability, never admission:
 /// nothing is admitted on a jti this table does not hold.
-pub(super) async fn run_catchup(http: &reqwest::Client, coord_url: &str, device_id: Uuid) {
-    match fetch_pending(http, coord_url, device_id).await {
+pub(super) async fn run_catchup(
+    http: &reqwest::Client,
+    coord_url: &str,
+    device_id: Uuid,
+    timeout: Duration,
+) {
+    match fetch_pending(http, coord_url, device_id, timeout).await {
         Ok(list) => {
             if list.storage.as_deref() == Some("absent") {
                 tracing::debug!(
@@ -317,12 +396,30 @@ pub(super) async fn run_catchup(http: &reqwest::Client, coord_url: &str, device_
     }
 }
 
+/// The catch-up GET's timeout on the BACKGROUND paths — the 60 s poll and the
+/// coord-WS / relay `connected` acks. Nothing is waiting on those.
+pub const CATCHUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run the catch-up once against the registry's coord — the door the backend
 /// relay calls on its `connected` ack.
 pub async fn catch_up_now(registry: &Arc<SessionRegistry>) {
+    catch_up_now_within(registry, CATCHUP_TIMEOUT).await;
+}
+
+/// [`catch_up_now`] with an explicit HTTP timeout.
+///
+/// The on-demand re-read — the one `handle_terminal_create` awaits on the
+/// backend relay's SERIAL read loop when a create names a jti this device does
+/// not know — passes
+/// [`crate::mcp::remote_terminal::CREATE_REREAD_TIMEOUT`] here instead of the
+/// background [`CATCHUP_TIMEOUT`]. That call freezes terminal input, terminal
+/// output and every other relay frame on the socket for as long as it runs, so
+/// its bound is a LIVENESS budget for the whole device and not a patience
+/// budget for one grant (review finding 5).
+pub async fn catch_up_now_within(registry: &Arc<SessionRegistry>, timeout: Duration) {
     let http = registry.coord_sync().http_client();
     let coord_url = registry.coord_sync().coord_url().to_string();
-    run_catchup(&http, &coord_url, registry.machine_id()).await;
+    run_catchup(&http, &coord_url, registry.machine_id(), timeout).await;
 }
 
 /// The 60 s catch-up loop. Returns the handle so the caller can hold it for the
@@ -423,6 +520,102 @@ mod tests {
             "payload": payload(other, json!(1_900_000_000)),
         });
         assert!(parse_create_push(&mismatched.to_string(), device).is_none());
+    }
+
+    /// **A feed row naming no source device is DROPPED** — review finding 9.
+    ///
+    /// The source binding in `RemoteCreateGrants::resolve` is what stops the
+    /// relay replaying a jti from a device coord never minted it for, and it
+    /// compares against this string. `Option<Uuid>` + `#[serde(default)]` made
+    /// an absent key a silent `None`, `None` became `""`, and `""` skipped the
+    /// comparison — so ONE key removed on the wire disabled the binding
+    /// entirely. Coord's column is `UUID NOT NULL`, so such a row is malformed,
+    /// not partial, and gets the same reading an unreadable `expires_at`
+    /// already got.
+    ///
+    /// Fails against the old `unwrap_or_default()`: that returned
+    /// `Some(CreateGrant { source_device_id: "", .. })`.
+    #[test]
+    fn a_request_with_no_source_device_is_dropped_rather_than_unbound() {
+        let device = Uuid::from_u128(10);
+        let mut body = payload(device, json!(1_900_000_000));
+        body.as_object_mut().unwrap().remove("source_device_id");
+        let pending: PendingCreate = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(pending.source_device_id, None, "it still PARSES");
+        assert!(
+            pending.into_grant().is_none(),
+            "…and is dropped rather than recorded with an empty binding"
+        );
+        assert!(
+            !record(serde_json::from_value(body).unwrap()),
+            "`record` reports the drop"
+        );
+
+        // An explicit null is the same row.
+        let mut nulled = payload(device, json!(1_900_000_000));
+        nulled["source_device_id"] = json!(null);
+        let pending: PendingCreate = serde_json::from_value(nulled).unwrap();
+        assert!(pending.into_grant().is_none());
+    }
+
+    /// The user the grant was minted for reaches the table, because the
+    /// `same_user` arm of this device's own dial is the only thing that can
+    /// enforce it locally (review finding 6). Absent stays EMPTY here — the
+    /// refusal is made at the dial, not by inventing an identity.
+    #[test]
+    fn the_source_user_reaches_the_grant() {
+        let device = Uuid::from_u128(10);
+        let grant = serde_json::from_value::<PendingCreate>(payload(device, json!(1_900_000_000)))
+            .unwrap()
+            .into_grant()
+            .expect("a complete row");
+        assert_eq!(grant.source_user_id, Uuid::from_u128(2).to_string());
+
+        let mut body = payload(device, json!(1_900_000_000));
+        body.as_object_mut().unwrap().remove("source_user_id");
+        let grant = serde_json::from_value::<PendingCreate>(body)
+            .unwrap()
+            .into_grant()
+            .expect("a user-less row is still a usable grant under `tenant`");
+        assert_eq!(grant.source_user_id, "");
+    }
+
+    /// The consume notice is RETRIED — it is the only barrier that survives a
+    /// target restart (review finding 4). The schedule stays inside a create
+    /// grant's 15-minute life, or a retry would outlive what it protects.
+    #[test]
+    fn the_consume_notice_retries_within_the_grants_life() {
+        assert!(
+            !CONSUME_BACKOFF.is_empty(),
+            "a single attempt is the defect"
+        );
+        let total: Duration = CONSUME_BACKOFF.iter().sum();
+        assert!(
+            total < Duration::from_secs(900),
+            "the schedule must finish inside the grant's own life"
+        );
+        // Monotonic: a flat schedule is a poll, not a backoff.
+        for pair in CONSUME_BACKOFF.windows(2) {
+            assert!(pair[1] > pair[0], "{pair:?}");
+        }
+    }
+
+    /// The ON-DEMAND re-read's timeout is a fraction of the background
+    /// catch-up's (review finding 5). It is awaited on the backend relay's
+    /// SERIAL read loop, so it freezes terminal input, terminal output and
+    /// every other frame on the socket for as long as it runs — a liveness
+    /// budget for the whole device, not a patience budget for one grant. It
+    /// must also be well under the throttle's cooldown, or the stalls run
+    /// back to back however the cooldown is stamped.
+    #[test]
+    fn the_on_demand_reread_is_bounded_far_tighter_than_the_background_catch_up() {
+        use crate::mcp::remote_terminal::{CREATE_REREAD_COOLDOWN_SECS, CREATE_REREAD_TIMEOUT};
+        assert!(CREATE_REREAD_TIMEOUT < CATCHUP_TIMEOUT);
+        assert!(
+            CREATE_REREAD_TIMEOUT < Duration::from_secs(CREATE_REREAD_COOLDOWN_SECS),
+            "a re-read that can run for a whole cooldown window makes the throttle a \
+             frequency bound on STARTS rather than a gap between stalls"
+        );
     }
 
     /// RFC 3339 and integer expiries both become a grant; an unreadable one

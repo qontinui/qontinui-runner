@@ -2063,47 +2063,150 @@ fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
         || REMOTE_ENVELOPE_TYPES.contains(&msg_type)
 }
 
+/// Where one inbound relay frame is going, decided BEFORE any handler runs.
+///
+/// Split out of [`handle_relay_command`] so the routing decision is testable
+/// without an `ApiState` — which owns a `tauri::AppHandle` and cannot be built
+/// in a unit test. That gap is why
+/// `envelope_carriers_pass_through_and_the_inner_type_is_what_decides` passed
+/// on a build where the envelope arm DROPPED the block it was said to carry
+/// through: the test exercised the predicate and the dispatch did the
+/// unwrapping (review finding 1, scenario B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayRoute {
+    /// Run this arm with this payload. Envelopes are already unwrapped, so
+    /// `msg_type` is the OPERATION and never a carrier.
+    Dispatch { msg_type: String, data: Value },
+    /// Refuse before dispatch; this frame goes back on the socket.
+    Refuse(Value),
+}
+
+/// How many nested envelopes to unwrap before refusing the frame outright.
+/// Two is the depth the protocol uses (`terminal` → `terminal_create`); the
+/// cap exists because a carrier whose `subtype` names another carrier is a
+/// loop a recursive dispatch would follow forever.
+const MAX_ENVELOPE_DEPTH: usize = 4;
+
+/// The pre-dispatch refusal frame for a `remote` block on a type that may not
+/// carry one.
+fn remote_type_refusal(msg_type: &str, data: &Value) -> Value {
+    serde_json::json!({
+        "type": "error",
+        "code": "remote_type_not_admitted",
+        "message": format!(
+            "`{msg_type}` may not carry a remote block — admitted: {}",
+            [REMOTE_TARGET_ADMITTED, REMOTE_SOURCE_ADMITTED].concat().join(", ")
+        ),
+        "request_id": data.get("request_id"),
+        "remote": crate::mcp::remote_terminal::remote_echo(data),
+    })
+}
+
+/// Decide what one inbound relay frame dispatches to.
+///
+/// Unwraps envelope carriers and re-applies [`remote_frame_admitted`] at every
+/// level — and **carries an envelope-level `remote` block down into the
+/// payload**, which is the half that was missing. The old envelope arm built
+/// its inner frame as `data.get("payload").cloned()`, so
+/// `{"type":"terminal","subtype":"terminal_create","remote":{…},
+///   "payload":{"working_dir":"/etc"}}` re-entered as a `terminal_create` with
+/// NO block: the predicate that had just refused it saw nothing to refuse and
+/// the frame reached the ungated arm. The same strip applied to
+/// `terminal_input`, whose ungated arm writes into any named terminal id.
+///
+/// A block on BOTH levels is refused unless the two are identical. There is no
+/// privilege difference between them — the relay stamps both — so the point is
+/// not to pick a winner but to keep the two from disagreeing about which grant
+/// a frame is being admitted under.
+pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
+    let mut msg_type = msg_type.to_string();
+    let mut data = data.clone();
+
+    for _ in 0..MAX_ENVELOPE_DEPTH {
+        // A frame carrying a `remote` block may only be a type that belongs to
+        // the remote-attach protocol. Checked at EVERY level, so no path
+        // reaches an ungated handler under a grant.
+        if !remote_frame_admitted(&msg_type, &data) {
+            warn!(
+                msg_type,
+                "remote attach: refusing a `remote` frame whose type is not part of the protocol"
+            );
+            return RelayRoute::Refuse(remote_type_refusal(&msg_type, &data));
+        }
+        if !REMOTE_ENVELOPE_TYPES.contains(&msg_type.as_str()) {
+            return RelayRoute::Dispatch { msg_type, data };
+        }
+
+        // Frontend WS endpoints relay through this single channel. The inner
+        // `subtype` field carries the original command name (e.g.
+        // "chat_message" inside a `chat` envelope).
+        let subtype = data
+            .get("subtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut inner = data.get("payload").cloned().unwrap_or_else(|| data.clone());
+
+        match data.get("remote") {
+            // `null` is ABSENT — the same reading `parse_remote_block` gives
+            // it, so a serializer emitting `Option::None` carries nothing.
+            None | Some(Value::Null) => {}
+            Some(outer) => match inner.get("remote") {
+                Some(existing) if existing == outer => {}
+                Some(_) => {
+                    warn!(
+                        msg_type,
+                        subtype,
+                        "remote attach: refusing an envelope whose `remote` block disagrees \
+                         with its payload's"
+                    );
+                    return RelayRoute::Refuse(remote_type_refusal(&subtype, &data));
+                }
+                None => match inner.as_object_mut() {
+                    Some(obj) => {
+                        obj.insert("remote".to_string(), outer.clone());
+                    }
+                    // A grant we cannot carry is a grant we do not honour.
+                    None => {
+                        warn!(
+                            msg_type,
+                            subtype,
+                            "remote attach: refusing an envelope carrying a `remote` block \
+                             over a non-object payload"
+                        );
+                        return RelayRoute::Refuse(remote_type_refusal(&subtype, &data));
+                    }
+                },
+            },
+        }
+
+        msg_type = subtype;
+        data = inner;
+    }
+
+    warn!(
+        msg_type,
+        "remote attach: refusing a frame nested deeper than {MAX_ENVELOPE_DEPTH} envelopes"
+    );
+    RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
+}
+
 async fn handle_relay_command(
     api_state: &Arc<ApiState>,
     msg_type: &str,
     data: &Value,
 ) -> Option<Value> {
-    // A frame carrying a `remote` block may only be a type that belongs to the
-    // remote-attach protocol. Checked BEFORE dispatch, and again on every
-    // envelope re-entry, so no path reaches an ungated handler under a grant.
-    if !remote_frame_admitted(msg_type, data) {
-        warn!(
-            msg_type,
-            "remote attach: refusing a `remote` frame whose type is not part of the protocol"
-        );
-        return Some(serde_json::json!({
-            "type": "error",
-            "code": "remote_type_not_admitted",
-            "message": format!(
-                "`{msg_type}` may not carry a remote block — admitted: {}",
-                [REMOTE_TARGET_ADMITTED, REMOTE_SOURCE_ADMITTED].concat().join(", ")
-            ),
-            "request_id": data.get("request_id"),
-            "remote": crate::mcp::remote_terminal::remote_echo(data),
-        }));
-    }
+    let (msg_type, data) = match route_relay_frame(msg_type, data) {
+        RelayRoute::Refuse(frame) => return Some(frame),
+        RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
+    };
+    let data = &data;
 
-    match msg_type {
+    match msg_type.as_str() {
         // --------------------------------------------------------------
-        // Phase 3 protocol — typed dispatch / command / chat / terminal
+        // Phase 3 protocol — typed dispatch
         // --------------------------------------------------------------
         "dispatch" => handle_dispatch(api_state, data).await,
-
-        "command" | "chat" | "terminal" => {
-            // Frontend WS endpoints now relay through this single channel.
-            // The inner `subtype` field carries the original command name
-            // (e.g. "chat_message" inside a `chat` envelope). Unwrap and
-            // dispatch through the legacy handler.
-            let subtype = data.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
-            let inner = data.get("payload").cloned().unwrap_or_else(|| data.clone());
-            // Box the recursive call to avoid an infinitely-sized future.
-            return Box::pin(handle_relay_command(api_state, subtype, &inner)).await;
-        }
 
         // --------------------------------------------------------------
         // Web -> runner WS bridge commands. The web side's
@@ -2187,7 +2290,7 @@ async fn handle_relay_command(
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
         | "remote_terminal_error" => {
-            crate::mcp::remote_terminal::client().handle_inbound(msg_type, data);
+            crate::mcp::remote_terminal::client().handle_inbound(&msg_type, data);
             None
         }
         "error" => {
@@ -3750,6 +3853,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             crate::mcp::remote_terminal::grants(),
             crate::mcp::remote_terminal::create_grants(),
             crate::settings::get_remote_create_preference,
+            qontinui_runner_lib::pair::read_paired_user_id_from_disk,
             remote_create_targets,
             data,
             crate::mcp::remote_terminal::now_epoch_secs(),
@@ -3808,7 +3912,23 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         "remote create: jti unknown to this device — asking coord directly \
                          before refusing (the directive may not have landed yet)"
                     );
-                    crate::session::create::catch_up_now(&registry).await;
+                    // BOUNDED, and the bound is a second rather than the
+                    // catch-up's ten: this `await` holds the relay's serial
+                    // read loop, so it is the whole device's liveness budget.
+                    crate::session::create::catch_up_now_within(
+                        &registry,
+                        crate::mcp::remote_terminal::CREATE_REREAD_TIMEOUT,
+                    )
+                    .await;
+                    // Re-stamp the cooldown on COMPLETION. `claim_create_reread`
+                    // stamped it when the re-read started, which bounds how
+                    // often one begins and not how much of the read loop it
+                    // occupies — a round-trip as long as the cooldown left the
+                    // next unknown jti free to claim immediately, so the stalls
+                    // ran back to back.
+                    crate::mcp::remote_terminal::finish_create_reread(
+                        crate::mcp::remote_terminal::now_epoch_secs(),
+                    );
                 }
                 None => return Some(frame),
             }
@@ -3854,17 +3974,45 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         .try_state::<Arc<crate::terminal::TerminalManager>>()
         .map(|s| s.inner().clone());
 
+    // This device's own spawn targets. Read once per create (a settings read,
+    // not a per-keystroke cost) and used by the UNGATED arm below — the gated
+    // one already resolved against the same table inside `admit_terminal_create`.
+    let relay_targets = remote_create_targets();
+
     if let Some(tm) = terminal_manager {
         let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
-        // A remote create NEVER reads the frame's `working_dir`: whatever it
-        // asked for was answered — or refused — by the gate above.
-        let working_dir = match &admitted {
-            Some(create) => Some(create.working_dir.clone()),
-            None => data
-                .get("working_dir")
-                .and_then(|v| v.as_str())
-                .map(String::from),
+
+        // `intent_repo` is the opt-in from Phase 2 of
+        // `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`, the
+        // same one the Tauri command and the HTTP-SDK proxy accept: allocation
+        // happens via the shared helper and the context is parked on the
+        // resulting TerminalSession.
+        //
+        // NEITHER arm reads the frame's spawn parameters verbatim any more.
+        //
+        // A remote create's were answered — or refused — by the gate above.
+        // The ungated arm (the operator-web / mobile path) goes through
+        // `resolve_relay_create`, which applies the SAME device-owned
+        // allowlists: "no `remote` block" is a choice the untrusted party
+        // makes, so leaving that arm caller-chosen made the whole grant gate
+        // opt-in by a marker the adversary stamps (review finding 1,
+        // scenario A). The mobile client sends none of the three, which is the
+        // arm that still gets this device's default.
+        let relay = match &admitted {
+            Some(create) => crate::mcp::remote_terminal::RelayCreate {
+                working_dir: Some(create.working_dir.clone()),
+                intent_repo: create.intent_repo.clone(),
+                agent_session_id: None,
+            },
+            None => match crate::mcp::remote_terminal::resolve_relay_create(&relay_targets, data) {
+                Ok(relay) => relay,
+                Err(frame) => return Some(frame),
+            },
         };
+        let working_dir = relay.working_dir.clone();
+        let intent_repo = relay.intent_repo.clone();
+        let agent_session_id = relay.agent_session_id;
+
         let cols = data
             .get("cols")
             .and_then(|v| v.as_u64())
@@ -3873,35 +4021,6 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             .get("rows")
             .and_then(|v| v.as_u64())
             .map(|v| v.min(u16::MAX as u64) as u16);
-        // Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
-        // Accept the same `intent_repo` opt-in the Tauri command + HTTP-SDK
-        // proxy accept so backend-relay callers can declare edit intent on
-        // a registered repo. Allocation happens via the shared helper; the
-        // context (if any) is parked on the resulting TerminalSession.
-        let intent_repo = match &admitted {
-            Some(create) => create.intent_repo.clone(),
-            None => data
-                .get("intent_repo")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        };
-
-        // Stable session id of the agent issuing this relay request, if the
-        // caller supplied one — folded into the claim owner token so distinct
-        // agent sessions on one machine are distinct holders. Sourced from the
-        // request payload (the initiator's context), NOT the runner's process
-        // env. Absent / unparseable → None.
-        //
-        // A REMOTE create never reads it: the id lands in a coord claim's
-        // owner token, and a remote caller naming another machine's session
-        // id would take a claim in that session's name.
-        let agent_session_id = match &admitted {
-            Some(_) => None,
-            None => data
-                .get("agent_session_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
-        };
 
         // L2 (shared-checkout coordination gap fix) — derive `intent_repo`
         // from `working_dir` when the caller didn't declare one (no-op
@@ -5880,9 +5999,27 @@ mod remote_admission_tests {
         ));
     }
 
-    /// A frame with no block is not a remote frame.
+    /// A frame with no block is not a remote frame — and that is ALL this
+    /// predicate says about it.
+    ///
+    /// It used to be named `a_frame_with_no_remote_block_is_always_admitted`,
+    /// which read as a security property and was not one: `terminal_create`
+    /// reaches the runner only over the backend relay, so "admitted here"
+    /// meant the relay could omit the block and route to an arm that honoured
+    /// `working_dir`, `intent_repo` and `agent_session_id` verbatim — a PTY at
+    /// `/`, a worktree, and a coord claim under a named session's owner token,
+    /// with no grant and no allowlist (review finding 1, scenario A).
+    ///
+    /// The predicate still admits such a frame, and MUST: the mobile terminal
+    /// path shares this socket and cannot present a create grant (coord mints
+    /// them for DEVICES). What changed is downstream —
+    /// `remote_terminal::resolve_relay_create` now resolves every spawn
+    /// parameter of a blockless create against this device's own allowlists,
+    /// so the target decides on both arms. The tests that pin THAT are in
+    /// `remote_terminal`, and this one is deliberately narrowed to the claim it
+    /// can actually make.
     #[test]
-    fn a_frame_with_no_remote_block_is_always_admitted() {
+    fn a_frame_with_no_remote_block_is_not_a_remote_frame_which_is_not_the_same_as_ungated() {
         for t in ["terminal_create", "terminal_list", "http_request"] {
             assert!(remote_frame_admitted(t, &json!({ "type": t })), "{t}");
         }
@@ -5908,5 +6045,187 @@ mod remote_admission_tests {
         assert!(!remote_frame_admitted("terminal_create", &malformed));
         let not_an_object = json!({ "type": "terminal_create", "remote": 7 });
         assert!(!remote_frame_admitted("terminal_create", &not_an_object));
+    }
+}
+
+#[cfg(test)]
+mod relay_routing_tests {
+    //! The ROUTING decision, not the predicate.
+    //!
+    //! `remote_admission_tests` above drives `remote_frame_admitted` in
+    //! isolation, and `envelope_carriers_pass_through_and_the_inner_type_is
+    //! _what_decides` passed for months while the property it names was FALSE:
+    //! the dispatch built its inner frame as `data.get("payload").cloned()`,
+    //! which DROPPED an envelope-level `remote` block instead of carrying it
+    //! down. So a `terminal` envelope stamped with a grant re-entered as an
+    //! unmarked `terminal_create` — the ungated arm — and the predicate that
+    //! had just refused it saw nothing left to refuse (review finding 1,
+    //! scenario B). Exercising the predicate can never catch that; exercising
+    //! the routing can.
+    //!
+    //! `route_relay_frame` is the whole pre-dispatch decision, extracted so
+    //! these tests reach it without an `ApiState` (which owns a
+    //! `tauri::AppHandle` and is not constructible in a unit test).
+
+    use super::{route_relay_frame, RelayRoute};
+    use serde_json::{json, Value};
+
+    fn create_block() -> Value {
+        json!({ "grant_jti": "jti-c1", "source_device_id": "dev-a", "kind": "create" })
+    }
+
+    fn attach_block() -> Value {
+        json!({ "grant_jti": "jti-a1", "source_device_id": "dev-a" })
+    }
+
+    fn dispatched(route: RelayRoute) -> (String, Value) {
+        match route {
+            RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
+            RelayRoute::Refuse(frame) => panic!("expected a dispatch, got {frame}"),
+        }
+    }
+
+    fn refusal(route: RelayRoute) -> Value {
+        match route {
+            RelayRoute::Refuse(frame) => frame,
+            RelayRoute::Dispatch { msg_type, data } => {
+                panic!("expected a refusal, got a dispatch of {msg_type}: {data}")
+            }
+        }
+    }
+
+    /// **The finding-1 scenario-B frame.** An ATTACH block on the envelope over
+    /// a `terminal_create` payload: the block must reach the inner type, where
+    /// it is refused because an attach grant does not buy a spawn. Before the
+    /// fix this dispatched a `terminal_create` with `working_dir: /etc` and no
+    /// block at all.
+    #[test]
+    fn an_envelope_stamped_with_an_attach_grant_cannot_smuggle_a_create_past_the_gate() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": attach_block(),
+            "payload": { "working_dir": "/etc" },
+        });
+        let refused = refusal(route_relay_frame("terminal", &frame));
+        assert_eq!(refused["code"], "remote_type_not_admitted");
+    }
+
+    /// The same strip applied to `terminal_input`, whose ungated arm writes
+    /// into ANY named terminal id with no grant. Here the block is legitimate
+    /// (attach grants drive PTYs), so the frame dispatches — but it must
+    /// dispatch WITH the block, or `apply_terminal_input`'s own gate has
+    /// nothing to gate on.
+    #[test]
+    fn an_envelope_level_remote_block_reaches_the_payload() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "data": "eA==" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_input");
+        assert_eq!(data["terminal_id"], "t1");
+        assert_eq!(
+            data["remote"],
+            attach_block(),
+            "the block must travel with the operation it authorises"
+        );
+    }
+
+    /// A CREATE block on the envelope reaches `terminal_create` and is
+    /// admitted there — the legitimate half of the same carry-down.
+    #[test]
+    fn a_create_grant_on_the_envelope_admits_the_inner_create() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": create_block(),
+            "payload": { "working_dir_key": "workspace_root" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert_eq!(data["remote"], create_block());
+    }
+
+    /// A block already on the payload is left alone when the two agree, and
+    /// the frame is refused when they disagree. Neither level is more
+    /// trustworthy — the relay stamps both — so the point is that a frame may
+    /// not be admitted under one grant and acted on under another.
+    #[test]
+    fn a_disagreeing_pair_of_remote_blocks_is_refused() {
+        let agreeing = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "remote": attach_block() },
+        });
+        let (_, data) = dispatched(route_relay_frame("terminal", &agreeing));
+        assert_eq!(data["remote"], attach_block());
+
+        let disagreeing = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "remote": create_block() },
+        });
+        assert_eq!(
+            refusal(route_relay_frame("terminal", &disagreeing))["code"],
+            "remote_type_not_admitted"
+        );
+    }
+
+    /// `"remote": null` on the envelope is ABSENT, the same reading
+    /// `parse_remote_block` gives it, so nothing is carried down and the
+    /// payload's own block (if any) stands.
+    #[test]
+    fn a_null_envelope_block_carries_nothing() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": Value::Null,
+            "payload": { "title": "t" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert!(data.get("remote").is_none());
+    }
+
+    /// A carrier whose `subtype` names another carrier is a loop. The old
+    /// dispatch followed it by recursion; this refuses past the cap.
+    #[test]
+    fn endlessly_nested_envelopes_are_refused_rather_than_followed() {
+        let mut frame = json!({ "type": "terminal", "subtype": "terminal_list" });
+        for _ in 0..8 {
+            frame = json!({ "type": "terminal", "subtype": "terminal", "payload": frame });
+        }
+        assert_eq!(
+            refusal(route_relay_frame("terminal", &frame))["code"],
+            "remote_type_not_admitted"
+        );
+    }
+
+    /// A payload-less envelope still re-enters on the inner subtype — the
+    /// pre-existing behaviour, and the block on such a frame is its own.
+    #[test]
+    fn a_payload_less_envelope_re_enters_on_its_subtype() {
+        let frame = json!({
+            "type": "command",
+            "subtype": "terminal_list",
+            "runner_id": "r1",
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("command", &frame));
+        assert_eq!(msg_type, "terminal_list");
+        assert_eq!(data["runner_id"], "r1");
+    }
+
+    /// A non-envelope frame is dispatched unchanged, block and all.
+    #[test]
+    fn a_plain_frame_is_dispatched_unchanged() {
+        let frame = json!({ "type": "terminal_create", "remote": create_block() });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert_eq!(data, frame);
     }
 }

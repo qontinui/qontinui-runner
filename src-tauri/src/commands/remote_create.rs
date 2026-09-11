@@ -749,6 +749,47 @@ pub async fn terminal_create_remote(
                 created_terminal_id: Some(created.terminal_id.clone()),
             })?;
 
+    // COORD places the session, not the relay. `terminal_attach_remote` has
+    // always refused a `target_device_id` that disagrees with the device the
+    // operator picked; the create-then-attach path called the same mint, got
+    // the same field, and DISCARDED it — on the path where the session id
+    // arrived over the untrusted relay (review finding 3).
+    //
+    // The scenario the check closes: the operator clicks New terminal on B, a
+    // relay rewrites `coord_session_id` on `remote_terminal_created` to a
+    // session living on C, and this window mints an attach grant for C's
+    // session, labels the tab B, and types into C's live agent session. Coord's
+    // answer is the only authority for where a session runs, and here it
+    // disagrees with the device this create was addressed to.
+    let asked = target.to_string();
+    if !super::remote_attach::coord_places_session_on(
+        &asked,
+        attach_grant.target_device_id.as_deref(),
+    ) {
+        let placed = attach_grant
+            .target_device_id
+            .as_deref()
+            .unwrap_or("<unreported>");
+        return Err(RemoteCreateError {
+            stage: "attach",
+            code: "target_mismatch".to_string(),
+            message: format!(
+                "The terminal WAS created on the remote device (terminal {}), but coord places \
+                 the session it reported ({session_uuid}) on device {placed}, not on {asked} — \
+                 the session id this device was told about does not belong to the device the \
+                 create was sent to, so no tab is opened onto it.",
+                created.terminal_id
+            ),
+            detail: Some(json!({
+                "targetDeviceId": asked,
+                "coordPlacesSessionOn": placed,
+                "remoteTerminalId": created.terminal_id,
+                "coordSessionId": session_uuid.to_string(),
+            })),
+            created_terminal_id: Some(created.terminal_id.clone()),
+        });
+    }
+
     super::remote_attach::open_remote_tab(
         terminal_manager.inner(),
         &app_handle,
