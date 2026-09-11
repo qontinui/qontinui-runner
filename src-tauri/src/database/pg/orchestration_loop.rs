@@ -27,7 +27,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_ol_configs: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_ol_configs", &e))?;
 
         Ok(rows.iter().map(|r| Self::ol_row_to_config(r)).collect())
     }
@@ -50,7 +50,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_ol_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_ol_config", &e))?;
 
         Ok(row.map(|r| Self::ol_row_to_config(&r)))
     }
@@ -76,7 +76,7 @@ impl PgDb {
             &[&id, &req.name, &req.description, &config_str, &now, &now],
         )
         .await
-        .map_err(|e| format!("PG insert_ol_config: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG insert_ol_config", &e))?;
 
         self.get_ol_config(&id)
             .await?
@@ -144,7 +144,7 @@ impl PgDb {
 
         conn.execute(&sql, &params)
             .await
-            .map_err(|e| format!("PG update_ol_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG update_ol_config", &e))?;
 
         self.get_ol_config(id)
             .await?
@@ -165,7 +165,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG delete_ol_config: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_ol_config", &e))?;
 
         Ok(affected > 0)
     }

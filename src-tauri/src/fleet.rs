@@ -51,6 +51,13 @@ use crate::database::pg::PgDb;
 /// module docs.
 pub(crate) mod resource_sample;
 
+/// TCP socket-state census for one port, split by which side owns the fd
+/// (plan `2026-08-31-devops-runner-9876-accept-path-starved-by-close-wait-sockets`,
+/// Phase 1). Consumed by [`resource_sample`]'s host lane; see its module docs
+/// for why the local/remote split is load-bearing and why an unmeasured census
+/// is `None` rather than a row of zeroes.
+pub(crate) mod socket_census;
+
 /// §3.2 declared role. Mirrors `qontinui-coord::fleet::MachineRole`.
 /// The runner publishes itself as `Agent`; the supervisor publishes
 /// as `Build`. Dev workstations collapse both onto one machine_id
@@ -431,23 +438,12 @@ struct DeviceBudgetRequest {
     max_concurrent_ci_jobs: i32,
 }
 
-/// Render an error with its full `source()` chain. `Display` on
-/// `reqwest::Error` alone collapses connect/DNS/TLS detail into the generic
-/// "error sending request for url (…)" — which made the 2026-06-03
-/// fleet-heartbeat outage undiagnosable from the WARN logs (every failed
-/// tick printed the same opaque line while the root cause stayed hidden in
-/// the source chain). Walk the chain so failure WARNs carry the root cause
-/// (e.g. "dns error", "os error 10060", schannel detail).
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut s = e.to_string();
-    let mut src = e.source();
-    while let Some(cause) = src {
-        s.push_str(": ");
-        s.push_str(&cause.to_string());
-        src = cause.source();
-    }
-    s
-}
+/// The 2026-06-03 fleet-heartbeat outage was undiagnosable from the WARN logs
+/// because every failed tick printed the same opaque `reqwest` `Display` line.
+/// The fix — walk the `source()` chain — is now shared rather than private
+/// here: see [`crate::util::error_chain`] for the full history and for why
+/// three copies of it was two too many.
+use crate::util::error_chain::error_chain;
 
 /// POST the budget payload with exponential backoff (2s, 4s, 8s, 16s, 32s, 60s).
 /// Returns Ok on first success; returns Err with the last error if every
@@ -1257,10 +1253,29 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 // to a Debian box with no `pwsh`, reported `spawned`, and did nothing.
 //
 // Vocabulary is the `key:value` grammar `build_ci_node_labels` already emits —
-// `os:linux`, `shell:powershell`, `runtime:docker`. The bare `ci_node` token
-// stays bare on purpose: eight shipped `capabilities @> '["ci_node"]'::jsonb`
-// filters in coord's `ci_dispatch.rs` read it, and `ci:node` would break all of
-// them for zero capability gain.
+// `os:linux`, `shell:powershell`, `runtime:docker`, `runtime:webview`. The bare
+// `ci_node` token stays bare on purpose: eight shipped
+// `capabilities @> '["ci_node"]'::jsonb` filters in coord's `ci_dispatch.rs`
+// read it, and `ci:node` would break all of them for zero capability gain.
+//
+// `runtime:webview` was added by plan
+// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four` Phase 2.
+// That plan named the root cause of its 21 `spawn_failed: no Tauri AppHandle`
+// continuations as a MISSING VOCABULARY TERM: coord's
+// `continuation.required_capabilities` matcher already existed, but nothing in
+// this set distinguished a device that can open a VISIBLE terminal from one
+// that cannot, so a headless runner was not mis-targeted by a bug — it was
+// untargetable-away by construction.
+//
+// ⚠️ THIS HALF ADVERTISES; IT DOES NOT YET EXCLUDE, so none of those 21
+// failures is fixed by this code alone. `required_capabilities` is entirely
+// caller-supplied at gate registration, coord derives nothing from a
+// continuation's `presentation`, and an empty slice is a tautology in
+// `gates::device_has_capabilities` — so every continuation registered today
+// still dispatches to a headless runner exactly as before. The exclusion
+// arrives only when a registration names this token. Advertise-before-require
+// is the correct ordering (a requirement naming a token no device advertises
+// would strand every dispatch), not a claim that the defect is closed.
 //
 // Two properties this section exists to hold:
 //
@@ -1272,53 +1287,148 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 //     posture as `ci_node_labels()`. A wedged `docker` costs the probe its
 //     bounded budget and yields "no docker", not a failed heartbeat.
 //
-// Cached behind `HOST_PROBE_TTL` (300s) so the 30s tick never re-stats PATH or
-// re-spawns `docker version`.
+// The SLOW probes (PATH stat, `docker version`) are cached behind
+// `HOST_PROBE_TTL` (300s) so the 30s tick never re-stats PATH or re-spawns
+// `docker version`. The webview probe deliberately is NOT — see
+// `webview_runtime_available`.
 // =============================================================================
 
-static HOST_CAPABILITY_CACHE: Mutex<Option<(Vec<String>, std::time::Instant)>> = Mutex::new(None);
+/// Results of the two SLOW host probes — the ones worth a 300s TTL because
+/// they touch the filesystem or spawn a subprocess.
+#[derive(Debug, Clone, Copy)]
+struct SlowHostProbes {
+    powershell: bool,
+    docker: bool,
+}
 
-/// Cached probed host-fact capability set for the heartbeat.
+static SLOW_HOST_PROBE_CACHE: Mutex<Option<(SlowHostProbes, std::time::Instant)>> =
+    Mutex::new(None);
+
+/// Cached results of the slow host probes.
 ///
 /// Separate cache slot from `CI_NODE_LABEL_CACHE` (same TTL) because the two
 /// sets have different lifetimes on the wire: these ride every heartbeat, the
 /// CI labels ride only while CI-node mode is on.
-fn host_capabilities() -> Vec<String> {
+fn slow_host_probes() -> SlowHostProbes {
     {
-        if let Ok(g) = HOST_CAPABILITY_CACHE.lock() {
-            if let Some((caps, taken)) = g.as_ref() {
+        if let Ok(g) = SLOW_HOST_PROBE_CACHE.lock() {
+            if let Some((probes, taken)) = g.as_ref() {
                 if taken.elapsed() < HOST_PROBE_TTL {
-                    return caps.clone();
+                    return *probes;
                 }
             }
         }
     }
-    let caps = detect_host_capabilities_now();
-    if let Ok(mut g) = HOST_CAPABILITY_CACHE.lock() {
-        *g = Some((caps.clone(), std::time::Instant::now()));
+    // Uncached one-shot: stats PATH and spawns `docker version`.
+    let probes = SlowHostProbes {
+        powershell: powershell_on_path(),
+        docker: docker_daemon_answers(),
+    };
+    if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
+        *g = Some((probes, std::time::Instant::now()));
     }
-    caps
+    probes
 }
 
-/// Uncached one-shot host probe. Stats PATH and spawns `docker version`;
-/// never call it off the cached path.
-fn detect_host_capabilities_now() -> Vec<String> {
+/// The probed host-fact capability set for the heartbeat.
+fn host_capabilities() -> Vec<String> {
+    let slow = slow_host_probes();
     build_host_capabilities(
         current_os_label(),
-        powershell_on_path(),
-        docker_daemon_answers(),
+        slow.powershell,
+        slow.docker,
+        webview_runtime_available(),
     )
 }
 
+/// The capability token asserting this device has a usable webview runtime and
+/// can therefore open a VISIBLE terminal.
+///
+/// **Spelling, and why it is fixed.** `runtime:` is the namespace
+/// `runtime:docker` already established for "a runtime this device can host
+/// work on", and `webview` is the exact noun the failing call site uses —
+/// `agent_runtime.rs`'s `run_continuation_terminal` reports
+/// `no Tauri AppHandle (runner has no webview runtime)`. So the observed
+/// diagnosis and the token a registration would have to name to exclude the
+/// device are the same word, with no translation step between reading a
+/// `spawn_failed` row and knowing which capability to require.
+///
+/// **The wire contract it is INTENDED for, which nothing exercises yet.** The
+/// half that would exclude a headless device is a continuation registered with
+/// `continuation.required_capabilities: ["runtime:webview"]`, which coord then
+/// matches by containment against `coord.devices.capabilities` — the column
+/// this heartbeat is the only writer of. That matcher is shipped and this
+/// spelling is verbatim-compatible with it, but `required_capabilities` is
+/// caller-supplied at registration, coord derives nothing from a continuation's
+/// `presentation`, and no registration names this token today (see the
+/// "ADVERTISES; DOES NOT YET EXCLUDE" note in the section header above). So
+/// this is a contract offered, not a contract in force.
+///
+/// Treat the spelling as frozen anyway: the moment a registration DOES name it,
+/// respelling here silently un-targets that registration, with nothing going
+/// red on either side. Do not.
+///
+/// One token rather than a dispatcher special-case, deliberately: it
+/// generalizes to every presentation-requiring continuation (and to device
+/// classes this fleet does not have yet), where a carve-out in the dispatcher
+/// would need re-deciding per continuation kind.
+pub const WEBVIEW_RUNTIME_CAPABILITY: &str = "runtime:webview";
+
+/// True when this process holds a Tauri `AppHandle`.
+///
+/// **Probes the real thing.** `crate::tauri_app_handle::current().is_some()` is
+/// not a proxy for the capability — it IS the branch that decides whether
+/// `run_continuation_terminal` and `run_condition_check_terminal` can open a
+/// visible terminal at all. It is deliberately not inferred from the OS: a
+/// Linux box can have a display and a Windows box can be running headless, and
+/// the 21 `spawn_failed: no Tauri AppHandle` continuations plan
+/// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
+/// measured are exactly the population an OS inference would have got wrong.
+///
+/// **Fail-closed.** Every way of not establishing the handle — a headless
+/// systemd user service, a unit-test process, a runner still inside
+/// `tauri::Builder::setup()` — yields `false` and costs the token. Advertising
+/// it falsely is the failure mode with teeth: it re-creates the dispatch that
+/// consumes a gate row and then cannot spawn. Under-advertising only moves the
+/// work to another device.
+///
+/// **Not behind `HOST_PROBE_TTL`, unlike the PATH and Docker probes.** This is
+/// a `OnceLock` read — no disk, no subprocess, nothing a TTL would save. And
+/// caching it would be actively wrong: the heartbeat thread is started from
+/// `main.rs` BEFORE `tauri_app_handle::set()` runs in the Tauri `setup()`
+/// callback, and `tokio::time::interval` fires its first tick immediately, so a
+/// cached first tick would pin `false` and under-advertise a perfectly capable
+/// device for a whole 300s window on every runner start. The slot is a
+/// set-once `OnceLock`, so the value only ever transitions `false -> true` and
+/// never back.
+fn webview_runtime_available() -> bool {
+    let present = crate::tauri_app_handle::current().is_some();
+    if !present {
+        // debug!, not warn!: on a headless runner this is a standing, correct
+        // property of the device rather than a fault, and the heartbeat asks
+        // every 30s. Same posture as `command_succeeds_within`'s
+        // binary-not-present arm, which is also debug + "not advertised".
+        debug!(
+            "host_capabilities: {WEBVIEW_RUNTIME_CAPABILITY}: no Tauri AppHandle \
+             (headless runner, or setup() has not run yet) — not advertised"
+        );
+    }
+    present
+}
+
 /// Pure host-capability assembly (unit-tested without disk or subprocesses),
-/// mirroring `build_ci_node_labels`.
-fn build_host_capabilities(os: &str, powershell: bool, docker: bool) -> Vec<String> {
+/// mirroring `build_ci_node_labels`. Every input is a settled probe verdict;
+/// this function performs no probing of its own.
+fn build_host_capabilities(os: &str, powershell: bool, docker: bool, webview: bool) -> Vec<String> {
     let mut caps = vec![format!("os:{os}")];
     if powershell {
         caps.push("shell:powershell".to_string());
     }
     if docker {
         caps.push("runtime:docker".to_string());
+    }
+    if webview {
+        caps.push(WEBVIEW_RUNTIME_CAPABILITY.to_string());
     }
     caps
 }
@@ -6833,7 +6943,8 @@ mod tests {",
     /// matching.
     #[test]
     fn heartbeat_sends_host_capability_tokens_verbatim() {
-        let caps = build_device_capabilities(true, &build_host_capabilities("windows", true, true));
+        let caps =
+            build_device_capabilities(true, &build_host_capabilities("windows", true, true, true));
         let body = serde_json::to_value(heartbeat_payload_with_ci(caps, Vec::new())).unwrap();
         assert_eq!(
             body.get("capabilities"),
@@ -6841,7 +6952,8 @@ mod tests {",
                 "ci_node",
                 "os:windows",
                 "shell:powershell",
-                "runtime:docker"
+                "runtime:docker",
+                "runtime:webview"
             ])),
             "populated capabilities must ride the wire verbatim, got {body}"
         );
@@ -6919,8 +7031,13 @@ mod tests {",
     #[test]
     fn host_capability_assembly_full_set() {
         assert_eq!(
-            build_host_capabilities("windows", true, true),
-            vec!["os:windows", "shell:powershell", "runtime:docker"]
+            build_host_capabilities("windows", true, true, true),
+            vec![
+                "os:windows",
+                "shell:powershell",
+                "runtime:docker",
+                "runtime:webview"
+            ]
         );
     }
 
@@ -6928,12 +7045,18 @@ mod tests {",
     #[test]
     fn host_capability_assembly_partial_sets() {
         assert_eq!(
-            build_host_capabilities("linux", true, false),
+            build_host_capabilities("linux", true, false, false),
             vec!["os:linux", "shell:powershell"]
         );
         assert_eq!(
-            build_host_capabilities("macos", false, true),
+            build_host_capabilities("macos", false, true, false),
             vec!["os:macos", "runtime:docker"]
+        );
+        assert_eq!(
+            build_host_capabilities("linux", false, false, true),
+            vec!["os:linux", "runtime:webview"],
+            "a headless-OS box WITH a webview runtime still advertises it — the \
+             token is probed, never inferred from the OS"
         );
     }
 
@@ -6943,11 +7066,72 @@ mod tests {",
     /// coord must NOT see `shell:powershell` for it.
     #[test]
     fn host_capability_assembly_degrades_to_os_only() {
-        let caps = build_host_capabilities("linux", false, false);
+        let caps = build_host_capabilities("linux", false, false, false);
         assert_eq!(caps, vec!["os:linux"]);
         assert!(
             !caps.iter().any(|c| c == "shell:powershell"),
             "a host without PowerShell must never advertise shell:powershell"
+        );
+    }
+
+    /// The headless runner of plan
+    /// `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`:
+    /// a Linux systemd user service with no display. It must NOT advertise
+    /// `runtime:webview` — the precondition for a future
+    /// `required_capabilities: ["runtime:webview"]` registration to exclude it.
+    /// No registration names the token today, so this pins the advertise half
+    /// only; it does not assert that anything is excluded yet.
+    ///
+    /// The inverse — advertising the token on a box where
+    /// `tauri_app_handle::current()` is `None` — is the failure with teeth: it
+    /// re-creates the dispatch that consumes a gate row and then cannot spawn.
+    #[test]
+    fn headless_host_never_advertises_the_webview_token() {
+        for (os, powershell, docker) in [
+            ("linux", false, false),
+            ("linux", true, true),
+            ("windows", true, true),
+            ("macos", false, true),
+        ] {
+            let caps = build_host_capabilities(os, powershell, docker, false);
+            assert!(
+                !caps.iter().any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
+                "os={os} with no webview runtime must not advertise \
+                 {WEBVIEW_RUNTIME_CAPABILITY}, got {caps:?}"
+            );
+        }
+    }
+
+    /// The token is a WIRE CONTRACT with coord's `required_capabilities`
+    /// containment matcher. Pin the exact bytes: a respelling silently
+    /// un-targets every continuation registered against the old string, and
+    /// nothing else in either repo would go red.
+    #[test]
+    fn webview_capability_token_spelling_is_pinned() {
+        assert_eq!(WEBVIEW_RUNTIME_CAPABILITY, "runtime:webview");
+        assert!(
+            build_host_capabilities("linux", false, false, true)
+                .iter()
+                .any(|c| c == "runtime:webview"),
+            "the advertised token must be the pinned literal, not a near-miss"
+        );
+    }
+
+    /// The probe reads the process-global Tauri slot rather than guessing from
+    /// the OS. A `cargo test` process never calls `tauri_app_handle::set`, so
+    /// the honest answer here is `false` on every platform — which is also the
+    /// fail-closed direction.
+    #[test]
+    fn webview_probe_is_false_without_a_tauri_runtime() {
+        assert!(
+            !webview_runtime_available(),
+            "a unit-test process holds no AppHandle; the probe must fail closed"
+        );
+        assert!(
+            !host_capabilities()
+                .iter()
+                .any(|c| c == WEBVIEW_RUNTIME_CAPABILITY),
+            "and the assembled set must not carry the token either"
         );
     }
 
@@ -6956,7 +7140,7 @@ mod tests {",
     /// not a CI node. `ci_node` alone is conditional, and stays a BARE token.
     #[test]
     fn device_capabilities_advertise_host_facts_without_ci_node() {
-        let host = build_host_capabilities("linux", true, false);
+        let host = build_host_capabilities("linux", true, false, false);
         assert_eq!(
             build_device_capabilities(false, &host),
             vec!["os:linux", "shell:powershell"],
@@ -6984,7 +7168,7 @@ mod tests {",
     /// Also records what THIS host actually advertises.
     #[test]
     fn host_capabilities_probe_smoke() {
-        if let Ok(mut g) = HOST_CAPABILITY_CACHE.lock() {
+        if let Ok(mut g) = SLOW_HOST_PROBE_CACHE.lock() {
             *g = None;
         }
         let first = host_capabilities();

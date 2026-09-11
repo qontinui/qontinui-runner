@@ -685,6 +685,14 @@ export interface SerializedComponent {
     label?: string;
     description?: string;
     paramSchema?: Record<string, unknown>;
+    /**
+     * Author-declared safety class, echoed verbatim from
+     * `ComponentActionDef.effect` (SDK `IREffect`). Absent means
+     * **unclassified, not safe** — the serializer never substitutes a default,
+     * because a server-applied one would let an unjudged destructive action
+     * read as `'read'` to an autonomous walk.
+     */
+    effect?: "read" | "write" | "destructive";
     /** HTTP path to invoke this action (e.g. POST to this URL with `{params: ...}`). */
     path?: string;
   }>;

@@ -135,6 +135,11 @@ export function ProjectCard({
         id: "open",
         label: "Open",
         description: `Activate "${project.name}" and show it.`,
+        // `destructive` — `handleOpen` -> `useProjectOpen.open`, which invokes
+        // `start_managed_process` for every process the project needs before opening its
+        // front page. Same OS-process lifecycle as `process-manager.start-process`, so it
+        // takes the same class; the label "Open" discloses none of it.
+        effect: "destructive",
         handler: () => {
           onOpen(project);
         },
@@ -143,6 +148,9 @@ export function ProjectCard({
         id: "work-on-it",
         label: "Work on it",
         description: `Bind a terminal to "${project.name}" and switch to it.`,
+        // `write` — sets the active-project hint and navigates to the terminal, which
+        // binds/spawns a plain terminal. No process lifecycle, no agent, reversible.
+        effect: "write",
         handler: () => {
           onWorkOnIt(project);
         },
@@ -151,6 +159,8 @@ export function ProjectCard({
         id: "show-detail",
         label: "Show detail",
         description: `Open the detail view for "${project.name}".`,
+        // `read` — navigates to the detail view. Display state.
+        effect: "read",
         handler: () => {
           onShowDetail?.(project.id);
         },
@@ -159,6 +169,10 @@ export function ProjectCard({
         id: "fix-this",
         label: "Fix this",
         description: `Launch an agent on "${project.name}"'s reported failure, with the error text attached.`,
+        // `destructive` — seeds an autonomous agent with a fix prompt and launches it on
+        // the project. Dim 2: the agent writes to the operator's repository; dim 1: its
+        // edits are not undone by closing the terminal.
+        effect: "destructive",
         handler: () => {
           onFixThis?.(project);
         },
@@ -167,6 +181,9 @@ export function ProjectCard({
         id: "toggle-pin",
         label: project.pinned ? "Unpin" : "Pin",
         description: `${project.pinned ? "Unpin" : "Pin"} "${project.name}" — pinned projects sort first.`,
+        // `write` — `set_project_pinned` persists a boolean. Reversible by toggling back,
+        // and loud (the grid re-sorts).
+        effect: "write",
         handler: () => {
           onTogglePin?.(project);
         },

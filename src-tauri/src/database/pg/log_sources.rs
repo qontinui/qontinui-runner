@@ -31,7 +31,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG list_log_sources: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG list_log_sources", &e))?;
 
         Ok(rows
             .iter()
@@ -60,7 +60,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_log_source: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_log_source", &e))?;
 
         Ok(row.map(|r| Self::log_source_row_to_config(&r)))
     }
@@ -118,7 +118,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG create_log_source: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG create_log_source", &e))?;
 
         let id: i64 = row.get(0);
         Ok(id)
@@ -173,7 +173,7 @@ impl PgDb {
             ],
         )
         .await
-        .map_err(|e| format!("PG update_log_source: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_log_source", &e))?;
 
         Ok(())
     }
@@ -189,7 +189,7 @@ impl PgDb {
         let affected = conn
             .execute("DELETE FROM log_sources WHERE id = $1", &[&id])
             .await
-            .map_err(|e| format!("PG delete_log_source: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_log_source", &e))?;
 
         Ok(affected > 0)
     }
@@ -233,7 +233,7 @@ impl PgDb {
             )
             .await
         }
-        .map_err(|e| format!("PG get_log_sources_enabled: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG get_log_sources_enabled", &e))?;
 
         Ok(rows
             .iter()
@@ -250,7 +250,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM log_sources WHERE name = $1", &[&name])
             .await
-            .map_err(|e| format!("PG delete_log_source_by_name: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG delete_log_source_by_name", &e))?;
         Ok(())
     }
 
@@ -263,7 +263,7 @@ impl PgDb {
             .map_err(|e| format!("PG pool error: {}", e))?;
         conn.execute("DELETE FROM log_sources", &[])
             .await
-            .map_err(|e| format!("PG clear log_sources: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG clear log_sources", &e))?;
 
         for source in sources {
             let error_patterns_json = source
@@ -303,7 +303,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG sync_log_sources insert: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG sync_log_sources insert", &e))?;
         }
 
         Ok(())

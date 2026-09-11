@@ -807,6 +807,39 @@ fn window_getter_outstanding_for() -> std::time::Duration {
     std::time::Duration::from_millis(window_getter_now_ms().saturating_sub(since))
 }
 
+/// `GET /capability-manifest` — WHICH RUNG answered for each capability this
+/// binary delivers. Plan `2026-08-31-published-build-parity-check`, Phase 4.
+///
+/// The running-instance twin of the pre-GUI `--capability-manifest --json`
+/// flag, and the reason both exist: a runner that is already up can be ASKED,
+/// with no restart, and its answer carries what the flag's cold process cannot
+/// — the session-provisioning ledger, any spec-corpus arm a real read took, and
+/// the `bundle_resource` rung, which needs the Tauri `AppHandle` this process
+/// holds and the pre-GUI door does not.
+///
+/// Emits [`crate::capability_manifest::render_manifest_json`]'s bytes verbatim
+/// rather than re-serializing, so this door and the CLI door cannot drift.
+///
+/// **Not a UI Bridge route.** It answers a question about this BINARY, not
+/// about a page, so it is deliberately absent from `route_entries()` /
+/// `route_manifest()` and the `sdk_manifest_routes_are_exposed_by_runner` drift
+/// test does not apply to it.
+///
+/// Stateless: the manifest is assembled from process-wide observations, not
+/// from `ApiState`.
+async fn capability_manifest() -> impl axum::response::IntoResponse {
+    let manifest = crate::capability_manifest::build_manifest(
+        &crate::capability_manifest::ManifestInputs::observed_here(),
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json; charset=utf-8",
+        )],
+        crate::capability_manifest::render_manifest_json(&manifest),
+    )
+}
+
 /// Health check endpoint (also served at `/ui-bridge/health` and
 /// `/ui-bridge/status` — all three share this handler).
 /// Includes `uiBridge` metadata so the app discovery scanner can detect the runner.
@@ -4129,35 +4162,75 @@ async fn coord_mcp_proxy_handler(
     };
 
     let unreachable_response = |e: reqwest::Error| {
+        // The FULL source chain, not `{e}`. `Display` on a `reqwest::Error`
+        // collapses to "error sending request for url (…)" — identical for a
+        // refused connect, a DNS failure, a TLS verdict and `os error 10053`.
+        // That is why 5,967 failures on 2026-08-02 were one indistinguishable
+        // line. The `code` is untouched (compat); only the human text grows.
+        let chain = crate::util::error_chain::error_chain(&e);
+        let egress = crate::util::egress_context::snapshot(
+            crate::util::egress_context::EgressClient::CoordMcpProxy,
+        );
+        // The SAME snapshot the envelope carries, rendered as compact JSON:
+        // one handle census per failure, and a log line joinable to the body a
+        // caller received.
         warn!(
             "coord-mcp proxy: forward to {url} failed \
-             (coord_base_source={coord_base_source}): {e}"
+             (coord_base_source={coord_base_source}): {chain} egress={egress}"
         );
         (
             axum::http::StatusCode::BAD_GATEWAY,
             Json(crate::coord_mcp::proxy_failure_envelope(
-                format!("coord /mcp unreachable: {e}"),
+                format!("coord /mcp unreachable: {chain}"),
                 "COORD_MCP_PROXY_UPSTREAM_UNREACHABLE",
                 // The hop never completed, so NEITHER credential was tested.
                 // Reporting this as a rejection is the misattribution Phase 3
                 // exists to stop.
                 crate::coord_mcp::ProxyFailureLayer::RunnerTransport,
-                format!("the forward to coord did not complete: {e}"),
+                format!("the forward to coord did not complete: {chain}"),
                 &[
                     ("upstream_url", serde_json::Value::from(url.clone())),
                     (
                         "coord_base_source",
                         serde_json::Value::from(coord_base_source.as_str()),
                     ),
+                    ("egress", egress),
                 ],
             )),
         )
             .into_response()
     };
 
-    let mut upstream = match build_forward(&bearer).send().await {
+    let first_forward = {
+        // Held across the await: `reqwest` exposes no pool introspection, so
+        // this counter is the only honest answer to "how many requests was
+        // this client carrying when it failed?".
+        let _in_flight = crate::util::egress_context::in_flight(
+            crate::util::egress_context::EgressClient::CoordMcpProxy,
+        );
+        build_forward(&bearer).send().await
+    };
+    let mut upstream = match first_forward {
         Ok(resp) => resp,
         Err(e) => {
+            // Item 1 + 2 + 3b, BEFORE the spool branch: the transport failure
+            // happened whether or not the payload is rescued into the outbox,
+            // so the counter and the durable rotation row must not hang off
+            // the branch that decides the caller's response shape. Detached —
+            // a failing hop never waits on forensics.
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::CoordMcpProxy,
+            );
+            {
+                let tail = crate::util::error_chain::error_chain_tail(&e);
+                let chain = crate::util::error_chain::error_chain(&e);
+                crate::coord_mcp::spawn_log_proxy_upstream_unreachable(
+                    nonce.as_deref(),
+                    crate::coord_mcp::UpstreamTransportClass::Unreachable,
+                    &url,
+                    if tail.is_empty() { chain } else { tail },
+                );
+            }
             // Plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-
             // offline, Phase 3. THE transport class — the forward never reached
             // a coord that could have accepted it, so NEITHER credential was
@@ -4176,7 +4249,12 @@ async fn coord_mcp_proxy_handler(
             // `RunnerTransport` envelope as before, never a false "spooled".
             if let Some(resp) = maybe_spool_finding(
                 &body,
-                &format!("coord /mcp unreachable: {e}"),
+                // Same chain the envelope and the rotation row carry, so the
+                // spooled record names the OS-level cause too.
+                &format!(
+                    "coord /mcp unreachable: {}",
+                    crate::util::error_chain::error_chain(&e)
+                ),
                 None,
                 &url,
                 coord_base_source,
@@ -4299,25 +4377,40 @@ async fn coord_mcp_proxy_handler(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            let chain = crate::util::error_chain::error_chain(&e);
+            let tail = crate::util::error_chain::error_chain_tail(&e);
+            let egress = crate::util::egress_context::snapshot(
+                crate::util::egress_context::EgressClient::CoordMcpProxy,
+            );
+            crate::util::egress_context::record_failure(
+                crate::util::egress_context::EgressClient::CoordMcpProxy,
+            );
             warn!(
                 "coord-mcp proxy: reading coord response body from {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
+                 (coord_base_source={coord_base_source}): {chain} egress={egress}"
+            );
+            crate::coord_mcp::spawn_log_proxy_upstream_unreachable(
+                nonce.as_deref(),
+                crate::coord_mcp::UpstreamTransportClass::ReadFailed,
+                &url,
+                if tail.is_empty() { chain.clone() } else { tail },
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(crate::coord_mcp::proxy_failure_envelope(
-                    format!("coord /mcp response read failed: {e}"),
+                    format!("coord /mcp response read failed: {chain}"),
                     "COORD_MCP_PROXY_UPSTREAM_READ_FAILED",
                     // coord answered — we could not READ it. That says nothing
                     // about either credential.
                     crate::coord_mcp::ProxyFailureLayer::RunnerTransport,
-                    format!("coord answered but its body could not be read: {e}"),
+                    format!("coord answered but its body could not be read: {chain}"),
                     &[
                         ("upstream_url", serde_json::Value::from(url.clone())),
                         (
                             "coord_base_source",
                             serde_json::Value::from(coord_base_source.as_str()),
                         ),
+                        ("egress", egress),
                     ],
                 )),
             )
@@ -4384,6 +4477,26 @@ async fn coord_mcp_proxy_handler(
             coord_base_source = %coord_base_source,
             "coord-mcp proxy: enveloping non-JSON upstream error from coord"
         );
+        // Item 3b: the third transport class, and the third that used to leave
+        // no joinable row. `cause` carries the intermediary's own evidence —
+        // the status plus the content-type it answered with — since there is no
+        // `source()` chain on a body that parsed fine and merely was not JSON.
+        crate::coord_mcp::spawn_log_proxy_upstream_unreachable(
+            nonce.as_deref(),
+            crate::coord_mcp::UpstreamTransportClass::NonJsonError,
+            &url,
+            format!(
+                "HTTP {status} content-type={}",
+                if upstream_content_type.is_empty() {
+                    "(missing)"
+                } else {
+                    &upstream_content_type
+                }
+            ),
+        );
+        crate::util::egress_context::record_failure(
+            crate::util::egress_context::EgressClient::CoordMcpProxy,
+        );
         return (
             status_code,
             Json(crate::coord_mcp::proxy_failure_envelope(
@@ -4417,6 +4530,12 @@ async fn coord_mcp_proxy_handler(
                     (
                         "coord_base_source",
                         serde_json::Value::from(coord_base_source.as_str()),
+                    ),
+                    (
+                        "egress",
+                        crate::util::egress_context::snapshot(
+                            crate::util::egress_context::EgressClient::CoordMcpProxy,
+                        ),
                     ),
                 ],
             )),
@@ -4905,6 +5024,14 @@ async fn forward_coord_get(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    // ONE `reqwest` pool serves BOTH read families (`ReadProxyCodes::CLAIMS`
+    // and `::COORD_READ`), so one egress client names it — attributing the
+    // in-flight count to the pool that actually exists rather than to the
+    // error-code family, which is a labelling detail.
+    use crate::util::egress_context as egress;
+    const EG: crate::util::egress_context::EgressClient =
+        crate::util::egress_context::EgressClient::CoordRead;
+
     // Shared client: connect fast-fail like the `/coord-mcp` proxy client, but
     // a much shorter overall timeout — these are bounded REST reads (a hook
     // helper sits on the response), not long-running MCP tool calls.
@@ -4918,21 +5045,31 @@ async fn forward_coord_get(
             .expect("coord claims proxy reqwest client")
     });
 
-    let upstream = match client.get(url).bearer_auth(bearer).send().await {
+    let upstream = {
+        let _in_flight = egress::in_flight(EG);
+        client.get(url).bearer_auth(bearer).send().await
+    };
+    let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
+            // Full `source()` chain, not `{e}`: `os error 10053` and
+            // `operation timed out` must reach the caller. `code` unchanged.
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
             warn!(
                 "{door}: forward to {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord read endpoint unreachable: {e}"),
+                    "error": format!("coord read endpoint unreachable: {chain}"),
                     "code": codes.upstream_unreachable,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -4954,18 +5091,22 @@ async fn forward_coord_get(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
             warn!(
                 "{door}: reading coord response body from {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord read response read failed: {e}"),
+                    "error": format!("coord read response read failed: {chain}"),
                     "code": codes.upstream_read_failed,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -4974,18 +5115,20 @@ async fn forward_coord_get(
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
+            let chain = crate::util::error_chain::error_chain(&e);
             warn!(
                 "{door}: response build failed \
-                 (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {chain}"
             );
             (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord read response build failed: {e}"),
+                    "error": format!("coord read response build failed: {chain}"),
                     "code": codes.response_build_failed,
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": egress::snapshot(EG),
                 })),
             )
                 .into_response()
@@ -5843,6 +5986,10 @@ async fn forward_coord_write_post(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    use crate::util::egress_context as egress;
+    const EG: crate::util::egress_context::EgressClient =
+        crate::util::egress_context::EgressClient::CoordWrite;
+
     // Shared client: connect fast-fail like the claims proxy client, with a
     // short overall timeout — these are bounded REST writes (a caller sits on
     // the response), not long-running MCP tool calls.
@@ -5856,21 +6003,28 @@ async fn forward_coord_write_post(
             .expect("coord write proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
-    // caller-resolved credential passed in by the handler, not this device's.
-    let upstream = match client
-        .post(url)
-        .bearer_auth(bearer)
-        .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(body.to_vec())
-        .send()
-        .await
-    {
+    let upstream = {
+        let _in_flight = egress::in_flight(EG);
+        // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
+        // caller-resolved credential passed in by the handler, not this device's.
+        client
+            .post(url)
+            .bearer_auth(bearer)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+    };
+    let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
+            // Full `source()` chain, not `{e}`. `code` unchanged (compat).
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
             warn!(
                 "coord-mcp write proxy: forward to {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
             );
             // THE transport class: connection refused, DNS, TLS, timeout — the
             // write never reached a coord that could have accepted it. Spool it
@@ -5878,7 +6032,7 @@ async fn forward_coord_write_post(
             // falls through to the pre-existing "unreachable and lost" answer,
             // which stays honest.
             if let Some(plan) = spool {
-                let cause = format!("coord write endpoint unreachable: {e}");
+                let cause = format!("coord write endpoint unreachable: {chain}");
                 if let Some(resp) = gate_spool_response(plan, &cause, None, url, coord_base_source)
                 {
                     return resp;
@@ -5888,10 +6042,11 @@ async fn forward_coord_write_post(
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord write endpoint unreachable: {e}"),
+                    "error": format!("coord write endpoint unreachable: {chain}"),
                     "code": "COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE",
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -5913,18 +6068,22 @@ async fn forward_coord_write_post(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
             warn!(
                 "coord-mcp write proxy: reading coord response body from {url} failed \
-                 (coord_base_source={coord_base_source}): {e}"
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
             );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord write response read failed: {e}"),
+                    "error": format!("coord write response read failed: {chain}"),
                     "code": "COORD_WRITE_PROXY_UPSTREAM_READ_FAILED",
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -5963,18 +6122,20 @@ async fn forward_coord_write_post(
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
+            let chain = crate::util::error_chain::error_chain(&e);
             warn!(
                 "coord-mcp write proxy: response build failed \
-                 (upstream_url={url}, coord_base_source={coord_base_source}): {e}"
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {chain}"
             );
             (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord write response build failed: {e}"),
+                    "error": format!("coord write response build failed: {chain}"),
                     "code": "COORD_WRITE_PROXY_RESPONSE_BUILD_FAILED",
                     "upstream_url": url,
                     "coord_base_source": coord_base_source.as_str(),
+                    "egress": egress::snapshot(EG),
                 })),
             )
                 .into_response()
@@ -6553,10 +6714,14 @@ async fn vcs_create_pull_request_handler(
 
     // Same coord-base resolution as every other loopback forwarder
     // (`COORD_HTTP_URL` override → profiles resolver → dev localhost).
-    let (coord_base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
+    let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = vcs_pr_upstream_url(&coord_base, owner, name);
     let upstream_body = vcs_pr_upstream_body(&req);
-    forward_vcs_pr_post(&url, &bearer, &upstream_body).await
+    // The source is threaded through now rather than discarded at the `_`: this
+    // was the ONE forwarder whose 502 named neither the URL it dialled nor
+    // where that base came from, which is exactly what a misconfigured-upstream
+    // 502 has to say to be actionable.
+    forward_vcs_pr_post(&url, &bearer, &upstream_body, coord_base_source).await
 }
 
 /// Forward the PR-creation POST to coord and return coord's status + headers +
@@ -6569,8 +6734,13 @@ async fn forward_vcs_pr_post(
     url: &str,
     bearer: &str,
     body: &serde_json::Value,
+    coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+
+    use crate::util::egress_context as egress;
+    const EG: crate::util::egress_context::EgressClient =
+        crate::util::egress_context::EgressClient::VcsPr;
 
     static VCS_PR_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let client = VCS_PR_PROXY_CLIENT.get_or_init(|| {
@@ -6581,18 +6751,35 @@ async fn forward_vcs_pr_post(
             .expect("vcs pr proxy reqwest client")
     });
 
-    // coord-auth-exempt(forwarder): VCS-PR forwarder hop — same posture as
-    // `forward_coord_write_post`; the caller owns the bearer.
-    let upstream = match client.post(url).bearer_auth(bearer).json(body).send().await {
+    let upstream = {
+        let _in_flight = egress::in_flight(EG);
+        // coord-auth-exempt(forwarder): VCS-PR forwarder hop — same posture as
+        // `forward_coord_write_post`; the caller owns the bearer.
+        client.post(url).bearer_auth(bearer).json(body).send().await
+    };
+    let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
-            warn!("vcs pr proxy: forward to {url} failed: {e}");
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
+            warn!(
+                "vcs pr proxy: forward to {url} failed \
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord PR endpoint unreachable: {e}"),
+                    "error": format!("coord PR endpoint unreachable: {chain}"),
                     "code": "VCS_PR_PROXY_UPSTREAM_UNREACHABLE",
+                    // Parity with the other three forwarders. This door alone
+                    // carried NEITHER field, so a misconfigured coord base
+                    // produced a 502 that could not say which base it dialled
+                    // or where that base came from.
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -6614,13 +6801,22 @@ async fn forward_vcs_pr_post(
     let bytes = match upstream.bytes().await {
         Ok(b) => b,
         Err(e) => {
-            warn!("vcs pr proxy: reading coord response body failed: {e}");
+            let chain = crate::util::error_chain::error_chain(&e);
+            egress::record_failure(EG);
+            let ctx = egress::snapshot(EG);
+            warn!(
+                "vcs pr proxy: reading coord response body from {url} failed \
+                 (coord_base_source={coord_base_source}): {chain} egress={ctx}"
+            );
             return (
                 axum::http::StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("coord PR response read failed: {e}"),
+                    "error": format!("coord PR response read failed: {chain}"),
                     "code": "VCS_PR_PROXY_UPSTREAM_READ_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                    "egress": ctx,
                 })),
             )
                 .into_response();
@@ -6629,8 +6825,27 @@ async fn forward_vcs_pr_post(
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
-            warn!("vcs pr proxy: response build failed: {e}");
-            axum::http::StatusCode::BAD_GATEWAY.into_response()
+            // This arm used to return a BARE 502 with no body at all — the one
+            // failure on this door a caller could learn nothing whatsoever
+            // from. It now answers in the same envelope shape as its three
+            // siblings.
+            let chain = crate::util::error_chain::error_chain(&e);
+            warn!(
+                "vcs pr proxy: response build failed \
+                 (upstream_url={url}, coord_base_source={coord_base_source}): {chain}"
+            );
+            (
+                axum::http::StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("coord PR response build failed: {chain}"),
+                    "code": "VCS_PR_PROXY_RESPONSE_BUILD_FAILED",
+                    "upstream_url": url,
+                    "coord_base_source": coord_base_source.as_str(),
+                    "egress": egress::snapshot(EG),
+                })),
+            )
+                .into_response()
         })
 }
 
@@ -6641,6 +6856,17 @@ pub fn create_router(
     app_handle: tauri::AppHandle,
     instance_manager: Arc<crate::instance_manager::InstanceManager>,
 ) -> Router {
+    // Anchor the egress uptime clock to the SAME instant `/health`'s
+    // `uptimeSeconds` uses (`MCPState::started_at`, a few lines below) so the
+    // two surfaces can never disagree about how old this process is — the
+    // series the "failure rate is governed by process age" hypothesis is
+    // tested against. Idempotent, so a second router build cannot reset it.
+    crate::util::egress_context::init_process_start();
+    // …and start the healthy-state baseline. A count captured mid-episode is a
+    // number with nothing to compare it to unless a baseline was already being
+    // emitted BEFORE the episode.
+    crate::util::egress_context::spawn_baseline_logger();
+
     // Get dev_logs path for session manager
     let dev_logs_path = get_workspace_paths_internal()
         .map(|(_, dev_logs, _)| dev_logs)
@@ -7747,6 +7973,24 @@ pub fn create_router(
         });
     }
 
+    // Phase 3b — the stale-`.coord-mcp-status` sweep, beside the boot heal that
+    // runs inside `reconcile_session_configs` above.
+    //
+    // The boot heal alone only fires at a runner START, and this fleet never
+    // restarts a runner to make something happen (policy `production-and-cost`
+    // `runner-lifecycle`) — which is exactly how a long-lived runner ends up
+    // carrying a breadcrumb that was already false hours earlier. The sweep is
+    // bounded to one `stat` per live non-ephemeral session per 5 min on a
+    // healthy box, and can only ever CLEAR or RE-DATE a breadcrumb, never mint
+    // one, so the absence of the file keeps meaning UNKNOWN.
+    {
+        let sweep_port = api_state
+            .app_state
+            .api_port
+            .load(std::sync::atomic::Ordering::Relaxed);
+        crate::coord_mcp::start_stale_breadcrumb_sweep(sweep_port);
+    }
+
     // Start zombie task run sweep (detects and cleans up stale "running" tasks)
     {
         let sweep_handle = app_handle.clone();
@@ -8302,6 +8546,11 @@ pub fn create_router(
         // `/health` answers a much richer and much more blockable question.
         .route("/livez", get(livez))
         .route("/health", get(health))
+        // What can this binary actually DO here? `/health` says WHAT this
+        // binary is (`gitSha`, `buildId`, `buildDrift`); this says which RUNG
+        // answered for each capability it delivers, so a development build's
+        // report and a published build's report can be diffed.
+        .route("/capability-manifest", get(capability_manifest))
         .route("/ui-bridge/health", get(health))
         .route("/ui-bridge/status", get(health))
         // The capture that used to run inline inside `/health` (Phase 1.2).
@@ -9511,6 +9760,9 @@ mod self_id_chain_tests {
             bypass_permissions: None,
             restored_from_boot_at: None,
             restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
         }
     }
 
@@ -13539,6 +13791,12 @@ mod vcs_pr_proxy_tests {
         assert_eq!(v["code"], "VCS_PR_PROXY_AGENT_GONE");
     }
 
+    /// The base-resolution arm the VCS forwarder now reports in its 502s. Any
+    /// arm would do for the transport tests below; naming one explicitly is
+    /// what makes the field's presence assertable.
+    const TEST_COORD_BASE_SOURCE: qontinui_runner_lib::profiles::CoordBaseSource =
+        qontinui_runner_lib::profiles::CoordBaseSource::Env;
+
     /// The forwarding leg against a local mock coord: the bearer is injected as
     /// `Authorization: Bearer <token>`, the JSON body arrives verbatim, and
     /// coord's status + body come back unreshaped — including the honest
@@ -13590,7 +13848,8 @@ mod vcs_pr_proxy_tests {
         // Happy path: 201 + coord's body verbatim, bearer injected.
         let url = vcs_pr_upstream_url(&base, "qontinui", "qontinui-runner");
         let body = serde_json::json!({"head": "feat/x", "title": "feat: x"});
-        let resp = forward_vcs_pr_post(&url, "test-device-jwt", &body).await;
+        let resp =
+            forward_vcs_pr_post(&url, "test-device-jwt", &body, TEST_COORD_BASE_SOURCE).await;
         assert_eq!(resp.status(), 201);
         let v = body_json(resp).await;
         assert_eq!(v["number"], 42);
@@ -13608,7 +13867,8 @@ mod vcs_pr_proxy_tests {
         // Non-2xx coord verdict: status + body verbatim, not reshaped.
         // (The specific mock route wins over the {owner}/{repo} template.)
         let url = vcs_pr_upstream_url(&base, "other", "denied");
-        let resp = forward_vcs_pr_post(&url, "test-device-jwt", &body).await;
+        let resp =
+            forward_vcs_pr_post(&url, "test-device-jwt", &body, TEST_COORD_BASE_SOURCE).await;
         assert_eq!(resp.status(), 403);
         let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
             .await
@@ -13628,12 +13888,76 @@ mod vcs_pr_proxy_tests {
         drop(listener);
 
         let url = vcs_pr_upstream_url(&format!("http://127.0.0.1:{port}"), "o", "r");
-        let resp =
-            forward_vcs_pr_post(&url, "test-device-jwt", &serde_json::json!({"head": "h"})).await;
+        let resp = forward_vcs_pr_post(
+            &url,
+            "test-device-jwt",
+            &serde_json::json!({"head": "h"}),
+            TEST_COORD_BASE_SOURCE,
+        )
+        .await;
         assert_eq!(resp.status(), 502);
         let v = body_json(resp).await;
         assert_eq!(v["success"], false);
         assert_eq!(v["code"], "VCS_PR_PROXY_UPSTREAM_UNREACHABLE");
+
+        // ---- ITEM 1: the 502 carries a MULTI-LEVEL source chain ------------
+        //
+        // A REAL refused connect, not a synthetic error: `reqwest`'s own
+        // `Display` stops at "error sending request for url (…)", identical for
+        // a refused connect, a DNS failure and a TLS verdict. The OS-level leaf
+        // ("Connection refused (os error 111)" on Linux, "os error 10061" on
+        // Windows) lives two `source()` hops below it, and reaching the caller
+        // is the whole point of the item.
+        let err = v["error"].as_str().expect("error is a string");
+        assert!(
+            err.starts_with("coord PR endpoint unreachable: "),
+            "the leading prose is compat-preserved: {err}"
+        );
+        assert!(
+            err.matches(": ").count() >= 3,
+            "at least THREE `: ` joins — the prefix, the reqwest head, and one \
+             real cause below it. A single-level render is the defect: {err}"
+        );
+        let lower = err.to_ascii_lowercase();
+        assert!(
+            lower.contains("os error") || lower.contains("connection refused"),
+            "the OS-level leaf must reach the caller, not be swallowed by a \
+             bare `{{e}}`: {err}"
+        );
+
+        // ---- ITEM 1 (parity): the two fields this door alone lacked --------
+        assert_eq!(v["upstream_url"], url);
+        assert_eq!(
+            v["coord_base_source"],
+            TEST_COORD_BASE_SOURCE.as_str(),
+            "a misconfigured-upstream 502 must say where the base came from"
+        );
+
+        // ---- ITEM 2: the egress discriminator ------------------------------
+        let eg = &v["egress"];
+        assert_eq!(eg["client"], "vcs-pr-proxy");
+        for k in [
+            "process_uptime_ms",
+            "open_handles",
+            "socket_handles",
+            "in_flight",
+            "failures_total",
+            "pool_introspection",
+        ] {
+            assert!(eg.get(k).is_some(), "missing egress.{k} in {v}");
+        }
+        assert!(
+            eg["failures_total"].as_u64().unwrap_or(0) >= 1,
+            "the failure that produced THIS envelope must already be counted"
+        );
+        // A count that could not be taken is a typed object, never a `0`.
+        for k in ["open_handles", "socket_handles"] {
+            let m = &eg[k];
+            assert!(
+                m.is_u64() || m.get("unavailable").is_some(),
+                "egress.{k} must be a count or a typed unavailable, got {m}"
+            );
+        }
     }
 }
 

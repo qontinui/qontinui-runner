@@ -386,7 +386,7 @@ That file is the **runner's** record that it could not give this workdir a
 working coord-mcp (`coord_mcp.rs`, `write_degraded_breadcrumb`;
 `/gate` and `/policy` tell an agent to read it and `qontinui-pr` points at it in
 its no-credential error — none of them writes it, and none of them opens it the
-way this script does). It matters here because **six of its seven reasons
+way this script does). It matters here because **six of its thirteen reasons
 say that provisioning pass wrote no `.mcp.json`**: no device JWT in the runner's
 access_token slot, a bearer whose `sub_type` is neither `device` nor `agent`, a
 workdir the non-clobber guard refused, an unresolvable
@@ -401,9 +401,8 @@ the file is read. Look at what is on disk rather than assuming the first.)
 **Count the reasons from the source, never from this paragraph.** Two of the six
 landed in runner `38c337ba5` on 2026-08-19 and were missing from every document
 in this repo until 2026-08-28 — including this one, which said "four of its
-five". It then went wrong in the other direction: from 2026-08-31 to 2026-09-06
-this paragraph counted thirteen, seven of them typed probe verdicts that a
-planned runner change has never landed.
+five". The seven typed probe verdicts below took it to thirteen when the runner
+started writing them.
 `scripts/breadcrumb-reason-drift.py` re-derives the set in one command, and
 since 2026-09-06 it runs in CI (`.github/workflows/doc-transcription-parity.yml`)
 against runner `main`, so this count now reddens a PR instead of rotting.
@@ -417,27 +416,32 @@ re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
 breadcrumb says "NOT written" is a consistent pair, not a contradiction.
 
-The remaining one is the PROBE's, and it means the opposite: a `.mcp.json` WAS
-written and did not answer at spawn. There is exactly one string for it,
-`port :N probe failed (dead port | 401 stale nonce | coord down)`, because the
-runner reduces every transport outcome to a single boolean. **The typed per-door
-vocabulary below is THIS SCRIPT's, not the breadcrumb's** — typing the runner's
-own probe is Phase 1 of
-`2026-08-31-coord-mcp-status-is-a-stale-snapshot-with-an-untyped-cause`, which
-has not landed, so a breadcrumb never says `CONNECT_REFUSED`, and reading one
-that way is reading this script's output back into the runner's file.
+The remaining **seven** reasons are the probe's typed verdicts, and they mean the
+opposite: a `.mcp.json` WAS written and did not answer at spawn. They are
+`TIMEOUT` (the 12 s budget expired — *NOT known dead*; the runner may merely be
+saturated), `CONNECT_REFUSED`, `UNAUTHORIZED (401)`,
+`CREDENTIAL_REFRESHING (503)`, some other `HTTP <status>`, `HTTP_200_NOT_MCP`,
+and an unclassified `TRANSPORT` error. Those are the words on **line 1**; line
+2's JSON `verdict` field carries the machine token, which differs for two of
+them: `UNAUTHORIZED (401)` is `PROXY_UNAUTHORIZED` there, and `HTTP <status>`
+is `HTTP_<code>` (for example `HTTP_502`). The other five read the same on both
+lines — the same vocabulary this script's own
+per-door table uses, reused on purpose rather than invented twice. Thirteen
+reasons in all, across **fourteen** call sites in the writer's two files.
 
-**That disjunction is not a diagnosis, whatever build wrote it.** The
-string is written on a **3-second** budget with every transport error collapsed
-to "not reachable", so *the runner was merely slow* is a fourth cause it never
-names, on a box where CLAUDE.md records `:9876/health` sampled between 296 ms
-and 10120 ms. On 2026-08-20 it named a dead port while `:9876` answered
+**A breadcrumb whose parenthetical instead GUESSES a three-way cause — a dead
+port, or a stale-nonce 401, or coord being down — came from a runner build
+predating those verdicts, and it is not a diagnosis.** (Described, not quoted:
+the verbatim disjunction is what a runner test now asserts is unreconstructible,
+and a reader should not re-seed it.) That string was written on a **3-second**
+budget with every transport error collapsed to "not reachable", so *the runner
+was merely slow* was a fourth cause it never named, on a box where CLAUDE.md
+records `:9876/health` sampled between 296 ms and 10120 ms. On 2026-08-20 it named a dead port while `:9876` answered
 `/health` `derived_status healthy` with 59 live terminals in the same session
-(plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`, finding 18);
-on the same plan, finding 75, a different session read the identical string and
-it was accurate. Read the string as "no 2xx within 3s" and nothing more —
-which cause it actually was is exactly what the typed per-door verdicts below
-settle, and that is the cascade's whole job.
+(plan `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`, finding 18).
+Read the legacy string as "no 2xx within 3s" and nothing more — which cause it
+actually was is exactly what the typed verdicts settle, and that is the
+cascade's whole job.
 
 **It never changes the verdict, and it is not a probe.** Three limits, all
 stated in the output rather than left for the reader to infer:
@@ -447,7 +451,9 @@ stated in the output rather than left for the reader to infer:
   provisioning passes is a property of the runner **build**, so a session that
   recovered on its own can keep a stale file; a session that lost coord later
   grows no new one either way. (A re-provision of the same workdir — a second
-  terminal, a looping agent — can clear or rewrite it on any build.)
+  terminal, a looping agent — can clear or rewrite it on any build; on a newer
+  build a boot reconcile and a periodic sweep can clear or re-date one too, but
+  neither ever CREATES one.)
 - **Freshness is read from line 2, and an unaged breadcrumb is UNKNOWN.** A
   stamping runner appends one JSON object — `written_at`, `workdir`, `port`,
   `verdict`, `build_id`, `schema`. The script reads line 1 and line 2

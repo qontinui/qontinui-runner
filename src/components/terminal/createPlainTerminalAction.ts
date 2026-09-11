@@ -36,6 +36,18 @@ export interface PlainTerminalActionDef {
   id: string;
   label: string;
   description: string;
+  /**
+   * Author-declared safety class, forwarded verbatim by `serializeComponent`.
+   *
+   * REQUIRED here, unlike the SDK's optional `ComponentActionDef.effect`: this
+   * is the one component action on `terminal-page` built by a factory rather
+   * than written as an object literal inside the registration, so the
+   * enumerated-coverage walk in
+   * `src/lib/ui-bridge/action-effect-coverage.test.ts` has to follow the call
+   * to find it. Making the field non-optional means the type system catches a
+   * dropped annotation here even if that walk is ever taught to skip factories.
+   */
+  effect: "read" | "write" | "destructive";
   handler: (params?: unknown) => Promise<{ success: boolean; tab_id: string | null }>;
 }
 
@@ -56,6 +68,12 @@ export function buildCreatePlainTerminalAction(
       "Spawn one plain (non-AI) PTY terminal in the user's default shell, assign it to " +
       "the active page's next free zone, and mount its xterm. Robust from a fresh page. " +
       "Returns { success, tab_id }. Use this to drive the terminal surface headlessly.",
+    // `write` — spawns a PTY in the user's default shell with NO command typed
+    // into it, and assigns it to a zone. A shell that runs nothing has no blast
+    // radius of its own, and closing the tab undoes it. Same call as
+    // `terminal-page.create-terminal`; contrast `create-with-command`, which
+    // auto-types an unbounded command and is `destructive`.
+    effect: "write",
     handler: async () => {
       const tabId = await createAndAssignTerminal();
       return { success: Boolean(tabId), tab_id: tabId ?? null };

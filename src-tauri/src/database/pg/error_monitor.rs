@@ -172,7 +172,7 @@ impl PgDb {
                 &[&signature_hash, &event.log_source_name, &task_run_id],
             )
             .await
-            .map_err(|e| format!("PG upsert_error_event (bump): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG upsert_error_event (bump)", &e))?;
 
         if bumped.is_some() {
             return Ok(false);
@@ -240,7 +240,7 @@ impl PgDb {
                 ],
             )
             .await
-            .map_err(|e| format!("PG upsert_error_event (insert): {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG upsert_error_event (insert)", &e))?;
 
         let _id: i64 = row.get(0);
         Ok(true)
@@ -286,7 +286,7 @@ impl PgDb {
                 &[&tid, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_unresolved_errors: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_unresolved_errors", &e))?
         } else {
             conn.query(
                 r#"
@@ -309,7 +309,7 @@ impl PgDb {
                 &[&limit_i64],
             )
             .await
-            .map_err(|e| format!("PG get_unresolved_errors: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_unresolved_errors", &e))?
         };
 
         Ok(rows
@@ -350,7 +350,7 @@ impl PgDb {
                 &[&tid],
             )
             .await
-            .map_err(|e| format!("PG get_error_summary: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_error_summary", &e))?
         } else {
             conn.query_one(
                 r#"
@@ -366,7 +366,7 @@ impl PgDb {
                 &[],
             )
             .await
-            .map_err(|e| format!("PG get_error_summary: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG get_error_summary", &e))?
         };
 
         // SQL casts every count to ::INTEGER (pg i32), so decode as i32 —
@@ -437,7 +437,7 @@ impl PgDb {
             &[&status, &resolution_notes, &ack_at, &resolved_at, &id],
         )
         .await
-        .map_err(|e| format!("PG update_error_status: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG update_error_status", &e))?;
 
         Ok(())
     }
@@ -467,7 +467,7 @@ impl PgDb {
             &[&task_run_id, &resolution_notes, &error_id],
         )
         .await
-        .map_err(|e| format!("PG mark_resolved_by_task: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG mark_resolved_by_task", &e))?;
 
         Ok(())
     }
@@ -509,7 +509,7 @@ impl PgDb {
                 &[&resolved_by_task_run_id, &task_run_id],
             )
             .await
-            .map_err(|e| format!("PG resolve_errors_by_task_run: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG resolve_errors_by_task_run", &e))?;
 
         Ok(count)
     }
@@ -542,7 +542,7 @@ impl PgDb {
                 &[&id],
             )
             .await
-            .map_err(|e| format!("PG get_error_event_by_id: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_error_event_by_id", &e))?;
 
         Ok(row.map(|r| Self::error_row_to_json(&r)))
     }
@@ -565,7 +565,7 @@ impl PgDb {
             &[&finding_id_str, &error_id],
         )
         .await
-        .map_err(|e| format!("PG link_error_to_finding: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG link_error_to_finding", &e))?;
 
         Ok(())
     }
@@ -601,7 +601,7 @@ impl PgDb {
                 &[&signature_hash],
             )
             .await
-            .map_err(|e| format!("PG get_error_recurrence_history: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_error_recurrence_history", &e))?;
 
         let entries = rows
             .iter()
@@ -831,7 +831,7 @@ impl PgDb {
         let rows = conn
             .query(&sql, &param_refs)
             .await
-            .map_err(|e| format!("PG query_error_events: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG query_error_events", &e))?;
 
         Ok(rows
             .iter()
@@ -873,7 +873,7 @@ impl PgDb {
                 &[&pattern, &limit_i64],
             )
             .await
-            .map_err(|e| format!("PG search_errors: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG search_errors", &e))?;
 
         Ok(rows
             .iter()
@@ -903,7 +903,7 @@ impl PgDb {
                 &[&now, &tid],
             )
             .await
-            .map_err(|e| format!("PG acknowledge_all_errors: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG acknowledge_all_errors", &e))?
         } else {
             conn.execute(
                 r#"
@@ -915,7 +915,7 @@ impl PgDb {
                 &[&now],
             )
             .await
-            .map_err(|e| format!("PG acknowledge_all_errors: {}", e))?
+            .map_err(|e| crate::database::pg::pg_err("PG acknowledge_all_errors", &e))?
         };
 
         Ok(count as u32)

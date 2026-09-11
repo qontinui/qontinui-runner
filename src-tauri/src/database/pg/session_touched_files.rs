@@ -269,7 +269,7 @@ impl PgDb {
             &[&task_run_id, &file_path, &worktree_id],
         )
         .await
-        .map_err(|e| format!("PG record_file_touched: {}", e))?;
+        .map_err(|e| crate::database::pg::pg_err("PG record_file_touched", &e))?;
 
         Ok(())
     }
@@ -298,7 +298,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG get_files_touched: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_files_touched", &e))?;
 
         Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
     }
@@ -339,7 +339,7 @@ impl PgDb {
                 &[&file_paths],
             )
             .await
-            .map_err(|e| format!("PG get_sessions_for_files: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG get_sessions_for_files", &e))?;
 
         Ok(rows
             .iter()
@@ -363,7 +363,7 @@ impl PgDb {
                 &[&task_run_id],
             )
             .await
-            .map_err(|e| format!("PG clear_files_touched: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG clear_files_touched", &e))?;
 
         Ok(n)
     }
@@ -463,7 +463,7 @@ impl PgDb {
                 &[&(window_secs as f64), &limit],
             )
             .await
-            .map_err(|e| format!("PG hot_files: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG hot_files", &e))?;
 
         Ok(rows
             .iter()
@@ -507,7 +507,7 @@ impl PgDb {
                 &[&(window_secs as f64), &limit],
             )
             .await
-            .map_err(|e| format!("PG hot_sessions: {}", e))?;
+            .map_err(|e| crate::database::pg::pg_err("PG hot_sessions", &e))?;
 
         Ok(rows
             .iter()

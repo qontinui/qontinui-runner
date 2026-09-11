@@ -47,6 +47,47 @@
 use super::parser::{authored_at_from_stem, ParsedWorkUnit};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// Pull the row array out of a work-units list body, tolerating a bare array
+/// or a `{units|work_units: [...]}` envelope — and ONLY those two.
+///
+/// Genuinely shared by `status_from_list_body` (behind `current_status`) and by
+/// `list_statuses`, so the two cannot drift in how they read the same door.
+///
+/// An envelope this reader does not recognize is an **error**, never a silent
+/// zero rows. Zero rows is a meaningful answer on this door ("coord has no
+/// units under that filter"), so returning it for a parse failure would let a
+/// total failure log as a successful seed of nothing — the `silent-empty-is-
+/// unknown` shape, in the one module whose entire discipline is that UNKNOWN is
+/// not zero. Both callers already have a non-fatal `Err` arm, so the strict
+/// reading costs nothing.
+fn rows_of(body: &serde_json::Value) -> Result<&Vec<serde_json::Value>> {
+    match body {
+        serde_json::Value::Array(a) => Ok(a),
+        serde_json::Value::Object(o) => o
+            .get("units")
+            .or_else(|| o.get("work_units"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GET /coord/agent-work-units returned an object with no `units`/`work_units` \
+                     array; refusing to read that as an absent unit"
+                )
+            }),
+        other => anyhow::bail!(
+            "GET /coord/agent-work-units returned an unrecognized envelope ({}); refusing to \
+             read it as an absent unit",
+            match other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                _ => "unknown",
+            }
+        ),
+    }
+}
 
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
@@ -117,30 +158,8 @@ fn status_from_list_body(
     // Tolerant of array or {units|work_units: [...]} envelope — but ONLY of
     // those two. An envelope this reader does not recognize must be an ERROR
     // (UNKNOWN), never a silent zero rows read as "the unit does not exist".
-    let rows: &Vec<serde_json::Value> = match body {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(o) => o
-            .get("units")
-            .or_else(|| o.get("work_units"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "GET /coord/agent-work-units returned an object with no `units`/`work_units` \
-                     array; refusing to read that as an absent unit"
-                )
-            })?,
-        other => anyhow::bail!(
-            "GET /coord/agent-work-units returned an unrecognized envelope ({}); refusing to \
-             read it as an absent unit",
-            match other {
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::String(_) => "string",
-                _ => "unknown",
-            }
-        ),
-    };
+    // [`rows_of`] is the shared reader; `list_statuses` uses the same one.
+    let rows: &Vec<serde_json::Value> = rows_of(body)?;
     for row in rows {
         if row.get("slug").and_then(|s| s.as_str()) == Some(slug) {
             // The row EXISTS, so this is never `None`. A null/absent `status`
@@ -210,9 +229,13 @@ impl std::error::Error for ForbiddenByCoord {}
 /// Turn a non-success response into an error, typing a `403` as
 /// [`ForbiddenByCoord`] so the caller can retire the slug instead of retrying.
 ///
-/// Every non-2xx sink response goes through here so the classification is made
-/// in exactly one place; a route that hand-rolled its own `bail!` would silently
-/// re-open the retry storm this exists to close.
+/// Both READ routes go through here so the classification is made in exactly
+/// one place; a read that hand-rolled its own `bail!` would silently re-open the
+/// retry storm this exists to close. The three WRITE routes carry their status
+/// and body in [`CoordWriteError`] instead — a strictly richer shape that keeps
+/// coord's machine-readable denial code — and
+/// [`super::trigger::reconcile_once`] retires the slug off EITHER, so a `403`
+/// on a write is retired just the same.
 async fn classify_failure(route: &'static str, resp: reqwest::Response) -> anyhow::Error {
     let status = resp.status();
     let detail = resp.text().await.unwrap_or_default();
@@ -425,6 +448,21 @@ pub trait WorkUnitSink: Send + Sync {
     /// absent (a truncated page, an envelope it does not recognize, a transport
     /// failure) must return `Err`, never `Ok(None)`.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+
+    /// Bulk read of every work-unit's current status, for COLD-START SEEDING.
+    ///
+    /// `reconcile_once` seeds `last_applied` per slug when this process has no
+    /// memory of it, which costs one `current_status` round-trip per plan on
+    /// the first cycle after a runner start — ~1,200 serialized GETs on this
+    /// fleet. This door collapses that into a handful of paged reads.
+    ///
+    /// `Ok(None)` means the sink has no bulk door; the caller then falls back
+    /// to the per-slug seed, which is the correctness path either way. An
+    /// `Err` is likewise non-fatal to the caller for the same reason — the
+    /// per-slug seed still runs, and it abstains rather than overwriting.
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
     /// the unit. Reads GET /coord/agent-work-units/<slug>/history
@@ -701,6 +739,80 @@ pub async fn push_archive_metadata<S: WorkUnitSink + ?Sized>(
     .await
 }
 
+/// A coord WRITE that came back non-2xx, **with the status and body kept**.
+///
+/// These three writes used to end in `anyhow::bail!("upsert {} -> {} {}", …)`,
+/// which formatted coord's answer into a `String` and threw the structure away.
+/// Downstream — `trigger::reconcile_once`'s `Err` arm — a `422
+/// status_is_derived` (coord evaluated the request and refused it; re-sending
+/// the identical body can never succeed) and a `502` (the socket blipped;
+/// re-sending is exactly right) were **indistinguishable**. That is the root
+/// defect this type closes: the information now survives the `Err` arm instead
+/// of being destroyed at the sink.
+///
+/// [`Display`](std::fmt::Display) reproduces the old string byte-for-byte, so
+/// every existing log line and error message is unchanged.
+///
+/// Recover it from an `anyhow::Error` with [`coord_write_error`], then ask it
+/// [`CoordWriteError::verdict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordWriteError {
+    /// The write that failed, spelled as the log has always spelled it:
+    /// `upsert`, `transition` or `set_deps`.
+    pub op: &'static str,
+    /// The unit the write targeted.
+    pub slug: String,
+    /// The HTTP status coord answered with. `None` is reserved for a write that
+    /// never got a status at all (a transport failure) — which today cannot
+    /// reach this type, because a `send()` failure is turned into a
+    /// [`Context`]-wrapped error before the status is read. It is modelled
+    /// anyway so the classifier's "no status ⇒ retry" arm is reachable if a
+    /// future caller constructs one.
+    pub status: Option<u16>,
+    /// coord's response body, verbatim. This is where the machine-readable
+    /// denial code lives (`{"error":"status_is_derived", …}`).
+    pub body: String,
+}
+
+impl CoordWriteError {
+    /// Classify this failure through the ONE shared classifier
+    /// ([`crate::http_disposition::classify`]) — never a second copy of it, and
+    /// never a client-side table of coord's status vocabulary.
+    ///
+    /// A `GiveUp` verdict carries coord's own denial tag when it named one.
+    /// `401`/`408`/`429` stay [`crate::http_disposition::PostDisposition::Retry`]
+    /// regardless of body: see the classifier's 401-burst carve-out.
+    pub fn verdict(&self) -> crate::http_disposition::Verdict {
+        crate::http_disposition::classify(self.status, &self.body)
+    }
+}
+
+impl std::fmt::Display for CoordWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self
+            .status
+            .and_then(|s| reqwest::StatusCode::from_u16(s).ok())
+        {
+            // Byte-identical to the string the three `bail!`s used to build:
+            // `StatusCode`'s Display is "422 Unprocessable Entity".
+            Some(code) => write!(f, "{} {} -> {} {}", self.op, self.slug, code, self.body),
+            None => write!(f, "{} {} -> (no status) {}", self.op, self.slug, self.body),
+        }
+    }
+}
+
+impl std::error::Error for CoordWriteError {}
+
+/// Recover the [`CoordWriteError`] behind an `anyhow::Error`, or `None` if the
+/// failure was not a coord write rejection (a transport error, a parse error).
+///
+/// Walks the whole cause chain rather than only the outermost error, so a
+/// caller that adds `.context(…)` on top still classifies correctly.
+pub fn coord_write_error(err: &anyhow::Error) -> Option<&CoordWriteError> {
+    err.chain()
+        .find_map(|c| c.downcast_ref::<CoordWriteError>())
+}
+
 /// Production [`WorkUnitSink`]: HTTP against coord with the device-JWT bearer.
 pub struct HttpWorkUnitSink {
     base: String,
@@ -752,6 +864,107 @@ impl WorkUnitSink for HttpWorkUnitSink {
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
     }
 
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        // Same agent-tier door as `current_status`, without a slug filter.
+        // `ListQuery` caps `limit` at 500, so page until a short page.
+        const PAGE: usize = 500;
+        // A hard bound on a network-driven `loop`. coord honours `offset`
+        // today, so this is never reached; a server that did NOT would
+        // otherwise spin forever inside a task on the single-worker
+        // `fleet-publishers` runtime, which is the same runtime whose
+        // blocking-walk hazard `trigger::LoopState::tick` documents at length.
+        // Bounded, the worst case is a short seed, which the per-slug seed
+        // covers.
+        const MAX_PAGES: usize = 200;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut offset = 0usize;
+        // Whether the paging ran to a SHORT page (the real end) rather than
+        // being cut off by `MAX_PAGES`. A cut-off read returns a short map, and
+        // a short map that does not say so is the `unknown-renders-as-a-default`
+        // shape this module refuses everywhere else.
+        let mut reached_the_end = false;
+        for _ in 0..MAX_PAGES {
+            let url = format!(
+                "{}/coord/agent-work-units?limit={}&offset={}",
+                self.base, PAGE, offset
+            );
+            // coord-tenant-scope(work-owed): the same door and the same debt as `current_status` above -- the cold-start seed runs from the periodic plan scan, which holds only self.base + self.client, so there is no session to ask and the plan's repo is the only tenancy signal. Phase 6.
+            let resp = crate::auth::attach_device_auth(self.client.get(&url))
+                .send()
+                .await
+                .context("GET /coord/agent-work-units (bulk seed)")?;
+            if !resp.status().is_success() {
+                anyhow::bail!(
+                    "GET /coord/agent-work-units (bulk seed) returned {}",
+                    resp.status()
+                );
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("parse work-units list (bulk seed)")?;
+            let rows = rows_of(&body)?;
+            let n = rows.len();
+            // Compare against the limit coord APPLIED (it echoes one) rather
+            // than the constant we asked for, so a server that clamps lower is
+            // DETECTED rather than assumed away — the same discipline
+            // `status_from_list_body` applies to its truncation guard. Reading
+            // a clamped full page as "short" would silently seed only page one.
+            let applied = body
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .filter(|v| *v > 0)
+                .unwrap_or(PAGE);
+            for row in rows {
+                if let (Some(slug), Some(status)) = (
+                    row.get("slug").and_then(|v| v.as_str()),
+                    row.get("status").and_then(|v| v.as_str()),
+                ) {
+                    // An empty status is coord's "no status yet" and is left
+                    // UNPRIMED here on purpose. That is safe ONLY because the
+                    // per-slug seed in `trigger::reconcile_once` then reads it
+                    // as `Ok(Some(""))` and routes the unit through
+                    // `Transition`, which passes the ownership deferral. The
+                    // fallback is LOAD-BEARING: if this prime is ever made
+                    // authoritative, these units become `UpsertWithStatus` and
+                    // bypass the deferral — the exact defect the seed closes.
+                    // Seed the empty string too if that day comes.
+                    if !status.is_empty() {
+                        out.insert(slug.to_string(), status.to_string());
+                    }
+                }
+            }
+            // A short page is the last one. Deliberately NOT also breaking on
+            // "this page added no new MAP entries": that conflates a server
+            // that is not advancing on `offset` with a full page whose rows
+            // were all filtered out, and the latter is plausible here — coord
+            // writes an EMPTY status on a fresh insert and orders by
+            // `updated_at DESC`, so a bulk-created block is contiguous and
+            // would silently truncate the seed. `MAX_PAGES` already bounds the
+            // non-advancing server, at a cost of some wasted GETs once per
+            // corpus, which the per-slug seed covers.
+            if n < applied {
+                reached_the_end = true;
+                break;
+            }
+            // Advance by what we GOT, not by what we asked for.
+            offset += n;
+        }
+        if !reached_the_end {
+            // Unreachable on any real corpus (MAX_PAGES x PAGE = 100,000 units
+            // against ~1,100 on this fleet), so say so rather than returning a
+            // silently short map as though it were complete.
+            tracing::warn!(
+                pages = MAX_PAGES,
+                seeded = out.len(),
+                "plan adapter: bulk seed hit its page bound; the prime is SHORT and the \
+                 per-slug seed covers the remainder"
+            );
+        }
+        Ok(Some(out))
+    }
+
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {
         // GET /coord/agent-work-units/<slug>/history returns
         // {"work_unit_id":..,"slug":..,"history":[{..,"by_actor":..,"to_status":..,
@@ -792,8 +1005,18 @@ impl WorkUnitSink for HttpWorkUnitSink {
             .send()
             .await
             .context("POST /coord/work-units/upsert")?;
-        if !resp.status().is_success() {
-            return Err(classify_failure("POST /coord/work-units/upsert", resp).await);
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            // Status + body PRESERVED, not formatted away: the `Err` arm has to
+            // be able to tell a structural refusal from a transport blip.
+            return Err(CoordWriteError {
+                op: "upsert",
+                slug: body.slug.clone(),
+                status: Some(status.as_u16()),
+                body: text,
+            }
+            .into());
         }
         Ok(())
     }
@@ -805,8 +1028,16 @@ impl WorkUnitSink for HttpWorkUnitSink {
             .send()
             .await
             .context("POST /coord/work-units/:slug/transition")?;
-        if !resp.status().is_success() {
-            return Err(classify_failure("POST /coord/work-units/:slug/transition", resp).await);
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            return Err(CoordWriteError {
+                op: "transition",
+                slug: slug.to_string(),
+                status: Some(status.as_u16()),
+                body: text,
+            }
+            .into());
         }
         Ok(())
     }
@@ -826,7 +1057,17 @@ impl WorkUnitSink for HttpWorkUnitSink {
             return Ok(SetDepsOutcome::TableNotMigrated);
         }
         if !status.is_success() {
-            return Err(classify_failure("POST /coord/work-units/:slug/deps", resp).await);
+            let text = resp.text().await.unwrap_or_default();
+            // The fifth failure class (`422 depends_on slug resolves to no
+            // work-unit in this tenant`) is as structural as the other four, so
+            // it carries the same recoverable shape.
+            return Err(CoordWriteError {
+                op: "set_deps",
+                slug: slug.to_string(),
+                status: Some(status.as_u16()),
+                body: text,
+            }
+            .into());
         }
         let parsed: serde_json::Value = resp.json().await.unwrap_or_default();
         let edges_set = parsed
@@ -1534,5 +1775,151 @@ mod tests {
         // would query for something else and its empty page would read as a
         // proven absence.
         assert!(current_status_url("https://c", "a&b").contains("slug_prefix=a%26b"));
+    }
+
+    /// The whole point of `CoordWriteError`: what coord ANSWERED survives the
+    /// `Err` arm. The old `bail!("upsert {} -> {} {}", …)` formatted the status
+    /// into a `String`, which is why a 422 and a 502 were indistinguishable
+    /// downstream. Neuter check for a regression back to a formatted string.
+    #[test]
+    fn a_rejected_write_carries_the_status_and_body_not_just_a_string() {
+        let e: anyhow::Error = CoordWriteError {
+            op: "upsert",
+            slug: "2026-08-14-runner-unauthenticated-coord-writers".into(),
+            status: Some(422),
+            body: r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable"}"#.into(),
+        }
+        .into();
+
+        let recovered = coord_write_error(&e).expect("the status must survive the anyhow boxing");
+        assert_eq!(recovered.status, Some(422));
+        assert_eq!(recovered.op, "upsert");
+        assert!(recovered.body.contains("status_is_derived"));
+
+        // ... and through a `.context()` layer a future caller might add.
+        let wrapped = Err::<(), _>(e)
+            .context("POST /coord/work-units/upsert")
+            .unwrap_err();
+        assert_eq!(
+            coord_write_error(&wrapped).map(|w| w.status),
+            Some(Some(422))
+        );
+    }
+
+    /// One classifier, reached from the adapter's call site. The four denial
+    /// codes coord emits layer onto `GiveUp`; an unknown one is still `GiveUp`
+    /// but is never mis-bucketed as one of the four.
+    #[test]
+    fn the_shared_classifier_reads_coords_denial_off_the_write_failure() {
+        use crate::http_disposition::{DenialTag, PostDisposition};
+
+        let cases: [(u16, &str, DenialTag); 4] = [
+            (
+                422,
+                r#"{"error":"status_is_derived"}"#,
+                DenialTag::StatusIsDerived,
+            ),
+            (
+                403,
+                r#"{"error":"self_attestation_forbidden"}"#,
+                DenialTag::SelfAttestationForbidden,
+            ),
+            (
+                403,
+                r#"{"error":"owner_unresolved"}"#,
+                DenialTag::OwnerUnresolved,
+            ),
+            (
+                403,
+                r#"{"error":"attester_unresolved"}"#,
+                DenialTag::AttesterUnresolved,
+            ),
+        ];
+        for (status, body, tag) in cases {
+            let v = CoordWriteError {
+                op: "upsert",
+                slug: "s".into(),
+                status: Some(status),
+                body: body.into(),
+            }
+            .verdict();
+            assert_eq!(v.disposition, PostDisposition::GiveUp, "{body}");
+            assert_eq!(v.denial, Some(tag), "{body}");
+            assert!(!v.is_retryable(), "{body}");
+        }
+
+        // The dep-edge 422 — the fifth class — names no code coord's
+        // `TransitionDenied` knows, so it must NOT be bucketed into one.
+        let deps = CoordWriteError {
+            op: "set_deps",
+            slug: "s".into(),
+            status: Some(422),
+            body: r#"{"error":"depends_on slug resolves to no work-unit in this tenant"}"#.into(),
+        }
+        .verdict();
+        assert_eq!(deps.disposition, PostDisposition::GiveUp);
+        assert!(deps.denial.is_some_and(|d| !d.is_recognized()));
+    }
+
+    /// The 401 burst: 4,268 consecutive `401 {"error":"invalid token"}` write
+    /// failures that self-cleared in 40 minutes when the device JWT was minted.
+    /// A write rejected this way must stay RETRYABLE at the adapter's own call
+    /// site, not only in the classifier's unit tests — marking it terminal
+    /// would tombstone every unit on the device for the process lifetime.
+    #[test]
+    fn a_401_write_failure_is_retryable_at_the_adapter_call_site() {
+        use crate::http_disposition::PostDisposition;
+
+        for op in ["upsert", "transition", "set_deps"] {
+            let v = CoordWriteError {
+                op,
+                slug: "s".into(),
+                status: Some(401),
+                body: r#"{"error":"invalid token"}"#.into(),
+            }
+            .verdict();
+            assert_eq!(v.disposition, PostDisposition::Retry, "{op}");
+            assert!(v.is_retryable(), "{op}");
+            assert!(!v.is_structural(), "{op}");
+            assert_eq!(v.denial, None, "{op} must carry no denial tag");
+        }
+
+        // Coord deploy blips stay retryable too.
+        for status in [502, 504] {
+            let v = CoordWriteError {
+                op: "upsert",
+                slug: "s".into(),
+                status: Some(status),
+                body: String::new(),
+            }
+            .verdict();
+            assert!(v.is_retryable(), "{status}");
+        }
+    }
+
+    /// The error message an operator reads is byte-identical to the string the
+    /// three `bail!`s built, so no log line or grep changes shape.
+    #[test]
+    fn coord_write_error_display_matches_the_old_bail_string() {
+        assert_eq!(
+            CoordWriteError {
+                op: "upsert",
+                slug: "2026-08-14-x".into(),
+                status: Some(422),
+                body: r#"{"error":"status_is_derived"}"#.into(),
+            }
+            .to_string(),
+            r#"upsert 2026-08-14-x -> 422 Unprocessable Entity {"error":"status_is_derived"}"#
+        );
+        assert_eq!(
+            CoordWriteError {
+                op: "transition",
+                slug: "s".into(),
+                status: Some(403),
+                body: "denied".into(),
+            }
+            .to_string(),
+            "transition s -> 403 Forbidden denied"
+        );
     }
 }

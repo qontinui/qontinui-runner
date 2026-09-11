@@ -1560,30 +1560,18 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
     Ok(Some((device_id, pull)))
 }
 
-/// Render an error together with its FULL source chain.
+/// The FULL-source-chain renderer, now shared rather than private here.
 ///
-/// `reqwest`'s `Display` prints only `error sending request for url (…)` and
-/// leaves the thing that actually explains the failure — the OS error, the DNS
-/// or TLS fault — reachable only via [`std::error::Error::source`]. A bare
-/// `format!("{e}")` therefore produces a line that names a symptom and no
-/// cause, which is not a diagnosable log entry.
+/// Between 2026-07-28 and 2026-08-01 this poller failed 100 % of its pulls for
+/// five days and emitted ~140 identical WARN lines per day, every one of them
+/// cause-free — the box reached coord fine over the same URL throughout, and
+/// the on-demand path calling the same function succeeded the whole time. The
+/// outage was undiagnosable from the logs by construction, because `reqwest`'s
+/// `Display` names a symptom and no cause.
 ///
-/// This is not hypothetical. Between 2026-07-28 and 2026-08-01 the reclaim
-/// poller failed 100 % of its pulls for five days and emitted ~140 identical
-/// WARN lines per day, every one of them cause-free; the box reached coord
-/// fine over the same URL throughout, and the on-demand path calling THIS
-/// function succeeded the whole time. The outage was undiagnosable from the
-/// logs by construction.
-fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
-    use std::fmt::Write as _;
-    let mut out = e.to_string();
-    let mut source = e.source();
-    while let Some(cause) = source {
-        let _ = write!(out, ": {cause}");
-        source = cause.source();
-    }
-    out
-}
+/// The fix was cloned into three modules before it was promoted; see
+/// [`crate::util::error_chain`] for the whole history.
+use crate::util::error_chain::error_chain;
 
 /// What one reclaim cycle actually did.
 ///

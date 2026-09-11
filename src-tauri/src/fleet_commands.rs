@@ -39,6 +39,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::agent_commands::AgentCommandRegistry;
+use crate::capability_manifest::{self, CapabilityObservation, ProvisionReport};
 
 /// `/vet-plan` procedure, bundled into the binary. Canonical source:
 /// `src-tauri/src/fleet_commands/vet-plan.md` in this repository — edit it
@@ -129,36 +130,45 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
 pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
     let registry = crate::agent_commands::resolve_registry();
     let commands_dir = Path::new(workdir).join(".claude").join("commands");
+
+    // The registry's own row: WHICH of `resolve_registry`'s three arms answered.
+    // Recorded before the write, because it is a fact about resolution rather
+    // than about provisioning and holds even if every write below is skipped.
+    let arm = registry.resolution_arm();
+    crate::capability_manifest::record_observation(
+        "agent_commands_registry",
+        CapabilityObservation::from_command_source(arm).with_detail(format!(
+            "CommandSource::{} — {} override(s) over {} embedded default(s)",
+            arm.as_str(),
+            registry.override_count(),
+            registry.builtin_count(),
+        )),
+    );
+
     match provision_fleet_commands_into(&commands_dir, &registry) {
-        Ok(Provisioned { written, skipped }) => {
-            info!(
-                "fleet_commands: provisioned {written} agent command(s) into {} \
-                 ({skipped} skipped as git-tracked; \
-                 {} account override(s), {} embedded default(s) available)",
-                commands_dir.display(),
-                registry.override_count(),
-                registry.builtin_count(),
-            );
-        }
+        Ok(report) => crate::capability_manifest::record_provision(workdir, report),
         Err(e) => {
+            // The destination directory itself could not be created, so no unit
+            // was even attempted. Still fail-soft — the spawn continues — but it
+            // is now a ROW rather than only a log line.
             warn!(
                 "fleet_commands: failed to provision agent commands into {} \
                  (continuing spawn; the fleet slash commands may not resolve): {e}",
                 commands_dir.display()
             );
+            let mut report = ProvisionReport::new(
+                "fleet_commands",
+                registry.all().len(),
+                capability_manifest::Rung::Unresolved,
+            )
+            .with_destination(commands_dir.display().to_string());
+            report.skip(
+                commands_dir.display().to_string(),
+                capability_manifest::SkipReason::WriteFailed(e.to_string()),
+            );
+            crate::capability_manifest::record_provision(workdir, report);
         }
     }
-}
-
-/// Outcome of one provisioning pass: how many command files were written, and
-/// how many were left alone because the destination is tracked by the enclosing
-/// git repository.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub(crate) struct Provisioned {
-    /// Files written (overwriting whatever was there).
-    pub(crate) written: usize,
-    /// Files NOT written because the destination exists and is git-tracked.
-    pub(crate) skipped: usize,
 }
 
 /// Core of [`provision_fleet_commands_for_session`]: create `commands_dir` and
@@ -169,7 +179,8 @@ pub(crate) struct Provisioned {
 /// Idempotent (a second pass over the same dir overwrites rather than errors),
 /// with ONE exception: a destination that already exists AND is tracked in the
 /// enclosing git repository is skipped, logged at `info!`, and counted in
-/// [`Provisioned::skipped`]. Spawning a session with such a checkout as its cwd
+/// [`ProvisionReport::skipped`] WITH its reason. Spawning a session with such a
+/// checkout as its cwd
 /// used to replace the repo's own content with the binary's embedded copy and
 /// leave the tree dirty.
 ///
@@ -189,11 +200,25 @@ pub(crate) struct Provisioned {
 fn provision_fleet_commands_into(
     commands_dir: &Path,
     registry: &AgentCommandRegistry,
-) -> std::io::Result<Provisioned> {
+) -> std::io::Result<ProvisionReport> {
     std::fs::create_dir_all(commands_dir)?;
     let tracked = crate::provision_guard::TrackedPaths::probe(commands_dir);
-    let mut out = Provisioned::default();
-    for command in registry.all() {
+    let resolved = registry.all();
+    // The BODIES are the embedded defaults unless an override replaced one; the
+    // rung of the account layer itself is the separate `agent_commands_registry`
+    // row, which `provision_fleet_commands_for_session` records.
+    let mut out = ProvisionReport::new(
+        "fleet_commands",
+        resolved.len(),
+        capability_manifest::Rung::Embedded,
+    )
+    .with_destination(commands_dir.display().to_string())
+    .with_detail(format!(
+        "{} embedded default(s), {} account override(s)",
+        registry.builtin_count(),
+        registry.override_count()
+    ));
+    for command in &resolved {
         let file_name = command.file_name();
         let dst = commands_dir.join(&file_name);
         if tracked.should_skip(&dst, Path::new(&file_name)) {
@@ -203,11 +228,16 @@ fn provision_fleet_commands_into(
                  own content and dirty its tree",
                 dst.display()
             );
-            out.skipped += 1;
+            out.skip(file_name, capability_manifest::SkipReason::GitTracked);
             continue;
         }
         std::fs::write(&dst, &command.body)?;
-        out.written += 1;
+        out.record_written();
+    }
+    // Nothing landed at all, so no rung answered for this session — a stated
+    // outcome rather than a claim that the embedded floor delivered.
+    if out.written == 0 {
+        out.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(out)
 }
@@ -228,7 +258,8 @@ mod tests {
             FLEET_COMMANDS.len(),
             "should provision every embedded command"
         );
-        assert_eq!(out.skipped, 0, "nothing here is git-tracked");
+        assert!(out.skipped.is_empty(), "nothing here is git-tracked");
+        assert!(out.is_complete(), "a full pass must not read as degraded");
 
         // Every embedded default lands, byte-identically to what
         // `include_str!` embedded.
@@ -288,18 +319,21 @@ mod tests {
 
         let (name, default_body) = FLEET_COMMANDS[0];
         let mut registry = AgentCommandRegistry::new();
-        registry.set_overrides(vec![qontinui_types::agent_commands::AgentCommand {
-            id: "id-1".to_string(),
-            organization_id: Some("org-1".to_string()),
-            created_by_user_id: None,
-            name: name.to_string(),
-            body: "# my own procedure\n".to_string(),
-            checksum: None,
-            is_shared: false,
-            current_version: 1,
-            created_at: "2026-08-04T00:00:00Z".to_string(),
-            updated_at: "2026-08-04T00:00:00Z".to_string(),
-        }]);
+        registry.set_overrides(
+            vec![qontinui_types::agent_commands::AgentCommand {
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: name.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
+            }],
+            crate::agent_commands::CommandSource::Served,
+        );
 
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
         assert_eq!(
@@ -333,7 +367,15 @@ mod tests {
         let registry = AgentCommandRegistry::new();
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped, 1, "the tracked file should be skipped");
+        assert_eq!(out.skipped.len(), 1, "the tracked file should be skipped");
+        // The REASON is the deliverable: a bare count is the same unreadable
+        // signal the `warn!` this report replaces already was.
+        assert_eq!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::GitTracked
+        );
+        assert_eq!(out.skipped[0].unit, format!("{tracked_name}.md"));
+        assert!(out.is_degraded(), "a skipped unit means the pass degraded");
         assert_eq!(
             out.written,
             FLEET_COMMANDS.len() - 1,
@@ -368,7 +410,15 @@ mod tests {
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
         assert_eq!(out.written, 0, "every destination is tracked");
-        assert_eq!(out.skipped, FLEET_COMMANDS.len());
+        assert_eq!(out.skipped.len(), FLEET_COMMANDS.len());
+        assert!(
+            out.skipped
+                .iter()
+                .all(|s| s.reason == crate::capability_manifest::SkipReason::GitTracked),
+            "every skip must carry the reason it was skipped for"
+        );
+        // Nothing landed, so no rung answered — stated, not assumed.
+        assert_eq!(out.rung, crate::capability_manifest::Rung::Unresolved);
         for (name, _) in FLEET_COMMANDS {
             assert_eq!(
                 std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap(),
@@ -396,22 +446,25 @@ mod tests {
         crate::provision_guard::test_support::git_add(tmp.path(), &dst);
 
         let mut registry = AgentCommandRegistry::new();
-        registry.set_overrides(vec![qontinui_types::agent_commands::AgentCommand {
-            id: "id-1".to_string(),
-            organization_id: Some("org-1".to_string()),
-            created_by_user_id: None,
-            name: name.to_string(),
-            body: "# my own procedure\n".to_string(),
-            checksum: None,
-            is_shared: false,
-            current_version: 1,
-            created_at: "2026-08-04T00:00:00Z".to_string(),
-            updated_at: "2026-08-04T00:00:00Z".to_string(),
-        }]);
+        registry.set_overrides(
+            vec![qontinui_types::agent_commands::AgentCommand {
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: name.to_string(),
+                body: "# my own procedure\n".to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
+            }],
+            crate::agent_commands::CommandSource::Served,
+        );
 
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped, 1);
+        assert_eq!(out.skipped.len(), 1);
         assert_eq!(
             std::fs::read_to_string(&dst).unwrap(),
             "# the repo's own body\n",
@@ -438,7 +491,10 @@ mod tests {
         let registry = AgentCommandRegistry::new();
         let out = provision_fleet_commands_into(&commands_dir, &registry).expect("provision");
 
-        assert_eq!(out.skipped, 0, "nothing is tracked, so nothing is skipped");
+        assert!(
+            out.skipped.is_empty(),
+            "nothing is tracked, so nothing is skipped"
+        );
         assert_eq!(out.written, FLEET_COMMANDS.len());
         assert_eq!(
             &std::fs::read_to_string(&dst).unwrap(),

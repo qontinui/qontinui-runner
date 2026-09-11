@@ -374,16 +374,33 @@ impl ClaudeSession {
         crate::ai_provider::oauth_refresh::try_ensure_valid_credentials(
             effective_config_dir.as_deref(),
         );
-        // Same posture, different gate: pre-accept the workspace-trust dialog
+        // Same posture, different gate: DERIVE the workspace-trust pre-accept
         // for `working_dir`. Untrusted here does not prompt (this child is
         // non-interactive) — it silently DROPS the workspace's hooks and MCP
         // servers, which is the harder failure to notice.
-        crate::claude_session::workspace_trust::ensure_workspace_trusted(
-            working_dir,
-            crate::claude_session::workspace_trust::TrustTargets::Account(
+        //
+        // Phases 2 + 4 of
+        // `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`: the
+        // write is now derived from the three conjuncts rather than minted, and
+        // a target whose trust cannot be derived refuses the spawn at a
+        // conservative dial setting instead of silently getting an ambient
+        // grant. Sync door — this builder is blocking, so conjunct 1 falls to
+        // its locally observable arm and says so.
+        {
+            let trust = crate::claude_session::spawn_preconditions::trust_precondition(
+                working_dir,
                 effective_config_dir.as_deref(),
-            ),
-        );
+            );
+            let gate = crate::claude_session::trust_gate::pre_accept_for_spawn_sync(
+                working_dir,
+                &trust.verdict,
+                effective_config_dir.as_deref(),
+                effective_config_dir.as_deref(),
+            );
+            if let Some(refusal) = gate.decision.refusal() {
+                return Err(refusal);
+            }
+        }
 
         // The LAST env mutations before the spawn — account pin, then the
         // credential scrub. Extracted so the production call site is
