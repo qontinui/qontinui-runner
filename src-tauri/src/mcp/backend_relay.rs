@@ -1551,10 +1551,20 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
         let registry = registry.inner().clone();
         tokio::spawn(async move {
             crate::session::attach::catch_up_now(&registry).await;
+            crate::session::create::catch_up_now(&registry).await;
         });
     }
     let coord_base = crate::commands::remote_attach::coord_base_for(&api_state.app_handle);
-    tokio::spawn(crate::commands::remote_attach::mirror_attach_preference_logged(coord_base));
+    tokio::spawn(
+        crate::commands::remote_attach::mirror_attach_preference_logged(coord_base.clone()),
+    );
+    // The CREATE preference mirrors on the same seam, for the same reason
+    // (plan `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase
+    // 3b): coord's `accept_remote_create` column is what the MINT gate reads,
+    // and the runner's local setting is the device owner's expressed choice.
+    // Re-mirroring on every relay connect is what keeps the two from drifting
+    // silently when a save-time PUT failed.
+    tokio::spawn(crate::commands::remote_create::mirror_create_preference_logged(coord_base));
 }
 
 /// Heartbeat sender. Every 30s, write a `{"type": "heartbeat"}` message.
@@ -3624,15 +3634,115 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     // directory and the `intent_repo` this device resolved for it. Gated
     // before the `TerminalManager` is even looked up, so a refusal cannot
     // touch terminal state.
-    let admitted = match crate::mcp::remote_terminal::admit_terminal_create(
-        crate::mcp::remote_terminal::grants(),
-        crate::settings::get_remote_create_preference,
-        remote_create_targets,
-        data,
-    ) {
-        Ok(admitted) => admitted,
-        Err(frame) => return Some(frame),
+    //
+    // Phase 3b: the gate now also consults this runner's OWN create-grant
+    // table, filled from coord's `create_request` directive and the
+    // `GET /sessions/create-requests` catch-up poll. Until then the target
+    // took the relay's word that a create grant existed, so a relay defect
+    // spawned PTYs here.
+    let gate = |data: &Value| {
+        crate::mcp::remote_terminal::admit_terminal_create(
+            crate::mcp::remote_terminal::grants(),
+            crate::mcp::remote_terminal::create_grants(),
+            crate::settings::get_remote_create_preference,
+            remote_create_targets,
+            data,
+            crate::mcp::remote_terminal::now_epoch_secs(),
+        )
     };
+    let admitted = match gate(data) {
+        Ok(admitted) => admitted,
+        Err(frame) => {
+            // The ONE refusal worth a second look, and only this one.
+            //
+            // Coord publishes the `create_request` directive before it answers
+            // the source's mint, but the directive rides NATS while the frame
+            // rides the source's HTTP round-trip and the relay socket — two
+            // paths with no ordering between them. So a LEGITIMATE create can
+            // arrive here microseconds before the directive that authorises it,
+            // and the 60 s catch-up poll would make that a minute-long flake.
+            //
+            // Ask coord directly, once, and re-gate. This does not weaken the
+            // check — the answer still comes from COORD and never from the
+            // relay — it only removes the race. A forged jti pays one coord
+            // round-trip and is refused exactly as before. The first gate
+            // refused at the LOOKUP, before any consume, so re-gating is
+            // idempotent.
+            let worth_a_reread = frame
+                .get("code")
+                .and_then(|c| c.as_str())
+                .is_some_and(crate::mcp::remote_terminal::refusal_warrants_a_coord_reread);
+            let jti = frame
+                .get("grant_jti")
+                .and_then(|j| j.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // THROTTLED, because this `await` runs on the relay's SERIAL read
+            // loop: an unthrottled re-read stalls terminal input, output and
+            // every other frame for up to the coord timeout, once per forged
+            // jti. `claim_create_reread` allows one per jti and one per
+            // cooldown window; everything else is refused from memory at no
+            // cost. It RECORDS the attempt, so call it once.
+            if !worth_a_reread
+                || jti.is_empty()
+                || !crate::mcp::remote_terminal::claim_create_reread(
+                    &jti,
+                    crate::mcp::remote_terminal::now_epoch_secs(),
+                )
+            {
+                return Some(frame);
+            }
+            match api_state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+            {
+                Some(registry) => {
+                    let registry = registry.inner().clone();
+                    tracing::debug!(
+                        grant_jti = %jti,
+                        "remote create: jti unknown to this device — asking coord directly \
+                         before refusing (the directive may not have landed yet)"
+                    );
+                    crate::session::create::catch_up_now(&registry).await;
+                }
+                None => return Some(frame),
+            }
+            match gate(data) {
+                Ok(admitted) => {
+                    // Coord knew it: the re-read raced the directive and won,
+                    // so drop the "already asked" memory rather than holding a
+                    // slot for a jti that turned out to be real.
+                    crate::mcp::remote_terminal::clear_create_reread(&jti);
+                    admitted
+                }
+                // Coord does not know it either. Return the SECOND refusal:
+                // it was decided against a freshly read list.
+                Err(frame) => return Some(frame),
+            }
+        }
+    };
+
+    // The grant is spent. Tell COORD so, so its pending list stops serving it.
+    //
+    // The runner's own spent-jti tombstone already refuses a replay in THIS
+    // process, but coord keeps a grant in `GET /sessions/create-requests` until
+    // its `consumed_at` is set — so without this, a restarted runner (or a
+    // second runner on the same device) reads the spent grant back as pending
+    // and it buys another PTY. Detached and best-effort: a coord blip must not
+    // stall the spawn the grant just paid for, and the local tombstone holds
+    // meanwhile.
+    if let Some(create) = admitted.as_ref() {
+        if let Some(registry) = api_state
+            .app_handle
+            .try_state::<Arc<crate::session::SessionRegistry>>()
+        {
+            let registry = registry.inner().clone();
+            let jti = create.block.grant_jti.clone();
+            tokio::spawn(async move {
+                crate::session::create::notify_consumed(&registry, &jti).await;
+            });
+        }
+    }
 
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
         .app_handle
