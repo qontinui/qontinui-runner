@@ -655,6 +655,27 @@ export interface SerializedElement {
   type: string;
   label?: string;
   actions: string[];
+  /**
+   * Custom (application-defined) actions.
+   *
+   * **This is a MIRROR, not a producer.** `serializeElement`
+   * (`./utils.ts`) delegates to the SDK's own `serializeRegisteredElement` and
+   * casts the result to this interface, so whatever the SDK emits is what goes
+   * on the wire — this declaration only describes it.
+   *
+   * The SDK widened that projection from bare names to `ElementActionInfo`
+   * objects on 2026-09-11 (plan
+   * `2026-09-04-effect-calculus-joins-the-component-action-registry`, Design
+   * decision 4 step 3), so an element's custom action now carries the author's
+   * `effect` safety class. This type stays `string[]` for exactly as long as
+   * this repo pins `@qontinui/ui-bridge ^0.24.0`, whose published projection
+   * still emits names; because `serializeElement` reaches this interface through
+   * an `as` cast, a mismatch here is silent rather than a compile error, which
+   * is why it is called out rather than left to be noticed.
+   *
+   * AT DD4 STEP 4 — the SDK pin bump — this becomes
+   * `SerializedElementAction[]`, re-exported from `@qontinui/ui-bridge`.
+   */
   customActions?: string[];
   identifier: ElementIdentifier;
   state: ElementState;
