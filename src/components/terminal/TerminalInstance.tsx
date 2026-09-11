@@ -1591,6 +1591,16 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
         exitedRef.current = null;
         refusalNoticeShownRef.current = false;
         exitUnsub = registerTerminalExitHandler(terminalId, (payload) => {
+          // A pane can be told about its exit TWICE, and that is by design on
+          // the Rust side: the waiter thread announces "the child process
+          // ended", and `close_with_deadline` announces "the session is gone"
+          // — two different facts, and the webview needs both, because only
+          // the second one arrives after `terminal_list` has stopped listing
+          // the terminal (see `terminal::exit_notice`). Only the FIRST is
+          // news to this pane, though: repeating the notice would print a
+          // second "[Process exited]" line and re-trim a scrollback that is
+          // already trimmed.
+          if (exitedRef.current) return;
           // Record it BEFORE painting: every write path reads this to refuse
           // (and explain) instead of resolving into a dead PTY.
           exitedRef.current = { exitCode: payload.exitCode ?? null };
