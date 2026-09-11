@@ -946,6 +946,18 @@ mod manifest_drift_tests {
             ("POST", "/ui-bridge/control/wait-for-route"),
             ("POST", "/ui-bridge/control/wait-for-route-change"),
             ("POST", "/ui-bridge/control/with-diff"),
+            // Effect-calculus predict route (Phase 6 of plan
+            // 2026-09-04-effect-calculus-joins-the-component-action-registry,
+            // ui-bridge PR #202). ui-bridge's own `main` branch declares this
+            // route in UI_BRIDGE_ROUTES, but the published `@qontinui/ui-bridge`
+            // this repo's package.json resolves (^0.24.0, currently 0.24.0)
+            // predates the feature entirely, so the installed SDK's manifest
+            // this test parses genuinely does not declare it yet. Temporary,
+            // same shape as every other SDK-publish-lag entry in this file:
+            // remove this line once @qontinui/ui-bridge is bumped past the
+            // version that ships the predict route (coord finding
+            // 0b8ebfff-d740-4fd4-acb8-294bc807ed5a / 8d4bf67d-5557-48e1-a3bf-24e1c71be7e4).
+            ("POST", "/ui-bridge/control/component/{}/action/{}/predict"),
         ]
         .into_iter()
         .collect();
