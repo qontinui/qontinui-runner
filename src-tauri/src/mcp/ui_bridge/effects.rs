@@ -362,8 +362,14 @@ mod tests {
 
     #[test]
     fn normalize_predict_body_on_a_non_object_input_is_empty() {
-        assert_eq!(normalize_predict_body(&serde_json::json!(null)), serde_json::json!({}));
-        assert_eq!(normalize_predict_body(&serde_json::json!(7)), serde_json::json!({}));
+        assert_eq!(
+            normalize_predict_body(&serde_json::json!(null)),
+            serde_json::json!({})
+        );
+        assert_eq!(
+            normalize_predict_body(&serde_json::json!(7)),
+            serde_json::json!({})
+        );
     }
 
     #[test]
