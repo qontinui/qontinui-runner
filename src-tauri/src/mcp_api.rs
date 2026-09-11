@@ -4189,15 +4189,21 @@ async fn coord_mcp_proxy_handler(
                 nonce.as_deref(),
                 "missing, unregistered, or expired proxy key (401)",
             );
+            // ONE shape for `COORD_MCP_PROXY_UNAUTHORIZED` (plan
+            // 2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported,
+            // Phase 2 runner sub-task). This lookup-MISS path used to return a
+            // bare `{success, error, code}` body while the `proxy_request_gate`
+            // refusal below returned the full `proxy_failure_envelope` for the
+            // SAME code — so any consumer keying on `layer` (the field the
+            // envelope exists for) silently missed the 401 that matters most:
+            // the absent / unregistered / evicted nonce, i.e. the transport-death
+            // event itself. `error` and `code` pass through byte-identical (the
+            // envelope's own contract); `layer` / `cause` / `next_door` /
+            // `probed_at` are added. Coord was never dialed here, so the layer is
+            // `runner-nonce` by construction.
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": crate::coord_mcp::stale_proxy_key_error(
-                        crate::coord_mcp::STALE_PROXY_KEY_CAUSE,
-                    ),
-                    "code": "COORD_MCP_PROXY_UNAUTHORIZED",
-                })),
+                Json(crate::coord_mcp::stale_proxy_key_unauthorized_body()),
             )
                 .into_response();
         }
