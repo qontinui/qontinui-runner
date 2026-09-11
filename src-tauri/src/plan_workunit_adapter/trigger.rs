@@ -279,18 +279,62 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
 pub struct PlanDirScan {
     pub units: Vec<ParsedWorkUnit>,
     /// `true` **iff** the directory listing succeeded AND every entry it
-    /// yielded was resolved AND every `*.md` among them was read. A failed
-    /// `read_dir`, a failed `DirEntry`, or a single `read_to_string` failure
-    /// (an EACCES, a file swapped out mid-walk, a non-UTF-8 body) all make it
-    /// `false` — the PARTIAL read is the nastier shape, because the vector
-    /// still looks plausible.
+    /// yielded was resolved AND every `*.md` among them was STATTED AND read.
+    /// A failed `read_dir`, a failed `DirEntry`, a failed `metadata`, or a
+    /// single `read_to_string` failure (an EACCES, a file swapped out
+    /// mid-walk, a non-UTF-8 body) all make it `false` — the PARTIAL read is
+    /// the nastier shape, because the vector still looks plausible.
     pub complete: bool,
+}
+
+/// What one `*.md` directory entry turned out to be, once its metadata was
+/// resolved.
+///
+/// This exists as a named classification — rather than the [`Path::is_file`]
+/// one-liner it replaced — because that call is
+/// `fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)`: it FOLDS the IO
+/// error into `false`, so an entry whose `stat` refuses is indistinguishable
+/// from a directory named `x.md` and was dropped with no log line while
+/// [`PlanDirScan::complete`] stayed `true`. That falsifies the invariant
+/// `complete` documents, and it does so BEFORE the instrumented
+/// `read_to_string` arm, so it pre-empts it.
+///
+/// The shape is not hypothetical. A POSIX plans dir at mode `0o644` (read, no
+/// execute — a botched `chmod -R a-x`, a tarball with odd modes, a restrictive
+/// Windows ACL) lists every name from `read_dir`, which needs only `r`, and
+/// then fails EACCES on every `stat`, which needs `x`. EIO/ESTALE on a network
+/// or 9p mount reaches the same arm. The result was `units` empty with
+/// `complete: true` — a picture the disappearance detector accepts, and it
+/// then burns the ENTIRE corpus into the warn-once `warned_disappeared` set.
+#[derive(Debug)]
+enum PlanEntry {
+    /// A regular file: read it.
+    Read,
+    /// Resolved, and genuinely not a plan — a DIRECTORY named `*.md`. Skipping
+    /// it is the guard's legitimate purpose and costs the scan nothing.
+    NotAPlan,
+    /// The listing yielded the name and `stat` refused it. A GAP, not a skip.
+    Unstattable(std::io::Error),
+}
+
+/// Classify one entry from its metadata result. Pure, so the `Err` arm is
+/// testable on every platform — including a box where no unprivileged process
+/// can manufacture a real `stat` failure.
+fn classify_plan_entry(meta: std::io::Result<std::fs::Metadata>) -> PlanEntry {
+    match meta {
+        Ok(m) if m.is_file() => PlanEntry::Read,
+        Ok(_) => PlanEntry::NotAPlan,
+        Err(e) => PlanEntry::Unstattable(e),
+    }
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
 /// matching coord's `walk_root`), reporting whether the walk was COMPLETE.
-/// IO errors on individual files are logged and skipped; a missing dir yields
-/// an empty vec. Both of those clear [`PlanDirScan::complete`].
+/// IO errors on individual files — a refused `stat` as well as a refused read
+/// — are logged and skipped; a missing dir yields an empty vec. All of those
+/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` is the one entry
+/// skipped WITHOUT clearing it: it is resolved, and it is genuinely not a
+/// plan.
 ///
 /// The absolute path is still what is OPENED and what is logged on an IO
 /// error; only the path RECORDED on the parsed unit is made relative — see
@@ -331,8 +375,18 @@ pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if !path.is_file() {
-            continue;
+        match classify_plan_entry(path.metadata()) {
+            PlanEntry::Read => {}
+            PlanEntry::NotAPlan => continue,
+            PlanEntry::Unstattable(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan adapter: cannot stat a plans-dir entry; scan is PARTIAL"
+                );
+                complete = false;
+                continue;
+            }
         }
         let path_str = path.to_string_lossy().to_string();
         let source_path = relative_source_path(source_root.as_deref(), &path);
@@ -2995,7 +3049,8 @@ mod tests {
         assert_eq!(first.errors, 0, "it is NOT counted as a retryable error");
         assert_eq!(
             first.forbidden, 0,
-            "...and it is NOT a permission verdict: `forbidden` answers a              different operator question (fix the grant) and must stay clean"
+            "...and it is NOT a permission verdict: `forbidden` answers a \
+             different operator question (fix the grant) and must stay clean"
         );
         assert_eq!(
             forb.retirement_for("a", "vetted"),
@@ -3192,7 +3247,8 @@ mod tests {
         assert_eq!(
             *sink.transition_attempts.lock().unwrap(),
             attempts_after_denial,
-            "...nor a transition — asserted on the ATTEMPT counter, the only one              that can see a re-issued DENIED request"
+            "...nor a transition — asserted on the ATTEMPT counter, the only one \
+             that can see a re-issued DENIED request"
         );
         assert_eq!(
             *sink.status_reads.lock().unwrap(),
@@ -3419,7 +3475,8 @@ mod tests {
         assert_eq!(
             *sink.transition_attempts.lock().unwrap(),
             transition_attempts,
-            "the permanently-refused transition must not be RE-ISSUED on any              later cycle — not merely fail again"
+            "the permanently-refused transition must not be RE-ISSUED on any \
+             later cycle — not merely fail again"
         );
         assert_eq!(
             *sink.status_reads.lock().unwrap(),
@@ -3681,7 +3738,8 @@ mod tests {
             assert_eq!(
                 mem.get("a").map(String::as_str),
                 Some("shipped"),
-                "cycle {cycle}: a deferral applies nothing, so the memory cannot move                  — which is exactly why the edge is re-derived next cycle"
+                "cycle {cycle}: a deferral applies nothing, so the memory cannot move \
+                 — which is exactly why the edge is re-derived next cycle"
             );
         }
 
@@ -3846,7 +3904,9 @@ mod tests {
         assert_eq!(
             *sink.upsert_calls.lock().unwrap(),
             3,
-            "a state-dependent denial must be re-asked every cycle — coord names the              event that clears it (any actor writing a Free status), and the caller              changes nothing to get there"
+            "a state-dependent denial must be re-asked every cycle — coord names the \
+             event that clears it (any actor writing a Free status), and the caller \
+             changes nothing to get there"
         );
         assert!(
             forb.is_empty(),
@@ -4871,6 +4931,115 @@ mod tests {
             "the readable plan is still returned — a partial scan is not an empty one"
         );
         assert!(!partial.complete, "...but the scan is PARTIAL and says so");
+
+        // 4. UNSTATTABLE: the OS lists the name and `stat` refuses it. This is
+        //    the arm `Path::is_file()` swallowed — it is
+        //    `fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)`, so the
+        //    entry was dropped with no log line while `complete` stayed `true`.
+        //    It sits BEFORE the `read_to_string` arm case 3 exercises, so it
+        //    PRE-EMPTS it: neither of the cases above can see this.
+        //
+        //    A dangling symlink is the portable spelling (ENOENT /
+        //    ERROR_FILE_NOT_FOUND on the `stat`, while `read_dir` still lists
+        //    the name). The real-world shape is the one the module doc names —
+        //    a plans dir at mode 0o644, where `read_dir` needs only `r` and
+        //    succeeds while every `stat` needs `x` and fails EACCES.
+        //
+        //    Creating a symlink needs a privilege on Windows (Developer Mode
+        //    or admin). Where it is refused this case cannot run — it says so
+        //    rather than passing silently, and the arm stays pinned by
+        //    `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip`, which is
+        //    pure and runs everywhere.
+        //
+        //    Neuter check: restore `if !path.is_file() { continue; }` at the
+        //    call site and the `complete` assertion below fails.
+        //
+        //    It gets its OWN tempdir on purpose. Reusing case 3's leaves that
+        //    case's unreadable file in the directory, which clears `complete`
+        //    by itself and makes this case prove nothing — measured, not
+        //    theorised: the first draft shared the dir and the mutation PASSED.
+        let dir4 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir4.path().join("2026-01-03-c.md"),
+            "# C\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let dangling = dir4.path().join("2026-01-04-d.md");
+        match try_symlink(Path::new("no-such-target.md"), &dangling) {
+            Ok(()) => {
+                assert!(
+                    std::fs::metadata(&dangling).is_err(),
+                    "precondition: the link must be UNSTATTABLE, else this case proves nothing"
+                );
+                let unstattable = scan_plan_dir(dir4.path(), &conv);
+                assert_eq!(
+                    unstattable.units.len(),
+                    1,
+                    "the readable plan is still returned"
+                );
+                assert!(
+                    !unstattable.complete,
+                    "an entry the OS LISTED but could not STAT is a gap in the scan, \
+                     not a silent skip"
+                );
+            }
+            Err(e) => {
+                // Not a pass: an explicit, printed inability to run this case.
+                eprintln!(
+                    "SKIPPED case 4 (unstattable entry): this platform refused to create a \
+                     symlink ({e}). The Err arm is pinned by \
+                     `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip` instead."
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    /// **A `stat` that FAILS is a gap; a `stat` that succeeds on a DIRECTORY is
+    /// a skip.** `Path::is_file()` collapsed both into `false`, which is the
+    /// whole defect — so the classification is pinned directly here, with no
+    /// filesystem and therefore no platform privilege in the way.
+    ///
+    /// Neuter check: fold the `Err` arm into `PlanEntry::NotAPlan` (which is
+    /// exactly what `is_file()` did) and the third assertion fails.
+    #[test]
+    fn an_entry_that_cannot_be_statted_is_a_gap_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.md");
+        std::fs::write(&file, "x").unwrap();
+
+        assert!(
+            matches!(classify_plan_entry(file.metadata()), PlanEntry::Read),
+            "a regular file is read"
+        );
+        assert!(
+            matches!(
+                classify_plan_entry(dir.path().metadata()),
+                PlanEntry::NotAPlan
+            ),
+            "a DIRECTORY named `*.md` is resolved and genuinely not a plan — the guard's \
+             legitimate purpose, which the fix must preserve"
+        );
+        assert!(
+            matches!(
+                classify_plan_entry(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "EACCES",
+                ))),
+                PlanEntry::Unstattable(_)
+            ),
+            "a REFUSED stat is never `not a plan` — it is a hole in the scan, and folding it \
+             into the skip is what left `complete: true` on an empty corpus"
+        );
     }
 
     /// **A failed or PARTIAL active scan must produce ZERO disappearance

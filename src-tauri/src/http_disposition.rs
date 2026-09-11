@@ -146,10 +146,15 @@ pub enum DenialTag {
     OwnerUnresolved,
     /// The attester identity could not be resolved from the presented token —
     /// it carries no device id, or it is not a credential coord issued to a
-    /// HOLDER. coord's own message is explicit that *"an anonymously minted
-    /// credential-only token IS device-scoped, so re-sending it will not
-    /// help"*: what clears this is a holder-issued credential (a paired device,
-    /// or an allocation-issued agent token), never merely a device-scoped one.
+    /// HOLDER. coord's own message says, contiguously, *"a credential-only
+    /// token IS device-scoped, so re-sending it will not help"* — but its very
+    /// next and FINAL words are "attest with a device-scoped token", which
+    /// contradicts that, so coord is not in fact explicit about the remedy.
+    /// The reading that matches coord's own logic — and the
+    /// `attester_unresolved` row in the table above — is the one this adapter
+    /// follows: what clears this is a holder-issued credential (a paired
+    /// device, or an allocation-issued agent token), never merely a
+    /// device-scoped one.
     AttesterUnresolved,
     /// A denial code this build does not recognise, carried **verbatim**.
     ///
