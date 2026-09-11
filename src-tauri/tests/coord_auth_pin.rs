@@ -816,7 +816,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/plan_library.rs", "work-owed", 3),
     ("mcp/probe_executor.rs", "device", 1),
     ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
-    ("plan_workunit_adapter/push.rs", "work-owed", 5),
+    ("plan_workunit_adapter/push.rs", "work-owed", 6),
     ("repo_detection.rs", "work-owed", 1),
     ("session/handoff.rs", "escalated", 1),
 ];
@@ -863,11 +863,18 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// lifecycle post is `session-noop` for exactly the reason its `spawn-stalled`
 /// sibling above is: keyed by the path `agent_id`, no tenant persisted. So
 /// `device` 20 -> 21 and `session-noop` 8 -> 9.
+///
+/// Adopting qontinui-runner#1278 (the plan adapter's cold-start seed) adds one
+/// more: `push.rs::list_statuses`, the bulk seed's paged read. It is
+/// `work-owed` for exactly the reason `current_status` beside it is — the
+/// periodic plan scan holds only `self.base` + `self.client`, so there is no
+/// session to ask and the plan's repo is the only tenancy signal. So
+/// `work-owed` 15 -> 16.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 21),
     ("session-noop", 9),
     ("session-owed", 0),
-    ("work-owed", 15),
+    ("work-owed", 16),
     ("escalated", 2),
 ];
 
@@ -1022,8 +1029,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 47,
-        "expected 47 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 48,
+        "expected 48 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1038,7 +1045,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          credential ladder's authed read in claude_session/spawn_preconditions.rs (device) and \
          agent_runtime's spawn-stalled lifecycle post (session-noop); 43 to 45. The same plan's Phases 2 + 4 added 2 more: the \
          trust gate's autonomy-dial read in claude_session/trust_gate.rs (device) and \
-         agent_runtime's spawn-blocked lifecycle post (session-noop); 45 to 47. Found {sites}. A change here is fine — it just has \
+         agent_runtime's spawn-blocked lifecycle post (session-noop); 45 to 47. Adopting \
+         qontinui-runner#1278 then added the plan adapter's cold-start bulk seed \
+         (plan_workunit_adapter/push.rs::list_statuses, work-owed, the same door and the \
+         same debt as current_status beside it); 47 to 48. Found {sites}. A change here \
+         is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
          defaulting caller, which is the event this number exists to make visible."

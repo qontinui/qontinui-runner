@@ -59,6 +59,11 @@ pub struct BuildDriftStatus {
     /// have — i.e. `commits_behind > 0`. A build off a feature branch is
     /// DIVERGENT from trunk without being behind it; see `divergent`.
     ///
+    /// `None` when the answer is not knowable — including the case where the
+    /// build IS divergent but `commits_behind` could not be measured. See
+    /// [`reconcile_behind`]; that arm used to answer `Some(true)` from
+    /// divergence alone, contradicting this very sentence.
+    ///
     /// This used to be `main_sha != embedded`, which made every non-tip build
     /// claim `behind: true` while `commitsBehind` sat at 0 — a body that
     /// contradicted itself. It feeds coord's `served_commits_behind`, so
@@ -208,9 +213,37 @@ fn compute_divergent(embedded: &str, main_sha: Option<&str>) -> Option<bool> {
 ///   lacks; it is on a branch off the tip, or ahead of it. This is exactly
 ///   the case that served `{"behind": true, "commitsBehind": 0}`.
 /// - divergent, count n>0 -> `behind: true`.
-/// - divergent, count unknown -> `behind` stays `true` (the conservative old
-///   answer) with a null count. "Differs from trunk by an amount we could not
-///   measure" is a warning, not a contradiction, so it is left standing.
+/// - divergent, count UNKNOWN -> `behind: None`. **Unknown, not true.**
+///
+/// # Why the last arm changed (manual-test-loop iteration 26, item 5)
+///
+/// It used to answer `Some(true)` — "the conservative old answer" — which
+/// asserted `behind` from DIVERGENCE ALONE. Three things say that is wrong:
+///
+/// 1. The [`BuildDriftStatus::behind`] doc-comment promises `Some(true)`
+///    **only** when `commits_behind > 0`. The old arm broke that promise on
+///    the one input where the count is missing.
+/// 2. The struct already documents `None` as its unknown idiom ("`None`
+///    fields mean unknown"). There was no need to invent a conservative
+///    default; the type has a word for this.
+/// 3. The null window is a LOCAL FETCH ARTIFACT, not a property of the build.
+///    Measured on ONE unchanged binary, 15 minutes apart: `{"behind": true,
+///    "commitsAhead": null, "commitsBehind": null, "divergent": true}` and
+///    then `{"behind": true, "commitsAhead": 0, "commitsBehind": 117,
+///    "divergent": true}`. `check_once_blocking` learns the trunk tip from
+///    `git ls-remote` (network) but never FETCHES the object, so
+///    `rev-list --count embedded..tip` fails until something else fetches —
+///    i.e. the count is unmeasurable exactly when a box IS behind, and the
+///    same arm fires for a build strictly AHEAD of trunk with an unfetched
+///    tip. `run_periodic` then logged "this binary was NOT built from the
+///    trunk's current commit — shipped fixes may not be running here" for a
+///    branch build, which is the false drift signal this module's earlier fix
+///    set out to remove.
+///
+/// A `divergent: true` with a null count is still SERVED — a reader wanting
+/// the weaker "not the trunk tip" signal reads `divergent`, which is exactly
+/// why that field exists as its own signal. What is no longer served is a
+/// confident `behind: true` derived from it.
 fn reconcile_behind(divergent: Option<bool>, commits_behind: Option<u64>) -> Option<bool> {
     match divergent {
         None => None,
@@ -218,7 +251,8 @@ fn reconcile_behind(divergent: Option<bool>, commits_behind: Option<u64>) -> Opt
         Some(true) => match commits_behind {
             Some(0) => Some(false),
             Some(_) => Some(true),
-            None => Some(true),
+            // Unmeasurable is UNKNOWN. See the doc-comment above.
+            None => None,
         },
     }
 }
@@ -302,6 +336,18 @@ pub async fn run_periodic() {
                 git_sha = env!("QONTINUI_GIT_SHA"),
                 "build drift: binary matches the trunk tip"
             ),
+            // Divergent from trunk with an UNMEASURABLE gap. Deliberately
+            // `debug!`, not the WARN above: `ls-remote` gave us the tip's SHA
+            // without fetching the object, so `rev-list --count` cannot run
+            // and we do not know whether this build is behind trunk, ahead of
+            // it, or both. Warning here is what produced a false "shipped
+            // fixes may not be running" on every branch build.
+            (None, Some(main)) if status.divergent == Some(true) => debug!(
+                git_sha = env!("QONTINUI_GIT_SHA"),
+                main_sha = main,
+                "build drift: binary differs from the trunk tip, but the gap is \
+                 not measurable locally (trunk commit not fetched) — drift UNKNOWN"
+            ),
             _ => debug!(
                 "build drift: trunk tip unresolvable (no repo / no network) — reporting unknown"
             ),
@@ -351,12 +397,62 @@ mod tests {
         assert_eq!(reconcile_behind(Some(false), Some(0)), Some(false));
         // Genuinely behind.
         assert_eq!(reconcile_behind(Some(true), Some(3)), Some(true));
-        // Divergent but unmeasurable: a warning, not a contradiction — there
-        // is no count for it to disagree with.
-        assert_eq!(reconcile_behind(Some(true), None), Some(true));
+        // Divergent but unmeasurable: UNKNOWN. See
+        // `behind_is_unknown_when_the_count_is_unknown` for why.
+        assert_eq!(reconcile_behind(Some(true), None), None);
         // Unknown stays unknown.
         assert_eq!(reconcile_behind(None, None), None);
         assert_eq!(reconcile_behind(None, Some(0)), None);
+    }
+
+    /// Iteration 26, item 5: `behind` must not be asserted from DIVERGENCE
+    /// ALONE.
+    ///
+    /// Measured on ONE unchanged binary, 15 minutes apart:
+    /// `{"behind": true, "commitsAhead": null, "commitsBehind": null,
+    /// "divergent": true}`, then `{"behind": true, "commitsAhead": 0,
+    /// "commitsBehind": 117, "divergent": true}`. Ground truth
+    /// `git rev-list --count` agreed with the second: 117 behind, 0 ahead. The
+    /// null window was a LOCAL FETCH ARTIFACT — `check_once_blocking` learns
+    /// the trunk tip from `git ls-remote` but never fetches the object — not a
+    /// property of the build, and the SAME arm fires for a build strictly
+    /// AHEAD of trunk.
+    ///
+    /// `behind`'s own doc-comment says `Some(true)` **only** when
+    /// `commits_behind > 0`, and the struct documents `None` as its unknown
+    /// idiom. An unmeasurable count therefore has exactly one honest answer.
+    #[test]
+    fn behind_is_unknown_when_the_count_is_unknown() {
+        assert_eq!(
+            reconcile_behind(Some(true), None),
+            None,
+            "divergent with an unmeasurable count must report behind:null, \
+             not a confident behind:true"
+        );
+    }
+
+    /// The invariant the `Some(0)` guard below states, generalized: a served
+    /// `behind: true` must be BACKED BY A MEASURED POSITIVE COUNT — never by
+    /// a zero, and never by a missing one.
+    ///
+    /// The pre-existing
+    /// `behind_true_is_never_served_alongside_zero_commits_behind` covers only
+    /// the `Some(0)` half; this adds the `None` half the iteration-26
+    /// measurement exposed.
+    #[test]
+    fn behind_true_is_only_ever_served_with_a_measured_positive_count() {
+        for divergent in [None, Some(false), Some(true)] {
+            for count in [None, Some(0u64), Some(1), Some(42)] {
+                if reconcile_behind(divergent, count) == Some(true) {
+                    assert!(
+                        matches!(count, Some(n) if n > 0),
+                        "behind:true served with commitsBehind:{count:?} \
+                         (divergent={divergent:?}) — it must come from a \
+                         measured positive count, not from divergence alone"
+                    );
+                }
+            }
+        }
     }
 
     /// Guards the invariant rather than the individual cases: across every

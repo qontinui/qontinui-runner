@@ -122,6 +122,19 @@ pub struct AdapterMetrics {
     /// separate authorization checks), so a deps-only refusal must not retire
     /// the whole unit — see the `forbidden_deps` set in [`reconcile_once`].
     pub deps_forbidden_total: AtomicU64,
+    /// Total units whose `last_applied` was seeded from coord's current status
+    /// because this process had no memory of them (counter). Non-zero almost
+    /// exclusively on the first cycle after a runner start — but that is true
+    /// only while the BULK prime is working. A DEFERRED unit deliberately never
+    /// enters `last_applied` (see [`reconcile_once`] for why the memory must
+    /// stay untouched), so in the per-slug fallback regime every persistently
+    /// deferred unit re-seeds every cycle. The bulk prime inserts directly into
+    /// `last_applied`, which is what keeps those units covered.
+    pub seeded_total: AtomicU64,
+    /// Total units SKIPPED because their seed read failed (counter). A unit
+    /// counted here was not pushed at all this cycle — see [`reconcile_once`]
+    /// for why an unreadable remote status must abstain rather than overwrite.
+    pub seed_errors_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -145,6 +158,8 @@ pub struct MetricsSnapshot {
     /// tick — see [`AdapterMetrics::scan_divergence`].
     pub scan_divergence: Option<ScanDivergence>,
     pub deps_forbidden_total: u64,
+    pub seeded_total: u64,
+    pub seed_errors_total: u64,
 }
 
 impl AdapterMetrics {
@@ -176,6 +191,8 @@ impl AdapterMetrics {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone(),
             deps_forbidden_total: self.deps_forbidden_total.load(Ordering::Relaxed),
+            seeded_total: self.seeded_total.load(Ordering::Relaxed),
+            seed_errors_total: self.seed_errors_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -720,6 +737,13 @@ pub struct ReconcileSummary {
     /// `errors` — and not folded into `forbidden`, since a deps refusal does
     /// not imply the unit's own upsert/transition route is refused too.
     pub deps_forbidden: u64,
+    /// Units whose `last_applied` was seeded from coord's current status this
+    /// cycle (no in-process memory of them).
+    pub seeded: u64,
+    /// Units SKIPPED this cycle because the seed read failed. These are NOT
+    /// counted in `errors` (nothing was pushed) and NOT in `scanned`'s
+    /// success sense — they are an explicit abstention.
+    pub seed_errors: u64,
 }
 
 /// The provenance path RECORDED for one scanned plan file: the scan root's
@@ -820,8 +844,77 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
             summary.forbidden += 1;
             continue;
         }
-        let prev = last_applied.get(&u.slug).cloned();
-        match push_work_unit(sink, u, prev.as_deref()).await {
+        // `last_applied` is per-PROCESS memory, rebuilt empty by `run_loop` on
+        // every runner start. Without seeding, the first cycle after a start
+        // sees `None` for EVERY slug — including slugs coord already has rows
+        // for — and `decide_push` returns `UpsertWithStatus`, which sends
+        // `status: Some(<file status>)`. That path bypasses BOTH safety
+        // mechanisms below it:
+        //
+        //   * the agent-ownership deferral in `push_work_unit` is gated on
+        //     `PushAction::Transition`, on the reasoning that an
+        //     `UpsertWithStatus` is a brand-new unit with no agent owner to
+        //     defer to — true per-process, NOT true per-row; and
+        //   * the remote-divergence conflict check is inside
+        //     `if let Some(prev) = last_applied`, so it is skipped entirely and
+        //     logs nothing.
+        //
+        // coord then applies `status = COALESCE($3, work_units.status)`, and a
+        // non-NULL `$3` OVERWRITES. Measured on this fleet 2026-09-01 against
+        // 488 plan-backed units: 233 file statuses diverged from coord and 88
+        // would have demoted a TERMINAL status (48 shipped -> in_progress,
+        // 11 shipped -> partial, 5 shipped -> draft, ...) — silently, on every
+        // runner start, not just the first.
+        //
+        // Seeding from the remote row restores the intended semantics: a unit
+        // coord already knows becomes `RefreshOnly` (status unchanged, sends
+        // `None`, COALESCE preserves) or a `Transition` that DOES pass through
+        // the ownership deferral and conflict check. A slug coord has never
+        // seen still reads `None` and is still created, which is correct.
+        let mut prev = last_applied.get(&u.slug).cloned();
+        // The seed read, when this cycle paid for one. `Some(_)` is a
+        // SUCCESSFUL read and is handed to the push as `known_remote` so the
+        // deferral's convergence check and the conflict check below it do not
+        // re-read the same value: without it every seeded unit costs TWO GETs,
+        // not one, and the cold cycle is ~2,400 serialized reads rather than
+        // ~1,200. There is no spelling of the hint that means "my read failed"
+        // — a failed read abstains and never reaches the push, which is exactly
+        // the contract `push_work_unit_with_remote` documents.
+        let mut seed_read: Option<Option<String>> = None;
+        if prev.is_none() {
+            match sink.current_status(&u.slug).await {
+                // Coord already has this unit. Treat its status as what we last
+                // applied so the edge-trigger compares against reality.
+                Ok(remote) => {
+                    if let Some(remote) = &remote {
+                        summary.seeded += 1;
+                        metrics.seeded_total.fetch_add(1, Ordering::Relaxed);
+                        prev = Some(remote.clone());
+                    }
+                    // `Ok(None)` is genuinely absent -> a real create, and
+                    // `prev` stays `None`, which is correct.
+                    seed_read = Some(remote);
+                }
+                // UNKNOWN. Falling through with `prev = None` would re-create
+                // the row from the file and is exactly the overwrite this seed
+                // exists to prevent, so ABSTAIN: skip the unit this cycle and
+                // count it. The next cycle retries; nothing is lost, because a
+                // plan file that still differs is still there to be pushed.
+                Err(e) => {
+                    summary.seed_errors += 1;
+                    metrics.seed_errors_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        slug = %u.slug,
+                        error = %format!("{e:#}"),
+                        "plan adapter: cannot read remote status to seed last-applied; \
+                         SKIPPING this unit rather than risk overwriting coord's status"
+                    );
+                    continue;
+                }
+            }
+        }
+        let known_remote = seed_read.as_ref().map(|s| s.as_deref());
+        match push_work_unit_with_remote(sink, u, prev.as_deref(), known_remote).await {
             Ok(outcome) => {
                 if outcome.conflict {
                     summary.conflicts += 1;
@@ -1263,6 +1356,13 @@ struct LoopState {
     /// [`ProcessGit`] in production; injected in tests so a tick neither
     /// shells out to a real `git` nor needs a real repo on disk.
     git: std::sync::Arc<dyn GitRefReader>,
+    /// Whether the cold-start BULK seed has been attempted for the current
+    /// corpus. `false` means the next tick will try to prime `last_applied`
+    /// from one paged read instead of paying `reconcile_once`'s per-slug seed
+    /// on every plan. Re-armed by [`LoopState::apply_resolution`] whenever the
+    /// active plans dir moves, because that clears `last_applied` and the
+    /// per-slug fallback would otherwise cost one round-trip per plan again.
+    bulk_seeded: bool,
 }
 
 impl LoopState {
@@ -1284,6 +1384,7 @@ impl LoopState {
             warned_disappeared: HashSet::new(),
             forbidden: HashSet::new(),
             forbidden_deps: HashSet::new(),
+            bulk_seeded: false,
         }
     }
 
@@ -1346,6 +1447,10 @@ impl LoopState {
         self.last_applied.clear();
         self.last_deps.clear();
         self.warned_disappeared.clear();
+        // `last_applied` is empty again, so the corpus is cold again: re-arm the
+        // bulk seed rather than leave the per-slug fallback to pay one
+        // round-trip per plan on the next cycle.
+        self.bulk_seeded = false;
         match &resolved.plans {
             Some(dir) => tracing::info!(
                 dir = %dir,
@@ -1368,6 +1473,82 @@ impl LoopState {
                  no restart needed. Catch a machine up immediately with \
                  `qontinui-pr plan-workunit-backfill --plans-dir <dir>`"
             ),
+        }
+    }
+
+    /// Cold-start BULK seed, attempted once per corpus.
+    ///
+    /// [`reconcile_once`] already seeds `last_applied` per slug when this
+    /// process has no memory of it — that is the CORRECTNESS path and it
+    /// abstains rather than overwriting. But it costs one `current_status`
+    /// round-trip per plan on the first cycle after a runner start (~1,200
+    /// serialized GETs on this fleet). One paged [`WorkUnitSink::list_statuses`]
+    /// read collapses that.
+    ///
+    /// Failure here is deliberately NON-FATAL in every arm, and the two arms
+    /// differ in whether they are TERMINAL. A sink with no bulk door returns
+    /// `Ok(None)` and will not grow one mid-process, so that arm retires the
+    /// attempt. An `Err` is logged and RETRIED on the next tick — a transient
+    /// failure must not retire the seed for the life of the process, because
+    /// the likeliest moment for one is the first cycle after a runner start.
+    /// Either way the per-slug seed still runs; nothing about correctness
+    /// depends on this method succeeding.
+    ///
+    /// Only slugs ACTUALLY IN the scanned dir are primed. Priming every unit
+    /// coord knows would feed `newly_disappeared_slugs` a set full of
+    /// coord-native units that were never plan-backed, and warn that each of
+    /// them had "disappeared from the active dir".
+    async fn bulk_seed<S: WorkUnitSink + ?Sized>(
+        &mut self,
+        units: &[ParsedWorkUnit],
+        sink: &S,
+        metrics: &AdapterMetrics,
+    ) {
+        // An EMPTY corpus must not consume the one attempt: `units` is empty
+        // both when the plans dir has not been populated yet and when the
+        // `spawn_blocking` walk failed with a JoinError. Burning the flag there
+        // primes nothing and never retries until the dir path changes.
+        if self.bulk_seeded || units.is_empty() {
+            return;
+        }
+        match sink.list_statuses().await {
+            Ok(Some(remote)) => {
+                // Arm only on a COMPLETED read. Arming before the await would
+                // let a transient failure retire the seed permanently — and the
+                // likeliest moment for that failure is the first cycle after a
+                // runner start, when coord may not be reachable yet, which is
+                // precisely the cycle the bulk read exists to make cheap.
+                self.bulk_seeded = true;
+                let mut primed = 0u64;
+                for u in units {
+                    if let Some(status) = remote.get(&u.slug) {
+                        self.last_applied.insert(u.slug.clone(), status.clone());
+                        primed += 1;
+                    }
+                }
+                metrics.seeded_total.fetch_add(primed, Ordering::Relaxed);
+                tracing::info!(
+                    primed,
+                    remote_units = remote.len(),
+                    scanned = units.len(),
+                    "plan adapter: cold-start bulk seed applied"
+                );
+            }
+            Ok(None) => {
+                // A sink with no bulk door will not grow one mid-process, so
+                // this arm IS terminal — unlike the error arm below it.
+                self.bulk_seeded = true;
+                tracing::debug!("plan adapter: sink has no bulk seed door; per-slug seed only");
+            }
+            Err(e) => {
+                // Deliberately leaves `bulk_seeded` false: the next tick retries.
+                // The per-slug seed carries correctness in the meantime, and it
+                // abstains rather than overwriting, so a retry costs only reads.
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "plan adapter: bulk seed failed; retrying next cycle, per-slug seed meanwhile"
+                );
+            }
         }
     }
 
@@ -1451,6 +1632,7 @@ impl LoopState {
                 }
             }
         };
+        self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
             &units,
             &mut self.last_applied,
@@ -1473,6 +1655,8 @@ impl LoopState {
             deps_errors = summary.deps_errors,
             forbidden = summary.forbidden,
             deps_forbidden = summary.deps_forbidden,
+            seeded = summary.seeded,
+            seed_errors = summary.seed_errors,
             "plan adapter: reconcile cycle complete"
         );
 
@@ -2627,6 +2811,12 @@ mod tests {
         /// normalisation. Idempotence must survive a backend that does not echo
         /// what it was handed.
         normalize: Option<(String, String)>,
+        /// When true, EVERY `current_status` read hard-errors regardless of
+        /// slug — the UNKNOWN branch the cold-start seed must abstain on
+        /// rather than fall through to an overwrite. Distinct from
+        /// `fail_status_read_for`, which targets one slug for the backfill's
+        /// per-unit failure path.
+        fail_current_status: bool,
         deps_calls: Mutex<Vec<(String, Vec<String>)>>,
         /// When set, every `upsert` answers with a coord `403` — the shape that
         /// used to be retried, and re-logged, once per slug per cycle forever.
@@ -2644,14 +2834,33 @@ mod tests {
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
         upserts: Mutex<Vec<UpsertBody>>,
+        /// When set, the sink HAS a bulk seed door and answers it with this map.
+        /// `None` (the default) models a sink with no bulk door, so the trait's
+        /// defaulted `Ok(None)` and the per-slug fallback stay the tested norm.
+        bulk: Option<HashMap<String, String>>,
+        /// Total `current_status` reads served, so a test can prove the bulk
+        /// prime REMOVED the per-slug round-trips rather than merely duplicating
+        /// them.
+        current_status_calls: Mutex<u64>,
+        /// Total `list_statuses` reads served, so "attempted once per corpus"
+        /// is asserted rather than assumed.
+        list_statuses_calls: Mutex<u64>,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, slug: &str) -> Result<Option<String>> {
+            *self.current_status_calls.lock().unwrap() += 1;
+            if self.fail_current_status {
+                anyhow::bail!("simulated current_status failure");
+            }
             if self.fail_status_read_for.as_deref() == Some(slug) {
                 anyhow::bail!("simulated work-unit status read failure");
             }
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
+        }
+        async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+            *self.list_statuses_calls.lock().unwrap() += 1;
+            Ok(self.bulk.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
             Ok(self.last_actor.clone())
@@ -2797,6 +3006,307 @@ mod tests {
         assert_eq!(s.transitions, 1);
         assert_eq!(*sink.transitions.lock().unwrap(), 1);
         assert_eq!(metrics.snapshot().transitions_total, 1);
+    }
+
+    // --- Cold-start seeding: a runner restart must not re-create coord's rows -
+    //
+    // `last_applied` is per-PROCESS. Before seeding, the first cycle after every
+    // runner start saw `None` for every slug and emitted `UpsertWithStatus` with
+    // the FILE's status — bypassing the ownership deferral (Transition-only) and
+    // the conflict check (inside `if let Some(prev)`), and landing on coord's
+    // `COALESCE($3, status)` which overwrites on a non-NULL `$3`.
+
+    #[tokio::test]
+    async fn cold_start_does_not_demote_a_unit_a_real_agent_owns() {
+        // coord says `shipped`; the plan file still says `in_progress` (the
+        // single commonest divergence on this fleet: 48 of 488 units).
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+        let metrics = AdapterMetrics::default();
+        // COLD: exactly the state `run_loop` builds on every runner start.
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        let s = reconcile_once(
+            &[unit("a", "in_progress")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        // Assert the DEMOTION first, so a regression fails on the behaviour
+        // this test exists for rather than on the mechanism that prevents it.
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("shipped"),
+            "coord's terminal status must survive a cold start (without seeding \
+             this reads `in_progress` — the measured 2026-09-01 demotion)"
+        );
+        assert_eq!(s.transitions, 0, "a real agent owns it -> DEFER");
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(s.seeded, 1, "the remote status must be seeded");
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            1,
+            "the seed read is handed to the push as `known_remote`, so the \
+             deferral's convergence check must NOT pay a second GET"
+        );
+        // And no upsert may carry a status: that is the overwrite vector.
+        assert!(
+            sink.upserts
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|b| b.status.is_none()),
+            "no upsert may carry a status for a unit coord already has"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_with_matching_status_refreshes_without_a_transition() {
+        let sink = FakeSink::default();
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "vetted".to_string());
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        let s = reconcile_once(
+            &[unit("a", "vetted")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s.seeded, 1);
+        assert_eq!(s.transitions, 0, "status unchanged -> RefreshOnly");
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("vetted")
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_start_still_creates_a_slug_coord_has_never_seen() {
+        // The seed must not break the legitimate create path.
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        let s = reconcile_once(
+            &[unit("new", "draft")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s.seeded, 0, "nothing to seed from — genuinely absent");
+        assert_eq!(s.seed_errors, 0);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("new").map(String::as_str),
+            Some("draft"),
+            "a brand-new unit is still created WITH its status"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_read_failure_abstains_rather_than_overwriting() {
+        // UNKNOWN must not degrade to "no prior status", which is precisely the
+        // fall-through that produced the demotions.
+        let sink = FakeSink {
+            fail_current_status: true,
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+
+        let s = reconcile_once(
+            &[unit("a", "in_progress")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s.seed_errors, 1);
+        assert_eq!(s.seeded, 0);
+        assert_eq!(s.errors, 0, "an abstention is not a push error");
+        assert!(
+            sink.upserts.lock().unwrap().is_empty(),
+            "an unreadable remote status must produce NO write at all"
+        );
+        assert_eq!(metrics.snapshot().seed_errors_total, 1);
+        // The unit is not remembered, so the next cycle retries it.
+        assert!(!mem.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn bulk_seed_primes_last_applied_and_removes_the_per_slug_reads() {
+        // What `run_loop`'s bulk prime does, asserted at the reconcile level:
+        // a pre-primed `last_applied` means reconcile_once issues NO per-slug
+        // seed at all.
+        //
+        // `last_actor` is set because priming ALONE does not protect anything —
+        // it restores the edge-trigger, and the OWNERSHIP DEFERRAL is what then
+        // withholds the transition. A unit with no history legitimately
+        // transitions (see `proceeds_when_no_history`), so a default sink here
+        // would demote and would be asserting the wrong thing. Every real coord
+        // row this adapter has never pushed has a non-adapter actor.
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+        let metrics = AdapterMetrics::default();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        // Primed exactly as run_loop primes it, from the bulk read.
+        let mut mem: HashMap<String, String> = [("a".to_string(), "shipped".to_string())]
+            .into_iter()
+            .collect();
+
+        let s = reconcile_once(
+            &[unit("a", "in_progress")],
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s.seeded, 0, "the bulk prime already covered this slug");
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            1,
+            "ZERO seed reads — the one read is the deferral's convergence check \
+             inside push_work_unit, not a seed"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("shipped"),
+            "priming must protect the terminal status just as the per-slug seed does"
+        );
+    }
+
+    /// A sink that does NOT implement `list_statuses` at all must inherit
+    /// `Ok(None)` from the trait — "I have no bulk door" — and never `Ok(Some(
+    /// empty))`, which would read as "coord has no units" and seed nothing
+    /// while claiming a successful read.
+    ///
+    /// `NoBulkSink` exists because `FakeSink` DOES override `list_statuses` (it
+    /// counts the calls), so asserting against `FakeSink::default()` would only
+    /// prove that its own `bulk` field defaults to `None` — deleting the trait
+    /// default entirely would not fail it. This sink implements every
+    /// REQUIRED method and nothing else, so the assertion below reaches the
+    /// default body or it does not compile.
+    #[derive(Default)]
+    struct NoBulkSink;
+
+    #[async_trait::async_trait]
+    impl WorkUnitSink for NoBulkSink {
+        async fn current_status(&self, _slug: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn upsert(&self, _body: &UpsertBody) -> Result<()> {
+            Ok(())
+        }
+        async fn transition(&self, _slug: &str, _body: &TransitionBody) -> Result<()> {
+            Ok(())
+        }
+        async fn set_deps(&self, _slug: &str, _depends_on: &[String]) -> Result<SetDepsOutcome> {
+            Ok(SetDepsOutcome::Ok { edges_set: 0 })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sink_without_a_bulk_door_falls_back_to_the_per_slug_seed() {
+        assert!(
+            NoBulkSink.list_statuses().await.unwrap().is_none(),
+            "the trait's DEFAULT bulk door must be None, not an empty map — an \
+             empty map would read as 'coord has no units' and seed nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn seeding_is_a_first_cycle_cost_only() {
+        // Steady state must not pay a current_status read per unit per cycle.
+        let sink = FakeSink::default();
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "vetted".to_string());
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let units = vec![unit("a", "vetted")];
+
+        let s1 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        let s2 = reconcile_once(
+            &units,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+
+        assert_eq!(s1.seeded, 1, "seeded on the cold cycle");
+        assert_eq!(s2.seeded, 0, "in-process memory serves the second cycle");
     }
 
     // --- Graduation-bootstrap P2a: markdown proxy defers to real agents ------
@@ -4099,6 +4609,135 @@ mod tests {
             logged.matches("markdown-plan tier is OFF").count(),
             1,
             "OFF is logged once per transition, not per idle tick; got: {logged}"
+        );
+    }
+
+    /// The COLD-START BULK SEED, at the loop level where it actually runs.
+    ///
+    /// `reconcile_once`'s per-slug seed is the correctness path and is tested
+    /// above; this asserts the cheap path that removes ~1,200 serialized
+    /// round-trips on the first cycle after a runner start — that the loop
+    /// primes `last_applied` from ONE `list_statuses` read, that the primed
+    /// status is what protects coord's terminal row, and that the read is
+    /// attempted once per corpus rather than once per cycle.
+    ///
+    /// Neuter check: delete the `self.bulk_seed(..)` call in `tick` and the
+    /// `list_statuses_calls` assertion fails.
+    #[tokio::test]
+    async fn the_loop_bulk_seeds_once_and_the_prime_protects_a_terminal_status() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        // coord says `shipped`; the file still says DRAFT — the divergence that
+        // demoted 88 terminal units per runner start before the seed existed.
+        // `last_actor` is a real agent because priming alone protects nothing:
+        // it restores the edge-trigger, and the OWNERSHIP DEFERRAL is what then
+        // withholds the transition.
+        let sink = FakeSink {
+            last_actor: Some("device:d:agent:a".to_string()),
+            bulk: Some(
+                [("2026-01-01-one-plan".to_string(), "shipped".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("2026-01-01-one-plan".to_string(), "shipped".to_string());
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(
+            sink.statuses
+                .lock()
+                .unwrap()
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("shipped"),
+            "the primed status must survive the first cycle after a start"
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0, "a real agent owns it");
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            1,
+            "one bulk read on the cold cycle"
+        );
+        assert_eq!(
+            metrics.snapshot().seeded_total,
+            1,
+            "the one slug present in the plans dir was primed"
+        );
+
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            1,
+            "the bulk seed is a cold-start cost, not a per-cycle one"
+        );
+    }
+
+    /// A sink with NO bulk door must still tick — the trait's defaulted
+    /// `Ok(None)` is a documented fallback to the per-slug seed, not an error,
+    /// and must not stop the cycle.
+    #[tokio::test]
+    async fn the_loop_falls_back_to_the_per_slug_seed_when_the_sink_has_no_bulk_door() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default(); // bulk: None
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the cycle still ran and still created the unit"
+        );
+    }
+
+    /// A corpus switch clears `last_applied`, so the corpus is COLD again and
+    /// the bulk seed must re-arm — otherwise the per-slug fallback pays one
+    /// round-trip per plan on the very next cycle, which is the cost the bulk
+    /// read exists to remove.
+    ///
+    /// Neuter check: drop `self.bulk_seeded = false;` from `apply_resolution`
+    /// and the second `list_statuses_calls` assertion reads 1.
+    #[tokio::test]
+    async fn changing_the_plans_dir_re_arms_the_bulk_seed() {
+        let first = one_plan_dir();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(
+            second.path().join("2026-02-02-another-plan.md"),
+            "# Another plan\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(first.path());
+        let sink = FakeSink {
+            bulk: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
+
+        *cell.lock().unwrap() = plans_dir_input(second.path());
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            2,
+            "a new corpus is cold again, so the bulk seed re-arms"
         );
     }
 

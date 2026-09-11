@@ -73,8 +73,29 @@ function Get-EffectProbeProblems {
             # from the value: `serializeComponent`'s per-action projection is a
             # closed allow-list, so a dropped field vanishes entirely rather
             # than arriving null.
-            $names = @($action.PSObject.Properties.Name)
-            if ($names -notcontains 'effect') {
+            # Explicit enumeration, NOT `@($action.PSObject.Properties.Name)`.
+            #
+            # MEASURED (CI run 34574931033, windows-latest, 2026-09-11): with
+            # that spelling, 6 of this file's 8 self-tests FAILED under Windows
+            # PowerShell 5.1 while all 8 passed under pwsh 7 on Linux. Every
+            # failure was this branch firing on an action that HAD the key —
+            # including the explicit-null case, which reported a MISSING key for
+            # one present with a null value. That shape is what an empty name
+            # list produces, and it is the whole of what was observed.
+            #
+            # WHAT IS NOT ESTABLISHED, said plainly so nobody quotes a cause
+            # that was never proven: the same `.PSObject.Properties.Name
+            # -contains` spelling appears a dozen times in contract-smoke.ps1
+            # and passes on that same lane, so "member enumeration is broken on
+            # 5.1" does NOT survive contact with the evidence. The engine-level
+            # reason is UNKNOWN. What is known is that the explicit loop below
+            # is unambiguous on both engines and the spelling above is not, so
+            # the fix does not depend on the diagnosis being right.
+            $hasEffect = $false
+            foreach ($prop in $action.PSObject.Properties) {
+                if ($prop.Name -eq 'effect') { $hasEffect = $true; break }
+            }
+            if (-not $hasEffect) {
                 $problems += "${surfaceName}: '$actionId' has NO effect key -- stripped by serializeComponent's per-action allow-list (src/hooks/ui-bridge-events/utils.ts)"
                 continue
             }

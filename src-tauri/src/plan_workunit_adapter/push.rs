@@ -47,6 +47,47 @@
 use super::parser::{authored_at_from_stem, ParsedWorkUnit};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::HashMap;
+
+/// Pull the row array out of a work-units list body, tolerating a bare array
+/// or a `{units|work_units: [...]}` envelope — and ONLY those two.
+///
+/// Genuinely shared by `status_from_list_body` (behind `current_status`) and by
+/// `list_statuses`, so the two cannot drift in how they read the same door.
+///
+/// An envelope this reader does not recognize is an **error**, never a silent
+/// zero rows. Zero rows is a meaningful answer on this door ("coord has no
+/// units under that filter"), so returning it for a parse failure would let a
+/// total failure log as a successful seed of nothing — the `silent-empty-is-
+/// unknown` shape, in the one module whose entire discipline is that UNKNOWN is
+/// not zero. Both callers already have a non-fatal `Err` arm, so the strict
+/// reading costs nothing.
+fn rows_of(body: &serde_json::Value) -> Result<&Vec<serde_json::Value>> {
+    match body {
+        serde_json::Value::Array(a) => Ok(a),
+        serde_json::Value::Object(o) => o
+            .get("units")
+            .or_else(|| o.get("work_units"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "GET /coord/agent-work-units returned an object with no `units`/`work_units` \
+                     array; refusing to read that as an absent unit"
+                )
+            }),
+        other => anyhow::bail!(
+            "GET /coord/agent-work-units returned an unrecognized envelope ({}); refusing to \
+             read it as an absent unit",
+            match other {
+                serde_json::Value::Null => "null",
+                serde_json::Value::Bool(_) => "bool",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::String(_) => "string",
+                _ => "unknown",
+            }
+        ),
+    }
+}
 
 /// Actor stamped on adapter-driven upserts/transitions.
 pub const ADAPTER_ACTOR: &str = "harness-markdown-adapter";
@@ -117,30 +158,8 @@ fn status_from_list_body(
     // Tolerant of array or {units|work_units: [...]} envelope — but ONLY of
     // those two. An envelope this reader does not recognize must be an ERROR
     // (UNKNOWN), never a silent zero rows read as "the unit does not exist".
-    let rows: &Vec<serde_json::Value> = match body {
-        serde_json::Value::Array(a) => a,
-        serde_json::Value::Object(o) => o
-            .get("units")
-            .or_else(|| o.get("work_units"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "GET /coord/agent-work-units returned an object with no `units`/`work_units` \
-                     array; refusing to read that as an absent unit"
-                )
-            })?,
-        other => anyhow::bail!(
-            "GET /coord/agent-work-units returned an unrecognized envelope ({}); refusing to \
-             read it as an absent unit",
-            match other {
-                serde_json::Value::Null => "null",
-                serde_json::Value::Bool(_) => "bool",
-                serde_json::Value::Number(_) => "number",
-                serde_json::Value::String(_) => "string",
-                _ => "unknown",
-            }
-        ),
-    };
+    // [`rows_of`] is the shared reader; `list_statuses` uses the same one.
+    let rows: &Vec<serde_json::Value> = rows_of(body)?;
     for row in rows {
         if row.get("slug").and_then(|s| s.as_str()) == Some(slug) {
             // The row EXISTS, so this is never `None`. A null/absent `status`
@@ -429,6 +448,21 @@ pub trait WorkUnitSink: Send + Sync {
     /// absent (a truncated page, an envelope it does not recognize, a transport
     /// failure) must return `Err`, never `Ok(None)`.
     async fn current_status(&self, slug: &str) -> Result<Option<String>>;
+
+    /// Bulk read of every work-unit's current status, for COLD-START SEEDING.
+    ///
+    /// `reconcile_once` seeds `last_applied` per slug when this process has no
+    /// memory of it, which costs one `current_status` round-trip per plan on
+    /// the first cycle after a runner start — ~1,200 serialized GETs on this
+    /// fleet. This door collapses that into a handful of paged reads.
+    ///
+    /// `Ok(None)` means the sink has no bulk door; the caller then falls back
+    /// to the per-slug seed, which is the correctness path either way. An
+    /// `Err` is likewise non-fatal to the caller for the same reason — the
+    /// per-slug seed still runs, and it abstains rather than overwriting.
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        Ok(None)
+    }
     /// The `by_actor` of the unit's most-recent status-history row, or None if
     /// the unit has no history. Used to defer when a real (non-proxy) actor owns
     /// the unit. Reads GET /coord/agent-work-units/<slug>/history
@@ -828,6 +862,107 @@ impl WorkUnitSink for HttpWorkUnitSink {
         }
         let body: serde_json::Value = resp.json().await.context("parse work-units list")?;
         status_from_list_body(&body, slug, PREFIX_SCAN_LIMIT)
+    }
+
+    async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+        // Same agent-tier door as `current_status`, without a slug filter.
+        // `ListQuery` caps `limit` at 500, so page until a short page.
+        const PAGE: usize = 500;
+        // A hard bound on a network-driven `loop`. coord honours `offset`
+        // today, so this is never reached; a server that did NOT would
+        // otherwise spin forever inside a task on the single-worker
+        // `fleet-publishers` runtime, which is the same runtime whose
+        // blocking-walk hazard `trigger::LoopState::tick` documents at length.
+        // Bounded, the worst case is a short seed, which the per-slug seed
+        // covers.
+        const MAX_PAGES: usize = 200;
+        let mut out: HashMap<String, String> = HashMap::new();
+        let mut offset = 0usize;
+        // Whether the paging ran to a SHORT page (the real end) rather than
+        // being cut off by `MAX_PAGES`. A cut-off read returns a short map, and
+        // a short map that does not say so is the `unknown-renders-as-a-default`
+        // shape this module refuses everywhere else.
+        let mut reached_the_end = false;
+        for _ in 0..MAX_PAGES {
+            let url = format!(
+                "{}/coord/agent-work-units?limit={}&offset={}",
+                self.base, PAGE, offset
+            );
+            // coord-tenant-scope(work-owed): the same door and the same debt as `current_status` above -- the cold-start seed runs from the periodic plan scan, which holds only self.base + self.client, so there is no session to ask and the plan's repo is the only tenancy signal. Phase 6.
+            let resp = crate::auth::attach_device_auth(self.client.get(&url))
+                .send()
+                .await
+                .context("GET /coord/agent-work-units (bulk seed)")?;
+            if !resp.status().is_success() {
+                anyhow::bail!(
+                    "GET /coord/agent-work-units (bulk seed) returned {}",
+                    resp.status()
+                );
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("parse work-units list (bulk seed)")?;
+            let rows = rows_of(&body)?;
+            let n = rows.len();
+            // Compare against the limit coord APPLIED (it echoes one) rather
+            // than the constant we asked for, so a server that clamps lower is
+            // DETECTED rather than assumed away — the same discipline
+            // `status_from_list_body` applies to its truncation guard. Reading
+            // a clamped full page as "short" would silently seed only page one.
+            let applied = body
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .filter(|v| *v > 0)
+                .unwrap_or(PAGE);
+            for row in rows {
+                if let (Some(slug), Some(status)) = (
+                    row.get("slug").and_then(|v| v.as_str()),
+                    row.get("status").and_then(|v| v.as_str()),
+                ) {
+                    // An empty status is coord's "no status yet" and is left
+                    // UNPRIMED here on purpose. That is safe ONLY because the
+                    // per-slug seed in `trigger::reconcile_once` then reads it
+                    // as `Ok(Some(""))` and routes the unit through
+                    // `Transition`, which passes the ownership deferral. The
+                    // fallback is LOAD-BEARING: if this prime is ever made
+                    // authoritative, these units become `UpsertWithStatus` and
+                    // bypass the deferral — the exact defect the seed closes.
+                    // Seed the empty string too if that day comes.
+                    if !status.is_empty() {
+                        out.insert(slug.to_string(), status.to_string());
+                    }
+                }
+            }
+            // A short page is the last one. Deliberately NOT also breaking on
+            // "this page added no new MAP entries": that conflates a server
+            // that is not advancing on `offset` with a full page whose rows
+            // were all filtered out, and the latter is plausible here — coord
+            // writes an EMPTY status on a fresh insert and orders by
+            // `updated_at DESC`, so a bulk-created block is contiguous and
+            // would silently truncate the seed. `MAX_PAGES` already bounds the
+            // non-advancing server, at a cost of some wasted GETs once per
+            // corpus, which the per-slug seed covers.
+            if n < applied {
+                reached_the_end = true;
+                break;
+            }
+            // Advance by what we GOT, not by what we asked for.
+            offset += n;
+        }
+        if !reached_the_end {
+            // Unreachable on any real corpus (MAX_PAGES x PAGE = 100,000 units
+            // against ~1,100 on this fleet), so say so rather than returning a
+            // silently short map as though it were complete.
+            tracing::warn!(
+                pages = MAX_PAGES,
+                seeded = out.len(),
+                "plan adapter: bulk seed hit its page bound; the prime is SHORT and the \
+                 per-slug seed covers the remainder"
+            );
+        }
+        Ok(Some(out))
     }
 
     async fn last_actor(&self, slug: &str) -> Result<Option<String>> {

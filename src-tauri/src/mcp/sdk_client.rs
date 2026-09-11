@@ -2460,9 +2460,17 @@ async fn handle_page_refresh(
     {
         Ok(data) => Json(data),
         Err(_) => {
-            // Fall back to IPC
+            // Fall back to IPC — the RUNNER-LOCAL path, where `page_refresh`
+            // is a documented no-op (`usePageEvents.ts`: "ignoring (full
+            // reload disabled in runner)"). Stamp the same outcome field the
+            // `/control/page/refresh` handler stamps, so the two spellings of
+            // one route do not disagree about whether anything reloaded.
+            // Iteration 26, item 1.
             match ui_bridge_request_sync(&state, "page_refresh", serde_json::json!({})).await {
-                Ok(data) => Json(serde_json::json!({ "success": true, "data": data })),
+                Ok(mut data) => {
+                    crate::mcp::ui_bridge::page::augment_refresh_response(&mut data);
+                    Json(serde_json::json!({ "success": true, "data": data }))
+                }
                 Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
             }
         }

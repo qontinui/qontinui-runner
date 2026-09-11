@@ -237,6 +237,8 @@ mod tests {
             archive_stamped_total: 0,
             forbidden_total: 0,
             deps_forbidden_total: 0,
+            seeded_total: 0,
+            seed_errors_total: 0,
             scan_roots,
             path_resolutions_total,
             active_plans_dir: None,
