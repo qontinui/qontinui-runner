@@ -3627,6 +3627,111 @@ fn remote_create_targets() -> crate::mcp::remote_terminal::CreateTargets {
     }
 }
 
+/// Register a REMOTE-created terminal as a coord session, and return the id.
+///
+/// **Why this exists, and why only for a remote create.** A create grant buys
+/// one spawn and the relay drops the attachment the moment it forwards
+/// `terminal_created`; driving the PTY afterwards needs an ATTACH grant, which
+/// coord mints BY SESSION (`POST /coord/sessions/{id}/attach-grants`). Without
+/// a coord session row the source can create a terminal it can never reach,
+/// and the terminal never appears in the fleet picker either — the feature
+/// would be a spawn button with no way back to what it spawned.
+///
+/// The local Tauri `terminal_create` command has always registered (it also
+/// resumes a persisted pane id and attaches an output pipe); the relay path
+/// never did. This closes it for the remote arm ONLY. The web / mobile arm is
+/// left as it was on purpose: registering every terminal qontinui-web opens
+/// would mint coord rows for a population that has never had them, which is a
+/// separate decision with its own blast radius and is not this plan's.
+///
+/// `None` on any failure — no registry in state, or a registry refusal — which
+/// the source then reports as "created but not attachable" rather than as a
+/// success. Failure never affects the terminal, which is already running.
+fn register_remote_created_session(
+    api_state: &Arc<ApiState>,
+    tm: &Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    purpose: Option<String>,
+    working_dir: Option<String>,
+    intent_repo: Option<String>,
+) -> Option<uuid::Uuid> {
+    use crate::session::{intent::Intent, SessionKind};
+
+    let registry = api_state
+        .app_handle
+        .try_state::<Arc<crate::session::SessionRegistry>>()?
+        .inner()
+        .clone();
+    let perf = crate::settings::get_performance_settings();
+    let intent = Intent {
+        kind: SessionKind::TerminalShell,
+        purpose: purpose
+            .filter(|t| t.trim().len() >= 3)
+            .unwrap_or_else(|| "Remote terminal shell session".to_string()),
+        repo: intent_repo,
+        branch: None,
+        work_unit_slug: None,
+        plan_slug: None,
+        correlation_topic: None,
+        // A present `page_id` is coord's "this is a gate continuation" marker;
+        // a remote create is not one.
+        page_id: None,
+        declared_paths: working_dir
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect(),
+        share_output: perf.share_terminal_output,
+        redact_secrets: perf.redact_terminal_secrets,
+        // The device default. A REMOTE caller naming a tenant would be choosing
+        // this machine's binding for it, which is not something a create grant
+        // conveys.
+        tenant_id: None,
+    };
+    // Keyed by the harness session id the identity seam pinned this PTY child
+    // to, exactly as the local create path does — without it the registry falls
+    // back to the runner's own ambient id, which no child runs under.
+    let pinned_session_id = tm
+        .get(terminal_id)
+        .map(|s| s.pinned_session_id().to_string());
+    match registry.register_external_with_lineage(intent, None, pinned_session_id) {
+        Ok(coord_id) => {
+            if let Some(session) = tm.get(terminal_id) {
+                session.set_coord_session_id(coord_id);
+                // Close the coord mirror the instant the PTY exits, instead of
+                // leaving a ghost for coord's stale watcher to reap. Same
+                // idempotent door the explicit close uses.
+                let close_registry = registry.clone();
+                session.set_on_exit(Box::new(move |id| {
+                    if let Err(e) = close_registry.close_by_id(id) {
+                        warn!(
+                            coord_session = %id,
+                            error = %e,
+                            "remote create: coord session close failed on PTY exit"
+                        );
+                    }
+                }));
+                let rx = session.subscribe_output();
+                registry.attach_output_pipe(coord_id, rx, true);
+            }
+            info!(
+                terminal_id = %terminal_id,
+                coord_session = %coord_id,
+                "remote create: coord session registered — the source can mint an attach grant"
+            );
+            Some(coord_id)
+        }
+        Err(e) => {
+            warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "remote create: coord session registration FAILED — the terminal is running but \
+                 the source cannot attach to it (no session id to mint an attach grant against)"
+            );
+            None
+        }
+    }
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
@@ -3841,6 +3946,12 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         let extra_env =
             crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
 
+        // Kept for the coord registration below, which runs after `title` has
+        // been moved into the spawn.
+        let registration_purpose = title.clone();
+        let registration_dir = working_dir.clone();
+        let registration_repo = effective_intent_repo.clone();
+
         match tm.create(
             title,
             working_dir,
@@ -3868,9 +3979,34 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         session.set_isolated_edit_ctx(ctx);
                     }
                 }
+                let mut terminal = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
+                // A REMOTE create is registered as a coord session; a local /
+                // mobile one is not, and that asymmetry is deliberate — see
+                // `register_remote_created_session`.
+                if admitted.is_some() {
+                    if let Some(coord_id) = register_remote_created_session(
+                        api_state,
+                        &tm,
+                        &info.id,
+                        registration_purpose,
+                        registration_dir,
+                        registration_repo,
+                    ) {
+                        if let Some(obj) = terminal.as_object_mut() {
+                            // INSIDE the terminal object on purpose: the relay
+                            // forwards that object verbatim and drops every
+                            // top-level key it does not know, so a sibling
+                            // field would never reach the source.
+                            obj.insert(
+                                "coordSessionId".to_string(),
+                                serde_json::Value::String(coord_id.to_string()),
+                            );
+                        }
+                    }
+                }
                 let mut frame = serde_json::json!({
                     "type": "terminal_created",
-                    "terminal": info,
+                    "terminal": terminal,
                     "request_id": data.get("request_id"),
                 });
                 // Echo the block a REMOTE create came under, so the relay can

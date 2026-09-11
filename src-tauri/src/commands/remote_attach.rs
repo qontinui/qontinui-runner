@@ -147,13 +147,50 @@ pub async fn remote_attach_preference_set(
 
 /// Coord's `201` from `POST /coord/sessions/{id}/attach-grants`.
 #[derive(Debug, Clone, Deserialize)]
-struct AttachGrantResponse {
-    grant: String,
-    grant_jti: String,
+pub(crate) struct AttachGrantResponse {
+    pub grant: String,
+    pub grant_jti: String,
     #[serde(default)]
-    target_device_id: Option<String>,
+    pub target_device_id: Option<String>,
     #[serde(default)]
-    expires_at: Option<Value>,
+    pub expires_at: Option<Value>,
+}
+
+/// Coord learns about a session through the registry's OUTBOX, not through the
+/// call that registered it, so a session registered microseconds ago is not yet
+/// a row coord's mint can resolve. A remote create hits exactly that window:
+/// the target registers, answers `terminal_created`, and the source mints
+/// against an id coord has not drained yet — a `404 session_not_found` that is
+/// a RACE, not an absence. Retried for this long before it is reported.
+const SESSION_VISIBILITY_RETRY: Duration = Duration::from_millis(750);
+const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
+
+/// [`mint_attach_grant`], retrying ONLY a `session_not_found` — the one
+/// refusal that can become an admission by waiting. Every other refusal
+/// (`attach_forbidden`, a credential answer, a transport failure) is returned
+/// on the first attempt: retrying those would turn one honest refusal into a
+/// long silence ending in the same refusal.
+pub(crate) async fn mint_attach_grant_awaiting_session(
+    coord_base: &str,
+    session_id: uuid::Uuid,
+) -> Result<AttachGrantResponse, String> {
+    let mut last = String::new();
+    for attempt in 0..SESSION_VISIBILITY_ATTEMPTS {
+        match mint_attach_grant(coord_base, session_id).await {
+            Ok(minted) => return Ok(minted),
+            Err(e) if e.starts_with("remote_attach:session_not_found") => {
+                last = e;
+                if attempt + 1 < SESSION_VISIBILITY_ATTEMPTS {
+                    tokio::time::sleep(SESSION_VISIBILITY_RETRY).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "{last} (retried for {}s while coord's outbox caught up)",
+        (SESSION_VISIBILITY_RETRY * SESSION_VISIBILITY_ATTEMPTS).as_secs_f32()
+    ))
 }
 
 async fn mint_attach_grant(
@@ -265,6 +302,62 @@ pub async fn terminal_attach_remote(
         "remote attach: grant minted; presenting through the relay"
     );
 
+    open_remote_tab(
+        terminal_manager.inner(),
+        &app_handle,
+        OpenRemoteTab {
+            minted,
+            device_id,
+            session_uuid,
+            cols,
+            rows,
+            page_id,
+            device_label,
+            session_label,
+            working_dir,
+        },
+    )
+    .await
+}
+
+/// Everything [`open_remote_tab`] needs that is not the manager or the app
+/// handle. A struct rather than eleven positional arguments, because two
+/// callers now build it: the attach command above, and the remote CREATE
+/// command, which mints its attach grant for a session the target had to
+/// register first.
+pub(crate) struct OpenRemoteTab {
+    pub minted: AttachGrantResponse,
+    pub device_id: String,
+    pub session_uuid: uuid::Uuid,
+    pub cols: u16,
+    pub rows: u16,
+    pub page_id: Option<String>,
+    pub device_label: Option<String>,
+    pub session_label: Option<String>,
+    pub working_dir: Option<String>,
+}
+
+/// Present a minted ATTACH grant through the relay and open the tab around the
+/// resulting [`RemotePaneIo`]. The single implementation of "a remote tab is
+/// opened this way" — the create path composes over it rather than growing a
+/// second one.
+pub(crate) async fn open_remote_tab(
+    terminal_manager: &Arc<TerminalManager>,
+    app_handle: &tauri::AppHandle,
+    req: OpenRemoteTab,
+) -> Result<RemoteTerminalInfo, String> {
+    let OpenRemoteTab {
+        minted,
+        device_id,
+        session_uuid,
+        cols,
+        rows,
+        page_id,
+        device_label,
+        session_label,
+        working_dir,
+    } = req;
+    let session_id = session_uuid.to_string();
     let attached = client()
         .attach(&minted.grant, cols, rows, ATTACH_TIMEOUT)
         .await
@@ -309,7 +402,7 @@ pub async fn terminal_attach_remote(
     };
 
     let io: Arc<dyn PaneIo> = pane.clone();
-    let tm = terminal_manager.inner().clone();
+    let tm = terminal_manager.clone();
     let pinned = session_uuid.to_string();
     let spawn_title = title.clone();
     let spawn_app = app_handle.clone();

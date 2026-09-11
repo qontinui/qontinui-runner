@@ -1664,6 +1664,70 @@ pub struct AttachedReply {
     pub ring: AttachedRing,
 }
 
+/// A parsed `remote_terminal_created` reply — the relay's answer to a
+/// `remote_terminal_create` (plan
+/// `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 5).
+///
+/// **`coord_session_id` is the field the whole flow turns on, and it is an
+/// `Option` on purpose.** A create grant buys ONE spawn and the relay drops the
+/// attachment the instant it forwards this frame, so driving what was spawned
+/// needs an ATTACH grant — which coord mints by SESSION id
+/// (`POST /coord/sessions/{id}/attach-grants`). The target therefore has to
+/// register the new PTY as a coord session and say which one it is. A target
+/// whose build predates that, or whose coord registration failed, answers
+/// `None`: **UNKNOWN, not "attach later"** — there is no id to address a mint
+/// to and inventing one is not available.
+///
+/// It rides INSIDE the reply's `terminal` object rather than beside it because
+/// the relay forwards that object verbatim and drops every top-level key it
+/// does not know (`remote_terminal_relay.py`, the `terminal_created` arm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedReply {
+    pub grant_jti: String,
+    /// The TARGET runner's terminal id for the PTY it just spawned.
+    pub terminal_id: String,
+    /// The coord session id the TARGET registered for that PTY, if it did.
+    pub coord_session_id: Option<String>,
+    /// The directory the TARGET chose. Display only — the caller never picked
+    /// it and must not be shown a value it supplied.
+    pub working_dir: Option<String>,
+    /// The title the target gave the terminal, when it reported one.
+    pub title: Option<String>,
+}
+
+/// Parse a `remote_terminal_created` frame. `None` when the frame does not
+/// carry the two fields a create is useless without.
+fn parse_created(data: &Value) -> Option<CreatedReply> {
+    let grant_jti = data.get("grant_jti")?.as_str()?.to_string();
+    let terminal = data.get("terminal");
+    let terminal_id = data
+        .get("terminal_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| terminal.and_then(|t| t.get("id")).and_then(|v| v.as_str()))?
+        .to_string();
+    let field = |name: &str| -> Option<String> {
+        terminal
+            .and_then(|t| t.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
+    Some(CreatedReply {
+        grant_jti,
+        terminal_id,
+        coord_session_id: field("coordSessionId").or_else(|| field("coord_session_id")),
+        working_dir: field("workingDir").or_else(|| field("working_dir")),
+        title: field("title"),
+    })
+}
+
+/// How long a remote create waits for `remote_terminal_created`.
+///
+/// Longer than [`ATTACH_TIMEOUT`] because the target is doing strictly more:
+/// resolving a directory, possibly allocating a worktree and taking a coord
+/// claim, and opening a PTY — where an attach only binds to one that exists.
+pub const CREATE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// A typed attach failure — the code is what the picker shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachError {
@@ -1678,6 +1742,7 @@ impl std::fmt::Display for AttachError {
 }
 
 type PendingAttach = oneshot::Sender<Result<AttachedReply, AttachError>>;
+type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
 
 /// The source side's routing table and outbound queue.
 pub struct RemoteAttachClient {
@@ -1685,6 +1750,12 @@ pub struct RemoteAttachClient {
     out_rx: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     panes: Mutex<HashMap<String, Arc<RemotePaneIo>>>,
     pending: Mutex<HashMap<String, PendingAttach>>,
+    /// Waiters for `remote_terminal_created`, keyed by the request id this
+    /// side minted. A SEPARATE map from `pending` rather than a shared one
+    /// holding an enum: the two replies carry different payloads, and a single
+    /// map would make "an attach reply resolved a create waiter" a type the
+    /// compiler cannot refuse. The error arms consult both, in that order.
+    pending_create: Mutex<HashMap<String, PendingCreate>>,
     /// Output that arrived between the `remote_terminal_attached` reply and
     /// `register_pane`, keyed by grant jti. Without it those frames were
     /// dropped ("output for no live pane") AND the pane's `remote_offset`
@@ -1714,6 +1785,7 @@ impl RemoteAttachClient {
             out_rx: tokio::sync::Mutex::new(out_rx),
             panes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            pending_create: Mutex::new(HashMap::new()),
             pending_output: Mutex::new(HashMap::new()),
         }
     }
@@ -1878,6 +1950,79 @@ impl RemoteAttachClient {
         self.pending.lock().ok()?.remove(request_id)
     }
 
+    fn take_pending_create(&self, request_id: &str) -> Option<PendingCreate> {
+        self.pending_create.lock().ok()?.remove(request_id)
+    }
+
+    /// Present a CREATE grant through the relay and wait for the target to
+    /// spawn a PTY and answer `remote_terminal_created`.
+    ///
+    /// The three preference fields are forwarded **only when the caller set
+    /// them**, so the target can tell "no preference — use your default" from
+    /// "this one, and refuse it if you do not offer it". Nothing here is a
+    /// path: `working_dir_key` is a LABEL into the target's own offered set
+    /// and `intent_repo` a member of the target's own allowlist. A caller
+    /// supplying a directory is the hole D2 closed, and this door does not
+    /// accept one.
+    pub async fn create(
+        &self,
+        grant: &str,
+        cols: u16,
+        rows: u16,
+        title: Option<&str>,
+        working_dir_key: Option<&str>,
+        intent_repo: Option<&str>,
+        timeout: Duration,
+    ) -> Result<CreatedReply, AttachError> {
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending_create.lock() {
+            pending.insert(request_id.clone(), tx);
+        }
+        let mut frame = json!({
+            "type": "remote_terminal_create",
+            "request_id": request_id,
+            "grant": grant,
+            "cols": cols,
+            "rows": rows,
+        });
+        for (key, value) in [
+            ("title", title),
+            ("working_dir_key", working_dir_key),
+            ("intent_repo", intent_repo),
+        ] {
+            if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+                frame[key] = json!(v);
+            }
+        }
+        if let Err(e) = self.send(frame) {
+            self.take_pending_create(&request_id);
+            return Err(AttachError {
+                code: "relay_unavailable".to_string(),
+                message: e,
+            });
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => Err(AttachError {
+                code: "create_canceled".to_string(),
+                message: "the create request was dropped before a reply arrived".to_string(),
+            }),
+            Err(_elapsed) => {
+                self.take_pending_create(&request_id);
+                Err(AttachError {
+                    code: "timeout".to_string(),
+                    message: format!(
+                        "no remote_terminal_created within {}s — the relay may be \
+                         disconnected or the target offline. The grant is single-use; if the \
+                         target did spawn a terminal it is running there unattached.",
+                        timeout.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+
     /// Phase 5 lazy scrollback: ask the target for the ring range
     /// `[from, to)` a pane did not receive at attach and wait for the
     /// `remote_terminal_buffer` that answers it. The bytes are returned to
@@ -1933,6 +2078,25 @@ impl RemoteAttachClient {
     /// in-band notice into each pane. Nothing closes — a drop is not an
     /// exit — and [`Self::on_relay_connected`] reattaches when it returns.
     pub fn on_relay_disconnected(&self) {
+        // A create in flight has no pane to write a notice into and no
+        // reconnect that can rescue it: the grant is single-use and the relay
+        // dropped the attachment with the socket. Settle it NOW rather than
+        // leaving the operator watching a spinner for the full create timeout
+        // and then being told the target might be offline.
+        let stranded: Vec<PendingCreate> = self
+            .pending_create
+            .lock()
+            .map(|mut p| p.drain().map(|(_, tx)| tx).collect())
+            .unwrap_or_default();
+        for tx in stranded {
+            let _ = tx.send(Err(AttachError {
+                code: "relay_disconnected".to_string(),
+                message: "the relay connection dropped while the create was in flight — the \
+                          grant is spent whether or not the target spawned a terminal; retry \
+                          mints a new one"
+                    .to_string(),
+            }));
+        }
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -2070,6 +2234,24 @@ impl RemoteAttachClient {
                 }
                 true
             }
+            "remote_terminal_created" => {
+                let Some(reply) = parse_created(data) else {
+                    warn!("remote create: malformed remote_terminal_created frame: {data}");
+                    return true;
+                };
+                match request_id.and_then(|rid| self.take_pending_create(rid)) {
+                    Some(tx) => {
+                        let _ = tx.send(Ok(reply));
+                    }
+                    None => warn!(
+                        grant_jti = %reply.grant_jti,
+                        terminal_id = %reply.terminal_id,
+                        "remote create: remote_terminal_created with no pending request — a \
+                         terminal was spawned on the target and nothing here is waiting for it"
+                    ),
+                }
+                true
+            }
             "remote_terminal_output" => {
                 let Some(jti) = grant_jti else {
                     return true;
@@ -2158,6 +2340,15 @@ impl RemoteAttachClient {
                     let _ = tx.send(Err(AttachError { code, message }));
                     return true;
                 }
+                // A refused remote CREATE arrives here too: the relay routes
+                // the target's typed refusal back as `remote_terminal_error`
+                // echoing THIS side's request id. Without this arm the waiter
+                // sat until its timeout and reported "the target may be
+                // offline" about a target that had answered in milliseconds.
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) {
+                    let _ = tx.send(Err(AttachError { code, message }));
+                    return true;
+                }
                 // A refused RE-attach names the pane in its request id.
                 let jti = grant_jti
                     .or_else(|| request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)));
@@ -2179,9 +2370,6 @@ impl RemoteAttachClient {
                     self.settle_pane_error(jti, code, message);
                     return true;
                 }
-                let Some(tx) = request_id.and_then(|rid| self.take_pending(rid)) else {
-                    return false;
-                };
                 let code = data
                     .get("code")
                     .and_then(|v| v.as_str())
@@ -2192,6 +2380,17 @@ impl RemoteAttachClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending(rid)) {
+                    let _ = tx.send(Err(AttachError { code, message }));
+                    return true;
+                }
+                // The RELAY's own refusal of a `remote_terminal_create` —
+                // `create_grant_invalid` / `_expired` / `_wrong_source`,
+                // `target_not_connected`, `grant_consumed` — arrives as a bare
+                // `error` correlated by the request id this side minted.
+                let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) else {
+                    return false;
+                };
                 let _ = tx.send(Err(AttachError { code, message }));
                 true
             }
