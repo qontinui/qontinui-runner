@@ -1,9 +1,9 @@
 import type { FleetSession, FleetSessionsResponse } from "./useFleetSessions";
 
 /**
- * Discovery logic for the Fleet session picker — paging, filtering and the
- * honesty rules that go with them (plan
- * `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 2).
+ * Discovery logic for the Fleet session picker — the cursor walk, filtering and
+ * the honesty rules that go with them (plan
+ * `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phases 2 and 5a).
  *
  * ## Why this file exists
  *
@@ -15,16 +15,37 @@ import type { FleetSession, FleetSessionsResponse } from "./useFleetSessions";
  * nothing to do about it, which is the failure mode `ux-priorities` calls
  * being honest about uncertainty without being actionable about it.
  *
- * ## Two filtering planes, and the difference is load-bearing
+ * ## The contract this file codes against (Phase 5a)
  *
- * coord's `GET /coord/sessions/fleet` takes `device_id`, `state`,
- * `include_closed` and `limit` — nothing else. So exactly two things can reach
- * a row that a truncated page did not serve: raising `limit`, and narrowing
- * with `device_id` / `state`, both of which coord applies in SQL. Text search
- * is **client-side over the rows already loaded** and therefore CANNOT reach
- * past truncation. The UI must say which plane a given control is on, because
- * a text box that silently searches only the first 100 of 400 sessions is a
- * more confident lie than the note it replaced.
+ * `GET /coord/sessions/fleet` used to have no offset and no cursor, so the only
+ * thing a client could do with `truncated` was ask for a BIGGER page, up to a
+ * hard ceiling — a ladder, not pagination. That route now does keyset
+ * pagination and `truncated` is GONE. The response carries:
+ *
+ * - `nextCursor` — always present as a KEY, `null` on the last page. So
+ *   `"nextCursor" in body` never separates a last page from an older server,
+ *   and only the VALUE decides. This is the field the picker classifies on.
+ * - `limit` — the EFFECTIVE, post-clamp page size. It is a statement about the
+ *   REQUEST; `nextCursor` is a statement about the DATA. They can never
+ *   contradict each other, and nothing here derives one from the other.
+ *
+ * The cursor is **opaque by contract**: it is sent back verbatim and compared
+ * for equality, never constructed, parsed, inspected or reinterpreted. The walk
+ * re-sends it as `?cursor=` with the IDENTICAL `device_id` / `state` /
+ * `include_closed` — changing any of those mid-walk is a `400
+ * cursor_scope_mismatch` and the walk must restart with no cursor. `limit` is
+ * deliberately NOT part of that scope fingerprint (resizing a page changes the
+ * slice, not the sequence), which is why [`fleetScopeKey`] omits it.
+ *
+ * ## Two filtering planes, and the difference is still load-bearing
+ *
+ * `device_id` and `state` are applied by coord in SQL, so they change WHICH
+ * rows the walk enumerates. Text search is **client-side over the rows already
+ * fetched**. With a cursor that set GROWS — every "load more" widens what the
+ * box can see — so it is no longer a hard ceiling, but at any moment it is
+ * still a subset, and the UI must say which plane a control is on. A text box
+ * that silently searches only the first 100 of 400 sessions is a more confident
+ * lie than the note it replaced.
  *
  * Everything here is pure so those rules are testable without a live coord;
  * `fleetDiscovery.test.ts` is the guard.
@@ -33,97 +54,329 @@ import type { FleetSession, FleetSessionsResponse } from "./useFleetSessions";
 /**
  * coord's hard per-read ceiling — `MAX_LIMIT` in
  * `qontinui-coord/crates/coord/src/session_fleet.rs`. A larger `limit` is
- * clamped server-side, so asking for more is not a way past it; narrowing is.
+ * clamped server-side and the clamped value comes back on the response as
+ * `limit`, so nothing here has to predict it: read it off the response.
+ *
+ * It is no longer a ceiling on REACHABILITY — it bounds one page, and the walk
+ * has as many pages as coord has rows.
  */
 export const FLEET_MAX_LIMIT = 500;
 
 /**
  * coord's `DEFAULT_LIMIT` — what a call naming no `limit` gets. The picker
  * requests it EXPLICITLY rather than sending nothing, so the page size it is
- * showing is a number the UI knows and can report, instead of a server default
- * it would have to guess at when deciding what "more" means.
+ * showing is a number the UI knows before the first response, instead of a
+ * server default it would have to guess at.
  */
 export const FLEET_DEFAULT_LIMIT = 100;
 
-/** The ladder the "Load more" control walks, ending at coord's ceiling. */
-export const FLEET_LIMIT_LADDER: readonly number[] = [FLEET_DEFAULT_LIMIT, 250, FLEET_MAX_LIMIT];
+/**
+ * The walk's scope fingerprint — everything coord validates a cursor against.
+ *
+ * `limit` is deliberately absent: coord's cursor survives a changed page size,
+ * so including it here would restart a walk that did not need restarting and
+ * silently re-fetch every page already loaded.
+ */
+export interface FleetScope {
+  deviceId: string | null;
+  state: string | null;
+  includeClosed: boolean;
+}
 
 /**
- * The next page size to ask coord for, or `null` when the current one is
- * already at (or past) coord's ceiling and no larger read exists.
- *
- * Returning `null` rather than a bigger number is the point: at the ceiling the
- * honest answer is "no larger read is possible, narrow instead", and a control
- * that kept offering a bigger page would be promising something coord clamps.
+ * A stable key for a scope. Equal keys mean a cursor minted under one is valid
+ * under the other; unequal keys mean the walk must restart with no cursor.
  */
-export function nextFleetLimit(current: number): number | null {
-  for (const step of FLEET_LIMIT_LADDER) {
-    if (step > current) return step;
+export function fleetScopeKey(scope: FleetScope): string {
+  return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);
+}
+
+/** True when two scopes would accept each other's cursors. */
+export function fleetScopesEqual(a: FleetScope, b: FleetScope): boolean {
+  return fleetScopeKey(a) === fleetScopeKey(b);
+}
+
+/**
+ * coord's cursor, normalised to "usable or absent".
+ *
+ * The value is OPAQUE: this reads its type and emptiness and nothing else. An
+ * empty string is treated as absent because coord's own walk protocol says an
+ * empty `cursor` is page one rather than an error — so sending one back would
+ * silently restart the walk while the UI claimed to be advancing it.
+ */
+export function normalizeFleetCursor(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * True when coord handed back the very cursor it was given.
+ *
+ * A keyset cursor encodes the last row of the page just served, so under the
+ * real contract this can never happen — and that is exactly what makes it
+ * useful: it is the signature of a cursor that was DROPPED somewhere between
+ * this module and coord (an intermediary that does not forward the parameter,
+ * say), which would otherwise show up as an infinite "load more" re-serving
+ * page one for ever. Equality only; the cursor is never inspected.
+ */
+export function fleetCursorStalled(sent: string | null, received: string | null): boolean {
+  return sent !== null && received !== null && sent === received;
+}
+
+/** What to say when the walk cannot advance because the cursor came back unchanged. */
+export const FLEET_CURSOR_STALLED_MESSAGE =
+  "coord returned the same page cursor it was given, so the walk cannot advance — " +
+  "this list may be incomplete. The pages already loaded are shown.";
+
+/**
+ * The accumulated state of one walk.
+ *
+ * `sessions` spans every page accepted since the last restart, so it is the
+ * number a completeness claim must be made with — the last RESPONSE only ever
+ * holds its own page.
+ */
+export interface FleetWalk {
+  sessions: FleetSession[];
+  /** The cursor the next page must carry, or null when there is no next page. */
+  nextCursor: string | null;
+  /** Pages accepted since the last restart. */
+  pages: number;
+}
+
+/** Stable identity so a consumer's `useMemo` is not defeated on every render. */
+const NO_WALK_SESSIONS: FleetSession[] = [];
+
+export const EMPTY_FLEET_WALK: FleetWalk = {
+  sessions: NO_WALK_SESSIONS,
+  nextCursor: null,
+  pages: 0,
+};
+
+/** Which kind of read produced a page. */
+export type FleetWalkMode = "restart" | "more";
+
+/**
+ * Accumulate rows across pages, keyed by `sessionId`.
+ *
+ * A keyset walk does not repeat a row, so the dedup is a GUARD rather than the
+ * mechanism — but it is the guard that keeps a re-served page (a retry, a
+ * cursor that did not advance, a row whose sort key moved under the walk) from
+ * showing the same session twice. A repeat REPLACES in place: the later page is
+ * the fresher read of that row, and moving it would reorder a list the operator
+ * is looking at.
+ *
+ * Returns `prev` unchanged for an empty page so identity is preserved.
+ */
+export function accumulateFleetSessions(
+  prev: FleetSession[],
+  page: FleetSession[],
+): FleetSession[] {
+  if (page.length === 0) return prev;
+  const at = new Map<string, number>();
+  prev.forEach((s, i) => at.set(s.sessionId, i));
+  const out = prev.slice();
+  for (const s of page) {
+    const i = at.get(s.sessionId);
+    if (i === undefined) {
+      at.set(s.sessionId, out.length);
+      out.push(s);
+    } else {
+      out[i] = s;
+    }
   }
-  // Unreachable while the ladder ends at the ceiling, and kept deliberately:
-  // it is the clause that keeps this function correct if a rung is ever removed
-  // from `FLEET_LIMIT_LADDER` without the ceiling moving with it.
-  return current < FLEET_MAX_LIMIT ? FLEET_MAX_LIMIT : null;
+  return out;
+}
+
+/**
+ * Fold one response into the walk.
+ *
+ * `restart` REPLACES the accumulation — it is page one of a new sequence, and
+ * carrying rows over from the previous scope would mix two different queries'
+ * results into one list that no filter set describes.
+ */
+export function fleetWalkAccept(
+  prev: FleetWalk,
+  response: FleetSessionsResponse,
+  mode: FleetWalkMode,
+): FleetWalk {
+  const page = response.sessions ?? [];
+  const nextCursor = normalizeFleetCursor(response.nextCursor);
+  if (mode === "restart") {
+    return { sessions: accumulateFleetSessions(NO_WALK_SESSIONS, page), nextCursor, pages: 1 };
+  }
+  return {
+    sessions: accumulateFleetSessions(prev.sessions, page),
+    nextCursor,
+    pages: prev.pages + 1,
+  };
+}
+
+/**
+ * Keep the rows, drop the cursor.
+ *
+ * For a cursor coord has refused as unusable: the pages already loaded are real
+ * and stay on screen, but a control that can only fail again must not be
+ * offered. The caller says WHY separately — dropping the cursor silently would
+ * turn an incomplete list into one that claims to be complete.
+ */
+export function fleetWalkDropCursor(prev: FleetWalk): FleetWalk {
+  if (prev.nextCursor === null) return prev;
+  return { ...prev, nextCursor: null };
 }
 
 /**
  * What the picker must say about completeness, and what it can offer.
  *
- * - `none` — coord served every matching row; the list is complete for the
- *   current server-side filters.
- * - `more-available` — coord had more rows than it served AND a larger read
- *   exists. `nextLimit` is the page size the control should ask for.
- * - `at-ceiling` — coord had more rows than it served and `limit` is already at
- *   `FLEET_MAX_LIMIT`. No larger read exists; only a narrower one does.
+ * - `none` — coord served the last page: every matching row for the current
+ *   server-side filters has been loaded, AS OF THAT READ. Sessions started
+ *   since need a fresh walk, which is why the refresh control says so.
+ * - `more-available` — coord handed back a cursor, so more rows are genuinely
+ *   REACHABLE. This is a "load more", not an apology.
  * - `unknown` — no successful read has completed, so completeness is not
  *   established. Explicitly NOT `none`: an absent answer is not a complete one.
+ *
+ * There is no longer an `at-ceiling` arm. It existed because the route took no
+ * offset and no cursor, so past `MAX_LIMIT` rows in one bucket were unreachable
+ * by ANY combination of parameters — and saying so was the honest thing to do.
+ * With keyset pagination that claim is simply FALSE, and a false warning is a
+ * worse failure of `ux-priorities` gate 4 than the silence it replaced.
  */
 export type FleetTruncation =
   | { kind: "none" }
   | { kind: "unknown" }
-  | { kind: "more-available"; shown: number; limit: number; nextLimit: number; message: string }
-  | { kind: "at-ceiling"; shown: number; limit: number; message: string };
+  | { kind: "more-available"; shown: number; pageSize: number; message: string };
 
 /**
- * Classify the last read's completeness.
+ * What the refresh control has to admit: a complete list is complete as of the
+ * read that completed it, and coord's `nextCursor: null` says nothing about
+ * sessions that start afterwards.
+ */
+export const FLEET_COMPLETE_AS_OF_NOW =
+  "Start the list again from coord's first page. A complete list is complete as of its " +
+  "last read — sessions started since then need a fresh one.";
+
+/**
+ * Classify the walk's completeness from the LAST page's envelope.
  *
- * `limit` is the page size that read was made with — the picker always names
- * one, so this is never inferred from the row count (a tenant with exactly 100
- * live sessions and a tenant truncated at 100 look identical by count alone;
- * only coord's `truncated` flag separates them, which is why it is the input).
+ * `loaded` is the ACCUMULATED row count, not the last page's: a walk three
+ * pages deep has served 300 rows while `response.sessions` holds the last 100,
+ * and a banner reading "100 loaded so far" over a 300-row list is the same
+ * class of false on-screen claim this phase exists to remove.
+ *
+ * The page size is read off the RESPONSE rather than taken as a parameter. That
+ * is deliberate and is stronger than the sibling fix it replaces: `limit` on
+ * the response is coord's effective, post-clamp size for the very page being
+ * classified, so it is structurally impossible to pair this classification with
+ * a page size the rows were not served under. A caller-supplied limit can be
+ * the pending one — and was.
  */
 export function fleetTruncation(
   response: FleetSessionsResponse | null,
-  limit: number,
+  loaded: number,
 ): FleetTruncation {
   if (!response) return { kind: "unknown" };
-  if (!response.truncated) return { kind: "none" };
+  // `nextCursor` is the ONLY completeness signal on the wire. `count`, the row
+  // count and `limit` are all statements about the request or the page, and a
+  // full page is not a truncated one.
+  if (normalizeFleetCursor(response.nextCursor) === null) return { kind: "none" };
 
-  const shown = response.sessions.length;
-  const next = nextFleetLimit(limit);
-  if (next === null) {
-    return {
-      kind: "at-ceiling",
-      shown,
-      limit,
-      message:
-        `Showing ${shown} sessions — coord's per-read ceiling of ${FLEET_MAX_LIMIT}. ` +
-        `More matched than one read can serve. Narrow by device or state to reach them — ` +
-        `but the device list holds only devices seen in the pages loaded so far (paste an id ` +
-        `to reach another), and coord takes no offset, so one device in one state with more ` +
-        `than ${FLEET_MAX_LIMIT} sessions cannot be paged further at all. The text box only ` +
-        `filters rows already loaded.`,
-    };
-  }
+  const pageSize =
+    typeof response.limit === "number" && response.limit > 0 ? response.limit : FLEET_DEFAULT_LIMIT;
   return {
     kind: "more-available",
-    shown,
-    limit,
-    nextLimit: next,
+    shown: loaded,
+    pageSize,
     message:
-      `Showing the first ${shown} of more — coord truncated this read at ${limit}. ` +
-      `Load ${next}, or narrow by device or state.`,
+      `${loaded} loaded so far — coord has more matching sessions, and they are reachable. ` +
+      `Load the next ${pageSize}, or narrow by device or state. The text box filters only ` +
+      `what is loaded.`,
   };
+}
+
+/**
+ * The stable machine codes coord's fleet route puts in a `400` body.
+ *
+ * The body is `{"error": "<code>", "detail": "<static prose>"}`; the CODE is
+ * the contract and the prose is not. `limit_not_positive` replaced an older
+ * free-text `{"error":"limit must be positive"}` — a deliberate break, and the
+ * reason nothing here matches on prose.
+ */
+export type FleetErrorCode =
+  | "cursor_scope_mismatch"
+  | "cursor_malformed"
+  | "cursor_version_unsupported"
+  | "limit_not_positive";
+
+const FLEET_ERROR_CODES: readonly string[] = [
+  "cursor_scope_mismatch",
+  "cursor_malformed",
+  "cursor_version_unsupported",
+  "limit_not_positive",
+];
+
+/**
+ * Pull coord's machine code out of a rejected read, or null when there is none.
+ *
+ * The Tauri wrapper rejects with a STRING that embeds coord's body verbatim
+ * (`... returned 400 — body: {"error":"…","detail":"…"}`), so the code has to
+ * be recovered from it. Matching requires the `"error"` KEY rather than a bare
+ * occurrence of the token: a code name appearing inside `detail`'s prose, or in a
+ * url, must not be read as the verdict.
+ *
+ * A transport failure carries no body and yields null — which is UNKNOWN, and
+ * the caller renders it as the raw failure rather than inventing a code.
+ */
+export function fleetErrorCode(raw: unknown): FleetErrorCode | null {
+  const text = typeof raw === "string" ? raw : String(raw);
+  const m = /"error"\s*:\s*"([a-z_]+)"/.exec(text);
+  const code = m?.[1];
+  if (code && FLEET_ERROR_CODES.includes(code)) return code as FleetErrorCode;
+  return null;
+}
+
+/**
+ * True when a code means "restart the walk", not "tell the operator something
+ * went wrong".
+ *
+ * `cursor_scope_mismatch` is what coord answers when a page in flight carries a
+ * cursor minted under a scope the caller has since changed. Changing a filter
+ * mid-walk is ordinary use, so surfacing it as an error would be blaming the
+ * operator for the UI's own race.
+ */
+export function fleetErrorIsRestart(code: FleetErrorCode | null): boolean {
+  return code === "cursor_scope_mismatch";
+}
+
+/**
+ * True when a code means the CURSOR is unusable — the rows already loaded stay,
+ * but no further page can be offered from it.
+ */
+export function fleetErrorInvalidatesCursor(code: FleetErrorCode | null): boolean {
+  return code === "cursor_malformed" || code === "cursor_version_unsupported";
+}
+
+/** What to show for a failed read. Honest about which of the two it is. */
+export function fleetErrorMessage(code: FleetErrorCode | null, raw: unknown): string {
+  switch (code) {
+    case "cursor_scope_mismatch":
+      // Handled by restarting rather than shown; kept so every code has an
+      // answer and a future caller that does show it says something true.
+      return "The filters changed while a page was loading — starting the list again.";
+    case "cursor_malformed":
+      return (
+        "coord rejected this list's page cursor as malformed. The pages already loaded are " +
+        "shown and there may be more — refresh to start the list again."
+      );
+    case "cursor_version_unsupported":
+      return (
+        "coord does not support this page cursor's version — this runner and coord disagree " +
+        "about the cursor format. The pages already loaded are shown and there may be more; " +
+        "refresh to start the list again."
+      );
+    case "limit_not_positive":
+      return "coord refused the read: the page size must be a positive number.";
+    default:
+      return `Failed to load fleet sessions: ${raw}`;
+  }
 }
 
 /** Split a search box's contents into the terms a row must match. */
@@ -185,7 +438,11 @@ export function fleetSessionMatchesTerms(s: FleetSession, terms: string[]): bool
   return terms.every((t) => hay.includes(t));
 }
 
-/** Apply a text query to the loaded page. Client-side — see the module doc. */
+/**
+ * Apply a text query to what has been LOADED. Client-side — see the module doc.
+ * The loaded set grows with every page of the walk, so this reaches further
+ * over time; it is never the whole fleet at any one moment.
+ */
 export function filterFleetSessions(sessions: FleetSession[], query: string): FleetSession[] {
   const terms = fleetSearchTerms(query);
   if (terms.length === 0) return sessions;
@@ -350,7 +607,14 @@ export function fleetStateOptions(seen: string[], selected: string | null): stri
   return [...FLEET_STATE_VOCABULARY, ...[...extra].sort()];
 }
 
-/** The server-side half of the picker's filter state — what coord is asked. */
+/**
+ * The server-side half of the picker's filter state — what coord is asked.
+ *
+ * `limit` is the page size, NOT a reachability control: it bounds one page of
+ * the walk and nothing else. It is kept in the filter because it is part of the
+ * request and the UI reports what the rows were served under; it is absent from
+ * [`FleetScope`] because coord's cursor survives a change to it.
+ */
 export interface FleetServerFilter {
   deviceId: string | null;
   state: string | null;
@@ -364,6 +628,11 @@ export const DEFAULT_FLEET_SERVER_FILTER: FleetServerFilter = {
   includeClosed: false,
   limit: FLEET_DEFAULT_LIMIT,
 };
+
+/** The scope half of a filter — what a cursor is validated against. */
+export function fleetScopeOf(server: FleetServerFilter): FleetScope {
+  return { deviceId: server.deviceId, state: server.state, includeClosed: server.includeClosed };
+}
 
 /**
  * True when anything narrows or widens the read away from the picker's default.
@@ -385,9 +654,9 @@ export function hasActiveFleetFilter(server: FleetServerFilter, text: string): b
  * True when a filter is NARROWING the read — the only kind that can explain an
  * empty list.
  *
- * Deliberately narrower than `hasActiveFleetFilter`: a raised `limit` and
- * `includeClosed` both WIDEN the read, so blaming an empty result on "these
- * filters" when the only non-default is a larger page would be a false
+ * Deliberately narrower than `hasActiveFleetFilter`: a changed page size and
+ * `includeClosed` cannot subtract rows, so blaming an empty result on "these
+ * filters" when the only non-default is a page size would be a false
  * explanation of an honest zero.
  */
 export function hasNarrowingFleetFilter(server: FleetServerFilter, text: string): boolean {
@@ -440,17 +709,17 @@ export function fleetEmptyReadMessage(
  * The one-line count summary, which must never present a filtered subset as a
  * total.
  *
- * `matched` is what is on screen; `loaded` is what coord served. When they
- * differ the line says so, because "12 sessions" over a 400-session tenant
- * filtered to 12 is exactly the confident-total shape the truncation note was
- * already getting wrong.
+ * `matched` is what is on screen; `loaded` is what the walk has served so far.
+ * When they differ the line says so, because "12 sessions" over a 400-session
+ * tenant filtered to 12 is exactly the confident-total shape the truncation
+ * note was already getting wrong.
  */
 export function fleetCountSummary(args: {
   matched: number;
   loaded: number;
   /** Devices spanned by the rows ON SCREEN. */
   devices: number;
-  /** Devices spanned by everything coord served. */
+  /** Devices spanned by everything the walk has served. */
   devicesLoaded: number;
   remote: number;
 }): string {
@@ -471,23 +740,29 @@ export function fleetCountSummary(args: {
 }
 
 /**
- * Why a filtered list is empty, when the underlying read was NOT empty.
+ * Why a filtered list is empty, when the underlying walk was NOT empty.
  *
- * Returns `null` when the loaded page was itself empty — that case belongs to
+ * Returns `null` when nothing has been loaded — that case belongs to
  * `emptyReasonFor`, which distinguishes a failed read from an observed-empty
  * fleet. Splitting the two keeps each answer true: "your filter matched
  * nothing" and "coord returned nothing" are different facts and must not share
  * a message.
+ *
+ * `moreAvailable` is what makes the message true under a cursor walk: with
+ * pages left, "no session matches" is a claim about the rows fetched so far and
+ * NOT about the fleet, and the way forward is to load more.
  */
 export function fleetFilteredOutMessage(
   loaded: number,
   matched: number,
   text: string,
+  moreAvailable = false,
 ): string | null {
   if (loaded === 0 || matched > 0) return null;
   const q = text.trim();
   if (!q) return null;
-  return `No loaded session matches “${q}”. ${loaded} session${loaded === 1 ? " is" : "s are"} loaded; this box filters only those.`;
+  const head = `No loaded session matches “${q}”. ${loaded} session${loaded === 1 ? " is" : "s are"} loaded; this box filters only those.`;
+  return moreAvailable ? `${head} coord has more — load another page to widen what it sees.` : head;
 }
 
 /**

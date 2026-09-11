@@ -18,8 +18,7 @@ import {
 } from "./useFleetSessions";
 import {
   DEFAULT_FLEET_SERVER_FILTER,
-  FLEET_DEFAULT_LIMIT,
-  FLEET_MAX_LIMIT,
+  FLEET_COMPLETE_AS_OF_NOW,
   fleetCountSummary,
   fleetEmptyReadMessage,
   fleetFilterConflict,
@@ -54,17 +53,21 @@ import { useTerminalSession } from "./contexts/TerminalSessionContext";
  * backend). Every failure is typed by the runner and shown INLINE in the row,
  * kept until the next attempt: never a toast that vanishes, never silence.
  *
- * ## Truncation is a control, not a footnote
+ * ## Completeness is a control, not a footnote
  *
- * coord serves a bounded page and sets `truncated` when more rows matched than
- * it served. This picker previously rendered that as the words "· more not
- * shown" and stopped there — on a tenant whose first read came back with
+ * coord serves a bounded page and hands back a `nextCursor` while more rows
+ * match. This picker previously rendered incompleteness as the words "· more
+ * not shown" and stopped there — on a tenant whose first read came back with
  * exactly 100 rows (coord's default page) the sessions past the hundredth were
- * simply unreachable. The truncation banner below is therefore ACTIONABLE: it
- * says how many are shown, offers the next larger read while one exists, and
- * once `limit` is at coord's `MAX_LIMIT` says plainly that no larger read
- * exists and that narrowing is the only way through. The filter logic and those
- * messages live in `fleetDiscovery.ts` and are unit-tested there.
+ * simply unreachable. Phase 2 made that reachable with a page LADDER (ask for a
+ * bigger page, up to a hard ceiling), because the route had no offset and no
+ * cursor. Phase 5a replaced the ladder with the real thing: the route does
+ * keyset pagination, `truncated` is gone, and the banner below is a genuine
+ * "load more" over a walk that can reach every matching row. The old
+ * at-the-ceiling copy — "some sessions cannot be paged further at all" — is now
+ * FALSE and has been deleted rather than softened. The walk, the filter logic
+ * and those messages live in `fleetDiscovery.ts` / `useFleetSessions.ts` and
+ * are unit-tested there.
  */
 
 export const FLEET_SESSION_PICKER_ELEMENT = "fleet-session-picker";
@@ -181,12 +184,16 @@ export function FleetSessionPicker() {
     sessions,
     response,
     loading,
+    loadingMore,
     error,
+    walkStalled,
     emptyReason,
     deviceCatalog,
     stateCatalog,
     appliedQuery,
+    pagesLoaded,
     refresh,
+    loadMore,
   } = useFleetSessions({
     deviceId: server.deviceId ?? undefined,
     state: server.state ?? undefined,
@@ -200,15 +207,24 @@ export function FleetSessionPicker() {
     () => fleetStateOptions(stateCatalog, server.state),
     [stateCatalog, server.state],
   );
-  // Said WITH the query the rows were served for, never with the pending one:
-  // between a filter change and its response — and permanently, if that
-  // response never arrives — they are different queries.
-  const truncation = fleetTruncation(response, appliedQuery?.limit ?? FLEET_DEFAULT_LIMIT);
+  // Both arguments come from the hook and move in the same tick as each other:
+  // `response` is the last page's envelope (which carries coord's own effective
+  // page size, so the classifier cannot be handed a limit the rows were not
+  // served under) and `sessions` is the accumulation that page landed in. The
+  // pending `server` filter is never an input here — between a filter change
+  // and its response, and permanently if that response never arrives, the two
+  // describe different queries.
+  const truncation = fleetTruncation(response, sessions.length);
   const notice = degradedNotice(response);
   const filtersActive = hasActiveFleetFilter(server, text);
   const emptyRead = fleetEmptyReadMessage(appliedQuery ?? server, text);
   const devicesLoaded = useMemo(() => new Set(sessions.map((s) => s.deviceId)).size, [sessions]);
-  const filteredOut = fleetFilteredOutMessage(sessions.length, visible.length, text);
+  const filteredOut = fleetFilteredOutMessage(
+    sessions.length,
+    visible.length,
+    text,
+    truncation.kind === "more-available",
+  );
   const conflict = fleetFilterConflict(server);
 
   const { pageId, setActiveId } = useTerminalSession();
@@ -219,20 +235,6 @@ export function FleetSessionPicker() {
     setText("");
     setDeviceIdEntry(false);
   }, []);
-
-  /**
-   * Ask for the next page size. When that size has ALREADY been requested — the
-   * read failed and the banner is still describing the older, smaller response
-   * — nothing about `server` changes, so a plain `setServer` would leave the
-   * click doing nothing at all. Retry the read instead.
-   */
-  const loadMore = useCallback(
-    (nextLimit: number) => {
-      if (server.limit >= nextLimit) void refresh();
-      else setServer((s) => ({ ...s, limit: nextLimit }));
-    },
-    [server.limit, refresh],
-  );
 
   const attach = useCallback(
     async (s: FleetSession, deviceLabel: string) => {
@@ -283,6 +285,7 @@ export function FleetSessionPicker() {
       data-fleet-limit={appliedQuery?.limit ?? ""}
       data-fleet-loaded={sessions.length}
       data-fleet-matched={visible.length}
+      data-fleet-pages={pagesLoaded}
       data-fleet-truncation={truncation.kind}
       data-fleet-device-filter={appliedQuery?.deviceId ?? ""}
       data-fleet-state-filter={appliedQuery?.state ?? ""}
@@ -321,9 +324,12 @@ export function FleetSessionPicker() {
         <button
           data-ui-bridge-id={FLEET_PICKER_REFRESH_ID}
           onClick={() => void refresh()}
-          disabled={loading}
+          disabled={loading || loadingMore}
           className="p-0.5 rounded text-[#565f89] hover:text-[#c0caf5] hover:bg-[#2a2d3d] transition-colors disabled:opacity-50"
-          title="Refresh fleet sessions"
+          // coord's `nextCursor: null` is "last page AS OF NOW" and nothing
+          // more, so the control that re-reads has to say what a finished walk
+          // does and does not claim.
+          title={FLEET_COMPLETE_AS_OF_NOW}
         >
           <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
         </button>
@@ -340,7 +346,7 @@ export function FleetSessionPicker() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             placeholder="Filter loaded sessions…"
-            title="Matches work unit, intent, repo, branch, device, state, provider and ids. Filters only the sessions already loaded — to reach sessions coord did not serve, use the device/state filters or load a larger page."
+            title="Matches work unit, intent, repo, branch, device, state, provider and ids. Filters only the sessions loaded so far — loading another page widens what it can see, and the device/state filters are applied by coord in SQL."
             className="w-full pl-7 pr-2 py-1 text-[11px] bg-[#1a1b26] border border-[#2a2d3d] rounded text-[#a9b1d6] placeholder-[#414868] focus:outline-none focus:border-[#7aa2f7]/50"
           />
         </div>
@@ -359,7 +365,7 @@ export function FleetSessionPicker() {
               setServer((s) => ({ ...s, deviceId: v === "" ? null : v }));
             }}
             placeholder="device uuid"
-            title="A device whose sessions all fall past a truncated page never reaches the dropdown — coord serves no device list. Paste its uuid here instead."
+            title="A device whose sessions all fall past the pages loaded so far never reaches the dropdown — coord serves no device list. Paste its uuid here instead."
             className={SELECT_CLASS + " placeholder-[#414868]"}
           />
         ) : (
@@ -370,7 +376,7 @@ export function FleetSessionPicker() {
             onChange={(e) =>
               setServer((s) => ({ ...s, deviceId: e.target.value === "" ? null : e.target.value }))
             }
-            title="Asks coord for one device only — applied in SQL, so it reaches sessions this page did not show. Lists only devices seen in the pages loaded so far; use “id” for one that is not here."
+            title="Asks coord for one device only — applied in SQL, so it narrows the whole walk rather than the rows on screen. Lists only devices seen in the pages loaded so far; use “id” for one that is not here."
             className={SELECT_CLASS}
           >
             <option value="">All devices</option>
@@ -403,7 +409,7 @@ export function FleetSessionPicker() {
           onChange={(e) =>
             setServer((s) => ({ ...s, state: e.target.value === "" ? null : e.target.value }))
           }
-          title="Asks coord for one session state only — applied in SQL, so it reaches sessions this page did not show"
+          title="Asks coord for one session state only — applied in SQL, so it narrows the whole walk rather than the rows on screen"
           className={SELECT_CLASS}
         >
           <option value="">Any state</option>
@@ -430,30 +436,34 @@ export function FleetSessionPicker() {
       </div>
 
       {/*
-        Truncation as a CONTROL. `more-available` offers the next larger read;
-        `at-ceiling` says no larger read exists and names what does work.
+        Incompleteness as a CONTROL, and under a cursor walk it is no longer an
+        apology: coord handed back a cursor, so the rows it names are REACHABLE.
+        One click fetches the next page and appends it — the rows on screen stay
+        put, which is why this is not styled or worded as an error.
       */}
-      {(truncation.kind === "more-available" || truncation.kind === "at-ceiling") && (
+      {truncation.kind === "more-available" && (
         <div
           data-ui-bridge-id={FLEET_PICKER_TRUNCATION_ID}
           data-truncation-kind={truncation.kind}
-          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#e0af68] bg-[#e0af68]/10 border-b border-[#2a2d3d]"
+          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#7aa2f7] bg-[#7aa2f7]/10 border-b border-[#2a2d3d]"
         >
-          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <ChevronsDown className="w-3 h-3 mt-px shrink-0" />
           <span className="min-w-0">{truncation.message}</span>
-          {truncation.kind === "more-available" && (
-            <button
-              data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}
-              aria-label={`Load up to ${truncation.nextLimit} fleet sessions`}
-              onClick={() => loadMore(truncation.nextLimit)}
-              disabled={loading}
-              className="ml-auto shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#e0af68]/20 text-[#e0af68] hover:bg-[#e0af68]/35 transition-colors disabled:opacity-50"
-              title={`Re-read with limit=${truncation.nextLimit} (coord's ceiling is ${FLEET_MAX_LIMIT})`}
-            >
+          <button
+            data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}
+            aria-label={`Load the next ${truncation.pageSize} fleet sessions`}
+            onClick={() => void loadMore()}
+            disabled={loading || loadingMore}
+            className="ml-auto shrink-0 flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-[#7aa2f7]/20 text-[#7aa2f7] hover:bg-[#7aa2f7]/35 transition-colors disabled:opacity-50"
+            title={`Fetch coord's next page of ${truncation.pageSize} and append it to this list`}
+          >
+            {loadingMore ? (
+              <div className="w-2.5 h-2.5 border-2 border-[#7aa2f7] border-t-transparent rounded-full animate-spin" />
+            ) : (
               <ChevronsDown className="w-2.5 h-2.5" />
-              Load {truncation.nextLimit}
-            </button>
-          )}
+            )}
+            {loadingMore ? "Loading…" : `Load ${truncation.pageSize} more`}
+          </button>
         </div>
       )}
 
@@ -540,7 +550,13 @@ export function FleetSessionPicker() {
               >
                 <AlertTriangle className="w-3 h-3 shrink-0" />
                 <span className="truncate" title={error}>
-                  Last refresh failed — showing the previous read. {error}
+                  {/* A stalled WALK is not a failed READ: coord answered, the
+                      rows below are current, and only the next page is out of
+                      reach. Prefixing that with "last refresh failed" would be
+                      a false claim in the other direction. */}
+                  {walkStalled
+                    ? error
+                    : `Last refresh failed — showing the previous read. ${error}`}
                 </span>
                 <button
                   data-ui-bridge-id={FLEET_PICKER_RETRY_ID}
@@ -552,10 +568,15 @@ export function FleetSessionPicker() {
               </div>
             )}
             {/*
-              A refetch keeps the previous rows on screen (deliberately — a
+              A RESTART keeps the previous rows on screen (deliberately — a
               filter change must not blank a list mid-read), so while one is in
               flight the rows below belong to the PREVIOUS filter. Say so:
               otherwise the selects claim one query and the list shows another.
+
+              A `loadingMore` page is NOT this case and must not borrow this
+              banner: the rows below are the same walk's earlier pages and stay
+              valid, so saying they are stale would be a false claim in the
+              other direction. The "Load more" button carries its own spinner.
             */}
             {loading && (
               <div
