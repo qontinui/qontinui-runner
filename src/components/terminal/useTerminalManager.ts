@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { TerminalInfo } from "@qontinui/shared-types/tauri-events";
+import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tauri-events";
 import type { CommandResponse } from "./types";
 import {
   buildSessionCloseArgs,
@@ -290,6 +290,9 @@ export function applyBypassMark(
  */
 export const RESYNC_CREATE_GRACE_MS = 5_000;
 
+/** Shared empty set, so the default argument allocates nothing per call. */
+const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+
 /**
  * Pure: reconcile the local tab list against the BACKEND's authoritative
  * terminal list for this page.
@@ -308,6 +311,14 @@ export const RESYNC_CREATE_GRACE_MS = 5_000;
  *    EXCEPT plan tabs (no PTY — the backend never lists them), synthetic tabs
  *    (test fixtures, never backed by a PTY) and tabs younger than
  *    `graceMs` (an in-flight create the backend list predates).
+ *  - The `graceMs` exemption does NOT apply to a tab in `settledIds` — an id
+ *    the runner has already emitted `terminal-exit` for. That event is proof
+ *    the backend knew this terminal, so "the list snapshot predates the
+ *    create" is no longer a possible explanation for its absence: it is gone.
+ *    Without this, a terminal created and then closed out-of-band inside the
+ *    grace window kept its tab until some LATER exit happened to trigger
+ *    another re-sync — which, on a box whose only close door is the HTTP/MCP
+ *    one, can be never.
  *  - Never touch a surviving tab's fields: `claudeSessionId`, worker/bypass
  *    marks, `isReconnecting`, `resumeFailed` etc. are owned by other writers and
  *    a re-sync must not clobber them.
@@ -329,6 +340,7 @@ export function reconcileTabsWithBackend(
   backendTerminals: readonly TerminalInfo[],
   now: number = Date.now(),
   graceMs: number = RESYNC_CREATE_GRACE_MS,
+  settledIds: ReadonlySet<string> = EMPTY_ID_SET,
 ): TerminalTab[] {
   const backendById = new Map(backendTerminals.map((t) => [t.id, t]));
 
@@ -337,6 +349,9 @@ export function reconcileTabsWithBackend(
     // Tabs the backend structurally cannot list.
     if (t.type === "plan" || t.id.startsWith("plan-")) return true;
     if (t.__synthetic) return true;
+    // The runner has already announced this terminal's exit, so its absence
+    // from the list is a real teardown, not a create the snapshot predates.
+    if (settledIds.has(t.id)) return false;
     // An in-flight create the list snapshot predates.
     return now - (t.createdAt ?? 0) < graceMs;
   });
@@ -482,6 +497,22 @@ export function useTerminalManager(
    * re-steals focus, mirroring `reduceCreatedTerminal`'s id-dedup.
    */
   const ingestedIds = useRef<Set<string>>(new Set());
+  /**
+   * Ids the runner has announced a `terminal-exit` for and that the backend
+   * has not listed since.
+   *
+   * These defeat the create-grace exemption in `reconcileTabsWithBackend`: an
+   * exit event is proof the backend knew the terminal, so its absence from
+   * `terminal_list` is a real tear-down rather than a list snapshot that
+   * predates the create. Without it, a terminal created and then closed
+   * out-of-band inside the grace window kept its tab until some later exit
+   * happened to trigger another re-sync — and on a headless runner, whose only
+   * close door is the HTTP/MCP one, that can be never.
+   *
+   * Pruned on every re-sync (ids the backend still lists, and ids whose tab is
+   * gone), so it stays bounded by the live tab count.
+   */
+  const settledIdsRef = useRef<Set<string>>(new Set());
 
   const markAsWorker = useCallback((terminalId: string, taskRunId: string) => {
     setTabs((prev) => {
@@ -896,9 +927,16 @@ export function useTerminalManager(
     if (!Array.isArray(terminals)) return; // malformed — never read as "empty"
 
     const mine = terminals.filter((t) => (t.pageId || "default") === pageId);
+    // Ids the runner has announced an exit for. They defeat the create grace
+    // (see `reconcileTabsWithBackend`), and anything the backend still lists
+    // is pruned back out so the set cannot grow without bound.
+    const settled = settledIdsRef.current;
+    for (const info of mine) settled.delete(info.id);
     setTabs((prev) => {
-      const next = reconcileTabsWithBackend(prev, mine);
+      const next = reconcileTabsWithBackend(prev, mine, Date.now(), RESYNC_CREATE_GRACE_MS, settled);
       if (next === prev) return prev;
+      const dropped = new Set(next.map((t) => t.id));
+      for (const tab of prev) if (!dropped.has(tab.id)) settled.delete(tab.id);
       logger.info(
         `Tab re-sync on page ${pageId}: ${prev.length} → ${next.length} (backend has ${mine.length})`,
       );
@@ -917,10 +955,21 @@ export function useTerminalManager(
 
     // Async: its `setTabs` runs in a later microtask, never during this
     // effect's render pass (same reasoning as `useTerminalPages`'s reconcile).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     void resyncTabs();
 
-    listen("terminal-exit", () => {
+    listen<TerminalExitEvent>("terminal-exit", (event) => {
+      // Record the id as SETTLED before the re-sync reads the list.
+      //
+      // The runner announces a pane's exit on BOTH tear-downs, because they
+      // are different facts: the waiter thread when the child process ends,
+      // and `close_with_deadline` when the SESSION goes away — the latter
+      // reached from the HTTP/MCP `terminal_close` door, which is the only
+      // close door a headless runner has. Only the second one arrives after
+      // `terminal_list` has stopped listing the terminal, which is why the
+      // re-sync below is what decides the tab's fate rather than this
+      // listener. See `terminal::exit_notice` on the Rust side.
+      const exitedId = event.payload?.terminalId;
+      if (exitedId) settledIdsRef.current.add(exitedId);
       // Debounced: a burst of exits (window close, batch kill) collapses into
       // one list read.
       if (timer) clearTimeout(timer);

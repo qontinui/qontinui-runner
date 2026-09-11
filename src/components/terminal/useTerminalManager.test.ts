@@ -372,4 +372,47 @@ describe("reconcileTabsWithBackend", () => {
     const tabs = [tab("a", old), tab("b", old)];
     expect(reconcileTabsWithBackend(tabs, [], NOW)).toEqual([]);
   });
+
+  // An id the runner has emitted `terminal-exit` for is SETTLED: the backend
+  // demonstrably knew that terminal, so "the list snapshot predates the
+  // create" is no longer an available explanation for its absence. Without
+  // this, a terminal created and then closed out-of-band inside the grace
+  // window kept its tab until some LATER exit happened to trigger another
+  // re-sync — which, on a box whose only close door is the HTTP/MCP one, can
+  // be never.
+  it("drops a settled tab even inside the create grace window", () => {
+    const tabs = [tab("fresh", { createdAt: NOW - 100 })];
+    expect(
+      reconcileTabsWithBackend(tabs, [], NOW, RESYNC_CREATE_GRACE_MS, new Set(["fresh"])),
+    ).toEqual([]);
+  });
+
+  it("keeps a settled tab the backend still lists (exited, not torn down)", () => {
+    const tabs = [tab("a", old)];
+    expect(
+      reconcileTabsWithBackend(
+        tabs,
+        [createdEvent("a", "p")],
+        NOW,
+        RESYNC_CREATE_GRACE_MS,
+        new Set(["a"]),
+      ),
+    ).toBe(tabs);
+  });
+
+  it("settling never overrides the plan/synthetic exemptions", () => {
+    const tabs = [
+      tab("plan-123", { ...old, type: "plan", planFilePath: "/x.md" }),
+      tab("synth", { ...old, __synthetic: true }),
+    ];
+    expect(
+      reconcileTabsWithBackend(
+        tabs,
+        [],
+        NOW,
+        RESYNC_CREATE_GRACE_MS,
+        new Set(["plan-123", "synth"]),
+      ),
+    ).toBe(tabs);
+  });
 });
