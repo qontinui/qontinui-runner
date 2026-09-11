@@ -604,6 +604,29 @@ pub fn render_onboarding_doc() -> String {
         }
         out.push_str(&format!("**Fix:** {}\n\n", s.fix));
     }
+    // Static trailer (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+    // Phase 3): the one convention a `-32601` reader who opens this checklist
+    // needs that no CHECK_SPECS entry can carry, because it is about what a
+    // LANDED PR has not yet done rather than about this box's provisioning.
+    out.push_str("## Allowlist changes land before they are delivered\n\n");
+    out.push_str(
+        "`COORD_MCP_ALLOWED_TOOLS` and `COORD_MCP_DELIBERATE_EXCLUSIONS` \
+         (`src-tauri/src/mcp_api.rs`) are compiled into the runner binary. A PR \
+         that edits either list is **not delivered when it lands**: every box \
+         keeps refusing the tool with `-32601` until it rebuilds from a sha that \
+         contains the change (measured 2026-08-24..28: runner#1127 landed on the \
+         24th and the primary still served a build 101 commits behind on the \
+         28th, refusing all nine tools it had added). So the session that lands \
+         such a PR registers a `runner_served_sha` gate per device that must \
+         serve it — `{\"kind\": \"runner_served_sha\", \"device_id\": \"<device>\", \
+         \"repo\": \"qontinui/qontinui-runner\", \"expected_sha\": \"<landed sha>\"}` \
+         (the pattern gate `65292ba0` used for #1127) — and reports the gate_id \
+         in full. Until that gate clears, a `-32601` for the tool on that box \
+         carries `data.cause: \"stale_binary\"`, which is the refusal saying the \
+         same thing; `GET /coord-mcp/tool-policy` shows the lists this binary \
+         actually compiled. Convention detail: the doc comments above both \
+         consts, and `coord-gates-and-access.md` in `qontinui-claude-config`.\n\n",
+    );
     out.push_str("---\n\n");
     out.push_str(
         "`coord doctor` runs these checks live. The **blocking** checks stop at the \

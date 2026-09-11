@@ -82,6 +82,10 @@ Advisory: a failure here is a **warning**, not a blocker — it does not stop ga
 
 **Fix:** spawn a terminal in that workdir (every session spawn rewrites the file through the current emitter), or restart the runner so the boot self-heal upgrades it in place with the same nonce
 
+## Allowlist changes land before they are delivered
+
+`COORD_MCP_ALLOWED_TOOLS` and `COORD_MCP_DELIBERATE_EXCLUSIONS` (`src-tauri/src/mcp_api.rs`) are compiled into the runner binary. A PR that edits either list is **not delivered when it lands**: every box keeps refusing the tool with `-32601` until it rebuilds from a sha that contains the change (measured 2026-08-24..28: runner#1127 landed on the 24th and the primary still served a build 101 commits behind on the 28th, refusing all nine tools it had added). So the session that lands such a PR registers a `runner_served_sha` gate per device that must serve it — `{"kind": "runner_served_sha", "device_id": "<device>", "repo": "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}` (the pattern gate `65292ba0` used for #1127) — and reports the gate_id in full. Until that gate clears, a `-32601` for the tool on that box carries `data.cause: "stale_binary"`, which is the refusal saying the same thing; `GET /coord-mcp/tool-policy` shows the lists this binary actually compiled. Convention detail: the doc comments above both consts, and `coord-gates-and-access.md` in `qontinui-claude-config`.
+
 ---
 
 `coord doctor` runs these checks live. The **blocking** checks stop at the first failure, naming that one link plus its fix — except any marked ALWAYS RUNS, which are blocking but independent of everything before them, so they execute anyway; **advisory** checks always run and only ever warn. Run it from **Settings → Account** in the runner app, or headless via the `coord_doctor` bin (`cargo run --bin coord_doctor`). Green on all of them ⇒ this runner can set gates.

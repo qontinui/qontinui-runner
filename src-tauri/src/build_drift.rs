@@ -91,6 +91,170 @@ fn latest_cell() -> &'static Mutex<Option<BuildDriftStatus>> {
     LATEST.get_or_init(|| Mutex::new(None))
 }
 
+// ---------------------------------------------------------------------------
+// Trunk's compiled coord-mcp tool policy (plan
+// `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 1).
+//
+// A `/coord-mcp` `-32601` refusal has three causes — the binary is STALE
+// (trunk allows the tool), the allowlist has DRIFTED (trunk allows it nowhere
+// and does not name it as deliberate), or the withholding is DELIBERATE — and
+// only the first two need something the running binary does not contain:
+// what trunk's `COORD_MCP_ALLOWED_TOOLS` / `COORD_MCP_DELIBERATE_EXCLUSIONS`
+// say TODAY. This module already runs bounded git against the source checkout
+// on the drift tick to learn trunk's SHA, so it is the one producer that can
+// also read those two consts at that SHA — and then `cause` and
+// `commitsBehind` in the refusal come from the same clock and can never
+// disagree about the same binary (the reason `/coord-mcp/tool-policy` refuses
+// to re-derive drift). Nothing here runs on the request path.
+// ---------------------------------------------------------------------------
+
+/// The repo-relative path of the file that declares the four consts, tried in
+/// order: the runner repo root (`candidate_repo_dir`'s first candidate), then
+/// the `src-tauri` crate root (its second).
+const TOOL_POLICY_SOURCE_PATHS: &[&str] = &["src-tauri/src/mcp_api.rs", "src/mcp_api.rs"];
+
+/// The four `&[&str]` consts parsed out of `mcp_api.rs` — the SAME four the
+/// binary compiled, read from a different commit. Pure data; see
+/// [`parse_tool_policy_consts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedToolPolicy {
+    pub allowed: Vec<String>,
+    pub allowed_prefixes: Vec<String>,
+    pub deliberate: Vec<String>,
+    pub deliberate_prefixes: Vec<String>,
+}
+
+impl ParsedToolPolicy {
+    /// Trunk's `coord_mcp_tool_is_allowed`.
+    pub fn allows(&self, tool: &str) -> bool {
+        self.allowed.iter().any(|t| t == tool)
+            || self.allowed_prefixes.iter().any(|p| tool.starts_with(p))
+    }
+
+    /// Trunk's `coord_mcp_withholding_is_deliberate`.
+    pub fn deliberately_excludes(&self, tool: &str) -> bool {
+        self.deliberate.iter().any(|t| t == tool)
+            || self.deliberate_prefixes.iter().any(|p| tool.starts_with(p))
+    }
+}
+
+/// Trunk's tool policy plus WHERE it was read from, so a refusal can say which
+/// trunk commit its `cause` is measured against.
+#[derive(Debug, Clone)]
+pub struct TrunkToolPolicy {
+    /// The commit whose `mcp_api.rs` was parsed — the resolved trunk tip when
+    /// `git show` could reach it.
+    pub trunk_sha: String,
+    /// Unix millis when the read completed.
+    pub read_at: i64,
+    /// `fetched` when `git fetch origin <trunk>` succeeded on this tick, else
+    /// `local-ref` — the object came from the last fetch someone else did, so
+    /// `trunk_sha` may trail the remote. Reported, never hidden.
+    pub source: &'static str,
+    pub policy: ParsedToolPolicy,
+}
+
+static TRUNK_TOOL_POLICY: OnceLock<Mutex<Option<TrunkToolPolicy>>> = OnceLock::new();
+
+fn trunk_tool_policy_cell() -> &'static Mutex<Option<TrunkToolPolicy>> {
+    TRUNK_TOOL_POLICY.get_or_init(|| Mutex::new(None))
+}
+
+/// Clone of the most recent trunk tool-policy read, if any tick has completed
+/// one. `None` is UNKNOWN — no repo, no readable trunk object, a parse
+/// failure, or simply "the first tick has not run yet" — and the refusal
+/// renders it as `cause: "unknown"`, never as a confident default.
+pub fn trunk_tool_policy() -> Option<TrunkToolPolicy> {
+    trunk_tool_policy_cell().lock().ok().and_then(|g| g.clone())
+}
+
+fn store_trunk_tool_policy(policy: Option<TrunkToolPolicy>) {
+    if let Ok(mut g) = trunk_tool_policy_cell().lock() {
+        *g = policy;
+    }
+}
+
+/// Extract the string literals of ONE `const <name>: &[&str] = &[ … ];`
+/// declaration. Line comments inside the block are stripped first, so a
+/// commented-out entry is not read as a member. `None` when the declaration
+/// is absent or unterminated.
+fn parse_str_slice_const(source: &str, name: &str) -> Option<Vec<String>> {
+    let needle = format!("const {name}: &[&str] = &[");
+    let start = source.find(&needle)? + needle.len();
+    let rest = &source[start..];
+    let end = rest.find("];")?;
+    let mut out = Vec::new();
+    for line in rest[..end].lines() {
+        let mut s = line.split("//").next().unwrap_or("");
+        while let Some(open) = s.find('"') {
+            let tail = &s[open + 1..];
+            let close = tail.find('"')?;
+            out.push(tail[..close].to_string());
+            s = &tail[close + 1..];
+        }
+    }
+    Some(out)
+}
+
+/// Parse the four coord-mcp tool-policy consts out of `mcp_api.rs` source
+/// text. Pure over its input, so the self-test in `mcp_api.rs` can pin it
+/// against `include_str!` of the very file it reads: a reformat that breaks
+/// this parser breaks that test, not production (production degrades to
+/// `None`, i.e. `cause: "unknown"`).
+pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
+    Some(ParsedToolPolicy {
+        allowed: parse_str_slice_const(source, "COORD_MCP_ALLOWED_TOOLS")?,
+        allowed_prefixes: parse_str_slice_const(source, "COORD_MCP_ALLOWED_TOOL_PREFIXES")?,
+        deliberate: parse_str_slice_const(source, "COORD_MCP_DELIBERATE_EXCLUSIONS")?,
+        deliberate_prefixes: parse_str_slice_const(
+            source,
+            "COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES",
+        )?,
+    })
+}
+
+/// Read trunk's `mcp_api.rs` and parse its tool policy. Every git call is
+/// bounded ([`git_output`]). A fetch failure is not fatal, but it changes
+/// WHICH commit is read: `main_sha` is `ls-remote`'s answer, which names an
+/// object this checkout may never have received, so after a failed fetch the
+/// read falls back to the LOCAL `origin/<trunk>` object and reports THAT sha
+/// as `trunk_sha` with `source: "local-ref"` — a possibly-trailing trunk is
+/// visible in the refusal rather than collapsing into a silent `unknown`
+/// when `git show <unfetched sha>` fails.
+fn read_trunk_tool_policy(repo: &Path, main_sha: &str) -> Option<TrunkToolPolicy> {
+    let branch = crate::git_trunk::resolve_trunk_branch(repo).unwrap_or_else(|| "main".to_string());
+    // Remote-tracking refs only — a fetch never touches a working tree, so it
+    // is safe against a peer's WIP in the source checkout. A quiet fetch
+    // prints nothing on success, which `git_output` would read as `None`, so
+    // the outcome is taken from `run_probe` directly rather than from stdout.
+    let fetched = {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.args(["fetch", "--quiet", "origin", &branch])
+            .current_dir(repo);
+        matches!(
+            run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git fetch"),
+            ProbeOutcome::Captured(_)
+        )
+    };
+    let (trunk_sha, source) = if fetched {
+        (main_sha.to_string(), "fetched")
+    } else {
+        let local = git_output(repo, &["rev-parse", &format!("origin/{branch}")])
+            .filter(|s| looks_like_sha(s))?;
+        (local, "local-ref")
+    };
+    let source_text = TOOL_POLICY_SOURCE_PATHS
+        .iter()
+        .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
+    let policy = parse_tool_policy_consts(&source_text)?;
+    Some(TrunkToolPolicy {
+        trunk_sha,
+        read_at: chrono::Utc::now().timestamp_millis(),
+        source,
+        policy,
+    })
+}
+
 /// Clone of the most recent drift status, if any check has completed.
 pub fn latest() -> Option<BuildDriftStatus> {
     latest_cell().lock().ok().and_then(|g| g.clone())
@@ -263,6 +427,7 @@ fn check_once_blocking() -> BuildDriftStatus {
     let checked_at = chrono::Utc::now().timestamp_millis();
 
     let Some(repo) = candidate_repo_dir() else {
+        store_trunk_tool_policy(None);
         return BuildDriftStatus {
             checked_at,
             main_sha: None,
@@ -274,6 +439,16 @@ fn check_once_blocking() -> BuildDriftStatus {
     };
 
     let main_sha = resolve_trunk_sha(&repo);
+    // Trunk's tool policy rides the same tick and the same SHA as the drift
+    // verdict, so a `/coord-mcp` refusal's `cause` and its `commitsBehind`
+    // describe one measurement. Stored here rather than returned: it is a
+    // second cache with its own reader (`trunk_tool_policy`), and an
+    // unresolvable trunk clears it to UNKNOWN instead of serving a stale read.
+    store_trunk_tool_policy(
+        main_sha
+            .as_deref()
+            .and_then(|m| read_trunk_tool_policy(&repo, m)),
+    );
     let divergent = compute_divergent(embedded, main_sha.as_deref());
     // Count FIRST, then derive `behind` from the count. The old code decided
     // `behind` from the SHA mismatch and only then counted, which is how the
@@ -492,6 +667,44 @@ mod tests {
         assert!(main_sha.is_null());
         assert!(drift["behind"].is_null());
         assert!(drift["checkedAt"].is_null());
+    }
+
+    // -- trunk tool-policy parser (plan 2026-09-03-coord-mcp-403-names-its-own-cause) --
+
+    const SAMPLE: &str = r#"
+/// doc mentioning `COORD_MCP_ALLOWED_TOOLS` must not confuse the parser.
+const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
+    "coord_alpha",
+    // "coord_commented_out",
+    "coord_beta", "coord_gamma",
+];
+const COORD_MCP_ALLOWED_TOOL_PREFIXES: &[&str] = &["coord_query_"];
+const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
+    "coord_create_pr",
+];
+const COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES: &[&str] = &["coord_onboard"];
+"#;
+
+    #[test]
+    fn parses_all_four_consts_and_strips_line_comments() {
+        let p = parse_tool_policy_consts(SAMPLE).expect("sample parses");
+        assert_eq!(p.allowed, vec!["coord_alpha", "coord_beta", "coord_gamma"]);
+        assert_eq!(p.allowed_prefixes, vec!["coord_query_"]);
+        assert_eq!(p.deliberate, vec!["coord_create_pr"]);
+        assert_eq!(p.deliberate_prefixes, vec!["coord_onboard"]);
+        assert!(p.allows("coord_alpha"));
+        assert!(p.allows("coord_query_anything"));
+        assert!(!p.allows("coord_commented_out"));
+        assert!(p.deliberately_excludes("coord_create_pr"));
+        assert!(p.deliberately_excludes("coord_onboarding_doctor"));
+        assert!(!p.deliberately_excludes("coord_alpha"));
+    }
+
+    #[test]
+    fn a_missing_or_unterminated_const_is_none_not_a_guess() {
+        assert!(parse_tool_policy_consts("nothing here").is_none());
+        let truncated = SAMPLE.replace("];\nconst COORD_MCP_ALLOWED_TOOL_PREFIXES", "\nconst X");
+        assert!(parse_tool_policy_consts(&truncated).is_none());
     }
 
     #[test]
