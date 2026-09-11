@@ -1,29 +1,51 @@
 /**
  * Unit tests for the Fleet picker's discovery logic (plan
- * `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 2).
+ * `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phases 2 and 5a).
  *
- * The properties under test are the ones the defect turned on: a truncated read
- * must be reachable, a filtered list must never read as a total, and the
+ * The properties under test are the ones the defect turned on: an incomplete
+ * list must be reachable, a filtered list must never read as a total, and the
  * client-side text filter must never be mistaken for one that reaches coord.
+ *
+ * Phase 5a repaired a live contract break. coord's fleet route retired
+ * `truncated` for keyset pagination, and the classifier still opened with
+ * `if (!response.truncated) return { kind: "none" }` — which reads `!undefined`
+ * as "complete", so the banner vanished and the picker silently claimed a full
+ * list again. The `nextCursor` tests below are written to FAIL if that
+ * semantics is ever restored.
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   DEFAULT_FLEET_SERVER_FILTER,
+  EMPTY_FLEET_WALK,
+  FLEET_COMPLETE_AS_OF_NOW,
+  FLEET_CURSOR_STALLED_MESSAGE,
   FLEET_DEFAULT_LIMIT,
-  FLEET_LIMIT_LADDER,
   FLEET_MAX_LIMIT,
   FLEET_STATE_VOCABULARY,
+  accumulateFleetSessions,
   fleetCountSummary,
+  fleetCursorStalled,
   fleetEmptyReadMessage,
+  fleetErrorCode,
+  fleetErrorInvalidatesCursor,
+  fleetErrorIsRestart,
+  fleetErrorMessage,
   fleetFilterConflict,
   fleetFilteredOutMessage,
+  fleetScopeKey,
+  fleetScopeOf,
+  fleetScopesEqual,
   fleetSearchTerms,
   fleetSessionHaystack,
   fleetSessionMatchesTerms,
   fleetStateOptions,
   fleetTruncation,
+  fleetWalkAccept,
+  fleetWalkDropCursor,
   filterFleetSessions,
   hasActiveFleetFilter,
   hasNarrowingFleetFilter,
@@ -31,7 +53,7 @@ import {
   isLikelyDeviceId,
   mergeDeviceCatalog,
   mergeStateCatalog,
-  nextFleetLimit,
+  normalizeFleetCursor,
   statesSeenIn,
   type FleetDeviceOption,
 } from "./fleetDiscovery";
@@ -67,7 +89,11 @@ function response(over: Partial<FleetSessionsResponse> = {}): FleetSessionsRespo
     tenantId: "33333333-3333-3333-3333-333333333333",
     callerDeviceId: "22222222-2222-2222-2222-222222222222",
     count: sessions.length,
-    truncated: false,
+    limit: FLEET_DEFAULT_LIMIT,
+    // Always present as a KEY, null on the last page — exactly as coord serves
+    // it, so no test here can accidentally exercise an "absent field" shape the
+    // wire never produces.
+    nextCursor: null,
     sessionBridgeColumnPresent: true,
     workAxisColumnsPresent: true,
     deviceIdentityColumnsPresent: true,
@@ -76,94 +102,454 @@ function response(over: Partial<FleetSessionsResponse> = {}): FleetSessionsRespo
   };
 }
 
-describe("nextFleetLimit — the page ladder ends at coord's ceiling", () => {
-  it("walks the ladder upward from coord's default page", () => {
-    expect(nextFleetLimit(FLEET_DEFAULT_LIMIT)).toBe(250);
-    expect(nextFleetLimit(250)).toBe(FLEET_MAX_LIMIT);
-  });
+function page(n: number, offset = 0): FleetSession[] {
+  return Array.from({ length: n }, (_, i) =>
+    session({ sessionId: `s-${offset + i}`, workUnitSlug: `plan-${offset + i}` }),
+  );
+}
 
-  it("returns null at the ceiling — no larger read exists, so none is offered", () => {
-    expect(nextFleetLimit(FLEET_MAX_LIMIT)).toBeNull();
-  });
-
-  it("returns null above the ceiling, which coord would clamp anyway", () => {
-    expect(nextFleetLimit(FLEET_MAX_LIMIT + 1)).toBeNull();
-    expect(nextFleetLimit(10_000)).toBeNull();
-  });
-
-  it("lifts an off-ladder limit onto the next rung rather than stalling", () => {
-    expect(nextFleetLimit(1)).toBe(FLEET_DEFAULT_LIMIT);
-    expect(nextFleetLimit(101)).toBe(250);
-    expect(nextFleetLimit(499)).toBe(FLEET_MAX_LIMIT);
-  });
-
-  it("never proposes a limit coord would clamp, and always converges", () => {
-    // The convergence is the property: from ANY starting limit the ladder walk
-    // terminates at exactly the ceiling, never above it and never in a loop.
-    // (Asserting each declared rung is <= the declared ceiling was dropped —
-    // both are constants two lines apart in the same file, so it could only
-    // fail if someone edited both.)
-    let at = 1;
-    for (let i = 0; i < 20; i += 1) {
-      const next = nextFleetLimit(at);
-      if (next === null) break;
-      expect(next).toBeGreaterThan(at);
-      expect(next).toBeLessThanOrEqual(FLEET_MAX_LIMIT);
-      at = next;
-    }
-    expect(at).toBe(FLEET_MAX_LIMIT);
-    expect(FLEET_LIMIT_LADDER.length).toBeGreaterThan(1);
-  });
-});
-
-describe("fleetTruncation — completeness is classified, never assumed", () => {
+describe("fleetTruncation — completeness is `nextCursor`, and nothing else", () => {
   it("is UNKNOWN before any read completes — not 'none'", () => {
-    // The distinction this phase exists for: no answer is not a complete answer.
-    expect(fleetTruncation(null, FLEET_DEFAULT_LIMIT)).toEqual({ kind: "unknown" });
+    // The distinction Phase 2 exists for: no answer is not a complete answer.
+    expect(fleetTruncation(null, 0)).toEqual({ kind: "unknown" });
   });
 
-  it("is 'none' when coord served every matching row", () => {
-    const r = response({ sessions: [session()], truncated: false });
-    expect(fleetTruncation(r, FLEET_DEFAULT_LIMIT)).toEqual({ kind: "none" });
+  it("is 'none' only when coord handed back no cursor", () => {
+    expect(fleetTruncation(response({ sessions: [session()], nextCursor: null }), 1)).toEqual({
+      kind: "none",
+    });
   });
 
-  it("offers the next larger read while one exists", () => {
-    const rows = Array.from({ length: 100 }, (_, i) =>
-      session({ sessionId: `s-${i}`, workUnitSlug: `plan-${i}` }),
-    );
-    const t = fleetTruncation(response({ sessions: rows, truncated: true }), FLEET_DEFAULT_LIMIT);
+  it("offers the next page whenever coord handed back a cursor", () => {
+    const t = fleetTruncation(response({ sessions: page(100), nextCursor: "ck-1" }), 100);
 
     expect(t.kind).toBe("more-available");
     if (t.kind !== "more-available") throw new Error("unreachable");
     expect(t.shown).toBe(100);
-    expect(t.nextLimit).toBe(250);
-    expect(t.message).toContain("Load 250");
+    expect(t.pageSize).toBe(FLEET_DEFAULT_LIMIT);
+    expect(t.message).toContain("100 loaded so far");
+    expect(t.message).toMatch(/reachable/i);
   });
 
-  it("at the ceiling says no larger read exists and names what does work", () => {
-    const rows = Array.from({ length: FLEET_MAX_LIMIT }, (_, i) =>
-      session({ sessionId: `s-${i}` }),
-    );
-    const t = fleetTruncation(response({ sessions: rows, truncated: true }), FLEET_MAX_LIMIT);
-
-    expect(t.kind).toBe("at-ceiling");
-    if (t.kind !== "at-ceiling") throw new Error("unreachable");
-    expect(t.message).toContain(String(FLEET_MAX_LIMIT));
-    expect(t.message).toMatch(/narrow by device or state/i);
-    // And it must say the text box does NOT reach past the page, since at this
-    // point it is the only other control on screen.
-    expect(t.message).toMatch(/already loaded/i);
+  /**
+   * THE DISCRIMINATING TEST for the break Phase 5a repaired.
+   *
+   * coord retired `truncated`, so the field is simply absent from the body the
+   * route now serves. The old classifier opened with
+   * `if (!response.truncated) return { kind: "none" }`, which reads `!undefined`
+   * as `true` — every read classified as complete, the banner never rendered,
+   * and the picker went back to silently claiming a full list. This asserts on
+   * a response with NO `truncated` key at all (cast, because the interface no
+   * longer declares one) and a cursor present: it fails the instant anything
+   * consults `truncated` again, and it fails if `nextCursor` is ignored.
+   */
+  it("classifies a body with NO `truncated` key at all from the cursor alone", () => {
+    const wire = response({ sessions: page(100), nextCursor: "ck-1" });
+    expect("truncated" in wire).toBe(false);
+    expect(fleetTruncation(wire, 100).kind).toBe("more-available");
   });
 
-  it("a full page that is NOT truncated is complete — count alone never decides", () => {
-    const rows = Array.from({ length: FLEET_DEFAULT_LIMIT }, (_, i) =>
-      session({ sessionId: `s-${i}` }),
-    );
+  it("ignores a stale `truncated` field in BOTH directions", () => {
+    // A server, proxy or fixture still carrying the retired flag must not be
+    // able to move this classification either way — `nextCursor` is the only
+    // completeness signal on the wire, so a `truncated: true` beside a null
+    // cursor is complete and a `truncated: false` beside a cursor is not.
+    const stale = (truncated: boolean, nextCursor: string | null) =>
+      ({ ...response({ sessions: page(3), nextCursor }), truncated }) as FleetSessionsResponse;
+
+    expect(fleetTruncation(stale(true, null), 3).kind).toBe("none");
+    expect(fleetTruncation(stale(false, "ck-9"), 3).kind).toBe("more-available");
+  });
+
+  it("an empty-string cursor is the LAST page, never a next one", () => {
+    // coord's walk protocol says an empty `cursor` is page one, so re-sending
+    // one would silently restart the walk while the UI claimed to advance it.
+    expect(fleetTruncation(response({ sessions: page(3), nextCursor: "" }), 3).kind).toBe("none");
+    expect(normalizeFleetCursor("")).toBeNull();
+    expect(normalizeFleetCursor(undefined)).toBeNull();
+    expect(normalizeFleetCursor("ck-1")).toBe("ck-1");
+  });
+
+  it("a FULL page with no cursor is complete — the row count never decides", () => {
+    // A tenant with exactly 100 live sessions and a tenant with a next page
+    // look identical by count alone.
     expect(
-      fleetTruncation(response({ sessions: rows, truncated: false }), FLEET_DEFAULT_LIMIT),
-    ).toEqual({
-      kind: "none",
-    });
+      fleetTruncation(response({ sessions: page(FLEET_DEFAULT_LIMIT), nextCursor: null }), 100)
+        .kind,
+    ).toBe("none");
+  });
+
+  it("counts what the WALK has loaded, not what the last page held", () => {
+    // Three pages in, `response.sessions` holds the last 100 while the list
+    // holds 300 — a banner reading "100 loaded so far" over a 300-row list is
+    // the same class of false on-screen claim this phase removes.
+    const t = fleetTruncation(response({ sessions: page(100, 200), nextCursor: "ck-3" }), 300);
+    if (t.kind !== "more-available") throw new Error("unreachable");
+    expect(t.shown).toBe(300);
+    expect(t.message).toContain("300 loaded so far");
+  });
+
+  it("names coord's OWN effective page size, clamp included", () => {
+    // `limit` on the response is post-clamp, so a caller that asked for 9999
+    // must see the 500 coord actually served rather than what it requested.
+    const t = fleetTruncation(
+      response({ sessions: page(500), limit: FLEET_MAX_LIMIT, nextCursor: "ck-1" }),
+      500,
+    );
+    if (t.kind !== "more-available") throw new Error("unreachable");
+    expect(t.pageSize).toBe(FLEET_MAX_LIMIT);
+    expect(t.message).toContain(`next ${FLEET_MAX_LIMIT}`);
+  });
+
+  it("falls back to the default page size when coord served no usable limit", () => {
+    const t = fleetTruncation(
+      { ...response({ sessions: page(5), nextCursor: "ck-1" }), limit: 0 },
+      5,
+    );
+    if (t.kind !== "more-available") throw new Error("unreachable");
+    expect(t.pageSize).toBe(FLEET_DEFAULT_LIMIT);
+  });
+
+  it("never claims some rows are unreachable — the ceiling copy is retired", () => {
+    // The at-the-ceiling arm said 500 sessions in one bucket "cannot be paged
+    // further at all". Keyset pagination makes that FALSE, and a false warning
+    // is a worse `ux-priorities` gate-4 failure than the silence it replaced.
+    const t = fleetTruncation(
+      response({ sessions: page(500), limit: FLEET_MAX_LIMIT, nextCursor: "ck-1" }),
+      500,
+    );
+    if (t.kind !== "more-available") throw new Error("unreachable");
+    expect(t.message).not.toMatch(/cannot be paged further/i);
+    expect(t.message).not.toMatch(/ceiling/i);
+    expect(t.message).not.toMatch(/no larger read/i);
+  });
+
+  it("says out loud that a complete walk is complete only AS OF NOW", () => {
+    expect(FLEET_COMPLETE_AS_OF_NOW).toMatch(/as of its last read/i);
+    expect(FLEET_COMPLETE_AS_OF_NOW).toMatch(/sessions started since/i);
+  });
+});
+
+describe("the cursor is OPAQUE — re-sent verbatim, never interpreted", () => {
+  const SOURCES = ["./fleetDiscovery.ts", "./useFleetSessions.ts"].map((rel) => ({
+    rel,
+    text: readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8"),
+  }));
+
+  it("no cursor-carrying module decodes, splits or parses a cursor", () => {
+    // coord's contract makes the cursor opaque: a client that learns to read it
+    // pins a format coord is free to change, and every such client then breaks
+    // silently on the next version bump — which is what
+    // `cursor_version_unsupported` exists to report rather than to survive.
+    for (const { rel, text } of SOURCES) {
+      for (const forbidden of [/atob\s*\(/, /Buffer\.from/, /JSON\.parse/, /decodeURIComponent/]) {
+        expect(text, `${rel} must not interpret the cursor: ${forbidden}`).not.toMatch(forbidden);
+      }
+      // Nor may it slice, split or regex a value named like a cursor.
+      expect(text, rel).not.toMatch(/cursor[A-Za-z]*\.(split|slice|substring|match|replace)\(/i);
+    }
+  });
+
+  it("compares cursors for EQUALITY only, to spot one that never reached coord", () => {
+    // A keyset cursor encodes the page just served, so coord returning the
+    // cursor it was GIVEN cannot happen under the contract — it is the
+    // signature of a parameter dropped in transit, which would otherwise show
+    // up as a "load more" that re-serves page one for ever.
+    expect(fleetCursorStalled("ck-1", "ck-1")).toBe(true);
+    expect(fleetCursorStalled("ck-1", "ck-2")).toBe(false);
+    expect(fleetCursorStalled("ck-1", null)).toBe(false);
+    // Page one sends no cursor, so there is nothing to have stalled.
+    expect(fleetCursorStalled(null, "ck-1")).toBe(false);
+    expect(fleetCursorStalled(null, null)).toBe(false);
+  });
+});
+
+describe("fleetScopeKey — what a cursor is valid within", () => {
+  const base = { deviceId: null, state: null, includeClosed: false };
+
+  it.each([
+    ["device", { ...base, deviceId: "a" }],
+    ["state", { ...base, state: "active" }],
+    ["closed", { ...base, includeClosed: true }],
+  ])("a changed %s invalidates the cursor", (_name, changed) => {
+    expect(fleetScopesEqual(base, changed)).toBe(false);
+  });
+
+  it("a changed LIMIT does NOT invalidate the cursor", () => {
+    // coord leaves `limit` out of the scope fingerprint on purpose: resizing a
+    // page changes the slice, not the sequence. Including it here would restart
+    // a walk that did not need restarting and silently re-fetch every page.
+    const small = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_DEFAULT_LIMIT });
+    const large = fleetScopeOf({ ...DEFAULT_FLEET_SERVER_FILTER, limit: FLEET_MAX_LIMIT });
+    expect(fleetScopesEqual(small, large)).toBe(true);
+    expect(fleetScopeKey(small)).not.toMatch(String(FLEET_MAX_LIMIT));
+    expect(fleetScopeKey(small)).not.toMatch(String(FLEET_DEFAULT_LIMIT));
+  });
+
+  it("distinguishes a null filter from the empty string", () => {
+    expect(fleetScopesEqual(base, { ...base, state: "" })).toBe(false);
+  });
+});
+
+describe("the walk — pages accumulate, a restart replaces", () => {
+  it("appends page two onto page one and carries the new cursor", () => {
+    const one = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: page(2), nextCursor: "ck-1" }),
+      "restart",
+    );
+    expect(one.sessions.map((s) => s.sessionId)).toEqual(["s-0", "s-1"]);
+    expect(one.nextCursor).toBe("ck-1");
+    expect(one.pages).toBe(1);
+
+    const two = fleetWalkAccept(
+      one,
+      response({ sessions: page(2, 2), nextCursor: "ck-2" }),
+      "more",
+    );
+    expect(two.sessions.map((s) => s.sessionId)).toEqual(["s-0", "s-1", "s-2", "s-3"]);
+    expect(two.nextCursor).toBe("ck-2");
+    expect(two.pages).toBe(2);
+  });
+
+  it("ends the walk on the last page, keeping every row it accumulated", () => {
+    let walk = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: page(2), nextCursor: "ck-1" }),
+      "restart",
+    );
+    walk = fleetWalkAccept(walk, response({ sessions: page(1, 2), nextCursor: null }), "more");
+    expect(walk.nextCursor).toBeNull();
+    expect(walk.sessions).toHaveLength(3);
+    expect(walk.pages).toBe(2);
+  });
+
+  it("a RESTART replaces the accumulation — two scopes never share a list", () => {
+    // The trap: a device filter narrows the walk, so carrying the previous
+    // scope's rows over would build a list that no filter set on screen
+    // describes, and the count beside it would be a claim about neither.
+    const first = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: page(3), nextCursor: "ck-1" }),
+      "restart",
+    );
+    const restarted = fleetWalkAccept(
+      first,
+      response({ sessions: [session({ sessionId: "other" })], nextCursor: null }),
+      "restart",
+    );
+    expect(restarted.sessions.map((s) => s.sessionId)).toEqual(["other"]);
+    expect(restarted.pages).toBe(1);
+    expect(restarted.nextCursor).toBeNull();
+  });
+
+  it("deduplicates by sessionId, keeping the later read of a repeated row", () => {
+    const one = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: [session({ sessionId: "a", state: "active" })], nextCursor: "ck-1" }),
+      "restart",
+    );
+    const two = fleetWalkAccept(
+      one,
+      response({
+        sessions: [session({ sessionId: "a", state: "stale" }), session({ sessionId: "b" })],
+        nextCursor: null,
+      }),
+      "more",
+    );
+    expect(two.sessions).toHaveLength(2);
+    // In place: moving the row would reorder a list the operator is reading.
+    expect(two.sessions[0]?.sessionId).toBe("a");
+    expect(two.sessions[0]?.state).toBe("stale");
+  });
+
+  it("an empty page keeps the array identity, so a consumer's memo survives", () => {
+    const one = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: page(2), nextCursor: "ck-1" }),
+      "restart",
+    );
+    const two = fleetWalkAccept(one, response({ sessions: [], nextCursor: null }), "more");
+    expect(two.sessions).toBe(one.sessions);
+    expect(accumulateFleetSessions(one.sessions, [])).toBe(one.sessions);
+  });
+
+  it("drops the cursor without touching the rows", () => {
+    const one = fleetWalkAccept(
+      EMPTY_FLEET_WALK,
+      response({ sessions: page(2), nextCursor: "ck-1" }),
+      "restart",
+    );
+    const stalled = fleetWalkDropCursor(one);
+    expect(stalled.nextCursor).toBeNull();
+    expect(stalled.sessions).toBe(one.sessions);
+    // And it is a no-op when there was no cursor, preserving identity.
+    expect(fleetWalkDropCursor(stalled)).toBe(stalled);
+  });
+
+  it("the empty walk is 'unknown', never 'none'", () => {
+    expect(EMPTY_FLEET_WALK.pages).toBe(0);
+    expect(EMPTY_FLEET_WALK.sessions).toHaveLength(0);
+    expect(EMPTY_FLEET_WALK.nextCursor).toBeNull();
+    expect(fleetTruncation(null, EMPTY_FLEET_WALK.sessions.length)).toEqual({ kind: "unknown" });
+  });
+});
+
+describe("a whole walk, driven the way the hook drives it", () => {
+  /**
+   * The sequence the hook performs, run over the same exported primitives it
+   * calls — not a re-implementation of the rules, which is the failure mode
+   * `fleet_sessions.rs`'s own tests record: a test that restates a predicate
+   * passes happily while the real path diverges. What is NOT reachable here is
+   * React's part (the generation guard and the restart effect); those are
+   * asserted against the hook's source in `FleetSessionPicker.wiring.test.ts`,
+   * because the runner's vitest environment is `node` with no DOM.
+   */
+  function walkPages(pages: { rows: FleetSession[]; nextCursor: string | null }[]) {
+    let walk = EMPTY_FLEET_WALK;
+    let sent: string | null = null;
+    const cursorsSent: (string | null)[] = [];
+    for (const [i, p] of pages.entries()) {
+      cursorsSent.push(sent);
+      const r = response({ sessions: p.rows, nextCursor: p.nextCursor });
+      walk = fleetWalkAccept(walk, r, i === 0 ? "restart" : "more");
+      sent = fleetCursorStalled(sent, walk.nextCursor) ? null : walk.nextCursor;
+      if (sent === null) walk = fleetWalkDropCursor(walk);
+    }
+    return { walk, cursorsSent };
+  }
+
+  it("accumulates three pages, sends each cursor verbatim, and stops on the last", () => {
+    const { walk, cursorsSent } = walkPages([
+      { rows: page(2, 0), nextCursor: "ck-1" },
+      { rows: page(2, 2), nextCursor: "ck-2" },
+      { rows: page(1, 4), nextCursor: null },
+    ]);
+    expect(cursorsSent).toEqual([null, "ck-1", "ck-2"]);
+    expect(walk.sessions.map((s) => s.sessionId)).toEqual(["s-0", "s-1", "s-2", "s-3", "s-4"]);
+    expect(walk.pages).toBe(3);
+    expect(fleetTruncation(response({ nextCursor: null }), walk.sessions.length).kind).toBe("none");
+  });
+
+  it("stops instead of looping when the cursor never reaches coord", () => {
+    // The shape of a dropped parameter: page one comes back for ever, each time
+    // with the same cursor. The dedup keeps the list honest and the stall check
+    // ends the walk rather than offering a control that cannot advance.
+    const { walk, cursorsSent } = walkPages([
+      { rows: page(2, 0), nextCursor: "ck-1" },
+      { rows: page(2, 0), nextCursor: "ck-1" },
+    ]);
+    expect(cursorsSent).toEqual([null, "ck-1"]);
+    expect(walk.sessions).toHaveLength(2);
+    expect(walk.nextCursor).toBeNull();
+  });
+
+  it("a scope change restarts the walk instead of appending across filters", () => {
+    // Coord answers `cursor_scope_mismatch` to a cursor carried across a filter
+    // change; the hook drops the cursor and restarts, which here is the
+    // `restart` fold — the previous scope's rows do not survive it.
+    const first = walkPages([
+      { rows: page(3, 0), nextCursor: "ck-1" },
+      { rows: page(3, 3), nextCursor: "ck-2" },
+    ]).walk;
+    expect(first.sessions).toHaveLength(6);
+
+    const code = fleetErrorCode(
+      'GET /coord/sessions/fleet returned 400 — body: {"error":"cursor_scope_mismatch","detail":"x"}',
+    );
+    expect(fleetErrorIsRestart(code)).toBe(true);
+
+    const restarted = fleetWalkAccept(
+      first,
+      response({ sessions: [session({ sessionId: "narrowed" })], nextCursor: null }),
+      "restart",
+    );
+    expect(restarted.sessions.map((s) => s.sessionId)).toEqual(["narrowed"]);
+    expect(restarted.pages).toBe(1);
+  });
+});
+
+describe("coord's 400 codes — the code is the contract, the prose is not", () => {
+  const body = (code: string) =>
+    `GET /coord/sessions/fleet returned 400 — body: {"error":"${code}","detail":"static prose"}`;
+
+  it.each([
+    "cursor_scope_mismatch",
+    "cursor_malformed",
+    "cursor_version_unsupported",
+    "limit_not_positive",
+  ])("recovers %s from the wrapped body", (code) => {
+    expect(fleetErrorCode(body(code))).toBe(code);
+  });
+
+  it("reads the `error` KEY, not a loose occurrence of the token", () => {
+    // A code name inside `detail`'s prose, or in a url, is not the verdict.
+    expect(
+      fleetErrorCode(
+        'returned 400 — body: {"error":"limit_not_positive","detail":"not a cursor_malformed"}',
+      ),
+    ).toBe("limit_not_positive");
+    expect(fleetErrorCode("GET /coord/sessions/fleet?cursor_malformed=1: timed out")).toBeNull();
+  });
+
+  it("is null for a transport failure, which is UNKNOWN rather than a code", () => {
+    expect(fleetErrorCode("GET https://coord/coord/sessions/fleet: connection refused")).toBeNull();
+    expect(fleetErrorCode(new Error("boom"))).toBeNull();
+    expect(fleetErrorCode(undefined)).toBeNull();
+  });
+
+  it("does not invent a code for an unknown one coord might add", () => {
+    expect(fleetErrorCode(body("cursor_expired"))).toBeNull();
+  });
+
+  it("never matches the RETIRED free-text limit body", () => {
+    // The non-positive-limit body changed shape from `{"error":"limit must be
+    // positive"}` to a machine code — a deliberate break, and the reason
+    // nothing here matches on prose.
+    expect(fleetErrorCode('returned 400 — body: {"error":"limit must be positive"}')).toBeNull();
+  });
+
+  it("routes a scope mismatch to a RESTART, never to the operator's screen", () => {
+    // Changing a filter mid-walk is ordinary use; showing it as an error would
+    // blame the operator for the UI's own race.
+    expect(fleetErrorIsRestart("cursor_scope_mismatch")).toBe(true);
+    for (const other of ["cursor_malformed", "cursor_version_unsupported", "limit_not_positive"]) {
+      expect(fleetErrorIsRestart(other as never)).toBe(false);
+    }
+    expect(fleetErrorIsRestart(null)).toBe(false);
+  });
+
+  it("invalidates the cursor for exactly the two codes that mean it is unusable", () => {
+    expect(fleetErrorInvalidatesCursor("cursor_malformed")).toBe(true);
+    expect(fleetErrorInvalidatesCursor("cursor_version_unsupported")).toBe(true);
+    expect(fleetErrorInvalidatesCursor("limit_not_positive")).toBe(false);
+    expect(fleetErrorInvalidatesCursor("cursor_scope_mismatch")).toBe(false);
+    expect(fleetErrorInvalidatesCursor(null)).toBe(false);
+  });
+
+  it("says the list may be INCOMPLETE when a bad cursor stops the walk", () => {
+    // Dropping the cursor silently would turn an incomplete list into one that
+    // claims to be complete — the exact defect this phase repaired.
+    for (const code of ["cursor_malformed", "cursor_version_unsupported"] as const) {
+      const msg = fleetErrorMessage(code, "raw");
+      expect(msg).toMatch(/there may be more/i);
+      expect(msg).toMatch(/refresh/i);
+    }
+  });
+
+  it("surfaces an uncoded failure raw rather than guessing at it", () => {
+    expect(fleetErrorMessage(null, "connection refused")).toBe(
+      "Failed to load fleet sessions: connection refused",
+    );
+  });
+
+  it("says the page size must be positive, without echoing coord's prose", () => {
+    expect(fleetErrorMessage("limit_not_positive", "raw")).toMatch(/positive/i);
+  });
+
+  it("the stalled-cursor message admits the list may be incomplete", () => {
+    expect(FLEET_CURSOR_STALLED_MESSAGE).toMatch(/cannot advance/i);
+    expect(FLEET_CURSOR_STALLED_MESSAGE).toMatch(/may be incomplete/i);
   });
 });
 
@@ -603,19 +989,19 @@ describe("isLikelyDeviceId — a value coord's Uuid extractor will accept", () =
   });
 });
 
-describe("truncation copy states the real limits of 'narrow instead'", () => {
-  it("at the ceiling, admits the device list is partial and that 500 in one bucket is a dead end", () => {
-    const rows = Array.from({ length: FLEET_MAX_LIMIT }, (_, i) =>
-      session({ sessionId: `s-${i}` }),
-    );
-    const t = fleetTruncation(response({ sessions: rows, truncated: true }), FLEET_MAX_LIMIT);
-    if (t.kind !== "at-ceiling") throw new Error("expected at-ceiling");
-    // coord serves no device-listing route, so the dropdown can only hold
-    // devices some loaded page contained — including, possibly, not the one
-    // truncation hid.
-    expect(t.message).toMatch(/loaded so far/i);
-    // And with no offset or cursor, one device in one state over the ceiling is
-    // unreachable by ANY combination of the four parameters.
-    expect(t.message).toMatch(/cannot be paged further/i);
+describe("fleetFilteredOutMessage under a walk — 'not loaded' is not 'not there'", () => {
+  it("points at the next page when one exists, instead of stopping at the loaded set", () => {
+    // Under the ladder this message was the end of the road once the page was
+    // at the ceiling. With a cursor it is not: the way to widen what the box
+    // sees is one click away, and saying so is what keeps it true.
+    const msg = fleetFilteredOutMessage(100, 0, "zzz", true);
+    expect(msg).toMatch(/coord has more/i);
+    expect(msg).toMatch(/load another page/i);
+  });
+
+  it("does NOT promise a next page when coord said there is none", () => {
+    const msg = fleetFilteredOutMessage(100, 0, "zzz", false);
+    expect(msg).not.toMatch(/coord has more/i);
+    expect(msg).toMatch(/filters only those/i);
   });
 });
