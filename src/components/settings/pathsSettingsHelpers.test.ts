@@ -249,7 +249,17 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
     const s = scanSourceStatus(measured());
     expect(s.tone).toBe("warn");
     expect(s.headline).toBe("Scan source: 2153 behind origin/main, 11 ahead");
-    expect(s.detail).toContain("refreshed 5m ago");
+    expect(s.detail).toContain("missing from what this machine feeds the corpus");
+    expect(s.detail).toContain("11 commit(s) of plan content");
+    expect(s.detail).toContain("refreshed 5m before this reading");
+  });
+
+  it("explains an ahead-only divergence without claiming anything is missing", () => {
+    const s = scanSourceStatus(measured({ behind: 0, ahead: 11 }));
+    expect(s.tone).toBe("warn");
+    expect(s.headline).toBe("Scan source: 11 ahead of origin/main");
+    expect(s.detail).not.toContain("missing");
+    expect(s.detail).toContain("11 commit(s) of plan content that origin/main does not carry");
   });
 
   it("reads 0/0 against a ref PROVEN current as in step", () => {
@@ -261,8 +271,9 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
   it("renders stale-ref counts as a lower bound", () => {
     const s = scanSourceStatus(measured({ ref_age_secs: 7 * 3600, counts_are_floors: true }));
     expect(s.tone).toBe("warn");
-    expect(s.headline).toBe("Scan source: at least 2153 behind origin/main, 11 ahead");
-    expect(s.detail).toContain("7h ago");
+    expect(s.headline).toBe("Scan source: at least 2153 behind origin/main, up to 11 ahead");
+    expect(s.detail).toContain("7h before this reading");
+    expect(s.detail).toContain("ahead count may overstate");
   });
 
   it("never renders a floor of 0 behind as in step — stale or unknown age, any ahead", () => {
@@ -286,7 +297,9 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
     expect(scanSourceStatus(floors[0]).tone).toBe("unknown");
     expect(scanSourceStatus(floors[1]).detail).toContain("no reflog entry");
     expect(scanSourceStatus(floors[2]).tone).toBe("warn");
-    expect(scanSourceStatus(floors[2]).headline).toContain("4 ahead");
+    expect(scanSourceStatus(floors[2]).headline).toBe(
+      "Scan source: up to 4 ahead of origin/main; behind unknown (0 is a lower bound, not agreement)",
+    );
   });
 
   it("takes the floor flag from the runner rather than re-deriving it from the age", () => {
@@ -296,6 +309,10 @@ describe("scanSourceStatus — the floor rule reaches the panel", () => {
       measured({ behind: 0, ahead: 0, ref_age_secs: 60, counts_are_floors: true }),
     );
     expect(s.headline).not.toMatch(/in step/);
+    // The wording defers to the runner's verdict rather than asserting an
+    // age comparison the panel did not make.
+    expect(s.detail).toContain("outside the adapter's freshness window");
+    expect(s.detail).not.toMatch(/longer than/);
   });
 
   it("gives the non-measured states no counts", () => {
