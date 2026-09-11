@@ -41,6 +41,27 @@ runner — need to reach it.
 - SDK side: `ui-bridge/packages/ui-bridge/src/server/types.ts` +
   `handlers.ts` (or `relay-handlers.ts`)
 
+#### The `effects` family — an SDK passthrough, and the one exception to "re-shaping"
+
+`effects.rs` is Runner-direct but it does **not** re-shape: both its routes
+forward to the SDK via `sdk_request` and return its JSON verbatim. Recorded
+here because the family was previously undocumented in this file, which is
+how `GET /ui-bridge/effects/recent` shipped without an entry.
+
+- `GET /ui-bridge/effects/recent` — recent predicted-vs-observed cycles.
+- `POST /ui-bridge/control/component/{id}/action/{action_id}/predict` — ask
+  the effect calculus what a component action **will** do, **without
+  invoking the handler**. Plan
+  `2026-09-04-effect-calculus-joins-the-component-action-registry`, Phase 6.
+
+Both are registered in `effects.rs::routes()` **and** mirrored in
+`effects.rs::route_entries()`. The second half is not optional: `mod.rs::
+route_manifest()` concatenates the per-family `route_entries()`, and
+`cargo test sdk_manifest_routes_are_exposed_by_runner` diffs that manifest
+against the SDK's `UI_BRIDGE_ROUTES`. A route in `routes()` alone answers
+HTTP while reading as missing to the contract gate — which is exactly the
+drift this document exists to prevent.
+
 ### Runner outer wrapper
 Handler lives in `qontinui-runner/src-tauri/src/mcp/sdk_client.rs`. Path
 sits under `/ui-bridge/sdk/<tail>`. The runner forwards over the WS bridge
