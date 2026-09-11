@@ -19,10 +19,13 @@ import {
   divergenceKind,
   draftsAreDirty,
   draftsFrom,
+  formatRefAge,
   normalizePathInput,
   planScanStatusLabel,
   resolvedDiffers,
+  scanSourceStatus,
   type PathSettings,
+  type ScanDivergenceView,
 } from "./pathsSettingsHelpers";
 
 const SAVED: PathSettings = {
@@ -203,5 +206,124 @@ describe("planScanStatusLabel", () => {
     expect(planScanStatusLabel(true, 1)).toBe("Plan scanning: on (1 scan root)");
     expect(planScanStatusLabel(true, 0)).toBe("Plan scanning: on (0 scan roots)");
     expect(planScanStatusLabel(true, null)).toBe("Plan scanning: on (scan roots: unknown)");
+  });
+});
+
+/** A `measured` reading with the operator box's numbers against a fresh ref. */
+function measured(overrides: Partial<ScanDivergenceView> = {}): ScanDivergenceView {
+  return {
+    state: "measured",
+    plans_dir: "/home/me/qontinui-dev-notes/plans",
+    repo_root: "/home/me/qontinui-dev-notes",
+    default_ref: "origin/main",
+    ref_sha: "a".repeat(40),
+    head_sha: "b".repeat(40),
+    behind: 2153,
+    ahead: 11,
+    ref_age_secs: 300,
+    counts_are_floors: false,
+    detail: null,
+    ...overrides,
+  };
+}
+
+describe("formatRefAge", () => {
+  it("renders whole units, rounded down", () => {
+    expect(formatRefAge(0)).toBe("0s");
+    expect(formatRefAge(59)).toBe("59s");
+    expect(formatRefAge(60)).toBe("1m");
+    expect(formatRefAge(3599)).toBe("59m");
+    expect(formatRefAge(7 * 3600)).toBe("7h");
+    expect(formatRefAge(3 * 86_400 + 5)).toBe("3d");
+  });
+});
+
+describe("scanSourceStatus — the floor rule reaches the panel", () => {
+  it("renders a missing reading as not measured, never in step", () => {
+    const s = scanSourceStatus(null);
+    expect(s.tone).toBe("unknown");
+    expect(s.headline).not.toMatch(/in step/);
+  });
+
+  it("reports current counts against a fresh ref as they are", () => {
+    const s = scanSourceStatus(measured());
+    expect(s.tone).toBe("warn");
+    expect(s.headline).toBe("Scan source: 2153 behind origin/main, 11 ahead");
+    expect(s.detail).toContain("refreshed 5m ago");
+  });
+
+  it("reads 0/0 against a ref PROVEN current as in step", () => {
+    const s = scanSourceStatus(measured({ behind: 0, ahead: 0 }));
+    expect(s.tone).toBe("ok");
+    expect(s.headline).toBe("Scan source: in step with origin/main");
+  });
+
+  it("renders stale-ref counts as a lower bound", () => {
+    const s = scanSourceStatus(measured({ ref_age_secs: 7 * 3600, counts_are_floors: true }));
+    expect(s.tone).toBe("warn");
+    expect(s.headline).toBe("Scan source: at least 2153 behind origin/main, 11 ahead");
+    expect(s.detail).toContain("7h ago");
+  });
+
+  it("never renders a floor of 0 behind as in step — stale or unknown age, any ahead", () => {
+    const floors = [
+      measured({ behind: 0, ahead: 0, ref_age_secs: 7 * 3600, counts_are_floors: true }),
+      measured({
+        behind: 0,
+        ahead: 0,
+        ref_age_secs: null,
+        counts_are_floors: true,
+        detail: "no reflog entry",
+      }),
+      measured({ behind: 0, ahead: 4, ref_age_secs: null, counts_are_floors: true }),
+    ];
+    for (const view of floors) {
+      const s = scanSourceStatus(view);
+      expect(s.tone).not.toBe("ok");
+      expect(s.headline).not.toMatch(/in step/);
+      expect(s.headline).toContain("lower bound");
+    }
+    expect(scanSourceStatus(floors[0]).tone).toBe("unknown");
+    expect(scanSourceStatus(floors[1]).detail).toContain("no reflog entry");
+    expect(scanSourceStatus(floors[2]).tone).toBe("warn");
+    expect(scanSourceStatus(floors[2]).headline).toContain("4 ahead");
+  });
+
+  it("takes the floor flag from the runner rather than re-deriving it from the age", () => {
+    // A young age with the flag set still renders as a floor: the window lives
+    // in Rust, and the panel does not second-guess it.
+    const s = scanSourceStatus(
+      measured({ behind: 0, ahead: 0, ref_age_secs: 60, counts_are_floors: true }),
+    );
+    expect(s.headline).not.toMatch(/in step/);
+  });
+
+  it("gives the non-measured states no counts", () => {
+    const off = scanSourceStatus(
+      measured({ state: "not_scanning", behind: null, ahead: null, ref_age_secs: null }),
+    );
+    expect(off.tone).toBe("off");
+    const plain = scanSourceStatus(
+      measured({
+        state: "not_a_git_work_tree",
+        behind: null,
+        ahead: null,
+        detail: "not inside a git work tree",
+      }),
+    );
+    expect(plain.tone).toBe("unknown");
+    expect(plain.detail).toBe("not inside a git work tree");
+    const unknown = scanSourceStatus(
+      measured({ state: "unknown", behind: null, ahead: null, detail: "origin/HEAD is not set" }),
+    );
+    expect(unknown.headline).toBe("Scan source: drift unknown");
+    expect(unknown.detail).toBe("origin/HEAD is not set");
+    for (const s of [off, plain, unknown]) expect(s.headline).not.toMatch(/\d+ behind/);
+  });
+
+  it("treats a measured reading missing a count as unknown rather than inventing a 0", () => {
+    const s = scanSourceStatus(measured({ ahead: null }));
+    expect(s.tone).toBe("unknown");
+    expect(s.headline).toBe("Scan source: drift unknown");
   });
 });

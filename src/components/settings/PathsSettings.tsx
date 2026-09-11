@@ -50,6 +50,7 @@ import {
   draftsFrom,
   normalizePathInput,
   planScanStatusLabel,
+  scanSourceStatus,
   type PathDrafts,
   type PathField,
   type PathSettingsView,
@@ -259,6 +260,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
       ) : (
         <>
           <PlanScanStatus resolved={view.resolved} />
+          <ScanSourceStatus resolved={view.resolved} />
 
           <div className="rounded-lg bg-card/50 p-4 space-y-5">
             {PATH_FIELDS.map((field) => (
@@ -356,6 +358,46 @@ function PlanScanStatus({ resolved }: { resolved: ResolvedPaths }) {
             ? "The adapter is scanning the plans directory in effect and pushing work units to coord."
             : "No plans directory is in effect, so nothing is scanned and no work units reach coord. Set one below to turn the tier on."}
         </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Scan-source drift ───────────────────────────────────────────────────────
+
+const SCAN_SOURCE_ACCENT = {
+  ok: "green",
+  warn: "amber",
+  unknown: "slate",
+  off: "slate",
+} as const;
+
+/**
+ * How far the directory the adapter scans has drifted from its default
+ * branch — the reading that makes a plans dir parked on a stale branch
+ * visible instead of silently authoritative. The wording, including the
+ * floor rule, is `scanSourceStatus`'s; this only picks the accent.
+ */
+function ScanSourceStatus({ resolved }: { resolved: ResolvedPaths }) {
+  const status = scanSourceStatus(resolved.plan_scan_divergence);
+  const accent = getAccentColors(SCAN_SOURCE_ACCENT[status.tone]);
+  return (
+    <div
+      data-ui-bridge-id="settings.paths-scan-source-status"
+      data-content-role="status"
+      data-content-label="plan scan source drift"
+      className={`p-3 ${accent.bg} rounded-lg flex items-start gap-2`}
+    >
+      {status.tone === "ok" ? (
+        <Check className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
+      ) : status.tone === "warn" ? (
+        <TriangleAlert className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
+      ) : (
+        <Info className={`w-4 h-4 ${accent.text} shrink-0 mt-0.5`} />
+      )}
+      <div className="space-y-0.5">
+        <p className={`text-xs font-medium ${accent.text}`}>{status.headline}</p>
+        {status.detail && <p className={`text-[10px] ${accent.text}`}>{status.detail}</p>}
       </div>
     </div>
   );

@@ -65,6 +65,39 @@ export interface ResolvedPaths {
    * has not completed a cycle yet — UNKNOWN, never zero.
    */
   plan_scan_roots: number | null;
+  /**
+   * How far the directory the adapter actually scans has drifted from its
+   * default branch; `null` when the adapter has not ticked yet — UNKNOWN,
+   * never "in step". See {@link scanSourceStatus}.
+   */
+  plan_scan_divergence: ScanDivergenceView | null;
+}
+
+/**
+ * Wire shape of `ScanDivergenceView` (`commands/path_settings.rs`): the plan
+ * adapter's last scan-source divergence reading.
+ *
+ * Only `state === "measured"` carries `behind` / `ahead`; every absent number
+ * is UNKNOWN. `counts_are_floors` is the runner's floor rule, computed there
+ * so the panel never re-derives it: the ref the counts were taken against is
+ * older than the adapter's freshness window, or of unknown age, so the counts
+ * are LOWER BOUNDS.
+ */
+export interface ScanDivergenceView {
+  state: "not_scanning" | "not_a_git_work_tree" | "measured" | "unknown";
+  plans_dir: string | null;
+  repo_root: string | null;
+  /** The repo's own default branch as resolved at scan time, e.g. `origin/main`. */
+  default_ref: string | null;
+  ref_sha: string | null;
+  head_sha: string | null;
+  behind: number | null;
+  ahead: number | null;
+  /** Seconds since `default_ref` was last known refreshed; `null` is UNKNOWN. */
+  ref_age_secs: number | null;
+  counts_are_floors: boolean;
+  /** Why the state is `unknown` / `not_a_git_work_tree`, or why the age is absent. */
+  detail: string | null;
 }
 
 /** Return shape of both `get_path_settings` and `save_path_settings`. */
@@ -213,4 +246,106 @@ export function planScanStatusLabel(active: boolean, scanRoots: number | null): 
   if (!active) return "Plan scanning: off";
   if (scanRoots === null) return "Plan scanning: on (scan roots: unknown)";
   return `Plan scanning: on (${scanRoots} scan ${scanRoots === 1 ? "root" : "roots"})`;
+}
+
+/** `45s`, `12m`, `7h`, `3d` — whole units, rounded down. */
+export function formatRefAge(secs: number): string {
+  const s = Math.max(0, Math.floor(secs));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86_400) return `${Math.floor(s / 3600)}h`;
+  return `${Math.floor(s / 86_400)}d`;
+}
+
+/**
+ * How the scan-source reading is shown:
+ * - `"ok"`      — measured in step against a ref proven current;
+ * - `"warn"`    — a measured divergence (current or a lower bound);
+ * - `"unknown"` — nothing that proves the distance either way;
+ * - `"off"`     — nothing is scanned.
+ */
+export type ScanSourceTone = "ok" | "warn" | "unknown" | "off";
+
+export interface ScanSourceStatus {
+  tone: ScanSourceTone;
+  headline: string;
+  /** The sentence under the headline; `null` when there is nothing to add. */
+  detail: string | null;
+}
+
+/**
+ * The panel's reading of {@link ScanDivergenceView}.
+ *
+ * The one rule this exists to keep is the runner's FLOOR RULE: when
+ * `counts_are_floors` is set, `behind` is a lower bound, so it renders as
+ * "at least N behind" — and a floor of `0 behind` (whatever `ahead` is) is
+ * UNKNOWN, never "in step". A `0/0` is the reading that LOOKS like agreement,
+ * which is exactly why it is the one that must not be trusted when the ref it
+ * was compared against is stale or of unknown age. Only a `0/0` against a ref
+ * proven current reads "in step".
+ */
+export function scanSourceStatus(view: ScanDivergenceView | null): ScanSourceStatus {
+  if (view === null) {
+    return {
+      tone: "unknown",
+      headline: "Scan source: not measured yet",
+      detail:
+        "The adapter has not completed a cycle since the runner started, so how far the scanned directory has drifted is unknown.",
+    };
+  }
+  if (view.state === "not_scanning") {
+    return { tone: "off", headline: "Scan source: nothing is scanned", detail: null };
+  }
+  if (view.state === "not_a_git_work_tree") {
+    return {
+      tone: "unknown",
+      headline: "Scan source: not a git work tree — drift cannot be measured",
+      detail: view.detail,
+    };
+  }
+  const { behind, ahead } = view;
+  if (view.state !== "measured" || behind === null || ahead === null) {
+    return { tone: "unknown", headline: "Scan source: drift unknown", detail: view.detail };
+  }
+
+  const ref = view.default_ref ?? "the default branch";
+  const aheadPart = ahead > 0 ? `, ${ahead} ahead` : "";
+  const age =
+    view.ref_age_secs === null
+      ? null
+      : `${ref} was last refreshed ${formatRefAge(view.ref_age_secs)} ago`;
+
+  if (view.counts_are_floors) {
+    const why =
+      age === null
+        ? `Nothing proves when ${ref} was last refreshed${view.detail ? ` (${view.detail})` : ""}`
+        : `${age}, longer than the adapter's freshness window`;
+    const consequence =
+      "so the true distance behind can only be larger. The adapter never fetches.";
+    if (behind === 0) {
+      return {
+        tone: ahead > 0 ? "warn" : "unknown",
+        headline: `Scan source: drift unknown (0 behind ${ref} is a lower bound, not agreement${aheadPart})`,
+        detail: `${why}, ${consequence}`,
+      };
+    }
+    return {
+      tone: "warn",
+      headline: `Scan source: at least ${behind} behind ${ref}${aheadPart}`,
+      detail: `${why}, ${consequence}`,
+    };
+  }
+
+  if (behind === 0 && ahead === 0) {
+    return {
+      tone: "ok",
+      headline: `Scan source: in step with ${ref}`,
+      detail: age === null ? null : `${age}.`,
+    };
+  }
+  return {
+    tone: "warn",
+    headline: `Scan source: ${behind} behind ${ref}${aheadPart}`,
+    detail: `The adapter publishes this working tree, not ${ref}: plans that are on ${ref} and not here are missing from what this machine feeds the corpus.${age === null ? "" : ` ${age}.`}`,
+  };
 }
