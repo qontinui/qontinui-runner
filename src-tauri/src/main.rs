@@ -2544,6 +2544,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_create::remote_create_preference_get,
             commands::remote_create::remote_create_preference_set,
             commands::remote_create::remote_create_preference_reconcile,
+            commands::remote_create::terminal_create_remote,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,

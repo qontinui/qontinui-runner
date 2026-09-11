@@ -5,6 +5,7 @@ import {
   ChevronsDown,
   Link2,
   Monitor,
+  Plus,
   RefreshCw,
   Search,
   Server,
@@ -38,6 +39,14 @@ import {
   remoteSessionLabel,
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
+import {
+  createButtonState,
+  describeRemoteCreateFailure,
+  fleetDeviceCreateErrorId,
+  fleetDeviceCreateId,
+  IDLE_DEVICE_CREATE,
+  type DeviceCreateState,
+} from "./remoteCreate";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
 import { formatRelativeTime } from "../../lib/formatting";
 
@@ -164,6 +173,135 @@ interface RowAttachState {
   openedId: string | null;
 }
 
+/**
+ * The "New terminal" action for one device. Disabled WITH a reason for the
+ * caller's own machine (that is the ordinary local button) and for a group
+ * whose device id coord could not vouch for.
+ */
+function RemoteCreateButton({
+  deviceId,
+  deviceLabel,
+  isCallerDevice,
+  state,
+  onCreate,
+  className,
+}: {
+  deviceId: string;
+  deviceLabel: string;
+  isCallerDevice: boolean;
+  state: DeviceCreateState | undefined;
+  onCreate: (deviceId: string, deviceLabel: string) => Promise<void>;
+  className?: string;
+}) {
+  const btn = createButtonState({ deviceId, isCallerDevice });
+  const pending = state?.pending === true;
+  return (
+    <button
+      type="button"
+      data-ui-bridge-id={fleetDeviceCreateId(deviceId)}
+      onClick={() => void onCreate(deviceId, deviceLabel)}
+      disabled={btn.disabled || pending}
+      aria-disabled={btn.disabled || pending}
+      title={
+        btn.reason ??
+        (pending
+          ? "Creating — minting a grant, waiting for the remote runner to spawn, then attaching"
+          : `Open a NEW terminal on ${deviceLabel}. That machine picks the working directory ` +
+            `from its own allowed list; this one never sends a path.`)
+      }
+      className={
+        "flex items-center gap-1 shrink-0 px-1.5 py-0.5 rounded text-[10px] " +
+        "bg-[#9ece6a]/15 text-[#9ece6a] hover:bg-[#9ece6a]/30 transition-colors " +
+        "disabled:opacity-40 disabled:cursor-not-allowed " +
+        (className ?? "")
+      }
+    >
+      {pending ? (
+        <div className="w-2.5 h-2.5 border-2 border-[#9ece6a] border-t-transparent rounded-full animate-spin" />
+      ) : (
+        <Plus className="w-2.5 h-2.5" />
+      )}
+      {pending ? "Creating…" : "New terminal"}
+    </button>
+  );
+}
+
+/**
+ * What a create ANSWERED with, rendered inline and kept until the next attempt.
+ *
+ * **The refusal is the deliverable here, not the success.** `accept_remote_create`
+ * is off on every device until someone opts in, so the first use of the button
+ * against any target is refused — by design, not by fault. This panel therefore
+ * renders the refusing party's own explanation plus the concrete steps that
+ * change it, and says separately when a terminal WAS spawned that this window
+ * is not showing.
+ */
+function RemoteCreateOutcome({
+  deviceId,
+  state,
+  onRetry,
+}: {
+  deviceId: string;
+  state: DeviceCreateState | undefined;
+  onRetry: () => void;
+}) {
+  if (!state || state.pending) return null;
+  if (state.refusal) {
+    const r = state.refusal;
+    return (
+      <div
+        data-ui-bridge-id={fleetDeviceCreateErrorId(deviceId)}
+        data-remote-create-code={r.code}
+        data-remote-create-stage={r.stage}
+        role="alert"
+        className="px-3 py-1.5 border-b border-[#2a2d3d] bg-[#f7768e]/5 text-[10px] break-words"
+      >
+        <div className="flex items-start gap-1.5">
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0 text-[#f7768e]" />
+          <div className="min-w-0">
+            <div className="text-[#f7768e] font-medium">{r.headline}</div>
+            <div className="mt-0.5 text-[#a9b1d6]">{r.explanation}</div>
+            {r.remedy.length > 0 && (
+              <ul className="mt-1 space-y-0.5 text-[#c0caf5] list-disc pl-3.5">
+                {r.remedy.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ul>
+            )}
+            {r.strandedTerminalId && (
+              <div className="mt-1 text-[#e0af68]">
+                A terminal ({r.strandedTerminalId}) IS running on that machine and is not shown
+                here. Retrying creates another one.
+              </div>
+            )}
+            <div className="mt-1 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={onRetry}
+                className="px-1.5 py-0.5 rounded bg-[#2a2d3d] text-[#c0caf5] hover:bg-[#3a3d4d] transition-colors"
+              >
+                Try again
+              </button>
+              {r.code && <span className="text-[#565f89]">code: {r.code}</span>}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (state.openedId) {
+    return (
+      <div
+        data-ui-bridge-id={`terminal.fleet-device-create-open.${deviceId}`}
+        className="px-3 py-1 border-b border-[#2a2d3d] text-[10px] text-[#9ece6a]"
+      >
+        Created and attached — tab open on this page.
+      </div>
+    );
+  }
+  return null;
+}
+
 const SELECT_CLASS =
   "min-w-0 flex-1 text-[10px] bg-[#1a1b26] border border-[#2a2d3d] rounded px-1 py-0.5 " +
   "text-[#a9b1d6] focus:outline-none focus:border-[#7aa2f7]/50";
@@ -265,6 +403,9 @@ export function FleetSessionPicker() {
 
   const { pageId, setActiveId } = useTerminalSession();
   const [attachState, setAttachState] = useState<Record<string, RowAttachState>>({});
+  /** Per-DEVICE create state. Keyed by device id: the action belongs to the
+   * group header, not to any one session row. */
+  const [createState, setCreateState] = useState<Record<string, DeviceCreateState>>({});
 
   const clearFilters = useCallback(() => {
     setServer(DEFAULT_FLEET_SERVER_FILTER);
@@ -302,6 +443,48 @@ export function FleetSessionPicker() {
       }
     },
     [pageId, setActiveId],
+  );
+
+  /**
+   * "New terminal" on a device group — the CREATE half of parity with a headed
+   * runner (Phase 5). One operator action covers the whole flow: the runner
+   * mints a single-use create grant from coord, presents it through the relay,
+   * the TARGET picks the working directory out of its own configuration and
+   * registers the new PTY as a coord session, and this side then mints an
+   * attach grant for that session and opens the tab — so the operator ends up
+   * IN the terminal rather than being told one was made.
+   *
+   * The caller supplies no path and no repo: those are the target's to choose,
+   * and a caller-chosen working directory is the hole this plan's D2 closed.
+   */
+  const createRemote = useCallback(
+    async (deviceId: string, deviceLabel: string) => {
+      const set = (patch: Partial<DeviceCreateState>) =>
+        setCreateState((prev) => ({
+          ...prev,
+          [deviceId]: { ...(prev[deviceId] ?? IDLE_DEVICE_CREATE), ...patch },
+        }));
+      set({ pending: true, refusal: null, openedId: null });
+      try {
+        const info = await invoke<RemoteTerminalInfoWire>("terminal_create_remote", {
+          deviceId,
+          deviceLabel,
+          title: null,
+          // The target offers a SET of roots and answers with its own default.
+          // Naming a key is the most a caller may do, and this action does not.
+          workingDirKey: null,
+          intentRepo: null,
+          pageId: pageId !== "default" ? pageId : null,
+        });
+        set({ pending: false, openedId: info.id });
+        setActiveId(info.id);
+        // The new session exists on that device now; the list should show it.
+        void refresh();
+      } catch (err) {
+        set({ pending: false, refusal: describeRemoteCreateFailure(err) });
+      }
+    },
+    [pageId, refresh, setActiveId],
   );
 
   const remoteCount = visible.filter((s) => !s.isCallerDevice).length;
@@ -607,6 +790,32 @@ export function FleetSessionPicker() {
             ) : (
               <>
                 {emptyRead.message}
+                {/* A device pinned by id that served no rows renders NO group,
+                    so the create action above is unreachable — and that is
+                    precisely the case this feature exists for: a headless
+                    runner with nothing running on it yet. Offer it here. */}
+                {appliedQuery?.deviceId && isLikelyDeviceId(appliedQuery.deviceId) && (
+                  <div className="mt-3 text-left">
+                    <RemoteCreateButton
+                      deviceId={appliedQuery.deviceId}
+                      deviceLabel={`device ${appliedQuery.deviceId.slice(0, 8)}`}
+                      isCallerDevice={false}
+                      state={createState[appliedQuery.deviceId]}
+                      onCreate={createRemote}
+                      className="mx-auto"
+                    />
+                    <RemoteCreateOutcome
+                      deviceId={appliedQuery.deviceId}
+                      state={createState[appliedQuery.deviceId]}
+                      onRetry={() =>
+                        void createRemote(
+                          appliedQuery.deviceId as string,
+                          `device ${(appliedQuery.deviceId as string).slice(0, 8)}`,
+                        )
+                      }
+                    />
+                  </div>
+                )}
                 {emptyRead.offerClear && (
                   <button
                     data-ui-bridge-id={FLEET_PICKER_CLEAR_FILTERS_EMPTY_ID}
@@ -698,7 +907,24 @@ export function FleetSessionPicker() {
                   <span className="text-[10px] text-[#565f89]">
                     {g.sessions.length} session{g.sessions.length !== 1 ? "s" : ""}
                   </span>
+                  <div className="flex-1" />
+                  {/* CREATE (Phase 5). A per-DEVICE action, so it lives on the
+                      group header — the per-tab affordances belong in
+                      RemoteTabControls and a per-session row cannot express
+                      "make a new one here". */}
+                  <RemoteCreateButton
+                    deviceId={g.deviceId}
+                    deviceLabel={g.label}
+                    isCallerDevice={g.isCallerDevice}
+                    state={createState[g.deviceId]}
+                    onCreate={createRemote}
+                  />
                 </div>
+                <RemoteCreateOutcome
+                  deviceId={g.deviceId}
+                  state={createState[g.deviceId]}
+                  onRetry={() => void createRemote(g.deviceId, g.label)}
+                />
 
                 {g.sessions.map((s) => {
                   const btn = attachButtonState(s, response?.deviceIdentityColumnsPresent);
