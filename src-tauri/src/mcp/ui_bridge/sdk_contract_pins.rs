@@ -121,13 +121,13 @@ fn lf(src: &str) -> String {
 
 /// Count route entries the way both readers must agree on: from the
 /// `UI_BRIDGE_ROUTES` marker onward, so literals appearing earlier in the
-/// file are not counted. (Slicing FROM the marker rather than after it
-/// cannot change the count: the marker holds no `path: '`, and no match
-/// can straddle the boundary, since every suffix of `UI_BRIDGE_ROUTES`
-/// starts uppercase and `path` does not.) Shared so the default read and the override validation
-/// cannot drift — they previously used the same threshold over different
-/// text, and a rename of the scraped literal would have changed one
-/// silently.
+/// file are not counted. (Slicing FROM the marker rather than after it cannot
+/// change the count: `UI_BRIDGE_ROUTES` contains no `p` at all, so no
+/// occurrence of `path: '` can begin inside it — neither wholly contained nor
+/// straddling the boundary — and the two slices therefore match identically.)
+/// Shared so the default read and the override validation cannot drift — they
+/// previously used the same threshold over different text, and a rename of the
+/// scraped literal would have changed one silently.
 fn count_routes(src: &str) -> usize {
     match src.find("UI_BRIDGE_ROUTES") {
         Some(i) => src[i..].matches("path: '").count(),
