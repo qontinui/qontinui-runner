@@ -55,6 +55,12 @@
 #   $QONTINUI_RUNNER_URL  points L4's mint at a dead port.
 #   $COORD_HTTP_URL       points L3/L4's bearer doors at a dead port, so a
 #                         credential that somehow resolves cannot reach coord.
+#   $QONTINUI_WEB_HTTP_URL points L6 -- the WEB host, a second remote host with
+#                         its own variable -- at a dead port. $COORD_HTTP_URL
+#                         does not reach it: from the day L6 landed
+#                         (qontinui-claude-config#888) until this line, every
+#                         case sent an anonymous GET to production
+#                         api.qontinui.io while this header claimed hermeticity.
 #
 # The RUNNER_URL line is belt; the COORD_HTTP_URL line is braces, and the braces
 # are there because the belt silently broke once. Until 2026-08-29 coord-revive
@@ -115,6 +121,7 @@ run_case() {
   out="$(cd "$proj" && HOME="$home" USERPROFILE="$home" CLAUDE_CONFIG_DIR="" \
         QONTINUI_ROOT="$proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
         COORD_HTTP_URL="http://127.0.0.1:1" \
+        QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
         COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
         bash "$SCRIPT" 2>&1)"
 
@@ -340,6 +347,7 @@ inv_run() {  # <outfile> -> prints "<exit> <verdict line>", full output to <outf
        CLAUDE_CONFIG_DIR="" \
        QONTINUI_ROOT="$inv_dir/proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
        COORD_HTTP_URL="http://127.0.0.1:1" \
+       QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
        COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
        bash "$SCRIPT" 2>/dev/null)"
   rc=$?
@@ -438,6 +446,7 @@ else
             CLAUDE_CONFIG_DIR="" \
             QONTINUI_ROOT="$wt_root" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
             COORD_HTTP_URL="http://127.0.0.1:1" \
+            QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
             COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
             bash "$SCRIPT" 2>&1)"
   # $wt_key, NOT $wt_root/main. The comment above worked out that git and mktemp
@@ -513,6 +522,7 @@ cfg_run() {  # <claude-config-dir value>
      CLAUDE_CONFIG_DIR="$1" \
      QONTINUI_ROOT="$cfg_proj" QONTINUI_RUNNER_URL="http://127.0.0.1:1" \
      COORD_HTTP_URL="http://127.0.0.1:1" \
+     QONTINUI_WEB_HTTP_URL="http://127.0.0.1:1" \
      COORD_AGENT_JWT="" COORD_DEVICE_JWT="" \
      bash "$SCRIPT" 2>&1)
 }
