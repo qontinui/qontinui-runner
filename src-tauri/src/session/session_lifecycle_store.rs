@@ -3483,6 +3483,50 @@ pub fn classify(
     base
 }
 
+/// The `close_reason` a [`PollAction::Close`] verdict should actually be
+/// recorded under, given the record's last restore outcome.
+///
+/// ## Why `Close` alone is not enough to pick `"poll-dead"`
+///
+/// `classify`'s `Close` verdict means "a live shell went idle with no Claude
+/// present for the full debounce" — true both for a real conversation that
+/// ended AND for a bare shell that [`RESTORE_TIER_TERMINAL_ONLY`] already
+/// established can never host one (a confirmed session with no transcript, or
+/// a terminal-only-tier provider — see `classifyRestoreAction` on the
+/// frontend, `useTerminalInitialization.ts`). The two cases must not share a
+/// close reason: `"poll-dead"` is what [`SessionLifecycleStore::
+/// restorable_records`] grants grace to (`RESTORABLE_POLL_DEAD_MS`), which is
+/// exactly right for a session that might come back and exactly wrong for a
+/// tile that was already restored honestly empty. Recording the latter as
+/// `"poll-dead"` hands the *next* restore pass the same unresumable record,
+/// which recreates the same blank terminal, which idles out the same way —
+/// an unbounded cycle of empty panes, each one costing a `terminal_create`
+/// call (and its resource-guard check) on every first activation of the page,
+/// with nothing ever actually restored.
+///
+/// ## Why this is a separate function rather than a `classify` arm
+///
+/// `classify` is deliberately kept narrow (see the `never-confirmed` guard's
+/// own comment above, and `classify_never_confirmed_leaves_other_arms_intact`
+/// — a 2026-09-04 vet already refused widening `classify` itself for a
+/// related worker-retirement case). This reads `restore_tier`, a field
+/// `classify` never touches and has no other reason to accept; keeping the
+/// decision here, downstream of the verdict, leaves `classify`'s contract
+/// untouched. Pure + exported so the mapping is unit-testable without the
+/// poll loop.
+///
+/// Any reason other than `"poll-dead"` / `"pty-exit"` is automatically
+/// excluded from `restorable_records`'s grace window (it matches those two
+/// strings by name and falls through to "not restorable" otherwise), so
+/// picking a new honest reason here needs no matching change there.
+pub fn close_reason_for_dead_shell(restore_tier: Option<&str>) -> &'static str {
+    if restore_tier == Some(RESTORE_TIER_TERMINAL_ONLY) {
+        "terminal-only-idle"
+    } else {
+        "poll-dead"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6377,6 +6421,51 @@ mod tests {
             ),
             PollAction::Skip,
         );
+    }
+
+    /// The exact observed shape: a page whose restore already landed several
+    /// records `terminal-only` (confirmed, no transcript) recreates a blank
+    /// terminal for each on every first activation; each one idles out and
+    /// re-classifies `Close`. Before this fix that closed `"poll-dead"`
+    /// (restorable), handing the next restore pass the identical unresumable
+    /// record and recreating the identical blank terminal — an unbounded
+    /// "many panes, no sessions" accumulation, and (on a machine near the
+    /// thread ceiling) a burst of resource-guard refusals from one tab click,
+    /// one per phantom pane.
+    #[test]
+    fn close_reason_for_dead_shell_retires_terminal_only_tiles_non_restorably() {
+        assert_eq!(
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            "terminal-only-idle",
+        );
+        // `restorable_records` only grants grace to "poll-dead" / "pty-exit" —
+        // pin that this reason is neither, so the fix does not also require
+        // touching that allowlist.
+        assert_ne!(
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            "poll-dead"
+        );
+        assert_ne!(
+            close_reason_for_dead_shell(Some(RESTORE_TIER_TERMINAL_ONLY)),
+            "pty-exit"
+        );
+    }
+
+    /// The guard stays narrow: every OTHER restore tier (a landed resume, a
+    /// still-in-flight/failed restore, or no restore ever recorded) is a
+    /// record that might genuinely still be alive right now — those must keep
+    /// closing `"poll-dead"` so a real dead session stays restorable.
+    #[test]
+    fn close_reason_for_dead_shell_leaves_other_tiers_as_poll_dead() {
+        assert_eq!(
+            close_reason_for_dead_shell(Some(RESTORE_TIER_RESUMED)),
+            "poll-dead"
+        );
+        assert_eq!(
+            close_reason_for_dead_shell(Some(RESTORE_TIER_FAILED)),
+            "poll-dead"
+        );
+        assert_eq!(close_reason_for_dead_shell(None), "poll-dead");
     }
 
     /// The regression that would have failed on runner#871.

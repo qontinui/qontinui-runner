@@ -4035,7 +4035,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     use std::collections::HashMap as StdHashMap;
                     use std::time::Duration;
 
-                    use session::session_lifecycle_store::{classify, PollAction, WorkerPlane};
+                    use session::session_lifecycle_store::{
+                        classify, close_reason_for_dead_shell, PollAction, WorkerPlane,
+                    };
 
                     // Reference instant for `claude_present_in_inclusive_subtree`'s
                     // PID-reuse guard: this primary's own boot time (captured once,
@@ -4405,12 +4407,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                                     );
                                 }
                                 PollAction::Close => {
+                                    // A bare shell whose last restore already
+                                    // landed `terminal-only` never hosted a
+                                    // conversation in this generation and never
+                                    // will; closing it `"poll-dead"` (restorable)
+                                    // would hand the next restore pass the same
+                                    // unresumable record, recreating the same
+                                    // blank terminal forever. See
+                                    // `close_reason_for_dead_shell`.
+                                    let reason =
+                                        close_reason_for_dead_shell(rec.restore_tier.as_deref());
                                     poll_lifecycle_store
-                                        .record_close(&rec.claude_session_id, "poll-dead");
+                                        .record_close(&rec.claude_session_id, reason);
                                     consecutive_dead.remove(&rec.claude_session_id);
                                     consecutive_no_match.remove(&rec.claude_session_id);
                                     tracing::info!(
                                         claude_session = %rec.claude_session_id,
+                                        reason = %reason,
                                         "session lifecycle poll: closing dead session"
                                     );
                                 }
