@@ -466,6 +466,43 @@ classify() {
           echo "CREDENTIAL_REFRESHING (retry-safe - proxy up, withholding while its device JWT refreshes)"; return ;;
         *COORD_MCP_PROXY_UNAUTHORIZED*)
           echo "$unauth"; return ;;
+        *COORD_MCP_PROXY_METHOD_NOT_ALLOWED*)
+          # A `-32601` from the proxy has three causes -- stale binary, drift,
+          # deliberate -- and since plan 2026-09-03-coord-mcp-403-names-its-own-cause
+          # the refusal NAMES which one in `data.cause` (`stale_binary` | `drift`
+          # | `deliberate` | `unknown`; `method_not_allowed` for a refused
+          # METHOD) with a one-sentence `data.remedy`. Print exactly what the
+          # body carries: the `-32601` posture discloses nothing about coord's
+          # upstream grant, and neither does this verdict. A runner built before
+          # that plan emits only `data.code`; then the cause is UNSTATED -- not
+          # "drift", not "boundary" -- and the reader runs the by-hand lookups
+          # (GET /coord-mcp/tool-policy, /health buildDrift) instead.
+          local mna_cause mna_remedy
+          if [ "$JSON_READER" = jq ]; then
+            mna_cause=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .cause?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r')  # envelope-ok: reads the typed `cause` token the refusal body carries; an absent field is "" and prints as UNSTATED, never as a default cause
+            mna_remedy=$(printf '%s' "$body" | jq -r '((.error? | objects | .data? | objects | .remedy?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n')  # envelope-ok: same typed read for the one-sentence `remedy`
+          else
+            mna_cause=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: the JSON-RPC error data object; a non-object reads as absent, never as a value
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' cause 2>/dev/null | tr -d '\r')
+            mna_remedy=$(printf '%s' "$body" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+e=d.get("error") if isinstance(d,dict) else None
+x=e.get("data") if isinstance(e,dict) else None  # envelope-ok: same typed read for the one-sentence `remedy`, python arm
+v=x.get(sys.argv[1]) if isinstance(x,dict) else None
+print(v if isinstance(v,str) else "")' remedy 2>/dev/null | tr -d '\r\n')
+          fi
+          if [ -n "$mna_cause" ]; then
+            echo "METHOD_NOT_ALLOWED (cause=$mna_cause remedy=${mna_remedy:-unstated})"
+          else
+            echo "METHOD_NOT_ALLOWED (cause=unstated (runner build predates the discriminator - read GET /coord-mcp/tool-policy and buildDrift))"
+          fi
+          return ;;
       esac ;;
   esac
   case "$code" in
