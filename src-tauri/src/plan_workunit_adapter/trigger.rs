@@ -265,26 +265,68 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
     }
 }
 
+/// What one [`scan_plan_dir`] walk produced — the parsed units, and whether the
+/// walk was **complete**.
+///
+/// The flag exists because an empty (or short) `units` is otherwise
+/// indistinguishable between *"the directory holds nothing"* and *"the
+/// directory could not be read"* — the `silent-empty-is-unknown` shape. Every
+/// consumer that reasons about ABSENCE (today: the disappeared-slug detector,
+/// [`newly_disappeared_slugs`]) must gate on `complete`; a consumer that only
+/// reasons about what it FOUND (the reconcile, the archive stamp) may ignore it,
+/// because a short scan pushes less rather than concluding more.
+#[derive(Debug)]
+pub struct PlanDirScan {
+    pub units: Vec<ParsedWorkUnit>,
+    /// `true` **iff** the directory listing succeeded AND every entry it
+    /// yielded was resolved AND every `*.md` among them was read. A failed
+    /// `read_dir`, a failed `DirEntry`, or a single `read_to_string` failure
+    /// (an EACCES, a file swapped out mid-walk, a non-UTF-8 body) all make it
+    /// `false` — the PARTIAL read is the nastier shape, because the vector
+    /// still looks plausible.
+    pub complete: bool,
+}
+
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
-/// matching coord's `walk_root`). IO errors on individual files are logged and
-/// skipped; a missing dir yields an empty vec.
+/// matching coord's `walk_root`), reporting whether the walk was COMPLETE.
+/// IO errors on individual files are logged and skipped; a missing dir yields
+/// an empty vec. Both of those clear [`PlanDirScan::complete`].
 ///
 /// The absolute path is still what is OPENED and what is logged on an IO
 /// error; only the path RECORDED on the parsed unit is made relative — see
 /// [`relative_source_path`].
-pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
+pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), error = %e, "plan adapter: cannot read plans dir");
-            return Vec::new();
+            return PlanDirScan {
+                units: Vec::new(),
+                complete: false,
+            };
         }
     };
     // Resolved ONCE per scan, not per file: it walks the ancestor chain
     // looking for `.git`, and every entry in this directory shares the answer.
     let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // A per-ENTRY failure: the listing started, but this name could
+                // not be resolved. `flatten()` used to drop it silently, which
+                // is exactly how a short read passed for an empty directory.
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "plan adapter: cannot read a plans-dir entry; scan is PARTIAL"
+                );
+                complete = false;
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
@@ -301,10 +343,23 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             }
             Err(e) => {
                 tracing::warn!(path = %path_str, error = %e, "plan adapter: cannot read plan file");
+                complete = false;
             }
         }
     }
-    out
+    PlanDirScan {
+        units: out,
+        complete,
+    }
+}
+
+/// [`scan_plan_dir`], for a caller that only reasons about what was FOUND.
+///
+/// **Never call this from a consumer that reasons about ABSENCE** — the
+/// discarded `complete` flag is the only thing separating "nothing is there"
+/// from "nothing could be read".
+pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
+    scan_plan_dir(dir, conv).units
 }
 
 /// Why a push was retired for the life of this process — **and how broadly**.
@@ -1023,6 +1078,13 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
 /// The caller only *warns* on the result — the work unit is left untouched.
 /// Terminal state is owned by coord's derive engine; the adapter must never
 /// push `shipped`/`archived` to fill the gap (a second-writer race).
+///
+/// **The caller MUST establish that both scans were COMPLETE before calling
+/// this** ([`PlanDirScan::complete`]). This function is pure set arithmetic: it
+/// cannot tell a directory that holds nothing from one that could not be read,
+/// and on the second it reports the entire corpus disappeared AND poisons
+/// `warned`, which is warn-once per process — permanent blindness from one
+/// transient IO fault. See the guard in `LoopState::tick`.
 pub fn newly_disappeared_slugs(
     known: &HashSet<String>,
     active_slugs: &HashSet<String>,
@@ -1255,20 +1317,29 @@ impl LoopState {
         // the scan duration. That is the mechanism behind a 20s keepalive firing
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
-        let units = {
+        let active_scan = {
             let dir = dir.clone();
             let conv = self.conv.clone();
-            match tokio::task::spawn_blocking(move || read_plan_dir(&dir, &conv)).await {
+            match tokio::task::spawn_blocking(move || scan_plan_dir(&dir, &conv)).await {
                 Ok(u) => u,
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        "plan adapter: plans-dir scan task failed; skipping this cycle"
+                        "plan adapter: plans-dir scan task failed; this cycle scanned NOTHING"
                     );
-                    Vec::new()
+                    // NOT "skipping this cycle" — the cycle continues. What an
+                    // empty-and-INCOMPLETE scan must not do is let any consumer
+                    // read the emptiness as absence; `complete: false` is what
+                    // stops that.
+                    PlanDirScan {
+                        units: Vec::new(),
+                        complete: false,
+                    }
                 }
             }
         };
+        let active_scan_complete = active_scan.complete;
+        let units = active_scan.units;
         let summary = reconcile_once(
             &units,
             &mut self.last_applied,
@@ -1300,22 +1371,34 @@ impl LoopState {
         // the archive slug set is empty — a slug that vanishes from the active
         // dir with no archive configured is still surfaced as disappeared.
         // Same reasoning as the active scan above: off the single worker.
-        let archived = match archive_dir {
+        let archive_scan = match archive_dir {
             Some(a) => {
                 let conv = self.conv.clone();
-                match tokio::task::spawn_blocking(move || read_plan_dir(&a, &conv)).await {
+                match tokio::task::spawn_blocking(move || scan_plan_dir(&a, &conv)).await {
                     Ok(u) => u,
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "plan adapter: archive-dir scan task failed; skipping this cycle"
+                            "plan adapter: archive-dir scan task failed; this cycle scanned \
+                             NOTHING from the archive"
                         );
-                        Vec::new()
+                        PlanDirScan {
+                            units: Vec::new(),
+                            complete: false,
+                        }
                     }
                 }
             }
-            None => Vec::new(),
+            // No archive dir configured: there is nothing to read, so the empty
+            // set is the WHOLE truth about the archive — a complete scan of
+            // nothing, not a failed scan.
+            None => PlanDirScan {
+                units: Vec::new(),
+                complete: true,
+            },
         };
+        let archive_scan_complete = archive_scan.complete;
+        let archived = archive_scan.units;
         if !archived.is_empty() {
             let asum = reconcile_archive_once(&archived, sink, metrics).await;
             tracing::info!(
@@ -1336,17 +1419,45 @@ impl LoopState {
         // status was pushable. See [`LoopState::seen_slugs`] for why the
         // apply-memory is the wrong input here.
         self.seen_slugs.extend(active_slugs.iter().cloned());
-        for slug in newly_disappeared_slugs(
-            &self.seen_slugs,
-            &active_slugs,
-            &archive_slugs,
-            &mut self.warned_disappeared,
-        ) {
+        // **The detector may only run on a COMPLETE picture of both dirs.**
+        //
+        // "Disappeared" is a claim about ABSENCE, and both scans report absence
+        // and failure with the same empty/short vector. Run unguarded, a single
+        // transient fault — a `read_dir` refused while a consolidation swaps the
+        // directory, an EACCES, a UNC/WSL hiccup, one unreadable file — makes
+        // every slug in `seen_slugs` look vanished. That is not merely a burst
+        // of false WARNs: `newly_disappeared_slugs` INSERTS each one into
+        // `warned_disappeared`, which is warn-once **per process**, so the
+        // detector goes permanently blind for the whole corpus — and a restart
+        // to clear it is forbidden by served policy `production-and-cost`
+        // `runner-lifecycle`.
+        //
+        // The cheap `active_slugs.is_empty()` guard is NOT enough: it misses the
+        // partial read, where the vector is non-empty and simply short. Only the
+        // scan's own `complete` flag distinguishes them.
+        if active_scan_complete && archive_scan_complete {
+            for slug in newly_disappeared_slugs(
+                &self.seen_slugs,
+                &active_slugs,
+                &archive_slugs,
+                &mut self.warned_disappeared,
+            ) {
+                tracing::warn!(
+                    slug = %slug,
+                    "plan adapter: work-unit slug disappeared from the active dir and is absent \
+                     from the archive dir; leaving the unit untouched (terminal state is owned by \
+                     coord's derive engine — the adapter never pushes shipped/archived)"
+                );
+            }
+        } else {
+            // One line per CYCLE, not per slug — the per-fault detail was
+            // already logged by `scan_plan_dir` itself.
             tracing::warn!(
-                slug = %slug,
-                "plan adapter: work-unit slug disappeared from the active dir and is absent \
-                 from the archive dir; leaving the unit untouched (terminal state is owned by \
-                 coord's derive engine — the adapter never pushes shipped/archived)"
+                active_scan_complete,
+                archive_scan_complete,
+                known_slugs = self.seen_slugs.len(),
+                "plan adapter: disappeared-slug detection SKIPPED this cycle — a directory scan \
+                 was incomplete, so an absent slug is UNKNOWN rather than gone"
             );
         }
     }
@@ -2118,10 +2229,32 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         statuses: Mutex<HashMap<String, String>>,
+        /// Transitions that SUCCEEDED. Deliberately incremented after the
+        /// `deny_status` check, because it doubles as "what coord now holds".
+        ///
+        /// **Never assert on this to prove a request was NOT SENT.** A denied
+        /// transition leaves it unmoved, so an `assert_eq!(transitions, N)` is
+        /// blind to exactly the request a write-suppression fix exists to
+        /// suppress — use [`FakeSink::transition_attempts`].
         transitions: Mutex<u64>,
+        /// Every `transition` call that reached the sink, counted BEFORE the
+        /// deny check — the door-level twin of `status_upsert_calls`.
+        ///
+        /// This is the ONLY counter that can see a re-issued DENIED transition,
+        /// and `Transition` is the one door a permanent retirement actually
+        /// suppresses: for a coord-derived status `settable_status` already
+        /// withdraws the word from `UpsertWithStatus`, so the retirement's
+        /// forcing of `action = RefreshOnly` is load-bearing here and nowhere
+        /// else. Asserting on `transitions` instead let that forcing be deleted
+        /// with every test still green.
+        transition_attempts: Mutex<u64>,
         /// Configured `by_actor` of every unit's latest history row (default
         /// None ⇒ no history ⇒ no owner to defer to).
         last_actor: Option<String>,
+        /// Total `last_actor` reads. Paired with `status_reads`, this is what
+        /// makes "a stable deferral costs TWO reads per cycle per slug"
+        /// measurable rather than asserted in prose.
+        last_actor_calls: Mutex<u64>,
         deps_behavior: DepsBehavior,
         /// Slug whose `current_status` read should hard-error, so the backfill's
         /// per-unit failure path is reachable without live HTTP.
@@ -2186,6 +2319,7 @@ mod tests {
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            *self.last_actor_calls.lock().unwrap() += 1;
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
@@ -2244,6 +2378,9 @@ mod tests {
             Ok(())
         }
         async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
+            // BEFORE the deny check: a refused transition is still a request
+            // that went out. See `transition_attempts`.
+            *self.transition_attempts.lock().unwrap() += 1;
             if let Some((denied, http, deny_body)) = &self.deny_status {
                 if body.to_status == *denied {
                     return Err(crate::plan_workunit_adapter::push::CoordWriteError {
@@ -3023,6 +3160,17 @@ mod tests {
         );
         let status_writes_after_denial = *sink.status_upsert_calls.lock().unwrap();
         let reads_after_denial = *sink.status_reads.lock().unwrap();
+        // The denial cost exactly one transition ATTEMPT — the request coord
+        // refused. `transitions` cannot see it (the refusal returns before the
+        // increment), which is why the suppression below is asserted on the
+        // attempt counter.
+        let attempts_after_denial = *sink.transition_attempts.lock().unwrap();
+        assert_eq!(attempts_after_denial, 1);
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "...and none of them SUCCEEDED"
+        );
 
         // 3. Still `shipped`: the identical request is not re-issued.
         let s3 = reconcile_once(
@@ -3041,7 +3189,11 @@ mod tests {
             status_writes_after_denial,
             "a still-`shipped` file must issue NO further status write"
         );
-        assert_eq!(*sink.transitions.lock().unwrap(), 0, "...nor a transition");
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            attempts_after_denial,
+            "...nor a transition — asserted on the ATTEMPT counter, the only one              that can see a re-issued DENIED request"
+        );
         assert_eq!(
             *sink.status_reads.lock().unwrap(),
             reads_after_denial,
@@ -3082,6 +3234,7 @@ mod tests {
         //    refused word costs no status write either.
         let status_writes_after_demotion = *sink.status_upsert_calls.lock().unwrap();
         let transitions_after_demotion = *sink.transitions.lock().unwrap();
+        let attempts_after_demotion = *sink.transition_attempts.lock().unwrap();
         let s5 = reconcile_once(
             &[unit("a", "shipped")],
             &mut mem,
@@ -3102,6 +3255,11 @@ mod tests {
             *sink.transitions.lock().unwrap(),
             transitions_after_demotion,
             "...by the transition door as well as the upsert one"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            attempts_after_demotion,
+            "...and the refused request is not even ATTEMPTED again"
         );
         assert_eq!(
             metrics.snapshot().retired_permanent_total,
@@ -3130,7 +3288,12 @@ mod tests {
     ///
     /// Neuter check: restore the `continue` in `reconcile_once`'s
     /// `PermanentForStatus` arm and the provenance assertions fail — the later
-    /// edits never reach the sink at all.
+    /// edits never reach the sink at all. Second neuter check, in the other
+    /// direction: delete `if status_retired { action = PushAction::RefreshOnly; }`
+    /// from `push_work_unit_with_status_write` and the `transition_attempts`
+    /// assertion fails (1 -> 3) — every OTHER assertion here stays green,
+    /// because a denied transition still emits the status-less provenance
+    /// upsert first and still classifies as `retired_permanent`.
     #[tokio::test]
     async fn a_permanently_retired_pair_still_pushes_its_provenance_every_cycle() {
         let logs = CapturedLogs::start();
@@ -3187,6 +3350,10 @@ mod tests {
         let status_writes = *sink.status_upsert_calls.lock().unwrap();
         let reads = *sink.status_reads.lock().unwrap();
         let transitions = *sink.transitions.lock().unwrap();
+        // The refused request itself. `transitions` stayed 0 through the
+        // denial, so only this counter can show whether it is re-issued.
+        let transition_attempts = *sink.transition_attempts.lock().unwrap();
+        assert_eq!(transition_attempts, 1, "one attempt, refused");
         let log_at_retirement = logs.text();
 
         // 3. THE POINT. The plan keeps being EDITED while its stamp stays
@@ -3242,6 +3409,18 @@ mod tests {
             transitions,
             "...nor a transition"
         );
+        // THE LOAD-BEARING ASSERTION for the retirement's
+        // `action = PushAction::RefreshOnly` forcing. `Transition` is the ONLY
+        // door that forcing suppresses — `settable_status` already withdraws a
+        // derived word from `UpsertWithStatus` — and a denied transition never
+        // reaches `transitions`, so every assertion above this one is blind to
+        // it. Delete the forcing (keeping `status_write_withdrawn`) and this
+        // climbs to 3 while the rest of the test stays green.
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            transition_attempts,
+            "the permanently-refused transition must not be RE-ISSUED on any              later cycle — not merely fail again"
+        );
         assert_eq!(
             *sink.status_reads.lock().unwrap(),
             reads,
@@ -3275,10 +3454,19 @@ mod tests {
     /// Reporting the OBSERVED REMOTE makes the next cycle a real edge, which
     /// goes through the deferral and the CAS guard.
     ///
+    /// **This test pins the UNOWNED branch only** — `FakeSink::last_actor` is
+    /// `None` here, so the deferral never fires and the file wins on cycle 3.
+    /// The OWNED branch (the dominant one, since a conflict means a non-adapter
+    /// writer moved the unit) reaches a stable DEFERRAL rather than
+    /// convergence, and is pinned separately by
+    /// [`a_conflicted_refresh_defers_stably_when_a_real_actor_owns_the_unit`].
+    /// The property both branches share — and the one this change bought — is
+    /// that the divergence WARN fires once per EVENT instead of once per cycle.
+    ///
     /// Neuter check: report `Some(u.status)` again — cycle 3 emits no
     /// transition and the divergence WARN count climbs with every cycle.
     #[tokio::test]
-    async fn a_conflicted_refresh_converges_instead_of_warning_forever() {
+    async fn a_conflicted_refresh_converges_when_no_real_actor_owns_the_unit() {
         let logs = CapturedLogs::start();
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
@@ -3375,6 +3563,162 @@ mod tests {
             1,
             "the override is announced ONCE — the loop announced it every \
              cycle; got: {}",
+            logs.text()
+        );
+        assert_eq!(
+            metrics.snapshot().conflicts_total,
+            1,
+            "`conflicts_total` stays a divergence signal instead of a tick count"
+        );
+    }
+
+    /// **The OWNED branch of a conflicted refresh is a STABLE DEFERRAL, not
+    /// convergence — and it is the DOMINANT one.**
+    ///
+    /// A conflict means, by definition, that some non-adapter writer moved the
+    /// unit; `is_real_agent_actor` treats every non-adapter non-empty actor as
+    /// an owner, `coord::derive_worker` included. So the ordinary steady state
+    /// of this fleet — file `vetted`, coord DERIVES `shipped` — lands here and
+    /// not in the sibling test above.
+    ///
+    /// What it actually costs, pinned rather than described: the edge is
+    /// re-derived every cycle and deferred every cycle, at TWO reads per cycle
+    /// per slug (one `last_actor`, one `current_status`) plus a
+    /// `deferrals_total` and an `info!`. The old shape paid ONE read, a WARN
+    /// and a `conflicts_total` per cycle. This test exists so that trade is a
+    /// documented steady state rather than an implied "converges".
+    ///
+    /// The property the change actually bought is here too, and it is the one
+    /// worth having: the `file wins (loud override)` WARN fires ONCE, on the
+    /// divergence EVENT, instead of once per cycle forever.
+    ///
+    /// Neuter check: record `Some(u.status)` again in the conflicted
+    /// `RefreshOnly` arm of `push_work_unit_with_status_write` — the memory
+    /// never moves to the observed remote, every cycle re-runs the conflict
+    /// check, and the WARN/`conflicts_total` assertions climb with the cycle
+    /// count. Second neuter check: make `is_real_agent_actor` reject
+    /// `coord::derive_worker` — cycle 3 transitions and the deferral
+    /// assertions fail.
+    #[tokio::test]
+    async fn a_conflicted_refresh_defers_stably_when_a_real_actor_owns_the_unit() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            // coord's own derive worker is a REAL (non-adapter) actor.
+            last_actor: Some("coord::derive_worker".to_string()),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut mem = HashMap::new();
+        let mut deps = HashMap::new();
+        let mut forb = RetiredSlugs::default();
+        let mut forb_deps: HashSet<String> = HashSet::new();
+        let file = [unit("a", "vetted")];
+
+        // 1. First sight of the unit: `UpsertWithStatus`, the one arm the
+        //    deferral never gates, so `vetted` lands even with an owner set.
+        let s1 = reconcile_once(
+            &file,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s1.conflicts, 0);
+        assert_eq!(s1.deferred, 0);
+        assert_eq!(mem.get("a").map(String::as_str), Some("vetted"));
+
+        // 2. coord DERIVES the terminal state out of band — the steady state
+        //    of this corpus.
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+
+        // 3. The file has not moved, so this is a `RefreshOnly`, and the
+        //    conflict check sees the divergence exactly ONCE.
+        let s2 = reconcile_once(
+            &file,
+            &mut mem,
+            &mut deps,
+            &mut forb,
+            &mut forb_deps,
+            &sink,
+            &metrics,
+        )
+        .await;
+        assert_eq!(s2.conflicts, 1, "the divergence is real and is announced");
+        assert_eq!(
+            mem.get("a").map(String::as_str),
+            Some("shipped"),
+            "the memory records what coord HOLDS"
+        );
+
+        // 4. THE POINT. Every later cycle derives the same real edge
+        //    `shipped -> vetted`, reads the owner, and DEFERS. Nothing
+        //    converges; the loop is stable and its cost is fixed.
+        let reads_before = *sink.status_reads.lock().unwrap();
+        let actor_reads_before = *sink.last_actor_calls.lock().unwrap();
+        for cycle in 3..7 {
+            let s = reconcile_once(
+                &file,
+                &mut mem,
+                &mut deps,
+                &mut forb,
+                &mut forb_deps,
+                &sink,
+                &metrics,
+            )
+            .await;
+            assert_eq!(s.transitions, 0, "cycle {cycle}: the owner is deferred to");
+            assert_eq!(s.deferred, 1, "cycle {cycle}: ...and that is counted");
+            assert_eq!(
+                s.conflicts, 0,
+                "cycle {cycle}: the deferral returns before the conflict check"
+            );
+            assert_eq!(
+                mem.get("a").map(String::as_str),
+                Some("shipped"),
+                "cycle {cycle}: a deferral applies nothing, so the memory cannot move                  — which is exactly why the edge is re-derived next cycle"
+            );
+        }
+
+        // The steady state's price, measured: two reads per cycle per slug.
+        assert_eq!(
+            *sink.status_reads.lock().unwrap() - reads_before,
+            4,
+            "one `current_status` per deferred cycle"
+        );
+        assert_eq!(
+            *sink.last_actor_calls.lock().unwrap() - actor_reads_before,
+            4,
+            "...plus one `last_actor` per deferred cycle — TWO reads, not one"
+        );
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "no status was ever overwritten"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            0,
+            "...and none was even attempted — the deferral suppresses the request"
+        );
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("shipped"),
+            "coord keeps the status its own derive worker set"
+        );
+        assert_eq!(metrics.snapshot().deferrals_total, 4);
+
+        // ...and the property the change bought, in the branch where the file
+        // never wins: the override is announced ONCE, on the event.
+        assert_eq!(
+            logs.text().matches("diverged from last-applied").count(),
+            1,
+            "the divergence WARN fires once per EVENT, not once per cycle; got: {}",
             logs.text()
         );
         assert_eq!(
@@ -4484,5 +4828,198 @@ mod tests {
         let mut warned: HashSet<String> = HashSet::new();
         assert!(newly_disappeared_slugs(&known, &active, &archive, &mut warned).is_empty());
         assert!(warned.is_empty());
+    }
+
+    /// **A scan must say whether it was COMPLETE — an empty or short vector
+    /// cannot.**
+    ///
+    /// Three outcomes, and the third is the one a cheap `units.is_empty()`
+    /// guard would miss entirely.
+    #[test]
+    fn a_plan_dir_scan_reports_whether_it_was_complete() {
+        let conv = PlanConvention::operator_default();
+
+        // 1. Healthy.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("2026-01-01-a.md"),
+            "# A\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let scan = scan_plan_dir(dir.path(), &conv);
+        assert_eq!(scan.units.len(), 1);
+        assert!(scan.complete);
+
+        // 2. A failed `read_dir` — empty AND incomplete. The vector alone reads
+        //    identically to an empty directory, which is the whole defect.
+        let gone = scan_plan_dir(Path::new("/definitely/not/a/dir/xyz"), &conv);
+        assert!(gone.units.is_empty());
+        assert!(
+            !gone.complete,
+            "a directory that could not be READ must never read as EMPTY"
+        );
+
+        // 3. PARTIAL: the OS lists the file, `read_to_string` refuses it
+        //    (invalid UTF-8 is the portable spelling of that failure — an
+        //    EACCES or a file swapped out mid-walk reaches the same arm). The
+        //    vector is non-empty and simply SHORT, so only the flag can tell.
+        std::fs::write(dir.path().join("2026-01-02-b.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        let partial = scan_plan_dir(dir.path(), &conv);
+        assert_eq!(
+            partial.units.len(),
+            1,
+            "the readable plan is still returned — a partial scan is not an empty one"
+        );
+        assert!(!partial.complete, "...but the scan is PARTIAL and says so");
+    }
+
+    /// **A failed or PARTIAL active scan must produce ZERO disappearance
+    /// warnings, and must poison nothing.**
+    ///
+    /// `warned_disappeared` is warn-once PER PROCESS. Run on a short scan, the
+    /// detector would warn for every slug it could not see AND insert each into
+    /// that set — so one transient IO fault (an EACCES, a directory swapped by
+    /// a consolidation, a UNC/WSL hiccup) leaves the detector permanently blind
+    /// for the whole corpus, with no way back: served policy
+    /// `production-and-cost` `runner-lifecycle` forbids the restart that would
+    /// clear it.
+    ///
+    /// Cycle 3 is the poisoning half: a slug the PARTIAL cycle could not see,
+    /// and which then genuinely vanishes, must still be surfaced.
+    ///
+    /// Neuter check: drop the `active_scan_complete && archive_scan_complete`
+    /// guard in `LoopState::tick` — cycle 2's zero-warning assertion fails, and
+    /// so does cycle 3's (the slug was already burned).
+    #[tokio::test]
+    async fn a_partial_active_scan_reports_no_disappearance_and_poisons_nothing() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("2026-02-01-a.md");
+        let b = dir.path().join("2026-02-02-b.md");
+        std::fs::write(&a, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        std::fs::write(&b, "# B\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        // 1. Healthy cycle: both slugs are SEEN, so both are candidates.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(state.seen_slugs.len(), 2, "both plans were scanned");
+
+        // 2. `b` becomes unreadable IN PLACE. The directory still lists it and
+        //    the path never changed, so nothing DISAPPEARED — the scan just
+        //    could not read it.
+        std::fs::write(&b, [0xff, 0xfe, 0xfd]).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a PARTIAL scan must claim nothing about absence; got: {}",
+            logs.text()
+        );
+        assert!(
+            state.warned_disappeared.is_empty(),
+            "...and must poison the warn-once memory with nothing"
+        );
+        assert!(
+            logs.text().contains("disappeared-slug detection SKIPPED"),
+            "the skip is stated out loud — a silent skip is the same \
+             absence-is-not-zero shape one layer up; got: {}",
+            logs.text()
+        );
+
+        // 3. THE POISONING HALF. `b` is now GENUINELY deleted and the scan is
+        //    complete again. It must be surfaced — which it cannot be if
+        //    cycle 2 already burned it.
+        std::fs::remove_file(&b).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(
+            logged.contains("2026-02-02-b"),
+            "...naming the slug; got: {logged}"
+        );
+    }
+
+    /// **The ARCHIVE scan gets the same guard — and this is the likelier
+    /// shape.**
+    ///
+    /// The archive set is the only thing that SUPPRESSES a warning, so an
+    /// archive scan that fails on its own false-fires every plan that was
+    /// scanned active and has since been consolidated into the archive — the
+    /// exact case the detector exists for.
+    ///
+    /// Cycle 4 is the poisoning half, as above.
+    ///
+    /// Neuter check: drop `archive_scan_complete` from the guard in
+    /// `LoopState::tick` — cycle 2 warns falsely and cycle 4 then says nothing.
+    #[tokio::test]
+    async fn a_partial_archive_scan_never_false_fires_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let active = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let plan = active.path().join("2026-04-04-consolidated.md");
+        let archived = archive.path().join("2026-04-04-consolidated.md");
+        std::fs::write(&plan, "# C\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_dir: Some(active.path().to_string_lossy().to_string()),
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..PathInputs::default()
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+
+        // 1. Healthy: the plan is seen in the active dir.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(state.seen_slugs.len(), 1);
+
+        // 2. A consolidation moves it into the archive — where THIS cycle
+        //    cannot read it. The slug is absent from both scan RESULTS while
+        //    being present on disk.
+        std::fs::remove_file(&plan).unwrap();
+        std::fs::write(&archived, [0xff, 0xfe, 0xfd]).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "an unreadable ARCHIVE cannot license a disappearance claim; got: {}",
+            logs.text()
+        );
+        assert!(state.warned_disappeared.is_empty(), "nothing poisoned");
+
+        // 3. The archive copy reads fine now: the plan was archived, not lost,
+        //    and must never be warned about at all.
+        std::fs::write(&archived, "# C\n\n> **Status: SHIPPED**\n").unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "an archived plan is not a disappeared one"
+        );
+
+        // 4. THE POISONING HALF. Now it really is gone from both dirs.
+        std::fs::remove_file(&archived).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is still detectable; got: {logged}"
+        );
+        assert!(logged.contains("2026-04-04-consolidated"));
     }
 }

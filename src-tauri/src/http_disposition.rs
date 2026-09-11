@@ -109,7 +109,7 @@ pub enum PostDisposition {
 /// | `status_is_derived` | `(slug, status)` | the file's status changing — `shipped`/`ready` never become settable |
 /// | `self_attestation_forbidden` | `(slug, status, actor)` | a graduation flip, or a token-shape change |
 /// | `owner_unresolved` | `(slug, status)` | *any* actor writing a Free status to that unit (out-of-band) |
-/// | `attester_unresolved` | `(slug, status, actor)` | a device-scoped token |
+/// | `attester_unresolved` | `(slug, status, actor)` | a HOLDER-ISSUED token — a paired device, or an allocation-issued agent credential. A device id ALONE no longer suffices |
 ///
 /// **coord `origin/main` already emits a fifth**, added after this build's list
 /// was written: `independence_declaration_malformed` (`422`, terminality
@@ -144,7 +144,12 @@ pub enum DenialTag {
     /// The unit has no recorded owner, so separation of duties cannot be
     /// evaluated.
     OwnerUnresolved,
-    /// The attester identity could not be resolved from the presented token.
+    /// The attester identity could not be resolved from the presented token —
+    /// it carries no device id, or it is not a credential coord issued to a
+    /// HOLDER. coord's own message is explicit that *"an anonymously minted
+    /// credential-only token IS device-scoped, so re-sending it will not
+    /// help"*: what clears this is a holder-issued credential (a paired device,
+    /// or an allocation-issued agent token), never merely a device-scoped one.
     AttesterUnresolved,
     /// A denial code this build does not recognise, carried **verbatim**.
     ///

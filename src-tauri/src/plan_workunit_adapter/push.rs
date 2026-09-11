@@ -838,11 +838,40 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
             //   and it was a per-cycle LOOP: every later cycle re-read the same
             //   divergence, re-warned `file wins (loud override)`, wrote no
             //   status, and re-recorded `u.status`, so the file never won and
-            //   `conflicts_total` climbed forever. Recording the OBSERVED
-            //   REMOTE instead makes the next cycle's `decide_push` emit
-            //   `Transition { from: remote, to: u.status }` — which goes
-            //   through the agent-owner deferral and the CAS guard, so the file
-            //   wins properly or defers properly, and either way converges.
+            //   `conflicts_total` climbed forever.
+            //
+            //   Recording the OBSERVED REMOTE instead makes the next cycle's
+            //   `decide_push` emit `Transition { from: remote, to: u.status }`,
+            //   which goes through the agent-owner deferral and the CAS guard.
+            //   Where that lands depends on who moved the unit, and only ONE of
+            //   the two branches actually CONVERGES:
+            //
+            //   - **Unowned** (`last_actor` absent, or the adapter itself): the
+            //     transition goes out, the file WINS, and the cycle after it is
+            //     a plain no-op refresh. Converged, once.
+            //   - **Owned** — and this is the DOMINANT branch here, because a
+            //     conflict means by definition that a non-adapter writer moved
+            //     the unit, and [`is_real_agent_actor`] counts every non-adapter
+            //     non-empty actor, `coord::derive_worker` included: the
+            //     transition DEFERS. The file still says `vetted`, coord still
+            //     holds `shipped`, and `applied_status` stays `None` (a deferral
+            //     is a write that did not happen), so the identical edge is
+            //     re-derived next cycle. That is a STABLE LOOP, not convergence:
+            //     a steady state costing TWO reads per cycle per slug (the
+            //     `last_actor` GET, then the deferral's `current_status` GET),
+            //     plus one `deferrals_total` and one `info!` — where the old
+            //     shape paid one GET, one WARN and one `conflicts_total`.
+            //
+            //   The trade is still right, and what pays for it is the WARN, not
+            //   the read count. Deferring to a real owner is the CORRECT
+            //   behaviour — the adapter must not collapse an agent's transition
+            //   back to the system actor, which is the whole point of the
+            //   deferral — and the `file wins (loud override)` WARN now fires
+            //   once per divergence EVENT instead of once per cycle forever,
+            //   which is what keeps `conflicts_total` a divergence signal rather
+            //   than a tick count. `deferred` is a live gauge by design, so the
+            //   steady state reads as exactly what it is.
+            //
             //   Recording `None` would NOT do: that routes the next cycle down
             //   `UpsertWithStatus`, the one arm the deferral never gates.
             //
