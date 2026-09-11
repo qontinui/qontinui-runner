@@ -637,11 +637,12 @@ fn resolve_stable_ref_reply_key_is_pinned_on_both_sides_of_the_boundary() {
 /// goes red, which is the only way a path convention gets noticed at all.
 const SDK_TYPES_RELATIVE: &str = "../../ui-bridge/packages/ui-bridge/src/server/types.ts";
 
-/// Supplies a types.ts for the PARSE assertions when the default path is
-/// absent. It does NOT decide presence — `mod.rs` honours no override, so this
-/// guard reads the default path or the proxy is worthless — but it is
-/// VALIDATED wherever it is set: unreadable or unparseable fails the test,
-/// so a typo cannot sit there doing nothing.
+/// A types.ts this test VALIDATES but never CONSUMES. It does not decide
+/// presence — `mod.rs` honours no override, so this guard reads the default
+/// path or the proxy is worthless — and its contents never reach the default
+/// read's assertions. What it does buy: wherever the variable is set, an
+/// unreadable file, or one declaring no `UI_BRIDGE_ROUTES`, or one yielding
+/// under 100 routes, fails the test — so a typo cannot sit there doing nothing.
 const SDK_TYPES_PATH_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_TYPES";
 
 /// Declares the absence, for the reason line only. It does NOT change any
@@ -676,7 +677,8 @@ const SDK_ABSENT_DECLARED_ENV: &str = "QONTINUI_UI_BRIDGE_SDK_ABSENT";
 /// * the DEFAULT path **unreadable** outside CI → a recorded UNKNOWN on
 ///   stderr, and pass. That is the whole difference from the silent skip:
 ///   unknown must never render as a default;
-/// * `QONTINUI_UI_BRIDGE_SDK_TYPES` set but **unreadable or unparseable** →
+/// * `QONTINUI_UI_BRIDGE_SDK_TYPES` set but **unreadable, or declaring no
+///   `UI_BRIDGE_ROUTES`, or yielding under 100 routes** →
 ///   **FAIL, anywhere, CI or not**, and independently of whether the default
 ///   resolved. An override that silently does nothing is worse than none;
 /// * present but **unparseable** (no `UI_BRIDGE_ROUTES`, or a parse that finds
@@ -696,10 +698,12 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
     // something" while `mod.rs` skipped anyway — defeating the proxy in exactly
     // the way that matters, and quietly.
     //
-    // So the PRESENCE decision below always reads the default path. The
-    // override only supplies a types.ts to run the PARSE assertions against
-    // when the default is absent (local convenience on a worktree that has no
-    // ui-bridge sibling); it can never turn an absent default into a pass.
+    // So the PRESENCE decision below always reads the default path, and the
+    // override is VALIDATED, never CONSUMED: its contents never become `src`,
+    // so it reaches none of the assertions the default read feeds, and it
+    // cannot turn an absent default into a pass. Validation runs wherever the
+    // variable is set — see the block below — not only when the default is
+    // missing.
     let default_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(SDK_TYPES_RELATIVE);
     let override_path = match std::env::var(SDK_TYPES_PATH_ENV) {
         Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p)),
@@ -725,11 +729,22 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
             ov.display(),
             SDK_TYPES_PATH_ENV
         );
+        // Same floor the default read gets. Without it "unparseable" in the
+        // outcomes list above would be broader than the check: an override
+        // holding a one-entry UI_BRIDGE_ROUTES passed while the doc said a
+        // parse finding almost nothing fails.
+        let ov_routes = ov_src.matches("path: '").count();
+        assert!(
+            ov_routes > 100,
+            "{} was supplied via {} and yielded only {ov_routes} route entries \
+             — a parse that finds almost nothing is the same vacuous green as \
+             an absent file, reached a different way",
+            ov.display(),
+            SDK_TYPES_PATH_ENV
+        );
     }
 
-    let path = default_path;
-
-    let src = match std::fs::read_to_string(&path) {
+    let src = match std::fs::read_to_string(&default_path) {
         Ok(s) => s,
         Err(e) => {
             let declared = std::env::var(SDK_ABSENT_DECLARED_ENV).unwrap_or_default() == "1";
@@ -773,7 +788,7 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
                  neither {SDK_TYPES_PATH_ENV} nor {SDK_ABSENT_DECLARED_ENV} changes \
                  this verdict, because the path mod.rs reads is the one that has to \
                  be there.",
-                path.display()
+                default_path.display()
             );
             // NOT `eprintln!`. `cargo test` installs an output capture that
             // swallows the `print!` family for a PASSING test, so an
@@ -787,7 +802,7 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
                 "UNKNOWN sdk_sibling_checkout_is_present_and_parseable: {} unreadable \
                  ({e}); passed because {}. SDK-vs-runner route drift is UNVERIFIED in \
                  this run — that is not the same as verified-clean.",
-                path.display(),
+                default_path.display(),
                 if declared {
                     "the absence is DECLARED"
                 } else {
@@ -806,7 +821,7 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
                 "{} is readable but declares no UI_BRIDGE_ROUTES — the SDK's \
                  route manifest has moved or been renamed, and the drift gate \
                  in mod.rs is now scanning a file that cannot answer it",
-                path.display()
+                default_path.display()
             )
         });
     let array_body = &src[array_start..];
@@ -817,7 +832,7 @@ fn sdk_sibling_checkout_is_present_and_parseable() {
         "only {route_count} route entries found in {} — a parse that finds \
          almost nothing is the same vacuous green as a missing file, reached \
          a different way",
-        path.display()
+        default_path.display()
     );
 
     // The single addition across 0.24.0 -> 0.26.0, and the one route in the
