@@ -328,6 +328,12 @@ mod flywheel_e2e_tests;
 // See plans/2026-05-20-runner-tier-decoupling.md.
 #[cfg(test)]
 mod tier_matrix_tests;
+// Source invariant: every test fn that writes `std::env` holds the ONE shared
+// env lock (`crate::test_env::env_lock()`), so an unlocked writer cannot race a
+// correctly-locked test. Parses `src/**/*.rs` with `syn`.
+// Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
+#[cfg(test)]
+mod env_write_lock_guard;
 // Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
 // fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
 // gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.

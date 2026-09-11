@@ -2752,34 +2752,31 @@ mod tests {
             "re-armed: the same reason recurring later is a NEW outage"
         );
     }
-    /// Serialises the token-variable tests against each other.
+    /// Save every token variable, run `body` with a known-clean environment,
+    /// then restore. Holds the shared env lock throughout.
     ///
     /// The environment is PROCESS-global while `cargo test` runs its cases on a
     /// thread pool, so two tests setting `GITHUB_TOKEN` concurrently read each
-    /// other's writes and fail at random. The lock is the whole fix; it is held
-    /// for the body so save, mutate and restore are one critical section.
-    static TOKEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Save every token variable, run `body` with a known-clean environment,
-    /// then restore. Holds [`TOKEN_ENV_LOCK`] throughout.
+    /// other's writes and fail at random. The lock is the whole fix, and it has
+    /// to be the SHARED one: this used to take a module-local mutex, which
+    /// serialised these token tests against each other and excluded nothing
+    /// else — a sibling holding `crate::test_env::env_lock()` was not kept out,
+    /// so the very race the mutex was added for stayed open. That is the
+    /// two-mutex defect #1401 closed one level up, and one lock must mean the
+    /// same thing everywhere.
+    /// Plan `2026-08-25-runner-test-suite-env-isolation`.
     fn with_clean_token_env(body: impl FnOnce()) {
-        // A panicking sibling poisons the lock but leaves the environment
-        // restorable, so recover rather than cascade the failure.
-        let _guard = TOKEN_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved: Vec<(&str, Option<String>)> = GITHUB_TOKEN_ENV_VARS
-            .iter()
-            .map(|v| (*v, std::env::var(v).ok()))
-            .collect();
-        for (v, _) in &saved {
+        // Poison-recovering, so a panicking sibling cannot cascade-fail this
+        // one — see `ambient::test_support::env_lock`.
+        let _g = crate::test_env::env_lock();
+        // Declared AFTER the lock so the restore runs while it is still held.
+        // It also restores on the panic path, which the hand-rolled save/
+        // restore this replaces skipped entirely.
+        let _restore = crate::test_env::EnvVarRestore::capture(&GITHUB_TOKEN_ENV_VARS);
+        for v in GITHUB_TOKEN_ENV_VARS {
             std::env::remove_var(v);
         }
         body();
-        for (v, prior) in saved {
-            match prior {
-                Some(val) => std::env::set_var(v, val),
-                None => std::env::remove_var(v),
-            }
-        }
     }
 
     /// The DEDICATED runner variable leads, and each fallback only gets a turn

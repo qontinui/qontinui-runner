@@ -2458,13 +2458,18 @@ mod tests {",
 
     #[test]
     fn survey_interval_is_floored() {
-        let prev = std::env::var(SURVEY_INTERVAL_SECS_ENV).ok();
+        // The env is process-global, so hold the ONE shared lock every
+        // env-touching test in this binary takes — a hand-rolled save/restore
+        // excludes nobody. The restore is declared AFTER the lock so it runs
+        // while the lock is still held, and it survives the panic path, which
+        // the manual restore below it did not.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[SURVEY_INTERVAL_SECS_ENV]);
         std::env::set_var(SURVEY_INTERVAL_SECS_ENV, "1");
-        let floored = survey_interval();
-        match prev {
-            Some(v) => std::env::set_var(SURVEY_INTERVAL_SECS_ENV, v),
-            None => std::env::remove_var(SURVEY_INTERVAL_SECS_ENV),
-        }
-        assert_eq!(floored, Duration::from_secs(MIN_SURVEY_INTERVAL_SECS));
+        assert_eq!(
+            survey_interval(),
+            Duration::from_secs(MIN_SURVEY_INTERVAL_SECS)
+        );
     }
 }
