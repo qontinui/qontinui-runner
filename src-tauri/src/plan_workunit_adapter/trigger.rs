@@ -4652,11 +4652,13 @@ mod tests {
     /// point — no log transition, not report-due inside the heartbeat — yet
     /// the store keeps the NEWER instant, and the heartbeat re-post carries it.
     /// The web ages a row by when it RECEIVED the report (its own clock) and
-    /// keeps the newest reading per device: a report whose `observed_at` is not
-    /// newer than the stored one is declined (`applied: false`) and the row is
-    /// marked `reading_superseded`. So a heartbeat that re-sent the first
-    /// measurement's time would be declined every time, and the row would stop
-    /// reflecting what this device currently measures.
+    /// keeps the newest reading per device: a report observed BEFORE the stored
+    /// one is declined (`applied: false`) and marks the row
+    /// `reading_superseded`, while an equal `observed_at` applies. So a
+    /// heartbeat that re-sent the first measurement's time would be accepted
+    /// but would freeze the stored `observed_at` at that first measurement —
+    /// `observed_skew_secs` would grow every heartbeat and the row would
+    /// misstate when this device last measured.
     #[tokio::test]
     async fn only_the_measurement_instant_differs_so_nothing_changes_but_the_post_is_current() {
         let first = measured_with(Ok(Some(NOW - 60)), 5, 0);
