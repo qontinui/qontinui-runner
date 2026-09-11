@@ -1,6 +1,8 @@
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+import { mergeDeviceCatalog, type FleetDeviceOption } from "./fleetDiscovery";
+
 /**
  * One session somewhere on the fleet, as coord's `GET /coord/sessions/fleet`
  * reports it (plan `2026-08-31-remote-session-tabs-in-runner-terminal`,
@@ -43,7 +45,14 @@ export interface FleetSession {
   claudeCodeSessionId: string | null;
   sessionKind: string | null;
   intent: string | null;
-  /** The LIVENESS axis (`working`, `waiting_human`, …). */
+  /**
+   * The LIVENESS axis — coord's `SessionState`
+   * (`expected | active | pending_resolution | stale | closed`). NOT the work
+   * axis: `working` / `waiting_human` / `finished` are `sessionStatus` values,
+   * and an earlier revision of this comment listed them here, which is what a
+   * state filter built from it would have offered — a dropdown of values coord
+   * never puts in this column.
+   */
   state: string | null;
   /**
    * The WORK axis, orthogonal to `state`. Null may mean unset OR degraded —
@@ -114,7 +123,36 @@ export interface UseFleetSessionsResult {
    * degradation and may be shown.
    */
   degraded: boolean;
+  /**
+   * Every device seen across the reads this hook has made, accumulated.
+   *
+   * The picker's device filter is served from this rather than from the latest
+   * response: selecting a device sends `device_id` to coord, whose next
+   * response then holds only that device, and a dropdown rebuilt from it would
+   * offer no way back to the others.
+   */
+  deviceCatalog: FleetDeviceOption[];
   refresh: () => Promise<void>;
+}
+
+/**
+ * The distinct devices a page of rows came from, labelled.
+ *
+ * Pure and exported so the picker's filter options are testable without a live
+ * coord. First row per device wins the label — every row of one device carries
+ * the same identity fields, so there is nothing to reconcile.
+ */
+export function devicesSeenIn(sessions: FleetSession[]): FleetDeviceOption[] {
+  const byId = new Map<string, FleetDeviceOption>();
+  for (const s of sessions) {
+    if (byId.has(s.deviceId)) continue;
+    byId.set(s.deviceId, {
+      deviceId: s.deviceId,
+      label: deviceLabel(s),
+      isCallerDevice: s.isCallerDevice,
+    });
+  }
+  return [...byId.values()];
 }
 
 /**
@@ -218,6 +256,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [deviceCatalog, setDeviceCatalog] = useState<FleetDeviceOption[]>([]);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -237,6 +276,12 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
       });
       setResponse(result);
       setLoaded(true);
+      // Accumulate here — in the fetch, which is an event — rather than in an
+      // effect over `response`: an effect that calls setState costs a cascading
+      // render per read, and the catalogue is a property of the read SEQUENCE,
+      // which is this hook's to own.
+      const seen = devicesSeenIn(result.sessions ?? []);
+      if (seen.length > 0) setDeviceCatalog((prev) => mergeDeviceCatalog(prev, seen));
     } catch (err) {
       // Keep the previous response rather than clearing it: a failed refresh
       // must not silently empty a list the operator is reading.
@@ -261,6 +306,7 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
     error,
     emptyReason: emptyReasonFor(loaded, error, sessions),
     degraded: isDegraded(response),
+    deviceCatalog,
     refresh: fetchSessions,
   };
 }
