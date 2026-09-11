@@ -1712,10 +1712,24 @@ fn parse_created(data: &Value) -> Option<CreatedReply> {
             .map(str::to_string)
             .filter(|s| !s.trim().is_empty())
     };
+    // TOP-LEVEL FIRST: `coord_session_id` is a declared field on
+    // `remote_terminal_created`, not a key inside `terminal`. It rode inside
+    // `terminal` only because the relay forwards that object verbatim, which
+    // is an undeclared dependency on a schema-typed object — the day anything
+    // validates `terminal`, create-then-attach breaks silently. Both places
+    // are read so a relay or target on either side of that change works.
+    let top = |name: &str| -> Option<String> {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
     Some(CreatedReply {
         grant_jti,
         terminal_id,
-        coord_session_id: field("coordSessionId").or_else(|| field("coord_session_id")),
+        coord_session_id: top("coord_session_id")
+            .or_else(|| field("coordSessionId"))
+            .or_else(|| field("coord_session_id")),
         working_dir: field("workingDir").or_else(|| field("working_dir")),
         title: field("title"),
     })
@@ -4720,5 +4734,86 @@ mod create_gate_tests {
             kind_of(json!({ "remote": { "grant_jti": "j" } })),
             RemoteGrantKind::Attach
         );
+    }
+}
+
+#[cfg(test)]
+mod created_reply_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `coord_session_id` is a DECLARED top-level field on
+    /// `remote_terminal_created`. It is what the source mints the
+    /// session-addressed attach grant against, so a create that cannot read it
+    /// produces a terminal nobody can drive.
+    #[test]
+    fn the_declared_top_level_field_is_read() {
+        let reply = parse_created(&json!({
+            "grant_jti": "g1",
+            "terminal_id": "t1",
+            "coord_session_id": "sess-top",
+            "terminal": {"id": "t1"},
+        }))
+        .expect("a well-formed created reply parses");
+        assert_eq!(reply.coord_session_id.as_deref(), Some("sess-top"));
+    }
+
+    /// The id used to ride INSIDE `terminal`, working only because the relay
+    /// forwards that object verbatim. A target or relay still on that spelling
+    /// must keep working, so both places are read.
+    #[test]
+    fn the_legacy_spelling_inside_terminal_still_works() {
+        for key in ["coordSessionId", "coord_session_id"] {
+            let reply = parse_created(&json!({
+                "grant_jti": "g1",
+                "terminal_id": "t1",
+                "terminal": {"id": "t1", key: "sess-legacy"},
+            }))
+            .expect("parses");
+            assert_eq!(
+                reply.coord_session_id.as_deref(),
+                Some("sess-legacy"),
+                "the {key} spelling inside `terminal` must still resolve"
+            );
+        }
+    }
+
+    /// The declared field WINS. Otherwise a stale value left inside `terminal`
+    /// by an older target would silently shadow the authoritative one and the
+    /// attach would be minted against the wrong session.
+    #[test]
+    fn the_declared_field_wins_over_a_stale_one_inside_terminal() {
+        let reply = parse_created(&json!({
+            "grant_jti": "g1",
+            "terminal_id": "t1",
+            "coord_session_id": "sess-authoritative",
+            "terminal": {"id": "t1", "coordSessionId": "sess-stale"},
+        }))
+        .expect("parses");
+        assert_eq!(
+            reply.coord_session_id.as_deref(),
+            Some("sess-authoritative")
+        );
+    }
+
+    /// Absent stays ABSENT. "Created but not addressable" is the honest
+    /// report; inventing an id sends the source off to attach to a session
+    /// that does not exist. Blank and whitespace are absent too — a present
+    /// but empty id is not an id.
+    #[test]
+    fn an_absent_or_blank_coord_session_is_none_never_guessed() {
+        for body in [
+            json!({"grant_jti": "g1", "terminal_id": "t1", "terminal": {"id": "t1"}}),
+            json!({"grant_jti": "g1", "terminal_id": "t1", "coord_session_id": "",
+                   "terminal": {"id": "t1"}}),
+            json!({"grant_jti": "g1", "terminal_id": "t1", "coord_session_id": "   ",
+                   "terminal": {"id": "t1"}}),
+        ] {
+            let reply = parse_created(&body).expect("parses");
+            assert_eq!(
+                reply.coord_session_id, None,
+                "a missing or blank coord session must not be guessed: {body}"
+            );
+        }
     }
 }
