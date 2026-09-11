@@ -104,6 +104,23 @@
 #   DEVICE_JWT_ENV_MALFORMED     — $COORD_DEVICE_JWT set but not JWT-shaped
 #   DEVICE_JWT_FILE_MALFORMED    — ~/.qontinui/coord-device-jwt likewise
 #   DEVICE_JWT_UNAUTHORIZED      — coord rejected the device JWT
+# and typed L6 causes, about the WEB host (api.qontinui.io — a different
+# program on a different host; see the L6 block):
+#   WEB_HOST_UNREACHABLE         — the ONE L6 verdict about the host itself
+#   WEB_HOST_NO_USER_JWT         — the host is UP; no user_id-bearing credential
+#                                  resolved, or the one sent lacks the claim.
+#                                  A CREDENTIAL fact, never a host verdict
+#   WEB_HOST_JWT_UNAUTHORIZED    — the host is UP and refused the bearer for
+#                                  another reason (expired is the normal one)
+#   WEB_HOST_HTTP_<code>         — served, answered something else
+#
+# THE TERMINAL LINE IS EMITTED FROM AN AXIS TABLE, not beside one. Every rung
+# is a row over host x prefix x credential, marked PROBED / SKIPPED / UNPROBED
+# / NOT APPLICABLE, followed by a machine-readable `axes: ... unprobed=` line.
+# DEAD is printable ONLY when every probeable row is PROBED; a run that skipped
+# an axis (the sweep budget, an env opt-out) prints VERDICT: UNKNOWN with that
+# axis named, never DEAD. The rows are DERIVED from the recorded outcomes, so
+# a rung that grows a sub-source (L4 in #785) is in the table with no edit.
 #
 # Why RUNNER_EVAL_FAILED and the two tier verdicts exist (2026-08-13): the
 # response reader returns the EMPTY STRING for every body it cannot parse, so an
@@ -254,6 +271,15 @@ RPC_LIST='{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 RPC_E2E='{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"coord_query_identity","arguments":{}}}'
 PROBE_E2E="${COORD_REVIVE_E2E:-1}"
 COORD_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
+# THE SECOND REMOTE HOST. Until 2026-09-11 this file named exactly one remote
+# host, and that single token WAS the whole host axis (plan
+# 2026-09-06-coord-reachability-verdicts-omit-the-host-axis). api.qontinui.io
+# is a DIFFERENT PROGRAM - the qontinui-web backend: plan-library, memory,
+# /api/v1 - on a different host. A 401 on coord.qontinui.io says nothing about
+# it: measured 2026-09-06 the same device JWT answered 200/422 there while
+# every coord.qontinui.io rung was refused. L6 probes it, and the AXES table
+# at the end names it whether or not L6 ran.
+WEB_URL="${QONTINUI_WEB_HTTP_URL:-https://api.qontinui.io}"
 # FOUR budgets, not one (three per-call, one for the whole sweep — the fourth is
 # defined below MINT_TIMEOUT). Until 2026-08-31 a single PROBE_TIMEOUT=15 was spent
 # on two calls that are orders of magnitude apart: the cheap JSON-RPC
@@ -1385,6 +1411,88 @@ cfg_shape() {
   esac
 }
 
+# ----- The AXIS TABLE: what this run asked, and what it did not -------------
+# A verdict is only as wide as the axes it was computed from. Ten recorded
+# occurrences (dossier coord-transport-cascades-are-rooted-on-the-local-runner)
+# probed ONE host-and-prefix, received a credential-shaped status, and
+# generalised it to the capability -- honestly, by walking this cascade to its
+# end. So the terminal VERDICT: token is now emitted FROM this table, never
+# beside it. Every rung is a row over host x prefix x credential, and each row is
+#   LIVE           -- the door this run stopped at
+#   PROBED         -- asked, and answered something other than LIVE (the verdict
+#                     tokens recorded for it follow in brackets, one per
+#                     sub-source, so #785's four RUNNER_EVAL_* sub-verdicts read
+#                     as L4 sub-rows)
+#   SKIPPED        -- a skip was RECORDED (the sweep budget, an env opt-out)
+#   UNPROBED       -- never reached, because a LIVE door above it short-circuited
+#   NOT APPLICABLE -- a transport this script cannot reach at all (the session's
+#                     own native coord_* tools)
+# and DEAD is printable ONLY when every probeable row is PROBED. The rows are
+# DERIVED from FAILS[] and the LIVE state rather than set by hand at each site,
+# so a rung that gains a sub-source is in the table with no edit here.
+# Plan 2026-09-06-coord-reachability-verdicts-omit-the-host-axis, Phase 2.
+AXES_UNPROBED=""     # comma-separated keys of the rows that were SKIPPED or UNPROBED
+LIVE_RUNG=""         # set by live_exit from its transport, before the table prints
+axis_row_status() {
+  # <rung> -> LIVE | PROBED | SKIPPED | UNPROBED, from the recorded outcomes.
+  local rung="$1" f n=0 skipped=0
+  [ "$LIVE_RUNG" = "$rung" ] && { echo LIVE; return; }
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    case "$f" in "$rung "*)
+      n=$((n + 1))
+      case "$f" in *": SKIPPED_"*) skipped=$((skipped + 1)) ;; esac ;;
+    esac
+  done
+  if [ "$n" -eq 0 ]; then echo UNPROBED
+  elif [ "$skipped" -eq "$n" ]; then echo SKIPPED
+  else echo PROBED; fi
+}
+axis_row_tokens() {
+  # <rung> -> the verdict TOKENS recorded for it (the first word after the
+  # door name), one per sub-source, deduplicated -- e.g. the L4 row reads
+  # "env=ENV_UNSET file=DEVICE_JWT_UNAUTHORIZED ui-bridge-mint=RUNNER_EVAL_CSP_BLOCKED".
+  local rung="$1" f name tok out=""
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    case "$f" in "$rung "*)
+      name="${f#"$rung "}"; name="${name%%:*}"
+      tok="${f#*: }"; tok="${tok%% *}"
+      case "$name" in
+        'device-jwt@$COORD_DEVICE_JWT') name="env" ;;
+        device-jwt@*coord-device-jwt)   name="file" ;;
+        nonce-mint*)                    name="nonce-mint" ;;
+        mint@*|device-jwt@*source=*)    name="ui-bridge-mint" ;;
+        web-host@*)                     name="web-host" ;;
+        sibling-sweep@*)                name="sibling-sweep" ;;
+      esac
+      case " $out " in *" $name=$tok "*) ;; *) out="${out:+$out }$name=$tok" ;; esac ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+axes_block() {
+  # Printed under EVERY terminal line -- LIVE, UNKNOWN, BUDGET_EXCEEDED and DEAD
+  # alike -- because a LIVE that stopped at L1 has said nothing about the web
+  # host either, and this table is what says so. Sets $AXES_UNPROBED; the
+  # caller prints the `axes:` roster line beside its own verdict.
+  local rung host prefix cred key st toks unprobed=""
+  echo "AXES (host x prefix x credential -- what this run asked, and what it did not):"
+  while IFS='|' read -r rung host prefix cred key; do
+    st="$(axis_row_status "$rung")"
+    toks="$(axis_row_tokens "$rung")"
+    printf '  %-3s %-22s %-32s %-30s %s%s\n' "$rung" "$host" "$prefix" "$cred" "$st" "${toks:+  [$toks]}"
+    case "$st" in SKIPPED|UNPROBED) unprobed="${unprobed:+$unprobed,}$key" ;; esac
+  done <<'AXES'
+L1|127.0.0.1 (loopback)|/coord-mcp|proxy-nonce (own .mcp.json)|L1-proxy-nonce
+L2|127.0.0.1 (loopback)|/coord-mcp|proxy-nonce (sibling .mcp.json)|L2-proxy-nonce
+L3|coord.qontinui.io|/mcp|acting-bearer ($COORD_AGENT_JWT)|L3-acting-bearer
+L4|coord.qontinui.io|/mcp|device-jwt (env, file, mints)|L4-device-jwt
+L5|coord.qontinui.io|/agents/credential + /coord/agent-|bootstrap-agent-jwt (anonymous mint)|L5-bootstrap-agent-jwt
+L6|api.qontinui.io|/api/v1|user-device-jwt (env, file)|L6-user-device-jwt
+AXES
+  printf '  %-3s %-22s %-32s %-30s %s\n' "--" "(this session)" "native coord_* MCP tools" "session .mcp.json" "NOT APPLICABLE - a separate transport this script cannot probe; ask it yourself with one cheap coord_gate_inspect"
+  AXES_UNPROBED="${unprobed:+$unprobed,}native-coord-mcp-tools"
+}
+
 # live_exit <transport> [partial-block]
 #
 # The optional second argument is a pre-formatted block of `PARTIAL: ` lines
@@ -1397,6 +1505,13 @@ cfg_shape() {
 # this script exists to replace, wearing a success label.
 live_exit() {
   local transport="$1" partial="${2:-}" v="${LIVE_VERDICT:-LIVE}"
+  case "$transport" in
+    loopback-proxy) if [ "$LIVE_FILE" = "$OWN" ]; then LIVE_RUNG=L1; else LIVE_RUNG=L2; fi ;;
+    https-acting-bearer) LIVE_RUNG=L3 ;;
+    https-device-jwt*|loopback-proxy-minted) LIVE_RUNG=L4 ;;
+    https-bootstrap-agent-jwt) LIVE_RUNG=L5 ;;
+    https-web-device-jwt) LIVE_RUNG=L6 ;;
+  esac
   # The verdict NAME leads, because there are three live-class ones and only one
   # of them is a bare LIVE. Printing "LIVE" over a PROXY_LIVE_E2E_UNVERIFIED
   # would be the same overstatement PARTIAL exists to prevent, one layer down.
@@ -1421,7 +1536,15 @@ live_exit() {
     PROXY_LIVE_E2E_UNVERIFIED*)
       echo "NOTE: only the PROXY was measured (tools/list). Whether coord answers behind it was NOT tested on this run, so re-issue your call and read the ANSWER rather than treating this verdict as end-to-end proof. Unset \$COORD_REVIVE_E2E to run the end-to-end probe." ;;
   esac
-  echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
+  if [ "$transport" = "https-web-device-jwt" ]; then
+    echo "NOTE: this LIVE is the WEB host (api.qontinui.io, the qontinui-web backend), NOT a coord door: it carries /api/v1 (plan-library, memory) and cannot re-issue a coord MCP tool call or reach /coord/*. Every coord.qontinui.io row below reads as recorded - a lost COORD write is still presumed LOST until verified by read over a coord door or your native coord_* tools."
+  else
+    echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
+  fi
+  # The table rides on LIVE too: a door that answered at L1 has said nothing
+  # about L3-L6, and the rows below it read UNPROBED, which is the truth.
+  axes_block
+  echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
   # The approval half rides ON the LIVE verdict, not only on DEAD. A door
   # answering says nothing about whether the session's native coord_* tools were
   # ever allowed to load, and LIVE is exactly where that distinction gets lost:
@@ -1498,7 +1621,7 @@ PARTIAL_BOOTSTRAP="PARTIAL: the url= above is the MINT, not a door to re-issue a
 PARTIAL: this bearer is sub_type=agent with a DEVICE subject (sub=device:<uuid>) and NO agent_id claim - measured 2026-09-04 - so it is scoped by whatever coord grants such a principal in this tenant, which is not the same set the L1/L2 proxy or an L4 device JWT carries. coord's own agent-refresh helper will not refresh it for that reason (agent-only route); re-mint instead.
 PARTIAL: VERIFIED here: the control read GET \${COORD_HTTP_URL}/coord/agent-findings?limit=1 answered 200. Measured 2026-09-04 the same bearer also read \${COORD_HTTP_URL}/coord/agent-prompt-documents and one policy document at 200, so tenant resolution DID work on those routes - but that is those routes' evidence, not a general guarantee: a 403 cannot-resolve-tenant elsewhere is THAT route's verdict, not a refutation of the credential.
 PARTIAL: it is SHORT-LIVED - ~4h (14400s, measured). It is NOT over-broad: measured 2026-09-04 every scope in the minted token was empty or false (git_push [], merge_propose false, build_submit false, strategy_admin false, introspect false, no NATS subjects), which is NARROWER than the sibling allocate route's token (that one carries git_push scoped to the reserved branch plus agent NATS subjects; neither mints merge_propose). Use it for the read or write you came for and DISCARD it: never persist it, never print it, never put it on any process's argv.
-PARTIAL: the anonymity of the SIBLING /agents/allocate route is an OPEN operator ruling - surfaced and deliberately left open by plan 2026-08-31-coord-mcp-credential-selection-by-binding-provenance Phase 8, and escalated as coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc. Nothing here licenses that route, and this credential is never preferred anywhere a device JWT resolves."
+PARTIAL: the anonymity of the SIBLING /agents/allocate route is UNKNOWN - neither gated nor cleared. It was escalated as coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc, which reads WITHDRAWN (re-verify with coord_gate_inspect before citing it anywhere); its successor 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5 is withdrawn too ('DECIDED, not escalated: do NOT clamp', read 2026-09-11) and names allocate's anonymity as the residual for the narrower MintCaller route (plan 2026-08-31-coord-mcp-credential-selection-by-binding-provenance decision (3)). UNKNOWN is not permission: nothing here licenses that route, and this credential is never preferred anywhere a device JWT resolves."
 
 # ----- runner-origin bookkeeping (feeds L4) -----------------------------------
 # Every proxy-shaped .mcp.json names a RUNNER: the proxy is served BY the runner
@@ -2621,8 +2744,19 @@ if [ -z "$ROOT" ] || [ "$ROOT" = "." ]; then
   echo "L2: not inside a git checkout — assuming \$PWD is the workspace root (set \$QONTINUI_ROOT to override)" >&2
   ROOT="$PWD"
 fi
+# The sweep RECORDS its own outcome even when it probes nothing. Every exit from
+# the loop below is a `continue` (unreadable, the door L1 already probed, an
+# unparseable file, a sibling naming a door already probed), so a sweep that
+# ends with no probe used to leave no trace in FAILS[] -- and the AXES table,
+# which derives each row from FAILS[], then read L2 as UNPROBED and withheld
+# DEAD for an axis that had nothing left to probe. On this fleet that is the
+# ORDINARY shape: dozens of checkouts share one door, so L2 usually dedups
+# everything against L1. NO_CANDIDATE is a PROBED outcome: the sweep ran and
+# established that no second door exists under $ROOT.
+L2_PROBES=0; L2_SEEN=0
 for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
   [ -r "$f" ] || continue
+  L2_SEEN=$((L2_SEEN + 1))
   seen_door "$f" && continue # canonical-path dedup: L1 (or an earlier glob hit) already probed it
   read_cfg "$f" || continue
   # (url, auth) dedup — a DIFFERENT file naming a door already probed is not a
@@ -2632,8 +2766,13 @@ for f in "$ROOT/.mcp.json" "$ROOT"/*/.mcp.json; do
     continue
   fi
   note_origin "$CFG_URL"
+  L2_PROBES=$((L2_PROBES + 1))
   probe_door "L2" "$f" "$CFG_URL" "$CFG_KEY_HEADER" "$CFG_KEY" && live_exit "loopback-proxy"
 done
+if [ "$L2_PROBES" -eq 0 ]; then
+  echo "L2: sibling-sweep@$ROOT -> NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen; every one was unparseable, or named the door L1 already probed. The sweep RAN and found no second loopback door - an established outcome, not an unprobed axis)" >&2
+  FAILS+=("L2 sibling-sweep@$ROOT: NO_CANDIDATE ($L2_SEEN readable .mcp.json file(s) seen under \$ROOT; every one was unparseable or named the door L1 already probed - the sweep ran and established that no second loopback door exists here)")
+fi
 
 # ----- L3: acting-bearer fallback (direct coord MCP over HTTPS) ---------------
 # Resolved by __resolve_fleet_script above, NOT by the fixed three-levels-up
@@ -3114,12 +3253,17 @@ done
 # It does NOT substitute POST /agents/allocate. Allocate mints the same class of
 # token today, and three shipped documents forbid carrying a coord rung on it
 # (/gate and /policy both carry it on their generic remote MCP rung, and
-# coord-gates-and-access.md restates it). Whether it may ever
-# be used this way is an OPEN OPERATOR RULING, escalated as coord gate
-# ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, gate_class
-# security-surface); an agent does not pre-empt a ruling that has just been
-# asked for. Until it lands, the honest outcome of an exhausted cascade is a
-# DEAD verdict plus a DURABLY RECORDED BLOCKER - never a token from that door.
+# coord-gates-and-access.md restates it). Whether it may ever be used this
+# way is UNKNOWN - neither gated nor cleared. It was escalated as coord gate
+# ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, security-surface),
+# which reads WITHDRAWN - re-verify with coord_gate_inspect before citing it;
+# a withdrawn gate reads identically to an open one in prose. Its successor
+# 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5 is withdrawn too (read 2026-09-11:
+# 'DECIDED, not escalated: do NOT clamp') and names allocate's anonymity as
+# the residual for the narrower MintCaller route. UNKNOWN is not permission:
+# the honest outcome of an exhausted cascade is the UNKNOWN or DEAD verdict
+# the axis table licenses, plus a DURABLY RECORDED BLOCKER - never a token
+# from that door.
 if budget_skip "L5" "bootstrap-credential"; then
   : # already recorded by budget_skip; L5 is not attempted on an exhausted budget
 elif [ -n "${COORD_REVIVE_NO_BOOTSTRAP:-}" ]; then
@@ -3229,7 +3373,7 @@ print(v if isinstance(v,str) else "")' < "$MACHINE_FILE" 2>/dev/null | tr -d '[:
       # not the norm. (`GET /agents/credential` answered 403 tenant_not_resolved
       # on 2026-09-02 and 405 on 2026-09-04; either is a router artefact and not
       # a device verdict - but this rung only ever POSTs.)
-      l5_fail "BOOTSTRAP_ROUTE_ABSENT (HTTP $BOOT_CODE from $BOOT_URL - the dedicated credential route is not answering on THIS coord; a 405 can mean exactly that here, since coord answers 405 for ANY unregistered POST under /agents/, verified 2026-09-02 and 2026-09-04). This is NOT the expected outcome: the same anonymous POST answered 200 with a device-subject agent JWT against production coord on 2026-09-04, so this arm now means a REGRESSION, a rollback, or a different deployment - report it as such rather than as a known-absent rung. It still does NOT license substituting POST /agents/allocate: three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is an OPEN OPERATOR RULING, coord gate ece99898-30c6-4f8c-be8e-1de5f09abebc (operator_approval, security-surface). With this arm hit and no other door, the honest outcome is a DEAD verdict PLUS a durably recorded blocker: write the gate or finding SPEC verbatim so a peer with a working transport can carry it"
+      l5_fail "BOOTSTRAP_ROUTE_ABSENT (HTTP $BOOT_CODE from $BOOT_URL - the dedicated credential route is not answering on THIS coord; a 405 can mean exactly that here, since coord answers 405 for ANY unregistered POST under /agents/, verified 2026-09-02 and 2026-09-04). This is NOT the expected outcome: the same anonymous POST answered 200 with a device-subject agent JWT against production coord on 2026-09-04, so this arm now means a REGRESSION, a rollback, or a different deployment - report it as such rather than as a known-absent rung. It still does NOT license substituting POST /agents/allocate: three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is UNKNOWN: the gate that carried it, ece99898-30c6-4f8c-be8e-1de5f09abebc, reads withdrawn (re-verify with coord_gate_inspect) and so does its successor 3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5; UNKNOWN is not permission. With this arm hit and no other door, the honest outcome is the verdict the axis table licenses PLUS a durably recorded blocker: write the gate or finding SPEC verbatim so a peer with a working transport can carry it"
       l5_count unknown l5-route-absent
     else
       case "$BOOT_CODE" in
@@ -3304,6 +3448,119 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
   fi
 fi
 
+# ----- L6: the WEB host -- api.qontinui.io, a different program on a different host
+# Every rung above probes ONE remote host. The web backend (qontinui-web,
+# ${WEB_URL}/api/v1/...) is a different program: plan-library and memory live
+# there, and its routes resolve the caller through get_audit_actor_user
+# (qontinui-web backend/app/api/deps.py), which answers `401 Device token
+# missing user_id claim.` to any bearer without a user_id -- an agent JWT minted
+# by /agents/credential or /agents/allocate has none; the pairing-minted
+# ~/.qontinui/coord-device-jwt has one. Measured 2026-09-06 from this box:
+# anonymous GET /api/v1/plan-library -> 401 (SERVED, refused); with the device
+# JWT -> 200; POST /api/v1/memory/query -> 401 anonymous, 422 with the JWT (the
+# door is OPEN - 422 is the schema, proof the handler ran); GET on that same
+# path -> 405, a METHOD verdict that reads exactly like a credential one. So
+# this rung emits TYPED faults on the credential axis and never a host-level
+# verdict for a credential fact (plan Design decision 4):
+#   WEB_HOST_UNREACHABLE      -- the ONE verdict about the host: connect/DNS/TLS/timeout
+#   WEB_HOST_NO_USER_JWT      -- no user_id-bearing credential resolved, or the host
+#                                refused the one sent for LACKING the claim. The host
+#                                is UP (it answered); the CREDENTIAL axis is what failed
+#   WEB_HOST_JWT_UNAUTHORIZED -- the host refused the bearer for another reason (a 401
+#                                without the user_id text: expired is the normal one)
+#   WEB_HOST_HTTP_<code>      -- served, answered something else (a 403, a 5xx)
+# and LIVE (PARTIAL) when the credentialed read answers 200.
+#
+# The credential comes from the same two STATIC sources as L4 sources 1 and 2,
+# in that order ($COORD_DEVICE_JWT, then ~/.qontinui/coord-device-jwt). Neither
+# mint is spent here: on the builds measured the runner mint is the OPERATOR's
+# Cognito token (PARTIAL_RUNNER_MINT), and the bootstrap credential carries no
+# user_id by construction. Each source is SHAPE-tested and sent, and the host's
+# 401 is the freshness gate -- exactly the mechanism L4 uses, and for the reason
+# the file header gives: no local `exp` decode, because the server's answer is
+# the only one that counts. The bearer is staged OFF argv, same rule as every
+# other rung. Plan Phase 3; the plan's "gated on exp validity" wording was
+# corrected to this at implementation.
+PARTIAL_WEB_HOST="PARTIAL: this door is the WEB host (api.qontinui.io - the qontinui-web backend), NOT coord. It carries /api/v1/plan-library and /api/v1/memory; it does NOT carry coord MCP tools, /coord/agent-* routes, gates, claims or work units, so it cannot re-issue a lost COORD write. What it proves: the host axis is live and the credential carries a user_id claim.
+PARTIAL: every coord.qontinui.io row in the AXES table below reads as recorded - a LIVE here does not revise them. A lost coord write stays presumed LOST until verified by read over a coord door or the session's native coord_* tools."
+if budget_skip "L6" "web-host@$WEB_URL"; then
+  : # recorded by budget_skip; the axis table prints this rung as SKIPPED
+elif [ -n "${COORD_REVIVE_NO_WEB_HOST:-}" ]; then
+  echo "L6: web-host@$WEB_URL -> SKIPPED_BY_ENV (\$COORD_REVIVE_NO_WEB_HOST is set, so the web host was not asked. A CHOICE, not a fault - and an UNPROBED axis, so no DEAD can be printed below)" >&2
+  FAILS+=("L6 web-host@$WEB_URL: SKIPPED_BY_ENV (\$COORD_REVIVE_NO_WEB_HOST is set)")
+else
+  l6_fail() {
+    echo "L6: web-host@$WEB_URL -> $1" >&2
+    FAILS+=("L6 web-host@$WEB_URL: $1")
+  }
+  WEB_PROBE_URL="${WEB_URL}/api/v1/plan-library?kind=plan&limit=1"
+  WEB_BODY="$TMPD/webbody"; WEB_ERR="$TMPD/weberr"; WEB_HDR="$TMPD/webhdr"
+  # --- 1. the HOST, anonymously: is a program answering at all? ---------------
+  # Registered for the DISTINCT count, as probe_door does for every other rung:
+  # without it the terminal line would count L6's probes in $DOORS_PROBED and
+  # not its door in $DISTINCT_DOORS -- the two-populations mismatch the
+  # probe_door comment records.
+  seen_endpoint "$WEB_PROBE_URL" "" "" || :
+  : > "$WEB_BODY"; : > "$WEB_ERR"
+  DOORS_PROBED=$((DOORS_PROBED + 1))
+  WEB_ANON_CODE=$(curl -sS -o "$(curl_path "$WEB_BODY")" -w '%{http_code}' \
+    --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" "$WEB_PROBE_URL" 2>"$WEB_ERR")
+  WEB_CE=$?
+  WEB_CURLERR="$(one_line 200 < "$WEB_ERR")"
+  if [ "$WEB_CE" != "0" ] || [ -z "$WEB_ANON_CODE" ] || [ "$WEB_ANON_CODE" = "000" ]; then
+    l6_fail "WEB_HOST_UNREACHABLE (the anonymous GET $WEB_PROBE_URL never completed - connect refused, DNS, TLS or a timeout (${PROBE_CONNECT_TIMEOUT}s connect / ${PROBE_TIMEOUT}s total). This is the ONE L6 verdict about the host itself; nothing was learned about any credential)${WEB_CURLERR:+ [curl: $WEB_CURLERR]}"
+  else
+    # The host ANSWERED. 401 is the served-and-refused shape and the expected
+    # anonymous answer; anything else is still an answer. The credential axis
+    # is probed separately below, so the host fact is never folded into it.
+    echo "L6: web-host@$WEB_URL -> host ANSWERED (anonymous GET -> HTTP $WEB_ANON_CODE; 401 is the served-and-refused shape). Now the credential axis" >&2
+    # --- 2. the CREDENTIAL: a user_id-bearing device JWT, static sources only --
+    WEBJWT=""; WEBJWT_SRC=""
+    if [ -n "${COORD_DEVICE_JWT:-}" ] && jwt_shaped "$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"; then
+      WEBJWT="$(printf '%s' "$COORD_DEVICE_JWT" | tr -d '[:space:]')"; WEBJWT_SRC='$COORD_DEVICE_JWT'
+    elif [ -n "$HOME_DIR" ] && [ -r "$STATIC_JWT_FILE" ] && jwt_shaped "$(tr -d '[:space:]' < "$STATIC_JWT_FILE" 2>/dev/null)"; then
+      WEBJWT="$(tr -d '[:space:]' < "$STATIC_JWT_FILE")"; WEBJWT_SRC="$STATIC_JWT_FILE"
+    fi
+    if [ -z "$WEBJWT" ]; then
+      WEB_HOME_NOTE=""; [ -z "$HOME_DIR" ] && WEB_HOME_NOTE=" (HOME_UNRESOLVED: neither \$HOME nor \$USERPROFILE is set, so source 2 had no path to read - the same LOCAL fault L4 names)"
+      l6_fail "WEB_HOST_NO_USER_JWT (the host is UP - anonymous GET answered HTTP $WEB_ANON_CODE - and NO user_id-bearing credential resolved: \$COORD_DEVICE_JWT and ~/.qontinui/coord-device-jwt are both unset, unreadable or not JWT-shaped$WEB_HOME_NOTE. A CREDENTIAL fact about this box, never a host verdict; the runner-minted and bootstrap tokens are not spent here because neither carries a user_id claim. Pair this device (a fresh ~/.qontinui/coord-device-jwt) to open this axis)"
+    else
+      { printf 'Authorization: Bearer %s\n' "$WEBJWT" > "$WEB_HDR"; } 2>/dev/null
+      if [ ! -s "$WEB_HDR" ]; then
+        l6_fail "AUTH_HEADER_STAGING_FAILED (could not write the bearer header under $TMPD - LOCAL fault, says nothing about the host or the credential)"
+      else
+        : > "$WEB_BODY"; : > "$WEB_ERR"
+        DOORS_PROBED=$((DOORS_PROBED + 1))
+        WEB_CODE=$(curl -sS -o "$(curl_path "$WEB_BODY")" -w '%{http_code}' \
+          --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+          -H "@$(curl_path "$WEB_HDR")" "$WEB_PROBE_URL" 2>"$WEB_ERR")
+        WEB_CE=$?
+        WEB_CURLERR="$(one_line 200 < "$WEB_ERR")"
+        WEB_MSG="$(one_line 160 < "$WEB_BODY")"
+        rm -f "$WEB_HDR"
+        if [ "$WEB_CE" != "0" ] || [ -z "$WEB_CODE" ] || [ "$WEB_CODE" = "000" ]; then
+          l6_fail "WEB_HOST_UNREACHABLE (the host answered the anonymous probe, then the credentialed GET $WEB_PROBE_URL did not complete${WEB_CURLERR:+ [curl: $WEB_CURLERR]} - transient; re-run)"
+        else
+          case "$WEB_CODE" in
+            200)
+              echo "L6: web-host@$WEB_URL -> LIVE (GET $WEB_PROBE_URL -> 200 with the device JWT from $WEBJWT_SRC)" >&2
+              LIVE_FILE="web-host (device JWT from $WEBJWT_SRC)"
+              LIVE_URL="$WEB_PROBE_URL"
+              live_exit "https-web-device-jwt" "$PARTIAL_WEB_HOST" ;;
+            401)
+              case "$WEB_MSG" in
+                *user_id*) l6_fail "WEB_HOST_NO_USER_JWT (the host is UP and refused the bearer from $WEBJWT_SRC for LACKING a user_id claim: \"$WEB_MSG\". A CREDENTIAL fact - this token is not a pairing-minted device JWT. Never a host verdict)" ;;
+                *) l6_fail "WEB_HOST_JWT_UNAUTHORIZED (the host is UP and refused the bearer from $WEBJWT_SRC - HTTP 401${WEB_MSG:+: \"$WEB_MSG\"}. Expired is the normal cause: device JWTs live ~4h, and this is the same shape-test-then-401 freshness gate L4 applies. A CREDENTIAL fact, never a host verdict)" ;;
+              esac ;;
+            *)
+              l6_fail "WEB_HOST_HTTP_${WEB_CODE} (the host is UP and answered HTTP $WEB_CODE to the credentialed GET $WEB_PROBE_URL${WEB_MSG:+: \"$WEB_MSG\"} - served, and neither LIVE nor a credential refusal. Read the code: a 403 is an authorization fact, a 5xx is the host's)" ;;
+          esac
+        fi
+      fi
+    fi
+  fi
+fi
+
 # ----- Honest failure: name the exhausted cascade ------------------------------
 # BUDGET_EXCEEDED IS NOT DEAD, and the distinction is the whole reason it exists.
 # DEAD asserts that every door was probed and none answered; a run that ran out
@@ -3312,16 +3569,10 @@ fi
 # false-DEAD class every other guard in this file is written against, reached by
 # a stopwatch instead of a bug. The exhausted list still prints underneath either
 # way: the skipped doors are IN it, named SKIPPED_*, so nothing is hidden.
-if [ -n "$BUDGET_TRIPPED" ]; then
-  echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked. Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
-else
-  echo "VERDICT: DEAD - no OUT-OF-BAND door, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential):"
-fi
-for f in "${FAILS[@]}"; do
-  echo "  - $f"
-done
+# THE TABLE FIRST, then the breadcrumb, then the verdict read off the table.
+axes_block
 # The runner's own spawn-time reason belongs IN the verdict block, not only in
-# the stderr log above it: an agent that pastes this DEAD verdict as its
+# the stderr log above it: an agent that pastes this verdict as its
 # blocked-evidence would otherwise drop the one line that names WHY there was no
 # door to find. Context only - it never changed the verdict, and it is a fact
 # about spawn time, not about now (see the reader near L1).
@@ -3331,6 +3582,23 @@ if [ -n "$CRUMB" ]; then
 else
   echo "BREADCRUMB: none in this cwd ($CRUMB_FILE: absent, unreadable or empty). That is UNKNOWN, not evidence of a healthy provision - the runner writes nothing on the healthy path AND nothing at all for a workdir it never provisioned. It also stays SILENT on purpose when it declines to overwrite a workdir that already DECLARES a coord-mcp (a foreign agent-JWT config, or a secondary runner leaving alone a primary shared-root config that declares one) - and declaring is only a /mcpServers/coord-mcp key test, never proof the door answers. So an absent breadcrumb beside an .mcp.json that L1 could not revive is a DIAGNOSED shape, not an unexplained one: a dead declared entry is precisely what buys that silence. This reader looks only in the cwd; the runner writes into the workdir IT provisioned, which on a linked worktree may be the primary checkout."
 fi
+# DEAD IS STRUCTURALLY UNPRINTABLE WHILE AN AXIS IS UNPROBED. An axis this run
+# did not ask - the sweep budget, an env opt-out - leaves that capability
+# UNMEASURED, and a DEAD printed over it would be the exact generalisation the
+# table exists to stop. The native-tools row is the one standing exclusion
+# (SCOPE below) and does not by itself withhold DEAD; every other unprobed row
+# does. The `axes:` roster line under the failure list is what a reader (and
+# check #58) reads the verdict against.
+if [ -n "$BUDGET_TRIPPED" ]; then
+  echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked (the AXES table above names them; axes: unprobed= carries them). Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
+elif [ "$AXES_UNPROBED" != "native-coord-mcp-tools" ]; then
+  echo "VERDICT: UNKNOWN - no door answered among the axes this run asked, and at least one axis was NOT asked: unprobed=$AXES_UNPROBED. Not DEAD: a verdict is only as wide as the axes it was computed from, and this one was computed over fewer than all of them. Probe the unprobed axis (drop the opt-out, or probe it by hand) before writing 'coord is unreachable' anywhere. What WAS asked - $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s):"
+else
+  echo "VERDICT: DEAD - no OUT-OF-BAND door on ANY probed axis, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential), L6 (the web host $WEB_URL). Every row in the AXES table above is PROBED; the one axis not asked is your native coord_* tools (SCOPE below):"
+fi
+for f in "${FAILS[@]}"; do
+  echo "  - $f"
+done
 # SCOPE is not a footnote. L4 closed the missing-DOOR route to a false DEAD; this
 # closes the remaining INFERENCE route to one. Every rung above probes a loopback
 # proxy or an HTTPS bearer — none touches the session's own coord_* MCP tools,
@@ -3342,7 +3610,8 @@ fi
 # off — so an agent would presume landed writes lost.
 wedge_block
 approval_verdict_block
-echo "SCOPE: this covers ONLY the out-of-band doors above. It does NOT probe your native coord_* MCP tools - a separate transport that can be fully LIVE while every door here is dead (observed 2026-08-08: DEAD alongside a successful coord_gate_inspect in the same minute)."
+echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+echo "SCOPE: the verdict above is exactly as wide as the AXES table - hosts 127.0.0.1, coord.qontinui.io and api.qontinui.io, the rows marked PROBED, and nothing else (unprobed=$AXES_UNPROBED). The one standing exclusion is your native coord_* MCP tools - a separate transport this script cannot probe, which can be fully LIVE while every door here is dead (observed 2026-08-08: DEAD alongside a successful coord_gate_inspect in the same minute)."
 echo "So BEFORE applying the lost-write doctrine, issue one cheap native coord read (coord_gate_inspect on any known gate_id). If it answers, coord is REACHABLE: re-issue over the native tools and verify by read - do not presume the write lost on this verdict alone."
 # THE RE-PROVISION ADVICE IS WEDGE-GATED. The ordinary Next line points at the
 # provisioning route to explain why re-running it by hand is pointless - but on a
