@@ -5564,9 +5564,19 @@ fn breadcrumb_stamp_json(workdir: &str, verdict: &str, port: Option<u16>) -> Str
 ///
 /// Two lines, and the split is load-bearing:
 ///
-/// 1. `coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate`
-///    — byte-compatible in shape with every breadcrumb ever written, so the
-///    prose readers and `/coord-revive`'s mechanical read keep working.
+/// 1. `coord-mcp UNREACHABLE ({reason}) — coord-mcp degraded; use /gate or /coord-revive`
+///    — the `coord-mcp UNREACHABLE (` prefix and the ` — ` separator are
+///    byte-compatible with every breadcrumb ever written, so the prose readers
+///    and `/coord-revive`'s mechanical read keep working. The remedy clause
+///    after the dash used to scope itself to gate registration (`gate
+///    registration degraded; use /gate`), which under-stated the outage — a
+///    dead transport loses EVERY coord tool, not one — and named one door
+///    where its sibling [`write_unprovisioned_breadcrumb`] already named two.
+///    Widened by plan
+///    `2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported`
+///    Phase 4 (the dossier's N+4 residual). Only the clause moved; `{reason}`
+///    and its call sites are owned by `scripts/breadcrumb-reason-drift.py`'s
+///    table and are untouched.
 /// 2. One JSON object ([`breadcrumb_stamp_json`]) carrying when/where/what.
 ///
 /// `verdict` is the uppercase cause token ([`ProbeVerdict::token`] for the probe
@@ -5578,7 +5588,9 @@ pub(crate) fn write_degraded_breadcrumb(
     verdict: &str,
     port: Option<u16>,
 ) {
-    let line1 = format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate");
+    let line1 = format!(
+        "coord-mcp UNREACHABLE ({reason}) — coord-mcp degraded; use /gate or /coord-revive"
+    );
     let line2 = breadcrumb_stamp_json(workdir, verdict, port);
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
     if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
@@ -11342,7 +11354,9 @@ mod tests {
             let line1 = read_crumb(&d).lines().next().unwrap().to_string();
             assert_eq!(
                 line1,
-                format!("coord-mcp UNREACHABLE ({needle}) — gate registration degraded; use /gate"),
+                format!(
+                    "coord-mcp UNREACHABLE ({needle}) — coord-mcp degraded; use /gate or /coord-revive"
+                ),
                 "{verdict:?}"
             );
         }
@@ -11671,7 +11685,7 @@ mod tests {
         std::fs::write(
             d.join(COORD_MCP_STATUS_FILE),
             format!(
-                "coord-mcp UNREACHABLE (stale) — gate registration degraded; use /gate\n\
+                "coord-mcp UNREACHABLE (stale) — coord-mcp degraded; use /gate or /coord-revive\n\
                  {{\"written_at\":\"{ancient}\",\"workdir\":\"{wd}\",\"port\":9876,\
                  \"verdict\":\"TIMEOUT\",\"build_id\":\"old\",\"schema\":1}}\n"
             ),
