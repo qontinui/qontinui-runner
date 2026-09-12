@@ -13,11 +13,19 @@
  *      not_connected → connected precedence, including the regression case
  *      where a thrown auth error must NOT collapse to the Connect-GitHub CTA.
  *   3. `isAuthLoadError` — which failures the error view offers sign-in for.
+ *   4. `parseGithubConnectResult` — the `github-connect-result` event payload
+ *      contract with the runner's `wake_handler`.
  */
 
 import { describe, it, expect } from "vitest";
 
-import { classifyLoadError, deriveGithubPickerView, isAuthLoadError } from "./GithubRepoPicker";
+import {
+  GITHUB_CONNECT_RESULT_EVENT,
+  classifyLoadError,
+  deriveGithubPickerView,
+  isAuthLoadError,
+  parseGithubConnectResult,
+} from "./GithubRepoPicker";
 
 const HEADLINE_401 = "Your Qontinui sign-in has expired. Sign in again to continue.";
 const HEADLINE_403 =
@@ -153,5 +161,31 @@ describe("deriveGithubPickerView", () => {
         connected: false,
       }),
     ).toBe("error");
+  });
+});
+
+describe("parseGithubConnectResult", () => {
+  it("names the event the runner's wake_handler emits", () => {
+    // Mirrors `GITHUB_CONNECT_RESULT_EVENT` in src-tauri/src/wake_handler.rs.
+    expect(GITHUB_CONNECT_RESULT_EVENT).toBe("github-connect-result");
+  });
+
+  it("accepts the { ok, message } contract either way", () => {
+    expect(parseGithubConnectResult({ ok: true, message: "GitHub connected" })).toEqual({
+      ok: true,
+      message: "GitHub connected",
+    });
+    expect(parseGithubConnectResult({ ok: false, message: "expired" })).toEqual({
+      ok: false,
+      message: "expired",
+    });
+  });
+
+  it("rejects a drifted or non-object payload rather than rendering undefined", () => {
+    expect(parseGithubConnectResult(null)).toBeNull();
+    expect(parseGithubConnectResult("ok")).toBeNull();
+    expect(parseGithubConnectResult({ ok: "true", message: "x" })).toBeNull();
+    expect(parseGithubConnectResult({ ok: true })).toBeNull();
+    expect(parseGithubConnectResult({ message: "x" })).toBeNull();
   });
 });
