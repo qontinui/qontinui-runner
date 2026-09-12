@@ -7549,6 +7549,7 @@ mod tests {
                 &mut forb_deps,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
             assert_eq!(s.forbidden, 1, "cycle {cycle}");
@@ -7586,6 +7587,7 @@ mod tests {
                 &mut forb_deps,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
             assert_eq!(s.errors, 1);
