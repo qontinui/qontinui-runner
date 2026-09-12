@@ -78,12 +78,17 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "20"
-      # No `pnpm install`: the script and its tests import only Node built-ins.
+      # No setup-node and no `pnpm install`: the script and its tests import
+      # only Node built-ins, and ubuntu-latest ships a Node new enough for
+      # them (>= 18: global fetch, node:test). setup-node@v5 is deliberately
+      # NOT used here — it reads `packageManager: pnpm@…` from package.json and
+      # enables pnpm caching on its own, which fails with "Unable to locate
+      # executable file: pnpm" unless pnpm/action-setup ran first (ci.yml does
+      # that; this job has nothing to install). Measured on this PR's first run.
       - name: Run unit tests
-        run: node --test scripts/__tests__/ci-flake-escalate.test.mjs
+        run: |
+          node --version
+          node --test scripts/__tests__/ci-flake-escalate.test.mjs
 
   escalate:
     name: Escalate flaky tests from coord's history
@@ -106,9 +111,7 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: "20"
+      # Runner-provided Node, for the same reason as the unit-tests job above.
       - name: Read coord's flake history and upsert escalation issues
         env:
           GH_TOKEN: ${{ github.token }}
