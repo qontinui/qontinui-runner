@@ -733,6 +733,72 @@ mod tests {
 
     // ---- app attribution -------------------------------------------------
 
+    /// The producer/consumer key pair behind attribution, pinned across the
+    /// language boundary.
+    ///
+    /// The frontend stamps `appId` from its own `RUNNER_APP_ID` literal
+    /// (`src/lib/ui-bridge/use-discovered-specs.ts`); the runner registers its
+    /// `project.apps` row from `crate::spec_api::storage::RUNNER_APP_ID`; and
+    /// `OBSERVATION_INSERT_SQL` matches the two with a subquery. Nothing else
+    /// ties them together: if the two literals drift, every observation is
+    /// recorded with `app_id NULL`, and the only symptom is one WARN per
+    /// process on a fire-and-forget path — the exact failure this feature
+    /// exists to make impossible, silently reintroduced. Cross-language, so
+    /// neither compiler can see it; this reads the TS source the way
+    /// `valid_navigate_pages_match_the_typescript_map` (`mcp::ui_bridge::page`)
+    /// already reads `useAppNavigation.ts`.
+    ///
+    /// The second half pins the *wiring*: the value only reaches a snapshot
+    /// if the `runner-tabs` enricher in `App.tsx` actually returns it — from
+    /// the imported constant, not a local shadow of the same name.
+    #[test]
+    fn the_frontend_stamps_the_same_app_id_the_runner_registers() {
+        // cargo runs tests with CWD = crate root (src-tauri).
+        let source = std::fs::read_to_string("../src/lib/ui-bridge/use-discovered-specs.ts")
+            .expect("use-discovered-specs.ts must be readable from the crate root");
+        let decl = source
+            .find("export const RUNNER_APP_ID =")
+            .expect("`export const RUNNER_APP_ID =` must be exported from use-discovered-specs.ts");
+        // Bound the literal search to the declaration's own line, so a
+        // declaration that stops being a string literal fails as "no literal
+        // on this line" rather than comparing against the next string in the
+        // file.
+        let line = source[decl..].lines().next().unwrap_or_default();
+        let open = line
+            .find('"')
+            .expect("RUNNER_APP_ID must be a string literal")
+            + 1;
+        let close = line[open..]
+            .find('"')
+            .expect("RUNNER_APP_ID literal must be terminated on its line")
+            + open;
+        let ts_app_id = &line[open..close];
+
+        assert_eq!(
+            ts_app_id,
+            crate::spec_api::storage::RUNNER_APP_ID,
+            "frontend RUNNER_APP_ID and Rust RUNNER_APP_ID have drifted: \
+             every observation would be recorded un-attributed"
+        );
+
+        let app = std::fs::read_to_string("../src/App.tsx")
+            .expect("App.tsx must be readable from the crate root");
+        assert!(
+            app.contains("import { loadDiscoveredSpecs, RUNNER_APP_ID }"),
+            "App.tsx must import RUNNER_APP_ID from use-discovered-specs (one literal, one owner)"
+        );
+        assert!(
+            !app.contains("const RUNNER_APP_ID"),
+            "App.tsx must not shadow RUNNER_APP_ID with a local binding"
+        );
+        assert!(
+            app.contains("appId: RUNNER_APP_ID"),
+            "App.tsx's `runner-tabs` snapshot enricher must return `appId: RUNNER_APP_ID` — \
+             that is the only place the id enters a snapshot, and `resolve_app_id` reads \
+             nothing else"
+        );
+    }
+
     #[test]
     fn app_id_is_read_from_the_snapshot_top_level() {
         // The runner frontend's `runner-tabs` enricher stamps this from
