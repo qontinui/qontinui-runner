@@ -12,6 +12,9 @@
  *   - Hide when the user dismissed it for the session AND status hasn't changed
  *     since dismissal (re-shows on reload, on token clear, or on a new
  *     registration error).
+ *   - SHOW unconditionally while the runner is credential-dark, with no
+ *     dismiss affordance: every session spawned in that state has no coord
+ *     access, and a dismissed banner is a silent runner again.
  *
  * The Authorize button invokes the `cognito_sign_in` Tauri command — the
  * canonical one-click connect path. It opens the system browser for Cognito
@@ -38,12 +41,15 @@ import { AlertCircle, X } from "lucide-react";
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 
 import {
+  credentialDarkPresentation,
   makeRePairClickHandler,
+  normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
   type AuthBannerStatus,
+  type CredentialDarkSignal,
 } from "./web-integration-banner-logic";
 
 // ---------------------------------------------------------------------------
@@ -111,16 +117,15 @@ export function WebIntegrationAuthBanner() {
   const [reKicking, setReKicking] = useState(false);
   const [reKickError, setReKickError] = useState<string | null>(null);
 
-  // Phase 2 (terminal-autonomy-survives-logout): credential-dark signal. The
-  // device-JWT refresher emits `autonomy-credential-dark` with
-  // `{ dark, message }` when a HARD Cognito refresh failure (expired/revoked
-  // refresh token — no headless recovery) parks the coord-dependent autonomy
-  // driver, and again with `dark:false` when a later refresh succeeds. We hold
-  // the latest signal and surface a distinct, top-precedence banner so the
-  // operator knows autonomy needs a re-auth instead of silently stalling.
-  const [credentialDark, setCredentialDark] = useState<{ dark: boolean; message: string } | null>(
-    null,
-  );
+  // Credential-dark signal. The device-JWT refresher emits
+  // `autonomy-credential-dark` with `{dark, cause, message, cta, since}` for
+  // EVERY terminal credential cause — a HARD Cognito refresh failure
+  // (`cognito_hard`, the original arm) and, since the coord-credential-posture
+  // plan, every non-answering coord-credential posture: `expired`, `absent`,
+  // `unrefreshable`, `upstream_401`. It fires at BOOT too, which is the moment
+  // a runner that restored a dead credential used to be silent. `dark:false`
+  // clears it on recovery.
+  const [credentialDark, setCredentialDark] = useState<CredentialDarkSignal | null>(null);
 
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
@@ -217,12 +222,14 @@ export function WebIntegrationAuthBanner() {
   // inside the event callback, satisfying react-hooks/set-state-in-effect.
   useEffect(() => {
     let cancelled = false;
-    const unlisten = listen<{ dark: boolean; message: string }>(
-      "autonomy-credential-dark",
-      (event) => {
-        if (!cancelled) setCredentialDark(event.payload);
-      },
-    );
+    const unlisten = listen<unknown>("autonomy-credential-dark", (event) => {
+      // Normalised, because this event comes from the RUNNER BINARY and the
+      // frontend may be running against a build that predates the widened
+      // payload. An unparseable payload is dropped rather than rendered as a
+      // blank banner.
+      const signal = normalizeCredentialDarkSignal(event.payload);
+      if (!cancelled && signal !== null) setCredentialDark(signal);
+    });
     return () => {
       cancelled = true;
       unlisten
@@ -301,19 +308,38 @@ export function WebIntegrationAuthBanner() {
   const handleDismiss = useCallback(() => {
     // `deviceJwtPresent !== false` treats the not-yet-loaded (null) state as
     // paired so a paired runner never flashes the banner while the
-    // device_jwt_present probe is in flight.
-    const sig = statusSignature(status, deviceJwtPresent !== false);
+    // device_jwt_present probe is in flight. The credential posture is part of
+    // the signature, so a later posture transition resurfaces the banner.
+    const sig = statusSignature(status, deviceJwtPresent !== false, credentialDark);
     writeDismissedSignature(sig);
     setDismissedSignature(sig);
-  }, [status, deviceJwtPresent]);
+  }, [status, deviceJwtPresent, credentialDark]);
+
+  // The credential banner's CTA. Both destinations are commands that already
+  // exist: an interactive Cognito re-login, or the headless refresher kick.
+  const handleCredentialCta = useCallback(
+    async (action: "cognito_sign_in" | "kick_refresher") => {
+      if (action === "cognito_sign_in") {
+        await handleAuthorize();
+        return;
+      }
+      await handleRePair();
+    },
+    [handleAuthorize, handleRePair],
+  );
 
   if (tier !== "qontinui_account") return null;
 
-  // Phase 2 (terminal-autonomy-survives-logout): credential-dark banner takes
-  // TOP precedence — when the refresher reports a dead Cognito refresh token,
-  // the coord-dependent autonomy driver is parked and only an interactive
-  // re-login fixes it. The "Sign in" CTA reuses the canonical Cognito flow.
+  // The credential banner takes TOP precedence. While the runner's credential
+  // is dark — a dead Cognito refresh token, an expired/absent/unrefreshable
+  // coord device JWT, or a coord that keeps rejecting it — every session this
+  // runner spawns works WITHOUT coord and does not know it. That is the whole
+  // defect this banner closes, so it is not dismissable and it renders the
+  // CAUSE rather than one generic sentence.
   if (credentialDark?.dark) {
+    const presentation = credentialDarkPresentation(credentialDark);
+    const busy = presentation.ctaAction === "cognito_sign_in" ? authorizing : reKicking;
+    const ctaError = presentation.ctaAction === "cognito_sign_in" ? authorizeError : reKickError;
     return (
       <div
         ref={rootRef}
@@ -344,37 +370,41 @@ export function WebIntegrationAuthBanner() {
           aria-hidden="true"
         />
         <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-          <div style={{ fontWeight: 600 }}>Autonomous sessions paused</div>
+          <div style={{ fontWeight: 600 }}>{presentation.title}</div>
           <div style={{ fontSize: "0.8125rem", opacity: 0.85 }}>
-            {credentialDark.message || "Sign in again to resume autonomous sessions."}
-            {authorizeError ? (
+            {presentation.body}
+            {ctaError ? (
               <>
                 <br />
-                <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{authorizeError}</span>
+                <span style={{ color: "hsl(var(--destructive, 0 84% 60%))" }}>{ctaError}</span>
               </>
             ) : null}
           </div>
         </div>
-        <button
-          ref={authorizeButtonRef}
-          type="button"
-          onClick={handleAuthorize}
-          disabled={authorizing}
-          style={{
-            background: "var(--accent, #6366f1)",
-            color: "#fff",
-            border: "none",
-            borderRadius: 4,
-            padding: "4px 10px",
-            fontSize: "0.8125rem",
-            fontWeight: 600,
-            cursor: authorizing ? "wait" : "pointer",
-            opacity: authorizing ? 0.7 : 1,
-            whiteSpace: "nowrap",
-          }}
-        >
-          {authorizing ? "Opening…" : "Sign in"}
-        </button>
+        {presentation.ctaAction ? (
+          <button
+            ref={presentation.ctaAction === "cognito_sign_in" ? authorizeButtonRef : rePairButtonRef}
+            type="button"
+            onClick={() => {
+              void handleCredentialCta(presentation.ctaAction!);
+            }}
+            disabled={busy}
+            style={{
+              background: "var(--accent, #6366f1)",
+              color: "#fff",
+              border: "none",
+              borderRadius: 4,
+              padding: "4px 10px",
+              fontSize: "0.8125rem",
+              fontWeight: 600,
+              cursor: busy ? "wait" : "pointer",
+              opacity: busy ? 0.7 : 1,
+              whiteSpace: "nowrap",
+            }}
+          >
+            {busy ? "Working…" : presentation.ctaLabel}
+          </button>
+        ) : null}
       </div>
     );
   }
@@ -459,7 +489,12 @@ export function WebIntegrationAuthBanner() {
     );
   }
 
-  const visible = shouldShowAuthBanner(status, deviceJwtPresent !== false, dismissedSignature);
+  const visible = shouldShowAuthBanner(
+    status,
+    deviceJwtPresent !== false,
+    dismissedSignature,
+    credentialDark,
+  );
   if (!visible) return null;
 
   return (

@@ -14,6 +14,34 @@ export interface AuthBannerStatus {
 }
 
 /**
+ * Which call to action a credential cause needs. Every one of these is served
+ * by a command that ALREADY exists — `cognito_sign_in` for an interactive
+ * re-login, `kick_device_jwt_refresher_cmd` for both the re-pair and the
+ * "retry refresh now" arms. This plan adds no Tauri command.
+ */
+export type CredentialDarkCta = "sign_in" | "re_pair" | "retry_refresh";
+
+/**
+ * Payload of the `autonomy-credential-dark` event, widened by the
+ * coord-credential-posture plan (DD3) from `{dark, message}` to carry the
+ * CAUSE and the CTA that cause needs.
+ *
+ * `cause` is the coord-credential posture token (`expired`, `absent`,
+ * `unrefreshable`, `upstream_401`) for a posture transition, `cognito_hard`
+ * for the pre-existing HARD Cognito arm, and `recovered` when `dark` is false.
+ * `since` is unix SECONDS at which the runner entered this state — the banner
+ * says "since 03:54" because a user needs to know whether the sessions they
+ * already opened are affected.
+ */
+export interface CredentialDarkSignal {
+  dark: boolean;
+  cause: string;
+  message: string;
+  cta: CredentialDarkCta | null;
+  since: number | null;
+}
+
+/**
  * Stable signature used to decide "did the status change since the user
  * dismissed?". Any change to the bits the banner cares about resurfaces it.
  *
@@ -22,16 +50,24 @@ export interface AuthBannerStatus {
  * `runner_token`). Including `registrationError` means a 401 transition (auth
  * failure after the credential was revoked / rotated server-side) re-shows the
  * banner even mid-session — the user explicitly needs to know.
+ *
+ * The credential POSTURE is part of the signature too. It was not, and that
+ * was a hole: the signature carried `enabled | deviceJwtPresent |
+ * registrationError`, none of which moves when the coord credential expires —
+ * so a banner dismissed while healthy stayed dismissed through the transition
+ * that mattered, and the runner was silent again.
  */
 export function statusSignature(
   status: AuthBannerStatus | null,
   deviceJwtPresent: boolean,
+  credentialDark: CredentialDarkSignal | null = null,
 ): string {
   if (!status) return "";
   return [
     status.enabled ? "1" : "0",
     deviceJwtPresent ? "P" : "_",
     status.registrationError ?? "",
+    credentialDark?.dark ? `D:${credentialDark.cause}` : "_",
   ].join("|");
 }
 
@@ -51,22 +87,126 @@ export function statusSignature(
  *   - Hide when the user dismissed it for the session AND status hasn't changed
  *     since dismissal (re-shows on reload, on un-pair, or on a new
  *     registration error).
+ *   - SHOW unconditionally while `credentialDark.dark` — no opt-out, no
+ *     dismissal, no "the runner is paired so it must be fine". See below.
  */
 export function shouldShowAuthBanner(
   status: AuthBannerStatus | null,
   deviceJwtPresent: boolean,
   dismissedSignature: string | null,
+  credentialDark: CredentialDarkSignal | null = null,
 ): boolean {
+  // NOT DISMISSABLE WHILE DARK, and not suppressible by any other rule.
+  //
+  // This overrides every hide below, including `enabled === false` and a
+  // present device JWT — because while the posture is dark those two say
+  // nothing useful: a paired runner holding an EXPIRED credential has a device
+  // JWT and is still spawning sessions with no coord access. A dismissed
+  // credential banner is a silent runner again, which is the whole defect.
+  if (credentialDark?.dark) return true;
   if (!status) return false;
   if (!status.enabled) return false;
   if (deviceJwtPresent) return false;
   if (
     dismissedSignature !== null &&
-    dismissedSignature === statusSignature(status, deviceJwtPresent)
+    dismissedSignature === statusSignature(status, deviceJwtPresent, credentialDark)
   ) {
     return false;
   }
   return true;
+}
+
+/**
+ * What the credential banner RENDERS for a given cause — kept here rather than
+ * in the `.tsx` so every cause's wording and CTA is unit-testable in node.
+ *
+ * `ctaAction` names which existing Tauri command the button invokes:
+ * `cognito_sign_in` for an interactive re-login, `kick_refresher` for the
+ * headless retry (`kick_device_jwt_refresher_cmd`).
+ */
+export interface CredentialDarkPresentation {
+  title: string;
+  body: string;
+  ctaLabel: string | null;
+  ctaAction: "cognito_sign_in" | "kick_refresher" | null;
+}
+
+/** Render `since` (unix SECONDS) as a wall-clock time for the banner body. */
+export function formatSince(since: number): string {
+  return new Date(since * 1000).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+const CREDENTIAL_DARK_TITLES: Record<string, string> = {
+  cognito_hard: "Autonomous sessions paused",
+  expired: "Coord credential expired",
+  unrefreshable: "Coord credential expired — automatic refresh failed",
+  absent: "This runner has no coord credential",
+  upstream_401: "Coord is rejecting this runner's credential",
+};
+
+const CREDENTIAL_DARK_CTA_LABELS: Record<CredentialDarkCta, string> = {
+  sign_in: "Sign in",
+  re_pair: "Re-pair",
+  retry_refresh: "Retry refresh now",
+};
+
+/**
+ * Coerce whatever arrived on the `autonomy-credential-dark` event into a
+ * complete {@link CredentialDarkSignal}.
+ *
+ * The event is emitted by the RUNNER BINARY, and the frontend can be running
+ * against a build that predates the widened payload (`{dark, message}` only).
+ * An unknown cause must still render a banner — a runner that says "I am dark"
+ * in the old shape is exactly as dark as one that says it in the new shape.
+ */
+export function normalizeCredentialDarkSignal(raw: unknown): CredentialDarkSignal | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.dark !== "boolean") return null;
+  const cta =
+    r.cta === "sign_in" || r.cta === "re_pair" || r.cta === "retry_refresh" ? r.cta : null;
+  return {
+    dark: r.dark,
+    // A legacy payload carries no cause. `cognito_hard` is what the only
+    // pre-widening emitter meant, so that is the honest default for `dark`.
+    cause:
+      typeof r.cause === "string" && r.cause.length > 0
+        ? r.cause
+        : r.dark
+          ? "cognito_hard"
+          : "recovered",
+    message: typeof r.message === "string" ? r.message : "",
+    // A legacy dark payload had exactly one remedy: sign in again.
+    cta: cta ?? (r.dark && r.cta === undefined ? "sign_in" : null),
+    since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
+  };
+}
+
+export function credentialDarkPresentation(
+  signal: CredentialDarkSignal,
+  formatTime: (since: number) => string = formatSince,
+): CredentialDarkPresentation {
+  const title = CREDENTIAL_DARK_TITLES[signal.cause] ?? "Coord credential problem";
+  const prefix =
+    typeof signal.since === "number" && Number.isFinite(signal.since)
+      ? `Since ${formatTime(signal.since)} — `
+      : "";
+  const body = `${prefix}${signal.message}`;
+  const ctaAction =
+    signal.cta === null
+      ? null
+      : signal.cta === "sign_in"
+        ? ("cognito_sign_in" as const)
+        : ("kick_refresher" as const);
+  return {
+    title,
+    body,
+    ctaLabel: signal.cta === null ? null : CREDENTIAL_DARK_CTA_LABELS[signal.cta],
+    ctaAction,
+  };
 }
 
 // ---------------------------------------------------------------------------
