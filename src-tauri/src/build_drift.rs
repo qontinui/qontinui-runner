@@ -214,35 +214,41 @@ pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
 }
 
 /// Read trunk's `mcp_api.rs` and parse its tool policy. Every git call is
-/// bounded ([`git_output`]). A fetch failure is not fatal, but it changes
-/// WHICH commit is read: `main_sha` is `ls-remote`'s answer, which names an
-/// object this checkout may never have received, so after a failed fetch the
-/// read falls back to the LOCAL `origin/<trunk>` object and reports THAT sha
-/// as `trunk_sha` with `source: "local-ref"` — a possibly-trailing trunk is
-/// visible in the refusal rather than collapsing into a silent `unknown`
-/// when `git show <unfetched sha>` fails.
-fn read_trunk_tool_policy(repo: &Path, main_sha: &str) -> Option<TrunkToolPolicy> {
+/// bounded ([`git_output`] / [`run_probe`]). The fetch touches the
+/// remote-tracking ref only: `--no-write-fetch-head` keeps it from rewriting
+/// the source checkout's per-worktree `FETCH_HEAD` (a peer mid-`git pull`
+/// there would otherwise merge OUR fetch), `gc.auto=0` keeps a 60 s tree-kill
+/// from interrupting a gc it triggered, and a refused terminal prompt keeps an
+/// unauthenticated remote from eating the whole timeout. Whether or not the
+/// fetch succeeded, `trunk_sha` is what `origin/<trunk>` resolves to AFTER
+/// the attempt — never a pre-fetch guess wearing a `fetched` label — and
+/// `source` records only the fetch verdict, so a possibly-trailing local ref
+/// is visible in the refusal rather than collapsing into `unknown`.
+fn read_trunk_tool_policy(repo: &Path) -> Option<TrunkToolPolicy> {
     let branch = crate::git_trunk::resolve_trunk_branch(repo).unwrap_or_else(|| "main".to_string());
-    // Remote-tracking refs only — a fetch never touches a working tree, so it
-    // is safe against a peer's WIP in the source checkout. A quiet fetch
-    // prints nothing on success, which `git_output` would read as `None`, so
-    // the outcome is taken from `run_probe` directly rather than from stdout.
+    // A quiet fetch prints nothing on success, which `git_output` would read
+    // as `None`, so the outcome is taken from `run_probe` directly.
     let fetched = {
         let mut cmd = crate::process_helpers::no_window("git");
-        cmd.args(["fetch", "--quiet", "origin", &branch])
-            .current_dir(repo);
+        cmd.args([
+            "-c",
+            "gc.auto=0",
+            "fetch",
+            "--quiet",
+            "--no-write-fetch-head",
+            "origin",
+            &branch,
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(repo);
         matches!(
             run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git fetch"),
             ProbeOutcome::Captured(_)
         )
     };
-    let (trunk_sha, source) = if fetched {
-        (main_sha.to_string(), "fetched")
-    } else {
-        let local = git_output(repo, &["rev-parse", &format!("origin/{branch}")])
-            .filter(|s| looks_like_sha(s))?;
-        (local, "local-ref")
-    };
+    let source = if fetched { "fetched" } else { "local-ref" };
+    let trunk_sha = git_output(repo, &["rev-parse", &format!("origin/{branch}")])
+        .filter(|s| looks_like_sha(s))?;
     let source_text = TOOL_POLICY_SOURCE_PATHS
         .iter()
         .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
@@ -312,7 +318,11 @@ fn candidate_repo_dir() -> Option<PathBuf> {
 /// failure (spawn error, non-zero exit, empty output) → `None`.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = crate::process_helpers::no_window("git");
-    cmd.args(args).current_dir(repo);
+    // A credential prompt would sit until `DRIFT_GIT_TIMEOUT` reaps it, every
+    // tick; refuse the prompt so an unauthenticated remote fails fast instead.
+    cmd.args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(repo);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git")
     else {
         return None;
@@ -444,11 +454,11 @@ fn check_once_blocking() -> BuildDriftStatus {
     // describe one measurement. Stored here rather than returned: it is a
     // second cache with its own reader (`trunk_tool_policy`), and an
     // unresolvable trunk clears it to UNKNOWN instead of serving a stale read.
-    store_trunk_tool_policy(
-        main_sha
-            .as_deref()
-            .and_then(|m| read_trunk_tool_policy(&repo, m)),
-    );
+    store_trunk_tool_policy(if main_sha.is_some() {
+        read_trunk_tool_policy(&repo)
+    } else {
+        None
+    });
     let divergent = compute_divergent(embedded, main_sha.as_deref());
     // Count FIRST, then derive `behind` from the count. The old code decided
     // `behind` from the SHA mismatch and only then counted, which is how the
