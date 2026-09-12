@@ -4951,7 +4951,7 @@ impl<'a> ProxyConfigIdentity<'a> {
     pub(crate) fn credential_file_name(&self) -> String {
         use sha2::{Digest as _, Sha256};
         let mut h = Sha256::new();
-        h.update(self.workdir.as_bytes());
+        h.update(credential_workdir_key(self.workdir).as_bytes());
         h.update(b"|");
         match self.principal {
             ProxyConfigPrincipal::Device => h.update(b"device"),
@@ -4967,6 +4967,26 @@ impl<'a> ProxyConfigIdentity<'a> {
         let digest = hex::encode(h.finalize());
         format!("{}.json", &digest[..16])
     }
+}
+
+/// The workdir as hashed into a credential file name. The four builder callers
+/// source the string differently (`primary_wt` at spawn, a census/record
+/// workdir on reconcile, `root.to_string_lossy()` for the shared root), and any
+/// spelling difference for ONE directory - a trailing separator, `\\` against
+/// `/`, drive-letter case on Windows - would make a rotation rewrite a
+/// DIFFERENT file from the one the live shim is reading: the stale-nonce-forever
+/// failure the stdio arm exists to end. So the key is spelling-insensitive:
+/// separators unified, trailing separators dropped (a bare root keeps its one),
+/// and case-folded on the case-insensitive filesystem.
+fn credential_workdir_key(workdir: &str) -> String {
+    let mut k = workdir.trim().replace('\\', "/");
+    while k.len() > 1 && k.ends_with('/') && !k.ends_with(":/") {
+        k.pop();
+    }
+    if cfg!(windows) {
+        k = k.to_lowercase();
+    }
+    k
 }
 
 /// The transport verdict the config builder acts on.
@@ -5067,10 +5087,59 @@ pub(crate) fn stdio_shim_gate() -> StdioShimGate {
 /// The per-process selftest cache behind [`stdio_shim_gate`].
 static STDIO_SHIM_PROBE: Mutex<Option<(std::time::Instant, StdioShimGate)>> = Mutex::new(None);
 
-/// Probe the shim at most once per [`STDIO_SHIM_REPROBE_INTERVAL`]. The lock is
-/// held across the probe on purpose: concurrent spawns during a probe wait for
-/// its verdict rather than each paying their own selftest.
+/// Set while a background re-probe is running, so a stale cache spawns ONE
+/// refresh thread rather than one per concurrent spawn.
+static STDIO_SHIM_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fill the selftest cache off the request path. Called once at boot from a
+/// `spawn_blocking`, so the first spawn after start reads a verdict instead of
+/// paying the probe inline on a tokio worker thread.
+pub(crate) fn warm_stdio_shim_probe() {
+    let _ = cached_stdio_shim_probe();
+}
+
+/// Probe the shim at most once per [`STDIO_SHIM_REPROBE_INTERVAL`].
+///
+/// This is reached inline from async spawn paths, so it must not park a tokio
+/// worker on a subprocess: a FRESH verdict is served from the cache; a STALE
+/// one is served as-is while a single background thread re-probes and refills
+/// the slot (the next caller after that reads the new verdict); only a COLD
+/// cache probes inline, and the boot warm-up makes that the exception.
 fn cached_stdio_shim_probe() -> StdioShimGate {
+    {
+        let slot = STDIO_SHIM_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, gate)) = slot.as_ref() {
+            if at.elapsed() < STDIO_SHIM_REPROBE_INTERVAL {
+                return gate.clone();
+            }
+            let stale = gate.clone();
+            drop(slot);
+            if !STDIO_SHIM_REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let spawned = std::thread::Builder::new()
+                    .name("coord-mcp-stdio-shim-probe".into())
+                    .spawn(|| {
+                        let _ = probe_stdio_shim_and_store();
+                        STDIO_SHIM_REFRESH_IN_FLIGHT
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    });
+                if spawned.is_err() {
+                    STDIO_SHIM_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            return stale;
+        }
+    }
+    probe_stdio_shim_and_store()
+}
+
+/// The uncached fill: probe, log the verdict, store it. The lock is held across
+/// the probe on purpose so concurrent COLD callers wait for one verdict rather
+/// than each paying their own selftest; a caller that finds the slot filled
+/// fresh under the lock returns that instead of probing again.
+fn probe_stdio_shim_and_store() -> StdioShimGate {
     let mut slot = STDIO_SHIM_PROBE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5227,21 +5296,29 @@ fn write_stdio_shim_credential(
         )
     })?;
     std::fs::create_dir_all(&dir)?;
-    if let Err(e) = crate::fs_perms::restrict_dir_to_owner(&dir) {
-        warn!(
-            "coord_mcp: could not restrict {} to owner-only: {e} — shim credential files \
-             inside may be readable by other local users",
-            dir.display()
-        );
-    }
-    let path = dir.join(identity.credential_file_name());
+    // Load-bearing, not advisory: a directory this runner could not restrict is
+    // a reason to fall open to the http document, never a warning to write past.
+    crate::fs_perms::restrict_dir_to_owner(&dir).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not restrict {} to owner-only: {e}", dir.display()),
+        )
+    })?;
+    let name = identity.credential_file_name();
+    let path = dir.join(&name);
     let body = serde_json::json!({ "url": url, "headers": headers });
-    crate::fs_perms::write_owner_only(
-        &path,
-        serde_json::to_string_pretty(&body)
-            .unwrap_or_default()
-            .as_bytes(),
-    )?;
+    let bytes = serde_json::to_string_pretty(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Atomic replace: the shim re-reads this file on EVERY call, so a call that
+    // lands mid-rotation must see the old document or the new one, never an
+    // empty or half-written one. Written owner-only to a sibling temp path,
+    // then renamed over the live name.
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
+    crate::fs_perms::write_owner_only(&tmp, bytes.as_bytes())?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(path)
 }
 
@@ -6629,6 +6706,17 @@ fn existing_config_write_verdict(workdir: &str, intended: IntendedWrite) -> Exis
         // unparseable foreign file → do not clobber
         Err(_) => return ExistingConfigVerdict::Foreign,
     };
+    // A stdio-shaped config whose credential file is gone or unreadable
+    // resolves to NO effective entry, so every principal predicate below reads
+    // `false` - and `false` must never mean "permit anything" (see
+    // `config_doc_is_agent_marked`). An agent's file with a missing credential
+    // would otherwise be overwritten by a device reconcile. Refuse: the file is
+    // not ours to classify until its credential can be read.
+    if crate::coord_mcp_config::config_doc_is_stdio_shim(&parsed)
+        && crate::coord_mcp_config::effective_coord_mcp_entry(&parsed).is_none()
+    {
+        return ExistingConfigVerdict::Foreign;
+    }
     match parsed.get("mcpServers").and_then(|m| m.as_object()) {
         Some(servers) => {
             if servers.len() == 1 && servers.contains_key("coord-mcp") {
@@ -7186,11 +7274,12 @@ pub(crate) fn provision_coord_mcp_config_file(
 /// exactly the stale-:9879 config this plan's Phase-0 probe found in the wild).
 /// The route cannot bypass this: it has no port argument to pass.
 ///
-/// `lifetime` and `terminal_id` are the ONLY axes the two callers differ on —
+/// `lifetime` and `terminal_id` are the ONLY axes the two callers differed on —
 /// see [`NonceLifetime`] for why the mint route's nonces are bounded and the
 /// seam's are not, and [`NonceBinding::terminal_id`] for why only the seam can
-/// name a terminal (the route serves sessions the runner did not spawn, so the
-/// ephemeral arm below ignores the argument by construction).
+/// name a terminal. Since the stdio arm the mint route no longer comes through
+/// here ([`provision_session_proxy_config`] is pinned to the http shape); the
+/// ephemeral arm is kept for the route's nonce lifetime.
 fn mint_device_proxy_config(
     workdir: &str,
     lifetime: NonceLifetime,
@@ -7229,8 +7318,26 @@ fn mint_device_proxy_config(
 /// Passes `terminal_id: None` — this route serves BARE sessions the runner did
 /// not spawn, so there is no terminal to bind (see
 /// [`register_session_proxy_nonce`]).
+///
+/// **Always the http shape, whatever [`stdio_shim_gate`] says.** This route's
+/// consumers are not MCP clients: `scripts/coord-provision-nonce.sh`,
+/// `scripts/lib/coord-credential.psm1` and, through them, `/coord-revive`'s L4
+/// source 3 and the `/gate` / `/policy` in-process-nonce rung read the nonce
+/// out of `.mcpServers["coord-mcp"].url` + `.headers` and replay it as an HTTP
+/// header themselves. A stdio document here (no `url`, no `headers`) would read
+/// as `PROVISION_SHAPE_UNRECOGNISED` and silently kill that rung on every
+/// machine the day the gate opened - the route is pinned to
+/// [`http_proxy_config_json`] and a test holds it there.
 pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
-    mint_device_proxy_config(workdir, NonceLifetime::ephemeral(), None)
+    let bound_port = resolve_bound_api_port()?;
+    Some(provision_session_proxy_config_at(workdir, bound_port))
+}
+
+/// [`provision_session_proxy_config`] over an explicit bound port (the part a
+/// test can reach without a listening API).
+fn provision_session_proxy_config_at(workdir: &str, bound_port: u16) -> serde_json::Value {
+    let nonce = register_session_proxy_nonce(workdir);
+    http_proxy_config_json(bound_port, &nonce, false)
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
@@ -9752,6 +9859,66 @@ mod tests {
             shim: shim.clone(),
         }));
         (amb, gate, interpreter, shim)
+    }
+
+    /// The `/coord-mcp/provision-session` route is pinned to the http shape:
+    /// its scripted consumers replay the nonce as an HTTP header and cannot
+    /// read a stdio document. Forced-Open gate, and the route still emits
+    /// `url` + `headers` and no `type`.
+    #[test]
+    fn provision_session_route_stays_http_under_an_open_stdio_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("shim.py");
+        std::fs::write(&shim, "#").expect("shim");
+        let _gate =
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+                interpreter: std::path::PathBuf::from("/usr/bin/python3"),
+                shim,
+            }));
+        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), 9876);
+        let entry = &doc["mcpServers"]["coord-mcp"];
+        assert_ne!(
+            entry["type"], "stdio",
+            "route emitted the stdio spelling: {doc}"
+        );
+        assert_eq!(
+            entry["type"], "http",
+            "route emitted a non-http transport: {doc}"
+        );
+        assert_eq!(entry["url"], "http://127.0.0.1:9876/coord-mcp");
+        assert!(
+            entry["headers"].is_object(),
+            "route emitted no headers: {doc}"
+        );
+        assert!(
+            crate::coord_mcp_config::proxy_nonce_from_header_object(&entry["headers"]).is_some(),
+            "route emitted no replayable nonce: {doc}"
+        );
+    }
+
+    /// One directory, several spellings, ONE credential file: a rotation must
+    /// rewrite the file the live shim is reading.
+    #[test]
+    fn credential_file_name_is_spelling_insensitive_for_one_directory() {
+        let a =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo", None).credential_file_name();
+        let b =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo/", None).credential_file_name();
+        let c = ProxyConfigIdentity::device("/home/u/qontinui-root/repo//", None)
+            .credential_file_name();
+        let d = ProxyConfigIdentity::device("\\home\\u\\qontinui-root\\repo", None)
+            .credential_file_name();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a, d);
+        let other =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo2", None).credential_file_name();
+        assert_ne!(a, other);
+        assert_eq!(credential_workdir_key("/"), "/");
+        assert_eq!(
+            credential_workdir_key("C:\\"),
+            if cfg!(windows) { "c:/" } else { "C:/" }
+        );
     }
 
     fn read_json(path: &Path) -> serde_json::Value {
