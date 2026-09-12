@@ -254,7 +254,43 @@ in_process_dispatch_table! {
         "redeem_pair_code" => in_process_redeem_pair_code(args),
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
         "get_coord_device_token" => in_process_get_coord_device_token(),
+        "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
     }
+}
+
+/// In-process arm for `get_access_token_for_websocket`
+/// (`crate::commands::auth::get_access_token_for_websocket`) — plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1f.
+///
+/// Calls the SAME `get_access_token_for_websocket_impl` the Tauri command
+/// wraps, so the HTTP door cannot drift from the IPC one. `require_tier_2()`
+/// is that function's first statement: a Tier-0/1 runner, or a signed-out
+/// Tier-2 one, lands in [`in_process_command_failed`]'s 500 with the
+/// structured error text — never an empty 200 a caller could read as a token.
+///
+/// Wire shape: success is `{ "success": true, "data": "<token>" }`; the token
+/// is the operator's Cognito ACCESS token (not a coord device JWT). Takes no
+/// arguments; a non-empty `args` object is a 400 rather than silently ignored.
+async fn in_process_get_access_token_for_websocket(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+    const COMMAND: &str = "get_access_token_for_websocket";
+
+    match args {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            return Err(in_process_bad_args(
+                COMMAND,
+                "takes no arguments — send `{}`",
+            ))
+        }
+    }
+
+    crate::commands::auth::get_access_token_for_websocket_impl()
+        .await
+        .map(Value::String)
+        .map_err(|e| in_process_command_failed(COMMAND, e.to_string()))
 }
 
 /// 400 for args that do not match an in-process command's `args_schema`.
@@ -776,6 +812,14 @@ mod in_process_dispatch_tests {
         // that a working `page/evaluate` already granted a superset of this
         // (arbitrary webview JS), so the reachable surface shrinks rather than
         // grows.
+        //
+        // `get_access_token_for_websocket` joined for plan
+        // `2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1f:
+        // the OPERATOR's Cognito access token (not the device JWT the entry above
+        // returns) — the fleet's `gate.md` / `coord-revive.sh` doors invoke both.
+        // Credential-returning, so content trigger 3 of `security-and-autonomy`;
+        // the same shrink-not-grow argument applies: `page/evaluate` exposed this
+        // token on the same unauthenticated loopback port.
         let mut in_process: Vec<&str> = all_entries()
             .filter(|c| c.dispatch == Dispatch::InProcess)
             .map(|c| c.name)
@@ -785,6 +829,7 @@ mod in_process_dispatch_tests {
             in_process,
             vec![
                 "dismiss_recent_crash",
+                "get_access_token_for_websocket",
                 "get_coord_device_token",
                 "redeem_pair_code"
             ]
@@ -837,6 +882,47 @@ mod in_process_dispatch_tests {
              have to reveal the token to be useful, which is not a projection -- and \
              UI_BRIDGE_OBSERVE_COMMANDS exists precisely so an observe tier never widens the \
              invoke surface.",
+        );
+    }
+
+    /// Phase 1f: the credential-returning arm takes no arguments and refuses
+    /// any it is given rather than coercing — the same discipline as the
+    /// other in-process arms. Its success path needs a signed-in Tier-2
+    /// runner and a keychain, which a unit test does not have; the
+    /// no-empty-200 property is `require_tier_2()` being the impl's first
+    /// statement (see `commands::auth::get_access_token_for_websocket_impl`).
+    #[tokio::test]
+    async fn access_token_arm_rejects_arguments_with_a_400() {
+        let (status, body) =
+            in_process_get_access_token_for_websocket(&serde_json::json!({"code": "x"}))
+                .await
+                .expect_err("a non-empty args object must be refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.0
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("takes no arguments"),
+            "the 400 names the contract: {:?}",
+            body.0.error
+        );
+    }
+
+    /// Phase 1f: the allowlist entry says what a caller gets, and never
+    /// probes on boot (a credential mint is not a health probe).
+    #[test]
+    fn access_token_entry_is_in_process_and_never_boot_probed() {
+        let entry = all_entries()
+            .find(|c| c.name == "get_access_token_for_websocket")
+            .expect("the Phase 1f allowlist entry");
+        assert_eq!(entry.dispatch, Dispatch::InProcess);
+        assert!(!entry.probe_with_empty_args);
+        assert_eq!(entry.args_schema, "{}");
+        assert_eq!(entry.response_schema, "string");
+        assert!(
+            entry.description.contains("NOT a coord device JWT"),
+            "the description must say which token this is"
         );
     }
 
