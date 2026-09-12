@@ -208,6 +208,23 @@ describe("a page in flight never makes a true list read as a stale one", () => {
     expect(SOURCE).toContain("disabled={loading || loadingMore}");
   });
 
+  it("never calls a stalled WALK a failed READ — in the EMPTY state too", () => {
+    // Reachable: coord serves an empty page carrying a cursor, then stalls on
+    // the `more`. The inline banner drew this distinction from the start; the
+    // empty-state branch printed "This is a failed read, not an empty fleet."
+    // over a read coord had answered.
+    // The sentence must be the FALSE arm of a `walkStalled` ternary, not the
+    // unconditional text it used to be.
+    const code = codeOf(SOURCE);
+    expect(code).toContain("This is a failed read, not an empty fleet.");
+    const at = code.indexOf("This is a failed read");
+    const guarded = code.slice(Math.max(0, at - 400), at);
+    expect(guarded).toContain("{walkStalled");
+    // Both empty-state arms are conditional on it, so neither can be reinstated
+    // unconditionally without this failing.
+    expect(code.split(/\bwalkStalled\b/).length - 1).toBeGreaterThanOrEqual(3);
+  });
+
   it("never calls a stalled WALK a failed READ", () => {
     // coord answered: the rows below are current and only the next page is out
     // of reach. "Last refresh failed — showing the previous read" over that is
@@ -236,37 +253,43 @@ describe("a dropped cursor removes the control, and does not claim completeness"
     expect(SOURCE).toContain("fleetTruncation(response, sessions.length, hasMore)");
   });
 
-  it("keeps the load-more control on `more-available` ALONE", () => {
-    // `unreachable` is the arm the drop lands in, and it must not render a page
-    // control: the hook answers that click by returning immediately.
+  it("invokes `loadMore` from exactly ONE place, inside the `more-available` guard", () => {
+    // The property is "no arm but `more-available` offers a page control", and
+    // two earlier attempts at it guarded a SPELLING instead.
     //
-    // Asserted by COUNTING the guards rather than by slicing a block. An
-    // earlier revision of this test sliced from the `unreachable` guard to an
-    // end anchor that `indexOf` found EARLIER in the file (the constant's own
-    // export, not its use), and `String.slice` with `end < start` returns "" —
-    // so both assertions were vacuously true and a live "Load more" button
-    // planted inside the unreachable block passed the whole suite. The counting
-    // form has no anchors to get wrong.
-    expect(SOURCE).toContain('truncation.kind === "more-available"');
-    expect(SOURCE).toContain('truncation.kind === "unreachable"');
-
+    // The first sliced between two `indexOf` anchors where the end anchor
+    // matched EARLIER in the file than the start; `String.slice` with
+    // `end < start` returns "", so both assertions were vacuously true and a
+    // live "Load more" button planted in the unreachable block passed.
+    //
+    // The second counted the shared id constant and the exact text
+    // `void loadMore()` — so a freshly written button with its own id and
+    // `onClick={() => { loadMore(); }}` spelled neither and passed too, while
+    // being exactly the dead control this phase exists to remove.
+    //
+    // What cannot be spelled around: a page control has to CALL `loadMore`.
+    // Count the references and pin where the single call site sits.
     const code = codeOf(SOURCE);
-    // Exactly one render site for the control, and exactly one handler.
-    expect(code.split("FLEET_PICKER_LOAD_MORE_ID").length - 1).toBe(2); // the export + the one use
-    expect(code.split("void loadMore()").length - 1).toBe(1);
 
-    // …and that one use sits inside the `more-available` guard: every character
-    // between that guard and the control is part of the same JSX block, so the
-    // control cannot have moved under another arm without this span changing.
-    const guard = code.indexOf('truncation.kind === "more-available"');
-    const use = code.indexOf("data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}");
-    expect(guard).toBeGreaterThan(-1);
-    expect(use).toBeGreaterThan(guard);
-    const between = code.slice(guard, use);
+    // One destructure from the hook, one call. A third reference is a second
+    // way to advance the walk, wherever and however it is written.
+    expect(code.split(/\bloadMore\b/).length - 1).toBe(2);
+
+    // The call site is inside the `more-available` JSX guard. Anchored on the
+    // guard's OPENING BRACE, which occurs once — the bare predicate also
+    // appears as an argument to `fleetFilteredOutMessage` far earlier in the
+    // component, and anchoring on that spans most of the file.
+    const jsxGuard = '{truncation.kind === "more-available" && (';
+    expect(code.split(jsxGuard).length - 1).toBe(1);
+    const guardAt = code.indexOf(jsxGuard);
+    const callAt = code.search(/\bloadMore\(\)/);
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(callAt).toBeGreaterThan(guardAt);
+    // …and no other truncation arm opens between the guard and the call, so the
+    // control cannot have been re-parented without this failing.
+    const between = code.slice(guardAt + jsxGuard.length, callAt);
     expect(between.length).toBeGreaterThan(0);
-    // No other truncation arm opens between the two.
-    expect(between).not.toContain('truncation.kind === "unreachable"');
-    expect(between).not.toContain('truncation.kind === "none"');
+    expect(between).not.toContain("truncation.kind ===");
   });
 
   it("does not stack two incompleteness warnings on the stalled path", () => {
