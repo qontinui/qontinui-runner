@@ -85,7 +85,9 @@ pub fn wrap_snapshot(
 /// `qontinui_types::canonical_hash` so this crate and the runner share one
 /// implementation (boundary rule §5.2 — the matcher crate cannot depend on
 /// src-tauri; the primitive lives in qontinui-types instead).
-pub(crate) fn compute_content_sha256(value: &serde_json::Value) -> Result<String, SnapshotFetchError> {
+pub(crate) fn compute_content_sha256(
+    value: &serde_json::Value,
+) -> Result<String, SnapshotFetchError> {
     qontinui_types::canonical_hash::canonical_hash(value)
         .map_err(|e| SnapshotFetchError::Malformed(format!("canonical hash: {e}")))
 }
@@ -280,8 +282,7 @@ mod tests {
         // result is Malformed — in which case skip the assertion (this test
         // is a best-effort smoke check on element_count wiring; the
         // deterministic guarantee is on the empty-elements path above).
-        if let Ok((_snap, fp, _id, _hash)) =
-            wrap_snapshot(raw, "app".to_string(), None, None, None)
+        if let Ok((_snap, fp, _id, _hash)) = wrap_snapshot(raw, "app".to_string(), None, None, None)
         {
             assert_eq!(fp.element_count, 3);
         }

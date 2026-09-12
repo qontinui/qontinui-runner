@@ -32,7 +32,9 @@ const ROLES: &[&str] = &[
 const TAGS: &[&str] = &["button", "a", "h1", "h2", "input", "div", "span", "li"];
 
 /// Small label vocabulary — `aria_label` / `accessible_name` text pool.
-const LABELS: &[&str] = &["Save", "Cancel", "Submit", "Edit", "Delete", "Open", "Close", "OK"];
+const LABELS: &[&str] = &[
+    "Save", "Cancel", "Submit", "Edit", "Delete", "Open", "Close", "OK",
+];
 
 /// Visible-text pool — picks short and longer strings to exercise tokenizer
 /// branches and includes the NBSP-only string to exercise text-norm.
@@ -264,25 +266,23 @@ fn arbitrary_criteria() -> impl Strategy<Value = JsonValue> {
         option::of(prop::sample::select(LABELS.to_vec())),
         option::of(prop::sample::select(LABELS.to_vec())),
     )
-        .prop_map(
-            |(role, tag_name, text, aria_label, accessible_name)| {
-                let mut obj = serde_json::Map::new();
-                if let Some(v) = role {
-                    obj.insert("role".to_string(), json!(v));
-                }
-                if let Some(v) = tag_name {
-                    obj.insert("tagName".to_string(), json!(v));
-                }
-                if let Some(v) = text {
-                    obj.insert("text".to_string(), json!(v));
-                }
-                if let Some(v) = aria_label {
-                    obj.insert("ariaLabel".to_string(), json!(v));
-                }
-                if let Some(v) = accessible_name {
-                    obj.insert("accessibleName".to_string(), json!(v));
-                }
-                JsonValue::Object(obj)
-            },
-        )
+        .prop_map(|(role, tag_name, text, aria_label, accessible_name)| {
+            let mut obj = serde_json::Map::new();
+            if let Some(v) = role {
+                obj.insert("role".to_string(), json!(v));
+            }
+            if let Some(v) = tag_name {
+                obj.insert("tagName".to_string(), json!(v));
+            }
+            if let Some(v) = text {
+                obj.insert("text".to_string(), json!(v));
+            }
+            if let Some(v) = aria_label {
+                obj.insert("ariaLabel".to_string(), json!(v));
+            }
+            if let Some(v) = accessible_name {
+                obj.insert("accessibleName".to_string(), json!(v));
+            }
+            JsonValue::Object(obj)
+        })
 }
