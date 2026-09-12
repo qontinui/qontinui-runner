@@ -1610,7 +1610,7 @@ fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
 /// while `pair` (the canonical v2-aware reader) is lib-only — same
 /// documented duplication pattern as the census/backstop `machine.json`
 /// readers. `None` on any failure (unpaired runner).
-fn default_binding_tenant() -> Option<Uuid> {
+pub(crate) fn default_binding_tenant() -> Option<Uuid> {
     let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
