@@ -33,9 +33,38 @@
 //!
 //! Parsed with `syn`, not a brace counter: the vet scan behind this plan
 //! counted braces, and a string literal holding a `{` merged two adjacent fns.
-//! A file only needs parsing if its text mentions `set_var` or `remove_var` —
-//! no other file can contain a writer under the rule above — and a file that
-//! does and fails to parse fails this test by name rather than being skipped.
+//! A file needs parsing if its text mentions `set_var`, `remove_var`, or any
+//! [`CROSS_FILE_WRITERS`] name — a file mentioning none of those cannot hold a
+//! writer under the rule above — and a file that does and fails to parse fails
+//! this test by name rather than being skipped.
+//!
+//! # Known limits
+//!
+//! Stated because a guard whose reach is undocumented gets trusted past it.
+//! Each is pinned by a fixture in the synthetic self-test below, so a change
+//! that closes one fails that test rather than passing silently.
+//!
+//! * **Release-then-write is missed.** `takes_lock` carries no ordering and no
+//!   liveness, so a helper that acquires the lock and releases it on return
+//!   still credits its caller — see the fixture
+//!   `unlocked_after_a_helper_released_the_lock`. `let _ = env_lock();`, which
+//!   drops at once, is the same class. The live shape is `with_body_sync_env`
+//!   in `plan_workunit_adapter/trigger.rs`.
+//! * **Cross-file reach is by NAME, not by analysis.** Only the
+//!   [`CROSS_FILE_WRITERS`] names and [`LOCK_FIXTURE`] cross a file boundary. A
+//!   writer or locker reached through any OTHER file's helper is invisible —
+//!   add the name here when you add such a helper.
+//! * **Aliased mutators are missed.** `use std::env as e; e::set_var(..)` and
+//!   `let f = std::env::set_var; f(..)`: the qualifier must read `env`, or the
+//!   call must be a bare `set_var` / `remove_var`.
+//! * **Drop-only writers** are seen only where the type's name is in
+//!   [`CROSS_FILE_WRITERS`] (`EnvVarRestore`). A new file-local guard type
+//!   whose `Drop` writes env — as the deleted `DbUrlRestore` did — is not.
+//!
+//! This module is registered in `main.rs` only: it walks all of `src`, so a
+//! `lib.rs` twin would only double the work. CI runs it in the ordinary
+//! `cargo test` job. Note the self-test's fixture is a raw STRING, which is why
+//! the guard does not flag its own deliberately-unlocked writers.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -49,6 +78,28 @@ const WRITE_FNS: [&str; 2] = ["set_var", "remove_var"];
 const LOCK_FN: &str = "env_lock";
 /// The fixture that holds [`LOCK_FN`]'s lock for its whole life.
 const LOCK_FIXTURE: &str = "IsolatedAmbient";
+
+/// Helpers that write the process env from ANOTHER FILE, named here because
+/// the same-file call closure cannot reach them.
+///
+/// `crate::test_env::isolate_coord_env` writes all seven
+/// `profiles::COORD_BASE_ENV_KEYS` and clears the runtime tier override;
+/// `capture_coord_env` and `EnvVarRestore` write on Drop. Without these, a
+/// test whose only mutation is a call to one of them is invisible to this
+/// guard — and its file need not contain `set_var` at all, which is why they
+/// also widen the parse prefilter below. `ci_node/subscription.rs` is exactly
+/// that shape: zero occurrences of either mutator, seven env writes per test
+/// through the helper, and the fixture family the 2026-08-25 flake came from.
+const CROSS_FILE_WRITERS: [&str; 3] = ["isolate_coord_env", "capture_coord_env", "EnvVarRestore"];
+
+/// Floor for the walk, so a broken path or filter cannot pass vacuously.
+/// Sibling ratchet `row_get_ratchet.rs` declares its own floor the same way;
+/// 1559 files were walked when this was written.
+const MIN_FILES_WALKED: usize = 1000;
+/// Floor for the detected population, for the same reason: an empty offender
+/// list proves nothing if the detector stopped recognising writers. ~131
+/// direct writers were found when this was written.
+const MIN_ENV_WRITING_TESTS: usize = 100;
 
 /// A test fn that writes the process env without holding the shared lock.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,6 +130,15 @@ struct BodyFacts {
 impl BodyFacts {
     fn record_call(&mut self, qualifier: Option<&str>, name: &str, self_ty: Option<&str>) {
         if WRITE_FNS.contains(&name) && matches!(qualifier, None | Some("env")) {
+            self.writes_env = true;
+        }
+        // A named cross-file helper, as the callee (`isolate_coord_env(..)`) or
+        // as the qualifier (`EnvVarRestore::capture(..)`). See
+        // [`CROSS_FILE_WRITERS`]: the same-file closure cannot see these, and
+        // the file need not mention either mutator.
+        if CROSS_FILE_WRITERS.contains(&name)
+            || qualifier.is_some_and(|q| CROSS_FILE_WRITERS.contains(&q))
+        {
             self.writes_env = true;
         }
         if name == LOCK_FN {
@@ -171,6 +231,20 @@ impl<'ast> Visit<'ast> for BodyScanner {
             self.facts.writes_env = true;
         }
         visit::visit_expr_path(self, p);
+    }
+
+    /// A method call is an EDGE but never itself a process-env write.
+    ///
+    /// Recording the name closes same-file reach through a method — e.g. an
+    /// `IsolatedAmbient::write_settings_json(&self)` that writes two env vars,
+    /// which is otherwise credited only because its callers happen to name the
+    /// fixture type. It deliberately does NOT consult [`WRITE_FNS`]: a
+    /// `Command::set_var`-style builder method is not `std::env`, and the
+    /// synthetic fixture `a_method_named_set_var_is_not_the_process_env` pins
+    /// that.
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.facts.calls.insert(call.method.to_string());
+        visit::visit_expr_method_call(self, call);
     }
 
     fn visit_path(&mut self, p: &'ast syn::Path) {
@@ -347,7 +421,7 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let files = rs_files(&root);
     assert!(
-        files.len() > 1000,
+        files.len() > MIN_FILES_WALKED,
         "walked only {} .rs files under {} — the guard scanned nothing",
         files.len(),
         root.display()
@@ -363,7 +437,14 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
             .to_string();
         let src =
             std::fs::read_to_string(file).unwrap_or_else(|e| panic!("reading src/{rel}: {e}"));
-        if !WRITE_FNS.iter().any(|w| src.contains(w)) {
+        // Parse a file if it mentions either mutator OR any named cross-file
+        // writer. `ci_node/subscription.rs` contains neither `set_var` nor
+        // `remove_var`, and still writes seven env vars per test through
+        // `crate::test_env::isolate_coord_env` — prefiltering on the mutators
+        // alone never parsed it. See [`CROSS_FILE_WRITERS`].
+        let mentions_writer = WRITE_FNS.iter().any(|w| src.contains(w))
+            || CROSS_FILE_WRITERS.iter().any(|w| src.contains(w));
+        if !mentions_writer {
             continue;
         }
         let report = scan_source(&src).unwrap_or_else(|e| {
@@ -386,7 +467,7 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
     // env-writing tests this binary is known to have. If it drops to a
     // handful, the detector broke — not the tree.
     assert!(
-        env_writing_tests > 100,
+        env_writing_tests > MIN_ENV_WRITING_TESTS,
         "found only {env_writing_tests} env-writing test fns — the detector has stopped \
          recognising them, so an empty offender list below would prove nothing"
     );
@@ -500,6 +581,32 @@ mod tests {
     }
     #[test]
     fn locked_through_a_helper_of_a_helper() {
+        lock_taking_helper(|| lock_taking_helper(|| std::env::set_var("K", "v")));
+    }
+    #[test]
+    fn locked_via_a_cross_file_helper() {
+        let _g = crate::test_env::env_lock();
+        crate::test_env::isolate_coord_env(dir.path(), "{}");
+    }
+    #[test]
+    fn unlocked_via_a_cross_file_helper() {
+        crate::test_env::isolate_coord_env(dir.path(), "{}");
+    }
+    #[test]
+    fn unlocked_via_env_var_restore() {
+        let _restore = crate::test_env::EnvVarRestore::capture(&["K"]);
+    }
+    /// KNOWN MISS, asserted as one below rather than left to be discovered.
+    ///
+    /// `takes_lock` is "this body reaches a locking fn", with no ordering and no
+    /// liveness, so a helper that acquires the lock and RELEASES it on return
+    /// still credits its caller — and the write below is genuinely unprotected.
+    /// Deciding otherwise needs the write to be lexically inside the helper's
+    /// closure, which this coarse rule does not model. The live shape is
+    /// `plan_workunit_adapter/trigger.rs`'s `with_body_sync_env`, and
+    /// `let _ = env_lock();` (dropped at once) is the same class.
+    #[test]
+    fn unlocked_after_a_helper_released_the_lock() {
         super::transitively_locks();
         std::env::set_var("K", "v");
     }
@@ -540,13 +647,26 @@ mod tests {
             "unlocked_in_a_closure",
             "unlocked_in_a_nested_module",
             "unlocked_inside_a_macro",
+            "unlocked_via_a_cross_file_helper",
             "unlocked_via_a_same_file_writer",
+            "unlocked_via_env_var_restore",
             "unlocked_via_use_env",
         ],
         "the guard must flag exactly the unlocked writers — no more, no fewer"
     );
-    // 8 unlocked + 6 locked writers; `only_reads` and the method call are not writers.
-    assert_eq!(report.env_writing_tests, 14);
+    // The ONE shape this rule does not model, pinned as a known miss rather
+    // than left for someone to discover: a helper that took the lock and
+    // released it still credits its caller. If the guard ever learns ordering,
+    // this assertion fails — tighten the rule and delete the fixture's caveat.
+    assert!(
+        !names.contains(&"unlocked_after_a_helper_released_the_lock"),
+        "the coarse reach rule cannot see a release-then-write; if it now can, \
+         update this test and the module doc's Known limits"
+    );
+    // 10 unlocked + 1 known miss + 7 locked writers. `only_reads` and
+    // `a_method_named_set_var_is_not_the_process_env` are not writers: a method
+    // call is an edge, never a `std::env` write.
+    assert_eq!(report.env_writing_tests, 18);
 
     // The line it reports is the fn's own line (proc-macro2 `span-locations`),
     // so a failure message is clickable rather than approximate.
