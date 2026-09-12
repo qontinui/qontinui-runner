@@ -515,6 +515,25 @@ describe("credentialDarkFromPostureSnapshot", () => {
     expect(effectiveCredentialDark(bySource)?.cause).toBe("cognito_hard");
   });
 
+  it("N3: a payload with no canAnswer key falls back to the POSTURE, not to health", () => {
+    // `canAnswer` missing used to read as "can answer", so a payload saying
+    // `posture: "expired"` would have CLEARED the banner. Unreachable from
+    // today's `to_json()` — which always emits the key — but the posture
+    // string is the same fact and must not default to health.
+    for (const posture of ["expired", "absent", "unrefreshable", "dark"]) {
+      const signal = credentialDarkFromPostureSnapshot({ posture, reason: "…" });
+      expect(signal?.dark, `${posture} without canAnswer must stay dark`).toBe(true);
+      expect(signal?.cause).toBe(posture);
+    }
+    for (const posture of ["live", "expiring"]) {
+      expect(credentialDarkFromPostureSnapshot({ posture, reason: "…" })?.dark).toBe(false);
+    }
+    // An explicit boolean still wins over the string.
+    expect(
+      credentialDarkFromPostureSnapshot({ posture: "live", canAnswer: false, reason: "…" })?.dark,
+    ).toBe(true);
+  });
+
   it("UNKNOWN contributes nothing — it is not health and not a recovery", () => {
     // `/health` renders "no pass has completed in this process yet" this way,
     // and the command answers `null` for it. Neither may clear a banner.

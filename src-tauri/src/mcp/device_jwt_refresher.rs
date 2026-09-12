@@ -1807,6 +1807,11 @@ fn latest_upstream_event(s: &UpstreamSignal) -> i64 {
 /// streaks would manufacture a dark out of a bucket that has since seen a
 /// 2xx): the bucket holding the MORE RECENT event wins whole, ties to the
 /// tenant's own.
+///
+/// ⚠ DO NOT "simplify" this into a field-wise merge. A `max` of the two
+/// streaks resurrects a rejection the other bucket has already answered with a
+/// 2xx, which is a manufactured `dark` on a working credential. The whole
+/// bucket moves or neither does; a pre-PR review called this out explicitly.
 fn upstream_signal_for_observation(tenant_id: Option<&str>, fold_default: bool) -> UpstreamSignal {
     let own = upstream_signal_for(tenant_id);
     if !fold_default || tenant_id.is_none() {
@@ -2122,6 +2127,27 @@ fn publish_coord_credential_posture_with(
 /// leaves nothing — every slot unreadable — nothing is published and the
 /// previous posture stands: an unreadable store is UNKNOWN, and publishing
 /// `absent` off it would manufacture a fault out of a missing measurement.
+///
+/// # The UNATTRIBUTABLE arm (N1)
+///
+/// Rejections filed under the DEFAULT slot key belong to no tenant
+/// observation. On a box with exactly one usable slot they are folded in
+/// ([`upstream_signal_for_observation`]) because there the two keys are the
+/// same credential — but on a box with TWO slots and a `machine.json` carrying
+/// no `active_tenant_id`, `resolve_session_tenant` answers `Ok(None)` for every
+/// session (`coord_mcp.rs`, the `Unpinned` row), every forwarded call presents
+/// the LEGACY slot, and every rejection lands under the default key with no
+/// tenant to hang it on.
+///
+/// Dropping those was a regression in the one direction that matters: both
+/// slots have a future `exp`, rung 6 calls them `live`, `canAnswer` reads
+/// `true`, no banner fires — while coord refuses every call this runner makes.
+/// The pre-keying global counter WOULD have surfaced it.
+///
+/// "Cannot attribute" therefore means *report it without a tenant*, never
+/// *drop it*: the arm publishes `dark` with `tenant_id: None`. It defers to a
+/// per-slot verdict that is ALREADY non-answering, because that one names a
+/// slot an operator can actually fix.
 pub(crate) fn derive_and_publish_posture(
     observations: &[SlotObservation],
     now: i64,
@@ -2137,6 +2163,31 @@ pub(crate) fn derive_and_publish_posture(
             (derive_coord_credential_posture(o, signal, now), o)
         })
         .max_by_key(|(p, _)| p.severity());
+
+    // N1 — the unattributable arm. Only when the fold did NOT already consume
+    // the default bucket; `fold_default` covers the one-slot case.
+    if !fold_default {
+        let default_signal = upstream_signal_for(None);
+        let slot_already_non_answering = worst.as_ref().is_some_and(|(p, _)| !p.can_answer());
+        if default_signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
+            && !slot_already_non_answering
+        {
+            return publish_coord_credential_posture_with(
+                CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                // No tenant, and that IS the finding: the credential coord
+                // keeps refusing is the legacy default slot, which no
+                // `device_jwt:<tenant>` observation describes. Naming an
+                // arbitrary tenant here would send an operator to the wrong
+                // slot.
+                None,
+                // Likewise no `exp`: the answer to "which slot's?" is none.
+                None,
+                None,
+                default_signal,
+            );
+        }
+    }
+
     let (posture, obs) = worst?;
     publish_coord_credential_posture_with(
         posture,
@@ -2536,6 +2587,41 @@ pub(crate) async fn refresh_tenant_slots(
         }
     }
     publish_tenant_slot_health(health);
+
+    // N2 — the DEFAULT-key half of M1, and the same latch.
+    //
+    // The heal paths reset the credential's own TENANT key. On a single-slot
+    // box whose sessions are UNPINNED — the exact shape the fold exists for —
+    // the forwarders file their verdicts under the DEFAULT key instead, so
+    // after a successful re-derive the default bucket still held a streak of
+    // 3 with a fresh `last_rejection_at`; the fold then picked it and the next
+    // `SkippedFresh` pass went `dark` again on a credential coord had just
+    // minted, behind a banner the user cannot dismiss. It self-heals on the
+    // first successful forwarded call, but that is a latch until then.
+    //
+    // Scoped to the one-slot case on purpose: with two or more slots the
+    // default bucket is NOT this tenant's credential (see the unattributable
+    // arm in `derive_and_publish_posture`), so clearing it there would erase
+    // another slot's evidence.
+    let sole_usable_slot = slot_seen
+        .iter()
+        .filter(|(_, _, _, unknown)| !*unknown)
+        .count()
+        == 1;
+    let pass_healed_a_slot = outcomes.iter().any(|(_, o)| {
+        matches!(
+            o,
+            TenantSlotOutcome::Refreshed
+                | TenantSlotOutcome::Cleared {
+                    rederived: true,
+                    ..
+                }
+        )
+    });
+    if sole_usable_slot && pass_healed_a_slot {
+        reset_upstream_rejections_for(None);
+    }
+
     // The pass's CONCLUDED posture: each slot as found, refined with what the
     // pass did about it. Published once per pass; a change fires the banner.
     debug_assert_eq!(slot_seen.len(), outcomes.len());
@@ -5607,6 +5693,108 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
+    /// **N2** — the DEFAULT-key half of the same latch, and the shape the
+    /// original M1 test did not cover.
+    ///
+    /// On a single-slot box whose sessions are UNPINNED, the forwarders file
+    /// their verdicts under the DEFAULT key while the heal paths reset the
+    /// TENANT key. So after a successful refresh the default bucket still held
+    /// a streak of 3 with a fresh `last_rejection_at`, the fold picked it, and
+    /// the next `SkippedFresh` pass went `dark` again on a credential coord
+    /// had just minted.
+    #[tokio::test]
+    async fn a_heal_also_spends_the_default_slots_streak_on_a_single_slot_box() {
+        let _serialised = health_lock();
+        reset_posture();
+        let mgr = test_auth_manager("posture_streak_reset_default");
+        let ta = tenant(5);
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tenant_device_jwt(&ta, &synth_jwt(now + 30 * 60, "stale"))
+            .expect("slot a");
+        // THE difference from the sibling test: the rejections are filed under
+        // the DEFAULT key, because an unpinned session presents the legacy
+        // slot. `device_bearer_for(None)` and `device_bearer_for(Some(ta))`
+        // are the same credential here — which is why the fold reads it.
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD
+        );
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![]);
+        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::Refreshed)]);
+
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            0,
+            "the heal must spend the DEFAULT bucket too, or the fold reads it back"
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("a pass publishes")
+                .posture,
+            CoordCredentialPosture::Live
+        );
+
+        // The latch: the next pass touches nothing, so rung 5 decides.
+        let fresh_obs = SlotObservation {
+            tenant_id: Some(ta.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        assert_eq!(
+            derive_and_publish_posture(std::slice::from_ref(&fresh_obs), now),
+            None,
+            "no relapse to dark on a freshly minted credential"
+        );
+        assert_eq!(
+            coord_credential_posture().expect("published").posture,
+            CoordCredentialPosture::Live
+        );
+        reset_posture();
+    }
+
+    /// The N2 reset is SCOPED to the one-slot case: with two slots the default
+    /// bucket is not this tenant's credential, so a heal on one slot must not
+    /// erase evidence the unattributable arm is about to report.
+    #[tokio::test]
+    async fn a_heal_on_a_multi_slot_box_does_not_erase_the_default_buckets_evidence() {
+        let _serialised = health_lock();
+        reset_posture();
+        let mgr = test_auth_manager("posture_streak_reset_multi");
+        let ta = tenant(0);
+        let tb = tenant(1);
+        let now = chrono::Utc::now().timestamp();
+        mgr.store_tenant_device_jwt(&ta, &synth_jwt(now + 30 * 60, "stale-a"))
+            .expect("slot a");
+        mgr.store_tenant_device_jwt(&tb, &synth_jwt(now + 3 * 60 * 60, "fresh-b"))
+            .expect("slot b");
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+
+        let (base, _cap, _shutdown) = spawn_mock(vec![]);
+        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "healing ONE slot says nothing about a credential no slot owns"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.posture,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)
+        );
+        assert_eq!(published.tenant_id, None);
+        reset_posture();
+    }
+
     /// **M2.** The streak was PROCESS-GLOBAL while the credential is PER
     /// TENANT. Tenant B's healthy traffic continuously reset tenant A's
     /// rejections, so A read `live` while dark — the dangerous direction.
@@ -5722,7 +5910,8 @@ mod tenant_slot_refresh_tests {
             "the timestamps published must be the ones the posture was DERIVED from,              not a re-read of a bucket that holds no evidence"
         );
         // …but with a SECOND tenant present the fold is off, because the
-        // default bucket can no longer be attributed.
+        // default bucket can no longer be ATTRIBUTED. It must still be
+        // REPORTED — see the unattributable arm, pinned next door.
         reset_coord_credential_posture_for_test();
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
@@ -5732,7 +5921,107 @@ mod tenant_slot_refresh_tests {
             ..slot.clone()
         };
         let transition = derive_and_publish_posture(&[slot, other], now);
-        assert_eq!(transition.map(|t| t.to), Some(CoordCredentialPosture::Live));
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "unattributable is not the same as absent — this assertion USED to \
+             read `Live`, which pinned the N1 defect as intended behaviour"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.tenant_id, None,
+            "no tenant owns these rejections, and saying so is the finding"
+        );
+        reset_posture();
+    }
+
+    /// **N1**, the whole scenario end to end: two `device_jwt:<tenant>` slots
+    /// and a `machine.json` with no `active_tenant_id`.
+    ///
+    /// `resolve_session_tenant` answers `Ok(None)` for every session on such a
+    /// box (both pins `Unpinned`), so every forwarded call presents
+    /// `device_bearer_for(None)` — the LEGACY slot — and every rejection lands
+    /// under the default key. With the fold scoped to one slot, nothing read
+    /// that bucket: both slots hold a future `exp`, rung 6 called them `live`,
+    /// `canAnswer` read `true`, and no banner fired while coord was refusing
+    /// every call the runner made. The pre-keying global counter WOULD have
+    /// surfaced it, so dropping the bucket was a regression in the one
+    /// direction that matters.
+    #[test]
+    fn rejections_no_tenant_slot_owns_are_reported_without_a_tenant_not_dropped() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let healthy_slot = |t: uuid::Uuid| SlotObservation {
+            tenant_id: Some(t.to_string()),
+            // Comfortably fresh: `exp` alone says `live`, which is exactly why
+            // the upstream signal has to be consulted.
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let slots = [healthy_slot(tenant(0)), healthy_slot(tenant(1))];
+
+        // Below the threshold, nothing happens — the rate rule still governs
+        // this arm, so a coord deploy cannot flip it either.
+        for _ in 1..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "two transient 401s on an unattributable credential are not a verdict"
+        );
+
+        // The threshold'th consecutive rejection IS the verdict.
+        note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+        let transition = derive_and_publish_posture(&slots, now);
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.tenant_id, None, "unattributable, and it says so");
+        assert_eq!(published.exp, None, "\"which slot's exp?\" has no answer");
+        assert!(published.last_401_at.is_some());
+        assert!(!published.posture.can_answer());
+        // And the banner fires: this is the state the whole plan exists for.
+        assert!(should_notify_posture(
+            Some(CoordCredentialPosture::Live),
+            published.posture
+        ));
+
+        // A per-slot verdict that is ALREADY non-answering keeps the floor —
+        // it names a slot an operator can actually fix, which the
+        // unattributable arm cannot.
+        reset_coord_credential_posture_for_test();
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+        let dead = SlotObservation {
+            exp: Some(now - 60),
+            ..healthy_slot(tenant(1))
+        };
+        let _ = derive_and_publish_posture(&[healthy_slot(tenant(0)), dead], now);
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(published.posture, CoordCredentialPosture::Expired);
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(tenant(1).to_string().as_str()),
+            "a slot-attributed fault outranks the unattributable one"
+        );
+
+        // A 2xx on the default credential clears it, same as any other slot.
+        reset_coord_credential_posture_for_test();
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+        note_coord_upstream_verdict(None, true, 200, br#"{"ok":true}"#);
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live)
+        );
         reset_posture();
     }
 
