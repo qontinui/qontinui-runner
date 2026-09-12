@@ -1515,17 +1515,48 @@ fn spawn_run_task(payload: LaunchPayload) {
             // only thing that posts spawn_complete/spawn_failed, so returning
             // silently would leave coord's agent row in `spawning` forever and
             // re-dispatch the same request on every reconnect — an endless
-            // dispatch/refuse loop. Unlike the gate-continuation path (whose
-            // row must stay PENDING and re-listable), a launch payload has no
-            // deferral shape: the honest answer is "this device will not run
-            // it, and here is why".
+            // dispatch/refuse loop. A registry refusal is a standing decision,
+            // so it is reported as a plain failure: "this device will not run
+            // it, and here is why". (A LOAD refusal, below, is not standing and
+            // is reported differently.)
+            report_spawn_failed(agent_id, &reason, None, 0, None).await;
+            return;
+        }
+        // Machine-load backstop (plan
+        // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
+        // Phase 1c): the SAME thread-pressure + live-session-cap guard the
+        // gate-continuation path applies (`evaluate_load_guard`), so a flood of
+        // coord launches cannot start more unattended sessions than the box can
+        // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
+        // path rewrite, account resolution and worktree materialization all
+        // happen — so a refused launch leaves no worktree, no daemon and no
+        // proxy nonce behind; only the stop-token entry exists, removed here.
+        //
+        // A launch payload has no deferred ack (continuations have
+        // `continuation-deferred`; launches only `spawn-complete` /
+        // `spawn-failed`). So a load refusal is posted as `spawn-failed` with a
+        // reason beginning `deferred_load:`, which coord treats as RE-OFFERABLE:
+        // it abandons the allocation and retires the dispatch dedup marker, so
+        // the work is offered again on a later pass rather than latched failed.
+        let verdict = evaluate_launch_guard(
+            agent_id,
+            &live_terminal_predicate(),
+            &crate::resource_guard::thread_pressure,
+        );
+        if let Some(reason) = launch_deferral_reason(&verdict) {
+            info!(
+                "agent_runtime: coord spawn-request agent_id={agent_id} deferred under machine \
+                 load, NOT launched — {reason}"
+            );
+            agent_stops().lock().unwrap().remove(&agent_id);
             report_spawn_failed(agent_id, &reason, None, 0, None).await;
             return;
         }
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // Drop the registry entry once the run task is fully done.
+        // Drop the registry entries once the run task is fully done.
+        release_admitted_launch(agent_id);
         agent_stops().lock().unwrap().remove(&agent_id);
         // Drop the agent's live-token slot so its proxy nonce hard-fails closed
         // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
@@ -2211,17 +2242,72 @@ fn evaluate_continuation_guard(
     // The count is read out above instead: it is a snapshot either way — see
     // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
     // and holding the lock longer would not make it one.
+    //
+    // Admitted coord LAUNCHES count toward the same cap: both populations are
+    // unattended coord-dispatched sessions spending the same machine, and a cap
+    // that one of them can walk past is not a bound on the box.
+    let live_count = live_count + admitted_launch_count(None);
 
-    // Thread pressure: ANY verdict that is not `Proceed` defers (see the
-    // asymmetry argument above). Taken HERE, after the dedup arm has had its
-    // chance to return, so a deduped row never pays for a thread snapshot at
-    // all — the cost-ordering argument on step 1. An unreadable thread sensor
-    // produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the
-    // fail-open doctrine this whole subsystem is built on — so a missing reading
-    // can never wedge the continuation queue shut.
+    // Thread pressure next, then the count cap — shared with the launch path
+    // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
+    // its chance to return, so a deduped row never pays for a thread snapshot.
+    match evaluate_load_guard(live_count, thread_pressure) {
+        LoadGuard::Proceed => ContinuationGuard::Proceed,
+        LoadGuard::ThreadPressure {
+            severity,
+            observation,
+        } => ContinuationGuard::ThreadPressure {
+            severity,
+            observation,
+        },
+        LoadGuard::AtCap { cap, .. } => ContinuationGuard::AtCap(cap),
+    }
+}
+
+/// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
+/// then the live-session count cap. Shared by the gate-continuation guard
+/// ([`evaluate_continuation_guard`], which runs its anchor dedup first) and the
+/// coord launch guard ([`evaluate_launch_guard`]), so the two paths can never
+/// disagree about when the machine is too loaded to take another unattended
+/// session.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadGuard {
+    /// Clear to spawn.
+    Proceed,
+    /// The thread lane tripped (warn or critical). See
+    /// [`ContinuationGuard::ThreadPressure`].
+    ThreadPressure {
+        severity: &'static str,
+        observation: crate::resource_guard::GateObservation,
+    },
+    /// The live-session count is at or over the cap.
+    AtCap {
+        /// The configured cap ([`continuation_session_cap`]).
+        cap: usize,
+        /// The live count that was compared against it.
+        live: usize,
+    },
+}
+
+/// The load guard proper: thread pressure first, then the count cap. Pure over
+/// (`live_count`, the injected thread verdict, env cap).
+///
+/// Thread pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
+/// argument on [`evaluate_continuation_guard`]). An unreadable thread sensor
+/// produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the fail-open
+/// doctrine this whole subsystem is built on — so a missing reading can never
+/// wedge the queue shut. The verdict is a closure so a caller that returns
+/// earlier (the continuation dedup arm) never pays for the reading.
+///
+/// A steady-state bound, not a semaphore — see
+/// [`DEFAULT_CONTINUATION_SESSION_CAP`].
+fn evaluate_load_guard(
+    live_count: usize,
+    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> LoadGuard {
     let verdict = thread_pressure();
     if let Some((severity, observation)) = verdict.tripped() {
-        return ContinuationGuard::ThreadPressure {
+        return LoadGuard::ThreadPressure {
             severity,
             observation: observation.clone(),
         };
@@ -2230,10 +2316,88 @@ fn evaluate_continuation_guard(
     // P4: at the cap → refuse.
     let cap = continuation_session_cap();
     if live_count >= cap {
-        return ContinuationGuard::AtCap(cap);
+        return LoadGuard::AtCap {
+            cap,
+            live: live_count,
+        };
     }
 
-    ContinuationGuard::Proceed
+    LoadGuard::Proceed
+}
+
+/// Process-wide set of coord LAUNCHES (`spawn_requested` payloads) that passed
+/// [`evaluate_launch_guard`] and whose run task has not finished. Distinct from
+/// [`agent_stops`], which is populated synchronously in the WS pump BEFORE the
+/// guard runs: counting that map would make every launch of a burst see the
+/// whole burst and refuse all of it. Only ADMITTED launches count.
+fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
+    static LAUNCHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>> =
+        std::sync::OnceLock::new();
+    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Count of admitted launches, excluding `except` (a launch re-evaluating
+/// itself must not count its own slot).
+fn admitted_launch_count(except: Option<uuid::Uuid>) -> usize {
+    let set = lock_recover(admitted_launches(), "admitted_launches");
+    match except {
+        Some(id) if set.contains(&id) => set.len() - 1,
+        _ => set.len(),
+    }
+}
+
+/// Release a launch's admitted slot once its run task has finished.
+fn release_admitted_launch(agent_id: uuid::Uuid) {
+    lock_recover(admitted_launches(), "admitted_launches").remove(&agent_id);
+}
+
+/// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
+///
+/// **A wire value.** A launch payload has no deferred ack (only
+/// `spawn-complete` / `spawn-failed` exist for it), so a load refusal rides
+/// `spawn-failed`, and coord's handler recognises this prefix as RE-OFFERABLE:
+/// it abandons the allocation and retires the dispatch dedup marker so the work
+/// is offered again on a later pass instead of latching as a failure. Plan
+/// `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
+/// Phase 1c. Rewording it silently turns every deferral into a terminal failure.
+const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
+
+/// The pre-spawn guard for a coord LAUNCH: prune dead continuations, then the
+/// shared [`evaluate_load_guard`] over every live unattended session
+/// (continuations plus other admitted launches). On `Proceed` the launch is
+/// recorded in [`admitted_launches`] so later launches count it; the caller
+/// releases it with [`release_admitted_launch`] when the run task ends.
+///
+/// No anchor dedup: a launch payload is already deduped by coord per
+/// `agent_id`, and has no anchor key.
+fn evaluate_launch_guard(
+    agent_id: uuid::Uuid,
+    is_live: &dyn Fn(&str) -> bool,
+    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> LoadGuard {
+    prune_dead_continuations(is_live);
+    let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
+    let live = continuations + admitted_launch_count(Some(agent_id));
+    let verdict = evaluate_load_guard(live, thread_pressure);
+    if verdict == LoadGuard::Proceed {
+        lock_recover(admitted_launches(), "admitted_launches").insert(agent_id);
+    }
+    verdict
+}
+
+/// The `spawn-failed` reason for a load-refused launch, or `None` when the
+/// verdict admits it. Always begins with [`DEFERRED_LOAD_REASON_PREFIX`], then
+/// the same `<class>:<detail>` stamp the continuation deferral uses.
+fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
+    let detail = match verdict {
+        LoadGuard::Proceed => return None,
+        LoadGuard::ThreadPressure {
+            severity,
+            observation,
+        } => thread_pressure_stamp_reason(severity, observation),
+        LoadGuard::AtCap { cap, live } => format!("{} live={live}", at_cap_stamp_reason(*cap)),
+    };
+    Some(format!("{DEFERRED_LOAD_REASON_PREFIX} {detail}"))
 }
 
 /// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
@@ -9870,6 +10034,100 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // Admitted launches share the cap, so they are part of the same reset.
+        admitted_launches()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
+    /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
+    /// prefix followed by the same thread-pressure stamp continuations use.
+    #[test]
+    fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let agent = uuid::Uuid::now_v7();
+
+        let verdict = evaluate_launch_guard(agent, &live_all, &|| thread_verdict(Some(300)));
+        assert!(
+            matches!(
+                verdict,
+                LoadGuard::ThreadPressure {
+                    severity: "warn",
+                    ..
+                }
+            ),
+            "300 threads must defer a launch, got {verdict:?}"
+        );
+        let reason = launch_deferral_reason(&verdict).expect("a refusal has a reason");
+        assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
+        assert_eq!(reason, "deferred_load: thread_pressure:warn:300_over_256");
+        assert_eq!(
+            admitted_launch_count(None),
+            0,
+            "a refused launch must not hold a slot"
+        );
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+    }
+
+    /// Phase 1c: the count lane binds launches — continuations and other
+    /// admitted launches both count, the launch's own slot does not, and a
+    /// released slot re-admits.
+    #[test]
+    fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
+        let _env_lock = env_lock();
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        let live_all = |_id: &str| true;
+
+        register_continuation_session("cont-1".into(), Some("anchor-1".into()), None);
+        let first = uuid::Uuid::now_v7();
+        assert_eq!(
+            evaluate_launch_guard(first, &live_all, &calm),
+            LoadGuard::Proceed,
+            "1 live of cap 2 admits"
+        );
+        assert_eq!(launch_deferral_reason(&LoadGuard::Proceed), None);
+        // Re-evaluating an already-admitted launch does not count itself.
+        assert_eq!(
+            evaluate_launch_guard(first, &live_all, &calm),
+            LoadGuard::Proceed
+        );
+
+        let second = uuid::Uuid::now_v7();
+        let verdict = evaluate_launch_guard(second, &live_all, &calm);
+        assert_eq!(verdict, LoadGuard::AtCap { cap: 2, live: 2 });
+        assert_eq!(
+            launch_deferral_reason(&verdict).as_deref(),
+            Some("deferred_load: at_cap:2 live=2")
+        );
+
+        // The admitted launch also binds the CONTINUATION guard (shared cap).
+        assert_eq!(
+            evaluate_continuation_guard(Some("anchor-2"), &live_all, &calm),
+            ContinuationGuard::AtCap(2)
+        );
+
+        release_admitted_launch(first);
+        assert_eq!(
+            evaluate_launch_guard(second, &live_all, &calm),
+            LoadGuard::Proceed,
+            "a released slot re-admits the deferred launch"
+        );
+        clear_continuation_registry();
+        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+    }
+
+    /// The prefix is a wire value coord matches on; pin its exact spelling.
+    #[test]
+    fn deferred_load_prefix_is_the_coord_wire_value() {
+        assert_eq!(DEFERRED_LOAD_REASON_PREFIX, "deferred_load:");
     }
 
     /// Poison-recovering (`unwrap_or_else(into_inner)`), matching the shared
