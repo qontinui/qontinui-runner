@@ -383,16 +383,54 @@ pub struct TestConnectionResponse {
     /// `false` means reachable-but-unpaired, which is a normal first-run state
     /// and NOT a configuration error.
     pub paired: bool,
+    /// WHY the identity leg did not succeed. `paired: false` alone conflates
+    /// faults an operator must act on differently — "never paired yet" and
+    /// "your stored credential was rejected" are not the same problem, and a UI
+    /// branching only on `paired` shows them identically.
+    pub identity_fault: IdentityFault,
     /// Device identity from `GET /api/v1/devices/me`. Present iff `paired`.
     pub device_id: Option<String>,
     pub user_id: Option<String>,
     pub tenant_id: Option<String>,
-    /// Whether the supplied runner token has the expected `qontinui_runner_`
-    /// shape. This is a LOCAL shape check only — see the note on
+    /// Whether the CONFIGURED runner token has the expected `qontinui_runner_`
+    /// shape. `None` means no token is configured at all, which is the normal
+    /// state for a runner paired through Cognito or a pair code — those paths
+    /// never mint a `qontinui_runner_` token, so absence is not a fault and
+    /// must not be rendered as one. `Some(false)` is the only actionable value.
+    /// A LOCAL shape check only — see the note on
     /// [`test_web_integration_connection`] for why the token is not sent.
-    pub token_format_valid: bool,
+    pub token_format_valid: Option<bool>,
     /// One line an operator can act on, covering whichever arm was reached.
     pub detail: String,
+}
+
+/// Why the identity leg of [`test_web_integration_connection`] did not produce
+/// an identity. Distinct variants because each wants a different operator
+/// action; collapsing them is what sends someone to re-paste a credential when
+/// coord's verifier is the thing that is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityFault {
+    /// The identity check succeeded.
+    None,
+    /// No device JWT is stored — this runner has never paired. A normal
+    /// first-run state, not a misconfiguration.
+    Unpaired,
+    /// The probed URL is not the backend this runner is bound to, so the
+    /// identity leg was deliberately SKIPPED rather than presenting this
+    /// runner's live credential to an unbound host. See the security note on
+    /// [`test_web_integration_connection`].
+    NotBoundBackend,
+    /// 401 — the stored device JWT was rejected (stale, revoked, or minted for
+    /// another backend). Re-pair.
+    Rejected,
+    /// 403 — understood, but not permitted here.
+    Forbidden,
+    /// 503 — the backend could not reach coord's JWKS to verify the token. A
+    /// coord-tier fault that says nothing about this runner's credential.
+    VerifierDown,
+    /// A 2xx whose body did not decode, or any other unexpected status.
+    Unexpected,
 }
 
 /// Response of `GET /api/v1/devices/me`.
@@ -408,6 +446,34 @@ struct DeviceIdentityResponse {
 /// round-trip; see [`test_web_integration_connection`] for why that is the only
 /// check this command can honestly make.
 const RUNNER_TOKEN_PREFIX: &str = "qontinui_runner_";
+
+/// Is `candidate` the backend this runner is BOUND to — the origin
+/// `api_config::get_api_base_url()` resolves to, which is what
+/// `mcp::backend_relay` dials and what the stored device JWT was minted for?
+///
+/// Compared on ORIGIN (scheme + host + port), not on the raw string, so a
+/// trailing slash or a case difference in the host does not read as a different
+/// backend. Anything that does not parse compares unequal — fail closed, since
+/// the consequence of a false positive is presenting a live credential to an
+/// unbound host.
+fn is_bound_backend(candidate: &str) -> bool {
+    fn origin(raw: &str) -> Option<(String, String, Option<u16>)> {
+        let u = reqwest::Url::parse(raw.trim()).ok()?;
+        let host = u.host_str()?.to_ascii_lowercase();
+        Some((
+            u.scheme().to_ascii_lowercase(),
+            host,
+            u.port_or_known_default(),
+        ))
+    }
+    match (
+        origin(candidate),
+        origin(&crate::api_config::get_api_base_url()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
 
 /// Validate a candidate `(backend_url, runner_token)` pair WITHOUT persisting
 /// anything and WITHOUT mutating the backend. Purely a probe.
@@ -437,6 +503,24 @@ const RUNNER_TOKEN_PREFIX: &str = "qontinui_runner_";
 ///    will really do. 200 yields `{device_id, user_id, tenant_id}`; 401 means
 ///    the stored JWT is stale or foreign; 503 means coord's JWKS is unreachable
 ///    and says nothing about this runner.
+///
+/// # The identity leg only runs against the BOUND backend
+///
+/// Step 2 presents this runner's live, 4-hour, coord-issued device JWT. That
+/// credential is minted for one backend, and this command's `backend_url` is
+/// caller-supplied — the command is on the UI-Bridge invoke allowlist, so a
+/// local HTTP caller supplies it directly with no operator in the loop. Sending
+/// the JWT to whatever host was typed would hand a live credential to an
+/// arbitrary, attacker-choosable origin, and the `/health/live` gate is no
+/// protection because any host can answer 200.
+///
+/// So the identity leg runs ONLY when the probed origin matches the persisted
+/// backend (`api_config::get_api_base_url`) — the same origin
+/// `mcp::backend_relay` dials. Any other URL still gets its reachability
+/// answered and comes back [`IdentityFault::NotBoundBackend`], which is an
+/// honest "not checked", never a pass. The predecessor sent the legacy runner
+/// token here; upgrading the credential without narrowing the destination would
+/// have widened the blast radius while fixing the 404.
 ///
 /// # Why the runner token is not sent anywhere
 ///
@@ -477,8 +561,14 @@ pub async fn test_web_integration_connection(
 
     // A missing token is no longer fatal: the probe's substantive half is the
     // device-JWT identity check, which does not use the token at all. Report
-    // the shape rather than refusing to run.
-    let token_format_valid = trimmed_token.starts_with(RUNNER_TOKEN_PREFIX);
+    // the shape rather than refusing to run — and report ABSENCE as absence
+    // (`None`), not as a malformed token, because a runner paired through
+    // Cognito or a pair code legitimately has none.
+    let token_format_valid = if trimmed_token.is_empty() {
+        None
+    } else {
+        Some(trimmed_token.starts_with(RUNNER_TOKEN_PREFIX))
+    };
 
     let client = build_http_client()?;
 
@@ -506,14 +596,49 @@ pub async fn test_web_integration_connection(
     }
 
     // ---- Step 2: identity, with the credential the relay actually uses ----
-    let device_jwt = crate::auth::AuthManager::new()
-        .get_access_token()
-        .ok()
-        .filter(|j| !j.trim().is_empty());
+    //
+    // GATE FIRST, read the credential second. The bound-backend check must
+    // happen before the JWT is even loaded, so an unbound URL cannot reach the
+    // credential at all. See the security note on this function.
+    if !is_bound_backend(&trimmed_backend) {
+        return Ok(TestConnectionResponse {
+            reachable: true,
+            paired: false,
+            identity_fault: IdentityFault::NotBoundBackend,
+            device_id: None,
+            user_id: None,
+            tenant_id: None,
+            token_format_valid,
+            detail: format!(
+                "Backend reachable at {trimmed_backend}, but that is not the backend \
+                 this runner is bound to ({}). Identity was NOT checked — this \
+                 runner's device credential is only ever presented to its bound \
+                 backend. Save this URL and re-pair to bind to it.",
+                crate::api_config::get_api_base_url()
+            ),
+        });
+    }
+
+    // `get_access_token` is synchronous and can fall through to the OS keychain,
+    // which on Linux is a D-Bus Secret Service round-trip bounded at 3s
+    // (`auth::keychain_call_bounded`). That is a real stall of a tokio worker on
+    // an operator button press, and the unpaired case — the one this branch
+    // exists to report — is precisely the one that always reaches the keychain.
+    // Same treatment `redeem_pair_code` below already gives its blocking call.
+    let device_jwt = spawn_blocking_tracked(|| {
+        crate::auth::AuthManager::new()
+            .get_access_token()
+            .ok()
+            .filter(|j| !j.trim().is_empty())
+    })
+    .await
+    .unwrap_or(None);
+
     let Some(device_jwt) = device_jwt else {
         return Ok(TestConnectionResponse {
             reachable: true,
             paired: false,
+            identity_fault: IdentityFault::Unpaired,
             device_id: None,
             user_id: None,
             tenant_id: None,
@@ -548,20 +673,33 @@ pub async fn test_web_integration_connection(
         // These are genuinely different faults. Collapsing them into one "auth
         // failed" is what sends an operator to re-paste a token when coord's
         // JWKS is the thing that is down.
-        let detail = match status.as_u16() {
-            401 => "the stored device JWT was rejected (stale, revoked, or issued \
-                    for another backend) — re-pair this runner"
-                .to_string(),
-            403 => "the device JWT was understood but is not permitted here".to_string(),
-            503 => "the backend could not reach coord's JWKS to verify the device \
-                    JWT — a coord-tier fault that says nothing about this runner's \
-                    credential"
-                .to_string(),
-            _ => format!("unexpected status from {me_url}"),
+        let (fault, detail) = match status.as_u16() {
+            401 => (
+                IdentityFault::Rejected,
+                "the stored device JWT was rejected (stale, revoked, or issued \
+                 for another backend) — re-pair this runner"
+                    .to_string(),
+            ),
+            403 => (
+                IdentityFault::Forbidden,
+                "the device JWT was understood but is not permitted here".to_string(),
+            ),
+            503 => (
+                IdentityFault::VerifierDown,
+                "the backend could not reach coord's JWKS to verify the device \
+                 JWT — a coord-tier fault that says nothing about this runner's \
+                 credential"
+                    .to_string(),
+            ),
+            _ => (
+                IdentityFault::Unexpected,
+                format!("unexpected status from {me_url}"),
+            ),
         };
         return Ok(TestConnectionResponse {
             reachable: true,
             paired: false,
+            identity_fault: fault,
             device_id: None,
             user_id: None,
             tenant_id: None,
@@ -582,6 +720,7 @@ pub async fn test_web_integration_connection(
         Ok(id) => Ok(TestConnectionResponse {
             reachable: true,
             paired: true,
+            identity_fault: IdentityFault::None,
             detail: format!(
                 "Connected to {} as device {} (tenant {}).",
                 trimmed_backend, id.device_id, id.tenant_id
@@ -855,7 +994,7 @@ mod ipc_wire_contract_tests {
     // The probe's own constants/types. This module deliberately does NOT
     // `use super::*` — it mirrors the Tauri wire shapes rather than exercising
     // the module — so the few real items the probe tests touch are named.
-    use super::{TestConnectionResponse, RUNNER_TOKEN_PREFIX};
+    use super::{is_bound_backend, IdentityFault, TestConnectionResponse, RUNNER_TOKEN_PREFIX};
 
     /// Mirror of what Tauri generates for `save_web_integration_settings`
     /// argument extraction. Top-level args are renamed camelCase → snake_case.
@@ -997,10 +1136,11 @@ mod ipc_wire_contract_tests {
         let resp = TestConnectionResponse {
             reachable: true,
             paired: true,
+            identity_fault: IdentityFault::None,
             device_id: Some("dev-1".to_string()),
             user_id: Some("user-1".to_string()),
             tenant_id: Some("tenant-1".to_string()),
-            token_format_valid: true,
+            token_format_valid: Some(true),
             detail: "ok".to_string(),
         };
         let v: serde_json::Value = serde_json::to_value(&resp).expect("serializes");
@@ -1008,6 +1148,7 @@ mod ipc_wire_contract_tests {
         for key in [
             "reachable",
             "paired",
+            "identityFault",
             "deviceId",
             "userId",
             "tenantId",
@@ -1016,9 +1157,43 @@ mod ipc_wire_contract_tests {
         ] {
             assert!(obj.contains_key(key), "missing `{key}` in {v}");
         }
-        for key in ["device_id", "user_id", "tenant_id", "token_format_valid"] {
+        for key in [
+            "device_id",
+            "user_id",
+            "tenant_id",
+            "token_format_valid",
+            "identity_fault",
+        ] {
             assert!(!obj.contains_key(key), "snake_case `{key}` leaked in {v}");
         }
+    }
+
+    /// The fault variants are a wire contract the UI branches on, so their
+    /// spelling is pinned. `snake_case` on the VALUES even though the fields
+    /// are camelCase — that is what `rename_all` on the enum produces.
+    #[test]
+    fn identity_fault_variants_serialize_as_named() {
+        for (v, want) in [
+            (IdentityFault::None, "\"none\""),
+            (IdentityFault::Unpaired, "\"unpaired\""),
+            (IdentityFault::NotBoundBackend, "\"not_bound_backend\""),
+            (IdentityFault::Rejected, "\"rejected\""),
+            (IdentityFault::Forbidden, "\"forbidden\""),
+            (IdentityFault::VerifierDown, "\"verifier_down\""),
+            (IdentityFault::Unexpected, "\"unexpected\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), want);
+        }
+    }
+
+    /// The security gate: a URL that is not the bound backend must never reach
+    /// the identity leg, because that leg presents a live device credential.
+    /// Anything unparseable compares unequal — fail closed.
+    #[test]
+    fn is_bound_backend_fails_closed_on_junk() {
+        assert!(!is_bound_backend(""));
+        assert!(!is_bound_backend("not-a-url"));
+        assert!(!is_bound_backend("https://evil.example"));
     }
 
     /// `token_format_valid` is a LOCAL shape check and nothing more — the token
@@ -1027,6 +1202,9 @@ mod ipc_wire_contract_tests {
     /// into "any non-empty string is fine".
     #[test]
     fn runner_token_prefix_is_the_only_local_check() {
+        // Absence is reported as `None`, never as a malformed token: a runner
+        // paired through Cognito or a pair code legitimately has no
+        // `qontinui_runner_` token at all.
         assert!("qontinui_runner_deadbeef".starts_with(RUNNER_TOKEN_PREFIX));
         assert!(!"qontinui_device_deadbeef".starts_with(RUNNER_TOKEN_PREFIX));
         assert!(!"".starts_with(RUNNER_TOKEN_PREFIX));
