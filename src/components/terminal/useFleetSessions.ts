@@ -292,8 +292,16 @@ export function emptyReasonFor(
 }
 
 /**
- * Group sessions by device, newest activity first within each device, and the
- * caller's own device first overall.
+ * Group sessions by device, most recently ACTIVE first within each device, and
+ * the caller's own device first overall.
+ *
+ * Activity order is imposed HERE rather than inherited from coord, because
+ * coord no longer serves it. Since qontinui-coord#2085 the fleet walk is
+ * `started_at DESC`: a heartbeat rewrites `last_heartbeat_at` every few
+ * seconds, and a cursor walking a key that moves silently drops rows. So rows
+ * ARRIVE in start order, and without this sort a session started three days ago
+ * and heartbeating now would sit below one started an hour ago that went quiet.
+ * See {@link activityInstant} for the key.
  *
  * The local-device-first ordering is deliberate: the picker exists to reach
  * REMOTE sessions, and putting the operator's own box at the top is what makes
@@ -305,6 +313,28 @@ export interface FleetDeviceGroup {
   label: string;
   isCallerDevice: boolean;
   sessions: FleetSession[];
+}
+
+/**
+ * The instant a row is ordered by within its device: its last heartbeat, else
+ * its start. Absent or unparseable sorts LAST: a row coord could not date is
+ * not evidence of recent activity.
+ */
+export function activityInstant(s: FleetSession): number {
+  for (const v of [s.lastHeartbeatAt, s.startedAt]) {
+    const t = v ? Date.parse(v) : Number.NaN;
+    if (!Number.isNaN(t)) return t;
+  }
+  return Number.NEGATIVE_INFINITY;
+}
+
+/**
+ * Newest activity first, with the session id as a total tiebreak so equal
+ * instants do not reorder between renders. Two undated rows give `-Inf - -Inf`,
+ * which is `NaN` and falsy, so they fall through to the id as well.
+ */
+function byActivityDesc(a: FleetSession, b: FleetSession): number {
+  return activityInstant(b) - activityInstant(a) || a.sessionId.localeCompare(b.sessionId);
 }
 
 export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
@@ -322,7 +352,7 @@ export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
       deviceId,
       label: deviceLabel(first),
       isCallerDevice: first.isCallerDevice,
-      sessions: rows,
+      sessions: [...rows].sort(byActivityDesc),
     });
   }
 

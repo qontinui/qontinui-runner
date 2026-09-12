@@ -32,7 +32,11 @@ use std::time::Duration;
 use serde::Deserialize;
 
 /// Filters the picker may apply. All optional — the default is "live sessions
-/// across the whole tenant, newest activity first".
+/// across the whole tenant, most recently STARTED first". That is coord's walk
+/// order, `started_at DESC, id DESC`, and not recency of activity: since
+/// qontinui-coord#2085 the key a cursor walks must not move, and a heartbeat
+/// moves `last_heartbeat_at` every few seconds. Activity is still on every row
+/// as `lastHeartbeatAt`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FleetSessionsArgs {

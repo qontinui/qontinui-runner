@@ -338,18 +338,26 @@ export function fleetTruncation(
  * the contract and the prose is not. `limit_not_positive` replaced an older
  * free-text `{"error":"limit must be positive"}` — a deliberate break, and the
  * reason nothing here matches on prose.
+ *
+ * `unknown_state` (qontinui-coord#2085) is a non-blank `?state=` that is not a
+ * `coord.sessions.state`. Before it, coord answered that with `200` and an
+ * empty page. Every state this picker offers comes from
+ * `FLEET_STATE_VOCABULARY` or from rows coord served, so the code means the
+ * runner's vocabulary and coord's have diverged.
  */
 export type FleetErrorCode =
   | "cursor_scope_mismatch"
   | "cursor_malformed"
   | "cursor_version_unsupported"
-  | "limit_not_positive";
+  | "limit_not_positive"
+  | "unknown_state";
 
 const FLEET_ERROR_CODES: readonly string[] = [
   "cursor_scope_mismatch",
   "cursor_malformed",
   "cursor_version_unsupported",
   "limit_not_positive",
+  "unknown_state",
 ];
 
 /**
@@ -413,6 +421,11 @@ export function fleetErrorMessage(code: FleetErrorCode | null, raw: unknown): st
       );
     case "limit_not_positive":
       return "coord refused the read: the page size must be a positive number.";
+    case "unknown_state":
+      return (
+        "coord does not recognise the selected state filter — this runner's list of session " +
+        "states and coord's disagree. Clear the state filter to list every state."
+      );
     default:
       return `Failed to load fleet sessions: ${raw}`;
   }
