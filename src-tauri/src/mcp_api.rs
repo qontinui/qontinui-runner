@@ -8163,6 +8163,10 @@ pub fn create_router(
             // population whichever side of the reconcile the walk runs on. (The
             // comment that used to sit here claimed the opposite, and that claim
             // was the stated reason for the ordering.)
+            // Warm the stdio-shim selftest cache off the request path, so the
+            // first spawn after boot reads a verdict instead of running the
+            // probe inline on a tokio worker (`coord_mcp::cached_stdio_shim_probe`).
+            tokio::task::spawn_blocking(crate::coord_mcp::warm_stdio_shim_probe);
             let census_task = {
                 let open = workdirs.clone();
                 let all = all_record_workdirs;
