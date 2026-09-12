@@ -1867,8 +1867,8 @@ pub(crate) fn derive_coord_credential_posture(
     }
     if obs.present {
         let dead = match obs.exp {
-            None => true,               // opaque — can never be presented
-            Some(e) => now >= e,        // already expired
+            None => true,        // opaque — can never be presented
+            Some(e) => now >= e, // already expired
         };
         if dead {
             return CoordCredentialPosture::Expired;
@@ -5014,7 +5014,10 @@ mod tenant_slot_refresh_tests {
         let concluded = coord_credential_posture().expect("a pass publishes a posture");
         assert_eq!(concluded.posture, CoordCredentialPosture::Unrefreshable);
         assert_eq!(concluded.last_refresh_outcome.as_deref(), Some("cleared"));
-        assert_eq!(concluded.tenant_id.as_deref(), Some(ta.to_string().as_str()));
+        assert_eq!(
+            concluded.tenant_id.as_deref(),
+            Some(ta.to_string().as_str())
+        );
         assert!(!concluded.posture.can_answer());
     }
 
@@ -5101,7 +5104,12 @@ mod tenant_slot_refresh_tests {
         // Neither does a 401 that names the NONCE rather than the token — the
         // 2026-09-12 first diagnosis blamed exactly that.
         for _ in 0..10 {
-            note_coord_upstream_verdict(None, true, 401, br#"{"code":"COORD_MCP_PROXY_UNAUTHORIZED"}"#);
+            note_coord_upstream_verdict(
+                None,
+                true,
+                401,
+                br#"{"code":"COORD_MCP_PROXY_UNAUTHORIZED"}"#,
+            );
         }
         assert_eq!(posture(), CoordCredentialPosture::Live);
         reset_posture();
@@ -5122,7 +5130,10 @@ mod tenant_slot_refresh_tests {
             classify_upstream_verdict(403, "Invalid token is not what happened here"),
             UpstreamVerdict::Indeterminate
         );
-        assert_eq!(classify_upstream_verdict(200, ""), UpstreamVerdict::Accepted);
+        assert_eq!(
+            classify_upstream_verdict(200, ""),
+            UpstreamVerdict::Accepted
+        );
         assert_eq!(
             classify_upstream_verdict(204, ""),
             UpstreamVerdict::Accepted
@@ -5528,11 +5539,7 @@ mod tenant_slot_refresh_tests {
             outcome: Some(TenantSlotOutcome::SkippedFresh),
         };
         assert_eq!(
-            derive_coord_credential_posture(
-                &obs,
-                upstream_signal_for(Some(&t.to_string())),
-                now
-            ),
+            derive_coord_credential_posture(&obs, upstream_signal_for(Some(&t.to_string())), now),
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
             "a box that polls claims must still be able to reach dark"
         );
@@ -5573,7 +5580,9 @@ mod tenant_slot_refresh_tests {
             "a NEW credential in the slot spends every rejection against the old one"
         );
         assert_eq!(
-            coord_credential_posture().expect("a pass publishes").posture,
+            coord_credential_posture()
+                .expect("a pass publishes")
+                .posture,
             CoordCredentialPosture::Live
         );
 
@@ -5628,12 +5637,20 @@ mod tenant_slot_refresh_tests {
         }
 
         assert_eq!(
-            derive_coord_credential_posture(&slot(a), upstream_signal_for(Some(&a.to_string())), now),
+            derive_coord_credential_posture(
+                &slot(a),
+                upstream_signal_for(Some(&a.to_string())),
+                now
+            ),
             CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
             "tenant A is dark and B's health is not evidence about A"
         );
         assert_eq!(
-            derive_coord_credential_posture(&slot(b), upstream_signal_for(Some(&b.to_string())), now),
+            derive_coord_credential_posture(
+                &slot(b),
+                upstream_signal_for(Some(&b.to_string())),
+                now
+            ),
             CoordCredentialPosture::Live
         );
 
