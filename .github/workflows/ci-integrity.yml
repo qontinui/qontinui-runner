@@ -380,8 +380,45 @@ jobs:
               remembered to add, including Actions syntax that does not exist yet.
               Inverting it means new syntax is captured by default.
 
-              Comments and key order do not survive parsing, so cosmetic edits still do
+              Key order does not survive parsing (canon sorts), so reordering keys does
               not move a digest; anything that reaches the Actions runtime does.
+
+              COMMENTS ARE NOT UNIFORMLY COSMETIC, and an earlier version of this
+              paragraph said they were. A YAML-level comment is dropped by the parser and
+              moves nothing. A SHELL comment inside a `run:` block scalar is part of that
+              scalar's VALUE -- the block scalar IS the shell text -- so editing one moves
+              a digest and the PR needs `alters-a-gate` plus a `Gate-Change:` line, not
+              the plain declaration.
+
+              WHICH digest depends on the file, and getting this wrong leaves an author
+              red with a token that matches nothing. In a WORKFLOW the run: block sits
+              inside a job, so the token is `<stem>#<job-key>`. A COMPOSITE ACTION
+              (`.github/actions/<name>/action.yml`) has no `jobs:` key at all -- its
+              `runs.steps[].run` lands in the WORKFLOW surface -- so the token there is
+              `<stem>#workflow`, and `<stem>` is the action's DIRECTORY name.
+
+              One more that is easy to get backwards: a trailing `# ...` on a PLAIN
+              `run: cargo test` IS stripped, because that value is a flow scalar; the same
+              text inside a `run: |` block is not.
+
+              BEYOND THAT, DO NOT REASON FROM YAML RULES HERE -- READ THE ASSERTIONS.
+              Re-indenting a block scalar, and re-wrapping a folded `>` one, are cosmetic
+              in some shapes and not in others, and this docstring is a bad place to
+              decide which: every attempt to summarise those rules in prose here has been
+              WRONG at least once, including three drafts of this very paragraph. The last
+              of them claimed a folded re-wrap "can neither reproduce a wider gap", which
+              a trailing space before the break does exactly. Prose cannot go red; the
+              suite can. The cases are enumerated as executable assertions in
+              scripts/tests/ci-integrity/test-surface.py -- read them, or just read the
+              guard's own log, which prints the directive lines it actually wants.
+
+              What IS asserted here: the comment rules above, and the token rules in the
+              paragraph before them, are measured against the guard's own lifted
+              `canon`/`digest`/`surface`/`token` by that suite, so a change to these
+              functions that makes one of them false goes red rather than quietly
+              misinforming. `token` is lifted for exactly that reason: while it was not,
+              deleting its composite-action branch left the suite green while misrouting
+              every action author.
 
               An ABSENT file is ({}, {}) -- every job it had at base then reads as
               removed. A PRESENT but unparseable file is None, which the caller turns into

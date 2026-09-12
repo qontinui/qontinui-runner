@@ -484,9 +484,18 @@ jobs:
       # Until the companion PR lands this step makes `Run Rust tests` RED —
       # that red is the plan's Phase 0 inventory running on CI, and the merge
       # train orders the two PRs by label. Separately, ANY edit under
-      # `.github/workflows/**` reds `ci-integrity` by design and needs the
-      # operator's review (plan 2026-08-30-runner-ci-has-no-flake-detection-
-      # so-one-flaky-test-freezes-the-train); expected, not a workaround target.
+      # `.github/workflows/**` reds `ci-integrity` by design on a main-based PR
+      # (plan 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-
+      # freezes-the-train); expected, not a workaround target. It does NOT need
+      # an operator's review — that arm was retired in favour of
+      # declare-and-verify. The author clears it: `ci:gate-change=declared` for
+      # a purely additive change — a whole new JOB, a new workflow FILE, or an
+      # edit that moves no surface at all, which includes a YAML-level
+      # comment-only edit like this one — or
+      # `ci:gate-change=alters-a-gate` plus a `Gate-Change: ci#<job-key>` line in
+      # the PR body when an existing job's surface moves — which includes adding
+      # or removing a STEP, and editing a shell comment inside a `run:` block.
+      # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
       - name: Poison ambient state
         run: |
           set -euo pipefail
