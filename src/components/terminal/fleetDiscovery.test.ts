@@ -38,6 +38,7 @@ import {
   fleetFilteredOutMessage,
   fleetScopeKey,
   fleetScopeOf,
+  fleetSessionActivity,
   fleetScopesEqual,
   fleetSearchTerms,
   fleetSessionHaystack,
@@ -111,17 +112,19 @@ function page(n: number, offset = 0): FleetSession[] {
 describe("fleetTruncation — completeness is `nextCursor`, and nothing else", () => {
   it("is UNKNOWN before any read completes — not 'none'", () => {
     // The distinction Phase 2 exists for: no answer is not a complete answer.
-    expect(fleetTruncation(null, 0)).toEqual({ kind: "unknown" });
+    expect(fleetTruncation(null, 0, true)).toEqual({ kind: "unknown" });
   });
 
   it("is 'none' only when coord handed back no cursor", () => {
-    expect(fleetTruncation(response({ sessions: [session()], nextCursor: null }), 1)).toEqual({
-      kind: "none",
-    });
+    expect(fleetTruncation(response({ sessions: [session()], nextCursor: null }), 1, true)).toEqual(
+      {
+        kind: "none",
+      },
+    );
   });
 
   it("offers the next page whenever coord handed back a cursor", () => {
-    const t = fleetTruncation(response({ sessions: page(100), nextCursor: "ck-1" }), 100);
+    const t = fleetTruncation(response({ sessions: page(100), nextCursor: "ck-1" }), 100, true);
 
     expect(t.kind).toBe("more-available");
     if (t.kind !== "more-available") throw new Error("unreachable");
@@ -146,7 +149,7 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
   it("classifies a body with NO `truncated` key at all from the cursor alone", () => {
     const wire = response({ sessions: page(100), nextCursor: "ck-1" });
     expect("truncated" in wire).toBe(false);
-    expect(fleetTruncation(wire, 100).kind).toBe("more-available");
+    expect(fleetTruncation(wire, 100, true).kind).toBe("more-available");
   });
 
   it("ignores a stale `truncated` field in BOTH directions", () => {
@@ -157,14 +160,16 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     const stale = (truncated: boolean, nextCursor: string | null) =>
       ({ ...response({ sessions: page(3), nextCursor }), truncated }) as FleetSessionsResponse;
 
-    expect(fleetTruncation(stale(true, null), 3).kind).toBe("none");
-    expect(fleetTruncation(stale(false, "ck-9"), 3).kind).toBe("more-available");
+    expect(fleetTruncation(stale(true, null), 3, true).kind).toBe("none");
+    expect(fleetTruncation(stale(false, "ck-9"), 3, true).kind).toBe("more-available");
   });
 
   it("an empty-string cursor is the LAST page, never a next one", () => {
     // coord's walk protocol says an empty `cursor` is page one, so re-sending
     // one would silently restart the walk while the UI claimed to advance it.
-    expect(fleetTruncation(response({ sessions: page(3), nextCursor: "" }), 3).kind).toBe("none");
+    expect(fleetTruncation(response({ sessions: page(3), nextCursor: "" }), 3, true).kind).toBe(
+      "none",
+    );
     expect(normalizeFleetCursor("")).toBeNull();
     expect(normalizeFleetCursor(undefined)).toBeNull();
     expect(normalizeFleetCursor("ck-1")).toBe("ck-1");
@@ -174,8 +179,11 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     // A tenant with exactly 100 live sessions and a tenant with a next page
     // look identical by count alone.
     expect(
-      fleetTruncation(response({ sessions: page(FLEET_DEFAULT_LIMIT), nextCursor: null }), 100)
-        .kind,
+      fleetTruncation(
+        response({ sessions: page(FLEET_DEFAULT_LIMIT), nextCursor: null }),
+        100,
+        true,
+      ).kind,
     ).toBe("none");
   });
 
@@ -183,7 +191,11 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     // Three pages in, `response.sessions` holds the last 100 while the list
     // holds 300 — a banner reading "100 loaded so far" over a 300-row list is
     // the same class of false on-screen claim this phase removes.
-    const t = fleetTruncation(response({ sessions: page(100, 200), nextCursor: "ck-3" }), 300);
+    const t = fleetTruncation(
+      response({ sessions: page(100, 200), nextCursor: "ck-3" }),
+      300,
+      true,
+    );
     if (t.kind !== "more-available") throw new Error("unreachable");
     expect(t.shown).toBe(300);
     expect(t.message).toContain("300 loaded so far");
@@ -195,6 +207,7 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     const t = fleetTruncation(
       response({ sessions: page(500), limit: FLEET_MAX_LIMIT, nextCursor: "ck-1" }),
       500,
+      true,
     );
     if (t.kind !== "more-available") throw new Error("unreachable");
     expect(t.pageSize).toBe(FLEET_MAX_LIMIT);
@@ -205,6 +218,7 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     const t = fleetTruncation(
       { ...response({ sessions: page(5), nextCursor: "ck-1" }), limit: 0 },
       5,
+      true,
     );
     if (t.kind !== "more-available") throw new Error("unreachable");
     expect(t.pageSize).toBe(FLEET_DEFAULT_LIMIT);
@@ -217,11 +231,55 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     const t = fleetTruncation(
       response({ sessions: page(500), limit: FLEET_MAX_LIMIT, nextCursor: "ck-1" }),
       500,
+      true,
     );
     if (t.kind !== "more-available") throw new Error("unreachable");
     expect(t.message).not.toMatch(/cannot be paged further/i);
     expect(t.message).not.toMatch(/ceiling/i);
     expect(t.message).not.toMatch(/no larger read/i);
+  });
+
+  /**
+   * THE DISCRIMINATING TEST for this follow-up's defect.
+   *
+   * `useFleetSessions` drops the walk's cursor on `cursor_malformed`,
+   * `cursor_version_unsupported` and on a cursor coord hands back unchanged —
+   * but it deliberately KEEPS the previous successful `response`, whose
+   * `nextCursor` is still set. Classifying on that envelope alone therefore
+   * returns `more-available` in a state where `loadMore` returns immediately,
+   * putting a "Load 100 more" button on screen that does nothing at all when
+   * clicked. Run this against a `fleetTruncation` that ignores its third
+   * argument and it fails.
+   */
+  it("is 'unreachable', not 'more-available', when the WALK's cursor is gone", () => {
+    const served = response({ sessions: page(100), nextCursor: "ck-1" });
+    const t = fleetTruncation(served, 100, false);
+
+    expect(t.kind).toBe("unreachable");
+    if (t.kind !== "unreachable") throw new Error("unreachable");
+    expect(t.shown).toBe(100);
+    expect(t.message).toContain("100 loaded");
+    // It must still say the list is INCOMPLETE — dropping the cursor silently
+    // would turn an incomplete list into one claiming to be complete.
+    expect(t.message).toMatch(/has more/i);
+    // And it must point at the refresh rather than at a next page.
+    expect(t.message).toMatch(/refresh/i);
+    expect(t.message).not.toMatch(/load the next/i);
+  });
+
+  it("does not invent 'unreachable' when coord itself said the walk was over", () => {
+    // The last page and a dropped cursor are both "cannot advance", and only
+    // one of them is incomplete. Reading them as the same fact would put a
+    // permanent incompleteness warning under every completed walk.
+    expect(fleetTruncation(response({ sessions: page(3), nextCursor: null }), 3, false).kind).toBe(
+      "none",
+    );
+  });
+
+  it("stays UNKNOWN before any read, whatever the walk says it can do", () => {
+    // A walk with no accepted page has no cursor either, and `unknown` must win
+    // over any completeness claim — an absent answer is not a complete one.
+    expect(fleetTruncation(null, 0, false)).toEqual({ kind: "unknown" });
   });
 
   it("says out loud that a complete walk is complete only AS OF NOW", () => {
@@ -391,7 +449,9 @@ describe("the walk — pages accumulate, a restart replaces", () => {
     expect(EMPTY_FLEET_WALK.pages).toBe(0);
     expect(EMPTY_FLEET_WALK.sessions).toHaveLength(0);
     expect(EMPTY_FLEET_WALK.nextCursor).toBeNull();
-    expect(fleetTruncation(null, EMPTY_FLEET_WALK.sessions.length)).toEqual({ kind: "unknown" });
+    expect(fleetTruncation(null, EMPTY_FLEET_WALK.sessions.length, true)).toEqual({
+      kind: "unknown",
+    });
   });
 });
 
@@ -428,7 +488,13 @@ describe("a whole walk, driven the way the hook drives it", () => {
     expect(cursorsSent).toEqual([null, "ck-1", "ck-2"]);
     expect(walk.sessions.map((s) => s.sessionId)).toEqual(["s-0", "s-1", "s-2", "s-3", "s-4"]);
     expect(walk.pages).toBe(3);
-    expect(fleetTruncation(response({ nextCursor: null }), walk.sessions.length).kind).toBe("none");
+    expect(
+      fleetTruncation(
+        response({ nextCursor: null }),
+        walk.sessions.length,
+        walk.nextCursor !== null,
+      ).kind,
+    ).toBe("none");
   });
 
   it("stops instead of looping when the cursor never reaches coord", () => {
@@ -1003,5 +1069,68 @@ describe("fleetFilteredOutMessage under a walk — 'not loaded' is not 'not ther
     const msg = fleetFilteredOutMessage(100, 0, "zzz", false);
     expect(msg).not.toMatch(/coord has more/i);
     expect(msg).toMatch(/filters only those/i);
+  });
+});
+
+describe("fleetSessionActivity — the row's most recent OBSERVED instant", () => {
+  it("is null when coord served none of the three timestamps", () => {
+    // UNKNOWN, and the picker must render nothing. A placeholder here would
+    // look like an answer coord never gave.
+    expect(fleetSessionActivity(session())).toBeNull();
+  });
+
+  it("prefers a close over a heartbeat over a start", () => {
+    const all = session({
+      startedAt: "2026-09-10T00:00:00Z",
+      lastHeartbeatAt: "2026-09-11T00:00:00Z",
+      closedAt: "2026-09-12T00:00:00Z",
+    });
+    expect(fleetSessionActivity(all)).toEqual({ verb: "closed", iso: "2026-09-12T00:00:00Z" });
+
+    const live = session({
+      startedAt: "2026-09-10T00:00:00Z",
+      lastHeartbeatAt: "2026-09-11T00:00:00Z",
+    });
+    expect(fleetSessionActivity(live)).toEqual({
+      verb: "heartbeat",
+      iso: "2026-09-11T00:00:00Z",
+    });
+
+    const fresh = session({ startedAt: "2026-09-10T00:00:00Z" });
+    expect(fleetSessionActivity(fresh)).toEqual({ verb: "started", iso: "2026-09-10T00:00:00Z" });
+  });
+
+  it("ranks by what the fact SETTLES, not by which instant is later", () => {
+    // A session closed at noon whose last heartbeat was at 6pm (a clock skew, a
+    // late-flushed beat) is still CLOSED, and reporting the heartbeat would
+    // describe it as live.
+    const skewed = session({
+      lastHeartbeatAt: "2026-09-12T18:00:00Z",
+      closedAt: "2026-09-12T12:00:00Z",
+    });
+    expect(fleetSessionActivity(skewed)?.verb).toBe("closed");
+  });
+
+  it("skips a value that is not a date and falls through to the next", () => {
+    // coord degrades a column it cannot read to null, but a proxy or a fixture
+    // can put something else there. Rendering it would produce "Invalid Date",
+    // or a relative time computed from NaN.
+    const junk = session({ closedAt: "not-a-date", lastHeartbeatAt: "2026-09-11T00:00:00Z" });
+    expect(fleetSessionActivity(junk)).toEqual({
+      verb: "heartbeat",
+      iso: "2026-09-11T00:00:00Z",
+    });
+    expect(fleetSessionActivity(session({ startedAt: "not-a-date" }))).toBeNull();
+  });
+
+  it("treats a blank string as absent rather than as an instant", () => {
+    expect(fleetSessionActivity(session({ closedAt: "   ", startedAt: "" }))).toBeNull();
+  });
+
+  it("returns the ISO string coord served, unparsed", () => {
+    // The caller puts the exact instant in a title beside the relative form, so
+    // a round-tripped or reformatted value would lose coord's own precision.
+    const iso = "2026-09-11T04:05:06.789123Z";
+    expect(fleetSessionActivity(session({ lastHeartbeatAt: iso }))?.iso).toBe(iso);
   });
 });
