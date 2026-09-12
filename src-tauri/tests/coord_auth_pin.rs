@@ -173,7 +173,6 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("ci_node/reporting.rs", "device-jwt-required", 2),
     ("commands/ai_settings.rs", "not-coord", 3),
     ("commands/productivity.rs", "user-jwt", 1),
-    ("commands/web_integration.rs", "not-coord", 2),
     ("coord_doctor.rs", "diagnostic", 1),
     ("coord_mcp.rs", "not-coord", 1),
     ("credential_helper.rs", "device-jwt-required", 1),
