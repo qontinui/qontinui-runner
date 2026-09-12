@@ -1795,6 +1795,87 @@ fn latest_upstream_event(s: &UpstreamSignal) -> i64 {
         .max(s.last_ok_at.unwrap_or(0))
 }
 
+/// How recent an UNCLAIMED bucket's last rejection must be before it is
+/// allowed to darken the posture.
+///
+/// Without this the unattributable arm over-fires STICKILY. A box that was
+/// unpinned-and-single-slot, accumulated its three rejections under the
+/// default key and then got pinned or re-paired onto two tenant slots now owns
+/// an orphan bucket nothing will ever write again: the streak never clears, so
+/// every pass publishes `dark(tenant_id: None)` FOREVER — `canAnswer: false`,
+/// `derived_status: degraded`, and a banner that cannot be dismissed on a
+/// runner whose credentials are both live. It compounds with the "Re-pair" CTA
+/// only kicking the refresher, which re-derives the same dark, so the button
+/// does nothing either.
+///
+/// A box coord is actually refusing files a rejection on every forwarded call,
+/// so anything older than this window is not evidence about NOW. Deliberately
+/// wider than the refresher's own cadence, so a quiet-but-broken runner still
+/// reports across a tick or two.
+///
+/// Note the asymmetry, which is on purpose: a CLAIMED slot's streak needs no
+/// age bound, because the pass that observes it also heals it and the heal
+/// spends the streak. Nothing observes an unclaimed bucket, which is exactly
+/// why it needs a clock.
+pub(crate) const UPSTREAM_ORPHAN_MAX_AGE_SECS: i64 = 30 * 60;
+
+/// The worst UNCLAIMED bucket: a slot key that no observation in this pass
+/// describes, whose streak is at or over the threshold and whose last
+/// rejection is recent.
+///
+/// # Why this is a MAP DIFF and not another special case
+///
+/// `derive_and_publish_posture` reads exactly two things per pass — each
+/// observed slot's own bucket, and (when the fold applies) the default one. It
+/// never enumerates [`UPSTREAM_SIGNALS`]. So **every bucket keyed by something
+/// no observation claims is read by nobody**, and the default key was only the
+/// first way to produce one. Two more, both reachable today:
+///
+/// * **A legacy-only install**, which is a supported shape.
+///   `paired_user.json` names `default_tenant_id: X`, `machine.json` pins
+///   `active_tenant_id: X`, the credential lives in the legacy `access_token`
+///   slot and there is NO `device_jwt:X` slot. The forwarder resolves
+///   `Ok(Some(X))`, `select_device_bearer` misses the tenant slot and falls
+///   back to `legacy_slot_bearer` because `default_tenant == Some(t)`
+///   (`crate::auth`, `select_device_bearer`'s default-binding arm), so coord's
+///   refusals file under key **`X`**. Meanwhile `list_tenant_device_jwt_tenants()`
+///   is empty, so the refresher takes its legacy branch and publishes ONE
+///   observation with `tenant_id: None` — which reads the DEFAULT bucket.
+///   Bucket `X` climbs forever, unread; the legacy `exp` is in the future, so
+///   rung 6 says `live` while coord refuses every call.
+/// * **A pin with no slot**: tenant slots for Y and Z, `machine.json` pinned
+///   to X. Same shape, same silence.
+///
+/// Diffing the map against what the observations claim closes the CLASS, so
+/// the next key source — whatever it turns out to be — is covered without a
+/// fourth narrowing.
+fn unclaimed_upstream_signal(
+    observations: &[SlotObservation],
+    fold_default: bool,
+    now: i64,
+) -> Option<(String, UpstreamSignal)> {
+    let mut claimed: std::collections::HashSet<&str> = observations
+        .iter()
+        .filter(|o| !o.unknown)
+        .map(|o| o.tenant_id.as_deref().unwrap_or(DEFAULT_SLOT_KEY))
+        .collect();
+    if fold_default {
+        // The sole observation already folded this bucket in.
+        claimed.insert(DEFAULT_SLOT_KEY);
+    }
+    with_upstream_signals(|m| {
+        m.iter()
+            .filter(|(k, _)| !claimed.contains(k.as_str()))
+            .filter(|(_, s)| {
+                s.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
+                    && s.last_rejection_at
+                        .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_MAX_AGE_SECS)
+            })
+            .map(|(k, s)| (k.clone(), *s))
+            .max_by_key(|(_, s)| s.consecutive_rejections)
+    })
+}
+
 /// The signal for ONE observed slot.
 ///
 /// `fold_default` is true only when this pass observed exactly one usable
@@ -2130,24 +2211,24 @@ fn publish_coord_credential_posture_with(
 ///
 /// # The UNATTRIBUTABLE arm (N1)
 ///
-/// Rejections filed under the DEFAULT slot key belong to no tenant
-/// observation. On a box with exactly one usable slot they are folded in
-/// ([`upstream_signal_for_observation`]) because there the two keys are the
-/// same credential — but on a box with TWO slots and a `machine.json` carrying
-/// no `active_tenant_id`, `resolve_session_tenant` answers `Ok(None)` for every
-/// session (`coord_mcp.rs`, the `Unpinned` row), every forwarded call presents
-/// the LEGACY slot, and every rejection lands under the default key with no
-/// tenant to hang it on.
+/// Per-slot keying reads only the buckets the pass's own observations name, so
+/// a bucket keyed by anything NO observation claims is read by nobody. That is
+/// a CLASS, not one bug — the default key was merely the first instance, a
+/// legacy-only install and a pin-with-no-slot are two more, and
+/// [`unclaimed_upstream_signal`] enumerates them by diffing
+/// [`UPSTREAM_SIGNALS`] against what the observations claim.
 ///
-/// Dropping those was a regression in the one direction that matters: both
-/// slots have a future `exp`, rung 6 calls them `live`, `canAnswer` reads
+/// Dropping those was a regression in the one direction that matters: the
+/// slots hold a future `exp`, rung 6 calls them `live`, `canAnswer` reads
 /// `true`, no banner fires — while coord refuses every call this runner makes.
 /// The pre-keying global counter WOULD have surfaced it.
 ///
 /// "Cannot attribute" therefore means *report it without a tenant*, never
 /// *drop it*: the arm publishes `dark` with `tenant_id: None`. It defers to a
 /// per-slot verdict that is ALREADY non-answering, because that one names a
-/// slot an operator can actually fix.
+/// slot an operator can actually fix, and it stands down on evidence older
+/// than [`UPSTREAM_ORPHAN_MAX_AGE_SECS`], because nothing will ever clear an
+/// orphan bucket and a permanent undismissable banner is its own defect.
 pub(crate) fn derive_and_publish_posture(
     observations: &[SlotObservation],
     now: i64,
@@ -2164,26 +2245,41 @@ pub(crate) fn derive_and_publish_posture(
         })
         .max_by_key(|(p, _)| p.severity());
 
-    // N1 — the unattributable arm. Only when the fold did NOT already consume
-    // the default bucket; `fold_default` covers the one-slot case.
-    if !fold_default {
-        let default_signal = upstream_signal_for(None);
+    // N1 — the unattributable arm, as a MAP DIFF rather than a special case
+    // for the default key. See [`unclaimed_upstream_signal`] for the class and
+    // the two shapes beyond the default key that reach it.
+    if let Some((orphan_key, orphan_signal)) =
+        unclaimed_upstream_signal(observations, fold_default, now)
+    {
         let slot_already_non_answering = worst.as_ref().is_some_and(|(p, _)| !p.can_answer());
-        if default_signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
-            && !slot_already_non_answering
-        {
+        if !slot_already_non_answering {
+            // The KEY is the one actionable fact the published posture cannot
+            // carry (see below), so it goes to the log where an operator can
+            // read it. A tenant UUID, never a credential.
+            warn!(
+                "device_jwt_refresher: coord has refused the credential filed under slot key \
+                 {:?} {} consecutive times, and NO slot this pass observed describes it — \
+                 publishing dark with no tenant (legacy-only install, or a pin with no slot)",
+                if orphan_key.is_empty() {
+                    "<default>"
+                } else {
+                    orphan_key.as_str()
+                },
+                orphan_signal.consecutive_rejections,
+            );
             return publish_coord_credential_posture_with(
                 CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
-                // No tenant, and that IS the finding: the credential coord
-                // keeps refusing is the legacy default slot, which no
-                // `device_jwt:<tenant>` observation describes. Naming an
-                // arbitrary tenant here would send an operator to the wrong
-                // slot.
+                // No tenant — deliberately, even when the orphan key IS a
+                // tenant id. `tenant_id` on this wire names the
+                // `device_jwt:<tenant>` SLOT an operator has to fix, and in
+                // every shape that reaches here no such slot exists; naming
+                // one would send them to a slot that is not there. The key is
+                // in the log line above instead.
                 None,
                 // Likewise no `exp`: the answer to "which slot's?" is none.
                 None,
                 None,
-                default_signal,
+                orphan_signal,
             );
         }
     }
@@ -6021,6 +6117,211 @@ mod tenant_slot_refresh_tests {
         assert_eq!(
             derive_and_publish_posture(&slots, now).map(|t| t.to),
             Some(CoordCredentialPosture::Live)
+        );
+        reset_posture();
+    }
+
+    /// **N1, the CLASS** — a LEGACY-ONLY INSTALL, which is a supported shape
+    /// and the most reachable remaining instance.
+    ///
+    /// `paired_user.json` names `default_tenant_id: X`, `machine.json` pins
+    /// `active_tenant_id: X`, the credential lives in the legacy
+    /// `access_token` slot, and there is no `device_jwt:X` slot at all.
+    ///
+    /// * FORWARDER side: `session_tenant_or_refuse` answers `Ok(Some(X))`;
+    ///   `select_device_bearer` misses the tenant slot and falls back to
+    ///   `legacy_slot_bearer` because `default_tenant == Some(t)`
+    ///   (`src-tauri/src/auth.rs:1527-1529`, reached from `device_bearer_for`
+    ///   at `:1463`, which supplies `default_binding_tenant()`). So coord's
+    ///   refusals file under key **`X`**.
+    /// * POSTURE side: `list_tenant_device_jwt_tenants()` is empty, so the
+    ///   refresher takes its legacy branch (`refresher_loop`, the
+    ///   `has_tenant_slots == false` arm) and publishes ONE observation with
+    ///   `tenant_id: None` — which reads the DEFAULT bucket.
+    ///
+    /// The fixture is the exact MIRROR of every other N1-adjacent test, and
+    /// that asymmetry is the whole point: the others build TENANT-keyed
+    /// observations and file under the DEFAULT key, so they stayed green while
+    /// this defect was live. Here the observation carries `tenant_id: None`
+    /// and the rejections are filed under a TENANT key.
+    ///
+    /// Bucket `X` therefore climbs past the threshold with nobody reading it,
+    /// the default bucket stays empty so the first cut of the unattributable
+    /// arm never fired, and the legacy `exp` is in the future → rung 6 →
+    /// `live`, `canAnswer: true`, `derived_status: healthy`, no banner, while
+    /// coord refuses every call the runner makes.
+    #[test]
+    fn a_legacy_only_install_refused_under_its_pinned_tenant_key_reads_dark() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let x = tenant(0);
+
+        // EXACTLY what the legacy branch publishes, built through the SAME
+        // constructor it uses (`SlotObservation::observed(None, …)`) rather
+        // than a hand-copied literal, so this fixture follows the production
+        // shape if that shape moves: one observation, NO tenant — because
+        // `list_tenant_device_jwt_tenants()` is empty on this box — carrying a
+        // live legacy credential.
+        let legacy_jwt = synth_jwt(now + 3 * 60 * 60, "legacy-only-install");
+        let legacy_obs = SlotObservation::observed(None, Some(legacy_jwt.as_str()));
+        assert_eq!(legacy_obs.tenant_id, None);
+        assert_eq!(legacy_obs.exp, Some(now + 3 * 60 * 60));
+        assert!(legacy_obs.present && !legacy_obs.unknown);
+        assert_eq!(
+            legacy_obs.outcome, None,
+            "no pass outcome on the legacy branch"
+        );
+        // …and exactly where the forwarder files coord's verdicts: under the
+        // PINNED TENANT's key, because that is the tenant it resolved.
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(x), true, 401, br#"{"code":"token_expired"}"#);
+        }
+        // The default bucket — the only one the first cut of this arm read —
+        // is empty, and the observation's own key IS the default one.
+        assert_eq!(upstream_signal_for(None).consecutive_rejections, 0);
+
+        let transition = derive_and_publish_posture(std::slice::from_ref(&legacy_obs), now);
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "a legacy-only install whose credential coord refuses must not read `live`"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.tenant_id, None,
+            "`tenant_id` names the device_jwt slot to fix, and on this box there is none"
+        );
+        assert!(!published.posture.can_answer());
+        assert!(published.last_401_at.is_some());
+        reset_posture();
+    }
+
+    /// The second shape of the same class: tenant slots for Y and Z, but the
+    /// machine is pinned to X, which has no slot. X's bucket is an orphan and
+    /// the healthy slots must not hide it.
+    #[test]
+    fn an_orphan_tenant_key_is_reported_even_when_every_observed_slot_is_healthy() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let healthy = |t: uuid::Uuid| SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let slots = [healthy(tenant(1)), healthy(tenant(2))];
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(tenant(3)), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        // Neither observed slot's own bucket, nor the default one, holds
+        // anything — the first cut read all three and saw nothing.
+        assert_eq!(upstream_signal_for(None).consecutive_rejections, 0);
+        assert_eq!(
+            upstream_signal_for(Some(&tenant(1).to_string())).consecutive_rejections,
+            0
+        );
+
+        let transition = derive_and_publish_posture(&slots, now);
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        assert_eq!(
+            coord_credential_posture().expect("published").tenant_id,
+            None
+        );
+
+        // A CLAIMED bucket is not an orphan: the same rejections filed under a
+        // slot this pass observes go down the ordinary per-slot path and NAME
+        // that slot, which is the more actionable answer.
+        reset_coord_credential_posture_for_test();
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(tenant(1)), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let _ = derive_and_publish_posture(&slots, now);
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(tenant(1).to_string().as_str()),
+            "an observed slot's own rejections are attributable, and must be attributed"
+        );
+        reset_posture();
+    }
+
+    /// The recency bound, which is what stops the arm from over-firing
+    /// STICKILY.
+    ///
+    /// Nothing ever writes an orphan bucket again, so without a clock a box
+    /// that was unpinned-and-single-slot, took three rejections under the
+    /// default key and then got re-paired onto two slots would publish
+    /// `dark(tenant_id: None)` FOREVER — `canAnswer: false`,
+    /// `derived_status: degraded`, and an undismissable banner on a runner
+    /// whose credentials are both live. The "Re-pair" CTA only kicks the
+    /// refresher, which re-derives the same dark, so the button would not
+    /// clear it either.
+    #[test]
+    fn a_stale_orphan_bucket_does_not_darken_a_healthy_runner() {
+        let _serialised = health_lock();
+        reset_posture();
+        let real_now = chrono::Utc::now().timestamp();
+        // `exp` far enough out that it is still live at the LATER clock below,
+        // so the only thing the two readings differ on is the bucket's age.
+        let healthy = |t: uuid::Uuid| SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(real_now + 30 * 24 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let slots = [healthy(tenant(4)), healthy(tenant(5))];
+        // The orphan: rejections stamped NOW, under a key no slot claims.
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+
+        // Read at the time they happened: fresh evidence, and it fires.
+        assert_eq!(
+            derive_and_publish_posture(&slots, real_now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "recent unattributable rejections MUST still darken the posture"
+        );
+
+        // Read one second past the window, with the same buckets: the box has
+        // been re-paired, nothing writes that key any more, and stale evidence
+        // is not evidence about now.
+        reset_coord_credential_posture_for_test();
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+        let later = real_now + UPSTREAM_ORPHAN_MAX_AGE_SECS + 1;
+        assert_eq!(
+            derive_and_publish_posture(&slots, later).map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "a bucket nothing will ever write again must not pin a healthy runner dark forever"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert!(published.posture.can_answer());
+        // The streak is still there — it is history, not a live verdict. The
+        // bound is a READ-side judgement, so a fresh rejection under the same
+        // key starts firing again immediately.
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD
+        );
+        reset_coord_credential_posture_for_test();
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(&slots, chrono::Utc::now().timestamp()).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "the bound is a READ-side judgement about age, not a reason to forget \
+             the key — a fresh rejection under it fires immediately"
         );
         reset_posture();
     }
