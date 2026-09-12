@@ -158,11 +158,12 @@ export type FleetWalkMode = "restart" | "more";
  * Accumulate rows across pages, keyed by `sessionId`.
  *
  * A keyset walk does not repeat a row, so the dedup is a GUARD rather than the
- * mechanism — but it is the guard that keeps a re-served page (a retry, a
- * cursor that did not advance, a row whose sort key moved under the walk) from
- * showing the same session twice. A repeat REPLACES in place: the later page is
- * the fresher read of that row, and moving it would reorder a list the operator
- * is looking at.
+ * mechanism — but it is the guard that keeps a re-served page (a retry, or a
+ * cursor that did not advance) from showing the same session twice. Since
+ * qontinui-coord#2085 coord walks an immutable key, so "a row whose sort key
+ * moved under the walk" no longer happens. A repeat REPLACES in place, because
+ * the later page is the fresher read of that row. Position here is arrival
+ * order only: what the operator SEES is ordered later, by `groupByDevice`.
  *
  * Returns `prev` unchanged for an empty page so identity is preserved.
  */
@@ -303,23 +304,24 @@ export function fleetTruncation(
  * `unknown_state` (qontinui-coord#2085) is a non-blank `?state=` that is not a
  * `coord.sessions.state`. Before it, coord answered that with `200` and an
  * empty page. Every state this picker offers comes from
- * `FLEET_STATE_VOCABULARY` or from rows coord served, so the code means the
- * runner's vocabulary and coord's have diverged.
+ * `FLEET_STATE_VOCABULARY` or from rows coord served, so the code means two
+ * vocabularies disagree. Usually that is this runner's and coord's. During an
+ * upgrade it can also be coord's database and coord's own parser, because a
+ * new state lands as a qontinui-web migration before coord's `SessionState`
+ * learns it.
+ *
+ * The type is DERIVED from the array, so the codes the parser accepts and the
+ * codes the switches cover are one list rather than two that can drift.
  */
-export type FleetErrorCode =
-  | "cursor_scope_mismatch"
-  | "cursor_malformed"
-  | "cursor_version_unsupported"
-  | "limit_not_positive"
-  | "unknown_state";
-
-const FLEET_ERROR_CODES: readonly string[] = [
+const FLEET_ERROR_CODES = [
   "cursor_scope_mismatch",
   "cursor_malformed",
   "cursor_version_unsupported",
   "limit_not_positive",
   "unknown_state",
-];
+] as const;
+
+export type FleetErrorCode = (typeof FLEET_ERROR_CODES)[number];
 
 /**
  * Pull coord's machine code out of a rejected read, or null when there is none.
@@ -337,7 +339,9 @@ export function fleetErrorCode(raw: unknown): FleetErrorCode | null {
   const text = typeof raw === "string" ? raw : String(raw);
   const m = /"error"\s*:\s*"([a-z_]+)"/.exec(text);
   const code = m?.[1];
-  if (code && FLEET_ERROR_CODES.includes(code)) return code as FleetErrorCode;
+  if (code && (FLEET_ERROR_CODES as readonly string[]).includes(code)) {
+    return code as FleetErrorCode;
+  }
   return null;
 }
 
@@ -384,8 +388,8 @@ export function fleetErrorMessage(code: FleetErrorCode | null, raw: unknown): st
       return "coord refused the read: the page size must be a positive number.";
     case "unknown_state":
       return (
-        "coord does not recognise the selected state filter — this runner's list of session " +
-        "states and coord's disagree. Clear the state filter to list every state."
+        "coord does not recognise the selected state filter — the lists of session states " +
+        "in play disagree. Clear the state filter to list every state."
       );
     default:
       return `Failed to load fleet sessions: ${raw}`;
@@ -599,11 +603,11 @@ export function mergeStateCatalog(prev: string[], seen: string[]): string[] {
  * The states to offer: the known vocabulary, plus everything coord has actually
  * served, plus whatever is SELECTED right now.
  *
- * The vocabulary union matters because the vocabulary is enforced in Rust
- * rather than by a DB constraint precisely so it can evolve without a migration
- * — a runner pinned to a stale list would silently hide a state coord had
- * started emitting, which is the same class of quiet omission this phase is
- * fixing.
+ * The vocabulary union matters because the list can grow while this runner
+ * ships on its own schedule. A new state is a qontinui-web migration (the
+ * `sessions_state_check` CHECK) plus a coord `SessionState` variant, and a
+ * runner pinned to a stale list would silently hide a state coord had started
+ * emitting. That is the same class of quiet omission this phase is fixing.
  *
  * The SELECTED union closes a sharper hole: a controlled `<select>` whose value
  * matches no `<option>` renders as the first option — "Any state" — while the

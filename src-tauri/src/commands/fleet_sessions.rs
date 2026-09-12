@@ -35,8 +35,9 @@ use serde::Deserialize;
 /// across the whole tenant, most recently STARTED first". That is coord's walk
 /// order, `started_at DESC, id DESC`, and not recency of activity: since
 /// qontinui-coord#2085 the key a cursor walks must not move, and a heartbeat
-/// moves `last_heartbeat_at` every few seconds. Activity is still on every row
-/// as `lastHeartbeatAt`.
+/// moves `last_heartbeat_at` (every 15 s by default, `DEFAULT_HEARTBEAT_SECS`).
+/// Activity is still on every row as `lastHeartbeatAt`; the picker orders each
+/// device's rows by it (`groupByDevice`).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FleetSessionsArgs {
