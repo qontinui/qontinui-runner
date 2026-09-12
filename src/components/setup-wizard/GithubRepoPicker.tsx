@@ -169,6 +169,11 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
    *  link), surfaced in the not_connected / connected views. Cleared when the
    *  user starts another connect. */
   const [connectResult, setConnectResult] = useState<GithubConnectResult | null>(null);
+  /** In-flight `github_connect_url` + browser open. The command now round-trips
+   *  to coord for a connect-state token, so the button is disabled meanwhile:
+   *  a second click would open a second browser tab whose flow can no longer
+   *  complete (the runner keeps one pending nonce — last click wins). */
+  const [connecting, setConnecting] = useState(false);
 
   const loadRepos = useCallback(async (): Promise<RepoListResponse | null> => {
     setLoading(true);
@@ -205,15 +210,23 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
-    void listen<unknown>(GITHUB_CONNECT_RESULT_EVENT, (event) => {
-      const result = parseGithubConnectResult(event.payload);
-      if (!result) return;
-      setConnectResult(result);
-      if (result.ok) void loadRepos();
-    }).then((fn) => {
-      if (cancelled) fn();
-      else unlisten = fn;
-    });
+    const subscribe = async () => {
+      try {
+        const fn = await listen<unknown>(GITHUB_CONNECT_RESULT_EVENT, (event) => {
+          const result = parseGithubConnectResult(event.payload);
+          if (!result) return;
+          setConnectResult(result);
+          if (result.ok) void loadRepos();
+        });
+        // Unmounted (or StrictMode re-ran the effect) before `listen` resolved.
+        if (cancelled) fn();
+        else unlisten = fn;
+      } catch {
+        // Outside Tauri (tests, storybook) there is no event bus — the picker
+        // still works through the manual refresh.
+      }
+    };
+    void subscribe();
     return () => {
       cancelled = true;
       if (unlisten) unlisten();
@@ -310,14 +323,19 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   // claim with, so it can fail (not signed in, coord unreachable) — that
   // failure belongs in the same panel, before the browser ever opens.
   const openConnect = useCallback(async () => {
+    if (connecting) return;
+    setConnecting(true);
     setConnectResult(null);
+    setError(null);
     try {
       const url = await invoke<string>("github_connect_url");
       await openUrl(url);
     } catch (err) {
       setError(`Couldn't open the GitHub connect page: ${err}`);
+    } finally {
+      setConnecting(false);
     }
-  }, []);
+  }, [connecting]);
 
   /**
    * Sign in to Qontinui without leaving the wizard (Cognito Hosted-UI PKCE in
@@ -482,8 +500,13 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           <button
             className="btn-primary flex items-center gap-2"
             onClick={() => void openConnect()}
+            disabled={connecting}
           >
-            <ExternalLink className="w-4 h-4" />
+            {connecting ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <ExternalLink className="w-4 h-4" />
+            )}
             Connect GitHub
           </button>
           <button
