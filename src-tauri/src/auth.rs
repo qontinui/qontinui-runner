@@ -1610,7 +1610,35 @@ fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
 /// while `pair` (the canonical v2-aware reader) is lib-only — same
 /// documented duplication pattern as the census/backstop `machine.json`
 /// readers. `None` on any failure (unpaired runner).
+/// `paired_user.json`, then the cached device token's own `tenant_id` claim.
+///
+/// **The second rung is load-bearing since [`TenantScope::Unbacked`] exists.**
+/// `select_device_bearer` reaches the legacy `access_token` slot for a NAMED
+/// tenant only when that tenant equals this value, so a device whose
+/// `paired_user.json` is absent, unreadable or tenant-less resolved `None`
+/// here — and `device_holds_usable_binding` was then false for *every* tenant
+/// including the device's own. Before the gate that cost nothing (the scope was
+/// `Unresolved`, and the single-bound arm presented the legacy slot anyway);
+/// with the gate it would demote that device's own writes to `Unbacked`, i.e.
+/// unauthenticated, on a box that was working. Sessions would then fail to
+/// register at all, because a 4xx on `POST /sessions` is Ack-dropped.
+///
+/// So it falls back exactly as `fleet::resolve_binding_set`'s documented
+/// Branch 2 does — that file may legitimately be missing, and the device token
+/// itself carries the claim. This keeps the gate's failure direction symmetric
+/// with [`device_binding_count`], whose own doc records the same priority:
+/// an unreadable binding state must not degrade live writes on a healthy
+/// machine.
 fn default_binding_tenant() -> Option<Uuid> {
+    default_binding_tenant_from_file().or_else(default_binding_tenant_from_slot_claim)
+}
+
+/// Rung 1 — `paired_user.json` (v2 `default_tenant_id`, legacy `tenant_id`).
+///
+/// Kept as a local minimal reader because `auth` compiles into BOTH the lib and
+/// bin crates while `pair` (the canonical v2-aware reader) is lib-only — the
+/// same documented duplication as the census/backstop `machine.json` readers.
+fn default_binding_tenant_from_file() -> Option<Uuid> {
     let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
@@ -1622,6 +1650,31 @@ fn default_binding_tenant() -> Option<Uuid> {
         .get("default_tenant_id")
         .and_then(|v| v.as_str())
         .or_else(|| value.get("tenant_id").and_then(|v| v.as_str()))?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
+/// Rung 2 — the tenant the device's OWN stored token claims.
+fn default_binding_tenant_from_slot_claim() -> Option<Uuid> {
+    let token = AuthManager::new().get_access_token().ok()?;
+    tenant_claim_from_jwt(&token)
+}
+
+/// The `tenant_id` claim of a JWT, as a [`Uuid`]. Signature is NOT verified —
+/// this reads a token this device already holds, exactly as
+/// [`decode_jwt_exp`] does, and `pair::tenant_id_from_oauth_claim` reads the
+/// same claim name lib-side.
+fn tenant_claim_from_jwt(token: &str) -> Option<Uuid> {
+    let token = token.trim();
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let raw = value.get("tenant_id").and_then(|v| v.as_str())?;
     Uuid::parse_str(raw.trim()).ok()
 }
 
@@ -3415,6 +3468,36 @@ mod bearer_selection_tests {
             TenantScope::Owned(t).backed_by(&|_| true),
             TenantScope::Owned(t)
         );
+    }
+
+    /// A legacy-paired device — `paired_user.json` absent, unreadable or
+    /// tenant-less — must still resolve its OWN tenant from the token it holds.
+    ///
+    /// This is what stops the `Unbacked` gate degrading such a box's writes to
+    /// unauthenticated: without the claim rung, `default_binding_tenant()` is
+    /// `None`, so `select_device_bearer` never reaches the legacy slot for a
+    /// named tenant and `device_holds_usable_binding` answers false for every
+    /// tenant, the device's own included.
+    #[test]
+    fn tenant_claim_from_jwt_reads_the_device_tokens_own_tenant() {
+        let t = tenant(0xF7);
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"tenant_id":"{t}"}}"#).as_bytes());
+        assert_eq!(
+            tenant_claim_from_jwt(&format!("{header}.{payload}.sig")),
+            Some(t)
+        );
+
+        // A token with no such claim, a non-JWT, and an empty string are all
+        // "no answer" — never a guess.
+        let no_claim = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
+        assert_eq!(
+            tenant_claim_from_jwt(&format!("{header}.{no_claim}.sig")),
+            None
+        );
+        assert_eq!(tenant_claim_from_jwt("not.a.jwt"), None);
+        assert_eq!(tenant_claim_from_jwt(""), None);
     }
 
     // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
