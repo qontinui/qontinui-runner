@@ -257,6 +257,13 @@ export function normalizeCredentialDarkSignal(raw: unknown): CredentialDarkSigna
 }
 
 /**
+ * The postures whose credential can still answer coord — the frontend twin of
+ * `CoordCredentialPosture::can_answer()`. Used only as the fallback when a
+ * payload carries no `canAnswer` key (N3).
+ */
+const ANSWERING_POSTURES: string[] = ["live", "expiring"];
+
+/**
  * Turn the `get_coord_credential_posture` command's answer into a
  * {@link CredentialDarkSignal}.
  *
@@ -277,7 +284,14 @@ export function credentialDarkFromPostureSnapshot(raw: unknown): CredentialDarkS
   const posture =
     typeof r.posture === "string" ? r.posture : typeof r.state === "string" ? r.state : null;
   if (posture === null || posture === "unknown") return null;
-  if (r.canAnswer !== false) {
+  // N3 — `canAnswer` decides, but only when it IS a boolean. Treating a
+  // MISSING key as "can answer" meant a payload carrying `posture: "expired"`
+  // and no `canAnswer` would CLEAR the banner. Unreachable from today's
+  // `to_json()`, which always emits the key — but the posture string is the
+  // same fact, so derive it rather than defaulting to health.
+  const canAnswer =
+    typeof r.canAnswer === "boolean" ? r.canAnswer : ANSWERING_POSTURES.includes(posture);
+  if (canAnswer) {
     return {
       source: DARK_SOURCE_POSTURE,
       dark: false,
