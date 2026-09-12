@@ -601,10 +601,12 @@ impl std::fmt::Debug for ConditionCheckPayload {
 enum SpawnPhase {
     Launched,
     Exited,
-    /// The spawn was REFUSED before a child existed, because workspace trust
+    /// The spawn was REFUSED before a child existed: either workspace trust
     /// could not be derived for the target and the tenant's autonomy dial
-    /// forbids minting it. Phase 2 of
-    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`.
+    /// forbids minting it (Phase 2 of
+    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`), or a coord
+    /// launch was deferred under machine load (reason `deferred_load:…`, plan
+    /// `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`).
     Blocked,
 }
 
@@ -1538,25 +1540,31 @@ fn spawn_run_task(payload: LaunchPayload) {
         // reason beginning `deferred_load:`, which coord treats as RE-OFFERABLE:
         // it abandons the allocation and retires the dispatch dedup marker, so
         // the work is offered again on a later pass rather than latched failed.
-        let verdict = evaluate_launch_guard(
+        //
+        // The admitted slot is an RAII guard: it is released when this task
+        // ends by ANY route, including a panic unwinding the future — a leaked
+        // slot would permanently shrink both the launch and continuation caps.
+        let slot = match admit_launch(
             agent_id,
             &live_terminal_predicate(),
             &crate::resource_guard::thread_pressure,
-        );
-        if let Some(reason) = launch_deferral_reason(&verdict) {
-            info!(
-                "agent_runtime: coord spawn-request agent_id={agent_id} deferred under machine \
-                 load, NOT launched — {reason}"
-            );
-            agent_stops().lock().unwrap().remove(&agent_id);
-            report_spawn_failed(agent_id, &reason, None, 0, None).await;
-            return;
-        }
+        ) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                info!(
+                    "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
+                     machine load, NOT launched — {reason}"
+                );
+                agent_stops().lock().unwrap().remove(&agent_id);
+                report_launch_deferral(agent_id, &reason).await;
+                return;
+            }
+        };
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
         // Drop the registry entries once the run task is fully done.
-        release_admitted_launch(agent_id);
+        drop(slot);
         agent_stops().lock().unwrap().remove(&agent_id);
         // Drop the agent's live-token slot so its proxy nonce hard-fails closed
         // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
@@ -2386,8 +2394,13 @@ fn evaluate_launch_guard(
 }
 
 /// The `spawn-failed` reason for a load-refused launch, or `None` when the
-/// verdict admits it. Always begins with [`DEFERRED_LOAD_REASON_PREFIX`], then
-/// the same `<class>:<detail>` stamp the continuation deferral uses.
+/// verdict admits it.
+///
+/// Shape: `deferred_load:<class>:<detail>`, with NO whitespace, so that the
+/// `<class>:<detail>` grammar this file's stamps follow (class = text before the
+/// first colon) still holds after coord strips the prefix:
+/// `deferred_load:thread_pressure:warn:300_over_256`,
+/// `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
 fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
     let detail = match verdict {
         LoadGuard::Proceed => return None,
@@ -2395,9 +2408,37 @@ fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
             severity,
             observation,
         } => thread_pressure_stamp_reason(severity, observation),
-        LoadGuard::AtCap { cap, live } => format!("{} live={live}", at_cap_stamp_reason(*cap)),
+        LoadGuard::AtCap { cap, live } => format!("at_cap:{live}_of_{cap}"),
     };
-    Some(format!("{DEFERRED_LOAD_REASON_PREFIX} {detail}"))
+    Some(format!("{DEFERRED_LOAD_REASON_PREFIX}{detail}"))
+}
+
+/// RAII hold on an admitted launch's slot in [`admitted_launches`]. Dropping it
+/// releases the slot on every exit route, a panic unwinding the run task
+/// included.
+#[derive(Debug)]
+struct AdmittedLaunchSlot(uuid::Uuid);
+
+impl Drop for AdmittedLaunchSlot {
+    fn drop(&mut self) {
+        release_admitted_launch(self.0);
+    }
+}
+
+/// The launch admission decision `spawn_run_task` takes before
+/// `run_agent_subprocess`: `Ok(slot)` admits (the slot is held until dropped),
+/// `Err(reason)` refuses with the `deferred_load:` reason to report, holding
+/// no slot.
+fn admit_launch(
+    agent_id: uuid::Uuid,
+    is_live: &dyn Fn(&str) -> bool,
+    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> Result<AdmittedLaunchSlot, String> {
+    let verdict = evaluate_launch_guard(agent_id, is_live, thread_pressure);
+    match launch_deferral_reason(&verdict) {
+        None => Ok(AdmittedLaunchSlot(agent_id)),
+        Some(reason) => Err(reason),
+    }
 }
 
 /// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
@@ -7118,8 +7159,46 @@ async fn report_spawn_failed_in_phase(
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
 ) {
+    let _ = post_spawn_failed(
+        agent_id,
+        reason,
+        exit_code,
+        restarts_attempted,
+        push_ref,
+        spawn_phase,
+    )
+    .await;
+}
+
+/// What one `spawn-failed` POST attempt achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnReportOutcome {
+    /// coord accepted it (2xx).
+    Delivered,
+    /// coord answered with a client error (4xx): re-sending the same body
+    /// cannot succeed, so it is not retried.
+    Rejected,
+    /// Nothing reached coord or coord failed transiently: no connected base,
+    /// no HTTP client, a transport error, or a 5xx.
+    Undelivered,
+}
+
+/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
+/// two arms that used to return silently (no coord base, no client).
+async fn post_spawn_failed(
+    agent_id: uuid::Uuid,
+    reason: &str,
+    exit_code: Option<i64>,
+    restarts_attempted: u32,
+    push_ref: Option<&str>,
+    spawn_phase: SpawnPhase,
+) -> SpawnReportOutcome {
     let Some(base) = connected_coord_base() else {
-        return;
+        warn!(
+            "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no connected coord \
+             base; reason={reason}"
+        );
+        return SpawnReportOutcome::Undelivered;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
         (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
@@ -7135,7 +7214,11 @@ async fn report_spawn_failed_in_phase(
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let Some(client) = crate::coord_http::coord_client() else {
-        return;
+        warn!(
+            "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no coord HTTP client; \
+             reason={reason}"
+        );
+        return SpawnReportOutcome::Undelivered;
     };
     // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id, persists no tenant and takes no auth extractor. Nothing to thread. Terminal.
     match crate::auth::attach_device_auth(client.post(&url))
@@ -7146,15 +7229,58 @@ async fn report_spawn_failed_in_phase(
     {
         Ok(resp) if resp.status().is_success() => {
             warn!("agent_runtime: spawn-failed posted agent_id={agent_id} reason={reason}");
+            SpawnReportOutcome::Delivered
         }
         Ok(resp) => {
-            warn!(
-                "agent_runtime: spawn-failed POST agent_id={agent_id} returned {}",
-                resp.status()
-            );
+            let status = resp.status();
+            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} returned {status}");
+            if status.is_client_error() {
+                SpawnReportOutcome::Rejected
+            } else {
+                SpawnReportOutcome::Undelivered
+            }
         }
-        Err(e) => warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}"),
+        Err(e) => {
+            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}");
+            SpawnReportOutcome::Undelivered
+        }
     }
+}
+
+/// Maximum POST attempts for a launch's `deferred_load:` report. Bounded on
+/// purpose: an unreported deferral leaves coord counting the allocation as
+/// in-flight until its own horizon, but an unbounded retry would park a task
+/// per deferred launch on a box that is, by definition, already loaded.
+const LAUNCH_DEFERRAL_REPORT_ATTEMPTS: u32 = 3;
+
+/// Backoff before retry `attempt + 1` (0-based `attempt` that just failed):
+/// 2s, then 4s.
+fn launch_deferral_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64 << attempt.min(4))
+}
+
+/// Whether a report with this outcome should be re-sent.
+fn launch_deferral_should_retry(outcome: SpawnReportOutcome) -> bool {
+    outcome == SpawnReportOutcome::Undelivered
+}
+
+/// Report a load-deferred launch to coord, with a bounded retry. Phase
+/// `blocked`: the launch was refused before any child existed.
+async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
+    for attempt in 0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
+        let outcome = post_spawn_failed(agent_id, reason, None, 0, None, SpawnPhase::Blocked).await;
+        if !launch_deferral_should_retry(outcome) {
+            return;
+        }
+        if attempt + 1 < LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
+            tokio::time::sleep(launch_deferral_retry_delay(attempt)).await;
+        }
+    }
+    warn!(
+        "agent_runtime: launch deferral for agent_id={agent_id} NOT delivered after \
+         {LAUNCH_DEFERRAL_REPORT_ATTEMPTS} attempts — coord keeps counting the allocation \
+         in-flight until its own horizon; reason={reason}"
+    );
 }
 
 // =============================================================================
@@ -10041,12 +10167,15 @@ mod tests {
             .clear();
     }
 
+    const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
+
     /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
     /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
     /// prefix followed by the same thread-pressure stamp continuations use.
     #[test]
     fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
@@ -10066,13 +10195,72 @@ mod tests {
         );
         let reason = launch_deferral_reason(&verdict).expect("a refusal has a reason");
         assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
-        assert_eq!(reason, "deferred_load: thread_pressure:warn:300_over_256");
+        assert_eq!(reason, "deferred_load:thread_pressure:warn:300_over_256");
+        assert!(
+            !reason.contains(char::is_whitespace),
+            "the wire reason carries no whitespace"
+        );
         assert_eq!(
             admitted_launch_count(None),
             0,
             "a refused launch must not hold a slot"
         );
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+    }
+
+    /// Phase 1c: `admit_launch` — the decision `spawn_run_task` takes before
+    /// `run_agent_subprocess` — refuses with the `deferred_load:` reason and
+    /// holds no slot, and an admitted slot is released when dropped, a panic
+    /// unwinding past it included.
+    #[test]
+    fn admit_launch_refusal_holds_no_slot_and_admitted_slot_releases_on_panic() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+
+        let refused = admit_launch(uuid::Uuid::now_v7(), &live_all, &|| {
+            thread_verdict(Some(540))
+        });
+        assert_eq!(
+            refused.as_ref().err().map(String::as_str),
+            Some("deferred_load:thread_pressure:critical:540_over_400")
+        );
+        assert_eq!(admitted_launch_count(None), 0);
+
+        let agent = uuid::Uuid::now_v7();
+        let result = std::panic::catch_unwind(|| {
+            let _slot = admit_launch(agent, &live_all, &calm).expect("calm machine admits");
+            assert_eq!(admitted_launch_count(None), 1, "the admitted slot is held");
+            panic!("simulated run-task panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            admitted_launch_count(None),
+            0,
+            "a panic must not leak the admitted slot"
+        );
+    }
+
+    /// The deferral report retries only undelivered attempts, boundedly.
+    #[test]
+    fn launch_deferral_report_retry_is_bounded() {
+        assert!(launch_deferral_should_retry(
+            SpawnReportOutcome::Undelivered
+        ));
+        assert!(!launch_deferral_should_retry(SpawnReportOutcome::Delivered));
+        assert!(!launch_deferral_should_retry(SpawnReportOutcome::Rejected));
+        assert_eq!(LAUNCH_DEFERRAL_REPORT_ATTEMPTS, 3);
+        assert_eq!(launch_deferral_retry_delay(0), Duration::from_secs(2));
+        assert_eq!(launch_deferral_retry_delay(1), Duration::from_secs(4));
+        let total: Duration = (0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS - 1)
+            .map(launch_deferral_retry_delay)
+            .sum();
+        assert!(
+            total <= Duration::from_secs(10),
+            "total backoff stays small"
+        );
     }
 
     /// Phase 1c: the count lane binds launches — continuations and other
@@ -10081,6 +10269,7 @@ mod tests {
     #[test]
     fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
         let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
         let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_continuation_registry();
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
@@ -10105,7 +10294,7 @@ mod tests {
         assert_eq!(verdict, LoadGuard::AtCap { cap: 2, live: 2 });
         assert_eq!(
             launch_deferral_reason(&verdict).as_deref(),
-            Some("deferred_load: at_cap:2 live=2")
+            Some("deferred_load:at_cap:2_of_2")
         );
 
         // The admitted launch also binds the CONTINUATION guard (shared cap).
@@ -10121,7 +10310,6 @@ mod tests {
             "a released slot re-admits the deferred launch"
         );
         clear_continuation_registry();
-        std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
     }
 
     /// The prefix is a wire value coord matches on; pin its exact spelling.
