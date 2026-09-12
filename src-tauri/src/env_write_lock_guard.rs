@@ -41,25 +41,40 @@
 //! # Known limits
 //!
 //! Stated because a guard whose reach is undocumented gets trusted past it.
-//! Each is pinned by a fixture in the synthetic self-test below, so a change
-//! that closes one fails that test rather than passing silently.
+//! Each bullet has a named KNOWN-MISS fixture in the synthetic self-test, and a
+//! loop there asserts every one is still missed — so closing a limit fails by
+//! name and points back here, instead of passing silently.
 //!
-//! * **Release-then-write is missed.** `takes_lock` carries no ordering and no
-//!   liveness, so a helper that acquires the lock and releases it on return
-//!   still credits its caller — see the fixture
-//!   `unlocked_after_a_helper_released_the_lock`. `let _ = env_lock();`, which
-//!   drops at once, is the same class. The live shape is `with_body_sync_env`
-//!   in `plan_workunit_adapter/trigger.rs`.
-//! * **Cross-file reach is by NAME, not by analysis.** Only the
-//!   [`CROSS_FILE_WRITERS`] names and [`LOCK_FIXTURE`] cross a file boundary. A
-//!   writer or locker reached through any OTHER file's helper is invisible —
-//!   add the name here when you add such a helper.
-//! * **Aliased mutators are missed.** `use std::env as e; e::set_var(..)` and
-//!   `let f = std::env::set_var; f(..)`: the qualifier must read `env`, or the
-//!   call must be a bare `set_var` / `remove_var`.
-//! * **Drop-only writers** are seen only where the type's name is in
-//!   [`CROSS_FILE_WRITERS`] (`EnvVarRestore`). A new file-local guard type
-//!   whose `Drop` writes env — as the deleted `DbUrlRestore` did — is not.
+//! * **Release-then-write is missed** (`unlocked_after_a_helper_released_the_lock`).
+//!   `takes_lock` carries no ordering and no liveness, so a helper that acquires
+//!   the lock and releases it on return still credits its caller;
+//!   `let _ = env_lock();`, which drops at once, is the same class. There is no
+//!   live instance in this tree today. `with_body_sync_env`
+//!   (`plan_workunit_adapter/trigger.rs`) looks like one and is NOT: it holds
+//!   its guard across the `f()` call, so it is the shape the rule correctly
+//!   credits.
+//! * **Cross-file reach is by NAME, not by analysis**
+//!   (`unlocked_via_an_unlisted_cross_file_helper`). Only [`LOCK_FN`],
+//!   [`LOCK_FIXTURE`] and the [`CROSS_FILE_WRITERS`] names cross a file
+//!   boundary — `env_lock` is how every locked test in the tree is credited,
+//!   since the single definition lives in `ambient::test_support`. A writer or
+//!   locker reached through any OTHER file's helper is invisible; add the name
+//!   here when you add such a helper.
+//! * **Reach through a METHOD is not closed**
+//!   (`unlocked_via_a_same_file_method`). [`FnCollector`] keys an impl fn as
+//!   `Type::name` while a method call site names only the method, so a
+//!   same-file `impl` method that writes env is unseen at its call sites.
+//!   Keying impl fns by bare name as well would credit any `X::new()` caller
+//!   with an unrelated `Y::new()`'s lock — a false-NEGATIVE machine — so this
+//!   is documented rather than closed.
+//! * **Aliased mutators are missed** (`unlocked_via_an_aliased_mutator`).
+//!   `use std::env as e; e::set_var(..)` and `let f = std::env::set_var; f(..)`:
+//!   the qualifier must read `env`, or the call must be a bare `set_var` /
+//!   `remove_var`.
+//! * **Drop-only writers** (`unlocked_via_a_local_drop_guard`) are seen only
+//!   where the type's name is in [`CROSS_FILE_WRITERS`] (`EnvVarRestore`). A
+//!   file-local guard type whose `Drop` writes env — as the deleted
+//!   `DbUrlRestore` did — is not.
 //!
 //! This module is registered in `main.rs` only: it walks all of `src`, so a
 //! `lib.rs` twin would only double the work. CI runs it in the ordinary
@@ -97,8 +112,9 @@ const CROSS_FILE_WRITERS: [&str; 3] = ["isolate_coord_env", "capture_coord_env",
 /// 1559 files were walked when this was written.
 const MIN_FILES_WALKED: usize = 1000;
 /// Floor for the detected population, for the same reason: an empty offender
-/// list proves nothing if the detector stopped recognising writers. ~131
-/// direct writers were found when this was written.
+/// list proves nothing if the detector stopped recognising writers. 169
+/// env-writing test fns were found when this was written (measured by running
+/// this detector standalone over the tree, not estimated).
 const MIN_ENV_WRITING_TESTS: usize = 100;
 
 /// A test fn that writes the process env without holding the shared lock.
@@ -231,20 +247,6 @@ impl<'ast> Visit<'ast> for BodyScanner {
             self.facts.writes_env = true;
         }
         visit::visit_expr_path(self, p);
-    }
-
-    /// A method call is an EDGE but never itself a process-env write.
-    ///
-    /// Recording the name closes same-file reach through a method — e.g. an
-    /// `IsolatedAmbient::write_settings_json(&self)` that writes two env vars,
-    /// which is otherwise credited only because its callers happen to name the
-    /// fixture type. It deliberately does NOT consult [`WRITE_FNS`]: a
-    /// `Command::set_var`-style builder method is not `std::env`, and the
-    /// synthetic fixture `a_method_named_set_var_is_not_the_process_env` pins
-    /// that.
-    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        self.facts.calls.insert(call.method.to_string());
-        visit::visit_expr_method_call(self, call);
     }
 
     fn visit_path(&mut self, p: &'ast syn::Path) {
@@ -557,6 +559,40 @@ mod tests {
     fn unlocked_via_a_same_file_writer() {
         super::writes_without_lock();
     }
+
+    // ---- KNOWN MISSES ----------------------------------------------------
+    // Each pins one bullet of the module doc's `# Known limits`, so closing a
+    // limit fails the loop in the self-test rather than passing silently. All
+    // four write the process env for real and none is flagged.
+    #[test]
+    fn unlocked_via_an_aliased_mutator() {
+        use std::env as e;
+        e::set_var("K", "v");
+    }
+    #[test]
+    fn unlocked_via_an_unlisted_cross_file_helper() {
+        crate::some_other_file::a_helper_that_writes_env();
+    }
+    struct LocalDropGuard;
+    impl Drop for LocalDropGuard {
+        fn drop(&mut self) {
+            std::env::remove_var("K");
+        }
+    }
+    #[test]
+    fn unlocked_via_a_local_drop_guard() {
+        let _g = LocalDropGuard;
+    }
+    struct MethodWriter;
+    impl MethodWriter {
+        fn writes_env_from_a_method(&self) {
+            std::env::set_var("K", "v");
+        }
+    }
+    #[test]
+    fn unlocked_via_a_same_file_method() {
+        MethodWriter.writes_env_from_a_method();
+    }
     mod nested {
         #[test]
         fn unlocked_in_a_nested_module() {
@@ -638,6 +674,40 @@ mod tests {
     let report = scan_source(SRC).expect("synthetic source parses");
     let mut names: Vec<&str> = report.offenders.iter().map(|o| o.name.as_str()).collect();
     names.sort_unstable();
+    // EVERY known limit in the module doc, pinned as a miss. This runs BEFORE
+    // the exact-list assertion below on purpose: that one would also fail if a
+    // limit closed, but it would fail saying "no more, no fewer" and name
+    // neither the limit nor this doc — so the diagnostic would be dead text.
+    // Closing any of these is welcome; update the doc's Known limits and delete
+    // the line here when you do.
+    for (miss, limit) in [
+        (
+            "unlocked_after_a_helper_released_the_lock",
+            "release-then-write: `takes_lock` carries no ordering or liveness",
+        ),
+        (
+            "unlocked_via_an_aliased_mutator",
+            "aliased mutators: the qualifier must read `env`",
+        ),
+        (
+            "unlocked_via_an_unlisted_cross_file_helper",
+            "cross-file reach is by NAME: only CROSS_FILE_WRITERS/LOCK_FIXTURE/LOCK_FN cross a file",
+        ),
+        (
+            "unlocked_via_a_local_drop_guard",
+            "a file-local guard type whose Drop writes env is not a writer at its call sites",
+        ),
+        (
+            "unlocked_via_a_same_file_method",
+            "reach through a METHOD is not closed: impl fns are keyed `Type::name`",
+        ),
+    ] {
+        assert!(
+            !names.contains(&miss),
+            "`{miss}` is now FLAGGED, so the guard has closed a documented limit \
+             ({limit}). Tighten this test and update the module doc's Known limits."
+        );
+    }
     assert_eq!(
         names,
         [
@@ -653,15 +723,6 @@ mod tests {
             "unlocked_via_use_env",
         ],
         "the guard must flag exactly the unlocked writers — no more, no fewer"
-    );
-    // The ONE shape this rule does not model, pinned as a known miss rather
-    // than left for someone to discover: a helper that took the lock and
-    // released it still credits its caller. If the guard ever learns ordering,
-    // this assertion fails — tighten the rule and delete the fixture's caveat.
-    assert!(
-        !names.contains(&"unlocked_after_a_helper_released_the_lock"),
-        "the coarse reach rule cannot see a release-then-write; if it now can, \
-         update this test and the module doc's Known limits"
     );
     // 10 unlocked + 1 known miss + 7 locked writers. `only_reads` and
     // `a_method_named_set_var_is_not_the_process_env` are not writers: a method
