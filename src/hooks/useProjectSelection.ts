@@ -49,26 +49,42 @@ const NO_CLOUD_SESSION_REASON_CODES = [
  * healthy runner as unhealthy. That is the regression the tier-gate arm of this
  * predicate was already written to prevent; this adds the arm it was missing.
  *
- * Three sources of "no cloud session", matched on stable substrings:
+ * Two sources of "no cloud session", matched on stable substrings:
  *  1. The tier gate (`require_tier_2_for`) — a Tier 0/1 runner has no account.
- *  2. `"Not authenticated"` — the keychain race the retry loop above gives up on.
- *  3. A bearer reason code — see [`NO_CLOUD_SESSION_REASON_CODES`]. These ride
+ *  2. A bearer reason code — see [`NO_CLOUD_SESSION_REASON_CODES`]. These ride
  *     inside the message `commands::auth::no_bearer_error` renders, e.g.
  *     `Not signed in to Qontinui (no_cognito_session). Sign in via Settings → Account.`
  *
- * Arm 3 is new. Before it, EVERY no-bearer refusal took the `console.error`
- * branch — including the plain not-signed-in case, which is the single most
- * common steady state for a runner with no account. The codes only became
- * matchable when PR #1342 put them in the message and #1379 (`e81e75ddc`) gave
- * them one definition; this is the consumer that makes them earn their keep.
+ * Arm 2 was added by #1389. Before it, EVERY no-bearer refusal took the
+ * `console.error` branch — including the plain not-signed-in case, which is the
+ * single most common steady state for a runner with no account. The codes only
+ * became matchable when PR #1342 put them in the message and #1379
+ * (`e81e75ddc`) gave them one definition; this is the consumer that makes them
+ * earn their keep.
+ *
+ * There used to be a third arm, `errorMsg.includes("Not authenticated")`,
+ * described as "the keychain race the retry loop above gives up on". Both
+ * halves of that description were stale by the time #1396 re-pointed the retry
+ * gate: `get_user_projects` has not emitted that string since #1342 (its only
+ * two auth refusals are the two arms above), and the retry loop now gives up on
+ * `cognito_access_token_unreadable` — which is deliberately NOT quiet, see
+ * [`NO_CLOUD_SESSION_REASON_CODES`]. The one message that could still carry the
+ * old string here is a web-backend response echoed verbatim through
+ * `AppError::HttpStatusError` (`HTTP 401: {"detail":"Not authenticated"}`):
+ * the runner presented a bearer its own refresher judged healthy and the
+ * backend refused it. That is a fault, not a steady state, and the Rust side
+ * already logs it at `error!`; the arm was silently classifying it as
+ * "expected" and keeping it off the health channel. Retired, and a test pins
+ * that the backend echo now reaches `console.error` — the same case
+ * [`isRetryableCredentialRace`] declines to retry, so the two predicates agree
+ * on it.
  */
 export function isExpectedNoCloudSession(errorMsg: string): boolean {
   return (
     // Matched on the canonical tier-gate sentence (stable across the
-    // Tier 0 / Tier 1 wording) plus the auth-race message the retry loop
-    // gives up on — both mean "no cloud session", not "broken".
+    // Tier 0 / Tier 1 wording) plus the reason codes that name an ordinary
+    // no-session state — both mean "no cloud session", not "broken".
     errorMsg.includes("Qontinui account commands are unavailable") ||
-    errorMsg.includes("Not authenticated") ||
     NO_CLOUD_SESSION_REASON_CODES.some((code) => errorMsg.includes(code))
   );
 }

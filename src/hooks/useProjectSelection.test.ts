@@ -66,13 +66,36 @@ describe("isExpectedNoCloudSession", () => {
     expect(isExpectedNoCloudSession(asRendered(A_REAL_FAULT))).toBe(false);
   });
 
-  it("keeps the two pre-existing arms", () => {
+  it("keeps the tier-gate arm", () => {
     expect(
       isExpectedNoCloudSession(
         "Tier 0/1 (Local / LocalProvider) — Qontinui account commands are unavailable.",
       ),
     ).toBe(true);
-    expect(isExpectedNoCloudSession("Not authenticated. Please log in first.")).toBe(true);
+  });
+
+  /**
+   * The arm this retires. `"Not authenticated"` was quieted as "the keychain
+   * race the retry loop gives up on", and neither half of that held once #1396
+   * re-pointed the retry gate: `get_user_projects` has not emitted the string
+   * since #1342, and the retry now gives up on `cognito_access_token_unreadable`,
+   * which is deliberately NOT quiet. The only way the old string still arrives
+   * is a web-backend body echoed verbatim through `AppError::HttpStatusError` —
+   * a bearer the runner judged healthy that the backend refused. That is a
+   * fault the health channel must keep seeing, not a steady state.
+   */
+  it("a backend response that echoes the old string is NOT suppressed", () => {
+    expect(isExpectedNoCloudSession('HTTP 401: {"detail":"Not authenticated"}')).toBe(false);
+    expect(isExpectedNoCloudSession('HTTP 403: {"detail":"Not authenticated"}')).toBe(false);
+  });
+
+  /**
+   * `get_access_token_for_websocket` renders this sentence; `get_user_projects`
+   * never has. It was the message the retired arm's test pinned, so it stays
+   * here as the proof that the arm is gone rather than re-spelled.
+   */
+  it("a sibling command's bare refusal is not this predicate's to quiet", () => {
+    expect(isExpectedNoCloudSession("Not authenticated. Please log in first.")).toBe(false);
   });
 
   /**
@@ -148,6 +171,19 @@ describe("isRetryableCredentialRace", () => {
   it("does not retry a backend response body that echoes the old string", () => {
     expect(isRetryableCredentialRace('HTTP 401: {"detail":"Not authenticated"}')).toBe(false);
     expect(isRetryableCredentialRace("Not authenticated. Please log in first.")).toBe(false);
+  });
+
+  /**
+   * The two predicates read the same message, and on the backend echo of the
+   * old string they must agree: it is neither retried (a definitive 4xx) nor
+   * quieted (a refused bearer is a fault). A gate that said "not retryable"
+   * while the classifier said "expected" would drop the failure on the floor
+   * with no retry AND no `console.error`.
+   */
+  it("agrees with the severity classifier that the backend echo is a fault", () => {
+    const echo = 'HTTP 401: {"detail":"Not authenticated"}';
+    expect(isRetryableCredentialRace(echo)).toBe(false);
+    expect(isExpectedNoCloudSession(echo)).toBe(false);
   });
 
   it("does not retry an unrelated failure", () => {
