@@ -131,6 +131,13 @@ struct FileReport {
     /// can prove it saw the population it polices.
     env_writing_tests: usize,
     offenders: Vec<Offender>,
+    /// EVERY test fn the scanner recognised, writer or not. The self-test pins
+    /// its known-miss fixtures against THIS rather than against the source
+    /// text: a fixture that was commented out, lost its `#[test]`, or moved
+    /// out of the test module is absent here, while a `SRC.contains("fn …(")`
+    /// check would still find it and the negative assertion beside it would go
+    /// vacuous again — the defect that pin exists to prevent.
+    test_fns: Vec<String>,
 }
 
 /// What one fn body does DIRECTLY — before same-file calls are resolved.
@@ -392,6 +399,9 @@ fn scan_source(src: &str) -> syn::Result<FileReport> {
 
     let mut report = FileReport::default();
     for (i, f) in fns.iter().enumerate() {
+        if f.is_test {
+            report.test_fns.push(f.name.clone());
+        }
         if !(f.is_test && writes[i]) {
             continue;
         }
@@ -471,7 +481,9 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
     // Printed, not just compared: the floor is deliberately slack, so the doc
     // figure beside [`MIN_ENV_WRITING_TESTS`] would otherwise be unverifiable
     // trust. `cargo test -- --nocapture <this test>` re-measures it.
-    eprintln!("env-writing test fns detected: {env_writing_tests} (floor {MIN_ENV_WRITING_TESTS})");
+    eprintln!(
+        "env-writing test fns detected: {env_writing_tests} (floor >{MIN_ENV_WRITING_TESTS})"
+    );
     assert!(
         env_writing_tests > MIN_ENV_WRITING_TESTS,
         "found only {env_writing_tests} env-writing test fns — the detector has stopped \
@@ -601,6 +613,9 @@ mod tests {
     fn unlocked_via_a_same_file_method() {
         MethodWriter.writes_env_from_a_method();
     }
+    // ---- end known misses ------------------------------------------------
+    // Everything below is an ordinary fixture again. `unlocked_in_a_nested_module`
+    // in particular is a FLAGGED offender, not a miss.
     mod nested {
         #[test]
         fn unlocked_in_a_nested_module() {
@@ -674,8 +689,16 @@ mod tests {
     #[test]
     fn a_method_named_set_var_is_not_the_process_env() {
         let mut cmd = Builder::default();
-        // INSIDE a macro on purpose: `scan_tokens`'s `is_method` check is the
-        // only method exclusion left, and it runs on macro tokens alone.
+        // BOTH spellings on purpose — they pin different arms, and keeping only
+        // the macro one left the first unpinned:
+        //   bare  → `syn` records no `ExprMethodCall` at all (`BodyScanner` has
+        //           no such visitor, and `visit_expr_call` fires only on a path
+        //           callee), so a builder method named `set_var` is never a call
+        //           this guard sees;
+        //   macro → `scan_tokens`'s `is_method` check, which runs on macro
+        //           tokens only and is the one method exclusion in the token
+        //           scanner.
+        cmd.set_var("K", "v");
         assert!({
             cmd.set_var("K", "v");
             true
@@ -715,15 +738,22 @@ mod tests {
             "reach through a METHOD is not closed: impl fns are keyed `Type::name`",
         ),
     ] {
-        // Absence has to mean "still missed", not "fixture deleted". Four of
-        // these five are not writers under the rule, so they contribute nothing
-        // to `env_writing_tests` and appear in no other assertion: without this
+        // Absence has to mean "still missed", not "fixture gone". Four of these
+        // five are not writers under the rule, so they contribute nothing to
+        // `env_writing_tests` and appear in no other assertion: without this
         // anchor, renaming or dropping one leaves the negative below trivially
         // true and the module doc's "each bullet has a fixture" quietly false.
+        //
+        // Anchored on what the SCANNER saw, not on the source text: a fixture
+        // that was commented out, lost its `#[test]`, or moved out of the test
+        // module is absent from `test_fns` while a `SRC.contains("fn …(")`
+        // check would still find it — and the negative below would be vacuous
+        // in exactly the way this pin exists to prevent.
         assert!(
-            SRC.contains(&format!("fn {miss}(")),
-            "known-miss fixture `{miss}` is gone, so the `# Known limits` bullet it pins \
-             ({limit}) is pinned by nothing. Restore it or update the doc."
+            report.test_fns.iter().any(|n| n == miss),
+            "known-miss fixture `{miss}` is no longer a test fn the scanner recognises, \
+             so the `# Known limits` bullet it pins ({limit}) is pinned by nothing. \
+             Restore it or update the doc."
         );
         assert!(
             !names.contains(&miss),
