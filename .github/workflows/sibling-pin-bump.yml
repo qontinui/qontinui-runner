@@ -361,18 +361,35 @@ jobs:
           #
           # ci-integrity.yml does not cover this. It triggers only on
           # .github/workflows/** and .github/actions/**, so a PR touching ONLY
-          # the manifest never fires it. And the manifest deliberately must NOT
-          # be added to its GATING list: that list means "editing this is
-          # high-trust, red the PR", and the bump PR edits this file EVERY DAY
-          # by design — gating it there would make the automation require an
-          # operator click daily, which is the mechanism defeating itself.
+          # the manifest never fires it — and there is no GATING list to add it
+          # to either. ci-integrity's scope is its own trigger minus an empty
+          # NON_GATING list, so membership is decided by the path, not by an
+          # allowlist anyone maintains — bringing this manifest in would mean
+          # widening that trigger AND its changed-file filter, not adding a line
+          # to a list. Which is the right outcome here anyway: the bump PR edits
+          # this manifest EVERY DAY by design.
           #
           # So the invariant is narrower and exactly right: a SHA may change
           # freely (that is the bump), but a repo may only LEAVE the manifest in
           # a PR that also edits ci.yml — the file that decides whether that
-          # sibling is checked out at all. ci.yml IS in ci-integrity's GATING
-          # list, so a genuine removal routes through operator review, while the
-          # daily bump does not.
+          # sibling is checked out at all. ci.yml IS inside ci-integrity's scope
+          # ON A PR BASED ON `main` — that guard is `pull_request_target:
+          # branches: [main]`, so a STACKED PR editing ci.yml produces no
+          # ci-integrity run at all, and this escape hatch is correspondingly
+          # unwitnessed there. So a genuine removal cannot be made silently on a
+          # main-based PR: the guard reds it until it is declared. Note WHICH
+          # declaration, because removing a checkout-sibling step mutates an
+          # EXISTING ci.yml job — `ci:gate-change=alters-a-gate` plus a whole-line
+          # `Gate-Change: ci#<job-key>` in the PR body, not the plain label. Only
+          # once that passes does the guard post its durable, attributed
+          # notification; an undeclared or under-declared PR gets a red job and no
+          # comment at all. STATE THAT ASSURANCE AT ITS REAL SIZE — this comment
+          # used to say the removal "routes through operator review", and it does
+          # not. The declaration is
+          # a label the authoring agent applies to itself; ci-integrity is a
+          # visibility guarantee, not a permission one, by its own deliberate
+          # design. What the escape hatch buys is that an un-pinning is declared
+          # and on the record, never that a human approved it.
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             if ! base_manifest="$(gh api "repos/$REPO/contents/$MANIFEST?ref=$BASE_REF" \
                                    -H "Accept: application/vnd.github.raw" 2>"$RUNNER_TEMP/err.txt")"; then
@@ -396,8 +413,10 @@ jobs:
             if [ -n "$removed" ]; then
               # The escape hatch is REAL, not advice: a removal is allowed when
               # this PR also touches ci.yml, because that is where the sibling's
-              # checkout lives and ci.yml is in ci-integrity's GATING list — so
-              # the PR reds there and an operator reviews it. Without this
+              # checkout lives and ci.yml is inside ci-integrity's scope — so
+              # the PR reds there until the un-pinning is declared, and the guard
+              # records it. (Declared by the author, not approved by an operator;
+              # see the scope note above.) Without this
               # branch the message below would promise a route that the check
               # itself refuses, which is worse than no message.
               #
@@ -422,7 +441,7 @@ jobs:
               # comments dedup below materializes a file to avoid; closed the
               # same way, without the pipe.
               if grep -qxF ".github/workflows/ci.yml" <<< "$changed"; then
-                echo "::warning::This PR removes pin entries from $MANIFEST and also edits .github/workflows/ci.yml — allowed, on the assumption the sibling's checkout is being removed with it. ci-integrity.yml will red this PR for the ci.yml edit, so an operator reviews the pair."
+                echo "::warning::This PR removes pin entries from $MANIFEST and also edits .github/workflows/ci.yml — allowed, on the assumption the sibling's checkout is being removed with it. ci-integrity.yml will red this PR for the ci.yml edit until you declare it, and will then post a durable notification naming the pair. Removing a checkout-sibling step mutates an EXISTING job (test, clippy-windows or security), so this is the STRONGER declaration, not the plain one: gh pr edit $PR_NUMBER -R $REPO --add-label 'ci:gate-change=alters-a-gate', plus a whole line 'Gate-Change: ci#<job-key>' in the PR body for each job you touched, then re-run that job. Read the ci-integrity job's own log for the exact token(s) it computed."
                 while IFS= read -r r; do
                   [ -n "$r" ] && echo "::warning::  un-pinned: $r"
                 done <<< "$removed"
@@ -432,7 +451,7 @@ jobs:
                   [ -n "$r" ] && echo "::error::  - $r"
                 done <<< "$removed"
                 echo "::error::A repo absent from this file is resolved by DEFAULT BRANCH, i.e. cloned floating — the coupling #1158 removed, and the one that held this repo's merge train for 5h+ on 2026-08-20 with no runner commit involved."
-                echo "::error::If un-pinning is genuinely intended, stop checking that sibling out in the same PR: remove its checkout-sibling step from .github/workflows/ci.yml. That file is guarded by ci-integrity.yml, so the change gets the operator review a re-float deserves — and this check then permits the removal."
+                echo "::error::If un-pinning is genuinely intended, stop checking that sibling out in the same PR: remove its checkout-sibling step from .github/workflows/ci.yml. That file is inside ci-integrity.yml's scope (on a PR based on main), so a re-float cannot be made silently: the guard reds the PR until you declare the change — 'ci:gate-change=alters-a-gate' plus a 'Gate-Change: ci#<job-key>' body line, because removing a step alters an existing job — and then records it against you. No operator is involved. This check then permits the removal."
                 exit 1
               fi
             fi

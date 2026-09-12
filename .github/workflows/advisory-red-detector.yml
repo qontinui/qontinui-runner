@@ -30,8 +30,22 @@ name: advisory-red detector selftest
 #
 # The selftest is fixture-driven: no network, no `gh`, no credentials, so this
 # runs on `push` to main as well and therefore has a baseline coord can read.
-# Not a gating workflow (see ci-integrity.yml's GATING list) — it tests a
-# reporting tool, not a merge gate.
+# Not a merge gate — it tests a reporting tool, so it is deliberately absent from
+# the repo ruleset's required contexts (measured 2026-09-12 against ruleset
+# 16044811: 10 contexts, none of them this one).
+#
+# That is a statement about REQUIRED CONTEXTS and not about ci-integrity.yml,
+# which keeps no GATING list a file could be listed in or absent from: its scope
+# is its own trigger (`.github/workflows/**`, `.github/actions/**`) minus a
+# deliberately EMPTY NON_GATING list. So this file IS inside that scope on a PR
+# based on `main` (that guard is `pull_request_target: branches: [main]`, so a
+# STACKED PR editing it fires no ci-integrity run at all). A main-based PR
+# editing it needs at least `ci:gate-change=declared`; one that alters an
+# existing surface needs `ci:gate-change=alters-a-gate` plus a `Gate-Change:`
+# line per altered item — `<stem>#<job-key>` for a job, and `<stem>#workflow`
+# for a change outside `jobs:`, which is what an edit to the `on:` block
+# directly below would be. A DELETED job takes `Gate-Removal:` instead. The
+# guard prints the exact lines it wants, so read its log rather than guessing.
 
 on:
   push:

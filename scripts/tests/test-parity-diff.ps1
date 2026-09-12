@@ -31,10 +31,20 @@
 # WHERE IT RUNS TODAY
 # -------------------
 # The first step of .github/workflows/published-parity.yml, before any compile.
-# It is NOT wired into ci.yml: ci.yml is on ci-integrity.yml's guarded list, so
-# adding a step there turns every PR touching it red for operator review. If
-# per-PR coverage is wanted, that is a deliberate one-line addition next to the
-# `Contract-smoke summary invariants (PS 5.1)` step, made with that cost in mind.
+# It is NOT wired into ci.yml. The cost of doing so is real but smaller than an
+# earlier version of this comment claimed: ci.yml is inside ci-integrity.yml's
+# scope (that scope is the guard's own trigger, not a "guarded list" — the
+# hand-kept allowlist was replaced by the trigger itself), so a main-based PR
+# editing ci.yml goes red until its author declares the change. That is NOT an
+# operator review — the guard's own error text says "No operator is involved."
+# But note WHICH declaration, because the two are not interchangeable: adding a
+# whole new JOB is additive and needs only `ci:gate-change=declared`, while
+# adding a STEP to an existing job mutates that job's surface. The addition
+# proposed below goes next to the `Contract-smoke summary invariants (PS 5.1)`
+# step, which lives in ci.yml's `test` job, so it would need the stronger
+# `ci:gate-change=alters-a-gate` plus a whole line `Gate-Change: ci#test` in the
+# PR body, and a re-run of that job. If per-PR coverage is wanted, that is a
+# deliberate one-line addition next to that step, made with that cost in mind.
 #
 # Usage:
 #   powershell -File scripts/tests/test-parity-diff.ps1

@@ -58,9 +58,14 @@
 //! `paths:` and are untouched.
 //!
 //! This runs inside the existing `cargo test` job, so it needs no workflow
-//! edit — which matters here beyond convenience: `ci-integrity.yml` reds any
-//! PR that touches a gating workflow, so an enforcement mechanism that lived
-//! in `.github/workflows/` could not land without an operator override.
+//! edit. That is convenience rather than necessity, and the original rationale
+//! here overstated it: `ci-integrity.yml` reds any main-based PR that touches a
+//! workflow, but clearing that red is the AUTHOR'S to do — a declaration label,
+//! and a `Gate-Change:` body line when an existing job surface moves. No
+//! operator override exists or is needed, so an enforcement mechanism living in
+//! `.github/workflows/` could land perfectly well; it would simply carry a
+//! declaration. What still argues for a `cargo test` is that it runs
+//! unconditionally, with no `paths:` filter of its own to keep honest.
 
 use std::path::{Path, PathBuf};
 

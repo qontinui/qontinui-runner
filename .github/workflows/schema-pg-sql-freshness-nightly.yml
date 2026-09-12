@@ -34,8 +34,26 @@ name: schema.pg.sql.generated nightly freshness
 # "simplify" by demoting `schema-fresh` to advisory: it is the only thing
 # blocking a runner PR that lands a stale dump beside a `src-tauri/queries/**`
 # change. And do not fold this file's logic INTO it — `schema-pg-sql-fresh.yml`
-# is a GATING_WORKFLOWS member (`ci-integrity.yml`), so even a comment-only edit
-# reds CI and forces an operator review round-trip.
+# is inside `ci-integrity.yml`'s scope — which is its trigger
+# (`.github/workflows/**`) minus an empty NON_GATING list, NOT the
+# `GATING_WORKFLOWS` allowlist this line used to name; that allowlist is gone,
+# and with it any notion of a workflow file being excluded by an allowlist entry.
+# Every workflow file is in scope ON A PR BASED ON `main` — the guard is
+# `pull_request_target: branches: [main]`, so a STACKED PR editing a workflow
+# fires no ci-integrity run at all. On a main-based PR even a comment-only edit
+# reds the guard until the PR is declared. WHICH declaration is decided PER-PR,
+# not per-edit: `ci:gate-change=declared` when nothing in the whole PR moves a
+# surface, and `alters-a-gate` plus a `Gate-Change:` body line per altered item
+# as soon as anything does — `<stem>#<job-key>` for a job, `<stem>#workflow`
+# outside `jobs:`, `Gate-Removal:` when a job is deleted. A comment-only edit
+# does not settle it either way: a YAML-level comment alters no surface, while a
+# shell comment inside a `run: |` block is part of that scalar's value and moves
+# the enclosing job's digest.
+# Weigh that cost at its real size: the label is one `gh pr edit` the authoring
+# agent applies to itself plus a re-run of the job, not the operator review
+# round-trip this line used to claim. The argument above still holds on its
+# merits (two complementary gates, disjoint drift sources); it no longer rests on
+# an unmergeable PR.
 #
 # ---------------------------------------------------------------------------
 # Trigger posture — deliberately schedule + dispatch ONLY
