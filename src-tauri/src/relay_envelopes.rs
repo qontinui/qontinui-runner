@@ -175,7 +175,9 @@ pub struct RunnerConnectedConnection {
 }
 
 /// Discriminated union of every event the Python backend pushes to the web
-/// client over the `/api/v1/runners/status` WebSocket.
+/// client over the `/api/v1/devices/ws` WebSocket. (Named
+/// `/api/v1/runners/status` here until 2026-09-12 — a route that no longer
+/// exists; the `/api/v1/runners` router was removed in `1574bd036`.)
 ///
 /// Internally tagged on `"type"` matching the Python wire format. Variant
 /// renames (`runner.woke` keeps the dot rather than going to snake_case)
