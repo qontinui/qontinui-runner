@@ -14,16 +14,22 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_MIN_OCCURRENCES,
   FLAKE_LABEL,
+  MAIN_RED_CAP,
   MAX_TITLE_LEN,
   TITLE_PREFIX,
   applyAction,
   classifyFlakinessResponse,
   ensureLabel,
+  fetchRunJobs,
   issueTitle,
   listFlakeIssues,
+  mergeEscalations,
   planIssueActions,
   renderIssueBody,
+  renderMainRedComment,
   selectEscalations,
+  selectMainRedEscalations,
+  sliceGatingStep,
 } from "../ci-flake-escalate.mjs";
 
 // The test #1444 fixed, at the numbers coord served on 2026-09-10.
@@ -289,7 +295,8 @@ test("the body carries the rate, the occurrence count, the window and the run li
   );
   assert.match(body, /\*\*0\.400\*\* \(40\.0%\)/);
   assert.match(body, /\*\*8\*\* of 20 runs disagreed/);
-  assert.match(body, /last 20 runs per test \(min_k 20\)/);
+  assert.match(body, /rate rule/);
+  assert.match(body, /last 20 observations per test \(min_k 20\)/);
   assert.match(
     body,
     /\[this run\]\(https:\/\/github\.com\/qontinui\/qontinui-runner\/actions\/runs\/1\)/,
@@ -301,7 +308,446 @@ test("the body carries the rate, the occurrence count, the window and the run li
 test("the body degrades honestly when the optional context is absent", () => {
   const body = renderIssueBody(ESC[0]);
   assert.match(body, /a manual run/);
-  assert.match(body, /last \? runs per test \(min_k \?\)/);
+  assert.match(body, /last \? observations per test \(min_k \?\)/);
+});
+
+// ---------------------------------------------------------------------------
+// The tally rule — coord's per-outcome `outcomes` beats the rate when served
+// ---------------------------------------------------------------------------
+
+/** A coord prior WITH the per-outcome tally (qontinui-coord since the 2026-09-12 read rewrite). */
+function tallied(outcomes, extra = {}) {
+  const total = Object.values(outcomes).reduce((a, b) => a + b, 0);
+  const modal = Object.entries(outcomes).sort((a, b) => b[1] - a[1])[0][0];
+  return {
+    sample_size: total,
+    modal_outcome: modal,
+    flake_rate: 1 - outcomes[modal] / total,
+    outcomes,
+    recent_failures: [],
+    ...extra,
+  };
+}
+
+test("tally: fail+error >= threshold with at least one pass escalates, and records the rule", () => {
+  const out = selectEscalations({ t: tallied({ pass: 10, fail: 2, error: 1 }) });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].occurrences, 3);
+  assert.equal(out[0].rule, "tally");
+  assert.deepEqual(out[0].outcomes, { pass: 10, fail: 2, error: 1 });
+});
+
+test("tally: a test that ONLY fails is broken, not flaky — no escalation even at rate 0", () => {
+  assert.deepEqual(selectEscalations({ t: tallied({ fail: 20 }) }), []);
+  // fail+error only, non-zero rate (modal fail, 5 errors disagree): the
+  // early `flake_rate <= 0` guard does NOT catch this one — only the tally
+  // rule's "passed at least once" does. Delete that line and this fails.
+  assert.deepEqual(selectEscalations({ t: tallied({ fail: 15, error: 5 }) }), []);
+  assert.deepEqual(selectEscalations({ t: tallied({ fail: 17, unknown: 3 }) }), []);
+  // …and modal=fail with a few passes is a flip (the rate arm's own case) —
+  // the tally says so too, on its failures.
+  const out = selectEscalations({ t: tallied({ fail: 17, pass: 3 }) });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].occurrences, 17);
+});
+
+test("tally: a skip/pass split (cfg_attr(windows, ignore)) is NOT a flake, whatever the rate says", () => {
+  const p = tallied({ pass: 10, skip: 10 });
+  assert.ok(p.flake_rate >= 0.5, "the rate alone would escalate this");
+  assert.equal(
+    selectEscalations({ t: { ...p, outcomes: undefined } }).length,
+    1,
+    "rate rule: escalates",
+  );
+  assert.deepEqual(selectEscalations({ t: p }), [], "tally rule: does not");
+});
+
+test("tally: below threshold does not escalate; --min-occurrences applies to failures", () => {
+  assert.deepEqual(selectEscalations({ t: tallied({ pass: 18, fail: 2 }) }), []);
+  assert.equal(
+    selectEscalations({ t: tallied({ pass: 18, fail: 2 }) }, { minOccurrences: 2 }).length,
+    1,
+  );
+});
+
+test("tally: recent_failures ride along into the escalation", () => {
+  const rf = [
+    {
+      outcome: "fail",
+      head_sha: "abc",
+      shard: "ubuntu-22.04",
+      observed_at: "2026-09-12T01:00:00Z",
+    },
+  ];
+  const out = selectEscalations({ t: tallied({ pass: 17, fail: 3 }, { recent_failures: rf }) });
+  assert.deepEqual(out[0].recentFailures, rf);
+});
+
+test("tally: a body carries the tally, the SHA table and the iterated-PR caveat", () => {
+  const [e] = selectEscalations({
+    t: tallied(
+      { pass: 17, fail: 3 },
+      {
+        recent_failures: [
+          {
+            outcome: "fail",
+            head_sha: "abcdef0123456789",
+            shard: "ubuntu-22.04",
+            observed_at: "2026-09-12T01:00:00Z",
+          },
+        ],
+      },
+    ),
+  });
+  const body = renderIssueBody(e, { repo: "o/r", minK: 20, window: 200, readAt: "x" });
+  assert.match(body, /tally rule/);
+  assert.match(body, /fail 3 · pass 17/);
+  assert.match(body, /commit\/abcdef0123456789/);
+  assert.match(body, /broken PR that was iterated/);
+  assert.equal(
+    body,
+    renderIssueBody(e, { repo: "o/r", minK: 20, window: 200, readAt: "x" }),
+    "deterministic",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The main-red arm — failing tests of a `failure` run on main
+// ---------------------------------------------------------------------------
+
+const TS = "2026-09-12T07:26:07.5955615Z ";
+
+const RED_UBUNTU_LOG = [
+  `${TS}     Running \`/home/runner/work/x/src-tauri/target/debug/deps/qontinui_runner_lib-a9341426b1692ff6\``,
+  `${TS}running 3 tests`,
+  `${TS}test spill::tests::evicts_oldest ... FAILED`,
+  `${TS}test spill::tests::keeps_newest ... ok`,
+  `${TS}test spill::tests::ignored_one ... ignored`,
+  `${TS}test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s`,
+].join("\n");
+
+const RED_WINDOWS_LOG = RED_UBUNTU_LOG.replace(
+  "/home/runner/work/x/src-tauri/target/debug/deps/qontinui_runner_lib-a9341426b1692ff6",
+  "D:\\a\\x\\src-tauri\\target\\debug\\deps\\qontinui_runner_lib-b1b2b3b4b5b6b7b8.exe",
+);
+
+const COMPILE_ERROR_LOG = [
+  `${TS}   Compiling qontinui-runner v1.0.10`,
+  `${TS}error[E0425]: cannot find value \`x\` in this scope`,
+  `${TS}error: could not compile \`qontinui-runner\``,
+].join("\n");
+
+test("main-red: failing tests come from failed test jobs only, binary-prefixed, with their shard", () => {
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: RED_UBUNTU_LOG },
+    { name: "test (windows-latest)", conclusion: "success", logText: RED_UBUNTU_LOG },
+    { name: "clippy-windows", conclusion: "failure", logText: RED_UBUNTU_LOG },
+  ]);
+  assert.deepEqual(r.escalations, [
+    {
+      testId: "qontinui_runner_lib::spill::tests::evicts_oldest",
+      mainRed: { shards: ["ubuntu-22.04"] },
+    },
+  ]);
+  assert.equal(r.failingCount, 1);
+  assert.equal(r.capped, false);
+  assert.deepEqual(r.unparsed, []);
+});
+
+test("main-red: the same test failing on both legs is ONE escalation carrying both shards", () => {
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: RED_UBUNTU_LOG },
+    { name: "test (windows-latest)", conclusion: "failure", logText: RED_WINDOWS_LOG },
+  ]);
+  assert.equal(r.escalations.length, 1);
+  assert.deepEqual(r.escalations[0].mainRed.shards, ["ubuntu-22.04", "windows-latest"]);
+});
+
+test("main-red: a failed job with no cargo output is reported unparsed, never as zero flakes", () => {
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: COMPILE_ERROR_LOG },
+    { name: "test (windows-latest)", conclusion: "failure", logText: null },
+  ]);
+  assert.deepEqual(r.escalations, []);
+  assert.deepEqual(r.unparsed, ["test (ubuntu-22.04)", "test (windows-latest)"]);
+});
+
+test("main-red: a mass failure is capped to nothing — a broken commit is not N flakes", () => {
+  const lines = [`${TS}running 12 tests`];
+  for (let i = 0; i <= MAIN_RED_CAP; i += 1) lines.push(`${TS}test m::t${i} ... FAILED`);
+  lines.push(
+    `${TS}test result: FAILED. 0 passed; 11 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`,
+  );
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: lines.join("\n") },
+  ]);
+  assert.equal(r.failingCount, MAIN_RED_CAP + 1);
+  assert.equal(r.capped, true);
+  assert.deepEqual(r.escalations, []);
+});
+
+test("merge: both arms land on one escalation per test id; rate order first, then main-red-only by id", () => {
+  const rate = selectEscalations({ "b::t": tallied({ pass: 17, fail: 3 }) });
+  const merged = mergeEscalations(rate, [
+    { testId: "b::u", mainRed: { shards: ["windows-latest"] } },
+    { testId: "b::t", mainRed: { shards: ["ubuntu-22.04"] } },
+  ]);
+  assert.deepEqual(
+    merged.map((e) => [e.testId, e.rule ?? null, e.mainRed?.shards ?? null]),
+    [
+      ["b::t", "tally", ["ubuntu-22.04"]],
+      ["b::u", null, ["windows-latest"]],
+    ],
+  );
+});
+
+test("main-red-only body: no rate rows, no coord paragraphs, the push-to-main row linking the CI run", () => {
+  const body = renderIssueBody(
+    { testId: "b::u", mainRed: { shards: ["windows-latest"] } },
+    {
+      repo: "o/r",
+      runUrl: "https://github.com/o/r/actions/runs/9",
+      ciRunUrl: "https://github.com/o/r/actions/runs/5",
+      readAt: "x",
+    },
+  );
+  assert.doesNotMatch(body, /flake_rate/);
+  assert.doesNotMatch(body, /POST \/coord\/test-flakiness/, "no coord read happened");
+  assert.doesNotMatch(body, /Read the number before/);
+  assert.match(body, /^a push to `main` failed this test/);
+  assert.match(
+    body,
+    /failed on a push to `main` \| `windows-latest` — \[the run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/5\)/,
+  );
+  assert.match(
+    body,
+    /escalated by \| \[this run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/9\)/,
+  );
+  assert.match(body, /test or production/);
+});
+
+test("main-red comment: an event naming the shards and the CI run, never the body", () => {
+  const c = renderMainRedComment(
+    { testId: "b::u", mainRed: { shards: ["ubuntu-22.04", "windows-latest"] } },
+    { ciRunUrl: "https://github.com/o/r/actions/runs/5", readAt: "2026-09-12T01:00:00.000Z" },
+  );
+  assert.match(
+    c,
+    /^Failed again on a push to `main` — `ubuntu-22.04`, `windows-latest` — \[the run\]/,
+  );
+  assert.match(c, /body above is coord's/);
+});
+
+test("applyAction: a main-red-only escalation on an existing issue comments, never edits the body", () => {
+  const { calls, gh } = recorder();
+  applyAction(
+    { action: "update", number: 7, escalation: { testId: "b::u", mainRed: { shards: ["x"] } } },
+    "BODY",
+    "o/r",
+    gh,
+    { comment: "EVENT" },
+  );
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [["issue", "comment"]],
+  );
+  assert.equal(calls[0].opts.input, "EVENT");
+});
+
+test("applyAction: a closed issue hit by the main-red arm is reopened, then commented", () => {
+  const { calls, gh } = recorder();
+  applyAction(
+    { action: "reopen", number: 7, escalation: { testId: "b::u", mainRed: { shards: ["x"] } } },
+    "BODY",
+    "o/r",
+    gh,
+    { comment: "EVENT" },
+  );
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [
+      ["issue", "reopen"],
+      ["issue", "comment"],
+    ],
+  );
+});
+
+test("applyAction: an escalation with a coord reading AND a push failure edits the body and comments", () => {
+  const { calls, gh } = recorder();
+  applyAction(
+    {
+      action: "update",
+      number: 7,
+      escalation: { testId: "t", rule: "tally", mainRed: { shards: ["x"] } },
+    },
+    "BODY",
+    "o/r",
+    gh,
+    { comment: "EVENT" },
+  );
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [
+      ["issue", "edit"],
+      ["issue", "comment"],
+    ],
+  );
+  assert.equal(calls[0].opts.input, "BODY");
+  assert.equal(calls[1].opts.input, "EVENT");
+});
+
+test("applyAction: create writes the body whichever arm produced it", () => {
+  const { calls, gh } = recorder({ "issue create": "u" });
+  applyAction(
+    {
+      action: "create",
+      title: "flaky test: b::u",
+      escalation: { testId: "b::u", mainRed: { shards: ["x"] } },
+    },
+    "BODY",
+    "o/r",
+    gh,
+    { comment: "EVENT" },
+  );
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [["issue", "create"]],
+  );
+  assert.equal(calls[0].opts.input, "BODY");
+});
+
+test("fetchRunJobs: lists the run's jobs and reads the log of failed test jobs only", () => {
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [
+        { id: 1, name: "test (ubuntu-22.04)", conclusion: "failure" },
+        { id: 2, name: "test (windows-latest)", conclusion: "success" },
+        { id: 3, name: "clippy-windows", conclusion: "failure" },
+      ],
+    }),
+    "api repos/o/r/actions/jobs/1/logs": RED_UBUNTU_LOG,
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.deepEqual(
+    jobs.map((j) => [j.name, j.logText === null ? null : "log"]),
+    [
+      ["test (ubuntu-22.04)", "log"],
+      ["test (windows-latest)", null],
+      ["clippy-windows", null],
+    ],
+  );
+  assert.equal(
+    calls.length,
+    2,
+    "one list call and one log read — never the green or non-test jobs",
+  );
+});
+
+test("fetchRunJobs: pins the attempt when given, so a re-run cannot hide the triggering failure", () => {
+  const { calls, gh } = recorder({
+    "api repos/o/r/actions/runs/5/attempts/2/jobs?per_page=100": JSON.stringify({ jobs: [] }),
+  });
+  fetchRunJobs("o/r", "5", { attempt: "2", gh });
+  assert.equal(calls[0].args[1], "repos/o/r/actions/runs/5/attempts/2/jobs?per_page=100");
+});
+
+test("fetchRunJobs: a log that cannot be read is marked unreadable, and the arm goes dark on it", () => {
+  const { gh } = recorder({
+    "api repos/o/r/actions/runs/5/jobs?per_page=100": JSON.stringify({
+      jobs: [{ id: 1, name: "test (ubuntu-22.04)", conclusion: "failure" }],
+    }),
+    "api repos/o/r/actions/jobs/1/logs": () => {
+      const e = new Error("HTTP 403");
+      e.stderr = "Resource not accessible by integration (HTTP 403)";
+      throw e;
+    },
+  });
+  const jobs = fetchRunJobs("o/r", "5", { gh });
+  assert.equal(jobs[0].unreadable, true);
+  const r = selectMainRedEscalations(jobs);
+  assert.deepEqual(r.unreadable, ["test (ubuntu-22.04)"]);
+  assert.deepEqual(
+    r.unparsed,
+    [],
+    "unreadable is NOT unparsed — one is a permissions failure, the other a broken build",
+  );
+  assert.deepEqual(r.escalations, []);
+});
+
+// ---------------------------------------------------------------------------
+// sliceGatingStep — only the gate's output is parsed, never the smoke step's
+// ---------------------------------------------------------------------------
+
+/** A job log with the shape ci.yml's `test (…)` job really has: gate, ingest, smoke, build. */
+const FULL_JOB_LOG = [
+  `${TS}##[group]Run pnpm test`,
+  `${TS}[36;1mpnpm test[0m`,
+  `${TS}##[endgroup]`,
+  `${TS}> vitest run`,
+  `${TS}##[group]Run if [ "$RUNNER_OS" = "Linux" ]; then`,
+  `${TS}[36;1mif [ "$RUNNER_OS" = "Linux" ]; then[0m`,
+  `${TS}[36;1mcargo test --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"[0m`,
+  `${TS}##[endgroup]`,
+  `${TS}     Running \`/home/runner/work/x/src-tauri/target/debug/deps/qontinui_runner-a9341426b1692ff6\``,
+  `${TS}running 2 tests`,
+  `${TS}test spill::tests::evicts_oldest ... FAILED`,
+  `${TS}test util::path_extraction::tests::test_extract_paths_via_ai_real_call ... ignored`,
+  `${TS}test result: FAILED. 0 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s`,
+  `${TS}##[group]Run node scripts/ci-test-results-ingest.mjs \\`,
+  `${TS}##[endgroup]`,
+  `${TS}[ci-test-results-ingest] chunk 1/1 (2 rows) -> HTTP 200 in 10ms`,
+  `${TS}##[group]Run if [ -z "$ANTHROPIC_API_KEY" ]; then`,
+  `${TS}[36;1mcargo test --bin qontinui-runner -- --ignored --exact \\[0m`,
+  `${TS}##[endgroup]`,
+  `${TS}     Running \`/home/runner/work/x/src-tauri/target/debug/deps/qontinui_runner-a9341426b1692ff6\``,
+  `${TS}running 1 test`,
+  `${TS}test util::path_extraction::tests::test_extract_paths_via_ai_real_call ... FAILED`,
+  `${TS}test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 9.01s`,
+  `${TS}##[group]Run pnpm run tauri build --debug --no-bundle`,
+  `${TS}##[endgroup]`,
+  `${TS}error: build failed`,
+].join("\n");
+
+test("sliceGatingStep: keeps the gate's output and drops the smoke step's FAILED line", () => {
+  const sliced = sliceGatingStep(FULL_JOB_LOG);
+  assert.match(sliced, /evicts_oldest \.\.\. FAILED/);
+  assert.match(sliced, /test_extract_paths_via_ai_real_call \.\.\. ignored/);
+  assert.doesNotMatch(sliced, /test_extract_paths_via_ai_real_call \.\.\. FAILED/);
+  assert.doesNotMatch(sliced, /ci-test-results-ingest/);
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: FULL_JOB_LOG },
+  ]);
+  assert.deepEqual(
+    r.escalations.map((e) => e.testId),
+    ["qontinui_runner::spill::tests::evicts_oldest"],
+    "the smoke test's failure never reds the job and must not be filed as a flake",
+  );
+});
+
+test("sliceGatingStep: a log with steps but no gating step is EMPTY (unparsed), never the whole log", () => {
+  const noGate = FULL_JOB_LOG.replace("cargo test --verbose", "cargo build --verbose");
+  assert.equal(sliceGatingStep(noGate), "");
+  const r = selectMainRedEscalations([
+    { name: "test (ubuntu-22.04)", conclusion: "failure", logText: noGate },
+  ]);
+  assert.deepEqual(r.unparsed, ["test (ubuntu-22.04)"]);
+});
+
+test("sliceGatingStep: a log with no step markers at all is returned whole", () => {
+  assert.equal(sliceGatingStep(RED_UBUNTU_LOG), RED_UBUNTU_LOG);
+});
+
+test("main-red: exactly MAIN_RED_CAP failing tests is NOT capped; one more is", () => {
+  const mk = (n) => {
+    const lines = [`${TS}running ${n} tests`];
+    for (let i = 0; i < n; i += 1) lines.push(`${TS}test m::t${i} ... FAILED`);
+    lines.push(
+      `${TS}test result: FAILED. 0 passed; ${n} failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`,
+    );
+    return [{ name: "test (ubuntu-22.04)", conclusion: "failure", logText: lines.join("\n") }];
+  };
+  assert.equal(selectMainRedEscalations(mk(MAIN_RED_CAP)).escalations.length, MAIN_RED_CAP);
+  assert.equal(selectMainRedEscalations(mk(MAIN_RED_CAP + 1)).capped, true);
 });
 
 // ---------------------------------------------------------------------------
