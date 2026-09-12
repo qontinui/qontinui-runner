@@ -750,8 +750,8 @@ impl ChunkPoster {
         // bearer lookup found no slot for it would file this device's census
         // under a tenant it cannot present, on an unauthenticated request.
         // `declared_tenant()` is `None` for both `Device` (no default
-        // configured — the legitimate single-tenant shape) and `Unresolved` (a
-        // default with no usable credential), so an ungated tenant can no
+        // configured — the legitimate single-tenant shape) and `Unbacked` (a
+        // default this device cannot present), so an ungated tenant can no
         // longer reach the body.
         let scope = crate::auth::TenantScope::for_bound_device_default(
             self.tenant_id,

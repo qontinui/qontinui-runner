@@ -227,8 +227,10 @@ impl CoordSync {
     /// Test-only constructor. Pins the coord URL and runs heartbeats on
     /// the millisecond cadence the tests need without polluting global
     /// env vars.
-    /// Test constructor whose binding gate answers "this device can present
-    /// every tenant". That is the right DEFAULT for the existing suite: those
+    /// Test-only constructor. Pins the coord URL, runs heartbeats on the
+    /// millisecond cadence the tests need without polluting global env vars,
+    /// and answers the binding gate with "this device can present every
+    /// tenant". That last part is the right DEFAULT for the existing suite: those
     /// tests assert on tenant PLUMBING (which id reaches which body/slot), not
     /// on the gate, and a test box has no credential store, so the real
     /// predicate would answer `false` for every synthetic id and turn each of
@@ -2887,6 +2889,11 @@ mod tests {
         .await;
 
         let g = rec.lock().await;
+        assert_eq!(
+            g.posts.len(),
+            1,
+            "exactly one create POST, and no retry storm"
+        );
         assert_eq!(
             g.posts[0]["tenant_id"],
             JsonValue::String(Uuid::nil().to_string()),

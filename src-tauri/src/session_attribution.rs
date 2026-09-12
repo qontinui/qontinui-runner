@@ -376,7 +376,10 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
     // then resolves the row's tenant server-side instead of trusting the body.
     let tenant_scope = crate::auth::TenantScope::for_bound_device_default(
         crate::fleet::resolve_tenant_id(),
-        &crate::auth::device_holds_usable_binding_cached,
+        // UNCACHED on purpose: this resolves once per cycle and every POST in
+        // the loop below reuses the scope, so there is no burst for the memo to
+        // collapse — it would only widen the staleness window.
+        &crate::auth::device_holds_usable_binding,
     );
     let tenant_id = tenant_scope.declared_tenant();
 
