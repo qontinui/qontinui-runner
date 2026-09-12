@@ -445,12 +445,27 @@ against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Three of the fourteen call sites return BEFORE that
-guard is consulted at all and the rest are reached after it; either way none
-deletes anything — so a
+our own `coord-mcp` config, and among the breadcrumb writers only
+`provision_coord_mcp_with_jwt` consults it. Of the fourteen call sites, the
+one in `provision_coord_mcp_for_session` (no device JWT) and the bearer check
+among the five in `provision_coord_mcp_with_jwt` return before that guard is
+reached; the other four there are its own refusal arm and three port /
+agent-id refusals after it; the seven in `apply_probe_verdict` fire only once
+a `.mcp.json` is in place and being probed; and the one in `agent_runtime.rs`
+sits on the agent-spawn path, which writes its `.mcp.json` without consulting
+the guard at all. Either way none of them deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
 breadcrumb says "NOT written" is a consistent pair, not a contradiction.
+(The per-writer counts in that sentence — one, five, seven, one — are gated
+by `scripts/breadcrumb-reason-drift.py`; "the other four" and "three ...
+after it" are arithmetic on the five, and which of them sit before or after
+the guard is control flow the checker neither gates nor prints — re-derive it
+from the source, never from here. Until the #893 follow-up this paragraph and
+its two siblings disagreed on that split — "three" here and in the knowledge
+base, "ten" after #893 counted by enclosing function rather than by path —
+with the check green throughout, because the subset word sat just outside the
+span it verified.)
 
 The remaining **seven** reasons are the probe's typed verdicts, and they mean the
 opposite: a `.mcp.json` WAS written and did not answer at spawn. They are

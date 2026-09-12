@@ -2002,11 +2002,19 @@ fi
 # against runner main, so a stale count here reddens a PR.
 #
 # NOT "the session never had a .mcp.json": `coord_mcp_safe_to_write` passes a
-# workdir whose file is absent OR holds solely our own coord-mcp config, and the
-# refusal arms return either side of that check (three of the eight never reach
-# it) and none of them DELETES — so a RE-provision of a workdir that
+# workdir whose file is absent OR holds solely our own coord-mcp config, and
+# only `provision_coord_mcp_with_jwt` among the breadcrumb writers consults it.
+# Of the fourteen call sites, the one in `provision_coord_mcp_for_session` and
+# the bearer check among the five in `provision_coord_mcp_with_jwt` return
+# before that check is reached; the seven in `apply_probe_verdict` fire once a
+# .mcp.json is in place; the one in `agent_runtime.rs` writes without the
+# check at all — and none of them DELETES, so a RE-provision of a workdir that
 # already carried one leaves the stale file in place. L1 probing a stale port or
-# an evicted nonce is fully consistent with a "NOT written" breadcrumb.
+# an evicted nonce is fully consistent with a "NOT written" breadcrumb. (The
+# per-writer counts are gated by scripts/breadcrumb-reason-drift.py; this
+# comment used to say "three of the eight never reach it" with the noun
+# elided, which that script's advisory cannot see, and it stayed at eight
+# through two total changes.)
 #
 # It NEVER changes the verdict. Three limits, all stated in the output rather
 # than left to the reader:
