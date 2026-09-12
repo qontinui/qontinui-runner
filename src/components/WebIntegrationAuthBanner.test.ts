@@ -9,12 +9,15 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  credentialDarkPresentation,
   makeRePairClickHandler,
+  normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
   shouldShowAuthBanner,
   shouldShowRePairCta,
   statusSignature,
   type AuthBannerStatus,
+  type CredentialDarkSignal,
   type RePairCtaInputs,
 } from "./web-integration-banner-logic";
 
@@ -179,5 +182,173 @@ describe("statusSignature", () => {
     expect(statusSignature(baseFreshInstall, false)).toBe(
       statusSignature({ ...baseFreshInstall }, false),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Coord-credential posture (plan 2026-09-12, Phase 2)
+//
+// The defect: a runner booted holding an expired coord device JWT, `/health`
+// read healthy, no banner fired, and every session it spawned silently had no
+// coord access. The banner is the user-visible half of the fix, so the rules
+// that could re-silence it — dismissal, and a signature that does not move
+// when the posture does — are pinned here.
+// ---------------------------------------------------------------------------
+
+const darkExpired: CredentialDarkSignal = {
+  dark: true,
+  cause: "expired",
+  message:
+    "the coord credential this runner holds has EXPIRED. Sessions spawned now have no coord access.",
+  cta: "retry_refresh",
+  since: 1_757_649_240, // 2026-09-12T03:54:00Z
+};
+
+const stubTime = () => "03:54";
+
+describe("credential-dark banner visibility", () => {
+  it("shows while dark even though the user dismissed the CURRENT signature", () => {
+    // A dismissed credential banner is a silent runner again — the exact state
+    // the plan exists to end. Dismissal may not win over `dark`.
+    const sig = statusSignature(baseFreshInstall, false, darkExpired);
+    expect(shouldShowAuthBanner(baseFreshInstall, false, sig, darkExpired)).toBe(true);
+  });
+
+  it("shows while dark even when the runner is PAIRED and the user opted out", () => {
+    // Both of these normally hide the banner, and both say nothing useful
+    // here: a paired runner holding an expired credential has a device JWT and
+    // is still spawning sessions with no coord access.
+    const paired: AuthBannerStatus = { ...baseFreshInstall, enabled: false };
+    expect(shouldShowAuthBanner(paired, true, null, darkExpired)).toBe(true);
+  });
+
+  it("shows while dark even before status has loaded", () => {
+    // The credential signal arrives from the refresher's BOOT pass, which can
+    // beat `get_web_integration_status`. A null status must not swallow it.
+    expect(shouldShowAuthBanner(null, false, null, darkExpired)).toBe(true);
+  });
+
+  it("CLEARS on dark:false — a stale banner after recovery teaches users to ignore it", () => {
+    const recovered: CredentialDarkSignal = {
+      dark: false,
+      cause: "recovered",
+      message: "Coord access restored — this runner's credential is live again.",
+      cta: null,
+      since: null,
+    };
+    // Recovered + paired + nothing else wrong → nothing to show.
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null, recovered)).toBe(false);
+    // …and the pre-existing rules are untouched by the recovered signal.
+    expect(shouldShowAuthBanner(baseFreshInstall, false, null, recovered)).toBe(true);
+  });
+
+  it("keeps the historical behaviour when no credential signal exists", () => {
+    // Every pre-existing call site passes no fourth argument.
+    expect(shouldShowAuthBanner(baseFreshInstall, false, null)).toBe(true);
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null)).toBe(false);
+  });
+});
+
+describe("statusSignature carries the credential posture", () => {
+  it("differs between healthy and dark, so a dismissed banner RESURFACES", () => {
+    // The hole this closes: the signature was
+    // `enabled | deviceJwtPresent | registrationError` — none of which moves
+    // when the coord credential expires. A banner dismissed while healthy
+    // stayed dismissed through the transition that mattered.
+    const dismissedWhileHealthy = statusSignature(baseFreshInstall, false, null);
+    expect(statusSignature(baseFreshInstall, false, darkExpired)).not.toBe(dismissedWhileHealthy);
+    expect(shouldShowAuthBanner(baseFreshInstall, false, dismissedWhileHealthy, darkExpired)).toBe(
+      true,
+    );
+  });
+
+  it("differs PER CAUSE, so expired -> unrefreshable resurfaces too", () => {
+    const unrefreshable: CredentialDarkSignal = { ...darkExpired, cause: "unrefreshable" };
+    const dismissedAtExpired = statusSignature(baseFreshInstall, false, darkExpired);
+    expect(statusSignature(baseFreshInstall, false, unrefreshable)).not.toBe(dismissedAtExpired);
+  });
+
+  it("is unchanged for callers that pass no credential signal", () => {
+    expect(statusSignature(baseFreshInstall, false)).toBe(
+      statusSignature(baseFreshInstall, false, null),
+    );
+  });
+});
+
+describe("credentialDarkPresentation", () => {
+  it("renders the cause, the time it started, and the CTA that cause needs", () => {
+    const p = credentialDarkPresentation(darkExpired, stubTime);
+    expect(p.title).toBe("Coord credential expired");
+    expect(p.body).toContain("Since 03:54");
+    expect(p.body).toContain("no coord access");
+    expect(p.ctaLabel).toBe("Retry refresh now");
+    // "Retry refresh now" needs NO new command — it kicks the existing
+    // device-JWT refresher.
+    expect(p.ctaAction).toBe("kick_refresher");
+  });
+
+  it("names each cause distinctly", () => {
+    const titleFor = (cause: string) =>
+      credentialDarkPresentation({ ...darkExpired, cause }, stubTime).title;
+    const titles = [
+      titleFor("cognito_hard"),
+      titleFor("expired"),
+      titleFor("unrefreshable"),
+      titleFor("absent"),
+      titleFor("upstream_401"),
+    ];
+    expect(new Set(titles).size).toBe(titles.length);
+    expect(titleFor("unrefreshable")).toContain("automatic refresh failed");
+    expect(titleFor("upstream_401")).toContain("rejecting");
+  });
+
+  it("routes the HARD Cognito cause to the interactive sign-in", () => {
+    const p = credentialDarkPresentation(
+      { ...darkExpired, cause: "cognito_hard", cta: "sign_in" },
+      stubTime,
+    );
+    expect(p.ctaAction).toBe("cognito_sign_in");
+    expect(p.ctaLabel).toBe("Sign in");
+  });
+
+  it("omits the time prefix when the runner did not say since when", () => {
+    const p = credentialDarkPresentation({ ...darkExpired, since: null }, stubTime);
+    expect(p.body.startsWith("Since")).toBe(false);
+    expect(p.body).toContain("no coord access");
+  });
+
+  it("still renders a banner for a cause this frontend does not know", () => {
+    // A newer runner binary may emit a cause this build has never heard of.
+    // Falling through to nothing would re-create the silence.
+    const p = credentialDarkPresentation({ ...darkExpired, cause: "some_future_cause" }, stubTime);
+    expect(p.title).toBe("Coord credential problem");
+    expect(p.body).toContain("no coord access");
+  });
+});
+
+describe("normalizeCredentialDarkSignal", () => {
+  it("accepts the widened payload verbatim", () => {
+    expect(normalizeCredentialDarkSignal({ ...darkExpired })).toEqual(darkExpired);
+  });
+
+  it("upgrades a LEGACY {dark, message} payload from an older runner build", () => {
+    // The event is emitted by the runner BINARY; this frontend can be running
+    // against a build that predates the widened payload. A runner that says
+    // "I am dark" in the old shape is exactly as dark.
+    const legacy = normalizeCredentialDarkSignal({ dark: true, message: "paused" });
+    expect(legacy).toEqual({
+      dark: true,
+      cause: "cognito_hard",
+      message: "paused",
+      cta: "sign_in",
+      since: null,
+    });
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null, legacy)).toBe(true);
+  });
+
+  it("drops a payload that is not a credential signal at all", () => {
+    expect(normalizeCredentialDarkSignal(null)).toBeNull();
+    expect(normalizeCredentialDarkSignal("dark")).toBeNull();
+    expect(normalizeCredentialDarkSignal({ message: "no dark flag" })).toBeNull();
   });
 });
