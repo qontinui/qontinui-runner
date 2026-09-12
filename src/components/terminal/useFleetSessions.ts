@@ -297,11 +297,17 @@ export function emptyReasonFor(
  *
  * Activity order is imposed HERE rather than inherited from coord, because
  * coord no longer serves it. Since qontinui-coord#2085 the fleet walk is
- * `started_at DESC`: a heartbeat rewrites `last_heartbeat_at` every few
- * seconds, and a cursor walking a key that moves silently drops rows. So rows
- * ARRIVE in start order, and without this sort a session started three days ago
- * and heartbeating now would sit below one started an hour ago that went quiet.
- * See {@link activityInstant} for the key.
+ * `started_at DESC`: a heartbeat rewrites `last_heartbeat_at` (every 15 s by
+ * default, the runner's `DEFAULT_HEARTBEAT_SECS`), and a cursor walking a key
+ * that moves silently drops rows. So rows ARRIVE in start order, and without
+ * this sort a loaded session started three days ago and heartbeating now would
+ * sit below one started an hour ago that went quiet. See
+ * {@link activityInstant} for the key.
+ *
+ * It orders what is LOADED, and nothing else. A row the walk has not reached
+ * cannot be placed. Before #2085 a long-running, currently-active session
+ * tended to arrive on page 1; now it may sit on a page not yet loaded.
+ * Reordering cannot fix that — only walking further can.
  *
  * The local-device-first ordering is deliberate: the picker exists to reach
  * REMOTE sessions, and putting the operator's own box at the top is what makes
@@ -316,13 +322,28 @@ export interface FleetDeviceGroup {
 }
 
 /**
- * The instant a row is ordered by within its device: its last heartbeat, else
- * its start. Absent or unparseable sorts LAST: a row coord could not date is
- * not evidence of recent activity.
+ * One of coord's instants in a form every JS engine must parse.
+ *
+ * coord serializes `DateTime<Utc>` as RFC 3339 with MICROSECOND precision
+ * (`2026-09-12T10:00:00.123456Z`). More than three fractional digits is
+ * outside ECMAScript's date-time string format, so whether `Date.parse`
+ * accepts it is up to the engine. V8 does; WebKit is not guaranteed to, and a
+ * NaN there would silently sink every row to the bottom of its group.
+ * Trimming to milliseconds yields the standard form, which only drops the
+ * sub-millisecond digits.
+ */
+export function normalizeCoordInstant(v: string): string {
+  return v.replace(/(\.\d{3})\d+/, "$1");
+}
+
+/**
+ * The instant a row is ordered by within its device: its last heartbeat if that
+ * parses, else its start. A row with NEITHER usable sorts last — a row coord
+ * could not date is not evidence of recent activity.
  */
 export function activityInstant(s: FleetSession): number {
   for (const v of [s.lastHeartbeatAt, s.startedAt]) {
-    const t = v ? Date.parse(v) : Number.NaN;
+    const t = v ? Date.parse(normalizeCoordInstant(v)) : Number.NaN;
     if (!Number.isNaN(t)) return t;
   }
   return Number.NEGATIVE_INFINITY;
@@ -331,10 +352,14 @@ export function activityInstant(s: FleetSession): number {
 /**
  * Newest activity first, with the session id as a total tiebreak so equal
  * instants do not reorder between renders. Two undated rows give `-Inf - -Inf`,
- * which is `NaN` and falsy, so they fall through to the id as well.
+ * which is `NaN` and falsy, so they fall through to the id as well. The id
+ * comparison is a plain code-unit one, so the order does not depend on locale.
  */
 function byActivityDesc(a: FleetSession, b: FleetSession): number {
-  return activityInstant(b) - activityInstant(a) || a.sessionId.localeCompare(b.sessionId);
+  const byInstant = activityInstant(b) - activityInstant(a);
+  if (byInstant) return byInstant;
+  if (a.sessionId === b.sessionId) return 0;
+  return a.sessionId < b.sessionId ? -1 : 1;
 }
 
 export function groupByDevice(sessions: FleetSession[]): FleetDeviceGroup[] {
