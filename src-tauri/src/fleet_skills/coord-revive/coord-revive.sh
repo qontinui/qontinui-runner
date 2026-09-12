@@ -834,7 +834,7 @@ fi
 # Named loudly: every probe stages its auth header here, so a silent failure
 # would surface later as AUTH_HEADER_STAGING_FAILED with an empty path — the
 # symptom without the cause.
-TMPD="$(mktemp -d)" || { echo "coord-revive: ERROR: mktemp -d failed — cannot stage probe headers." >&2; exit 127; }
+TMPD="$(mktemp -d)" || { echo "$DOOR_SCRIPT_NAME: ERROR: mktemp -d failed — cannot stage probe headers (LOCAL fault, not a coord verdict)." >&2; exit 127; }
 trap 'rm -rf "$TMPD"' EXIT
 
 FAILS=()
