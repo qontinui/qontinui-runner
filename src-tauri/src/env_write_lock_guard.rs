@@ -468,6 +468,10 @@ fn every_env_writing_test_holds_the_shared_env_lock() {
     // Non-vacuity: the detector must actually be finding the (locked)
     // env-writing tests this binary is known to have. If it drops to a
     // handful, the detector broke — not the tree.
+    // Printed, not just compared: the floor is deliberately slack, so the doc
+    // figure beside [`MIN_ENV_WRITING_TESTS`] would otherwise be unverifiable
+    // trust. `cargo test -- --nocapture <this test>` re-measures it.
+    eprintln!("env-writing test fns detected: {env_writing_tests} (floor {MIN_ENV_WRITING_TESTS})");
     assert!(
         env_writing_tests > MIN_ENV_WRITING_TESTS,
         "found only {env_writing_tests} env-writing test fns — the detector has stopped \
@@ -562,8 +566,12 @@ mod tests {
 
     // ---- KNOWN MISSES ----------------------------------------------------
     // Each pins one bullet of the module doc's `# Known limits`, so closing a
-    // limit fails the loop in the self-test rather than passing silently. All
-    // four write the process env for real and none is flagged.
+    // limit fails the loop in the self-test rather than passing silently. Four
+    // are here and the fifth, `unlocked_after_a_helper_released_the_lock`, is
+    // below with the locked fixtures it resembles. Three of these four write
+    // the process env for real; `unlocked_via_an_unlisted_cross_file_helper`
+    // does not — its write lives in the (deliberately absent) helper it names,
+    // so what it pins is that an unrecognised callee name is not a writer.
     #[test]
     fn unlocked_via_an_aliased_mutator() {
         use std::env as e;
@@ -666,7 +674,12 @@ mod tests {
     #[test]
     fn a_method_named_set_var_is_not_the_process_env() {
         let mut cmd = Builder::default();
-        cmd.set_var("K", "v");
+        // INSIDE a macro on purpose: `scan_tokens`'s `is_method` check is the
+        // only method exclusion left, and it runs on macro tokens alone.
+        assert!({
+            cmd.set_var("K", "v");
+            true
+        });
         let _ = "std::env::set_var(\"K\", \"v\")";
     }
 }
@@ -702,6 +715,16 @@ mod tests {
             "reach through a METHOD is not closed: impl fns are keyed `Type::name`",
         ),
     ] {
+        // Absence has to mean "still missed", not "fixture deleted". Four of
+        // these five are not writers under the rule, so they contribute nothing
+        // to `env_writing_tests` and appear in no other assertion: without this
+        // anchor, renaming or dropping one leaves the negative below trivially
+        // true and the module doc's "each bullet has a fixture" quietly false.
+        assert!(
+            SRC.contains(&format!("fn {miss}(")),
+            "known-miss fixture `{miss}` is gone, so the `# Known limits` bullet it pins \
+             ({limit}) is pinned by nothing. Restore it or update the doc."
+        );
         assert!(
             !names.contains(&miss),
             "`{miss}` is now FLAGGED, so the guard has closed a documented limit \
@@ -726,7 +749,10 @@ mod tests {
     );
     // 10 unlocked + 1 known miss + 7 locked writers. `only_reads` and
     // `a_method_named_set_var_is_not_the_process_env` are not writers: a method
-    // call is an edge, never a `std::env` write.
+    // call is not recorded at all — see `# Known limits`. That fixture puts its
+    // `cmd.set_var(..)` inside a macro so it pins the ONE method exclusion that
+    // still exists, `is_method` in [`scan_tokens`]; outside a macro there would
+    // be no branch left to pin.
     assert_eq!(report.env_writing_tests, 18);
 
     // The line it reports is the fn's own line (proc-macro2 `span-locations`),
