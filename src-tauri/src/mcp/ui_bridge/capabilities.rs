@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
+use crate::spec_api::storage::RUNNER_APP_ID;
 
 use super::helpers::compute_snapshot_diff;
 use super::request::{handle_ui_bridge_response, ui_bridge_request_sync};
@@ -556,7 +557,10 @@ pub async fn ui_bridge_control_batch_execute_handler(
 pub async fn ui_bridge_capabilities_handler() -> Json<ApiResponse<serde_json::Value>> {
     Json(ApiResponse::success(serde_json::json!({
         "version": "0.3.1",
-        "appId": "qontinui-runner",
+        // The same constant the frontend stamps into every snapshot as `appId`
+        // and `project.apps` is self-registered under — one id, never a
+        // second literal (see `state_discovery::capture::resolve_app_id`).
+        "appId": RUNNER_APP_ID,
         "appType": "desktop",
         "framework": "tauri",
         "categories": {

@@ -1484,7 +1484,9 @@ async fn health(
         "success": true,
         "data": data,
         "uiBridge": {
-            "appId": "qontinui-runner",
+            // Same constant the snapshot enricher stamps and `project.apps`
+            // is self-registered under — one id, never a second literal.
+            "appId": crate::spec_api::storage::RUNNER_APP_ID,
             "appName": "Qontinui Runner",
             "appType": "desktop",
             "framework": "tauri",
