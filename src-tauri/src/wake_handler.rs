@@ -41,10 +41,11 @@ pub const SCHEME: &str = "qontinui";
 pub const WAKE_HOST: &str = "wake";
 
 /// P2 runner-native GitHub claim return host:
-/// `qontinui://github-connected?code=…&installation_id=…&state=…`. The web
-/// connect flow deep-links back here after the user installs/authorizes the
-/// GitHub App, and the runner completes the claim itself (see
-/// `setup_wizard::claim_github_connection` for the nonce threat model).
+/// `qontinui://github-connected?code=…&installation_id=…&state=…&connect_state=…`.
+/// The web connect flow deep-links back here after the user installs/authorizes
+/// the GitHub App, and the runner completes the claim itself (see
+/// `setup_wizard::claim_github_connection` for the nonce threat model and for
+/// what `connect_state` — coord's own tenant-binding token — is doing here).
 pub const GITHUB_CONNECTED_HOST: &str = "github-connected";
 
 /// Tauri event emitted to the frontend when a `github-connected` deep-link
@@ -128,8 +129,9 @@ fn handle_url(app: AppHandle, url: &Url, raw: &str) {
             .query_pairs()
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
             .collect();
-        // SECURITY: never log `raw`, `code`, or `state` for this host — the
-        // URL carries a live OAuth authorization code + the connect nonce.
+        // SECURITY: never log `raw`, `code`, `state` or `connect_state` for
+        // this host — the URL carries a live OAuth authorization code, the
+        // connect nonce and coord's single-use connect-state token.
         let installation_id = params.get("installation_id").cloned();
         info!(
             "Received github-connected deep-link (installation_id={:?})",
@@ -169,6 +171,18 @@ async fn handle_github_connected(app: AppHandle, params: HashMap<String, String>
                 .map(|v| GithubClaimTarget::AccountLogin(v.clone()))
         });
 
+    // coord's tenant-binding token, minted by the browser before the GitHub
+    // hop and forwarded on the deep link (qontinui-web `buildRunnerDeepLink`).
+    // Optional here, not required: a web build that predates forwarding it
+    // sends none, and whether a stateless claim is acceptable is coord's call
+    // (`COORD_REQUIRE_CONNECT_STATE`), so it is passed through as-is and a
+    // refusal comes back as coord's own `{error, message}` envelope, which
+    // `setup_wizard::claim_error_message` renders for the result event.
+    let connect_state = params
+        .get("connect_state")
+        .filter(|v| !v.is_empty())
+        .cloned();
+
     let outcome = match (
         params.get("code").filter(|v| !v.is_empty()),
         target,
@@ -179,6 +193,7 @@ async fn handle_github_connected(app: AppHandle, params: HashMap<String, String>
                 code.clone(),
                 target,
                 state.clone(),
+                connect_state,
             )
             .await
         }
@@ -293,7 +308,7 @@ mod tests {
     #[test]
     fn parses_github_connected_url() {
         let url = Url::parse(
-            "qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef",
+            "qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef&connect_state=0a1b2c",
         )
         .unwrap();
         assert_eq!(url.scheme(), SCHEME);
@@ -310,6 +325,26 @@ mod tests {
             Some(143833618)
         );
         assert_eq!(params.get("state").map(String::as_str), Some("deadbeef"));
+        assert_eq!(
+            params.get("connect_state").map(String::as_str),
+            Some("0a1b2c")
+        );
+    }
+
+    #[test]
+    fn github_connected_url_without_connect_state_still_parses() {
+        // A web build that predates forwarding the token sends none; the
+        // parameter is optional at THIS layer and coord decides what a
+        // stateless claim is worth.
+        let url = Url::parse(
+            "qontinui://github-connected?code=abc123&installation_id=143833618&state=deadbeef",
+        )
+        .unwrap();
+        let params: HashMap<String, String> = url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        assert_eq!(params.get("connect_state").filter(|v| !v.is_empty()), None);
     }
 
     #[test]

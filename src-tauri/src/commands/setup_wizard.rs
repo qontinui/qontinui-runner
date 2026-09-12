@@ -380,17 +380,97 @@ pub enum GithubClaimTarget {
     AccountLogin(String),
 }
 
+/// The claim body for `POST /api/v1/operations/pr-merge/onboarding/claim`.
+///
+/// `connect_state` is set only when present — omitted, not `null`, because the
+/// web proxy distinguishes an absent token from a null one and coord decides
+/// what an absent one is worth (`COORD_REQUIRE_CONNECT_STATE`).
+fn build_claim_body(
+    code: String,
+    target: &GithubClaimTarget,
+    connect_state: Option<String>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "code": code,
+        "bind_only": true,
+    });
+    if let Some(token) = connect_state {
+        body["connect_state"] = serde_json::json!(token);
+    }
+    match target {
+        GithubClaimTarget::InstallationId(id) => {
+            body["installation_id"] = serde_json::json!(id);
+        }
+        GithubClaimTarget::AccountLogin(login) => {
+            body["account_login"] = serde_json::json!(login);
+        }
+    }
+    body
+}
+
+/// The human-readable reason a claim was refused, from whichever envelope the
+/// proxy handed back.
+///
+/// Two shapes reach here. The web proxy's own refusals are FastAPI's
+/// `{"detail": "…"}` (or `{"detail": {"message": "…"}}`). A coord refusal is
+/// passed through verbatim as `{"error": "<code>", "message": "…"}` — and that
+/// is the shape every connect-state refusal takes (`connect_state_required`,
+/// `connect_state_operator_mismatch`, the tenant mismatch), so until this read
+/// the top-level `message` those surfaced to the user as a bare
+/// "claim failed with status 403" with no pointer to the browser fallback.
+/// The code is appended when present so the message stays greppable against
+/// coord's `ClaimError`.
+fn claim_error_message(status: reqwest::StatusCode, body: &Value) -> String {
+    let detail = body.get("detail").and_then(|d| {
+        d.as_str().map(str::to_string).or_else(|| {
+            d.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
+    });
+    let message = detail.or_else(|| {
+        body.get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+    });
+    let code = body.get("error").and_then(|e| e.as_str());
+    match (message, code) {
+        (Some(m), Some(c)) => format!("{} ({})", m, c),
+        (Some(m), None) => m,
+        (None, Some(c)) => format!("claim failed with status {}: {}", status, c),
+        (None, None) => format!("claim failed with status {}", status),
+    }
+}
+
 /// Complete a runner-initiated GitHub App connect: validate + consume the
 /// `state` nonce, then claim the installation through the existing web proxy
 /// (`POST /api/v1/operations/pr-merge/onboarding/claim`) with the runner's own
 /// Cognito bearer, `bind_only: true` (D2 decision — the clone flow must never
 /// surprise a partner org with bootstrap PRs).
 ///
-/// Returns the human-readable outcome message. Never logs `code` or the nonce.
+/// `connect_state` is coord's tenant-binding token. The browser minted it on
+/// `/connect-runner-github` before the GitHub hop, and qontinui-web forwards
+/// it on the deep link because with `COORD_REQUIRE_CONNECT_STATE` armed —
+/// which coord's deployed taskdef does — a claim that presents no token is
+/// refused `connect_state_required` before anything is bound, whoever files
+/// it. It is forwarded verbatim when present and simply omitted when absent
+/// (an older web build) — coord, not this runner, decides what a stateless
+/// claim is worth. Note what the token changes about the bind: coord checks
+/// the runner's bearer against the token's tenant AND its minting operator,
+/// so the claim succeeds when this runner is signed in as the person who ran
+/// the browser flow (the ordinary case — this runner opened that page) and is
+/// refused otherwise. The web "Complete in this browser instead" fallback
+/// recovers THAT refusal (coord checks both before the OAuth exchange and
+/// before consuming the token); a refusal at the bind itself has already
+/// consumed both and the web page offers a restart instead.
+///
+/// Returns the human-readable outcome message. Never logs `code`, the nonce
+/// or the token.
 pub async fn claim_github_connection(
     code: String,
     target: GithubClaimTarget,
     state: String,
+    connect_state: Option<String>,
 ) -> Result<String, String> {
     take_connect_state_if_valid(&state)?;
 
@@ -405,20 +485,11 @@ pub async fn claim_github_connection(
         "{}/api/v1/operations/pr-merge/onboarding/claim",
         crate::api_config::get_api_base_url()
     );
-    let mut body = serde_json::json!({
-        "code": code,
-        "bind_only": true,
-    });
     let target_label = match &target {
-        GithubClaimTarget::InstallationId(id) => {
-            body["installation_id"] = serde_json::json!(id);
-            format!("installation_id={}", id)
-        }
-        GithubClaimTarget::AccountLogin(login) => {
-            body["account_login"] = serde_json::json!(login);
-            format!("account_login={}", login)
-        }
+        GithubClaimTarget::InstallationId(id) => format!("installation_id={}", id),
+        GithubClaimTarget::AccountLogin(login) => format!("account_login={}", login),
     };
+    let body = build_claim_body(code, &target, connect_state);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
@@ -449,16 +520,7 @@ pub async fn claim_github_connection(
         info!("Runner-native GitHub claim succeeded ({})", target_label);
         Ok("GitHub connected — your repositories are now available.".to_string())
     } else {
-        let msg = body
-            .get("detail")
-            .and_then(|d| {
-                d.as_str().map(str::to_string).or_else(|| {
-                    d.get("message")
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-            })
-            .unwrap_or_else(|| format!("claim failed with status {}", status));
+        let msg = claim_error_message(status, &body);
         warn!(
             "Runner-native GitHub claim failed ({}, status={}): {}",
             target_label, status, msg
@@ -1460,6 +1522,61 @@ mod tests {
     /// Whole nonce lifecycle in ONE test fn: the pending-flow slot is a global,
     /// so parallel test fns would race it (see the fleet note on global-state
     /// test flake). Sequential assertions inside one fn keep it deterministic.
+    #[test]
+    fn claim_body_forwards_connect_state_verbatim_and_omits_it_when_absent() {
+        let with = build_claim_body(
+            "gho_code".to_string(),
+            &GithubClaimTarget::InstallationId(4242),
+            Some("0a1b2c".to_string()),
+        );
+        assert_eq!(with["code"], "gho_code");
+        assert_eq!(with["bind_only"], true);
+        assert_eq!(with["installation_id"], 4242);
+        assert_eq!(with["connect_state"], "0a1b2c");
+
+        // Absent, not null: the proxy tells the two apart, and coord — not
+        // this runner — decides what a stateless claim is worth.
+        let without = build_claim_body(
+            "gho_code".to_string(),
+            &GithubClaimTarget::AccountLogin("acme".to_string()),
+            None,
+        );
+        assert_eq!(without["account_login"], "acme");
+        assert!(without.get("installation_id").is_none());
+        assert!(without.get("connect_state").is_none());
+    }
+
+    #[test]
+    fn claim_error_message_reads_both_envelopes() {
+        use reqwest::StatusCode;
+        // coord's refusal, passed through the proxy verbatim — the shape every
+        // connect-state refusal takes.
+        let coord = serde_json::json!({
+            "error": "connect_state_operator_mismatch",
+            "message": "connect-state was minted by a different operator"
+        });
+        assert_eq!(
+            claim_error_message(StatusCode::FORBIDDEN, &coord),
+            "connect-state was minted by a different operator (connect_state_operator_mismatch)"
+        );
+        // The proxy's own refusal (FastAPI `detail`).
+        let fastapi = serde_json::json!({ "detail": "Not authenticated" });
+        assert_eq!(
+            claim_error_message(StatusCode::UNAUTHORIZED, &fastapi),
+            "Not authenticated"
+        );
+        let nested = serde_json::json!({ "detail": { "message": "nested" } });
+        assert_eq!(
+            claim_error_message(StatusCode::BAD_REQUEST, &nested),
+            "nested"
+        );
+        // Nothing usable: the status is all there is.
+        assert_eq!(
+            claim_error_message(StatusCode::BAD_GATEWAY, &Value::Null),
+            "claim failed with status 502 Bad Gateway"
+        );
+    }
+
     #[test]
     fn connect_state_nonce_lifecycle() {
         // No pending flow → reject.
