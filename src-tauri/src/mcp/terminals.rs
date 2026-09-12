@@ -268,10 +268,17 @@ pub async fn create_terminal_handler(
     // Per-request account pin: resolve → validate → pre-seed CLAUDE_CONFIG_DIR
     // onto the PTY env (merged with the session env above, not replacing it).
     // Bogus name → 400, logged-out → 409 — same contract as /sessions/spawn.
+    // The trust arm follows the pin: a resolved account means workspace trust is
+    // DERIVED for that one account at the PTY seam (and the dial is warmed here,
+    // the async side, so the seam's sync gate does not decide on a cold cache);
+    // no account means it is chosen by whatever the caller types.
+    let mut trust_arm = crate::terminal::TrustArm::AccountChosenLater;
     if let Some(account) = request.account.as_deref().filter(|a| !a.is_empty()) {
         match crate::ai_provider::resolve_requested_account(account) {
             Ok(resolved) => {
+                trust_arm = crate::terminal::TrustArm::Pinned(Some(resolved.config_dir.clone()));
                 extra_env_vec.push(("CLAUDE_CONFIG_DIR".to_string(), resolved.config_dir));
+                crate::claude_session::trust_gate::warm_dial().await;
             }
             Err(e @ crate::ai_provider::AccountSelectError::NotInRoster { .. }) => {
                 return Err((StatusCode::BAD_REQUEST, Json(api_error(e.message()))));
@@ -305,6 +312,10 @@ pub async fn create_terminal_handler(
         // box has room. A door that quietly overrode the floor would let any
         // remote caller undo the machine owner's own protection.
         false,
+        // With `account` the caller resolved the account and pinned it above, so
+        // trust is derived for that one account; without it the account is chosen
+        // by whatever the caller types into the shell.
+        trust_arm,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {

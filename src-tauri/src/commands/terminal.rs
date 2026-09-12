@@ -205,6 +205,9 @@ pub async fn terminal_create(
             command,
             extra_env,
             create_resource_override,
+            // Operator-opened terminal (the Tauri `terminal_create` command):
+            // the account is chosen after this point.
+            crate::terminal::TrustArm::AccountChosenLater,
         )
     })
     .await
@@ -1832,9 +1835,13 @@ pub async fn terminal_migrate_session_account(
 /// `None` and skip the resolver entirely.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionCaptureHint {
-    /// Config dir the session launched under, if known. Continuation spawns
-    /// run under the runner's DEFAULT dir (no `CLAUDE_CONFIG_DIR`), so this is
-    /// `None` for them and the resolver scans every known config dir.
+    /// The account the session launches under — the `CLAUDE_CONFIG_DIR` the
+    /// caller RESOLVED (continuations pin the most-available token-bearing
+    /// account; a migration pins its destination). It is pinned onto the PTY
+    /// env, and it is the account workspace trust is derived for
+    /// (`TrustArm::Pinned`). `None` means the child inherits the ambient
+    /// default, which is a value, not an absence: trust is derived for the
+    /// ambient config, and the transcript resolver scans every known dir.
     pub config_dir: Option<String>,
     /// Working directory of the session — the transcript resolver's
     /// `project_path`.
@@ -2141,6 +2148,12 @@ pub(crate) fn create_terminal_session_backend(
         command,
         extra_env,
         resource_override,
+        // Every backend spawn pins the account it resolved (`capture_hint.config_dir`,
+        // the same field that became the `CLAUDE_CONFIG_DIR` pair above; `None`
+        // is the ambient default, gated as such), and execs an interactive
+        // `claude` — so trust is DERIVED for that account, never minted for every
+        // account on the box.
+        crate::terminal::TrustArm::Pinned(capture_hint.as_ref().and_then(|h| h.config_dir.clone())),
     )?;
 
     // Park the pre-acquired isolated edit context on the session so its

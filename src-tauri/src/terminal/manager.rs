@@ -47,6 +47,86 @@ fn workspace_trust_is_in_scope(dir: &str) -> bool {
     is_within(dir, &root)
 }
 
+/// How [`TerminalManager::create`] establishes Claude workspace trust for the
+/// PTY's directory — STATED by the caller, never inferred.
+///
+/// Stated rather than derived from `extra_env` for the reason `resource_override`
+/// is a required parameter on the same function: a default would let the next
+/// spawn surface inherit an answer nobody chose. The two arms differ in who
+/// knows the account, and therefore in whether the trust write can be derived
+/// at all (conjunct 3 of `claude_session::trust_gate` — "the write targets the
+/// exact `CLAUDE_CONFIG_DIR` the spawn will use").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustArm {
+    /// The caller has RESOLVED the account the child runs under — `None` is
+    /// the ambient default (`~/.claude.json`), a value and not an absence —
+    /// and pins it onto the PTY. Every backend spawn is this: the
+    /// gate-continuation and condition-check terminals, a looping agent, an
+    /// account-migration respawn, `POST /terminals` with `account`. These exec
+    /// `claude` INTERACTIVELY, the one child shape that hangs on the trust
+    /// dialog, and the coord-driven ones are unattended by construction. Trust
+    /// is DERIVED for that one account through the trust gate at the tenant's
+    /// dial strength (`SpawnSurface::InteractivePty`, so a withheld mint is a
+    /// refusal rather than a hang); a refusal refuses the spawn, as the gate's
+    /// own `spawn_blocked …` text.
+    Pinned(Option<String>),
+    /// The account is chosen AFTER this point — the frontend types
+    /// `CLAUDE_CONFIG_DIR=… claude …` into the PTY, or nothing Claude-shaped is
+    /// ever typed. Conjunct 3 is unanswerable by construction, so the write is
+    /// the documented every-account best-effort mint
+    /// (`TrustTargets::EveryKnownAccount`), never fatal. Conjunct 2 (parent
+    /// repo already trusted) is not enforced on this arm.
+    AccountChosenLater,
+}
+
+/// Apply one [`TrustArm`] to `working_dir`, BEFORE the PTY exists.
+///
+/// `child_pin` is the `CLAUDE_CONFIG_DIR` the caller actually put on the PTY
+/// env (read by the one shared reader, `TerminalSession::caller_pinned_config_dir`).
+/// On the pinned arm it must agree with the arm's own account: the two come from
+/// the same field at every call site today, and a disagreement is the runner's
+/// own drift — the write would land in one account while the child reads
+/// another, the silent no-op the gate's conjunct 3 exists to catch — so it is
+/// refused outright rather than gated.
+///
+/// Extracted from `create` so the arm selection — the load-bearing decision on
+/// this seam — is testable without opening a PTY.
+fn apply_trust_arm(
+    working_dir: &str,
+    trust: &TrustArm,
+    child_pin: Option<&str>,
+) -> Result<(), String> {
+    match trust {
+        TrustArm::Pinned(account) => {
+            if let (Some(pinned), Some(stated)) = (child_pin, account.as_deref()) {
+                if pinned != stated {
+                    return Err(format!(
+                        "terminal trust arm names account {stated} but the PTY is pinned to \
+                         {pinned}; refusing rather than deriving trust for an account the \
+                         child will not read"
+                    ));
+                }
+            }
+            let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
+                working_dir,
+                account.as_deref(),
+                crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
+            );
+            match gate.decision.refusal() {
+                Some(refusal) => Err(refusal),
+                None => Ok(()),
+            }
+        }
+        TrustArm::AccountChosenLater => {
+            crate::claude_session::workspace_trust::ensure_workspace_trusted(
+                working_dir,
+                crate::claude_session::workspace_trust::TrustTargets::EveryKnownAccount,
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Containment test on canonicalized paths, so `..` segments and Windows
 /// short/verbatim spellings cannot walk out of the root. Case-insensitive on
 /// Windows, where the filesystem is.
@@ -119,6 +199,12 @@ impl TerminalManager {
     /// an attended spawn (an operator who can be shown a dialog and asked) or an
     /// unattended one, and a default would let the next surface inherit an
     /// answer nobody chose. See [`crate::resource_guard`].
+    ///
+    /// `trust` is the same kind of parameter for the same reason: every surface
+    /// states whether it has resolved the account the child runs under
+    /// ([`TrustArm::Pinned`] — trust is derived for that account and a refusal
+    /// refuses the spawn) or whether the account is chosen later
+    /// ([`TrustArm::AccountChosenLater`] — the every-account best-effort mint).
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -131,6 +217,7 @@ impl TerminalManager {
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
+        trust: TrustArm,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -142,41 +229,33 @@ impl TerminalManager {
             })
             .unwrap_or_default();
 
-        // Pre-accept the Claude workspace-trust dialog for this directory before
-        // anything can be typed into the PTY. This is the drift-proof seam for
-        // it: several launch surfaces have the FRONTEND compose the
+        // Establish Claude workspace trust for this directory before anything
+        // can be typed into the PTY. This is the drift-proof seam for it:
+        // several launch surfaces have the FRONTEND compose the
         // `CLAUDE_CONFIG_DIR=… claude …` line and type it in, so the launch-spec
         // builder is not a complete chokepoint, but every one of them first
-        // creates a terminal here. Idempotent and best-effort — see
-        // `claude_session::workspace_trust`.
+        // creates a terminal here. WHICH arm runs is the caller's statement
+        // (`trust`, see [`TrustArm`]); the scope fence confines both arms to
+        // the workspace root and beneath it.
         //
-        // DELIBERATELY NOT routed through `claude_session::trust_gate` (Phase 2
-        // of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`),
-        // which gates every OTHER trust write. Stated rather than left implicit,
-        // because "the gate covers three of four minting sites" is exactly the
-        // kind of hole that reads as complete:
-        //
-        // * This surface is **operator-attended**. Creating a terminal is a
-        //   human act with a human present to answer a dialog, which is the
-        //   condition the trust control exists to produce. The gate exists for
-        //   the AUTONOMOUS spawns, where nobody is there to answer.
-        // * It has **no resolved account** — the frontend picks
-        //   `CLAUDE_CONFIG_DIR` afterwards and types it into the PTY — so
-        //   conjunct 3 ("the write targets the exact config dir the spawn will
-        //   use") is unanswerable here by construction, and `EveryKnownAccount`
-        //   is the documented consequence.
-        // * The scope fence above (`workspace_trust_is_in_scope`) already
-        //   confines it to the workspace root and below.
-        //
-        // What is genuinely NOT enforced here is conjunct 2 (parent repo already
-        // trusted). Adding it would need this synchronous constructor to read a
-        // config file per known account, which is affordable — the gap is scope,
-        // not cost, and it is the obvious next increment.
+        // Until the follow-up to `2026-08-20-worktree-spawn-autonomy-and-trust-
+        // preconditions` this seam was the one minting site NOT routed through
+        // `claude_session::trust_gate`, on the premise that it was
+        // operator-attended with no resolved account. That held for the
+        // operator's shells and was false for every backend spawn, which pins
+        // the account it resolved and execs an interactive `claude` — the one
+        // path that actually hangs on the dialog — so those fell through to the
+        // every-account mint, the ambient grant the plan names as its top risk.
+        // A refusal on the pinned arm is returned as the gate's own
+        // `spawn_blocked …` text, which the lifecycle-posting caller classifies
+        // with `trust_gate::is_spawn_blocked_refusal` rather than reporting a
+        // child that never existed as `exited`.
         if workspace_trust_is_in_scope(&working_dir) {
-            crate::claude_session::workspace_trust::ensure_workspace_trusted(
+            apply_trust_arm(
                 &working_dir,
-                crate::claude_session::workspace_trust::TrustTargets::EveryKnownAccount,
-            );
+                &trust,
+                TerminalSession::caller_pinned_config_dir(extra_env.as_deref()),
+            )?;
         }
 
         let page_id = page_id.unwrap_or_else(|| "default".to_string());
@@ -680,7 +759,93 @@ pub(crate) fn command_implies_bypass_permissions(argv: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::command_implies_bypass_permissions;
+    use super::{apply_trust_arm, command_implies_bypass_permissions, TrustArm};
+
+    fn account_with(projects: serde_json::Value) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path()
+                .join(crate::claude_session::workspace_trust::CONFIG_FILE),
+            serde_json::json!({ "projects": projects }).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The pinned arm: an already-trusted target passes at any dial, an
+    /// untrusted non-worktree target is refused at the strictest one, and the
+    /// refusal is the gate's prefix-classifiable text. Runs the real gate with
+    /// the dial override under the env lock; no PTY is opened.
+    #[test]
+    fn pinned_arm_derives_for_that_account_and_refuses_when_it_cannot() {
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["QONTINUI_TRUST_GATE_TIER"]);
+        std::env::set_var("QONTINUI_TRUST_GATE_TIER", "ask-first");
+
+        let target = tempfile::tempdir().unwrap();
+        let cwd = target.path().to_string_lossy().into_owned();
+        let key = crate::claude_session::workspace_trust::project_key(target.path()).unwrap();
+
+        let trusted = account_with(serde_json::json!({ key: { "hasTrustDialogAccepted": true } }));
+        let trusted_dir = trusted.path().to_string_lossy().into_owned();
+        assert_eq!(
+            apply_trust_arm(
+                &cwd,
+                &TrustArm::Pinned(Some(trusted_dir.clone())),
+                Some(&trusted_dir)
+            ),
+            Ok(())
+        );
+
+        let untrusted = account_with(serde_json::json!({}));
+        let untrusted_dir = untrusted.path().to_string_lossy().into_owned();
+        let err = apply_trust_arm(
+            &cwd,
+            &TrustArm::Pinned(Some(untrusted_dir.clone())),
+            Some(&untrusted_dir),
+        )
+        .expect_err("ask-first must refuse an underivable mint");
+        assert!(
+            crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "{err}"
+        );
+        // And nothing was written into the untrusted account's file.
+        let raw = std::fs::read_to_string(
+            untrusted
+                .path()
+                .join(crate::claude_session::workspace_trust::CONFIG_FILE),
+        )
+        .unwrap();
+        assert!(!raw.contains("hasTrustDialogAccepted"), "{raw}");
+    }
+
+    /// The arm's account and the PTY's actual pin are the same field at every
+    /// call site; if they ever diverge the seam refuses instead of deriving
+    /// trust for an account the child will not read.
+    #[test]
+    fn pinned_arm_refuses_a_pin_that_disagrees_with_the_stated_account() {
+        let target = tempfile::tempdir().unwrap();
+        let cwd = target.path().to_string_lossy().into_owned();
+        let err = apply_trust_arm(
+            &cwd,
+            &TrustArm::Pinned(Some("C:/claude/.claude-a".into())),
+            Some("C:/claude/.claude-b"),
+        )
+        .expect_err("a disagreeing pin is refused");
+        assert!(
+            err.contains(".claude-a") && err.contains(".claude-b"),
+            "{err}"
+        );
+        assert!(
+            !crate::claude_session::trust_gate::is_spawn_blocked_refusal(&err),
+            "runner drift is not a trust verdict: {err}"
+        );
+    }
+
+    // The every-account arm is deliberately NOT exercised here: it writes into
+    // every account config on the box (the real roster), which no unit test
+    // may touch. Its never-fatal property is `ensure_workspace_trusted`'s own
+    // contract, tested beside it.
 
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()

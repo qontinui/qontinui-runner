@@ -1232,11 +1232,8 @@ impl TerminalSession {
         // consumed by the loop below — a caller pin (backend continuation /
         // account-migration respawn) is the authoritative account for this
         // session and is what the spawn-time record must bind.
-        let caller_config_dir_value: Option<String> = extra_env.as_ref().and_then(|env| {
-            env.iter()
-                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
-                .map(|(_, v)| v.clone())
-        });
+        let caller_config_dir_value: Option<String> =
+            Self::caller_pinned_config_dir(extra_env.as_deref()).map(str::to_string);
         let caller_pinned_config_dir = caller_config_dir_value.is_some();
         if let Some(env) = extra_env {
             for (k, v) in env {
@@ -2107,6 +2104,24 @@ impl TerminalSession {
         // `credential_helper::non_interactive_git_env` for the three layers,
         // the precedence rationale, and the named trade-off.
         crate::credential_helper::apply_non_interactive_git_env_pty(cmd);
+    }
+
+    /// The `CLAUDE_CONFIG_DIR` a caller pinned onto this PTY through
+    /// `extra_env`, if any. An empty value is no pin.
+    ///
+    /// ONE reader for the two consumers that key a decision on it —
+    /// [`Self::spawn`], where the pin is the authoritative account the
+    /// spawn-time record binds, and `TerminalManager::create`, where a pin
+    /// means the account is RESOLVED and workspace trust for the directory is
+    /// derived for that one account rather than minted for every account on the
+    /// box. Two readers of the same `(key, value)` list would be the drift the
+    /// trust gate's conjunct 3 exists to catch.
+    pub(crate) fn caller_pinned_config_dir(extra_env: Option<&[(String, String)]>) -> Option<&str> {
+        extra_env?
+            .iter()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| v.as_str())
+            .filter(|v| !v.trim().is_empty())
     }
 
     /// The final env mutations applied to a PTY child before it is spawned:
@@ -4056,6 +4071,44 @@ mod tests {
             cmd.get_env("CLAUDE_CONFIG_DIR").and_then(|v| v.to_str()),
             Some("/caller/pinned"),
             "a caller pin must not be clobbered by the resolved dir"
+        );
+    }
+
+    /// The one pin reader `spawn` and `TerminalManager::create` share: a
+    /// `CLAUDE_CONFIG_DIR` entry is the pin, an empty one is no pin, and the
+    /// key is exact.
+    #[test]
+    fn caller_pinned_config_dir_reads_exactly_the_pin() {
+        let e = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert_eq!(TerminalSession::caller_pinned_config_dir(None), None);
+        assert_eq!(
+            TerminalSession::caller_pinned_config_dir(Some(&e(&[]))),
+            None
+        );
+        assert_eq!(
+            TerminalSession::caller_pinned_config_dir(Some(&e(&[(
+                "QONTINUI_SESSION_WORKTREES",
+                "x"
+            )]))),
+            None,
+            "an unrelated var is not a pin"
+        );
+        assert_eq!(
+            TerminalSession::caller_pinned_config_dir(Some(&e(&[("CLAUDE_CONFIG_DIR", "  ")]))),
+            None,
+            "an empty pin is no pin"
+        );
+        assert_eq!(
+            TerminalSession::caller_pinned_config_dir(Some(&e(&[
+                ("QONTINUI_SESSION_WORKTREES", "x"),
+                ("CLAUDE_CONFIG_DIR", "C:/claude/.claude-sales"),
+            ]))),
+            Some("C:/claude/.claude-sales")
         );
     }
 

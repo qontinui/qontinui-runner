@@ -924,6 +924,24 @@ async fn do_spawn(
                  retrying on the next tick, no backoff"
             );
         }
+        Err(e) if crate::claude_session::trust_gate::is_spawn_blocked_refusal(&e) => {
+            // The trust gate refused: workspace trust for the agent's home dir
+            // could not be DERIVED for the pinned account and the tenant's
+            // autonomy dial forbids minting it. Also a policy verdict, not a
+            // broken agent — but unlike the resource refusal it is
+            // DETERMINISTIC: the conjuncts and the dial do not change between
+            // ticks, so it DOES take the backoff. Retrying every 30 s would
+            // only re-log the same refusal; what changes it is an operator
+            // trusting the directory for that account, or the dial moving.
+            warn!(
+                agent = %def.id,
+                error = %e,
+                "looping_agent_supervisor: spawn refused by the workspace-trust gate — \
+                 a policy verdict, backing off; trust the agent's home dir for the pinned \
+                 account or move the tenant's autonomy dial"
+            );
+            note_spawn_failure(&def.id, now_ms);
+        }
         Err(e) => {
             warn!(
                 agent = %def.id,
@@ -1080,6 +1098,11 @@ async fn spawn_looping_agent_terminal(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
     };
+
+    // The PTY seam derives workspace trust for `selected_config_dir` through
+    // the trust gate's sync door; warm the dial from this async context so the
+    // first spawn after a runner start is not decided by a cold cache.
+    crate::claude_session::trust_gate::warm_dial().await;
 
     let (terminal_id, _coord_session) =
         crate::commands::terminal::create_tracked_terminal_session_backend(

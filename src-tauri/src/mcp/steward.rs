@@ -590,6 +590,9 @@ pub async fn steward_start_handler(
         // body (with lane/headroom/floor), and stewards are explicitly
         // restartable, so a refusal defers the steward rather than losing it.
         false,
+        // Interactive shell; the skill command is typed in afterwards and the
+        // account is chosen then, so the every-account mint applies.
+        crate::terminal::TrustArm::AccountChosenLater,
     ) {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);

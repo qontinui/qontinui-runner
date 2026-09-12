@@ -270,6 +270,9 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 // re-invokes with `resourceOverride: true` — see the field's
                 // doc. Nothing is ever assumed on the caller's behalf here.
                 a.resource_override,
+                // The account is chosen after this point, so the every-account
+                // mint applies.
+                crate::terminal::TrustArm::AccountChosenLater,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {
