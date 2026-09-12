@@ -481,12 +481,59 @@ fn csp_permits_eval(csp: &str) -> bool {
 ///   is not the one asking. A caller that reads `canAnswer: true` and still gets
 ///   a 403 has the typed code telling it which handshake step failed.
 /// * `coordMcpForwarder` — the `/coord-mcp*` family (JSON-RPC proxy, the
-///   enumerated reads, the write forwarder). Every route is nonce-gated, so it
-///   answers whenever this process is serving; what it CANNOT do is hand a
-///   caller its first nonce — that is `provisionSessionMint`'s job.
+///   enumerated reads, the write forwarder). Every route is nonce-gated and
+///   in-process, so the door is always SERVING; what decides `canAnswer` is
+///   whether the device JWT it forwards is alive — the runner's
+///   [`crate::mcp::device_jwt_refresher::CoordCredentialPosture`]. This field
+///   used to be a hard-coded `true` describing the shape alone, which is
+///   exactly the false positive the paragraph above rejects for `evalMint`.
+///   What it CANNOT do, at any posture, is hand a caller its first nonce —
+///   that is `provisionSessionMint`'s job.
 fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
+    credential_doors_health_with_posture(
+        frontend_ready,
+        crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.posture),
+    )
+}
+
+/// The pure half of [`credential_doors_health`]: the posture is passed in
+/// rather than read from the process-global cell, so the forwarder's verdict
+/// can be asserted for every posture without a running refresher.
+///
+/// `posture: None` is UNKNOWN — no refresher pass has run in this process yet.
+/// It is NOT rendered as either verdict: `canAnswer` is `null` and the reason
+/// says so. Defaulting it to `true` is precisely the false positive that let a
+/// runner with a dead credential read healthy for ten hours; defaulting it to
+/// `false` would manufacture a fault out of a missing measurement.
+fn credential_doors_health_with_posture(
+    frontend_ready: bool,
+    posture: Option<crate::mcp::device_jwt_refresher::CoordCredentialPosture>,
+) -> serde_json::Value {
     let marker = crate::coord_mcp::session_identity_marker_path();
     let marker_present = marker.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let forwarder_can_answer = match posture {
+        Some(p) => serde_json::Value::Bool(p.can_answer()),
+        None => serde_json::Value::Null,
+    };
+    let forwarder_reason: String = match posture {
+        Some(p) if p.can_answer() => format!(
+            "in-process and nonce-gated; it forwards with a freshly-read device JWT \
+             (coord-credential posture: {}) and never emits one. It cannot issue your \
+             FIRST nonce — that is provisionSessionMint",
+            p.as_str()
+        ),
+        Some(p) => format!(
+            "the door is serving, but this runner's coord credential is {} — {} A call \
+             forwarded now returns coord's 401, which is the RUNNER's credential and NOT \
+             your nonce. See /health.coordCredential",
+            p.as_str(),
+            p.message()
+        ),
+        None => "the door is serving, but the coord-credential posture is UNKNOWN — no \
+                 device-JWT refresher pass has completed in this process yet. UNKNOWN is \
+                 not health: read /health.coordCredential again once a pass has run"
+            .to_string(),
+    };
     serde_json::json!({
         "evalMint": {
             "canAnswer": frontend_ready && csp_allows_eval(),
@@ -522,14 +569,18 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
             "requiresWebview": false,
         },
         "coordMcpForwarder": {
-            // Nonce-gated, in-process, no WebView: it answers whenever this
-            // process is serving /health at all.
-            "canAnswer": true,
+            // READS THE POSTURE. This was a hard-coded literal `true`, which
+            // described the door's SHAPE — nonce-gated, in-process, no WebView
+            // — and never whether the JWT it forwards is alive. On 2026-09-12
+            // a runner restored an already-expired coord slot at boot and this
+            // field read `true` for ten hours while every forwarded call came
+            // back 401. The doc comment above already argued against reporting
+            // `canAnswer` off shape alone; this completes that argument.
+            "canAnswer": forwarder_can_answer,
+            "posture": posture.map(|p| p.as_str()),
             "transport": "POST /coord-mcp, GET /coord-mcp/claims/*, GET /coord-mcp/agent-*, \
                           GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*",
-            "reason": "in-process and nonce-gated; it forwards with a freshly-read device \
-                       JWT and never emits one. It cannot issue your FIRST nonce — that is \
-                       provisionSessionMint",
+            "reason": forwarder_reason,
             "requiresWebview": false,
         },
     })
@@ -1342,6 +1393,23 @@ async fn health(
         // out" for what is really a dead transport). This states the fact
         // instead of leaving it to be inferred from a timeout.
         "credentialDoors": credential_doors_health(frontend_ready),
+        // The runner's own coord-credential POSTURE (plan
+        // 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+        // Phase 1): `live | expiring | expired | absent | unrefreshable | dark`,
+        // derived every device-JWT refresher pass from the per-tenant slot
+        // pass's outcomes and the verdicts coord actually returned. `null`
+        // means UNKNOWN — no pass has completed in this process — and is NOT
+        // health. A runner that boots holding a dead credential is otherwise
+        // indistinguishable here from a healthy one, which is the whole
+        // defect: `derived_status: healthy` while every session it spawns has
+        // no coord access.
+        "coordCredential": crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .map(|s| s.to_json())
+            .unwrap_or_else(|| serde_json::json!({
+                "state": "unknown",
+                "reason": "no device-JWT refresher pass has completed in this process yet \
+                           — UNKNOWN, never 'healthy'",
+            })),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -5451,6 +5519,14 @@ async fn forward_coord_get(
                 .into_response();
         }
     };
+    // Coord-credential posture (plan 2026-09-12, Phase 1): coord's verdict on
+    // the DEVICE credential this door just presented. `proxy_request_gate`
+    // above admits only a device-bound nonce and a `sub_type == "device"`
+    // bearer, so a 401 here is genuinely about THIS RUNNER's credential — the
+    // input that makes a token with a future `exp` that coord refuses read
+    // `dark(upstream_401)` instead of `live`. A single answer never moves the
+    // posture; the threshold is a rate.
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(status, &bytes);
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -6428,6 +6504,15 @@ async fn forward_coord_write_post(
                 .into_response();
         }
     };
+    // Coord-credential posture (plan 2026-09-12, Phase 1): coord's verdict on
+    // the DEVICE credential this door just presented. `proxy_request_gate`
+    // above admits only a device-bound nonce and a `sub_type == "device"`
+    // bearer, so a 401 here is genuinely about THIS RUNNER's credential — the
+    // input that makes a token with a future `exp` that coord refuses read
+    // `dark(upstream_401)` instead of `live`. A single answer never moves the
+    // posture; the threshold is a rate.
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(status, &bytes);
+
     // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
     // front of it) did not reach a verdict on the content, so the write is
     // still worth keeping. A 4xx is NOT: that is coord refusing the body, and
@@ -13124,7 +13209,10 @@ mod coord_read_proxy_tests {
 /// credential store.
 #[cfg(test)]
 mod coord_provision_session_gate_tests {
-    use super::{coord_provision_session_handler, credential_doors_health, csp_allows_eval};
+    use super::{
+        coord_provision_session_handler, credential_doors_health_with_posture, csp_allows_eval,
+    };
+    use crate::mcp::device_jwt_refresher::{CoordCredentialPosture, DarkCause};
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
 
@@ -13278,7 +13366,13 @@ mod coord_provision_session_gate_tests {
     #[test]
     fn credential_doors_names_each_transport_and_never_leaks_a_secret() {
         for frontend_ready in [true, false] {
-            let v = credential_doors_health(frontend_ready);
+            // The forwarder's verdict now READS the coord-credential posture,
+            // so the door summary is only meaningful against a posture. `live`
+            // is the case this assertion used to pin as a hard-coded literal.
+            let v = credential_doors_health_with_posture(
+                frontend_ready,
+                Some(CoordCredentialPosture::Live),
+            );
 
             // The eval mint is gated on the frontend AND on the shipped CSP.
             // The frontend half is the original point: a headless runner must
@@ -13316,7 +13410,9 @@ mod coord_provision_session_gate_tests {
             // their verdict must not move with the frontend.
             assert_eq!(v["provisionSessionMint"]["requiresWebview"], false);
             assert_eq!(v["coordMcpForwarder"]["requiresWebview"], false);
+            // A LIVE posture is the only thing that makes this `true` now.
             assert_eq!(v["coordMcpForwarder"]["canAnswer"], true);
+            assert_eq!(v["coordMcpForwarder"]["posture"], "live");
             assert_eq!(
                 v["provisionSessionMint"]["handshakeHeader"],
                 "X-Qontinui-Loopback-Key"
@@ -13338,6 +13434,74 @@ mod coord_provision_session_gate_tests {
             assert!(!rendered.contains("runner-loopback-key"), "{rendered}");
             assert!(!rendered.to_lowercase().contains("bearer "), "{rendered}");
         }
+    }
+
+    /// THE regression this plan exists for: `coordMcpForwarder.canAnswer` was
+    /// a hard-coded `true` describing the door's SHAPE. On 2026-09-12 a runner
+    /// restored an already-expired coord slot at boot and `/health` advertised
+    /// this door as answerable for ten hours while every forwarded call came
+    /// back 401. The verdict must now move with the posture.
+    #[test]
+    fn coord_mcp_forwarder_can_answer_follows_the_credential_posture() {
+        let answering = [
+            CoordCredentialPosture::Live,
+            CoordCredentialPosture::Expiring,
+        ];
+        for posture in answering {
+            let v = credential_doors_health_with_posture(true, Some(posture));
+            assert_eq!(
+                v["coordMcpForwarder"]["canAnswer"], true,
+                "{} must advertise the forwarder",
+                posture.as_str()
+            );
+            assert_eq!(v["coordMcpForwarder"]["posture"], posture.as_str());
+        }
+
+        let dark = [
+            CoordCredentialPosture::Expired,
+            CoordCredentialPosture::Absent,
+            CoordCredentialPosture::Unrefreshable,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+        ];
+        for posture in dark {
+            let v = credential_doors_health_with_posture(true, Some(posture));
+            assert_eq!(
+                v["coordMcpForwarder"]["canAnswer"], false,
+                "{} must NOT advertise the forwarder",
+                posture.as_str()
+            );
+            assert_eq!(v["coordMcpForwarder"]["posture"], posture.as_str());
+            let reason = v["coordMcpForwarder"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(posture.as_str()),
+                "the refusal must NAME the posture, got: {reason}"
+            );
+            // The 2026-09-12 first diagnosis blamed the nonce. The reason must
+            // say outright that it is the runner's credential.
+            assert!(
+                reason.contains("RUNNER's credential") && reason.contains("NOT"),
+                "the refusal must not read as a nonce fault, got: {reason}"
+            );
+        }
+    }
+
+    /// UNKNOWN is neither verdict. No pass has run, so `canAnswer` is `null`
+    /// and the reason says why — defaulting it to `true` is the original
+    /// defect, and defaulting it to `false` invents a fault out of a missing
+    /// measurement.
+    #[test]
+    fn an_unknown_posture_renders_as_null_not_as_either_verdict() {
+        let v = credential_doors_health_with_posture(true, None);
+        assert!(
+            v["coordMcpForwarder"]["canAnswer"].is_null(),
+            "UNKNOWN must not render as a default: {v}"
+        );
+        assert!(v["coordMcpForwarder"]["posture"].is_null());
+        let reason = v["coordMcpForwarder"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("UNKNOWN") && reason.contains("not health"),
+            "got: {reason}"
+        );
     }
 }
 
