@@ -364,6 +364,17 @@ struct ConnectStateToken {
     expires_at: std::time::Instant,
 }
 
+/// Redacting `Debug`: the token is bearer-equivalent on the claim, so a
+/// `{:?}` (an `unwrap_err` in a test, a stray log) must never print it.
+impl std::fmt::Debug for ConnectStateToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectStateToken")
+            .field("token", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 impl ConnectStateToken {
     fn expired(&self) -> bool {
         std::time::Instant::now() >= self.expires_at
@@ -1780,37 +1791,38 @@ mod tests {
     #[test]
     fn parse_mint_response_token_and_deadline() {
         let ok = reqwest::StatusCode::OK;
-        let before = std::time::Instant::now();
+        // Life left as of just AFTER the parse: at most the expected TTL
+        // (the deadline was stamped before this `now`), and within a few
+        // seconds of it on any sane box.
+        let life_left = |minted: &ConnectStateToken| {
+            minted
+                .expires_at
+                .saturating_duration_since(std::time::Instant::now())
+        };
+        let slack = std::time::Duration::from_secs(5);
 
         // Coord's expiry is shorter than the local TTL → coord's wins, less
         // the margin.
         let short = serde_json::json!({ "connect_state": " tok ", "expires_in_seconds": 120 });
         let minted = parse_mint_response(ok, &short).unwrap();
         assert_eq!(minted.token, "tok");
-        let ttl = minted.expires_at.duration_since(before);
-        assert!(ttl <= std::time::Duration::from_secs(90), "ttl={ttl:?}");
-        assert!(ttl > std::time::Duration::from_secs(80), "ttl={ttl:?}");
+        let expected = std::time::Duration::from_secs(120) - CONNECT_STATE_EXPIRY_MARGIN;
+        let left = life_left(&minted);
+        assert!(left <= expected, "left={left:?}");
+        assert!(left > expected - slack, "left={left:?}");
         assert!(!minted.expired());
 
         // Coord's expiry is longer than the local TTL → the local TTL wins.
         let long = serde_json::json!({ "connect_state": "tok", "expires_in_seconds": 3600 });
-        let ttl = parse_mint_response(ok, &long)
-            .unwrap()
-            .expires_at
-            .duration_since(before);
-        assert!(ttl <= CONNECT_STATE_TTL, "ttl={ttl:?}");
+        let left = life_left(&parse_mint_response(ok, &long).unwrap());
+        assert!(left <= CONNECT_STATE_TTL, "left={left:?}");
+        assert!(left > CONNECT_STATE_TTL - slack, "left={left:?}");
 
         // No expiry field → the local TTL.
         let bare = serde_json::json!({ "connect_state": "tok" });
-        let ttl = parse_mint_response(ok, &bare)
-            .unwrap()
-            .expires_at
-            .duration_since(before);
-        assert!(ttl <= CONNECT_STATE_TTL, "ttl={ttl:?}");
-        assert!(
-            ttl > CONNECT_STATE_TTL - std::time::Duration::from_secs(5),
-            "ttl={ttl:?}"
-        );
+        let left = life_left(&parse_mint_response(ok, &bare).unwrap());
+        assert!(left <= CONNECT_STATE_TTL, "left={left:?}");
+        assert!(left > CONNECT_STATE_TTL - slack, "left={left:?}");
 
         // A coord expiry at or under the margin is already dead on arrival.
         let dead = serde_json::json!({ "connect_state": "tok", "expires_in_seconds": 10 });
