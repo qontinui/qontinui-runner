@@ -1378,6 +1378,46 @@ fn the_gated_constructors_are_used_in_production_code() {
     );
 }
 
+/// The PRODUCTION wiring of the gate, pinned lexically.
+///
+/// `CoordSync::new_for_test` answers "every tenant is presentable", which is
+/// right for the plumbing tests and would be catastrophic as a production
+/// default — and **no test would notice the swap**: the unit tests inject their
+/// own predicate, and the two scans above count only the `for_bound_*`
+/// spellings, which a permissive predicate leaves untouched. The gate would be
+/// reachable, gated, and permanently open. So assert the real predicate is what
+/// the drain path is constructed with.
+#[test]
+fn the_drain_path_wires_the_real_binding_predicate() {
+    let path = src_root().join("session/coord_sync.rs");
+    let body = fs::read_to_string(&path).expect("read session/coord_sync.rs");
+    let lines: Vec<&str> = body.lines().collect();
+    let test_ranges = cfg_test_ranges(&lines);
+
+    let mut wired = 0usize;
+    for i in 0..lines.len() {
+        if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+            continue;
+        }
+        // `device_holds_usable_binding` is a prefix of the `_cached` spelling,
+        // so either real predicate satisfies this; a test stub does not.
+        if code_only(&lines, i, i)
+            .contains("binding_check: crate::auth::device_holds_usable_binding")
+        {
+            wired += 1;
+        }
+    }
+
+    assert_eq!(
+        wired, 1,
+        "session/coord_sync.rs must wire `binding_check` to the REAL predicate exactly once in \
+         production code (found {wired}). A permissive predicate here — the value \
+         `new_for_test` uses — leaves every test green while the gate never fires: the unit \
+         tests inject their own, and the census scans count constructor spellings, not the \
+         predicate handed to them."
+    );
+}
+
 #[test]
 fn tenant_scope_kinds_are_a_closed_distinct_set() {
     let mut seen = std::collections::BTreeSet::new();

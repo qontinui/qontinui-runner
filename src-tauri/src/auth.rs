@@ -1709,6 +1709,7 @@ pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
 /// | [`TenantScope::Owned`] | the owning tenant is known | that binding's `device_jwt:<t>` slot |
 /// | [`TenantScope::Device`] | the bearer carries no tenancy on this route | the default binding's slot |
 /// | [`TenantScope::Unresolved`] | the row has an owner the caller could not resolve | the default slot on a single-bound device; **nothing** on a multi-bound one |
+/// | [`TenantScope::Unbacked`] | the owner is KNOWN and this device cannot present it | **nothing**, on either device shape |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TenantScope {
     /// The owning tenant is known. Present THAT binding's slot, and never
@@ -1799,7 +1800,8 @@ impl TenantScope {
     /// declared body tenant that the bearer lookup cannot back, and the write
     /// would go out unauthenticated under that id. That is the cross-tenant
     /// defect `repo_tenant` closes, reached through the device default instead
-    /// of the repo registry. An unbacked default is `Unresolved`: declare nothing.
+    /// of the repo registry. An unbacked default is [`TenantScope::Unbacked`]:
+    /// declare nothing, and present nothing either.
     pub fn for_bound_device_default(
         tenant: Option<Uuid>,
         device_is_bound_to: &dyn Fn(&Uuid) -> bool,
@@ -1833,8 +1835,9 @@ impl TenantScope {
     }
 
     /// Demote an `Owned(t)` this device cannot present to
-    /// [`TenantScope::Unresolved`], so a body can never declare a tenant the
-    /// bearer lookup will not back.
+    /// [`TenantScope::Unbacked`], so a body can never declare a tenant the
+    /// bearer lookup will not back — and so the bearer path presents nothing
+    /// rather than falling back to the default binding.
     ///
     /// The ONE place this gate is spelled — both gated constructors go through
     /// it, so the session carrier and the device-default carrier cannot drift
@@ -1924,6 +1927,7 @@ impl TenantScope {
 /// | `Owned(t)` | `t`'s slot | `t`'s slot |
 /// | `Device` | default slot | default slot |
 /// | `Unresolved` | default slot — **unchanged** | **unauthenticated** |
+/// | `Unbacked(t)` | **unauthenticated** | **unauthenticated** |
 ///
 /// The `Unresolved` row is the whole rule. A blanket *"unresolvable → send
 /// nothing"* would regress every correctly-configured single-tenant machine,
@@ -1957,10 +1961,18 @@ pub fn device_holds_usable_binding(tenant: &Uuid) -> bool {
 
 /// How long a [`device_holds_usable_binding_cached`] answer is reused.
 ///
-/// Short on purpose. The value it caches changes when the refresher re-mints a
-/// slot, so a long TTL would keep declaring nothing for minutes after the
-/// credential came back; a few seconds is enough to collapse a per-record or
-/// per-chunk burst into one read.
+/// Short on purpose, and the two directions are NOT symmetric.
+///
+/// A cached `false` only over-degrades: it keeps declaring nothing for a few
+/// seconds after the refresher re-minted the slot. A cached `true` is the
+/// direction that matters — inside the window the DECLARATION (this memo) and
+/// the BEARER (resolved live by `select_device_bearer`, which tests validity
+/// rather than presence) can disagree, so a slot that expires mid-walk yields a
+/// body declaring `t` on an unauthenticated request. That is the defect this
+/// gate exists to close, reachable for at most one TTL. The residual is
+/// accepted here rather than hidden: the alternative is deriving the
+/// declaration from the bearer that was actually attached, which is the right
+/// shape and a larger refactor of `attach_device_auth_for`'s contract.
 const BINDING_CACHE_TTL: Duration = Duration::from_secs(5);
 
 type BindingCache = std::collections::HashMap<Uuid, (bool, std::time::Instant)>;
@@ -2124,8 +2136,9 @@ pub fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilde
 /// the second is a cross-tenant write on every route where coord derives
 /// ownership from the verified bearer (`ident.require_tenant()`, which has no
 /// fallback). A caller can no longer spell that ambiguity: it states
-/// [`TenantScope::Device`], [`TenantScope::Owned`] or [`TenantScope::Unresolved`],
-/// and the D2 degrade in [`select_scoped_bearer`] does the rest.
+/// [`TenantScope::Device`], [`TenantScope::Owned`], [`TenantScope::Unresolved`]
+/// or [`TenantScope::Unbacked`], and the D2 degrade in
+/// [`select_scoped_bearer`] does the rest.
 ///
 /// Slot-miss posture is [`device_bearer_for`]'s and is unchanged: never another
 /// tenant's credential — degrade to unauthenticated.
@@ -2178,9 +2191,11 @@ pub fn attach_device_auth_blocking(
 ///
 /// The transport-independent core of [`attach_device_auth_for`] and
 /// [`attach_device_auth_blocking`]. Returns `None` when no credential is held
-/// (unpaired runner, non-default tenant slot miss) or when the D2 degrade
-/// fired (an `Unresolved` scope on a multi-bound device) — the caller then
-/// sends the request unauthenticated, which coord still accepts.
+/// (unpaired runner, non-default tenant slot miss), when the D2 degrade fired
+/// (an `Unresolved` scope on a multi-bound device), or when the scope is
+/// [`TenantScope::Unbacked`] — a KNOWN owner this device cannot present, which
+/// yields no bearer on either device shape. The caller then sends the request
+/// unauthenticated, which coord still accepts.
 ///
 /// The returned token is only ever moved into a request header; it must never
 /// reach a log line or a process argument.
@@ -3404,9 +3419,13 @@ mod bearer_selection_tests {
 
     // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
     //
-    // Phase 6. The only caller is a site that already puts the device default
-    // on the wire (`fs_backstop`'s `CanonicalDriftRequest.tenant_id`), so the
-    // question these cover is not "which slot" but "what does the row say".
+    // Phase 6. Every caller is a site that already puts the device default on
+    // the wire — `fs_backstop`'s `CanonicalDriftRequest.tenant_id`, and (since
+    // the session-tenant gate) `coord_sync`'s `commit_report` header and its
+    // `POST /sessions` create body — so the question these cover is not "which
+    // slot" but "what does the row say". The two coord_sync callers are on a
+    // session-create path, where coord freezes the declared tenant for the
+    // session's life; that is why the `false` predicate arms below matter.
 
     #[test]
     fn or_device_default_never_declares_a_default_this_device_cannot_present() {
@@ -3414,9 +3433,11 @@ mod bearer_selection_tests {
         let s = TenantScope::Unresolved.or_device_default_with_count(Some(a), 1, &|_| false);
         assert_eq!(
             s,
-            TenantScope::Unresolved,
-            "a machine.json default with no usable slot must not become a declared \
-             body tenant the bearer cannot back"
+            TenantScope::Unbacked(a),
+            "a machine.json default with no usable slot must not become a declared body \
+             tenant the bearer cannot back — and `Unbacked` is strictly stronger than the \
+             `Unresolved` this once returned: it also stops the single-bound arm presenting \
+             the default slot for a row whose owner is known to be someone else"
         );
         assert_eq!(s.declared_tenant(), None);
     }

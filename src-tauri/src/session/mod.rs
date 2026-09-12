@@ -1252,13 +1252,18 @@ impl SessionRegistry {
     /// cross-tenant write `repo_tenant::scope_from_lookup` closes for a
     /// repo-derived tenant.
     ///
-    /// An unbacked tenant therefore degrades to [`TenantScope::Unresolved`],
-    /// where the D2 rule decides: unauthenticated on a multi-bound device, the
-    /// default slot on a single-bound one. On a single-bound device whose
-    /// session names a tenant it is not bound to — an unbound SPAWN tenant —
-    /// that means the device's only binding is presented and nothing is
-    /// declared, the same outcome `scope_from_lookup` chose for an unbacked
-    /// repo tenant. Refusing such a spawn at its source is P1 of plan
+    /// An unbacked tenant therefore degrades to [`TenantScope::Unbacked`],
+    /// which declares nothing AND presents nothing. It is deliberately not
+    /// [`TenantScope::Unresolved`]: that variant means *"I could not work out
+    /// who owns this"*, so D2's single-bound arm falls back to the default
+    /// binding — right when the owner is unknown, wrong here, where the owner
+    /// is positively known and is someone else. Falling back would present the
+    /// default binding's credential for another tenant's row, which is the
+    /// cross-tenant PRESENTATION the gate exists to prevent one level over
+    /// from the cross-tenant DECLARATION.
+    ///
+    /// The session shape that reaches this is an unbound SPAWN tenant;
+    /// refusing such a spawn at its source is P1 of plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`.
     pub(crate) fn tenant_scope_of_with(
         &self,
@@ -1589,7 +1594,7 @@ mod tests {
     /// pairing state — the same reason the sibling above holds an
     /// `IsolatedAmbient`.
     #[test]
-    fn a_session_tenant_with_no_usable_credential_is_unresolved() {
+    fn a_session_tenant_with_no_usable_credential_is_unbacked() {
         let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
         let (registry, _dir) = make_registry();
         let bound = Uuid::from_u128(0xB1);
@@ -1603,9 +1608,10 @@ mod tests {
         let holds = |t: &Uuid| *t == bound;
         assert_eq!(
             registry.tenant_scope_of_with(session.id(), &holds),
-            TenantScope::Unresolved,
-            "an unbacked session tenant must not stay Owned — a body would declare a \
-             tenant the bearer lookup cannot present"
+            TenantScope::Unbacked(unbound),
+            "an unbacked session tenant must not stay Owned — a body would declare a tenant \
+             the bearer lookup cannot present. It must also not become `Unresolved`, whose \
+             single-bound arm would present the DEFAULT binding for this row"
         );
         assert_eq!(
             registry

@@ -215,8 +215,10 @@ impl CoordSync {
     /// Test-only constructor. Pins the coord URL and runs heartbeats on
     /// the millisecond cadence the tests need without polluting global
     /// env vars.
-    /// Test constructor whose binding gate answers "this device can present
-    /// every tenant". That is the right DEFAULT for the existing suite: those
+    /// Test-only constructor. Pins the coord URL, runs heartbeats on the
+    /// millisecond cadence the tests need without polluting global env vars,
+    /// and answers the binding gate with "this device can present every
+    /// tenant". That last part is the right DEFAULT for the existing suite: those
     /// tests assert on tenant PLUMBING (which id reaches which body/slot), not
     /// on the gate, and a test box has no credential store, so the real
     /// predicate would answer `false` for every synthetic id and turn each of
@@ -2384,6 +2386,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_started_event_as_post_sessions() {
+        // The create arm reads `machine.json`'s default for an unstamped
+        // session, so the fixture owns that file rather than the box does
+        // (plan `2026-09-03-runner-tests-read-ambient-machine-state`).
+        let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2639,6 +2645,11 @@ mod tests {
 
         let g = rec.lock().await;
         assert_eq!(
+            g.posts.len(),
+            1,
+            "exactly one create POST, and no retry storm"
+        );
+        assert_eq!(
             g.posts[0]["tenant_id"],
             JsonValue::String(Uuid::nil().to_string()),
             "an unpresentable tenant must not be declared — coord resolves it server-side"
@@ -2725,6 +2736,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_treats_409_as_acked_for_started() {
+        // Same ambient read as the sibling above: the create arm consults the
+        // device default when the session carries no tenant.
+        let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
