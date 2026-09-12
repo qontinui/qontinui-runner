@@ -77,11 +77,21 @@ repos:
       # no gate at all: until now the only thing that named this test was a
       # comment saying "run me by hand", which is how a test stops being run.
       #
-      # Here rather than in ci.yml, deliberately. `ci.yml` is on
-      # `ci-integrity.yml`'s GATING_WORKFLOWS list, so a PR that edits it fails
-      # that check BY DESIGN and coord will not land it — adding the job would
-      # have made the PR carrying it unmergeable. That is a real constraint, not
-      # a preference; revisit only via a standalone workflow file.
+      # Here rather than in ci.yml — but NOT for the reason this comment used to
+      # give. It said `ci.yml` is on `ci-integrity.yml`'s `GATING_WORKFLOWS`
+      # list, so a PR editing it fails that check by design and is unmergeable.
+      # Neither half holds today. That hand-kept allowlist was replaced by the
+      # trigger itself, and the guard no longer reds a DECLARED change: adding a
+      # job to ci.yml is purely additive and needs only the
+      # `ci:gate-change=declared` label, which the authoring agent applies with
+      # `gh` and re-runs the job. (Altering an EXISTING job's surface is the
+      # stronger case — `ci:gate-change=alters-a-gate` plus a `Gate-Change:`
+      # line in the PR body.) So ci.yml is not closed to this hook.
+      #
+      # What still argues for pre-commit is the paragraph below, on its own
+      # merits rather than on a prohibition: it runs before the commit exists
+      # instead of after the PR does. Moving it into CI is a live option to be
+      # judged on that trade, not a blocked one.
       #
       # Triggered ONLY by edits to the decision or its test, so a normal commit
       # pays nothing. That is what lets it live at pre-commit at all: it needs no

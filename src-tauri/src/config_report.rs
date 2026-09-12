@@ -1879,10 +1879,16 @@ absence of a reading, NOT a finding that the generations agree.
     /// regenerate-and-`git diff --exit-code`), for two reasons. It runs
     /// unconditionally in `cargo test --lib` instead of behind that workflow's
     /// `detect` gate, so it cannot be skipped by a path filter; and a PR that
-    /// edits a gating workflow trips `ci-integrity.yml`'s self-edit guard by
-    /// design, which would make the anti-drift gate itself unmergeable through
-    /// the normal train. A stale doc fails an ordinary unit test here, rather
-    /// than a workflow that has to be able to edit itself to be maintained.
+    /// edits a workflow trips `ci-integrity.yml`'s self-edit guard by design,
+    /// which costs the author a declaration on every maintenance edit. Note what
+    /// that is NOT: it does not make such a gate unmergeable, and an earlier
+    /// version of this comment said it did. The guard reds a main-based PR until
+    /// the author declares the change (a label, plus a `Gate-Change:` body line
+    /// when an existing job surface moves) and then records it; no operator is
+    /// involved and nothing is blocked. So the second reason is a real but
+    /// modest cost, not a prohibition — a stale doc failing an ordinary unit
+    /// test here is simply cheaper than a workflow that must re-declare itself
+    /// every time it is maintained.
     ///
     /// Line endings are not a hazard: `.gitattributes` pins `*.md text eol=lf`,
     /// so the working-tree bytes `include_str!` reads are LF on every platform,

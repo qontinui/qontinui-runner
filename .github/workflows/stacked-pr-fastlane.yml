@@ -38,8 +38,25 @@ name: Stacked PR fast lane
 # of them required would block every ordinary PR forever on a context with no
 # producer — precisely the 2026-06-26 fleet wedge that ci-integrity.yml's header
 # documents, and precisely the absent-is-blocking arm that plan Phase 3 adds to
-# coord. Keep `required_status_checks.contexts` untouched; keep this file out of
-# ci-integrity.yml's GATING list (it gates nothing — it is an advisory lane).
+# coord. Leave the ruleset's required contexts untouched. There is no
+# ci-integrity.yml GATING list left to keep this file out of either: that
+# hand-kept allowlist was replaced by the trigger itself
+# (`.github/workflows/**`) minus a deliberately EMPTY NON_GATING list, precisely
+# because an allowlist fails open for every file nobody remembers to add. So
+# this file IS in ci-integrity's scope even though it gates nothing, and a
+# main-based PR editing it needs at least `ci:gate-change=declared` (or
+# `alters-a-gate` plus a `Gate-Change:` line per altered item — `<stem>#<job-key>`
+# for a job, `<stem>#workflow` outside `jobs:`, `Gate-Removal:` for a deletion).
+# A comment-only edit does not settle which label: this file's `run:` blocks hold
+# shell comments, and those ARE part of the digested scalar.
+#
+# With the blind spot this very file exists for: ci-integrity is
+# `pull_request_target: branches: [main]`, so a PR STACKED on another branch —
+# the lane below — fires no ci-integrity run at all, and an edit to any workflow
+# made on a stacked PR is unwitnessed by it until a PUSH to a main-based PR. A
+# re-target alone does not restore it: that fires the `edited` activity type,
+# which a default `pull_request_target` trigger does not listen for, and
+# ci-integrity declares no `workflow_dispatch` to invoke by hand.
 #
 # BUDGET CEILING — 40 billable minutes, absolute worst case.
 #

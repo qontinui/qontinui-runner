@@ -268,10 +268,13 @@ name: forbid untimed subprocess waits
 #
 # SELF-PROTECTION — ONLY THIS WORKFLOW FILE HAS IT, NOT THE CHECKER. ci-integrity.yml
 # triggers on `.github/workflows/**` and `.github/actions/**` alone, filters the
-# PR's changed files to those two prefixes, and digests each one's PARSED YAML
-# structure (jobs, triggers, permissions). So a PR that deletes this workflow or
-# changes its steps is flagged for operator review. But the entire verdict lives
-# in `scripts/check_untimed_subprocess.py`: BLOCKING_WAITS, the receiver resolver,
+# PR's changed files to those two prefixes, and digests each one's PARSED YAML —
+# WHOLE mappings, not a chosen list of fields, which is what makes new Actions
+# syntax captured by default. So a PR that deletes this workflow or changes its
+# steps is flagged: declared by its author and recorded, NOT sent for operator
+# review — that arm was retired in favour of declare-and-verify, and the guard's
+# own error text says "No operator is involved." But the entire verdict lives in
+# `scripts/check_untimed_subprocess.py`: BLOCKING_WAITS, the receiver resolver,
 # what suppresses a finding, the scope discovery, the baseline format check. That
 # file matches neither trigger glob, has no digest, and has no test file, so a PR
 # that neuters the gate by editing ONLY the checker gets ordinary PR review and
