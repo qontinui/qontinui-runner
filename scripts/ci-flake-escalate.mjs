@@ -24,7 +24,9 @@
  * — stable, so the upsert is idempotent: an existing open issue gets its
  * body refreshed, a closed one is reopened (the test flaked again after
  * someone closed it), and only a test with no issue at all gets a new one.
- * Every issue carries the `flake` label; the label is created on first use.
+ * The candidate set is every `flake`-labelled issue PLUS every issue whose
+ * title carries the prefix, so a hand-filed or de-labelled issue is adopted
+ * (and relabelled) rather than duplicated. The label is created on first use.
  *
  * THE FIRST ESCALATION WAS DONE BY HAND. Before this reader existed, a session
  * read the endpoint, found `wedge_diagnostics::tests::a_spinning_child_reports_meaningful_cpu`
@@ -57,7 +59,10 @@
  * EXIT CODES
  *   0  read was `ok` (issues upserted, or `--dry-run` printed the plan) or
  *      `thin` (nothing scorable yet — a notice, not an error).
- *   1  read was `failed`/unrecognised, or a `gh` write failed. Loud on purpose.
+ *   1  the read could not be taken as an observation (network failure,
+ *      non-2xx, non-JSON, `history_read: failed`, or an unrecognised body),
+ *      or any `gh` call — label, list, create, edit, reopen — failed. Loud on
+ *      purpose; nothing is filed on that path.
  *   2  CLI usage error.
  */
 
@@ -84,8 +89,8 @@ const FLAKE_LABEL_DESCRIPTION =
 /// GitHub caps issue titles at 256 characters. Titles are the upsert key, so
 /// a long test id is truncated DETERMINISTICALLY (with a digest suffix that
 /// keeps two long ids from colliding) rather than rejected.
-const TITLE_PREFIX = "flaky test: ";
-const MAX_TITLE_LEN = 250;
+export const TITLE_PREFIX = "flaky test: ";
+export const MAX_TITLE_LEN = 250;
 
 /// Bound the coord read. The read itself has been measured to fail
 /// server-side at ~60 s; a client bound above that lets coord report its own
@@ -220,11 +225,20 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, readAt
     `| read at | ${readAt ?? "?"} |`,
     `| escalated by | ${runUrl ? `[this run](${runUrl})` : "a manual run"} |`,
     ``,
+    `**Read the number before reading the word "flaky".** Every CI run ingests`,
+    `one row per platform leg under the SAME test id (coord's \`test_id\` carries`,
+    `no platform component), so a window of ${window ?? "N"} runs is ~${window ? Math.round(window / 2) : "N/2"} CI runs × 2`,
+    `legs. A rate near **0.500** with modal \`pass\` is therefore usually a test`,
+    `that fails DETERMINISTICALLY on one platform and passes on the other — the`,
+    `plan's own Phase 0 found 10 of 12 same-SHA disagreements were windows-only —`,
+    `not nondeterminism. Check the platform split (the \`shard\` column in`,
+    `\`coord.test_results\`, which this endpoint does not serve) before treating`,
+    `it as a flake.`,
+    ``,
     `Source: \`POST /coord/test-flakiness\` \`{"repo":"${repo ?? ""}"}\` — the rate is`,
     `coord's \`flakiness_priors\` over \`coord.test_results\`, filled by the`,
-    `\`Report test results to coord\` step of \`ci.yml\`. Platform split is not`,
-    `served by that endpoint (coord's \`test_id\` carries no platform component;`,
-    `the \`shard\` column does — see the plan's "Known limitation").`,
+    `\`Report test results to coord\` step of \`ci.yml\` (see the plan's "Known`,
+    `limitation" for why the platform is not in the key).`,
     ``,
     `**Root-cause it before touching the threshold.** Ask *test or production*`,
     `*defect?* first, and expect the answer to sometimes be production — that is`,
@@ -247,7 +261,10 @@ export function renderIssueBody(escalation, { repo, minK, window, runUrl, readAt
  * Match is on the EXACT title — that is the whole idempotency contract. An
  * open match is refreshed, a closed match is reopened and refreshed, and no
  * match creates. When two issues somehow share a title (a hand-filed
- * duplicate), the lowest-numbered one is the owner and the rest are named in
+ * duplicate), the owner is the lowest-numbered OPEN one — never a closed one
+ * while an open one exists, or the run would reopen a second issue for the
+ * same test while claiming to dedupe — and only when every match is closed
+ * is the lowest-numbered closed one reopened. The rest are named in
  * `duplicates` so the run can warn rather than pick silently.
  */
 export function planIssueActions(escalations, existingIssues) {
@@ -258,20 +275,22 @@ export function planIssueActions(escalations, existingIssues) {
     list.push(issue);
     byTitle.set(issue.title, list);
   }
+  const isClosed = (issue) => String(issue.state ?? "").toUpperCase() === "CLOSED";
   const actions = [];
   for (const escalation of escalations) {
     const title = issueTitle(escalation.testId);
     const matches = (byTitle.get(title) ?? [])
       .slice()
-      .sort((a, b) => Number(a.number) - Number(b.number));
+      .sort(
+        (a, b) => Number(isClosed(a)) - Number(isClosed(b)) || Number(a.number) - Number(b.number),
+      );
     if (matches.length === 0) {
       actions.push({ action: "create", title, escalation, duplicates: [] });
       continue;
     }
     const [owner, ...duplicates] = matches;
-    const closed = String(owner.state ?? "").toUpperCase() === "CLOSED";
     actions.push({
-      action: closed ? "reopen" : "update",
+      action: isClosed(owner) ? "reopen" : "update",
       title,
       number: owner.number,
       escalation,
@@ -335,8 +354,12 @@ async function readFlakiness(base, repo) {
   }
 }
 
-/** Run `gh` with the repo pinned; throws with stderr on failure. */
-function gh(args, { repo, input } = {}) {
+/**
+ * Run `gh` with the repo pinned (`GH_REPO`, which `gh` honours as an env
+ * override); throws with stderr on failure. `execFileSync` with an argv, never
+ * a shell — test ids flow into these arguments and must not be interpreted.
+ */
+function execGh(args, { repo, input } = {}) {
   return execFileSync("gh", args, {
     encoding: "utf8",
     input,
@@ -346,17 +369,19 @@ function gh(args, { repo, input } = {}) {
   });
 }
 
-function ensureLabel(repo) {
-  const raw = gh(["label", "list", "--search", FLAKE_LABEL, "--json", "name", "--limit", "100"], {
-    repo,
-  });
-  const names = JSON.parse(raw || "[]").map((l) => l.name);
-  if (names.includes(FLAKE_LABEL)) return false;
+/**
+ * Create-or-update the `flake` label. `--force` is what makes this idempotent
+ * under a case-different pre-existing `Flake` (label names are unique
+ * case-insensitively, so a list-then-create would 422) and under two runs
+ * racing the same first use.
+ */
+export function ensureLabel(repo, gh = execGh) {
   gh(
     [
       "label",
       "create",
       FLAKE_LABEL,
+      "--force",
       "--color",
       FLAKE_LABEL_COLOR,
       "--description",
@@ -364,29 +389,33 @@ function ensureLabel(repo) {
     ],
     { repo },
   );
-  return true;
 }
 
-function listFlakeIssues(repo) {
-  const raw = gh(
-    [
-      "issue",
-      "list",
-      "--label",
-      FLAKE_LABEL,
-      "--state",
-      "all",
-      "--limit",
-      "1000",
-      "--json",
-      "number,title,state",
-    ],
-    { repo },
+/**
+ * The issues the upsert matches against. Two lists, unioned by number: every
+ * `flake`-labelled issue, plus every issue whose title carries the prefix —
+ * so a hand-filed `flaky test: …` issue nobody labelled, or one whose label
+ * was removed, is still found and adopted (and relabelled by the edit)
+ * rather than duplicated. The exact-title match is `planIssueActions`'s.
+ */
+export function listFlakeIssues(repo, gh = execGh) {
+  const common = ["--state", "all", "--limit", "1000", "--json", "number,title,state"];
+  const labelled = JSON.parse(
+    gh(["issue", "list", "--label", FLAKE_LABEL, ...common], { repo }) || "[]",
   );
-  return JSON.parse(raw || "[]");
+  const titled = JSON.parse(
+    gh(["issue", "list", "--search", `"${TITLE_PREFIX.trim()}" in:title`, ...common], { repo }) ||
+      "[]",
+  );
+  const byNumber = new Map();
+  for (const issue of [...labelled, ...titled]) {
+    if (issue && issue.number !== undefined) byNumber.set(issue.number, issue);
+  }
+  return [...byNumber.values()];
 }
 
-function applyAction(action, body, repo) {
+/** Apply one planned action; returns the created URL or `#<number>`. */
+export function applyAction(action, body, repo, gh = execGh) {
   switch (action.action) {
     case "create": {
       const url = gh(
@@ -452,10 +481,9 @@ async function main(argv) {
     printUsage(process.stderr);
     return 2;
   }
-  const minOccurrences = parsed.values["min-occurrences"]
-    ? Number.parseInt(parsed.values["min-occurrences"], 10)
-    : DEFAULT_MIN_OCCURRENCES;
-  if (!Number.isInteger(minOccurrences) || minOccurrences < 1) {
+  const rawMin = parsed.values["min-occurrences"];
+  const minOccurrences = rawMin === undefined ? DEFAULT_MIN_OCCURRENCES : Number(rawMin);
+  if (!/^\d+$/.test(rawMin ?? "1") || !Number.isInteger(minOccurrences) || minOccurrences < 1) {
     process.stderr.write("ci-flake-escalate: --min-occurrences must be a positive integer\n");
     return 2;
   }
@@ -479,10 +507,10 @@ async function main(argv) {
   );
   if (verdict.kind === "failed") {
     error(
-      `coord could not serve a flake history for ${repo} (${verdict.reason}). ` +
-        `Filing nothing — this is UNKNOWN, not "no flaky tests". ` +
-        `Measured 2026-09-12: the read failed server-side after ~60 s on every probe; ` +
-        `that is a qontinui-coord defect (\`load_result_history\` over coord.test_results), not this repo's.`,
+      `coord could not serve a flake history for ${repo} after ${read.ms}ms — ${verdict.reason}. ` +
+        `Filing nothing: this is UNKNOWN, not "no flaky tests". A read that fails server-side ` +
+        `is a coord-side condition (see the header of scripts/ci-flake-escalate.mjs and coord ` +
+        `finding e5311ec9-1592-430e-a7f8-9cc6eb84032e, topic test-flakiness), not this repo's.`,
     );
     return 1;
   }
@@ -523,7 +551,7 @@ async function main(argv) {
 
   let failures = 0;
   try {
-    if (ensureLabel(repo)) info(`created label "${FLAKE_LABEL}"`);
+    ensureLabel(repo);
   } catch (err) {
     error(`could not ensure label "${FLAKE_LABEL}": ${String(err.stderr || err.message).trim()}`);
     return 1;
