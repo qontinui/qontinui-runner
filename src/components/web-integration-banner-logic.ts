@@ -34,11 +34,79 @@ export type CredentialDarkCta = "sign_in" | "re_pair" | "retry_refresh";
  * already opened are affected.
  */
 export interface CredentialDarkSignal {
+  /**
+   * WHICH authority published this signal — `"cognito"` for the Cognito
+   * refresh loop, `"posture"` for the coord-credential posture.
+   *
+   * Two independent authorities publish onto one event. Without a source they
+   * last-writer-win into a single slot and the banner can be wrongly CLEARED:
+   * Cognito goes dark, the user signs in, Cognito's recovery fires
+   * `dark:false`, the banner clears — while the coord slot is still
+   * `unrefreshable`, and the posture arm will not re-fire because the posture
+   * did not change. So the component holds one signal PER SOURCE and reduces
+   * them ({@link applyCredentialDarkSignal}, {@link effectiveCredentialDark}).
+   */
+  source: string;
   dark: boolean;
   cause: string;
   message: string;
   cta: CredentialDarkCta | null;
   since: number | null;
+}
+
+/** The two authorities the runner binary publishes under. */
+export const DARK_SOURCE_COGNITO = "cognito";
+export const DARK_SOURCE_POSTURE = "posture";
+
+/**
+ * Fold a newly-arrived signal into the per-source map.
+ *
+ * A `dark:false` clears ONLY its own source's entry — that is the whole point:
+ * Cognito recovering says nothing about the coord credential.
+ */
+export function applyCredentialDarkSignal(
+  prev: Record<string, CredentialDarkSignal>,
+  next: CredentialDarkSignal,
+): Record<string, CredentialDarkSignal> {
+  const out = { ...prev };
+  if (next.dark) {
+    out[next.source] = next;
+  } else {
+    delete out[next.source];
+  }
+  return out;
+}
+
+/**
+ * Which cause the banner shows when more than one authority is dark at once.
+ * Ordered by how much operator action the cause needs: a state whose automatic
+ * recovery has already been tried and refused outranks one that has not.
+ */
+const CREDENTIAL_DARK_PRIORITY: string[] = [
+  "unrefreshable",
+  "cognito_hard",
+  "absent",
+  "upstream_401",
+  "expired",
+];
+
+/**
+ * The single signal the banner renders, or `null` when no source is dark.
+ *
+ * Never "the most recent one": the most recent event is routinely a RECOVERY
+ * from the other authority, which is exactly how the banner used to be cleared
+ * while the runner was still dark.
+ */
+export function effectiveCredentialDark(
+  bySource: Record<string, CredentialDarkSignal>,
+): CredentialDarkSignal | null {
+  const dark = Object.values(bySource).filter((s) => s.dark);
+  if (dark.length === 0) return null;
+  const rank = (s: CredentialDarkSignal) => {
+    const i = CREDENTIAL_DARK_PRIORITY.indexOf(s.cause);
+    return i === -1 ? CREDENTIAL_DARK_PRIORITY.length : i;
+  };
+  return dark.reduce((best, s) => (rank(s) < rank(best) ? s : best));
 }
 
 /**
@@ -169,6 +237,9 @@ export function normalizeCredentialDarkSignal(raw: unknown): CredentialDarkSigna
   const cta =
     r.cta === "sign_in" || r.cta === "re_pair" || r.cta === "retry_refresh" ? r.cta : null;
   return {
+    // A build that predates the source had exactly ONE emitter — the Cognito
+    // refresh loop — so that is the honest default, not a third bucket.
+    source: typeof r.source === "string" && r.source.length > 0 ? r.source : DARK_SOURCE_COGNITO,
     dark: r.dark,
     // A legacy payload carries no cause. `cognito_hard` is what the only
     // pre-widening emitter meant, so that is the honest default for `dark`.
@@ -184,6 +255,52 @@ export function normalizeCredentialDarkSignal(raw: unknown): CredentialDarkSigna
     since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
   };
 }
+
+/**
+ * Turn the `get_coord_credential_posture` command's answer into a
+ * {@link CredentialDarkSignal}.
+ *
+ * M4 — the posture reached the UI only as a Tauri event, and `emit` has no
+ * replay. The BOOT publish happens before the React tree has registered its
+ * `listen()`, so the one case the posture exists for — a runner that came up
+ * holding a dead credential — landed on no listener at all; and after a
+ * webview reload nothing re-fired, because the posture had not CHANGED.
+ * Reading it on mount is what closes both.
+ *
+ * `null` in means UNKNOWN (no refresher pass has concluded). UNKNOWN is not
+ * health, but there is nothing to SHOW for it, so it contributes no signal —
+ * it must never be rendered as a recovery.
+ */
+export function credentialDarkFromPostureSnapshot(raw: unknown): CredentialDarkSignal | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const posture =
+    typeof r.posture === "string" ? r.posture : typeof r.state === "string" ? r.state : null;
+  if (posture === null || posture === "unknown") return null;
+  if (r.canAnswer !== false) {
+    return {
+      source: DARK_SOURCE_POSTURE,
+      dark: false,
+      cause: "recovered",
+      message: typeof r.reason === "string" ? r.reason : "",
+      cta: null,
+      since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
+    };
+  }
+  const cta =
+    r.cta === "sign_in" || r.cta === "re_pair" || r.cta === "retry_refresh" ? r.cta : null;
+  return {
+    source: DARK_SOURCE_POSTURE,
+    dark: true,
+    cause: typeof r.cause === "string" && r.cause.length > 0 ? r.cause : posture,
+    message: typeof r.reason === "string" ? r.reason : "",
+    cta,
+    since: typeof r.since === "number" && Number.isFinite(r.since) ? r.since : null,
+  };
+}
+
+/** Command name the mount-time posture read invokes. */
+export const GET_COORD_CREDENTIAL_POSTURE_CMD = "get_coord_credential_posture";
 
 export function credentialDarkPresentation(
   signal: CredentialDarkSignal,
