@@ -845,7 +845,13 @@ mod tests {
         // Under the Claude Code harness `$TMPDIR` is
         // `~/.qontinui/scratch/.claude-<account>/…`, so the old substring check
         // on the full path failed deterministically there while CI stayed green.
-        for path in [settings_path, script_path.as_path()] {
+        for path in [
+            settings_path,
+            script_path.as_path(),
+            stop_script_path.as_path(),
+            precompact_script_path.as_path(),
+            policy_script_path.as_path(),
+        ] {
             let below = path.strip_prefix(tmp).unwrap_or_else(|_| {
                 panic!("{} is not under the base {}", path.display(), tmp.display())
             });
