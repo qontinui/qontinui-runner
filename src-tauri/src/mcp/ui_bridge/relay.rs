@@ -47,9 +47,11 @@ use crate::mcp::types::{api_error, ApiResponse, ApiState};
 /// FIRST age at which a disconnected tab is dropped, not the last age at which
 /// it survives (`evict_stale` retains while `age < STALE_TAB_EVICT_MS`, and
 /// `eviction_fires_when_the_age_reaches_the_bound_not_after` pins it).
-/// Eviction is lazy, on the next registry operation. Served to callers as
-/// `staleTabEvictMs` on `GET /ui-bridge/tabs`, beside the `lastSeen` it is
-/// measured against. Heartbeats arrive every 10s; 60s = 6 missed beats.
+/// Eviction is lazy: it runs on the next registry read or upsert (listing,
+/// heartbeat, stream connect, dispatch), not on a disconnect or a result.
+/// Served to callers as `staleTabEvictMs` on `GET /ui-bridge/tabs`, beside
+/// the `lastSeen` it is measured against. Heartbeats arrive every 10s;
+/// 60s = 6 missed beats.
 pub const STALE_TAB_EVICT_MS: u64 = 60_000;
 
 /// Default await window for a dispatched command's result.
