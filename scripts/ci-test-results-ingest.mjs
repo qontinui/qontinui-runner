@@ -43,9 +43,12 @@
  *                        (mirrors scripts/export-test-coverage.mjs).
  *   COORD_INGEST_BUDGET_MS
  *                        Whole-invocation wall-clock budget across every
- *                        chunk. Default 180000 (3 min). Chunks that would
- *                        start past it are NOT sent and are reported as a
- *                        `::error::` naming the row count.
+ *                        chunk. Default 180000 (3 min). A chunk that would
+ *                        start with less than a 5 s floor of it left is NOT
+ *                        sent; every such chunk is reported as one
+ *                        `::error::` naming the row count. A set but
+ *                        unusable value falls back to the default with a
+ *                        `::warning::`.
  *
  * EXIT CODES
  *   Always 0, including on a coord/network failure or a missing token —
@@ -114,17 +117,29 @@ const DEFAULT_BUDGET_MS = 180_000;
 
 /// The smallest per-request timeout worth starting a chunk with. A chunk
 /// whose remaining budget is below this is skipped outright rather than
-/// started and aborted: an abort still costs the round trip and records
-/// nothing, so it is strictly worse than the honest skip.
+/// started and aborted: an abort still costs the round trip, and leaves the
+/// client unable to say whether coord committed the rows before it hung up
+/// (the request may complete server-side after the abort) — so it is worse
+/// than the honest skip, which at least knows what it did not send.
 const MIN_CHUNK_TIMEOUT_MS = 5_000;
 
 /// Resolve the whole-invocation budget from `COORD_INGEST_BUDGET_MS`, falling
 /// back to [`DEFAULT_BUDGET_MS`] for an unset, non-numeric or non-positive
 /// value — a misconfigured knob must degrade to the default bound, never to
-/// "no bound", which is the state this constant exists to end.
+/// "no bound", which is the state this constant exists to end. PURE: returns
+/// `{budgetMs, warning}` so the caller surfaces a SET-but-unusable value the
+/// way every other degraded input here is surfaced, and an unset one silently.
 export function resolveBudgetMs(raw) {
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_BUDGET_MS;
+  if (Number.isFinite(n) && n > 0) return { budgetMs: Math.floor(n), warning: null };
+  const unset = raw === undefined || raw === null || String(raw).trim() === "";
+  return {
+    budgetMs: DEFAULT_BUDGET_MS,
+    warning: unset
+      ? null
+      : `COORD_INGEST_BUDGET_MS=${JSON.stringify(String(raw))} is not a positive number of ` +
+        `milliseconds; using the default ${DEFAULT_BUDGET_MS}`,
+  };
 }
 
 /// The per-request timeout the NEXT chunk may use given `remainingMs` of the
@@ -135,15 +150,24 @@ export function resolveBudgetMs(raw) {
 /// Never more than [`REQUEST_TIMEOUT_MS`] (the per-request bound stands on its
 /// own), never less than `floorMs` (see [`MIN_CHUNK_TIMEOUT_MS`]), `null` once
 /// the budget cannot cover even that. The caller clamps `floorMs` to the
-/// invocation budget, so a budget smaller than the floor still sends its
-/// first chunk rather than nothing at all.
+/// invocation budget, so a budget smaller than the floor is not refused
+/// outright: its first chunk is started with the whole budget as its
+/// timeout (which for a budget of a few milliseconds is a guaranteed abort —
+/// the knob's floor is the operator's to respect, not this function's to
+/// second-guess).
 export function chunkTimeoutMs(
   remainingMs,
   requestTimeoutMs = REQUEST_TIMEOUT_MS,
   floorMs = MIN_CHUNK_TIMEOUT_MS,
 ) {
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0 || remainingMs < floorMs) return null;
-  return Math.min(requestTimeoutMs, Math.floor(remainingMs));
+  if (!Number.isFinite(remainingMs)) return null;
+  // Whole milliseconds, rounded UP: the clock is read once at the start and
+  // again per iteration, so the very first remaining value is the budget less
+  // a fraction of a millisecond — and `999.98 < 1000` would skip the first
+  // chunk of a budget that exactly equals the floor.
+  const remaining = Math.ceil(remainingMs);
+  if (remaining <= 0 || remaining < floorMs) return null;
+  return Math.min(requestTimeoutMs, remaining);
 }
 
 /**
@@ -293,14 +317,17 @@ async function postResults(url, body, token, budgetMs = DEFAULT_BUDGET_MS) {
   let skippedChunks = 0;
   let skippedRows = 0;
   let serverFailed = 0;
-  const startedAt = Date.now();
+  // Monotonic: an NTP step on the runner must not stretch or shrink the
+  // budget. Read ONCE per iteration, so the remaining-budget arithmetic and
+  // the skip decision see the same instant.
+  const startedAt = performance.now();
   // The floor can never exceed the budget, or a small budget would send
   // nothing at all instead of its first chunk.
   const floorMs = Math.min(MIN_CHUNK_TIMEOUT_MS, budgetMs);
 
   for (const [i, results] of chunks.entries()) {
     const timeoutMs = chunkTimeoutMs(
-      budgetMs - (Date.now() - startedAt),
+      budgetMs - (performance.now() - startedAt),
       REQUEST_TIMEOUT_MS,
       floorMs,
     );
@@ -326,7 +353,7 @@ async function postResults(url, body, token, budgetMs = DEFAULT_BUDGET_MS) {
   }
 
   const total = body.results.length;
-  const elapsed = Date.now() - startedAt;
+  const elapsed = Math.round(performance.now() - startedAt);
   info(
     `POST ${url} (repo=${body.repo} head_sha=${body.head_sha}) — ` +
       `${sent}/${total} row(s) recorded across ${chunks.length} chunk(s) in ${elapsed}ms`,
@@ -412,12 +439,9 @@ async function main(argv) {
   }
 
   const base = (process.env.COORD_HTTP_URL || DEFAULT_COORD_URL).replace(/\/+$/, "");
-  await postResults(
-    base + INGEST_PATH,
-    body,
-    token,
-    resolveBudgetMs(process.env.COORD_INGEST_BUDGET_MS),
-  );
+  const budget = resolveBudgetMs(process.env.COORD_INGEST_BUDGET_MS);
+  if (budget.warning) warn(budget.warning);
+  await postResults(base + INGEST_PATH, body, token, budget.budgetMs);
   return 0;
 }
 

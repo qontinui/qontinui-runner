@@ -717,11 +717,18 @@ jobs:
           # and independent of where the unpoison sits.
           #
           # Empty, not a literal host: the script reads
-          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL`
-          # (scripts/ci-test-results-ingest.mjs:321), so "" falls back to its
+          # `process.env.COORD_HTTP_URL || DEFAULT_COORD_URL` (in `main()` of
+          # scripts/ci-test-results-ingest.mjs), so "" falls back to its
           # documented default — the same "empty means unset" contract
           # `Unpoison` itself relies on.
           COORD_HTTP_URL: ""
+          # Whole-invocation budget for the POSTs (see the script's
+          # DEFAULT_BUDGET_MS for the measurement behind it). Spelled here at
+          # its default so the bound is visible where the step is, and so an
+          # operator changes it in ONE place. This step's wall time is the
+          # merge train's wait: coord's predicate waits for every check run on
+          # the head, so the job is held until this step ends.
+          COORD_INGEST_BUDGET_MS: "180000"
         run: |
           node scripts/ci-test-results-ingest.mjs \
             --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
