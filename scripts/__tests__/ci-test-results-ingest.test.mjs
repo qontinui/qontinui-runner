@@ -251,7 +251,7 @@ test("resolveBudgetMs reads the knob and falls back to the 3-minute default, nev
   }
   // Set but unusable falls back to the default AND says so — the one degraded
   // input this script would otherwise swallow silently.
-  for (const bad of ["0", "-1", "abc", "Infinity", "3m"]) {
+  for (const bad of ["0", "0.5", "-1", "abc", "Infinity", "3m"]) {
     const r = resolveBudgetMs(bad);
     assert.equal(r.budgetMs, 180_000, `expected the default for ${JSON.stringify(bad)}`);
     assert.match(r.warning, /is not a positive number of milliseconds; using the default 180000/);
@@ -432,22 +432,33 @@ function syntheticLog(n) {
 /** Serve `POST /coord/test-results/ingest`, answering after `delayMs`. */
 async function slowCoord(delayMs) {
   let hits = 0;
+  // Every pending reply timer, so `close` can cancel them: a reply owed to a
+  // client that already aborted would otherwise keep the test process alive
+  // for the rest of `delayMs` after the last test has finished.
+  const timers = new Set();
   const server = createServer((req, res) => {
     hits += 1;
     let bytes = 0;
     req.on("data", (c) => (bytes += c.length));
     req.on("end", () => {
-      setTimeout(() => {
+      const t = setTimeout(() => {
+        timers.delete(t);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }));
       }, delayMs);
+      timers.add(t);
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   return {
     url: `http://127.0.0.1:${server.address().port}`,
     hits: () => hits,
-    close: () => new Promise((r) => server.close(r)),
+    close: () => {
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+      server.closeAllConnections?.();
+      return new Promise((r) => server.close(r));
+    },
   };
 }
 
@@ -464,26 +475,43 @@ function runCli(logPath, env) {
 }
 
 /**
+ * The wall time the SCRIPT reports for its own POST loop, from its summary
+ * line `… across N chunk(s) in <ms>ms`. This is the number the budget bounds —
+ * the parent's clock around `execFile` also counts process spawn, the
+ * 4,500-line parse and exit, which under CPU contention on a 2-vCPU runner
+ * added up to 2 s on top and failed an honest script.
+ */
+function scriptLoopMs(out) {
+  const m = /across \d+ chunk\(s\) in (\d+)ms/.exec(out);
+  assert.ok(m, `no loop-duration summary line in output:\n${out}`);
+  return Number(m[1]);
+}
+
+/**
  * One CLI run against a stand-in coord answering after `delayMs`, with a
  * 4,500-test log (5 chunks) and the given budget; the server and temp dir are
- * torn down whatever happens. Resolves `{code, out, hits, elapsed}`.
+ * torn down whatever happens. Resolves `{code, out, hits, loopMs}`.
  */
 async function runBudgetScenario({ delayMs, budgetMs }) {
-  const coord = await slowCoord(delayMs);
+  // File setup BEFORE the server is listening, so a throw here leaves
+  // nothing open (an open server with no per-file timeout under `node --test`
+  // holds the gating step until the job timeout).
   const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
   const logPath = join(dir, "cargo-test-output.log");
   writeFileSync(logPath, syntheticLog(4500));
-  const started = Date.now();
+  const coord = await slowCoord(delayMs);
   try {
     const r = await runCli(logPath, {
       COORD_INGEST_TOKEN: "tok",
       COORD_HTTP_URL: coord.url,
       COORD_INGEST_BUDGET_MS: String(budgetMs),
     });
-    return { ...r, hits: coord.hits(), elapsed: Date.now() - started };
+    return { ...r, hits: coord.hits(), loopMs: scriptLoopMs(r.out) };
   } finally {
     await coord.close();
-    rmSync(dir, { recursive: true, force: true });
+    // maxRetries: on windows-latest an antivirus handle on the just-written
+    // log turns a one-shot rm into an EBUSY flake.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
   }
 }
 
@@ -500,11 +528,11 @@ test("CLI: a slow coord cannot hold the invocation past COORD_INGEST_BUDGET_MS; 
 
   assert.equal(r.code, 0, `best-effort: exit 0 even over budget\n${r.out}`);
   assert.equal(r.hits, 3, `expected exactly 3 requests, got ${r.hits}:\n${r.out}`);
-  // The skips cost nothing: the invocation ends when the third chunk does,
-  // not at the budget.
-  assert.ok(r.elapsed < 7_000, `must not wait out its budget, took ${r.elapsed}ms\n${r.out}`);
+  // The skips cost nothing: the loop ends when the third chunk does (~3 s),
+  // not at the budget — asserted on the script's OWN clock.
+  assert.ok(r.loopMs < 7_000, `must not wait out its budget, loop took ${r.loopMs}ms\n${r.out}`);
   assert.match(r.out, /3000\/4500 row\(s\) recorded across 5 chunk\(s\)/);
-  assert.match(r.out, /::error title=test-results-ingest::invocation budget of 7999ms exhausted/);
+  assert.match(r.out, /::error title=test-results-ingest::invocation budget of 7999ms reached/);
   // The two skipped chunks are the fourth (1000 rows) and the short fifth (500).
   assert.match(r.out, /2 of 5 chunk\(s\) \(1500 row\(s\)\) were NOT sent for o\/r@h \(shard s\)/);
   // A budget skip is not a coord failure and must not be reported as one.
@@ -522,7 +550,7 @@ test("CLI: the per-request timeout is the remaining budget, so one slow chunk is
 
   assert.equal(r.code, 0, `best-effort: exit 0 even on abort\n${r.out}`);
   assert.equal(r.hits, 1, `expected exactly 1 request, got ${r.hits}:\n${r.out}`);
-  assert.ok(r.elapsed < 2_500, `must abort at the budget, not wait for coord, took ${r.elapsed}ms\n${r.out}`);
+  assert.ok(r.loopMs < 2_500, `must abort at the budget, not wait for coord, loop took ${r.loopMs}ms\n${r.out}`);
   assert.match(r.out, /ABORTED by the client after \d+ms \(timeout 1000ms\)/);
   assert.match(r.out, /0\/4500 row\(s\) recorded across 5 chunk\(s\)/);
   assert.match(r.out, /1 of 5 chunk\(s\) failed — 1000 of 4500 row\(s\) were NOT recorded/);
@@ -538,10 +566,10 @@ test("CLI: within budget every chunk is sent and no budget error is emitted", as
 });
 
 test("CLI: a set-but-unusable COORD_INGEST_BUDGET_MS is warned about and falls back to the default", async () => {
-  const coord = await slowCoord(0);
   const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
   const logPath = join(dir, "cargo-test-output.log");
   writeFileSync(logPath, syntheticLog(1));
+  const coord = await slowCoord(0);
   let r;
   try {
     r = await runCli(logPath, {
@@ -551,7 +579,7 @@ test("CLI: a set-but-unusable COORD_INGEST_BUDGET_MS is warned about and falls b
     });
   } finally {
     await coord.close();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
   }
   assert.equal(r.code, 0, r.out);
   assert.match(r.out, /::warning title=test-results-ingest::COORD_INGEST_BUDGET_MS="3m" is not a positive number/);

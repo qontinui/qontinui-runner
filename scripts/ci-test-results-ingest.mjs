@@ -45,10 +45,10 @@
  *                        Whole-invocation wall-clock budget across every
  *                        chunk. Default 180000 (3 min). A chunk that would
  *                        start with less than a 5 s floor of it left is NOT
- *                        sent; every such chunk is reported as one
- *                        `::error::` naming the row count. A set but
- *                        unusable value falls back to the default with a
- *                        `::warning::`.
+ *                        sent; the skipped chunks are reported together
+ *                        in one `::error::` naming the row count. A set
+ *                        but unusable value falls back to the default with
+ *                        a `::warning::`.
  *
  * EXIT CODES
  *   Always 0, including on a coord/network failure or a missing token —
@@ -108,11 +108,20 @@ const REQUEST_TIMEOUT_MS = 120_000;
 ///
 /// So: sequential chunks, and a hard stop once this much wall time has been
 /// spent, reported as a loud `::error` naming exactly how many rows were not
-/// sent. Coord's batched insert (its own follow-up to qontinui-runner#1306)
-/// takes a chunk to well under a second, so in the healthy case the whole
-/// suite lands in seconds and this budget never binds; it exists for the day
-/// coord is slow again, so that day costs the train three minutes, not
-/// twenty-four.
+/// sent.
+///
+/// WHAT THIS COSTS, stated rather than assumed. Against the coord that
+/// produced the numbers above — one autocommitted INSERT per row — three
+/// minutes covers only a few chunks: on that same ubuntu leg it would have
+/// recorded ~0 of 11,107 rows (chunk 1 aborted at 120 s, chunk 2 at 60 s, the
+/// other ten skipped) and ~3,000 of 11,111 on windows. That is the trade this
+/// constant makes on purpose: the merge train's wait is bounded FIRST, and
+/// the rows are the price until coord is fast. The speed comes from coord's
+/// batched insert (the qontinui-coord half of this same follow-up — one
+/// `unnest` statement per chunk instead of a thousand round trips), after
+/// which a chunk lands well under a second, the whole suite in seconds, and
+/// this budget never binds. The runner PR carrying this constant is labelled
+/// downstream of that coord PR so it lands after it.
 const DEFAULT_BUDGET_MS = 180_000;
 
 /// The smallest per-request timeout worth starting a chunk with. A chunk
@@ -131,7 +140,9 @@ const MIN_CHUNK_TIMEOUT_MS = 5_000;
 /// way every other degraded input here is surfaced, and an unset one silently.
 export function resolveBudgetMs(raw) {
   const n = Number(raw);
-  if (Number.isFinite(n) && n > 0) return { budgetMs: Math.floor(n), warning: null };
+  // Floor BEFORE the positivity test: "0.5" is > 0 and floors to 0, and 0
+  // is the unbounded-looking value that must never come out of here.
+  if (Number.isFinite(n) && Math.floor(n) > 0) return { budgetMs: Math.floor(n), warning: null };
   const unset = raw === undefined || raw === null || String(raw).trim() === "";
   return {
     budgetMs: DEFAULT_BUDGET_MS,
@@ -265,7 +276,7 @@ export function chunkResults(results, size) {
 async function postOneChunk(url, body, token, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const started = Date.now();
+  const started = performance.now();
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -276,8 +287,13 @@ async function postOneChunk(url, body, token, timeoutMs = REQUEST_TIMEOUT_MS) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    const text = await res.text().catch(() => "");
-    const ms = Date.now() - started;
+    // An abort that fires while the BODY is being read must not be laundered
+    // into an HTTP 200: only a non-abort read failure degrades to "".
+    const text = await res.text().catch((e) => {
+      if (controller.signal.aborted) throw e;
+      return "";
+    });
+    const ms = Math.round(performance.now() - started);
     if (!res.ok) {
       // Include the elapsed time on EVERY outcome. The 60 s abort was only
       // diagnosable because the timestamps happened to bracket it exactly;
@@ -296,7 +312,7 @@ async function postOneChunk(url, body, token, timeoutMs = REQUEST_TIMEOUT_MS) {
     }
     return { ok: true, ms, status: res.status, serverFailed };
   } catch (err) {
-    const ms = Date.now() - started;
+    const ms = Math.round(performance.now() - started);
     const aborted = err?.name === "AbortError" || /abort/i.test(err?.message ?? "");
     error(
       aborted
@@ -366,7 +382,8 @@ async function postResults(url, body, token, budgetMs = DEFAULT_BUDGET_MS) {
     // was never sent is a budget decision this script made, not a coord
     // failure, and the two want different fixes.
     error(
-      `invocation budget of ${budgetMs}ms exhausted after ${elapsed}ms — ` +
+      `invocation budget of ${budgetMs}ms reached after ${elapsed}ms ` +
+        `(remaining budget under the ${floorMs}ms per-request floor) — ` +
         `${skippedChunks} of ${chunks.length} chunk(s) (${skippedRows} row(s)) were NOT sent ` +
         `for ${where}; raise COORD_INGEST_BUDGET_MS only if coord is known to be fast again`,
     );
