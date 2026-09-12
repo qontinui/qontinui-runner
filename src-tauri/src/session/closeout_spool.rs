@@ -56,6 +56,18 @@ use super::SessionEventKind;
 /// only ever knew the slug.
 pub const WORK_UNIT_UPSERT_HINT_KEY: &str = "work_unit_upsert";
 
+/// The payload key a spooled `gate_registration` row carries the RUNNER-resolved
+/// caller session under, so the drain can replay it as `X-Coord-Caller-Session`
+/// — coord's `register_unit_gate` stamps that header as the new gate's author,
+/// and a gate replayed without it lands authorless.
+///
+/// Written ONLY by [`CloseoutSpool::spool_gate_registration`] from the id the
+/// write forwarder resolved itself. The payload is otherwise a copy of the
+/// CALLER's request body, so a body that already carries this key has it
+/// removed first: a client must never be able to name the replay's author by
+/// putting a field in the JSON it sends.
+pub const GATE_CALLER_SESSION_KEY: &str = "caller_session";
+
 /// How a non-2xx coord write response divides for retry purposes.
 ///
 /// The ONE definition both halves of the plan read. `coord_sync`'s drain turns
@@ -177,6 +189,7 @@ impl CloseoutSpool {
         slug: &str,
         register_gate_body: &JsonMap<String, JsonValue>,
         work_unit_upsert: Option<JsonValue>,
+        caller_session: Option<Uuid>,
     ) -> std::io::Result<Spooled> {
         let mut payload = register_gate_body.clone();
         payload.insert(
@@ -185,6 +198,15 @@ impl CloseoutSpool {
         );
         if let Some(upsert) = work_unit_upsert {
             payload.insert(WORK_UNIT_UPSERT_HINT_KEY.to_string(), upsert);
+        }
+        // Only the runner's own resolution may name the replay's author — see
+        // [`GATE_CALLER_SESSION_KEY`]. Remove a caller-supplied copy first.
+        payload.remove(GATE_CALLER_SESSION_KEY);
+        if let Some(sid) = caller_session {
+            payload.insert(
+                GATE_CALLER_SESSION_KEY.to_string(),
+                JsonValue::String(sid.to_string()),
+            );
         }
         let rec = self.outbox.record(
             self.machine_id,
@@ -568,6 +590,7 @@ mod tests {
                 "2026-08-28-closeout-store",
                 &input.body,
                 input.work_unit_upsert,
+                Some(Uuid::from_u128(0x0199_a1b2_c3d4_7e5f_8a9b_0c1d_2e3f_4a5b)),
             )
             .unwrap();
         assert_eq!(out.kind, "gate_registration");
@@ -590,6 +613,53 @@ mod tests {
         assert_eq!(
             row.payload["work_unit_upsert"]["title"],
             json!("Closeout has no durable store")
+        );
+        // The runner-resolved author survives too, for the replay's header.
+        assert_eq!(
+            row.payload[GATE_CALLER_SESSION_KEY],
+            json!("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b")
+        );
+    }
+
+    /// A caller cannot name the replay's author through the request body: a
+    /// body-supplied `caller_session` is removed, and only the runner's own
+    /// resolution (or nothing) is written.
+    #[test]
+    fn a_body_supplied_caller_session_never_reaches_the_spooled_row() {
+        let (spool, _dir) = spool();
+        let input = parse_gate_registration_body(
+            br#"{
+                "predicate": {"kind": "unit_ready"},
+                "phase_name": "Phase 1",
+                "caller_session": "11111111-1111-4111-8111-111111111111"
+            }"#,
+        )
+        .expect("a complete register-gate body is spoolable");
+
+        // Nothing resolved: the key is ABSENT, not the caller's value.
+        spool
+            .spool_gate_registration("unit-a", &input.body, None, None)
+            .unwrap();
+        // Resolved: the runner's id replaces the caller's.
+        let runner = Uuid::from_u128(0x0199_a1b2_c3d4_7e5f_8a9b_0c1d_2e3f_4a5b);
+        spool
+            .spool_gate_registration("unit-b", &input.body, None, Some(runner))
+            .unwrap();
+
+        let pending = spool.outbox.pending().unwrap();
+        let row_for = |slug: &str| {
+            pending
+                .iter()
+                .find(|r| r.payload["work_unit_slug"] == json!(slug))
+                .unwrap_or_else(|| panic!("no spooled row for {slug}"))
+        };
+        assert!(row_for("unit-a")
+            .payload
+            .get(GATE_CALLER_SESSION_KEY)
+            .is_none());
+        assert_eq!(
+            row_for("unit-b").payload[GATE_CALLER_SESSION_KEY],
+            json!(runner.to_string())
         );
     }
 
