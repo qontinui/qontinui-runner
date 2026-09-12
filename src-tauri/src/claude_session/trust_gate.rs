@@ -253,7 +253,12 @@ pub enum EnforcementPosture {
 ///   untrusted workspace — it silently drops the workspace's hooks and MCP
 ///   servers (`super::workspace_trust`). So a withheld spawn degrades visibly
 ///   instead of stalling, which is the failure the plan's "never a spawn that
-///   will hang" clause is about.
+///   will hang" clause is about. **That premise holds only for a `--print`
+///   child.** An interactive PTY child DOES hang, so on that surface a
+///   `Withhold` is promoted to a refusal — [`promote_for_surface`], keyed by
+///   [`SpawnSurface`] — rather than the posture being changed here, because
+///   the posture is a fact about the DIAL and the hang is a fact about the
+///   SURFACE.
 ///
 /// [`DialResolution::Unpaired`] is a third thing again. An unpaired runner has
 /// no coord tenant, so there is no preference to honour; anything but
@@ -494,6 +499,21 @@ pub async fn resolve_dial() -> DialResolution {
             error: "dial cache lock poisoned".to_string(),
         },
     }
+}
+
+/// Warm the dial cache from an async context so a SYNC door that runs next
+/// decides on the tenant's word rather than on a cold cache.
+///
+/// [`peek_dial`] cannot fetch, so the first sync-gated spawn after a runner
+/// start would otherwise read [`DialResolution::Unresolved`] and take the
+/// `Withhold` posture — which on an interactive PTY spawn means a not-yet-trusted
+/// worktree faces the dialog. Every async caller that is about to reach the PTY
+/// seam (`TerminalManager::create`) calls this first; it costs nothing when the
+/// snapshot is fresh and is bounded by [`DIAL_TIMEOUT`] when it is not. The
+/// resolution itself is discarded on purpose: the sync door re-reads the cache
+/// this call just filled, so there is one decision, made in one place.
+pub async fn warm_dial() {
+    let _ = resolve_dial().await;
 }
 
 /// One dial read against coord's AGENT door (never the operator door, which
@@ -1094,16 +1114,37 @@ impl TrustGateDecision {
 
     /// The typed refusal a caller turns into a `spawn_blocked` report. `None`
     /// when the spawn may proceed.
+    ///
+    /// Always begins with [`SPAWN_BLOCKED_REFUSAL_PREFIX`], so a caller that
+    /// only holds the rendered string — every `Result<_, String>` seam between
+    /// here and the lifecycle post — can still classify it with
+    /// [`is_spawn_blocked_refusal`].
     pub fn refusal(&self) -> Option<String> {
         match self {
             TrustGateDecision::SpawnBlocked { rule, failed } => Some(format!(
-                "spawn_blocked ({rule}): workspace trust could not be DERIVED for this target \
-                 and the tenant's autonomy dial forbids minting it — {}",
+                "{SPAWN_BLOCKED_REFUSAL_PREFIX} ({rule}): workspace trust could not be DERIVED \
+                 for this target and the tenant's autonomy dial forbids minting it — {}",
                 failed.join("; ")
             )),
             _ => None,
         }
     }
+}
+
+/// The fixed head of every [`TrustGateDecision::refusal`] string.
+///
+/// Same device as [`crate::resource_guard::CRITICAL_REFUSAL_PREFIX`], for the
+/// same reason: the PTY seam (`TerminalManager::create`) returns
+/// `Result<_, String>`, so by the time a refusal reaches the caller that posts
+/// the coord lifecycle status it is text. The prefix is what lets that caller
+/// say `phase: blocked` rather than `exited` for a spawn that never started a
+/// child.
+pub const SPAWN_BLOCKED_REFUSAL_PREFIX: &str = "spawn_blocked";
+
+/// Whether an error string is a trust-gate refusal rendered by
+/// [`TrustGateDecision::refusal`].
+pub fn is_spawn_blocked_refusal(message: &str) -> bool {
+    message.starts_with(SPAWN_BLOCKED_REFUSAL_PREFIX)
 }
 
 /// The pure decision core: no HTTP, no clock, no globals.
@@ -1150,6 +1191,56 @@ pub fn decide(
     }
 }
 
+/// What kind of child the spawn surface is about to start — the one property
+/// of the SURFACE (not the target, not the dial) that changes what a withheld
+/// mint means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnSurface {
+    /// A `claude --print` child (the headless funnel, the inline session
+    /// builders). On an untrusted workspace it does not stop: it silently
+    /// drops the workspace's hooks and MCP servers and runs on. A withheld
+    /// mint therefore degrades the spawn visibly, which is what
+    /// [`EnforcementPosture::Withhold`] promises.
+    NonInteractive,
+    /// An interactive `claude` execed into a PTY (every backend terminal
+    /// spawn). On an untrusted workspace it HANGS on the trust dialog — the
+    /// exact defect the plan exists to remove — and nothing in the runner
+    /// observes that as a failure. A withheld mint here is not attenuation; it
+    /// is the stall.
+    InteractivePty,
+}
+
+/// Rule name for the one decision [`promote_for_surface`] changes.
+const RULE_WITHHOLD_ON_INTERACTIVE_PTY: &str = "dial-withholds-underived-mint-on-interactive-pty";
+
+/// Map a decision onto the surface it will be acted on.
+///
+/// Pure. Exactly one arm changes: a [`TrustGateDecision::Withhold`] reaching an
+/// [`SpawnSurface::InteractivePty`] becomes a [`TrustGateDecision::SpawnBlocked`]
+/// under its own rule, carrying the same failing conjuncts. The reasoning is in
+/// [`posture_for`]'s Withhold paragraph: that posture is safe because a
+/// `--print` child degrades instead of hanging, and that premise is false for a
+/// PTY child. Refusing is the honest attenuation on that surface — a refusal is
+/// a typed `spawn_failed phase=blocked` that coord and the operator can see; a
+/// hang is a live terminal row with nobody in it. Every other decision, on
+/// either surface, is returned unchanged: an already-trusted target still mints
+/// nothing, a full derivation still grants, and a block is still a block.
+pub fn promote_for_surface(
+    decision: TrustGateDecision,
+    surface: SpawnSurface,
+) -> TrustGateDecision {
+    match (decision, surface) {
+        (TrustGateDecision::Withhold { failed, .. }, SpawnSurface::InteractivePty) => {
+            TrustGateDecision::SpawnBlocked {
+                rule: RULE_WITHHOLD_ON_INTERACTIVE_PTY,
+                failed,
+            }
+        }
+        (other, _) => other,
+    }
+}
+
 /// Everything the gate derived for one spawn, flat enough to log and to POST.
 #[derive(Debug, Clone, Serialize)]
 pub struct TrustGateReport {
@@ -1161,6 +1252,8 @@ pub struct TrustGateReport {
     pub conjuncts: Conjuncts,
     pub dial: DialResolution,
     pub posture: EnforcementPosture,
+    /// The surface the decision was promoted for — see [`promote_for_surface`].
+    pub surface: SpawnSurface,
     pub decision: TrustGateDecision,
     /// The [`TrustOutcome`] of the write, when one was made. `None` when the
     /// decision withheld it or the target was already trusted.
@@ -1333,9 +1426,13 @@ fn config_file_for(config_dir: Option<&str>) -> Option<PathBuf> {
 /// and read as authoritative.
 ///
 /// `config_dir` is the `CLAUDE_CONFIG_DIR` the spawn RESOLVED; `child_config_dir`
-/// is what the child will actually be pinned to. They are equal by construction
-/// at today's single call site, and conjunct 3 checks that rather than assuming
+/// is what the child will actually be pinned to. At the headless funnel they
+/// are equal by construction, and conjunct 3 checks that rather than assuming
 /// it.
+///
+/// This door is the `--print` funnel's, so the decision is taken for
+/// [`SpawnSurface::NonInteractive`]; the PTY surfaces go through
+/// [`pre_accept_for_account_sync`] and say so.
 pub async fn pre_accept_for_spawn(
     cwd: &str,
     trust: &TrustVerdict,
@@ -1356,30 +1453,72 @@ pub async fn pre_accept_for_spawn(
                 reason: "already trusted; ledger not consulted".to_string(),
             },
             peek_dial(),
+            SpawnSurface::NonInteractive,
         );
     }
     let dial = resolve_dial().await;
     let coord = coord_row_lookup(Path::new(cwd)).await;
-    finish(cwd, trust, config_dir, child_config_dir, coord, dial)
+    finish(
+        cwd,
+        trust,
+        config_dir,
+        child_config_dir,
+        coord,
+        dial,
+        SpawnSurface::NonInteractive,
+    )
 }
 
-/// The synchronous door, for spawn surfaces that cannot await.
+/// The synchronous core, for spawn surfaces that cannot await.
 ///
-/// Identical except that coord's ledger is only PEEKED (never fetched), so
-/// conjunct 1 falls to its locally observable arm. That is the honest shape:
-/// this path must not make a network call, and a conjunct it could not ask coord
-/// about says so rather than pretending.
-pub fn pre_accept_for_spawn_sync(
+/// Identical to [`pre_accept_for_spawn`] except that coord's ledger is only
+/// PEEKED (never fetched), so conjunct 1 falls to its locally observable arm.
+/// That is the honest shape: this path must not make a network call, and a
+/// conjunct it could not ask coord about says so rather than pretending.
+///
+/// `config_dir` is the account the WRITE targets; `child_config_dir` is what
+/// the child will actually read. Private: every blocking surface enters through
+/// [`pre_accept_for_account_sync`], which also computes the verdict.
+fn pre_accept_for_spawn_sync(
     cwd: &str,
     trust: &TrustVerdict,
     config_dir: Option<&str>,
     child_config_dir: Option<&str>,
+    surface: SpawnSurface,
 ) -> TrustGateReport {
     let dial = peek_dial();
     let coord = CoordRowLookup::Unavailable {
         reason: "no async context on this spawn path; coord ledger not consulted".to_string(),
     };
-    finish(cwd, trust, config_dir, child_config_dir, coord, dial)
+    finish(
+        cwd,
+        trust,
+        config_dir,
+        child_config_dir,
+        coord,
+        dial,
+        surface,
+    )
+}
+
+/// **The blocking-surface entry point**, for a spawn whose account is ALREADY
+/// RESOLVED to one `CLAUDE_CONFIG_DIR` (`None` = the ambient default) — the
+/// inline session builders, the PTY seam when the caller states the account,
+/// and an account migration deciding for its destination.
+///
+/// Computes the Phase-1 trust verdict for that exact `(cwd, config dir)` pair
+/// and gates it with the same dir on both sides of conjunct 3. One helper rather
+/// than three copies of the pair, so a fourth blocking surface cannot compute
+/// the verdict against one account and gate another. `surface` says what kind
+/// of child follows, which is what decides whether a withheld mint is a
+/// degradation or a hang ([`promote_for_surface`]).
+pub fn pre_accept_for_account_sync(
+    cwd: &str,
+    config_dir: Option<&str>,
+    surface: SpawnSurface,
+) -> TrustGateReport {
+    let trust = super::spawn_preconditions::trust_precondition(cwd, config_dir);
+    pre_accept_for_spawn_sync(cwd, &trust.verdict, config_dir, config_dir, surface)
 }
 
 fn finish(
@@ -1389,6 +1528,7 @@ fn finish(
     child_config_dir: Option<&str>,
     coord: CoordRowLookup,
     dial: DialResolution,
+    surface: SpawnSurface,
 ) -> TrustGateReport {
     let (posture, posture_rule) = posture_for(&dial);
     let write_target = config_file_for(config_dir);
@@ -1410,7 +1550,7 @@ fn finish(
         child_reads.as_deref(),
         read_parent,
     );
-    let decision = decide(trust, &conjuncts, posture);
+    let decision = promote_for_surface(decide(trust, &conjuncts, posture), surface);
 
     let mut write_outcome = None;
     if decision.writes_trust() {
@@ -1467,6 +1607,7 @@ fn finish(
             rule,
             dial = ?dial,
             posture_rule,
+            surface = ?surface,
             failed = %failed.join("; "),
             derivation = %conjuncts.derivation(),
             "trust gate: SPAWN BLOCKED — workspace trust could not be derived and the tenant's \
@@ -1483,6 +1624,7 @@ fn finish(
         conjuncts,
         dial,
         posture,
+        surface,
         decision,
         write_outcome,
     }
@@ -2067,5 +2209,208 @@ THE AUTONOMY DIAL. One of:
         });
         assert_eq!(parent.label(), "failed");
         assert!(!decide(&v, &conj(true, false, true), EnforcementPosture::Block).allows_spawn());
+    }
+
+    // ------------------------------------------------- the string-typed seam
+
+    /// The PTY seam hands a refusal back as text. The prefix classifier must
+    /// recognise exactly what `refusal()` renders and nothing else — a create
+    /// failure or a resource-guard refusal carrying the word elsewhere is not a
+    /// block.
+    #[test]
+    fn a_rendered_refusal_is_recognised_by_its_prefix_and_nothing_else_is() {
+        let r = decide(
+            &untrusted(),
+            &conj(false, true, true),
+            EnforcementPosture::Block,
+        )
+        .refusal()
+        .unwrap();
+        assert!(is_spawn_blocked_refusal(&r), "{r}");
+        assert!(r.starts_with(SPAWN_BLOCKED_REFUSAL_PREFIX));
+        for other in [
+            "terminal session create failed: spawn_blocked (…)",
+            "resource_guard:critical: commit headroom below the floor",
+            "",
+            "SPAWN_BLOCKED",
+        ] {
+            assert!(!is_spawn_blocked_refusal(other), "{other:?}");
+        }
+    }
+
+    /// The account-resolved sync door: a target that already reads trusted for
+    /// the pinned account mints nothing and refuses nothing at ANY dial
+    /// position — the same short-circuit the async door has, reached through
+    /// the one helper every blocking surface now shares.
+    #[test]
+    fn the_account_sync_door_short_circuits_on_an_already_trusted_target() {
+        let account = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let key = workspace_trust::project_key(target.path()).unwrap();
+        std::fs::write(
+            account.path().join(workspace_trust::CONFIG_FILE),
+            serde_json::json!({ "projects": { key: { "hasTrustDialogAccepted": true } } })
+                .to_string(),
+        )
+        .unwrap();
+        // The strictest dial the override can express; it must not matter.
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DIAL_OVERRIDE_ENV]);
+        std::env::set_var(DIAL_OVERRIDE_ENV, "ask-first");
+        let report = pre_accept_for_account_sync(
+            &target.path().to_string_lossy(),
+            Some(&account.path().to_string_lossy()),
+            SpawnSurface::InteractivePty,
+        );
+        assert_eq!(report.trust, TrustVerdict::Trusted);
+        assert_eq!(report.decision, TrustGateDecision::AlreadyTrusted);
+        assert!(report.decision.refusal().is_none());
+        assert!(report.write_outcome.is_none(), "nothing may be minted");
+        // The verdict was computed against the PINNED account's file, and
+        // conjunct 3 sees the same file on both sides.
+        assert_eq!(
+            report.account_config_file.as_deref(),
+            Some(
+                account
+                    .path()
+                    .join(workspace_trust::CONFIG_FILE)
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    /// …and an UNTRUSTED target under the strictest dial refuses through that
+    /// same door, with the refusal in the prefix-classifiable form the PTY seam
+    /// relies on.
+    #[test]
+    fn the_account_sync_door_refuses_an_underivable_mint_at_ask_first() {
+        let account = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(
+            account.path().join(workspace_trust::CONFIG_FILE),
+            r#"{"projects":{}}"#,
+        )
+        .unwrap();
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DIAL_OVERRIDE_ENV]);
+        std::env::set_var(DIAL_OVERRIDE_ENV, "ask-first");
+        let report = pre_accept_for_account_sync(
+            &target.path().to_string_lossy(),
+            Some(&account.path().to_string_lossy()),
+            SpawnSurface::NonInteractive,
+        );
+        assert!(matches!(report.trust, TrustVerdict::Untrusted { .. }));
+        assert_eq!(report.posture, EnforcementPosture::Block);
+        let refusal = report.decision.refusal().expect("ask-first must block");
+        assert!(is_spawn_blocked_refusal(&refusal), "{refusal}");
+        assert!(report.write_outcome.is_none(), "a block never writes");
+        // A plain temp dir is not a linked worktree: conjunct 1 failed on the
+        // local arm, and the refusal says so.
+        assert!(refusal.contains("coord_worktree_row=failed"), "{refusal}");
+    }
+
+    // ------------------------------------------------------- surface promotion
+
+    /// A withheld mint is a degradation for a `--print` child and a HANG for a
+    /// PTY child. Exactly one arm of the matrix moves: Withhold on the PTY
+    /// becomes a block under its own rule, keeping the failing conjuncts; every
+    /// other decision is untouched on both surfaces.
+    #[test]
+    fn only_withhold_on_an_interactive_pty_is_promoted_and_it_keeps_its_conjuncts() {
+        let withheld = decide(
+            &untrusted(),
+            &conj(true, false, true),
+            EnforcementPosture::Withhold,
+        );
+        let TrustGateDecision::Withhold { failed, .. } = &withheld else {
+            panic!("fixture must withhold: {withheld:?}");
+        };
+        let failed = failed.clone();
+
+        let promoted = promote_for_surface(withheld.clone(), SpawnSurface::InteractivePty);
+        assert_eq!(
+            promoted,
+            TrustGateDecision::SpawnBlocked {
+                rule: RULE_WITHHOLD_ON_INTERACTIVE_PTY,
+                failed,
+            }
+        );
+        let refusal = promoted.refusal().expect("a promoted withhold refuses");
+        assert!(is_spawn_blocked_refusal(&refusal), "{refusal}");
+        assert!(refusal.contains("parent_repo_trusted"), "{refusal}");
+        // The `--print` surface keeps the withhold: the spawn proceeds, degraded.
+        assert_eq!(
+            promote_for_surface(withheld.clone(), SpawnSurface::NonInteractive),
+            withheld
+        );
+
+        for surface in [SpawnSurface::NonInteractive, SpawnSurface::InteractivePty] {
+            for (trust, posture) in [
+                (TrustVerdict::Trusted, EnforcementPosture::Withhold),
+                (untrusted(), EnforcementPosture::Report),
+                (untrusted(), EnforcementPosture::Block),
+            ] {
+                let d = decide(&trust, &conj(true, false, true), posture);
+                assert_eq!(
+                    promote_for_surface(d.clone(), surface),
+                    d,
+                    "{surface:?} {d:?}"
+                );
+            }
+            let granted = decide(
+                &untrusted(),
+                &conj(true, true, true),
+                EnforcementPosture::Block,
+            );
+            assert_eq!(promote_for_surface(granted.clone(), surface), granted);
+        }
+    }
+
+    /// The account door threads the surface through to the decision: the same
+    /// dial and the same target refuse on a PTY and merely withhold for a
+    /// `--print` child.
+    #[test]
+    fn the_account_sync_door_refuses_a_withheld_mint_only_on_a_pty() {
+        let account = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(
+            account.path().join(workspace_trust::CONFIG_FILE),
+            r#"{"projects":{}}"#,
+        )
+        .unwrap();
+        let _env_lock = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[DIAL_OVERRIDE_ENV]);
+        std::env::set_var(DIAL_OVERRIDE_ENV, "draft-required");
+        let cwd = target.path().to_string_lossy().into_owned();
+        let acct = account.path().to_string_lossy().into_owned();
+
+        let print_child =
+            pre_accept_for_account_sync(&cwd, Some(&acct), SpawnSurface::NonInteractive);
+        assert_eq!(print_child.posture, EnforcementPosture::Withhold);
+        assert!(matches!(
+            print_child.decision,
+            TrustGateDecision::Withhold { .. }
+        ));
+        assert!(print_child.decision.refusal().is_none());
+        assert!(print_child.write_outcome.is_none());
+
+        let pty_child =
+            pre_accept_for_account_sync(&cwd, Some(&acct), SpawnSurface::InteractivePty);
+        assert_eq!(
+            pty_child.posture,
+            EnforcementPosture::Withhold,
+            "the dial is unchanged"
+        );
+        assert_eq!(pty_child.surface, SpawnSurface::InteractivePty);
+        let refusal = pty_child
+            .decision
+            .refusal()
+            .expect("a PTY child must not be left to hang");
+        assert!(
+            refusal.contains(RULE_WITHHOLD_ON_INTERACTIVE_PTY),
+            "{refusal}"
+        );
+        assert!(pty_child.write_outcome.is_none(), "still nothing minted");
     }
 }

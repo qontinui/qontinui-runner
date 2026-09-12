@@ -29,7 +29,7 @@ pub mod usage_limit;
 pub mod visibility;
 pub mod vt_sanitize;
 
-pub use manager::TerminalManager;
+pub use manager::{TerminalManager, TrustArm};
 
 /// Environment variables that carry a credential VALUE and must never be
 /// inherited by a runner-spawned session.

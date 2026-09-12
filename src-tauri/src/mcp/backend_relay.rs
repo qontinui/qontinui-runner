@@ -3635,6 +3635,9 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // over the relay as this frame's error, naming lane/headroom/floor,
             // which is what lets the web UI tell the user why.
             false,
+            // The account is chosen after this point (a shell the relay
+            // types into), so the every-account mint applies.
+            crate::terminal::TrustArm::AccountChosenLater,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {
