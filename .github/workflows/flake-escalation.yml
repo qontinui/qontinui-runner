@@ -1,0 +1,123 @@
+name: Flake escalation
+
+# Phase 2 of plan
+# 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train:
+# "make a flake a defect, not a fact of life".
+#
+# Phase 1 (`Report test results to coord` in ci.yml) fills coord.test_results
+# with every per-test outcome the gating `cargo test` prints. coord scores
+# that history into a per-test flake_rate (`flakiness_priors`, readable at
+# POST /coord/test-flakiness). Until this workflow, nothing READ that score:
+# the first — and only — escalation the rail produced was a session reading
+# the endpoint by hand, finding wedge_diagnostics' spinning-child test at
+# 0.400 and fixing it in #1444. This workflow is that read, made recurring:
+# scripts/ci-flake-escalate.mjs upserts one `flaky test: <test id>` issue
+# (label `flake`) per test at or above the plan's threshold of 3 disagreeing
+# runs in coord's window.
+#
+# Trigger posture (deliberately NOT a per-PR check, and NOT in ci.yml):
+#   - schedule (daily): the rate moves per landed run, not per PR, and an
+#     escalation is a repo-level fact rather than a verdict on one branch.
+#     Same reasoning as atlas-exclude-fresh.yml's nightly.
+#   - workflow_dispatch: on-demand read, with `dry_run` to print the plan
+#     without touching a single issue.
+#   - pull_request (paths: the script, its tests, this file): runs the
+#     script's unit tests so a regression cannot ship untested. Kept OUT of
+#     ci.yml's "Run CI-tooling unit tests" step on purpose — editing ci.yml
+#     alters a required gate's surface and costs an `alters-a-gate`
+#     declaration for what is a non-gating tool; here the tests gate only the
+#     PRs that touch this tool. Self-inclusion is deliberate: a paths-filtered
+#     job that omits its own path does not run on the PR that edits it.
+#
+# What a RED run means, and why it is red rather than green-and-empty: the
+# script exits 1 when coord reports `history_read: failed` (or serves a body it
+# cannot read as an observation). Measured 2026-09-12 against this repo the
+# read failed server-side after ~60 s on every probe — a qontinui-coord defect
+# (`load_result_history` over coord.test_results), not this repo's. A red
+# nightly says "the rail is dark"; a green one with no issues would say "no
+# flakes", which is the false clean bill of health the plan exists to abolish.
+# `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
+#
+# The plan's second escalation arm — "any occurrence on a push to
+# refs/heads/main" — is NOT implemented: it needs per-run outcomes the
+# flakiness endpoint does not serve. Named in the plan as open.
+
+on:
+  schedule:
+    # Daily, 06:17 UTC — off the hour so it does not stack on the top-of-hour
+    # schedules GitHub throttles hardest.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Print the escalations without creating or editing any issue"
+        type: boolean
+        default: false
+      min_occurrences:
+        description: "Disagreeing runs in coord's window needed to escalate (plan default 3)"
+        type: string
+        default: "3"
+  pull_request:
+    branches: [main]
+    paths:
+      - scripts/ci-flake-escalate.mjs
+      - scripts/__tests__/ci-flake-escalate.test.mjs
+      - .github/workflows/flake-escalation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Flake-escalate unit tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      # No `pnpm install`: the script and its tests import only Node built-ins.
+      - name: Run unit tests
+        run: node --test scripts/__tests__/ci-flake-escalate.test.mjs
+
+  escalate:
+    name: Escalate flaky tests from coord's history
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # The coord read is bounded at 120 s inside the script; the rest is a
+    # handful of `gh` calls.
+    timeout-minutes: 10
+    # Two overlapping runs (a dispatch during the nightly) would race the
+    # list-then-create upsert and could file one test twice.
+    concurrency:
+      group: flake-escalation
+      cancel-in-progress: false
+    # `issues: write` covers creating/editing/reopening issues AND creating
+    # the `flake` label (labels are an issues-scoped resource). Nothing here
+    # opens a PR, so the repo's "Allow GitHub Actions to create and approve
+    # pull requests" setting is irrelevant.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+      - name: Read coord's flake history and upsert escalation issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Default in the script is https://coord.qontinui.io; set explicitly
+          # so a future ambient-poison step (see ci.yml) cannot redirect this.
+          COORD_HTTP_URL: https://coord.qontinui.io
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          MIN_OCCURRENCES: ${{ github.event.inputs.min_occurrences }}
+        run: |
+          set -euo pipefail
+          args=(--repo "${{ github.repository }}"
+                --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+          if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
+          if [ -n "${MIN_OCCURRENCES:-}" ]; then args+=(--min-occurrences "${MIN_OCCURRENCES}"); fi
+          node scripts/ci-flake-escalate.mjs "${args[@]}"
