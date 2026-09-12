@@ -41,7 +41,11 @@ import { AlertCircle, X } from "lucide-react";
 import { useRunnerTier } from "@/hooks/useRunnerTier";
 
 import {
+  applyCredentialDarkSignal,
+  credentialDarkFromPostureSnapshot,
   credentialDarkPresentation,
+  effectiveCredentialDark,
+  GET_COORD_CREDENTIAL_POSTURE_CMD,
   makeRePairClickHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
@@ -125,7 +129,17 @@ export function WebIntegrationAuthBanner() {
   // `unrefreshable`, `upstream_401`. It fires at BOOT too, which is the moment
   // a runner that restored a dead credential used to be silent. `dark:false`
   // clears it on recovery.
-  const [credentialDark, setCredentialDark] = useState<CredentialDarkSignal | null>(null);
+  //
+  // M5 — held PER SOURCE. The Cognito loop and the coord-credential posture
+  // are two independent authorities on one event; in a single slot they
+  // last-writer-win, and the losing write is routinely a RECOVERY: Cognito
+  // goes dark, the user signs in, Cognito fires `dark:false`, the banner
+  // clears — while the coord slot is still `unrefreshable` and the posture arm
+  // will not re-fire, because the posture did not change.
+  const [credentialDarkBySource, setCredentialDarkBySource] = useState<
+    Record<string, CredentialDarkSignal>
+  >({});
+  const credentialDark = effectiveCredentialDark(credentialDarkBySource);
 
   const { ref: rootRef } = useUIElement({
     id: "web-integration-banner",
@@ -228,8 +242,52 @@ export function WebIntegrationAuthBanner() {
       // payload. An unparseable payload is dropped rather than rendered as a
       // blank banner.
       const signal = normalizeCredentialDarkSignal(event.payload);
-      if (!cancelled && signal !== null) setCredentialDark(signal);
+      if (!cancelled && signal !== null) {
+        setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+      }
     });
+    return () => {
+      cancelled = true;
+      unlisten
+        .then((fn) => fn())
+        .catch(() => {
+          /* listener cleanup is best-effort */
+        });
+    };
+  }, []);
+
+  // M4 — READ the coord-credential posture on mount.
+  //
+  // Without this the posture reached the UI only as a Tauri event, and
+  // `emit` has no replay: the BOOT publish happens before this tree has
+  // registered its `listen()` above, so the one case the posture exists for —
+  // a runner that came up holding a dead credential — landed on no listener at
+  // all. After a webview reload nothing re-fired either, because the posture
+  // had not CHANGED. Re-read on `web-integration-changed` too, piggybacking
+  // the same listener shape the two fetches above use.
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchPosture = () => {
+      invoke<unknown>(GET_COORD_CREDENTIAL_POSTURE_CMD)
+        .then((raw) => {
+          if (cancelled) return;
+          const signal = credentialDarkFromPostureSnapshot(raw);
+          // `null` is UNKNOWN — no refresher pass has concluded. It is not
+          // health, and it is not a recovery: contribute nothing.
+          if (signal !== null) {
+            setCredentialDarkBySource((prev) => applyCredentialDarkSignal(prev, signal));
+          }
+        })
+        .catch(() => {
+          // Older runner build without the command — we cannot tell, so we
+          // say nothing rather than clearing a banner an event may have set.
+        });
+    };
+
+    fetchPosture();
+    const unlisten = listen("web-integration-changed", fetchPosture);
+
     return () => {
       cancelled = true;
       unlisten
@@ -383,7 +441,9 @@ export function WebIntegrationAuthBanner() {
         </div>
         {presentation.ctaAction ? (
           <button
-            ref={presentation.ctaAction === "cognito_sign_in" ? authorizeButtonRef : rePairButtonRef}
+            ref={
+              presentation.ctaAction === "cognito_sign_in" ? authorizeButtonRef : rePairButtonRef
+            }
             type="button"
             onClick={() => {
               void handleCredentialCta(presentation.ctaAction!);

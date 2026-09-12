@@ -1138,6 +1138,10 @@ async fn health(
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
         relay_connected,
+        // M7: a credential-dark runner is DEGRADED, not healthy. `None` while
+        // no refresher pass has concluded — UNKNOWN, never health.
+        coord_credential_can_answer: crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .map(|s| s.posture.can_answer()),
     });
 
     // `frontendReady` is DERIVED, not latched (2026-08-05).
@@ -1399,13 +1403,16 @@ async fn health(
         // derived every device-JWT refresher pass from the per-tenant slot
         // pass's outcomes and the verdicts coord actually returned. `null`
         // means UNKNOWN — no pass has completed in this process — and is NOT
-        // health. A runner that boots holding a dead credential is otherwise
-        // indistinguishable here from a healthy one, which is the whole
-        // defect: `derived_status: healthy` while every session it spawns has
-        // no coord access.
+        // health. A runner that boots holding a dead credential used to be
+        // indistinguishable here from a healthy one — `derived_status:
+        // healthy` while every session it spawns has no coord access. It is
+        // not any more: `can_answer() == false` feeds `derived_status` as a
+        // `degraded` input (M7, `HealthInputs::coord_credential_can_answer`),
+        // so the top-level verdict moves with this block.
         "coordCredential": crate::mcp::device_jwt_refresher::coord_credential_posture()
             .map(|s| s.to_json())
             .unwrap_or_else(|| serde_json::json!({
+                "posture": "unknown",
                 "state": "unknown",
                 "reason": "no device-JWT refresher pass has completed in this process yet \
                            — UNKNOWN, never 'healthy'",
@@ -4303,6 +4310,11 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
+    // C3/M2: the tenant whose DEVICE slot supplied the bearer, hoisted out of
+    // the `Device` arm so the upstream verdict below can be filed against the
+    // right credential. Stays `None` for an AGENT principal, whose bearer is
+    // that agent's own token and says nothing about this runner's credential.
+    let mut device_tenant: Option<uuid::Uuid> = None;
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
     //    off the async executor), the same fresh token `backend_relay` reads.
@@ -4341,6 +4353,7 @@ async fn coord_mcp_proxy_handler(
                             .into_response();
                     }
                 };
+            device_tenant = session_tenant;
             // The live device JWT was read alongside the pin decision above
             // (same blocking pool, same freshness as `backend_relay`'s read).
             let mut tok = initial_tok;
@@ -4825,6 +4838,25 @@ async fn coord_mcp_proxy_handler(
         }
     };
 
+    // C3 — THE highest-volume credential consumer. This handler carried the
+    // richest 401 handling in the file (kick the refresher, re-select once,
+    // attribute the rejection to a workdir) and yet told the posture nothing:
+    // 50 `coord_*` tool calls could all 401 `token_expired` while the streak
+    // sat at 0 and `/health` read `live`.
+    //
+    // DEVICE principal only, for the same reason the retry arm above is: an
+    // AGENT bearer comes from that agent's own token slot, so coord's verdict
+    // on it is not a verdict on this runner's credential. `/coord/mcp` is a
+    // genuinely guarded route, so `authenticating` is unconditionally true.
+    if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+            device_tenant,
+            true,
+            status,
+            &bytes,
+        );
+    }
+
     // A 5xx is the other half of the retryable class (same shared classifier as
     // the write forwarder): coord did not reach a verdict on the content. A
     // JSON-RPC error INSIDE a 200 is the opposite — coord answering — and is
@@ -5142,6 +5174,34 @@ impl ClaimsReadTarget {
         }
     }
 
+    /// Does coord ACTUALLY verify the device bearer on this route?
+    ///
+    /// C1 — this is not a formality. Coord's two claims reads sit behind an
+    /// INFALLIBLE extractor (`qontinui-coord/crates/coord/src/
+    /// claims_read_observe.rs`, `type Rejection = Infallible`): an expired,
+    /// revoked or bad-signature JWT gets a **200**, the rejection being only a
+    /// Prometheus label. The enforcement arm is gated on
+    /// `COORD_CLAIMS_READ_AUTH_REQUIRED`, which is absent from
+    /// `deploy/taskdef.json` — so it is inert in production.
+    ///
+    /// A 200 from a route that never looked at the credential is NOT evidence
+    /// the credential works, so it must not reach
+    /// [`note_coord_upstream_verdict`] — with it counted, every claims poll
+    /// reset the rejection streak, a box that polls claims could never reach
+    /// `dark`, and `lastOkAt` claimed coord had accepted a credential coord
+    /// never checked.
+    ///
+    /// `WorkUnitDeps` is the exception INSIDE this family: it is served by
+    /// coord's `work_units_agent_authed` sub-router behind `require_jwt`, so a
+    /// verdict there is real. The flag is therefore per TARGET, not per
+    /// error-code family.
+    fn upstream_authenticates(&self) -> bool {
+        match self {
+            ClaimsReadTarget::List | ClaimsReadTarget::ByResource => false,
+            ClaimsReadTarget::WorkUnitDeps { .. } => true,
+        }
+    }
+
     /// Validate the dynamic segment (if any). Returns `Err((status, code, msg))`
     /// on a bad shape so the caller can emit a runner-originated 400 — the
     /// segment is rejected BEFORE any coord URL is built, mirroring
@@ -5256,11 +5316,13 @@ async fn coord_claims_read_proxy_handler(
     // Validate the dynamic segment (if any) up front, but do NOT emit its 400
     // yet — the shared body emits it only AFTER the nonce gate, so an
     // unauthenticated caller can never use the validator as an oracle.
+    let upstream_authenticates = target.upstream_authenticates();
     let validated_path = target.validate().map(|()| target.coord_path());
     nonce_gated_coord_get(
         validated_path,
         ReadProxyCodes::CLAIMS,
         "coord-mcp claims proxy",
+        upstream_authenticates,
         headers,
         raw_query,
     )
@@ -5286,6 +5348,10 @@ async fn nonce_gated_coord_get(
     validated_path: Result<String, (u16, &'static str, String)>,
     codes: ReadProxyCodes,
     door: &'static str,
+    // C1: does coord VERIFY the device bearer at this target? See
+    // [`ClaimsReadTarget::upstream_authenticates`] — a `false` keeps the
+    // answer out of the credential-posture streak in BOTH directions.
+    upstream_authenticates: bool,
     headers: axum::http::HeaderMap,
     raw_query: Option<String>,
 ) -> axum::response::Response {
@@ -5333,7 +5399,7 @@ async fn nonce_gated_coord_get(
     // does filesystem I/O, so the decision runs on the blocking pool.
     // Phase 3 (memory-injection plan): pin resolution + the fail-closed
     // refusal live in ONE helper shared by all four bearer-selection sites.
-    let (_session_tenant, bearer) =
+    let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
             Err((status, msg)) => {
@@ -5393,7 +5459,18 @@ async fn nonce_gated_coord_get(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = read_upstream_url(&coord_base, &coord_path, raw_query.as_deref());
-    forward_coord_get(&url, &bearer, coord_base_source, codes, door).await
+    forward_coord_get(
+        &url,
+        &bearer,
+        coord_base_source,
+        codes,
+        door,
+        // M2: the posture is PER TENANT because the credential is — this is the
+        // slot whose bearer we just presented.
+        session_tenant,
+        upstream_authenticates,
+    )
+    .await
 }
 
 /// Forward a claims read to coord and return coord's status + headers + body
@@ -5407,6 +5484,8 @@ async fn forward_claims_get(
     url: &str,
     bearer: &str,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    tenant: Option<uuid::Uuid>,
+    upstream_authenticates: bool,
 ) -> axum::response::Response {
     forward_coord_get(
         url,
@@ -5414,6 +5493,8 @@ async fn forward_claims_get(
         coord_base_source,
         ReadProxyCodes::CLAIMS,
         "coord-mcp claims proxy",
+        tenant,
+        upstream_authenticates,
     )
     .await
 }
@@ -5428,6 +5509,11 @@ async fn forward_coord_get(
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
     codes: ReadProxyCodes,
     door: &'static str,
+    // The tenant whose device slot supplied `bearer` — the credential the
+    // posture will be about (M2).
+    tenant: Option<uuid::Uuid>,
+    // Does coord verify the bearer at this upstream route (C1)?
+    upstream_authenticates: bool,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -5526,7 +5612,15 @@ async fn forward_coord_get(
     // input that makes a token with a future `exp` that coord refuses read
     // `dark(upstream_401)` instead of `live`. A single answer never moves the
     // posture; the threshold is a rate.
-    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(status, &bytes);
+    //
+    // `upstream_authenticates` is load-bearing: a 200 from a route coord does
+    // not gate is not evidence about the credential, and counting it was C1.
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+        tenant,
+        upstream_authenticates,
+        status,
+        &bytes,
+    );
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -5771,6 +5865,11 @@ async fn coord_read_proxy_handler(
         validated_path,
         ReadProxyCodes::COORD_READ,
         "coord-mcp coord-read proxy",
+        // Every route in this family is behind a real coord guard — the
+        // `/coord/agent-*` device-authed exceptions (`require_jwt`) and the
+        // `FleetPrincipal`-gated `/pr-merge/*` reads — so coord's answer here
+        // IS a verdict on this runner's credential.
+        true,
         headers,
         raw_query,
     )
@@ -6164,7 +6263,7 @@ async fn coord_write_proxy_handler(
     // does filesystem I/O, so the decision runs on the blocking pool.
     // Phase 3 (memory-injection plan): pin resolution + the fail-closed
     // refusal live in ONE helper shared by all four bearer-selection sites.
-    let (_session_tenant, bearer) =
+    let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
             Err((status, msg)) => {
@@ -6235,7 +6334,15 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(&url, &bearer, body, coord_base_source, spool_plan.as_ref()).await
+    forward_coord_write_post(
+        &url,
+        &bearer,
+        body,
+        coord_base_source,
+        spool_plan.as_ref(),
+        session_tenant,
+    )
+    .await
 }
 
 /// The durable fallback a `WorkUnitRegisterGate` forward may take when coord is
@@ -6398,6 +6505,10 @@ async fn forward_coord_write_post(
     body: axum::body::Bytes,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
     spool: Option<&GateSpoolPlan>,
+    // The tenant whose device slot supplied `bearer` (M2). Every target on
+    // this forwarder is a real coord WRITE behind a real guard, so there is no
+    // `upstream_authenticates` question here — the answer is always yes.
+    tenant: Option<uuid::Uuid>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -6511,7 +6622,7 @@ async fn forward_coord_write_post(
     // input that makes a token with a future `exp` that coord refuses read
     // `dark(upstream_401)` instead of `live`. A single answer never moves the
     // posture; the threshold is a rate.
-    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(status, &bytes);
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(tenant, true, status, &bytes);
 
     // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
     // front of it) did not reach a verdict on the content, so the write is
@@ -12723,6 +12834,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -12739,6 +12852,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -12749,6 +12864,151 @@ mod coord_claims_proxy_tests {
             std::str::from_utf8(&bytes).unwrap(),
             r#"{"detail":"tenant_not_resolved"}"#,
             "coord's body must come back verbatim"
+        );
+    }
+
+    /// **C1** — the review's first blocking finding, at the level that
+    /// actually shipped it: the WIRING, not the classifier.
+    ///
+    /// `forward_coord_get` called `note_coord_upstream_verdict` for every
+    /// response, and one of this door's targets is the claims read. Coord's
+    /// claims routes sit behind an INFALLIBLE extractor
+    /// (`qontinui-coord/crates/coord/src/claims_read_observe.rs`,
+    /// `type Rejection = Infallible`) whose enforcement arm is gated on
+    /// `COORD_CLAIMS_READ_AUTH_REQUIRED` — a variable absent from
+    /// `deploy/taskdef.json`, so inert in production. An expired, revoked or
+    /// bad-signature JWT gets a **200** there.
+    ///
+    /// So every claims poll used to reset the streak and stamp `lastOkAt`: a
+    /// box that polls claims could never reach `dark`, and `lastOkAt` claimed
+    /// coord had accepted a credential coord never looked at.
+    #[tokio::test]
+    async fn a_claims_read_never_moves_the_credential_posture() {
+        use crate::mcp::device_jwt_refresher as djr;
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The production shape: coord answers 200 WITHOUT having verified the
+        // bearer at all.
+        let app: Router = Router::new()
+            .route(
+                "/coord/claims/list",
+                get(|| async { axum::Json(serde_json::json!({"claims": []})) }),
+            )
+            .route(
+                "/coord/work-units/{slug}/deps",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"token expired","code":"token_expired"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+        let tenant = uuid::Uuid::from_bytes([0x2a; 16]);
+
+        // Seed a real rejection, so "did not reset" is distinguishable from
+        // "was already zero".
+        djr::note_coord_upstream_verdict(Some(tenant), true, 401, br#"{"code":"token_expired"}"#);
+        assert_eq!(
+            djr::upstream_signal_for(Some(&tenant.to_string())).consecutive_rejections,
+            1
+        );
+
+        // Twenty claims polls, exactly as a live box produces them.
+        let url = claims_upstream_url(&base, ClaimsReadTarget::List, None);
+        for _ in 0..20 {
+            let resp = forward_claims_get(
+                &url,
+                "test-device-jwt",
+                qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+                Some(tenant),
+                ClaimsReadTarget::List.upstream_authenticates(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+        }
+        let sig = djr::upstream_signal_for(Some(&tenant.to_string()));
+        assert_eq!(
+            sig.consecutive_rejections, 1,
+            "a 200 from coord's UNGATED claims route must not reset the streak"
+        );
+        assert!(
+            sig.last_ok_at.is_none(),
+            "lastOkAt must not claim coord accepted a credential coord never checked"
+        );
+
+        // The work-unit deps read on the SAME door IS gated (`require_jwt` on
+        // coord's `work_units_agent_authed` sub-router), so its verdict counts.
+        // The flag is per TARGET, not per error-code family.
+        assert!(!ClaimsReadTarget::List.upstream_authenticates());
+        assert!(!ClaimsReadTarget::ByResource.upstream_authenticates());
+        let deps = ClaimsReadTarget::WorkUnitDeps {
+            slug: "a-plan".to_string(),
+        };
+        assert!(deps.upstream_authenticates());
+        let url = claims_upstream_url(&base, deps.clone(), None);
+        let resp = forward_claims_get(
+            &url,
+            "test-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            Some(tenant),
+            deps.upstream_authenticates(),
+        )
+        .await;
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            djr::upstream_signal_for(Some(&tenant.to_string())).consecutive_rejections,
+            2,
+            "a refusal from a route coord DOES gate is a verdict on the credential"
+        );
+
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// **C3** — the `/coord-mcp` JSON-RPC proxy is the highest-volume
+    /// credential consumer in the runner (every `coord_*` MCP tool call), and
+    /// it had `status` and `bytes` in hand and told the posture nothing: 50
+    /// tool calls could all 401 `token_expired` while the streak sat at 0 and
+    /// `/health` read `live`.
+    ///
+    /// A behavioural test would need a registered proxy nonce plus a live
+    /// device JWT in the encrypted `AuthManager` slot, neither of which a unit
+    /// test can seed — so this pins the wiring at the source, the same
+    /// technique `ui_error`'s writer guard uses. It fails against a
+    /// `coord_mcp_proxy_handler` that does not make the call.
+    #[test]
+    fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
+        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
+        // from anywhere.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let start = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("coord_mcp_proxy_handler exists");
+        // The next top-level item ends the handler's body.
+        let end = text[start..]
+            .find("\n/// ")
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        let body = &text[start..end];
+        assert!(
+            body.contains("note_coord_upstream_verdict"),
+            "the highest-volume device-credential consumer must report coord's \
+             verdict to the posture, or a box whose every tool call 401s still \
+             reads `live`"
+        );
+        assert!(
+            body.contains("ProxyPrincipal::Device"),
+            "and it must be gated on the DEVICE principal — an agent bearer \
+             comes from that agent's own slot and says nothing about this \
+             runner's credential"
         );
     }
 
@@ -12770,6 +13030,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -13156,6 +13418,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -13173,6 +13437,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -13188,6 +13454,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -14014,6 +14282,7 @@ mod coord_write_proxy_tests {
             axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -14034,6 +14303,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
             None,
         )
         .await;
@@ -14067,6 +14337,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            None,
             None,
         )
         .await;
@@ -14214,6 +14485,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
             plan.as_ref(),
+            None,
         )
         .await;
 
@@ -14291,6 +14563,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
+            None,
         )
         .await;
         assert_eq!(resp.status(), 422);
@@ -14318,6 +14591,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
+            None,
         )
         .await;
         assert_eq!(resp.status(), 503, "coord's own status is preserved");

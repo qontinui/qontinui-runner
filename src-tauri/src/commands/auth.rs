@@ -1582,6 +1582,23 @@ pub async fn kick_device_jwt_refresher_cmd() -> Result<(), String> {
     Ok(())
 }
 
+/// Read the runner's current coord-credential POSTURE.
+///
+/// M4 — without this command the posture reached the UI only as a Tauri
+/// event, and Tauri's `emit` has no replay: the BOOT publish happens before
+/// the React tree has registered its `listen()`, so the one case the posture
+/// exists for (a runner that came up holding a dead credential) landed on no
+/// listener at all. A webview reload then cleared the banner permanently,
+/// because the posture had not CHANGED and so never re-fired.
+///
+/// Returns the same `coordCredential` object `/health` serves, or `null` when
+/// no refresher pass has concluded in this process yet. `null` is UNKNOWN,
+/// never health — the caller must not render it as "fine".
+#[tauri::command]
+pub async fn get_coord_credential_posture() -> Option<serde_json::Value> {
+    crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.to_json())
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -1605,6 +1622,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             device_jwt_present,
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,
+            get_coord_credential_posture,
         ])
         .build()
 }
