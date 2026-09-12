@@ -75,14 +75,41 @@ interface WebIntegrationStatus {
   } | null;
 }
 
-/** Shape of `test_web_integration_connection` response on success. */
+/**
+ * Shape of `test_web_integration_connection` response on success.
+ *
+ * The command is READ-ONLY as of 2026-09-12. It used to register a throwaway
+ * runner against `POST /api/v1/runners/register` and return its id; that
+ * endpoint was deleted from qontinui-web in April 2026, so the old
+ * `{ runnerId }` shape described a call that always 404'd. It now reports two
+ * independent facts — reachability and pairing — because they fail separately
+ * and the operator needs to know which one broke.
+ */
 interface WebIntegrationTestResult {
-  runnerId: string;
+  /** The backend answered its unauthenticated liveness route. */
+  reachable: boolean;
+  /** This runner holds a device JWT the backend accepted. */
+  paired: boolean;
+  /** Present iff `paired` — from `GET /api/v1/devices/me`. */
+  deviceId?: string | null;
+  userId?: string | null;
+  tenantId?: string | null;
+  /** LOCAL shape check on the runner token only; it is not sent anywhere. */
+  tokenFormatValid: boolean;
+  /** One actionable line covering whichever arm was reached. */
+  detail: string;
 }
 
 interface TestConnectionUIState {
   state: "idle" | "testing" | "success" | "error";
-  runnerId?: string;
+  /** Set on a reachable-and-paired result. */
+  deviceId?: string;
+  /**
+   * Reachable but NOT paired. This is a normal first-run state, not a
+   * misconfiguration, so it renders as a warning rather than an error.
+   */
+  unpaired?: boolean;
+  detail?: string;
   error?: string;
 }
 
@@ -514,7 +541,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         backendUrl: formBackendUrl.trim(),
         runnerToken: tokenForTest,
       });
-      setTestState({ state: "success", runnerId: result.runnerId });
+      setTestState({
+        state: "success",
+        deviceId: result.deviceId ?? undefined,
+        unpaired: !result.paired,
+        detail: result.detail,
+      });
     } catch (err) {
       setTestState({ state: "error", error: String(err) });
     }
@@ -621,7 +653,12 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         backendUrl: formBackendUrl.trim(),
         runnerToken: tokenEdited ? formToken : "",
       });
-      setTestState({ state: "success", runnerId: result.runnerId });
+      setTestState({
+        state: "success",
+        deviceId: result.deviceId ?? undefined,
+        unpaired: !result.paired,
+        detail: result.detail,
+      });
       await invoke<void>("save_web_integration_settings", {
         enabled: formEnabled,
         backendUrl: formBackendUrl.trim(),
@@ -834,10 +871,25 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
           </div>
         );
       case "success":
+        // Reachable-but-unpaired is a real, common, non-error state: the URL is
+        // right and the server is up, but this runner has no device JWT yet.
+        // Showing it as a green "connected" would be a lie; showing it as a red
+        // failure would send the operator to fix a URL that is already correct.
+        if (testState.unpaired) {
+          return (
+            <div
+              className="flex items-center gap-1.5 text-xs text-yellow-500"
+              title={testState.detail}
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              {truncate(testState.detail ?? "Backend reachable, runner not paired", 100)}
+            </div>
+          );
+        }
         return (
-          <div className="flex items-center gap-1.5 text-xs text-green-500">
+          <div className="flex items-center gap-1.5 text-xs text-green-500" title={testState.detail}>
             <CheckCircle2 className="w-3.5 h-3.5" />
-            Connected as <code className="font-mono">{testState.runnerId}</code>
+            Connected as device <code className="font-mono">{testState.deviceId}</code>
           </div>
         );
       case "error":

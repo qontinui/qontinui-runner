@@ -438,8 +438,12 @@ pub struct AppState {
     ///
     /// `Some` when [`crate::settings::WebIntegrationSettings::enabled`] is
     /// true and both `backend_url` and `runner_token` are set. Holds the
-    /// runner_id assigned by `/api/v1/runners/register` and the token needed
-    /// for authenticated POSTs to the web backend.
+    /// device_id the web backend returns in the `/api/v1/devices/ws`
+    /// handshake, plus the token needed for authenticated calls to it.
+    ///
+    /// The name `runner_id` is historical. It used to be assigned by
+    /// `POST /api/v1/runners/register`, an endpoint deleted in `ad3692e6c`
+    /// (2026-04-28); identity now arrives over the WS handshake instead.
     ///
     /// Wrapped in `Arc<RwLock<...>>` so the settings-save command can
     /// hot-reload the integration without restarting the runner: the command

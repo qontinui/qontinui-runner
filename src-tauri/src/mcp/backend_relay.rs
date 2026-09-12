@@ -4107,8 +4107,10 @@ fn handle_terminal_buffer(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
 ///
 /// The relay was historically called the "cloud relay"; the function names
 /// preserve that prefix because they're used from `mcp_api::start_server`
-/// and from the auth refresh flow. They drive the unified runner WS at
-/// `/api/v1/runners/ws`, not a separate cloud-relay path.
+/// and from the auth refresh flow. They drive the unified device WS at
+/// `/api/v1/devices/ws` (see the module header), not a separate cloud-relay
+/// path. This comment said `/api/v1/runners/ws` until 2026-09-12; that router
+/// was removed from qontinui-web in `1574bd036` with no alias.
 pub mod commands {
     use super::*;
     use std::sync::OnceLock;
