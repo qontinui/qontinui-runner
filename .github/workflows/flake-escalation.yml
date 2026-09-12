@@ -36,6 +36,9 @@ name: Flake escalation
 # (`load_result_history` over coord.test_results), not this repo's. A red
 # nightly says "the rail is dark"; a green one with no issues would say "no
 # flakes", which is the false clean bill of health the plan exists to abolish.
+# That condition is tracked as coord finding e5311ec9-1592-430e-a7f8-9cc6eb84032e
+# (topic `test-flakiness`); the fix is a coord/web index or a horizon-bounded
+# read, never a change to this workflow.
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
 # The plan's second escalation arm — "any occurrence on a push to
@@ -114,10 +117,14 @@ jobs:
           COORD_HTTP_URL: https://coord.qontinui.io
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           MIN_OCCURRENCES: ${{ github.event.inputs.min_occurrences }}
+          # Routed through env rather than interpolated into `run:` — none of
+          # these is attacker-controlled today, but the interpolated form is
+          # the one a future edit copies with a value that is.
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          args=(--repo "${{ github.repository }}"
-                --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+          args=(--repo "$REPO" --run-url "$RUN_URL")
           if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
           if [ -n "${MIN_OCCURRENCES:-}" ]; then args+=(--min-occurrences "${MIN_OCCURRENCES}"); fi
           node scripts/ci-flake-escalate.mjs "${args[@]}"

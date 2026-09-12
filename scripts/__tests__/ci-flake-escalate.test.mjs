@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Unit tests for the PURE half of ci-flake-escalate.mjs (Phase 2 of plan
+// Unit tests for ci-flake-escalate.mjs — the pure half directly, the IO half through a recording `gh` runner (Phase 2 of plan
 // `2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train`).
 //
 // Uses Node's built-in `node:test` runner, mirroring
@@ -13,8 +13,14 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_MIN_OCCURRENCES,
+  FLAKE_LABEL,
+  MAX_TITLE_LEN,
+  TITLE_PREFIX,
+  applyAction,
   classifyFlakinessResponse,
+  ensureLabel,
   issueTitle,
+  listFlakeIssues,
   planIssueActions,
   renderIssueBody,
   selectEscalations,
@@ -87,6 +93,16 @@ test("an unrecognised history_read token is UNKNOWN", () => {
   const v = classifyFlakinessResponse({ history_read: "partial", priors: LIVE_PRIORS });
   assert.equal(v.kind, "failed");
   assert.match(v.reason, /unrecognised/);
+});
+
+test("history_read=ok with EMPTY priors is trusted as an observation (nothing to escalate)", () => {
+  // Deliberate policy, pinned so a later "make it UNKNOWN" edit is a choice
+  // and not a drift: coord's `ok` means the read succeeded and at least one
+  // test reached the window, so an empty map here is coord's own claim and
+  // the script has no better information to overrule it with.
+  const v = classifyFlakinessResponse({ history_read: "ok", min_k: 20, window: 20, priors: {} });
+  assert.equal(v.kind, "ok");
+  assert.deepEqual(selectEscalations(v.priors), []);
 });
 
 test("non-object bodies and bodies without priors are UNKNOWN", () => {
@@ -182,8 +198,9 @@ test("a title over GitHub's limit is truncated deterministically and stays uniqu
   const longB = "a::" + "x".repeat(400) + "::two";
   const ta = issueTitle(longA);
   const tb = issueTitle(longB);
-  assert.ok(ta.length <= 256, `too long: ${ta.length}`);
-  assert.ok(ta.startsWith("flaky test: a::xxx"));
+  assert.equal(MAX_TITLE_LEN, 250, "headroom under GitHub's 256-character cap");
+  assert.ok(ta.length <= MAX_TITLE_LEN, `too long: ${ta.length}`);
+  assert.ok(ta.startsWith(`${TITLE_PREFIX}a::xxx`));
   assert.notEqual(ta, tb, "two long ids sharing a prefix must not collide");
   assert.equal(ta, issueTitle(longA), "truncation must be deterministic");
 });
@@ -226,15 +243,27 @@ test("matching is on the EXACT title — a near-miss does not adopt", () => {
   assert.equal(actions[0].action, "create");
 });
 
-test("duplicate titles: the lowest number owns, the rest are reported", () => {
+test("duplicate titles: the lowest OPEN issue owns; a closed one is never reopened beside it", () => {
+  // Reopening #9 here would leave THREE open issues for one test while the
+  // run claims to dedupe — the review of this script caught exactly that.
   const actions = planIssueActions(ESC, [
     { number: 12, title: issueTitle(WEDGE), state: "OPEN" },
     { number: 9, title: issueTitle(WEDGE), state: "CLOSED" },
     { number: 15, title: issueTitle(WEDGE), state: "OPEN" },
   ]);
+  assert.equal(actions[0].number, 12);
+  assert.equal(actions[0].action, "update");
+  assert.deepEqual(actions[0].duplicates, [15, 9]);
+});
+
+test("duplicate titles, all CLOSED: the lowest number is reopened", () => {
+  const actions = planIssueActions(ESC, [
+    { number: 12, title: issueTitle(WEDGE), state: "CLOSED" },
+    { number: 9, title: issueTitle(WEDGE), state: "CLOSED" },
+  ]);
   assert.equal(actions[0].number, 9);
   assert.equal(actions[0].action, "reopen");
-  assert.deepEqual(actions[0].duplicates, [12, 15]);
+  assert.deepEqual(actions[0].duplicates, [12]);
 });
 
 test("issues with no title are ignored rather than crashing the plan", () => {
@@ -273,4 +302,116 @@ test("the body degrades honestly when the optional context is absent", () => {
   const body = renderIssueBody(ESC[0]);
   assert.match(body, /a manual run/);
   assert.match(body, /last \? runs per test \(min_k \?\)/);
+});
+
+// ---------------------------------------------------------------------------
+// IO half — the exact `gh` argv each action issues, through a recording runner
+// (flag drift is where a CLI wrapper breaks, and the pure tests cannot see it)
+// ---------------------------------------------------------------------------
+
+function recorder(responses = {}) {
+  const calls = [];
+  const gh = (args, opts) => {
+    calls.push({ args, opts });
+    const key = args.slice(0, 2).join(" ");
+    const r = responses[key];
+    return typeof r === "function" ? r(args, opts) : (r ?? "");
+  };
+  return { calls, gh };
+}
+
+test("ensureLabel is a single --force create (idempotent under case and race)", () => {
+  const { calls, gh } = recorder();
+  ensureLabel("o/r", gh);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args.slice(0, 4), ["label", "create", FLAKE_LABEL, "--force"]);
+  assert.equal(calls[0].opts.repo, "o/r");
+});
+
+test("listFlakeIssues unions the labelled list with the title search, by number", () => {
+  const { calls, gh } = recorder({
+    "issue list": (args) =>
+      args.includes("--label")
+        ? JSON.stringify([{ number: 1, title: "flaky test: a", state: "OPEN" }])
+        : JSON.stringify([
+            { number: 1, title: "flaky test: a", state: "OPEN" },
+            { number: 2, title: "flaky test: b (hand-filed, no label)", state: "OPEN" },
+          ]),
+  });
+  const issues = listFlakeIssues("o/r", gh);
+  assert.deepEqual(issues.map((i) => i.number).sort(), [1, 2]);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].args.includes("--label") && calls[0].args.includes(FLAKE_LABEL));
+  assert.ok(calls[1].args.includes("--search"));
+  assert.ok(calls[1].args.includes(`"${TITLE_PREFIX.trim()}" in:title`));
+  for (const c of calls) {
+    assert.ok(
+      c.args.includes("--state") && c.args.includes("all"),
+      "closed issues must be visible",
+    );
+    assert.ok(c.args.includes("number,title,state"));
+  }
+});
+
+test("applyAction create: title + label + body via stdin, never on argv", () => {
+  const { calls, gh } = recorder({ "issue create": "https://github.com/o/r/issues/42\n" });
+  const ref = applyAction({ action: "create", title: "flaky test: x" }, "BODY", "o/r", gh);
+  assert.equal(ref, "https://github.com/o/r/issues/42");
+  assert.deepEqual(calls[0].args, [
+    "issue",
+    "create",
+    "--title",
+    "flaky test: x",
+    "--label",
+    FLAKE_LABEL,
+    "--body-file",
+    "-",
+  ]);
+  assert.equal(calls[0].opts.input, "BODY");
+});
+
+test("applyAction update: edit re-adds the label and refreshes the body", () => {
+  const { calls, gh } = recorder();
+  const ref = applyAction({ action: "update", number: 7 }, "BODY", "o/r", gh);
+  assert.equal(ref, "#7");
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, [
+    "issue",
+    "edit",
+    "7",
+    "--add-label",
+    FLAKE_LABEL,
+    "--body-file",
+    "-",
+  ]);
+  assert.equal(calls[0].opts.input, "BODY");
+});
+
+test("applyAction reopen: reopens THEN edits (the fall-through is load-bearing)", () => {
+  const { calls, gh } = recorder();
+  const ref = applyAction({ action: "reopen", number: 7 }, "BODY", "o/r", gh);
+  assert.equal(ref, "#7");
+  assert.deepEqual(
+    calls.map((c) => c.args.slice(0, 2)),
+    [
+      ["issue", "reopen"],
+      ["issue", "edit"],
+    ],
+  );
+  assert.equal(calls[1].opts.input, "BODY");
+});
+
+test("applyAction refuses an unknown action rather than guessing", () => {
+  const { gh } = recorder();
+  assert.throws(
+    () => applyAction({ action: "close", number: 7 }, "BODY", "o/r", gh),
+    /unknown action/,
+  );
+});
+
+test("a test id with shell metacharacters reaches gh as one argv entry, unchanged", () => {
+  const id = 'crate::mod::test $(rm -rf /) `x` ; & | > "q"';
+  const { calls, gh } = recorder({ "issue create": "u" });
+  applyAction({ action: "create", title: issueTitle(id) }, "BODY", "o/r", gh);
+  assert.equal(calls[0].args[3], `${TITLE_PREFIX}${id}`);
 });
