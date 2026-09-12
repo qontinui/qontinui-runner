@@ -10,6 +10,7 @@ import {
   fleetErrorInvalidatesCursor,
   fleetErrorIsRestart,
   fleetErrorMessage,
+  fleetScopeKey,
   fleetWalkAccept,
   fleetWalkDropCursor,
   mergeDeviceCatalog,
@@ -405,9 +406,38 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const state = opts?.state ?? null;
   const includeClosed = opts?.includeClosed ?? false;
   const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
+  /**
+   * The walk's scope, as one comparable string. This — not `fetchPage`'s
+   * identity — is what a restart keys on, and the difference is the whole point
+   * of [`fleetScopeKey`] omitting `limit`.
+   *
+   * Closing `fetchPage` over `limit` and then keying the mount effect on
+   * `fetchPage` makes a page RESIZE restart the walk and discard every page
+   * already accumulated, which is exactly what this module's contract says must
+   * not happen: coord's cursor survives a changed page size. The scope key is
+   * the three parameters coord actually fingerprints into the cursor, so it
+   * moves when and only when a cursor really is invalidated.
+   */
+  const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });
+
+  /**
+   * The page size as of the CALL, not as of the render that built the callback.
+   *
+   * `limit` is read through a ref for the same reason `cursorRef` exists: it
+   * must not enter `fetchPage`'s dependency list, because everything in that
+   * list restarts the walk through the effect below.
+   */
+  const limitRef = useRef(limit);
+  // Synced in an effect rather than during render: a render-phase ref write is
+  // what `react-hooks/refs` flags, and nothing reads this before an effect or a
+  // click handler runs — `useRef(limit)` already seeds the mount read.
+  useEffect(() => {
+    limitRef.current = limit;
+  }, [limit]);
 
   const fetchPage = useCallback(
     async (mode: FleetWalkMode) => {
+      const limit = limitRef.current;
       const cursor = mode === "more" ? cursorRef.current : null;
       // Nothing to walk. Not an error and not a read: coord said this was the
       // last page, and asking again with no cursor would silently restart.
@@ -498,15 +528,21 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
         }
       }
     },
-    [deviceId, state, includeClosed, limit],
+    [deviceId, state, includeClosed],
   );
 
-  // Runs on mount, whenever the query identity changes (a new device/state must
-  // restart the walk — a cursor is only valid within its scope), and when a
+  // Runs on mount, whenever the SCOPE changes (a new device/state/include-closed
+  // must restart the walk — a cursor is only valid within its scope), and when a
   // scope-mismatch restart bumps the token.
+  //
+  // Keyed on `scopeKey` rather than on `fetchPage`: a page RESIZE changes the
+  // slice, not the sequence, and coord's cursor survives it — so resizing must
+  // re-use the walk rather than throw away the pages already loaded. The next
+  // page fetched picks the new size up through `limitRef`.
   useEffect(() => {
     void fetchPage("restart");
-  }, [fetchPage, restartToken]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `fetchPage` closes over the same three scope values `scopeKey` is built from, so keying on both is redundant; naming it here is the shape that puts `limit` back in and restarts the walk on a page resize
+  }, [scopeKey, restartToken]);
 
   const refresh = useCallback(() => fetchPage("restart"), [fetchPage]);
   const loadMore = useCallback(() => fetchPage("more"), [fetchPage]);
