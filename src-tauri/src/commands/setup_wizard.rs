@@ -284,14 +284,36 @@ pub async fn github_list_repos() -> Result<Value, String> {
 /// runner's tenant deterministically, independent of which account happens to
 /// be logged into the browser. The browser-session claim remains the fallback
 /// when the deep link never arrives (cross-device install, older web build).
+///
+/// The runner also mints its OWN coord `connect_state` token here — over the
+/// same Cognito bearer the later claim uses — and holds it beside the nonce
+/// until the deep link comes back. Coord requires a connect-state on every
+/// claim (`COORD_REQUIRE_CONNECT_STATE`, armed in production 2026-08-01) and
+/// asserts the token's tenant + minting operator against the claiming caller,
+/// so the browser's token cannot be forwarded to the runner: the runner claims
+/// as itself. Minting with the same bearer is what makes the two anchors name
+/// the same tenant (plan `2026-07-31-p2-runner-return-nonce-vs-server-minted-
+/// connect-state` §2.3, Option A). The mint records `flow: runner-clone` and no
+/// target — the org is picked on GitHub after this point — so coord derives
+/// `bind_only` from the row and skips the target assertion.
+///
+/// A mint failure is returned rather than swallowed: opening a browser flow
+/// whose hand-off is already known to fail would only surface the same error
+/// later, after the user has installed the App.
 #[tauri::command]
-pub fn github_connect_url() -> String {
-    let state = mint_connect_state();
-    format!(
+pub async fn github_connect_url() -> Result<String, String> {
+    let Some(bearer) = cognito_bearer().await else {
+        return Err(
+            "Sign in to your Qontinui account in the runner before connecting GitHub.".to_string(),
+        );
+    };
+    let connect_state = mint_backend_connect_state(&bearer).await?;
+    let state = arm_pending_connect(connect_state);
+    Ok(format!(
         "{}/connect-runner-github?state={}",
         crate::api_config::derive_web_base_url(&crate::api_config::get_api_base_url()),
         state
-    )
+    ))
 }
 
 // ---- P2: runner-native claim on the `github-connected` deep-link ----------
@@ -312,14 +334,26 @@ pub fn github_connect_url() -> String {
 /// pending flow can't be redeemed much later.
 const CONNECT_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
-/// Single pending-flow slot `(nonce, minted_at)`. Clicking Connect again
-/// replaces any previous pending flow (last click wins — matches the UI, where
-/// only one connect flow is ever visible).
-static PENDING_CONNECT_STATE: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+/// One runner-initiated connect flow awaiting its deep link.
+struct PendingConnect {
+    /// The return nonce carried through `?state=` and back on the deep link.
+    nonce: String,
+    /// The coord connect-state token minted for this flow, sent on the claim.
+    /// Never leaves process memory until then; never logged.
+    connect_state: String,
+    minted_at: std::time::Instant,
+}
+
+/// Single pending-flow slot. Clicking Connect again replaces any previous
+/// pending flow (last click wins — matches the UI, where only one connect flow
+/// is ever visible). The replaced flow's coord row is simply left to expire;
+/// coord expects concurrent live rows per tenant and bounds their count.
+static PENDING_CONNECT_STATE: std::sync::Mutex<Option<PendingConnect>> =
     std::sync::Mutex::new(None);
 
-/// Mint + arm a fresh connect nonce (256-bit hex from the OS CSPRNG).
-fn mint_connect_state() -> String {
+/// Mint a fresh connect nonce (256-bit hex from the OS CSPRNG) and arm the
+/// pending slot with it and the coord `connect_state` the claim will present.
+fn arm_pending_connect(connect_state: String) -> String {
     use rand::RngCore;
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
@@ -329,11 +363,16 @@ fn mint_connect_state() -> String {
     // permanently brick the connect feature (review L2).
     *PENDING_CONNECT_STATE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some((nonce.clone(), std::time::Instant::now()));
+        .unwrap_or_else(|e| e.into_inner()) = Some(PendingConnect {
+        nonce: nonce.clone(),
+        connect_state,
+        minted_at: std::time::Instant::now(),
+    });
     nonce
 }
 
-/// Validate a deep-link `state` against the pending flow and consume it.
+/// Validate a deep-link `state` against the pending flow and consume it,
+/// handing back the `connect_state` token that flow was minted with.
 ///
 /// Single-use: consumed only on a MATCH — a mismatching presentation must not
 /// clear the slot, or any crafted deep link could cancel a legitimate pending
@@ -341,7 +380,7 @@ fn mint_connect_state() -> String {
 /// nonce; the OS-launch channel also makes timing measurement impractical, so
 /// a constant-time compare buys nothing here). An expired slot is cleared on
 /// sight so it can't linger.
-fn take_connect_state_if_valid(presented: &str) -> Result<(), String> {
+fn take_connect_state_if_valid(presented: &str) -> Result<String, String> {
     let mut slot = PENDING_CONNECT_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -357,18 +396,89 @@ fn take_connect_state_if_valid(presented: &str) -> Result<(), String> {
                      from Connect GitHub here, or use \"Complete in this browser instead\""
                 .to_string(),
         ),
-        Some((nonce, minted_at)) => {
-            if minted_at.elapsed() > CONNECT_STATE_TTL {
+        Some(pending) => {
+            if pending.minted_at.elapsed() > CONNECT_STATE_TTL {
                 *slot = None;
                 Err("the GitHub connect flow expired — click Connect GitHub again".to_string())
-            } else if nonce != presented {
+            } else if pending.nonce != presented {
                 Err("state nonce does not match the pending connect flow".to_string())
             } else {
-                *slot = None;
-                Ok(())
+                // `take` moves the whole entry out, so the token is handed to
+                // exactly one claim.
+                Ok(slot.take().map(|p| p.connect_state).unwrap_or_default())
             }
         }
     }
+}
+
+/// The human-readable message in a failed web-proxy response.
+///
+/// Two shapes reach the runner. A failure raised by the proxy itself (FastAPI
+/// `HTTPException`: 401/422/502/504) carries `detail`, as a string or an
+/// object with a `message`. A failure coord returned is passed through
+/// VERBATIM by the onboarding proxies — `{ "error": <code>, "message": … }` at
+/// the top level — so a reader that only knew `detail` rendered every coord
+/// refusal (`connect_state_required`, `installation_not_administered`, …) as a
+/// bare status code.
+fn backend_error_message(body: &Value, status: reqwest::StatusCode, what: &str) -> String {
+    let non_empty = |v: &Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    body.get("detail")
+        .and_then(|d| non_empty(d).or_else(|| d.get("message").and_then(non_empty)))
+        .or_else(|| body.get("message").and_then(non_empty))
+        .or_else(|| body.get("error").and_then(non_empty))
+        .unwrap_or_else(|| format!("{} failed with status {}", what, status))
+}
+
+/// Mint a coord connect-state token for the `runner-clone` flow through the
+/// web proxy (`POST /api/v1/operations/pr-merge/onboarding/connect-state`),
+/// with the same bearer the claim will use. Returns the plaintext token, which
+/// coord hands out exactly once and never persists.
+async fn mint_backend_connect_state(bearer: &str) -> Result<String, String> {
+    let url = format!(
+        "{}/api/v1/operations/pr-merge/onboarding/connect-state",
+        crate::api_config::get_api_base_url()
+    );
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .bearer_auth(bearer)
+        .json(&serde_json::json!({ "flow": "runner-clone" }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach Qontinui backend: {}", e))?;
+
+    let status = resp.status();
+    let (host, path) = crate::outbound_trace::split_url(&url);
+    crate::outbound_trace::record(
+        "mint_connect_state",
+        crate::outbound_trace::OutboundTrace {
+            method: "POST".to_string(),
+            host,
+            path,
+            status: status.as_u16(),
+            bearer_kind: "access".to_string(),
+            // The response body IS the single-use token — record the status only.
+            response_shape: None,
+        },
+    );
+
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let msg = backend_error_message(&body, status, "starting the GitHub connect");
+        warn!("connect-state mint failed (status={}): {}", status, msg);
+        return Err(msg);
+    }
+    body.get("connect_state")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .ok_or_else(|| "Coord returned no connect-state token — please retry.".to_string())
 }
 
 /// Which GitHub account the claim targets. Fresh installs return an
@@ -383,16 +493,20 @@ pub enum GithubClaimTarget {
 /// Complete a runner-initiated GitHub App connect: validate + consume the
 /// `state` nonce, then claim the installation through the existing web proxy
 /// (`POST /api/v1/operations/pr-merge/onboarding/claim`) with the runner's own
-/// Cognito bearer, `bind_only: true` (D2 decision — the clone flow must never
-/// surprise a partner org with bootstrap PRs).
+/// Cognito bearer, the `connect_state` token minted for this flow in
+/// [`github_connect_url`], and `bind_only: true` (D2 decision — the clone flow
+/// must never surprise a partner org with bootstrap PRs; coord also derives it
+/// from the token's recorded `runner-clone` flow and rejects a body that
+/// disagrees).
 ///
-/// Returns the human-readable outcome message. Never logs `code` or the nonce.
+/// Returns the human-readable outcome message. Never logs `code`, the nonce,
+/// or the token.
 pub async fn claim_github_connection(
     code: String,
     target: GithubClaimTarget,
     state: String,
 ) -> Result<String, String> {
-    take_connect_state_if_valid(&state)?;
+    let connect_state = take_connect_state_if_valid(&state)?;
 
     let Some(bearer) = cognito_bearer().await else {
         return Err(
@@ -408,6 +522,7 @@ pub async fn claim_github_connection(
     let mut body = serde_json::json!({
         "code": code,
         "bind_only": true,
+        "connect_state": connect_state,
     });
     let target_label = match &target {
         GithubClaimTarget::InstallationId(id) => {
@@ -449,16 +564,7 @@ pub async fn claim_github_connection(
         info!("Runner-native GitHub claim succeeded ({})", target_label);
         Ok("GitHub connected — your repositories are now available.".to_string())
     } else {
-        let msg = body
-            .get("detail")
-            .and_then(|d| {
-                d.as_str().map(str::to_string).or_else(|| {
-                    d.get("message")
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string)
-                })
-            })
-            .unwrap_or_else(|| format!("claim failed with status {}", status));
+        let msg = backend_error_message(&body, status, "claim");
         warn!(
             "Runner-native GitHub claim failed ({}, status={}): {}",
             target_label, status, msg
@@ -1466,40 +1572,101 @@ mod tests {
         assert!(take_connect_state_if_valid("anything").is_err());
 
         // Minted nonce is 256-bit hex and lands in the connect URL shape.
-        let nonce = mint_connect_state();
+        let nonce = arm_pending_connect("token-1".to_string());
         assert_eq!(nonce.len(), 64);
         assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
 
         // A mismatching presentation is rejected AND must not consume the
         // pending flow (a crafted deep link must not cancel a real one).
         assert!(take_connect_state_if_valid("wrong-nonce").is_err());
-        assert!(take_connect_state_if_valid(&nonce).is_ok());
+        // A match hands back the connect_state the flow was armed with — the
+        // claim presents THIS token, never the browser's.
+        assert_eq!(
+            take_connect_state_if_valid(&nonce).as_deref(),
+            Ok("token-1")
+        );
 
         // Single-use: the same nonce cannot be redeemed twice.
         assert!(take_connect_state_if_valid(&nonce).is_err());
 
-        // A re-mint replaces the previous pending flow (last click wins).
-        let first = mint_connect_state();
-        let second = mint_connect_state();
+        // A re-mint replaces the previous pending flow (last click wins),
+        // token included.
+        let first = arm_pending_connect("token-first".to_string());
+        let second = arm_pending_connect("token-second".to_string());
         assert_ne!(first, second);
         assert!(take_connect_state_if_valid(&first).is_err());
-        assert!(take_connect_state_if_valid(&second).is_ok());
+        assert_eq!(
+            take_connect_state_if_valid(&second).as_deref(),
+            Ok("token-second")
+        );
 
         // Expired slot → rejected and cleared. (Backdate the minted_at; skip
         // silently if the platform clock can't represent the subtraction.)
         let expired_at = std::time::Instant::now()
             .checked_sub(CONNECT_STATE_TTL + std::time::Duration::from_secs(1));
         if let Some(minted_at) = expired_at {
-            let stale = mint_connect_state();
+            let stale = arm_pending_connect("token-stale".to_string());
             PENDING_CONNECT_STATE
                 .lock()
                 .unwrap()
-                .replace((stale.clone(), minted_at));
+                .replace(PendingConnect {
+                    nonce: stale.clone(),
+                    connect_state: "token-stale".to_string(),
+                    minted_at,
+                });
             let err = take_connect_state_if_valid(&stale).unwrap_err();
             assert!(err.contains("expired"), "unexpected error: {err}");
             // Cleared on sight — a second presentation now sees no pending flow.
             let err2 = take_connect_state_if_valid(&stale).unwrap_err();
             assert!(err2.contains("no pending"), "unexpected error: {err2}");
         }
+    }
+
+    /// The two failure shapes that reach the runner: the proxy's own
+    /// `detail` (string or `{message}`) and coord's verbatim pass-through
+    /// (`{error, message}` at the top level). The latter is every coord
+    /// refusal — `connect_state_required`, `installation_not_administered` —
+    /// and used to render as a bare status code.
+    #[test]
+    fn backend_error_message_reads_both_shapes() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let detail_str = serde_json::json!({ "detail": "coord is not reachable" });
+        assert_eq!(
+            backend_error_message(&detail_str, status, "claim"),
+            "coord is not reachable"
+        );
+
+        let detail_obj = serde_json::json!({ "detail": { "message": "nested" } });
+        assert_eq!(
+            backend_error_message(&detail_obj, status, "claim"),
+            "nested"
+        );
+
+        let coord_passthrough = serde_json::json!({
+            "error": "connect_state_required",
+            "message": "this connect did not start from Qontinui",
+        });
+        assert_eq!(
+            backend_error_message(&coord_passthrough, status, "claim"),
+            "this connect did not start from Qontinui"
+        );
+
+        // Code only — still better than the bare status.
+        let code_only = serde_json::json!({ "error": "connect_state_required" });
+        assert_eq!(
+            backend_error_message(&code_only, status, "claim"),
+            "connect_state_required"
+        );
+
+        // Nothing usable (empty strings included) → the status fallback.
+        let empty = serde_json::json!({ "detail": "", "message": " " });
+        assert_eq!(
+            backend_error_message(&empty, status, "claim"),
+            "claim failed with status 400 Bad Request"
+        );
+        assert_eq!(
+            backend_error_message(&Value::Null, status, "starting the GitHub connect"),
+            "starting the GitHub connect failed with status 400 Bad Request"
+        );
     }
 }
