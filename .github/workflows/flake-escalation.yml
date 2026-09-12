@@ -21,6 +21,26 @@ name: Flake escalation
 #     Same reasoning as atlas-exclude-fresh.yml's nightly.
 #   - workflow_dispatch: on-demand read, with `dry_run` to print the plan
 #     without touching a single issue.
+#   - workflow_run (CI on main, completed): the plan's SECOND arm — "any
+#     occurrence on a push to refs/heads/main". A red push to main is the one
+#     that freezes the merge train and, until now, left no trace once someone
+#     re-ran it. When the triggering CI run concluded `failure`, the script
+#     reads its failed `test (<platform>)` jobs' logs (`actions: read`) and
+#     files/refreshes an issue per failing test (capped — a mass failure is a
+#     broken commit, not N flakes). The coord read is skipped on this trigger
+#     (`--no-rate`): it belongs to the nightly, and repeating it ~20x/day
+#     would also make every push red while the rail is dark.
+#     Why not a step in ci.yml: the escalator needs `issues: write`, and the
+#     gating `test` job runs the PR's own code under `cargo test` with the job
+#     token in its environment — ci.yml's header says no job there needs a
+#     write scope, and widening it for a telemetry step would hand every
+#     same-repo PR's test code an issues-write token. `workflow_run` executes
+#     the default branch's copy of this file, after CI concluded, with its
+#     own token, and runs no PR code. Its `branches:` filter is on the
+#     TRIGGERING run's head branch, so this fires for runs on main only; the
+#     event this workflow's own runs carry is `workflow_run`, which coord's
+#     `establishes_main_baseline` does not admit (it admits `push` only), so
+#     a red run here cannot hold the train.
 #   - pull_request (paths: the script, its tests, this file): runs the
 #     script's unit tests so a regression cannot ship untested. Kept OUT of
 #     ci.yml's "Run CI-tooling unit tests" step on purpose — editing ci.yml
@@ -42,8 +62,11 @@ name: Flake escalation
 # `history_read: thin` (no test has 20 samples yet) is a notice and exits 0.
 #
 # The plan's second escalation arm — "any occurrence on a push to
-# refs/heads/main" — is NOT implemented: it needs per-run outcomes the
-# flakiness endpoint does not serve. Named in the plan as open.
+# refs/heads/main" — is the `workflow_run` trigger above. It does not need
+# per-run outcomes from the flakiness endpoint at all: the failing tests are
+# in the CI run's own job logs, parsed with the same parser Phase 1 ingests
+# with, so the issue title matches the coord identity and both arms land on
+# one issue.
 
 on:
   schedule:
@@ -60,10 +83,17 @@ on:
         description: "Disagreeing runs in coord's window needed to escalate (plan default 3)"
         type: string
         default: "3"
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   pull_request:
     branches: [main]
     paths:
       - scripts/ci-flake-escalate.mjs
+      # The parser the main-red arm imports; a change to it must run these
+      # tests too, not only ci-flake-analyze's own.
+      - scripts/ci-flake-analyze.mjs
       - scripts/__tests__/ci-flake-escalate.test.mjs
       - .github/workflows/flake-escalation.yml
 
@@ -97,10 +127,16 @@ jobs:
     # The coord read is bounded at 120 s inside the script; the rest is a
     # handful of `gh` calls.
     timeout-minutes: 10
-    # Two overlapping runs (a dispatch during the nightly) would race the
-    # list-then-create upsert and could file one test twice.
+    # One group per TRIGGERING CI run, and one for the nightly/dispatch.
+    # A single shared group would be worse than a race: GitHub keeps at most
+    # one running and one PENDING job per group, and a third arrival CANCELS
+    # the pending one — with ~20 main pushes a day that silently drops a
+    # push-red's evidence, and can drop the nightly itself. Keying per CI run
+    # means two main-red runs for the same test can race list-then-create;
+    # `planIssueActions` already picks the lowest open owner and warns on the
+    # duplicate, which is the cheaper failure.
     concurrency:
-      group: flake-escalation
+      group: flake-escalation-${{ github.event.workflow_run.id || 'nightly' }}
       cancel-in-progress: false
     # `issues: write` covers creating/editing/reopening issues AND creating
     # the `flake` label (labels are an issues-scoped resource). Nothing here
@@ -108,16 +144,25 @@ jobs:
     # pull requests" setting is irrelevant.
     permissions:
       contents: read
+      # Reading the triggering run's jobs and their logs (main-red arm).
+      actions: read
       issues: write
     steps:
       - uses: actions/checkout@v5
       # Runner-provided Node, for the same reason as the unit-tests job above.
       - name: Read coord's flake history and upsert escalation issues
+        # Step-level, never job-level: a job-level `if:` publishes a
+        # `skipped` check run that coord reads as passing
+        # (ci-rerun-on-declaration.yml documents this). A `workflow_run` whose
+        # triggering event was not a `push` (a `workflow_dispatch` of CI) has
+        # no train-freeze meaning and is skipped here.
+        if: github.event_name != 'workflow_run' || github.event.workflow_run.event == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           # Default in the script is https://coord.qontinui.io; set explicitly
           # so a future ambient-poison step (see ci.yml) cannot redirect this.
           COORD_HTTP_URL: https://coord.qontinui.io
+          EVENT_NAME: ${{ github.event_name }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           MIN_OCCURRENCES: ${{ github.event.inputs.min_occurrences }}
           # Routed through env rather than interpolated into `run:` — none of
@@ -125,9 +170,19 @@ jobs:
           # the one a future edit copies with a value that is.
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The TRIGGERING CI run (main-red arm); empty on schedule/dispatch.
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          CI_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: |
           set -euo pipefail
+          # --run-url is always THIS run (where the cap / unreadable-log
+          # warnings live); the script derives the CI run's URL from --run-id.
           args=(--repo "$REPO" --run-url "$RUN_URL")
+          if [ "${EVENT_NAME}" = "workflow_run" ]; then
+            args+=(--run-id "${CI_RUN_ID}" --run-conclusion "${CI_RUN_CONCLUSION}")
+            args+=(--run-attempt "${CI_RUN_ATTEMPT}" --no-rate)
+          fi
           if [ "${DRY_RUN:-false}" = "true" ]; then args+=(--dry-run); fi
           if [ -n "${MIN_OCCURRENCES:-}" ]; then args+=(--min-occurrences "${MIN_OCCURRENCES}"); fi
           node scripts/ci-flake-escalate.mjs "${args[@]}"
