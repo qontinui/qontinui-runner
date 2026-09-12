@@ -235,9 +235,9 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "test_web_integration_connection",
         dispatch: Dispatch::Frontend,
-        description: "Probe the given backend URL + runner token by making a throwaway runner-registration call and immediately deleting the created entry. Returns the transient runner id (for debugging only; do not reuse it).",
+        description: "Probe the given backend URL. READ-ONLY: reaches GET /api/v1/health/live for reachability, then — only when the URL is the backend this runner is BOUND to — GET /api/v1/devices/me for identity. Creates and deletes nothing. `identityFault` says why identity is absent: none | unpaired | not_bound_backend | rejected | forbidden | verifier_down | unexpected. `runnerToken` is shape-checked locally and never sent.",
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
-        response_schema: "{ \"runner_id\": string }",
+        response_schema: "{ \"reachable\": boolean, \"paired\": boolean, \"identityFault\": string, \"deviceId\": string|null, \"userId\": string|null, \"tenantId\": string|null, \"tokenFormatValid\": boolean|null, \"detail\": string }",
         probe_with_empty_args: true,
         observe_projection: None,
     },
