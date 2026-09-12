@@ -689,7 +689,11 @@ impl ChunkPoster {
         let volumes = chunk.volumes.unwrap_or_default();
         let body = WorktreeCensusReq {
             device_id: self.device_id,
-            tenant_id: self.tenant_id,
+            // Left `None` deliberately: [`ChunkPoster::send`] derives the
+            // declared tenant from the gated scope and overwrites this field,
+            // so setting the raw default here would only read as if it still
+            // reached the wire.
+            tenant_id: None,
             volumes,
             worktrees: chunk.rows,
         };
@@ -720,7 +724,11 @@ impl ChunkPoster {
         }
         let body = WorktreeCensusReq {
             device_id: self.device_id,
-            tenant_id: self.tenant_id,
+            // Left `None` deliberately: [`ChunkPoster::send`] derives the
+            // declared tenant from the gated scope and overwrites this field,
+            // so setting the raw default here would only read as if it still
+            // reached the wire.
+            tenant_id: None,
             volumes,
             worktrees: Vec::new(),
         };
@@ -747,7 +755,8 @@ impl ChunkPoster {
         // longer reach the body.
         let scope = crate::auth::TenantScope::for_bound_device_default(
             self.tenant_id,
-            &crate::auth::device_holds_usable_binding,
+            // Cached: asked once per census CHUNK, and a walk emits many.
+            &crate::auth::device_holds_usable_binding_cached,
         );
         body.tenant_id = scope.declared_tenant();
         // Tenant-scoped: the census row this POST carries declares
