@@ -384,6 +384,12 @@ async fn connect_and_pump(
     // grants coord minted for this device while the socket was down, into the
     // table the backend relay's terminal handlers enforce against.
     super::attach::run_catchup(http, coord_url, device_id).await;
+    // …and the REMOTE-CREATE one beside it (plan
+    // `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 3b).
+    // Without this the target has no source for the create grants coord
+    // minted while it was down, and a `terminal_create` arriving under one of
+    // them is refused — which is correct, but avoidable.
+    super::create::run_catchup(http, coord_url, device_id, super::create::CATCHUP_TIMEOUT).await;
 
     while let Some(msg) = ws.next().await {
         let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
@@ -482,6 +488,11 @@ async fn handle_push_frame(
     // The ATTACH arm — third suffix on the same socket (`.attach_request`),
     // same disambiguation. Records a grant; materializes nothing.
     super::attach::handle_push_frame(device_id, text);
+    // The CREATE arm — fourth suffix on the same socket (`.create_request`),
+    // same disambiguation. Records a grant; materializes nothing. The two
+    // grant arms are disjoint in both directions (asserted in `create`'s
+    // tests), so an attach grant can never land in the create table.
+    super::create::handle_push_frame(device_id, text);
 
     let Some(handoff) = parse_handoff_push(text, device_id) else {
         return;

@@ -974,6 +974,32 @@ pub fn routes() -> axum::Router<Arc<ApiState>> {
         .route("/terminals/{id}", delete(close_terminal_handler))
 }
 
+/// Static `(method, path)` tuples for every route [`routes`] registers.
+///
+/// Exists so `mcp::relay_path_policy` can be asserted against the REAL route
+/// table rather than against a list somebody remembered to keep in step: the
+/// tests below pin that every entry here is refused over the `http_request`
+/// relay arm, and that the distinct paths here match the number of route
+/// registrations in this file — so a terminal route added later is closed by
+/// default AND cannot slip past the enumeration silently (review round 2,
+/// finding 1).
+pub fn route_entries() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("GET", "/terminals"),
+        ("POST", "/terminals"),
+        ("GET", "/terminal-pages"),
+        ("POST", "/terminals/{id}/write"),
+        ("GET", "/terminals/{id}/buffer"),
+        ("GET", "/terminals/{id}/output"),
+        ("GET", "/terminals/{id}/coord-session"),
+        ("POST", "/terminals/{id}/submit-prompt"),
+        ("POST", "/terminals/{id}/resize"),
+        ("POST", "/terminals/{id}/move"),
+        ("GET", "/terminals/{id}/ws"),
+        ("DELETE", "/terminals/{id}"),
+    ]
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1159,5 +1185,73 @@ mod tests {
         // the manager's project-root fallback keeps working.
         let req: CreateTerminalRequest = serde_json::from_str(r#"{"title":"t"}"#).unwrap();
         assert!(req.working_dir.is_none());
+    }
+    // ------------------------------------------------------------------
+    // The relay path policy, against THIS module's real route table.
+    //
+    // Review round 2, finding 1: the typed `terminal_create` gate is defeated
+    // by `backend_relay`'s `http_request` arm, which self-calls these routes
+    // over loopback with a caller-chosen method, path and body. The policy
+    // lives in `mcp::relay_path_policy` — since round 4 a TOTAL allowlist, so
+    // these routes are refused by being unlisted rather than by being named.
+    // What is pinned HERE is that the policy covers every route this module
+    // actually registers, now and after the next one is added.
+    // ------------------------------------------------------------------
+
+    /// Not one route in this module is reachable over the `http_request` arm.
+    #[test]
+    fn no_terminal_route_is_reachable_over_the_http_relay() {
+        use crate::mcp::relay_path_policy::{relay_path_verdict, RelayPathVerdict};
+        for (method, path) in route_entries() {
+            // The pattern as registered, and a concrete instance of it.
+            let concrete = path.replace("{id}", "11111111-2222-3333-4444-555555555555");
+            for candidate in [path.to_string(), concrete] {
+                assert_eq!(
+                    relay_path_verdict(method, &candidate),
+                    RelayPathVerdict::NotAllowed,
+                    "{method} {candidate} must not be reachable over the http_request relay"
+                );
+            }
+        }
+    }
+
+    /// `route_entries()` is the policy's view of this module, so it must not
+    /// drift from `routes()`. Counted off the source of the `routes()` FUNCTION
+    /// BODY rather than trusted: a registration added there without an entry
+    /// here would leave a terminal route unclassified, which is exactly the
+    /// fail-open the policy exists to prevent.
+    ///
+    /// Scoped to the function body deliberately — a first cut counted the whole
+    /// file and was defeated by prose in a doc comment (including this one),
+    /// which is a test that fails for a reason unrelated to what it claims.
+    #[test]
+    fn route_entries_covers_every_route_registration_in_this_file() {
+        // Both built at runtime so this test's own source cannot match itself.
+        let needle = format!(".{}(", "route");
+        let fn_header = format!("pub fn {}() -> axum::Router<Arc<ApiState>> {{", "routes");
+        let src = include_str!("terminals.rs");
+
+        let start = src
+            .find(fn_header.as_str())
+            .expect("routes() signature — update this test if it changes");
+        let body = &src[start..];
+        // The function's own closing brace is the first one at column 0.
+        let end = body
+            .find("\n}")
+            .expect("routes() must be closed by a brace at column 0");
+        let registered = body[..end].matches(needle.as_str()).count();
+
+        let mut paths: Vec<&str> = route_entries().iter().map(|(_, p)| *p).collect();
+        paths.sort_unstable();
+        paths.dedup();
+
+        assert_eq!(
+            paths.len(),
+            registered,
+            "route_entries() lists {} distinct paths but routes() registers {} — a new terminal \
+             route must be added to route_entries() so the relay path policy classifies it",
+            paths.len(),
+            registered
+        );
     }
 }

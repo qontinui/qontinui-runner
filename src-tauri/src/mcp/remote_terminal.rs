@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::settings::AcceptRemoteAttach;
+use crate::settings::{AcceptRemoteAttach, AcceptRemoteCreate};
 use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
 
 // ---------------------------------------------------------------------------
@@ -250,6 +250,19 @@ impl RemoteAttachGrants {
         self.inner.lock().ok()?.remove(grant_jti)
     }
 
+    /// True when this jti names a row in the ATTACH table, expired or not.
+    ///
+    /// Used by the create gate, and only there: a jti coord minted as an
+    /// attach grant must never buy a PTY spawn, however the block reaching
+    /// this machine was stamped. Expired rows count — a jti that was an attach
+    /// grant does not become a create grant by ageing.
+    pub fn contains(&self, grant_jti: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .unwrap_or(false)
+    }
+
     /// Clear a grant's terminal binding, keeping the row until it expires.
     /// This is what `terminal_detach` does rather than [`Self::remove`]: the
     /// backend tears the attachment down on every SOURCE socket drop — a
@@ -308,6 +321,302 @@ impl RemoteAttachGrants {
         if let Ok(mut map) = self.inner.lock() {
             map.retain(|_, g| g.expires_at > now);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Target role — CREATE grants (plan
+// `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 3b)
+// ---------------------------------------------------------------------------
+
+/// One create grant as this runner knows it, learned from COORD — the
+/// `create_request` directive or the `GET /sessions/create-requests` catch-up
+/// poll — and never from the frame that presents it.
+///
+/// **That provenance is the whole point.** Before Phase 3b the target held no
+/// create-grant table at all: it read `remote.kind == "create"` off the frame
+/// the web relay forwarded and spawned a PTY, so the relay alone decided
+/// whether a coord grant existed. A relay defect or a compromised relay then
+/// spawned PTYs here. A create grant has no session and no terminal, so the
+/// row is just the jti, the source device it was minted for, and its expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateGrant {
+    pub grant_jti: String,
+    /// The source device coord minted the grant for. **Never empty** — a feed
+    /// row that carries no source device is DROPPED at
+    /// [`crate::session::create::PendingCreate::into_grant`] rather than
+    /// recorded with an empty binding.
+    ///
+    /// It used to be "empty when the feed did not carry one", and the
+    /// cross-check in [`RemoteCreateGrants::resolve`] skips on empty — so a
+    /// coord that stopped sending the field, or a feed row a proxy stripped it
+    /// from, silently disabled the source binding for that grant. An
+    /// unreadable `expires_at` was already fail-closed; this is the same rule
+    /// applied to the other half of the row.
+    pub source_device_id: String,
+    /// The USER coord minted the grant for, empty when the feed carried none.
+    ///
+    /// Read only by the `same_user` arm of this device's own
+    /// `accept_remote_create` dial, and empty there is a REFUSAL rather than a
+    /// skip: the local dial is the half coord cannot enforce for us, so it
+    /// fails closed. It is deliberately not part of the identity cross-check —
+    /// the device binding is what a replay has to beat.
+    pub source_user_id: String,
+    /// Unix seconds.
+    pub expires_at: u64,
+}
+
+/// The in-memory create-grant table (target role). The twin of
+/// [`RemoteAttachGrants`], minus everything a create has no room for: no
+/// terminal binding (the terminal is what the grant will create) and no
+/// session (none exists yet).
+///
+/// **Single-use, and single-use against the FEED as well as against a replay.**
+/// [`Self::consume`] removes the row it returns: a create grant buys ONE spawn.
+/// But removal alone is not enough, because the row's SOURCE is coord's pending
+/// list, and coord's list keeps serving a grant until its `consumed_at` is set:
+/// the 60 s catch-up poll would re-insert the jti this process just spent and
+/// the "single use" would be a per-minute allowance. So a spent jti is also
+/// remembered in [`Self::spent`] and [`Self::insert`] refuses to resurrect it.
+///
+/// The tombstone is the belt; coord's `POST …/create-requests/{jti}/consume` is
+/// the braces, and both are needed. The tombstone alone dies with the process;
+/// coord's flip alone leaves the window between the local spend and the flip.
+///
+/// The relay's Redis `SET NX` claim is neither: it is RELEASED when the create
+/// completes, while the grant JWT stays valid for the rest of its 15 minutes.
+#[derive(Default)]
+pub struct RemoteCreateGrants {
+    inner: Mutex<HashMap<String, CreateGrant>>,
+    /// jtis this process has already spent, and their `expires_at`. Kept until
+    /// the grant's own expiry — past that coord will not serve it either, so
+    /// the tombstone has nothing left to guard and is purged with the rest.
+    spent: Mutex<HashMap<String, u64>>,
+}
+
+impl RemoteCreateGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a grant coord published. Idempotent on `grant_jti` (push and
+    /// poll both deliver the same row); expired rows are purged first; past
+    /// [`MAX_GRANTS`] the soonest-expiring row is evicted. No row here is ever
+    /// "live" the way a bound attach row is — a create grant is consumed the
+    /// moment it is used — so eviction has no attachment to sever and never
+    /// refuses. Returns `false` only when the lock is poisoned.
+    pub fn insert(&self, grant: CreateGrant, now: u64) -> bool {
+        // A jti this process already spent is NEVER re-admitted, however it
+        // arrives. Coord keeps serving a grant until its `consumed_at` is set,
+        // and the catch-up poll runs every 60 s, so without this the single-use
+        // property degrades into "once per poll interval".
+        if self.is_spent(&grant.grant_jti, now) {
+            warn!(
+                grant_jti = %grant.grant_jti,
+                "remote create: refusing to re-record a grant this device already spent \\
+                 (coord has not marked it consumed yet)"
+            );
+            return false;
+        }
+        let Ok(mut map) = self.inner.lock() else {
+            return false;
+        };
+        map.retain(|_, g| g.expires_at > now);
+        if let Some(existing) = map.get_mut(&grant.grant_jti) {
+            existing.expires_at = grant.expires_at;
+            if existing.source_device_id.trim().is_empty() {
+                existing.source_device_id = grant.source_device_id;
+            }
+            if existing.source_user_id.trim().is_empty() {
+                existing.source_user_id = grant.source_user_id;
+            }
+            return true;
+        }
+        if map.len() >= MAX_GRANTS {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, g)| g.expires_at)
+                .map(|(k, _)| k.clone())
+            {
+                warn!(
+                    evicted = %victim,
+                    cap = MAX_GRANTS,
+                    "remote create: grant table at capacity — evicting the soonest-expiring grant"
+                );
+                map.remove(&victim);
+            }
+        }
+        map.insert(grant.grant_jti.clone(), grant);
+        true
+    }
+
+    /// Presence + source device + expiry, WITHOUT consuming. The read a test
+    /// or a diagnostic wants; the admission path calls [`Self::consume`].
+    ///
+    /// Order, and the reason for it, is [`RemoteAttachGrants::lookup`]'s: a
+    /// source-device mismatch answers the SAME refusal as an unknown jti, so a
+    /// broker replaying jti J from the wrong device learns nothing about
+    /// whether J exists here; and it is checked BEFORE expiry so a wrong-source
+    /// frame never learns the jti was merely expired.
+    pub fn lookup(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        self.resolve(grant_jti, source_device_id, now, false)
+    }
+
+    /// [`Self::lookup`] and REMOVE the row, **atomically** — the admission
+    /// path. See the type docs for why a create grant is single-use.
+    ///
+    /// One lock spans the check and the removal, deliberately: a check that
+    /// released the lock before removing would let two concurrent frames
+    /// carrying the same jti both pass and both spawn, which is precisely the
+    /// double-spend this table exists to prevent. Exactly one caller can see
+    /// `Ok` for a given jti.
+    pub fn consume(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        self.resolve(grant_jti, source_device_id, now, true)
+    }
+
+    /// The one implementation behind [`Self::lookup`] and [`Self::consume`],
+    /// so the two can never drift into checking different things — and so the
+    /// consume is one critical section rather than two.
+    ///
+    /// A POISONED lock answers [`CreateRefusal::GrantUnknown`]: the table's
+    /// contents are then unknowable, and "unknown" is the fail-closed reading.
+    fn resolve(
+        &self,
+        grant_jti: &str,
+        source_device_id: Option<&str>,
+        now: u64,
+        take: bool,
+    ) -> Result<CreateGrant, CreateRefusal> {
+        // A zero clock means [`now_epoch_secs`] could not read the system time.
+        // Every `expires_at <= 0` comparison is then false, i.e. every grant
+        // reads as unexpired — fail-OPEN on an expiry check. Refuse instead.
+        if now == 0 {
+            warn!(
+                grant_jti,
+                "remote create: refused — this device cannot read its clock, so no grant's \
+                 expiry can be evaluated"
+            );
+            return Err(CreateRefusal::GrantUnknown);
+        }
+        if self.is_spent(grant_jti, now) {
+            return Err(CreateRefusal::GrantUnknown);
+        }
+        let mut map = self.inner.lock().map_err(|_| CreateRefusal::GrantUnknown)?;
+        let Some(grant) = map.get(grant_jti) else {
+            return Err(CreateRefusal::GrantUnknown);
+        };
+        // The source binding is REQUIRED, not merely checked when offered.
+        //
+        // The relay is the party this whole check defends against, and it is
+        // the party that stamps `remote.source_device_id`. A "check it if
+        // present" rule is therefore opt-out BY THE ADVERSARY: omit the key and
+        // the binding evaporates. Coord's ledger column is `UUID NOT NULL` and
+        // its directive always carries the field, so a grant whose row names a
+        // source can only meet a frame that names one too — unless something
+        // stripped it.
+        //
+        // And a row that names NO source is refused as well, rather than
+        // skipping the check: the feed drops such a row at
+        // [`crate::session::create::PendingCreate::into_grant`], so one
+        // reaching here at all means something built a grant by hand. Skipping
+        // on empty is how a stripped field turns a required binding into no
+        // binding (review finding 9); the second reader of the same rule.
+        let expected = grant.source_device_id.trim();
+        match source_device_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(claimed) if !expected.is_empty() && expected.eq_ignore_ascii_case(claimed) => {}
+            claimed => {
+                warn!(
+                    grant_jti,
+                    granted_source = expected,
+                    frame_source = claimed.unwrap_or("<absent>"),
+                    "remote create: the frame's source device is not the one the grant was \
+                     minted for (or either side names none at all) — refused as unknown"
+                );
+                return Err(CreateRefusal::GrantUnknown);
+            }
+        }
+        if grant.expires_at <= now {
+            map.remove(grant_jti);
+            return Err(CreateRefusal::GrantExpired);
+        }
+        let grant = grant.clone();
+        if take {
+            map.remove(grant_jti);
+            drop(map);
+            self.mark_spent(&grant, now);
+        }
+        Ok(grant)
+    }
+
+    /// True when this process already spent `grant_jti` and the grant has not
+    /// yet expired. Expired tombstones are purged on the way past: coord stops
+    /// serving an expired grant too, so there is nothing left to guard.
+    ///
+    /// A poisoned tombstone lock answers `true` — fail CLOSED. The cost is
+    /// refusing creates on a process whose lock is already broken; the
+    /// alternative is admitting a spent grant.
+    fn is_spent(&self, grant_jti: &str, now: u64) -> bool {
+        let Ok(mut spent) = self.spent.lock() else {
+            return true;
+        };
+        spent.retain(|_, exp| *exp > now);
+        spent.contains_key(grant_jti)
+    }
+
+    fn mark_spent(&self, grant: &CreateGrant, now: u64) {
+        if let Ok(mut spent) = self.spent.lock() {
+            spent.retain(|_, exp| *exp > now);
+            spent.insert(grant.grant_jti.clone(), grant.expires_at);
+        }
+    }
+
+    /// True when this jti names a row here, expired or not. The mirror of
+    /// [`RemoteAttachGrants::contains`], and used for the same kind of
+    /// cross-check.
+    pub fn contains(&self, grant_jti: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|map| map.contains_key(grant_jti))
+            .unwrap_or(false)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn purge_expired(&self, now: u64) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.retain(|_, g| g.expires_at > now);
+        }
+        if let Ok(mut spent) = self.spent.lock() {
+            spent.retain(|_, exp| *exp > now);
+        }
+    }
+
+    /// How many spent-jti tombstones are live — a diagnostic, and what the
+    /// resurrection tests assert against.
+    pub fn spent_len(&self, now: u64) -> usize {
+        self.spent
+            .lock()
+            .map(|mut s| {
+                s.retain(|_, exp| *exp > now);
+                s.len()
+            })
+            .unwrap_or(0)
     }
 }
 
@@ -477,11 +786,48 @@ pub fn grants() -> &'static RemoteAttachGrants {
     GRANTS.get_or_init(RemoteAttachGrants::new)
 }
 
+static CREATE_GRANTS: OnceLock<RemoteCreateGrants> = OnceLock::new();
+
+/// The process-wide CREATE grant table — deliberately a SECOND table rather
+/// than a `kind` column on the attach one. The two capabilities have disjoint
+/// lifecycles (an attach row is bound and re-bound and lives to `exp`; a create
+/// row is consumed by its one use) and disjoint shapes, and keeping them apart
+/// is what makes `attach_grants.contains(jti)` a meaningful cross-check.
+pub fn create_grants() -> &'static RemoteCreateGrants {
+    CREATE_GRANTS.get_or_init(RemoteCreateGrants::new)
+}
+
 pub fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Which capability the grant behind a `remote` block claims.
+///
+/// The web relay stamps `kind` from the grant's own `sub_type` — `attach_grant`
+/// → [`RemoteGrantKind::Attach`], `create_grant` → [`RemoteGrantKind::Create`]
+/// — and the two are NOT interchangeable here: an attach grant drives a PTY
+/// the operator already opened, a create grant spawns one. Anything the relay
+/// did not stamp `create` (absent, misspelled, a non-string) reads as
+/// [`RemoteGrantKind::Attach`], the narrower of the two, so an unrecognised
+/// value can only ever lose capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RemoteGrantKind {
+    #[default]
+    Attach,
+    Create,
+}
+
+impl RemoteGrantKind {
+    /// The wire spelling the relay stamps.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RemoteGrantKind::Attach => "attach",
+            RemoteGrantKind::Create => "create",
+        }
+    }
 }
 
 /// The `remote` block the web relay attaches to a forwarded frame.
@@ -491,6 +837,9 @@ pub struct RemoteBlock {
     pub source_device_id: Option<String>,
     pub session_id: Option<Uuid>,
     pub terminal_id: Option<String>,
+    /// What the grant behind this block is for. Fails closed to
+    /// [`RemoteGrantKind::Attach`] — see [`RemoteGrantKind`].
+    pub kind: RemoteGrantKind,
 }
 
 /// `None` when the frame carries no `remote` block (the operator-web path);
@@ -522,6 +871,10 @@ pub fn parse_remote_block(data: &Value) -> Option<Result<RemoteBlock, ()>> {
             .get("terminal_id")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        kind: match obj.get("kind").and_then(|v| v.as_str()).map(str::trim) {
+            Some("create") => RemoteGrantKind::Create,
+            _ => RemoteGrantKind::Attach,
+        },
     }))
 }
 
@@ -712,6 +1065,695 @@ pub fn refusal_frame(refusal: AttachRefusal, data: &Value, terminal_id: Option<&
     })
 }
 
+// ---------------------------------------------------------------------------
+// Target role — remote CREATE (plan
+// `2026-09-11-headless-runner-parity-from-a-headed-runner`, D2)
+// ---------------------------------------------------------------------------
+
+/// **D2, in one sentence: the TARGET chooses the working directory.**
+///
+/// A remote `terminal_create` spawns a PTY on THIS machine and can allocate a
+/// worktree and take a coord claim, so neither the directory nor the repo may
+/// come off the wire. The caller may express a PREFERENCE; this device answers
+/// it out of its own configuration ([`CreateTargets`], built from
+/// `settings.remote_create`), and a preference that is not a member of that
+/// set is REFUSED — never quietly redirected to something else, because a
+/// silent redirect teaches a caller that its value was honoured.
+///
+/// Concretely, the value this device spawns in is ALWAYS a string that came
+/// out of [`CreateTargets`]; a caller-supplied string is only ever compared,
+/// never used. That is what makes path trickery (`..`, a symlink, a differing
+/// spelling of the same directory) uninteresting here: the worst a matching
+/// string can achieve is the directory the operator already listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRoot {
+    /// The label a caller may name in `working_dir_key`.
+    pub key: String,
+    /// The directory this device actually spawns in.
+    pub path: String,
+}
+
+/// What this device is willing to spawn a remote terminal in, and under which
+/// edit intents. Resolved on the target, per create.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CreateTargets {
+    /// In order; the FIRST is what a create naming no directory lands in.
+    /// Empty means this device resolved nowhere to spawn — a refusal, not a
+    /// fallback to the process cwd.
+    pub roots: Vec<CreateRoot>,
+    /// The `intent_repo` values a remote create may declare. Empty means NONE.
+    pub repos: Vec<String>,
+}
+
+impl CreateTargets {
+    pub fn keys(&self) -> Vec<String> {
+        self.roots.iter().map(|r| r.key.clone()).collect()
+    }
+}
+
+/// Why a remote `terminal_create` was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateRefusal {
+    Disabled,
+    GrantRequired,
+    /// This device holds no live create grant with that jti — including the
+    /// case where it holds one minted for a DIFFERENT source device, which
+    /// answers the same code deliberately (see [`RemoteCreateGrants::lookup`]).
+    /// **The refusal the relay-trust hole became.** Reaching it means the relay
+    /// forwarded a `terminal_create` whose grant coord never told this device
+    /// about; before Phase 3b that frame spawned a PTY.
+    GrantUnknown,
+    /// The jti is one coord minted for this device, and it has expired.
+    GrantExpired,
+    NoTargetDirectory,
+    WorkingDirNotAllowed,
+    IntentRepoNotAllowed,
+    /// The device's own `accept_remote_create` dial reads `same_user`, and the
+    /// grant's source user is not this device's paired user — or is not
+    /// knowable at all. The LOCAL half of a three-valued dial coord also
+    /// enforces at the mint: without this the target could only tell `off`
+    /// from not-`off`, so an operator narrowing `tenant` -> `same_user` while
+    /// coord was unreachable changed nothing this device enforced.
+    SourceUserNotAllowed,
+}
+
+impl CreateRefusal {
+    pub fn code(self) -> &'static str {
+        match self {
+            CreateRefusal::Disabled => "remote_create_disabled",
+            CreateRefusal::GrantRequired => "remote_create_grant_required",
+            CreateRefusal::GrantUnknown => "remote_create_grant_unknown",
+            CreateRefusal::GrantExpired => "remote_create_grant_expired",
+            CreateRefusal::NoTargetDirectory => "remote_create_no_target_directory",
+            CreateRefusal::WorkingDirNotAllowed => "remote_create_working_dir_not_allowed",
+            CreateRefusal::IntentRepoNotAllowed => "remote_create_intent_repo_not_allowed",
+            CreateRefusal::SourceUserNotAllowed => "remote_create_source_user_not_allowed",
+        }
+    }
+
+    /// The refusal text. [`CreateRefusal::Disabled`] NAMES the preference and
+    /// says how to turn it on: the default is `off`, so without that sentence
+    /// the first thing every operator meets reads as a bug rather than as a
+    /// decision.
+    pub fn message(self) -> &'static str {
+        match self {
+            CreateRefusal::Disabled => {
+                "this device does not accept remote terminal creation — it is off by default; \
+                 set `remote_create.accept_remote_create` to `same_user` or `tenant` in the \
+                 runner's settings.json to allow it"
+            }
+            CreateRefusal::GrantRequired => {
+                "terminal_create is admitted only under a coord-minted CREATE grant — an attach \
+                 grant does not authorise spawning a terminal"
+            }
+            CreateRefusal::GrantUnknown => {
+                "no live create grant with that jti on this device — coord did not tell this \
+                 device about it, and this device does not take the relay's word for a grant"
+            }
+            CreateRefusal::GrantExpired => "the create grant has expired",
+            CreateRefusal::NoTargetDirectory => {
+                "this device resolved no directory to spawn a remote terminal in — list one in \
+                 `remote_create.allowed_working_dirs`, or set `paths.workspace_root`"
+            }
+            CreateRefusal::WorkingDirNotAllowed => {
+                "the requested working directory is not one this device offers for remote \
+                 creation — name one of `allowed_working_dir_keys`"
+            }
+            CreateRefusal::IntentRepoNotAllowed => {
+                "the requested intent_repo is not one this device offers for remote creation — \
+                 list it in `remote_create.allowed_intent_repos`"
+            }
+            CreateRefusal::SourceUserNotAllowed => {
+                "this device accepts remote terminal creation only from its OWN user \
+                 (`remote_create.accept_remote_create` is `same_user`), and the grant behind \
+                 this frame was not minted for that user — or names no user at all"
+            }
+        }
+    }
+}
+
+/// Normalize a directory string for COMPARISON only: trim, `\` → `/`, drop a
+/// trailing separator. Never used to build the path that is spawned in.
+fn normalize_dir(raw: &str) -> String {
+    let unified = raw.trim().replace('\\', "/");
+    let trimmed = unified.trim_end_matches('/');
+    if trimmed.is_empty() {
+        unified
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Resolve the directory a remote create spawns in — always one of
+/// `targets.roots`, never the caller's string.
+///
+/// - No preference → the first root (this device's default).
+/// - `working_dir_key` → exact key match, else [`CreateRefusal::WorkingDirNotAllowed`].
+/// - `working_dir` → admitted only when it normalizes to a root's own path,
+///   and even then the ROOT's spelling is returned. A `..` segment is refused
+///   outright rather than resolved.
+///
+/// `working_dir_key` wins when both are present; they cannot disagree
+/// usefully, and preferring the label keeps the path form from becoming the
+/// interesting one.
+pub fn resolve_create_working_dir(
+    targets: &CreateTargets,
+    requested_key: Option<&str>,
+    requested_dir: Option<&str>,
+) -> Result<String, CreateRefusal> {
+    let Some(default_root) = targets.roots.first() else {
+        return Err(CreateRefusal::NoTargetDirectory);
+    };
+    if let Some(key) = requested_key.map(str::trim).filter(|k| !k.is_empty()) {
+        return targets
+            .roots
+            .iter()
+            .find(|r| r.key.trim() == key)
+            .map(|r| r.path.clone())
+            .ok_or(CreateRefusal::WorkingDirNotAllowed);
+    }
+    if let Some(dir) = requested_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let wanted = normalize_dir(dir);
+        if wanted.split('/').any(|seg| seg == "..") {
+            return Err(CreateRefusal::WorkingDirNotAllowed);
+        }
+        return targets
+            .roots
+            .iter()
+            .find(|r| normalize_dir(&r.path) == wanted)
+            .map(|r| r.path.clone())
+            .ok_or(CreateRefusal::WorkingDirNotAllowed);
+    }
+    Ok(default_root.path.clone())
+}
+
+/// Resolve the directory a RELAY-delivered create with **no grant** spawns in.
+///
+/// The operator-web / mobile arm of `terminal_create` reaches the same relay
+/// socket as a remote create and used to honour `data["working_dir"]`
+/// VERBATIM — so the entire grant gate was opt-in by a marker the untrusted
+/// party stamps: omit the `remote` block and a relay frame bought a PTY at any
+/// path on the box (review finding 1, scenario A). The target decides here
+/// too; what differs from [`resolve_create_working_dir`] is only the
+/// no-preference arm:
+///
+/// * neither `working_dir_key` nor `working_dir` → **`Ok(None)`, always**,
+///   meaning "the runner's own default". The caller asked for nothing, so
+///   nothing about this device's remote-create configuration is applied to it:
+///   the mobile client (`createSession()` takes no working dir) lands exactly
+///   where it landed before any of this existed.
+/// * a NAMED directory → exactly [`resolve_create_working_dir`]'s rule: it
+///   must be one this device offers, and the ROOT's spelling is what is
+///   returned. With no roots configured that is
+///   [`CreateRefusal::NoTargetDirectory`] — a caller naming a directory on a
+///   device that offers none is refused rather than obeyed.
+///
+/// **The no-preference arm returned the first configured root for one review
+/// round, and that was a regression, not a hardening** (review round 2,
+/// finding 2). Two things followed from substituting a directory nobody asked
+/// for. `backend_relay`'s blockless arm derives `intent_repo` FROM
+/// `working_dir`, and `canonical_paths::repo_slug_for_path` matches any path
+/// under `<workspace-root>/<repo>` — so an operator whose first
+/// `remote_create.allowed_working_dirs` entry is a checkout (the natural
+/// config) silently allocated a worktree and took a coord claim for every
+/// mobile terminal anyone opened, under `QONTINUI_AGENT_WORKTREE_MODE`. And
+/// unconditionally, the mobile terminal's cwd moved off this runner's own
+/// default onto remote-create config it has nothing to do with. A blockless
+/// frame still cannot CHOOSE a directory — that is the named arm's job, and it
+/// is unchanged.
+pub fn resolve_relay_working_dir(
+    targets: &CreateTargets,
+    requested_key: Option<&str>,
+    requested_dir: Option<&str>,
+) -> Result<Option<String>, CreateRefusal> {
+    let named = requested_key.map(str::trim).is_some_and(|k| !k.is_empty())
+        || requested_dir.map(str::trim).is_some_and(|d| !d.is_empty());
+    if !named {
+        return Ok(None);
+    }
+    resolve_create_working_dir(targets, requested_key, requested_dir).map(Some)
+}
+
+/// The spawn parameters a RELAY-delivered `terminal_create` with **no grant**
+/// is allowed to choose — which is: none of them, freely.
+///
+/// The twin of [`AdmittedCreate`] for the ungated arm. Same shape for the same
+/// reason: the handler must have no second source for any of these, or the
+/// resolution here becomes advisory.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RelayCreate {
+    /// `None` = the runner's own default (this device offers no roots).
+    pub working_dir: Option<String>,
+    pub intent_repo: Option<String>,
+    /// **Always `None`, and it is a field rather than an omission so a test can
+    /// pin it.**
+    ///
+    /// `agent_session_id` is folded into a coord claim's OWNER TOKEN, so
+    /// honouring the frame's copy let a relay take a claim in a named agent
+    /// session's name (review finding 1, scenario A). Nothing on the web side
+    /// has ever sent the key on a `terminal_create` — neither
+    /// `runner_terminal_ws.py` nor the mobile client — so what it bought was
+    /// exactly the impersonation. The local Tauri command and the loopback HTTP
+    /// route, whose callers ARE the initiator, still read it.
+    pub agent_session_id: Option<Uuid>,
+}
+
+/// Gate one inbound `terminal_create` that carries **no `remote` block**.
+///
+/// This is the arm review finding 1 (scenario A) is about. `terminal_create`
+/// reaches the runner only over the backend relay, and the gate in
+/// [`admit_terminal_create`] engages only when the caller volunteers a block —
+/// so the relay could simply omit it and reach a path that honoured
+/// `working_dir`, `intent_repo` (worktree + coord claim) and
+/// `agent_session_id` (claim owner token) VERBATIM: no grant, no preference
+/// check, no allowlist, a PTY at `/`.
+///
+/// The gate cannot be made unconditional without deleting the mobile terminal
+/// feature, which reaches this same socket and cannot present a grant (coord
+/// mints create grants for DEVICES, and a mobile client is not one). So what
+/// this restores instead is the property the grant gate exists for — **the
+/// target decides the spawn parameters, not the caller** — on both arms:
+///
+/// * `working_dir` / `working_dir_key` resolve through the device's own roots
+///   ([`resolve_relay_working_dir`]), so a frame can only ask for a directory
+///   this device offers. The mobile client sends none, which is the arm that
+///   still gets this device's default.
+/// * `intent_repo` resolves through the device's own `allowed_intent_repos`,
+///   empty by default — so declaring one, which allocates a worktree AND takes
+///   a coord claim, is opt-in per device rather than per frame.
+/// * `agent_session_id` is not read at all. See [`RelayCreate`].
+pub fn resolve_relay_create(targets: &CreateTargets, data: &Value) -> Result<RelayCreate, Value> {
+    let requested_key = data.get("working_dir_key").and_then(|v| v.as_str());
+    let requested_dir = data.get("working_dir").and_then(|v| v.as_str());
+    let working_dir =
+        resolve_relay_working_dir(targets, requested_key, requested_dir).map_err(|refusal| {
+            warn!(
+                code = refusal.code(),
+                requested_key = requested_key.unwrap_or(""),
+                requested_dir = requested_dir.unwrap_or(""),
+                "relay create: refused the requested working directory — a frame with no grant \
+                 may only name a directory this device offers"
+            );
+            create_refusal_frame(refusal, data, Some(targets))
+        })?;
+
+    let requested_repo = data.get("intent_repo").and_then(|v| v.as_str());
+    let intent_repo = resolve_create_intent_repo(targets, requested_repo).map_err(|refusal| {
+        warn!(
+            code = refusal.code(),
+            requested_repo = requested_repo.unwrap_or(""),
+            "relay create: refused the requested intent_repo — a frame with no grant may only \
+             name a repo this device offers"
+        );
+        create_refusal_frame(refusal, data, Some(targets))
+    })?;
+
+    Ok(RelayCreate {
+        working_dir,
+        intent_repo,
+        agent_session_id: None,
+    })
+}
+
+/// Resolve a remote create's `intent_repo` against this device's allowlist.
+/// `Ok(None)` = none declared (and none is DERIVED for a remote create — the
+/// local path's `working_dir`-derived intent is deliberately not reachable
+/// from the wire, or an allowlisted directory that happens to be a checkout
+/// would allocate a worktree nobody asked for).
+pub fn resolve_create_intent_repo(
+    targets: &CreateTargets,
+    requested: Option<&str>,
+) -> Result<Option<String>, CreateRefusal> {
+    let Some(requested) = requested.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(None);
+    };
+    targets
+        .repos
+        .iter()
+        .find(|r| r.trim() == requested)
+        .cloned()
+        .map(Some)
+        .ok_or(CreateRefusal::IntentRepoNotAllowed)
+}
+
+/// A remote create this device admitted: the block it came under, and the
+/// TARGET-RESOLVED spawn parameters the handler must use in place of anything
+/// the frame carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmittedCreate {
+    pub block: RemoteBlock,
+    pub working_dir: String,
+    pub intent_repo: Option<String>,
+}
+
+/// The typed refusal frame for a remote create. Carries the allowlist the
+/// caller missed (keys and repos), so a source can offer the operator a choice
+/// instead of guessing paths.
+pub fn create_refusal_frame(
+    refusal: CreateRefusal,
+    data: &Value,
+    targets: Option<&CreateTargets>,
+) -> Value {
+    let remote = remote_echo(data);
+    let mut frame = json!({
+        "type": "error",
+        "code": refusal.code(),
+        "message": refusal.message(),
+        "request_id": data.get("request_id").cloned().unwrap_or(Value::Null),
+        "grant_jti": remote["grant_jti"].clone(),
+        "remote": remote,
+    });
+    if let Some(targets) = targets {
+        frame["allowed_working_dir_keys"] = json!(targets.keys());
+        frame["allowed_intent_repos"] = json!(targets.repos);
+    }
+    frame
+}
+
+/// Gate one inbound `terminal_create`.
+///
+/// `Ok(None)` — the frame carries no `remote` block: the operator-web / mobile
+/// path, untouched, caller-chosen `working_dir` and all. `Ok(Some(admitted))`
+/// — a remote create this device authorises, whose `working_dir` and
+/// `intent_repo` the caller did NOT choose. `Err(frame)` — the typed refusal
+/// to send back, having touched no terminal.
+///
+/// Order: block → kind → preference → attach-table cross-check → **this
+/// device's own create-grant table** → directory → repo.
+///
+/// The kind check is first among the refusals because it closes the hole the
+/// gate was first written for: `terminal_create` used to be reachable by
+/// anything holding an ATTACH grant. The create-grant lookup is the Phase 3b
+/// addition and closes the deeper one: every check above it reads fields the
+/// RELAY stamped, so together they only ever established *"the relay says a
+/// create grant backs this"*. [`RemoteCreateGrants::consume`] asks a table this
+/// device built from COORD's own directive and catch-up poll, so a frame whose
+/// jti coord never minted for this device is refused however the relay stamped
+/// it — which is the property a relay bug or compromise must not be able to
+/// spend.
+///
+/// It is ALSO where the grant is spent — but at the END, not at that lookup:
+/// see the two comments in the body. One grant buys one spawn, and no refusal
+/// burns one.
+pub fn admit_terminal_create<P, T, U>(
+    attach_grants: &RemoteAttachGrants,
+    create_grants: &RemoteCreateGrants,
+    preference: P,
+    local_user_id: U,
+    targets: T,
+    data: &Value,
+    now: u64,
+) -> Result<Option<AdmittedCreate>, Value>
+where
+    P: FnOnce() -> AcceptRemoteCreate,
+    U: FnOnce() -> Option<String>,
+    T: FnOnce() -> CreateTargets,
+{
+    let block = match parse_remote_block(data) {
+        None => return Ok(None),
+        Some(Err(())) => {
+            return Err(create_refusal_frame(
+                CreateRefusal::GrantRequired,
+                data,
+                None,
+            ))
+        }
+        Some(Ok(block)) => block,
+    };
+
+    if block.kind != RemoteGrantKind::Create {
+        warn!(
+            grant_jti = %block.grant_jti,
+            kind = block.kind.as_str(),
+            "remote create: refused — the grant behind this frame is not a create grant"
+        );
+        return Err(create_refusal_frame(
+            CreateRefusal::GrantRequired,
+            data,
+            None,
+        ));
+    }
+
+    // Read ONCE: the `same_user` arm below needs the same value, and a dial
+    // that could change between the two reads would be enforced as `tenant` by
+    // one check and `same_user` by the other.
+    let preference = preference();
+    if preference == AcceptRemoteCreate::Off {
+        warn!(
+            grant_jti = %block.grant_jti,
+            "remote create: refused — accept_remote_create is off on this device"
+        );
+        return Err(create_refusal_frame(CreateRefusal::Disabled, data, None));
+    }
+
+    // A jti coord minted as an ATTACH grant, presented as a create. The relay
+    // verifies `sub_type` itself, so this fires only on a broker defect or a
+    // forged block — which is exactly when the PTY owner's own check is the
+    // one that matters.
+    if attach_grants.contains(&block.grant_jti) {
+        warn!(
+            grant_jti = %block.grant_jti,
+            "remote create: refused — this jti is an ATTACH grant on this device"
+        );
+        return Err(create_refusal_frame(
+            CreateRefusal::GrantRequired,
+            data,
+            None,
+        ));
+    }
+
+    // THE INDEPENDENT CHECK. Everything above this line reads fields the RELAY
+    // stamped; this reads a table COORD filled — the `create_request` directive
+    // and the `GET /sessions/create-requests` catch-up poll. A jti coord never
+    // minted for this device is refused here no matter how the frame was
+    // labelled, which is the whole of what Phase 3b bought.
+    //
+    // It is a LOOKUP, not yet a consume, and it sits BEFORE the directory
+    // resolution below on purpose: the refusal frames from there echo this
+    // device's `allowed_working_dir_keys` and `allowed_intent_repos`, and an
+    // unauthorised caller must not be able to enumerate them by guessing.
+    let grant = match create_grants.lookup(&block.grant_jti, block.source_device_id.as_deref(), now)
+    {
+        Ok(grant) => grant,
+        Err(refusal) => {
+            warn!(
+                grant_jti = %block.grant_jti,
+                code = refusal.code(),
+                known_grants = create_grants.len(),
+                "remote create: refused — this device holds no live create grant with that jti \
+                 (the relay's word is not evidence of one)"
+            );
+            // `None` targets: no allowlist in the body. See above.
+            return Err(create_refusal_frame(refusal, data, None));
+        }
+    };
+
+    // THE LOCAL HALF OF THE DIAL. `accept_remote_create` is three-valued and
+    // coord enforces it at the MINT — but coord's copy of the column and this
+    // device's `settings.json` are two stores, and only one of them is the one
+    // the operator just edited. Until this check existed the target could only
+    // tell `off` from not-`off`, so narrowing `tenant` -> `same_user` while
+    // coord was unreachable changed nothing here and coord kept minting under
+    // the old value (review finding 6).
+    //
+    // Fail CLOSED on every unknown: a grant whose feed row named no user, and a
+    // device that cannot say which user it is paired to, are both refusals
+    // rather than skips — an unknowable identity is not a matching one.
+    if preference == AcceptRemoteCreate::SameUser {
+        let granted = grant.source_user_id.trim().to_string();
+        let local = local_user_id().unwrap_or_default();
+        let local = local.trim();
+        if granted.is_empty() || local.is_empty() || !granted.eq_ignore_ascii_case(local) {
+            warn!(
+                grant_jti = %block.grant_jti,
+                granted_user = %if granted.is_empty() { "<absent>" } else { granted.as_str() },
+                local_user = %if local.is_empty() { "<unknown>" } else { local },
+                "remote create: refused — this device accepts creates only from its own user"
+            );
+            return Err(create_refusal_frame(
+                CreateRefusal::SourceUserNotAllowed,
+                data,
+                None,
+            ));
+        }
+    }
+
+    let targets = targets();
+    let working_dir = resolve_create_working_dir(
+        &targets,
+        data.get("working_dir_key").and_then(|v| v.as_str()),
+        data.get("working_dir").and_then(|v| v.as_str()),
+    )
+    .map_err(|refusal| {
+        warn!(
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            requested_key = data.get("working_dir_key").and_then(|v| v.as_str()).unwrap_or(""),
+            requested_dir = data.get("working_dir").and_then(|v| v.as_str()).unwrap_or(""),
+            "remote create: refused the requested working directory"
+        );
+        create_refusal_frame(refusal, data, Some(&targets))
+    })?;
+
+    let intent_repo =
+        resolve_create_intent_repo(&targets, data.get("intent_repo").and_then(|v| v.as_str()))
+            .map_err(|refusal| {
+                warn!(
+                    grant_jti = %block.grant_jti,
+                    code = refusal.code(),
+                    requested_repo = data.get("intent_repo").and_then(|v| v.as_str()).unwrap_or(""),
+                    "remote create: refused the requested intent_repo"
+                );
+                create_refusal_frame(refusal, data, Some(&targets))
+            })?;
+
+    // SPEND the grant, and only now: a grant is consumed exactly when a spawn
+    // is authorised, so a caller who named a directory this device does not
+    // offer has not burned a capability they never got to use. The re-check is
+    // not redundant — `lookup` above ran before the two resolutions, and this
+    // is what makes the admission single-use.
+    if let Err(refusal) =
+        create_grants.consume(&block.grant_jti, block.source_device_id.as_deref(), now)
+    {
+        warn!(
+            grant_jti = %block.grant_jti,
+            code = refusal.code(),
+            "remote create: refused at the spend — the grant went away between the check and \
+             the spend (a concurrent use, or it expired)"
+        );
+        return Err(create_refusal_frame(refusal, data, None));
+    }
+
+    info!(
+        grant_jti = %block.grant_jti,
+        working_dir = %working_dir,
+        intent_repo = ?intent_repo,
+        "remote create: admitted — spawning in a directory THIS device resolved"
+    );
+    Ok(Some(AdmittedCreate {
+        block,
+        working_dir,
+        intent_repo,
+    }))
+}
+
+/// Is this create refusal worth ONE coord re-read before it is returned?
+///
+/// Exactly one is: [`CreateRefusal::GrantUnknown`]. Coord publishes the
+/// `create_request` directive before it answers the source's mint, but the
+/// directive rides NATS while the frame rides the source's HTTP round-trip and
+/// the relay socket — two paths with no ordering between them, so a LEGITIMATE
+/// create can arrive microseconds before the directive that authorises it. A
+/// single on-demand `GET /sessions/create-requests` removes that race; the 60 s
+/// catch-up poll alone would turn it into a minute-long flake.
+///
+/// **Every other refusal is final**, and that is the point of spelling this as
+/// a predicate rather than as an `if` in the handler:
+///
+/// * `Disabled` — the device's own dial; coord has nothing to add.
+/// * `GrantRequired` — the block is not a create block at all.
+/// * `GrantExpired` — coord's list cannot un-expire it.
+/// * the two allowlist refusals — decided entirely from local config.
+///
+/// Re-reading on any of those would be a coord round-trip per refused frame,
+/// which is a denial-of-service lever pointed at coord.
+pub fn refusal_warrants_a_coord_reread(code: &str) -> bool {
+    code == CreateRefusal::GrantUnknown.code()
+}
+
+/// Minimum gap between two on-demand coord re-reads, whatever jti asked.
+///
+/// The re-read is `await`ed on the backend relay's read loop, which is serial:
+/// every one of them stalls terminal input, output and every other relay frame
+/// for as long as the coord GET takes (up to its 10 s timeout). Unthrottled,
+/// that is a liveness lever a compromised relay can pull at will by forwarding
+/// a stream of creates carrying invented jtis.
+///
+/// Three seconds is chosen against the thing being raced — the gap between
+/// coord publishing the `create_request` directive and the relay's frame
+/// arriving, which is milliseconds — not against the 900 s grant life. A
+/// legitimate create that loses the race is served by the first re-read; a
+/// flood gets at most one coord round-trip per window and is otherwise refused
+/// from memory at no cost.
+pub const CREATE_REREAD_COOLDOWN_SECS: u64 = 3;
+
+/// Per-jti + global throttle for the on-demand re-read. `(last_reread_at,
+/// jtis already re-read and still unknown)`.
+static CREATE_REREAD_STATE: OnceLock<Mutex<(u64, HashMap<String, u64>)>> = OnceLock::new();
+
+fn create_reread_state() -> &'static Mutex<(u64, HashMap<String, u64>)> {
+    CREATE_REREAD_STATE.get_or_init(|| Mutex::new((0, HashMap::new())))
+}
+
+/// Should this unknown-jti refusal buy a coord re-read *right now*?
+///
+/// Two independent brakes, and a caller must clear BOTH:
+///
+/// * **once per jti** — a jti coord has already been asked about, and did not
+///   know, is never asked about again while it could still be live. Retrying it
+///   cannot produce a different answer for the same reason the first read
+///   didn't.
+/// * **once per [`CREATE_REREAD_COOLDOWN_SECS`]** — a flood of DISTINCT jtis
+///   would otherwise slip past the per-jti brake, which is exactly the shape an
+///   attacker would choose.
+///
+/// Calling this RECORDS the attempt, so it is not a pure predicate and must be
+/// called once per decision. `grant_expires_hint` bounds how long the per-jti
+/// memory is kept; a create grant lives 15 minutes, so an hour is a generous
+/// upper bound for a jti nobody can name an expiry for.
+pub fn claim_create_reread(grant_jti: &str, now: u64) -> bool {
+    const UNKNOWN_JTI_MEMORY_SECS: u64 = 3600;
+    let Ok(mut state) = create_reread_state().lock() else {
+        // A poisoned throttle must not become an unthrottled door.
+        return false;
+    };
+    let (last, asked) = &mut *state;
+    asked.retain(|_, at| now.saturating_sub(*at) < UNKNOWN_JTI_MEMORY_SECS);
+    if asked.contains_key(grant_jti) {
+        return false;
+    }
+    if now.saturating_sub(*last) < CREATE_REREAD_COOLDOWN_SECS {
+        return false;
+    }
+    *last = now;
+    asked.insert(grant_jti.to_string(), now);
+    true
+}
+
+/// Forget that `grant_jti` was re-read — called when the re-read FOUND it, so
+/// the memory holds only jtis coord genuinely did not know. Without this a
+/// legitimate grant that lost the race would occupy a slot for an hour.
+pub fn clear_create_reread(grant_jti: &str) {
+    if let Ok(mut state) = create_reread_state().lock() {
+        state.1.remove(grant_jti);
+    }
+}
+
+/// Re-stamp the cooldown clock when a re-read FINISHES. Call it once, after
+/// the coord round-trip, on every arm.
+///
+/// [`claim_create_reread`] stamps the clock at CLAIM time, which bounds how
+/// often a re-read starts and not how much of the relay's serial read loop it
+/// occupies: a round-trip that takes as long as the cooldown ends with
+/// `now - last >= COOLDOWN` already true, so the next unknown jti claims
+/// immediately and the stalls run back to back (review finding 5). Stamping
+/// again here makes the cooldown a gap BETWEEN stalls, which is what it was
+/// described as.
+pub fn finish_create_reread(now: u64) {
+    if let Ok(mut state) = create_reread_state().lock() {
+        state.0 = now;
+    }
+}
+
+/// How long the ON-DEMAND re-read may hold the relay's serial read loop.
+///
+/// Not the 10 s the catch-up GET otherwise allows. What this re-read races is
+/// the gap between coord publishing the `create_request` directive and the
+/// relay's frame arriving — milliseconds — so a second is already generous for
+/// the legitimate case, while the 10 s timeout was a ten-second freeze of every
+/// terminal on the socket for each forged jti that won the throttle.
+pub const CREATE_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
 /// tested against a recorder that proves a refused frame never reaches it.
 pub trait TerminalInputSink {
@@ -850,6 +1892,84 @@ pub struct AttachedReply {
     pub ring: AttachedRing,
 }
 
+/// A parsed `remote_terminal_created` reply — the relay's answer to a
+/// `remote_terminal_create` (plan
+/// `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 5).
+///
+/// **`coord_session_id` is the field the whole flow turns on, and it is an
+/// `Option` on purpose.** A create grant buys ONE spawn and the relay drops the
+/// attachment the instant it forwards this frame, so driving what was spawned
+/// needs an ATTACH grant — which coord mints by SESSION id
+/// (`POST /coord/sessions/{id}/attach-grants`). The target therefore has to
+/// register the new PTY as a coord session and say which one it is. A target
+/// whose build predates that, or whose coord registration failed, answers
+/// `None`: **UNKNOWN, not "attach later"** — there is no id to address a mint
+/// to and inventing one is not available.
+///
+/// It rides INSIDE the reply's `terminal` object rather than beside it because
+/// the relay forwards that object verbatim and drops every top-level key it
+/// does not know (`remote_terminal_relay.py`, the `terminal_created` arm).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedReply {
+    pub grant_jti: String,
+    /// The TARGET runner's terminal id for the PTY it just spawned.
+    pub terminal_id: String,
+    /// The coord session id the TARGET registered for that PTY, if it did.
+    pub coord_session_id: Option<String>,
+    /// The directory the TARGET chose. Display only — the caller never picked
+    /// it and must not be shown a value it supplied.
+    pub working_dir: Option<String>,
+    /// The title the target gave the terminal, when it reported one.
+    pub title: Option<String>,
+}
+
+/// Parse a `remote_terminal_created` frame. `None` when the frame does not
+/// carry the two fields a create is useless without.
+fn parse_created(data: &Value) -> Option<CreatedReply> {
+    let grant_jti = data.get("grant_jti")?.as_str()?.to_string();
+    let terminal = data.get("terminal");
+    let terminal_id = data
+        .get("terminal_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| terminal.and_then(|t| t.get("id")).and_then(|v| v.as_str()))?
+        .to_string();
+    let field = |name: &str| -> Option<String> {
+        terminal
+            .and_then(|t| t.get(name))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
+    // TOP-LEVEL FIRST: `coord_session_id` is a declared field on
+    // `remote_terminal_created`, not a key inside `terminal`. It rode inside
+    // `terminal` only because the relay forwards that object verbatim, which
+    // is an undeclared dependency on a schema-typed object — the day anything
+    // validates `terminal`, create-then-attach breaks silently. Both places
+    // are read so a relay or target on either side of that change works.
+    let top = |name: &str| -> Option<String> {
+        data.get(name)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+    };
+    Some(CreatedReply {
+        grant_jti,
+        terminal_id,
+        coord_session_id: top("coord_session_id")
+            .or_else(|| field("coordSessionId"))
+            .or_else(|| field("coord_session_id")),
+        working_dir: field("workingDir").or_else(|| field("working_dir")),
+        title: field("title"),
+    })
+}
+
+/// How long a remote create waits for `remote_terminal_created`.
+///
+/// Longer than [`ATTACH_TIMEOUT`] because the target is doing strictly more:
+/// resolving a directory, possibly allocating a worktree and taking a coord
+/// claim, and opening a PTY — where an attach only binds to one that exists.
+pub const CREATE_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// A typed attach failure — the code is what the picker shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachError {
@@ -864,6 +1984,7 @@ impl std::fmt::Display for AttachError {
 }
 
 type PendingAttach = oneshot::Sender<Result<AttachedReply, AttachError>>;
+type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
 
 /// The source side's routing table and outbound queue.
 pub struct RemoteAttachClient {
@@ -871,6 +1992,12 @@ pub struct RemoteAttachClient {
     out_rx: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     panes: Mutex<HashMap<String, Arc<RemotePaneIo>>>,
     pending: Mutex<HashMap<String, PendingAttach>>,
+    /// Waiters for `remote_terminal_created`, keyed by the request id this
+    /// side minted. A SEPARATE map from `pending` rather than a shared one
+    /// holding an enum: the two replies carry different payloads, and a single
+    /// map would make "an attach reply resolved a create waiter" a type the
+    /// compiler cannot refuse. The error arms consult both, in that order.
+    pending_create: Mutex<HashMap<String, PendingCreate>>,
     /// Output that arrived between the `remote_terminal_attached` reply and
     /// `register_pane`, keyed by grant jti. Without it those frames were
     /// dropped ("output for no live pane") AND the pane's `remote_offset`
@@ -900,6 +2027,7 @@ impl RemoteAttachClient {
             out_rx: tokio::sync::Mutex::new(out_rx),
             panes: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
+            pending_create: Mutex::new(HashMap::new()),
             pending_output: Mutex::new(HashMap::new()),
         }
     }
@@ -1064,6 +2192,79 @@ impl RemoteAttachClient {
         self.pending.lock().ok()?.remove(request_id)
     }
 
+    fn take_pending_create(&self, request_id: &str) -> Option<PendingCreate> {
+        self.pending_create.lock().ok()?.remove(request_id)
+    }
+
+    /// Present a CREATE grant through the relay and wait for the target to
+    /// spawn a PTY and answer `remote_terminal_created`.
+    ///
+    /// The three preference fields are forwarded **only when the caller set
+    /// them**, so the target can tell "no preference — use your default" from
+    /// "this one, and refuse it if you do not offer it". Nothing here is a
+    /// path: `working_dir_key` is a LABEL into the target's own offered set
+    /// and `intent_repo` a member of the target's own allowlist. A caller
+    /// supplying a directory is the hole D2 closed, and this door does not
+    /// accept one.
+    pub async fn create(
+        &self,
+        grant: &str,
+        cols: u16,
+        rows: u16,
+        title: Option<&str>,
+        working_dir_key: Option<&str>,
+        intent_repo: Option<&str>,
+        timeout: Duration,
+    ) -> Result<CreatedReply, AttachError> {
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut pending) = self.pending_create.lock() {
+            pending.insert(request_id.clone(), tx);
+        }
+        let mut frame = json!({
+            "type": "remote_terminal_create",
+            "request_id": request_id,
+            "grant": grant,
+            "cols": cols,
+            "rows": rows,
+        });
+        for (key, value) in [
+            ("title", title),
+            ("working_dir_key", working_dir_key),
+            ("intent_repo", intent_repo),
+        ] {
+            if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+                frame[key] = json!(v);
+            }
+        }
+        if let Err(e) = self.send(frame) {
+            self.take_pending_create(&request_id);
+            return Err(AttachError {
+                code: "relay_unavailable".to_string(),
+                message: e,
+            });
+        }
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_canceled)) => Err(AttachError {
+                code: "create_canceled".to_string(),
+                message: "the create request was dropped before a reply arrived".to_string(),
+            }),
+            Err(_elapsed) => {
+                self.take_pending_create(&request_id);
+                Err(AttachError {
+                    code: "timeout".to_string(),
+                    message: format!(
+                        "no remote_terminal_created within {}s — the relay may be \
+                         disconnected or the target offline. The grant is single-use; if the \
+                         target did spawn a terminal it is running there unattached.",
+                        timeout.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+
     /// Phase 5 lazy scrollback: ask the target for the ring range
     /// `[from, to)` a pane did not receive at attach and wait for the
     /// `remote_terminal_buffer` that answers it. The bytes are returned to
@@ -1119,6 +2320,25 @@ impl RemoteAttachClient {
     /// in-band notice into each pane. Nothing closes — a drop is not an
     /// exit — and [`Self::on_relay_connected`] reattaches when it returns.
     pub fn on_relay_disconnected(&self) {
+        // A create in flight has no pane to write a notice into and no
+        // reconnect that can rescue it: the grant is single-use and the relay
+        // dropped the attachment with the socket. Settle it NOW rather than
+        // leaving the operator watching a spinner for the full create timeout
+        // and then being told the target might be offline.
+        let stranded: Vec<PendingCreate> = self
+            .pending_create
+            .lock()
+            .map(|mut p| p.drain().map(|(_, tx)| tx).collect())
+            .unwrap_or_default();
+        for tx in stranded {
+            let _ = tx.send(Err(AttachError {
+                code: "relay_disconnected".to_string(),
+                message: "the relay connection dropped while the create was in flight — the \
+                          grant is spent whether or not the target spawned a terminal; retry \
+                          mints a new one"
+                    .to_string(),
+            }));
+        }
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -1256,6 +2476,24 @@ impl RemoteAttachClient {
                 }
                 true
             }
+            "remote_terminal_created" => {
+                let Some(reply) = parse_created(data) else {
+                    warn!("remote create: malformed remote_terminal_created frame: {data}");
+                    return true;
+                };
+                match request_id.and_then(|rid| self.take_pending_create(rid)) {
+                    Some(tx) => {
+                        let _ = tx.send(Ok(reply));
+                    }
+                    None => warn!(
+                        grant_jti = %reply.grant_jti,
+                        terminal_id = %reply.terminal_id,
+                        "remote create: remote_terminal_created with no pending request — a \
+                         terminal was spawned on the target and nothing here is waiting for it"
+                    ),
+                }
+                true
+            }
             "remote_terminal_output" => {
                 let Some(jti) = grant_jti else {
                     return true;
@@ -1344,6 +2582,15 @@ impl RemoteAttachClient {
                     let _ = tx.send(Err(AttachError { code, message }));
                     return true;
                 }
+                // A refused remote CREATE arrives here too: the relay routes
+                // the target's typed refusal back as `remote_terminal_error`
+                // echoing THIS side's request id. Without this arm the waiter
+                // sat until its timeout and reported "the target may be
+                // offline" about a target that had answered in milliseconds.
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) {
+                    let _ = tx.send(Err(AttachError { code, message }));
+                    return true;
+                }
                 // A refused RE-attach names the pane in its request id.
                 let jti = grant_jti
                     .or_else(|| request_id.and_then(|rid| rid.strip_prefix(REATTACH_PREFIX)));
@@ -1365,9 +2612,6 @@ impl RemoteAttachClient {
                     self.settle_pane_error(jti, code, message);
                     return true;
                 }
-                let Some(tx) = request_id.and_then(|rid| self.take_pending(rid)) else {
-                    return false;
-                };
                 let code = data
                     .get("code")
                     .and_then(|v| v.as_str())
@@ -1378,6 +2622,17 @@ impl RemoteAttachClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Some(tx) = request_id.and_then(|rid| self.take_pending(rid)) {
+                    let _ = tx.send(Err(AttachError { code, message }));
+                    return true;
+                }
+                // The RELAY's own refusal of a `remote_terminal_create` —
+                // `create_grant_invalid` / `_expired` / `_wrong_source`,
+                // `target_not_connected`, `grant_consumed` — arrives as a bare
+                // `error` correlated by the request id this side minted.
+                let Some(tx) = request_id.and_then(|rid| self.take_pending_create(rid)) else {
+                    return false;
+                };
                 let _ = tx.send(Err(AttachError { code, message }));
                 true
             }
@@ -2871,5 +4126,1362 @@ mod tests {
         ));
         assert!(pane.is_finished());
         assert!(client.pane("jti-1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod create_gate_tests {
+    //! D2 — **the TARGET chooses the working directory.**
+    //!
+    //! These are the pin on the hole review round 1 found and closed:
+    //! `terminal_create` spawns a PTY, and it used to be reachable under an
+    //! attach grant with a caller-chosen `working_dir`. Every test here is
+    //! written so that it FAILS against an implementation that trusts the
+    //! caller — if `admit_terminal_create` ever returns the frame's own
+    //! `working_dir` or `intent_repo`, these go red rather than silently
+    //! admitting the frame.
+
+    use super::*;
+    use serde_json::json;
+
+    const TARGET_ROOT: &str = "/home/agent/qontinui-root";
+    const OTHER_ROOT: &str = "/home/agent/scratch";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![
+                CreateRoot {
+                    key: "workspace_root".to_string(),
+                    path: TARGET_ROOT.to_string(),
+                },
+                CreateRoot {
+                    key: "scratch".to_string(),
+                    path: OTHER_ROOT.to_string(),
+                },
+            ],
+            repos: vec!["qontinui-runner".to_string()],
+        }
+    }
+
+    /// A frame under a CREATE grant. `extra` carries whatever the caller is
+    /// trying to choose.
+    fn create_frame(extra: Value) -> Value {
+        let mut frame = json!({
+            "type": "terminal_create",
+            "request_id": "req-1",
+            "remote": {
+                "grant_jti": "jti-create-1",
+                "source_device_id": "dev-source",
+                "kind": "create",
+            },
+        });
+        if let Some(obj) = extra.as_object() {
+            for (k, v) in obj {
+                frame[k] = v.clone();
+            }
+        }
+        frame
+    }
+
+    fn empty_grants() -> RemoteAttachGrants {
+        RemoteAttachGrants::new()
+    }
+
+    /// `NOW` is any fixed instant; the fixture grant below outlives it.
+    const NOW: u64 = 1_700_000_000;
+
+    /// A create-grant table holding exactly the grant [`create_frame`]
+    /// presents — i.e. coord told this device about it. Every test that
+    /// expects an ADMISSION uses this; the ones that must be refused for
+    /// some OTHER reason use it too, so the refusal they assert is the one
+    /// they name and not an incidental unknown-grant.
+    fn known_create_grants() -> RemoteCreateGrants {
+        let table = RemoteCreateGrants::new();
+        assert!(table.insert(
+            CreateGrant {
+                grant_jti: "jti-create-1".to_string(),
+                source_device_id: "dev-source".to_string(),
+                source_user_id: PAIRED_USER.to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        table
+    }
+
+    /// The user this device is paired to, and (in the fixture grant above) the
+    /// user coord minted the grant for — so the `same_user` dial admits.
+    const PAIRED_USER: &str = "11111111-1111-4111-8111-111111111111";
+
+    fn admit(data: &Value) -> Result<Option<AdmittedCreate>, Value> {
+        admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            data,
+            NOW,
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // THE discriminating test.
+    // ------------------------------------------------------------------
+
+    /// A create naming a directory outside the target-resolved set is
+    /// REFUSED — not silently redirected to the default, and above all not
+    /// honoured.
+    ///
+    /// This is the test that fails against a caller-chosen-cwd
+    /// implementation: such an implementation returns
+    /// `Ok(Some(AdmittedCreate { working_dir: "/etc", .. }))`, and both
+    /// assertions below reject that — the first because it is not an `Err`,
+    /// and (were the refusal ever weakened into a redirect) the second
+    /// because `/etc` is not in `CreateTargets`.
+    #[test]
+    fn a_working_dir_outside_the_targets_set_is_refused() {
+        for requested in [
+            "/etc",
+            "/",
+            "/home/agent",                      // a PARENT of a member
+            "/home/agent/qontinui-root/secret", // a CHILD of a member
+            "/home/agent/qontinui-root/../../../etc",
+            "../../etc",
+            "C:/Windows/System32",
+        ] {
+            let frame = create_frame(json!({ "working_dir": requested }));
+            let err = admit(&frame).expect_err(&format!(
+                "a remote create naming {requested:?} must be REFUSED — the target chooses the \
+                 working directory, a caller only ever indexes into the set it offers"
+            ));
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "refusal must name WHY, for {requested:?}"
+            );
+            // The refusal carries the choice the caller actually has.
+            assert_eq!(
+                err["allowed_working_dir_keys"],
+                json!(["workspace_root", "scratch"])
+            );
+        }
+    }
+
+    /// The same property stated positively: whatever is admitted, the
+    /// directory spawned in is a string that came out of `CreateTargets` —
+    /// never one off the wire.
+    #[test]
+    fn the_admitted_working_dir_is_always_a_member_of_the_targets_set() {
+        let admitted_defaults = admit(&create_frame(json!({})))
+            .expect("no preference is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_defaults.working_dir, TARGET_ROOT);
+
+        let admitted_key = admit(&create_frame(json!({ "working_dir_key": "scratch" })))
+            .expect("a member key is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_key.working_dir, OTHER_ROOT);
+
+        // An exact-path preference is admitted, and what comes back is the
+        // TARGET's spelling of that root.
+        let admitted_path = admit(&create_frame(json!({ "working_dir": OTHER_ROOT })))
+            .expect("an exact member path is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted_path.working_dir, OTHER_ROOT);
+
+        for admitted in [admitted_defaults, admitted_key, admitted_path] {
+            assert!(
+                targets()
+                    .roots
+                    .iter()
+                    .any(|root| root.path == admitted.working_dir),
+                "the spawn directory must be one the TARGET offered"
+            );
+        }
+    }
+
+    /// A key the target does not offer is refused rather than falling back to
+    /// the default — a silent fallback would teach a caller its key worked.
+    #[test]
+    fn an_unknown_working_dir_key_is_refused_not_defaulted() {
+        let err = admit(&create_frame(json!({ "working_dir_key": "wherever" })))
+            .expect_err("an unknown key must be refused");
+        assert_eq!(err["code"], "remote_create_working_dir_not_allowed");
+    }
+
+    /// With no root at all this device refuses rather than spawning in the
+    /// runner process's cwd.
+    #[test]
+    fn no_resolved_root_refuses_rather_than_guessing() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
+            CreateTargets::default,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect_err("nowhere to spawn must refuse");
+        assert_eq!(err["code"], "remote_create_no_target_directory");
+    }
+
+    // ------------------------------------------------------------------
+    // `intent_repo` — the same shape, and the reason it matters: it
+    // ALLOCATES A WORKTREE and TAKES A COORD CLAIM.
+    // ------------------------------------------------------------------
+
+    /// The discriminating test for the second caller-chosen value. A trusting
+    /// implementation returns `intent_repo: Some("qontinui-web")` and fails
+    /// here.
+    #[test]
+    fn an_intent_repo_outside_the_targets_set_is_refused() {
+        for requested in ["qontinui-web", "qontinui/qontinui-runner", "../escape"] {
+            let err =
+                admit(&create_frame(json!({ "intent_repo": requested }))).expect_err(&format!(
+                    "a remote create declaring intent_repo {requested:?} must be REFUSED — it \
+                     allocates a worktree and takes a coord claim"
+                ));
+            assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+            assert_eq!(err["allowed_intent_repos"], json!(["qontinui-runner"]));
+        }
+    }
+
+    #[test]
+    fn an_allowlisted_intent_repo_is_admitted_in_the_targets_own_spelling() {
+        let admitted = admit(&create_frame(json!({ "intent_repo": "qontinui-runner" })))
+            .expect("an allowlisted repo is admitted")
+            .expect("a remote block means a remote create");
+        assert_eq!(admitted.intent_repo.as_deref(), Some("qontinui-runner"));
+    }
+
+    /// The default configuration lists NO repo, so a remote create allocates
+    /// no worktree and takes no claim until an operator says otherwise.
+    #[test]
+    fn the_default_allowlist_admits_no_intent_repo_at_all() {
+        let no_repos = || CreateTargets {
+            roots: targets().roots,
+            repos: Vec::new(),
+        };
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
+            no_repos,
+            &create_frame(json!({ "intent_repo": "qontinui-runner" })),
+            NOW,
+        )
+        .expect_err("an empty allowlist admits nothing");
+        assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+
+        // …and a create declaring none still works, with no intent.
+        let admitted = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
+            no_repos,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect("no declared intent is fine")
+        .expect("a remote block means a remote create");
+        assert_eq!(admitted.intent_repo, None);
+    }
+
+    // ------------------------------------------------------------------
+    // Who may create at all.
+    // ------------------------------------------------------------------
+
+    /// The preference is OFF by default, and the refusal says so and says how
+    /// to change it — an OFF default that does not explain itself reads as a
+    /// bug.
+    #[test]
+    fn the_default_preference_refuses_and_names_itself() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            AcceptRemoteCreate::default,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect_err("accept_remote_create defaults to off");
+        assert_eq!(err["code"], "remote_create_disabled");
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("accept_remote_create"),
+            "the refusal must NAME the preference: {message}"
+        );
+        assert!(
+            message.contains("same_user") && message.contains("tenant"),
+            "the refusal must say how to enable it: {message}"
+        );
+    }
+
+    /// An ATTACH grant does not buy a spawn — at the PTY owner, not only at
+    /// the relay.
+    #[test]
+    fn an_attach_grant_cannot_create() {
+        let mut frame = create_frame(json!({}));
+        frame["remote"]["kind"] = json!("attach");
+        let err = admit(&frame).expect_err("an attach grant must not create");
+        assert_eq!(err["code"], "remote_create_grant_required");
+
+        // …and so does a block that names no kind at all (an older relay, or
+        // one that forgot to stamp it): absent reads as `attach`.
+        let mut unstamped = create_frame(json!({}));
+        unstamped["remote"]
+            .as_object_mut()
+            .unwrap()
+            .remove("kind")
+            .expect("the fixture stamps a kind");
+        let err = admit(&unstamped).expect_err("an unstamped block must not create");
+        assert_eq!(err["code"], "remote_create_grant_required");
+    }
+
+    /// A jti this device holds as an ATTACH grant is refused even when the
+    /// block claims `create` — the broker is not the last word here.
+    #[test]
+    fn a_jti_known_as_an_attach_grant_cannot_create() {
+        let grants = RemoteAttachGrants::new();
+        assert!(grants.insert(
+            AttachGrant {
+                grant_jti: "jti-create-1".to_string(),
+                source_device_id: "dev-source".to_string(),
+                session_id: Uuid::from_u128(3),
+                terminal_id: None,
+                expires_at: u64::MAX,
+            },
+            0,
+        ));
+        let err = admit_terminal_create(
+            &grants,
+            &known_create_grants(),
+            || AcceptRemoteCreate::SameUser,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect_err("an attach jti stamped `create` must still be refused");
+        assert_eq!(err["code"], "remote_create_grant_required");
+    }
+
+    // ------------------------------------------------------------------
+    // THE Phase 3b discriminating pair — the target verifies for itself.
+    // ------------------------------------------------------------------
+
+    /// **The test this phase exists for.** The frame here is a
+    /// PERFECTLY WELL-FORMED relay-forwarded create: `kind: "create"`, a
+    /// source device, the preference ON, a directory this device offers, an
+    /// allowlisted repo, and no jti in the attach table. Every check the
+    /// pre-Phase-3b gate performed PASSES. It is refused anyway, because
+    /// coord never told this device about that jti.
+    ///
+    /// **How this discriminates.** A trust-the-relay implementation — the one
+    /// that shipped — returns `Ok(Some(AdmittedCreate { .. }))` here and
+    /// spawns a PTY, so `expect_err` fails. The positive control below runs
+    /// the SAME frame against a table that holds the grant and asserts an
+    /// admission, so the refusal cannot be bought by breaking the gate
+    /// outright: an implementation that refuses everything fails that one.
+    /// The pair together is the property — *the target's own grant table, and
+    /// nothing the relay stamped, decides.*
+    #[test]
+    fn a_create_whose_jti_this_device_never_learned_is_refused() {
+        let unknown = RemoteCreateGrants::new();
+        assert!(unknown.is_empty());
+        let frame = create_frame(json!({
+            "working_dir_key": "workspace_root",
+            "intent_repo": "qontinui-runner",
+        }));
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &unknown,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect_err(
+            "the relay forwarded a well-formed create, but coord never told this device about \
+             that jti — the PTY owner must refuse it",
+        );
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        let message = err["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("no live create grant"),
+            "the refusal must say what is missing: {message}"
+        );
+    }
+
+    /// The positive control for the test above: the identical frame, against a
+    /// table that HOLDS the grant, is admitted. Without this, "refused" would
+    /// be satisfiable by a gate that refuses everything.
+    #[test]
+    fn the_same_frame_is_admitted_once_coord_has_told_this_device() {
+        let frame = create_frame(json!({
+            "working_dir_key": "workspace_root",
+            "intent_repo": "qontinui-runner",
+        }));
+        let admitted = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect("a jti coord told this device about is admitted")
+        .expect("a remote block means a remote create");
+        assert_eq!(admitted.working_dir, TARGET_ROOT);
+        assert_eq!(admitted.intent_repo.as_deref(), Some("qontinui-runner"));
+    }
+
+    /// A grant minted for a DIFFERENT source device is refused, and with the
+    /// SAME code an unknown jti gets — so a broker replaying jti J from the
+    /// wrong device learns nothing about whether J exists here.
+    ///
+    /// **And the binding is REQUIRED, not merely checked when offered.** The
+    /// relay is the party this check defends against and the party that stamps
+    /// the field, so a check-if-present rule is opt-out by the adversary:
+    /// omitting the key would evaporate the binding. Both the wrong value and
+    /// the absent one are asserted, and the absent one is the case an attacker
+    /// would actually choose.
+    #[test]
+    fn a_grant_minted_for_another_source_device_is_refused_as_unknown() {
+        for mutate in [
+            (|f: &mut Value| f["remote"]["source_device_id"] = json!("dev-somebody-else"))
+                as fn(&mut Value),
+            |f: &mut Value| {
+                f["remote"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("source_device_id")
+                    .expect("the fixture stamps a source device");
+            },
+            |f: &mut Value| f["remote"]["source_device_id"] = json!("   "),
+            |f: &mut Value| f["remote"]["source_device_id"] = json!(null),
+        ] {
+            let table = known_create_grants();
+            let mut frame = create_frame(json!({}));
+            mutate(&mut frame);
+            let err = admit_terminal_create(
+                &empty_grants(),
+                &table,
+                || AcceptRemoteCreate::Tenant,
+                || Some(PAIRED_USER.to_string()),
+                targets,
+                &frame,
+                NOW,
+            )
+            .expect_err("the grant was not minted for the source this frame names (or names none)");
+            assert_eq!(err["code"], "remote_create_grant_unknown", "{frame}");
+            // …and the row survives, so the rightful source can still use it: a
+            // wrong-source probe must not be a way to burn someone's grant.
+            assert!(table.contains("jti-create-1"), "{frame}");
+        }
+
+        // Case-insensitive on the UUID's hex, which is the only tolerance.
+        let table = known_create_grants();
+        let mut frame = create_frame(json!({}));
+        frame["remote"]["source_device_id"] = json!("DEV-SOURCE");
+        assert!(admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &frame,
+            NOW,
+        )
+        .is_ok());
+    }
+
+    /// **A spent jti is never resurrected by the feed.** Coord keeps serving a
+    /// grant in its pending list until `consumed_at` is set, and the catch-up
+    /// poll runs every 60 s — so without a tombstone the "single use" would be
+    /// an allowance of one per poll interval, which is not single use at all.
+    ///
+    /// This fails against an implementation that only removes the row on
+    /// consume: `insert` would take the re-delivered grant and the second
+    /// admission would succeed.
+    #[test]
+    fn a_spent_jti_cannot_be_re_recorded_by_the_catch_up_feed() {
+        let table = known_create_grants();
+        assert!(admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect("the first use is admitted")
+        .is_some());
+        assert!(table.is_empty());
+        assert_eq!(table.spent_len(NOW), 1);
+
+        // Coord's poll re-delivers the row — it has not marked it consumed yet.
+        assert!(
+            !table.insert(
+                CreateGrant {
+                    grant_jti: "jti-create-1".to_string(),
+                    source_device_id: "dev-source".to_string(),
+                    source_user_id: PAIRED_USER.to_string(),
+                    expires_at: NOW + 900,
+                },
+                NOW,
+            ),
+            "a spent jti must not be re-recorded"
+        );
+        assert!(table.is_empty(), "and it must not be in the table");
+
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            NOW,
+        )
+        .expect_err("a re-delivered spent grant must not spawn a second PTY");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+
+        // The tombstone expires with the grant — past that coord stops serving
+        // it too, so there is nothing left to guard.
+        assert_eq!(table.spent_len(NOW + 901), 0);
+    }
+
+    /// **An unreadable clock fails CLOSED.** `now_epoch_secs()` answers `0`
+    /// when the system time cannot be read, and every `expires_at <= 0` is
+    /// false — i.e. every grant would read as unexpired. Refuse instead.
+    #[test]
+    fn a_zero_clock_refuses_rather_than_reading_every_grant_as_live() {
+        let table = known_create_grants();
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            0,
+        )
+        .expect_err("a device that cannot read its clock cannot evaluate an expiry");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        assert!(table.contains("jti-create-1"), "and nothing was burned");
+    }
+
+    /// An expired grant is refused with its OWN code — the source learns to
+    /// mint a fresh one rather than chasing a phantom unknown-jti.
+    #[test]
+    fn an_expired_create_grant_is_refused_as_expired() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &known_create_grants(),
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({})),
+            NOW + 901,
+        )
+        .expect_err("a grant past its exp must not spawn");
+        assert_eq!(err["code"], "remote_create_grant_expired");
+    }
+
+    /// **A create grant buys ONE spawn.** The row is consumed on admission, so
+    /// a replayed frame — the relay's Redis claim bypassed, or the same frame
+    /// delivered twice — is refused the second time.
+    #[test]
+    fn a_create_grant_is_single_use_at_the_target() {
+        // Concurrency half: the consume is ONE critical section, so two frames
+        // carrying the same jti at once cannot both see `Ok`.
+        {
+            let table = std::sync::Arc::new(known_create_grants());
+            let wins: std::sync::Arc<std::sync::atomic::AtomicUsize> = Default::default();
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    let table = table.clone();
+                    let wins = wins.clone();
+                    s.spawn(move || {
+                        if table
+                            .consume("jti-create-1", Some("dev-source"), NOW)
+                            .is_ok()
+                        {
+                            wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                wins.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "exactly one concurrent consumer may win a create grant"
+            );
+        }
+
+        let table = known_create_grants();
+        let frame = create_frame(json!({}));
+        let first = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect("the first use is admitted");
+        assert!(first.is_some());
+        assert!(table.is_empty(), "admission must consume the grant");
+
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &table,
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &frame,
+            NOW,
+        )
+        .expect_err("a replay of an admitted create must not spawn a second PTY");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+    }
+
+    /// **A grant is consumed exactly when a spawn is authorised.** No refusal
+    /// burns one — not the switched-off device, not a directory this device
+    /// does not offer, not a repo outside the allowlist. Otherwise a typo in
+    /// `working_dir_key` would cost the source a capability it never spent.
+    #[test]
+    fn no_refusal_consumes_the_grant() {
+        for (label, pref, frame) in [
+            (
+                "preference off",
+                AcceptRemoteCreate::Off,
+                create_frame(json!({})),
+            ),
+            (
+                "unoffered directory",
+                AcceptRemoteCreate::Tenant,
+                create_frame(json!({ "working_dir_key": "wherever" })),
+            ),
+            (
+                "unallowlisted repo",
+                AcceptRemoteCreate::Tenant,
+                create_frame(json!({ "intent_repo": "qontinui-web" })),
+            ),
+        ] {
+            let table = known_create_grants();
+            assert!(
+                admit_terminal_create(
+                    &empty_grants(),
+                    &table,
+                    move || pref,
+                    || Some(PAIRED_USER.to_string()),
+                    targets,
+                    &frame,
+                    NOW,
+                )
+                .is_err(),
+                "{label} must refuse"
+            );
+            assert!(
+                table.contains("jti-create-1"),
+                "{label} must not burn the grant"
+            );
+        }
+    }
+
+    /// EXACTLY ONE refusal buys a coord re-read. Widening this would point a
+    /// coord round-trip-per-refused-frame lever at coord; narrowing it to none
+    /// would reinstate the directive/frame race as a 60 s flake.
+    #[test]
+    fn only_an_unknown_grant_warrants_a_coord_reread() {
+        assert!(refusal_warrants_a_coord_reread(
+            CreateRefusal::GrantUnknown.code()
+        ));
+        for final_refusal in [
+            CreateRefusal::Disabled,
+            CreateRefusal::GrantRequired,
+            CreateRefusal::GrantExpired,
+            CreateRefusal::NoTargetDirectory,
+            CreateRefusal::WorkingDirNotAllowed,
+            CreateRefusal::IntentRepoNotAllowed,
+        ] {
+            assert!(
+                !refusal_warrants_a_coord_reread(final_refusal.code()),
+                "{final_refusal:?} is final — coord has nothing to add"
+            );
+        }
+        // An unrecognised code is final too: an unknown refusal must not be a
+        // way to make this device call coord.
+        assert!(!refusal_warrants_a_coord_reread("something_else"));
+        assert!(!refusal_warrants_a_coord_reread(""));
+    }
+
+    /// **The re-read is throttled on two independent axes**, because it is
+    /// `await`ed on the relay's SERIAL read loop: every one stalls terminal
+    /// input, output and every other frame for up to the coord timeout. A
+    /// compromised relay forwarding invented jtis must not be able to hold the
+    /// runner's whole relay hostage.
+    ///
+    /// The global `OnceLock` state is process-wide, so this test uses jtis
+    /// nothing else touches and asserts relative behaviour rather than an
+    /// absolute first call.
+    #[test]
+    fn the_coord_reread_is_throttled_per_jti_and_per_window() {
+        let base = 9_000_000u64;
+        let tag = "throttle-test";
+
+        // One per window: the first distinct jti in a window wins, the next
+        // does not, and the window reopens after the cooldown.
+        assert!(claim_create_reread(&format!("{tag}-a"), base));
+        assert!(
+            !claim_create_reread(&format!("{tag}-b"), base),
+            "a DIFFERENT jti inside the cooldown must not slip past — a flood of distinct jtis \
+             is the shape an attacker would choose"
+        );
+        assert!(claim_create_reread(
+            &format!("{tag}-b"),
+            base + CREATE_REREAD_COOLDOWN_SECS
+        ));
+
+        // Once per jti: `-a` is remembered as asked-and-unknown, so it buys no
+        // second round-trip for as long as the grant it names could still be
+        // live. A create grant lives 900 s; the memory is an hour, so this is
+        // well inside it. (The memory is deliberately BOUNDED rather than
+        // forever — an unbounded set is a leak — and past the bound the jti it
+        // names is long expired, so re-asking about it is harmless and the
+        // global cooldown still caps the rate.)
+        assert!(
+            !claim_create_reread(&format!("{tag}-a"), base + 900),
+            "a jti coord already said it did not know must not be asked again while the grant \
+             it names could still be live"
+        );
+
+        // …unless the re-read FOUND it, which clears the memory: a legitimate
+        // grant that lost the directive race must not hold a slot for an hour.
+        clear_create_reread(&format!("{tag}-a"));
+        assert!(claim_create_reread(&format!("{tag}-a"), base + 900));
+
+        // The cooldown is sized against the directive race (milliseconds), not
+        // against the grant's 900 s life.
+        assert!(CREATE_REREAD_COOLDOWN_SECS > 0 && CREATE_REREAD_COOLDOWN_SECS < 60);
+
+        // --- and the cooldown must bound the STALL, not merely how often one
+        // --- STARTS (review finding 5). In the SAME test, not a second one:
+        // --- the throttle is one process-global and cargo runs `#[test]`s on
+        // --- parallel threads, so a separate test asserting on it races this
+        // --- one — which is exactly how this pair first went red.
+        //
+        // `claim_create_reread` stamps the clock at CLAIM time, and the re-read
+        // is awaited inline on the relay's serial read loop. A round-trip that
+        // takes as long as the cooldown therefore ends with
+        // `now - last >= COOLDOWN` already true, and the next unknown jti
+        // claims immediately: the stalls run BACK TO BACK and every terminal on
+        // the socket freezes for the duration. `finish_create_reread` re-stamps
+        // on COMPLETION, which is what makes the cooldown a gap BETWEEN stalls.
+        //
+        // Fails against a build without that call: the second claim succeeds
+        // there, because `finished - stall` is exactly one cooldown.
+        let stall = base + 100_000;
+        assert!(claim_create_reread(&format!("{tag}-stall-a"), stall));
+        let finished = stall + CREATE_REREAD_COOLDOWN_SECS;
+        finish_create_reread(finished);
+        assert!(
+            !claim_create_reread(&format!("{tag}-stall-b"), finished),
+            "a second stall must not begin the instant the first one ends"
+        );
+        assert!(
+            claim_create_reread(
+                &format!("{tag}-stall-b"),
+                finished + CREATE_REREAD_COOLDOWN_SECS
+            ),
+            "…and the window reopens a cooldown AFTER the previous one finished"
+        );
+    }
+
+    /// An unauthorised caller must not learn this device's directory and repo
+    /// allowlists. The grant lookup therefore runs BEFORE the two resolutions,
+    /// whose refusal bodies echo them — so an unknown jti gets a bare refusal.
+    #[test]
+    fn an_unknown_grant_refusal_does_not_leak_the_allowlists() {
+        let err = admit_terminal_create(
+            &empty_grants(),
+            &RemoteCreateGrants::new(),
+            || AcceptRemoteCreate::Tenant,
+            || Some(PAIRED_USER.to_string()),
+            targets,
+            &create_frame(json!({ "working_dir_key": "wherever" })),
+            NOW,
+        )
+        .expect_err("an unknown jti must be refused");
+        assert_eq!(err["code"], "remote_create_grant_unknown");
+        assert!(
+            err.get("allowed_working_dir_keys").is_none(),
+            "a caller with no grant must not enumerate this device's directories: {err}"
+        );
+        assert!(err.get("allowed_intent_repos").is_none(), "{err}");
+    }
+
+    /// A frame with NO `remote` block is the operator-web / mobile path: the
+    /// gate returns `None` and the handler keeps its caller-chosen
+    /// `working_dir`. This is the arm that must NOT be tightened — doing so
+    /// would break every local terminal.
+    #[test]
+    fn a_local_create_is_untouched() {
+        let local = json!({
+            "type": "terminal_create",
+            "working_dir": "/anywhere/at/all",
+            "intent_repo": "qontinui-web",
+        });
+        let admitted = admit(&local).expect("a local create is never refused here");
+        assert!(admitted.is_none(), "a local create resolves nothing");
+    }
+
+    /// A malformed block is a block: refused, never read as absent.
+    #[test]
+    fn a_malformed_remote_block_is_refused() {
+        for block in [json!({}), json!({ "grant_jti": "" }), json!(7)] {
+            let mut frame = create_frame(json!({}));
+            frame["remote"] = block.clone();
+            let err = admit(&frame).expect_err("a malformed block must not create");
+            assert_eq!(err["code"], "remote_create_grant_required", "{block}");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The resolver itself.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_working_dir_tolerates_spelling_but_not_substitution() {
+        let targets = targets();
+        // A trailing separator and a backslash spelling of a member still
+        // resolve — to the TARGET's own string.
+        for spelling in [
+            "/home/agent/scratch/",
+            "  /home/agent/scratch  ",
+            "\\home\\agent\\scratch",
+        ] {
+            assert_eq!(
+                resolve_create_working_dir(&targets, None, Some(spelling)),
+                Ok(OTHER_ROOT.to_string()),
+                "{spelling}"
+            );
+        }
+        // Case is NOT normalized: a differing case is a refusal, because a
+        // refusal is the safe answer and a redirect is not.
+        assert_eq!(
+            resolve_create_working_dir(&targets, None, Some("/home/agent/SCRATCH")),
+            Err(CreateRefusal::WorkingDirNotAllowed)
+        );
+    }
+
+    #[test]
+    fn the_key_wins_over_the_path_when_both_are_named() {
+        let targets = targets();
+        assert_eq!(
+            resolve_create_working_dir(&targets, Some("scratch"), Some(TARGET_ROOT)),
+            Ok(OTHER_ROOT.to_string())
+        );
+        assert_eq!(
+            resolve_create_working_dir(&targets, Some("nope"), Some(TARGET_ROOT)),
+            Err(CreateRefusal::WorkingDirNotAllowed),
+            "a bad key is refused rather than falling through to the path"
+        );
+    }
+
+    #[test]
+    fn parse_remote_block_reads_the_kind_and_fails_closed() {
+        let kind_of = |v: Value| match parse_remote_block(&v) {
+            Some(Ok(block)) => block.kind,
+            other => panic!("expected a parsed block, got {other:?}"),
+        };
+        assert_eq!(
+            kind_of(json!({ "remote": { "grant_jti": "j", "kind": "create" } })),
+            RemoteGrantKind::Create
+        );
+        for spelling in [
+            json!("attach"),
+            json!("CREATE"),
+            json!("nonsense"),
+            json!(3),
+        ] {
+            assert_eq!(
+                kind_of(json!({ "remote": { "grant_jti": "j", "kind": spelling } })),
+                RemoteGrantKind::Attach,
+                "{spelling} must read as the NARROWER kind"
+            );
+        }
+        assert_eq!(
+            kind_of(json!({ "remote": { "grant_jti": "j" } })),
+            RemoteGrantKind::Attach
+        );
+    }
+}
+
+#[cfg(test)]
+mod created_reply_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `coord_session_id` is a DECLARED top-level field on
+    /// `remote_terminal_created`. It is what the source mints the
+    /// session-addressed attach grant against, so a create that cannot read it
+    /// produces a terminal nobody can drive.
+    #[test]
+    fn the_declared_top_level_field_is_read() {
+        let reply = parse_created(&json!({
+            "grant_jti": "g1",
+            "terminal_id": "t1",
+            "coord_session_id": "sess-top",
+            "terminal": {"id": "t1"},
+        }))
+        .expect("a well-formed created reply parses");
+        assert_eq!(reply.coord_session_id.as_deref(), Some("sess-top"));
+    }
+
+    /// The id used to ride INSIDE `terminal`, working only because the relay
+    /// forwards that object verbatim. A target or relay still on that spelling
+    /// must keep working, so both places are read.
+    #[test]
+    fn the_legacy_spelling_inside_terminal_still_works() {
+        for key in ["coordSessionId", "coord_session_id"] {
+            let reply = parse_created(&json!({
+                "grant_jti": "g1",
+                "terminal_id": "t1",
+                "terminal": {"id": "t1", key: "sess-legacy"},
+            }))
+            .expect("parses");
+            assert_eq!(
+                reply.coord_session_id.as_deref(),
+                Some("sess-legacy"),
+                "the {key} spelling inside `terminal` must still resolve"
+            );
+        }
+    }
+
+    /// The declared field WINS. Otherwise a stale value left inside `terminal`
+    /// by an older target would silently shadow the authoritative one and the
+    /// attach would be minted against the wrong session.
+    #[test]
+    fn the_declared_field_wins_over_a_stale_one_inside_terminal() {
+        let reply = parse_created(&json!({
+            "grant_jti": "g1",
+            "terminal_id": "t1",
+            "coord_session_id": "sess-authoritative",
+            "terminal": {"id": "t1", "coordSessionId": "sess-stale"},
+        }))
+        .expect("parses");
+        assert_eq!(
+            reply.coord_session_id.as_deref(),
+            Some("sess-authoritative")
+        );
+    }
+
+    /// Absent stays ABSENT. "Created but not addressable" is the honest
+    /// report; inventing an id sends the source off to attach to a session
+    /// that does not exist. Blank and whitespace are absent too — a present
+    /// but empty id is not an id.
+    #[test]
+    fn an_absent_or_blank_coord_session_is_none_never_guessed() {
+        for body in [
+            json!({"grant_jti": "g1", "terminal_id": "t1", "terminal": {"id": "t1"}}),
+            json!({"grant_jti": "g1", "terminal_id": "t1", "coord_session_id": "",
+                   "terminal": {"id": "t1"}}),
+            json!({"grant_jti": "g1", "terminal_id": "t1", "coord_session_id": "   ",
+                   "terminal": {"id": "t1"}}),
+        ] {
+            let reply = parse_created(&body).expect("parses");
+            assert_eq!(
+                reply.coord_session_id, None,
+                "a missing or blank coord session must not be guessed: {body}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod relay_create_tests {
+    //! The UNGATED arm of `terminal_create` — review finding 1, scenario A.
+    //!
+    //! `terminal_create` reaches this runner only over the backend relay, and
+    //! `admit_terminal_create` answers `Ok(None)` for any frame with no
+    //! `remote` block, routing it to a path that honoured `working_dir`,
+    //! `intent_repo` and `agent_session_id` VERBATIM. So the entire grant gate
+    //! was opt-in by a marker the untrusted party stamps: the relay could send
+    //! `{"type":"terminal_create","working_dir":"/","intent_repo":"…",
+    //! "agent_session_id":"…"}` and get a PTY at `/`, a worktree, and a coord
+    //! claim under a named session's owner token.
+    //!
+    //! [`resolve_relay_create`] is the whole of what that arm may now choose,
+    //! and `handle_terminal_create` has no second source for any of the three —
+    //! so these tests pin the dispatch's behaviour, not an advisory helper.
+
+    use super::*;
+    use serde_json::json;
+
+    const ROOT: &str = "/home/agent/qontinui-root";
+    const SCRATCH: &str = "/home/agent/scratch";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![
+                CreateRoot {
+                    key: "workspace_root".to_string(),
+                    path: ROOT.to_string(),
+                },
+                CreateRoot {
+                    key: "scratch".to_string(),
+                    path: SCRATCH.to_string(),
+                },
+            ],
+            repos: vec!["qontinui-runner".to_string()],
+        }
+    }
+
+    /// **THE discriminating test.** The literal scenario-A frame, with no
+    /// `remote` block at all. Against the unfixed code this returned a
+    /// `RelayCreate` naming `/`.
+    #[test]
+    fn a_blockless_relay_frame_may_not_choose_the_directory() {
+        for requested in [
+            "/",
+            "/etc",
+            "/home/agent",
+            "/home/agent/qontinui-root/secret",
+        ] {
+            let frame = json!({ "type": "terminal_create", "working_dir": requested });
+            let err = resolve_relay_create(&targets(), &frame)
+                .expect_err("a frame with no grant may not name any directory it likes");
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "{requested}"
+            );
+        }
+    }
+
+    /// …and it may not take a worktree + coord claim either.
+    #[test]
+    fn a_blockless_relay_frame_may_not_declare_an_unlisted_intent_repo() {
+        let frame = json!({ "type": "terminal_create", "intent_repo": "qontinui-coord" });
+        let err = resolve_relay_create(&targets(), &frame).expect_err("not on this device's list");
+        assert_eq!(err["code"], "remote_create_intent_repo_not_allowed");
+
+        // With an EMPTY allowlist — the default — nothing is declarable.
+        let none = CreateTargets {
+            roots: targets().roots,
+            repos: vec![],
+        };
+        assert!(resolve_relay_create(
+            &none,
+            &json!({ "type": "terminal_create", "intent_repo": "qontinui-runner" })
+        )
+        .is_err());
+    }
+
+    /// …and above all it may not name whose claim it takes. This is the field
+    /// that made the escalation an IMPERSONATION rather than merely an
+    /// over-broad spawn.
+    #[test]
+    fn a_blockless_relay_frame_never_names_the_claim_owner() {
+        let frame = json!({
+            "type": "terminal_create",
+            "agent_session_id": "0192a1b2-0000-7000-8000-0000000000ff",
+        });
+        let relay = resolve_relay_create(&targets(), &frame).expect("no dir, no repo — admitted");
+        assert_eq!(
+            relay.agent_session_id, None,
+            "the claim owner token is never chosen by a relay frame"
+        );
+    }
+
+    /// The mobile arm, which is what this must not break: it sends title, cols
+    /// and rows and NO working dir, and gets **the runner's own default** —
+    /// `None`, not a directory read out of `remote_create.allowed_working_dirs`.
+    ///
+    /// Review round 2, finding 2. Round 1 made this arm return
+    /// `targets.roots.first()`, which silently relocated every mobile terminal
+    /// onto remote-create config it never asked about. A test asserting
+    /// `Some(ROOT)` pinned that change without surfacing it as one.
+    #[test]
+    fn the_mobile_arm_still_works_and_gets_this_runners_own_default() {
+        let frame = json!({ "type": "terminal_create", "title": "headless", "cols": 80 });
+        let relay = resolve_relay_create(&targets(), &frame).expect("admitted");
+        assert_eq!(
+            relay.working_dir, None,
+            "a frame that names no directory gets the runner's own default, not a configured root"
+        );
+        assert_eq!(relay.intent_repo, None);
+    }
+
+    /// Review round 2, finding 2 — the regression this closes, stated as the
+    /// mechanism rather than as the symptom.
+    ///
+    /// `backend_relay`'s blockless arm derives `intent_repo` from
+    /// `working_dir` via `canonical_paths::repo_slug_for_path`, which matches
+    /// **any path under** `<workspace-root>/<repo>`. So substituting the first
+    /// configured root — which an operator will naturally point at a checkout —
+    /// handed every blockless mobile create a worktree allocation and a coord
+    /// claim it never asked for, under `QONTINUI_AGENT_WORKTREE_MODE`.
+    ///
+    /// The predicate: a blockless frame naming nothing must yield a
+    /// `working_dir` from which NO repo slug can be derived. `None` is the
+    /// only such value, so this fails the moment any root is substituted —
+    /// including a root this test never named.
+    #[test]
+    fn a_blockless_frame_acquires_no_worktree_from_a_directory_it_did_not_name() {
+        // A root that IS a checkout under a workspace root, i.e. the
+        // configuration the derivation fires on.
+        let checkout_targets = CreateTargets {
+            roots: vec![CreateRoot {
+                key: "runner".to_string(),
+                path: format!("{ROOT}/qontinui-runner"),
+            }],
+            repos: vec![],
+        };
+        let relay = resolve_relay_create(
+            &checkout_targets,
+            &json!({ "type": "terminal_create", "title": "t", "cols": 80 }),
+        )
+        .expect("admitted");
+
+        assert_eq!(relay.intent_repo, None, "the frame declared no repo");
+        let derived = relay.working_dir.as_deref().and_then(|wd| {
+            crate::agent_worktree::canonical_paths::repo_slug_for_path(std::path::Path::new(wd))
+        });
+        assert_eq!(
+            derived, None,
+            "a blockless create that named no directory must not have an intent_repo derived for \
+             it — that allocates a worktree and takes a coord claim nobody asked for"
+        );
+    }
+
+    /// …while a frame that DOES name a directory is still confined to this
+    /// device's own roots. The fix above must not have reopened the choice.
+    #[test]
+    fn a_blockless_frame_still_cannot_choose_a_directory() {
+        for dir in [
+            "/",
+            "/etc",
+            "/home/agent",
+            "../../",
+            "/home/agent/qontinui-root/sub",
+        ] {
+            let err = resolve_relay_create(
+                &targets(),
+                &json!({ "type": "terminal_create", "working_dir": dir }),
+            )
+            .expect_err("a directory this device does not offer");
+            assert_eq!(
+                err["code"], "remote_create_working_dir_not_allowed",
+                "{dir}"
+            );
+        }
+        // An offered one still resolves — to the DEVICE's spelling.
+        let relay = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir": ROOT }),
+        )
+        .expect("an offered root");
+        assert_eq!(relay.working_dir.as_deref(), Some(ROOT));
+    }
+
+    /// A device offering NO roots keeps the runner's own default for a frame
+    /// that names none — the pre-existing behaviour — and refuses one that
+    /// names a directory. Without the first half, a box with no resolvable
+    /// workspace root would refuse every mobile terminal.
+    #[test]
+    fn a_device_with_no_roots_defaults_rather_than_refusing_an_unasked_frame() {
+        let none = CreateTargets {
+            roots: vec![],
+            repos: vec![],
+        };
+        let relay = resolve_relay_create(&none, &json!({ "type": "terminal_create" }))
+            .expect("naming nothing is always allowed");
+        assert_eq!(relay.working_dir, None, "the runner's own default");
+
+        let err = resolve_relay_create(
+            &none,
+            &json!({ "type": "terminal_create", "working_dir": "/tmp" }),
+        )
+        .expect_err("naming one on a device that offers none is refused");
+        assert_eq!(err["code"], "remote_create_no_target_directory");
+    }
+
+    /// A named KEY resolves to that root's own spelling, same as a remote
+    /// create's — so the relay arm is not a second, looser vocabulary.
+    #[test]
+    fn a_named_key_resolves_to_the_devices_own_spelling() {
+        let relay = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir_key": "scratch" }),
+        )
+        .expect("an offered key");
+        assert_eq!(relay.working_dir.as_deref(), Some(SCRATCH));
+
+        assert!(resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir_key": "nope" })
+        )
+        .is_err());
+    }
+
+    /// The refusal carries the remedy, so a caller can be told what it MAY ask
+    /// for instead of guessing.
+    #[test]
+    fn a_relay_refusal_names_what_this_device_offers() {
+        let err = resolve_relay_create(
+            &targets(),
+            &json!({ "type": "terminal_create", "working_dir": "/" }),
+        )
+        .expect_err("refused");
+        assert_eq!(
+            err["allowed_working_dir_keys"],
+            json!(["workspace_root", "scratch"])
+        );
+        assert_eq!(err["allowed_intent_repos"], json!(["qontinui-runner"]));
+    }
+}
+
+#[cfg(test)]
+mod same_user_dial_tests {
+    //! Review finding 6 — the LOCAL half of `accept_remote_create`.
+    //!
+    //! The dial is three-valued and the target enforced only `off` vs
+    //! not-`off`, because `CreateGrant` dropped `source_user_id` entirely. So
+    //! an operator narrowing `tenant` -> `same_user` while coord was
+    //! unreachable changed nothing this device enforced: coord's column still
+    //! said `tenant` and it kept minting, and the target admitted every one.
+
+    use super::*;
+    use serde_json::json;
+
+    const NOW: u64 = 1_700_000_000;
+    const MINE: &str = "11111111-1111-4111-8111-111111111111";
+    const THEIRS: &str = "22222222-2222-4222-8222-222222222222";
+
+    fn targets() -> CreateTargets {
+        CreateTargets {
+            roots: vec![CreateRoot {
+                key: "workspace_root".to_string(),
+                path: "/home/agent/qontinui-root".to_string(),
+            }],
+            repos: vec![],
+        }
+    }
+
+    fn table(source_user_id: &str) -> RemoteCreateGrants {
+        let t = RemoteCreateGrants::new();
+        assert!(t.insert(
+            CreateGrant {
+                grant_jti: "jti-c".to_string(),
+                source_device_id: "dev-source".to_string(),
+                source_user_id: source_user_id.to_string(),
+                expires_at: NOW + 900,
+            },
+            NOW,
+        ));
+        t
+    }
+
+    fn frame() -> Value {
+        json!({
+            "type": "terminal_create",
+            "remote": {
+                "grant_jti": "jti-c",
+                "source_device_id": "dev-source",
+                "kind": "create",
+            },
+        })
+    }
+
+    fn admit(
+        grants: &RemoteCreateGrants,
+        pref: AcceptRemoteCreate,
+        local: Option<&str>,
+    ) -> Result<Option<AdmittedCreate>, Value> {
+        let local = local.map(str::to_string);
+        admit_terminal_create(
+            &RemoteAttachGrants::new(),
+            grants,
+            move || pref,
+            move || local,
+            targets,
+            &frame(),
+            NOW,
+        )
+    }
+
+    /// **THE discriminating test.** Under `same_user`, a grant minted for
+    /// ANOTHER user is refused — and the grant is not burned by the refusal.
+    /// Against the unfixed code this was admitted, because the only test the
+    /// target ran was `!= Off`.
+    #[test]
+    fn same_user_refuses_a_grant_minted_for_another_user() {
+        let grants = table(THEIRS);
+        let err = admit(&grants, AcceptRemoteCreate::SameUser, Some(MINE))
+            .expect_err("another user's grant must not spawn here");
+        assert_eq!(err["code"], "remote_create_source_user_not_allowed");
+        assert!(
+            grants.contains("jti-c"),
+            "a refusal must not burn someone else's grant"
+        );
+    }
+
+    /// The same grant IS admitted under `tenant` — which is what makes the
+    /// test above about the dial rather than about the grant.
+    #[test]
+    fn tenant_admits_what_same_user_refuses() {
+        assert!(
+            admit(&table(THEIRS), AcceptRemoteCreate::Tenant, Some(MINE))
+                .expect("tenant admits any user in the tenant")
+                .is_some()
+        );
+    }
+
+    /// The matching case, case-insensitively on the uuid's hex.
+    #[test]
+    fn same_user_admits_this_devices_own_user() {
+        assert!(
+            admit(&table(MINE), AcceptRemoteCreate::SameUser, Some(MINE))
+                .expect("my own grant")
+                .is_some()
+        );
+        assert!(admit(
+            &table(&MINE.to_uppercase()),
+            AcceptRemoteCreate::SameUser,
+            Some(MINE)
+        )
+        .expect("hex case is not identity")
+        .is_some());
+    }
+
+    /// Both unknowns fail CLOSED: a grant whose feed row named no user, and a
+    /// device that cannot say which user it is paired to. An unknowable
+    /// identity is not a matching one — and `same_user` is precisely the arm an
+    /// operator picks when they do not trust the rest of the tenant.
+    #[test]
+    fn an_unknowable_identity_is_refused_not_skipped() {
+        for (label, granted, local) in [
+            ("the feed named no user", "", Some(MINE)),
+            ("this device is not paired", MINE, None),
+            ("neither", "", None),
+            ("a blank local id", MINE, Some("   ")),
+        ] {
+            let err = admit(&table(granted), AcceptRemoteCreate::SameUser, local).expect_err(label);
+            assert_eq!(
+                err["code"], "remote_create_source_user_not_allowed",
+                "{label}"
+            );
+        }
     }
 }

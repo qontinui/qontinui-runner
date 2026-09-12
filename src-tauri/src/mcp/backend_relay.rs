@@ -1551,10 +1551,20 @@ async fn handle_connected_message(api_state: &Arc<ApiState>, data: &Value) {
         let registry = registry.inner().clone();
         tokio::spawn(async move {
             crate::session::attach::catch_up_now(&registry).await;
+            crate::session::create::catch_up_now(&registry).await;
         });
     }
     let coord_base = crate::commands::remote_attach::coord_base_for(&api_state.app_handle);
-    tokio::spawn(crate::commands::remote_attach::mirror_attach_preference_logged(coord_base));
+    tokio::spawn(
+        crate::commands::remote_attach::mirror_attach_preference_logged(coord_base.clone()),
+    );
+    // The CREATE preference mirrors on the same seam, for the same reason
+    // (plan `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase
+    // 3b): coord's `accept_remote_create` column is what the MINT gate reads,
+    // and the runner's local setting is the device owner's expressed choice.
+    // Re-mirroring on every relay connect is what keeps the two from drifting
+    // silently when a save-time PUT failed.
+    tokio::spawn(crate::commands::remote_create::mirror_create_preference_logged(coord_base));
 }
 
 /// Heartbeat sender. Every 30s, write a `{"type": "heartbeat"}` message.
@@ -1964,6 +1974,17 @@ async fn sleep_with_kick(
 /// enforces the grant itself against the process-wide table
 /// (`mcp::remote_terminal`). This is the set an attach grant can actually ask
 /// this machine to do, so changing it changes what a grant is worth.
+///
+/// `terminal_create` is on this list as of plan
+/// `2026-09-11-headless-runner-parity-from-a-headed-runner` — and it is the one
+/// entry membership alone does not settle. It is admitted ONLY under a CREATE
+/// grant (`remote.kind == "create"`), never under an attach grant, and
+/// `mcp::remote_terminal::admit_terminal_create` then resolves its working
+/// directory and `intent_repo` from THIS device's configuration. The two
+/// halves of the original defect are closed in different places, deliberately:
+/// this predicate stops an attach grant reaching the handler at all, and the
+/// handler's own gate stops a create grant choosing where the PTY lands. See
+/// [`remote_frame_admitted`] for the kind arm.
 const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_input",
     "terminal_resize",
@@ -1973,6 +1994,7 @@ const REMOTE_TARGET_ADMITTED: &[&str] = &[
     "terminal_detach",
     "terminal_flow",
     "remote_terminal_flow",
+    "terminal_create",
 ];
 
 /// SOURCE role — the RETURN path for panes THIS runner opened on another
@@ -2015,12 +2037,158 @@ const REMOTE_ENVELOPE_TYPES: &[&str] = &["command", "chat", "terminal"];
 /// web control path. A malformed block is still a block, and is refused here
 /// unless its type is admitted, then refused again by the handler's own gate.
 fn remote_frame_admitted(msg_type: &str, data: &Value) -> bool {
-    if crate::mcp::remote_terminal::parse_remote_block(data).is_none() {
+    use crate::mcp::remote_terminal::RemoteGrantKind;
+    let Some(parsed) = crate::mcp::remote_terminal::parse_remote_block(data) else {
         return true;
+    };
+    // A malformed block parses as `Err` and is `Attach` for this predicate —
+    // the narrower kind — so it can never reach `terminal_create`.
+    let create_grant = matches!(&parsed, Ok(block) if block.kind == RemoteGrantKind::Create);
+
+    // `terminal_create` SPAWNS a PTY: admitted under a create grant and under
+    // nothing else. An attach grant naming it is refused here, before the
+    // handler exists in the call stack — the shape review round 1 found open.
+    if msg_type == "terminal_create" {
+        return create_grant;
     }
+    // And the converse, which is the same rule read the other way: a create
+    // grant is not an attach grant, so it may not drive an existing PTY. It
+    // buys exactly one frame type, the one above.
+    if create_grant && REMOTE_TARGET_ADMITTED.contains(&msg_type) {
+        return false;
+    }
+
     REMOTE_TARGET_ADMITTED.contains(&msg_type)
         || REMOTE_SOURCE_ADMITTED.contains(&msg_type)
         || REMOTE_ENVELOPE_TYPES.contains(&msg_type)
+}
+
+/// Where one inbound relay frame is going, decided BEFORE any handler runs.
+///
+/// Split out of [`handle_relay_command`] so the routing decision is testable
+/// without an `ApiState` — which owns a `tauri::AppHandle` and cannot be built
+/// in a unit test. That gap is why
+/// `envelope_carriers_pass_through_and_the_inner_type_is_what_decides` passed
+/// on a build where the envelope arm DROPPED the block it was said to carry
+/// through: the test exercised the predicate and the dispatch did the
+/// unwrapping (review finding 1, scenario B).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelayRoute {
+    /// Run this arm with this payload. Envelopes are already unwrapped, so
+    /// `msg_type` is the OPERATION and never a carrier.
+    Dispatch { msg_type: String, data: Value },
+    /// Refuse before dispatch; this frame goes back on the socket.
+    Refuse(Value),
+}
+
+/// How many nested envelopes to unwrap before refusing the frame outright.
+/// Two is the depth the protocol uses (`terminal` → `terminal_create`); the
+/// cap exists because a carrier whose `subtype` names another carrier is a
+/// loop a recursive dispatch would follow forever.
+const MAX_ENVELOPE_DEPTH: usize = 4;
+
+/// The pre-dispatch refusal frame for a `remote` block on a type that may not
+/// carry one.
+fn remote_type_refusal(msg_type: &str, data: &Value) -> Value {
+    serde_json::json!({
+        "type": "error",
+        "code": "remote_type_not_admitted",
+        "message": format!(
+            "`{msg_type}` may not carry a remote block — admitted: {}",
+            [REMOTE_TARGET_ADMITTED, REMOTE_SOURCE_ADMITTED].concat().join(", ")
+        ),
+        "request_id": data.get("request_id"),
+        "remote": crate::mcp::remote_terminal::remote_echo(data),
+    })
+}
+
+/// Decide what one inbound relay frame dispatches to.
+///
+/// Unwraps envelope carriers and re-applies [`remote_frame_admitted`] at every
+/// level — and **carries an envelope-level `remote` block down into the
+/// payload**, which is the half that was missing. The old envelope arm built
+/// its inner frame as `data.get("payload").cloned()`, so
+/// `{"type":"terminal","subtype":"terminal_create","remote":{…},
+///   "payload":{"working_dir":"/etc"}}` re-entered as a `terminal_create` with
+/// NO block: the predicate that had just refused it saw nothing to refuse and
+/// the frame reached the ungated arm. The same strip applied to
+/// `terminal_input`, whose ungated arm writes into any named terminal id.
+///
+/// A block on BOTH levels is refused unless the two are identical. There is no
+/// privilege difference between them — the relay stamps both — so the point is
+/// not to pick a winner but to keep the two from disagreeing about which grant
+/// a frame is being admitted under.
+pub(crate) fn route_relay_frame(msg_type: &str, data: &Value) -> RelayRoute {
+    let mut msg_type = msg_type.to_string();
+    let mut data = data.clone();
+
+    for _ in 0..MAX_ENVELOPE_DEPTH {
+        // A frame carrying a `remote` block may only be a type that belongs to
+        // the remote-attach protocol. Checked at EVERY level, so no path
+        // reaches an ungated handler under a grant.
+        if !remote_frame_admitted(&msg_type, &data) {
+            warn!(
+                msg_type,
+                "remote attach: refusing a `remote` frame whose type is not part of the protocol"
+            );
+            return RelayRoute::Refuse(remote_type_refusal(&msg_type, &data));
+        }
+        if !REMOTE_ENVELOPE_TYPES.contains(&msg_type.as_str()) {
+            return RelayRoute::Dispatch { msg_type, data };
+        }
+
+        // Frontend WS endpoints relay through this single channel. The inner
+        // `subtype` field carries the original command name (e.g.
+        // "chat_message" inside a `chat` envelope).
+        let subtype = data
+            .get("subtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mut inner = data.get("payload").cloned().unwrap_or_else(|| data.clone());
+
+        match data.get("remote") {
+            // `null` is ABSENT — the same reading `parse_remote_block` gives
+            // it, so a serializer emitting `Option::None` carries nothing.
+            None | Some(Value::Null) => {}
+            Some(outer) => match inner.get("remote") {
+                Some(existing) if existing == outer => {}
+                Some(_) => {
+                    warn!(
+                        msg_type,
+                        subtype,
+                        "remote attach: refusing an envelope whose `remote` block disagrees \
+                         with its payload's"
+                    );
+                    return RelayRoute::Refuse(remote_type_refusal(&subtype, &data));
+                }
+                None => match inner.as_object_mut() {
+                    Some(obj) => {
+                        obj.insert("remote".to_string(), outer.clone());
+                    }
+                    // A grant we cannot carry is a grant we do not honour.
+                    None => {
+                        warn!(
+                            msg_type,
+                            subtype,
+                            "remote attach: refusing an envelope carrying a `remote` block \
+                             over a non-object payload"
+                        );
+                        return RelayRoute::Refuse(remote_type_refusal(&subtype, &data));
+                    }
+                },
+            },
+        }
+
+        msg_type = subtype;
+        data = inner;
+    }
+
+    warn!(
+        msg_type,
+        "remote attach: refusing a frame nested deeper than {MAX_ENVELOPE_DEPTH} envelopes"
+    );
+    RelayRoute::Refuse(remote_type_refusal(&msg_type, &data))
 }
 
 async fn handle_relay_command(
@@ -2028,42 +2196,17 @@ async fn handle_relay_command(
     msg_type: &str,
     data: &Value,
 ) -> Option<Value> {
-    // A frame carrying a `remote` block may only be a type that belongs to the
-    // remote-attach protocol. Checked BEFORE dispatch, and again on every
-    // envelope re-entry, so no path reaches an ungated handler under a grant.
-    if !remote_frame_admitted(msg_type, data) {
-        warn!(
-            msg_type,
-            "remote attach: refusing a `remote` frame whose type is not part of the protocol"
-        );
-        return Some(serde_json::json!({
-            "type": "error",
-            "code": "remote_type_not_admitted",
-            "message": format!(
-                "`{msg_type}` may not carry a remote block — admitted: {}",
-                [REMOTE_TARGET_ADMITTED, REMOTE_SOURCE_ADMITTED].concat().join(", ")
-            ),
-            "request_id": data.get("request_id"),
-            "remote": crate::mcp::remote_terminal::remote_echo(data),
-        }));
-    }
+    let (msg_type, data) = match route_relay_frame(msg_type, data) {
+        RelayRoute::Refuse(frame) => return Some(frame),
+        RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
+    };
+    let data = &data;
 
-    match msg_type {
+    match msg_type.as_str() {
         // --------------------------------------------------------------
-        // Phase 3 protocol — typed dispatch / command / chat / terminal
+        // Phase 3 protocol — typed dispatch
         // --------------------------------------------------------------
         "dispatch" => handle_dispatch(api_state, data).await,
-
-        "command" | "chat" | "terminal" => {
-            // Frontend WS endpoints now relay through this single channel.
-            // The inner `subtype` field carries the original command name
-            // (e.g. "chat_message" inside a `chat` envelope). Unwrap and
-            // dispatch through the legacy handler.
-            let subtype = data.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
-            let inner = data.get("payload").cloned().unwrap_or_else(|| data.clone());
-            // Box the recursive call to avoid an infinitely-sized future.
-            return Box::pin(handle_relay_command(api_state, subtype, &inner)).await;
-        }
 
         // --------------------------------------------------------------
         // Web -> runner WS bridge commands. The web side's
@@ -2147,7 +2290,7 @@ async fn handle_relay_command(
         | "remote_terminal_exit"
         | "remote_terminal_buffer"
         | "remote_terminal_error" => {
-            crate::mcp::remote_terminal::client().handle_inbound(msg_type, data);
+            crate::mcp::remote_terminal::client().handle_inbound(&msg_type, data);
             None
         }
         "error" => {
@@ -2684,11 +2827,39 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         }
     };
 
-    let path = data
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let raw_path = data.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+    // The path policy, BEFORE anything else is decoded or sent. `http_request`
+    // is otherwise an unrestricted loopback proxy — caller-chosen method, path,
+    // headers and body against an API that "binds the IPv4 loopback only and
+    // these routes carry no further gate" — so the typed `terminal_create`
+    // gate in `mcp::remote_terminal` was worth nothing while the sibling arm of
+    // this same `match` reached `POST /terminals` with `working_dir`,
+    // `intent_repo` and `agent_session_id` verbatim (review round 2, finding
+    // 1).
+    //
+    // Since round 4 this is a TOTAL ALLOWLIST, not a denylist of dangerous
+    // prefixes: round 3's `GUARDED_PREFIXES` still let this arm reach
+    // `POST /execute-python`, `POST /sessions/spawn` + `/sessions/{id}/message`
+    // and `POST /ui-bridge/invoke/{get_coord_device_token,spawn_worker_session}`
+    // — arbitrary code, a process in any directory with its stdin, the coord
+    // device JWT, and a Claude-backed PTY — because nobody had thought to name
+    // them. An unlisted path is now refused whatever it is and whenever it was
+    // added. The refusal is decided on a NORMALISED path and the request is
+    // forwarded verbatim; see `mcp::relay_path_policy` for the list and how it
+    // was derived from the two real clients.
+    let verdict = crate::mcp::relay_path_policy::relay_path_verdict(&method_str, raw_path);
+    if verdict.is_refusal() {
+        warn!(
+            code = verdict.code(),
+            method = %method_str,
+            path = %raw_path,
+            "http_request relay: refused a path that is not reachable over this arm"
+        );
+        return http_relay_error(&request_id, 403, verdict.message());
+    }
+
+    let path = raw_path.trim_start_matches('/');
     let query = data.get("query").and_then(|v| v.as_str()).unwrap_or("");
 
     // Decode the request body (base64). Empty / absent => no body.
@@ -3544,18 +3715,332 @@ fn handle_terminal_list(api_state: &Arc<ApiState>, data: &Value) -> Option<Value
     }
 }
 
+/// What THIS device is willing to spawn a remote terminal in.
+///
+/// The operator's `remote_create.allowed_working_dirs` when it has any;
+/// otherwise exactly one root — this machine's own workspace root, under the
+/// key `workspace_root`. An unresolvable workspace root leaves the list EMPTY,
+/// which `admit_terminal_create` answers `remote_create_no_target_directory`
+/// to: with nowhere the operator has vouched for, a remote create refuses
+/// rather than falling back to the runner process's cwd.
+fn remote_create_targets() -> crate::mcp::remote_terminal::CreateTargets {
+    use crate::mcp::remote_terminal::{CreateRoot, CreateTargets};
+    let configured = crate::settings::get_remote_create_settings();
+    let mut roots: Vec<CreateRoot> = configured
+        .allowed_working_dirs
+        .iter()
+        .filter(|root| !root.key.trim().is_empty() && !root.path.trim().is_empty())
+        .map(|root| CreateRoot {
+            key: root.key.trim().to_string(),
+            path: root.path.trim().to_string(),
+        })
+        .collect();
+    if roots.is_empty() {
+        match crate::workspace_paths::workspace_root() {
+            Some(root) => roots.push(CreateRoot {
+                key: "workspace_root".to_string(),
+                path: root.display().to_string(),
+            }),
+            None => warn!(
+                "remote create: no `remote_create.allowed_working_dirs` and no resolvable \
+                 workspace root — every remote create will be refused"
+            ),
+        }
+    }
+    CreateTargets {
+        roots,
+        repos: configured
+            .allowed_intent_repos
+            .iter()
+            .map(|repo| repo.trim().to_string())
+            .filter(|repo| !repo.is_empty())
+            .collect(),
+    }
+}
+
+/// Register a REMOTE-created terminal as a coord session, and return the id.
+///
+/// **Why this exists, and why only for a remote create.** A create grant buys
+/// one spawn and the relay drops the attachment the moment it forwards
+/// `terminal_created`; driving the PTY afterwards needs an ATTACH grant, which
+/// coord mints BY SESSION (`POST /coord/sessions/{id}/attach-grants`). Without
+/// a coord session row the source can create a terminal it can never reach,
+/// and the terminal never appears in the fleet picker either — the feature
+/// would be a spawn button with no way back to what it spawned.
+///
+/// The local Tauri `terminal_create` command has always registered (it also
+/// resumes a persisted pane id and attaches an output pipe); the relay path
+/// never did. This closes it for the remote arm ONLY. The web / mobile arm is
+/// left as it was on purpose: registering every terminal qontinui-web opens
+/// would mint coord rows for a population that has never had them, which is a
+/// separate decision with its own blast radius and is not this plan's.
+///
+/// `None` on any failure — no registry in state, or a registry refusal — which
+/// the source then reports as "created but not attachable" rather than as a
+/// success. Failure never affects the terminal, which is already running.
+fn register_remote_created_session(
+    api_state: &Arc<ApiState>,
+    tm: &Arc<crate::terminal::TerminalManager>,
+    terminal_id: &str,
+    purpose: Option<String>,
+    working_dir: Option<String>,
+    intent_repo: Option<String>,
+) -> Option<uuid::Uuid> {
+    use crate::session::{intent::Intent, SessionKind};
+
+    let registry = api_state
+        .app_handle
+        .try_state::<Arc<crate::session::SessionRegistry>>()?
+        .inner()
+        .clone();
+    let perf = crate::settings::get_performance_settings();
+    let intent = Intent {
+        kind: SessionKind::TerminalShell,
+        purpose: purpose
+            .filter(|t| t.trim().len() >= 3)
+            .unwrap_or_else(|| "Remote terminal shell session".to_string()),
+        repo: intent_repo,
+        branch: None,
+        work_unit_slug: None,
+        plan_slug: None,
+        correlation_topic: None,
+        // A present `page_id` is coord's "this is a gate continuation" marker;
+        // a remote create is not one.
+        page_id: None,
+        declared_paths: working_dir
+            .map(std::path::PathBuf::from)
+            .into_iter()
+            .collect(),
+        share_output: perf.share_terminal_output,
+        redact_secrets: perf.redact_terminal_secrets,
+        // The device default. A REMOTE caller naming a tenant would be choosing
+        // this machine's binding for it, which is not something a create grant
+        // conveys.
+        tenant_id: None,
+    };
+    // Keyed by the harness session id the identity seam pinned this PTY child
+    // to, exactly as the local create path does — without it the registry falls
+    // back to the runner's own ambient id, which no child runs under.
+    let pinned_session_id = tm
+        .get(terminal_id)
+        .map(|s| s.pinned_session_id().to_string());
+    match registry.register_external_with_lineage(intent, None, pinned_session_id) {
+        Ok(coord_id) => {
+            if let Some(session) = tm.get(terminal_id) {
+                session.set_coord_session_id(coord_id);
+                // Close the coord mirror the instant the PTY exits, instead of
+                // leaving a ghost for coord's stale watcher to reap. Same
+                // idempotent door the explicit close uses.
+                let close_registry = registry.clone();
+                session.set_on_exit(Box::new(move |id| {
+                    if let Err(e) = close_registry.close_by_id(id) {
+                        warn!(
+                            coord_session = %id,
+                            error = %e,
+                            "remote create: coord session close failed on PTY exit"
+                        );
+                    }
+                }));
+                let rx = session.subscribe_output();
+                registry.attach_output_pipe(coord_id, rx, true);
+            }
+            info!(
+                terminal_id = %terminal_id,
+                coord_session = %coord_id,
+                "remote create: coord session registered — the source can mint an attach grant"
+            );
+            Some(coord_id)
+        }
+        Err(e) => {
+            warn!(
+                terminal_id = %terminal_id,
+                error = %e,
+                "remote create: coord session registration FAILED — the terminal is running but \
+                 the source cannot attach to it (no session id to mint an attach grant against)"
+            );
+            None
+        }
+    }
+}
+
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+    // D2 — the TARGET chooses. A frame with no `remote` block is the
+    // operator-web / mobile path and keeps its caller-chosen `working_dir`;
+    // one carrying a block is a REMOTE create, and `admitted` holds the
+    // directory and the `intent_repo` this device resolved for it. Gated
+    // before the `TerminalManager` is even looked up, so a refusal cannot
+    // touch terminal state.
+    //
+    // Phase 3b: the gate now also consults this runner's OWN create-grant
+    // table, filled from coord's `create_request` directive and the
+    // `GET /sessions/create-requests` catch-up poll. Until then the target
+    // took the relay's word that a create grant existed, so a relay defect
+    // spawned PTYs here.
+    let gate = |data: &Value| {
+        crate::mcp::remote_terminal::admit_terminal_create(
+            crate::mcp::remote_terminal::grants(),
+            crate::mcp::remote_terminal::create_grants(),
+            crate::settings::get_remote_create_preference,
+            qontinui_runner_lib::pair::read_paired_user_id_from_disk,
+            remote_create_targets,
+            data,
+            crate::mcp::remote_terminal::now_epoch_secs(),
+        )
+    };
+    let admitted = match gate(data) {
+        Ok(admitted) => admitted,
+        Err(frame) => {
+            // The ONE refusal worth a second look, and only this one.
+            //
+            // Coord publishes the `create_request` directive before it answers
+            // the source's mint, but the directive rides NATS while the frame
+            // rides the source's HTTP round-trip and the relay socket — two
+            // paths with no ordering between them. So a LEGITIMATE create can
+            // arrive here microseconds before the directive that authorises it,
+            // and the 60 s catch-up poll would make that a minute-long flake.
+            //
+            // Ask coord directly, once, and re-gate. This does not weaken the
+            // check — the answer still comes from COORD and never from the
+            // relay — it only removes the race. A forged jti pays one coord
+            // round-trip and is refused exactly as before. The first gate
+            // refused at the LOOKUP, before any consume, so re-gating is
+            // idempotent.
+            let worth_a_reread = frame
+                .get("code")
+                .and_then(|c| c.as_str())
+                .is_some_and(crate::mcp::remote_terminal::refusal_warrants_a_coord_reread);
+            let jti = frame
+                .get("grant_jti")
+                .and_then(|j| j.as_str())
+                .unwrap_or_default()
+                .to_string();
+            // THROTTLED, because this `await` runs on the relay's SERIAL read
+            // loop: an unthrottled re-read stalls terminal input, output and
+            // every other frame for up to the coord timeout, once per forged
+            // jti. `claim_create_reread` allows one per jti and one per
+            // cooldown window; everything else is refused from memory at no
+            // cost. It RECORDS the attempt, so call it once.
+            if !worth_a_reread
+                || jti.is_empty()
+                || !crate::mcp::remote_terminal::claim_create_reread(
+                    &jti,
+                    crate::mcp::remote_terminal::now_epoch_secs(),
+                )
+            {
+                return Some(frame);
+            }
+            match api_state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+            {
+                Some(registry) => {
+                    let registry = registry.inner().clone();
+                    tracing::debug!(
+                        grant_jti = %jti,
+                        "remote create: jti unknown to this device — asking coord directly \
+                         before refusing (the directive may not have landed yet)"
+                    );
+                    // BOUNDED, and the bound is a second rather than the
+                    // catch-up's ten: this `await` holds the relay's serial
+                    // read loop, so it is the whole device's liveness budget.
+                    crate::session::create::catch_up_now_within(
+                        &registry,
+                        crate::mcp::remote_terminal::CREATE_REREAD_TIMEOUT,
+                    )
+                    .await;
+                    // Re-stamp the cooldown on COMPLETION. `claim_create_reread`
+                    // stamped it when the re-read started, which bounds how
+                    // often one begins and not how much of the read loop it
+                    // occupies — a round-trip as long as the cooldown left the
+                    // next unknown jti free to claim immediately, so the stalls
+                    // ran back to back.
+                    crate::mcp::remote_terminal::finish_create_reread(
+                        crate::mcp::remote_terminal::now_epoch_secs(),
+                    );
+                }
+                None => return Some(frame),
+            }
+            match gate(data) {
+                Ok(admitted) => {
+                    // Coord knew it: the re-read raced the directive and won,
+                    // so drop the "already asked" memory rather than holding a
+                    // slot for a jti that turned out to be real.
+                    crate::mcp::remote_terminal::clear_create_reread(&jti);
+                    admitted
+                }
+                // Coord does not know it either. Return the SECOND refusal:
+                // it was decided against a freshly read list.
+                Err(frame) => return Some(frame),
+            }
+        }
+    };
+
+    // The grant is spent. Tell COORD so, so its pending list stops serving it.
+    //
+    // The runner's own spent-jti tombstone already refuses a replay in THIS
+    // process, but coord keeps a grant in `GET /sessions/create-requests` until
+    // its `consumed_at` is set — so without this, a restarted runner (or a
+    // second runner on the same device) reads the spent grant back as pending
+    // and it buys another PTY. Detached and best-effort: a coord blip must not
+    // stall the spawn the grant just paid for, and the local tombstone holds
+    // meanwhile.
+    if let Some(create) = admitted.as_ref() {
+        if let Some(registry) = api_state
+            .app_handle
+            .try_state::<Arc<crate::session::SessionRegistry>>()
+        {
+            let registry = registry.inner().clone();
+            let jti = create.block.grant_jti.clone();
+            tokio::spawn(async move {
+                crate::session::create::notify_consumed(&registry, &jti).await;
+            });
+        }
+    }
+
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
         .app_handle
         .try_state::<Arc<crate::terminal::TerminalManager>>()
         .map(|s| s.inner().clone());
 
+    // This device's own spawn targets. Read once per create (a settings read,
+    // not a per-keystroke cost) and used by the UNGATED arm below — the gated
+    // one already resolved against the same table inside `admit_terminal_create`.
+    let relay_targets = remote_create_targets();
+
     if let Some(tm) = terminal_manager {
         let title = data.get("title").and_then(|v| v.as_str()).map(String::from);
-        let working_dir = data
-            .get("working_dir")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+
+        // `intent_repo` is the opt-in from Phase 2 of
+        // `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`, the
+        // same one the Tauri command and the HTTP-SDK proxy accept: allocation
+        // happens via the shared helper and the context is parked on the
+        // resulting TerminalSession.
+        //
+        // NEITHER arm reads the frame's spawn parameters verbatim any more.
+        //
+        // A remote create's were answered — or refused — by the gate above.
+        // The ungated arm (the operator-web / mobile path) goes through
+        // `resolve_relay_create`, which applies the SAME device-owned
+        // allowlists: "no `remote` block" is a choice the untrusted party
+        // makes, so leaving that arm caller-chosen made the whole grant gate
+        // opt-in by a marker the adversary stamps (review finding 1,
+        // scenario A). The mobile client sends none of the three, which is the
+        // arm that still gets this device's default.
+        let relay = match &admitted {
+            Some(create) => crate::mcp::remote_terminal::RelayCreate {
+                working_dir: Some(create.working_dir.clone()),
+                intent_repo: create.intent_repo.clone(),
+                agent_session_id: None,
+            },
+            None => match crate::mcp::remote_terminal::resolve_relay_create(&relay_targets, data) {
+                Ok(relay) => relay,
+                Err(frame) => return Some(frame),
+            },
+        };
+        let working_dir = relay.working_dir.clone();
+        let intent_repo = relay.intent_repo.clone();
+        let agent_session_id = relay.agent_session_id;
+
         let cols = data
             .get("cols")
             .and_then(|v| v.as_u64())
@@ -3564,44 +4049,34 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             .get("rows")
             .and_then(|v| v.as_u64())
             .map(|v| v.min(u16::MAX as u64) as u16);
-        // Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`.
-        // Accept the same `intent_repo` opt-in the Tauri command + HTTP-SDK
-        // proxy accept so backend-relay callers can declare edit intent on
-        // a registered repo. Allocation happens via the shared helper; the
-        // context (if any) is parked on the resulting TerminalSession.
-        let intent_repo = data
-            .get("intent_repo")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        // Stable session id of the agent issuing this relay request, if the
-        // caller supplied one — folded into the claim owner token so distinct
-        // agent sessions on one machine are distinct holders. Sourced from the
-        // request payload (the initiator's context), NOT the runner's process
-        // env. Absent / unparseable → None.
-        let agent_session_id = data
-            .get("agent_session_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| uuid::Uuid::parse_str(s).ok());
 
         // L2 (shared-checkout coordination gap fix) — derive `intent_repo`
         // from `working_dir` when the caller didn't declare one (no-op
         // until `QONTINUI_AGENT_WORKTREE_MODE` is on).
-        let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
-            working_dir.as_deref().and_then(|wd| {
-                let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
-                    std::path::Path::new(wd),
-                );
-                if let Some(ref repo) = derived {
-                    tracing::debug!(
-                        working_dir = %wd,
-                        derived_intent_repo = %repo,
-                        "backend_relay terminal_create: derived intent_repo from working_dir"
+        //
+        // A REMOTE create takes the resolved intent and NOTHING else: the
+        // derivation would otherwise allocate a worktree — and take a coord
+        // claim — for an allowlisted directory that happens to be a checkout,
+        // which is not something the caller was granted.
+        let effective_intent_repo: Option<String> = if admitted.is_some() {
+            intent_repo.clone()
+        } else {
+            intent_repo.clone().or_else(|| {
+                working_dir.as_deref().and_then(|wd| {
+                    let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
+                        std::path::Path::new(wd),
                     );
-                }
-                derived
+                    if let Some(ref repo) = derived {
+                        tracing::debug!(
+                            working_dir = %wd,
+                            derived_intent_repo = %repo,
+                            "backend_relay terminal_create: derived intent_repo from working_dir"
+                        );
+                    }
+                    derived
+                })
             })
-        });
+        };
 
         let (working_dir, isolated_ctx) =
             crate::agent_worktree::isolated_edit::acquire_for_terminal(
@@ -3617,6 +4092,12 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
         // ctx is parked. See `agent_worktree::session_env`.
         let extra_env =
             crate::agent_worktree::session_env::session_extra_env(isolated_ctx.as_ref());
+
+        // Kept for the coord registration below, which runs after `title` has
+        // been moved into the spawn.
+        let registration_purpose = title.clone();
+        let registration_dir = working_dir.clone();
+        let registration_repo = effective_intent_repo.clone();
 
         match tm.create(
             title,
@@ -3645,17 +4126,56 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                         session.set_isolated_edit_ctx(ctx);
                     }
                 }
-                Some(serde_json::json!({
+                let mut terminal = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
+                // A REMOTE create is registered as a coord session; a local /
+                // mobile one is not, and that asymmetry is deliberate — see
+                // `register_remote_created_session`.
+                if admitted.is_some() {
+                    if let Some(coord_id) = register_remote_created_session(
+                        api_state,
+                        &tm,
+                        &info.id,
+                        registration_purpose,
+                        registration_dir,
+                        registration_repo,
+                    ) {
+                        if let Some(obj) = terminal.as_object_mut() {
+                            // INSIDE the terminal object on purpose: the relay
+                            // forwards that object verbatim and drops every
+                            // top-level key it does not know, so a sibling
+                            // field would never reach the source.
+                            obj.insert(
+                                "coordSessionId".to_string(),
+                                serde_json::Value::String(coord_id.to_string()),
+                            );
+                        }
+                    }
+                }
+                let mut frame = serde_json::json!({
                     "type": "terminal_created",
-                    "terminal": info,
+                    "terminal": terminal,
                     "request_id": data.get("request_id"),
-                }))
+                });
+                // Echo the block a REMOTE create came under, so the relay can
+                // route the reply by grant as well as by the request id it
+                // minted — the same two keys every other target-side remote
+                // reply carries.
+                if admitted.is_some() {
+                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                }
+                Some(frame)
             }
-            Err(e) => Some(serde_json::json!({
-                "type": "error",
-                "message": format!("Failed to create terminal: {}", e),
-                "request_id": data.get("request_id"),
-            })),
+            Err(e) => {
+                let mut frame = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Failed to create terminal: {}", e),
+                    "request_id": data.get("request_id"),
+                });
+                if admitted.is_some() {
+                    frame["remote"] = crate::mcp::remote_terminal::remote_echo(data);
+                }
+                Some(frame)
+            }
         }
     } else {
         Some(serde_json::json!({
@@ -4554,13 +5074,17 @@ mod tests {
                 body,
             )
         }
-        let base = spawn_test_server(Router::new().route("/echo", get(handler))).await;
+        // The path is an ALLOWLISTED one (`mcp::relay_path_policy`), because
+        // the policy runs before anything else in `relay_http_to_base`: a
+        // synthetic `/echo` now 403s and this test would be measuring the
+        // policy instead of the round trip it is named for.
+        let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
 
         let env = json!({
             "type": "http_request",
             "request_id": "req-1",
             "method": "GET",
-            "path": "/echo",
+            "path": "/status",
             "query": "foo=bar",
             "headers": { "x-test": "hello", "host": "should-be-stripped" },
             "body_b64": ""
@@ -4590,7 +5114,8 @@ mod tests {
         async fn handler(body: Bytes) -> impl axum::response::IntoResponse {
             (AxumStatus::OK, body)
         }
-        let base = spawn_test_server(Router::new().route("/bin", post(handler))).await;
+        // An allowlisted POST — see the note on the GET round trip above.
+        let base = spawn_test_server(Router::new().route("/run-workflow", post(handler))).await;
 
         // Bytes that are not valid UTF-8 — proves we carry raw binary, not text.
         let raw: Vec<u8> = vec![0x00, 0xff, 0x10, 0x80, 0x7f, 0xfe, 0x01];
@@ -4598,7 +5123,7 @@ mod tests {
             "type": "http_request",
             "request_id": "req-bin",
             "method": "POST",
-            "path": "bin",
+            "path": "run-workflow",
             "body_b64": STANDARD.encode(&raw),
         });
 
@@ -4617,7 +5142,10 @@ mod tests {
             "type": "http_request",
             "request_id": "req-big",
             "method": "POST",
-            "path": "anything",
+            // Allowlisted: the path policy runs FIRST, so an unlisted path
+            // would answer 403 and this test would never reach the size cap
+            // it exists to pin.
+            "path": "run-workflow",
             "body_b64": oversize,
         });
 
@@ -4646,6 +5174,295 @@ mod tests {
         assert_eq!(reply["type"], "command_response");
         assert_eq!(reply["request_id"], "req-502");
         assert_eq!(reply["status"], 502);
+    }
+
+    // ------------------------------------------------------------------
+    // The `http_request` PATH POLICY — review round 2, finding 1.
+    //
+    // Round 1 hardened the typed `terminal_create` frame. `http_request` is
+    // the sibling arm of the same `match` in `handle_relay_command`, and it is
+    // an unrestricted loopback proxy onto the runner's own API — so
+    // `POST /terminals` with `working_dir` / `intent_repo` /
+    // `agent_session_id` reached the SAME create handler with none of the
+    // gate. These tests exercise the DISPATCH, not a predicate: a real local
+    // server stands in for the runner's API and COUNTS what actually arrived,
+    // because round 1's lesson was that a predicate-only test passes while the
+    // routing property is false.
+    // ------------------------------------------------------------------
+
+    /// A router that records every path it is asked for and answers 200. Any
+    /// hit at all is a failure for a guarded route.
+    fn recording_router() -> (Router, Arc<std::sync::Mutex<Vec<String>>>) {
+        let hits: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = hits.clone();
+        let router = Router::new().fallback(move |req: axum::http::Request<axum::body::Body>| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(req.uri().to_string());
+                (AxumStatus::OK, "reached")
+            }
+        });
+        (router, hits)
+    }
+
+    /// The reviewer's exact frame: a create with a caller-chosen working dir,
+    /// intent repo and agent session id, relayed at the local API. It must be
+    /// refused BEFORE the socket is touched.
+    #[tokio::test]
+    async fn the_http_relay_never_reaches_the_terminal_create_route() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        let body = serde_json::to_string(&json!({
+            "working_dir": "/",
+            "intent_repo": "qontinui-runner",
+            "agent_session_id": "0192a1b2-0000-7000-8000-0000000000ff",
+        }))
+        .unwrap();
+        let env = json!({
+            "type": "http_request",
+            "request_id": "x",
+            "method": "POST",
+            "path": "/terminals",
+            "body_b64": STANDARD.encode(body.as_bytes()),
+        });
+
+        let reply = relay_http_to_base(&base, &env).await;
+
+        assert_eq!(reply["type"], "command_response");
+        assert_eq!(reply["request_id"], "x");
+        assert_eq!(reply["status"], 403, "reply: {reply}");
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// Every route `mcp::terminals` registers, in its registered spelling and
+    /// in a concrete one — plus the tauri-invoke proxy, whose safelist carries
+    /// `terminal_create` / `terminal_write` / `terminal_close`, and the two
+    /// steward routes that spawn and kill a PTY. None of them may be reached,
+    /// whatever the method.
+    #[tokio::test]
+    async fn no_terminal_mutating_route_is_reachable_over_the_http_relay() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        let mut cases: Vec<(String, String)> = Vec::new();
+        for (method, path) in crate::mcp::terminals::route_entries() {
+            cases.push((method.to_string(), path.to_string()));
+            cases.push((
+                method.to_string(),
+                path.replace("{id}", "11111111-2222-3333-4444-555555555555"),
+            ));
+        }
+        for path in [
+            "/ui-bridge/tauri/invoke",
+            "/steward/dev-ops/start",
+            "/steward/dev-ops/stop",
+            // The evasions: leading doubles, a dot segment, case, percent
+            // encoding, a backslash separator, and a query hiding the route.
+            "//terminals",
+            "/./terminals",
+            "/TERMINALS",
+            "%2fterminals",
+            "/ter%6Dinals",
+            "\\terminals",
+            "/terminals?workingDir=/",
+            "/terminals/abc/write",
+            "/x/../terminals",
+            "/x/%252e%252e/terminals",
+        ] {
+            for method in ["GET", "POST", "DELETE"] {
+                cases.push((method.to_string(), path.to_string()));
+            }
+        }
+
+        for (method, path) in &cases {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// **Review round 4, item 1 — the routes a DENYLIST could never have
+    /// covered.** Round 3 named four dangerous prefixes and allowed the rest;
+    /// these five calls were `Allow` over the same arm the whole time. Two of
+    /// them (`/sessions/*`) are registered in the same `routes()` function as
+    /// a prefix that WAS denied.
+    ///
+    /// Driven through the DISPATCH against a recording server, not the
+    /// predicate: the reply must be a 403 AND the local API must not have been
+    /// touched. A predicate test cannot tell those apart.
+    #[tokio::test]
+    async fn the_http_relay_never_reaches_code_execution_or_a_credential_mint() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        // `POST /execute-python` with a body that would exfiltrate if it ran.
+        let python = serde_json::to_string(&json!({
+            "code": "import os; print(os.environ)",
+        }))
+        .unwrap();
+
+        let cases: Vec<(&str, &str, String)> = vec![
+            // Arbitrary code execution (`mcp::misc`).
+            ("POST", "/execute-python", python),
+            // Mints/returns the coord device JWT, headless-capable
+            // (`commands::auth::get_coord_device_token`).
+            (
+                "POST",
+                "/ui-bridge/invoke/get_coord_device_token",
+                "{}".to_string(),
+            ),
+            // A Claude-backed PTY (`commands::productivity::spawn_worker_session`).
+            (
+                "POST",
+                "/ui-bridge/invoke/spawn_worker_session",
+                "{}".to_string(),
+            ),
+            // Spawn a process in a caller-chosen directory (`mcp::sessions`)…
+            (
+                "POST",
+                "/sessions/spawn",
+                serde_json::to_string(&json!({
+                    "task_name": "t",
+                    "prompt": "p",
+                    "cwd": "/",
+                    "account": "hotmail",
+                }))
+                .unwrap(),
+            ),
+            // …then write to its stdin.
+            (
+                "POST",
+                "/sessions/11111111-2222-3333-4444-555555555555/message",
+                serde_json::to_string(&json!({ "message": "rm -rf /" })).unwrap(),
+            ),
+        ];
+
+        for (method, path, body) in &cases {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r4",
+                "method": method,
+                "path": path,
+                "body_b64": STANDARD.encode(body.as_bytes()),
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// Closed by DEFAULT: a route nobody has heard of is refused too. This is
+    /// the property a denylist cannot have, so it is worth a dispatch test of
+    /// its own rather than only a predicate one.
+    #[tokio::test]
+    async fn a_route_nobody_listed_never_reaches_the_local_api() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        for (method, path) in [
+            ("POST", "/a-route-added-next-tuesday"),
+            ("GET", "/agent-worktrees/reclaimable"),
+            ("POST", "/executor/restart"),
+            ("GET", "/files"),
+            ("POST", "/files/read"),
+            ("DELETE", "/task-runs/abc"),
+        ] {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(
+                reply["status"], 403,
+                "{method} {path} was not refused: {reply}"
+            );
+        }
+
+        assert!(
+            hits.lock().unwrap().is_empty(),
+            "the local API was called for: {:?}",
+            hits.lock().unwrap()
+        );
+    }
+
+    /// The other half of the property: the surface the two real clients
+    /// actually use still relays. Without this, a policy that refused
+    /// everything would pass every test above.
+    #[tokio::test]
+    async fn the_http_relay_still_reaches_the_measured_client_surface() {
+        let (router, hits) = recording_router();
+        let base = spawn_test_server(router).await;
+
+        // One representative call per client family on `RELAY_ALLOWED`.
+        let cases = [
+            // qontinui-web: the documented proxy example, and `useUiBridge`.
+            ("GET", "/health"),
+            ("GET", "/apps/qontinui-web/spec/list"),
+            ("GET", "/ui-bridge/control/snapshot"),
+            // qontinui-web: the co-pilot planner.
+            ("POST", "/prompt-home/plan"),
+            // qontinui-mobile in remote mode: its whole API surface rides
+            // this arm, so a sample from across its domain clients.
+            ("GET", "/status"),
+            ("GET", "/task-runs/running"),
+            ("POST", "/task-runs/abc/message"),
+            ("POST", "/run-workflow"),
+            ("GET", "/hitl/pending"),
+            ("POST", "/hitl/q-1/respond"),
+            ("POST", "/worktrees/merge"),
+            ("GET", "/files/browse"),
+            ("PUT", "/settings/general"),
+            ("GET", "/analytics/account-usage"),
+        ];
+
+        for (method, path) in cases {
+            let env = json!({
+                "type": "http_request",
+                "request_id": "r",
+                "method": method,
+                "path": path,
+                "body_b64": "",
+            });
+            let reply = relay_http_to_base(&base, &env).await;
+            assert_eq!(reply["status"], 200, "{method} {path} was refused: {reply}");
+        }
+
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            cases.len(),
+            "every allowlisted call must have reached the local API"
+        );
     }
 
     #[test]
@@ -5349,15 +6166,81 @@ mod remote_admission_tests {
         v
     }
 
+    /// The same, under a CREATE grant — the block the web relay stamps after
+    /// verifying a `create_grant` token.
+    fn with_create_grant(v: serde_json::Value) -> serde_json::Value {
+        let mut v = v;
+        v["remote"] = json!({
+            "grant_jti": "jti-c1",
+            "source_device_id": "dev-a",
+            "kind": "create",
+        });
+        v
+    }
+
     /// The two handlers that were reachable under a grant. `terminal_create`
     /// spawns a PTY with a caller-chosen working directory; `terminal_list`
     /// enumerates every terminal on the device.
+    ///
+    /// Still true after `terminal_create` joined [`REMOTE_TARGET_ADMITTED`]:
+    /// membership alone does not admit it, a CREATE grant does. This test is
+    /// the reason that distinction had to live in the predicate rather than in
+    /// the list.
     #[test]
     fn the_ungated_handlers_are_refused_under_a_grant() {
         for t in ["terminal_create", "terminal_list"] {
             assert!(
                 !remote_frame_admitted(t, &with_grant(json!({ "type": t }))),
                 "`{t}` must not be admissible under an attach grant"
+            );
+        }
+    }
+
+    /// A CREATE grant admits `terminal_create` — and only that.
+    #[test]
+    fn a_create_grant_admits_terminal_create() {
+        assert!(remote_frame_admitted(
+            "terminal_create",
+            &with_create_grant(json!({ "type": "terminal_create" }))
+        ));
+    }
+
+    /// …and buys nothing else on this device. A create grant is not an attach
+    /// grant: it may not type into, resize, close, read or attach a PTY, and
+    /// it may not enumerate them either.
+    #[test]
+    fn a_create_grant_drives_no_existing_terminal() {
+        for t in [
+            "terminal_input",
+            "terminal_resize",
+            "terminal_close",
+            "terminal_buffer",
+            "terminal_attach",
+            "terminal_detach",
+            "terminal_flow",
+            "remote_terminal_flow",
+            "terminal_list",
+            "http_request",
+        ] {
+            assert!(
+                !remote_frame_admitted(t, &with_create_grant(json!({ "type": t }))),
+                "`{t}` must not be admissible under a CREATE grant"
+            );
+        }
+    }
+
+    /// A block whose `kind` is anything but `create` — absent, misspelled,
+    /// not a string — reads as an attach grant, the narrower capability, so it
+    /// cannot spawn. (Surrounding whitespace IS trimmed; a differing CASE is
+    /// not, because a near-miss spelling should lose capability, not gain it.)
+    #[test]
+    fn only_the_create_spelling_admits_a_spawn() {
+        for kind in [json!("attach"), json!("Create"), json!("creates"), json!(1)] {
+            let mut frame = json!({ "type": "terminal_create" });
+            frame["remote"] = json!({ "grant_jti": "j", "kind": kind });
+            assert!(
+                !remote_frame_admitted("terminal_create", &frame),
+                "kind {kind} must not admit a spawn"
             );
         }
     }
@@ -5441,9 +6324,39 @@ mod remote_admission_tests {
         ));
     }
 
-    /// A frame with no block is not a remote frame.
+    /// A frame with no block is not a remote frame — and that is ALL this
+    /// predicate says about it.
+    ///
+    /// It used to be named `a_frame_with_no_remote_block_is_always_admitted`,
+    /// which read as a security property and was not one: `terminal_create`
+    /// reaches the runner only over the backend relay, so "admitted here"
+    /// meant the relay could omit the block and route to an arm that honoured
+    /// `working_dir`, `intent_repo` and `agent_session_id` verbatim — a PTY at
+    /// `/`, a worktree, and a coord claim under a named session's owner token,
+    /// with no grant and no allowlist (review finding 1, scenario A).
+    ///
+    /// The predicate still admits such a frame, and MUST: the mobile terminal
+    /// path shares this socket and cannot present a create grant (coord mints
+    /// them for DEVICES). What changed is downstream —
+    /// `remote_terminal::resolve_relay_create` now resolves every spawn
+    /// parameter of a blockless create against this device's own allowlists,
+    /// so the target decides on both arms. The tests that pin THAT are in
+    /// `remote_terminal`, and this one is deliberately narrowed to the claim it
+    /// can actually make.
+    ///
+    /// The same reading governs `http_request` in the list below, and for a
+    /// second round it was the harder half: this predicate admits it, and what
+    /// stops it self-calling `POST /terminals` with those same three fields is
+    /// `mcp::relay_path_policy`, applied inside `relay_http_to_base` (review
+    /// round 2, finding 1; inverted from a prefix denylist to a total
+    /// allowlist in round 4, which is what also closed `/execute-python`,
+    /// `/sessions/spawn` and the invoke proxy's credential mint). The tests
+    /// that pin THAT are
+    /// `no_terminal_mutating_route_is_reachable_over_the_http_relay`,
+    /// `the_http_relay_never_reaches_code_execution_or_a_credential_mint` and
+    /// their neighbours, which count what reached a real local server.
     #[test]
-    fn a_frame_with_no_remote_block_is_always_admitted() {
+    fn a_frame_with_no_remote_block_is_not_a_remote_frame_which_is_not_the_same_as_ungated() {
         for t in ["terminal_create", "terminal_list", "http_request"] {
             assert!(remote_frame_admitted(t, &json!({ "type": t })), "{t}");
         }
@@ -5469,5 +6382,187 @@ mod remote_admission_tests {
         assert!(!remote_frame_admitted("terminal_create", &malformed));
         let not_an_object = json!({ "type": "terminal_create", "remote": 7 });
         assert!(!remote_frame_admitted("terminal_create", &not_an_object));
+    }
+}
+
+#[cfg(test)]
+mod relay_routing_tests {
+    //! The ROUTING decision, not the predicate.
+    //!
+    //! `remote_admission_tests` above drives `remote_frame_admitted` in
+    //! isolation, and `envelope_carriers_pass_through_and_the_inner_type_is
+    //! _what_decides` passed for months while the property it names was FALSE:
+    //! the dispatch built its inner frame as `data.get("payload").cloned()`,
+    //! which DROPPED an envelope-level `remote` block instead of carrying it
+    //! down. So a `terminal` envelope stamped with a grant re-entered as an
+    //! unmarked `terminal_create` — the ungated arm — and the predicate that
+    //! had just refused it saw nothing left to refuse (review finding 1,
+    //! scenario B). Exercising the predicate can never catch that; exercising
+    //! the routing can.
+    //!
+    //! `route_relay_frame` is the whole pre-dispatch decision, extracted so
+    //! these tests reach it without an `ApiState` (which owns a
+    //! `tauri::AppHandle` and is not constructible in a unit test).
+
+    use super::{route_relay_frame, RelayRoute};
+    use serde_json::{json, Value};
+
+    fn create_block() -> Value {
+        json!({ "grant_jti": "jti-c1", "source_device_id": "dev-a", "kind": "create" })
+    }
+
+    fn attach_block() -> Value {
+        json!({ "grant_jti": "jti-a1", "source_device_id": "dev-a" })
+    }
+
+    fn dispatched(route: RelayRoute) -> (String, Value) {
+        match route {
+            RelayRoute::Dispatch { msg_type, data } => (msg_type, data),
+            RelayRoute::Refuse(frame) => panic!("expected a dispatch, got {frame}"),
+        }
+    }
+
+    fn refusal(route: RelayRoute) -> Value {
+        match route {
+            RelayRoute::Refuse(frame) => frame,
+            RelayRoute::Dispatch { msg_type, data } => {
+                panic!("expected a refusal, got a dispatch of {msg_type}: {data}")
+            }
+        }
+    }
+
+    /// **The finding-1 scenario-B frame.** An ATTACH block on the envelope over
+    /// a `terminal_create` payload: the block must reach the inner type, where
+    /// it is refused because an attach grant does not buy a spawn. Before the
+    /// fix this dispatched a `terminal_create` with `working_dir: /etc` and no
+    /// block at all.
+    #[test]
+    fn an_envelope_stamped_with_an_attach_grant_cannot_smuggle_a_create_past_the_gate() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": attach_block(),
+            "payload": { "working_dir": "/etc" },
+        });
+        let refused = refusal(route_relay_frame("terminal", &frame));
+        assert_eq!(refused["code"], "remote_type_not_admitted");
+    }
+
+    /// The same strip applied to `terminal_input`, whose ungated arm writes
+    /// into ANY named terminal id with no grant. Here the block is legitimate
+    /// (attach grants drive PTYs), so the frame dispatches — but it must
+    /// dispatch WITH the block, or `apply_terminal_input`'s own gate has
+    /// nothing to gate on.
+    #[test]
+    fn an_envelope_level_remote_block_reaches_the_payload() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "data": "eA==" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_input");
+        assert_eq!(data["terminal_id"], "t1");
+        assert_eq!(
+            data["remote"],
+            attach_block(),
+            "the block must travel with the operation it authorises"
+        );
+    }
+
+    /// A CREATE block on the envelope reaches `terminal_create` and is
+    /// admitted there — the legitimate half of the same carry-down.
+    #[test]
+    fn a_create_grant_on_the_envelope_admits_the_inner_create() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": create_block(),
+            "payload": { "working_dir_key": "workspace_root" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert_eq!(data["remote"], create_block());
+    }
+
+    /// A block already on the payload is left alone when the two agree, and
+    /// the frame is refused when they disagree. Neither level is more
+    /// trustworthy — the relay stamps both — so the point is that a frame may
+    /// not be admitted under one grant and acted on under another.
+    #[test]
+    fn a_disagreeing_pair_of_remote_blocks_is_refused() {
+        let agreeing = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "remote": attach_block() },
+        });
+        let (_, data) = dispatched(route_relay_frame("terminal", &agreeing));
+        assert_eq!(data["remote"], attach_block());
+
+        let disagreeing = json!({
+            "type": "terminal",
+            "subtype": "terminal_input",
+            "remote": attach_block(),
+            "payload": { "terminal_id": "t1", "remote": create_block() },
+        });
+        assert_eq!(
+            refusal(route_relay_frame("terminal", &disagreeing))["code"],
+            "remote_type_not_admitted"
+        );
+    }
+
+    /// `"remote": null` on the envelope is ABSENT, the same reading
+    /// `parse_remote_block` gives it, so nothing is carried down and the
+    /// payload's own block (if any) stands.
+    #[test]
+    fn a_null_envelope_block_carries_nothing() {
+        let frame = json!({
+            "type": "terminal",
+            "subtype": "terminal_create",
+            "remote": Value::Null,
+            "payload": { "title": "t" },
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert!(data.get("remote").is_none());
+    }
+
+    /// A carrier whose `subtype` names another carrier is a loop. The old
+    /// dispatch followed it by recursion; this refuses past the cap.
+    #[test]
+    fn endlessly_nested_envelopes_are_refused_rather_than_followed() {
+        let mut frame = json!({ "type": "terminal", "subtype": "terminal_list" });
+        for _ in 0..8 {
+            frame = json!({ "type": "terminal", "subtype": "terminal", "payload": frame });
+        }
+        assert_eq!(
+            refusal(route_relay_frame("terminal", &frame))["code"],
+            "remote_type_not_admitted"
+        );
+    }
+
+    /// A payload-less envelope still re-enters on the inner subtype — the
+    /// pre-existing behaviour, and the block on such a frame is its own.
+    #[test]
+    fn a_payload_less_envelope_re_enters_on_its_subtype() {
+        let frame = json!({
+            "type": "command",
+            "subtype": "terminal_list",
+            "runner_id": "r1",
+        });
+        let (msg_type, data) = dispatched(route_relay_frame("command", &frame));
+        assert_eq!(msg_type, "terminal_list");
+        assert_eq!(data["runner_id"], "r1");
+    }
+
+    /// A non-envelope frame is dispatched unchanged, block and all.
+    #[test]
+    fn a_plain_frame_is_dispatched_unchanged() {
+        let frame = json!({ "type": "terminal_create", "remote": create_block() });
+        let (msg_type, data) = dispatched(route_relay_frame("terminal_create", &frame));
+        assert_eq!(msg_type, "terminal_create");
+        assert_eq!(data, frame);
     }
 }

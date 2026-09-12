@@ -147,13 +147,50 @@ pub async fn remote_attach_preference_set(
 
 /// Coord's `201` from `POST /coord/sessions/{id}/attach-grants`.
 #[derive(Debug, Clone, Deserialize)]
-struct AttachGrantResponse {
-    grant: String,
-    grant_jti: String,
+pub(crate) struct AttachGrantResponse {
+    pub grant: String,
+    pub grant_jti: String,
     #[serde(default)]
-    target_device_id: Option<String>,
+    pub target_device_id: Option<String>,
     #[serde(default)]
-    expires_at: Option<Value>,
+    pub expires_at: Option<Value>,
+}
+
+/// Coord learns about a session through the registry's OUTBOX, not through the
+/// call that registered it, so a session registered microseconds ago is not yet
+/// a row coord's mint can resolve. A remote create hits exactly that window:
+/// the target registers, answers `terminal_created`, and the source mints
+/// against an id coord has not drained yet — a `404 session_not_found` that is
+/// a RACE, not an absence. Retried for this long before it is reported.
+const SESSION_VISIBILITY_RETRY: Duration = Duration::from_millis(750);
+const SESSION_VISIBILITY_ATTEMPTS: u32 = 10;
+
+/// [`mint_attach_grant`], retrying ONLY a `session_not_found` — the one
+/// refusal that can become an admission by waiting. Every other refusal
+/// (`attach_forbidden`, a credential answer, a transport failure) is returned
+/// on the first attempt: retrying those would turn one honest refusal into a
+/// long silence ending in the same refusal.
+pub(crate) async fn mint_attach_grant_awaiting_session(
+    coord_base: &str,
+    session_id: uuid::Uuid,
+) -> Result<AttachGrantResponse, String> {
+    let mut last = String::new();
+    for attempt in 0..SESSION_VISIBILITY_ATTEMPTS {
+        match mint_attach_grant(coord_base, session_id).await {
+            Ok(minted) => return Ok(minted),
+            Err(e) if e.starts_with("remote_attach:session_not_found") => {
+                last = e;
+                if attempt + 1 < SESSION_VISIBILITY_ATTEMPTS {
+                    tokio::time::sleep(SESSION_VISIBILITY_RETRY).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(format!(
+        "{last} (retried for {}s while coord's outbox caught up)",
+        (SESSION_VISIBILITY_RETRY * SESSION_VISIBILITY_ATTEMPTS).as_secs_f32()
+    ))
 }
 
 async fn mint_attach_grant(
@@ -248,14 +285,13 @@ pub async fn terminal_attach_remote(
 
     let base = coord_base_for(&app_handle);
     let minted = mint_attach_grant(&base, session_uuid).await?;
-    if let Some(target) = minted.target_device_id.as_deref() {
+    if !coord_places_session_on(&device_id, minted.target_device_id.as_deref()) {
+        let target = minted.target_device_id.as_deref().unwrap_or("<unreported>");
         let asked = device_id.trim();
-        if !asked.is_empty() && !target.eq_ignore_ascii_case(asked) {
-            return Err(format!(
-                "remote_attach:target_mismatch: coord places session {session_uuid} on device \
-                 {target}, not {asked} — refresh the fleet list"
-            ));
-        }
+        return Err(format!(
+            "remote_attach:target_mismatch: coord places session {session_uuid} on device \
+             {target}, not {asked} — refresh the fleet list"
+        ));
     }
     info!(
         session = %session_uuid,
@@ -265,6 +301,62 @@ pub async fn terminal_attach_remote(
         "remote attach: grant minted; presenting through the relay"
     );
 
+    open_remote_tab(
+        terminal_manager.inner(),
+        &app_handle,
+        OpenRemoteTab {
+            minted,
+            device_id,
+            session_uuid,
+            cols,
+            rows,
+            page_id,
+            device_label,
+            session_label,
+            working_dir,
+        },
+    )
+    .await
+}
+
+/// Everything [`open_remote_tab`] needs that is not the manager or the app
+/// handle. A struct rather than eleven positional arguments, because two
+/// callers now build it: the attach command above, and the remote CREATE
+/// command, which mints its attach grant for a session the target had to
+/// register first.
+pub(crate) struct OpenRemoteTab {
+    pub minted: AttachGrantResponse,
+    pub device_id: String,
+    pub session_uuid: uuid::Uuid,
+    pub cols: u16,
+    pub rows: u16,
+    pub page_id: Option<String>,
+    pub device_label: Option<String>,
+    pub session_label: Option<String>,
+    pub working_dir: Option<String>,
+}
+
+/// Present a minted ATTACH grant through the relay and open the tab around the
+/// resulting [`RemotePaneIo`]. The single implementation of "a remote tab is
+/// opened this way" — the create path composes over it rather than growing a
+/// second one.
+pub(crate) async fn open_remote_tab(
+    terminal_manager: &Arc<TerminalManager>,
+    app_handle: &tauri::AppHandle,
+    req: OpenRemoteTab,
+) -> Result<RemoteTerminalInfo, String> {
+    let OpenRemoteTab {
+        minted,
+        device_id,
+        session_uuid,
+        cols,
+        rows,
+        page_id,
+        device_label,
+        session_label,
+        working_dir,
+    } = req;
+    let session_id = session_uuid.to_string();
     let attached = client()
         .attach(&minted.grant, cols, rows, ATTACH_TIMEOUT)
         .await
@@ -309,7 +401,7 @@ pub async fn terminal_attach_remote(
     };
 
     let io: Arc<dyn PaneIo> = pane.clone();
-    let tm = terminal_manager.inner().clone();
+    let tm = terminal_manager.clone();
     let pinned = session_uuid.to_string();
     let spawn_title = title.clone();
     let spawn_app = app_handle.clone();
@@ -449,4 +541,80 @@ pub async fn terminal_remote_history_load(
             "requestedTo": to,
         })),
     })
+}
+
+/// Does coord place this session on the device the operator addressed?
+///
+/// **The authority for WHERE a session lives is coord's answer to the mint, not
+/// the device id the caller carried.** `terminal_attach_remote` has always
+/// refused a disagreement; the create-then-attach path called the same mint,
+/// read the same field, and DISCARDED it — on the path where the session id
+/// arrived over the untrusted relay (review finding 3). One predicate now, so
+/// the two cannot drift again.
+///
+/// **Every arm fails CLOSED.** An unreported placement is not an agreement: the
+/// question this predicate asks is *which session may this caller address*, and
+/// device authentication answers *who is asking* — a different question, so it
+/// is no justification for taking silence as a yes. Against a coord that omits
+/// `target_device_id`, create-then-attach is exactly as unbound as it was
+/// before the check existed, which is the whole defect (review round 2, finding
+/// 5). Coord's `AttachGrantResponse.target_device_id` is a non-`Option` `Uuid`
+/// today, so nothing reaches the permissive arm — and the field being
+/// `Option<String>` here is only wire tolerance, not a supported coord that
+/// omits it. An `asked` this device could not name is refused for the same
+/// reason: nothing was claimed, so nothing is confirmed.
+///
+/// Both refusals surface as the caller's existing `target_mismatch`, which
+/// names `<unreported>` when coord said nothing — so the operator sees the
+/// unanswered question rather than a silent bind.
+pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -> bool {
+    let asked = asked.trim();
+    if asked.is_empty() {
+        return false;
+    }
+    match coord_placed.map(str::trim).filter(|p| !p.is_empty()) {
+        None => false,
+        Some(placed) => placed.eq_ignore_ascii_case(asked),
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::coord_places_session_on;
+
+    /// Review finding 3. The scenario: the operator clicks New terminal on B, a
+    /// relay rewrites `coord_session_id` on `remote_terminal_created` to a
+    /// session living on C, and the source mints an attach grant for C's
+    /// session while labelling the tab B — so the operator types into C's live
+    /// agent session. Coord's placement is the only thing that catches it, and
+    /// the create path was throwing it away.
+    #[test]
+    fn a_session_coord_places_elsewhere_is_refused() {
+        assert!(!coord_places_session_on("device-b", Some("device-c")));
+        assert!(!coord_places_session_on("  device-b  ", Some("device-c")));
+    }
+
+    /// Hex case is not identity.
+    #[test]
+    fn the_matching_case_is_case_insensitive_and_trimmed() {
+        assert!(coord_places_session_on("DEVICE-B", Some("device-b")));
+        assert!(coord_places_session_on("device-b", Some("  DEVICE-B ")));
+    }
+
+    /// Review round 2, finding 5. An unanswered question is not a yes.
+    ///
+    /// The permissive arm was justified as "safe because the mint is
+    /// device-authenticated" — but device auth establishes WHO is asking, not
+    /// WHICH session they may address. Against a coord that omits the field,
+    /// create-then-attach was exactly as unbound as before the check.
+    #[test]
+    fn an_unreported_placement_is_refused() {
+        assert!(!coord_places_session_on("device-b", None));
+        assert!(!coord_places_session_on("device-b", Some("")));
+        assert!(!coord_places_session_on("device-b", Some("   ")));
+        // …and a caller that named no device confirms nothing either.
+        assert!(!coord_places_session_on("", Some("device-c")));
+        assert!(!coord_places_session_on("   ", Some("device-c")));
+        assert!(!coord_places_session_on("", None));
+    }
 }
