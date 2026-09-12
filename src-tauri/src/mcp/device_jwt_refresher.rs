@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use tauri::Emitter;
 use tokio::sync::{watch, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::mcp::types::ApiState;
 use crate::settings::{self, RunnerTier};
@@ -1739,12 +1739,16 @@ pub fn note_coord_upstream_verdict(
     }
     let key = upstream_key(tenant);
     let now = chrono::Utc::now().timestamp();
+    let mut spent = false;
     with_upstream_signals(|m| {
-        let slot = m.entry(key).or_default();
+        let slot = m.entry(key.clone()).or_default();
         match verdict {
             UpstreamVerdict::Accepted => {
+                // CONTRADICTION — the honest retirement, and the reason a
+                // claimed slot has never needed a clock.
                 slot.consecutive_rejections = 0;
                 slot.last_ok_at = Some(now);
+                spent = true;
             }
             UpstreamVerdict::CredentialRejected => {
                 slot.consecutive_rejections = slot.consecutive_rejections.saturating_add(1);
@@ -1753,6 +1757,9 @@ pub fn note_coord_upstream_verdict(
             UpstreamVerdict::Indeterminate => unreachable!("returned above"),
         }
     });
+    if spent {
+        clear_orphan_warning(&key);
+    }
 }
 
 /// A NEW credential was persisted into `tenant`'s slot — so every rejection
@@ -1766,11 +1773,12 @@ pub fn note_coord_upstream_verdict(
 pub(crate) fn reset_upstream_rejections_for(tenant: Option<uuid::Uuid>) {
     let key = upstream_key(tenant);
     with_upstream_signals(|m| {
-        let slot = m.entry(key).or_default();
+        let slot = m.entry(key.clone()).or_default();
         // The timestamps stay: `last401At` is forensics about a real past
         // event. Only the STREAK — the live predicate — is spent.
         slot.consecutive_rejections = 0;
     });
+    clear_orphan_warning(&key);
 }
 
 /// Read one slot's aggregated upstream signal. `tenant_id` is the slot key as
@@ -1795,29 +1803,129 @@ fn latest_upstream_event(s: &UpstreamSignal) -> i64 {
         .max(s.last_ok_at.unwrap_or(0))
 }
 
-/// How recent an UNCLAIMED bucket's last rejection must be before it is
-/// allowed to darken the posture.
+/// Evidence about an unclaimed bucket is retired by CONTRADICTION or by
+/// IMPOSSIBILITY — never by age. This is the impossibility half's backstop,
+/// and it is deliberately far past any plausible idle period.
 ///
-/// Without this the unattributable arm over-fires STICKILY. A box that was
-/// unpinned-and-single-slot, accumulated its three rejections under the
-/// default key and then got pinned or re-paired onto two tenant slots now owns
-/// an orphan bucket nothing will ever write again: the streak never clears, so
-/// every pass publishes `dark(tenant_id: None)` FOREVER — `canAnswer: false`,
-/// `derived_status: degraded`, and a banner that cannot be dismissed on a
-/// runner whose credentials are both live. It compounds with the "Re-pair" CTA
-/// only kicking the refresher, which re-derives the same dark, so the button
-/// does nothing either.
+/// The first cut of this used a 30-minute age bound as the PRIMARY guard, and
+/// that was a healthy-while-dead defect in its own right. A legacy-only box
+/// that coord is refusing goes QUIET — every call failing is exactly what
+/// stops sessions calling — so at t+35min the bucket aged out, the orphan was
+/// filtered, `worst` fell through to the legacy observation's future `exp`,
+/// and the pass published `live` plus an explicit *"Coord access restored"*
+/// banner. Nothing had healed. It was self-reinforcing: the darker a box, the
+/// quieter it gets, and the quieter it gets, the healthier it reports.
 ///
-/// A box coord is actually refusing files a rejection on every forwarded call,
-/// so anything older than this window is not evidence about NOW. Deliberately
-/// wider than the refresher's own cadence, so a quiet-but-broken runner still
-/// reports across a tick or two.
+/// The two honest retirements, both used here:
 ///
-/// Note the asymmetry, which is on purpose: a CLAIMED slot's streak needs no
-/// age bound, because the pass that observes it also heals it and the heal
-/// spends the streak. Nothing observes an unclaimed bucket, which is exactly
-/// why it needs a clock.
-pub(crate) const UPSTREAM_ORPHAN_MAX_AGE_SECS: i64 = 30 * 60;
+/// * **CONTRADICTION** — a 2xx on that key zeroes the streak
+///   ([`note_coord_upstream_verdict`]). Needs no clock, which is precisely why
+///   a CLAIMED slot has never needed one.
+/// * **IMPOSSIBILITY** — the key can never be written again, because no
+///   credential this runner can present resolves to it any more
+///   ([`evict_unwritable_upstream_buckets`]). That is the re-pair/unpair case
+///   the clock was actually written for, and it is CHECKABLE rather than
+///   guessed.
+///
+/// What remains is a bucket that survived both — no success, still writable,
+/// and silent for a week. That is not evidence about now either, but it is
+/// also not a reason to announce health: it makes the pass ABSTAIN
+/// ([`UnclaimedVerdict::StaleEvidence`]), leaving the previous posture
+/// standing. Stuck-dark is the acceptable direction; false-healthy is not.
+pub(crate) const UPSTREAM_ORPHAN_STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
+
+/// Slot keys whose orphan warning has already been emitted this process, so
+/// the `warn!` beside the unattributable publish fires ONCE per key instead of
+/// every pass forever (the same latching the `warn_once_per_tenant_*` idiom in
+/// `crate::auth` uses). Cleared whenever the bucket's streak is spent or the
+/// bucket is evicted, so a genuinely new episode warns again.
+static ORPHAN_WARNED_KEYS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn with_orphan_warned<T>(f: impl FnOnce(&mut std::collections::BTreeSet<String>) -> T) -> T {
+    let mut g = ORPHAN_WARNED_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut g)
+}
+
+/// Latch the orphan warning for `key`. `true` the first time, `false` after.
+fn latch_orphan_warning(key: &str) -> bool {
+    with_orphan_warned(|s| s.insert(key.to_string()))
+}
+
+fn clear_orphan_warning(key: &str) {
+    with_orphan_warned(|s| {
+        s.remove(key);
+    });
+}
+
+/// Drop every bucket that NOTHING CAN EVER WRITE AGAIN.
+///
+/// A tenant-keyed bucket is only ever written by a forwarder that resolved
+/// that tenant and presented a credential for it. The three routes to such a
+/// resolution are the per-tenant slots
+/// ([`crate::auth::AuthManager::list_tenant_device_jwt_tenants`]), the device's
+/// DEFAULT binding ([`crate::auth::default_binding_tenant`], which
+/// `select_device_bearer` serves out of the legacy slot) and the live machine
+/// pin ([`crate::session::tenant_pin::resolve_tenant_pin`]). A key in none of them
+/// belongs to a tenant this runner has been re-paired or unpaired away from:
+/// its streak can never be contradicted by a 2xx, because no call will ever
+/// present that credential again.
+///
+/// That — not a clock — is what stops an orphan bucket pinning a healthy
+/// re-paired runner dark forever.
+///
+/// The DEFAULT key is NEVER evicted: an unpinned session presents the legacy
+/// slot, so that bucket is always writable.
+///
+/// `writable` is passed in rather than resolved here so the sweep is
+/// hermetically testable without touching `$HOME`, the credential store or
+/// `machine.json`. Returns the keys it dropped, for the log and the tests.
+pub(crate) fn evict_unwritable_upstream_buckets(
+    writable: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let dropped: Vec<String> = with_upstream_signals(|m| {
+        let doomed: Vec<String> = m
+            .keys()
+            .filter(|k| k.as_str() != DEFAULT_SLOT_KEY && !writable.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for k in &doomed {
+            m.remove(k);
+        }
+        doomed
+    });
+    for k in &dropped {
+        clear_orphan_warning(k);
+    }
+    dropped
+}
+
+/// Resolve this machine's writable slot keys and run the sweep. The I/O half
+/// of [`evict_unwritable_upstream_buckets`], called once per refresher pass
+/// from BOTH branches — the tenant-slot pass and the legacy one — because a
+/// re-pair can happen from either shape.
+fn sweep_unwritable_upstream_buckets(tenant_slots: &[uuid::Uuid]) {
+    let mut writable: std::collections::HashSet<String> =
+        tenant_slots.iter().map(|t| t.to_string()).collect();
+    if let Some(t) = crate::auth::default_binding_tenant() {
+        writable.insert(t.to_string());
+    }
+    if let crate::session::tenant_pin::TenantPin::Pinned(t) =
+        crate::session::tenant_pin::resolve_tenant_pin()
+    {
+        writable.insert(t.to_string());
+    }
+    let dropped = evict_unwritable_upstream_buckets(&writable);
+    if !dropped.is_empty() {
+        info!(
+            "device_jwt_refresher: evicted {} upstream-verdict bucket(s) for tenants this \
+             runner can no longer present a credential for ({dropped:?}) — a re-pair or \
+             unpair makes their rejections unfalsifiable, so they are retired rather than \
+             left to darken the posture forever",
+            dropped.len()
+        );
+    }
+}
 
 /// The worst UNCLAIMED bucket: a slot key that no observation in this pass
 /// describes, whose streak is at or over the threshold and whose last
@@ -1849,11 +1957,24 @@ pub(crate) const UPSTREAM_ORPHAN_MAX_AGE_SECS: i64 = 30 * 60;
 /// Diffing the map against what the observations claim closes the CLASS, so
 /// the next key source — whatever it turns out to be — is covered without a
 /// fourth narrowing.
-fn unclaimed_upstream_signal(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnclaimedVerdict {
+    /// No unclaimed bucket carries a verdict.
+    Nothing,
+    /// An unclaimed bucket coord is refusing NOW.
+    Dark(String, UpstreamSignal),
+    /// An unclaimed bucket over the threshold whose last rejection is older
+    /// than [`UPSTREAM_ORPHAN_STALE_AFTER_SECS`]. Neither a verdict nor a
+    /// clean bill: the pass ABSTAINS rather than letting `worst` fall through
+    /// to `live` and fire a false recovery.
+    StaleEvidence(String),
+}
+
+fn unclaimed_upstream_verdict(
     observations: &[SlotObservation],
     fold_default: bool,
     now: i64,
-) -> Option<(String, UpstreamSignal)> {
+) -> UnclaimedVerdict {
     let mut claimed: std::collections::HashSet<&str> = observations
         .iter()
         .filter(|o| !o.unknown)
@@ -1863,17 +1984,26 @@ fn unclaimed_upstream_signal(
         // The sole observation already folded this bucket in.
         claimed.insert(DEFAULT_SLOT_KEY);
     }
-    with_upstream_signals(|m| {
+    let worst = with_upstream_signals(|m| {
         m.iter()
             .filter(|(k, _)| !claimed.contains(k.as_str()))
-            .filter(|(_, s)| {
-                s.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
-                    && s.last_rejection_at
-                        .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_MAX_AGE_SECS)
-            })
+            .filter(|(_, s)| s.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD)
             .map(|(k, s)| (k.clone(), *s))
             .max_by_key(|(_, s)| s.consecutive_rejections)
-    })
+    });
+    match worst {
+        None => UnclaimedVerdict::Nothing,
+        Some((k, s)) => {
+            let fresh = s
+                .last_rejection_at
+                .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_STALE_AFTER_SECS);
+            if fresh {
+                UnclaimedVerdict::Dark(k, s)
+            } else {
+                UnclaimedVerdict::StaleEvidence(k)
+            }
+        }
+    }
 }
 
 /// The signal for ONE observed slot.
@@ -2126,6 +2256,7 @@ pub(crate) fn reset_coord_credential_posture_for_test() {
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = None;
     with_upstream_signals(|m| m.clear());
+    with_orphan_warned(|s| s.clear());
     POSTURE_TRANSITIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2215,7 +2346,7 @@ fn publish_coord_credential_posture_with(
 /// a bucket keyed by anything NO observation claims is read by nobody. That is
 /// a CLASS, not one bug — the default key was merely the first instance, a
 /// legacy-only install and a pin-with-no-slot are two more, and
-/// [`unclaimed_upstream_signal`] enumerates them by diffing
+/// [`unclaimed_upstream_verdict`] enumerates them by diffing
 /// [`UPSTREAM_SIGNALS`] against what the observations claim.
 ///
 /// Dropping those was a regression in the one direction that matters: the
@@ -2226,9 +2357,14 @@ fn publish_coord_credential_posture_with(
 /// "Cannot attribute" therefore means *report it without a tenant*, never
 /// *drop it*: the arm publishes `dark` with `tenant_id: None`. It defers to a
 /// per-slot verdict that is ALREADY non-answering, because that one names a
-/// slot an operator can actually fix, and it stands down on evidence older
-/// than [`UPSTREAM_ORPHAN_MAX_AGE_SECS`], because nothing will ever clear an
-/// orphan bucket and a permanent undismissable banner is its own defect.
+/// slot an operator can actually fix.
+///
+/// An orphan's evidence is retired by CONTRADICTION (a 2xx zeroes the streak)
+/// or by IMPOSSIBILITY ([`evict_unwritable_upstream_buckets`] drops a bucket
+/// no credential can ever write again) — never by age. A bucket that survives
+/// both and has merely gone silent makes the pass ABSTAIN rather than publish
+/// `live`: see [`UPSTREAM_ORPHAN_STALE_AFTER_SECS`] for why the age-as-primary
+/// version was itself a healthy-while-dead defect.
 pub(crate) fn derive_and_publish_posture(
     observations: &[SlotObservation],
     now: i64,
@@ -2246,41 +2382,72 @@ pub(crate) fn derive_and_publish_posture(
         .max_by_key(|(p, _)| p.severity());
 
     // N1 — the unattributable arm, as a MAP DIFF rather than a special case
-    // for the default key. See [`unclaimed_upstream_signal`] for the class and
-    // the two shapes beyond the default key that reach it.
-    if let Some((orphan_key, orphan_signal)) =
-        unclaimed_upstream_signal(observations, fold_default, now)
-    {
-        let slot_already_non_answering = worst.as_ref().is_some_and(|(p, _)| !p.can_answer());
-        if !slot_already_non_answering {
-            // The KEY is the one actionable fact the published posture cannot
-            // carry (see below), so it goes to the log where an operator can
-            // read it. A tenant UUID, never a credential.
-            warn!(
-                "device_jwt_refresher: coord has refused the credential filed under slot key \
-                 {:?} {} consecutive times, and NO slot this pass observed describes it — \
-                 publishing dark with no tenant (legacy-only install, or a pin with no slot)",
-                if orphan_key.is_empty() {
-                    "<default>"
-                } else {
-                    orphan_key.as_str()
-                },
-                orphan_signal.consecutive_rejections,
-            );
-            return publish_coord_credential_posture_with(
-                CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
-                // No tenant — deliberately, even when the orphan key IS a
-                // tenant id. `tenant_id` on this wire names the
-                // `device_jwt:<tenant>` SLOT an operator has to fix, and in
-                // every shape that reaches here no such slot exists; naming
-                // one would send them to a slot that is not there. The key is
-                // in the log line above instead.
-                None,
-                // Likewise no `exp`: the answer to "which slot's?" is none.
-                None,
-                None,
-                orphan_signal,
-            );
+    // for the default key. See [`unclaimed_upstream_verdict`] for the class
+    // and the shapes beyond the default key that reach it.
+    //
+    // A per-slot verdict that is ALREADY non-answering wins over both arms
+    // below: it names a slot an operator can actually fix.
+    let slot_already_non_answering = worst.as_ref().is_some_and(|(p, _)| !p.can_answer());
+    if !slot_already_non_answering {
+        match unclaimed_upstream_verdict(observations, fold_default, now) {
+            UnclaimedVerdict::Dark(orphan_key, orphan_signal) => {
+                // The KEY is the one actionable fact the published posture
+                // cannot carry (see below), so it goes to the log — LATCHED,
+                // because this condition holds across every pass and an
+                // unlatched line would repeat every five minutes forever.
+                // A tenant UUID, never a credential.
+                if latch_orphan_warning(&orphan_key) {
+                    warn!(
+                        "device_jwt_refresher: coord has refused the credential filed under \
+                         slot key {:?} {} consecutive times, and NO slot this pass observed \
+                         describes it — publishing dark with no tenant (legacy-only install, \
+                         a pin with no slot, or a slot this pass could not read)",
+                        if orphan_key.is_empty() {
+                            "<default>"
+                        } else {
+                            orphan_key.as_str()
+                        },
+                        orphan_signal.consecutive_rejections,
+                    );
+                }
+                return publish_coord_credential_posture_with(
+                    CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                    // No tenant — deliberately, even when the orphan key IS a
+                    // tenant id. `tenant_id` on this wire names a
+                    // `device_jwt:<tenant>` SLOT an operator can act on, and
+                    // this arm cannot in general point at one: the shapes that
+                    // reach it include a legacy-only install and an unpaired
+                    // tenant (no slot exists at all) AND an observation this
+                    // pass marked `unknown` (the slot exists, but the pass
+                    // could not read it, so nothing here describes its state).
+                    // Rather than sometimes-right, the field is withheld and
+                    // the key goes to the log line above, which is honest in
+                    // every shape.
+                    None,
+                    // Likewise no `exp`: the answer to "which slot's?" is none.
+                    None,
+                    None,
+                    orphan_signal,
+                );
+            }
+            UnclaimedVerdict::StaleEvidence(orphan_key) => {
+                // ABSTAIN. The bucket is over the threshold, nothing has
+                // contradicted it with a 2xx, and it is still writable (an
+                // unwritable one was evicted) — but its last rejection is
+                // ancient. That is not a verdict, and it is emphatically not a
+                // clean bill: falling through to `worst` here would publish
+                // `live` off a future `exp` and fire an explicit "Coord access
+                // restored" banner at a runner that never healed, because a
+                // box whose every coord call fails is a box whose sessions go
+                // quiet. Publish NOTHING; the previous posture stands.
+                debug!(
+                    "device_jwt_refresher: unclaimed slot key {orphan_key:?} still holds a \
+                     rejection streak but its evidence is stale — abstaining (the previous \
+                     posture stands) rather than publishing `live` off an untested `exp`"
+                );
+                return None;
+            }
+            UnclaimedVerdict::Nothing => {}
         }
     }
 
@@ -3062,7 +3229,14 @@ async fn refresher_loop(
         // before the decision match so the Idle arm (legacy JWT fresh)
         // still ticks the tenant slots each cadence/kick. Runners with no
         // tenant slots (never paired post-8a) skip in one storage read.
-        let has_tenant_slots = !auth_manager.list_tenant_device_jwt_tenants().is_empty();
+        let tenant_slots = auth_manager.list_tenant_device_jwt_tenants();
+        let has_tenant_slots = !tenant_slots.is_empty();
+        // Retire every upstream-verdict bucket this runner can no longer write
+        // (a re-pair or an unpair), BEFORE the posture is derived from what is
+        // left. Runs in BOTH branches because a re-pair can happen from either
+        // shape, and it is the IMPOSSIBILITY half of retiring an orphan's
+        // evidence — the half that replaced a guessed clock.
+        sweep_unwritable_upstream_buckets(&tenant_slots);
         if has_tenant_slots {
             let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
                 .ok()
@@ -6253,24 +6427,208 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// The recency bound, which is what stops the arm from over-firing
-    /// STICKILY.
+    /// **THE ROUND-4 BLOCKER**: a dark box goes QUIET, and a quiet box used to
+    /// report itself healthy.
     ///
-    /// Nothing ever writes an orphan bucket again, so without a clock a box
-    /// that was unpinned-and-single-slot, took three rejections under the
-    /// default key and then got re-paired onto two slots would publish
-    /// `dark(tenant_id: None)` FOREVER — `canAnswer: false`,
-    /// `derived_status: degraded`, and an undismissable banner on a runner
-    /// whose credentials are both live. The "Re-pair" CTA only kicks the
-    /// refresher, which re-derives the same dark, so the button would not
-    /// clear it either.
+    /// Legacy-only install, dark. t=0: three forwarded calls 401 under key
+    /// `X`. The t+5min pass fires `dark(tenant_id: None)` — correct. Sessions
+    /// then STOP calling coord, which is the normal consequence of every coord
+    /// call failing, not an edge case. Under the age-as-primary-guard version
+    /// the t+35min pass filtered the orphan, fell through to `worst` — the
+    /// legacy observation with a future `exp` — and published `live`,
+    /// `canAnswer: true`, `derived_status: healthy`, plus an explicit "Coord
+    /// access restored — this runner's credential is live again." banner,
+    /// because `should_notify_posture(Some(Dark), Live)` fires on `was_dark`.
+    ///
+    /// Nothing had healed. The box was exactly as dead at t+35min as at t+5min,
+    /// and the defect was self-reinforcing: the darker a box, the quieter its
+    /// sessions get, and the quieter it gets, the healthier it reports.
     #[test]
-    fn a_stale_orphan_bucket_does_not_darken_a_healthy_runner() {
+    fn a_dark_box_that_goes_quiet_does_not_report_itself_healthy() {
+        let _serialised = health_lock();
+        reset_posture();
+        let t0 = chrono::Utc::now().timestamp();
+        let x = tenant(0);
+        // 30 days, so every probe below stays INSIDE the credential's own
+        // validity: the only thing changing across them is how long the box
+        // has been quiet. (A shorter exp made the t+24h probe cross it and
+        // transition to `expired` — correct behaviour, but it tests the clock
+        // rather than the silence.)
+        let legacy_jwt = synth_jwt(t0 + 30 * 24 * 60 * 60, "legacy-only-install");
+        let legacy_obs = SlotObservation::observed(None, Some(legacy_jwt.as_str()));
+
+        // t=0 — three forwarded calls, all refused, filed under the PINNED
+        // tenant's key because that is the tenant the forwarder resolved.
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(x), true, 401, br#"{"code":"token_expired"}"#);
+        }
+
+        // t+5min — dark, correctly.
+        let t5 = t0 + 5 * 60;
+        assert_eq!(
+            derive_and_publish_posture(std::slice::from_ref(&legacy_obs), t5).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+
+        // …and then silence, because every call fails.
+        let transitions_before = recorded_posture_transitions().len();
+        for minutes in [35i64, 90, 6 * 60, 24 * 60] {
+            let later = t0 + minutes * 60;
+            let transition = derive_and_publish_posture(std::slice::from_ref(&legacy_obs), later);
+            assert_eq!(
+                transition, None,
+                "t+{minutes}min: nothing healed, so nothing may transition"
+            );
+            let published = coord_credential_posture().expect("published");
+            assert_eq!(
+                published.posture,
+                CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+                "t+{minutes}min: a quiet dark box must stay dark, never read `live`"
+            );
+            // THE property, stated independently of which non-answering
+            // posture we are in: silence must never buy `canAnswer: true`.
+            assert!(!published.posture.can_answer());
+        }
+
+        // And above all: no "Coord access restored" was ever emitted.
+        assert_eq!(
+            recorded_posture_transitions().len(),
+            transitions_before,
+            "a recovery banner on a box that never healed is worse than silence"
+        );
+        assert!(
+            !recorded_posture_transitions().iter().any(|t| t.from
+                == Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+                && t.to.can_answer()),
+            "no dark -> answering transition may be published without a 2xx"
+        );
+
+        // CONTRADICTION is what clears it — a real success on that key, at any
+        // time, with no clock involved.
+        note_coord_upstream_verdict(Some(x), true, 200, br#"{"ok":true}"#);
+        assert_eq!(
+            derive_and_publish_posture(std::slice::from_ref(&legacy_obs), t0 + 48 * 60 * 60)
+                .map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "a 2xx on the orphan key retires its evidence the honest way"
+        );
+        reset_posture();
+    }
+
+    /// The IMPOSSIBILITY half, which replaced the clock: a bucket for a tenant
+    /// this runner can no longer present a credential for is EVICTED, so it
+    /// cannot pin a re-paired runner dark forever.
+    ///
+    /// This is what `a_stale_orphan_bucket_does_not_darken_a_healthy_runner`
+    /// used to assert through a 30-minute age bound. The scenario it was
+    /// written for is real; the guard was the wrong one, because age also
+    /// retires the evidence of a box that is still dark and merely silent.
+    #[test]
+    fn an_evicted_bucket_does_not_darken_a_re_paired_runner() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let gone = tenant(0); // the tenant this box was re-paired AWAY from
+        let y = tenant(1);
+        let z = tenant(2);
+        let healthy = |t: uuid::Uuid| SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let slots = [healthy(y), healthy(z)];
+
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(gone), true, 401, br#"{"code":"token_expired"}"#);
+        }
+        // Before the sweep it is a live orphan and MUST darken: at this point
+        // the box has not been re-paired, it is simply unattributable.
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+
+        // The re-pair: `gone` is in no slot, is not the default binding and is
+        // not the live pin, so nothing can ever write its bucket again.
+        let writable: std::collections::HashSet<String> =
+            [y.to_string(), z.to_string()].into_iter().collect();
+        assert_eq!(
+            evict_unwritable_upstream_buckets(&writable),
+            vec![gone.to_string()]
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&gone.to_string())).consecutive_rejections,
+            0,
+            "the bucket is gone, not merely ignored"
+        );
+
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Live),
+            "a re-paired runner with two live slots is live"
+        );
+        reset_posture();
+    }
+
+    /// The eviction predicate's three writable routes, and the one key that is
+    /// never evicted.
+    #[test]
+    fn eviction_spares_every_key_a_credential_can_still_reach() {
+        let _serialised = health_lock();
+        reset_posture();
+        let in_a_slot = tenant(0);
+        let default_binding = tenant(1);
+        let live_pin = tenant(2);
+        let orphan = tenant(3);
+        for t in [in_a_slot, default_binding, live_pin, orphan] {
+            note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_expired"}"#);
+        }
+        // The DEFAULT key is always writable: an UNPINNED session presents the
+        // legacy slot, so that bucket can always be contradicted.
+        note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
+
+        let writable: std::collections::HashSet<String> = [
+            in_a_slot.to_string(),
+            default_binding.to_string(),
+            live_pin.to_string(),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            evict_unwritable_upstream_buckets(&writable),
+            vec![orphan.to_string()],
+            "only the key no credential can reach is retired"
+        );
+        for t in [in_a_slot, default_binding, live_pin] {
+            assert_eq!(
+                upstream_signal_for(Some(&t.to_string())).consecutive_rejections,
+                1,
+                "a reachable key keeps its evidence — a 2xx is what retires it"
+            );
+        }
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            1,
+            "the DEFAULT key is never evicted"
+        );
+        reset_posture();
+    }
+
+    /// The backstop, and the direction it fails in.
+    ///
+    /// A bucket that survived BOTH honest retirements — no 2xx, still writable
+    /// — and has been silent for longer than
+    /// [`UPSTREAM_ORPHAN_STALE_AFTER_SECS`] is not a verdict. It is also not a
+    /// clean bill, so the pass ABSTAINS: it publishes nothing and the previous
+    /// posture stands. Falling through to `worst` here is precisely the
+    /// healthy-while-dead defect this round exists to close.
+    #[test]
+    fn ancient_unclaimed_evidence_makes_the_pass_abstain_never_publish_live() {
         let _serialised = health_lock();
         reset_posture();
         let real_now = chrono::Utc::now().timestamp();
-        // `exp` far enough out that it is still live at the LATER clock below,
-        // so the only thing the two readings differ on is the bucket's age.
         let healthy = |t: uuid::Uuid| SlotObservation {
             tenant_id: Some(t.to_string()),
             exp: Some(real_now + 30 * 24 * 60 * 60),
@@ -6279,36 +6637,32 @@ mod tenant_slot_refresh_tests {
             outcome: Some(TenantSlotOutcome::SkippedFresh),
         };
         let slots = [healthy(tenant(4)), healthy(tenant(5))];
-        // The orphan: rejections stamped NOW, under a key no slot claims.
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
         }
 
-        // Read at the time they happened: fresh evidence, and it fires.
+        // Fresh: fires, and that is the posture on record.
         assert_eq!(
             derive_and_publish_posture(&slots, real_now).map(|t| t.to),
-            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
-            "recent unattributable rejections MUST still darken the posture"
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
 
-        // Read one second past the window, with the same buckets: the box has
-        // been re-paired, nothing writes that key any more, and stale evidence
-        // is not evidence about now.
-        reset_coord_credential_posture_for_test();
-        for _ in 0..UPSTREAM_DARK_THRESHOLD {
-            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
-        }
-        let later = real_now + UPSTREAM_ORPHAN_MAX_AGE_SECS + 1;
+        // A week and a second later, with nothing else changed: ABSTAIN.
+        let later = real_now + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1;
         assert_eq!(
-            derive_and_publish_posture(&slots, later).map(|t| t.to),
-            Some(CoordCredentialPosture::Live),
-            "a bucket nothing will ever write again must not pin a healthy runner dark forever"
+            derive_and_publish_posture(&slots, later),
+            None,
+            "ancient evidence is not a verdict — and publishing `live` off it \
+             would announce a recovery that never happened"
         );
-        let published = coord_credential_posture().expect("published");
-        assert!(published.posture.can_answer());
-        // The streak is still there — it is history, not a live verdict. The
-        // bound is a READ-side judgement, so a fresh rejection under the same
-        // key starts firing again immediately.
+        assert_eq!(
+            coord_credential_posture().expect("published").posture,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            "the previous posture stands; stuck-dark is the acceptable direction"
+        );
+
+        // The evidence is not forgotten, and a fresh rejection under the same
+        // key fires again immediately.
         assert_eq!(
             upstream_signal_for(None).consecutive_rejections,
             UPSTREAM_DARK_THRESHOLD
@@ -6319,10 +6673,37 @@ mod tenant_slot_refresh_tests {
         }
         assert_eq!(
             derive_and_publish_posture(&slots, chrono::Utc::now().timestamp()).map(|t| t.to),
-            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
-            "the bound is a READ-side judgement about age, not a reason to forget \
-             the key — a fresh rejection under it fires immediately"
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
+        reset_posture();
+    }
+
+    /// The orphan `warn!` is LATCHED. The condition holds across every pass —
+    /// once per five minutes, indefinitely — so an unlatched line would be a
+    /// log flood for as long as the box stays dark. It re-arms when the
+    /// evidence is honestly retired, so a genuinely new episode warns again.
+    #[test]
+    fn the_orphan_warning_is_latched_per_key_and_re_arms_on_retirement() {
+        let _serialised = health_lock();
+        reset_posture();
+        let x = tenant(0);
+        assert!(latch_orphan_warning(&x.to_string()), "first is the warning");
+        assert!(
+            !latch_orphan_warning(&x.to_string()),
+            "every later pass is silent"
+        );
+        // CONTRADICTION re-arms it.
+        note_coord_upstream_verdict(Some(x), true, 200, br#"{"ok":true}"#);
+        assert!(
+            latch_orphan_warning(&x.to_string()),
+            "a new episode after a real success warns again"
+        );
+        // So does eviction.
+        let _ = evict_unwritable_upstream_buckets(&std::collections::HashSet::new());
+        assert!(latch_orphan_warning(&x.to_string()));
+        // …and so does spending the streak on a heal.
+        reset_upstream_rejections_for(Some(x));
+        assert!(latch_orphan_warning(&x.to_string()));
         reset_posture();
     }
 
