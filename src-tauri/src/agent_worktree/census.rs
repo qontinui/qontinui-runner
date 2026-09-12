@@ -730,10 +730,26 @@ impl ChunkPoster {
     /// The single wire send. `release_boot_gate` is `true` only for bodies
     /// that actually refresh coord's WORKTREE view (census chunks) — see
     /// [`ChunkPoster::post_volumes`].
-    async fn send(&mut self, body: WorktreeCensusReq, release_boot_gate: bool) {
+    async fn send(&mut self, mut body: WorktreeCensusReq, release_boot_gate: bool) {
         let Some((client, url)) = &self.dest else {
             return;
         };
+        // The body DECLARES `tenant_id`, so it is derived from the SAME scope
+        // that selects the bearer — and that scope is gated on this device
+        // holding a usable credential for the tenant
+        // (`TenantScope::for_bound_device_default`). `self.tenant_id` is the raw
+        // `machine.json::active_tenant_id`; writing it onto the wire while the
+        // bearer lookup found no slot for it would file this device's census
+        // under a tenant it cannot present, on an unauthenticated request.
+        // `declared_tenant()` is `None` for both `Device` (no default
+        // configured — the legitimate single-tenant shape) and `Unresolved` (a
+        // default with no usable credential), so an ungated tenant can no
+        // longer reach the body.
+        let scope = crate::auth::TenantScope::for_bound_device_default(
+            self.tenant_id,
+            &crate::auth::device_holds_usable_binding,
+        );
+        body.tenant_id = scope.declared_tenant();
         // Tenant-scoped: the census row this POST carries declares
         // `tenant_id`, so the bearer must come from THAT binding's slot and
         // not the device default. `attach_device_auth_for` degrades to
@@ -747,12 +763,9 @@ impl ChunkPoster {
         // `Unpinned`, not `Unresolvable` (the same split
         // `session::tenant_pin::TenantPin` draws), so its absence must NOT arm
         // the D2 degrade — the census is this device's own view of itself.
-        match crate::auth::attach_device_auth_for(
-            client.post(url).json(&body),
-            crate::auth::TenantScope::for_device_default(self.tenant_id),
-        )
-        .send()
-        .await
+        match crate::auth::attach_device_auth_for(client.post(url).json(&body), scope)
+            .send()
+            .await
         {
             Ok(resp) if resp.status().is_success() => {
                 self.posted += 1;
