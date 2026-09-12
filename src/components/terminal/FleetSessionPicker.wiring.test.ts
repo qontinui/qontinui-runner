@@ -59,9 +59,12 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     // the response itself, so there is no parameter a caller could hand the
     // wrong value to. `sessions` is the hook's accumulation for that same
     // response — both move in one tick.
-    expect(SOURCE).toContain("fleetTruncation(response, sessions.length)");
-    expect(SOURCE).not.toContain("fleetTruncation(response, server.limit)");
+    expect(SOURCE).toContain("fleetTruncation(response, sessions.length, hasMore)");
+    expect(SOURCE).not.toContain("fleetTruncation(response, server.limit");
     expect(SOURCE).not.toContain("fleetTruncation(response, appliedQuery");
+    // And never on the ENVELOPE's cursor, which is the pair that diverges the
+    // moment the walk drops one — see the suite below.
+    expect(SOURCE).not.toContain("response.nextCursor");
   });
 
   it("explains an empty READ with the applied query, falling back to the pending one", () => {
@@ -208,5 +211,109 @@ describe("a page in flight never makes a true list read as a stale one", () => {
     // a false claim in the other direction, so the prefix is conditional.
     expect(HOOK).toContain("walkStalled,");
     expect(SOURCE).toMatch(/\{walkStalled\s*\?\s*error\s*:/);
+  });
+});
+
+/**
+ * The walk's own cursor and the last envelope's `nextCursor` are DIFFERENT
+ * facts, and the picker must classify on the first.
+ *
+ * `useFleetSessions` drops the walk's cursor on `cursor_malformed`,
+ * `cursor_version_unsupported` and on a cursor coord returns unchanged, while
+ * deliberately keeping the previous successful response — whose `nextCursor` is
+ * still set. Reading completeness off that envelope puts a "Load more" control
+ * on screen in exactly the state where `fetchPage("more")` returns immediately:
+ * a button that does nothing at all when clicked, which is the failure the
+ * whole phase exists to remove rather than a cosmetic one.
+ */
+describe("a dropped cursor removes the control, and does not claim completeness", () => {
+  it("reads the WALK's answer, which the hook exports for this", () => {
+    expect(HOOK).toContain("hasMore: walk.nextCursor !== null,");
+    expect(SOURCE).toContain("hasMore,");
+    expect(SOURCE).toContain("fleetTruncation(response, sessions.length, hasMore)");
+  });
+
+  it("keeps the load-more control on `more-available` ALONE", () => {
+    // `unreachable` is the arm the drop lands in, and it must not render a page
+    // control: the hook answers that click by returning immediately.
+    expect(SOURCE).toContain('truncation.kind === "more-available"');
+    expect(SOURCE).toContain('truncation.kind === "unreachable"');
+    const unreachableBlock = SOURCE.slice(
+      SOURCE.indexOf('truncation.kind === "unreachable"'),
+      SOURCE.indexOf("FLEET_PICKER_DEVICE_ID_INVALID_ID"),
+    );
+    expect(unreachableBlock).not.toContain("FLEET_PICKER_LOAD_MORE_ID");
+    expect(unreachableBlock).not.toContain("loadMore()");
+  });
+
+  it("gives the two strips DISTINCT bridge ids", () => {
+    // They make opposite claims about whether the next page can be fetched. A
+    // driver that could not tell them apart would read "there is more" as
+    // "there is a control for it".
+    expect(SOURCE).toContain('FLEET_PICKER_UNREACHABLE_ID = "terminal.fleet-picker-unreachable"');
+    expect(SOURCE).toContain('FLEET_PICKER_TRUNCATION_ID = "terminal.fleet-picker-truncation"');
+  });
+
+  it("projects coord's machine error code, not only the prose banner", () => {
+    // The CODE is coord's contract and the detail prose explicitly is not, so a
+    // driver that had to match on the sentence would break on a reword.
+    expect(HOOK).toContain("errorCode,");
+    expect(SOURCE).toContain("errorCode,");
+    expect(SOURCE).toContain('data-fleet-error-code={errorCode ?? ""}');
+  });
+});
+
+/**
+ * A page RESIZE must re-use the walk, not restart it.
+ *
+ * coord fingerprints `device_id` / `state` / `include_closed` into the cursor
+ * and deliberately leaves `limit` out, so a cursor survives a changed page size
+ * — which is why `fleetScopeKey` omits it. Closing `fetchPage` over `limit` and
+ * then keying the restart effect on `fetchPage` undoes all of that silently:
+ * every accumulated page is discarded and re-fetched.
+ */
+describe("the restart trigger is the SCOPE, not the callback's identity", () => {
+  it("keys the effect on the scope key rather than on `fetchPage`", () => {
+    expect(HOOK).toContain("const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });");
+    expect(HOOK).toContain("}, [scopeKey, restartToken]);");
+    expect(HOOK).not.toContain("}, [fetchPage, restartToken]);");
+  });
+
+  it("keeps `limit` out of the dependency list that restarts the walk", () => {
+    expect(HOOK).toContain("[deviceId, state, includeClosed],");
+    expect(HOOK).not.toContain("[deviceId, state, includeClosed, limit],");
+  });
+
+  it("reads the page size through a ref so the next page uses the new one", () => {
+    // Out of the dep list, but still current at the moment of the call — the
+    // same reason `cursorRef` exists.
+    expect(HOOK).toContain("const limitRef = useRef(limit);");
+    expect(HOOK).toContain("const limit = limitRef.current;");
+  });
+
+  it("leaves `limit` out of the scope fingerprint itself", () => {
+    expect(DISCOVERY).toContain(
+      "return JSON.stringify([scope.deviceId, scope.state, scope.includeClosed]);",
+    );
+  });
+});
+
+/**
+ * Two timestamps coord serves and the picker used to read neither.
+ *
+ * On a list capped at one page that was survivable; under a cursor walk the
+ * list runs to every session on the tenant, and `coord.sessions.state` is a
+ * stored column a watcher advances — it can read `active` over a session whose
+ * last heartbeat was days ago.
+ */
+describe("a walked list shows when each row was last observed", () => {
+  it("renders the row's most recent instant through the shared formatter", () => {
+    expect(SOURCE).toContain("fleetSessionActivity(s)");
+    expect(SOURCE).toContain("formatRelativeTime(activity.iso)");
+  });
+
+  it("renders nothing at all when coord served no parseable timestamp", () => {
+    // Null is UNKNOWN. A placeholder would look like an answer coord never gave.
+    expect(SOURCE).toContain("if (parts.length === 0) return null;");
   });
 });

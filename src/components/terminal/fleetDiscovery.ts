@@ -234,16 +234,28 @@ export function fleetWalkDropCursor(prev: FleetWalk): FleetWalk {
  * - `unknown` — no successful read has completed, so completeness is not
  *   established. Explicitly NOT `none`: an absent answer is not a complete one.
  *
+ * - `unreachable` — coord said there were more rows, and the walk can no longer
+ *   reach them: its cursor was dropped because coord refused it
+ *   (`cursor_malformed` / `cursor_version_unsupported`) or handed back the very
+ *   cursor it was given. The rows on screen are real and incomplete, and the
+ *   way forward is a REFRESH, not another page.
+ *
  * There is no longer an `at-ceiling` arm. It existed because the route took no
  * offset and no cursor, so past `MAX_LIMIT` rows in one bucket were unreachable
  * by ANY combination of parameters — and saying so was the honest thing to do.
  * With keyset pagination that claim is simply FALSE, and a false warning is a
  * worse failure of `ux-priorities` gate 4 than the silence it replaced.
+ *
+ * `unreachable` is NOT that arm returning under a new name. The retired one
+ * claimed rows could not be reached by any parameter at all, which keyset
+ * pagination made false; this one describes ONE walk whose cursor is spent, and
+ * the refresh that starts a fresh walk is a real way to the same rows.
  */
 export type FleetTruncation =
   | { kind: "none" }
   | { kind: "unknown" }
-  | { kind: "more-available"; shown: number; pageSize: number; message: string };
+  | { kind: "more-available"; shown: number; pageSize: number; message: string }
+  | { kind: "unreachable"; shown: number; message: string };
 
 /**
  * What the refresh control has to admit: a complete list is complete as of the
@@ -268,16 +280,43 @@ export const FLEET_COMPLETE_AS_OF_NOW =
  * classified, so it is structurally impossible to pair this classification with
  * a page size the rows were not served under. A caller-supplied limit can be
  * the pending one — and was.
+ *
+ * `walkCanAdvance` is the WALK's own answer to "is there a next page I can
+ * actually fetch", and it is a separate fact from what the last response said.
+ * They diverge in exactly one direction: coord hands back a cursor and the walk
+ * then DROPS it — refused as malformed or of an unsupported version, or handed
+ * back unchanged, all three of which clear the cursor while the last successful
+ * envelope still carries one. Classifying on `response.nextCursor` alone in
+ * that state returns `more-available`, which puts a "Load more" control on
+ * screen that the hook answers by returning immediately: a control that cannot
+ * do the thing it offers. This parameter is what separates the two, and it is
+ * required rather than defaulted precisely so no call site can re-acquire the
+ * defect by omission.
  */
 export function fleetTruncation(
   response: FleetSessionsResponse | null,
   loaded: number,
+  walkCanAdvance: boolean,
 ): FleetTruncation {
   if (!response) return { kind: "unknown" };
   // `nextCursor` is the ONLY completeness signal on the wire. `count`, the row
   // count and `limit` are all statements about the request or the page, and a
   // full page is not a truncated one.
   if (normalizeFleetCursor(response.nextCursor) === null) return { kind: "none" };
+
+  // coord said there is more, and the walk cannot get there. Saying `none` here
+  // would claim a completeness coord never stated; saying `more-available`
+  // would offer a page that silently does nothing.
+  if (!walkCanAdvance) {
+    return {
+      kind: "unreachable",
+      shown: loaded,
+      message:
+        `${loaded} loaded — coord has more matching sessions, but this list's page cursor is ` +
+        `no longer usable, so the next page cannot be fetched from it. Refresh to start the ` +
+        `walk again, or narrow by device or state.`,
+    };
+  }
 
   const pageSize =
     typeof response.limit === "number" && response.limit > 0 ? response.limit : FLEET_DEFAULT_LIMIT;
@@ -447,6 +486,57 @@ export function filterFleetSessions(sessions: FleetSession[], query: string): Fl
   const terms = fleetSearchTerms(query);
   if (terms.length === 0) return sessions;
   return sessions.filter((s) => fleetSessionMatchesTerms(s, terms));
+}
+
+/**
+ * Which timestamp describes a row's most recent activity, and what to call it.
+ *
+ * coord serves three (`closedAt`, `lastHeartbeatAt`, `startedAt`) and until now
+ * the picker read none of them. On a list that was capped at one page of 100
+ * that was survivable; under a cursor walk the list runs to every session on
+ * the tenant, and `state` alone does not separate a session working right now
+ * from one whose last heartbeat was three days ago — `coord.sessions.state` is
+ * a stored column advanced by a watcher, so a row can read `active` long after
+ * its process died. The heartbeat is the observation; the state is an inference
+ * over it.
+ *
+ * Precedence is by what the fact SETTLES, not by recency: a closed session's
+ * `closedAt` is the end of its story and outranks a heartbeat from before it;
+ * a heartbeat outranks the start time, which is only what to say when a session
+ * has never beaten.
+ *
+ * Returns `null` when coord served none of the three, or served something that
+ * is not a date. That is UNKNOWN and the caller must render nothing — an
+ * "Invalid Date", or a relative time computed from `NaN`, would be a claim
+ * coord did not make. The ISO string comes back UNPARSED so the caller can put
+ * the exact instant in a title beside the relative form.
+ */
+export interface FleetSessionActivity {
+  /** What the instant is — "closed", "heartbeat" or "started". */
+  verb: string;
+  /** The ISO timestamp coord served, verbatim and known-parseable. */
+  iso: string;
+}
+
+export function fleetSessionActivity(
+  s: Pick<FleetSession, "closedAt" | "lastHeartbeatAt" | "startedAt">,
+): FleetSessionActivity | null {
+  const candidates: [string, string | null][] = [
+    ["closed", s.closedAt],
+    ["heartbeat", s.lastHeartbeatAt],
+    ["started", s.startedAt],
+  ];
+  for (const [verb, raw] of candidates) {
+    if (typeof raw !== "string") continue;
+    const iso = raw.trim();
+    if (iso.length === 0) continue;
+    // A value coord could not vouch for is not rendered at all. `Date.parse`
+    // returning NaN is the only check that separates a timestamp from a string
+    // that merely occupies the field.
+    if (Number.isNaN(Date.parse(iso))) continue;
+    return { verb, iso };
+  }
+  return null;
 }
 
 /** One selectable device in the picker's device filter. */

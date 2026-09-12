@@ -23,6 +23,7 @@ import {
   fleetEmptyReadMessage,
   fleetFilterConflict,
   fleetFilteredOutMessage,
+  fleetSessionActivity,
   fleetStateOptions,
   fleetTruncation,
   filterFleetSessions,
@@ -38,6 +39,7 @@ import {
   type RemoteTerminalInfoWire,
 } from "./remoteTabs";
 import { useTerminalSession } from "./contexts/TerminalSessionContext";
+import { formatRelativeTime } from "../../lib/formatting";
 
 /**
  * Picker listing which Claude Code sessions exist on which fleet machine
@@ -93,6 +95,11 @@ export const FLEET_PICKER_REREADING_ID = "terminal.fleet-picker-rereading";
 export const FLEET_PICKER_CONFLICT_ID = "terminal.fleet-picker-filter-conflict";
 export const FLEET_PICKER_TRUNCATION_ID = "terminal.fleet-picker-truncation";
 export const FLEET_PICKER_LOAD_MORE_ID = "terminal.fleet-picker-load-more";
+/** The incomplete-and-unreachable strip. A DISTINCT id from the truncation one:
+ * the two make opposite claims about whether the next page can be fetched, and
+ * a driver that could not tell them apart would read "there is more" as "there
+ * is a control for it". */
+export const FLEET_PICKER_UNREACHABLE_ID = "terminal.fleet-picker-unreachable";
 
 export function fleetSessionRowId(sessionId: string): string {
   return `terminal.fleet-session.${sessionId}`;
@@ -186,12 +193,14 @@ export function FleetSessionPicker() {
     loading,
     loadingMore,
     error,
+    errorCode,
     walkStalled,
     emptyReason,
     deviceCatalog,
     stateCatalog,
     appliedQuery,
     pagesLoaded,
+    hasMore,
     refresh,
     loadMore,
   } = useFleetSessions({
@@ -214,7 +223,12 @@ export function FleetSessionPicker() {
   // pending `server` filter is never an input here — between a filter change
   // and its response, and permanently if that response never arrives, the two
   // describe different queries.
-  const truncation = fleetTruncation(response, sessions.length);
+  // `hasMore` is the WALK's answer, and it is not the same fact as the last
+  // response's `nextCursor`: a cursor coord refused, or handed back unchanged,
+  // is dropped from the walk while that envelope still carries one. Without it
+  // the classifier returns `more-available` in a state where `loadMore` returns
+  // immediately — a "Load more" button that does nothing at all when clicked.
+  const truncation = fleetTruncation(response, sessions.length, hasMore);
   const notice = degradedNotice(response);
   const filtersActive = hasActiveFleetFilter(server, text);
   const emptyRead = fleetEmptyReadMessage(appliedQuery ?? server, text);
@@ -287,6 +301,11 @@ export function FleetSessionPicker() {
       data-fleet-matched={visible.length}
       data-fleet-pages={pagesLoaded}
       data-fleet-truncation={truncation.kind}
+      // coord's stable machine code for the last failed read. Projected because
+      // the banner beside it carries PROSE, which is explicitly not the
+      // contract — a driver that had to match on the sentence would break on
+      // any rewording of it.
+      data-fleet-error-code={errorCode ?? ""}
       data-fleet-device-filter={appliedQuery?.deviceId ?? ""}
       data-fleet-state-filter={appliedQuery?.state ?? ""}
       data-fleet-include-closed={appliedQuery ? String(appliedQuery.includeClosed) : ""}
@@ -464,6 +483,25 @@ export function FleetSessionPicker() {
             )}
             {loadingMore ? "Loading…" : `Load ${truncation.pageSize} more`}
           </button>
+        </div>
+      )}
+
+      {/*
+        coord had more and the walk can no longer reach it — its cursor was
+        refused or came back unchanged. Deliberately NOT a "load more": offering
+        a page control here would offer a click the hook answers by returning
+        immediately. The way forward is the refresh above, which starts a fresh
+        walk with no cursor, and the banner says so instead of implying a
+        control that is not there.
+      */}
+      {truncation.kind === "unreachable" && (
+        <div
+          data-ui-bridge-id={FLEET_PICKER_UNREACHABLE_ID}
+          data-truncation-kind={truncation.kind}
+          className="flex items-start gap-1.5 px-3 py-1.5 text-[10px] text-[#e0af68] bg-[#e0af68]/10 border-b border-[#2a2d3d]"
+        >
+          <AlertTriangle className="w-3 h-3 mt-px shrink-0" />
+          <span className="min-w-0">{truncation.message}</span>
         </div>
       )}
 
@@ -666,11 +704,31 @@ export function FleetSessionPicker() {
                           {pending ? "Attaching…" : "Attach"}
                         </button>
                       </div>
-                      {(s.provider || s.correlationTopic) && (
-                        <div className="text-[10px] text-[#565f89] truncate">
-                          {[s.provider, s.correlationTopic].filter(Boolean).join(" · ")}
-                        </div>
-                      )}
+                      {(() => {
+                        // The row's most recent OBSERVED instant, beside the
+                        // two free-text fields. `state` is a stored column a
+                        // watcher advances, so it can read `active` over a
+                        // session that last beat days ago; the heartbeat is
+                        // what an operator scanning a walked list of hundreds
+                        // actually needs. Null — coord served no parseable
+                        // timestamp — renders nothing rather than a placeholder
+                        // that would look like an answer.
+                        const activity = fleetSessionActivity(s);
+                        const parts = [
+                          s.provider,
+                          s.correlationTopic,
+                          activity ? `${activity.verb} ${formatRelativeTime(activity.iso)}` : null,
+                        ].filter(Boolean);
+                        if (parts.length === 0) return null;
+                        return (
+                          <div
+                            className="text-[10px] text-[#565f89] truncate"
+                            title={activity ? `${activity.verb} at ${activity.iso}` : undefined}
+                          >
+                            {parts.join(" · ")}
+                          </div>
+                        );
+                      })()}
                       {row?.error && (
                         <div
                           data-ui-bridge-id={`terminal.fleet-session-attach-error.${s.sessionId}`}
