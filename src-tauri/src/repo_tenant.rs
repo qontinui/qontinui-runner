@@ -368,10 +368,13 @@ pub async fn is_repo_registered(slug: &str) -> bool {
 /// [`TenantScope::Device`] is unreachable from here **by construction**, and
 /// that is a decision, not an omission: a work unit, a drift alarm and a commit
 /// observation all HAVE an owning tenant, so "this route carries no tenancy"
-/// is never a true statement about them. Only `Owned` and `Unresolved` are
-/// honest answers, and `Unresolved` is safe — on a single-bound device D2 still
-/// presents the default (nothing regresses today), while on a multi-bound one
-/// it degrades to unauthenticated, which is the point.
+/// is never a true statement about them. The honest answers are `Owned`,
+/// `Unresolved` (coord did not answer, or the row carries no tenant — the owner
+/// is genuinely UNKNOWN from here) and [`TenantScope::Unbacked`] (the owner is
+/// KNOWN and this device cannot present it). The last distinction matters:
+/// `Unresolved` lets D2 present the default binding on a single-bound device,
+/// which is right when nobody knows the owner and wrong when the owner is known
+/// to be someone else — that would file this repo's row under another tenant.
 fn scope_from_lookup(
     repos: Result<&CanonicalRepos, &str>,
     slug: &str,
@@ -391,7 +394,13 @@ fn scope_from_lookup(
             // the write would go out unauthenticated under a foreign tenant id.
             // UNKNOWN is the honest answer from where this device stands.
             Ok(t) if device_is_bound_to(&t) => TenantScope::Owned(t),
-            Ok(_) => TenantScope::Unresolved,
+            // The owner is POSITIVELY KNOWN (coord's registry said so) and this
+            // device cannot present it: `TenantScope::Unbacked`, never
+            // `Unresolved`. `Unresolved` would let D2's single-bound arm present
+            // the DEFAULT binding's credential for this repo's row — a
+            // cross-tenant presentation, which is the same class as the
+            // cross-tenant declaration the `device_is_bound_to` arm above stops.
+            Ok(t) => TenantScope::Unbacked(t),
             // A tenant_id coord served that will not parse is a shape we do
             // not understand, not an absence.
             Err(_) => TenantScope::Unresolved,
@@ -489,10 +498,11 @@ mod tests {
         );
         assert_eq!(
             super::scope_from_lookup(Ok(&m), "other/theirs", &bound_to_mine_only),
-            TenantScope::Unresolved,
-            "a registry answer naming a tenant this device cannot present must not \
-             become a declared tenant: the body would claim it while the bearer \
-             found no slot"
+            TenantScope::Unbacked(theirs),
+            "a registry answer naming a tenant this device cannot present must not become a \
+             declared tenant: the body would claim it while the bearer found no slot. It must \
+             also not be `Unresolved`, whose single-bound arm would present the DEFAULT \
+             binding's credential for a repo owned by someone else"
         );
         // And therefore nothing is ever declared for it on the wire.
         assert_eq!(

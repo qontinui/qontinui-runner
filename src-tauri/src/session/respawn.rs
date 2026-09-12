@@ -730,7 +730,12 @@ async fn materialize(
             coord_url,
             claim,
             device_id,
-            crate::auth::TenantScope::for_session(child_intent.tenant_id),
+            // GATED, exactly as the handoff receiver is: the tenant reaches the
+            // `/claims/acquire` body, so it must be one this device can present.
+            crate::auth::TenantScope::for_bound_session(
+                child_intent.tenant_id,
+                &crate::auth::device_holds_usable_binding,
+            ),
         )
         .await
         {

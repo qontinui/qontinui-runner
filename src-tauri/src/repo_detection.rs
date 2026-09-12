@@ -35,6 +35,9 @@ fn rebadge(scope: qontinui_runner_lib::auth::TenantScope) -> crate::auth::Tenant
         qontinui_runner_lib::auth::TenantScope::Owned(t) => crate::auth::TenantScope::Owned(t),
         qontinui_runner_lib::auth::TenantScope::Device => crate::auth::TenantScope::Device,
         qontinui_runner_lib::auth::TenantScope::Unresolved => crate::auth::TenantScope::Unresolved,
+        qontinui_runner_lib::auth::TenantScope::Unbacked(t) => {
+            crate::auth::TenantScope::Unbacked(t)
+        }
     }
 }
 
