@@ -574,8 +574,10 @@ pub async fn test_web_integration_connection(
 
     // ---- Step 1: reachability (unauthenticated) ----
     let health_url = format!("{}/api/v1/health/live", trimmed_backend);
-    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/health/live`, an
-    // unauthenticated liveness route.
+    // Not a coord call: `qontinui-web`'s own unauthenticated liveness route.
+    // No `coord-auth-exempt` marker — the coord-auth pin inventories WRITE verbs
+    // only (`.post(`/`.put(`/`.patch(`/`.delete(`), so a marker on a `.get(`
+    // would read as a pinned exemption while being invisible to the pin.
     let health_resp = client.get(&health_url).send().await.map_err(|e| {
         String::from(AppError::NetworkError(format!(
             "cannot reach {} — check the backend URL: {}",
@@ -652,8 +654,9 @@ pub async fn test_web_integration_connection(
     };
 
     let me_url = format!("{}/api/v1/devices/me", trimmed_backend);
-    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/devices/me`, with
-    // the runner's own coord-issued device JWT.
+    // Not a coord call: `qontinui-web`'s own route, presented with this runner's
+    // coord-ISSUED device JWT (coord mints it; the read goes to web). Read verb,
+    // so no `coord-auth-exempt` marker — see the note on the liveness call.
     let me_resp = client
         .get(&me_url)
         .bearer_auth(&device_jwt)
