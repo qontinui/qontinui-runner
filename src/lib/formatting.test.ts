@@ -21,10 +21,20 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/**
+ * Run `fn` with the clock pinned to `NOW`, and restore real timers before
+ * returning — not merely in `afterEach`. Leaving them installed would put every
+ * later statement in the test, the `expect` included, under fake timers, so a
+ * future `await` placed after a call would hang until the hook ran.
+ */
 function withFrozenClock<T>(fn: () => T): T {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
-  return fn();
+  try {
+    return fn();
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 describe("formatRelativeTime — a FUTURE instant is never 'just now'", () => {
