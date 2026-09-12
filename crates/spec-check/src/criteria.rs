@@ -32,11 +32,7 @@ use crate::snapshot::{ElementIdx, IndexedSnapshot};
 /// against `idx`. No partial credit — a single non-perfect field flips the
 /// whole criterion to false. This is the hot path: callers narrow the
 /// candidate set via [`narrow_candidates`] first.
-pub fn matches_all(
-    snapshot: &IndexedSnapshot,
-    crit: &IrElementCriteria,
-    idx: ElementIdx,
-) -> bool {
+pub fn matches_all(snapshot: &IndexedSnapshot, crit: &IrElementCriteria, idx: ElementIdx) -> bool {
     let el = snapshot.element(idx);
 
     if let Some(role) = crit.role.as_deref() {
@@ -99,10 +95,7 @@ pub fn matches_all(
 /// Returned vec preserves the natural index ordering of the underlying
 /// snapshot; downstream callers should still run [`matches_all`] to
 /// disambiguate.
-pub fn narrow_candidates(
-    snapshot: &IndexedSnapshot,
-    crit: &IrElementCriteria,
-) -> Vec<ElementIdx> {
+pub fn narrow_candidates(snapshot: &IndexedSnapshot, crit: &IrElementCriteria) -> Vec<ElementIdx> {
     // (1) id — strongest signal; if the user declared an ID and we have a
     //     hit, that's the candidate set, period.
     if let Some(id) = crit.id.as_deref() {
@@ -210,7 +203,11 @@ pub fn score_text(declared: &str, observed: &Option<String>) -> f32 {
         return 1.0;
     }
 
-    let substring = if o.contains(&d) || d.contains(&o) { 1.0 } else { 0.0 };
+    let substring = if o.contains(&d) || d.contains(&o) {
+        1.0
+    } else {
+        0.0
+    };
     let jaccard = jaccard_words(&d, &o);
     let lev = 1.0 - strsim::normalized_levenshtein(&d, &o) as f32;
     let lev_sim = 1.0 - lev;
@@ -241,9 +238,9 @@ pub fn score_attributes(
         let nk = normalize_text(k);
         let nv = normalize_text(v);
         // Look up by normalized key — observed map may have the literal key.
-        let found = obs.iter().any(|(ok, ov)| {
-            normalize_text(ok) == nk && normalize_text(ov) == nv
-        });
+        let found = obs
+            .iter()
+            .any(|(ok, ov)| normalize_text(ok) == nk && normalize_text(ov) == nv);
         if found {
             matched += 1;
         }
@@ -588,7 +585,15 @@ mod tests {
 
     #[test]
     fn matches_all_with_no_declared_fields_matches_any_element() {
-        let s = snap(vec![elem("e0", Some("button"), None, None, None, None, empty_identifier())]);
+        let s = snap(vec![elem(
+            "e0",
+            Some("button"),
+            None,
+            None,
+            None,
+            None,
+            empty_identifier(),
+        )]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria::default();
         assert!(matches_all(&idx, &crit, ElementIdx(0)));
@@ -597,8 +602,24 @@ mod tests {
     #[test]
     fn matches_all_role_only() {
         let s = snap(vec![
-            elem("e0", Some("button"), None, None, None, None, empty_identifier()),
-            elem("e1", Some("link"), None, None, None, None, empty_identifier()),
+            elem(
+                "e0",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            elem(
+                "e1",
+                Some("link"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -612,8 +633,24 @@ mod tests {
     #[test]
     fn matches_all_text_contains() {
         let s = snap(vec![
-            elem("e0", None, None, None, None, Some("Save changes and quit"), empty_identifier()),
-            elem("e1", None, None, None, None, Some("Cancel"), empty_identifier()),
+            elem(
+                "e0",
+                None,
+                None,
+                None,
+                None,
+                Some("Save changes and quit"),
+                empty_identifier(),
+            ),
+            elem(
+                "e1",
+                None,
+                None,
+                None,
+                None,
+                Some("Cancel"),
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -689,7 +726,15 @@ mod tests {
 
         let s = snap(vec![
             elem("e0", Some("button"), None, None, None, None, ident),
-            elem("e1", Some("button"), None, None, None, None, empty_identifier()),
+            elem(
+                "e1",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -702,7 +747,15 @@ mod tests {
 
     #[test]
     fn narrow_by_nonexistent_id_returns_empty() {
-        let s = snap(vec![elem("e0", Some("button"), None, None, None, None, empty_identifier())]);
+        let s = snap(vec![elem(
+            "e0",
+            Some("button"),
+            None,
+            None,
+            None,
+            None,
+            empty_identifier(),
+        )]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
             id: Some("nonexistent".to_string()),
@@ -715,8 +768,24 @@ mod tests {
     #[test]
     fn narrow_by_aria_label() {
         let s = snap(vec![
-            elem("e0", Some("button"), None, Some("Save"), None, None, empty_identifier()),
-            elem("e1", Some("button"), None, Some("Cancel"), None, None, empty_identifier()),
+            elem(
+                "e0",
+                Some("button"),
+                None,
+                Some("Save"),
+                None,
+                None,
+                empty_identifier(),
+            ),
+            elem(
+                "e1",
+                Some("button"),
+                None,
+                Some("Cancel"),
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -730,11 +799,35 @@ mod tests {
     fn narrow_by_role_and_text_intersects() {
         let s = snap(vec![
             // role match but no "save" word
-            elem("e0", Some("button"), None, None, None, Some("Cancel"), empty_identifier()),
+            elem(
+                "e0",
+                Some("button"),
+                None,
+                None,
+                None,
+                Some("Cancel"),
+                empty_identifier(),
+            ),
             // role match + "save" → candidate
-            elem("e1", Some("button"), None, None, None, Some("Save changes"), empty_identifier()),
+            elem(
+                "e1",
+                Some("button"),
+                None,
+                None,
+                None,
+                Some("Save changes"),
+                empty_identifier(),
+            ),
             // wrong role
-            elem("e2", Some("link"), None, None, None, Some("Save link"), empty_identifier()),
+            elem(
+                "e2",
+                Some("link"),
+                None,
+                None,
+                None,
+                Some("Save link"),
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -748,8 +841,24 @@ mod tests {
     #[test]
     fn narrow_by_role_alone() {
         let s = snap(vec![
-            elem("e0", Some("button"), None, None, None, None, empty_identifier()),
-            elem("e1", Some("link"), None, None, None, None, empty_identifier()),
+            elem(
+                "e0",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            elem(
+                "e1",
+                Some("link"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -814,7 +923,11 @@ mod tests {
             assert_eq!(score_aria_label(label, &el.aria_label), 1.0, "aria_label");
         }
         if let Some(ref name) = crit.accessible_name {
-            assert_eq!(score_text(name, &el.accessible_name), 1.0, "accessible_name");
+            assert_eq!(
+                score_text(name, &el.accessible_name),
+                1.0,
+                "accessible_name"
+            );
         }
     }
 
@@ -959,7 +1072,11 @@ mod tests {
         };
 
         let cands = narrow_candidates(&idx, &crit);
-        assert_eq!(cands.len(), 1, "expected the email input to derive role=textbox");
+        assert_eq!(
+            cands.len(),
+            1,
+            "expected the email input to derive role=textbox"
+        );
         assert!(matches_all(&idx, &crit, cands[0]));
     }
 

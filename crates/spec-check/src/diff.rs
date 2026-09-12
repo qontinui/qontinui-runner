@@ -378,13 +378,14 @@ pub(crate) fn score_element_against(
         // text_contains is asymmetric — emit 1.0 if the observed text
         // contains the needle, else use score_text similarity for the diff.
         let observed = derive::text(el);
-        let observed_lower = observed
-            .as_deref()
-            .map(normalize_text)
-            .unwrap_or_default();
+        let observed_lower = observed.as_deref().map(normalize_text).unwrap_or_default();
         let needle_lower = normalize_text(needle);
         let contains = !needle_lower.is_empty() && observed_lower.contains(&needle_lower);
-        let sim = if contains { 1.0 } else { score_text(needle, &observed) };
+        let sim = if contains {
+            1.0
+        } else {
+            score_text(needle, &observed)
+        };
         let w = sel.weight_for_text_phrase(needle);
         score += sim * w;
         if sim < 1.0 {
@@ -559,7 +560,11 @@ fn classify_field(field: &str) -> DiffKind {
     // Match by prefix so `attribute:data-state` and friends route correctly.
     if field == "role" {
         DiffKind::Role
-    } else if field == "text" || field == "textContains" || field == "ariaLabel" || field == "accessibleName" {
+    } else if field == "text"
+        || field == "textContains"
+        || field == "ariaLabel"
+        || field == "accessibleName"
+    {
         DiffKind::Text
     } else if field == "state.visible" {
         DiffKind::Visibility
@@ -750,7 +755,16 @@ mod tests {
                 true,
             ));
         }
-        elements.push(elem("dlg", "#dlg", Some("dialog"), None, None, None, None, true));
+        elements.push(elem(
+            "dlg",
+            "#dlg",
+            Some("dialog"),
+            None,
+            None,
+            None,
+            None,
+            true,
+        ));
 
         let s = snap(elements);
         let idx = IndexedSnapshot::new(&s);
@@ -767,7 +781,14 @@ mod tests {
     #[test]
     fn selectivity_id_weight_is_max() {
         let s = snap(vec![elem(
-            "only", "#only", Some("button"), None, None, None, None, true,
+            "only",
+            "#only",
+            Some("button"),
+            None,
+            None,
+            None,
+            None,
+            true,
         )]);
         let idx = IndexedSnapshot::new(&s);
         let sel = SelectivityIndex::build(&idx);
@@ -796,7 +817,14 @@ mod tests {
     #[test]
     fn total_declared_weight_aggregates_across_fields() {
         let s = snap(vec![elem(
-            "e0", "#e0", Some("button"), None, None, None, Some("hello"), true,
+            "e0",
+            "#e0",
+            Some("button"),
+            None,
+            None,
+            None,
+            Some("hello"),
+            true,
         )]);
         let idx = IndexedSnapshot::new(&s);
         let sel = SelectivityIndex::build(&idx);
@@ -831,7 +859,14 @@ mod tests {
         // Plan §Step 5 acceptance: a spec with only role mismatch (button
         // vs link, same category) emits RoleMismatch with similarity 0.5.
         let s = snap(vec![elem(
-            "e0", "#e0", Some("link"), None, None, None, None, true,
+            "e0",
+            "#e0",
+            Some("link"),
+            None,
+            None,
+            None,
+            None,
+            true,
         )]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -916,8 +951,26 @@ mod tests {
     fn compute_miss_multiple_matches_on_ties_without_diffs() {
         // Two elements that perfectly match the criterion → MultipleMatches.
         let s = snap(vec![
-            elem("a", "#a", Some("button"), None, None, None, Some("Save"), true),
-            elem("b", "#b", Some("button"), None, None, None, Some("Save"), true),
+            elem(
+                "a",
+                "#a",
+                Some("button"),
+                None,
+                None,
+                None,
+                Some("Save"),
+                true,
+            ),
+            elem(
+                "b",
+                "#b",
+                Some("button"),
+                None,
+                None,
+                None,
+                Some("Save"),
+                true,
+            ),
         ]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -932,7 +985,14 @@ mod tests {
     #[test]
     fn compute_miss_visibility_mismatch_when_otherwise_perfect_but_hidden() {
         let s = snap(vec![elem(
-            "e0", "#e0", Some("button"), None, None, None, Some("Save"), false,
+            "e0",
+            "#e0",
+            Some("button"),
+            None,
+            None,
+            None,
+            Some("Save"),
+            false,
         )]);
         let idx = IndexedSnapshot::new(&s);
         let crit = IrElementCriteria {
@@ -978,8 +1038,14 @@ mod tests {
         // Both fields should appear in field_diffs.
         let c = &miss.candidates[0];
         let fields: Vec<&str> = c.field_diffs.iter().map(|d| d.field.as_str()).collect();
-        assert!(fields.contains(&"role"), "expected role diff, got {fields:?}");
-        assert!(fields.contains(&"text"), "expected text diff, got {fields:?}");
+        assert!(
+            fields.contains(&"role"),
+            "expected role diff, got {fields:?}"
+        );
+        assert!(
+            fields.contains(&"text"),
+            "expected text diff, got {fields:?}"
+        );
     }
 
     #[test]
@@ -988,9 +1054,7 @@ mod tests {
         // are non-trivial so normalized score may stay below the floor.
         // The exact floor behavior depends on selectivity, so just verify
         // we don't crash and the result is sane.
-        let s = snap(vec![elem(
-            "e0", "#e0", None, None, None, None, None, true,
-        )]);
+        let s = snap(vec![elem("e0", "#e0", None, None, None, None, None, true)]);
         let idx = IndexedSnapshot::new(&s);
         let mut attrs = BTreeMap::new();
         attrs.insert("data-state".to_string(), "open".to_string());
