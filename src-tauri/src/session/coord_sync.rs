@@ -151,6 +151,15 @@ struct CoordSyncInner {
     /// default dormant. The poll task ([`CoordSync::start_flag_poll_task`])
     /// refreshes it from coord's `/tenant-policy` endpoint.
     dual_write: DualWriteGate,
+    /// Whether this device can present a credential for a given tenant — the
+    /// gate that decides whether a body may DECLARE its session's tenant.
+    ///
+    /// A field rather than a direct call so it is injectable: the production
+    /// value reads the real credential store, and a test can pin it without a
+    /// store on disk. Before this seam existed, three tests asserting on
+    /// synthetic tenant ids silently depended on ambient machine state (plan
+    /// `2026-09-03-runner-tests-read-ambient-machine-state`).
+    binding_check: fn(&Uuid) -> bool,
 }
 
 impl std::fmt::Debug for CoordSync {
@@ -197,6 +206,8 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
+                // Cached: this is asked once per outbox RECORD.
+                binding_check: crate::auth::device_holds_usable_binding_cached,
             }),
         }
     }
@@ -204,12 +215,33 @@ impl CoordSync {
     /// Test-only constructor. Pins the coord URL and runs heartbeats on
     /// the millisecond cadence the tests need without polluting global
     /// env vars.
+    /// Test constructor whose binding gate answers "this device can present
+    /// every tenant". That is the right DEFAULT for the existing suite: those
+    /// tests assert on tenant PLUMBING (which id reaches which body/slot), not
+    /// on the gate, and a test box has no credential store, so the real
+    /// predicate would answer `false` for every synthetic id and turn each of
+    /// them into an assertion about the gate instead.
+    ///
+    /// Use [`CoordSync::new_for_test_with_binding_check`] to drive the gate.
     #[cfg(test)]
     pub fn new_for_test(
         outbox: Arc<OutboxWriter>,
         coord_url: String,
         heartbeat: Duration,
         stale: Duration,
+    ) -> Self {
+        Self::new_for_test_with_binding_check(outbox, coord_url, heartbeat, stale, |_| true)
+    }
+
+    /// [`CoordSync::new_for_test`] with the binding gate pinned explicitly —
+    /// for the tests that are ABOUT the gate.
+    #[cfg(test)]
+    pub fn new_for_test_with_binding_check(
+        outbox: Arc<OutboxWriter>,
+        coord_url: String,
+        heartbeat: Duration,
+        stale: Duration,
+        binding_check: fn(&Uuid) -> bool,
     ) -> Self {
         Self {
             inner: Arc::new(CoordSyncInner {
@@ -225,6 +257,7 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
+                binding_check,
             }),
         }
     }
@@ -816,25 +849,27 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // already stamped the row's id + intent into the payload at
             // session start; we just forward it.
             //
-            // FAIL CLOSED, not omit — the one route in this module that does.
-            // coord's `create_session` takes the body's `tenant_id` as the
-            // session's tenancy FOR LIFE (immutable afterwards), and a nil one
-            // falls through to sole-binding and then the legacy
-            // `coord.devices.tenant_id` pointer — "most recently paired" — so
-            // dropping an unpresentable tenant here would not degrade to
-            // "coord decides", it would permanently file the session under a
-            // guess. Deferring is retryable and self-healing instead: the
-            // device-JWT refresher re-mints the slot within minutes, and the
-            // outbox replays this record until the body and the bearer agree.
-            if let Some(t) = unpresentable_create_tenant(rec) {
-                return PushOutcome::Transport(format!(
-                    "POST /sessions deferred: the session's tenant {t} has no usable \
-                     credential on this device, and the create body's tenant is \
-                     immutable once written — retrying until the refresher re-mints \
-                     that slot (or the runner is re-paired for that tenant)"
-                ));
-            }
-            let body = rebuild_create_body(rec);
+            // The body's tenant comes from the SAME scope that selects the
+            // bearer, so the two cannot disagree — the sibling
+            // `commit_report` header derives its value the same way.
+            //
+            // This route does NOT fail closed, and that is a deliberate
+            // reversal of the plan's first draft. Deferring an unpresentable
+            // tenant looked safer (coord's `create_session` freezes the body's
+            // tenant for the session's life) but is worse in three measured
+            // ways: `started` is not a best-effort kind, so a `Transport`
+            // outcome sets the SHARED abort flag and curtails every other
+            // session's chain for the tick; the deferral never clears on a
+            // signed-out runner or an unbound spawn tenant, so no session ever
+            // registers; and the outbox's 64 MB trim drops the oldest UNACKED
+            // row, which is exactly the stuck `started`. Declaring nothing and
+            // letting coord resolve server-side (sole-binding, then its legacy
+            // device pointer) is a worse ATTRIBUTION than a correct declaration
+            // and a better outcome than no session row at all.
+            let declared = scope
+                .or_device_default(crate::session::dual_write::resolve_active_tenant_id())
+                .declared_tenant();
+            let body = rebuild_create_body(rec, declared);
             let url = format!("{base}/sessions");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
                 .send()
@@ -1134,13 +1169,10 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Ten
         .and_then(|s| Uuid::parse_str(s.trim()).ok());
     if from_payload.is_some() {
         // GATED for the same reason the registry arm below is: this scope both
-        // selects the bearer and (on `started`) accompanies a body that names
-        // the tenant, so a tenant this device cannot present would put a
+        // selects the bearer and (on `started`) decides what the body may
+        // declare, so a tenant this device cannot present must not become a
         // declared tenant on an unauthenticated request.
-        return TenantScope::for_bound_session(
-            from_payload,
-            &crate::auth::device_holds_usable_binding,
-        );
+        return TenantScope::for_bound_session(from_payload, &inner.binding_check);
     }
     session_tenant_by_id(inner, rec.session_id)
 }
@@ -1165,7 +1197,7 @@ fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> Tenant
             .and_then(Weak::upgrade)
             .and_then(|reg| reg.describe_by_id(session_id).ok())
             .and_then(|d| d.intent.tenant_id),
-        &crate::auth::device_holds_usable_binding,
+        &inner.binding_check,
     )
 }
 
@@ -1493,28 +1525,7 @@ async fn bootstrap_then_register(
 /// machine_id. The session start path writes the create body shape into
 /// `payload` directly (`{id, kind, intent, state, started_at}`), so
 /// rebuilding for the wire is mostly relabeling.
-/// The tenant [`rebuild_create_body`] would DECLARE, when this device cannot
-/// present a credential for it — the predicate the `started` arm fails closed on.
-///
-/// Reads the body the sender would actually build rather than re-deriving the
-/// resolution order, so the two cannot drift: whatever lands in `tenant_id`
-/// (intent, payload, or the `machine.json` default) is what gets checked.
-///
-/// `None` means "safe to send": either the tenant is backed by a usable slot,
-/// or it is the nil UUID, which declares nothing and is coord's own
-/// resolve-server-side signal.
-fn unpresentable_create_tenant(rec: &OutboxRecord) -> Option<Uuid> {
-    let t = rebuild_create_body(rec)
-        .get("tenant_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Uuid::parse_str(s.trim()).ok())?;
-    if t.is_nil() || crate::auth::device_holds_usable_binding(&t) {
-        return None;
-    }
-    Some(t)
-}
-
-fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
+fn rebuild_create_body(rec: &OutboxRecord, declared_tenant: Option<Uuid>) -> JsonValue {
     // tenant_id resolution order: the intent/payload body (Phase 8b: the
     // registry stamps the session's tenant into the intent at creation —
     // spawn input or the machine.json default-for-new-sessions, so this arm
@@ -1530,14 +1541,14 @@ fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
         .get("intent")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let tenant_id = intent
-        .get("tenant_id")
-        .or_else(|| rec.payload.get("tenant_id"))
-        .cloned()
-        .or_else(|| {
-            crate::session::dual_write::resolve_active_tenant_id()
-                .map(|u| JsonValue::String(u.to_string()))
-        })
+    // The DECLARED tenant is decided by the caller, from the same gated scope
+    // that selects the bearer — never re-derived here. This function used to
+    // run its own resolution order (intent → payload → `machine.json` →
+    // nil), which is how a create body could declare the device default while
+    // the scope had resolved to something unpresentable and attached no
+    // credential at all. Nil is coord's resolve-server-side signal.
+    let tenant_id = declared_tenant
+        .map(|t| JsonValue::String(t.to_string()))
         .unwrap_or_else(|| JsonValue::String(Uuid::nil().to_string()));
     let kind = rec
         .payload
@@ -2591,6 +2602,54 @@ mod tests {
         );
     }
 
+    /// The gate, on the drain path: a session whose stamped tenant this device
+    /// cannot present must NOT have that tenant declared in the create body.
+    ///
+    /// The sibling above pins the presentable case; this one pins the arm that
+    /// used to inject a row into a tenant the request could not authenticate
+    /// as. It also pins the DECISION not to fail closed here — the create is
+    /// still sent, with coord's nil resolve-server-side signal, because
+    /// deferring `started` sets the shared abort flag for every other session's
+    /// chain and never clears on a runner that holds no binding for the tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_declares_no_tenant_when_the_device_cannot_present_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test_with_binding_check(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+            // This device can present NOTHING.
+            |_| false,
+        );
+        let registry = build_registry(coord.clone());
+        let tenant = Uuid::from_bytes([0x77; 16]);
+        let mut intent = make_test_intent();
+        intent.tenant_id = Some(tenant);
+        let _handle = registry.start(intent).unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.posts.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.posts[0]["tenant_id"],
+            JsonValue::String(Uuid::nil().to_string()),
+            "an unpresentable tenant must not be declared — coord resolves it server-side"
+        );
+        assert_eq!(
+            g.posts[0]["intent"]["tenant_id"],
+            JsonValue::String(tenant.to_string()),
+            "the intent blob is forwarded verbatim; it is the top-level declaration that is gated"
+        );
+    }
+
     /// Phase 8b slot-selector resolution: payload intent wins, then the
     /// top-level payload field, then the live registry record, else None
     /// (→ default slot, the pre-8b behavior).
@@ -2991,10 +3050,23 @@ mod tests {
             recorded_at: Utc::now(),
             acked_at: None,
         };
-        let body = rebuild_create_body(&rec);
+        // The DECLARED tenant is the CALLER's now, taken from the same gated
+        // scope that selects the bearer. This function no longer runs its own
+        // resolution order, which is how a create body could name the device
+        // default while the scope had attached no credential for it.
+        let declared = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let body = rebuild_create_body(&rec, Some(declared));
         assert_eq!(body["session_kind"], "terminal_claude");
         assert_eq!(body["intent"]["purpose"], "p");
-        assert_eq!(body["tenant_id"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(body["tenant_id"], declared.to_string());
+
+        // Declaring nothing yields coord's nil resolve-server-side signal, even
+        // though the payload's intent still names a tenant.
+        assert_eq!(
+            rebuild_create_body(&rec, None)["tenant_id"],
+            Uuid::nil().to_string(),
+            "an unpresentable tenant must not reach the wire via the payload"
+        );
     }
 
     /// rebuild_create_body forwards the ambient Claude Code session id as a
@@ -3016,7 +3088,7 @@ mod tests {
             recorded_at: Utc::now(),
             acked_at: None,
         };
-        let body = rebuild_create_body(&with);
+        let body = rebuild_create_body(&with, None);
         assert_eq!(
             body["claude_code_session_id"],
             "7e0b5d6a-9b8e-4f2c-a3d1-c1d9f0e7a2b4"
@@ -3031,7 +3103,7 @@ mod tests {
             }),
             ..with
         };
-        let body = rebuild_create_body(&without);
+        let body = rebuild_create_body(&without, None);
         assert!(body.get("claude_code_session_id").is_none());
     }
 
@@ -3054,7 +3126,7 @@ mod tests {
             recorded_at: Utc::now(),
             acked_at: None,
         };
-        let body = rebuild_create_body(&with);
+        let body = rebuild_create_body(&with, None);
         assert_eq!(body["task_run_id"], "11111111-2222-3333-4444-555555555555");
         assert_eq!(body["session_kind"], "agentic");
 
@@ -3067,7 +3139,7 @@ mod tests {
             }),
             ..with
         };
-        let body = rebuild_create_body(&without);
+        let body = rebuild_create_body(&without, None);
         assert!(body.get("task_run_id").is_none());
     }
 

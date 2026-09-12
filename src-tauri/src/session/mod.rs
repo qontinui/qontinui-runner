@@ -1645,7 +1645,7 @@ mod tests {
         // device default, and it must be the one we wrote.
         let stamped = registry.start(shell_intent()).unwrap();
         assert_eq!(
-            registry.tenant_scope_of(stamped.id()),
+            registry.tenant_scope_of_with(stamped.id(), &|_| true),
             TenantScope::Owned(device_default),
             "the device default in the fixture's machine.json must reach the session"
         );
@@ -1657,7 +1657,7 @@ mod tests {
         intent.tenant_id = Some(explicit);
         let owned = registry.start(intent).unwrap();
         assert_eq!(
-            registry.tenant_scope_of(owned.id()),
+            registry.tenant_scope_of_with(owned.id(), &|_| true),
             TenantScope::Owned(explicit)
         );
     }

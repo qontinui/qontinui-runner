@@ -1736,6 +1736,25 @@ pub enum TenantScope {
     /// Distinct from [`TenantScope::Device`] precisely so the degrade below can
     /// fire without touching the callers for which the default is right.
     Unresolved,
+    /// The owning tenant is KNOWN to be `t`, and this device holds no usable
+    /// credential for it ([`device_holds_usable_binding`] is false).
+    ///
+    /// Distinct from [`TenantScope::Unresolved`], and the distinction is the
+    /// whole point: `Unresolved` means *"I could not work out who owns this"*,
+    /// so D2's degrade may fall back to the default binding on a single-bound
+    /// device — the default IS the only tenant there, so it is the right
+    /// answer. Here the owner is positively known and is NOT the default, so
+    /// presenting the default binding's credential would file `t`'s row under
+    /// another tenant: a cross-tenant PRESENTATION, one level over from the
+    /// cross-tenant DECLARATION [`Self::backed_by`] exists to stop.
+    ///
+    /// So this variant declares nothing ([`Self::declared_tenant`]) **and**
+    /// presents nothing ([`select_scoped_bearer_lazy`]). The write goes out
+    /// unauthenticated and coord refuses or resolves it server-side, which is
+    /// exactly what happened before this type existed — an `Owned(t)` whose
+    /// slot was missing already resolved to no bearer. Nothing regresses; the
+    /// declaration is what got fixed.
+    Unbacked(Uuid),
 }
 
 impl TenantScope {
@@ -1828,7 +1847,10 @@ impl TenantScope {
     /// seam [`Self::or_device_default_with_count`] uses.
     pub(crate) fn backed_by(self, device_is_bound_to: &dyn Fn(&Uuid) -> bool) -> Self {
         match self {
-            TenantScope::Owned(t) if !device_is_bound_to(&t) => TenantScope::Unresolved,
+            // NOT `Unresolved`: the owner is positively known here, and
+            // `Unresolved` would let D2's single-bound arm present the DEFAULT
+            // binding for `t`'s row. See [`TenantScope::Unbacked`].
+            TenantScope::Owned(t) if !device_is_bound_to(&t) => TenantScope::Unbacked(t),
             other => other,
         }
     }
@@ -1844,7 +1866,9 @@ impl TenantScope {
     pub fn declared_tenant(self) -> Option<Uuid> {
         match self {
             TenantScope::Owned(t) => Some(t),
-            TenantScope::Device | TenantScope::Unresolved => None,
+            // `Unbacked` knows the owner and deliberately does not say it: a
+            // declared tenant the bearer cannot back is the injected-row defect.
+            TenantScope::Device | TenantScope::Unresolved | TenantScope::Unbacked(_) => None,
         }
     }
 
@@ -1931,6 +1955,74 @@ pub fn device_holds_usable_binding(tenant: &Uuid) -> bool {
     select_device_bearer(&AuthManager::new(), Some(tenant), default_binding_tenant()).is_some()
 }
 
+/// How long a [`device_holds_usable_binding_cached`] answer is reused.
+///
+/// Short on purpose. The value it caches changes when the refresher re-mints a
+/// slot, so a long TTL would keep declaring nothing for minutes after the
+/// credential came back; a few seconds is enough to collapse a per-record or
+/// per-chunk burst into one read.
+const BINDING_CACHE_TTL: Duration = Duration::from_secs(5);
+
+type BindingCache = std::collections::HashMap<Uuid, (bool, std::time::Instant)>;
+
+static BINDING_CACHE: std::sync::Mutex<Option<BindingCache>> = std::sync::Mutex::new(None);
+
+/// [`device_holds_usable_binding`] with a few-seconds memo, for the sites that
+/// ask once per OUTBOX RECORD or once per census chunk.
+///
+/// The uncached call is not cheap: `AuthManager::new()` builds a
+/// `SecureStorage`, which `create_dir_all`s, sweeps stale temp files (a
+/// directory scan) and then decrypts the store. Paying that per record — on top
+/// of the resolution `attach_device_auth_for` already pays — turns a drain tick
+/// into N filesystem passes.
+///
+/// Fails toward the UNCACHED call on a poisoned lock: a memo is an
+/// optimisation, never the authority on whether a credential exists.
+pub fn device_holds_usable_binding_cached(tenant: &Uuid) -> bool {
+    let now = std::time::Instant::now();
+    let Ok(mut guard) = BINDING_CACHE.lock() else {
+        return device_holds_usable_binding(tenant);
+    };
+    let cache = guard.get_or_insert_with(BindingCache::new);
+    if let Some((hit, at)) = cache.get(tenant) {
+        if now.duration_since(*at) < BINDING_CACHE_TTL {
+            return *hit;
+        }
+    }
+    // Do not hold the lock across the store read — another tenant's lookup
+    // would block behind this one's decrypt.
+    drop(guard);
+    let fresh = device_holds_usable_binding(tenant);
+    if let Ok(mut guard) = BINDING_CACHE.lock() {
+        guard
+            .get_or_insert_with(BindingCache::new)
+            .insert(*tenant, (fresh, now));
+    }
+    fresh
+}
+
+/// One warning per unbacked owning tenant, per process — the
+/// [`TenantScope::Unbacked`] counterpart of
+/// [`warn_once_unresolved_on_multi_bound`]. Without it the safest outcome (send
+/// nothing) is also the quietest, and a permanently unbound spawn tenant looks
+/// identical to a healthy single-tenant box.
+fn warn_once_unbacked_owner(tenant: &Uuid) {
+    static WARNED: std::sync::Mutex<Option<std::collections::BTreeSet<Uuid>>> =
+        std::sync::Mutex::new(None);
+    let Ok(mut guard) = WARNED.lock() else { return };
+    if guard
+        .get_or_insert_with(std::collections::BTreeSet::new)
+        .insert(*tenant)
+    {
+        warn!(
+            "coord data-plane: row is owned by tenant {tenant}, which this device holds no \
+             usable credential for — sending UNAUTHENTICATED and declaring no tenant rather \
+             than presenting another tenant's slot. Pair this runner for that tenant, or let \
+             the refresher re-mint its slot."
+        );
+    }
+}
+
 /// [`select_scoped_bearer`] with the binding count read on demand.
 ///
 /// Only the `Unresolved` arm consults it, and reading it costs a
@@ -1948,6 +2040,14 @@ pub(crate) fn select_scoped_bearer_lazy(
     match scope {
         TenantScope::Owned(t) => select_device_bearer(am, Some(&t), default_tenant),
         TenantScope::Device => select_device_bearer(am, None, default_tenant),
+        // The owner is known and unpresentable: send NOTHING rather than
+        // another tenant's credential. Deliberately not routed through the
+        // `Unresolved` arm below, whose single-bound fallback would present the
+        // default binding for this row — see [`TenantScope::Unbacked`].
+        TenantScope::Unbacked(t) => {
+            warn_once_unbacked_owner(&t);
+            None
+        }
         TenantScope::Unresolved => {
             let count = binding_count();
             if count > 1 {
@@ -3180,6 +3280,40 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Owned(t).declared_tenant(), Some(t));
         assert_eq!(TenantScope::Device.declared_tenant(), None);
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
+        assert_eq!(
+            TenantScope::Unbacked(t).declared_tenant(),
+            None,
+            "an unbacked owner is known internally and must never be declared on the wire"
+        );
+    }
+
+    /// The reason `Unbacked` is not just `Unresolved`: on a SINGLE-bound device
+    /// `Unresolved` falls back to the default binding's slot, which for a row
+    /// whose owner is known to be someone else is a cross-tenant presentation.
+    /// `Unbacked` presents nothing on both device shapes.
+    #[test]
+    fn unbacked_presents_nothing_where_unresolved_would_present_the_default() {
+        let mgr = create_test_auth_manager("scope_unbacked_presents_nothing");
+        let default_tenant = tenant(0xF1);
+        let other = tenant(0xF2);
+        let default_jwt = live_jwt("default.jwt");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+
+        // Single-bound: this is the arm that used to leak.
+        assert!(
+            select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(default_tenant), 1).is_some(),
+            "control: `Unresolved` on a single-bound device still presents the default slot"
+        );
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Unbacked(other), Some(default_tenant), 1),
+            None,
+            "a row owned by `other` must NOT be sent under the default binding's credential"
+        );
+        // Multi-bound: both refuse, for different reasons.
+        assert_eq!(
+            select_scoped_bearer(&mgr, TenantScope::Unbacked(other), Some(default_tenant), 2),
+            None
+        );
     }
 
     // ---- the GATE: a declared tenant must be one this device can present ---
@@ -3204,8 +3338,9 @@ mod bearer_selection_tests {
         );
         assert_eq!(
             TenantScope::for_bound_session(Some(unbound), &holds),
-            TenantScope::Unresolved,
-            "an unbacked session tenant must not reach a body"
+            TenantScope::Unbacked(unbound),
+            "an unbacked session tenant must not reach a body — and must keep naming its \
+             owner internally, so the bearer arm can refuse rather than fall back to the default"
         );
         assert_eq!(
             TenantScope::for_bound_session(Some(unbound), &holds).declared_tenant(),
@@ -3254,7 +3389,7 @@ mod bearer_selection_tests {
 
         assert_eq!(
             TenantScope::Owned(t).backed_by(&never),
-            TenantScope::Unresolved
+            TenantScope::Unbacked(t)
         );
         assert_eq!(TenantScope::Device.backed_by(&never), TenantScope::Device);
         assert_eq!(

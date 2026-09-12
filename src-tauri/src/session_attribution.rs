@@ -376,7 +376,7 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
     // then resolves the row's tenant server-side instead of trusting the body.
     let tenant_scope = crate::auth::TenantScope::for_bound_device_default(
         crate::fleet::resolve_tenant_id(),
-        &crate::auth::device_holds_usable_binding,
+        &crate::auth::device_holds_usable_binding_cached,
     );
     let tenant_id = tenant_scope.declared_tenant();
 

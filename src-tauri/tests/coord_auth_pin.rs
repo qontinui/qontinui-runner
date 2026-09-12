@@ -310,9 +310,10 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Join `lines[lo..=hi]` with comments removed, so prose can never satisfy a
 /// code-level check. Line comments are dropped whole; a trailing `//` truncates
-/// its line. Truncating at `//` inside a URL literal is harmless here: the only
-/// token looked for is `attach_device_auth`, which in a wrapped call always
-/// precedes the URL.
+/// its line. Truncating at `//` inside a URL literal is harmless for every
+/// token this file looks for — `attach_device_auth`, the `coord-*` annotation
+/// markers, and the `TenantScope::` constructor spellings — because in a
+/// wrapped call each of them precedes the URL.
 fn code_only(lines: &[&str], lo: usize, hi: usize) -> String {
     lines[lo..=hi]
         .iter()
@@ -1117,6 +1118,24 @@ const GATED_CONSTRUCTORS: &[&str] = &[
     "TenantScope::for_bound_device_default(",
 ];
 
+/// Where the gate is REACHED, per file, excluding `auth.rs`.
+///
+/// Pinned per file rather than asserted as "appears at least once", because
+/// `for_bound_device_default` also occurs INSIDE `auth.rs` (in
+/// `or_device_default_with_count`). A presence-only check therefore stayed green
+/// with both real call sites deleted — the exact vacuity this test exists to
+/// prevent. `auth.rs` is excluded for the same reason it is a special row in the
+/// ungated table: it is the type's own module, and its internal use says nothing
+/// about whether any CALLER is gated.
+const EXPECTED_GATED_SITES: &[(&str, usize)] = &[
+    ("agent_worktree/census.rs", 1),
+    ("session/coord_sync.rs", 2),
+    ("session/handoff.rs", 1),
+    ("session/mod.rs", 1),
+    ("session/respawn.rs", 1),
+    ("session_attribution.rs", 1),
+];
+
 /// The ungated spellings. `Owned(` is included deliberately — hand-building the
 /// variant bypasses both constructors, which is the easiest way to reintroduce
 /// the defect without touching either of them.
@@ -1164,10 +1183,11 @@ const EXPECTED_UNGATED_SITES: &[(&str, usize, &str)] = &[
     ),
     (
         "repo_detection.rs",
-        2,
-        "one lib->bin `TenantScope` rebadge (a conversion of an already-resolved \
-         scope, not a resolution), and one register whose body deliberately \
-         carries no tenant field.",
+        3,
+        "the lib->bin `TenantScope` rebadge (a conversion of an already-resolved \
+         scope, not a resolution — its `Owned` arm names the spelling twice on \
+         one line, which is why this scan counts MATCHES), and one register \
+         whose body deliberately carries no tenant field.",
     ),
     (
         "repo_tenant.rs",
@@ -1223,9 +1243,17 @@ fn every_ungated_tenant_scope_construction_is_a_reviewed_exception() {
             }
             // Comment-stripped: prose naming a constructor must never score as
             // a construction, the same rule every other scan in this file uses.
+            // Count MATCHES, not lines: `repo_detection.rs`'s rebadge arm
+            // already puts two `TenantScope::Owned(` on one line, so a
+            // per-line count would hide a second construction appended to an
+            // existing matching line.
             let code = code_only(&lines, i, i);
-            if UNGATED_CONSTRUCTORS.iter().any(|m| code.contains(m)) {
-                *found.entry(rel.clone()).or_default() += 1;
+            let hits: usize = UNGATED_CONSTRUCTORS
+                .iter()
+                .map(|m| code.matches(m).count())
+                .sum();
+            if hits > 0 {
+                *found.entry(rel.clone()).or_default() += hits;
             }
         }
     }
@@ -1271,9 +1299,9 @@ fn every_ungated_tenant_scope_construction_is_a_reviewed_exception() {
 
     let total: usize = found.values().sum();
     assert_eq!(
-        total, 14,
-        "expected 14 ungated `TenantScope` constructions in production code — 5 in auth.rs \
-         (the type's own module) and 9 reviewed exceptions, every one of them a route whose \
+        total, 15,
+        "expected 15 ungated `TenantScope` constructions in production code — 5 in auth.rs \
+         (the type's own module) and 10 reviewed exceptions, every one of them a route whose \
          body carries no tenant, a caller-named read, the credential-health publish, or a \
          gate's own internals. Found {total}. It goes DOWN when a site adopts a gated \
          constructor, and UP only when a new ungated resolution ships, which is the event \
@@ -1291,7 +1319,6 @@ fn the_gated_constructors_are_used_in_production_code() {
     rust_files(&root, &mut files);
     files.sort();
 
-    let mut per_spelling: BTreeMap<&str, usize> = BTreeMap::new();
     let mut gated_files: BTreeMap<String, usize> = BTreeMap::new();
     for path in &files {
         let rel = path
@@ -1306,23 +1333,38 @@ fn the_gated_constructors_are_used_in_production_code() {
             if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
                 continue;
             }
+            // `auth.rs` is the type's own module: its internal
+            // `for_bound_device_default` call says nothing about callers.
+            if rel == "auth.rs" {
+                continue;
+            }
             let code = code_only(&lines, i, i);
-            for spelling in GATED_CONSTRUCTORS {
-                if code.contains(spelling) {
-                    *per_spelling.entry(spelling).or_default() += 1;
-                    *gated_files.entry(rel.clone()).or_default() += 1;
-                }
+            let hits: usize = GATED_CONSTRUCTORS
+                .iter()
+                .map(|m| code.matches(m).count())
+                .sum();
+            if hits > 0 {
+                *gated_files.entry(rel.clone()).or_default() += hits;
             }
         }
     }
 
-    for spelling in GATED_CONSTRUCTORS {
-        let n = per_spelling.get(spelling).copied().unwrap_or(0);
+    let expected: BTreeMap<&str, usize> = EXPECTED_GATED_SITES.iter().copied().collect();
+    for (file, want) in &expected {
+        let got = gated_files.get(*file).copied().unwrap_or(0);
+        assert_eq!(
+            got, *want,
+            "{file} reaches a gated constructor {got} time(s), expected {want}. A site that \
+             stopped being gated puts its session's stamped tenant back on the wire unchecked \
+             — the defect this PR closed. If a site legitimately moved, update \
+             EXPECTED_GATED_SITES in the SAME commit."
+        );
+    }
+    for (file, got) in &gated_files {
         assert!(
-            n > 0,
-            "`{spelling}` is never called in production code — the gate exists but nothing \
-             reaches it, so a body tenant is once again whatever was stamped. Either a call \
-             site regressed to an ungated constructor, or the gate was deleted."
+            expected.contains_key(file.as_str()),
+            "{file} now reaches a gated constructor ({got} time(s)) and is not in \
+             EXPECTED_GATED_SITES — welcome, but add the row so the count is watched"
         );
     }
 
