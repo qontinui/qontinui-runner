@@ -16,7 +16,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { buildIngestBody, chunkResults } from "../ci-test-results-ingest.mjs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+
+import {
+  buildIngestBody,
+  chunkResults,
+  chunkTimeoutMs,
+  resolveBudgetMs,
+} from "../ci-test-results-ingest.mjs";
 
 const TS = "2026-09-02T07:26:07.5955615Z ";
 
@@ -190,6 +200,51 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 });
 
 // ---------------------------------------------------------------------------
+// The whole-invocation budget. This step runs INSIDE the gating `test` job and
+// coord's merge predicate waits for every check run on the head, so the step's
+// wall time is the merge train's wait: run 34660689077 (2026-09-12) held the
+// job 11m39s on ubuntu / 6m13s on windows AFTER `cargo test` had passed, and
+// twelve chunks at the 120 s per-request cap is 24 min with no bound at all.
+// Every expectation is a LITERAL for the same reason as the chunk tests above.
+// ---------------------------------------------------------------------------
+
+test("chunkTimeoutMs caps the next request at the smaller of the two bounds", () => {
+  // Plenty of budget left: the per-request cap stands on its own.
+  assert.equal(chunkTimeoutMs(1_000_000, 120_000), 120_000);
+  // Less budget than the per-request cap: the budget wins.
+  assert.equal(chunkTimeoutMs(30_000, 120_000), 30_000);
+  assert.equal(chunkTimeoutMs(30_000.9, 120_000), 30_000);
+});
+
+test("chunkTimeoutMs refuses to start a chunk it could only abort", () => {
+  // Below the 5 s floor a request would be aborted mid-flight — it still costs
+  // the round trip and records nothing, so the honest answer is "do not start".
+  assert.equal(chunkTimeoutMs(4_999, 120_000), null);
+  assert.equal(chunkTimeoutMs(0, 120_000), null);
+  assert.equal(chunkTimeoutMs(-1, 120_000), null);
+  assert.equal(chunkTimeoutMs(Number.NaN, 120_000), null);
+  // Exactly at the floor is still worth starting.
+  assert.equal(chunkTimeoutMs(5_000, 120_000), 5_000);
+});
+
+test("chunkTimeoutMs honours a caller-lowered floor, so a small budget still sends its first chunk", () => {
+  // `postResults` clamps the floor to the budget: with a 1 s budget the first
+  // chunk gets 1 s rather than the invocation sending nothing at all.
+  assert.equal(chunkTimeoutMs(1_000, 120_000, 1_000), 1_000);
+  assert.equal(chunkTimeoutMs(999, 120_000, 1_000), null);
+  assert.equal(chunkTimeoutMs(0, 120_000, 0), null);
+});
+
+test("resolveBudgetMs reads the knob and falls back to the 3-minute default, never to unbounded", () => {
+  assert.equal(resolveBudgetMs("60000"), 60_000);
+  assert.equal(resolveBudgetMs(" 60000 "), 60_000);
+  assert.equal(resolveBudgetMs("60000.7"), 60_000);
+  for (const bad of [undefined, "", "0", "-1", "abc", "Infinity"]) {
+    assert.equal(resolveBudgetMs(bad), 180_000, `expected the default for ${JSON.stringify(bad)}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Regression: the ingest step must pin its own COORD_HTTP_URL.
 //
 // `Poison ambient state` exports COORD_HTTP_URL=http://poison.invalid to
@@ -323,4 +378,114 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
     /^\s*COORD_HTTP_URL\s*:\s*(""|'')\s*(#.*)?$/,
     `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
   );
+});
+
+// ---------------------------------------------------------------------------
+// The budget, end to end: the REAL CLI (a child process, so this file's own
+// stdout is never touched — `node --test` parses it) against a local coord
+// stand-in that answers each chunk after a fixed delay. CHUNK_SIZE is 1000 and
+// is deliberately not imported, so the log below carries 4,500 tests = 5
+// chunks by the module's own arithmetic.
+// ---------------------------------------------------------------------------
+
+const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "ci-test-results-ingest.mjs");
+
+/** A cargo-test log with `n` passing tests, in the real timestamped shape. */
+function syntheticLog(n) {
+  const lines = [`${TS}running ${n} tests`];
+  for (let i = 0; i < n; i++) lines.push(`${TS}test m::t${i} ... ok`);
+  lines.push(
+    `${TS}test result: ok. ${n} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s`,
+  );
+  return lines.join("\n");
+}
+
+/** Serve `POST /coord/test-results/ingest`, answering after `delayMs`. */
+async function slowCoord(delayMs) {
+  let hits = 0;
+  const server = createServer((req, res) => {
+    hits += 1;
+    let bytes = 0;
+    req.on("data", (c) => (bytes += c.length));
+    req.on("end", () => {
+      setTimeout(() => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }));
+      }, delayMs);
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    hits: () => hits,
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
+/** Run the CLI with `env` merged over a minimal base; resolve `{code, out}`. */
+function runCli(logPath, env) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [SCRIPT, "--log", logPath, "--repo", "o/r", "--head-sha", "h", "--shard", "s"],
+      { env: { PATH: process.env.PATH, ...env }, timeout: 30_000 },
+      (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: `${stdout}${stderr}` }),
+    );
+  });
+}
+
+test("CLI: a slow coord cannot hold the invocation past COORD_INGEST_BUDGET_MS; later chunks are skipped and named", async () => {
+  // 400 ms per chunk against a 6 s budget with the 5 s floor: chunks start at
+  // ~0 / 0.4 / 0.8 s with 6.0 / 5.6 / 5.2 s left and are sent; the fourth
+  // would start at ~1.2 s with 4.8 s left, under the floor, so it and the
+  // fifth are skipped. (Process start adds tens of ms, not hundreds.)
+  const coord = await slowCoord(400);
+  const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
+  const logPath = join(dir, "cargo-test-output.log");
+  writeFileSync(logPath, syntheticLog(4500));
+  const started = Date.now();
+  let r;
+  try {
+    r = await runCli(logPath, {
+      COORD_INGEST_TOKEN: "tok",
+      COORD_HTTP_URL: coord.url,
+      COORD_INGEST_BUDGET_MS: "6000",
+    });
+  } finally {
+    await coord.close();
+  }
+  const elapsed = Date.now() - started;
+
+  assert.equal(r.code, 0, `best-effort: exit 0 even over budget\n${r.out}`);
+  assert.equal(coord.hits(), 3, `expected exactly 3 requests, got ${coord.hits()}:\n${r.out}`);
+  // The skips cost nothing: the invocation ends when the third chunk does,
+  // not at the budget.
+  assert.ok(elapsed < 5_000, `must not wait out its budget, took ${elapsed}ms\n${r.out}`);
+  assert.match(r.out, /3000\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.match(r.out, /::error title=test-results-ingest::invocation budget of 6000ms exhausted/);
+  // The two skipped chunks are the fourth (1000 rows) and the short fifth (500).
+  assert.match(r.out, /2 of 5 chunk\(s\) \(1500 row\(s\)\) were NOT sent for o\/r@h \(shard s\)/);
+  // A budget skip is not a coord failure and must not be reported as one.
+  assert.doesNotMatch(r.out, /chunk\(s\) failed/);
+});
+
+test("CLI: within budget every chunk is sent and no budget error is emitted", async () => {
+  const coord = await slowCoord(0);
+  const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
+  const logPath = join(dir, "cargo-test-output.log");
+  writeFileSync(logPath, syntheticLog(4500));
+  let r;
+  try {
+    r = await runCli(logPath, {
+      COORD_INGEST_TOKEN: "tok",
+      COORD_HTTP_URL: coord.url,
+      COORD_INGEST_BUDGET_MS: "60000",
+    });
+  } finally {
+    await coord.close();
+  }
+  assert.equal(r.code, 0, r.out);
+  assert.equal(coord.hits(), 5, r.out);
+  assert.match(r.out, /4500\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.doesNotMatch(r.out, /::error/);
 });
