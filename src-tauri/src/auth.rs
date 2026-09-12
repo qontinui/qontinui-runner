@@ -1604,13 +1604,9 @@ fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
     }
 }
 
-/// The device's DEFAULT binding tenant, read from `paired_user.json`
-/// (v2 `default_tenant_id`, legacy `tenant_id` fallback). Kept as a local
-/// minimal reader because `auth` compiles into BOTH the lib and bin crates
-/// while `pair` (the canonical v2-aware reader) is lib-only — same
-/// documented duplication pattern as the census/backstop `machine.json`
-/// readers. `None` on any failure (unpaired runner).
-/// `paired_user.json`, then the cached device token's own `tenant_id` claim.
+/// The device's DEFAULT binding tenant: `paired_user.json` first, then the
+/// cached device token's own `tenant_id` claim. `None` when neither answers
+/// (a genuinely unpaired runner).
 ///
 /// **The second rung is load-bearing since [`TenantScope::Unbacked`] exists.**
 /// `select_device_bearer` reaches the legacy `access_token` slot for a NAMED
@@ -1654,28 +1650,13 @@ fn default_binding_tenant_from_file() -> Option<Uuid> {
 }
 
 /// Rung 2 — the tenant the device's OWN stored token claims.
+///
+/// Reuses [`jwt_tenant_claim`], the decoder this module already had for exactly
+/// this question ("which LOCAL slot does this credential belong in"); a second
+/// copy would be one more thing to keep in step.
 fn default_binding_tenant_from_slot_claim() -> Option<Uuid> {
     let token = AuthManager::new().get_access_token().ok()?;
-    tenant_claim_from_jwt(&token)
-}
-
-/// The `tenant_id` claim of a JWT, as a [`Uuid`]. Signature is NOT verified —
-/// this reads a token this device already holds, exactly as
-/// [`decode_jwt_exp`] does, and `pair::tenant_id_from_oauth_claim` reads the
-/// same claim name lib-side.
-fn tenant_claim_from_jwt(token: &str) -> Option<Uuid> {
-    let token = token.trim();
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(parts[1])
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(parts[1]))
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
-    let raw = value.get("tenant_id").and_then(|v| v.as_str())?;
-    Uuid::parse_str(raw.trim()).ok()
+    jwt_tenant_claim(&token)
 }
 
 /// How many tenant bindings this device holds, per `paired_user.json`.
@@ -3479,25 +3460,35 @@ mod bearer_selection_tests {
     /// named tenant and `device_holds_usable_binding` answers false for every
     /// tenant, the device's own included.
     #[test]
-    fn tenant_claim_from_jwt_reads_the_device_tokens_own_tenant() {
+    fn the_slot_claim_rung_reads_the_device_tokens_own_tenant() {
         let t = tenant(0xF7);
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(format!(r#"{{"tenant_id":"{t}"}}"#).as_bytes());
-        assert_eq!(
-            tenant_claim_from_jwt(&format!("{header}.{payload}.sig")),
-            Some(t)
-        );
+        // `jwt_with_tenant` is this module's own helper for exactly this shape,
+        // and `jwt_tenant_claim` is the decoder rung 2 reuses — no second copy.
+        let live = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+        assert_eq!(jwt_tenant_claim(&jwt_with_tenant(&t, live)), Some(t));
 
         // A token with no such claim, a non-JWT, and an empty string are all
         // "no answer" — never a guess.
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
         let no_claim = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"x"}"#);
         assert_eq!(
-            tenant_claim_from_jwt(&format!("{header}.{no_claim}.sig")),
-            None
+            jwt_tenant_claim(&format!("{header}.{no_claim}.sig")),
+            None,
+            "a token that names no tenant must not resolve one"
         );
-        assert_eq!(tenant_claim_from_jwt("not.a.jwt"), None);
-        assert_eq!(tenant_claim_from_jwt(""), None);
+        assert_eq!(jwt_tenant_claim("not.a.jwt"), None);
+        assert_eq!(jwt_tenant_claim(""), None);
+
+        // And the rung cannot manufacture a binding from a DEAD credential:
+        // the claim still reads, but the bearer path rejects the token, so the
+        // gate stays closed. That asymmetry is what keeps the fallback from
+        // being a way around `slot_jwt_is_usable`.
+        let expired = jwt_with_tenant(&t, chrono::Utc::now().timestamp() - 60 * 60);
+        assert_eq!(jwt_tenant_claim(&expired), Some(t));
+        assert!(
+            !slot_jwt_is_usable(&expired),
+            "an expired token yields a claim but never a usable slot"
+        );
     }
 
     // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
