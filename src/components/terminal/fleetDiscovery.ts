@@ -512,16 +512,22 @@ export function filterFleetSessions(sessions: FleetSession[], query: string): Fl
  * the exact instant in a title beside the relative form.
  */
 export interface FleetSessionActivity {
-  /** What the instant is — "closed", "heartbeat" or "started". */
-  verb: string;
-  /** The ISO timestamp coord served, verbatim and known-parseable. */
+  /** What the instant is. A union, so a consumer switching on it is exhaustive. */
+  verb: "closed" | "heartbeat" | "started";
+  /**
+   * The timestamp coord served, TRIMMED and known-parseable — not otherwise
+   * reformatted, so the caller can show coord's own precision. The trim is
+   * load-bearing rather than tidiness: `Date.parse` rejects a value with
+   * surrounding whitespace, so an untrimmed field would be discarded as
+   * unparseable instead of rendered.
+   */
   iso: string;
 }
 
 export function fleetSessionActivity(
   s: Pick<FleetSession, "closedAt" | "lastHeartbeatAt" | "startedAt">,
 ): FleetSessionActivity | null {
-  const candidates: [string, string | null][] = [
+  const candidates: [FleetSessionActivity["verb"], string | null][] = [
     ["closed", s.closedAt],
     ["heartbeat", s.lastHeartbeatAt],
     ["started", s.startedAt],

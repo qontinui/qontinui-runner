@@ -112,15 +112,15 @@ function page(n: number, offset = 0): FleetSession[] {
 describe("fleetTruncation — completeness is `nextCursor`, and nothing else", () => {
   it("is UNKNOWN before any read completes — not 'none'", () => {
     // The distinction Phase 2 exists for: no answer is not a complete answer.
-    expect(fleetTruncation(null, 0, true)).toEqual({ kind: "unknown" });
+    expect(fleetTruncation(null, 0, false)).toEqual({ kind: "unknown" });
   });
 
   it("is 'none' only when coord handed back no cursor", () => {
-    expect(fleetTruncation(response({ sessions: [session()], nextCursor: null }), 1, true)).toEqual(
-      {
-        kind: "none",
-      },
-    );
+    expect(
+      fleetTruncation(response({ sessions: [session()], nextCursor: null }), 1, false),
+    ).toEqual({
+      kind: "none",
+    });
   });
 
   it("offers the next page whenever coord handed back a cursor", () => {
@@ -160,14 +160,14 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
     const stale = (truncated: boolean, nextCursor: string | null) =>
       ({ ...response({ sessions: page(3), nextCursor }), truncated }) as FleetSessionsResponse;
 
-    expect(fleetTruncation(stale(true, null), 3, true).kind).toBe("none");
+    expect(fleetTruncation(stale(true, null), 3, false).kind).toBe("none");
     expect(fleetTruncation(stale(false, "ck-9"), 3, true).kind).toBe("more-available");
   });
 
   it("an empty-string cursor is the LAST page, never a next one", () => {
     // coord's walk protocol says an empty `cursor` is page one, so re-sending
     // one would silently restart the walk while the UI claimed to advance it.
-    expect(fleetTruncation(response({ sessions: page(3), nextCursor: "" }), 3, true).kind).toBe(
+    expect(fleetTruncation(response({ sessions: page(3), nextCursor: "" }), 3, false).kind).toBe(
       "none",
     );
     expect(normalizeFleetCursor("")).toBeNull();
@@ -182,7 +182,7 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
       fleetTruncation(
         response({ sessions: page(FLEET_DEFAULT_LIMIT), nextCursor: null }),
         100,
-        true,
+        false,
       ).kind,
     ).toBe("none");
   });
@@ -277,9 +277,12 @@ describe("fleetTruncation — completeness is `nextCursor`, and nothing else", (
   });
 
   it("stays UNKNOWN before any read, whatever the walk says it can do", () => {
-    // A walk with no accepted page has no cursor either, and `unknown` must win
-    // over any completeness claim — an absent answer is not a complete one.
+    // A walk with no accepted page has no cursor either, so `false` is what the
+    // real state carries — but `unknown` must win over ANY completeness claim,
+    // so the impossible `true` is asserted HERE rather than left sitting in a
+    // fixture elsewhere that pretends it is a reachable state.
     expect(fleetTruncation(null, 0, false)).toEqual({ kind: "unknown" });
+    expect(fleetTruncation(null, 0, true)).toEqual({ kind: "unknown" });
   });
 
   it("says out loud that a complete walk is complete only AS OF NOW", () => {
@@ -449,7 +452,9 @@ describe("the walk — pages accumulate, a restart replaces", () => {
     expect(EMPTY_FLEET_WALK.pages).toBe(0);
     expect(EMPTY_FLEET_WALK.sessions).toHaveLength(0);
     expect(EMPTY_FLEET_WALK.nextCursor).toBeNull();
-    expect(fleetTruncation(null, EMPTY_FLEET_WALK.sessions.length, true)).toEqual({
+    expect(
+      fleetTruncation(null, EMPTY_FLEET_WALK.sessions.length, EMPTY_FLEET_WALK.nextCursor !== null),
+    ).toEqual({
       kind: "unknown",
     });
   });

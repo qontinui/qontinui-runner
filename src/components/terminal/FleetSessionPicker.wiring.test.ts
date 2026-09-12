@@ -63,8 +63,11 @@ describe("everything said ABOUT the loaded rows is said with the query they came
     expect(SOURCE).not.toContain("fleetTruncation(response, server.limit");
     expect(SOURCE).not.toContain("fleetTruncation(response, appliedQuery");
     // And never on the ENVELOPE's cursor, which is the pair that diverges the
-    // moment the walk drops one — see the suite below.
-    expect(SOURCE).not.toContain("response.nextCursor");
+    // moment the walk drops one — see the suite below. Scanned through
+    // `codeOf` for the reason its own jsdoc gives: these files DOCUMENT the
+    // defect at length on purpose, and a raw-text guard would fail on the
+    // explanation and pressure someone into deleting that instead.
+    expect(codeOf(SOURCE)).not.toContain("response.nextCursor");
   });
 
   it("explains an empty READ with the applied query, falling back to the pending one", () => {
@@ -236,14 +239,41 @@ describe("a dropped cursor removes the control, and does not claim completeness"
   it("keeps the load-more control on `more-available` ALONE", () => {
     // `unreachable` is the arm the drop lands in, and it must not render a page
     // control: the hook answers that click by returning immediately.
+    //
+    // Asserted by COUNTING the guards rather than by slicing a block. An
+    // earlier revision of this test sliced from the `unreachable` guard to an
+    // end anchor that `indexOf` found EARLIER in the file (the constant's own
+    // export, not its use), and `String.slice` with `end < start` returns "" —
+    // so both assertions were vacuously true and a live "Load more" button
+    // planted inside the unreachable block passed the whole suite. The counting
+    // form has no anchors to get wrong.
     expect(SOURCE).toContain('truncation.kind === "more-available"');
     expect(SOURCE).toContain('truncation.kind === "unreachable"');
-    const unreachableBlock = SOURCE.slice(
-      SOURCE.indexOf('truncation.kind === "unreachable"'),
-      SOURCE.indexOf("FLEET_PICKER_DEVICE_ID_INVALID_ID"),
-    );
-    expect(unreachableBlock).not.toContain("FLEET_PICKER_LOAD_MORE_ID");
-    expect(unreachableBlock).not.toContain("loadMore()");
+
+    const code = codeOf(SOURCE);
+    // Exactly one render site for the control, and exactly one handler.
+    expect(code.split("FLEET_PICKER_LOAD_MORE_ID").length - 1).toBe(2); // the export + the one use
+    expect(code.split("void loadMore()").length - 1).toBe(1);
+
+    // …and that one use sits inside the `more-available` guard: every character
+    // between that guard and the control is part of the same JSX block, so the
+    // control cannot have moved under another arm without this span changing.
+    const guard = code.indexOf('truncation.kind === "more-available"');
+    const use = code.indexOf("data-ui-bridge-id={FLEET_PICKER_LOAD_MORE_ID}");
+    expect(guard).toBeGreaterThan(-1);
+    expect(use).toBeGreaterThan(guard);
+    const between = code.slice(guard, use);
+    expect(between.length).toBeGreaterThan(0);
+    // No other truncation arm opens between the two.
+    expect(between).not.toContain('truncation.kind === "unreachable"');
+    expect(between).not.toContain('truncation.kind === "none"');
+  });
+
+  it("does not stack two incompleteness warnings on the stalled path", () => {
+    // A stalled cursor sets BOTH `walkStalled` (whose banner says, in the same
+    // words, that the walk cannot advance — with a Retry) and `unreachable`.
+    // Rendering both puts the same fact on screen twice, one styled as an error.
+    expect(SOURCE).toContain('truncation.kind === "unreachable" && !walkStalled');
   });
 
   it("gives the two strips DISTINCT bridge ids", () => {
@@ -273,10 +303,24 @@ describe("a dropped cursor removes the control, and does not claim completeness"
  * every accumulated page is discarded and re-fetched.
  */
 describe("the restart trigger is the SCOPE, not the callback's identity", () => {
-  it("keys the effect on the scope key rather than on `fetchPage`", () => {
+  it("names the scope explicitly in the restart trigger", () => {
+    // Not because `fetchPage`'s identity is wrong — the two move together — but
+    // so the trigger SAYS what it is. Keying only on a callback's identity makes
+    // the trigger an implicit consequence of that callback's dependency list,
+    // which is exactly how `limit` got in.
     expect(HOOK).toContain("const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });");
-    expect(HOOK).toContain("}, [scopeKey, restartToken]);");
-    expect(HOOK).not.toContain("}, [fetchPage, restartToken]);");
+    expect(HOOK).toContain("}, [fetchPage, scopeKey, restartToken]);");
+    // And it needs no suppression: both are real dependencies of the effect.
+    expect(HOOK).not.toContain("eslint-disable-next-line react-hooks/exhaustive-deps");
+  });
+
+  it("syncs the page-size ref BEFORE the restart effect, in declaration order", () => {
+    // React runs effects in declaration order. Reversed, a commit that changes
+    // the page size and the scope together fetches page one at the OLD size —
+    // silently, and only in that one case.
+    expect(HOOK.indexOf("limitRef.current = limit;")).toBeLessThan(
+      HOOK.indexOf('void fetchPage("restart");'),
+    );
   });
 
   it("keeps `limit` out of the dependency list that restarts the walk", () => {
@@ -314,6 +358,22 @@ describe("a walked list shows when each row was last observed", () => {
 
   it("renders nothing at all when coord served no parseable timestamp", () => {
     // Null is UNKNOWN. A placeholder would look like an answer coord never gave.
-    expect(SOURCE).toContain("if (parts.length === 0) return null;");
+    expect(SOURCE).toContain("if (free.length === 0 && !activity) return null;");
+  });
+
+  it("projects the exact instant for a driver, not only the locale prose", () => {
+    // Same rule as `data-fleet-error-code`: the rendered form is locale- and
+    // clock-dependent and the span is `truncate`d, so it is not a contract.
+    expect(SOURCE).toContain("data-session-activity={activity.iso}");
+    expect(SOURCE).toContain("data-session-activity-kind={activity.verb}");
+  });
+
+  it("keeps the relative label moving while the panel sits open", () => {
+    // Computed during render, and nothing else re-renders the picker between
+    // fetches — without a tick a row reads "heartbeat 2m ago" an hour later,
+    // which is a stale liveness claim in the one place this list must be honest.
+    expect(SOURCE).toContain("setClockTick");
+    expect(SOURCE).toContain("setInterval(() => setClockTick((t) => t + 1), 30_000)");
+    expect(SOURCE).toContain("clearInterval(id)");
   });
 });
