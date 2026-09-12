@@ -120,8 +120,8 @@ const REQUEST_TIMEOUT_MS = 120_000;
 /// batched insert (the qontinui-coord half of this same follow-up — one
 /// `unnest` statement per chunk instead of a thousand round trips), after
 /// which a chunk lands well under a second, the whole suite in seconds, and
-/// this budget never binds. The runner PR carrying this constant is labelled
-/// downstream of that coord PR so it lands after it.
+/// this budget never binds. The runner PR carrying this constant MUST carry
+/// `coord:downstream-of` that coord PR, so it lands after it.
 const DEFAULT_BUDGET_MS = 180_000;
 
 /// The smallest per-request timeout worth starting a chunk with. A chunk

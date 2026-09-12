@@ -430,7 +430,7 @@ function syntheticLog(n) {
 }
 
 /** Serve `POST /coord/test-results/ingest`, answering after `delayMs`. */
-async function slowCoord(delayMs) {
+async function slowCoord(delayMs, { stallBody = false } = {}) {
   let hits = 0;
   // Every pending reply timer, so `close` can cancel them: a reply owed to a
   // client that already aborted would otherwise keep the test process alive
@@ -441,8 +441,19 @@ async function slowCoord(delayMs) {
     let bytes = 0;
     req.on("data", (c) => (bytes += c.length));
     req.on("end", () => {
+      // `stallBody`: send the 200 and the first byte of the body at once,
+      // and hold the rest for `delayMs` — the client is then inside
+      // `res.text()`, not `fetch()`, when its timeout fires.
+      if (stallBody) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write("{");
+      }
       const t = setTimeout(() => {
         timers.delete(t);
+        if (stallBody) {
+          res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }).slice(1));
+          return;
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }));
       }, delayMs);
@@ -492,15 +503,16 @@ function scriptLoopMs(out) {
  * 4,500-test log (5 chunks) and the given budget; the server and temp dir are
  * torn down whatever happens. Resolves `{code, out, hits, loopMs}`.
  */
-async function runBudgetScenario({ delayMs, budgetMs }) {
+async function runBudgetScenario({ delayMs, budgetMs, stallBody = false }) {
   // File setup BEFORE the server is listening, so a throw here leaves
   // nothing open (an open server with no per-file timeout under `node --test`
   // holds the gating step until the job timeout).
   const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
   const logPath = join(dir, "cargo-test-output.log");
   writeFileSync(logPath, syntheticLog(4500));
-  const coord = await slowCoord(delayMs);
+  let coord;
   try {
+    coord = await slowCoord(delayMs, { stallBody });
     const r = await runCli(logPath, {
       COORD_INGEST_TOKEN: "tok",
       COORD_HTTP_URL: coord.url,
@@ -508,7 +520,7 @@ async function runBudgetScenario({ delayMs, budgetMs }) {
     });
     return { ...r, hits: coord.hits(), loopMs: scriptLoopMs(r.out) };
   } finally {
-    await coord.close();
+    await coord?.close();
     // maxRetries: on windows-latest an antivirus handle on the just-written
     // log turns a one-shot rm into an EBUSY flake.
     rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
@@ -555,6 +567,20 @@ test("CLI: the per-request timeout is the remaining budget, so one slow chunk is
   assert.match(r.out, /0\/4500 row\(s\) recorded across 5 chunk\(s\)/);
   assert.match(r.out, /1 of 5 chunk\(s\) failed — 1000 of 4500 row\(s\) were NOT recorded/);
   assert.match(r.out, /4 of 5 chunk\(s\) \(3500 row\(s\)\) were NOT sent/);
+});
+
+test("CLI: an abort that fires while the response BODY is being read is a failure, not an HTTP 200", async () => {
+  // The stand-in sends the 200 and one byte immediately and stalls the rest
+  // for 3 s; with a 1 s budget the client's timeout fires inside
+  // `res.text()`, the path a plain `.catch(() => "")` used to launder into a
+  // success with zero rows recorded server-side and "1000/4500" claimed.
+  const r = await runBudgetScenario({ delayMs: 3_000, budgetMs: 1_000, stallBody: true });
+
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.hits, 1, r.out);
+  assert.match(r.out, /ABORTED by the client after \d+ms \(timeout 1000ms\)/);
+  assert.match(r.out, /0\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.doesNotMatch(r.out, /chunk 1\/5 \(1000 rows\) -> HTTP 200/);
 });
 
 test("CLI: within budget every chunk is sent and no budget error is emitted", async () => {
