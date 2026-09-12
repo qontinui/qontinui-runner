@@ -13718,7 +13718,8 @@ mod coord_provision_session_gate_tests {
         for posture in answering {
             let v = credential_doors_health_with_posture(true, Some(posture));
             assert_eq!(
-                v["coordMcpForwarder"]["canAnswer"], true,
+                v["coordMcpForwarder"]["canAnswer"],
+                true,
                 "{} must advertise the forwarder",
                 posture.as_str()
             );
@@ -13734,7 +13735,8 @@ mod coord_provision_session_gate_tests {
         for posture in dark {
             let v = credential_doors_health_with_posture(true, Some(posture));
             assert_eq!(
-                v["coordMcpForwarder"]["canAnswer"], false,
+                v["coordMcpForwarder"]["canAnswer"],
+                false,
                 "{} must NOT advertise the forwarder",
                 posture.as_str()
             );
