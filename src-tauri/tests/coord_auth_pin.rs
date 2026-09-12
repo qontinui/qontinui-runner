@@ -847,7 +847,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("mcp/plan_library.rs", "work-owed", 5),
     ("mcp/probe_executor.rs", "device", 1),
     ("repo_tenant.rs", "device", 1),
-    ("plan_workunit_adapter/body_push.rs", "work-owed", 2),
+    ("plan_workunit_adapter/body_push.rs", "work-owed", 3),
     ("session/handoff.rs", "escalated", 1),
 ];
 
@@ -926,7 +926,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// session-less, artifact-keyed posture and the same E3 open question. So
 /// `work-owed` 17 -> 19.
 ///
-/// Phase 6 then removed 10 the same way: every `work-owed` site that talks to
+/// Phase 6 then removed 11 the same way: every `work-owed` site that talks to
 /// COORD now resolves its tenant from the artifact's repo and states it via
 /// `attach_device_auth_for` — `plan_workunit_adapter/push.rs` (5),
 /// `install_effects_producer/coord_client.rs` (2), `agent_worktree/fs_backstop.rs`,
@@ -934,7 +934,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// call. It also ADDED one `device` site: the canonical-repo READ that backs the
 /// whole resolution (`repo_tenant::fetch_registered_repos`), which cannot itself
 /// be tenant-scoped without circularity. So `device` 22 -> 23 and `work-owed`
-/// 19 -> 9. The `work-owed` sites that remain post to **qontinui-web**, which
+/// 19 -> 8, leaving 23 + 10 + 8 + 2 = 43. The `work-owed` sites that remain post to **qontinui-web**, which
 /// derives `organization_id` from the authenticated principal — lowering them
 /// waits on escalation E3, not on another credential-threading phase. (The two
 /// Phase-5 `mcp/plan_library.rs` forwards are among those that remain: they are
@@ -943,7 +943,7 @@ const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 23),
     ("session-noop", 10),
     ("session-owed", 0),
-    ("work-owed", 9),
+    ("work-owed", 8),
     ("escalated", 2),
 ];
 
@@ -1102,8 +1102,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 44,
-        "expected 44 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 43,
+        "expected 43 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1135,9 +1135,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          2026-09-20-a-recorded-delivery-scope-is-permanent-so-a-mis-declared-phase-is-uncorrectable \
          then added mcp/plan_library.rs's upstream_put and upstream_delete (both work-owed, the \
          two new edge-correction/retraction forwards sharing upstream_post's qontinui-web base \
-         and session-less, artifact-keyed posture); 51 to 53. Phase 6 then moved the 10 \
-         work-scoped COORD sites onto the stating seam and added one `device` read \
-         (repo_tenant's canonical-repo fetch): 53 - 10 + 1 = 44. Found {sites}. A change here \
+         and session-less, artifact-keyed posture); 51 to 53. Phase 6 then moved the 11 \
+         work-scoped COORD sites onto the stating seam (push.rs 6, repo_detection.rs, \
+         git_supervision/commit_forwarder.rs, install_effects_producer/coord_client.rs 2, \
+         agent_worktree/fs_backstop.rs) and added one `device` read (repo_tenant's \
+         canonical-repo fetch): 53 - 11 + 1 = 43. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
