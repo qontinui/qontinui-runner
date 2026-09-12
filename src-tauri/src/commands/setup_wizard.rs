@@ -348,7 +348,14 @@ const CONNECT_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(15
 /// spending the nonce on a claim coord is about to refuse as expired.
 const CONNECT_STATE_EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// A repeat click reuses the pending token only when at least this much of
+/// its life is left — a flow needs a human to sign in and install the App,
+/// and re-arming with a token about to expire would fail exactly the late
+/// retry the reuse is meant to help.
+const CONNECT_STATE_REUSE_FLOOR: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// A coord connect-state token together with the deadline it is good until.
+#[derive(Clone)]
 struct ConnectStateToken {
     /// Sent on the claim. Never leaves process memory until then; never logged.
     token: String,
@@ -360,6 +367,13 @@ struct ConnectStateToken {
 impl ConnectStateToken {
     fn expired(&self) -> bool {
         std::time::Instant::now() >= self.expires_at
+    }
+
+    /// Enough life left for a fresh browser flow to finish on it.
+    fn reusable(&self) -> bool {
+        self.expires_at
+            .checked_duration_since(std::time::Instant::now())
+            .is_some_and(|left| left >= CONNECT_STATE_REUSE_FLOOR)
     }
 }
 
@@ -378,21 +392,31 @@ struct PendingConnect {
 static PENDING_CONNECT_STATE: std::sync::Mutex<Option<PendingConnect>> =
     std::sync::Mutex::new(None);
 
-/// The pending flow's token when it is still good, for a repeat Connect click
-/// to re-arm with instead of minting another coord row. Safe to reuse: coord
-/// consumes a token on the matching claim only, and a replaced nonce can never
-/// match, so the carried-over token is still presented at most once.
+/// The pending flow's token when it still has [`CONNECT_STATE_REUSE_FLOOR`]
+/// of life, for a repeat Connect click to re-arm with instead of minting
+/// another coord row. Safe to reuse: coord consumes a token on the matching
+/// claim only, and a replaced nonce can never match, so the carried-over token
+/// is still presented at most once. The token is bound server-side to the
+/// account that minted it, which is why a sign-out clears the slot
+/// ([`clear_pending_connect`]) rather than letting the next account reuse it.
 fn reusable_connect_state() -> Option<ConnectStateToken> {
     let slot = PENDING_CONNECT_STATE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     slot.as_ref()
         .map(|p| &p.connect_state)
-        .filter(|t| !t.expired())
-        .map(|t| ConnectStateToken {
-            token: t.token.clone(),
-            expires_at: t.expires_at,
-        })
+        .filter(|t| t.reusable())
+        .cloned()
+}
+
+/// Drop any pending connect flow. Called on sign-out: the token was minted
+/// under the account that is leaving, and coord asserts the minting operator
+/// and tenant against the claiming caller, so a later account must not
+/// inherit it.
+pub(crate) fn clear_pending_connect() {
+    *PENDING_CONNECT_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Mint a fresh connect nonce (256-bit hex from the OS CSPRNG) and arm the
@@ -1705,6 +1729,25 @@ mod tests {
         );
         // Consumed → nothing to reuse.
         assert!(reusable_connect_state().is_none());
+
+        // A token under the reuse floor is still claimable but is NOT carried
+        // over — the repeat click mints instead of re-arming a dying token.
+        let dying = arm_pending_connect(ConnectStateToken {
+            token: "token-dying".to_string(),
+            expires_at: std::time::Instant::now() + CONNECT_STATE_REUSE_FLOOR / 2,
+        });
+        assert!(reusable_connect_state().is_none());
+        assert_eq!(
+            take_connect_state_if_valid(&dying).as_deref(),
+            Ok("token-dying")
+        );
+
+        // Sign-out drops the pending flow outright.
+        let orphaned = arm_pending_connect(fresh_token("token-orphaned"));
+        clear_pending_connect();
+        assert!(reusable_connect_state().is_none());
+        let err = take_connect_state_if_valid(&orphaned).unwrap_err();
+        assert!(err.contains("no pending"), "unexpected error: {err}");
 
         // Expired slot → rejected and cleared. (Backdate the deadline; skip
         // silently if the platform clock can't represent the subtraction.)
