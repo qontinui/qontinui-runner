@@ -1214,6 +1214,12 @@ async fn finalize_signed_in(
             error!("finalize_signed_in: step 2 (store_oauth_tokens_fresh) failed: {e}");
             AppError::Raw(format!("persist Cognito tokens: {e}"))
         })?;
+    // The identity just changed: a pending GitHub connect (setup-wizard clone
+    // picker) minted its coord connect-state under the previous account, and
+    // coord asserts that account on the claim, so the new one must not reuse
+    // it. This is the identity-WRITE point, so it covers every sign-in path;
+    // the two full sign-out paths clear as well.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     // 3. Device identity from disk. Mint it first if a fresh install never
     //    ran `device init` (startup already does this, but sign-in self-heals
