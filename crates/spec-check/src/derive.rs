@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn role_for_input_uses_element_type() {
         let cases = [
-            ("input", "textbox"),     // plain text input
+            ("input", "textbox"), // plain text input
             ("email", "textbox"),
             ("password", "textbox"),
             ("search", "searchbox"),
@@ -305,16 +305,7 @@ mod tests {
     #[test]
     fn role_falls_back_to_element_type_when_tag_is_generic() {
         // `<div role="...">` style — generic tag, but element_type is semantic.
-        let e = el(
-            "heading",
-            Some("div"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        );
+        let e = el("heading", Some("div"), None, None, None, None, None, None);
         assert_eq!(role(&e).as_deref(), Some("heading"));
     }
 
@@ -334,7 +325,7 @@ mod tests {
             None,
             None,
             Some("Submit form"),
-            Some("Submit"),       // label loses to accessible_name
+            Some("Submit"), // label loses to accessible_name
             None,
             Some("Submit form"),
         );
@@ -462,7 +453,16 @@ mod tests {
     fn whitespace_only_strings_are_treated_as_absent() {
         // role: "   " should NOT short-circuit; we should fall through to
         // the tag-derived role.
-        let e = el("heading", Some("h1"), Some("   "), None, None, None, None, None);
+        let e = el(
+            "heading",
+            Some("h1"),
+            Some("   "),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(role(&e).as_deref(), Some("heading"));
     }
 }
