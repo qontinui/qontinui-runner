@@ -445,8 +445,11 @@ against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Three of the fourteen call sites return BEFORE that
-guard is consulted at all and the rest are reached after it; either way none
+our own `coord-mcp` config. Ten of the fourteen call sites return BEFORE that
+guard is consulted at all -- seven in `apply_probe_verdict`, one in
+`provision_coord_mcp_for_session`, one early-returning at
+`provision_coord_mcp_with_jwt`'s bearer check, and one in
+`agent_runtime.rs` -- and the remaining four are reached after it; either way none
 deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
