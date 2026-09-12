@@ -12698,17 +12698,19 @@ mod coord_mcp_body_gate_tests {
     /// result with no tools key — advertises nothing, so there is nothing to
     /// withhold and the upstream bytes go out byte-identically.
     #[test]
-    fn filter_leaves_shapeless_responses_unchanged() {
+    fn filter_forwards_shapeless_responses_untouched_but_not_as_observed_clean() {
         for resp in [
             br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#.as_slice(),
         ] {
+            // Forwarded untouched, and typed apart from `Unchanged`: nothing was
+            // inspected, so nothing may be recorded as an observed-clean list.
             assert!(
                 matches!(
                     coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp),
-                    CoordMcpToolsListFilter::Unchanged
+                    CoordMcpToolsListFilter::NoToolsArray
                 ),
-                "a response advertising no tools must forward untouched"
+                "a response advertising no tools array must forward untouched as NoToolsArray"
             );
         }
     }
