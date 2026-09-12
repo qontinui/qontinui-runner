@@ -1,5 +1,5 @@
 ---
-description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), the generic remote MCP door (POST /mcp, device JWT), or the device-authed HTTP agent routes, with the qontinui-dev-notes policy mirrors as a disclosed last resort (and `mirrors` to report their drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
+description: One transport-agnostic read-only door to list or fetch coord prompt documents (the fleet policies) — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), the generic remote MCP door (POST /mcp, device JWT), or the device-authed HTTP agent routes, with the local steering cache as the last rung for the six intent kinds and the qontinui-dev-notes policy mirrors as the last rung for `policy` (both disclosed; `mirrors` reports the mirrors' drift) — so you never touch ports, nonces, or proxies. Use it whenever coord_list_prompt_documents is not a visible tool.
 argument-hint: "list | get <kind> <name> | mirrors"
 allowed-tools: Read, Bash, PowerShell, Glob, Grep, ToolSearch
 ---
@@ -36,7 +36,10 @@ handler, never from an argument**.
   include `policy`, `agent_playbook`, `continuation_rules`, `prompt_template`,
   `response_prompt`). **Default when no sub-verb is given.**
 - `get <kind> <name>` — fetch one document's body, e.g.
-  `/policy get policy escalation-bar`.
+  `/policy get policy escalation-bar`, or `/policy get domain_spec
+  coord-merge-train` for one of the six **intent** kinds (`product_intent`,
+  `initiative`, `success_metric`, `domain_spec`, `audience_profile`,
+  `decision_record`).
 - `mirrors` — **diagnostic only.** Compare every rung-5 mirror's version stamp
   against the served `current_version` and print the drift table (Step 5).
   Requires a reachable coord transport; answers "should these files be
@@ -53,9 +56,11 @@ rules" below).
 - **No caching to disk.** Policies version frequently (`coordination` reached
   v9 within days); a cached copy drifts and reintroduces the stale-source
   problem the fleet already retired a SessionStart hook to avoid. Reading the
-  Step-4 mirrors is **not** caching — this skill writes nothing, and every
+  LAST-RESORT mirrors (Step 5) is **not** caching — this skill writes nothing, and every
   mirror it serves carries its own version stamp plus an explicit statement
-  that the stamp could not be verified.
+  that the stamp could not be verified. The same holds for the steering cache
+  (Step 4c): a separate renderer writes it, this door only reads it, and every
+  answer served from it quotes the cache's own Rendered stamp.
   > *Corrected 2026-08-06.* This bullet used to say the mirrors "are maintained
   > elsewhere." **There is no elsewhere** — nothing maintains them, and 6 of 14
   > were behind the served store six days after a full hand regeneration. The
@@ -209,12 +214,25 @@ if command -v jq >/dev/null 2>&1; then
   mcp_key() { jq -r '(.mcpServers["coord-mcp"].headers // {}) as $h | if (($h.Authorization // "") | tostring) != "" then $h.Authorization else ($h["X-Coord-Mcp-Proxy-Key"] // "") end' < "$MCP_CFG" 2>/dev/null; }
   mcp_keyhdr() { jq -r 'if (((.mcpServers["coord-mcp"].headers.Authorization // "") | tostring) != "") then "Authorization" else "X-Coord-Mcp-Proxy-Key" end' < "$MCP_CFG" 2>/dev/null; }
 elif command -v python >/dev/null 2>&1; then
-  # The FILE PATH on argv is fine — it is not key material. The KEY still never
-  # reaches any argv: it is returned on stdout into a shell variable, exactly as
-  # the jq arm does. Same no-positionals rule as the jq arm: `$MCP_CFG`, never `$N`.
-  mcp_url() { python -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8')).get('mcpServers',{}).get('coord-mcp',{}).get('url',''))" "$MCP_CFG" 2>/dev/null; }
-  mcp_key() { python -c "import json,sys;h=json.load(open(sys.argv[1],encoding='utf-8')).get('mcpServers',{}).get('coord-mcp',{}).get('headers',{});print(h.get('Authorization') or h.get('X-Coord-Mcp-Proxy-Key','') or '')" "$MCP_CFG" 2>/dev/null; }
-  mcp_keyhdr() { python -c "import json,sys;h=json.load(open(sys.argv[1],encoding='utf-8')).get('mcpServers',{}).get('coord-mcp',{}).get('headers',{});print('Authorization' if h.get('Authorization') else 'X-Coord-Mcp-Proxy-Key')" "$MCP_CFG" 2>/dev/null; }
+  # BOTH the path and the key stay off argv, and for TWO different reasons.
+  # The KEY is credential material: it is returned on stdout into a shell
+  # variable, exactly as the jq arm does. The PATH is fed on STDIN because a
+  # NATIVE python.exe cannot open a POSIX path under an inherited
+  # MSYS_NO_PATHCONV=1 / MSYS2_ARG_CONV_EXCL='*' — the identical hazard the jq
+  # arm below the loop is hardened against, and the identical failure: every
+  # candidate reads EMPTY, every one is skipped, and the sweep reports "no live
+  # proxy" over a workspace full of live doors. Until 2026-09-06 this comment
+  # said the path on argv "is fine — it is not key material", which answers the
+  # security question and silently waves through the path-conversion one; on the
+  # Windows operator box, where jq is ABSENT, this arm is the ONLY arm, so the
+  # defect sat on the live path. Measured that day: the sweep reported no live
+  # proxy while http://127.0.0.1:9876/coord-mcp answered tools/list 200.
+  # coord-revive.sh — the canonical resolver — already feeds BOTH arms on stdin
+  # for this reason; this arm is now consistent with it.
+  # Same no-positionals rule as the jq arm: `$MCP_CFG`, never `$N`.
+  mcp_url() { python -c "import json,sys;print(json.load(sys.stdin).get('mcpServers',{}).get('coord-mcp',{}).get('url',''))" < "$MCP_CFG" 2>/dev/null; }
+  mcp_key() { python -c "import json,sys;h=json.load(sys.stdin).get('mcpServers',{}).get('coord-mcp',{}).get('headers',{});print(h.get('Authorization') or h.get('X-Coord-Mcp-Proxy-Key','') or '')" < "$MCP_CFG" 2>/dev/null; }
+  mcp_keyhdr() { python -c "import json,sys;h=json.load(sys.stdin).get('mcpServers',{}).get('coord-mcp',{}).get('headers',{});print('Authorization' if h.get('Authorization') else 'X-Coord-Mcp-Proxy-Key')" < "$MCP_CFG" 2>/dev/null; }
 else
   echo "neither jq nor python can read .mcp.json — cannot probe any proxy candidate (LOCAL fault, not a coord verdict)" >&2
   exit 1
@@ -256,6 +274,17 @@ done
 (`$LIVE_KEY`, `$HDR`, the `EXIT` trap); the Bash tool does not persist state
 between calls, so splitting them mid-block leaves an empty variable and a
 tempfile the previous call's trap already deleted.
+
+> **A uniform failure across every candidate is the expected shape of ONE flaky
+> probe, not corroboration.** These candidates usually name the SAME door — one
+> `.mcp.json` per session workdir, all pointing at the local runner — so "all N
+> timed out" is frequently N attempts at a single endpoint on a loaded box, not N
+> independent verdicts. A curl exit 28 says nothing about the door; it says this
+> box got no answer inside the budget. Before reporting no live proxy: **re-run
+> the sweep once** (`coord-revive.sh`'s `probe_door()` now retries a `TIMEOUT`
+> exactly once after `sleep 3`, and dedups candidates to distinct `(url, auth)`
+> pairs so the count it prints is doors, not files). A live door has been
+> reported DEAD this way — finding `4e8bcd86`.
 
 If a live proxy is found, read via raw JSON-RPC `tools/call` against it. The
 proxy carries MCP JSON-RPC only, so use the **MCP tools** here:
@@ -351,7 +380,18 @@ printf 'Authorization: Bearer %s\n' "$DEVICE_JWT" > "$AUTH"
 AUTHP=$AUTH; command -v cygpath >/dev/null 2>&1 && AUTHP=$(cygpath -w "$AUTH")
 # 3) PROBE first — this rung's own validation. A 200 whose body carries no
 #    JSON-RPC `result` is NOT a live door; treat it as dead and fall to Step 4.
-curl -fsS -X POST "$COORD_HTTP_URL/mcp" -H "Content-Type: application/json" \
+# BUDGET. `--connect-timeout 5 -m 15` — the same pair `coord-revive.sh` spends
+# on this EXACT call (`PROBE_CONNECT_TIMEOUT` / `PROBE_TIMEOUT`, whose comment
+# names "the L3/L4 bearer probes against ${COORD_URL}/mcp" as what the 15s
+# covers). A probe is the one call in a cascade that must not be allowed to
+# hang: this rung is REMOTE, so unlike the Step-2 loopback sweep a black-holed
+# host can stall it indefinitely, and it is the last live rung — a hang here
+# costs the caller the honest-failure report it was owed. The action calls
+# below carry no bound on purpose: once the probe has said the door is live, a
+# slow write is still a write, and killing one at 15s would leave a coord-side
+# effect nobody read back.
+curl -fsS --connect-timeout 5 -m 15 -X POST "$COORD_HTTP_URL/mcp" \
+  -H "Content-Type: application/json" \
   -H @"$AUTHP" -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 # list:
 curl -fsS -X POST "$COORD_HTTP_URL/mcp" -H "Content-Type: application/json" \
@@ -390,7 +430,13 @@ is a **pass** — it proves the deployment is up and routing `/coord/…`, so a
 deployment predates it. Only a curl that fails to **connect** leaves the
 deployment in question, and then the verdict is **UNKNOWN**, never "coord is
 down". Whatever you conclude, name both probes in the rung-3 line of your
-report — and never let a rung-3 failure be reported as a policy answer.
+report — and never let a rung-3 failure be reported as a policy answer. The
+stamped form of that line is `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim`:
+it runs this same probe as one door of its cascade and prints a `FLOOR-CLAIM:`
+block (probe time, runner build, this box's load, one line per door) — paste
+that block; a `verdict=UNKNOWN` there (sampled under own load) means the
+rung-3 line is UNKNOWN, and "coord is down" is written from a `verdict=FLOOR`
+block or not at all.
 
 ### Step 4 — Direct device-authed HTTP, hand-written routes (probe: the GET itself)
 
@@ -453,10 +499,201 @@ the inventory grows, and a quoted count is the same stale-source defect Step 5
 now refuses to commit.) Tenant always derives server-side from the JWT — never
 pass a tenant argument.
 
+#### Step 4b — the bootstrap credential: LIVE on this tenant (re-measured 2026-09-10)
+
+**This rung works. Try it before falling through to the mirrors.** Measured
+against production coord on 2026-09-04 from `merytshost` and **re-measured
+2026-09-10**: the anonymous `POST $COORD_HTTP_URL/agents/credential` answered
+**`200`** with `{token, token_exp, token_jti}`, and that bearer read
+`GET $COORD_HTTP_URL/coord/agent-prompt-documents` and one policy document at
+`200` each — the same two routes answering **`401` without it** — i.e. it
+carries a `/policy` read end to end, and the mint is a real authentication
+rather than a string that happens to be accepted.
+
+**The route is in coord's source, so this is not probe-only.**
+`pub async fn post_credential` (`crates/coord/src/agent_worktrees.rs`) is
+registered at `/agents/credential` in `crates/coord/src/routes.rs` on
+`qontinui-coord` `origin/main`, commit **`5dd99cc3`** (PR #1850, ff-landed).
+Cite the commit for *existence* and a dated probe for *reachability* — they go
+stale at different rates, and collapsing them is what produced the error below.
+
+> ⚠️ Until 2026-09-04 this section said the rung "cannot currently succeed on
+> any deployment". That was measured wrong, and it sent sessions to a
+> drift-unverifiable mirror while a live door was open. **Re-probe before
+> quoting any status here** — including this one.
+
+**The problem it is shaped for is real.** The rungs above are less independent
+than the numbering suggests: Step 2 *is* the runner, and every mint in the
+Step-3/Step-4 credential cascade except the two static files is minted *by* the
+runner. One wedged runner takes all of them down at once, and the static files
+hold a **~4h** device JWT, so they are expired far more often than not. Measured
+2026-08-28: a closeout on such a box walked the whole cascade and reached only
+the file mirrors — which answered, and are **read-only and drift-unverifiable**.
+For a READ door that is the whole cost: a mirror whose drift is UNKNOWN instead
+of a live policy body. Plan
+`2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`.
+
+**The shape:** resolve a `device_id`
+(`$QONTINUI_MACHINE_ID` first, else `~/.qontinui/machine.json` `"device_id"`,
+falling back to the legacy `"machine_id"`) and POST it **anonymously** to
+`$COORD_HTTP_URL/agents/credential` — a dedicated credential-only route, which is
+the `pair.rs::pair_via_browser` carve-out shape (anonymous *because it mints the
+credential, so requiring one is circular*). It answers `200` with a `token`
+field: an EdDSA JWT, `sub=device:<device_id>`, `sub_type=agent`, tenant
+resolved, all scopes empty, ~4h TTL.
+
+**If it does NOT answer `200`, say which code you saw.** A `404`/`405` is a
+router artefact — `POST /agents/definitely-not-a-route` returns the identical
+empty `405` (2026-09-02, re-confirmed 2026-09-04), so "route absent" is spelled
+405 here rather than 404 — but since the route answered `200` on 2026-09-04, a
+`405` from it now reads as a regression or a different deployment, not as a
+known-absent rung. Then fall through to Step 5 with its full staleness
+disclosure.
+
+> ⚠️ **A failing route does NOT license `POST /agents/allocate` as a substitute.**
+> Step 3's prohibition above is unqualified and three shipped documents carry it.
+> The gate this paragraph used to cite as live authority — coord gate
+> **`ece99898-30c6-4f8c-be8e-1de5f09abebc`** (`operator_approval`, `gate_class:
+> security-surface`) — is **`withdrawn`**; re-verify with `coord_gate_inspect`
+> before citing it here or anywhere. Read over the live coord door 2026-09-06,
+> the withdrawal reads *"over-broad and superseded by gate
+> `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5`"* — inspect that gate too
+> (`coord_gate_inspect`): it is open, but anchored to a **different arm**, the
+> `agent_tool_access` uncurated-catalog fallback, not the allocate mint.
+> **So the allocate question is UNKNOWN — neither still-gated nor cleared.**
+> Whether it was among the four arms the withdrawal called "not the operator's to
+> decide", or is simply unasked, is settled by neither read — and **UNKNOWN is
+> not permission**. The prohibition therefore stands exactly as written: the
+> honest outcome of this rung is **fall through to Step 5 with its full staleness
+> disclosure** — never a token from `/agents/allocate`.
+> (This paragraph said "currently **open**" until 2026-09-06. A withdrawn gate
+> reads identically to an open one in prose, which is precisely why the pointer
+> above is mandatory and this sentence is not a substitute for asking.)
+
+Three things stay true of this rung now that it is reachable, and they
+are `/policy`-specific:
+
+- **The scope fence is a property of `/policy`, not of any transport.** The
+  Non-goals at the top of this file are unchanged: this rung fetches exactly
+  the two prompt-document reads and nothing else. A credential obtained as a last
+  resort is the *worst* one to widen scope with, regardless of how narrow its
+  claims are (measured 2026-09-04: every scope in the minted token was empty or
+  false — the fence is a rule about what `/policy` does, not a hope about what
+  the bearer can reach).
+- **Verify before you read, and say what the verification covered.** The control
+  read is `GET $COORD_HTTP_URL/coord/agent-findings?limit=1` — `200` with a good
+  bearer, `401 {"error":"missing Bearer token"}` without one, both verified live
+  2026-09-02. A mint is not an authentication, and a false green here is worse
+  than a mirror: it would serve a failed read as a policy answer. What that
+  control read does **not** by itself prove is **tenant resolution** — the
+  agent-prompt-document routes need a JWT whose tenant coord can resolve. On
+  2026-09-04 the bootstrap bearer resolved tenant fine (both
+  `/coord/agent-prompt-documents` and one policy document answered `200`), but
+  that is those routes' evidence on that day, not a guarantee: a
+  `403 cannot resolve the caller's tenant` remains **that route's own verdict**,
+  not a refutation of the credential. On that 403, fall to Step 5 **with its full
+  staleness disclosure** — never report a 403 as "no policy found".
+- **Say which rung carried the read, as always.** When this rung carries
+  one, the transport line is `HTTP agent door (bootstrap credential)`, never a
+  bare `HTTP agent door`: a reader weighing a policy answer is entitled to know it
+  came from the rung of last resort.
+
+**Record that you got this far.** Reaching Step 4b means every ordinary door
+failed, and nothing counts how often that happens — the supervisor already
+*detects* the underlying wedge (`health_cache.rs` step 3e, `RUNNER WEDGED: …`
+every ~5 min, refusing to auto-restart by contract), so the gap is aggregation,
+not detection. Append one record to the guard component's existing local
+breadcrumb. It is local on purpose: a counter that had to reach coord would be
+missing in exactly the outage it measures. **The count is the point whatever the
+rung returns** — a rising `l5-reached` rate is the fleet's only
+view of how often a session is driven this far.
+
+```bash
+. "$ROOT/qontinui-claude-config/scripts/lib/guard-decision-log.sh" 2>/dev/null \
+  && guard_decide policy warn l5-reached
+```
+
+### Step 4c — the six INTENT kinds only: the local steering cache (disclosed, never silent)
+
+The mirrors in Step 5 cover kind `policy` **exclusively** — a rung-5 `get` for
+any other kind is reported unavailable. So until this rung existed, the six
+**intent** kinds (`product_intent`, `initiative`, `success_metric`,
+`domain_spec`, `audience_profile`, `decision_record`) had **no** last rung at
+all: a session with every live door dead could not read what the tenant is
+building, only how it must behave. Plan
+`2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1f adds the
+local **steering cache** — rendered detached at every SessionStart by
+`.claude/hooks/render-steering-cache.sh` → `scripts/render-steering-cache.ps1`,
+in `$QONTINUI_STEERING_CACHE_DIR` (default `C:/claude/steering-cache`) — and
+this rung reads it. **For the six intent kinds only.** A `get` for `policy` or
+any other kind skips this rung and falls to Step 5 unchanged.
+
+Only when rungs 1–4 **all** fail, Step 4b included. Same doctrine as Step 5:
+a cache is as old as its Rendered stamp, **stale or absent is UNKNOWN, never
+empty**, and every answer served from here says so:
+
+```bash
+STEERING="${QONTINUI_STEERING_CACHE_DIR:-C:/claude/steering-cache}"
+# Absent is a rung-4c FAILURE, not an empty corpus. Say which.
+if [ ! -f "$STEERING/STEERING-CACHE.json" ]; then
+  echo "rung 4c UNAVAILABLE: no steering cache at $STEERING (never rendered on this box, or a different QONTINUI_STEERING_CACHE_DIR) - UNKNOWN, not 'no intent documents'" >&2
+else
+  # Provenance FIRST. rendered_at is the last SUCCESSFUL render; the sidecar's
+  # render_exit_reason says what the LAST ATTEMPT did, which may be a failure
+  # that left this stamp where it was.
+  python -c "import json,sys;d=json.load(sys.stdin);print('STEERING CACHE (rung 4c) rendered',d['rendered_at'],'UTC over',d['transport'])" < "$STEERING/STEERING-CACHE.json"
+  python -c "import json,sys;d=json.load(sys.stdin);print('  last attempt',d.get('last_attempt_at'),'->',d.get('render_exit_reason'))" < "$STEERING/STEERING-CACHE.state.json" 2>/dev/null || echo "  (no readable sidecar - the last attempt's outcome is UNKNOWN)"
+  echo "  DRIFT: UNKNOWN - no live door answered, so nothing here can be compared to served."
+  # A drift verdict is only as wide as the doors that were ASKED, so name them
+  # beside it. Without this line "no live door answered" reads as "the doors are
+  # down", when what actually happened is that ONE host was asked: rungs 1-4b are
+  # coord.qontinui.io plus loopback, and this cache rung probes no host at all.
+  # api.qontinui.io is a different program on a different host (measured
+  # 2026-09-06: 401 anonymous, 200 with a user_id-bearing device JWT), so unless
+  # you asked it, it is UNPROBED - not down. Edit the roster to what you ran.
+  echo "  axes: hosts=coord.qontinui.io prefixes=/coord/agent-* credentials=proxy-nonce,device-jwt unprobed=api.qontinui.io"
+  # list: the six kinds with the SKELETON flag AS RENDERED. Read the flag: a
+  # SKELETON row is the unedited seed - UNKNOWN, not intent - and UNKNOWN means
+  # the served row carried neither field, which is NOT `authored`.
+  python -c "import json,sys;d=json.load(sys.stdin);[print(f\"{x['kind']:18} {x['name']:40} v{x['current_version']} {x['skeleton']}\") for x in d['documents']]" < "$STEERING/STEERING-CACHE.json"  # envelope-ok: the local steering-cache render written by render-steering-cache.ps1, not a fleet door response
+  # get one: KIND and NAME are shell variables you set - never a positional,
+  # which in a slash-command body is a harness placeholder.
+  BODY=$(python -c "import json,sys;d=json.load(sys.stdin);print(next((x['body_file'] or '' for x in d['documents'] if x['kind']==sys.argv[1] and x['name']==sys.argv[2]),''))" "$KIND" "$NAME" < "$STEERING/STEERING-CACHE.json")  # envelope-ok: the local steering-cache render written by render-steering-cache.ps1, not a fleet door response
+  if [ -z "$BODY" ]; then
+    echo "$KIND/$NAME: NOT in the steering cache rendered $(python -c "import json,sys;print(json.load(sys.stdin)['rendered_at'])" < "$STEERING/STEERING-CACHE.json") - UNKNOWN, not absent (the render may predate it, or its body read failed that run)" >&2
+  else
+    cat "$STEERING/$BODY"
+  fi
+fi
+```
+
+Rules for this rung, in addition to Step 5's:
+
+- **Quote the Rendered stamp on every answer**, and the transport line reads
+  `steering cache (rendered <stamp>)` — never a bare "HTTP agent door".
+- **The `skeleton` flag is served as rendered, never recomputed here.** It was
+  resolved from the served row at render time — coord's `unedited_seed` verdict
+  where that build served one, else the term-by-term fallback, which leaves
+  `UNKNOWN` only for a SEEDED row past version 1; a cached `authored` says the
+  row was authored *then*.
+  `/chart` still refuses cached input for its Step 1.2 filter — a
+  ranking against a stale skeleton flag is the confident-wrong shape — so this
+  rung feeds a **read**, not a ranking.
+- **Dossier heads are in the same cache** (`dossiers/<slug>.md`, resolved by
+  client-side title prefix; `STEERING-CACHE.json` says `dossiers_refreshed` and
+  `dossier_hits_at_cap`). They are outside `/policy`'s two verbs; read them
+  with `coord-read.ps1 steering dossier <slug>`, which serves the same cache
+  labelled.
+- **A dead proxy binding is not this rung's case.** A coord-mcp that answers
+  `401` over a healthy transport wants `/coord-revive`; reaching for a cache
+  there serves stale intent over a live door. Earn "no live door" with the
+  unauthenticated `curl` Step 5 prescribes before you serve from here.
+
 ### Step 5 — LAST RESORT: the file mirrors (disclosed, never silent)
 
-Only when rungs 1–4 **all** fail (no coord transport reachable at all), read
-the mirrors at
+Only when rungs 1–4 **all** fail — **Step 4b included**, since a live read beats
+an unverifiable mirror and 4b is the one rung a dead runner cannot take down —
+and, for the six intent kinds, after Step 4c — read the mirrors at
 `$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0/*.md` (derive `$ROOT`
 exactly as the Step-2 block does). This rung is not an invention:
 `policy/session-protocol` blesses exactly this fallback — with a **mandatory
@@ -529,18 +766,20 @@ rung-5 response**, not once at the top:
 - The mirror set covers **kind `policy` exclusively** — mirrors are keyed by
   name only, so a rung-5 `get` for any OTHER kind (`agent_playbook`,
   `continuation_rules`, `prompt_template`, `response_prompt`) is reported
-  unavailable by kind+name, never served from a same-named policy mirror.
+  unavailable by kind+name, never served from a same-named policy mirror. The
+  six intent kinds have their own last rung, Step 4c, and never reach here.
 - `list` from mirrors = the filenames present **counted at read time**, labelled
   as the mirror set, not the live inventory.
 - **Say which COMMIT the mirrors came from, not just which version they claim.**
-  This rung reads a shared checkout, so there are two staleness axes:
-  mirror-vs-served (the stamp) and **checkout-vs-origin** (nothing used to
-  report it). Prefer `origin/main`'s blob and print the checkout's distance. A
+  This rung reads a shared checkout, so there are two independent staleness
+  axes: mirror-vs-served (what the stamp is about) and **checkout-vs-origin**
+  (what nothing used to report). Prefer `origin/main`'s blob and print the
+  checkout's distance; when only the worktree is readable, say so loudly. A
   correctly-stamped mirror on a branch 466 commits behind is still superseded
-  policy and looks identical to a current one.
-- **Never report a worktree comparison as fleet drift.** It measures your
-  checkout, not the fleet — measured 2026-08-31, a worktree read gave 13-of-14
-  BEHIND while `origin/main` gave 13-of-14 CURRENT, same box, minutes apart.
+  policy, and it looks identical to a current one.
+- **Never report a worktree comparison as fleet drift.** If you compare mirrors
+  to served from a checkout that is behind `origin/main`, you are measuring your
+  own checkout, not the fleet. Three sessions have now made exactly that claim.
 - **"No coord transport is reachable" is a CAUSE — earn it with one `curl`
   before you serve a mirror on it.** Rungs 1–4 failing is a *measurement* about
   this session's doors: a masked tool, a dead nonce, an unmintable JWT. Reaching
@@ -556,6 +795,41 @@ rung-5 response**, not once at the top:
   not run — leaves it **UNKNOWN**, which is still not "coord is down". Print the
   probe's own result beside the drift-UNKNOWN line: this rung's whole contract
   is that the reader is never left to infer what was not checked.
+- **That probe is the WEAK instance — it shares a host with the thing you are
+  accusing. Ask the SEPARATE HOST too, and say which surface answered.**
+  Every LIVE rung above, and the probe in the bullet before this one, is
+  `coord.qontinui.io` plus loopback — one host, one program, so all of them can
+  fail together for one cause that says nothing about the fleet's serving plane
+  (rungs 4c and 5 are local files, so they are not a second host either).
+  `api.qontinui.io` is a **different program on a different host** (qontinui-web's
+  FastAPI backend), so it is the genuinely independent instance:
+  `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 "${QONTINUI_WEB_HTTP_URL:-https://api.qontinui.io}/api/v1/plan-library?kind=plan&limit=1"`.
+  Measured 2026-09-06: `401` anonymous, **`200`** with a `user_id`-bearing device
+  JWT (`~/.qontinui/coord-device-jwt`; an `/agents/allocate` token carries no
+  `user_id` and never substitutes, on this rung or any other). **Either code is a
+  pass.** What it buys is a *decomposition*, which is why it is worth a second
+  `curl`: a `200` here with the same credential that 401s on
+  `coord.qontinui.io` says the credential is live and the fault is coord-side;
+  a `401` on both says the credential is the fault; a connect failure here leaves
+  the web-host axis **UNKNOWN**, which is still not "down".
+  ⚠️ **Two discriminators, both measured the same day, both of which read as a
+  credential verdict to a careless probe.** (i) **Method, not credential:** `GET
+  https://api.qontinui.io/api/v1/memory/query` answers `405` while `POST` answers
+  `401` anonymous and `422` with a device JWT — a `422` there means the door is
+  OPEN and only the body was wrong. (ii) **Prefix, not credential:** `POST
+  https://coord.qontinui.io/agents/allocate` answers `422` anonymous while `POST
+  https://coord.qontinui.io/coord/agents/allocate` answers `401` — the same
+  capability, one path segment apart.
+  It is a **liveness and credential** axis, not a sixth rung: prompt documents
+  live in coord and `api.qontinui.io` does not serve them, so a `404` for a
+  policy path there is a statement about that program's route table and nothing
+  about the document. Do not read one as "the policy does not exist".
+  **`/policy` may not report a document, a kind, or the policy surface itself as
+  "unavailable" while this axis is unprobed.** An unprobed axis is
+  `not attempted`, never `unavailable`. This is the same disclosure discipline
+  the rung already applies to a served mirror and to the Step 4c cache: **say
+  which surface answered** — `coord.qontinui.io`, `api.qontinui.io`, the steering
+  cache, the file mirrors — and say which you never asked.
 
 ```bash
 MIRRORS="$ROOT/qontinui-dev-notes/prompts/policy-bodies-phase0"
@@ -573,20 +847,29 @@ fi
 
 # ---------------------------------------------------------------------------
 # THE CHECKOUT AXIS. Everything else in this rung compares MIRROR to SERVED.
-# There is a second axis: the path above is a plain filesystem read of the
-# WORKING TREE, so it serves whatever branch this shared checkout is parked on.
-# Measured 2026-08-31 on merytshost — dev-notes sat on a peer's branch 466
-# commits behind origin/main, and this rung served verification-and-evidence v2
-# while BOTH origin/main and the served store were at v7. Nothing warned: the
-# version stamp says nothing about which COMMIT the mirror is, and mtime is
-# checkout time, biased fresh.
+# There is a second axis, and it is the one that actually bit: the path above
+# is a plain filesystem read of the WORKING TREE, so it serves whatever branch
+# this shared checkout happens to be parked on. Measured 2026-08-31 on
+# merytshost: dev-notes sat on a peer's branch 466 commits behind origin/main,
+# and rung 5 served verification-and-evidence v2 while BOTH origin/main and the
+# served store were at v7. Nothing warned — the version stamp is honest about
+# the mirror it came from and says nothing about which COMMIT that mirror is,
+# and mtime is checkout time, which is biased FRESH.
+#
+# So: prefer origin/main's blob, and ALWAYS report the distance. Three separate
+# sessions have now reported a stale checkout's distance as FLEET drift
+# (dev-notes#364's commit message, and two /unattended closeouts) — that is a
+# measurement error this rung should make structurally hard, not a slip.
 git -C "$DN" fetch -q origin main 2>/dev/null || true
 MIRROR_SRC="worktree"
 BEHIND=$(git -C "$DN" rev-list --count HEAD..origin/main 2>/dev/null || echo "?")
 if git -C "$DN" cat-file -e "origin/main:prompts/policy-bodies-phase0" 2>/dev/null; then
   MIRROR_SRC="origin/main"
 fi
-# Reads $MIRROR_NAME (a variable, NOT an argument): a shell positional inside a
+# Read a mirror by NAME through whichever source won. Never inline a shell
+# positional here — in a slash-command body those are harness placeholders.
+# Reads $MIRROR_NAME (a variable, NOT an argument) and writes the body to
+# stdout. It takes no parameter on purpose: a shell positional inside a
 # slash-command fence is a HARNESS placeholder, substituted at injection time.
 mirror_body() {
   if [ "$MIRROR_SRC" = "origin/main" ]; then
@@ -601,19 +884,39 @@ if [ "$MIRROR_SRC" = "worktree" ]; then
   echo "  A stale checkout serves stale policy with a correct-looking stamp." >&2
 fi
 if [ "$BEHIND" != "0" ] && [ "$BEHIND" != "?" ]; then
-  echo "  NOTE: this checkout is behind origin/main. Any mirror-vs-served drift" >&2
-  echo "  computed from the WORKTREE is this checkout's distance, NOT fleet state." >&2
+  echo "  NOTE: this checkout is behind origin/main. Any mirror-vs-served drift you" >&2
+  echo "  compute from the WORKTREE is this checkout's distance, NOT fleet state." >&2
 fi
 
-# list (mirror set — say so in the output; the count is derived, never quoted):
-ls "$MIRRORS"/*.md
-printf 'mirror set: %s files (counted now, NOT the live inventory)\n' \
-  "$(ls "$MIRRORS"/*.md 2>/dev/null | wc -l)"
+# list (mirror set — say so in the output; the count is derived, never quoted).
+# Listed through the SAME source the bodies come from: a listing taken from a
+# stale worktree while bodies come from origin/main would disagree with itself.
+mirror_list() {
+  if [ "$MIRROR_SRC" = "origin/main" ]; then
+    git -C "$DN" ls-tree --name-only "origin/main:prompts/policy-bodies-phase0" 2>/dev/null | grep '\.md$'
+  else
+    ls "$MIRRORS"/*.md 2>/dev/null | xargs -r -n1 basename
+  fi
+}
+mirror_list
+printf 'mirror set (%s): %s files (counted now, NOT the live inventory)\n' \
+  "$MIRROR_SRC" "$(mirror_list | wc -l)"
 
 # get one — provenance first, and no body without a readable stamp.
-f="$MIRRORS/<name>.md"
-if [ ! -r "$f" ]; then
-  echo "policy/<name>: NO MIRROR — read unavailable (not substituted)" >&2
+# Materialise through mirror_body so the body comes from origin/main when that
+# resolved, and from the worktree only as the disclosed fallback. Every grep
+# below then works unchanged against a single file.
+MIRROR_NAME="<name>"
+f=$(mktemp) || { echo "mktemp failed (LOCAL fault)" >&2; exit 1; }
+# ONE trap covering every staged file, for the same reason Steps 2 and 3 spell
+# it out: a later `trap ... EXIT` REPLACES the earlier one, so a bare
+# `trap 'rm -f "$f"' EXIT` here would silently drop their cleanup and leave a
+# live proxy nonce and device JWT in $TMPDIR. `rm -f` on an unset var is
+# harmless when this rung runs in a fresh shell.
+trap 'rm -f "$HDR" "$AUTH" "$f"' EXIT
+mirror_body > "$f" 2>/dev/null || true
+if [ ! -s "$f" ]; then
+  echo "policy/<name>: NO MIRROR in $MIRROR_SRC — read unavailable (not substituted)" >&2
 else
   # `|| true` on every grep: a no-match exits non-zero, and under `set -e` that
   # would abort the snippet BEFORE the withhold branch below prints — failing
@@ -753,41 +1056,84 @@ Rules for this path:
 - If no coord transport is reachable, `/policy mirrors` reports **"drift
   unknown — no coord transport"** and exits. It never falls back to comparing
   mirrors against each other, and never reports "no drift" from a failed read.
-- **Probe before you re-derive the drift.** A mirror-drift verdict naming some
-  specific fraction of the set as behind is one of the most-repeated wrong
-  answers on this fleet: three separate sessions asserted one, and every one of
-  them had measured a stale shared **checkout** rather than the mirrors. Before
-  reporting drift, call **`coord_recent_findings`** with `topic:
-  "policy-mirrors"`, or with `resource_keys` naming the mirror paths
+- **Compare `origin/main`'s mirrors, and say so.** Read each stamp from
+  `git show origin/main:prompts/policy-bodies-phase0/<name>.md`, not from the
+  working tree, and print the checkout's `HEAD..origin/main` distance in the
+  summary line. A shared checkout parked on a feature branch makes every row
+  read `BEHIND` — that is the checkout's distance, not the fleet's, and
+  reporting it as drift sends someone to re-render mirrors that are already
+  correct. Measured 2026-08-31: a worktree read gave 13-of-14 BEHIND while
+  `origin/main` gave 13-of-14 CURRENT, on the same box, minutes apart. If the
+  two sources disagree, the answer is "this checkout is stale", not "the
+  mirrors are stale".
+- **Probe before you re-derive the drift itself.** A mirror-drift verdict — *"N
+  of the policy mirrors are behind"*, some specific fraction of the set — is one
+  of the most-repeated wrong answers on this fleet: three separate sessions
+  asserted one, and every one of them had measured a stale shared **checkout**
+  rather than the mirrors, the same defect the `origin/main` bullet above exists
+  to prevent. (Do not copy a fraction out of this bullet either; the no-literal-
+  count rule above governs here too.) Before reporting drift, call
+  **`coord_recent_findings`** with `topic: "policy-mirrors"`, or with
+  `resource_keys` naming the mirror paths
   (`qontinui-dev-notes/prompts/policy-bodies-phase0/<name>.md`). Findings are
   pull-by-relevance — nothing pushes one at you, so a session that never asks is
-  told nothing, and a peer's correction from yesterday stays invisible while you
-  re-derive it. HTTP twin for a masked tool or a dead transport: `GET
+  told nothing, and a peer's correction from yesterday is invisible while you
+  re-derive it. The HTTP twin, for a masked tool or a dead transport, is `GET
   $COORD_HTTP_URL/coord/agent-findings?topic=…&resource_keys=…`; the two filters
-  are **OR'd, not AND'd**, so passing both WIDENS the read. Read `available`
-  **before** `count` — `available: false` is UNKNOWN, not "nobody filed
-  anything" [policy: `verification-and-evidence` `silent-empty-is-unknown`]. If a
-  returned finding already covers the drift, cite it and stop.
+  are **OR'd, not AND'd**, so passing both WIDENS the read rather than narrowing
+  it. Read `available` **before** `count` — `available: false` is UNKNOWN, not
+  "nobody has filed anything" [policy: `verification-and-evidence`
+  `silent-empty-is-unknown`]. If a returned finding already covers the drift,
+  cite it and stop; if your measurement *corrects* it, that is a finding worth
+  posting with `supersedes` set, not a paragraph in a transcript nobody rereads.
 
 ### Honest failure (never a silent no-op)
 
-If all five rungs fail (mirrors absent too — e.g. no `qontinui-dev-notes`
+If all rungs fail (mirrors absent too — e.g. no `qontinui-dev-notes`
 checkout), **do not pretend**. Report exactly which link failed at each rung:
 native tools not visible; per-candidate `.mcp.json` probe results (file → HTTP
 code, or "no `.mcp.json` readable anywhere"); the remote MCP door's status
 (`POST $COORD_HTTP_URL/mcp` → HTTP code, and whether a DEVICE JWT was
-resolvable at all — never an `/agents/allocate` one); the HTTP door's status +
-whether a tenant-resolvable JWT could be minted; the mirror path checked. Then point
-at **`coord doctor`** (runner self-check) for the credential-chain diagnosis.
+resolvable at all — never an `/agents/allocate` one, on any rung); the HTTP
+door's status + whether a tenant-resolvable JWT could be minted; **Step 4b's
+bootstrap mint** (`POST $COORD_HTTP_URL/agents/credential` → HTTP code —
+measured `200` against production coord on 2026-09-04 and again 2026-09-10, and
+present in coord's source since commit `5dd99cc3`, so a non-2xx here is a
+REGRESSION worth naming, not a known-absent route; and whatever the code, the
+substitute `/agents/allocate` stays prohibited — the gate once cited for it,
+coord gate `ece99898-30c6-4f8c-be8e-1de5f09abebc`, reads `withdrawn` as of
+2026-09-06 and its successor is anchored to a different arm, so the question is
+UNKNOWN, not cleared; **re-verify with `coord_gate_inspect`** rather than
+trusting this line); the mirror path checked. Then point at
+**`coord doctor`** (runner self-check) for the credential-chain diagnosis.
+**Report Step 4b's status rather than omitting it** — a reader who is handed a
+mirror is owed the reason there was no live door, and "the credential route
+answered <code> when it answered 200 on 2026-09-04" is a different
+fact from "coord is down".
+
+**And report the WEB-HOST axis on its own line — it is not one of the rungs
+above, and every live one of those is the same host.** Rungs 1–4b and the
+same-host falsification probe are `coord.qontinui.io` plus loopback (4c and 5
+are local files), so an exhausted cascade is a statement about one program. Add:
+`GET https://api.qontinui.io/api/v1/plan-library?kind=plan&limit=1` → HTTP code,
+or **NOT ATTEMPTED**. Measured 2026-09-06: `401` anonymous, `200` with a
+`user_id`-bearing device JWT — **either is a PASS**, and a pass means the fleet's
+serving plane answers, so the honest report is a credential or route failure on
+the coord host, never "policy unavailable". An axis you did not probe is
+`not attempted`, never `unavailable`; that is the same distinction this door
+already draws for a document with no mirror, applied to a host instead of a file.
 
 If a `.coord-mcp-status` breadcrumb sits in your cwd, quote its reason **and its
 age** in that report: it is the RUNNER's own record that this workdir's coord-mcp
 provisioning was degraded, and six of its thirteen reasons mean that pass wrote
 no `.mcp.json` — which names the cause of an exhausted cascade rather than
 restating its symptom (a stale config, a foreign one or an unparseable one can
-still be sitting there, so rung 2 probing one is not a contradiction). The other
-seven are the probe's typed verdicts and mean the opposite: a config WAS written
-and did not answer at spawn.
+still be sitting there, so rung 2 probing one is not a contradiction). The
+other seven are the probe's typed verdicts (`TIMEOUT`, `CONNECT_REFUSED`,
+`UNAUTHORIZED (401)`, `CREDENTIAL_REFRESHING (503)`, `HTTP <observed>`,
+`HTTP_200_NOT_MCP`, `TRANSPORT`) and mean the opposite: a config WAS written
+and gave no usable answer at spawn; only `TIMEOUT` cannot tell a dead port from a busy
+one, and says so (`NOT known dead`).
 
 **Age it before you quote it.** Line 2 is a JSON stamp carrying `written_at`,
 `workdir`, `port`, `verdict`, `build_id` and `schema`; older runner builds write
@@ -809,12 +1155,47 @@ and the freshness rule:
   tool", a 4xx, or an empty response must never read as a successful read.
 - **Always name the transport used** (native MCP / proxy `<url>` via
   `<candidate file>` / remote MCP `$COORD_HTTP_URL/mcp` / HTTP agent door /
-  file mirror **with the staleness disclosure**) alongside the result, so the
-  reader can weigh freshness.
+  **HTTP agent door (bootstrap credential)** / **steering cache (rendered
+  <stamp>)** / file mirror **with the staleness
+  disclosure**) alongside the result, so the reader can weigh freshness. The
+  bootstrap spelling is distinct on purpose: it is the rung of last resort and a
+  reader weighing a policy answer is entitled to know one carried it.
 - **A masked/unknown native tool is not the end** — fall through
-  Step 1 → 2 → 3 → 4 → 5.
+  Step 1 → 2 → 3 → 4 → 4b → (4c, the six intent kinds only) → 5.
+- **Steering-cache reads always disclose** that they are a cache, quote its
+  Rendered stamp, and report a document the cache lacks as UNKNOWN.
 - **Mirror reads always disclose** that they are mirrors, that mirrors can lag
   the live store, and any requested document that has no mirror.
+- **Never report policy — a document, a kind, or the surface — as "unavailable"
+  while the WEB-HOST axis is unprobed.** Every rung of this cascade is
+  `coord.qontinui.io` plus loopback; `api.qontinui.io` is a separate program on a
+  separate host and answers `401` anonymous / `200` with a `user_id`-bearing
+  device JWT (measured 2026-09-06). Probe it, **name which surface answered**,
+  and name the ones you skipped as `not attempted` — never as `unavailable`.
+
+And the same rule one level up, for the claim this door is most likely to
+manufacture: **a capability negative cites a CENSUS, never a probe.** "There is
+no door for this kind", "agents cannot read policy here", "that route does not
+exist" are searches, and a cascade of probes is a sample:
+
+<!-- detector-reach-fence:start -->
+> **A capability negative cites a CENSUS, never a probe.** Before recording
+> "no door", "agents cannot", "this route does not exist" or any other claim
+> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
+> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
+> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
+> host) and paste its trailer verbatim beside the claim:
+> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+> — the line that parses under `CENSUS_TRAILER_RE` in
+> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> ONE host is a sample, not a search: `/api/v1/memory` refuses on
+> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
+> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
+> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
+> could not read a source and settles nothing; `routes=0` with both refs
+> resolved is the only honest negative, and `admits=unknown` on a listed row
+> means unmeasured, never "operator-only".
+<!-- detector-reach-fence:end -->
 
 ---
 

@@ -48,8 +48,9 @@ as free text. Map what you are waiting on to exactly one kind:
 
 | What you are waiting on | Predicate kind | Shape / notes |
 |---|---|---|
-| A PR merging | `pr_merged` | identify the PR (`repo` + `pr` number). It **does** clear on a coord-orchestrated repo: `gates::pr_merged_verdict` never reads GitHub's `merged` bool, it reads coord's OWN land record — `pr_state = 'merged'` **or** `close_cause ∈ {merged, commits_landed_via_other_pr}` — so **both** land shapes clear, and registration emits an informational steer, not a rejection. Two qualifications, both load-bearing: an explicitly `open`/`draft` `pr_state` carrying a land cause hits the **contradiction guard** and returns `Open` (not a clear — it converges once the PR leaves open/draft); and a **dying land** can leave it terminally `Failed` on work that is provably on `main`, whose discriminator is a `merged` `coord.merge_proposals` row for **this** PR — no merged proposal ⇒ the `Failed` is genuine (`author_closed` reaches `Failed` too, and its content is on `main` as well). Canonical: `_gate-registration`. ⚠️ The older *"never fires on a coord-orchestrated repo"* advice is **STALE** — true when learned (2026-07-11, on runner PR #744), fixed in coord days later by the land-aware `pr_merged_verdict` |
+| A PR merging | `pr_merged` | identify the PR (`repo` + `pr` number). It **does** clear on a coord-orchestrated repo: `gates::pr_merged_verdict` never reads GitHub's `merged` bool, it reads coord's OWN land record — `pr_state = 'merged'` **or** `close_cause ∈ {merged, commits_landed_via_other_pr}` — so **both** land shapes clear, and registration emits an informational steer, not a rejection. Two qualifications, both load-bearing: an explicitly `open`/`draft` `pr_state` carrying a land cause hits the **contradiction guard** and returns `Open` (not a clear — it converges once the PR leaves open/draft); and a **dying land** can leave it terminally `Failed` on work that is provably on `main`, whose discriminator is a `merged` `coord.merge_proposals` row for **this** PR — no merged proposal ⇒ the `Failed` is genuine (`author_closed` reaches `Failed` too, and its content is on `main` as well). Canonical: `_gate-registration`. ⚠️ The older *"never fires on a coord-orchestrated repo"* advice is **STALE** — true when learned (2026-07-11, on runner PR #744), fixed in coord days later by the land-aware `pr_merged_verdict`. **Before registering, apply `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed"** (`gh pr view <n> --json state,headRefOid`). This gate clears on the land, so a commit pushed after coord lands the PR is watched by nothing. If that section says the PR no longer carries your commits, take its fresh-branch path and gate the new PR instead, unless the close was deliberate. If nothing is unlanded, the wait is over: register no `pr_merged` gate. If the PR does carry them but its head is not your local tip, push (or reconcile) first, then apply the section's after-push re-check before registering. Decide what is unlanded by content, not ancestry: after a rebase-land your SHA is never on `main` (`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Ancestry is a one-way signal") |
 | Work landing on main of a **coord-orchestrated repo** | `commit_live` | `{repo, commit_sha, on_ref?}` — ancestor-of-main check; anchor a **post-land main SHA** (or use `unit_status` — **not `file_exists`, which is broken**), NEVER the pre-land branch-head SHA. That anchor **is** a coin-flip: it clears only if the rebase preserved the sha, and whether `main` moves between your read and coord's land is not predictable at registration time — so on a rewrite the SHA never becomes an ancestor and the gate rots open (gate `c14d103c`, 2026-07-11). The hazard is the pre-land SHA, **not** `pr_merged` |
+| A specific **device's running build** being at-or-past a SHA | `runner_served_sha` | `{device_id, repo, expected_sha}` — device-scoped, and NOT interchangeable with `commit_live`: `commit_live` only checks repo-main ancestry (the code has landed), while `runner_served_sha` checks that THAT device's currently-running binary is at-or-past `expected_sha` (the code has been rebuilt onto). Stays `open` while the commit has landed but the device hasn't restarted onto it — `verdict_reason` names the device's current build id when open (canonical: `_gate-registration`) |
 | A deploy going healthy | `deploy_healthy` | the service/env that must be healthy |
 | A claim going terminal (released/expired) | `claim_terminal` | claim-anchored, not plan-anchored (`claim_kind`+`resource_key`) |
 | A human decision / judgment | `operator_approval` | `{prompt}` — notify-only; the only free-text-ish kind, and the human escape hatch |
@@ -60,7 +61,7 @@ as free text. Map what you are waiting on to exactly one kind:
 | A vetted plan that is ready, dispatchable work | `unit_ready` | `{work_unit_id, ready_status}` — auto-clears when the unit reaches `ready_status` + sibling gates cleared; **NOT** `operator_approval`. Transition the unit FIRST and set `ready_status` to what landed (`vetted`, else the Free fallback `vetted_unattested`) — a hardcoded Attested value on a unit you own never clears (canonical: `_gate-registration`) |
 | A schema/alembic reaching head | `migration_at_head` | `{schema}` — delegates to the live schema observer (`applied_head == chain_head`) |
 | Infra drift / active-negation clearing | `infra_drift_clear` | `{}` — delegates to the live infra observer (no active negation) |
-| A repo **file / workflow / migration file** existing | ⛔ `file_exists` — **KNOWN BROKEN 2026-08-05, do not register one** (403s fleet-wide on the contents API, control-probed; the gate can never clear). Use `commit_live` with a post-land SHA, or `unit_status`. | `{repo, path, on_ref?}` — file **contents/presence**, unlike `ref_exists` |
+| A repo **file / workflow / migration file** existing | `file_exists` — **usable again.** The 2026-08-05 fleet-wide 403 was root-caused and FIXED by coord `e6f486b8` (2026-08-15), which is deployed; a live re-probe on 2026-08-31 registered `201` and cleared. Residual: that probe was one PUBLIC repo — re-probe before relying on it against a private one. | `{repo, path, on_ref?}` — file **contents/presence**, unlike `ref_exists` |
 | A coord **data count** crossing a bound | `sql_count` | `{query_id, op, n}` — `query_id` is a **whitelisted named query** (`devices_null_tenant` \| `open_gates` \| `draft_plans`), never raw SQL |
 | An umbrella plan (work unit) reaching a status | `unit_status` | `{work_unit_id, status}` — reads the work unit's `status` (e.g. `shipped`/`archived`); distinct from `unit_ready` (ready + siblings) |
 | Another, cross-anchor gate clearing | `gate_cleared` | `{gate_id}` — composition; same-anchor AND-of-gates is already implicit |
@@ -166,7 +167,7 @@ known action, pass one so coord can pick it up on clearance instead of just
 recording it:
 
 - `continuation` (preferred, typed) — e.g.
-  `{"action":"run_skill","skill":"implement-phase","args":["<plan-stem>","Phase N"]}`.
+  `{"action":"run_skill","skill":"implement-phase","args":["<plan-stem>","Phase N"],"hint":"<the brief below>"}`.
   `args` MUST be a JSON **array**. A typed `{"action":"notify_only"}` is coord's
   explicit no-op action — it is NOT the default (the default is no continuation
   field at all).
@@ -182,9 +183,37 @@ recording it:
   becomes *eligible* to spawn then — coord still requires a resolved ONLINE target
   device and a non-sensitive anchor, else it notifies instead.
 
-**Still omit it when** the blocker is **sensitive** (security / credential /
-billing / strategy) — those notify a human and never auto-spawn. **That is the
-only omit case in `/blocked`.**
+**Always populate `hint` — it is the spawned agent's ONLY context.** coord
+flattens the continuation to `run /<skill> <args>` and appends `\n\n<hint>` only
+if a hint is present; no other key in the frame carries a plan body, a PR body,
+prior findings, or the predicate. So a hintless `/blocked` continuation spawns a
+fresh agent that knows neither which blocker it is resuming nor what you already
+tried. Six labelled lines, **references before bodies**, **≤2000 characters**:
+
+```
+Plan: <plan-stem>
+Why: <≤2 sentences — the blocker, in your own words>
+PR: <owner/repo#N>
+Blocked: <block_reason_code>[ ×N since <ISO8601>]
+Resource-keys: <the keys a peer's coord_recent_findings would match>
+Tried: <what this session did, and what it deliberately did NOT do>
+```
+
+Omit a line you have no value for; never write `unknown`. Nothing enforces the
+cap and nothing truncates for you, so if you must cut, cut prose and keep the
+references (the spawned agent has the plan-library door, `coord_pr_status` and
+`coord_recent_findings`) and end with
+`[hint truncated at 2000 chars -- full context: <plan-stem> / <owner/repo#N>]` —
+a silent truncation is the failure mode. Legacy `continuation_prompt` has no
+hint field: append the brief to the prompt after a blank line. (Canonical:
+`_gate-registration` → "The brief — a continuation with no `hint` is a fresh
+agent with no context" — keep copies in sync.)
+
+**Still omit the CONTINUATION when** the blocker is **sensitive** (security /
+credential / billing / strategy) — those notify a human and never auto-spawn.
+**That is the only omit case in `/blocked`** — and it is the continuation that
+is omitted, never the `hint` of one you did attach: an attached continuation
+always carries a brief, per the block above.
 
 **Hard guard — if you are CLOSING, attach the continuation regardless of the
 expected wait.** Charter rule 10's ≲2h monitor window is a reason **not to run
@@ -284,8 +313,38 @@ as "no such tool"). If the call fails as unknown / method-not-found:
   session's tool allow-set"**, then
 - Fall back to the HTTP route (Step 5: device-authed `POST /coord/work-units/upsert`
   then `POST /coord/work-units/<slug>/register-gate` for a plan-anchored agent
-  session, else `POST /coord/gates/register` for a claim-anchored gate), OR surface
-  the blocker to the operator if HTTP is also unavailable.
+  session, else `POST /coord/gates/register` for a claim-anchored gate), OR —
+  only once `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` from the real cwd has
+  printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — surface the blocker
+  to the operator **with that block pasted verbatim**. The block carries the
+  probe time, the runner build, this box's load and a per-door table; the bare
+  sentence "HTTP is also unavailable" carries none of them and is not written.
+  A `verdict=UNKNOWN` (exit 5: sampled under this box's own load, or an
+  unreadable load) is reported as UNKNOWN with its reason — re-run after the
+  builds finish — never as "unavailable".
+
+Before "HTTP is also unavailable" becomes the last word: a 401/405 on one
+spelling of one host is what the wrong-host mechanism looks like from inside.
+Enumerate before you conclude —
+
+<!-- detector-reach-fence:start -->
+> **A capability negative cites a CENSUS, never a probe.** Before recording
+> "no door", "agents cannot", "this route does not exist" or any other claim
+> that a capability is ABSENT, run `bash scripts/coord-route-census.sh
+> <fragment>` (qontinui-claude-config; reads `origin/main` of BOTH
+> `qontinui-coord` and `qontinui-web`, never a working tree and never a live
+> host) and paste its trailer verbatim beside the claim:
+> `census: fragment=<f> hosts_read=coord.qontinui.io,api.qontinui.io ref=<sha>,<sha> routes=<n> unextracted=<n> unmounted=<n> generated=<ISO time>`
+> — the line that parses under `CENSUS_TRAILER_RE` in
+> `scripts/detector_reach/__init__.py`. A 401, 404 or 405 on ONE spelling of
+> ONE host is a sample, not a search: `/api/v1/memory` refuses on
+> `coord.qontinui.io` and answers on `api.qontinui.io`. A claim without the
+> trailer is **UNVERIFIED and is not recorded** — not as a finding, not as a
+> memory, not as a plan premise. `routes=UNKNOWN` (exit 2) means the census
+> could not read a source and settles nothing; `routes=0` with both refs
+> resolved is the only honest negative, and `admits=unknown` on a listed row
+> means unmeasured, never "operator-only".
+<!-- detector-reach-fence:end -->
 
 **NEVER report a gate as registered without a returned `gate_id`.** A silent "no
 such tool" — or any response missing the `gate_id` — must never read as success.
@@ -299,48 +358,70 @@ and verify by read. This matters most at `/blocked`: a session closing on a gate
 it wrongly believes it set leaves the blocker unwatched with nobody left to
 notice. Canonical: `_gate-registration` → "Dead-transport honesty".
 
-## Step 6 — Report the continuation's work outcome (if you are one)
+## Step 6 — If this session IS a gate continuation, say so on the gate
 
-A session spawned by a gate continuation is the **only actor that can honestly
-say whether the work happened** — the runner saw a terminal open and a terminal
-close, nothing more. If this is such a session, its PTY carries the gate it must
-answer. Read the two variables **by name**; never with an `env` dump, which
-splashes the session's plaintext passwords across the transcript:
+A continuation is spawned to *do* something, and coord records what came of it
+on the gate's `continuation_consumed_outcome`. The runner writes only
+`spawned` / `spawn_failed` there, the instant the spawn attempt resolves — that
+answers *"did a terminal appear?"*, never *"did the work happen?"*. **The
+spawned session is the only actor that can answer the second question**, and by
+the time `/blocked` fires the honest answer is `work_abandoned`: this session is
+stopping incomplete, and the gate it was spawned from must not read as if the
+work landed.
+
+**The precondition is two environment variables, and you read them BY NAME:**
 
 ```bash
-printenv QONTINUI_GATE_ID
-printenv QONTINUI_GATE_DEVICE_ID
+GATE_ID="$(printenv QONTINUI_GATE_ID)"
+GATE_DEVICE_ID="$(printenv QONTINUI_GATE_DEVICE_ID)"
 ```
 
-**Either one empty means there is no gate to report to** — skip this step. An
-absent variable is the signal, not an error (an operator-opened session, a
-work-unit DAG dispatch, and a runner predating the injection all read empty).
+Never an `env` dump. The session environment carries plaintext passwords, and
+the habitual `JWT|KEY|TOKEN|SECRET` redaction filter matches no variable named
+`PASSWORD` — the same rule `/whereami` applies to `QONTINUI_RUNNER_CONTEXT`.
 
-Both present: you are stopping incomplete, so the honest token is
-`work_abandoned` plus a one-line reason. `QONTINUI_GATE_DEVICE_ID` is the
-**consuming** device — coord's outcome write is keyed on it, so post it verbatim
-rather than resolving a device id yourself.
+The runner injects both **only for a genuine gate continuation.** coord's
+payload slot is overloaded: a work-unit DAG dispatch reuses the same frame with
+a `dispatch_id` and has **no `coord.gates` row at all**. So **either variable
+absent means there is no gate to report to — skip this step silently.** Never
+guess a gate id, and never substitute a device id from another source: the
+outcome UPDATE carries `AND continuation_consumed_by = $3`, so a device id that
+is not the consuming one writes nothing and tells you nothing.
+
+**The call.** This is coord's unauthenticated device-keyed data-plane ack, so it
+carries no bearer (`$COORD_HTTP_URL` defaults to `https://coord.qontinui.io`):
 
 ```bash
-COORD_HTTP_URL="${COORD_HTTP_URL:-https://coord.qontinui.io}"
 curl -sS -X POST \
-  "$COORD_HTTP_URL/coord/gates/$QONTINUI_GATE_ID/continuation-consumed" \
-  -H 'content-type: application/json' \
-  -d "{\"device_id\":\"$QONTINUI_GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<one line: what you were waiting on>\"}"
+  "$COORD_HTTP_URL/coord/gates/$GATE_ID/continuation-consumed" \
+  -H 'Content-Type: application/json' \
+  -d "{\"device_id\":\"$GATE_DEVICE_ID\",\"outcome\":\"work_abandoned\",\"detail\":\"<one line naming what you are waiting on>\"}"
 ```
 
-**Read the response — a 200 is NOT a receipt.** coord answers 200 for a REFUSED
-outcome write too and echoes what actually stands in `outcome_recorded`. Your
-claim landed only if that reads `work_abandoned` or `work_abandoned: <your
-detail>`. Anything else — `work_completed`, `spawn_failed`, `null` — means it did
-**not** land, and Step 7 says so plainly rather than reporting a success you did
-not verify. Same honesty rule as the `gate_id` read-back above.
+`detail` is **one line** — coord keeps its first line, trimmed, to 200 chars,
+and discards the rest. Spend it on the blocker and the `gate_id` you just
+registered in Step 5, e.g. `blocked on CI green for qontinui-web#1712, gate
+3f1c8a02`. That is what a later reader gets instead of this transcript.
 
-**Never post `work_completed` from here**: `/blocked` is by definition the arm
-where the work did not complete. And do not skip the post on the theory that the
-runner covers it — when your PTY exits without a report the runner writes
-`work_unreported`, which says only "the session said nothing" and cannot tell
-anyone what you were blocked on.
+**Read the response — the 200 is not the answer, `outcome_recorded` is.** coord
+echoes what it actually persisted, and `normalize_consume_outcome` persists
+`work_abandoned` as `work_abandoned: <your first line>`, so match the **prefix**
+— never equality on the bare marker. A non-2xx, a missing `outcome_recorded`, or
+a value that is not the one you sent is **a failure to report**, and Step 7 says
+so. A producer that reads a 200 as success is the silent-success defect this
+route was fixed to expose.
+
+**One transition, and yours is the authoritative one.** coord permits exactly
+one `spawned → work_*` move and refuses `work_* → work_*`. A refusal here
+therefore means an outcome already stands: if this same session posted
+`work_completed` earlier (`/implement-plan` Step 6, `/unattended` Step 4.5),
+that is the intended ordering and not a failure — report which value stands and
+move on. The runner's own PTY-exit fallback fires after you and is refused the
+same way, by design.
+
+**Best-effort, never blocking.** A missing variable, an unreachable coord or a
+refused write must never block the registration in Step 5 or anything else this
+session owes. It is *reported*, never swallowed.
 
 ## Step 7 — Report
 
@@ -353,6 +434,15 @@ In your session-close report, list for each blocker either:
 - **new predicate kind needed** — a real observable trigger exists but no current
   kind expresses it; interim `operator_approval` registered (with its `gate_id`),
   plus the proposed `<shape>`.
+
+**And one line for Step 6**, whenever this session was a gate continuation:
+the `gate_id` it reported against and the `outcome_recorded` coord echoed back —
+or **"work outcome NOT reported"** plus the failure you actually saw (variables
+absent, a non-2xx, a mismatched echo — or coord unreachable, which is only ever
+the `FLOOR-CLAIM: verdict=FLOOR` block that `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim`
+printed, pasted verbatim, never the bare phrase). "Not a continuation" is
+also an outcome: when both variables were absent, say the step did not apply
+rather than leaving the reader to guess whether it was skipped or failed.
 
 (Optional convenience: you MAY mirror what you registered into a `## Gates` block
 in the plan file for the operator's eyeballs — but **coord is the source of
