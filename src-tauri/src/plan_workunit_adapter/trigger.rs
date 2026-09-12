@@ -11432,6 +11432,7 @@ Body.
                 &mut forb_deps,
                 &sink,
                 &metrics,
+                TenantScope::Unresolved,
             )
             .await;
             assert_eq!(s.forbidden, 1, "cycle {cycle}");
@@ -11489,6 +11490,7 @@ Body.
                 &mut self.forb_deps,
                 sink,
                 &self.metrics,
+                TenantScope::Unresolved,
             )
             .await
         }
