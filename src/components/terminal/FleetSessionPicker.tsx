@@ -580,7 +580,18 @@ export function FleetSessionPicker() {
           <div className="px-3 py-8 text-center text-[#f7768e] text-xs">
             <AlertTriangle className="w-4 h-4 mx-auto mb-2" />
             {error}
-            <div className="mt-1 text-[#565f89]">This is a failed read, not an empty fleet.</div>
+            {/* A stalled WALK is not a failed READ — coord answered, and the
+                page it answered with was empty. "This is a failed read" over
+                that is a false claim in the other direction, which is the whole
+                distinction the inline banner below already draws. The empty
+                state has to draw it too: this branch is reached when coord
+                serves an empty page carrying a cursor and the walk then stalls
+                on the next one. */}
+            <div className="mt-1 text-[#565f89]">
+              {walkStalled
+                ? "coord answered — this page was empty and the walk cannot advance past it."
+                : "This is a failed read, not an empty fleet."}
+            </div>
             <button
               data-ui-bridge-id={FLEET_PICKER_RETRY_ID}
               onClick={() => void refresh()}
