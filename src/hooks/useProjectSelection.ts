@@ -65,19 +65,22 @@ const NO_CLOUD_SESSION_REASON_CODES = [
  * There used to be a third arm, `errorMsg.includes("Not authenticated")`,
  * described as "the keychain race the retry loop above gives up on". Both
  * halves of that description were stale by the time #1396 re-pointed the retry
- * gate: `get_user_projects` has not emitted that string since #1342 (its only
- * two auth refusals are the two arms above), and the retry loop now gives up on
+ * gate: `get_user_projects` has not emitted that string since #330
+ * (`bddc9f438`, which replaced it with "Not signed in to Qontinui…"; #1342 and
+ * #1379 only added the reason code), its only two auth refusals are the two
+ * arms above, and the retry loop now gives up on
  * `cognito_access_token_unreadable` — which is deliberately NOT quiet, see
- * [`NO_CLOUD_SESSION_REASON_CODES`]. The one message that could still carry the
- * old string here is a web-backend response echoed verbatim through
- * `AppError::HttpStatusError` (`HTTP 401: {"detail":"Not authenticated"}`):
- * the runner presented a bearer its own refresher judged healthy and the
- * backend refused it. That is a fault, not a steady state, and the Rust side
- * already logs it at `error!`; the arm was silently classifying it as
- * "expected" and keeping it off the health channel. Retired, and a test pins
- * that the backend echo now reaches `console.error` — the same case
- * [`isRetryableCredentialRace`] declines to retry, so the two predicates agree
- * on it.
+ * [`NO_CLOUD_SESSION_REASON_CODES`]. The only path left for the old string is a
+ * web-backend response body echoed verbatim through `AppError::HttpStatusError`
+ * (`HTTP 401: {"detail":"Not authenticated"}` is FastAPI's `HTTPBearer`
+ * default; the backend's own rejected-bearer wording is
+ * `Invalid or expired token`, so even that path is narrow): the runner
+ * presented a bearer its own refresher judged healthy and the backend refused
+ * it. That is a fault, not a steady state, and the Rust side already logs it
+ * at `error!`; the arm was silently classifying it as "expected" and keeping it
+ * off the health channel. Retired, and a test pins that the backend echo now
+ * reaches `console.error` — the same case [`isRetryableCredentialRace`]
+ * declines to retry, so the two predicates agree on it.
  */
 export function isExpectedNoCloudSession(errorMsg: string): boolean {
   return (

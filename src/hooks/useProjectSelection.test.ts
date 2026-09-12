@@ -78,7 +78,7 @@ describe("isExpectedNoCloudSession", () => {
    * The arm this retires. `"Not authenticated"` was quieted as "the keychain
    * race the retry loop gives up on", and neither half of that held once #1396
    * re-pointed the retry gate: `get_user_projects` has not emitted the string
-   * since #1342, and the retry now gives up on `cognito_access_token_unreadable`,
+   * since #330, and the retry now gives up on `cognito_access_token_unreadable`,
    * which is deliberately NOT quiet. The only way the old string still arrives
    * is a web-backend body echoed verbatim through `AppError::HttpStatusError` —
    * a bearer the runner judged healthy that the backend refused. That is a
