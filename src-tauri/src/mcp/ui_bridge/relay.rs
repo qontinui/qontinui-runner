@@ -42,9 +42,14 @@ use tracing::{info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-/// Tabs with no live SSE listener whose last sign of life is older than this
-/// are evicted from the registry (lazily, on the next registry operation).
-/// Heartbeats arrive every 10s; 60s = 6 missed beats.
+/// Tabs with no live SSE listener are evicted from the registry once their
+/// last sign of life (`last_seen_ms`) is this old — inclusive: this is the
+/// FIRST age at which a disconnected tab is dropped, not the last age at which
+/// it survives (`evict_stale` retains while `age < STALE_TAB_EVICT_MS`, and
+/// `eviction_fires_when_the_age_reaches_the_bound_not_after` pins it).
+/// Eviction is lazy, on the next registry operation. Served to callers as
+/// `staleTabEvictMs` on `GET /ui-bridge/tabs`, beside the `lastSeen` it is
+/// measured against. Heartbeats arrive every 10s; 60s = 6 missed beats.
 pub const STALE_TAB_EVICT_MS: u64 = 60_000;
 
 /// Default await window for a dispatched command's result.
@@ -410,9 +415,11 @@ impl RelayRegistry {
     }
 }
 
-/// Remove tabs with no live SSE listener whose last sign of life is older
-/// than [`STALE_TAB_EVICT_MS`]. Connected tabs are never evicted — the SSE
-/// drop guard handles their lifecycle.
+/// Remove tabs with no live SSE listener whose last sign of life is at least
+/// [`STALE_TAB_EVICT_MS`] old — `age < bound` is retained, `age == bound` is
+/// dropped, which is the boundary `CONTRACT.md` states for `staleTabEvictMs`.
+/// Connected tabs are never evicted — the SSE drop guard handles their
+/// lifecycle.
 fn evict_stale(inner: &mut RegistryInner, now: u64) {
     inner.tabs.retain(|_, record| {
         record.listener.is_some() || now.saturating_sub(record.last_seen_ms) < STALE_TAB_EVICT_MS
