@@ -549,16 +549,25 @@ pub(crate) const SIBLING_PIN_FILE: &str = ".github/sibling-pins.conf";
 /// match counted rather than the first taken — and the bump workflow's own
 /// parser, which the #1221 pre-PR review cross-checked against the action.
 /// Two programs already read this file and agree; this is the third, and it
-/// must not be the one that disagrees.
+/// must not be the one that disagrees. The agreement is held by the tests
+/// below against a FIXTURE of that grammar, so a Rust-side drift fails
+/// `cargo test`; a change to either awk has to be mirrored here by hand.
 pub(crate) fn lookup_pin(manifest_text: &str, repo: &str) -> Result<Option<String>, String> {
     let mut matches: Vec<(usize, Vec<&str>)> = Vec::new();
     for (idx, raw) in manifest_text.lines().enumerate() {
-        // `lines()` already drops a trailing `\n`; a CRLF-committed file
-        // leaves the `\r`, which the action's `tr -d '\r'` tolerates and so
-        // must this — or a manifest CI accepts dies here blaming the SHA.
+        // `lines()` strips `\r\n` as a unit, so a CRLF-committed file is
+        // already clean here; the trim covers a stray `\r` that `lines()`
+        // cannot pair with a `\n`, which the bump workflow's `tr -d '\r'`
+        // also removes.
         let line = raw.trim_end_matches('\r');
         let code = line.split_once('#').map_or(line, |(before, _)| before);
-        let fields: Vec<&str> = code.split_whitespace().collect();
+        // Space and tab ONLY — awk's default `FS`. `split_whitespace` would
+        // also split on NBSP, form-feed and the Unicode separators, and then
+        // `repo<NBSP>sha` reads as pinned here while the action reads it as
+        // one unlisted token and floats, or `sha<NBSP>` reads as a clean SHA
+        // here while both awks red it. NBSP arrives by copy-paste from a
+        // rendered page, so this is not exotic.
+        let fields: Vec<&str> = code.split([' ', '\t']).filter(|f| !f.is_empty()).collect();
         if fields.first().copied() == Some(repo) {
             matches.push((idx + 1, fields));
         }
@@ -615,22 +624,26 @@ pub(crate) fn lookup_pin(manifest_text: &str, repo: &str) -> Result<Option<Strin
 /// declining an offer. The error names the two honest ways out.
 fn read_pin(worktree: &Path, repo: &str) -> Result<String, String> {
     let path = worktree.join(SIBLING_PIN_FILE);
-    let text = std::fs::read_to_string(&path).map_err(|e| {
+    // Bytes, not `read_to_string`: both awks are byte-oriented and accept a
+    // Latin-1 `é` in a `#` comment, so an invalid UTF-8 byte must not red
+    // this lane alone. Lossy decoding cannot manufacture a 40-hex SHA.
+    let bytes = std::fs::read(&path).map_err(|e| {
         format!(
             "sibling '{repo}' is pinned with pin = \"pin-file\", but {SIBLING_PIN_FILE} could \
-             not be read from the dispatched checkout ({}): {e}. Without it the sibling would \
-             resolve by default branch — the floating checkout #1158 removed. Restore the \
+             not be read from the dispatched checkout ({}): {e}. Refusing to resolve the sibling \
+             by default branch instead — that is the floating checkout #1158 removed. Restore the \
              manifest, or set pin = \"default-branch\" to float on purpose.",
             path.display()
         )
     })?;
+    let text = String::from_utf8_lossy(&bytes);
     match lookup_pin(&text, repo)? {
         Some(sha) => Ok(sha),
         None => Err(format!(
             "sibling '{repo}' is pinned with pin = \"pin-file\", but {SIBLING_PIN_FILE} does not \
-             list it. A repo absent from that file is resolved by DEFAULT BRANCH, i.e. floating \
-             — the coupling that held this repo's merge train for 5h+ on 2026-08-20. Add the \
-             entry (gh api repos/{repo}/commits/<default-branch> --jq .sha), or set \
+             list it. Refusing to resolve it by default branch instead — that is the floating \
+             checkout that held this repo's merge train for 5h+ on 2026-08-20. Add the entry \
+             (gh api repos/{repo}/commits/<default-branch> --jq .sha), or set \
              pin = \"default-branch\" in .qontinui/ci.toml so the float is visible."
         )),
     }
@@ -1707,6 +1720,21 @@ mod tests {
         // name alone is not the entry.
         assert_eq!(lookup_pin(&text, "ui-bridge").unwrap(), None);
         assert_eq!(lookup_pin(&text, "other/ui-bridge").unwrap(), None);
+        // awk's default FS is space and tab. An NBSP (the copy-paste
+        // separator) is NOT a separator to either awk, so `repo<NBSP>sha`
+        // is one token that equals no repo — unlisted, exactly as the action
+        // reads it — and never a pin.
+        assert_eq!(
+            lookup_pin(&format!("{UI_BRIDGE}\u{a0}{PIN_A}\n"), UI_BRIDGE).unwrap(),
+            None
+        );
+        // A tab IS a separator, as in the real file.
+        assert_eq!(
+            lookup_pin(&format!("{UI_BRIDGE}\t{PIN_A}\n"), UI_BRIDGE)
+                .unwrap()
+                .as_deref(),
+            Some(PIN_A)
+        );
     }
 
     /// The fail-open the action refuses, refused here too: a listed entry
@@ -1715,7 +1743,7 @@ mod tests {
     /// missed, floats the sibling while looking deliberate.
     #[test]
     fn pin_lookup_rejects_unusable_entries_instead_of_floating() {
-        let cases: [(&str, &str); 6] = [
+        let cases: [(&str, &str); 7] = [
             (
                 "listed twice",
                 &format!("{UI_BRIDGE} {PIN_A}\n{UI_BRIDGE} {PIN_B}\n"),
@@ -1730,6 +1758,13 @@ mod tests {
             (
                 "uppercase sha",
                 &format!("{UI_BRIDGE} {}\n", PIN_A.to_ascii_uppercase()),
+            ),
+            // Both awks read `sha<NBSP>` as a 41-byte second field that fails
+            // the 40-hex glob; `split_whitespace` would have eaten the NBSP
+            // and passed a pin the Actions lane reds.
+            (
+                "trailing NBSP glued to the sha",
+                &format!("{UI_BRIDGE} {PIN_A}\u{a0}\n"),
             ),
         ];
         for (what, text) in cases {
@@ -1795,8 +1830,9 @@ mod tests {
 
         let mut sibling = sib(UI_BRIDGE);
         sibling.pin = SiblingPin::PinFile;
-        // `cwd` is a path nothing can `ls-remote` from; reaching the branch
-        // would surface as an error, which is the assertion.
+        // The SHA assertion below is what catches a regression that consulted
+        // the branch: `ls-remote` needs no repository cwd, so on a networked
+        // box it would answer with ui-bridge's real tip, which is not PIN_A.
         let resolved = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
             .await
             .unwrap();
@@ -1829,13 +1865,27 @@ mod tests {
     ///   red the Actions lane too, so it is caught here first);
     /// * every repo the pin file lists is a declared sibling here — a pin for
     ///   a repo this lane never checks out is a pin nothing reads, i.e. the
-    ///   two lanes' sibling lists have drifted.
+    ///   two lanes' sibling lists have drifted;
+    /// * every repo the pin file lists that this lane does NOT read the pin
+    ///   for (a listed sibling on `declared-adaptation` / `default-branch`)
+    ///   is named in [`KNOWN_DIVERGENT`] — the ci.toml block that records
+    ///   the divergence is prose, and this is what makes an UNRECORDED one
+    ///   red: a sibling the Actions lane pins and this lane floats, with no
+    ///   line here admitting it. When the two entries flip to `pin-file`
+    ///   the list empties, and it must, because an entry left in it that
+    ///   is no longer divergent is refused too.
     ///
     /// Read against the checked-in bytes (`include_str!`), never a copy:
     /// a copy is the second source of truth this whole mechanism exists to
     /// avoid.
     #[test]
     fn this_repo_manifests_agree_on_which_siblings_are_pinned() {
+        /// Siblings the pin file lists that `.qontinui/ci.toml` deliberately
+        /// does NOT read the pin for yet — its DECLARED DIVERGENCE block says
+        /// why (coord's allocate-lane reader must accept `pin-file` first).
+        /// Deleting the divergence deletes the entry here, in the same PR.
+        const KNOWN_DIVERGENT: &[&str] = &["qontinui/qontinui-web", "qontinui/ui-bridge"];
+
         let ci_toml = include_str!("../../../.qontinui/ci.toml");
         let pin_file = include_str!("../../../.github/sibling-pins.conf");
         let manifest = super::super::manifest::parse_and_validate(ci_toml)
@@ -1848,13 +1898,32 @@ mod tests {
             let pinned = lookup_pin(pin_file, &s.repo).unwrap_or_else(|e| {
                 panic!("{SIBLING_PIN_FILE} entry for {} is unusable: {e}", s.repo)
             });
-            if s.pin == SiblingPin::PinFile {
-                assert!(
-                    pinned.is_some(),
-                    "{} says pin = \"pin-file\" in .qontinui/ci.toml but {SIBLING_PIN_FILE} \
-                     does not list it — every dispatch would hard-fail on this sibling",
+            let reads_pin = s.pin == SiblingPin::PinFile;
+            let admitted = KNOWN_DIVERGENT.contains(&s.repo.as_str());
+            match (reads_pin, pinned.is_some(), admitted) {
+                (true, false, _) => panic!(
+                    "{} says pin = \"pin-file\" in .qontinui/ci.toml but {SIBLING_PIN_FILE} does \
+                     not list it — every dispatch would hard-fail on this sibling",
                     s.repo
-                );
+                ),
+                (true, true, true) => panic!(
+                    "{} reads its pin now; drop it from KNOWN_DIVERGENT — the divergence it \
+                     admits no longer exists",
+                    s.repo
+                ),
+                (false, true, false) => panic!(
+                    "{SIBLING_PIN_FILE} pins {} but .qontinui/ci.toml resolves it by {:?}, and \
+                     nothing admits the divergence: the Actions lane compiles against the pinned \
+                     commit while this lane floats. Either set pin = \"pin-file\" or record why \
+                     not in ci.toml's DECLARED DIVERGENCE block AND in KNOWN_DIVERGENT here",
+                    s.repo, s.pin
+                ),
+                (false, false, true) => panic!(
+                    "{} is in KNOWN_DIVERGENT but {SIBLING_PIN_FILE} does not list it — there is \
+                     no pin to diverge from; drop the entry",
+                    s.repo
+                ),
+                (true, true, false) | (false, true, true) | (false, false, false) => {}
             }
         }
         let declared: Vec<&str> = manifest.siblings.iter().map(|s| s.repo.as_str()).collect();

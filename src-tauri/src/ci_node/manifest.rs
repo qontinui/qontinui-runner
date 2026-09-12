@@ -283,8 +283,8 @@ pub(crate) struct CiStep {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SiblingPin {
-    /// The Actions rule in full: the sibling tree is the **declared
-    /// adaptation PR** — the coord dep edge (`coord:downstream-of=` on the
+    /// The Actions rule for a sibling `.github/sibling-pins.conf` does not
+    /// list: the sibling tree is the **declared adaptation PR** — the coord dep edge (`coord:downstream-of=` on the
     /// dispatched PR, or `coord:upstream-of=` on a sibling PR) that the pair
     /// already has to declare for merge ordering — pinned to that PR's head
     /// SHA. A branch NAME is not an identity: it cannot be checked for having
@@ -293,7 +293,10 @@ pub(crate) enum SiblingPin {
     /// 2026-07-28 (a consumer gate went green against a branch with no PR).
     ///
     /// With no declaration — and, per the Actions action's property 3, with
-    /// no pull request at all — this resolves to [`CiSibling::branch`]. The
+    /// no pull request at all — this resolves to [`CiSibling::branch`],
+    /// which is the action's answer only for a sibling the pin file does not
+    /// list; for a listed one [`SiblingPin::PinFile`] is the action's rule.
+    /// The
     /// CI-node lane dispatches `refs/heads/merge-candidate/<proposal_id>`
     /// pushes, which is exactly the event class the Actions action resolves
     /// to the default branch WITHOUT an API call, and for the same reason:
@@ -322,7 +325,7 @@ pub(crate) enum SiblingPin {
     /// commit involved; #1158 pinned the Actions lane, and until this variant
     /// existed `.qontinui/ci.toml` could only DECLARE the divergence.
     ///
-    /// Stricter than the action in one place, on purpose: the action floats a
+    /// Stricter than the action in two places, on purpose: the action floats a
     /// sibling that is simply not listed (its pin is opt-in per entry, and the
     /// file is the only place that opt-in can live), whereas this variant IS
     /// the opt-in, so a manifest that lacks the entry — or no manifest at all
