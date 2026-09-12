@@ -301,6 +301,85 @@ printf 'ci:gate-change=declared
 ' > "$FIXTURE/labels.txt"
 run_case "X9 an unreadable file count is a hard error, not a skip" 1 no "certifies nothing"
 
+# --- the guard's own blind-spot list ----------------------------------------
+#
+# NON_GATING is the one way a path under the trigger can be made INVISIBLE to
+# this guard, and the workflow states the invariant itself: "Every entry needs a
+# justification, because anything listed here is invisible to this guard. Empty
+# is the correct default: a file earns a place only once someone can say why
+# weakening it could not affect a merge." Nothing enforced that, so an entry
+# could be added in
+# an ordinary workflow edit and silently un-gate a file -- the same fail-open
+# shape the hand-kept GATING allowlist was deleted for, rebuilt from the other
+# side. Read from the LIVE run-block, so it cannot drift from the shipped guard.
+#
+# A RATCHET, not a prohibition. If an entry is genuinely earned, add it AND
+# update this assertion in the same commit, and say in the commit message why
+# weakening that path cannot affect a merge -- which is exactly the
+# justification the workflow already demands and had no way to collect.
+#
+# Deliberately NOT a run_case: it is a static assertion about the shipped guard,
+# not a scenario, so it needs no fixture and calls no new_fixture. Do not "fix"
+# that by routing it through run_case.
+#
+# TWO NAMES, because they are two different claims. N1a says the emptiness was
+# MEASURABLE; N1 says it is EMPTY. An unmeasurable input fails N1a and never
+# reaches N1 -- it must not print as though the emptiness claim itself had been
+# tested and failed. The firing condition here is "not empty", so a silently
+# zero count from an unreadable run-block would PASS, i.e. an UNKNOWN rendering
+# as the safe answer, which is the one thing a check like this must never do.
+#
+# SCOPE, stated so the PASS line is not read for more than it measures: this
+# looks at the NON_GATING heredoc and nothing else. The marker check below
+# catches that heredoc being RENAMED. It cannot catch a SECOND exclusion
+# mechanism being added elsewhere in the run block, and it equally cannot catch
+# the FIRST one being narrowed -- tightening the `case "${f}" in
+# .github/workflows/*|.github/actions/*)` scope filter to a subdirectory would
+# un-watch paths with NON_GATING still empty and this still green.
+NON_GATING_AWK='/^read -r -d .. NON_GATING <</{f=1;next} /^NONGATING$/{f=0} f'
+if [ ! -s "$BLOCK" ]; then
+  echo "  FAIL  N1a NON_GATING is measurable -- the run-block did not extract, so nothing was measured"; FAIL=$((FAIL+1))
+elif ! grep -q "^read -r -d .. NON_GATING <<" "$BLOCK" || ! grep -qx "NONGATING" "$BLOCK"; then
+  echo "  FAIL  N1a NON_GATING is measurable -- the heredoc markers were not found in the shipped guard; this assertion needs updating to wherever the blind-spot list now lives"; FAIL=$((FAIL+1))
+elif ! awk "$NON_GATING_AWK" "$BLOCK" >"$HERE/non-gating.txt" 2>/dev/null; then
+  # PROBE THAT THE EXTRACTOR RAN, do not infer it from its output. awk appears
+  # nowhere else in this file, so a missing or erroring awk would go unnoticed
+  # here and its empty output would read as "the list is empty" -- the exact
+  # UNKNOWN-as-safe-answer this assertion exists to refuse. Same reason the PY
+  # probe near the top of this file checks that python3 genuinely RUNS rather
+  # than merely resolving on PATH.
+  echo "  FAIL  N1a NON_GATING is measurable -- the awk extraction did not run, so its empty output says nothing about the list"; FAIL=$((FAIL+1))
+else
+  # Counted and VALIDATED before either verdict is printed, so N1a is emitted
+  # exactly once. Validating the count the way the guard itself validates its
+  # file count (and this file asserts at X9) also stops a non-integer leaking a
+  # bare "integer expression expected" from `[` instead of a diagnostic in this
+  # file's own voice. It fails closed either way; this makes it say why.
+  NON_GATING_ENTRIES="$(grep -c '[^[:space:]]' "$HERE/non-gating.txt" || true)"
+  case "$NON_GATING_ENTRIES" in
+    ''|*[!0-9]*)
+      echo "  FAIL  N1a NON_GATING is measurable -- the entry count was not a number ('$NON_GATING_ENTRIES'), so nothing was compared"; FAIL=$((FAIL+1)) ;;
+    *)
+      echo "  PASS  N1a NON_GATING is measurable"; PASS=$((PASS+1))
+      if [ "$NON_GATING_ENTRIES" -eq 0 ]; then
+        echo "  PASS  N1 the NON_GATING heredoc is empty"; PASS=$((PASS+1))
+      else
+        echo "  FAIL  N1 the NON_GATING heredoc is empty -- found $NON_GATING_ENTRIES entr(y|ies); each is a path this guard no longer sees:"; FAIL=$((FAIL+1))
+        # No pipe: the guard under test bans piping into a consumer that can
+        # exit early ("NO PIPE into `grep -q` anywhere in this job, deliberately"),
+        # and this block refuses to infer anything from unprobed output, so it
+        # should not model the shape it argues against. awk slices in-process.
+        # Skip blank lines, so the listing and the "... and N more" arithmetic
+        # agree with the count above whenever a blank line sits between entries.
+        # (`NF` and the count's `[^[:space:]]` are not the same predicate -- awk's
+        # default FS ignores CR/VT/FF -- but the extractor writes this file with
+        # \n line endings from PyYAML-normalised scalars, so none can occur.)
+        awk 'NF && ++n<=16 {print "        | " $0}' "$HERE/non-gating.txt"
+        [ "$NON_GATING_ENTRIES" -gt 16 ] && echo "        | ... and $((NON_GATING_ENTRIES - 16)) more (listing capped at 16)"
+      fi ;;
+  esac
+fi
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
