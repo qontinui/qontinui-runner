@@ -1084,6 +1084,258 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
     );
 }
 
+// ============================================================================
+// A DECLARED tenant may only be one this device can PRESENT.
+//
+// `repo_tenant::scope_from_lookup` closed this for a repo-derived tenant and
+// `TenantScope::for_bound_device_default` for the `machine.json` default: both
+// answer `Owned(t)` only when `auth::device_holds_usable_binding(t)` holds —
+// the exact predicate `select_scoped_bearer_lazy` applies to `Owned`. The same
+// class was still open on the SESSION carrier: `session::stamp_session_tenant`
+// fills `intent.tenant_id` from the spawn input or the device default with no
+// binding check, and that value reached request bodies at ~10 sites. A body
+// could therefore name a tenant while the bearer lookup found no slot for it
+// and the request went out UNAUTHENTICATED — rows injected into a tenant this
+// device cannot present.
+//
+// The fix is one gate (`TenantScope::backed_by`) behind two constructors. This
+// test is what stops a FUTURE site from resolving a body tenant around it: every
+// ungated construction in production code is pinned per file, with the reason it
+// is allowed, so a new one fails until someone writes it down.
+//
+// WHAT IT DOES NOT PROVE, stated so nobody reads more into a green run: it is a
+// lexical census, not a dataflow check. It cannot prove that a scope built by a
+// gated constructor is the same value later handed to `declared_tenant()`, and a
+// site that is listed here for a bearer-only reason is trusted not to grow a
+// body tenant later. It catches the event that actually recurs — a new call site
+// reaching for the ungated constructor — and says nothing stronger.
+// ============================================================================
+
+/// The gated constructors: `Owned` only for a tenant this device can present.
+const GATED_CONSTRUCTORS: &[&str] = &[
+    "TenantScope::for_bound_session(",
+    "TenantScope::for_bound_device_default(",
+];
+
+/// The ungated spellings. `Owned(` is included deliberately — hand-building the
+/// variant bypasses both constructors, which is the easiest way to reintroduce
+/// the defect without touching either of them.
+const UNGATED_CONSTRUCTORS: &[&str] = &[
+    "TenantScope::for_session(",
+    "TenantScope::for_device_default(",
+    "TenantScope::Owned(",
+];
+
+/// Per-file ungated construction in PRODUCTION code, with the reason each file
+/// is allowed to do it. A hand-reviewed list of EXCEPTIONS, not an inventory of
+/// call sites: it should change whenever an exception does.
+///
+/// The reason column is the point. "Bearer-only" means the request body carries
+/// no tenant field at all, so there is nothing to declare and the D2 degrade
+/// already decides the credential; those are the sites for which gating would
+/// change behaviour without closing anything.
+const EXPECTED_UNGATED_SITES: &[(&str, usize, &str)] = &[
+    (
+        "auth.rs",
+        5,
+        "the type's OWN module: the two ungated constructors, `backed_by`'s \
+         `Owned` arm, `declared_tenant`'s, and the bearer selector's. Gating the \
+         gate would be circular.",
+    ),
+    (
+        "bin/qontinui_profile.rs",
+        1,
+        "the operator NAMES the tenant on argv, so the CLI asserts it rather \
+         than inferring it, and coord derives the row from the verified \
+         principal either way.",
+    ),
+    (
+        "mcp/device_jwt_refresher.rs",
+        1,
+        "the credential-health publish. It exists to report a DEAD credential \
+         and so must still run without one — gating it would stop an expired \
+         slot from ever being reported, and so from ever being re-minted.",
+    ),
+    (
+        "mcp/session_repository.rs",
+        1,
+        "a READ whose tenant is the caller's own query parameter, not an \
+         inferred one. Nothing is declared on a wire body.",
+    ),
+    (
+        "repo_detection.rs",
+        2,
+        "one lib->bin `TenantScope` rebadge (a conversion of an already-resolved \
+         scope, not a resolution), and one register whose body deliberately \
+         carries no tenant field.",
+    ),
+    (
+        "repo_tenant.rs",
+        1,
+        "the repo gate ITSELF: `scope_from_lookup` answers `Owned` only inside \
+         its own `device_is_bound_to` arm.",
+    ),
+    (
+        "session/coord_sync.rs",
+        1,
+        "`probe_resume` — bearer-only; its body is `{state, heartbeat}` and \
+         carries no tenant. The module's two body-bearing resolvers \
+         (`record_session_tenant`, `session_tenant_by_id`) are gated.",
+    ),
+    (
+        "session/mod.rs",
+        1,
+        "the output pipe's scope — bearer-only; `POST /sessions/:id/output` \
+         carries no tenant field. The registry accessor `tenant_scope_of` is \
+         gated, and it is what every body-declaring consumer reads.",
+    ),
+    (
+        "session_archive/push.rs",
+        1,
+        "qontinui-web derives `organization_id` from the verified bearer and \
+         refuses an unauthenticated request, so an unbacked declaration there is \
+         REJECTED rather than injected — the opposite of coord's body-derived \
+         routes.",
+    ),
+];
+
+#[test]
+fn every_ungated_tenant_scope_construction_is_a_reviewed_exception() {
+    let root = src_root();
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+
+    let mut found: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("path under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let lines: Vec<&str> = body.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+
+        for i in 0..lines.len() {
+            if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+                continue;
+            }
+            // Comment-stripped: prose naming a constructor must never score as
+            // a construction, the same rule every other scan in this file uses.
+            let code = code_only(&lines, i, i);
+            if UNGATED_CONSTRUCTORS.iter().any(|m| code.contains(m)) {
+                *found.entry(rel.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    let expected: BTreeMap<&str, usize> = EXPECTED_UNGATED_SITES
+        .iter()
+        .map(|(f, n, _)| (*f, *n))
+        .collect();
+
+    for (file, got) in &found {
+        match expected.get(file.as_str()) {
+            Some(want) => assert_eq!(
+                got, want,
+                "{file}: {got} ungated `TenantScope` construction(s), expected {want}. A NEW one \
+                 must either resolve through a gated constructor \
+                 (`TenantScope::for_bound_session` / `for_bound_device_default`, which answer \
+                 `Owned` only when `auth::device_holds_usable_binding` holds) or be added to \
+                 EXPECTED_UNGATED_SITES with the reason it cannot."
+            ),
+            None => panic!(
+                "{file} constructs a `TenantScope` through an UNGATED constructor ({got} \
+                 site(s)) and is not a reviewed exception.\n\nIf this site puts the tenant \
+                 into a REQUEST BODY, it must resolve through \
+                 `TenantScope::for_bound_session(..)` or \
+                 `TenantScope::for_bound_device_default(..)` — otherwise the body can declare \
+                 a tenant the bearer lookup will not back, and the write goes out \
+                 unauthenticated under that id. If the route carries no tenant field (the \
+                 scope only selects a credential), add a row to EXPECTED_UNGATED_SITES saying \
+                 so."
+            ),
+        }
+    }
+
+    for (file, want, why) in EXPECTED_UNGATED_SITES {
+        let got = found.get(*file).copied().unwrap_or(0);
+        assert_eq!(
+            got, *want,
+            "EXPECTED_UNGATED_SITES says {file} has {want} ungated construction(s) ({why}), \
+             found {got}. If a change legitimately removed one, lower the row in the SAME \
+             commit — an exception list that is not watched is not a list."
+        );
+    }
+
+    let total: usize = found.values().sum();
+    assert_eq!(
+        total, 14,
+        "expected 14 ungated `TenantScope` constructions in production code — 5 in auth.rs \
+         (the type's own module) and 9 reviewed exceptions, every one of them a route whose \
+         body carries no tenant, a caller-named read, the credential-health publish, or a \
+         gate's own internals. Found {total}. It goes DOWN when a site adopts a gated \
+         constructor, and UP only when a new ungated resolution ships, which is the event \
+         this number exists to make visible."
+    );
+}
+
+/// The gate must actually be REACHED. Without this, deleting every
+/// `for_bound_*` call would leave the census above green — nothing ungated was
+/// added, so nothing would fail — while the defect was fully reopened.
+#[test]
+fn the_gated_constructors_are_used_in_production_code() {
+    let root = src_root();
+    let mut files = Vec::new();
+    rust_files(&root, &mut files);
+    files.sort();
+
+    let mut per_spelling: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut gated_files: BTreeMap<String, usize> = BTreeMap::new();
+    for path in &files {
+        let rel = path
+            .strip_prefix(&root)
+            .expect("path under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let body = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let lines: Vec<&str> = body.lines().collect();
+        let test_ranges = cfg_test_ranges(&lines);
+        for i in 0..lines.len() {
+            if test_ranges.iter().any(|(a, b)| i >= *a && i <= *b) {
+                continue;
+            }
+            let code = code_only(&lines, i, i);
+            for spelling in GATED_CONSTRUCTORS {
+                if code.contains(spelling) {
+                    *per_spelling.entry(spelling).or_default() += 1;
+                    *gated_files.entry(rel.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    for spelling in GATED_CONSTRUCTORS {
+        let n = per_spelling.get(spelling).copied().unwrap_or(0);
+        assert!(
+            n > 0,
+            "`{spelling}` is never called in production code — the gate exists but nothing \
+             reaches it, so a body tenant is once again whatever was stamped. Either a call \
+             site regressed to an ungated constructor, or the gate was deleted."
+        );
+    }
+
+    // The session carrier is the one this closed; its choke point is the
+    // registry accessor every body-declaring consumer reads.
+    assert!(
+        gated_files.contains_key("session/mod.rs"),
+        "session/mod.rs no longer calls a gated constructor — `tenant_scope_of` is the \
+         accessor ~10 body-declaring sites resolve through, so an ungated one there reopens \
+         all of them at once"
+    );
+}
+
 #[test]
 fn tenant_scope_kinds_are_a_closed_distinct_set() {
     let mut seen = std::collections::BTreeSet::new();

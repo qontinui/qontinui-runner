@@ -815,6 +815,25 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // POST /sessions with the full create body. The runner
             // already stamped the row's id + intent into the payload at
             // session start; we just forward it.
+            //
+            // FAIL CLOSED, not omit — the one route in this module that does.
+            // coord's `create_session` takes the body's `tenant_id` as the
+            // session's tenancy FOR LIFE (immutable afterwards), and a nil one
+            // falls through to sole-binding and then the legacy
+            // `coord.devices.tenant_id` pointer — "most recently paired" — so
+            // dropping an unpresentable tenant here would not degrade to
+            // "coord decides", it would permanently file the session under a
+            // guess. Deferring is retryable and self-healing instead: the
+            // device-JWT refresher re-mints the slot within minutes, and the
+            // outbox replays this record until the body and the bearer agree.
+            if let Some(t) = unpresentable_create_tenant(rec) {
+                return PushOutcome::Transport(format!(
+                    "POST /sessions deferred: the session's tenant {t} has no usable \
+                     credential on this device, and the create body's tenant is \
+                     immutable once written — retrying until the refresher re-mints \
+                     that slot (or the runner is re-paired for that tenant)"
+                ));
+            }
             let body = rebuild_create_body(rec);
             let url = format!("{base}/sessions");
             crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
@@ -954,9 +973,18 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 inner.http.post(&url).json(&rec.payload),
                 scope,
             );
+            // The header DECLARES the tenant, so it may name only what the
+            // bearer attached above can present. `or_device_default` is the
+            // gated fallback: it fires only on `Unresolved` on a SINGLE-bound
+            // device (where the default binding is the only tenant, and is the
+            // slot `attach_device_auth_for` just presented) and only when that
+            // default is backed by a usable credential. The raw
+            // `resolve_active_tenant_id()` this replaced was neither gated nor
+            // count-conditioned, so on a multi-bound device it stamped a guess
+            // onto a request that carried no credential at all.
             if let Some(tid) = scope
+                .or_device_default(crate::session::dual_write::resolve_active_tenant_id())
                 .declared_tenant()
-                .or_else(crate::session::dual_write::resolve_active_tenant_id)
             {
                 rb = rb.header("X-Qontinui-Tenant-Id", tid.to_string());
             }
@@ -1104,8 +1132,15 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Ten
         .or_else(|| rec.payload.get("tenant_id"))
         .and_then(|v| v.as_str())
         .and_then(|s| Uuid::parse_str(s.trim()).ok());
-    if let Some(t) = from_payload {
-        return TenantScope::Owned(t);
+    if from_payload.is_some() {
+        // GATED for the same reason the registry arm below is: this scope both
+        // selects the bearer and (on `started`) accompanies a body that names
+        // the tenant, so a tenant this device cannot present would put a
+        // declared tenant on an unauthenticated request.
+        return TenantScope::for_bound_session(
+            from_payload,
+            &crate::auth::device_holds_usable_binding,
+        );
     }
     session_tenant_by_id(inner, rec.session_id)
 }
@@ -1121,7 +1156,7 @@ fn record_session_tenant(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> Ten
 /// [`TenantScope::Device`]: a session row HAS an owning tenant, so failing to
 /// find it is a failure, and the D2 degrade is what should decide the outcome.
 fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> TenantScope {
-    TenantScope::for_session(
+    TenantScope::for_bound_session(
         inner
             .registry
             .lock()
@@ -1130,6 +1165,7 @@ fn session_tenant_by_id(inner: &Arc<CoordSyncInner>, session_id: Uuid) -> Tenant
             .and_then(Weak::upgrade)
             .and_then(|reg| reg.describe_by_id(session_id).ok())
             .and_then(|d| d.intent.tenant_id),
+        &crate::auth::device_holds_usable_binding,
     )
 }
 
@@ -1457,6 +1493,27 @@ async fn bootstrap_then_register(
 /// machine_id. The session start path writes the create body shape into
 /// `payload` directly (`{id, kind, intent, state, started_at}`), so
 /// rebuilding for the wire is mostly relabeling.
+/// The tenant [`rebuild_create_body`] would DECLARE, when this device cannot
+/// present a credential for it — the predicate the `started` arm fails closed on.
+///
+/// Reads the body the sender would actually build rather than re-deriving the
+/// resolution order, so the two cannot drift: whatever lands in `tenant_id`
+/// (intent, payload, or the `machine.json` default) is what gets checked.
+///
+/// `None` means "safe to send": either the tenant is backed by a usable slot,
+/// or it is the nil UUID, which declares nothing and is coord's own
+/// resolve-server-side signal.
+fn unpresentable_create_tenant(rec: &OutboxRecord) -> Option<Uuid> {
+    let t = rebuild_create_body(rec)
+        .get("tenant_id")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s.trim()).ok())?;
+    if t.is_nil() || crate::auth::device_holds_usable_binding(&t) {
+        return None;
+    }
+    Some(t)
+}
+
 fn rebuild_create_body(rec: &OutboxRecord) -> JsonValue {
     // tenant_id resolution order: the intent/payload body (Phase 8b: the
     // registry stamps the session's tenant into the intent at creation —

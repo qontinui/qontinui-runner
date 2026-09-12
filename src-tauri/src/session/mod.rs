@@ -1238,8 +1238,35 @@ impl SessionRegistry {
     /// [`TenantScope::Unresolved`]; see [`session_tenant_scope`] for why that
     /// is not [`TenantScope::Device`].
     pub fn tenant_scope_of(&self, id: Uuid) -> TenantScope {
+        self.tenant_scope_of_with(id, &crate::auth::device_holds_usable_binding)
+    }
+
+    /// [`Self::tenant_scope_of`] with the binding predicate injected, so every
+    /// arm is testable without a real credential store.
+    ///
+    /// The gate is [`TenantScope::for_bound_session`]: a session's stamped
+    /// tenant is only `Owned` when this device can actually present that
+    /// tenant's credential. Every consumer of this accessor either declares the
+    /// tenant in a request body or selects a bearer with it, and those two must
+    /// agree — a body that names a tenant the bearer cannot back is the
+    /// cross-tenant write `repo_tenant::scope_from_lookup` closes for a
+    /// repo-derived tenant.
+    ///
+    /// An unbacked tenant therefore degrades to [`TenantScope::Unresolved`],
+    /// where the D2 rule decides: unauthenticated on a multi-bound device, the
+    /// default slot on a single-bound one. On a single-bound device whose
+    /// session names a tenant it is not bound to — an unbound SPAWN tenant —
+    /// that means the device's only binding is presented and nothing is
+    /// declared, the same outcome `scope_from_lookup` chose for an unbacked
+    /// repo tenant. Refusing such a spawn at its source is P1 of plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`.
+    pub(crate) fn tenant_scope_of_with(
+        &self,
+        id: Uuid,
+        device_is_bound_to: &dyn Fn(&Uuid) -> bool,
+    ) -> TenantScope {
         match self.describe_by_id(id) {
-            Ok(d) => TenantScope::for_session(d.intent.tenant_id),
+            Ok(d) => TenantScope::for_bound_session(d.intent.tenant_id, device_is_bound_to),
             Err(_) => TenantScope::Unresolved,
         }
     }
@@ -1527,27 +1554,74 @@ mod tests {
         stamped.tenant_id = Some(tenant);
         let owned = registry.start(stamped).unwrap();
         assert_eq!(
-            registry.tenant_scope_of(owned.id()),
+            registry.tenant_scope_of_with(owned.id(), &|_| true),
             TenantScope::Owned(tenant)
         );
 
         // Live session, no tenant stamped (single-tenant install with no
         // configured default): the row still has an owner we cannot name.
         let bare = registry.start(shell_intent()).unwrap();
-        assert_eq!(registry.tenant_scope_of(bare.id()), TenantScope::Unresolved);
+        assert_eq!(
+            registry.tenant_scope_of_with(bare.id(), &|_| true),
+            TenantScope::Unresolved
+        );
 
         // An id the registry never held — the claim path's `agent_session_id`
         // is a looser space than the registry's (orchestration `task_run_id`s
         // land here), which is exactly why this must not resolve to anything.
         assert_eq!(
-            registry.tenant_scope_of(Uuid::new_v4()),
+            registry.tenant_scope_of_with(Uuid::new_v4(), &|_| true),
             TenantScope::Unresolved
         );
 
         assert_ne!(
-            registry.tenant_scope_of(bare.id()),
+            registry.tenant_scope_of_with(bare.id(), &|_| true),
             TenantScope::Device,
             "an unstamped session must never be reported as having no tenant dimension"
+        );
+    }
+
+    /// The gate: a session whose stamped tenant this device holds no usable
+    /// credential for is `Unresolved`, so nothing downstream can DECLARE it.
+    ///
+    /// The predicate is injected (`tenant_scope_of_with`) rather than read from
+    /// the credential store, so this asserts the rule rather than the machine's
+    /// pairing state — the same reason the sibling above holds an
+    /// `IsolatedAmbient`.
+    #[test]
+    fn a_session_tenant_with_no_usable_credential_is_unresolved() {
+        let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let (registry, _dir) = make_registry();
+        let bound = Uuid::from_u128(0xB1);
+        let unbound = Uuid::from_u128(0xB2);
+
+        let mut stamped = shell_intent();
+        stamped.tenant_id = Some(unbound);
+        let session = registry.start(stamped).unwrap();
+
+        // This device is bound to `bound` alone.
+        let holds = |t: &Uuid| *t == bound;
+        assert_eq!(
+            registry.tenant_scope_of_with(session.id(), &holds),
+            TenantScope::Unresolved,
+            "an unbacked session tenant must not stay Owned — a body would declare a \
+             tenant the bearer lookup cannot present"
+        );
+        assert_eq!(
+            registry
+                .tenant_scope_of_with(session.id(), &holds)
+                .declared_tenant(),
+            None,
+            "and it must declare nothing on the wire"
+        );
+
+        // The same session, on a device that DOES hold the binding.
+        let mut ok_intent = shell_intent();
+        ok_intent.tenant_id = Some(bound);
+        let ok = registry.start(ok_intent).unwrap();
+        assert_eq!(
+            registry.tenant_scope_of_with(ok.id(), &holds),
+            TenantScope::Owned(bound)
         );
     }
 

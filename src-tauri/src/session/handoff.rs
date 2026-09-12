@@ -650,7 +650,12 @@ async fn materialize(
     // Captured before `intent` moves into the registry: the child inherits the
     // SOURCE session's tenant (`build_child_intent` carries `tenant_id` across),
     // and the claims re-acquired below belong to that same tenant.
-    let tenant = TenantScope::for_session(intent.tenant_id);
+    // GATED: `reacquire_claim` below writes this tenant into the
+    // `/claims/acquire` body, so it may name only a tenant this device can
+    // present a credential for — otherwise the claim is re-acquired under a
+    // tenant the request cannot authenticate as.
+    let tenant =
+        TenantScope::for_bound_session(intent.tenant_id, &crate::auth::device_holds_usable_binding);
 
     // Start the child session locally with lineage back to the source.
     let child = registry

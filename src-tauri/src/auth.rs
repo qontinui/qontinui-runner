@@ -1785,10 +1785,51 @@ impl TenantScope {
         tenant: Option<Uuid>,
         device_is_bound_to: &dyn Fn(&Uuid) -> bool,
     ) -> Self {
-        match tenant {
-            Some(t) if device_is_bound_to(&t) => TenantScope::Owned(t),
-            Some(_) => TenantScope::Unresolved,
-            None => TenantScope::Device,
+        Self::for_device_default(tenant).backed_by(device_is_bound_to)
+    }
+
+    /// [`Self::for_session`] for a site that DECLARES the tenant in a request
+    /// body: `Owned` only when this device can present that tenant's credential
+    /// ([`device_holds_usable_binding`]).
+    ///
+    /// The same rule as [`Self::for_bound_device_default`], one carrier over.
+    /// `session::stamp_session_tenant` fills a session's `intent.tenant_id`
+    /// from the spawn input or the `machine.json` default with no binding
+    /// check, and that value reaches request bodies at ~10 sites (the claim
+    /// verbs, allocate, the fs-observation and verify pushes, the handoff /
+    /// respawn re-acquires, the coord-sync create body and its commit-report
+    /// header). Nothing checked that a usable credential backed it, so a
+    /// declared tenant could go out on an UNAUTHENTICATED request — rows
+    /// injected into a tenant this device cannot present, which is exactly the
+    /// defect `repo_tenant` closes for a repo-derived tenant.
+    ///
+    /// `None` stays [`TenantScope::Unresolved`] for [`Self::for_session`]'s
+    /// reason: a session-owned row always HAS an owner, so absence is a
+    /// resolution FAILURE and never [`TenantScope::Device`].
+    pub fn for_bound_session(
+        tenant: Option<Uuid>,
+        device_is_bound_to: &dyn Fn(&Uuid) -> bool,
+    ) -> Self {
+        Self::for_session(tenant).backed_by(device_is_bound_to)
+    }
+
+    /// Demote an `Owned(t)` this device cannot present to
+    /// [`TenantScope::Unresolved`], so a body can never declare a tenant the
+    /// bearer lookup will not back.
+    ///
+    /// The ONE place this gate is spelled — both gated constructors go through
+    /// it, so the session carrier and the device-default carrier cannot drift
+    /// apart. `Device` and `Unresolved` pass through untouched: neither
+    /// declares a tenant ([`Self::declared_tenant`]), so neither has anything
+    /// to gate.
+    ///
+    /// The predicate is injected rather than read here so every arm is
+    /// hermetically testable without touching `paired_user.json` — the same
+    /// seam [`Self::or_device_default_with_count`] uses.
+    pub(crate) fn backed_by(self, device_is_bound_to: &dyn Fn(&Uuid) -> bool) -> Self {
+        match self {
+            TenantScope::Owned(t) if !device_is_bound_to(&t) => TenantScope::Unresolved,
+            other => other,
         }
     }
 
@@ -3139,6 +3180,91 @@ mod bearer_selection_tests {
         assert_eq!(TenantScope::Owned(t).declared_tenant(), Some(t));
         assert_eq!(TenantScope::Device.declared_tenant(), None);
         assert_eq!(TenantScope::Unresolved.declared_tenant(), None);
+    }
+
+    // ---- the GATE: a declared tenant must be one this device can present ---
+    //
+    // `backed_by` is the single spelling of the rule, and both gated
+    // constructors route through it. The sites that use them write the tenant
+    // into a request body, so an `Owned(t)` with no usable slot would put a
+    // declared tenant on an UNAUTHENTICATED request — rows injected into a
+    // tenant this device cannot present.
+
+    /// The session carrier: bound stays `Owned`, unbacked degrades, and absence
+    /// keeps `for_session`'s meaning rather than becoming `Device`.
+    #[test]
+    fn for_bound_session_is_owned_only_for_a_presentable_tenant() {
+        let bound = tenant(0xE1);
+        let unbound = tenant(0xE2);
+        let holds = |t: &Uuid| *t == bound;
+
+        assert_eq!(
+            TenantScope::for_bound_session(Some(bound), &holds),
+            TenantScope::Owned(bound)
+        );
+        assert_eq!(
+            TenantScope::for_bound_session(Some(unbound), &holds),
+            TenantScope::Unresolved,
+            "an unbacked session tenant must not reach a body"
+        );
+        assert_eq!(
+            TenantScope::for_bound_session(Some(unbound), &holds).declared_tenant(),
+            None
+        );
+        assert_eq!(
+            TenantScope::for_bound_session(None, &holds),
+            TenantScope::Unresolved,
+            "absence is still a resolution FAILURE for a session-owned row, never `Device`"
+        );
+    }
+
+    /// The gate is the SAME predicate for both carriers — the property that
+    /// keeps the session path and the device-default path from drifting apart.
+    /// Only the `None` arm may differ, because only absence means different
+    /// things on the two carriers.
+    #[test]
+    fn both_gated_constructors_share_one_gate_and_differ_only_on_absence() {
+        let unbound = tenant(0xE3);
+        let never = |_: &Uuid| false;
+        let always = |_: &Uuid| true;
+
+        assert_eq!(
+            TenantScope::for_bound_session(Some(unbound), &never),
+            TenantScope::for_bound_device_default(Some(unbound), &never),
+            "an unbacked PRESENT tenant degrades identically on both carriers"
+        );
+        assert_eq!(
+            TenantScope::for_bound_session(Some(unbound), &always),
+            TenantScope::for_bound_device_default(Some(unbound), &always),
+        );
+        assert_ne!(
+            TenantScope::for_bound_session(None, &always),
+            TenantScope::for_bound_device_default(None, &always),
+            "absence must keep meaning what each ungated constructor says it means"
+        );
+    }
+
+    /// `backed_by` touches `Owned` and nothing else: neither `Device` nor
+    /// `Unresolved` declares a tenant, so neither has anything to gate — and a
+    /// gate that rewrote `Device` would re-collapse the two absences.
+    #[test]
+    fn backed_by_gates_owned_and_passes_the_other_two_through() {
+        let t = tenant(0xE4);
+        let never = |_: &Uuid| false;
+
+        assert_eq!(
+            TenantScope::Owned(t).backed_by(&never),
+            TenantScope::Unresolved
+        );
+        assert_eq!(TenantScope::Device.backed_by(&never), TenantScope::Device);
+        assert_eq!(
+            TenantScope::Unresolved.backed_by(&never),
+            TenantScope::Unresolved
+        );
+        assert_eq!(
+            TenantScope::Owned(t).backed_by(&|_| true),
+            TenantScope::Owned(t)
+        );
     }
 
     // ---- `or_device_default` — D2's rule applied to a DECLARED tenant ------
