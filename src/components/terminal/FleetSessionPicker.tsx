@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
@@ -186,6 +186,28 @@ export function FleetSessionPicker() {
    * that truncation hid. This is the way out: coord takes a raw uuid.
    */
   const [deviceIdEntry, setDeviceIdEntry] = useState(false);
+
+  /**
+   * Re-render on a slow timer so the per-row relative times keep moving.
+   *
+   * `formatRelativeTime` is computed during render, and nothing else here
+   * re-renders while the panel sits open — the hook only re-renders on a fetch.
+   * A row that read "heartbeat 2m ago" would still read "heartbeat 2m ago" an
+   * hour later, which is a stale liveness claim in the one place this list
+   * exists to answer honestly. The same display elsewhere in the app
+   * (`WebIntegrationSettings`) polls for exactly this reason.
+   *
+   * 30s, because the finest unit rendered is the minute: a shorter tick buys no
+   * visible accuracy and re-renders a list that can run to hundreds of rows,
+   * and a longer one lets a minute boundary sit visibly wrong. The tick is the
+   * ONLY thing it advances — no read is issued, so this never hides a stale
+   * fetch behind a moving label.
+   */
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setClockTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const {
     sessions,
@@ -493,8 +515,15 @@ export function FleetSessionPicker() {
         immediately. The way forward is the refresh above, which starts a fresh
         walk with no cursor, and the banner says so instead of implying a
         control that is not there.
+
+        Suppressed while `walkStalled`, where the error banner below carries the
+        SAME fact in the same words ("the walk cannot advance") plus a Retry.
+        Two incompleteness warnings stacked, one of them styled as an error, is
+        the confident-on-screen-claim shape this whole phase removes. The other
+        drop path — a cursor coord REFUSED — says something different (why the
+        cursor is gone, not how complete the list is), so there both belong.
       */}
-      {truncation.kind === "unreachable" && (
+      {truncation.kind === "unreachable" && !walkStalled && (
         <div
           data-ui-bridge-id={FLEET_PICKER_UNREACHABLE_ID}
           data-truncation-kind={truncation.kind}
@@ -714,18 +743,34 @@ export function FleetSessionPicker() {
                         // timestamp — renders nothing rather than a placeholder
                         // that would look like an answer.
                         const activity = fleetSessionActivity(s);
-                        const parts = [
-                          s.provider,
-                          s.correlationTopic,
-                          activity ? `${activity.verb} ${formatRelativeTime(activity.iso)}` : null,
-                        ].filter(Boolean);
-                        if (parts.length === 0) return null;
+                        const free = [s.provider, s.correlationTopic].filter(
+                          (v): v is string => typeof v === "string" && v.length > 0,
+                        );
+                        if (free.length === 0 && !activity) return null;
                         return (
-                          <div
-                            className="text-[10px] text-[#565f89] truncate"
-                            title={activity ? `${activity.verb} at ${activity.iso}` : undefined}
-                          >
-                            {parts.join(" · ")}
+                          <div className="text-[10px] text-[#565f89] truncate">
+                            {/* Each half carries its OWN title. One tooltip over
+                                the whole line would claim to explain the free
+                                text it says nothing about — and this line is
+                                `truncate`d, so the tooltip is often the only way
+                                to read either half. */}
+                            {free.length > 0 && (
+                              <span title={free.join(" · ")}>{free.join(" · ")}</span>
+                            )}
+                            {free.length > 0 && activity && " · "}
+                            {activity && (
+                              <span
+                                // The exact instant, machine-readable, for the
+                                // same reason `data-fleet-error-code` exists: a
+                                // driver must not have to scrape a truncated,
+                                // locale-formatted span for a timestamp.
+                                data-session-activity={activity.iso}
+                                data-session-activity-kind={activity.verb}
+                                title={`${activity.verb} at ${activity.iso}`}
+                              >
+                                {activity.verb} {formatRelativeTime(activity.iso)}
+                              </span>
+                            )}
                           </div>
                         );
                       })()}

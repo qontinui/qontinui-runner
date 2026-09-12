@@ -407,16 +407,21 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   const includeClosed = opts?.includeClosed ?? false;
   const limit = opts?.limit ?? FLEET_DEFAULT_LIMIT;
   /**
-   * The walk's scope, as one comparable string. This — not `fetchPage`'s
-   * identity — is what a restart keys on, and the difference is the whole point
-   * of [`fleetScopeKey`] omitting `limit`.
+   * The walk's scope, as one comparable string, named EXPLICITLY in the restart
+   * effect's dependencies.
    *
-   * Closing `fetchPage` over `limit` and then keying the mount effect on
-   * `fetchPage` makes a page RESIZE restart the walk and discard every page
-   * already accumulated, which is exactly what this module's contract says must
-   * not happen: coord's cursor survives a changed page size. The scope key is
-   * the three parameters coord actually fingerprints into the cursor, so it
-   * moves when and only when a cursor really is invalidated.
+   * What actually fixed the page-resize restart is one line below this: `limit`
+   * came out of `fetchPage`'s dependency list. While it was in, `fetchPage` got
+   * a new identity on every resize, the restart effect keyed on that identity,
+   * and every accumulated page was discarded and re-fetched — the opposite of
+   * this module's contract, since coord's cursor survives a changed page size.
+   *
+   * This key does not do that work and is not load-bearing for it. It is here
+   * because the restart trigger should SAY what it is: keying only on a
+   * callback's identity makes the trigger an implicit consequence of that
+   * callback's dependency list, which is exactly how `limit` got in. `fetchPage`
+   * is still named beside it — the two move together, so the effect needs no
+   * lint suppression and no claim that one replaces the other.
    */
   const scopeKey = fleetScopeKey({ deviceId, state, includeClosed });
 
@@ -431,6 +436,12 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   // Synced in an effect rather than during render: a render-phase ref write is
   // what `react-hooks/refs` flags, and nothing reads this before an effect or a
   // click handler runs — `useRef(limit)` already seeds the mount read.
+  //
+  // This effect MUST stay declared above the restart effect below. React runs
+  // effects in declaration order, so a commit that changes the page size and the
+  // scope together syncs the ref here first and the restart then reads the new
+  // size. Reordering the two would leave that one commit fetching page one at
+  // the previous size, silently and only in that case.
   useEffect(() => {
     limitRef.current = limit;
   }, [limit]);
@@ -535,14 +546,18 @@ export function useFleetSessions(opts?: FleetSessionsQuery): UseFleetSessionsRes
   // must restart the walk — a cursor is only valid within its scope), and when a
   // scope-mismatch restart bumps the token.
   //
-  // Keyed on `scopeKey` rather than on `fetchPage`: a page RESIZE changes the
-  // slice, not the sequence, and coord's cursor survives it — so resizing must
-  // re-use the walk rather than throw away the pages already loaded. The next
-  // page fetched picks the new size up through `limitRef`.
+  // A page RESIZE is deliberately absent from that list: it changes the slice,
+  // not the sequence, and coord's cursor survives it, so resizing re-uses the
+  // walk rather than throwing away the pages already loaded. The next page
+  // fetched picks the new size up through `limitRef`.
+  //
+  // `scopeKey` and `fetchPage` move together by construction — both derive from
+  // exactly `deviceId` / `state` / `includeClosed` — so naming both is honest
+  // rather than redundant-and-suppressed, and it keeps the trigger readable
+  // without an eslint directive standing in for the explanation.
   useEffect(() => {
     void fetchPage("restart");
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `fetchPage` closes over the same three scope values `scopeKey` is built from, so keying on both is redundant; naming it here is the shape that puts `limit` back in and restarts the walk on a page resize
-  }, [scopeKey, restartToken]);
+  }, [fetchPage, scopeKey, restartToken]);
 
   const refresh = useCallback(() => fetchPage("restart"), [fetchPage]);
   const loadMore = useCallback(() => fetchPage("more"), [fetchPage]);
