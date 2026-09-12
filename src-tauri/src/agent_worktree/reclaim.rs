@@ -905,7 +905,15 @@ fn worktree_is_building(worktree: &Path, window: Duration) -> bool {
 /// Execute all instructions in one pull.
 fn execute_pull(pull: &ReclaimPull) {
     if pull.instructions.is_empty() {
-        debug!("worktree_reclaim: no instructions");
+        // INFO, not DEBUG, deliberately: this is the executor's per-tick heartbeat.
+        // Every other `worktree_reclaim:` line is downstream of a NON-EMPTY
+        // instruction list, so at the default INFO level an idle tick used to emit
+        // nothing at all -- and "the executor ran and coord sent no work" (the
+        // census-starvation incident) was indistinguishable in the log from "the
+        // executor never ran". One line per interval (default 300 s, ~288/day)
+        // makes the former directly witnessable. Named follow-up of
+        // qontinui-claude-config#859 (/cleanup-steward SS4a-1, control (ii)).
+        info!("worktree_reclaim: no instructions");
         return;
     }
     info!(
