@@ -902,6 +902,15 @@ pub struct HealthInputs {
     pub pg_reachable: Option<bool>,
     /// Backend WS relay liveness; `None` when no relay is expected.
     pub relay_connected: Option<bool>,
+    /// M7 — can this runner's own coord credential answer RIGHT NOW?
+    /// `Some(false)` for every non-answering posture (`expired`, `absent`,
+    /// `unrefreshable`, `dark`). `None` is UNKNOWN — no refresher pass has
+    /// concluded, or this sink does not measure it — and is NEVER health.
+    ///
+    /// Without this input `/health` reported `derived_status: "healthy"` for a
+    /// runner whose every spawned session has no coord access, which is the
+    /// defect the coord-credential posture exists to make visible.
+    pub coord_credential_can_answer: Option<bool>,
 }
 
 pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
@@ -914,6 +923,7 @@ pub fn compute_derived_status(i: &HealthInputs) -> &'static str {
     } else if matches!(i.embedding_reachable, Some(false))
         || matches!(i.pg_reachable, Some(false))
         || matches!(i.relay_connected, Some(false))
+        || matches!(i.coord_credential_can_answer, Some(false))
     {
         "degraded"
     } else {

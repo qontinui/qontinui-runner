@@ -9,7 +9,10 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  applyCredentialDarkSignal,
+  credentialDarkFromPostureSnapshot,
   credentialDarkPresentation,
+  effectiveCredentialDark,
   makeRePairClickHandler,
   normalizeCredentialDarkSignal,
   RE_PAIR_CTA_GRACE_MS,
@@ -196,6 +199,7 @@ describe("statusSignature", () => {
 // ---------------------------------------------------------------------------
 
 const darkExpired: CredentialDarkSignal = {
+  source: "posture",
   dark: true,
   cause: "expired",
   message:
@@ -230,6 +234,7 @@ describe("credential-dark banner visibility", () => {
 
   it("CLEARS on dark:false — a stale banner after recovery teaches users to ignore it", () => {
     const recovered: CredentialDarkSignal = {
+      source: "posture",
       dark: false,
       cause: "recovered",
       message: "Coord access restored — this runner's credential is live again.",
@@ -337,6 +342,8 @@ describe("normalizeCredentialDarkSignal", () => {
     // "I am dark" in the old shape is exactly as dark.
     const legacy = normalizeCredentialDarkSignal({ dark: true, message: "paused" });
     expect(legacy).toEqual({
+      // A build that predates the source had exactly one emitter.
+      source: "cognito",
       dark: true,
       cause: "cognito_hard",
       message: "paused",
@@ -350,5 +357,172 @@ describe("normalizeCredentialDarkSignal", () => {
     expect(normalizeCredentialDarkSignal(null)).toBeNull();
     expect(normalizeCredentialDarkSignal("dark")).toBeNull();
     expect(normalizeCredentialDarkSignal({ message: "no dark flag" })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M5 — two authorities, one event. Held per SOURCE and reduced, because a
+// single slot is last-writer-wins and the losing write is routinely a
+// RECOVERY from the other authority.
+// ---------------------------------------------------------------------------
+
+describe("per-source credential-dark signals", () => {
+  const cognitoDark: CredentialDarkSignal = {
+    source: "cognito",
+    dark: true,
+    cause: "cognito_hard",
+    message: "Autonomous sessions paused — sign in again to resume.",
+    cta: "sign_in",
+    since: null,
+  };
+  const cognitoRecovered: CredentialDarkSignal = {
+    source: "cognito",
+    dark: false,
+    cause: "recovered",
+    message: "Autonomous sessions resumed — credentials refreshed.",
+    cta: null,
+    since: null,
+  };
+  const postureUnrefreshable: CredentialDarkSignal = {
+    source: "posture",
+    dark: true,
+    cause: "unrefreshable",
+    message:
+      "the coord credential expired and automatic refresh FAILED (unrefreshable). Sessions spawned now have no coord access.",
+    cta: "re_pair",
+    since: 1_757_649_240,
+  };
+
+  it("THE bug: Cognito recovering must not clear a posture that is still dark", () => {
+    // Cognito goes dark, the posture goes dark, the user signs in. Cognito's
+    // `notify_recovered` fires `dark:false` — and in a single slot that
+    // CLEARED the banner while the tenant slot was still `unrefreshable`,
+    // with the posture arm unable to re-fire because the posture had not
+    // changed.
+    let bySource: Record<string, CredentialDarkSignal> = {};
+    bySource = applyCredentialDarkSignal(bySource, cognitoDark);
+    bySource = applyCredentialDarkSignal(bySource, postureUnrefreshable);
+    bySource = applyCredentialDarkSignal(bySource, cognitoRecovered);
+
+    const effective = effectiveCredentialDark(bySource);
+    expect(effective).not.toBeNull();
+    expect(effective?.cause).toBe("unrefreshable");
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null, effective)).toBe(true);
+  });
+
+  it("clears only when EVERY source has recovered", () => {
+    let bySource: Record<string, CredentialDarkSignal> = {};
+    bySource = applyCredentialDarkSignal(bySource, cognitoDark);
+    bySource = applyCredentialDarkSignal(bySource, postureUnrefreshable);
+    bySource = applyCredentialDarkSignal(bySource, cognitoRecovered);
+    bySource = applyCredentialDarkSignal(bySource, {
+      ...postureUnrefreshable,
+      dark: false,
+      cause: "recovered",
+    });
+    expect(effectiveCredentialDark(bySource)).toBeNull();
+    expect(shouldShowAuthBanner(baseFreshInstall, true, null, null)).toBe(false);
+  });
+
+  it("shows the cause that needs the most operator action when both are dark", () => {
+    const bySource = applyCredentialDarkSignal(
+      applyCredentialDarkSignal({}, { ...postureUnrefreshable, cause: "expired" }),
+      cognitoDark,
+    );
+    // `cognito_hard` has already exhausted its automatic recovery; `expired`
+    // has not.
+    expect(effectiveCredentialDark(bySource)?.cause).toBe("cognito_hard");
+  });
+
+  it("an unknown cause from a future runner build still shows", () => {
+    const bySource = applyCredentialDarkSignal(
+      {},
+      {
+        ...postureUnrefreshable,
+        cause: "some_future_cause",
+      },
+    );
+    expect(effectiveCredentialDark(bySource)?.cause).toBe("some_future_cause");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// M4 — the posture must be READ on mount. Tauri `emit` has no replay, so the
+// boot publish lands on no listener, and a webview reload never re-fires.
+// ---------------------------------------------------------------------------
+
+describe("credentialDarkFromPostureSnapshot", () => {
+  it("turns a non-answering posture into a dark signal the banner can render", () => {
+    const signal = credentialDarkFromPostureSnapshot({
+      posture: "dark",
+      cause: "upstream_401",
+      canAnswer: false,
+      reason: "coord is REJECTING this runner's credential even though it has not expired locally.",
+      cta: "re_pair",
+      since: 1_757_649_240,
+    });
+    expect(signal).toEqual({
+      source: "posture",
+      dark: true,
+      cause: "upstream_401",
+      message:
+        "coord is REJECTING this runner's credential even though it has not expired locally.",
+      cta: "re_pair",
+      since: 1_757_649_240,
+    });
+    // And it is enough on its own: this is the BOOT case, before
+    // `get_web_integration_status` has resolved.
+    expect(shouldShowAuthBanner(null, false, null, signal)).toBe(true);
+  });
+
+  it("reads the deprecated `state` spelling from an older runner build", () => {
+    const signal = credentialDarkFromPostureSnapshot({
+      state: "unrefreshable",
+      canAnswer: false,
+      reason: "refresh failed",
+      cta: "re_pair",
+      since: null,
+    });
+    expect(signal?.dark).toBe(true);
+    expect(signal?.cause).toBe("unrefreshable");
+  });
+
+  it("an answering posture is a RECOVERY for the posture source only", () => {
+    const signal = credentialDarkFromPostureSnapshot({
+      posture: "live",
+      cause: null,
+      canAnswer: true,
+      reason: "coord credential is live",
+      cta: null,
+      since: 1_757_649_240,
+    });
+    expect(signal?.dark).toBe(false);
+    expect(signal?.source).toBe("posture");
+    // It clears the posture entry and leaves a Cognito-dark entry standing.
+    const bySource = applyCredentialDarkSignal(
+      {
+        cognito: {
+          source: "cognito",
+          dark: true,
+          cause: "cognito_hard",
+          message: "paused",
+          cta: "sign_in",
+          since: null,
+        },
+      },
+      signal!,
+    );
+    expect(effectiveCredentialDark(bySource)?.cause).toBe("cognito_hard");
+  });
+
+  it("UNKNOWN contributes nothing — it is not health and not a recovery", () => {
+    // `/health` renders "no pass has completed in this process yet" this way,
+    // and the command answers `null` for it. Neither may clear a banner.
+    expect(credentialDarkFromPostureSnapshot(null)).toBeNull();
+    expect(
+      credentialDarkFromPostureSnapshot({ state: "unknown", reason: "no pass yet" }),
+    ).toBeNull();
+    expect(credentialDarkFromPostureSnapshot("dark")).toBeNull();
+    expect(credentialDarkFromPostureSnapshot({})).toBeNull();
   });
 });
