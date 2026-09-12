@@ -1594,6 +1594,30 @@ pub(crate) enum SelfIdOutcome {
     /// an identical header from all three success arms; the /health split
     /// keeps the resolving chain diagnosable per-plane.
     InjectedViaLifecycle,
+    /// The header was sent, resolved by the CALLER'S OWN assertion settling a
+    /// key the runner had narrowed to several candidates and could not settle
+    /// alone. The request's `X-Coord-Caller-Session` — the header
+    /// `coord-revive.sh call` (qontinui-runner#1432) and the config-repo
+    /// doors (qontinui-claude-config#865) now forward — is consumed as a
+    /// TIE-BREAK, never as an identity in its own right: it resolves only
+    /// when it names one of the runner's admitted candidates for the
+    /// terminal or workdir the nonce is bound to. A fourth success arm, kept
+    /// separate so the /health split says how much of the attribution is the
+    /// client's word narrowing the runner's proof, versus the runner's proof
+    /// alone — and split PER LEG, because leg 1's `terminal_leg` self-report
+    /// sums its own outcome family and a shared variant would let a settled
+    /// terminal read as leg 1 never engaging (the `ResolverStateMissing`
+    /// exclusion, from the other direction). See [`settle_ambiguity`].
+    ///
+    /// This one is leg 1: several open rows on the nonce's TERMINAL, the
+    /// assertion named one of them.
+    InjectedViaClientPickTerminal,
+    /// The leg-3 twin of [`SelfIdOutcome::InjectedViaClientPickTerminal`]:
+    /// several admitted sessions on the nonce's WORKDIR, the assertion named
+    /// one of them. This is the arm the 178 `ambiguous_workdir` misses on the
+    /// operator's box (2026-09-12) move into once the caller says which of
+    /// the workdir's sessions it is.
+    InjectedViaClientPickWorkdir,
     /// An agent-spawn session — out of scope by design; those carry their own
     /// scoped identity.
     NonDevicePrincipal,
@@ -1628,7 +1652,11 @@ pub(crate) enum SelfIdOutcome {
     /// rows, and in the dangerous window (a reused terminal between PTY spawn
     /// and the SessionStart hook's confirmation) the STALE row is the
     /// confirmed one — so authority-ranking would actively prefer the
-    /// PREVIOUS run's session id. See [`select_terminal_caller`].
+    /// PREVIOUS run's session id. See [`select_terminal_caller`]. A
+    /// client-asserted id naming one of those rows settles it (the live
+    /// session knows which row is its own — see
+    /// [`SelfIdOutcome::InjectedViaClientPickTerminal`]); this bucket is what
+    /// remains when the request asserted nothing.
     AmbiguousTerminal,
     /// The nonce is not in the live binding map.
     NoWorkdir,
@@ -1663,8 +1691,30 @@ pub(crate) enum SelfIdOutcome {
     /// workdir key (the workspace root hosts 13 open records). Deliberately
     /// resolved to no header rather than to an arbitrary winner — see
     /// [`select_lifecycle_caller`]. This is the honest residual the terminal
-    /// leg exists to shrink.
+    /// leg exists to shrink — and the one a client-asserted id may settle
+    /// (see [`SelfIdOutcome::InjectedViaClientPickWorkdir`]); this bucket is
+    /// what remains when the request asserted nothing.
     AmbiguousWorkdir,
+    /// The key was ambiguous (on either leg) AND the request asserted a
+    /// session id, but the asserted id is NOT one of the runner's admitted
+    /// candidates for that key — so it settled nothing and the call goes
+    /// headerless. Counted apart from the two `ambiguous_*` buckets because
+    /// it is a different fact: a session in this workdir/terminal is naming
+    /// itself and the runner holds no trusted record of it (a hand-launched
+    /// session with no lifecycle record, a `reconciled` anchor, or an
+    /// assertion naming a session elsewhere). Measured 0 before this arm
+    /// existed by construction; a non-zero reading here is the population
+    /// the runner's own record-keeping is blind to. Split per leg for the
+    /// same reason as the success twin. This one is leg 1 (the terminal's
+    /// rows); the `terminal_leg` block counts it as engagement, and the
+    /// asserted id is NOT carried in `recent_misses` — that ring is the
+    /// workdir leg's sample (it carries a workdir and a record census, which
+    /// a terminal key has no analogue of).
+    ClientPickNotCandidateTerminal,
+    /// Leg 3 (the workdir's admitted sessions). This one DOES land in
+    /// `recent_misses`, with `client_asserted` set to the id the session
+    /// claimed, beside the census of what the runner held for that workdir.
+    ClientPickNotCandidateWorkdir,
     /// The lifecycle store is absent from Tauri state, so the lifecycle leg
     /// could not run at all. Should read **0** in production: the store is
     /// managed at `main.rs:2786`. That is what makes this arm a useful
@@ -1703,6 +1753,10 @@ impl SelfIdOutcome {
             Self::AmbiguousWorkdir => "ambiguous_workdir",
             Self::ResolverStateMissing => "resolver_state_missing",
             Self::NoSession => "no_session",
+            Self::InjectedViaClientPickTerminal => "injected_via_client_pick_terminal",
+            Self::InjectedViaClientPickWorkdir => "injected_via_client_pick_workdir",
+            Self::ClientPickNotCandidateTerminal => "client_pick_not_candidate_terminal",
+            Self::ClientPickNotCandidateWorkdir => "client_pick_not_candidate_workdir",
         }
     }
 
@@ -1738,12 +1792,19 @@ impl SelfIdOutcome {
             Self::AmbiguousWorkdir => 13,
             Self::ResolverStateMissing => 14,
             Self::NoSession => 15,
+            // Appended, never interleaved: the slots above are the series
+            // operators have been reading since 2026-08, and renumbering them
+            // would make a counter silently change meaning across builds.
+            Self::InjectedViaClientPickTerminal => 16,
+            Self::InjectedViaClientPickWorkdir => 17,
+            Self::ClientPickNotCandidateTerminal => 18,
+            Self::ClientPickNotCandidateWorkdir => 19,
         }
     }
 
     /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
     /// in the tests so the two orderings cannot drift.
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
@@ -1760,13 +1821,17 @@ impl SelfIdOutcome {
         Self::AmbiguousWorkdir,
         Self::ResolverStateMissing,
         Self::NoSession,
+        Self::InjectedViaClientPickTerminal,
+        Self::InjectedViaClientPickWorkdir,
+        Self::ClientPickNotCandidateTerminal,
+        Self::ClientPickNotCandidateWorkdir,
     ];
 }
 
 /// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
 /// declaration order of [`SelfIdOutcome::ALL`]).
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 16] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 16]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 20] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 20]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -1840,6 +1905,16 @@ struct SelfIdMissSample {
     open_dirs: Vec<String>,
     /// The undeduplicated counts behind the verdict.
     census: LifecycleMissCensus,
+    /// What the REQUEST said it was, when it said anything: the parsed
+    /// `X-Coord-Caller-Session` the client forwarded. `None` for a request
+    /// that asserted nothing (or asserted a non-UUID, which is the same
+    /// thing — see [`client_asserted_session`]). Beside `distinct_candidates`
+    /// this is what makes a `client_pick_not_candidate_workdir` miss
+    /// diagnosable: the operator can see the id the session claimed and ask
+    /// why the runner holds no trusted record naming it. This ring is the
+    /// WORKDIR leg's sample — a terminal-leg rejection is counted
+    /// (`client_pick_not_candidate_terminal`) but not sampled here.
+    client_asserted: Option<uuid::Uuid>,
 }
 
 /// The miss ring itself: newest at the back, capped at
@@ -1861,6 +1936,7 @@ fn record_self_id_miss_sample(
     candidate_dirs: Vec<String>,
     open_dirs: Vec<String>,
     census: LifecycleMissCensus,
+    client_asserted: Option<uuid::Uuid>,
 ) {
     let sample = SelfIdMissSample {
         gate: gate.label(),
@@ -1868,6 +1944,7 @@ fn record_self_id_miss_sample(
         candidate_dirs,
         open_dirs,
         census,
+        client_asserted,
     };
     let Ok(mut q) = self_id_miss_samples().lock() else {
         return;
@@ -1919,6 +1996,10 @@ fn self_id_miss_sample_entry_json(s: &SelfIdMissSample) -> serde_json::Value {
         "matched_record_count": s.census.matched,
         "admitted_record_count": s.census.admitted,
         "distinct_candidate_count": s.census.distinct_candidates,
+        // The request's own claim, or `null` — rendered even when absent so a
+        // reader can tell "asserted nothing" from "this build does not
+        // report it".
+        "client_asserted": s.client_asserted.map(|u| u.to_string()),
     })
 }
 
@@ -1963,12 +2044,19 @@ fn terminal_leg_no_terminal_counter() -> &'static std::sync::atomic::AtomicU64 {
 /// though leg 1 can emit it: the lifecycle leg emits it too, so counting it as
 /// leg-1 engagement would let a store-wiring fault on the OTHER leg report
 /// this one as healthy — the exact false-calm this surface exists to prevent.
-const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 5] = [
+///
+/// The two client-pick outcomes here are the TERMINAL-keyed ones only; their
+/// workdir twins are leg 3's, and a shared variant would have put leg 1 back
+/// in the same false-calm shape (a box whose every terminal-bound nonce is
+/// settled by pick would have read `engaged == 0`, verdict `inert`).
+const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 7] = [
     SelfIdOutcome::InjectedViaTerminal,
     SelfIdOutcome::TerminalRecordMissing,
     SelfIdOutcome::TerminalRecordUnadmitted,
     SelfIdOutcome::TerminalAnchorNotUuid,
     SelfIdOutcome::AmbiguousTerminal,
+    SelfIdOutcome::InjectedViaClientPickTerminal,
+    SelfIdOutcome::ClientPickNotCandidateTerminal,
 ];
 
 /// The honest three-way reading of leg 1's health, from its two halves.
@@ -2004,6 +2092,10 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
         );
     }
     obj.insert("recent_misses".to_string(), self_id_miss_sample_json());
+    obj.insert(
+        "client_assertion_overridden".to_string(),
+        serde_json::json!(client_assertion_overridden_counter().load(Ordering::Relaxed)),
+    );
     let no_terminal = terminal_leg_no_terminal_counter().load(Ordering::Relaxed);
     let engaged: u64 = TERMINAL_LEG_OUTCOMES
         .iter()
@@ -2043,6 +2135,13 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 ///    names exactly one admitted session, and otherwise reports
 ///    [`SelfIdOutcome::AmbiguousWorkdir`] rather than picking one.
 ///
+/// `client_asserted` is the request's OWN `X-Coord-Caller-Session`, already
+/// parsed strictly ([`client_asserted_session`]). It never adds a candidate:
+/// it can only settle an ambiguity between candidates the runner derived
+/// itself, on legs 1 and 3 — see [`settle_ambiguity`] for the rule and its
+/// bound. A resolved leg ignores it (and counts the disagreement, see
+/// [`client_assertion_overridden_counter`]).
+///
 /// Every link is best-effort; a break anywhere yields `None` (the caller then
 /// omits the header and coord keeps its fuzzy fallback), and the break point
 /// is reported as a [`SelfIdOutcome`] so the chain is diagnosable from
@@ -2060,6 +2159,7 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 fn resolve_caller_session_id(
     state: &Arc<ApiState>,
     nonce: Option<&str>,
+    client_asserted: Option<uuid::Uuid>,
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     let Some(nonce) = nonce else {
         return (None, SelfIdOutcome::NoNonce);
@@ -2073,6 +2173,12 @@ fn resolve_caller_session_id(
     // workdir — see [`TerminalLeg`].
     match resolve_caller_via_terminal(state, nonce) {
         TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
+        // Several open rows on one terminal: the live session is the one
+        // that can say which row is its own. Still a terminal-leg verdict
+        // either way — never a fallthrough to the workdir chain.
+        TerminalLeg::Ambiguous(candidates) => {
+            return settle_ambiguity(&candidates, client_asserted, AmbiguousKey::Terminal);
+        }
         TerminalLeg::Miss(outcome) => return (None, outcome),
         TerminalLeg::NoTerminal => {
             // Count the FALLTHROUGH, not just the verdicts. `NoTerminal` ends
@@ -2117,10 +2223,146 @@ fn resolve_caller_session_id(
         // plane never has one), so resolve through the durable lifecycle
         // store instead: workdir → the single admitted open record → its own
         // anchor. Every miss arrives already typed as the gate that rejected.
-        None => match resolve_caller_via_lifecycle(state, &workdir) {
-            Ok(sid) => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
-            Err(outcome) => (None, outcome),
-        },
+        None => resolve_caller_via_lifecycle(state, &workdir, client_asserted),
+    }
+}
+
+/// The request's own `X-Coord-Caller-Session`, as the STRICT UUID it must be
+/// to name a `coord.agent_sessions` row — or `None`.
+///
+/// The SAME parse the runner applies to its own anchors
+/// ([`anchor_as_caller_session`]: trimmed, `Uuid::parse_str`, no repair), so
+/// the id a client asserts and the ids in `candidates` are compared in one
+/// namespace. A client that forwards a non-UUID has asserted nothing; it is
+/// neither counted as a pick nor logged, because the bundled `coord-revive.sh`
+/// and the config-repo doors already refuse to forward anything but a
+/// hyphenated UUID, so a malformed value here is a foreign client rather than
+/// a fleet bug. `HeaderMap::get` reads the FIRST value when the header is
+/// repeated — a second copy is ignored, not merged.
+fn client_asserted_session(headers: &axum::http::HeaderMap) -> Option<uuid::Uuid> {
+    let raw = headers
+        .get(crate::coord_mcp::CALLER_SESSION_HEADER)?
+        .to_str()
+        .ok()?;
+    anchor_as_caller_session(raw)
+}
+
+/// Which runner-owned key produced the ambiguity a client assertion is being
+/// asked to settle. Each maps to its own three outcomes, so the `/health`
+/// split — and leg 1's `terminal_leg` self-report in particular — keeps the
+/// leg provenance of every pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousKey {
+    /// Leg 1: several open rows on the nonce's terminal.
+    Terminal,
+    /// Leg 3: several admitted sessions on the nonce's workdir.
+    Workdir,
+}
+
+impl AmbiguousKey {
+    /// Nothing asserted — the leg's own bucket, as before this arm existed.
+    const fn unsettled(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::AmbiguousTerminal,
+            Self::Workdir => SelfIdOutcome::AmbiguousWorkdir,
+        }
+    }
+    /// Asserted, and one of the runner's candidates.
+    const fn picked(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::InjectedViaClientPickTerminal,
+            Self::Workdir => SelfIdOutcome::InjectedViaClientPickWorkdir,
+        }
+    }
+    /// Asserted, and NOT one of the runner's candidates.
+    const fn rejected(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::ClientPickNotCandidateTerminal,
+            Self::Workdir => SelfIdOutcome::ClientPickNotCandidateWorkdir,
+        }
+    }
+}
+
+/// Let the caller's own assertion settle an ambiguity the runner could not —
+/// and ONLY that.
+///
+/// The rule, in one line: the asserted id resolves iff it is one of
+/// `candidates`. `candidates` is the set the runner derived itself (the
+/// admitted, uuid-anchored open records on the nonce's terminal or workdir),
+/// so the client's word never ADDS an identity — it picks among identities
+/// the runner already vouches for on that key. That bound is what keeps the
+/// proxy's standing strip of the client header (see
+/// [`coord_mcp_forward_header_is_dropped`]) honest: a client still cannot
+/// name an arbitrary sibling on the device, only one the runner would have
+/// been willing to name had the key been 1:1.
+///
+/// Why this is the right bound and not a weakening. Every session in one
+/// workdir sharing an in-cwd `.mcp.json` already presents the SAME nonce and
+/// so the same principal; when that workdir held exactly one trusted record
+/// the runner already attributed EVERY holder of that nonce to it. The
+/// identity granularity the proxy could ever offer on the workdir key was
+/// therefore "a session of this workdir", and a pick among the workdir's own
+/// candidates stays inside it. coord then re-validates the id fail-closed
+/// against the device (`session_on_device`), and the JWT — not this header —
+/// remains the authorization boundary throughout.
+///
+/// Why it is needed at all. Measured on the operator's box 2026-09-12, since
+/// that runner booted: `ambiguous_workdir = 178`, `no_workdir = 69`,
+/// `no_lifecycle_record = 14`, every injected arm together = 10. The
+/// workspace root hosts a dozen open records, so the workdir key is ambiguous
+/// for most interactive calls — and the client-forwarded header that
+/// qontinui-runner#1432 / qontinui-claude-config#865 added was, until this
+/// arm, stripped by this proxy before it could settle any of them.
+///
+/// Three outcomes per key, each its own counter ([`AmbiguousKey`]):
+/// - asserted and a candidate → `picked()` (`injected_via_client_pick_*`);
+/// - asserted and NOT a candidate → `rejected()`
+///   (`client_pick_not_candidate_*`), headerless — the runner holds no
+///   trusted record for what the session says it is, and a wrong id is worse
+///   than no id;
+/// - nothing asserted → `unsettled()` (the leg's own `ambiguous_*` bucket),
+///   headerless, exactly as before.
+fn settle_ambiguity(
+    candidates: &[uuid::Uuid],
+    client_asserted: Option<uuid::Uuid>,
+    key: AmbiguousKey,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    match client_asserted {
+        Some(asserted) if candidates.contains(&asserted) => (Some(asserted), key.picked()),
+        Some(_) => (None, key.rejected()),
+        None => (None, key.unsettled()),
+    }
+}
+
+/// How often a request asserted a session id that DISAGREED with the one the
+/// runner resolved on its own (legs 1–3, single candidate). The runner's
+/// proof wins and the header carries the runner's id — this only counts.
+///
+/// It is the falsifier for the runner's own confidence. A single trusted
+/// record on a workdir makes leg 3 attribute every nonce-holder in that
+/// workdir to it, including a hand-launched session the store never saw; that
+/// session now says who it is, and this counter is the only place the
+/// contradiction becomes visible. Zero means the runner's records and the
+/// callers' self-reports agree; a climbing value names a population the
+/// lifecycle store is missing. Rendered as `client_assertion_overridden` in
+/// `GET /health` `selfId`.
+fn client_assertion_overridden_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(Default::default)
+}
+
+/// Count a resolved-vs-asserted disagreement, if there is one. Pure on its
+/// inputs apart from the counter bump; `true` iff it counted.
+fn note_client_assertion_disagreement(
+    resolved: Option<uuid::Uuid>,
+    client_asserted: Option<uuid::Uuid>,
+) -> bool {
+    match (resolved, client_asserted) {
+        (Some(r), Some(a)) if r != a => {
+            client_assertion_overridden_counter().fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2138,7 +2380,7 @@ fn resolve_caller_session_id(
 /// and reports `RecordUnregistered`" only holds when the workdir hosts no
 /// OTHER admitted record; when it does, the guard is satisfied by the wrong
 /// session. The runner had the information to know better, and now uses it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalLeg {
     /// The binding carries NO terminal (restore, adopt, the mint route, an
     /// in-cwd `.mcp.json`) — the majority of persisted nonces today. Fall
@@ -2146,9 +2388,42 @@ enum TerminalLeg {
     NoTerminal,
     /// The terminal named exactly one admitted open record with a uuid anchor.
     Resolved(uuid::Uuid),
+    /// The terminal named SEVERAL admitted open records with distinct uuid
+    /// anchors (a reused terminal whose stale rows never closed). The
+    /// runner cannot rank them — see [`select_terminal_caller`] — but the
+    /// request's own assertion may pick one of exactly these
+    /// ([`settle_ambiguity`]). Still a leg-1 verdict: it never falls through.
+    Ambiguous(Vec<uuid::Uuid>),
     /// The terminal IS known but did not resolve. STOP — never fall through:
     /// the workdir chain would answer with a DIFFERENT terminal's session.
     Miss(SelfIdOutcome),
+}
+
+/// Why [`select_terminal_caller`] produced no single caller. Mirrors
+/// [`LifecycleMiss`]: the ambiguous arm carries the candidates so the request's
+/// own assertion can settle it, and every arm maps to exactly one counted
+/// outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalMiss {
+    /// No OPEN record names this terminal.
+    RecordMissing,
+    /// Records name it, none with a trusted anchor origin.
+    RecordUnadmitted,
+    /// Admitted records exist, none with a uuid anchor.
+    AnchorNotUuid,
+    /// More than one distinct admitted uuid anchor on this terminal.
+    Ambiguous(Vec<uuid::Uuid>),
+}
+
+impl TerminalMiss {
+    fn outcome(&self) -> SelfIdOutcome {
+        match self {
+            Self::RecordMissing => SelfIdOutcome::TerminalRecordMissing,
+            Self::RecordUnadmitted => SelfIdOutcome::TerminalRecordUnadmitted,
+            Self::AnchorNotUuid => SelfIdOutcome::TerminalAnchorNotUuid,
+            Self::Ambiguous(_) => SelfIdOutcome::AmbiguousTerminal,
+        }
+    }
 }
 
 /// Leg 1: resolve the caller from the nonce's TERMINAL — the finest key the
@@ -2213,7 +2488,8 @@ fn terminal_leg(
     };
     match select_terminal_caller(records, terminal_id) {
         Ok(sid) => TerminalLeg::Resolved(sid),
-        Err(outcome) => TerminalLeg::Miss(outcome),
+        Err(TerminalMiss::Ambiguous(candidates)) => TerminalLeg::Ambiguous(candidates),
+        Err(miss) => TerminalLeg::Miss(miss.outcome()),
     }
 }
 
@@ -2249,7 +2525,7 @@ fn terminal_leg(
 fn select_terminal_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
-) -> Result<uuid::Uuid, SelfIdOutcome> {
+) -> Result<uuid::Uuid, TerminalMiss> {
     let mut matched = 0usize;
     let mut admitted = 0usize;
     let mut candidates: Vec<uuid::Uuid> = Vec::new();
@@ -2270,15 +2546,15 @@ fn select_terminal_caller(
         }
     }
     if matched == 0 {
-        return Err(SelfIdOutcome::TerminalRecordMissing);
+        return Err(TerminalMiss::RecordMissing);
     }
     if admitted == 0 {
-        return Err(SelfIdOutcome::TerminalRecordUnadmitted);
+        return Err(TerminalMiss::RecordUnadmitted);
     }
     match candidates.len() {
-        0 => Err(SelfIdOutcome::TerminalAnchorNotUuid),
+        0 => Err(TerminalMiss::AnchorNotUuid),
         1 => Ok(candidates[0]),
-        _ => Err(SelfIdOutcome::AmbiguousTerminal),
+        _ => Err(TerminalMiss::Ambiguous(candidates)),
     }
 }
 
@@ -2298,15 +2574,22 @@ fn select_terminal_caller(
 /// The bounded `/health` miss sample is recorded HERE rather than inside the
 /// pure selector, so the selector stays a pure function and the sample costs
 /// nothing on the success path.
+///
+/// `client_asserted` settles an [`LifecycleMiss::Ambiguous`] verdict and
+/// nothing else — [`settle_ambiguity`]. The composition is
+/// [`settle_lifecycle_selection`], pure so the rule is testable without a
+/// Tauri app; this function only supplies the store snapshot and records the
+/// sample when the result is still a miss.
 fn resolve_caller_via_lifecycle(
     state: &Arc<ApiState>,
     workdir: &str,
-) -> Result<uuid::Uuid, SelfIdOutcome> {
+    client_asserted: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     let Some(store) = state
         .app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     else {
-        return Err(SelfIdOutcome::ResolverStateMissing);
+        return (None, SelfIdOutcome::ResolverStateMissing);
     };
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
@@ -2316,13 +2599,34 @@ fn resolve_caller_via_lifecycle(
     // drift from the admission rules. See [`LifecycleMissCensus`].
     let (result, census) =
         select_lifecycle_caller_censused(&records, workdir, target_canon.as_deref());
-    result.map_err(|miss| {
-        let outcome = miss.outcome();
+    let (sid, outcome) = settle_lifecycle_selection(result, client_asserted);
+    if sid.is_none() {
         let (candidates, open) =
             self_id_miss_sample_dirs(&records, workdir, target_canon.as_deref());
-        record_self_id_miss_sample(outcome, workdir, candidates, open, census);
-        outcome
-    })
+        record_self_id_miss_sample(outcome, workdir, candidates, open, census, client_asserted);
+    }
+    (sid, outcome)
+}
+
+/// Leg 3's verdict from the selector's result and the request's assertion —
+/// the pure half of [`resolve_caller_via_lifecycle`].
+///
+/// A single candidate resolves as before and the assertion is not consulted;
+/// an [`LifecycleMiss::Ambiguous`] set is handed to [`settle_ambiguity`]; every
+/// other miss is the gate that rejected, untouched by the assertion (a client
+/// cannot talk its way past "no trusted record on this workdir" — that would
+/// be adding an identity, which the pick is bound never to do).
+fn settle_lifecycle_selection(
+    selection: Result<uuid::Uuid, LifecycleMiss>,
+    client_asserted: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    match selection {
+        Ok(sid) => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
+        Err(LifecycleMiss::Ambiguous(candidates)) => {
+            settle_ambiguity(&candidates, client_asserted, AmbiguousKey::Workdir)
+        }
+        Err(miss) => (None, miss.outcome()),
+    }
 }
 
 /// The caller-session id to put on `X-Coord-Caller-Session` for a session
@@ -2351,7 +2655,7 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
 /// FIRST gate a workdir's records failed, so the `/health` counters partition
 /// the misses instead of collapsing them into one bucket (they were a single
 /// `no_task_run` before, which is why 678 identical misses were undiagnosable).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LifecycleMiss {
     /// No OPEN record's `working_dir` matched.
     NoRecord,
@@ -2360,17 +2664,19 @@ enum LifecycleMiss {
     Unregistered,
     /// Admitted records existed, none had a uuid anchor.
     AnchorNotUuid,
-    /// More than one admitted uuid candidate on this workdir.
-    Ambiguous,
+    /// More than one admitted uuid candidate on this workdir — carried, in
+    /// record order, so the request's own assertion can pick among exactly
+    /// these ([`settle_ambiguity`]).
+    Ambiguous(Vec<uuid::Uuid>),
 }
 
 impl LifecycleMiss {
-    const fn outcome(self) -> SelfIdOutcome {
+    fn outcome(&self) -> SelfIdOutcome {
         match self {
             Self::NoRecord => SelfIdOutcome::NoLifecycleRecord,
             Self::Unregistered => SelfIdOutcome::RecordUnregistered,
             Self::AnchorNotUuid => SelfIdOutcome::RecordAnchorNotUuid,
-            Self::Ambiguous => SelfIdOutcome::AmbiguousWorkdir,
+            Self::Ambiguous(_) => SelfIdOutcome::AmbiguousWorkdir,
         }
     }
 }
@@ -2524,7 +2830,7 @@ fn select_lifecycle_caller_censused(
         match candidates.len() {
             0 => Err(LifecycleMiss::AnchorNotUuid),
             1 => Ok(candidates[0]),
-            _ => Err(LifecycleMiss::Ambiguous),
+            _ => Err(LifecycleMiss::Ambiguous(candidates)),
         }
     };
     (result, census)
@@ -3769,6 +4075,12 @@ async fn enrich_memory_search_body_with(
 /// live per-request JWT this handler selects; the caller-session header is
 /// authoritative only when the RUNNER sets it, or a client could name a sibling
 /// session to spoof its identity.)
+///
+/// The client's copy of the caller-session header is still never FORWARDED.
+/// It is READ, before this loop, as an input to the runner's own resolution —
+/// and honoured only as a tie-break among candidates the runner derived
+/// itself ([`settle_ambiguity`]); whatever the runner concludes is what goes
+/// upstream, under the runner's own header write below.
 fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
     matches!(
         name,
@@ -4088,13 +4400,32 @@ async fn coord_mcp_proxy_handler(
     // the authorization boundary, and the strip of any CLIENT-supplied copy
     // below is likewise unconditional, so no client can spoof a sibling
     // session's identity.
+    //
+    // The client's copy IS read, though — as a tie-break and nothing more.
+    // `coord-revive.sh call` (qontinui-runner#1432) and the config-repo doors
+    // (qontinui-claude-config#865) forward the session's own id on this
+    // header, and the runner honours it only when its own resolution ended
+    // in several candidates it could not rank, and the asserted id is one of
+    // them. It never adds an identity the runner does not already vouch for
+    // on that key — see `settle_ambiguity`. Read once, here, so the strip in
+    // the forwarding loop stays unconditional.
+    let client_asserted = client_asserted_session(&headers);
     let (caller_session_id, self_id_outcome) =
         if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
-            resolve_caller_session_id(&state, nonce.as_deref())
+            resolve_caller_session_id(&state, nonce.as_deref(), client_asserted)
         } else {
             (None, SelfIdOutcome::NonDevicePrincipal)
         };
     record_self_id_outcome(self_id_outcome);
+    if note_client_assertion_disagreement(caller_session_id, client_asserted) {
+        tracing::debug!(
+            "coord-mcp proxy: caller-session header carries the runner's {:?} \
+             ({}), not the client's asserted {:?}",
+            caller_session_id,
+            self_id_outcome.label(),
+            client_asserted
+        );
+    }
 
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
@@ -9584,8 +9915,9 @@ mod window_getter_single_flight_tests {
 mod self_id_chain_tests {
     use super::{
         select_lifecycle_caller, select_lifecycle_caller_censused, select_terminal_caller,
-        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg,
-        terminal_leg_verdict, LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg,
+        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, settle_ambiguity,
+        settle_lifecycle_selection, terminal_leg, terminal_leg_verdict, AmbiguousKey,
+        LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg, TerminalMiss,
         SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
@@ -9605,8 +9937,10 @@ mod self_id_chain_tests {
         );
         // 12 before the terminal-leg fix; +4 terminal-leg gates
         // (`terminal_record_missing`, `terminal_record_unadmitted`,
-        // `terminal_anchor_not_uuid`, `ambiguous_terminal`).
-        assert_eq!(SelfIdOutcome::ALL.len(), 16);
+        // `terminal_anchor_not_uuid`, `ambiguous_terminal`); +4 for the
+        // client-pick arm, two per leg (`injected_via_client_pick_*`,
+        // `client_pick_not_candidate_*`).
+        assert_eq!(SelfIdOutcome::ALL.len(), 20);
     }
 
     /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
@@ -9660,8 +9994,9 @@ mod self_id_chain_tests {
                 outcome.label()
             );
         }
-        // Every counter series, plus the bounded diagnostic sample and the
-        // terminal-leg self-report.
+        // Every counter series, plus the bounded diagnostic sample, the
+        // terminal-leg self-report, and the client-assertion disagreement
+        // counter.
         assert!(
             obj["recent_misses"].is_array(),
             "the miss sample must be rendered as an array"
@@ -9675,16 +10010,21 @@ mod self_id_chain_tests {
                 "GET /health selfId.terminal_leg is missing `{key}`"
             );
         }
-        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 2);
+        assert!(
+            obj["client_assertion_overridden"].is_u64(),
+            "the resolved-vs-asserted disagreement counter must be a series of its own"
+        );
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 3);
     }
 
     #[test]
-    fn the_three_injected_arms_are_the_only_success_outcomes() {
+    fn the_five_injected_arms_are_the_only_success_outcomes() {
         // coord cannot distinguish the failure arms: from its side every
         // non-injected outcome is an identical `absent`. Guards against a
         // future variant being added as another "success" without the header
         // actually going. Phase 3 added `injected_via_lifecycle`; the
-        // terminal-keyed fix adds `injected_via_terminal`.
+        // terminal-keyed fix adds `injected_via_terminal`; the client-pick
+        // arm adds one per leg.
         let successes: Vec<&str> = SelfIdOutcome::ALL
             .iter()
             .filter(|o| {
@@ -9693,6 +10033,8 @@ mod self_id_chain_tests {
                     SelfIdOutcome::Injected
                         | SelfIdOutcome::InjectedViaTerminal
                         | SelfIdOutcome::InjectedViaLifecycle
+                        | SelfIdOutcome::InjectedViaClientPickTerminal
+                        | SelfIdOutcome::InjectedViaClientPickWorkdir
                 )
             })
             .map(|o| o.label())
@@ -9702,7 +10044,9 @@ mod self_id_chain_tests {
             vec![
                 "injected",
                 "injected_via_terminal",
-                "injected_via_lifecycle"
+                "injected_via_lifecycle",
+                "injected_via_client_pick_terminal",
+                "injected_via_client_pick_workdir"
             ]
         );
     }
@@ -9715,7 +10059,7 @@ mod self_id_chain_tests {
             LifecycleMiss::NoRecord,
             LifecycleMiss::Unregistered,
             LifecycleMiss::AnchorNotUuid,
-            LifecycleMiss::Ambiguous,
+            LifecycleMiss::Ambiguous(vec![]),
         ]
         .iter()
         .map(|m| m.outcome().label())
@@ -9858,7 +10202,10 @@ mod self_id_chain_tests {
         ];
         assert_eq!(
             select_lifecycle_caller(&mixed, "D:/repo", None),
-            Err(LifecycleMiss::Ambiguous)
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B)
+            ]))
         );
     }
 
@@ -9886,14 +10233,25 @@ mod self_id_chain_tests {
             rec(ANCHOR_B, Some("D:/repo"), 200),
         ];
         let got = select_lifecycle_caller(&records, "D:/repo", None);
-        assert_eq!(got, Err(LifecycleMiss::Ambiguous));
+        // The ambiguity CARRIES its candidates — that is what the request's
+        // own assertion gets to pick among, and nothing else.
+        assert_eq!(
+            got,
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B)
+            ]))
+        );
         assert_eq!(got.unwrap_err().outcome(), SelfIdOutcome::AmbiguousWorkdir);
 
         // Input order cannot smuggle a winner back in either.
         let reversed: Vec<_> = records.iter().rev().cloned().collect();
         assert_eq!(
             select_lifecycle_caller(&reversed, "D:/repo", None),
-            Err(LifecycleMiss::Ambiguous)
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_B),
+                uuid_of(ANCHOR_A)
+            ]))
         );
 
         // …but if only ONE of them is admissible, that one resolves exactly:
@@ -9942,12 +10300,20 @@ mod self_id_chain_tests {
         // Each gate is now its own typed outcome instead of a bare `None`.
         assert_eq!(
             select_terminal_caller(&records, "term-nope"),
-            Err(SelfIdOutcome::TerminalRecordMissing)
+            Err(TerminalMiss::RecordMissing)
+        );
+        assert_eq!(
+            TerminalMiss::RecordMissing.outcome(),
+            SelfIdOutcome::TerminalRecordMissing
         );
         let bad = vec![rec("not-a-uuid", Some("D:/repo"), 1)];
         assert_eq!(
             select_terminal_caller(&bad, "term-not-a-uuid"),
-            Err(SelfIdOutcome::TerminalAnchorNotUuid)
+            Err(TerminalMiss::AnchorNotUuid)
+        );
+        assert_eq!(
+            TerminalMiss::AnchorNotUuid.outcome(),
+            SelfIdOutcome::TerminalAnchorNotUuid
         );
     }
 
@@ -9976,11 +10342,12 @@ mod self_id_chain_tests {
             vec![stale.clone(), fresh.clone()],
             vec![fresh.clone(), stale.clone()],
         ] {
-            assert_eq!(
-                select_terminal_caller(&records, "term-reused"),
-                Err(SelfIdOutcome::AmbiguousTerminal),
-                "two open rows on one terminal must refuse, in EITHER input order"
+            let got = select_terminal_caller(&records, "term-reused");
+            assert!(
+                matches!(&got, Err(TerminalMiss::Ambiguous(c)) if c.len() == 2),
+                "two open rows on one terminal must refuse, in EITHER input order: {got:?}"
             );
+            assert_eq!(got.unwrap_err().outcome(), SelfIdOutcome::AmbiguousTerminal);
         }
 
         // Two rows naming the SAME session are one candidate, not an
@@ -10053,8 +10420,12 @@ mod self_id_chain_tests {
             r.origin = origin.clone();
             assert_eq!(
                 select_terminal_caller(&[r], &format!("term-{ANCHOR_A}")),
-                Err(SelfIdOutcome::TerminalRecordUnadmitted),
+                Err(TerminalMiss::RecordUnadmitted),
                 "a {origin:?}-origin anchor must NOT resolve, even as the terminal's only record"
+            );
+            assert_eq!(
+                TerminalMiss::RecordUnadmitted.outcome(),
+                SelfIdOutcome::TerminalRecordUnadmitted
             );
         }
         // FIX 3: both TRUSTED origins resolve on this leg — so the guard
@@ -10107,7 +10478,14 @@ mod self_id_chain_tests {
             rec(ANCHOR_C, Some("D:/repo"), 3),
         ];
         let (result, census) = select_lifecycle_caller_censused(&records, "D:/repo", None);
-        assert_eq!(result, Err(LifecycleMiss::Ambiguous));
+        assert_eq!(
+            result,
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B),
+                uuid_of(ANCHOR_C)
+            ]))
+        );
 
         // The dir list — deduped by dir string — collapses to ONE entry, which
         // is exactly why it cannot explain a 3-way collision.
@@ -10227,6 +10605,7 @@ mod self_id_chain_tests {
                 admitted: 5,
                 distinct_candidates: 4,
             },
+            client_asserted: None,
         };
         let rendered = super::self_id_miss_sample_entry_json(&sample);
         assert_eq!(rendered["gate"], "ambiguous_workdir");
@@ -10234,6 +10613,251 @@ mod self_id_chain_tests {
         assert_eq!(rendered["matched_record_count"], 7);
         assert_eq!(rendered["admitted_record_count"], 5);
         assert_eq!(rendered["distinct_candidate_count"], 4);
+        // Asserted nothing renders as an explicit null, never as an absent
+        // key — "said nothing" and "this build does not report it" must not
+        // read the same.
+        assert!(rendered["client_asserted"].is_null());
+        assert!(rendered
+            .as_object()
+            .unwrap()
+            .contains_key("client_asserted"));
+
+        let asserted = super::SelfIdMissSample {
+            gate: SelfIdOutcome::ClientPickNotCandidateWorkdir.label(),
+            client_asserted: Some(uuid_of(ANCHOR_C)),
+            ..sample
+        };
+        let rendered = super::self_id_miss_sample_entry_json(&asserted);
+        assert_eq!(rendered["gate"], "client_pick_not_candidate_workdir");
+        assert_eq!(rendered["client_asserted"], ANCHOR_C);
+    }
+
+    // ── The client-pick arm (post-merge follow-up to #1432) ────────────
+
+    /// THE rule: the request's own assertion settles an ambiguity iff it names
+    /// one of the runner's candidates. It never adds one.
+    #[test]
+    fn a_client_assertion_settles_an_ambiguity_only_to_a_runner_candidate() {
+        let candidates = vec![uuid_of(ANCHOR_A), uuid_of(ANCHOR_B)];
+
+        // Names a candidate → resolves, and to THAT candidate.
+        assert_eq!(
+            settle_ambiguity(&candidates, Some(uuid_of(ANCHOR_B)), AmbiguousKey::Workdir),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        // Names a session the runner holds no trusted record for on this key
+        // → headerless, and counted APART from the plain ambiguity.
+        assert_eq!(
+            settle_ambiguity(&candidates, Some(uuid_of(ANCHOR_C)), AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        // Asserted nothing → the leg's own bucket, exactly as before.
+        assert_eq!(
+            settle_ambiguity(&candidates, None, AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::AmbiguousWorkdir)
+        );
+        assert_eq!(
+            settle_ambiguity(&candidates, None, AmbiguousKey::Terminal),
+            (None, SelfIdOutcome::AmbiguousTerminal)
+        );
+        // An EMPTY candidate set can never be settled by assertion — the
+        // client's word adds nothing.
+        assert_eq!(
+            settle_ambiguity(&[], Some(uuid_of(ANCHOR_A)), AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        // The three outcomes of a key are distinct from each other and from
+        // the other key's — six counters, no collisions.
+        let mut all: Vec<&str> = [AmbiguousKey::Terminal, AmbiguousKey::Workdir]
+            .iter()
+            .flat_map(|k| [k.picked(), k.rejected(), k.unsettled()])
+            .map(|o| o.label())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 6);
+    }
+
+    /// Leg 3 end to end through the pure composition: the shared-workdir
+    /// fixture that produced 178 `ambiguous_workdir` misses on the operator's
+    /// box now resolves when the caller says which of the workdir's sessions
+    /// it is — and ONLY then.
+    #[test]
+    fn a_client_assertion_resolves_the_shared_workdir_it_could_not_before() {
+        let records = vec![
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 200),
+        ];
+        let selection = select_lifecycle_caller(&records, "D:/repo", None);
+        assert!(matches!(selection, Err(LifecycleMiss::Ambiguous(_))));
+
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_A))),
+            (
+                Some(uuid_of(ANCHOR_A)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_B))),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_C))),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection, None),
+            (None, SelfIdOutcome::AmbiguousWorkdir)
+        );
+    }
+
+    /// The assertion is a tie-break, not an override: a single candidate
+    /// resolves to the RUNNER's id whatever the client says, and a non-ambiguous
+    /// miss stays that miss — a client cannot talk its way past "no trusted
+    /// record here".
+    #[test]
+    fn a_client_assertion_never_overrides_a_resolved_leg_or_a_gate_miss() {
+        // Single trusted candidate: the runner's proof wins — and an AGREEING
+        // assertion is still the leg's own outcome, not a client pick: the
+        // pick counters mean "the client's word decided", never "the client
+        // was consulted".
+        assert_eq!(
+            settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), Some(uuid_of(ANCHOR_B))),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+        assert_eq!(
+            settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), Some(uuid_of(ANCHOR_A))),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+        // No record / untrusted / non-uuid: the gate's verdict stands.
+        for miss in [
+            LifecycleMiss::NoRecord,
+            LifecycleMiss::Unregistered,
+            LifecycleMiss::AnchorNotUuid,
+        ] {
+            let expected = miss.outcome();
+            assert_eq!(
+                settle_lifecycle_selection(Err(miss), Some(uuid_of(ANCHOR_A))),
+                (None, expected),
+                "an assertion must not add an identity past a `{}` gate",
+                expected.label()
+            );
+        }
+        // …and the disagreement between a resolved id and the assertion is
+        // COUNTED, so the runner's confidence has a falsifier. This is the
+        // ONLY test that bumps this process-global counter; a second one
+        // would have to assert its own delta under the parallel runner rather
+        // than an absolute value.
+        let before = self_id_health_snapshot()["client_assertion_overridden"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert!(super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            Some(uuid_of(ANCHOR_B))
+        ));
+        // Agreement, no assertion, and no resolution are NOT disagreements.
+        assert!(!super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            Some(uuid_of(ANCHOR_A))
+        ));
+        assert!(!super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            None
+        ));
+        assert!(!super::note_client_assertion_disagreement(
+            None,
+            Some(uuid_of(ANCHOR_B))
+        ));
+        let after = self_id_health_snapshot()["client_assertion_overridden"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert_eq!(after, before + 1);
+    }
+
+    /// Leg 1's ambiguity (several open rows on one reused terminal) is settled
+    /// the same way — and it is still a leg-1 verdict, never a fallthrough.
+    #[test]
+    fn a_client_assertion_settles_a_reused_terminal_without_falling_through() {
+        let mut stale = rec(ANCHOR_A, Some("D:/repo"), 100);
+        stale.terminal_id = "term-reused".to_string();
+        stale.confirmed_at = Some(50);
+        let mut fresh = rec(ANCHOR_B, Some("D:/repo"), 200);
+        fresh.terminal_id = "term-reused".to_string();
+        fresh.confirmed_at = None;
+        let records = vec![stale, fresh];
+
+        // The leg carries the candidates rather than a bare miss…
+        let leg = terminal_leg(&records, Some("term-reused"));
+        let TerminalLeg::Ambiguous(candidates) = &leg else {
+            panic!("expected TerminalLeg::Ambiguous, got {leg:?}");
+        };
+        assert_eq!(candidates.len(), 2);
+        // …and the live session (the UNCONFIRMED fresh row — the one
+        // authority-ranking would have lost) can name itself. The outcome is
+        // the TERMINAL-keyed one, which `terminal_leg.engaged` counts.
+        assert_eq!(
+            settle_ambiguity(candidates, Some(uuid_of(ANCHOR_B)), AmbiguousKey::Terminal),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickTerminal
+            )
+        );
+        // A same-cwd sibling that is NOT on this terminal cannot be picked
+        // here: the bound is the terminal's own rows, not the workdir's.
+        assert_eq!(
+            settle_ambiguity(candidates, Some(uuid_of(ANCHOR_C)), AmbiguousKey::Terminal),
+            (None, SelfIdOutcome::ClientPickNotCandidateTerminal)
+        );
+        // Every non-ambiguous leg-1 miss is unchanged and still typed.
+        assert_eq!(
+            terminal_leg(&records, Some("term-absent")),
+            TerminalLeg::Miss(SelfIdOutcome::TerminalRecordMissing)
+        );
+    }
+
+    /// The header is read the way the runner's own anchors are read: strict
+    /// UUID or nothing. Whitespace is trimmed; anything else asserts nothing.
+    #[test]
+    fn the_client_assertion_is_a_strict_uuid_or_nothing() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(super::client_asserted_session(&headers), None);
+
+        for bad in ["", "  ", "not-a-uuid", "term-123", "<uuid>"] {
+            headers.insert(
+                crate::coord_mcp::CALLER_SESSION_HEADER,
+                axum::http::HeaderValue::from_str(bad).expect("ascii"),
+            );
+            assert_eq!(
+                super::client_asserted_session(&headers),
+                None,
+                "{bad:?} must assert nothing"
+            );
+        }
+        headers.insert(
+            crate::coord_mcp::CALLER_SESSION_HEADER,
+            axum::http::HeaderValue::from_str(&format!("  {ANCHOR_A} ")).expect("ascii"),
+        );
+        assert_eq!(
+            super::client_asserted_session(&headers),
+            Some(uuid_of(ANCHOR_A))
+        );
+        // Case is not identity: the parse accepts upper-case hex and the
+        // resulting id compares equal to the anchor.
+        headers.insert(
+            crate::coord_mcp::CALLER_SESSION_HEADER,
+            axum::http::HeaderValue::from_str(&ANCHOR_A.to_uppercase()).expect("ascii"),
+        );
+        assert_eq!(
+            super::client_asserted_session(&headers),
+            Some(uuid_of(ANCHOR_A))
+        );
     }
 
     /// A detector that reports nothing when it is not running reports CALM.
@@ -10277,12 +10901,47 @@ mod self_id_chain_tests {
                 "terminal_record_unadmitted",
                 "terminal_anchor_not_uuid",
                 "ambiguous_terminal",
+                "injected_via_client_pick_terminal",
+                "client_pick_not_candidate_terminal",
             ]
         );
         assert!(
             !TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::ResolverStateMissing),
             "shared with the lifecycle leg — counting it would be false calm"
         );
+        // The client-pick outcomes are leg-keyed for the same reason: a
+        // settled TERMINAL ambiguity is leg-1 engagement and must count as
+        // such, while the workdir twins belong to leg 3 and must not.
+        for leg1 in [
+            SelfIdOutcome::InjectedViaClientPickTerminal,
+            SelfIdOutcome::ClientPickNotCandidateTerminal,
+        ] {
+            assert!(
+                TERMINAL_LEG_OUTCOMES.contains(&leg1),
+                "{} is leg 1",
+                leg1.label()
+            );
+        }
+        for leg3 in [
+            SelfIdOutcome::InjectedViaClientPickWorkdir,
+            SelfIdOutcome::ClientPickNotCandidateWorkdir,
+        ] {
+            assert!(
+                !TERMINAL_LEG_OUTCOMES.contains(&leg3),
+                "{} is leg 3 — counting it here would be false engagement",
+                leg3.label()
+            );
+        }
+        // …and every AmbiguousKey::Terminal verdict lands in that family, so
+        // a box whose every terminal-bound nonce is settled by pick cannot
+        // read `engaged == 0` / `inert`.
+        for outcome in [
+            AmbiguousKey::Terminal.picked(),
+            AmbiguousKey::Terminal.rejected(),
+            AmbiguousKey::Terminal.unsettled(),
+        ] {
+            assert!(TERMINAL_LEG_OUTCOMES.contains(&outcome));
+        }
 
         // `engaged` must be the sum of exactly those five series in the SAME
         // snapshot. Deliberately no counter bump here: these counters are
@@ -10313,18 +10972,39 @@ mod self_id_chain_tests {
                 vec![],
                 vec!["D:/root".to_string()],
                 super::LifecycleMissCensus::default(),
+                None,
             );
         }
+        // A workdir-leg rejection of a client pick lands in the same ring,
+        // carrying the id the session claimed — the diagnosable half of
+        // `client_pick_not_candidate_workdir`.
+        super::record_self_id_miss_sample(
+            SelfIdOutcome::ClientPickNotCandidateWorkdir,
+            "D:/repo/asserted",
+            vec!["D:/repo/asserted".to_string()],
+            vec!["D:/root".to_string()],
+            super::LifecycleMissCensus {
+                matched: 3,
+                admitted: 2,
+                distinct_candidates: 2,
+            },
+            Some(uuid_of(ANCHOR_C)),
+        );
         let q = self_id_miss_samples().lock().expect("miss ring poisoned");
         assert_eq!(q.len(), SELF_ID_MISS_SAMPLE_CAP, "the ring must be capped");
         let newest = q.back().expect("ring is non-empty");
-        assert_eq!(newest.gate, "no_lifecycle_record");
-        assert_eq!(newest.workdir, format!("D:/repo/{}", overflow - 1));
-        assert_eq!(newest.open_dirs, vec!["D:/root".to_string()]);
+        assert_eq!(newest.gate, "client_pick_not_candidate_workdir");
+        assert_eq!(newest.workdir, "D:/repo/asserted");
+        assert_eq!(newest.client_asserted, Some(uuid_of(ANCHOR_C)));
+        let previous = q.iter().rev().nth(1).expect("ring holds more than one");
+        assert_eq!(previous.gate, "no_lifecycle_record");
+        assert_eq!(previous.workdir, format!("D:/repo/{}", overflow - 1));
+        assert_eq!(previous.open_dirs, vec!["D:/root".to_string()]);
+        assert_eq!(previous.client_asserted, None);
         // Oldest entries were evicted, newest kept.
         assert_eq!(
             q.front().expect("ring is non-empty").workdir,
-            format!("D:/repo/{}", overflow - SELF_ID_MISS_SAMPLE_CAP)
+            format!("D:/repo/{}", overflow + 1 - SELF_ID_MISS_SAMPLE_CAP)
         );
     }
 
