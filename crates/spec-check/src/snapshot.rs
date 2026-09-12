@@ -238,10 +238,7 @@ impl<'a> IndexedSnapshot<'a> {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-fn slice_or_empty<'m>(
-    map: &'m HashMap<String, Vec<ElementIdx>>,
-    key: &str,
-) -> &'m [ElementIdx] {
+fn slice_or_empty<'m>(map: &'m HashMap<String, Vec<ElementIdx>>, key: &str) -> &'m [ElementIdx] {
     if key.is_empty() {
         return &[];
     }
@@ -360,9 +357,33 @@ mod tests {
     #[test]
     fn lookup_by_role_matches_normalized() {
         let snap = make_snapshot(vec![
-            element("e0", Some("Button"), None, None, None, None, empty_identifier()),
-            element("e1", Some("link"), None, None, None, None, empty_identifier()),
-            element("e2", Some("button"), None, None, None, None, empty_identifier()),
+            element(
+                "e0",
+                Some("Button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e1",
+                Some("link"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e2",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
@@ -379,9 +400,33 @@ mod tests {
     #[test]
     fn lookup_by_tag_matches_normalized() {
         let snap = make_snapshot(vec![
-            element("e0", None, Some("button"), None, None, None, empty_identifier()),
-            element("e1", None, Some("BUTTON"), None, None, None, empty_identifier()),
-            element("e2", None, Some("input"), None, None, None, empty_identifier()),
+            element(
+                "e0",
+                None,
+                Some("button"),
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e1",
+                None,
+                Some("BUTTON"),
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e2",
+                None,
+                Some("input"),
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
@@ -398,15 +443,7 @@ mod tests {
         ident.awas_id = Some("awas-1".to_string());
         ident.ui_id = Some("ui-1".to_string());
 
-        let snap = make_snapshot(vec![element(
-            "bare-1",
-            None,
-            None,
-            None,
-            None,
-            None,
-            ident,
-        )]);
+        let snap = make_snapshot(vec![element("bare-1", None, None, None, None, None, ident)]);
         let idx = IndexedSnapshot::new(&snap);
 
         assert_eq!(idx.lookup_by_id("bare-1"), &[ElementIdx(0)]);
@@ -439,23 +476,66 @@ mod tests {
     #[test]
     fn lookup_by_aria_label_and_accessible_name() {
         let snap = make_snapshot(vec![
-            element("e0", None, None, Some("Save"), Some("Save document"), None, empty_identifier()),
-            element("e1", None, None, Some("Cancel"), Some("Cancel changes"), None, empty_identifier()),
+            element(
+                "e0",
+                None,
+                None,
+                Some("Save"),
+                Some("Save document"),
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e1",
+                None,
+                None,
+                Some("Cancel"),
+                Some("Cancel changes"),
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
         assert_eq!(idx.lookup_by_aria_label("save"), &[ElementIdx(0)]);
         assert_eq!(idx.lookup_by_aria_label("CANCEL"), &[ElementIdx(1)]);
-        assert_eq!(idx.lookup_by_accessible_name("save document"), &[ElementIdx(0)]);
+        assert_eq!(
+            idx.lookup_by_accessible_name("save document"),
+            &[ElementIdx(0)]
+        );
         assert!(idx.lookup_by_aria_label("missing").is_empty());
     }
 
     #[test]
     fn text_inverted_tokenizes_on_whitespace() {
         let snap = make_snapshot(vec![
-            element("e0", None, None, None, None, Some("Save and Quit"), empty_identifier()),
-            element("e1", None, None, None, None, Some("Quit without saving"), empty_identifier()),
-            element("e2", None, None, None, None, Some("Discard changes"), empty_identifier()),
+            element(
+                "e0",
+                None,
+                None,
+                None,
+                None,
+                Some("Save and Quit"),
+                empty_identifier(),
+            ),
+            element(
+                "e1",
+                None,
+                None,
+                None,
+                None,
+                Some("Quit without saving"),
+                empty_identifier(),
+            ),
+            element(
+                "e2",
+                None,
+                None,
+                None,
+                None,
+                Some("Discard changes"),
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
@@ -496,8 +576,24 @@ mod tests {
     #[test]
     fn iter_elements_yields_every_element_in_order() {
         let snap = make_snapshot(vec![
-            element("e0", Some("button"), None, None, None, None, empty_identifier()),
-            element("e1", Some("link"), None, None, None, None, empty_identifier()),
+            element(
+                "e0",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "e1",
+                Some("link"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
@@ -508,8 +604,24 @@ mod tests {
     #[test]
     fn element_resolves_idx_to_underlying_element() {
         let snap = make_snapshot(vec![
-            element("first", Some("button"), None, None, None, None, empty_identifier()),
-            element("second", Some("link"), None, None, None, None, empty_identifier()),
+            element(
+                "first",
+                Some("button"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
+            element(
+                "second",
+                Some("link"),
+                None,
+                None,
+                None,
+                None,
+                empty_identifier(),
+            ),
         ]);
         let idx = IndexedSnapshot::new(&snap);
 
