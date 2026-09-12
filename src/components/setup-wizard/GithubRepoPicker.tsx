@@ -174,6 +174,10 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
    *  a second click would open a second browser tab whose flow can no longer
    *  complete (the runner keeps one pending nonce — last click wins). */
   const [connecting, setConnecting] = useState(false);
+  /** Same guard as `connecting`, but read synchronously: a ref latch does not
+   *  depend on React having flushed the `disabled` attribute before a second
+   *  click event dispatches. */
+  const connectingRef = useRef(false);
 
   const loadRepos = useCallback(async (): Promise<RepoListResponse | null> => {
     setLoading(true);
@@ -323,7 +327,8 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   // claim with, so it can fail (not signed in, coord unreachable) — that
   // failure belongs in the same panel, before the browser ever opens.
   const openConnect = useCallback(async () => {
-    if (connecting) return;
+    if (connectingRef.current) return;
+    connectingRef.current = true;
     setConnecting(true);
     setConnectResult(null);
     setError(null);
@@ -333,9 +338,10 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
     } catch (err) {
       setError(`Couldn't open the GitHub connect page: ${err}`);
     } finally {
+      connectingRef.current = false;
       setConnecting(false);
     }
-  }, [connecting]);
+  }, []);
 
   /**
    * Sign in to Qontinui without leaving the wizard (Cognito Hosted-UI PKCE in

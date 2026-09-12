@@ -406,6 +406,8 @@ async fn sign_out_full_impl() -> Result<(), AppError> {
 
     let auth_manager = AuthManager::new();
     auth_manager.clear_all_credentials()?;
+    // A pending GitHub connect is bound to the identity that just left.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     info!(
         "Full sign-out successful — autonomous terminal sessions stopped (Cognito session wiped)"
@@ -1464,6 +1466,10 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
             e
         );
     }
+    // A pending GitHub connect (setup-wizard clone picker) holds a coord
+    // connect-state minted under the account that is leaving; the next
+    // account's click must mint its own rather than reuse it.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     if crate::instance::is_secondary() {
         warn!(
