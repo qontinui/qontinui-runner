@@ -3862,13 +3862,18 @@ fn coord_mcp_request_is_tools_list(body: &[u8]) -> bool {
 /// The names are collected rather than merely counted so the caller can LOG
 /// them. A capability this door subtracts silently is the exact failure this
 /// whole function exists to stop being invisible.
-fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Vec<String>) {
+///
+/// Returns whether a `result.tools` ARRAY was present at all. A response
+/// without one (an upstream JSON-RPC error, a foreign shape) has nothing to
+/// filter — and, for the drift observation, nothing to OBSERVE: `false` here
+/// is what stops such an answer being recorded as "observed clean".
+fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Vec<String>) -> bool {
     let tools = match resp
         .pointer_mut("/result/tools")
         .and_then(|t| t.as_array_mut())
     {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
     tools.retain(|t| match t.get("name").and_then(|n| n.as_str()) {
         Some(name) if coord_mcp_tool_is_allowed(name) => true,
@@ -3881,6 +3886,7 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
             false
         }
     });
+    true
 }
 
 /// The outcome is TYPED rather than an `Option` because three of its four cases
@@ -3896,6 +3902,12 @@ enum CoordMcpToolsListFilter {
     /// overwhelmingly common case. Forward the upstream bytes byte-identically;
     /// re-serialising a clean response is pure risk for no gain.
     Unchanged,
+    /// A `tools/list` answer carrying NO `result.tools` array — an upstream
+    /// JSON-RPC error, or a shape this door does not know. Forward untouched:
+    /// there is nothing to withhold, and — unlike `Unchanged` — nothing was
+    /// INSPECTED, so it must not be recorded as an observed-clean list
+    /// (plan `2026-09-03-coord-mcp-403-names-its-own-cause` review finding).
+    NoToolsArray,
     /// Non-allowlisted entries were dropped. Carries the shortened body and the
     /// dropped NAMES, so the caller can say which capabilities it withheld.
     Filtered { body: Vec<u8>, removed: Vec<String> },
@@ -3949,13 +3961,14 @@ fn coord_mcp_filter_tools_list_response(
         }
     };
     let mut removed: Vec<String> = Vec::new();
-    match &mut parsed {
-        serde_json::Value::Array(elems) => {
-            for elem in elems.iter_mut() {
-                coord_mcp_retain_allowed_tools(elem, &mut removed);
-            }
-        }
+    let inspected = match &mut parsed {
+        serde_json::Value::Array(elems) => elems.iter_mut().fold(false, |seen, elem| {
+            coord_mcp_retain_allowed_tools(elem, &mut removed) | seen
+        }),
         other => coord_mcp_retain_allowed_tools(other, &mut removed),
+    };
+    if !inspected {
+        return CoordMcpToolsListFilter::NoToolsArray;
     }
     if removed.is_empty() {
         return CoordMcpToolsListFilter::Unchanged;
@@ -4145,6 +4158,16 @@ fn short_sha(sha: &str) -> &str {
 /// `probed_at` is the wall-clock of THIS refusal, so a durable artifact quoting
 /// it carries the time it learned this (dossier `stale-capability-floor`).
 fn coord_mcp_refusal_data(rejection: &CoordMcpBodyRejection) -> serde_json::Value {
+    coord_mcp_refusal_data_with(rejection, crate::build_drift::trunk_tool_policy().as_ref())
+}
+
+/// [`coord_mcp_refusal_data`] over an EXPLICIT trunk read, so the wire shape
+/// can be pinned in tests without depending on whether a drift tick has
+/// filled the process-wide cache.
+fn coord_mcp_refusal_data_with(
+    rejection: &CoordMcpBodyRejection,
+    trunk: Option<&crate::build_drift::TrunkToolPolicy>,
+) -> serde_json::Value {
     const CODE: &str = "COORD_MCP_PROXY_METHOD_NOT_ALLOWED";
     const NEXT_DOOR: &str = "GET /coord-mcp/tool-policy";
     let probed_at = chrono::Utc::now().to_rfc3339();
@@ -4156,8 +4179,7 @@ fn coord_mcp_refusal_data(rejection: &CoordMcpBodyRejection) -> serde_json::Valu
             "probed_at": probed_at,
         });
     };
-    let trunk = crate::build_drift::trunk_tool_policy();
-    let diagnosis = coord_mcp_refusal_cause(tool, trunk.as_ref());
+    let diagnosis = coord_mcp_refusal_cause(tool, trunk);
     let (_, build_drift) = crate::build_drift::health_fields();
     let commits_behind = crate::build_drift::latest().and_then(|s| s.commits_behind);
     serde_json::json!({
@@ -5087,7 +5109,7 @@ async fn coord_mcp_proxy_handler(
                 .get("cause")
                 .and_then(|c| c.as_str())
                 .unwrap_or("unknown"),
-            tool = reject.tool.as_deref().unwrap_or("-"),
+            tool = ?reject.tool,
             "coord-mcp proxy: refused non-allowlisted JSON-RPC request: {}",
             reject.message
         );
@@ -5857,7 +5879,9 @@ async fn coord_mcp_proxy_handler(
     // rewrites anything; the other three forward the upstream bytes untouched,
     // and they are kept distinct because one of them is a failure to check.
     let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        CoordMcpToolsListFilter::NotApplicable => axum::body::Body::from(bytes),
+        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => {
+            axum::body::Body::from(bytes)
+        }
         CoordMcpToolsListFilter::Unchanged => {
             // A `tools/list` that withheld nothing is an OBSERVED-CLEAN
             // answer, and recording it is what lets `/health`'s
@@ -13512,7 +13536,7 @@ mod coord_mcp_body_gate_tests {
             message: "m".to_string(),
             tool: Some("coord_create_pr".to_string()),
         };
-        let d = super::coord_mcp_refusal_data(&rej);
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
         assert_eq!(d["tool"], "coord_create_pr");
         assert_eq!(d["cause"], "deliberate");
@@ -13554,18 +13578,23 @@ mod coord_mcp_body_gate_tests {
     /// The `unknown` arm renders `inAllowlistOnTrunk: null`, never a bool.
     #[test]
     fn refusal_data_unknown_arm_renders_null_not_false() {
-        // No drift tick has run in a test process, so the trunk cache is
-        // `None` and a non-deliberate name must land on the unknown arm.
         let rej = super::CoordMcpBodyRejection {
             id: serde_json::json!(1),
             message: "m".to_string(),
             tool: Some("coord_definitely_not_a_tool".to_string()),
         };
-        let d = super::coord_mcp_refusal_data(&rej);
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["cause"], "unknown");
         assert!(d["inAllowlistOnTrunk"].is_null());
         assert!(d["trunkSha"].is_null());
         assert_eq!(d["inDeliberateExclusions"], false);
+        // And with a trunk read the same name renders a bool + the sha.
+        let t = trunk_with(&["coord_definitely_not_a_tool"], &[]);
+        let d = super::coord_mcp_refusal_data_with(&rej, Some(&t));
+        assert_eq!(d["cause"], "stale_binary");
+        assert_eq!(d["inAllowlistOnTrunk"], true);
+        assert_eq!(d["trunkSha"], t.trunk_sha);
+        assert_eq!(d["trunkSource"], "fetched");
     }
 
     /// A refused METHOD has no tool to diagnose: `method_not_allowed`, no
@@ -13577,7 +13606,7 @@ mod coord_mcp_body_gate_tests {
             message: "m".to_string(),
             tool: None,
         };
-        let d = super::coord_mcp_refusal_data(&rej);
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
         assert_eq!(d["cause"], "method_not_allowed");
         assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
         let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
@@ -13606,6 +13635,37 @@ mod coord_mcp_body_gate_tests {
         assert!(e.tool.is_none());
         let e = coord_mcp_body_gate(b"not json").unwrap_err();
         assert!(e.tool.is_none());
+    }
+
+    /// A `tools/list` answer with no `result.tools` array — an upstream
+    /// JSON-RPC error — is NOT an observed-clean list. It forwards untouched
+    /// and is typed apart from `Unchanged`, which is what keeps `coordMcpDrift`
+    /// from reading "clean" off an error.
+    #[test]
+    fn tools_list_error_response_is_no_tools_array_not_unchanged() {
+        let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+        let err = serde_json::json!({"jsonrpc":"2.0","id":1,
+            "error":{"code":-32000,"message":"upstream unavailable"}})
+        .to_string();
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(req.as_bytes(), err.as_bytes()),
+            CoordMcpToolsListFilter::NoToolsArray
+        ));
+        let clean = serde_json::json!({"jsonrpc":"2.0","id":1,
+            "result":{"tools":[{"name": COORD_MCP_ALLOWED_TOOLS[0]}]}})
+        .to_string();
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(req.as_bytes(), clean.as_bytes()),
+            CoordMcpToolsListFilter::Unchanged
+        ));
+        let empty = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}}).to_string();
+        assert!(
+            matches!(
+                coord_mcp_filter_tools_list_response(req.as_bytes(), empty.as_bytes()),
+                CoordMcpToolsListFilter::Unchanged
+            ),
+            "an EMPTY tools array was inspected: observed clean, not uninspected"
+        );
     }
 
     /// Phase 2: one finding per distinct drifted set per process; a clean
