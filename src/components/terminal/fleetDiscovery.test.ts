@@ -478,6 +478,7 @@ describe("coord's 400 codes — the code is the contract, the prose is not", () 
     "cursor_malformed",
     "cursor_version_unsupported",
     "limit_not_positive",
+    "unknown_state",
   ])("recovers %s from the wrapped body", (code) => {
     expect(fleetErrorCode(body(code))).toBe(code);
   });
@@ -513,7 +514,12 @@ describe("coord's 400 codes — the code is the contract, the prose is not", () 
     // Changing a filter mid-walk is ordinary use; showing it as an error would
     // blame the operator for the UI's own race.
     expect(fleetErrorIsRestart("cursor_scope_mismatch")).toBe(true);
-    for (const other of ["cursor_malformed", "cursor_version_unsupported", "limit_not_positive"]) {
+    for (const other of [
+      "cursor_malformed",
+      "cursor_version_unsupported",
+      "limit_not_positive",
+      "unknown_state",
+    ]) {
       expect(fleetErrorIsRestart(other as never)).toBe(false);
     }
     expect(fleetErrorIsRestart(null)).toBe(false);
@@ -524,6 +530,7 @@ describe("coord's 400 codes — the code is the contract, the prose is not", () 
     expect(fleetErrorInvalidatesCursor("cursor_version_unsupported")).toBe(true);
     expect(fleetErrorInvalidatesCursor("limit_not_positive")).toBe(false);
     expect(fleetErrorInvalidatesCursor("cursor_scope_mismatch")).toBe(false);
+    expect(fleetErrorInvalidatesCursor("unknown_state")).toBe(false);
     expect(fleetErrorInvalidatesCursor(null)).toBe(false);
   });
 
@@ -545,6 +552,16 @@ describe("coord's 400 codes — the code is the contract, the prose is not", () 
 
   it("says the page size must be positive, without echoing coord's prose", () => {
     expect(fleetErrorMessage("limit_not_positive", "raw")).toMatch(/positive/i);
+  });
+
+  it("names an unknown state as a FILTER problem with a way out, not a raw failure", () => {
+    // Before qontinui-coord#2085 an unknown `?state=` answered 200 with an empty
+    // page. Now it is a typed 400, and falling through to the raw-failure arm
+    // would read as coord being down rather than as a filter it cannot match.
+    const msg = fleetErrorMessage("unknown_state", "raw");
+    expect(msg).not.toMatch(/^Failed to load fleet sessions/);
+    expect(msg).toMatch(/state filter/i);
+    expect(msg).toMatch(/clear/i);
   });
 
   it("the stalled-cursor message admits the list may be incomplete", () => {

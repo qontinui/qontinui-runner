@@ -136,6 +136,49 @@ describe("groupByDevice", () => {
   it("is empty for no rows", () => {
     expect(groupByDevice([])).toEqual([]);
   });
+
+  it("orders a device's sessions by ACTIVITY, not by the start order coord serves", () => {
+    // coord walks `started_at DESC` since qontinui-coord#2085, so this is the
+    // order rows ARRIVE in: `recent-start` started last, `old-start` days ago.
+    // `old-start` is the one heartbeating now, and it belongs on top.
+    const rows = [
+      session({
+        sessionId: "recent-start",
+        deviceId: "d1",
+        startedAt: "2026-09-12T09:00:00Z",
+        lastHeartbeatAt: "2026-09-12T09:05:00Z",
+      }),
+      session({
+        sessionId: "old-start",
+        deviceId: "d1",
+        startedAt: "2026-09-09T09:00:00Z",
+        lastHeartbeatAt: "2026-09-12T10:00:00Z",
+      }),
+    ];
+    expect(groupByDevice(rows)[0].sessions.map((s) => s.sessionId)).toEqual([
+      "old-start",
+      "recent-start",
+    ]);
+    // The caller's array is not reordered in place.
+    expect(rows.map((s) => s.sessionId)).toEqual(["recent-start", "old-start"]);
+  });
+
+  it("falls back to startedAt, sorts an undatable row last, and breaks ties by id", () => {
+    const rows = [
+      session({ sessionId: "undated", deviceId: "d1" }),
+      session({ sessionId: "b", deviceId: "d1", lastHeartbeatAt: "2026-09-12T10:00:00Z" }),
+      session({ sessionId: "a", deviceId: "d1", lastHeartbeatAt: "2026-09-12T10:00:00Z" }),
+      session({ sessionId: "started-only", deviceId: "d1", startedAt: "2026-09-12T11:00:00Z" }),
+      session({ sessionId: "garbage", deviceId: "d1", lastHeartbeatAt: "not a date" }),
+    ];
+    expect(groupByDevice(rows)[0].sessions.map((s) => s.sessionId)).toEqual([
+      "started-only",
+      "a",
+      "b",
+      "garbage",
+      "undated",
+    ]);
+  });
 });
 
 describe("deviceLabel", () => {
