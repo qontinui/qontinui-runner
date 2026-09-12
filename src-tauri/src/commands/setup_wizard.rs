@@ -300,6 +300,12 @@ pub async fn github_list_repos() -> Result<Value, String> {
 /// A mint failure is returned rather than swallowed: opening a browser flow
 /// whose hand-off is already known to fail would only surface the same error
 /// later, after the user has installed the App.
+///
+/// A second click while a flow is still pending re-arms with a fresh nonce
+/// but REUSES the unexpired token (see [`arm_pending_connect`]): coord bounds
+/// live rows per tenant and flow, and the browser page mints its own row on
+/// every attempt too, so minting again here would spend that budget twice per
+/// click for a token that is consumed at most once anyway.
 #[tauri::command]
 pub async fn github_connect_url() -> Result<String, String> {
     let Some(bearer) = cognito_bearer().await else {
@@ -307,7 +313,10 @@ pub async fn github_connect_url() -> Result<String, String> {
             "Sign in to your Qontinui account in the runner before connecting GitHub.".to_string(),
         );
     };
-    let connect_state = mint_backend_connect_state(&bearer).await?;
+    let connect_state = match reusable_connect_state() {
+        Some(existing) => existing,
+        None => mint_backend_connect_state(&bearer).await?,
+    };
     let state = arm_pending_connect(connect_state);
     Ok(format!(
         "{}/connect-runner-github?state={}",
@@ -334,26 +343,61 @@ pub async fn github_connect_url() -> Result<String, String> {
 /// pending flow can't be redeemed much later.
 const CONNECT_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// Safety margin under coord's own token expiry, so the local check fails a
+/// flow FIRST — with the "click Connect GitHub again" message — rather than
+/// spending the nonce on a claim coord is about to refuse as expired.
+const CONNECT_STATE_EXPIRY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A coord connect-state token together with the deadline it is good until.
+struct ConnectStateToken {
+    /// Sent on the claim. Never leaves process memory until then; never logged.
+    token: String,
+    /// The earlier of the local [`CONNECT_STATE_TTL`] and coord's own expiry
+    /// (from the mint response's `expires_in_seconds`, less a margin).
+    expires_at: std::time::Instant,
+}
+
+impl ConnectStateToken {
+    fn expired(&self) -> bool {
+        std::time::Instant::now() >= self.expires_at
+    }
+}
+
 /// One runner-initiated connect flow awaiting its deep link.
 struct PendingConnect {
     /// The return nonce carried through `?state=` and back on the deep link.
     nonce: String,
-    /// The coord connect-state token minted for this flow, sent on the claim.
-    /// Never leaves process memory until then; never logged.
-    connect_state: String,
-    minted_at: std::time::Instant,
+    /// The coord connect-state token the claim will present.
+    connect_state: ConnectStateToken,
 }
 
 /// Single pending-flow slot. Clicking Connect again replaces any previous
-/// pending flow (last click wins — matches the UI, where only one connect flow
-/// is ever visible). The replaced flow's coord row is simply left to expire;
-/// coord expects concurrent live rows per tenant and bounds their count.
+/// pending flow's NONCE (last click wins — matches the UI, where only one
+/// connect flow is ever visible) while its unexpired token is carried over,
+/// see [`reusable_connect_state`].
 static PENDING_CONNECT_STATE: std::sync::Mutex<Option<PendingConnect>> =
     std::sync::Mutex::new(None);
 
+/// The pending flow's token when it is still good, for a repeat Connect click
+/// to re-arm with instead of minting another coord row. Safe to reuse: coord
+/// consumes a token on the matching claim only, and a replaced nonce can never
+/// match, so the carried-over token is still presented at most once.
+fn reusable_connect_state() -> Option<ConnectStateToken> {
+    let slot = PENDING_CONNECT_STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    slot.as_ref()
+        .map(|p| &p.connect_state)
+        .filter(|t| !t.expired())
+        .map(|t| ConnectStateToken {
+            token: t.token.clone(),
+            expires_at: t.expires_at,
+        })
+}
+
 /// Mint a fresh connect nonce (256-bit hex from the OS CSPRNG) and arm the
 /// pending slot with it and the coord `connect_state` the claim will present.
-fn arm_pending_connect(connect_state: String) -> String {
+fn arm_pending_connect(connect_state: ConnectStateToken) -> String {
     use rand::RngCore;
     let mut buf = [0u8; 32];
     rand::rng().fill_bytes(&mut buf);
@@ -366,7 +410,6 @@ fn arm_pending_connect(connect_state: String) -> String {
         .unwrap_or_else(|e| e.into_inner()) = Some(PendingConnect {
         nonce: nonce.clone(),
         connect_state,
-        minted_at: std::time::Instant::now(),
     });
     nonce
 }
@@ -397,15 +440,19 @@ fn take_connect_state_if_valid(presented: &str) -> Result<String, String> {
                 .to_string(),
         ),
         Some(pending) => {
-            if pending.minted_at.elapsed() > CONNECT_STATE_TTL {
+            if pending.connect_state.expired() {
                 *slot = None;
                 Err("the GitHub connect flow expired — click Connect GitHub again".to_string())
             } else if pending.nonce != presented {
                 Err("state nonce does not match the pending connect flow".to_string())
             } else {
                 // `take` moves the whole entry out, so the token is handed to
-                // exactly one claim.
-                Ok(slot.take().map(|p| p.connect_state).unwrap_or_default())
+                // exactly one claim. The slot was just observed `Some` under
+                // this same guard, so the `None` arm is unreachable.
+                let Some(pending) = slot.take() else {
+                    return Err("pending connect flow vanished under lock".to_string());
+                };
+                Ok(pending.connect_state.token)
             }
         }
     }
@@ -437,8 +484,8 @@ fn backend_error_message(body: &Value, status: reqwest::StatusCode, what: &str) 
 /// Mint a coord connect-state token for the `runner-clone` flow through the
 /// web proxy (`POST /api/v1/operations/pr-merge/onboarding/connect-state`),
 /// with the same bearer the claim will use. Returns the plaintext token, which
-/// coord hands out exactly once and never persists.
-async fn mint_backend_connect_state(bearer: &str) -> Result<String, String> {
+/// coord hands out exactly once and never persists, plus its local deadline.
+async fn mint_backend_connect_state(bearer: &str) -> Result<ConnectStateToken, String> {
     let url = format!(
         "{}/api/v1/operations/pr-merge/onboarding/connect-state",
         crate::api_config::get_api_base_url()
@@ -455,7 +502,9 @@ async fn mint_backend_connect_state(bearer: &str) -> Result<String, String> {
     let status = resp.status();
     let (host, path) = crate::outbound_trace::split_url(&url);
     crate::outbound_trace::record(
-        "mint_connect_state",
+        // Keyed by the COMMAND that made the call, which is how the observe
+        // tier looks a trace up.
+        "github_connect_url",
         crate::outbound_trace::OutboundTrace {
             method: "POST".to_string(),
             host,
@@ -468,17 +517,68 @@ async fn mint_backend_connect_state(bearer: &str) -> Result<String, String> {
     );
 
     let body: Value = resp.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        let msg = backend_error_message(&body, status, "starting the GitHub connect");
+    parse_mint_response(status, &body).map_err(|msg| {
         warn!("connect-state mint failed (status={}): {}", status, msg);
-        return Err(msg);
+        msg
+    })
+}
+
+/// Read the mint response: the token, and a local deadline no later than
+/// coord's own. Coord stamps `expires_at` at insert and echoes
+/// `expires_in_seconds` derived from it, so honouring that (less a margin)
+/// keeps the local check ahead of the server's; a response without the field
+/// falls back to the local TTL.
+fn parse_mint_response(
+    status: reqwest::StatusCode,
+    body: &Value,
+) -> Result<ConnectStateToken, String> {
+    if !status.is_success() {
+        return Err(backend_error_message(
+            body,
+            status,
+            "starting the GitHub connect",
+        ));
     }
-    body.get("connect_state")
+    let token = body
+        .get("connect_state")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(String::from)
-        .ok_or_else(|| "Coord returned no connect-state token — please retry.".to_string())
+        .ok_or_else(|| "Coord returned no connect-state token — please retry.".to_string())?;
+    let ttl = body
+        .get("expires_in_seconds")
+        .and_then(Value::as_u64)
+        .map(std::time::Duration::from_secs)
+        .map(|coord_ttl| coord_ttl.saturating_sub(CONNECT_STATE_EXPIRY_MARGIN))
+        .map_or(CONNECT_STATE_TTL, |coord_ttl| {
+            coord_ttl.min(CONNECT_STATE_TTL)
+        });
+    Ok(ConnectStateToken {
+        token,
+        expires_at: std::time::Instant::now() + ttl,
+    })
+}
+
+/// The claim body: `bind_only: true` (D2 — the clone flow must never surprise a
+/// partner org with bootstrap PRs; coord also derives it from the token's
+/// recorded `runner-clone` flow and rejects a body that disagrees), the
+/// connect-state token, and exactly the target key the deep link carried.
+fn build_claim_body(code: &str, target: &GithubClaimTarget, connect_state: &str) -> Value {
+    let mut body = serde_json::json!({
+        "code": code,
+        "bind_only": true,
+        "connect_state": connect_state,
+    });
+    match target {
+        GithubClaimTarget::InstallationId(id) => {
+            body["installation_id"] = serde_json::json!(id);
+        }
+        GithubClaimTarget::AccountLogin(login) => {
+            body["account_login"] = serde_json::json!(login);
+        }
+    }
+    body
 }
 
 /// Which GitHub account the claim targets. Fresh installs return an
@@ -519,20 +619,10 @@ pub async fn claim_github_connection(
         "{}/api/v1/operations/pr-merge/onboarding/claim",
         crate::api_config::get_api_base_url()
     );
-    let mut body = serde_json::json!({
-        "code": code,
-        "bind_only": true,
-        "connect_state": connect_state,
-    });
+    let body = build_claim_body(&code, &target, &connect_state);
     let target_label = match &target {
-        GithubClaimTarget::InstallationId(id) => {
-            body["installation_id"] = serde_json::json!(id);
-            format!("installation_id={}", id)
-        }
-        GithubClaimTarget::AccountLogin(login) => {
-            body["account_login"] = serde_json::json!(login);
-            format!("account_login={}", login)
-        }
+        GithubClaimTarget::InstallationId(id) => format!("installation_id={}", id),
+        GithubClaimTarget::AccountLogin(login) => format!("account_login={}", login),
     };
     let client = reqwest::Client::new();
     let resp = client
@@ -1572,7 +1662,7 @@ mod tests {
         assert!(take_connect_state_if_valid("anything").is_err());
 
         // Minted nonce is 256-bit hex and lands in the connect URL shape.
-        let nonce = arm_pending_connect("token-1".to_string());
+        let nonce = arm_pending_connect(fresh_token("token-1"));
         assert_eq!(nonce.len(), 64);
         assert!(nonce.chars().all(|c| c.is_ascii_hexdigit()));
 
@@ -1591,8 +1681,8 @@ mod tests {
 
         // A re-mint replaces the previous pending flow (last click wins),
         // token included.
-        let first = arm_pending_connect("token-first".to_string());
-        let second = arm_pending_connect("token-second".to_string());
+        let first = arm_pending_connect(fresh_token("token-first"));
+        let second = arm_pending_connect(fresh_token("token-second"));
         assert_ne!(first, second);
         assert!(take_connect_state_if_valid(&first).is_err());
         assert_eq!(
@@ -1600,26 +1690,125 @@ mod tests {
             Ok("token-second")
         );
 
-        // Expired slot → rejected and cleared. (Backdate the minted_at; skip
+        // A repeat click while a flow is pending re-arms with a NEW nonce but
+        // carries the unexpired token over (no second coord row), and the old
+        // nonce is dead.
+        let armed = arm_pending_connect(fresh_token("token-reused"));
+        let carried = reusable_connect_state().expect("unexpired token is reusable");
+        assert_eq!(carried.token, "token-reused");
+        let re_armed = arm_pending_connect(carried);
+        assert_ne!(armed, re_armed);
+        assert!(take_connect_state_if_valid(&armed).is_err());
+        assert_eq!(
+            take_connect_state_if_valid(&re_armed).as_deref(),
+            Ok("token-reused")
+        );
+        // Consumed → nothing to reuse.
+        assert!(reusable_connect_state().is_none());
+
+        // Expired slot → rejected and cleared. (Backdate the deadline; skip
         // silently if the platform clock can't represent the subtraction.)
-        let expired_at = std::time::Instant::now()
-            .checked_sub(CONNECT_STATE_TTL + std::time::Duration::from_secs(1));
-        if let Some(minted_at) = expired_at {
-            let stale = arm_pending_connect("token-stale".to_string());
-            PENDING_CONNECT_STATE
-                .lock()
-                .unwrap()
-                .replace(PendingConnect {
-                    nonce: stale.clone(),
-                    connect_state: "token-stale".to_string(),
-                    minted_at,
-                });
+        let expired_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
+        if let Some(expires_at) = expired_at {
+            let stale = arm_pending_connect(ConnectStateToken {
+                token: "token-stale".to_string(),
+                expires_at,
+            });
+            // An expired token is not reusable either — a repeat click mints.
+            assert!(reusable_connect_state().is_none());
             let err = take_connect_state_if_valid(&stale).unwrap_err();
             assert!(err.contains("expired"), "unexpected error: {err}");
             // Cleared on sight — a second presentation now sees no pending flow.
             let err2 = take_connect_state_if_valid(&stale).unwrap_err();
             assert!(err2.contains("no pending"), "unexpected error: {err2}");
         }
+    }
+
+    fn fresh_token(token: &str) -> ConnectStateToken {
+        ConnectStateToken {
+            token: token.to_string(),
+            expires_at: std::time::Instant::now() + CONNECT_STATE_TTL,
+        }
+    }
+
+    /// The mint response seam: coord's `connect_state` key, the deadline
+    /// bounded by coord's own `expires_in_seconds` (less the margin) and by
+    /// the local TTL, and the failure shapes.
+    #[test]
+    fn parse_mint_response_token_and_deadline() {
+        let ok = reqwest::StatusCode::OK;
+        let before = std::time::Instant::now();
+
+        // Coord's expiry is shorter than the local TTL → coord's wins, less
+        // the margin.
+        let short = serde_json::json!({ "connect_state": " tok ", "expires_in_seconds": 120 });
+        let minted = parse_mint_response(ok, &short).unwrap();
+        assert_eq!(minted.token, "tok");
+        let ttl = minted.expires_at.duration_since(before);
+        assert!(ttl <= std::time::Duration::from_secs(90), "ttl={ttl:?}");
+        assert!(ttl > std::time::Duration::from_secs(80), "ttl={ttl:?}");
+        assert!(!minted.expired());
+
+        // Coord's expiry is longer than the local TTL → the local TTL wins.
+        let long = serde_json::json!({ "connect_state": "tok", "expires_in_seconds": 3600 });
+        let ttl = parse_mint_response(ok, &long)
+            .unwrap()
+            .expires_at
+            .duration_since(before);
+        assert!(ttl <= CONNECT_STATE_TTL, "ttl={ttl:?}");
+
+        // No expiry field → the local TTL.
+        let bare = serde_json::json!({ "connect_state": "tok" });
+        let ttl = parse_mint_response(ok, &bare)
+            .unwrap()
+            .expires_at
+            .duration_since(before);
+        assert!(ttl <= CONNECT_STATE_TTL, "ttl={ttl:?}");
+        assert!(
+            ttl > CONNECT_STATE_TTL - std::time::Duration::from_secs(5),
+            "ttl={ttl:?}"
+        );
+
+        // A coord expiry at or under the margin is already dead on arrival.
+        let dead = serde_json::json!({ "connect_state": "tok", "expires_in_seconds": 10 });
+        assert!(parse_mint_response(ok, &dead).unwrap().expired());
+
+        // 2xx without a usable token, and a coord refusal passed through.
+        assert!(parse_mint_response(ok, &serde_json::json!({ "connect_state": "" })).is_err());
+        assert!(parse_mint_response(ok, &Value::Null).is_err());
+        let refused = serde_json::json!({
+            "error": "connect_state_quota_exceeded",
+            "message": "too many attempts of this kind are already in flight",
+        });
+        assert_eq!(
+            parse_mint_response(reqwest::StatusCode::BAD_REQUEST, &refused).unwrap_err(),
+            "too many attempts of this kind are already in flight"
+        );
+    }
+
+    /// The claim body carries the token and `bind_only: true`, and exactly one
+    /// target key — what the web proxy's `OnboardingClaimRequest` expects.
+    #[test]
+    fn build_claim_body_carries_connect_state_and_one_target() {
+        let by_id = build_claim_body(
+            "code-1",
+            &GithubClaimTarget::InstallationId(143833618),
+            "tok",
+        );
+        assert_eq!(by_id["code"], "code-1");
+        assert_eq!(by_id["bind_only"], true);
+        assert_eq!(by_id["connect_state"], "tok");
+        assert_eq!(by_id["installation_id"], 143833618u64);
+        assert!(by_id.get("account_login").is_none());
+
+        let by_login = build_claim_body(
+            "code-2",
+            &GithubClaimTarget::AccountLogin("qontinui".to_string()),
+            "tok",
+        );
+        assert_eq!(by_login["account_login"], "qontinui");
+        assert!(by_login.get("installation_id").is_none());
+        assert_eq!(by_login["connect_state"], "tok");
     }
 
     /// The two failure shapes that reach the runner: the proxy's own
