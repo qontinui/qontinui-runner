@@ -924,9 +924,17 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             };
             let url = format!("{base}/coord/work-units/{slug}/register-gate");
             let body = gate_registration_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-                .send()
-                .await
+            let mut rb =
+                crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope);
+            // The author the live forward would have sent, recorded by the
+            // write forwarder when it spooled the row. coord's
+            // `register_unit_gate` stamps it only if `session_on_device` binds
+            // it to this device — closed or not, deliberately, so a session
+            // reaped while still running keeps its provenance — and otherwise
+            // records NULL. It never refuses the gate over this header, so a
+            // replay cannot be lost to it.
+            rb = with_gate_caller_session(rb, &rec.payload);
+            rb.send().await
         }
         "finding_posted" => {
             // Closeout finding (same plan/phase). POST /coord/agent-findings
@@ -1260,6 +1268,37 @@ fn gate_registration_slug(payload: &JsonValue) -> Option<String> {
     Some(slug.to_string())
 }
 
+/// The runner-resolved author a `gate_registration` payload carries under
+/// [`super::closeout_spool::GATE_CALLER_SESSION_KEY`], as the strict UUID the
+/// `X-Coord-Caller-Session` header must be — or `None`.
+///
+/// Absent (a row spooled with no resolution, or by a build predating the key)
+/// and malformed both mean "replay headerless": a value that is not a UUID can
+/// name no `coord.agent_sessions` row, and coord would only ignore it.
+fn gate_registration_caller_session(payload: &JsonValue) -> Option<Uuid> {
+    let raw = payload
+        .get(super::closeout_spool::GATE_CALLER_SESSION_KEY)?
+        .as_str()?;
+    Uuid::parse_str(raw.trim()).ok()
+}
+
+/// Attach the spooled author ([`gate_registration_caller_session`]) to a
+/// register-gate request, when the row carries one.
+///
+/// The ONE place a replayed gate gets its `X-Coord-Caller-Session`, used by
+/// both register-gate POSTs — the first replay and the retry after a
+/// `work_unit_not_found` bootstrap — so the retry cannot land the very gates
+/// the bootstrap exists for without their author.
+fn with_gate_caller_session(
+    rb: reqwest::RequestBuilder,
+    payload: &JsonValue,
+) -> reqwest::RequestBuilder {
+    match gate_registration_caller_session(payload) {
+        Some(sid) => rb.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string()),
+        None => rb,
+    }
+}
+
 /// Build the `POST /coord/work-units/:slug/register-gate` body from a
 /// `gate_registration` outbox payload — coord's `UnitGateRequest` shape.
 ///
@@ -1433,10 +1472,9 @@ async fn bootstrap_then_register(
     // values, so the retry costs nothing beyond one extra request.
     let url = format!("{base}/coord/work-units/{slug}/register-gate");
     let body = gate_registration_body(&rec.payload);
-    match crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
-        .send()
-        .await
-    {
+    let rb = crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope);
+    // Same author as the first attempt — see [`with_gate_caller_session`].
+    match with_gate_caller_session(rb, &rec.payload).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_success() {
@@ -2017,6 +2055,9 @@ mod tests {
         /// `(slug, body)` per accepted
         /// `POST /coord/work-units/:slug/register-gate`.
         gates: Vec<(String, JsonValue)>,
+        /// The `X-Coord-Caller-Session` each accepted register-gate carried,
+        /// index-aligned with `gates` (`None` = no header).
+        gate_callers: Vec<Option<String>>,
         /// Bodies accepted by `POST /coord/work-units/upsert`.
         unit_upserts: Vec<JsonValue>,
         /// Bodies accepted by `POST /coord/agent-findings`.
@@ -2174,7 +2215,12 @@ mod tests {
                 post(
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(slug): AxumPath<String>,
+                     headers: axum::http::HeaderMap,
                      Json(body): Json<JsonValue>| async move {
+                        let caller = headers
+                            .get("x-coord-caller-session")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
                         let mut g = state.lock().await;
                         if g.gate_needs_work_unit && !g.upserted_slugs.iter().any(|s| *s == slug) {
                             // Byte-shape of coord's own refusal
@@ -2190,6 +2236,7 @@ mod tests {
                                 .into_response();
                         }
                         g.gates.push((slug, body));
+                        g.gate_callers.push(caller);
                         (
                             AxumStatus::CREATED,
                             Json(json!({
@@ -3360,6 +3407,8 @@ mod tests {
                 "title": "Closeout has no durable store",
                 "status": "in_progress",
             },
+            // The author the write forwarder resolved when it spooled the row.
+            "caller_session": "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b",
         })
     }
 
@@ -3407,6 +3456,14 @@ mod tests {
         // The two runner-side fields never reach coord.
         assert!(body.get("work_unit_slug").is_none());
         assert!(body.get("work_unit_upsert").is_none());
+        // The spooled author rides as the HEADER coord stamps the gate's
+        // session from — never in the body.
+        assert!(body.get("caller_session").is_none());
+        assert_eq!(
+            g.gate_callers,
+            vec![Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".to_string())],
+            "the replay carries the spooled author as X-Coord-Caller-Session"
+        );
         // No bootstrap upsert fires when the work unit already exists.
         assert!(g.unit_upserts.is_empty());
         drop(g);
@@ -3515,6 +3572,14 @@ mod tests {
         // The gate landed on the second attempt, at the same slug.
         assert_eq!(g.gates.len(), 1);
         assert_eq!(g.gates[0].0, "2026-08-28-closeout-store");
+        // …and that second POST still carries the spooled author. This is the
+        // offline case the bootstrap exists for, so a header on the first
+        // POST only would land exactly the gates that need it authorless.
+        assert_eq!(
+            g.gate_callers,
+            vec![Some("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b".to_string())],
+            "the post-bootstrap register-gate carries X-Coord-Caller-Session"
+        );
         drop(g);
 
         wait_until(Duration::from_secs(3), || {
@@ -3622,6 +3687,7 @@ mod tests {
         assert_eq!(body["gate_class"], json!("closeout"));
         assert!(body.get("work_unit_slug").is_none());
         assert!(body.get("work_unit_upsert").is_none());
+        assert!(body.get("caller_session").is_none());
         assert!(body.get("continuation_spawn").is_none());
 
         let nulled = gate_registration_body(&json!({
@@ -3658,6 +3724,35 @@ mod tests {
             json!({"work_unit_slug": "a b"}),
         ] {
             assert_eq!(gate_registration_slug(&bad), None, "rejected: {bad}");
+        }
+    }
+
+    /// The spooled author replays only as a strict UUID; anything else (or
+    /// nothing) replays headerless rather than sending a value coord can only
+    /// refuse.
+    #[test]
+    fn gate_registration_caller_session_is_a_strict_uuid_or_nothing() {
+        let sid = Uuid::parse_str("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap();
+        assert_eq!(gate_registration_caller_session(&gate_payload()), Some(sid));
+        assert_eq!(
+            gate_registration_caller_session(&json!({
+                "caller_session": " 0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b "
+            })),
+            Some(sid),
+            "trimmed"
+        );
+        for absent in [
+            json!({}),
+            json!({"caller_session": null}),
+            json!({"caller_session": 7}),
+            json!({"caller_session": ""}),
+            json!({"caller_session": "not-a-uuid"}),
+        ] {
+            assert_eq!(
+                gate_registration_caller_session(&absent),
+                None,
+                "replays headerless: {absent}"
+            );
         }
     }
 
