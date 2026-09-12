@@ -44,8 +44,19 @@ pub struct FleetSessionsArgs {
     /// an attach wants live sessions.
     #[serde(default)]
     pub include_closed: bool,
-    /// Page size. coord clamps to its own ceiling and reports `truncated`.
+    /// Page size. coord clamps to its own ceiling and echoes the effective
+    /// value back as `limit`.
     pub limit: Option<i64>,
+    /// A `nextCursor` from a previous page of the SAME scope, passed back
+    /// verbatim to advance the keyset walk.
+    ///
+    /// OPAQUE: never construct, parse or rewrite it here. coord fingerprints
+    /// the scope (`device_id` / `state` / `include_closed`) into the token and
+    /// answers `400 cursor_scope_mismatch` when a cursor is replayed under a
+    /// different one, so this wrapper must forward the caller's string
+    /// unchanged and let coord adjudicate. `limit` is deliberately NOT part of
+    /// that fingerprint — resizing a page changes the slice, not the sequence.
+    pub cursor: Option<String>,
 }
 
 /// Per-request deadline. Discovery is a foreground read behind a picker, so a
@@ -85,6 +96,12 @@ fn build_fleet_url(base: &str, args: &FleetSessionsArgs) -> String {
     }
     if let Some(l) = args.limit {
         query.push(("limit", l.to_string()));
+    }
+    if let Some(c) = args.cursor.as_deref() {
+        let c = c.trim();
+        if !c.is_empty() {
+            query.push(("cursor", c.to_string()));
+        }
     }
 
     let url = format!("{base}/coord/sessions/fleet");
@@ -171,6 +188,7 @@ mod tests {
                 state: Some(String::new()),
                 include_closed: false,
                 limit: None,
+                cursor: None,
             },
         );
         assert_eq!(url, "https://coord.example.test/coord/sessions/fleet");
@@ -188,6 +206,7 @@ mod tests {
                 state: Some("working".to_string()),
                 include_closed: true,
                 limit: Some(25),
+                cursor: None,
             },
         );
         assert!(url.contains("device_id=abc-123"));
@@ -218,5 +237,100 @@ mod tests {
     fn trailing_slash_on_base_is_normalised() {
         let url = build_fleet_url("https://coord.example.test/", &FleetSessionsArgs::default());
         assert_eq!(url, "https://coord.example.test/coord/sessions/fleet");
+    }
+
+    /// The keyset walk is only reachable if this wrapper FORWARDS the cursor.
+    ///
+    /// It did not, until 2026-09-11. `FleetSessionsArgs` had no `cursor` field
+    /// and `FleetSessionsArgs` carries no `deny_unknown_fields`, so serde
+    /// silently DROPPED the key the picker was sending: the request succeeded,
+    /// coord served page one again, and the walk could never advance. A silent
+    /// drop is the worst shape available here — the UI has every reason to
+    /// believe it paged.
+    #[test]
+    fn a_cursor_is_forwarded_so_the_walk_can_advance() {
+        let url = build_fleet_url(
+            BASE,
+            &FleetSessionsArgs {
+                cursor: Some("Q3Vyc29yLXYx".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            url.contains("cursor=Q3Vyc29yLXYx"),
+            "the cursor must reach coord or the walk silently repeats page one: {url}"
+        );
+    }
+
+    /// The token is OPAQUE, so it is forwarded byte-for-byte apart from the
+    /// trim every other filter gets. base64url can carry `-` and `_`, and
+    /// percent-encoding must not mangle a token coord will compare exactly.
+    #[test]
+    fn a_cursor_is_forwarded_verbatim_not_rewritten() {
+        // The fixture is deliberately low-entropy, obviously synthetic, and NOT
+        // bound to a name in the secret family. Two separate gitleaks rules
+        // fire on the obvious spellings: the default JWT rule on anything
+        // `eyJ`-prefixed (a cursor is base64url of JSON, so a realistic one is
+        // byte-indistinguishable from a JWT), and `generic-api-key` on a
+        // high-entropy literal assigned to `token` / `key` / `secret` — which
+        // also base64-DECODES the value and re-fires on the plaintext. Gitleaks
+        // scans commit history, so either one fails the branch permanently.
+        // It still carries `-` and `_`, the base64url property this test pins.
+        let cursor_fixture = "cursor-page-2_of-3";
+        let url = build_fleet_url(
+            BASE,
+            &FleetSessionsArgs {
+                cursor: Some(format!("  {cursor_fixture}  ")),
+                ..Default::default()
+            },
+        );
+        assert!(
+            url.contains(&format!("cursor={cursor_fixture}")),
+            "cursor must survive the round trip unaltered: {url}"
+        );
+    }
+
+    /// A blank cursor is page one, not a filter. Sending `cursor=` would make
+    /// coord adjudicate an empty token rather than start a fresh walk.
+    #[test]
+    fn a_blank_cursor_is_dropped_not_sent() {
+        for blank in ["", "   "] {
+            let url = build_fleet_url(
+                BASE,
+                &FleetSessionsArgs {
+                    cursor: Some(blank.to_string()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(url, "https://coord.example.test/coord/sessions/fleet");
+            assert!(!url.contains("cursor"));
+        }
+    }
+
+    /// A cursor rides ALONGSIDE its scope, never instead of it: coord
+    /// fingerprints `device_id` / `state` / `include_closed` into the token and
+    /// answers `400 cursor_scope_mismatch` if they disagree, so dropping one on
+    /// an advance would break every walk that has a filter applied.
+    #[test]
+    fn a_cursor_does_not_displace_the_scope_it_was_minted_under() {
+        let url = build_fleet_url(
+            BASE,
+            &FleetSessionsArgs {
+                device_id: Some("dev-1".to_string()),
+                state: Some("active".to_string()),
+                include_closed: true,
+                limit: Some(100),
+                cursor: Some("tok".to_string()),
+            },
+        );
+        for expected in [
+            "device_id=dev-1",
+            "state=active",
+            "include_closed=true",
+            "limit=100",
+            "cursor=tok",
+        ] {
+            assert!(url.contains(expected), "missing {expected} in {url}");
+        }
     }
 }
