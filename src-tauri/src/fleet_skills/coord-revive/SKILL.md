@@ -89,6 +89,89 @@ Because those two sources are *static* while device JWTs live ~4h, **a 401 from
 one of them is expected and is NOT terminal** — it is recorded and the cascade
 falls through to the next source. Only the runner mint's 401 ends L4.
 
+### Which copy you are running, and the ONE exit that carries no verdict
+
+**The copy does not matter; the cwd does.** L1 reads `$PWD/.mcp.json` and L2
+derives the workspace root from the cwd's `git rev-parse --git-common-dir`, so
+`bash <path-to-this-skill-dir>/coord-revive.sh` answers for the directory you
+run it *from*, whichever checkout's skill dir that path names. What the
+script's own location decides is only where it finds the four helpers it needs
+from the config repo's `scripts/` — `lib/envelope.sh`, `coord-acting-bearer.sh`,
+`coord-provision-nonce.sh` and `lib/guard-decision-log.sh` — and since #814 /
+#845 that lookup is ONE resolver (`__resolve_fleet_script` in
+`.claude/skills/coord-revive/coord-revive.sh`) that works from any checkout: the
+original three fixed rungs first (`$HERE/../../../scripts/`, the same with
+`$HERE` resolved physically, `$QONTINUI_ROOT/qontinui-claude-config/scripts/`),
+then `$HERE` and every ancestor of it — logical and physical — tested for
+`scripts/` and for `qontinui-claude-config/scripts/`, then the
+`--git-common-dir` workspace root. The three fixed rungs alone assumed `$HERE` sat three levels
+below the config repo, which holds for `<workspace-root>/.claude` (a symlink
+into it) and for a config-repo checkout new enough to ship `scripts/lib/` — and
+for nothing else: every other checkout carries its own REAL copy of the bundle,
+so `pwd -P` had no symlink to resolve, and a config-repo worktree parked on a
+commit older than `scripts/lib/envelope.sh` refuses the same way while holding
+a provisioned bundle newer than its own tree (the walk's
+`<ancestor>/qontinui-claude-config/scripts/` rung is what reaches past both).
+Measured 2026-09-06 on the operator box: **31 of 32** checkouts carrying this
+skill refused to run at all.
+
+**Exit 127 is the one exit that reached NO door.** Four local faults end the
+script before its first probe, each on stderr, each saying `LOCAL fault` in so
+many words, and none of them followed by a `VERDICT:` line: `curl` missing;
+neither `jq` nor a working `python` to read JSON; `scripts/lib/envelope.sh` not
+found (the message names every rung the resolver searched, and says which of
+its two conditional rungs — `$QONTINUI_ROOT`, the git root — emitted no
+candidate); and `mktemp -d` failing. A caller told to "branch on the `VERDICT:`
+line" has nothing to branch on here, and that is the honest shape — **read a
+127 as UNKNOWN about coord, never as `DEAD`**. In the session that measured the
+31 of 32, every coord door was LIVE throughout; the refusal was the script's
+own.
+
+**A copy that predates the resolver is still the common case on a box whose
+runner has not been rebuilt, and it refuses with the OLD message.** The runner
+bundle is a render of this directory that lags its source
+(`knowledge-base/qontinui-specific/fleet-skill-bundle-authority.md`), and the
+copy a session finds in a product checkout is whatever the RUNNING runner build
+unpacked there. Re-measured 2026-09-12 on the operator box, six days after the
+fix landed: **31 of 33** checkouts still carried a pre-resolver copy, because
+the running build (`fea16af05-1789184319940`) predates it. Tell them apart
+without running anything:
+
+```bash
+grep -c '__resolve_fleet_script' <path-to-this-skill-dir>/coord-revive.sh
+# 0 -> pre-resolver copy: refuses from every checkout but the config repo and
+#      the workspace root, with "envelope.sh not found beside this skill"
+# >0 -> carries the resolver
+```
+
+Never restart the runner to refresh a copy (served policy `production-and-cost`
+`runner-lifecycle`). The recovery is the third fixed rung, which every copy
+ever shipped carries — set the variable and all four helpers resolve through
+it. The same variable is also L2's sweep-root override (see "Worktree-safe"
+below), so it must be the directory the checkouts sit in — the workspace root,
+not the config repo and not a worktree container:
+
+```bash
+QONTINUI_ROOT=<workspace-root> bash <path-to-this-skill-dir>/coord-revive.sh
+```
+
+Measured on a pre-resolver copy from `qontinui-coord` on 2026-09-12: exit 127
+and no `VERDICT:` line without the variable, a `VERDICT:` line with it.
+
+**The limit, stated so "any checkout" is not read as "anywhere".** The
+resolver finds a config-repo checkout; it cannot conjure one. The runner bundle
+ships this skill's directory and nothing under `scripts/` — none of the four
+helpers, nor the `lib/native-path.sh` that `lib/envelope.sh` sources when it
+is present — so on a device with no `qontinui-claude-config` checkout in reach
+of any rung, EVERY copy, resolver or not, exits 127 at the `envelope.sh` lookup
+before probing a single door. That is the one
+population the fleet-served-skills bundling was built for, and for this script
+it is not yet served; the gap is recorded rather than closed here (coord
+finding `92219d86-db0b-42c8-9e4d-d2cf7b2d2666`, plan
+`2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without`),
+because closing it is a bundle-roster change plus a bundle-local rung in the
+resolver, not a documentation edit.
+
 ### The AXES table: every verdict names what it did not ask
 
 The terminal line is emitted **from a table**, never beside one. Every rung is a
@@ -445,8 +528,11 @@ against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Three of the fourteen call sites return BEFORE that
-guard is consulted at all and the rest are reached after it; either way none
+our own `coord-mcp` config. Ten of the fourteen call sites return BEFORE that
+guard is consulted at all -- seven in `apply_probe_verdict`, one in
+`provision_coord_mcp_for_session`, one early-returning at
+`provision_coord_mcp_with_jwt`'s bearer check, and one in
+`agent_runtime.rs` -- and the remaining four are reached after it; either way none
 deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
