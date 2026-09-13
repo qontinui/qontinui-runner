@@ -2,6 +2,12 @@ import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
 import type { TerminalPageConfig } from "./useTerminalPages";
 
+/**
+ * Sentinel `dragOverId` value for the drop zone AFTER the last tab (the
+ * "move to end" gesture) — distinct from any real page id.
+ */
+const END_ZONE_ID = "__terminal-tab-end-zone__";
+
 interface TerminalPageTabBarProps {
   pages: TerminalPageConfig[];
   activePageId: string;
@@ -9,8 +15,13 @@ interface TerminalPageTabBarProps {
   onAddPage: (name: string) => void;
   onRemovePage: (id: string) => void;
   onRenamePage: (id: string, name: string) => void;
-  /** Drag-to-reorder: move `sourceId` to sit immediately before `targetId`. */
-  onReorderPage?: (sourceId: string, targetId: string) => void;
+  /**
+   * Drag-to-reorder (and its Alt+Arrow keyboard equivalent — WCAG 2.5.7
+   * requires a non-dragging alternative to a drag-only gesture): move
+   * `sourceId` to sit immediately before `targetId`, or to the end of the
+   * list when `targetId` is `null`.
+   */
+  onReorderPage?: (sourceId: string, targetId: string | null) => void;
   onReorganize?: () => void;
   /** Open a new pop-out OS window (same process) hosting its own terminals. */
   onPopOut?: () => void;
@@ -91,7 +102,7 @@ export function TerminalPageTabBar({
         const isDragging = draggedId === page.id;
         // Only the tab under the pointer — not the one being dragged — shows
         // the drop-target highlight (dragging a tab over itself is a no-op).
-        const isDropTarget = onReorderPage && dragOverId === page.id && draggedId !== page.id;
+        const isDropTarget = !!onReorderPage && dragOverId === page.id && draggedId !== page.id;
 
         const tabClasses = `group flex items-center gap-1 px-2.5 py-1 rounded text-[11px] cursor-pointer transition-colors ${
           isActive
@@ -162,7 +173,25 @@ export function TerminalPageTabBar({
                 onReorderPage(sourceId, page.id);
               }
             }}
-            title={`Switch to ${page.name}${onReorderPage ? " (drag to reorder)" : ""}`}
+            onKeyDown={(e) => {
+              // Alt+Arrow reorder: the non-dragging alternative WCAG 2.5.7
+              // requires for a drag-only interaction. Swaps the focused tab
+              // with its immediate neighbor; focus follows it (React moves
+              // rather than remounts a same-key element across a reorder).
+              if (!onReorderPage || !e.altKey) return;
+              if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+              e.preventDefault();
+              const i = pages.findIndex((p) => p.id === page.id);
+              if (i < 0) return;
+              if (e.key === "ArrowLeft") {
+                if (i > 0) onReorderPage(page.id, pages[i - 1].id);
+              } else if (i < pages.length - 1) {
+                // Moving right one slot means landing just before whatever is
+                // now two slots ahead — or the end, if there's nothing there.
+                onReorderPage(page.id, i + 2 < pages.length ? pages[i + 2].id : null);
+              }
+            }}
+            title={`Switch to ${page.name}${onReorderPage ? " (drag, or Alt+←/→, to reorder)" : ""}`}
           >
             <span className="truncate max-w-[120px]">{page.name}</span>
             {onPopOutPage && (
@@ -208,6 +237,33 @@ export function TerminalPageTabBar({
           </button>
         );
       })}
+      {onReorderPage && draggedId && (
+        // "Move to end" drop zone: only a per-tab `onDrop` exists otherwise,
+        // so a tab could never become the LAST tab (there's nothing after it
+        // to drop "before"). Rendered only mid-drag so it costs no layout
+        // space the rest of the time.
+        <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            if (dragOverId !== END_ZONE_ID) setDragOverId(END_ZONE_ID);
+          }}
+          onDragLeave={() => {
+            setDragOverId((current) => (current === END_ZONE_ID ? null : current));
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            const sourceId = draggedId ?? e.dataTransfer.getData("text/plain");
+            setDraggedId(null);
+            setDragOverId(null);
+            if (sourceId) onReorderPage(sourceId, null);
+          }}
+          className={`self-stretch w-2 rounded transition-colors ${
+            dragOverId === END_ZONE_ID ? "bg-[#7aa2f7]/30 ring-1 ring-inset ring-[#7aa2f7]" : ""
+          }`}
+          aria-hidden="true"
+        />
+      )}
       <button
         onClick={handleAdd}
         aria-label="Add terminal page"

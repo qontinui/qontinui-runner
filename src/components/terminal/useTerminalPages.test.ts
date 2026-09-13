@@ -182,6 +182,23 @@ describe("reorderPagesArray (drag-to-reorder)", () => {
     const out = reorderPagesArray([A, B, C], "c", "a");
     expect(out.find((p) => p.id === "c")).toEqual(C);
   });
+
+  it("moves a page to the end when targetId is null", () => {
+    const out = reorderPagesArray([A, B, C], "a", null);
+    expect(out.map((p) => p.id)).toEqual(["b", "c", "a"]);
+  });
+
+  it("is a no-op (same reference) when the last page is dropped past itself (null target)", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "c", null)).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when a drop would not change the order", () => {
+    // "a" is already immediately before "b" — dropping it there again must
+    // not allocate a new (element-wise identical) array.
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "a", "b")).toBe(pages);
+  });
 });
 
 describe("computeVisiblePages (default-tab visibility)", () => {
