@@ -29,7 +29,7 @@
 //! names are one decision (ours / theirs-for-another-quantity / theirs-renamed)
 //! and splitting them across two files is how one of them gets dropped in a
 //! later edit. Likewise, `screenshots.rs::visibility_tests` already covers the
-//! entry and report key names; genuinely new here are the snake_case negative
+//! entry and report key names; genuinely new here are the snake_case alias
 //! pins, the SDK-only-key absence pins, the strict-`<` boundary and the handler
 //! status/default scrape. Overlap is cheap; a reader who believes there is none
 //! and finds some is the expensive outcome.
@@ -169,19 +169,29 @@ fn visibility_request_deserializes_the_sdk_camelcase_names() {
          every caller's flag a silent no-op rather than an error"
     );
 
-    // The snake_case spellings are NOT accepted. Pinned as an explicit
-    // negative because `#[serde(default)]` turns an unrecognised key into
-    // `None` rather than a 4xx — so if the rename were ever dropped, a
-    // camelCase caller would degrade silently in exactly this shape.
+    // The snake_case spellings ARE accepted, as aliases of the camelCase
+    // names. `VisibilityRequest` carries `serde(alias = "min_ratio")` and
+    // `serde(alias = "include_expected")` (screenshots.rs, aae5c6d4a) because
+    // the sibling `discover` route already takes both spellings. Before the
+    // alias, `{"min_ratio":0.9}` answered `200` and silently swept at the 0.02
+    // default. Pinned as a POSITIVE so that removing the alias fails a test
+    // instead of reintroducing that silent drop: `#[serde(default)]` turns an
+    // unrecognised key into `None`, not a 4xx.
     let snake: VisibilityRequest =
         serde_json::from_str(r#"{"min_ratio":0.5,"include_expected":true}"#)
-            .expect("unknown keys are ignored, not rejected");
+            .expect("snake_case body");
     assert_eq!(
-        snake.min_ratio, None,
-        "snake_case must NOT be a second accepted spelling — one wire name per \
-         quantity, or the two implementations drift without anything failing"
+        snake.min_ratio,
+        Some(0.5),
+        "`min_ratio` is an accepted alias of `minRatio` (the discover route \
+         takes both grammars); dropping the alias makes the caller's filter \
+         vanish behind a 200"
     );
-    assert_eq!(snake.include_expected, None, "same, for include_expected");
+    assert_eq!(
+        snake.include_expected,
+        Some(true),
+        "same, for `include_expected`"
+    );
 
     // A bodyless POST is accepted. The SDK's manifest declares this route
     // `bodyRequired: true` (types.ts UI_BRIDGE_ROUTES); the runner is
@@ -496,6 +506,29 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
          would change which occlusions a default call reports"
     );
     assert!(
+        body.contains("StatusCode::UNPROCESSABLE_ENTITY") && body.contains("\"INVALID_MIN_RATIO\""),
+        "an out-of-range or NaN minRatio is a 422 INVALID_MIN_RATIO (aae5c6d4a). \
+         That is a real caller error: minRatio lies in [0, 1] by construction, \
+         and before the check `minRatio: 2` answered 200 with a clear verdict \
+         the threshold itself guaranteed. A client should not retry it"
+    );
+    let validate_at = body
+        .find("validate_min_ratio(")
+        .expect("the handler must range-check minRatio via validate_min_ratio");
+    let discover_at = body
+        .find("\"discover\"")
+        .expect("the handler must issue a discover request");
+    assert_eq!(
+        body.matches("StatusCode::UNPROCESSABLE_ENTITY").count(),
+        1,
+        "exactly one 422 arm (INVALID_MIN_RATIO); any other failure is a 500"
+    );
+    assert!(
+        validate_at < discover_at,
+        "minRatio is validated BEFORE the discover IPC, so an invalid threshold \
+         can never produce a report"
+    );
+    assert!(
         body.contains("StatusCode::INTERNAL_SERVER_ERROR"),
         "a webview that cannot answer `discover` is a 500. That is a server \
          fault, and SDK clients retry 5xx"
@@ -503,14 +536,14 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
     for four_xx in [
         "StatusCode::BAD_REQUEST",
         "StatusCode::NOT_FOUND",
-        "StatusCode::UNPROCESSABLE_ENTITY",
         "StatusCode::SERVICE_UNAVAILABLE",
     ] {
         assert!(
             !body.contains(four_xx),
-            "{four_xx} must not appear in this handler: the only failure arm \
-             is an unreachable webview, and reporting it as caller error makes \
-             an SDK client stop retrying a fault it did not cause"
+            "{four_xx} must not appear in this handler: apart from the 422 for \
+             an invalid minRatio, the only failure arm is an unreachable webview. \
+             Reporting that as a caller error makes an SDK client stop retrying \
+             a fault it did not cause"
         );
     }
 }
