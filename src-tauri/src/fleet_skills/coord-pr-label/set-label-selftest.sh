@@ -184,6 +184,56 @@ rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked)
 err | grep -q 'NOTHING was written' && pass "no-door message says nothing was written" || fail "no-door render: $(err)"
 err | grep -q 'coord_pr_label_set' && pass "no-door message points at the MCP tool" || fail "no MCP pointer: $(err)"
 
+# ---- 8b. AN ANSWERED-BUT-FAILED CALL IS NOT "nothing was written" (exit 5)
+#
+# The regression this pins: the status test used to be `startswith(("2","4"))`
+# minus 401/403/404, so 400, 409, 413 and 429 fell into the SUCCESS renderer.
+# A POST printed nothing and exited 0; a DELETE printed
+# `ok: retracted "None" from None#None`. The 400 is not hypothetical -- it is
+# the door's own `tenant_from_auth` refusal for a bearer with no tenant claim.
+clear_fixtures; set_fixture forwarder 400 '{"error":"this route requires a tenant-scoped JWT (the token has no tenant_id claim)"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a 400 is exit 5, not a silent success" || fail "400 rc=$rc out=$(out)"
+out | grep -q 'ok:' && fail "a 400 printed an ok: line" || pass "a 400 claims nothing"
+err | grep -q 'tenant-scoped JWT' && pass "the 400 body reaches the caller" || fail "400 render: $(err)"
+
+clear_fixtures; set_fixture forwarder 400 '{"error":"this route requires a tenant-scoped JWT (the token has no tenant_id claim)"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --unset coord:migrate-repair)
+[[ "$rc" == 5 ]] && pass "a 400 on DELETE is exit 5" || fail "400 delete rc=$rc"
+out | grep -q 'ok: retracted' && fail 'DELETE asserted a retraction that did not happen' || pass "a failed DELETE asserts no retraction"
+
+# A 5xx from COORD ITSELF is an answer, and the POST arm must say so: the door
+# writes GitHub FIRST, so a 500 from the row INSERT lands with the label
+# already on the PR. Exit 4 would promise the opposite.
+clear_fixtures; set_fixture forwarder 500 '{"error":"INSERT coord.pr_labels: connection closed"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a coord 500 is exit 5, never 4" || fail "500 rc=$rc"
+err | grep -q 'writes GitHub FIRST' && pass "the 500 message refuses to claim nothing happened" || fail "500 render: $(err)"
+
+clear_fixtures; set_fixture forwarder 429 '{"error":"rate limited"}'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a 429 is exit 5" || fail "429 rc=$rc"
+
+# A non-JSON body is also an ANSWER of unknown effect -- 5, not 4.
+clear_fixtures; set_fixture forwarder 502 '<html>gateway</html>'
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash)
+[[ "$rc" == 5 ]] && pass "a non-JSON body is exit 5" || fail "non-JSON rc=$rc"
+
+# ---- 8c. a RUNNER-originated 5xx is not an answer: fall through to rung 2
+# `COORD_MCP_PROXY_TENANT_UNRESOLVABLE` is a 503 from a missing or malformed
+# ~/.qontinui/machine.json -- the runner failing, not coord answering. Rung 2
+# exists for exactly that runner.
+clear_fixtures
+set_fixture forwarder 503 '{"success":false,"error":"tenant unresolvable","code":"COORD_MCP_PROXY_TENANT_UNRESOLVABLE"}'
+set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_DEVICE_JWT="device.jwt" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 0 && "$(req_count)" == 2 ]] && pass "a runner-originated 503 falls through to the direct rung" || fail "proxy 503: rc=$rc reqs=$(req_count) err=$(err)"
+# ...but a 5xx carrying no runner code IS coord answering, and stops the cascade.
+clear_fixtures
+set_fixture forwarder 500 '{"error":"coord exploded"}'; set_fixture direct 200 "$ok_body"
+rc=$( cd "$WORK/cwd" && HOME="$WORK/home" PATH="$STUBS:$PATH" STUB_LOG="$LOG" STUB_FIXTURES="$FIX" COORD_HTTP_URL="https://coord.example.test" COORD_DEVICE_JWT="device.jwt" bash "$SCRIPT" --repo qontinui/does-not-exist --pr 0 --label coord:merge-strategy=squash >"$WORK/out" 2>"$WORK/err"; echo $? )
+[[ "$rc" == 5 && "$(req_count)" == 1 ]] && pass "a coord 5xx stops the cascade (it is an answer)" || fail "coord 500 cascade: rc=$rc reqs=$(req_count)"
+
 # ---- 9. usage errors exit 2 before any request
 clear_fixtures
 rc=$(run_client --repo qontinui/does-not-exist --pr 0)
@@ -192,6 +242,10 @@ rc=$(run_client --repo qontinui/does-not-exist --pr abc --label coord:blocked)
 [[ "$rc" == 2 ]] && pass "non-integer --pr ⇒ exit 2" || fail "bad pr rc=$rc"
 rc=$(run_client --repo qontinui/does-not-exist --pr 0 --label coord:blocked --unset coord:blocked)
 [[ "$rc" == 2 ]] && pass "--label and --unset together ⇒ exit 2" || fail "exclusive rc=$rc"
+# The door has no dry run on its retract verb, so silently ignoring the flag
+# would RETRACT the label the caller asked to rehearse.
+rc=$(run_client --repo qontinui/does-not-exist --pr 0 --unset coord:migrate-repair --dry-run)
+[[ "$rc" == 2 && "$(req_count)" == 0 ]] && pass "--dry-run with --unset ⇒ exit 2, no request" || fail "dry-run unset rc=$rc reqs=$(req_count)"
 
 # ---- 10. the script itself carries no localhost:9870 default and no gh call
 grep -q 'localhost:9870\|127\.0\.0\.1:9870' "$SCRIPT" && fail "set-label.sh still names the dead :9870 default" || pass "no :9870 default in set-label.sh"

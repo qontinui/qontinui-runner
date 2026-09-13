@@ -93,14 +93,26 @@ The script reaches the door through a cascade and reports which rung answered:
 1. the local runner's coord-mcp write forwarder (`<proxy-url>/pr-labels`, nonce
    from a runner-written `.mcp.json` near `$PWD`; the runner injects a fresh
    device JWT — nothing to export);
-2. coord directly at `${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/pr-labels`
+2. coord directly at
+   `${COORD_HTTP_URL:-${COORD_URL:-https://coord.qontinui.io}}/coord/pr-labels`
    with `$COORD_AGENT_JWT`, else `$COORD_DEVICE_JWT`, else
    `~/.qontinui/coord-device-jwt`.
 
+A **runner-originated** 5xx on rung 1 (`COORD_MCP_PROXY_*` /
+`COORD_WRITE_PROXY_*` — an unresolvable machine id, or a runner that could not
+reach coord) is the runner failing, not coord answering, so it falls through to
+rung 2. A 5xx carrying neither code IS coord answering and stops the cascade.
+
 Exit codes: `0` everything declared/retracted; `1` coord refused some or all
-labels (one `rejected:` line each, nothing partial left behind for them); `2`
-usage; `4` no door answered — and then **nothing was written anywhere**, which
-the message says. `--json` prints the raw answer after the summary lines.
+labels (one `rejected:` line each, nothing partial left behind for them — the
+typed 404 for a repo outside your tenant is a refusal too); `2` usage; `4` no
+door answered — and then **nothing was written anywhere**, which the message
+says; `5` a door **answered** and the call failed anyway (a 5xx, an unexpected
+4xx, or a non-JSON body). `4` and `5` are kept apart deliberately: coord writes
+GitHub FIRST, so a 500 from its row INSERT lands with the label already on the
+PR, and reporting that as "nothing was written" would be exactly the false
+reassurance this plan exists to end. `--json` prints the raw answer after the
+summary lines.
 
 ## When To Use
 
@@ -127,12 +139,23 @@ the message says. `--json` prints the raw answer after the summary lines.
 - **Withdrawing a dependency**: `coord_pr_label_unset` (or `--unset`) — the
   edge is gone from coord and the label from GitHub when it returns. This is
   the retraction path `qontinui-runner#1153` / `#1147` lacked.
+  **It retracts only what an author may SET through this door** — exactly the
+  set `--replace` may sweep. A coord-set label (`coord:state=*`,
+  `coord:landed`, `coord:blocked-by=*`), `coord:priority`, a retired label, or
+  anything outside `coord:*` is refused with `label_not_author_settable`: those
+  are the orchestrator's to clear, and an operator lever already exists for
+  them. One door, one accept set — the retract verb cannot be a wider lever
+  than the declare verb.
 
 > **No label holds a PR** (holds retired 2026-06-20). To hold a PR: **convert
 > it to draft**, or **register a coord gate with a `MergePr` continuation**.
 > **`coord:blocked` and `coord:experimental` are RETIRED hold labels and the
-> door REFUSES them**, the same way it refuses `coord:operator-review` and
-> `coord:version-bump=*`. coord treats all four as inert hold-shaped labels
+> door REFUSES them.** `coord:operator-review` and `coord:version-bump=*` are
+> refused too, but not in the same way, and the difference is visible:
+> `blocked` / `experimental` stay **author-settable**, so `--replace` sweeps one
+> already on a PR, while the other two are outside that set and `--replace`
+> leaves them alone. Refusing to SET a lever and refusing to CLEAN IT UP are
+> different decisions. coord treats all four as inert hold-shaped labels
 > (`data/repo_branches.rs` `inert_hold_labels`, whose
 > `render_inert_hold_label_comment` posts a one-time PR comment saying so) —
 > the PR still auto-merges once green. `blocked` / `experimental` only
@@ -153,8 +176,12 @@ the message says. `--json` prints the raw answer after the summary lines.
 **Don't use** to set `coord:state=*`, `coord:blocked-by=*`,
 `coord:specialist-decision=*` (coord-set, read-only through this door) or
 `coord:priority` (set it on the PR itself with
-`gh pr edit --add-label coord:priority`; the priority lane honours
-`source='github'` rows written by the webhook only, and the door tells you so).
+`gh pr edit --add-label coord:priority`; the door rejects it here with that
+advice in the reason). The old rationale — "the lane honours `source='github'`
+rows written by the webhook only, so a skill-set row would be inert" — no longer
+distinguishes anything, because this door writes `source='github'` for
+everything it declares. What keeps `coord:priority` out is the validator, not
+the provenance.
 
 ## Validation
 
@@ -169,7 +196,7 @@ client-side mirror any more, so nothing here can drift from it. Accepted:
 | `coord:requires-tag=<pattern>` | any non-empty value |
 | `coord:merge-strategy=squash\|rebase\|merge` | one of the three |
 | `coord:credibility-override`, `coord:migrate-repair` | flags — accepted; **not holds** (`migrate-repair` is bounded at the consuming end) |
-| `coord:blocked`, `coord:experimental` | REFUSED at the declare surface — retired hold labels (2026-06-20). Still **retractable** through `--unset` / `--replace` |
+| `coord:blocked`, `coord:experimental` | REFUSED at the declare surface — retired hold labels (2026-06-20). Still **retractable** through `--unset` / `--replace`, because they are author-settable |
 | `coord:priority[=*]`, `coord:operator-review`, `coord:version-bump[=*]`, `coord:state=*`, `coord:blocked-by=*`, `coord:specialist-decision=*`, `coord:red-main-fix` | REJECTED, each with coord's own reason in `rejected[]` |
 
 A bare `<repo>#<n>` is canonicalized to `owner/repo#<n>` against your tenant's

@@ -32,9 +32,15 @@
 #
 # Exit codes:
 #   0  every requested label was declared / retracted
-#   1  the door answered and refused some or all labels (`rejected:` lines say why)
+#   1  the door answered and REFUSED some or all labels (`rejected:` lines say why);
+#      nothing partial was left behind for a refused label
 #   2  usage error, or no JSON tool (python3/python/jq) on PATH
-#   4  no transport answered (nothing was written anywhere)
+#   4  no transport answered — NOTHING was written, on either side. This is the
+#      only code that promises that, which is why 5 exists.
+#   5  a door ANSWERED and the call failed anyway (a 5xx, an unexpected 4xx, or a
+#      body that is not JSON). NOT the same as 4: coord writes GitHub FIRST, so a
+#      500 from the row INSERT lands after the label is already on the PR. Re-run
+#      with --dry-run, or look at the PR, before assuming nothing happened.
 
 set -euo pipefail
 
@@ -108,6 +114,14 @@ if [[ -z "$REPO" || -z "$PR" ]]; then
 fi
 if [[ -n "$UNSET" && ${#LABELS[@]} -gt 0 ]]; then
   echo "error: --unset and --label are exclusive (one retraction per call)" >&2
+  exit 2
+fi
+# The door has no dry_run on its retract verb, so accepting the flag here would
+# silently perform the retraction the caller asked to rehearse. A destructive
+# verb never ignores a flag: refuse instead.
+if [[ -n "$UNSET" && "$DRY_RUN" -eq 1 ]]; then
+  echo "error: --dry-run does not apply to --unset — the retract verb has no dry run," >&2
+  echo "       and ignoring the flag would retract the label you asked to rehearse." >&2
   exit 2
 fi
 if [[ -z "$UNSET" && ${#LABELS[@]} -eq 0 && "$MODE" != "replace" ]]; then
@@ -239,6 +253,18 @@ for cfg in "${CANDIDATES[@]}"; do
         # latter is an answer.
         if [[ "$RESPONSE" == *repo_not_found_in_tenant_scope* ]]; then ANSWERED="forwarder $PURL"; break; fi
         continue ;;
+      5*)
+        # A 5xx carrying a RUNNER-originated code is the runner failing, not
+        # coord answering — `COORD_MCP_PROXY_TENANT_UNRESOLVABLE` is a 503 from a
+        # missing or malformed ~/.qontinui/machine.json, and
+        # `COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE` is a 502 because the runner
+        # could not reach coord at all. Rung 2 exists for exactly that runner, so
+        # fall through instead of stopping on it. A 5xx that coord itself
+        # produced carries neither code and IS an answer.
+        case "$RESPONSE" in
+          *COORD_MCP_PROXY_*|*COORD_WRITE_PROXY_*) continue ;;
+          *) ANSWERED="forwarder $PURL"; break ;;
+        esac ;;
       *) ANSWERED="forwarder $PURL"; break ;;
     esac
   fi
@@ -296,10 +322,32 @@ try:
     d = json.loads(raw)
 except Exception:
     print(f"error: HTTP {code} from {door} with a non-JSON body: {raw[:400]}", file=sys.stderr)
-    sys.exit(4)
-if not code.startswith(("2", "4")) or code in ("401", "403", "404"):
+    # 5, not 4: a door answered. Whether it wrote anything is UNKNOWN.
+    sys.exit(5)
+# The typed 404: coord considered the request and refused it outright because
+# the repo is not in the acting tenant's scope. It is an ANSWER and a REFUSAL,
+# so it exits 1 -- never into the success renderer, whose body it does not have.
+# `acting_tenant_id` is echoed because it is the fact that separates "I typed
+# the repo wrong" from "my credential is for another tenant".
+if code == "404":
+    print(f"rejected: {d.get('repo')} — {d.get('detail') or d.get('error')}", file=sys.stderr)
+    if d.get("acting_tenant_id"):
+        print(f"       acting tenant: {d['acting_tenant_id']} — check THAT before the repo name.",
+              file=sys.stderr)
+    sys.exit(1)
+# ONLY a 2xx is success from here, plus 422 -- the code the door uses to say
+# "everything you posted was refused", whose body IS the normal response shape
+# and renders below as `rejected:` lines. Everything else -- 400 from
+# `tenant_from_auth` when the bearer carries no tenant claim, 409, 413, 429,
+# every 5xx -- is a FAILURE. The test was `startswith(("2","4"))`, which let
+# 400/409/429 fall into the success renderer: a POST printed nothing and exited
+# 0, and a DELETE printed `ok: retracted "None" from None#None`.
+if not (code.startswith("2") or code == "422"):
     print(f"error: HTTP {code} from {door}: {json.dumps(d)[:600]}", file=sys.stderr)
-    sys.exit(1 if code == "404" else 4)
+    if method == "POST":
+        print("       The door writes GitHub FIRST, so this does NOT mean nothing happened -- "
+              "check the PR, or re-run with --dry-run.", file=sys.stderr)
+    sys.exit(5)
 if method == "DELETE":
     print(f"ok: retracted \"{d.get('label')}\" from {d.get('repo')}#{d.get('pr_number')} "
           f"(GitHub + coord; coord row existed: {str(d.get('deleted')).lower()}) via {door}")
