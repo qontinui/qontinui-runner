@@ -251,6 +251,62 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
 The PowerShell twin is `scripts/coord-read.ps1 call` / `tools`, over the same
 own-config rule (`Get-CoordOwnProxyConfig`), for pi, Codex and CI.
 
+### The floor claim — `--floor-claim`, and why a session never writes "unavailable" itself
+
+`bash coord-revive.sh --floor-claim` runs the SAME cascade and changes only what
+stdout carries at the end: one pasteable block headed by a machine-shaped line,
+
+```
+FLOOR-CLAIM: verdict=<LIVE|FLOOR|UNKNOWN> probed_at=<ISO8601Z> runner_build=<buildId|UNKNOWN — unrecorded> load=<1m>/<nproc> build_procs=<n> health_ms=<n|timeout|UNKNOWN> doors=<n> live=<n>[ reason=…][ envelope=UNKNOWN(key not confirmed)]
+  <one line per door: <rung> <host+prefix or name> -> <verdict token>>
+```
+
+Plan `2026-09-03-capability-floor-claims-carry-their-probe` (dossier
+`stale-capability-floor`). The sentence a session writes — "coord was
+unavailable this session" — carries no probe, no time and no load context, so
+nothing downstream can tell a fresh measurement from a stale one, or a real
+floor from one the session's own `cargo` builds manufactured (occurrence 9:
+`/health` timed out behind the session's builds, "the write doors are dead"
+went to the operator in writing, and every door answered 30 minutes later).
+So the session stops authoring the sentence: this script emits it, stamped,
+and check #60 (`scripts/lint-capability-floor-stamp.py`) refuses the unstamped
+form in every durable text it reaches. The line prints on EVERY run, with or
+without the flag; the flag suppresses the surrounding prose so the block pastes
+on its own.
+
+- **`verdict=LIVE`** — a door answered (`live=1`); the `VERDICT: LIVE …` line
+  still prints above it. Phase 2's control read can qualify it to `live=0
+  envelope=UNKNOWN(key not confirmed)` when a 2xx parsed to zero rows under
+  every known list key — that is not "present but empty", it is an unconfirmed
+  key.
+- **`verdict=FLOOR`**, exit 1 — every door dead **and** the box was not under
+  heavy local load: `load/nproc <= $COORD_REVIVE_LOAD_RATIO` (default `1.0`),
+  same-user `rustc|cargo|cc1|cc1plus|ld|lld` processes `<=
+  $COORD_REVIVE_BUILD_PROCS` (default `0`; counted with `pgrep`, or on Git
+  Bash — which ships none — box-wide with `tasklist`, so a Windows box can
+  reach `FLOOR` at all), and `/health` not slower than
+  `$COORD_REVIVE_HEALTH_SLOW_MS` (default `5000`) nor timed out. This is the
+  ONLY verdict that licenses the word "unavailable".
+- **`verdict=UNKNOWN reason=sampled-under-own-load (…)`**, **exit 5** — every
+  door dead, but the sample was taken under this box's own load; re-run after
+  the builds finish. A load or process count that could not be READ is
+  `UNKNOWN` and blocks `FLOOR` the same way (`reason=load-unreadable`, served
+  policy `verification-and-evidence` `silent-empty-is-unknown`). A peer's build
+  blocks your `FLOOR` too — the correct direction of error. `BUDGET_EXCEEDED`
+  renders `UNKNOWN reason=budget-exceeded` and keeps exit 1.
+- **`runner_build=`** and **`health_ms=`** come from the SAME `/health` read
+  the headless arm keys on (`scripts/coord-provision-nonce.sh frontend-state`,
+  which prints `buildId=` and `healthMs=` beside `frontendReady=`), so the
+  claim is bound to a read that ran; when it did not, the literal
+  `UNKNOWN — unrecorded` (the arm check #44 already accepts), never an id.
+
+Exit codes are otherwise unchanged: `0` LIVE, `1` DEAD/FLOOR/BUDGET_EXCEEDED,
+`3`/`4` the verbs, `127` local fault. No consumer maps the cascade's exit status
+(measured 2026-09-11: every scripted caller uses the `call`/`tools` verbs). The
+line's grammar is `FLOOR_CLAIM_LINE_RE` in the script — exported so
+`floor-claim-test.sh` parses a real run back with it and #60 copies the same
+one.
+
 ### L5 — the bootstrap credential: WIRED, PROBED, and LIVE
 
 > ✅ **L5 works. Measured against production coord 2026-09-04 from
@@ -340,7 +396,12 @@ in the ordinary runner-wedged case, and the recovery is to spend that bearer on
 the device-authed `${COORD_HTTP_URL}/coord/...` REST routes. When L5 too comes
 back dead (`BOOTSTRAP_ROUTE_ABSENT`, `BOOTSTRAP_UNREACHABLE`,
 `BOOTSTRAP_TOKEN_UNVERIFIED`, no device_id), the answer is a `DEAD` verdict
-**plus a durably recorded blocker** — not a token from the forbidden door.
+**plus a durably recorded blocker** — not a token from the forbidden door. And
+the only form that verdict takes in a durable text is the `FLOOR-CLAIM:` block
+`--floor-claim` prints (the section above): `verdict=FLOOR` with its probe
+time, runner build, load and per-door table, pasted verbatim. A
+`verdict=UNKNOWN` sampled under this box's own load (exit 5) is not an
+exhausted cascade — it is a sample to retake after the builds finish.
 Write the gate or finding SPEC verbatim so a peer with a working transport can
 carry it, exactly as `_gate-registration`'s transport-floor rule already
 requires, and **name the verdict L5 actually returned**. **That is a materially

@@ -408,6 +408,7 @@ fi
 # coord-mcp entry" (a message that blames the CONFIG), and the cascade print
 # VERDICT: DEAD over live doors. That is the missing-binary-reads-as-empty-field
 # bug this fix exists to kill, reintroduced one layer up. Smoke-test instead.
+# unstamped-floor-ok: a counterfactual about a missing JSON reader, not a measured floor 2026-09-11
 JSON_READER=""
 if command -v jq >/dev/null 2>&1; then
   JSON_READER=jq
@@ -501,6 +502,59 @@ try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
 r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
 sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_result_rows — reads a JSON-RPC body on STDIN; prints the ROW COUNT the
+# `result` carries under the FIRST PRESENT key of a closed list, or `-1` when
+# no listed key is present. Not a verdict by itself (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D3): a 2xx whose list
+# is empty under a key the caller GUESSED is indistinguishable from an empty
+# corpus at the call site, and it fails toward a false negative about a
+# capability — occurrence 10 read `.records`/`.results` off a body whose key
+# was `.hits` and reported 0 hits four times, including for a bare `DOSSIER`.
+# So the rule is: zero rows under every known key is UNKNOWN(envelope) until a
+# control read against a known-present record confirms the key.
+#
+# An MCP tool result arrives boxed — `result.content[0].text` holding the
+# tool's JSON as a string — so that box is opened first when it is present; a
+# bare `result` object (tools/list's `tools`) is read directly. The closed
+# list, in order: hits, records, results, items, findings, documents,
+# work_units, gates, tools. Anything that is not an array under the matched key
+# is `-1`, never a count.
+rpc_result_rows() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def rows: . as $r
+        | (["hits","records","results","items","findings","documents","work_units","gates","tools"]
+           | map(select(. as $k | $r | has($k)))) as $present
+        | if ($present | length) == 0 then -1
+          else ($r[$present[0]] | if type == "array" then length else -1 end) end;
+      (.result? // null) as $res
+      | if ($res | type) != "object" then -1
+        elif (($res.content? | type) == "array") and (($res.content[0]?.text? | type) == "string")
+          then (($res.content[0].text | try fromjson catch null) as $inner
+                | if ($inner | type) == "object" then ($inner | rows) else -1 end)
+        else ($res | rows) end' 2>/dev/null  # envelope-ok: a COUNT under the first present key of a closed list, -1 when none is present; no row value leaves it
+  else
+    "$JSON_READER" -c 'import json,sys
+KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools")
+def rows(r):
+    for k in KEYS:
+        if k in r:
+            v=r[k]
+            return len(v) if isinstance(v,list) else -1
+    return -1
+try: d=json.load(sys.stdin)
+except Exception: print(-1); sys.exit(0)
+res=d.get("result") if isinstance(d,dict) else None  # envelope-ok: the PRESENCE/shape walk that picks a list to count; the count is the only value that leaves
+if not isinstance(res,dict): print(-1); sys.exit(0)
+c=res.get("content")
+if isinstance(c,list) and c and isinstance(c[0],dict) and isinstance(c[0].get("text"),str):
+    try: inner=json.loads(c[0]["text"])
+    except Exception: print(-1); sys.exit(0)
+    print(rows(inner) if isinstance(inner,dict) else -1); sys.exit(0)
+print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
   fi
 }
 
@@ -1138,6 +1192,7 @@ probe_door() {
   # $DOORS_PROBED counted every rung — two different populations printed side by
   # side in the DEAD line, which produced "1 probe(s) across 0 distinct door(s)".
   seen_endpoint "$url" "$hname" "$hvalue" || :
+  door_url_note "$label" "$name" "$url"
   # Braces so 2>/dev/null is in effect for the redirection failure itself —
   # `printf > file 2>/dev/null` applies redirections left to right, so the
   # shell's "cannot create" reaches the console before the suppression does.
@@ -1236,6 +1291,11 @@ probe_door() {
       LIVE_FILE="$name"
       LIVE_URL="$url"
       LIVE_VERDICT="$verdict"
+      # The header pair the LIVE door answered to, kept for the floor claim's
+      # control read (Phase 2). Never printed; staged into a private file there
+      # exactly as it was here.
+      LIVE_HNAME="$hname"
+      LIVE_HVALUE="$hvalue"
       return 0
     fi
     echo "$label: $name -> $verdict [probe $attempt/2]" >&2
@@ -1293,6 +1353,7 @@ probe_door() {
 # precedence in `coord_mcp_proxy_handler`, so the script probes with whatever the
 # server would actually honour. The value is kept VERBATIM (the `Bearer ` prefix
 # included) precisely so the replay is byte-identical to what the client sends.
+# unstamped-floor-ok: the false-DEAD incidents above are history, not a live floor 2026-09-11
 read_cfg() {
   CFG_KEY_HEADER="X-Coord-Mcp-Proxy-Key"
   if [ "$JSON_READER" = jq ]; then
@@ -1521,6 +1582,21 @@ live_exit() {
     echo "$partial"
   else
     echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
+  fi
+  # The stamped claim, ALWAYS - a LIVE door is a measurement too, and a pasted
+  # LIVE block that carries its probe time is what lets a later reader tell it
+  # from a stale one. Under --floor-claim the prose NOTEs below are suppressed
+  # so the block pastes on its own, and the control read runs first.
+  floor_control_read
+  floor_claim_block LIVE
+  if [ "$FLOOR_CLAIM" = "1" ]; then
+    # The table and the roster ride on the pasted LIVE block too (check #58):
+    # a door that answered at L1 has said nothing about L3-L6.
+    axes_block
+    echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+    wedge_block
+    approval_verdict_block
+    exit 0
   fi
   # Unconditional, by design. This script cannot observe the session's native
   # coord_* MCP tools (the SCOPE note at the end of this file says so), so it
@@ -1755,6 +1831,12 @@ CALL_TIMEOUT="${COORD_REVIVE_CALL_TIMEOUT:-60}"
 verb_usage() {
   cat >&2 <<'EOF'
 usage: coord-revive.sh                          run the transport cascade (default)
+       coord-revive.sh --floor-claim            the same cascade; stdout is ONE pasteable block
+                                                headed by a FLOOR-CLAIM: line that carries the
+                                                probe time, the runner build, the box's load and
+                                                a per-door table - the only sanctioned form of
+                                                "coord was unavailable". Exit 5 = UNKNOWN: the
+                                                sample was taken under this box's own load.
        coord-revive.sh tools                    list the tools this session's own nonce may call
        coord-revive.sh call <tool> ['<json-object>']
                                                 EXECUTE one coord MCP tool over that nonce - whatever
@@ -1876,6 +1958,16 @@ rpc_print_result() {
   esac
 }
 
+# --floor-claim: a MODE of the cascade, not a verb (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D1). The cascade runs
+# unchanged; only what stdout carries at the end differs (floor_claim_block).
+FLOOR_CLAIM=0
+if [ "${1:-}" = "--floor-claim" ]; then
+  FLOOR_CLAIM=1
+  shift
+  [ $# -eq 0 ] || { echo "coord-revive: --floor-claim runs the cascade and takes no verb or argument" >&2; verb_usage; exit 4; }
+fi
+
 if [ $# -gt 0 ]; then
   case "$1" in
     call|tools) ;;
@@ -1946,7 +2038,18 @@ if [ $# -gt 0 ]; then
       printf '%s' "$VBODY" | rpc_print_result
       VRC=$?
       case "$VRC" in
-        0) echo "coord-revive: $VERB -> OK over $CFG_URL (nonce from $OWN_CFG_PATH, header $CFG_KEY_HEADER; source=own-mcp-json, nothing minted)" >&2; exit 0 ;;
+        0)
+          # The envelope advisory (Phase 2 of plan
+          # 2026-09-03-capability-floor-claims-carry-their-probe): a result that
+          # parsed to ZERO rows under a known list key is UNKNOWN(envelope), not
+          # an empty corpus, until a control read against a known-present record
+          # confirms the key. stderr only - stdout stays the raw result so
+          # scripted callers are unchanged. `-1` (no known key at all) says
+          # nothing either way and prints nothing.
+          if [ "$(printf '%s' "$VBODY" | rpc_result_rows)" = "0" ]; then
+            echo "coord-revive: $VERB -> 0 rows under known list keys (hits/records/results/items/findings/documents/work_units/gates/tools) - UNKNOWN(envelope) until confirmed against a known-present record; do not read this as an empty corpus" >&2
+          fi
+          echo "coord-revive: $VERB -> OK over $CFG_URL (nonce from $OWN_CFG_PATH, header $CFG_KEY_HEADER; source=own-mcp-json, nothing minted)" >&2; exit 0 ;;
         3) echo "coord-revive: $VERB -> RPC_ERROR (the tool answered with a JSON-RPC error - printed above; that is ITS answer, the door carried the call)" >&2; exit 3 ;;
         *) echo "coord-revive: $VERB -> HTTP_200_NOT_MCP (200 without a JSON-RPC result or error - treat the door as dead: $(printf '%s' "$VBODY" | one_line 200))" >&2; exit 1 ;;
       esac ;;
@@ -2686,6 +2789,257 @@ approval_note "These are UNIONED readings across the layers, NOT a resolved effe
 approval_note "This block READ files; it does not reproduce Claude Code's own resolution and never changes the verdict below. The doors below are a DIFFERENT transport from your native coord_* tools - a LIVE door beside a withheld approval is a coherent pair, and it is the pair no line here could print before."
 printf '%s' "$APPROVAL_LINES" >&2
 
+# ----- The capability-floor claim: the probe carries its own stamp ------------
+# Plan 2026-09-03-capability-floor-claims-carry-their-probe (dossier
+# stale-capability-floor). A session probes a transport, correctly observes it
+# down, and asserts that floor in a durable artifact minutes-to-hours later
+# without re-probing; or it samples at the moment of its OWN peak build load and
+# publishes the worst possible reading as an environmental fact (occurrence 9:
+# /health timed out at 20s behind the session's cargo builds, "the coord write
+# doors are dead" went to the operator in writing, and 30 minutes later every
+# one of them answered in 26ms). Nothing in the sentence the session writes
+# carries a probe, a time, or a load context, so nothing downstream can tell a
+# fresh measurement from a stale one or a real floor from a self-generated one.
+#
+# So the session stops authoring the sentence. THIS SCRIPT emits it, stamped:
+#
+#   FLOOR-CLAIM: verdict=<LIVE|FLOOR|UNKNOWN> probed_at=<ISO8601Z> runner_build=<buildId|UNKNOWN — unrecorded> load=<1m>/<nproc> build_procs=<n> health_ms=<n|timeout|UNKNOWN> doors=<n> live=<n>[ reason=…][ envelope=UNKNOWN(key not confirmed)]
+#     <one line per door: <rung> <host+prefix or name> -> <verdict token>>
+#
+# and check #60 (scripts/lint-capability-floor-stamp.py) refuses the unstamped
+# form in every durable text it reaches. Printed UNCONDITIONALLY on both exits,
+# so the lint's "the emitter's line" binding is reachable from every existing
+# run; --floor-claim only suppresses the surrounding prose.
+#
+# THE LOAD GATE ANSWERS UNKNOWN, NEVER FLOOR (D2). `verdict=FLOOR` is emitted
+# only when every door is dead AND the box is not under heavy local load. "Own
+# load" is the BOX's load, not attributed to a session: every session on a box
+# here runs as one user, so same-user rustc/cargo/cc1/ld processes, the 1-minute
+# load average over nproc, and a /health slower than the slow-threshold are the
+# honest proxies. A load or process count that could not be READ is UNKNOWN and
+# also blocks FLOOR (served policy verification-and-evidence
+# silent-empty-is-unknown). A peer's build blocks this session's FLOOR too -
+# that is the correct direction of error, and the line says so.
+#
+# Exit codes: 0 LIVE, 1 DEAD/FLOOR (unchanged), 5 UNKNOWN sampled under own
+# load (verified unused before this: the script exited 0, 1, 3, 4, 127 only). No
+# consumer maps the cascade's exit status (measured 2026-09-11: every scripted
+# caller invokes the `call`/`tools` verbs, whose codes are untouched).
+COORD_REVIVE_LOAD_RATIO="${COORD_REVIVE_LOAD_RATIO:-1.0}"
+COORD_REVIVE_BUILD_PROCS="${COORD_REVIVE_BUILD_PROCS:-0}"
+COORD_REVIVE_HEALTH_SLOW_MS="${COORD_REVIVE_HEALTH_SLOW_MS:-5000}"
+# A non-numeric override is refused loudly and replaced by the default rather
+# than silently read as 0 by awk / as noise by `[ -gt ]` -- either of which
+# would flip the gate one way for every run without saying so.
+case "$COORD_REVIVE_LOAD_RATIO" in ''|*[!0-9.]*|.|*.*.*) echo "coord-revive: \$COORD_REVIVE_LOAD_RATIO='$COORD_REVIVE_LOAD_RATIO' is not a number - using 1.0" >&2; COORD_REVIVE_LOAD_RATIO="1.0" ;; esac
+case "$COORD_REVIVE_BUILD_PROCS" in ''|*[!0-9]*) echo "coord-revive: \$COORD_REVIVE_BUILD_PROCS='$COORD_REVIVE_BUILD_PROCS' is not an integer - using 0" >&2; COORD_REVIVE_BUILD_PROCS="0" ;; esac
+case "$COORD_REVIVE_HEALTH_SLOW_MS" in ''|*[!0-9]*) echo "coord-revive: \$COORD_REVIVE_HEALTH_SLOW_MS='$COORD_REVIVE_HEALTH_SLOW_MS' is not an integer - using 5000" >&2; COORD_REVIVE_HEALTH_SLOW_MS="5000" ;; esac
+# The claim line's own grammar, EXPORTED so floor-claim-test.sh parses a real
+# run back with it and check #60 copies (never imports) the same one. POSIX ERE.
+# Keep the em dash / hyphen alternation: `UNKNOWN — unrecorded` is the honest
+# arm #44 already accepts, and the ASCII spelling must parse on a cp1252 box.
+FLOOR_CLAIM_LINE_RE='^FLOOR-CLAIM: verdict=(LIVE|FLOOR|UNKNOWN) probed_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z runner_build=(UNKNOWN (—|-) unrecorded|[A-Za-z0-9._-]+) load=([0-9]+(\.[0-9]+)?|UNKNOWN)/([0-9]+|UNKNOWN) build_procs=([0-9]+|UNKNOWN) health_ms=([0-9]+|timeout|UNKNOWN) doors=[0-9]+ live=[0-9]+( reason=[^ ].*)?( envelope=UNKNOWN\(key not confirmed\))?$'
+# Filled at L4 from the SAME /health read the headless arm keys on
+# (coord-provision-nonce.sh frontend-state, which prints buildId= and healthMs=
+# beside frontendReady=). Until then, and when that read never ran, the honest
+# arm: the literal `UNKNOWN — unrecorded`, never an id invented after the fact.
+RUNNER_BUILD_ID="UNKNOWN — unrecorded"
+HEALTH_MS="UNKNOWN"
+# The envelope verdict of the Phase 2 control read; empty until it runs.
+FLOOR_ENVELOPE=""
+# <label> <name> <url> -> remembered so the door table can print the host and
+# prefix a door was probed at, not only the file that named it (dossier
+# coord-transport-cascades-are-rooted-on-the-local-runner, direction 7: never a
+# single DEAD/LIVE over one axis).
+DOOR_URL_MAP=""
+door_url_note() {
+  DOOR_URL_MAP="$DOOR_URL_MAP
+$1 $2	$3"
+}
+# floor_capture -- probed_at, the 1-minute load, nproc and the same-user build
+# process count, read ONCE before L1 so every door in this run shares one
+# sample. Each read that fails renders UNKNOWN: pgrep exiting other than 0/1
+# is a failed read, not zero processes.
+floor_capture() {
+  PROBED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$PROBED_AT" ] || PROBED_AT="UNKNOWN"
+  LOAD1="UNKNOWN"
+  local lf="${COORD_REVIVE_LOADAVG_FILE:-/proc/loadavg}" up
+  if [ -r "$lf" ]; then
+    LOAD1="$(cut -d' ' -f1 < "$lf" 2>/dev/null)"
+  elif command -v uptime >/dev/null 2>&1; then
+    # Portable fallback: `load average: 0.52, 0.58, 0.59` (GNU) or
+    # `load averages: 1.23 1.10 1.00` (BSD/macOS). First figure only.
+    up="$(uptime 2>/dev/null)"
+    LOAD1="$(printf '%s' "$up" | sed -n 's/.*load average[s]*: *\([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+  fi
+  case "$LOAD1" in
+    ''|*[!0-9.]*|.|*.*.*) LOAD1="UNKNOWN" ;;
+  esac
+  NPROC="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null)"
+  case "$NPROC" in ''|*[!0-9]*|0) NPROC="UNKNOWN" ;; esac
+  BUILD_PROCS="UNKNOWN"
+  local who rc
+  if command -v pgrep >/dev/null 2>&1; then
+    who="${USER:-$(id -un 2>/dev/null)}"
+    pgrep -u "$who" -x 'rustc|cargo|cc1|cc1plus|ld|lld' > "$TMPD/build-procs" 2>/dev/null
+    rc=$?
+    # 0 = matches, 1 = none. Anything else is pgrep failing, which is UNKNOWN.
+    case "$rc" in
+      # `grep -c` prints its 0 AND exits 1 on an empty file, so an `|| echo 0`
+      # here would splice a second line into the count. Read the count, then
+      # default only an EMPTY read.
+      0|1) BUILD_PROCS="$(grep -c . "$TMPD/build-procs" 2>/dev/null)"; [ -n "$BUILD_PROCS" ] || BUILD_PROCS=0 ;;
+    esac
+  elif command -v tasklist >/dev/null 2>&1; then
+    # Git Bash ships no pgrep. Without this arm every all-dead run on a Windows
+    # box -- the fleet's majority -- would render build_procs=UNKNOWN and so
+    # never FLOOR, while Phase 4 makes FLOOR the only sanctioned "unavailable".
+    # tasklist is box-wide rather than same-user, which is the load the gate
+    # actually asks about ("own load" is the BOX's load, see the header).
+    # MSYS would rewrite `/FO` into `C:/Program Files/Git/FO` (the hazard
+    # behind the `cmd //c` idiom); both variables pin the arguments verbatim
+    # and are no-ops everywhere else. A failure here is NAMED on stderr rather
+    # than swallowed -- an unexplained UNKNOWN is the state this arm exists to end.
+    if MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' tasklist /FO CSV /NH > "$TMPD/build-procs" 2>/dev/null; then
+      BUILD_PROCS="$(tr -d '\r' < "$TMPD/build-procs" | grep -c -i -E '^"(rustc|cargo|cc1|cc1plus|ld|lld|rust-lld|link)\.exe"' 2>/dev/null)"
+      [ -n "$BUILD_PROCS" ] || BUILD_PROCS=0
+    else
+      echo "coord-revive: build_procs=UNKNOWN (tasklist failed on this box; no pgrep either) - FLOOR is withheld on that alone" >&2
+    fi
+  fi
+}
+# floor_gate_reason -> prints the reason FLOOR must not be emitted, or nothing.
+floor_gate_reason() {
+  local r=""
+  if [ "$LOAD1" = "UNKNOWN" ] || [ "$NPROC" = "UNKNOWN" ]; then
+    r="load-unreadable"
+  elif awk -v l="$LOAD1" -v n="$NPROC" -v r="$COORD_REVIVE_LOAD_RATIO" 'BEGIN { exit !((l / n) > r) }'; then
+    r="sampled-under-own-load"
+  fi
+  if [ "$BUILD_PROCS" = "UNKNOWN" ]; then
+    r="${r:-build-procs-unreadable}"
+  elif [ "$BUILD_PROCS" -gt "$COORD_REVIVE_BUILD_PROCS" ] 2>/dev/null; then
+    r="sampled-under-own-load"
+  fi
+  case "$HEALTH_MS" in
+    timeout) r="sampled-under-own-load" ;;
+    ''|*[!0-9]*) ;;
+    *) [ "$HEALTH_MS" -gt "$COORD_REVIVE_HEALTH_SLOW_MS" ] 2>/dev/null && r="sampled-under-own-load" ;;
+  esac
+  [ -n "$r" ] && printf '%s' "$r"
+  return 0
+}
+# floor_door_rows -- one line per door, from the same FAILS[] the DEAD block
+# prints, plus the LIVE door when there is one. The verdict is reduced to its
+# TOKEN (the first word) so a row is one line; the parentheticals stay in the
+# DEAD list above it.
+floor_door_rows() {
+  local f key tok url
+  # Guarded: on the LIVE path FAILS is empty, and a bare "${FAILS[@]}" is an
+  # unbound-variable abort under set -u on bash < 4.4 (the axis_row_* idiom).
+  for f in ${FAILS[@]+"${FAILS[@]}"}; do
+    key="${f%%: *}"
+    tok="${f#*: }"; tok="${tok%% *}"
+    url="$(printf '%s\n' "$DOOR_URL_MAP" | awk -F'\t' -v k="$key" '$1 == k { print $2; exit }')"
+    echo "  $key -> $tok${url:+ ($url)}"
+  done
+  if [ -n "$LIVE_URL" ]; then
+    if [ -n "$FLOOR_ENVELOPE" ]; then
+      echo "  LIVE $LIVE_FILE -> LIVE-BUT-EMPTY ($LIVE_URL; $FLOOR_ENVELOPE)"
+    else
+      echo "  LIVE $LIVE_FILE -> ${LIVE_VERDICT%% *} ($LIVE_URL)"
+    fi
+  fi
+}
+# floor_control_read -- Phase 2's envelope arm, run under --floor-claim once a
+# door is LIVE. `tools/list` must return >= 1 tool, and -- the door being the
+# full MCP surface -- `coord_memory_search {"query":"DOSSIER","limit":1}` must
+# return >= 1 row under `hits`. A 2xx control read with zero rows under every
+# known key sets FLOOR_ENVELOPE, which renders `live=0
+# envelope=UNKNOWN(key not confirmed)` on the claim line and LIVE-BUT-EMPTY in
+# the door table: the claim never reports a capability as "present but empty"
+# from an unconfirmed key. A control read the door REFUSES (a JSON-RPC error,
+# a non-2xx) is neither confirmation nor an envelope verdict; it is named on
+# stderr and the line stays as the probe left it. The header pair is the one
+# the LIVE door answered to, staged into a private file exactly as probe_door
+# stages it; the L5 bootstrap route is REST, carries no MCP header pair, and is
+# skipped by construction.
+floor_control_read() {
+  [ "$FLOOR_CLAIM" = "1" ] || return 0
+  [ -n "${LIVE_HNAME:-}" ] && [ -n "${LIVE_URL:-}" ] || return 0
+  local hdr="$TMPD/ctl-hdr" body="$TMPD/ctl-body" errf="$TMPD/ctl-err" code ce rows what payload
+  { printf '%s: %s\n' "$LIVE_HNAME" "$LIVE_HVALUE" > "$hdr"; } 2>/dev/null
+  [ -s "$hdr" ] || { echo "control-read: SKIPPED (could not stage the header file - LOCAL fault)" >&2; return 0; }
+  for what in tools/list coord_memory_search; do
+    if [ "$what" = "tools/list" ]; then
+      payload="$RPC_LIST"
+    else
+      payload='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"coord_memory_search","arguments":{"query":"DOSSIER","limit":1}}}'
+    fi
+    : > "$body"; : > "$errf"
+    code=$(curl -sS -o "$(curl_path "$body")" -w '%{http_code}' \
+      --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+      -X POST "$LIVE_URL" -H "Content-Type: application/json" \
+      -H "@$(curl_path "$hdr")" -d "$payload" 2>"$errf")
+    ce=$?
+    if [ "$ce" != "0" ] || [ "$code" != "200" ]; then
+      echo "control-read: $what -> NOT CONFIRMED (curl exit $ce, HTTP ${code:-000}) - the control read did not answer; the claim line is left as the probe measured it" >&2
+      break
+    fi
+    if ! rpc_has_result < "$body"; then
+      echo "control-read: $what -> REFUSED ($(rpc_error_code < "$body" | tr -d '\r')${code:+ HTTP $code}) - a JSON-RPC error is the tool's answer, not an envelope verdict" >&2
+      break
+    fi
+    rows="$(rpc_result_rows < "$body")"
+    case "$rows" in
+      ''|*[!0-9-]*) rows=-1 ;;
+    esac
+    if [ "$rows" -ge 1 ] 2>/dev/null; then
+      echo "control-read: $what -> $rows row(s) under a known list key (confirmed)" >&2
+      continue
+    fi
+    FLOOR_ENVELOPE="$what answered 2xx with $rows row(s) under every known list key (hits/records/results/items/findings/documents/work_units/gates/tools)"
+    echo "control-read: $what -> UNKNOWN(envelope): $FLOOR_ENVELOPE - the key is unconfirmed, so this is NOT 'present but empty'" >&2
+    break
+  done
+  rm -f "$hdr"
+}
+# floor_claim_block <LIVE|DEAD|BUDGET|UNPROBED> -- prints the block on stdout and sets FLOOR_EXIT (0 LIVE, 1 FLOOR/DEAD/BUDGET/UNPROBED, 5
+# UNKNOWN-under-load). UNPROBED is #888's third terminal verdict: no door
+# answered among the axes asked and at least one axis was not asked, which is
+# UNKNOWN by construction and never a FLOOR, however idle the box.
+floor_claim_block() {
+  local mode="$1" verdict live=0 reason="" tail="" doors="${DISTINCT_DOORS:-0}"
+  # No second argument: the transport is already on the VERDICT line above.
+  case "$mode" in
+    LIVE)
+      verdict="LIVE"; live=1; FLOOR_EXIT=0
+      if [ -n "$FLOOR_ENVELOPE" ]; then
+        # A 2xx that parsed to zero rows under every known key is not a
+        # capability "present but empty" - the key is unconfirmed (D3).
+        live=0; tail=" envelope=UNKNOWN(key not confirmed)"
+      fi ;;
+    BUDGET)
+      verdict="UNKNOWN"; FLOOR_EXIT=1
+      reason="budget-exceeded (${DOORS_SKIPPED:-0} door(s) never probed) - raise \$COORD_REVIVE_TOTAL_BUDGET and re-run; do NOT write \"unavailable\" from this sample" ;;
+    UNPROBED)
+      verdict="UNKNOWN"; FLOOR_EXIT=1
+      reason="axis-unprobed (unprobed=${AXES_UNPROBED:-?}) - probe the unprobed axis and re-run; do NOT write \"unavailable\" from this sample" ;;
+    *)
+      reason="$(floor_gate_reason)"
+      if [ -z "$reason" ]; then
+        verdict="FLOOR"; FLOOR_EXIT=1
+      else
+        verdict="UNKNOWN"; FLOOR_EXIT=5
+        reason="$reason (load=$LOAD1/$NPROC, build_procs=$BUILD_PROCS, health_ms=$HEALTH_MS) - re-run after the builds finish; do NOT write \"unavailable\" from this sample"
+      fi ;;
+  esac
+  echo "FLOOR-CLAIM: verdict=$verdict probed_at=$PROBED_AT runner_build=$RUNNER_BUILD_ID load=$LOAD1/$NPROC build_procs=$BUILD_PROCS health_ms=$HEALTH_MS doors=$doors live=$live${reason:+ reason=$reason}$tail"
+  floor_door_rows
+}
+floor_capture
+
 # ----- L1: re-read OWN cwd's .mcp.json ----------------------------------------
 # THE SWEEP BUDGET STARTS HERE, not at process start. Everything above this line
 # is local file reads (the approval layers, the breadcrumb) that no probe budget
@@ -2886,11 +3240,21 @@ fi
 # The documented default (127.0.0.1:9876) is passed EXPLICITLY rather than left
 # to the helper: `--origin` suppresses the helper's own default, so naming the
 # discovered origins without it would silently drop the fallback that finds a
-# runner no .mcp.json pointed at. $QONTINUI_RUNNER_URL still wins inside the
-# helper - it reads it from the environment - so the precedence is unchanged
-# from the UI-Bridge loop below.
+# runner no .mcp.json pointed at.
+#
+# $QONTINUI_RUNNER_URL genuinely OVERRIDES that default here, exactly as it does
+# in the UI-Bridge loop below and for the same reason. Until 2026-09-11 this
+# line appended the literal default unconditionally and the comment above it
+# claimed the variable "still wins inside the helper" - it did win the FIRST
+# slot there, and the default was still probed after it. So the in-process
+# mint (and the /health frontend-state read that rides on this same list, which
+# now stamps the floor claim's runner_build= and health_ms=) reached the REAL
+# runner on 9876 from every suite that had pinned the variable to a dead port
+# to be hermetic - the 2026-08-29 defect, one loop over. Found by
+# floor-claim-test.sh, whose runner_build= assertion read a live build id from
+# a sandbox whose only runner was a stub.
 MINT_ORIGIN_ARGS=""
-for o in $RUNNER_ORIGINS http://127.0.0.1:9876; do
+for o in $RUNNER_ORIGINS ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}; do
   case " $MINT_ORIGIN_ARGS " in *" $o "*) continue ;; esac
   MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
 done
@@ -2968,10 +3332,26 @@ MINT_BODY='{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_
 FE_ORIGIN=""; FE_READY="unknown"; FE_STATE="unknown"
 if [ -n "$CPN" ]; then
   FEOUT="$(bash "$CPN" frontend-state $MINT_ORIGIN_ARGS 2>/dev/null)"
-  if [ $? = 0 ]; then
+  FERC=$?
+  # healthMs= is read on BOTH exits: the helper prints `healthMs=timeout` on
+  # its no-answer path when an origin timed out, and that is a LOAD signal the
+  # floor claim must carry (a refused connect prints nothing and stays UNKNOWN).
+  FE_MS="$(printf '%s\n' "$FEOUT" | sed -n 's/^healthMs=//p' | head -n 1 | tr -d '\r')"
+  case "$FE_MS" in
+    timeout|[0-9]*) HEALTH_MS="$FE_MS" ;;
+  esac
+  if [ "$FERC" = "0" ]; then
     FE_ORIGIN="$(printf '%s\n' "$FEOUT" | sed -n 's/^origin=//p' | head -n 1 | tr -d '\r')"
     FE_READY="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendReady=//p' | head -n 1 | tr -d '\r')"
     FE_STATE="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendState=//p' | head -n 1 | tr -d '\r')"
+    # The runner's own buildId from the SAME body: the floor claim's
+    # `runner_build=` binding. `unknown` from the helper (no string field on
+    # this build) keeps the `UNKNOWN — unrecorded` arm rather than a default.
+    FE_BUILD="$(printf '%s\n' "$FEOUT" | sed -n 's/^buildId=//p' | head -n 1 | tr -d '\r')"
+    case "$FE_BUILD" in
+      ""|unknown) ;;
+      *) RUNNER_BUILD_ID="$FE_BUILD" ;;
+    esac
   fi
 fi
 
@@ -3576,7 +3956,11 @@ axes_block
 # blocked-evidence would otherwise drop the one line that names WHY there was no
 # door to find. Context only - it never changed the verdict, and it is a fact
 # about spawn time, not about now (see the reader near L1).
-if [ -n "$CRUMB" ]; then
+if [ "$FLOOR_CLAIM" = "1" ]; then
+  # One pasteable block: the breadcrumb without its prose (the AXES table above
+  # and the FLOOR-CLAIM door table below already name every rung and verdict).
+  [ -n "$CRUMB" ] && echo "BREADCRUMB ($CRUMB_QUAL): $CRUMB$CRUMB_NOTE"
+elif [ -n "$CRUMB" ]; then
   echo "BREADCRUMB ($CRUMB_QUAL): the runner recorded a DEGRADED coord-mcp provision for this workdir: $CRUMB$CRUMB_NOTE"
   echo "  (spawn-time evidence from $CRUMB_FILE. The AGE above is part of the evidence - quote it whenever you paste this block, because an unaged breadcrumb travels furthest and reads as present tense. Whether anything re-evaluated it after provisioning is a property of the runner build, so it can be stale, and it never describes coord's state now. A 'NOT written' reason means THAT pass wrote no .mcp.json; a stale one from an earlier pass can still be sitting there.)"
 else
@@ -3591,10 +3975,27 @@ fi
 # check #58) reads the verdict against.
 if [ -n "$BUDGET_TRIPPED" ]; then
   echo "VERDICT: BUDGET_EXCEEDED - the ${PROBE_TOTAL_BUDGET}s sweep budget ran out after $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s), with $DOORS_SKIPPED door(s) SKIPPED UNPROBED. This is UNKNOWN, NOT dead: no door answered among the ones reached, and the ones below marked SKIPPED_BUDGET_EXCEEDED were never asked (the AXES table above names them; axes: unprobed= carries them). Raise \$COORD_REVIVE_TOTAL_BUDGET (default 60) to finish the sweep, or read the skipped list and probe one by hand:"
+  floor_claim_block BUDGET
 elif [ "$AXES_UNPROBED" != "native-coord-mcp-tools" ]; then
   echo "VERDICT: UNKNOWN - no door answered among the axes this run asked, and at least one axis was NOT asked: unprobed=$AXES_UNPROBED. Not DEAD: a verdict is only as wide as the axes it was computed from, and this one was computed over fewer than all of them. Probe the unprobed axis (drop the opt-out, or probe it by hand) before writing 'coord is unreachable' anywhere. What WAS asked - $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s):"
+  # An unprobed axis is not a floor: the claim reads UNKNOWN with the axis named.
+  floor_claim_block UNPROBED
 else
   echo "VERDICT: DEAD - no OUT-OF-BAND door on ANY probed axis, $DOORS_PROBED probe(s) across $DISTINCT_DOORS distinct door(s): L1 (own $OWN), L2 (sibling sweep under $ROOT), L3 (acting-bearer), L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the in-process nonce mint, then the UI-Bridge mint), L5 (the runner-independent bootstrap credential), L6 (the web host $WEB_URL). Every row in the AXES table above is PROBED; the one axis not asked is your native coord_* tools (SCOPE below):"
+  # The stamped claim, and the ONE verdict about the floor: FLOOR only when
+  # the box was not under its own load, else UNKNOWN with the reason and exit 5.
+  floor_claim_block DEAD
+fi
+if [ "$FLOOR_CLAIM" = "1" ]; then
+  # The per-door parentheticals, the SCOPE prose and the recovery advice are
+  # the default run's; the roster line rides under this terminal line too
+  # (check #58), so the pasted block is exactly as wide as its axes, and the
+  # one SCOPE sentence the DEAD line points at travels with the block.
+  echo "axes: hosts=127.0.0.1,coord.qontinui.io,api.qontinui.io prefixes=/coord-mcp,/mcp,/agents/credential,/coord/agent-,/api/v1 credentials=proxy-nonce,acting-bearer,device-jwt,bootstrap-agent-jwt,user-device-jwt unprobed=$AXES_UNPROBED"
+  echo "SCOPE: the verdict above is exactly as wide as the AXES table (unprobed=$AXES_UNPROBED); the one standing exclusion is your native coord_* MCP tools, a separate transport this script cannot probe - issue one cheap native coord read before applying the lost-write doctrine."
+  wedge_block
+  approval_verdict_block
+  exit "$FLOOR_EXIT"
 fi
 for f in "${FAILS[@]}"; do
   echo "  - $f"
@@ -3624,4 +4025,7 @@ if [ -n "$WEDGED_ENDPOINTS" ]; then
 else
   echo "Next: run 'coord doctor' (runner self-check) to name the failing credential-chain link. L4 source 3 ALREADY attempted /coord-mcp/provision-session for this cwd (bounded: only after L1+L2 proved this workdir's key dead, so there was no live slot here to evict) - re-running it by hand will not find a door this did not, and calling it for ANOTHER workdir would evict that workdir's live key."
 fi
-exit 1
+# 1 for DEAD/FLOOR, BUDGET_EXCEEDED and UNKNOWN-unprobed (unchanged); 5 when the
+# FLOOR-CLAIM line above reads UNKNOWN because the sample was taken under this
+# box's own load.
+exit "$FLOOR_EXIT"
