@@ -1,7 +1,9 @@
 //! Web-backend integration state.
 //!
 //! The runner ↔ qontinui-web channel is a single outbound WebSocket to
-//! `WS /api/v1/runners/ws`. This module holds the shared *runtime state*
+//! `WS /api/v1/devices/ws` (the route `mcp::backend_relay` actually dials;
+//! this header said `/api/v1/runners/ws` until 2026-09-12, and that router no
+//! longer exists). This module holds the shared *runtime state*
 //! of that connection — runner_id returned in the handshake response,
 //! last heartbeat timestamp, last registration error — so other
 //! subsystems (`commands::web_integration`) can read it without owning

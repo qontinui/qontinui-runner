@@ -387,15 +387,10 @@ impl ClaudeSession {
         // grant. Sync door — this builder is blocking, so conjunct 1 falls to
         // its locally observable arm and says so.
         {
-            let trust = crate::claude_session::spawn_preconditions::trust_precondition(
+            let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
                 working_dir,
                 effective_config_dir.as_deref(),
-            );
-            let gate = crate::claude_session::trust_gate::pre_accept_for_spawn_sync(
-                working_dir,
-                &trust.verdict,
-                effective_config_dir.as_deref(),
-                effective_config_dir.as_deref(),
+                crate::claude_session::trust_gate::SpawnSurface::NonInteractive,
             );
             if let Some(refusal) = gate.decision.refusal() {
                 return Err(refusal);

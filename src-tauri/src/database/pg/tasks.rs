@@ -717,8 +717,8 @@ mod tests {
             )
             .await
             .expect("insert plan");
-        let plan_id: String = plan_row.get(0);
-        let plan_version_hash: String = plan_row.get(1);
+        let plan_id: String = plan_row.try_get(0).expect("plan id");
+        let plan_version_hash: String = plan_row.try_get(1).expect("plan version_hash");
 
         // 1. insert_task — exercises the $1::uuid bind in INSERT.
         let task = pg

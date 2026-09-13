@@ -1503,7 +1503,11 @@ struct ProxyConfigFacts {
 fn parse_mcp_json_proxy(path: &Path) -> Option<ProxyConfigFacts> {
     let bytes = std::fs::read(path).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let server = v.get("mcpServers")?.get("coord-mcp")?;
+    // Through the EFFECTIVE entry: a stdio-shaped config keeps its `url` and
+    // `headers` in the credential file it names, and the boot reconcile reads
+    // it that way - the doctor must never call a file the reconcile accepts
+    // "not a proxy config".
+    let server = crate::coord_mcp_config::effective_coord_mcp_entry(&v)?;
     let url = server.get("url")?.as_str()?;
     // Expect http://127.0.0.1:<port>/coord-mcp
     let after = url.strip_prefix("http://127.0.0.1:")?;

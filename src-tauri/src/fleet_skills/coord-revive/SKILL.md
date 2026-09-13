@@ -89,6 +89,89 @@ Because those two sources are *static* while device JWTs live ~4h, **a 401 from
 one of them is expected and is NOT terminal** — it is recorded and the cascade
 falls through to the next source. Only the runner mint's 401 ends L4.
 
+### Which copy you are running, and the ONE exit that carries no verdict
+
+**The copy does not matter; the cwd does.** L1 reads `$PWD/.mcp.json` and L2
+derives the workspace root from the cwd's `git rev-parse --git-common-dir`, so
+`bash <path-to-this-skill-dir>/coord-revive.sh` answers for the directory you
+run it *from*, whichever checkout's skill dir that path names. What the
+script's own location decides is only where it finds the four helpers it needs
+from the config repo's `scripts/` — `lib/envelope.sh`, `coord-acting-bearer.sh`,
+`coord-provision-nonce.sh` and `lib/guard-decision-log.sh` — and since #814 /
+#845 that lookup is ONE resolver (`__resolve_fleet_script` in
+`.claude/skills/coord-revive/coord-revive.sh`) that works from any checkout: the
+original three fixed rungs first (`$HERE/../../../scripts/`, the same with
+`$HERE` resolved physically, `$QONTINUI_ROOT/qontinui-claude-config/scripts/`),
+then `$HERE` and every ancestor of it — logical and physical — tested for
+`scripts/` and for `qontinui-claude-config/scripts/`, then the
+`--git-common-dir` workspace root. The three fixed rungs alone assumed `$HERE` sat three levels
+below the config repo, which holds for `<workspace-root>/.claude` (a symlink
+into it) and for a config-repo checkout new enough to ship `scripts/lib/` — and
+for nothing else: every other checkout carries its own REAL copy of the bundle,
+so `pwd -P` had no symlink to resolve, and a config-repo worktree parked on a
+commit older than `scripts/lib/envelope.sh` refuses the same way while holding
+a provisioned bundle newer than its own tree (the walk's
+`<ancestor>/qontinui-claude-config/scripts/` rung is what reaches past both).
+Measured 2026-09-06 on the operator box: **31 of 32** checkouts carrying this
+skill refused to run at all.
+
+**Exit 127 is the one exit that reached NO door.** Four local faults end the
+script before its first probe, each on stderr, each saying `LOCAL fault` in so
+many words, and none of them followed by a `VERDICT:` line: `curl` missing;
+neither `jq` nor a working `python` to read JSON; `scripts/lib/envelope.sh` not
+found (the message names every rung the resolver searched, and says which of
+its two conditional rungs — `$QONTINUI_ROOT`, the git root — emitted no
+candidate); and `mktemp -d` failing. A caller told to "branch on the `VERDICT:`
+line" has nothing to branch on here, and that is the honest shape — **read a
+127 as UNKNOWN about coord, never as `DEAD`**. In the session that measured the
+31 of 32, every coord door was LIVE throughout; the refusal was the script's
+own.
+
+**A copy that predates the resolver is still the common case on a box whose
+runner has not been rebuilt, and it refuses with the OLD message.** The runner
+bundle is a render of this directory that lags its source
+(`knowledge-base/qontinui-specific/fleet-skill-bundle-authority.md`), and the
+copy a session finds in a product checkout is whatever the RUNNING runner build
+unpacked there. Re-measured 2026-09-12 on the operator box, six days after the
+fix landed: **31 of 33** checkouts still carried a pre-resolver copy, because
+the running build (`fea16af05-1789184319940`) predates it. Tell them apart
+without running anything:
+
+```bash
+grep -c '__resolve_fleet_script' <path-to-this-skill-dir>/coord-revive.sh
+# 0 -> pre-resolver copy: refuses from every checkout but the config repo and
+#      the workspace root, with "envelope.sh not found beside this skill"
+# >0 -> carries the resolver
+```
+
+Never restart the runner to refresh a copy (served policy `production-and-cost`
+`runner-lifecycle`). The recovery is the third fixed rung, which every copy
+ever shipped carries — set the variable and all four helpers resolve through
+it. The same variable is also L2's sweep-root override (see "Worktree-safe"
+below), so it must be the directory the checkouts sit in — the workspace root,
+not the config repo and not a worktree container:
+
+```bash
+QONTINUI_ROOT=<workspace-root> bash <path-to-this-skill-dir>/coord-revive.sh
+```
+
+Measured on a pre-resolver copy from `qontinui-coord` on 2026-09-12: exit 127
+and no `VERDICT:` line without the variable, a `VERDICT:` line with it.
+
+**The limit, stated so "any checkout" is not read as "anywhere".** The
+resolver finds a config-repo checkout; it cannot conjure one. The runner bundle
+ships this skill's directory and nothing under `scripts/` — none of the four
+helpers, nor the `lib/native-path.sh` that `lib/envelope.sh` sources when it
+is present — so on a device with no `qontinui-claude-config` checkout in reach
+of any rung, EVERY copy, resolver or not, exits 127 at the `envelope.sh` lookup
+before probing a single door. That is the one
+population the fleet-served-skills bundling was built for, and for this script
+it is not yet served; the gap is recorded rather than closed here (coord
+finding `92219d86-db0b-42c8-9e4d-d2cf7b2d2666`, plan
+`2026-09-12-fleet-skills-bundle-ships-coord-revive-without-the-helpers-it-cannot-run-without`),
+because closing it is a bundle-roster change plus a bundle-local rung in the
+resolver, not a documentation edit.
+
 ### The AXES table: every verdict names what it did not ask
 
 The terminal line is emitted **from a table**, never beside one. Every rung is a
@@ -167,6 +250,62 @@ bash <path-to-this-skill-dir>/coord-revive.sh call coord_memory_search '{"query_
 
 The PowerShell twin is `scripts/coord-read.ps1 call` / `tools`, over the same
 own-config rule (`Get-CoordOwnProxyConfig`), for pi, Codex and CI.
+
+### The floor claim — `--floor-claim`, and why a session never writes "unavailable" itself
+
+`bash coord-revive.sh --floor-claim` runs the SAME cascade and changes only what
+stdout carries at the end: one pasteable block headed by a machine-shaped line,
+
+```
+FLOOR-CLAIM: verdict=<LIVE|FLOOR|UNKNOWN> probed_at=<ISO8601Z> runner_build=<buildId|UNKNOWN — unrecorded> load=<1m>/<nproc> build_procs=<n> health_ms=<n|timeout|UNKNOWN> doors=<n> live=<n>[ reason=…][ envelope=UNKNOWN(key not confirmed)]
+  <one line per door: <rung> <host+prefix or name> -> <verdict token>>
+```
+
+Plan `2026-09-03-capability-floor-claims-carry-their-probe` (dossier
+`stale-capability-floor`). The sentence a session writes — "coord was
+unavailable this session" — carries no probe, no time and no load context, so
+nothing downstream can tell a fresh measurement from a stale one, or a real
+floor from one the session's own `cargo` builds manufactured (occurrence 9:
+`/health` timed out behind the session's builds, "the write doors are dead"
+went to the operator in writing, and every door answered 30 minutes later).
+So the session stops authoring the sentence: this script emits it, stamped,
+and check #60 (`scripts/lint-capability-floor-stamp.py`) refuses the unstamped
+form in every durable text it reaches. The line prints on EVERY run, with or
+without the flag; the flag suppresses the surrounding prose so the block pastes
+on its own.
+
+- **`verdict=LIVE`** — a door answered (`live=1`); the `VERDICT: LIVE …` line
+  still prints above it. Phase 2's control read can qualify it to `live=0
+  envelope=UNKNOWN(key not confirmed)` when a 2xx parsed to zero rows under
+  every known list key — that is not "present but empty", it is an unconfirmed
+  key.
+- **`verdict=FLOOR`**, exit 1 — every door dead **and** the box was not under
+  heavy local load: `load/nproc <= $COORD_REVIVE_LOAD_RATIO` (default `1.0`),
+  same-user `rustc|cargo|cc1|cc1plus|ld|lld` processes `<=
+  $COORD_REVIVE_BUILD_PROCS` (default `0`; counted with `pgrep`, or on Git
+  Bash — which ships none — box-wide with `tasklist`, so a Windows box can
+  reach `FLOOR` at all), and `/health` not slower than
+  `$COORD_REVIVE_HEALTH_SLOW_MS` (default `5000`) nor timed out. This is the
+  ONLY verdict that licenses the word "unavailable".
+- **`verdict=UNKNOWN reason=sampled-under-own-load (…)`**, **exit 5** — every
+  door dead, but the sample was taken under this box's own load; re-run after
+  the builds finish. A load or process count that could not be READ is
+  `UNKNOWN` and blocks `FLOOR` the same way (`reason=load-unreadable`, served
+  policy `verification-and-evidence` `silent-empty-is-unknown`). A peer's build
+  blocks your `FLOOR` too — the correct direction of error. `BUDGET_EXCEEDED`
+  renders `UNKNOWN reason=budget-exceeded` and keeps exit 1.
+- **`runner_build=`** and **`health_ms=`** come from the SAME `/health` read
+  the headless arm keys on (`scripts/coord-provision-nonce.sh frontend-state`,
+  which prints `buildId=` and `healthMs=` beside `frontendReady=`), so the
+  claim is bound to a read that ran; when it did not, the literal
+  `UNKNOWN — unrecorded` (the arm check #44 already accepts), never an id.
+
+Exit codes are otherwise unchanged: `0` LIVE, `1` DEAD/FLOOR/BUDGET_EXCEEDED,
+`3`/`4` the verbs, `127` local fault. No consumer maps the cascade's exit status
+(measured 2026-09-11: every scripted caller uses the `call`/`tools` verbs). The
+line's grammar is `FLOOR_CLAIM_LINE_RE` in the script — exported so
+`floor-claim-test.sh` parses a real run back with it and #60 copies the same
+one.
 
 ### L5 — the bootstrap credential: WIRED, PROBED, and LIVE
 
@@ -257,19 +396,28 @@ in the ordinary runner-wedged case, and the recovery is to spend that bearer on
 the device-authed `${COORD_HTTP_URL}/coord/...` REST routes. When L5 too comes
 back dead (`BOOTSTRAP_ROUTE_ABSENT`, `BOOTSTRAP_UNREACHABLE`,
 `BOOTSTRAP_TOKEN_UNVERIFIED`, no device_id), the answer is a `DEAD` verdict
-**plus a durably recorded blocker** — not a token from the forbidden door.
+**plus a durably recorded blocker** — not a token from the forbidden door. And
+the only form that verdict takes in a durable text is the `FLOOR-CLAIM:` block
+`--floor-claim` prints (the section above): `verdict=FLOOR` with its probe
+time, runner build, load and per-door table, pasted verbatim. A
+`verdict=UNKNOWN` sampled under this box's own load (exit 5) is not an
+exhausted cascade — it is a sample to retake after the builds finish.
 Write the gate or finding SPEC verbatim so a peer with a working transport can
 carry it, exactly as `_gate-registration`'s transport-floor rule already
 requires, and **name the verdict L5 actually returned**. **That is a materially
 different report from "coord is down."**
 
-**Why the shape is right even though it does not work yet.** The design question
+**Why the shape is right — and it DOES work.** (This heading read "even though
+it does not work yet" until 2026-09-13; L5 has answered `200` from three boxes
+since 2026-09-04.) The design question
 this rung answers is whether a *credential-minting* route may be anonymous at
 all. Shipped plan `2026-08-14-runner-unauthenticated-coord-writers` drove bare
 coord writes 63 → 0 and left `src-tauri/tests/coord_auth_pin.rs` as the durable
 guard — and it sanctioned exactly one carve-out shape,
-`pair.rs::pair_via_browser`, which is anonymous **because it mints the
-credential, so requiring one is circular.** A credential-only route is that
+coord's own anonymous device-pairing surfaces — `post_pair_start` / `post_pair_complete` / `post_pair_cli` (`crates/coord/src/routes_phase3.rs`), registered ungated at `/coord/devices/pair-start|pair-complete|pair-cli` in `crates/coord/src/routes.rs`, which are anonymous **because they mint the
+credential, so requiring one is circular.** (That sentence cited
+`pair.rs::pair_via_browser` until 2026-09-13; no such symbol exists in coord —
+verify a route by name in `routes.rs` before citing it as precedent.) A credential-only route is that
 shape, and the pin objects to an unauthenticated *write*, not to *using an issued
 token*: everything L5 would do after a mint carries a bearer. The exposure that
 remains open is a property of the **sibling** `/agents/allocate` route, not of
@@ -283,7 +431,7 @@ scopes.) Plan
 surfaced that and refused to close it; the gate above is the escalation that
 asks for the ruling. Full chain and citations:
 `knowledge-base/qontinui-specific/coord-gates-and-access.md` → "The
-`/agents/allocate` exposure and its open ruling".
+`/agents/allocate` exposure, and why it stays prohibited".
 
 **The credential is verified with a control read before L5 is called LIVE — and
 that arm now runs for real.** (Measured 2026-09-04: mint `200`, control read
@@ -361,7 +509,7 @@ client's mask):
 | `DEVICE_JWT_UNAUTHORIZED` | L4: coord rejected a device JWT | Expired, or bound to another tenant. From a **static** source this is expected and **not terminal** — the cascade falls through to the next source |
 | `BOOTSTRAP_NO_DEVICE_ID` | L5: no `device_id` resolvable — `$QONTINUI_MACHINE_ID` unset **and** `~/.qontinui/machine.json` absent or unreadable. A statement of **absence**, and a LOCAL one | Nothing about coord. Export `$QONTINUI_MACHINE_ID`, or pair this machine so the runner writes `machine.json`. Nothing is sent — an empty `device_id` would draw a 4xx this script would then blame on coord |
 | `BOOTSTRAP_MACHINE_FILE_MALFORMED` | L5: `~/.qontinui/machine.json` is readable but carries neither a `device_id` nor the legacy `machine_id` (or is not JSON) | Also LOCAL, and kept apart from the row above on purpose: "the file is not there" and "the file is there and says nothing" have different fixes. Repair the file; nothing was sent |
-| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is open operator ruling `ece99898-30c6-4f8c-be8e-1de5f09abebc`. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
+| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is **UNKNOWN, not an open ruling**: gate `ece99898-30c6-4f8c-be8e-1de5f09abebc` was **withdrawn** 2026-09-02 as over-broad — four of its five arms were resolved by policy (`security-and-autonomy` `implement_tier: proceed`, "tightening is ordinary work"; `decision_record/operational-work-is-autonomous`); the dedicated route and the anonymous-mint tightening are qontinui-coord#1850 (ff-landed, `5dd99cc3`); the ONE arm still the operator's is gate `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (arm (b), `agent_tool_access` rows), which gates no cascade rung. UNKNOWN is not permission. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
 | `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405 (an unknown or unregistered `device_id`, or a malformed UUID) | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
 | `BOOTSTRAP_NO_TOKEN_IN_RESPONSE` | L5: the route answered `2xx` but the body carried no JWT-shaped token (3 dot-separated base64url parts) | The route's response shape changed, or something else answers on that host. NOT sent onward — an unshaped bearer would draw a 401 this script would then report against coord |
 | `BOOTSTRAP_TOKEN_UNVERIFIED` | L5: a token WAS minted, and the control read `GET /coord/agent-findings?limit=1` did not answer `200`. **The whole point of the rung's verification half** | Never report LIVE on this. A mint is not an authentication: say the mint succeeded AND the credential did not verify, and name the control read's status — the two facts together are the diagnosis |
@@ -445,8 +593,11 @@ against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Three of the fourteen call sites return BEFORE that
-guard is consulted at all and the rest are reached after it; either way none
+our own `coord-mcp` config. Ten of the fourteen call sites return BEFORE that
+guard is consulted at all -- seven in `apply_probe_verdict`, one in
+`provision_coord_mcp_for_session`, one early-returning at
+`provision_coord_mcp_with_jwt`'s bearer check, and one in
+`agent_runtime.rs` -- and the remaining four are reached after it; either way none
 deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
@@ -1020,6 +1171,16 @@ Track A item A3.)*
 times** — and it is the artifact that makes a coord-mcp 401 *provable* instead
 of merely plausible. Read it before you reach for any door, and certainly
 before you name a cause.
+
+> ⚠️ **Cheapest discriminator first, and it needs no log at all: compare the
+> workdir `.mcp.json`'s MTIME to this session's start.** If the file is NEWER,
+> the MCP CLIENT is holding a key it read at spawn while the file on disk
+> carries a fresher one — the client's cache is stale, the proxy is fine. L1 and
+> L2 read the FILE's key and speak raw JSON-RPC to `/coord-mcp`, so that key
+> still works and the verdict is **"client cache stale"**, never "proxy dead".
+> The raw workdir-key path is not a rung to add — it IS L1, and `/gate` Step 2 —
+> so say so rather than reaching for a new door. (Dossier contribution
+> `9206bde5-2d3e-4cf4-ab7c-c5d526b6d995`, "Mechanism 4".)
 
 ```
 ~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl

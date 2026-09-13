@@ -531,15 +531,10 @@ fn run_claude_session_inline(
     {
         let ai = crate::settings::get_ai_settings();
         let (trust_dir, _src) = crate::ai_provider::get_effective_config_dir(&ai.claude_cli);
-        let trust = crate::claude_session::spawn_preconditions::trust_precondition(
+        let gate = crate::claude_session::trust_gate::pre_accept_for_account_sync(
             working_dir,
             trust_dir.as_deref(),
-        );
-        let gate = crate::claude_session::trust_gate::pre_accept_for_spawn_sync(
-            working_dir,
-            &trust.verdict,
-            trust_dir.as_deref(),
-            trust_dir.as_deref(),
+            crate::claude_session::trust_gate::SpawnSurface::NonInteractive,
         );
         if let Some(refusal) = gate.decision.refusal() {
             return Err(refusal);

@@ -39,7 +39,9 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use qontinui_spec_check::{evaluate, evaluate_batch, IrPageSpec, SpecCheckResult, UIBridgeSnapshot};
+use qontinui_spec_check::{
+    evaluate, evaluate_batch, IrPageSpec, SpecCheckResult, UIBridgeSnapshot,
+};
 
 // ============================================================================
 // Shared fixtures
@@ -150,8 +152,7 @@ fn assertion_1_tracing_spans_round_trip_with_snapshot_id() {
     // installation does not provide — the explicit-loop path sidesteps that
     // entirely.
     let results_batch: Vec<SpecCheckResult> = tracing::subscriber::with_default(subscriber, || {
-        let single: Vec<SpecCheckResult> =
-            specs.iter().map(|s| evaluate(&snapshot, s)).collect();
+        let single: Vec<SpecCheckResult> = specs.iter().map(|s| evaluate(&snapshot, s)).collect();
         let batch = evaluate_batch(&snapshot, &specs);
         // Sanity-check shape inside the closure so any span emissions
         // triggered by panicking happen before subscriber teardown.
@@ -242,7 +243,11 @@ fn assertion_2_event_broadcast_shape() {
 
     tx.send(SpecApiEvent::SpecCheckInvoked {
         snapshot_id: snapshot_id.clone(),
-        page_ids: vec!["smoke-page-0".into(), "smoke-page-1".into(), "smoke-page-2".into()],
+        page_ids: vec![
+            "smoke-page-0".into(),
+            "smoke-page-1".into(),
+            "smoke-page-2".into(),
+        ],
         invoked_via: "http".into(),
         at_ms: invoked_at_ms,
     })
@@ -363,10 +368,11 @@ fn assertion_3_jsonb_persistence_round_trips_snapshot_id() {
 #[test]
 #[ignore = "requires live PG dev DB + psql on PATH; set DATABASE_URL"]
 fn assertion_4_match_outcome_query_uses_index_or_seq_scan_only_when_table_small() {
-    let database_url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set for assertion 4");
+    let database_url =
+        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for assertion 4");
 
-    let explain_sql = "EXPLAIN (FORMAT JSON) SELECT id FROM project.workflow_verification_phase_results \
+    let explain_sql =
+        "EXPLAIN (FORMAT JSON) SELECT id FROM project.workflow_verification_phase_results \
                        WHERE result_json->'summary'->>'match_outcome' = 'NoMatch'";
     let stdout = psql_run(&database_url, explain_sql).expect("EXPLAIN must succeed");
 
@@ -379,13 +385,13 @@ fn assertion_4_match_outcome_query_uses_index_or_seq_scan_only_when_table_small(
         .and_then(|p| p.get("Plan"))
         .expect("EXPLAIN JSON must have [0].Plan");
 
-    let node_type = plan
-        .get("Node Type")
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
+    let node_type = plan.get("Node Type").and_then(|n| n.as_str()).unwrap_or("");
     let plan_rows = plan.get("Plan Rows").and_then(|n| n.as_u64()).unwrap_or(0);
 
-    let is_index_path = matches!(node_type, "Index Scan" | "Bitmap Heap Scan" | "Index Only Scan");
+    let is_index_path = matches!(
+        node_type,
+        "Index Scan" | "Bitmap Heap Scan" | "Index Only Scan"
+    );
     let is_seq_scan = node_type == "Seq Scan";
 
     if is_index_path {
@@ -451,13 +457,14 @@ fn assertion_5_cli_coverage_emits_expected_keys() {
     }
 
     let stdout = String::from_utf8(output.stdout).expect("stdout must be UTF-8");
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or_else(|e| panic!("coverage --format json must emit valid JSON: {e}\nstdout was:\n{stdout}"));
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("coverage --format json must emit valid JSON: {e}\nstdout was:\n{stdout}")
+    });
 
     for key in ["pages_specced", "pages_observed", "coverage_pct"] {
-        let v = parsed.get(key).unwrap_or_else(|| {
-            panic!("coverage JSON must include `{key}` key; got: {parsed}")
-        });
+        let v = parsed
+            .get(key)
+            .unwrap_or_else(|| panic!("coverage JSON must include `{key}` key; got: {parsed}"));
         // Per Phase C: if `state_discovery_artifacts` / `cached_specs` are
         // absent on the dev DB, the binary returns the literal string
         // "unavailable" rather than failing. Accept both shapes.

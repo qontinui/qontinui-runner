@@ -32,11 +32,17 @@ def lift(fn_name):
     return textwrap.dedent("\n".join(lines[start:end]))
 
 
-ns = {"yaml": yaml, "hashlib": hashlib, "json": json}
+# `token` is lifted alongside the digest functions because the guard's own
+# docstring tells authors WHICH token to write into the PR body, and an untested
+# rule there misroutes every author of the file it governs. Deleting token()'s
+# composite-action branch used to leave this suite green while telling every
+# action author to write `action#workflow`, which matches nothing.
+ns = {"yaml": yaml, "hashlib": hashlib, "json": json, "os": os}
 exec(compile(lift("canon") + "\n\n" + lift("digest") + "\n\n"
-             + lift("uses_yaml_aliases") + "\n\n" + lift("surface"),
+             + lift("uses_yaml_aliases") + "\n\n" + lift("surface") + "\n\n"
+             + lift("token"),
              "lifted", "exec"), ns)
-surface, digest = ns["surface"], ns["digest"]
+surface, digest, token = ns["surface"], ns["digest"], ns["token"]
 uses_yaml_aliases = ns["uses_yaml_aliases"]
 
 checks = failures = 0
@@ -234,15 +240,98 @@ eq("1 and '1' stay distinct", True, digest({1: "x"}) != digest({"1": "x"}))
 eq("digest is stable across key insertion order", True,
    digest({"a": 1, "b": 2}) == digest({"b": 2, "a": 1}))
 
-print("\n3. Additive and cosmetic changes must NOT move an existing digest.")
+print("\n3. Additive and genuinely cosmetic changes must NOT move an existing digest.")
 added_job = BASE + "  extra:\n    name: new gate\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hi\n"
 eq("adding a NEW job leaves the existing job's digest alone", False, job_changed(added_job))
 eq("adding a NEW job is visible as a new key", True, "extra" in jobs_of(added_job))
-eq("a comment-only edit does not move the digest", False,
+eq("a YAML-LEVEL comment does not move the digest", False,
    job_changed(BASE.replace("      - run: cargo test", "      # a comment\n      - run: cargo test")))
 eq("key ORDER does not move the digest", False,
    job_changed(BASE.replace("    name: security\n    runs-on: ubuntu-latest",
                             "    runs-on: ubuntu-latest\n    name: security")))
+
+# COMMENTS ARE NOT UNIFORMLY COSMETIC, which is why the assertion above names
+# the YAML-level case rather than "a comment-only edit". A block scalar's VALUE
+# is the shell text, so a `#` line inside `run: |` is part of the digested
+# string. The guard's docstring states this; without the cases below nothing
+# would fail if a future edit to surface() made it false again, and an author
+# would be told the weak label sufficed for an edit that needs `alters-a-gate`.
+BLOCK = BASE.replace("      - run: cargo test",
+                     "      - run: |\n          cargo test\n          cargo clippy")
+eq("a SHELL comment inside a `run: |` block DOES move the digest", True,
+   digest(jobs_of(BLOCK)["test"]) != digest(jobs_of(
+       BLOCK.replace("          cargo test", "          # why we test\n          cargo test"))["test"]))
+eq("a trailing comment INSIDE a block scalar moves it too", True,
+   digest(jobs_of(BLOCK)["test"]) != digest(jobs_of(
+       BLOCK.replace("          cargo test", "          cargo test   # trailing"))["test"]))
+# The MIRROR of that, and the reason the assertion above names the block scalar
+# rather than "a run: line": on a PLAIN `run: cargo test` the value is a FLOW
+# scalar, so ` # trailing` is a YAML comment and the parser strips it. Naming
+# this case wrongly would push an author to `alters-a-gate` for an edit that
+# needs only `declared` -- over-declaring is the same defect mirrored.
+eq("a trailing comment on a PLAIN run: scalar is stripped (no move)", False,
+   digest(jobs_of(BASE)["test"]) != digest(jobs_of(
+       BASE.replace("      - run: cargo test", "      - run: cargo test   # trailing"))["test"]))
+# ...but only a RELATIVE re-indent does. Stripping the block's own detected
+# indentation means shifting the WHOLE block is cosmetic, and a folded `>`
+# scalar folds re-wrapped lines back into one string. Stating otherwise would
+# over-declare, which the docstring's own "in either direction" rule forbids.
+eq("re-indenting the WHOLE block scalar is cosmetic", False,
+   digest(jobs_of(BLOCK)["test"]) != digest(jobs_of(
+       BLOCK.replace("          cargo test\n          cargo clippy",
+                     "            cargo test\n            cargo clippy"))["test"]))
+eq("re-indenting ONE line inside the block is NOT cosmetic", True,
+   digest(jobs_of(BLOCK)["test"]) != digest(jobs_of(
+       BLOCK.replace("          cargo clippy", "            cargo clippy"))["test"]))
+FOLDED = BASE.replace("      - run: cargo test",
+                      "      - run: >\n          cargo test\n          --all-targets")
+eq("a FOLDED re-wrap at the same indent across ONE space is cosmetic", False,
+   digest(jobs_of(FOLDED)["test"]) != digest(jobs_of(
+       FOLDED.replace("          cargo test\n          --all-targets",
+                      "          cargo\n          test --all-targets"))["test"]))
+# Same indent is NECESSARY but not SUFFICIENT, which is why the name above says
+# "across ONE space": wrapping at a double space changes the value even though
+# nothing moved indent. Stated as the measured OUTCOME on these fixtures and not
+# as a YAML rule -- the general rule is subtler than it looks (a trailing space
+# before the break reproduces a two-space gap, so "a wrap cannot widen a gap" is
+# false), and a wrong mechanism in a comment is exactly what this suite exists to
+# stop the docstring doing.
+DOUBLE = BASE.replace("      - run: cargo test",
+                      "      - run: >\n          cargo test  --all-targets")
+eq("a FOLDED re-wrap across a DOUBLE space is NOT cosmetic", True,
+   digest(jobs_of(DOUBLE)["test"]) != digest(jobs_of(
+       DOUBLE.replace("          cargo test  --all-targets",
+                      "          cargo test\n          --all-targets"))["test"]))
+# ...but folding is NOT a general licence, which is why no prose here says
+# "re-wrapping a folded scalar is safe". A line indented MORE than the block is
+# not folded at all -- YAML keeps both the newline and the extra indent -- and
+# that hanging-indent style is the ordinary way people wrap. Folded scalars do
+# occur under this guard's trigger globs, so this case is reachable, not
+# theoretical.
+eq("re-wrapping a FOLDED scalar to a HANGING indent is NOT cosmetic", True,
+   digest(jobs_of(FOLDED)["test"]) != digest(jobs_of(
+       FOLDED.replace("          cargo test\n          --all-targets",
+                      "          cargo test\n            --all-targets"))["test"]))
+eq("a blank line introduced by a re-wrap is NOT cosmetic", True,
+   digest(jobs_of(FOLDED)["test"]) != digest(jobs_of(
+       FOLDED.replace("          cargo test\n          --all-targets",
+                      "          cargo test\n\n          --all-targets"))["test"]))
+
+print("\n3b. token() -- WHICH identifier the author must write.")
+eq("a workflow job token is <stem>#<job-key>", "ci#test",
+   token(".github/workflows/ci.yml", "test"))
+eq("a non-jobs change is <stem>#workflow", "ci#workflow",
+   token(".github/workflows/ci.yml", "workflow"))
+eq(".yaml spelling resolves the same stem", "ci#test",
+   token(".github/workflows/ci.yaml", "test"))
+# The branch a mutation test showed was uncovered: without it every composite
+# action author is told to write `action#workflow`, which matches nothing.
+eq("a COMPOSITE ACTION's stem is its DIRECTORY, not 'action'", "checkout-sibling#workflow",
+   token(".github/actions/checkout-sibling/action.yml", "workflow"))
+eq("...and the .yaml spelling of it too", "checkout-sibling#workflow",
+   token(".github/actions/checkout-sibling/action.yaml", "workflow"))
+eq("a job key with whitespace is collapsed, not left to forge a TSV row", "ci#a b",
+   token(".github/workflows/ci.yml", "a\tb"))
 
 print("\n4. Job removal is a key difference, not a digest difference.")
 removed = BASE.replace("""  test:

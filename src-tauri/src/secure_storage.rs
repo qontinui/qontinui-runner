@@ -185,6 +185,32 @@ pub enum NonceStoreLoad {
     Loaded(std::collections::HashMap<String, StoredNonceBinding>),
 }
 
+/// A DEVICE nonce evicted by a re-mint whose grace window was still open when
+/// the store was last written (plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1a).
+///
+/// Persisted so a runner restart does not close every open window at once:
+/// measured 2026-09-02, 61 of 144 attributable rejects were graced keys whose
+/// grace died with the previous process while the `.mcp.json` on disk still
+/// carried them. The deadline is carried as wall-clock unix seconds so the
+/// restore re-enters the key with its REMAINING window, never a fresh one; an
+/// entry already past its deadline is dropped on load.
+///
+/// Its own field on `StoredTokens`, not a flag on [`StoredNonceBinding`]: a
+/// binary predating this field ignores it on read and drops it on its next
+/// write, whereas a flagged binding would restore on that binary as a LIVE,
+/// unbounded key — laundering a superseded credential into a permanent one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredGracedNonce {
+    /// The workdir the evicted binding was provisioned into.
+    pub workdir: String,
+    /// The terminal it was provisioned for, when there was one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// End of the grace window, whole seconds since the Unix epoch.
+    pub grace_until_unix: u64,
+}
+
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
 /// readable so **no `.enc` migration is required**.
 ///
@@ -244,6 +270,13 @@ struct StoredTokens {
     /// bare-string shape readable so no `.enc` migration is required.
     #[serde(default)]
     coord_mcp_nonces: std::collections::HashMap<String, StoredNonceEntry>,
+    /// Evicted DEVICE nonces whose grace window was still open at the last
+    /// write (Phase 1a of plan
+    /// `2026-09-02-steering-layers-unreadable-without-a-credential`) — see
+    /// [`StoredGracedNonce`]. `#[serde(default)]` so a pre-Phase-1a `.enc`
+    /// deserializes; a pre-Phase-1a binary ignores and then drops it.
+    #[serde(default)]
+    coord_mcp_graced_nonces: std::collections::HashMap<String, StoredGracedNonce>,
     /// Per-machine API key for the dev-environment capture agent
     /// (`mk_<token>`), minted ONCE by the qontinui-web enroll endpoint
     /// (`POST /api/v1/devenv/agent/enroll`). Sent as the `X-Machine-Key`
@@ -1024,6 +1057,37 @@ impl SecureStorage {
         Ok(())
     }
 
+    /// Persist the live binding set AND the open grace set in ONE rewrite
+    /// (Phase 1a). The production persist path writes both together because
+    /// the event that adds a grace entry — a re-mint — is the same event that
+    /// changes the binding set; two writes would double the store rewrite on
+    /// every mint for nothing.
+    pub fn store_coord_mcp_nonce_sets(
+        &self,
+        nonces: &std::collections::HashMap<String, StoredNonceBinding>,
+        graced: &std::collections::HashMap<String, StoredGracedNonce>,
+    ) -> Result<()> {
+        let mut tokens = self.load_tokens_for_write()?;
+        tokens.coord_mcp_nonces = nonces
+            .iter()
+            .map(|(n, b)| (n.clone(), StoredNonceEntry::Modern(b.clone())))
+            .collect();
+        tokens.coord_mcp_graced_nonces = graced.clone();
+        self.save_tokens(&tokens)?;
+        Ok(())
+    }
+
+    /// Load the persisted grace set (Phase 1a). Empty when the store is
+    /// absent, unreadable, or predates the field — the safe default: a lost
+    /// grace entry 401s exactly as it did before the field existed.
+    pub fn load_coord_mcp_graced_nonces(
+        &self,
+    ) -> std::collections::HashMap<String, StoredGracedNonce> {
+        self.load_tokens()
+            .map(|t| t.coord_mcp_graced_nonces)
+            .unwrap_or_default()
+    }
+
     /// Load the persisted coord-mcp loopback proxy nonce map, normalizing both
     /// on-disk shapes to [`StoredNonceBinding`] (a pre-Phase-4 bare-string entry
     /// reads back with `terminal_id: None`, exactly as it behaved before, and a
@@ -1176,16 +1240,31 @@ impl SecureStorage {
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
     /// deterministic (BTreeMap key) order. Unreadable stores and malformed
     /// keys yield an empty / filtered list — enumeration is never fatal.
+    ///
+    /// ⚠ The empty Vec is AMBIGUOUS: it means "no tenant slots" and "the store
+    /// could not be read" alike. That is fine for a caller choosing a code
+    /// path, and NOT fine for a caller about to do something destructive with
+    /// the answer — use [`Self::try_list_tenant_device_jwt_tenants`] there.
     pub fn list_tenant_device_jwt_tenants(&self) -> Vec<uuid::Uuid> {
-        self.load_tokens()
-            .map(|t| {
-                t.tenant_device_jwts
-                    .keys()
-                    .filter_map(|k| k.strip_prefix(TENANT_DEVICE_JWT_PREFIX))
-                    .filter_map(|s| uuid::Uuid::parse_str(s).ok())
-                    .collect()
-            })
+        self.try_list_tenant_device_jwt_tenants()
             .unwrap_or_default()
+    }
+
+    /// [`Self::list_tenant_device_jwt_tenants`] without the collapse: a store
+    /// that could not be read is `Err`, distinguishable from a store that
+    /// genuinely holds no tenant slots.
+    ///
+    /// A present-but-undecryptable store, a partial write, an I/O blip or
+    /// contention with a concurrent writer all reach the `Err` arm — states in
+    /// which a caller must not conclude "this runner has no tenant slots".
+    pub fn try_list_tenant_device_jwt_tenants(&self) -> Result<Vec<uuid::Uuid>> {
+        Ok(self
+            .load_tokens()?
+            .tenant_device_jwts
+            .keys()
+            .filter_map(|k| k.strip_prefix(TENANT_DEVICE_JWT_PREFIX))
+            .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+            .collect())
     }
 
     /// Store the device-bound machine key (`dmk_<token>`). Minted by the
@@ -2127,6 +2206,45 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
+    }
+
+    /// Phase 1a of plan
+    /// `2026-09-02-steering-layers-unreadable-without-a-credential`: the grace
+    /// set round-trips through the real store beside the bindings, a store
+    /// predating the field loads it as EMPTY (not an error), and the
+    /// bindings-only writer leaves it untouched.
+    #[test]
+    fn test_coord_mcp_graced_nonces_round_trip_and_default_empty() {
+        let raw = r#"{"coord_mcp_nonces":{"n":{"workdir":"D:\\wd"}}}"#;
+        let parsed: StoredTokens = serde_json::from_str(raw).expect("pre-1a store decodes");
+        assert!(parsed.coord_mcp_graced_nonces.is_empty());
+
+        let storage = create_test_storage("coord_mcp_graced_round_trip");
+        let bindings = std::collections::HashMap::from([(
+            "live".to_string(),
+            StoredNonceBinding {
+                workdir: "D:\\wd".into(),
+                terminal_id: Some("term-1".into()),
+                minted_at_unix: Some(1_700_000_000),
+            },
+        )]);
+        let graced = std::collections::HashMap::from([(
+            "old".to_string(),
+            StoredGracedNonce {
+                workdir: "D:\\wd".into(),
+                terminal_id: Some("term-1".into()),
+                grace_until_unix: 1_700_021_600,
+            },
+        )]);
+        storage
+            .store_coord_mcp_nonce_sets(&bindings, &graced)
+            .unwrap();
+        assert_eq!(storage.load_coord_mcp_nonces(), bindings);
+        assert_eq!(storage.load_coord_mcp_graced_nonces(), graced);
+
+        // The bindings-only writer does not clear the grace set.
+        storage.store_coord_mcp_nonces(&bindings).unwrap();
+        assert_eq!(storage.load_coord_mcp_graced_nonces(), graced);
     }
 
     /// The widened value survives a REAL encrypted store round trip through the

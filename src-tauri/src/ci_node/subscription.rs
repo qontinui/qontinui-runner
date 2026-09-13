@@ -323,14 +323,25 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             crate::test_env::isolate_coord_env(dir.path(), settings);
 
+            // Which arm the base resolves through, read BEFORE the asserted
+            // reads; each failure message adds a second read taken at failure.
+            // See `crate::test_env::coord_base_diagnostic`.
+            let before = crate::test_env::coord_base_diagnostic();
             let gate = qontinui_runner_lib::profiles::connected_coord_base();
             let ws = ci_ws_url(device);
             assert_eq!(
                 gate.is_some(),
                 ws.is_some(),
-                "gate and WS resolver disagreed for settings {settings:?}"
+                "gate and WS resolver disagreed for settings {settings:?}\n  before: {before}\n  \
+                 at failure: {}",
+                crate::test_env::coord_base_diagnostic()
             );
-            assert_eq!(ws, expected, "settings {settings:?}");
+            assert_eq!(
+                ws,
+                expected,
+                "settings {settings:?}\n  before: {before}\n  at failure: {}",
+                crate::test_env::coord_base_diagnostic()
+            );
         }
     }
 

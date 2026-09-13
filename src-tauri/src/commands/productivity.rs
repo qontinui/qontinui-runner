@@ -1113,6 +1113,8 @@ pub async fn launch_coordinator_session(
         // command argument: absent on the first attempt, `true` on the retry
         // the "Start anyway" dialog issues.
         resource_override.unwrap_or(false),
+        // Operator-launched shell: the account is chosen after this point.
+        crate::terminal::TrustArm::AccountChosenLater,
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1279,6 +1281,8 @@ pub async fn spawn_worker_session(
         // `claude` CLI that will immediately start `cargo` builds), so the warn
         // notice on this path is the one most likely to earn its keep.
         resource_override.unwrap_or(false),
+        // Operator-launched shell: the account is chosen after this point.
+        crate::terminal::TrustArm::AccountChosenLater,
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession

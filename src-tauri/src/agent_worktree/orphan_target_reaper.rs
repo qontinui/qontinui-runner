@@ -3724,18 +3724,19 @@ mod tests {
 
     #[test]
     fn classify_skips_via_keep_env_allowlist() {
+        // The env is process-global, so hold the ONE shared lock every
+        // env-touching test in this binary takes — the set/assert/restore
+        // dance this replaces excluded nobody. The restore is declared AFTER
+        // the lock so it runs while the lock is still held, and it survives
+        // the panic path, which the manual restore did not.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[KEEP_ENV]);
         let tmp = tempfile::tempdir().unwrap();
         let tgt = tmp.path().join("target-wt-pinned");
         mk_target_root(&tgt);
-        // Guard the process-global env: set, assert, restore.
-        let prev = std::env::var(KEEP_ENV).ok();
         std::env::set_var(KEEP_ENV, "foo, target-wt-pinned ,bar");
-        let verdict = classify(&tgt, Duration::ZERO);
-        match prev {
-            Some(v) => std::env::set_var(KEEP_ENV, v),
-            None => std::env::remove_var(KEEP_ENV),
-        }
-        assert_eq!(verdict, Err(SkipReason::Kept));
+        assert_eq!(classify(&tgt, Duration::ZERO), Err(SkipReason::Kept));
     }
 
     #[test]

@@ -212,6 +212,12 @@ pub async fn handle_usage_limit_hint(terminal_id: String, matched_pattern: &'sta
         "token exhaustion confirmed — migrating session to a fresh account"
     );
 
+    // The migration decides workspace trust for the destination through the
+    // trust gate's SYNC door (it is a blocking function); warm the dial here,
+    // on the async side, so that decision is the tenant's rather than a cold
+    // cache's.
+    crate::claude_session::trust_gate::warm_dial().await;
+
     match migrate_session(&app, &record, &src, &dst) {
         Ok(outcome) => {
             info!(
@@ -571,6 +577,29 @@ pub fn migrate_session(
         &working_dir,
         &record.claude_session_id,
     )?;
+
+    // 1b. Workspace trust for the DESTINATION account, decided BEFORE anything
+    // is torn down. The respawn below reaches `TerminalManager::create` on its
+    // pinned arm, which derives trust for `dst` through the trust gate and
+    // refuses when it cannot; refusing THERE would be after step 2 has closed
+    // the old pane — a refusal that destroys the session it was meant to
+    // protect, the inversion the resource override on this path exists to
+    // avoid. So the same decision is taken here first: a refusal aborts the
+    // migration with the old pane intact (the caller emits `skipped`), and a
+    // grant means the seam's own check short-circuits on `AlreadyTrusted`.
+    // The destination is not pre-trusted by the source's spawn any more (that
+    // spawn mints for its own account only), so this is the usual case, not an
+    // edge: trust the session had under `src` is not the same key under `dst`.
+    let trust = crate::claude_session::trust_gate::pre_accept_for_account_sync(
+        &working_dir,
+        Some(dst_config_dir),
+        crate::claude_session::trust_gate::SpawnSurface::InteractivePty,
+    );
+    if let Some(refusal) = trust.decision.refusal() {
+        return Err(format!(
+            "workspace trust for the destination account could not be derived — the old pane              is left in place: {refusal}"
+        ));
+    }
 
     // 2. Close the old pane. Record the migration close-reason BEFORE the
     // PTY teardown so the exit hook's later `pty-exit` close is a no-op

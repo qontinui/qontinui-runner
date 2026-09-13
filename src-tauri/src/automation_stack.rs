@@ -154,7 +154,7 @@ impl Capability {
 /// The inherited PATH is the point: `window_manager` and the recorder shell out
 /// with a bare program name, so what matters is what the RUNNER's environment
 /// resolves — not what a login shell would.
-fn which(program: &str) -> Option<PathBuf> {
+pub(crate) fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         if dir.as_os_str().is_empty() {

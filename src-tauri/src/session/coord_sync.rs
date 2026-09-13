@@ -74,7 +74,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -151,7 +151,18 @@ struct CoordSyncInner {
     /// default dormant. The poll task ([`CoordSync::start_flag_poll_task`])
     /// refreshes it from coord's `/tenant-policy` endpoint.
     dual_write: DualWriteGate,
+    /// Invoked with the payload's `claude_session_id` and `finished_at` when coord ACKs a
+    /// `finished` record — main.rs attaches `SessionLifecycleStore::
+    /// mark_finish_synced` (plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2, "Clear
+    /// `finish_synced` on ACK"). Only a real `PushOutcome::Acked` counts; a
+    /// permanent failure is ACK-dropped from the outbox but NOT synced.
+    /// Unattached (tests, pre-wiring) → the flag is never stamped.
+    finished_ack_observer: OnceLock<FinishedAckObserver>,
 }
+
+/// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
+struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +208,7 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
+                finished_ack_observer: OnceLock::new(),
             }),
         }
     }
@@ -225,6 +237,7 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
+                finished_ack_observer: OnceLock::new(),
             }),
         }
     }
@@ -298,6 +311,23 @@ impl CoordSync {
             .lock()
             .expect("coord_sync registry slot poisoned");
         *slot = Some(Arc::downgrade(registry));
+    }
+
+    /// Attach the `finished`-ACK observer (once, at startup) — invoked with the
+    /// `claude_session_id` from a `finished` record's payload each time coord
+    /// ACKs one. See `CoordSyncInner::finished_ack_observer`.
+    pub fn attach_finished_ack_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_ack_observer
+            .set(FinishedAckObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-ACK observer already attached — ignoring");
+        }
     }
 
     /// Start the drain task. Returns the [`JoinHandle`] so `main.rs` can
@@ -611,6 +641,7 @@ async fn push_chain(
             PushOutcome::Acked => {
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
+                notify_finished_ack(&inner, &rec);
             }
             PushOutcome::Conflict { row } => {
                 out.succeeded.push((rec.session_id, rec.seq));
@@ -774,6 +805,33 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
             backoff = TICK_BUSY;
             tokio::time::sleep(TICK_BUSY).await;
         }
+    }
+}
+
+/// Stamp `finish_synced` back onto the local record once coord has ACKed a
+/// `finished` row. A record whose payload carries no `claude_session_id` (none
+/// is written without one) is skipped rather than guessed at.
+fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
+    if rec.event_kind != SessionEventKind::Finished.as_str() {
+        return;
+    }
+    let Some(obs) = inner.finished_ack_observer.get() else {
+        return;
+    };
+    match rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        Some(csid) => (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+        ),
+        None => tracing::warn!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
+        ),
     }
 }
 
@@ -2856,6 +2914,103 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
+    }
+
+    /// The round trip the source-text guards above cannot observe: a `finished`
+    /// row enqueued in the outbox drains to the path-addressed PATCH, and
+    /// coord's 2xx ACK reaches the observer with the row's `claude_session_id`
+    /// (plan `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_row_drains_to_patch_and_its_ack_reaches_the_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let acked: Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>> = Default::default();
+        {
+            let acked = acked.clone();
+            coord.attach_finished_ack_observer(move |csid, at| {
+                acked.lock().unwrap().push((csid.to_string(), at))
+            });
+        }
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                session_id,
+                SessionEventKind::Finished,
+                json!({ "id": session_id, "claude_session_id": "csid-1", "finished_at": 42 }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(10), || {
+            acked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| *a == ("csid-1".to_string(), Some(42)))
+        })
+        .await;
+        let g = rec.lock().await;
+        assert!(
+            g.patches
+                .iter()
+                .any(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished"),
+            "the marker must reach coord as PATCH /sessions/:id: {:?}",
+            g.patches
+        );
+    }
+
+    /// A refused `finished` write is ACK-dropped from the outbox so the queue
+    /// moves, but it must NOT stamp `finish_synced` — coord never took it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_finished_row_never_reaches_the_ack_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let acked: Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>> = Default::default();
+        {
+            let acked = acked.clone();
+            coord.attach_finished_ack_observer(move |csid, at| {
+                acked.lock().unwrap().push((csid.to_string(), at))
+            });
+        }
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                session_id,
+                SessionEventKind::Finished,
+                json!({ "id": session_id, "claude_session_id": "csid-404" }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(10), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(
+            !rec.lock().await.patches.is_empty(),
+            "the PATCH was attempted"
+        );
+        assert!(
+            acked.lock().unwrap().is_empty(),
+            "a 404-refused marker is dropped, never reported as synced"
+        );
     }
 
     /// Plan A3 — an ABANDONED session (heartbeats ceased) must NOT

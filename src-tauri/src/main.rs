@@ -328,6 +328,12 @@ mod flywheel_e2e_tests;
 // See plans/2026-05-20-runner-tier-decoupling.md.
 #[cfg(test)]
 mod tier_matrix_tests;
+// Source invariant: every test fn that writes `std::env` holds the ONE shared
+// env lock (`crate::test_env::env_lock()`), so an unlocked writer cannot race a
+// correctly-locked test. Parses `src/**/*.rs` with `syn`.
+// Plan `2026-08-25-runner-test-suite-env-isolation` Phase 2.
+#[cfg(test)]
+mod env_write_lock_guard;
 // Source-scan ratchet for the `tokio_postgres::Row::get` deny lint: the
 // fn-level `#[expect(clippy::disallowed_methods)]` count only falls, and the
 // gate (repo-root clippy.toml + the two deny levels in Cargo.toml) stays wired.
@@ -688,6 +694,33 @@ pub(crate) mod test_env {
         std::env::remove_var("QONTINUI_RUNNER_TIER");
         qontinui_runner_lib::profiles::set_runtime_tier_override(None);
         std::fs::write(dir.join("settings.json"), settings_json).unwrap();
+    }
+
+    /// One line naming which arm the coord base resolved through, for the
+    /// failure message of every test that asserts on `connected_coord_base()`
+    /// behind an [`isolate_coord_env`] fixture.
+    ///
+    /// `connected_coord_base()` answers `None` from two different arms of
+    /// `profiles::classify_connected`: the tier read as something other than
+    /// `qontinui_account` (source `DevLocalhostFallback`), or `settings.json`
+    /// was unreadable (`UnknownTierProdDefault`). Those point at different
+    /// fixes, and the 2026-08-25 flake of
+    /// `coord_ws_url_resolves_on_hosted_tier_with_no_profile_coord_url` printed
+    /// only `left: None` — naming neither, so it could not be diagnosed then or
+    /// since. Plan `2026-08-25-runner-test-suite-env-isolation` Phase 1.
+    ///
+    /// These are FRESH reads, not the one the assertion made. Take one before
+    /// the asserted read and one in the failure message: a persistent misread
+    /// shows the same arm twice, a transient race shows the two disagreeing.
+    pub(crate) fn coord_base_diagnostic() -> String {
+        let (path, path_source) = qontinui_runner_lib::profiles::settings_json_path();
+        format!(
+            "coord_base_policy={:?} read_runner_tier={:?} settings_json_path={:?} ({:?})",
+            qontinui_runner_lib::profiles::coord_base_policy(),
+            qontinui_runner_lib::profiles::read_runner_tier(),
+            path,
+            path_source,
+        )
     }
 
     /// Drift guard: [`isolate_coord_env`] must actually pin EVERY key the lib
@@ -2421,6 +2454,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::auth::is_api_ready,
             commands::auth::get_runner_tier,
             commands::auth::kick_device_jwt_refresher_cmd,
+            commands::auth::get_coord_credential_posture,
             commands::auth::logout,
             commands::auth::qontinui_sign_out,
             commands::auth::reset_credential_store,
@@ -2507,6 +2541,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::remote_attach::terminal_attach_remote,
             commands::remote_attach::terminal_remote_identities,
             commands::remote_attach::terminal_remote_history_load,
+            commands::remote_create::remote_create_preference_get,
+            commands::remote_create::remote_create_preference_set,
+            commands::remote_create::remote_create_preference_reconcile,
+            commands::remote_create::terminal_create_remote,
             commands::command_interpreter::command_interpret,
             commands::comparison::get_comparison_status,
             commands::comparison::list_comparisons,
@@ -3865,6 +3903,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         mcp::session_compliance::finalize_on_close(csid, &store);
                     });
                 }
+                // Session FINISHED marker → coord (plan
+                // `2026-09-01-session-finished-marker-and-unfinished-resume`
+                // §5.2). `set_finished` is the one funnel both the Tauri
+                // command and `POST /sessions/{id}/finish` go through; its
+                // observer enqueues the `Finished` outbox row (or, on an
+                // unmark, a `working` progress row), and the drain's
+                // ACK stamps `finish_synced` back so the boot reconcile can
+                // tell a synced mark from one coord has not seen. Weak handles
+                // for the same Arc-cycle reason as the close observer above.
+                {
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    lifecycle_store.attach_finish_observer(move |rec| {
+                        if let Some(r) = reg.upgrade() {
+                            match rec.finished_at {
+                                Some(at) => r.finish_session(&rec.claude_session_id, Some(at)),
+                                None => r.unfinish_session(&rec.claude_session_id),
+                            };
+                        }
+                    });
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
+                        if let Some(s) = store.upgrade() {
+                            s.mark_finish_synced(csid, finished_at);
+                        }
+                    });
+                }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
                 // session set, written on every layout-meaningful registry
@@ -4689,6 +4753,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     // socket above; this is the poll beside it.
                     let _attach_poll =
                         session::attach::start_poll_task(loop_registry.clone());
+                    // The same for remote-CREATE grants (plan
+                    // `2026-09-11-headless-runner-parity-from-a-headed-runner`,
+                    // Phase 3b).
+                    let _create_poll =
+                        session::create::start_poll_task(loop_registry.clone());
                     let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);

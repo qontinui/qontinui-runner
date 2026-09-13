@@ -1119,7 +1119,7 @@ mod timestamptz_parameter_binding_pg_tests {
             )
             .await
             .expect("read back seeded id");
-        row.get(0)
+        row.try_get(0).expect("seeded error_events id")
     }
 
     /// Refetch through the read path the page uses — NOT the write's return

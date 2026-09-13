@@ -2161,22 +2161,6 @@ mod tests {
         assert_eq!(dev.auth.as_ref().unwrap().kind, "static-dev-token");
     }
 
-    /// RAII guard that restores `RUNNER_DATABASE_URL` to its pre-test value on
-    /// drop, including the panic path. Without this, a panic in the test body
-    /// between `remove_var` and the manual restore would leak the unset state
-    /// to any sibling test that reads the var.
-    struct DbUrlRestore {
-        prev: Option<String>,
-    }
-    impl Drop for DbUrlRestore {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("RUNNER_DATABASE_URL", v),
-                None => std::env::remove_var("RUNNER_DATABASE_URL"),
-            }
-        }
-    }
-
     /// The fallback honours an EXPLICIT `RUNNER_DATABASE_URL` and fabricates
     /// nothing when it is unset.
     ///
@@ -2188,9 +2172,14 @@ mod tests {
     /// answered on `:5432`. Restoring the external arm must not restore that.
     #[test]
     fn legacy_fallback_uses_env_and_never_fabricates_a_default() {
-        let _restore = DbUrlRestore {
-            prev: std::env::var("RUNNER_DATABASE_URL").ok(),
-        };
+        // The env is process-global, so hold the ONE shared lock for the whole
+        // body. The `DbUrlRestore` guard this replaces restored the value but
+        // took no lock at all, so it could not keep a sibling test from
+        // reading `RUNNER_DATABASE_URL` mid-write; this test was its last user,
+        // so it is deleted rather than left behind.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&["RUNNER_DATABASE_URL"]);
 
         std::env::set_var("RUNNER_DATABASE_URL", "postgres://explicit:5499/db");
         let p = legacy_env_fallback();
@@ -2545,6 +2534,31 @@ mod tests {
         );
     }
 
+    /// One line naming which arm the coord base resolved through — the LIB-side
+    /// twin of `main.rs`'s `test_env::coord_base_diagnostic`.
+    ///
+    /// [`connected_coord_base`] answers `None` from two different arms of
+    /// [`classify_connected`]: the tier read as something other than
+    /// `qontinui_account` (source [`CoordBaseSource::DevLocalhostFallback`]), or
+    /// an unreadable `settings.json`
+    /// ([`CoordBaseSource::UnknownTierProdDefault`]). Those point at different
+    /// fixes, and a bare `left: None` names neither — which is why the
+    /// 2026-08-25 flake of the bin-side twin could not be diagnosed then or
+    /// since. These are FRESH reads: take one before the asserted read and one
+    /// in the failure message, so a persistent misread shows the same arm twice
+    /// while a transient race shows the two disagreeing.
+    /// Plan `2026-08-25-runner-test-suite-env-isolation` Phase 1.
+    fn coord_base_diagnostic() -> String {
+        let (path, path_source) = settings_json_path();
+        format!(
+            "coord_base_policy={:?} read_runner_tier={:?} settings_json_path={:?} ({:?})",
+            coord_base_policy(),
+            read_runner_tier(),
+            path,
+            path_source,
+        )
+    }
+
     /// The shipped end-user hosted configuration: tier `qontinui_account`, no
     /// `coord_url` in profiles.json, no `COORD_HTTP_URL`. This runner IS
     /// connected — reading it as isolated silently drops the entire hosted
@@ -2558,14 +2572,20 @@ mod tests {
             dir.path(),
             Some(&format!(r#"{{"tier":"{QONTINUI_ACCOUNT_TIER}"}}"#)),
         );
+        let before = coord_base_diagnostic();
         assert_eq!(
             read_runner_tier(),
-            TierRead::Known(QONTINUI_ACCOUNT_TIER.into())
+            TierRead::Known(QONTINUI_ACCOUNT_TIER.into()),
+            "the hosted-tier fixture did not read as hosted\n  before: {before}\n  \
+             at failure: {}",
+            coord_base_diagnostic()
         );
         assert_eq!(
             connected_coord_base(),
             Some(PROD_COORD_BASE.to_string()),
-            "a hosted runner with no explicit coord_url must read as CONNECTED"
+            "a hosted runner with no explicit coord_url must read as CONNECTED\n  \
+             before: {before}\n  at failure: {}",
+            coord_base_diagnostic()
         );
     }
 
@@ -2590,13 +2610,20 @@ mod tests {
         let _restore = crate::test_env::EnvVarRestore::capture(COORD_ENV_KEYS);
         let dir = tempfile::tempdir().unwrap();
         isolate_coord_env(dir.path(), Some("{not json"));
-        assert!(matches!(read_runner_tier(), TierRead::Unknown(_)));
+        let before = coord_base_diagnostic();
+        assert!(
+            matches!(read_runner_tier(), TierRead::Unknown(_)),
+            "an unreadable settings.json must read as UNKNOWN\n  before: {before}\n  \
+             at failure: {}",
+            coord_base_diagnostic()
+        );
         assert_eq!(
             connected_coord_base(),
             None,
             "an UNKNOWN tier must not read as connected — that would let one \
              transient settings.json read failure point a local dev box at \
-             production coord"
+             production coord\n  before: {before}\n  at failure: {}",
+            coord_base_diagnostic()
         );
         // The policy layer itself is untouched: it still resolves the prod base
         // with the `unknown_tier_prod_default` source. Only the Option family's

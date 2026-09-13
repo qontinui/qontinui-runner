@@ -4404,6 +4404,13 @@ async fn run_continuation_terminal(
     // no qontinui-claude-config checkout has no skills dir at all.
     crate::fleet_skills::provision_fleet_skills_for_session(workdir);
 
+    // The PTY seam derives workspace trust for the pinned account through the
+    // trust gate's SYNC door, which can only read the dial cache. Warm it here,
+    // from the one async context on this path, so that decision is made on the
+    // tenant's dial rather than on a cold cache (which would withhold the mint
+    // and leave an unattended, interactive `claude` facing the trust dialog).
+    crate::claude_session::trust_gate::warm_dial().await;
+
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -4460,16 +4467,33 @@ async fn run_continuation_terminal(
             Ok(())
         }
         Err(e) => {
-            report_spawn_failed(
-                agent_id,
-                &format!("terminal session create failed: {e}"),
-                None,
-                0,
-                None,
-            )
-            .await;
+            // The PTY seam returns text, so a trust-gate refusal arrives as the
+            // gate's own `spawn_blocked …` string rather than as the typed
+            // `SpawnBlocked` the headless funnel downcasts. Classify it by its
+            // prefix — the same device the resource guard uses — so the
+            // lifecycle post says `blocked` for a spawn that never started a
+            // child, instead of `exited`, and carries the refusal verbatim
+            // (it names the failing conjuncts) rather than wrapped as a create
+            // failure.
+            let (reason, phase) = classify_pty_spawn_error(&e);
+            report_spawn_failed_in_phase(agent_id, &reason, None, 0, None, phase).await;
             Err(anyhow::anyhow!(e))
         }
+    }
+}
+
+/// The PTY-seam twin of [`classify_spawn_error`]: the terminal spawn surfaces
+/// hand back a `String`, so the trust gate's refusal is recognised by its
+/// [`crate::claude_session::trust_gate::SPAWN_BLOCKED_REFUSAL_PREFIX`] rather
+/// than by downcast. Pure, so the two arms are pinned by a test.
+fn classify_pty_spawn_error(e: &str) -> (String, SpawnPhase) {
+    if crate::claude_session::trust_gate::is_spawn_blocked_refusal(e) {
+        (e.to_string(), SpawnPhase::Blocked)
+    } else {
+        (
+            format!("terminal session create failed: {e}"),
+            SpawnPhase::Exited,
+        )
     }
 }
 
@@ -5023,6 +5047,10 @@ async fn run_condition_check_terminal(
         ),
     };
 
+    // Same as the gate-continuation terminal: warm the dial so the PTY seam's
+    // sync trust gate decides on the tenant's word, not a cold cache.
+    crate::claude_session::trust_gate::warm_dial().await;
+
     let result = crate::commands::terminal::create_tracked_terminal_session_backend(
         &terminal_manager,
         &session_registry,
@@ -5058,7 +5086,13 @@ async fn run_condition_check_terminal(
             Ok(())
         }
         Err(e) => {
-            let reason = format!("condition-check terminal session create failed: {e}");
+            // Same classification as the gate-continuation terminal: a
+            // trust-gate refusal travels verbatim (it names the failing
+            // conjuncts); anything else is the ordinary create failure. The
+            // condition-run report has no phase field, so the `spawn_failed:`
+            // head stays as the wire contract and the classified reason follows.
+            let (reason, _phase) = classify_pty_spawn_error(&e);
+            let reason = format!("condition-check {reason}");
             warn!("agent_runtime: {reason}");
             report_condition_run_failed(&payload, format!("spawn_failed: {reason}")).await;
             Err(anyhow::anyhow!(reason))
@@ -8241,10 +8275,16 @@ mod tests {
         crate::test_env::isolate_coord_env(dir.path(), r#"{"tier":"qontinui_account"}"#);
 
         let device = uuid::Uuid::nil();
+        // Which arm the base resolves through, read BEFORE the asserted read;
+        // each failure message adds a second read taken at failure. See
+        // `crate::test_env::coord_base_diagnostic`.
+        let before = crate::test_env::coord_base_diagnostic();
         // The gate says connected…
         assert_eq!(
             qontinui_runner_lib::profiles::connected_coord_base().as_deref(),
             Some(qontinui_runner_lib::profiles::PROD_COORD_BASE),
+            "the hosted-tier fixture did not read as connected\n  before: {before}\n  at failure: {}",
+            crate::test_env::coord_base_diagnostic()
         );
         // …so the resolver behind it must agree, and produce exactly one `/ws`.
         assert_eq!(
@@ -8252,7 +8292,9 @@ mod tests {
             Some(format!(
                 "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
             )),
-            "gate and WS resolver disagreed — the respawn-loop regression"
+            "gate and WS resolver disagreed — the respawn-loop regression\n  before: {before}\n  \
+             at failure: {}",
+            crate::test_env::coord_base_diagnostic()
         );
     }
 
@@ -8274,15 +8316,20 @@ mod tests {
         for settings in [r#"{"tier":"local"}"#, "{not json"] {
             let dir = tempfile::tempdir().unwrap();
             crate::test_env::isolate_coord_env(dir.path(), settings);
+            // Read BEFORE the asserted reads; see the hosted-tier test above.
+            let before = crate::test_env::coord_base_diagnostic();
             assert_eq!(
                 qontinui_runner_lib::profiles::connected_coord_base(),
                 None,
-                "settings {settings:?}"
+                "settings {settings:?}\n  before: {before}\n  at failure: {}",
+                crate::test_env::coord_base_diagnostic()
             );
             assert_eq!(
                 coord_ws_url(uuid::Uuid::nil()),
                 None,
-                "settings {settings:?} must not open a prod WS subscription"
+                "settings {settings:?} must not open a prod WS subscription\n  before: {before}\n  \
+                 at failure: {}",
+                crate::test_env::coord_base_diagnostic()
             );
         }
     }
@@ -9115,6 +9162,47 @@ mod tests {
             None
         );
         assert_eq!(continuation_fallback_workdir(None, &[], canonical), None);
+    }
+
+    /// The terminal presentation's refusal arrives as text. A trust-gate
+    /// refusal must post `blocked` — no child ever existed — and carry the
+    /// gate's own reason verbatim; anything else is the ordinary create
+    /// failure, wrapped and `exited`, exactly as before.
+    #[test]
+    fn a_pty_trust_refusal_is_classified_blocked_and_everything_else_exited() {
+        let refusal = crate::claude_session::trust_gate::decide(
+            &crate::claude_session::spawn_preconditions::TrustVerdict::Untrusted {
+                reason: "no entry for this project key",
+            },
+            &crate::claude_session::trust_gate::Conjuncts {
+                coord_worktree_row: crate::claude_session::trust_gate::ConjunctVerdict::Failed {
+                    decided_by: "test",
+                    detail: "plain directory".into(),
+                },
+                parent_repo_trusted: crate::claude_session::trust_gate::ConjunctVerdict::Unknown {
+                    reason: "no parent".into(),
+                },
+                config_dir_pinned: crate::claude_session::trust_gate::ConjunctVerdict::Satisfied {
+                    decided_by: "test",
+                    detail: String::new(),
+                },
+            },
+            crate::claude_session::trust_gate::EnforcementPosture::Block,
+        )
+        .refusal()
+        .unwrap();
+        let (reason, phase) = classify_pty_spawn_error(&refusal);
+        assert_eq!(phase, SpawnPhase::Blocked);
+        assert_eq!(reason, refusal, "the gate's reason travels unwrapped");
+
+        let (reason, phase) =
+            classify_pty_spawn_error("resource_guard:critical: commit headroom below the floor");
+        assert_eq!(phase, SpawnPhase::Exited);
+        assert_eq!(
+            reason,
+            "terminal session create failed: resource_guard:critical: commit headroom below the \
+             floor"
+        );
     }
 
     #[test]

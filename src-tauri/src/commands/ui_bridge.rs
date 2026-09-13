@@ -46,8 +46,9 @@ use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 // Re-export wire-format DTOs from qontinui-types (canonical source of truth).
 pub use qontinui_types::ui_bridge::{
     ActionResponse, ComponentActionInfo, ComponentActionRequest, DiscoveredElement,
-    DiscoveryRequest, DiscoveryResponse, ElementActionRequest, ElementIdentifier, ElementRect,
-    ElementState, UIBridgeComponent, UIBridgeElement, UIBridgeSnapshot, WaitOptions, WorkflowInfo,
+    DiscoveryRequest, DiscoveryResponse, ElementActionInfo, ElementActionRequest,
+    ElementIdentifier, ElementRect, ElementState, UIBridgeComponent, UIBridgeElement,
+    UIBridgeSnapshot, WaitOptions, WorkflowInfo,
 };
 
 /// Get all registered UI elements from the React UI Bridge.

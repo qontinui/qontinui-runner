@@ -697,8 +697,13 @@ pub struct TerminalSessionRecord {
     /// write coord has not seen yet and reverting it would silently undo the
     /// operator's action.
     ///
-    /// `false` on a finished record therefore means "coord write still owed",
-    /// and the outbox retries it.
+    /// `false` on a finished record therefore means "coord write still owed".
+    /// The write is enqueued when the mark is made AND again on the session's
+    /// next FRESH registration with coord in this process
+    /// (`AiCoordRegistrar::register_inner`), which covers a mark made while
+    /// the session had no coord row yet. A write coord REFUSES (4xx) is
+    /// ACK-dropped and not retried until the next registration — the flag
+    /// stays `false`, which is the honest reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
 }
@@ -817,11 +822,31 @@ pub struct SessionLifecycleStore {
     /// never registered no-ops inside `close_session` (index miss).
     /// Unattached (tests, ephemeral fallbacks) → no-op.
     close_observer: OnceLock<CloseObserver>,
+    /// Optional finish observer (plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2):
+    /// invoked with the resulting record AFTER [`Self::set_finished`] durably
+    /// writes a change coord must hear about — a mark coord has not ACKed yet
+    /// (`finished_at: Some`), or an unmark (`finished_at: None`). main.rs
+    /// attaches a closure that enqueues the matching outbox row through
+    /// `AiCoordRegistrar::finish_session` / `unfinish_session`, which is what
+    /// makes coord authoritative for the marker rather than blind to it — and
+    /// keeps an unmark from leaving coord saying `finished`. Unattached
+    /// (tests, ephemeral fallbacks) → every change stays local-only.
+    finish_observer: OnceLock<FinishObserver>,
 }
 
 /// Boxed close-observer callback (see `SessionLifecycleStore::close_observer`).
 /// Newtype so the store can keep `#[derive(Debug)]`.
 struct CloseObserver(Box<dyn Fn(&str) + Send + Sync>);
+
+/// Boxed finish-observer callback (see `SessionLifecycleStore::finish_observer`).
+struct FinishObserver(Box<dyn Fn(&TerminalSessionRecord) + Send + Sync>);
+
+impl std::fmt::Debug for FinishObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FinishObserver")
+    }
+}
 
 impl std::fmt::Debug for CloseObserver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -854,6 +879,7 @@ impl SessionLifecycleStore {
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
             close_observer: OnceLock::new(),
+            finish_observer: OnceLock::new(),
         };
         if replay.applied > 0 || replay.damaged {
             info!(
@@ -875,6 +901,23 @@ impl SessionLifecycleStore {
     pub fn attach_close_observer(&self, f: impl Fn(&str) + Send + Sync + 'static) {
         if self.close_observer.set(CloseObserver(Box::new(f))).is_err() {
             warn!("session_lifecycle_store: close observer already attached — ignoring");
+        }
+    }
+
+    /// Attach the finish observer (once, at startup) — invoked with the
+    /// resulting record after every [`Self::set_finished`] write that owes
+    /// coord a write: an unsynced mark, or an unmark. See the field doc for
+    /// the production wiring. Without it every change is local-only.
+    pub fn attach_finish_observer(
+        &self,
+        f: impl Fn(&TerminalSessionRecord) + Send + Sync + 'static,
+    ) {
+        if self
+            .finish_observer
+            .set(FinishObserver(Box::new(f)))
+            .is_err()
+        {
+            warn!("session_lifecycle_store: finish observer already attached — ignoring");
         }
     }
 
@@ -1768,6 +1811,17 @@ impl SessionLifecycleStore {
                 rec: Box::new(changed.clone()),
             }],
         );
+        // Notify AFTER the durable local write and outside the map lock (the
+        // guard was consumed by `persist`). Fires for every write that owes
+        // coord a write — a fresh mark, a reason update on a mark coord has not
+        // ACKed yet, or an unmark (reaching here means it really changed). A
+        // duplicate enqueue is harmless: both coord writes are idempotent
+        // path-addressed PATCHes.
+        if changed.finished_at.is_none() || !changed.finish_synced {
+            if let Some(obs) = self.finish_observer.get() {
+                (obs.0)(&changed);
+            }
+        }
         Some(changed)
     }
 
@@ -1778,7 +1832,13 @@ impl SessionLifecycleStore {
     /// while this flag is what later permits the boot reconcile to defer to
     /// coord. Only a still-finished record is stamped — an ACK arriving after
     /// the operator unmarked the session must not resurrect the marker.
-    pub fn mark_finish_synced(&self, claude_session_id: &str) {
+    ///
+    /// `acked_finished_at` is the `finished_at` the ACKed write carried. When
+    /// `Some`, only the SAME mark is stamped: after mark → unmark → re-mark, a
+    /// late ACK for the first mark must not report the second as synced
+    /// before its own write has drained. `None` stamps whatever mark is
+    /// current (a row written without the field).
+    pub fn mark_finish_synced(&self, claude_session_id: &str, acked_finished_at: Option<i64>) {
         let mut m = match self.map.lock() {
             Ok(m) => m,
             Err(e) => {
@@ -1787,7 +1847,11 @@ impl SessionLifecycleStore {
             }
         };
         let changed = match m.get_mut(claude_session_id) {
-            Some(rec) if rec.finished_at.is_some() && !rec.finish_synced => {
+            Some(rec)
+                if rec.finished_at.is_some()
+                    && !rec.finish_synced
+                    && acked_finished_at.is_none_or(|at| rec.finished_at == Some(at)) =>
+            {
                 rec.finish_synced = true;
                 rec.clone()
             }
@@ -5616,7 +5680,7 @@ mod tests {
             .unwrap();
         assert_eq!(snap.finished_at, Some(stamped), "timestamp must not move");
 
-        store.mark_finish_synced("s");
+        store.mark_finish_synced("s", None);
         assert!(
             store
                 .all_records()
@@ -5641,6 +5705,93 @@ mod tests {
         );
     }
 
+    /// The finish observer is the producer seam for coord's `Finished` outbox
+    /// row: it must fire for a fresh mark, stay silent on a no-op repeat, on an
+    /// unmark and on an unknown id, and stop firing once coord has ACKed.
+    #[test]
+    fn finish_observer_fires_only_while_a_coord_write_is_owed() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        // (csid, finished?) per notification.
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>> = Default::default();
+        {
+            let seen = seen.clone();
+            store.attach_finish_observer(move |rec| {
+                seen.lock()
+                    .unwrap()
+                    .push((rec.claude_session_id.clone(), rec.finished_at.is_some()))
+            });
+        }
+        store.record_open(rec("s"));
+
+        store.set_finished("ghost", true, None);
+        store.set_finished("s", false, None);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "an unknown id and a no-op unmark never fire"
+        );
+
+        store.set_finished("s", true, None);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("s".to_string(), true)],
+            "fresh mark fires"
+        );
+
+        store.set_finished("s", true, None);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a no-op repeat does not fire"
+        );
+
+        store.set_finished("s", true, Some("reason".into()));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "a reason update on an UNSYNCED mark re-fires — coord still owes the write"
+        );
+
+        store.mark_finish_synced("s", None);
+        store.set_finished("s", true, Some("later reason".into()));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "once coord has ACKed, a reason-only update owes coord nothing"
+        );
+
+        store.set_finished("s", false, None);
+        assert_eq!(
+            seen.lock().unwrap().last(),
+            Some(&("s".to_string(), false)),
+            "a real unmark fires, so coord is told the session is NOT finished"
+        );
+    }
+
+    /// After mark → unmark → re-mark, the first mark's late ACK must not stamp
+    /// the second mark synced before the second write has drained.
+    #[test]
+    fn a_stale_ack_never_syncs_a_newer_mark() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(rec("s"));
+
+        let first = store.set_finished("s", true, None).unwrap().finished_at;
+        store.set_finished("s", false, None);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = store.set_finished("s", true, None).unwrap().finished_at;
+        assert_ne!(first, second);
+
+        store.mark_finish_synced("s", first);
+        assert!(!store.get("s").unwrap().finish_synced, "stale ACK ignored");
+
+        store.mark_finish_synced("s", second);
+        assert!(
+            store.get("s").unwrap().finish_synced,
+            "the matching ACK stamps"
+        );
+    }
+
     /// An ACK that arrives after the operator unmarked the session must not
     /// resurrect the marker.
     #[test]
@@ -5653,7 +5804,7 @@ mod tests {
         store.set_finished("s", true, None);
         store.set_finished("s", false, None);
 
-        store.mark_finish_synced("s"); // the in-flight ACK lands late
+        store.mark_finish_synced("s", None); // the in-flight ACK lands late
 
         let snap = store
             .all_records()
