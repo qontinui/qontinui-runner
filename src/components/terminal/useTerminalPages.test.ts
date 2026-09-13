@@ -18,6 +18,7 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
+  reorderPagesArray,
   computeVisiblePages,
   pageIdsFromTerminals,
   pageIdsFromSessions,
@@ -137,6 +138,49 @@ describe("reconcilePages", () => {
     const out = reconcilePages([DEFAULT], ["a", "b"]);
     const names = out.filter((p) => p.id !== "default").map((p) => p.name);
     expect(names).toEqual(["Page 1", "Page 2"]);
+  });
+});
+
+describe("reorderPagesArray (drag-to-reorder)", () => {
+  const A: TerminalPageConfig = { id: "a", name: "A", createdAt: 1 };
+  const B: TerminalPageConfig = { id: "b", name: "B", createdAt: 2 };
+  const C: TerminalPageConfig = { id: "c", name: "C", createdAt: 3 };
+
+  it("moves a page forward to sit immediately before the target", () => {
+    const out = reorderPagesArray([A, B, C], "a", "c");
+    expect(out.map((p) => p.id)).toEqual(["b", "a", "c"]);
+  });
+
+  it("moves a page backward to sit immediately before the target", () => {
+    const out = reorderPagesArray([A, B, C], "c", "a");
+    expect(out.map((p) => p.id)).toEqual(["c", "a", "b"]);
+  });
+
+  it("is a no-op (same reference) when source and target are the same id", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "b", "b")).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when the source id is unknown", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "missing", "a")).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when the target id is unknown", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "a", "missing")).toBe(pages);
+  });
+
+  it("does not mutate the input array", () => {
+    const pages = [A, B, C];
+    const snapshot = [...pages];
+    reorderPagesArray(pages, "a", "c");
+    expect(pages).toEqual(snapshot);
+  });
+
+  it("preserves every page's own fields (only order changes)", () => {
+    const out = reorderPagesArray([A, B, C], "c", "a");
+    expect(out.find((p) => p.id === "c")).toEqual(C);
   });
 });
 
