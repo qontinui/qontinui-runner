@@ -64,46 +64,50 @@ settings; a session launched outside the runner will not have them.
 >   is byte-identical to "no such plan". Record `corpus_health` (or the two
 >   counts) beside the zero, and never write a cause for a door that did not
 >   answer — settle one against a second independent instance first.
-> * **The scan-root roll-up can widen a miss to UNKNOWN; it never proves one
->   absent.** The list result carries `corpus_health.scan_roots.by_source_repo`
->   (under `data` on the runner door): one roll-up per reported `source_repo`,
->   the `<repo>/<dir relative to the repo root>` key of a device's
->   `paths.plans_dir`. When no git door found the file (after a `git fetch`),
->   the roll-up gives you nothing to test; the miss stays whatever the other
->   doors made it. When one did, the roll-up leaves the miss where the other
->   doors put it in ONE case only: the roll-up for the file's key
->   (`qontinui-dev-notes/plans` for a hit on `origin/main:plans/<stem>.md`)
->   reads `state: measured` with `min_behind: 0` and
->   `min_behind_is_floor: false`, and the file exists at the shared `ref_sha`
->   (after a `git fetch`,
->   `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits 0;
->   any other exit, including an object this clone lacks, is UNKNOWN). Read
->   `ref_sha` off `scan_roots.rows[]` for an id in `least_behind_device_ids`,
->   since the roll-up carries none. Anything else makes the miss UNKNOWN: no
->   `corpus_health` or no `scan_roots` (on `/candidates`,
->   `corpus_health_unavailable_reason` names why), `scan_roots.state: unknown`
->   with a `no_observation:` or `read_failed:` detail, no roll-up for the key
->   (an archived plan's `.../plans/archive`; the archive and prompts scan roots
->   are never measured), an `unknown` roll-up, `min_behind` above 0, or a file
->   absent at that ref. Even in the one case, the 0 says only that a feeder's
->   HEAD held that ref's commits when it took its reading (up to ~45 min, plus
->   one reconcile tick, before you read it, against a ref fetched up to 6 h
->   before that): not that the working tree its body sync scans still held the
->   plan (a commit of its own or uncommitted work can remove it), nor that the
->   sync wrote it under `kind=plan` — a push not yet made; a paused or failing
->   sync; a runner that stopped, or a capture dial shut, within the last
->   45 min; a file its scan skips (no line starting with `#` and no
->   `> **Status:` stamp, or unreadable, including not UTF-8); a kind fork,
->   which writes nothing; or a row whose kind was locked away from `plan`,
->   which a `kind=plan` read never returns (retry with `slug=<stem>` and no
->   `kind`). It also settles only whether a row with that slug should exist,
->   not which copy's body or status it holds: any other device the roll-up
->   lists can write its own copy over it, so a miss from `/candidates` or a
->   `status` or `q` filter stays UNKNOWN. `min_behind` counts default-branch
->   commits, never missing plans, and a writer that posts no reading — e.g.
->   the web UI, a hand `POST`, the runner's write door,
->   `qontinui-pr plan-library-backfill`, a secondary or temp runner instance,
->   a runner build predating the report — is never measured.
+> * **The scan-root roll-up can make a miss UNKNOWN; it never proves a plan
+>   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
+>   runner door) has one roll-up per `source_repo` key: the
+>   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
+>   so `qontinui-dev-notes/plans` for a hit on `origin/main:plans/<stem>.md`.
+>   - **No git door found the file** (after a `git fetch`): the roll-up has
+>     nothing to add.
+>   - **A git door found it, and you read by `slug=<stem>`:** the miss is
+>     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
+>     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
+>     then always `false`); (b) after a `git fetch`,
+>     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     0 (any other exit, including an object this clone lacks, is UNKNOWN).
+>     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
+>     `least_behind_device_ids` (they share it); that row's own `state` may
+>     read `unknown` with a `ref_stale:` detail, and the roll-up's verdict is
+>     the one that counts. Everything else is UNKNOWN: no `corpus_health` or
+>     no `scan_roots` (on `/candidates`, `corpus_health_unavailable_reason`
+>     names why), `scan_roots.state: unknown` (`no_observation:` or
+>     `read_failed:`), no roll-up for the key, an `unknown` roll-up,
+>     `min_behind` above 0, or `cat-file` failing.
+>   - **Any other read** — `/candidates`, or a `status`, `q`,
+>     `work_unit_slug`, `repo`, `intent_ref` or `since` filter — stays
+>     UNKNOWN whatever the roll-up says: any writer can replace a row's body
+>     or its metadata (`status`, `work_unit_slug`, `repos`, ...) without the
+>     file changing, and a scanner never writes an unchanged file back.
+>   - **Even when (a) and (b) hold,** the roll-up only stops adding doubt; the
+>     miss is no stronger than the doors that produced it. The reading can be
+>     up to ~45 min old when you read it (plus one reconcile tick), and the
+>     ref it counted against can have been fetched up to 6 h before that
+>     reading. It establishes neither that the working tree the body sync
+>     scans still held the plan (a commit of its own or uncommitted work can
+>     remove it) nor that the sync wrote it under `kind=plan`: a push not yet
+>     made; a paused or failing sync; a runner that stopped, or a capture dial
+>     shut, within the last 45 min; a file its scan skips (no line whose first
+>     non-blank character is `#` and no `> **Status:` stamp, or unreadable,
+>     including not UTF-8); a kind fork, which writes nothing; or a row whose
+>     kind was locked away from `plan` (retry with `slug=<stem>` and no
+>     `kind`).
+>   - **Never measured:** `min_behind` counts default-branch commits, never
+>     missing plans. The archive and prompts scan roots have no reading, and
+>     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
+>     the runner's write door, `qontinui-pr plan-library-backfill`, a
+>     secondary or temp runner instance, a runner build predating the report.
 > * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
 >   PowerShell interpreter (`pwsh` on Linux via
 >   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
