@@ -60,6 +60,46 @@ function Assert-Problems {
     }
 }
 
+# --- TEMPORARY DIAGNOSTIC ---------------------------------------------------
+# Windows PowerShell 5.1 reports "has NO effect key" for EVERY action the probe
+# successfully finds, while `$_.id` matches on that same object and the
+# genuinely-absent case fires correctly. Two fixes aimed at
+# `PSObject.Properties` spelling have now failed to move that, so the shape of
+# `$action` under 5.1 is UNKNOWN rather than diagnosed. This block prints it.
+# DELETE THIS BLOCK once the divergence is identified and fixed.
+function Show-Diag {
+    param([string]$Label, $Value)
+    Write-Host ("  DIAG {0,-22} {1}" -f $Label, $Value)
+}
+Write-Host "test-effect-probe: DIAGNOSTIC"
+Show-Diag "PSVersion" "$($PSVersionTable.PSVersion) edition=$($PSVersionTable.PSEdition)"
+$diagSurface = Surface 'diag' $GOOD_ACTIONS
+Show-Diag "surface type" $diagSurface.GetType().FullName
+$diagActions = @($diagSurface.Actions)
+Show-Diag "actions.Count" $diagActions.Count
+Show-Diag "actions type" $diagActions.GetType().FullName
+$a0 = $diagActions[0]
+if ($null -eq $a0) {
+    Show-Diag "actions[0]" "<null>"
+} else {
+    Show-Diag "actions[0] type" $a0.GetType().FullName
+    Show-Diag "actions[0] props" (@($a0.PSObject.Properties | ForEach-Object { $_.Name }) -join ',')
+    Show-Diag "actions[0] json" ($a0 | ConvertTo-Json -Compress)
+}
+$picked = $diagActions | Where-Object { $_.id -eq 'switch-tab' } | Select-Object -First 1
+if ($null -eq $picked) {
+    Show-Diag "picked" "<null>"
+} else {
+    Show-Diag "picked type" $picked.GetType().FullName
+    Show-Diag "picked props" (@($picked.PSObject.Properties | ForEach-Object { $_.Name }) -join ',')
+    Show-Diag "picked.id" "[$($picked.id)]"
+    Show-Diag "picked.effect" "[$($picked.effect)]"
+    Show-Diag "picked json" ($picked | ConvertTo-Json -Compress)
+    Show-Diag "Members['effect']" "$($null -ne $picked.PSObject.Members['effect'])"
+}
+Write-Host ""
+# --- END TEMPORARY DIAGNOSTIC -----------------------------------------------
+
 Write-Host "test-effect-probe: Get-EffectProbeProblems"
 
 # --- The green case ---------------------------------------------------------
