@@ -1177,14 +1177,15 @@ argv.
 > ⚠️ **A failing route does NOT license `POST $COORD_HTTP_URL/agents/allocate`
 > as a substitute.** Step 3's prohibition is unqualified and three shipped
 > documents carry it. The gate once cited as live authority for the question —
-> coord gate **`ece99898-30c6-4f8c-be8e-1de5f09abebc`** (`operator_approval`,
-> `gate_class: security-surface`) — reads **`withdrawn`**, and so does its
-> successor `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (read 2026-09-11:
-> *"DECIDED, not escalated: do NOT clamp"*), which names allocate's anonymity as
-> the residual for the narrower MintCaller route. **Re-verify both with
-> `coord_gate_inspect` before citing either** — a withdrawn gate reads
-> identically to an open one in prose, which is why this pointer is mandatory
-> and this sentence is not a substitute for asking. So the allocate question is
+> coord gate **`ece99898-30c6-4f8c-be8e-1de5f09abebc`** — **re-verify it with
+> `coord_gate_inspect` (or `/gate-sweep`) before citing it here or anywhere; a
+> withdrawn gate reads identically to an open one in prose, so this pointer is
+> mandatory and no sentence below is a substitute for asking.** Read that way it
+> is `operator_approval`, `gate_class: security-surface`, and **`withdrawn`**, as
+> is its successor `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` — **`coord_gate_inspect`
+> that one too** (read 2026-09-11: *"DECIDED, not escalated: do NOT clamp"*),
+> which names allocate's anonymity as the residual for the narrower MintCaller
+> route. So the allocate question is
 > **UNKNOWN — neither still-gated nor cleared — and UNKNOWN is not permission.**
 > Two further reasons the prohibition stands independently of any ruling: #1850
 > supplies the sanctioned door above and narrows allocate's anonymous scopes,
