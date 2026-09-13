@@ -90,6 +90,7 @@ pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;
 pub mod transport;
+pub mod wind_down_observer; // Wind-down eligibility observation — the one entry point readiness and the drain wind-down tick share (plan 2026-09-13-drained-runner-never-reaches-idle)
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

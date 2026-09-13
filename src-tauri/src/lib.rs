@@ -182,6 +182,14 @@ pub mod env_generations;
 // visible tabs lives in the bin at `src/looping_agent_supervisor.rs`.
 pub mod looping_agent;
 
+// Wind-down eligibility (plan `2026-09-13-drained-runner-never-reaches-idle`,
+// Phase 1): the pure verdict "may a drained runner close this session?" plus
+// the grid-idle continuity tracker behind it. In the lib crate for the same
+// reason as `looping_agent`: the whole decision is `--lib`-tested, while the
+// impure observation glue lives in the bin (`terminal::session`,
+// `mcp::restart_readiness`).
+pub mod wind_down;
+
 // "Did the server evaluate this request and refuse it, or did the transport
 // blip?" — the ONE structural-vs-transient HTTP classifier, plus the denial
 // tags a server names on the refusal. In the lib for the same reason as

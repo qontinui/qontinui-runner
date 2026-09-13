@@ -13,6 +13,7 @@ pub mod commit_report;
 pub mod context_watcher;
 pub mod coord_warn;
 pub mod exit_notice;
+pub mod graceful_exit;
 pub mod grid;
 pub mod interceptor;
 pub mod manager;

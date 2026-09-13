@@ -40,7 +40,8 @@
 //!   clobbers a turn.
 //! - **PTY / `WorkerSession`** — `submit_prompt` writes raw bracketed-paste +
 //!   CR with NO state check, so injecting mid-turn corrupts the running turn.
-//!   We FIRST check the idle gate ([`terminal_looks_idle`]); only inject when
+//!   We FIRST check the idle gate (`TerminalSession::looks_idle_quiescent`,
+//!   over `looping_agent::idle::snapshot_looks_idle`); only inject when
 //!   the terminal is quiescent and showing its input prompt. If not idle we
 //!   SKIP this tick (leave the message unacked; retry next poll).
 //!
@@ -424,108 +425,6 @@ async fn surface_blocked_delivery(
             );
         }
     }
-}
-
-// ===========================================================================
-// PTY idle gate
-// ===========================================================================
-
-/// Working/processing indicators that mean Claude is mid-turn. If ANY appears
-/// on the rendered screen the terminal is NOT idle. Lowercased before match.
-/// Sourced from the Claude Code TUI working line ("… esc to interrupt") and the
-/// spinner glyphs it cycles; conservative — any hit vetoes idle.
-const PROCESSING_INDICATORS: &[&str] = &[
-    "esc to interrupt",
-    "to interrupt)",
-    "interrupt)",
-    "tokens ·",
-    "thinking…",
-    "thinking...",
-    "compacting",
-    "summarizing",
-];
-
-/// Spinner glyphs the Claude Code TUI animates while working. Their presence on
-/// screen is a strong "busy" signal independent of the text indicators above.
-const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '∗'];
-
-/// The Claude Code input-prompt marker. When Claude is ready for input the
-/// input box shows this caret. (We also accept a bare `>` box-input fallback
-/// row in case the glyph is stripped, but `❯` is the canonical tell.)
-const PROMPT_MARKER: char = '❯';
-
-/// Decide whether a single rendered grid snapshot looks IDLE / ready for input.
-///
-/// Pure over the snapshot so it is unit-testable against synthetic grids.
-/// CONSERVATIVE: returns false (NOT idle) on any ambiguity. Idle requires ALL:
-///
-/// 1. NO processing indicator text anywhere on screen
-///    ([`PROCESSING_INDICATORS`]).
-/// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`]) — except that the `·`
-///    middot is common in static UI, so it only counts when it co-occurs with a
-///    working line; we treat it via the text indicators, not as a bare glyph.
-/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
-/// 4. The cursor sits AT OR BELOW the prompt row (i.e. in the input area), not
-///    up in streaming output.
-fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
-    // (1) any processing-indicator text ⇒ busy.
-    let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
-    for line in &lower {
-        for ind in PROCESSING_INDICATORS {
-            if line.contains(ind) {
-                return false;
-            }
-        }
-    }
-
-    // (2) spinner glyphs (excluding bare `·`, handled via text) ⇒ busy.
-    for line in lines {
-        for ch in line.chars() {
-            if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
-                return false;
-            }
-        }
-    }
-
-    // (3) prompt marker visible — and remember its row for (4).
-    let prompt_row = lines.iter().position(|l| l.contains(PROMPT_MARKER));
-    let Some(prompt_row) = prompt_row else {
-        // No visible input prompt ⇒ we can't confirm ready-for-input ⇒ not idle.
-        return false;
-    };
-
-    // (4) cursor in the input area (at/below the prompt row). A cursor up in
-    // the scrollback/output region means output is still being drawn.
-    (cursor_row as usize) >= prompt_row
-}
-
-/// Read a terminal's rendered grid as `(lines, cursor_row)`. Lock-poison
-/// tolerant (reads the inner value) so a poisoned grid never wedges the loop.
-fn read_grid(session: &crate::terminal::session::TerminalSession) -> (Vec<String>, u16) {
-    let grid = session.grid();
-    let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-    let snap = guard.text_snapshot();
-    (snap.lines, snap.cursor_row)
-}
-
-/// PTY idle gate: the terminal looks idle AND has not mutated across a short
-/// quiescence debounce. Two reads [`IDLE_QUIESCENCE_DEBOUNCE`] apart must both
-/// look idle and render identical text (no streaming between them).
-///
-/// Async because it sleeps for the debounce; the two grid reads themselves are
-/// cheap synchronous lock-and-snapshot calls.
-async fn terminal_looks_idle(session: &crate::terminal::session::TerminalSession) -> bool {
-    let (lines_a, cursor_a) = read_grid(session);
-    if !snapshot_looks_idle(&lines_a, cursor_a) {
-        return false;
-    }
-    tokio::time::sleep(IDLE_QUIESCENCE_DEBOUNCE).await;
-    let (lines_b, cursor_b) = read_grid(session);
-    if !snapshot_looks_idle(&lines_b, cursor_b) {
-        return false;
-    }
-    // Quiescent: identical render across the debounce ⇒ nothing streaming.
-    lines_a == lines_b && cursor_a == cursor_b
 }
 
 // ===========================================================================
@@ -1023,7 +922,7 @@ async fn deliver_once(
                     );
                     continue;
                 };
-                if !terminal_looks_idle(&term).await {
+                if !term.looks_idle_quiescent(IDLE_QUIESCENCE_DEBOUNCE).await {
                     debug!(
                         "session_message_poller: terminal {terminal_id} not idle — deferring msg {}",
                         msg.message_id
@@ -1144,90 +1043,6 @@ mod tests {
 
     fn lines(rows: &[&str]) -> Vec<String> {
         rows.iter().map(|s| s.to_string()).collect()
-    }
-
-    // ---- idle gate: snapshot predicate ----------------------------------
-
-    #[test]
-    fn idle_when_prompt_visible_and_quiescent() {
-        // Canonical ready-for-input frame: an input box with the ❯ caret and
-        // the cursor on the prompt row, no working indicators.
-        let grid = lines(&[
-            "Some earlier output line.",
-            "Another line of a finished turn.",
-            "",
-            "╭──────────────────────────────────────────╮",
-            "│ ❯                                          │",
-            "╰──────────────────────────────────────────╯",
-        ]);
-        // cursor on the prompt row (row 4, 0-indexed).
-        assert!(snapshot_looks_idle(&grid, 4));
-    }
-
-    #[test]
-    fn not_idle_when_working_indicator_present() {
-        // The Claude Code working line — even with a ❯ elsewhere, the
-        // "esc to interrupt" veto wins.
-        let grid = lines(&[
-            "✻ Thinking…",
-            "  Reticulating splines… (esc to interrupt)",
-            "│ ❯                                          │",
-        ]);
-        assert!(!snapshot_looks_idle(&grid, 2));
-    }
-
-    #[test]
-    fn not_idle_when_spinner_glyph_present() {
-        // A spinner glyph alone (no text indicator) still vetoes idle.
-        let grid = lines(&[
-            "✶ Working",
-            "│ ❯                                          │",
-        ]);
-        assert!(!snapshot_looks_idle(&grid, 1));
-    }
-
-    #[test]
-    fn not_idle_when_no_prompt_marker() {
-        // Streaming output, no input box yet ⇒ can't confirm ready ⇒ not idle.
-        let grid = lines(&[
-            "Here is a long answer still being written",
-            "and another line of output",
-            "and more output",
-        ]);
-        assert!(!snapshot_looks_idle(&grid, 2));
-    }
-
-    #[test]
-    fn not_idle_when_cursor_above_prompt_row() {
-        // Prompt visible but the cursor is up in the output region — output is
-        // still being drawn above the (stale) input box.
-        let grid = lines(&[
-            "streaming output line being drawn",
-            "│ ❯                                          │",
-        ]);
-        // cursor on row 0, prompt on row 1 ⇒ cursor ABOVE prompt ⇒ not idle.
-        assert!(!snapshot_looks_idle(&grid, 0));
-    }
-
-    #[test]
-    fn middot_glyph_alone_does_not_veto_idle() {
-        // A bare `·` middot is common static UI chrome; it must NOT, by itself,
-        // mark a session busy (only the "tokens ·" text indicator does).
-        let grid = lines(&[
-            "Context · 42% used",
-            "│ ❯                                          │",
-        ]);
-        assert!(snapshot_looks_idle(&grid, 1));
-    }
-
-    #[test]
-    fn tokens_middot_text_indicator_vetoes_idle() {
-        // The working line's "<n> tokens ·" form IS a busy indicator.
-        let grid = lines(&[
-            "  12.3k tokens · esc to interrupt",
-            "│ ❯                                          │",
-        ]);
-        assert!(!snapshot_looks_idle(&grid, 1));
     }
 
     // ---- delivery guard: dedup + cooldown -------------------------------

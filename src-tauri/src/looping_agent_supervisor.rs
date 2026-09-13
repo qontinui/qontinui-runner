@@ -266,15 +266,6 @@ fn role_for_agent(playbook_ref: &str) -> Option<&'static str> {
     }
 }
 
-/// Rendered-grid read for one session: `(lines, cursor_row)`. Lock-poison
-/// tolerant; the guard never crosses an await.
-fn read_grid(session: &crate::terminal::session::TerminalSession) -> (Vec<String>, u16) {
-    let grid = session.grid();
-    let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
-    let snap = guard.text_snapshot();
-    (snap.lines, snap.cursor_row)
-}
-
 /// Resolve the agent's live tab: direct terminal-id hit first, then re-attach
 /// through the durable lifecycle record (whose terminal id a boot-restore
 /// rewrites). Returns the pure [`Liveness`] plus the live session handle.
@@ -430,10 +421,10 @@ async fn supervise_one(
     // — never nudge into a frame that is still streaming).
     let (mut idle, mut context_low) = (false, false);
     if let Some((_, session)) = &live {
-        let (lines_a, cursor_a) = read_grid(session);
+        let (lines_a, cursor_a) = session.grid_text();
         if snapshot_looks_idle(&lines_a, cursor_a) {
             tokio::time::sleep(IDLE_QUIESCENCE_DEBOUNCE).await;
-            let (lines_b, cursor_b) = read_grid(session);
+            let (lines_b, cursor_b) = session.grid_text();
             idle = snapshot_looks_idle(&lines_b, cursor_b)
                 && lines_a == lines_b
                 && cursor_a == cursor_b;
@@ -1170,7 +1161,7 @@ pub(crate) fn status_snapshot(
 ) -> LoopingAgentStatus {
     let (liveness, live) = resolve_live_session(app, rec);
     let idle = live.as_ref().map(|(_, session)| {
-        let (lines, cursor_row) = read_grid(session);
+        let (lines, cursor_row) = session.grid_text();
         snapshot_looks_idle(&lines, cursor_row)
     });
     LoopingAgentStatus {

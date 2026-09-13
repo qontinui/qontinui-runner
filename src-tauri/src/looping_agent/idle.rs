@@ -7,12 +7,14 @@
 //! a rolling byte window only ever retains the bottom of a frame and misses
 //! mid-screen text. The grid always reflects what is actually on screen.
 //!
-//! [`snapshot_looks_idle`] intentionally mirrors the PTY idle gate in
-//! `mcp/session_message_poller.rs` (the proven turn-complete recognizer for
-//! injecting into live sessions) — same conservative rules, same indicator
-//! vocabulary. It lives here (lib crate) so the looping-agent supervisor's
-//! decision core is fully `--lib`-tested; if you extend the indicator lists,
-//! extend BOTH sites (cross-referenced in the poller too).
+//! [`snapshot_looks_idle`] is the ONE turn-complete recognizer in the runner.
+//! Its consumers: the looping-agent supervisor, the session message poller's
+//! PTY injection gate and the wind-down grid observation (both through
+//! `TerminalSession::looks_idle_quiescent` / `observe_grid_idle`, which add
+//! the quiescence debounce). A byte-identical copy used to live in
+//! `mcp/session_message_poller.rs` with a "extend BOTH sites" comment; it was
+//! deleted by plan `2026-09-13-drained-runner-never-reaches-idle` Phase 1, so
+//! there is now exactly one indicator list to extend.
 
 /// Working/processing indicators that mean Claude is mid-turn. If ANY appears
 /// on the rendered screen the terminal is NOT idle. Lowercased before match.
@@ -185,6 +187,52 @@ mod tests {
         assert!(!snapshot_looks_idle(&grid, 0));
         // Cursor at/below the prompt row ⇒ idle.
         assert!(snapshot_looks_idle(&grid, 2));
+    }
+
+    // The next four cases came over from the deleted poller copy of this
+    // predicate: they exercise the boxed input frame Claude Code actually
+    // renders rather than a bare `❯` row.
+
+    #[test]
+    fn boxed_input_frame_with_cursor_on_the_prompt_row_is_idle() {
+        let grid = lines(&[
+            "Some earlier output line.",
+            "Another line of a finished turn.",
+            "",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯                                          │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 4));
+    }
+
+    #[test]
+    fn working_line_vetoes_idle_even_with_a_boxed_prompt() {
+        let grid = lines(&[
+            "✻ Thinking…",
+            "  Reticulating splines… (esc to interrupt)",
+            "│ ❯                                          │",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 2));
+    }
+
+    #[test]
+    fn static_middot_chrome_beside_a_boxed_prompt_is_idle() {
+        let grid = lines(&[
+            "Context · 42% used",
+            "│ ❯                                          │",
+        ]);
+        assert!(snapshot_looks_idle(&grid, 1));
+    }
+
+    #[test]
+    fn streaming_output_with_no_prompt_is_not_idle() {
+        let grid = lines(&[
+            "Here is a long answer still being written",
+            "and another line of output",
+            "and more output",
+        ]);
+        assert!(!snapshot_looks_idle(&grid, 2));
     }
 
     #[test]

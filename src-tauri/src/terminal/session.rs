@@ -15,6 +15,8 @@ use tokio::sync::{broadcast, oneshot};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use portable_pty::CommandBuilder;
 use tauri::{AppHandle, Emitter};
+
+use crate::terminal::agent_status_sideband::ObservedAgentState;
 use tracing::{debug, info, warn};
 
 use super::exit_notice::{ExitNoticeSink, TauriExitSink};
@@ -1354,6 +1356,15 @@ pub struct TerminalSession {
     /// see the `terminal::scan_gate` module docs for why the ordering is
     /// load-bearing.
     grid_generation: Arc<AtomicU64>,
+    /// The last state-bearing OSC 9999 agent-status payload this pane reported
+    /// and when it arrived. Written by the reader thread
+    /// ([`crate::terminal::agent_status_sideband::dispatch`]); read by wind-down
+    /// eligibility through [`Self::last_agent_status`].
+    agent_status_last: Arc<Mutex<Option<ObservedAgentState>>>,
+    /// Grid-idle continuity for wind-down: extends an idle window only while the
+    /// grid generation has not moved between observations
+    /// ([`qontinui_runner_lib::wind_down::GridIdleTracker`]).
+    grid_idle_tracker: Mutex<qontinui_runner_lib::wind_down::GridIdleTracker>,
     /// Unix timestamp in milliseconds when the session was created.
     created_at: u64,
     /// Broadcast channel for HTTP/SSE subscribers to receive base64-encoded output chunks.
@@ -1770,6 +1781,9 @@ impl TerminalSession {
         // a clone for the OSC 9999 agent-status sideband: a payload for a
         // terminal with no coord mirror has nowhere to go and is dropped.
         let coord_session_id: Arc<Mutex<Option<uuid::Uuid>>> = Arc::new(Mutex::new(None));
+        // Runner-local last OSC 9999 state, written by the reader thread even
+        // when there is no coord mirror (wind-down reads it, not coord).
+        let agent_status_last: Arc<Mutex<Option<ObservedAgentState>>> = Arc::new(Mutex::new(None));
 
         // Spawn reader thread: reads PTY output → interceptor → scrollback + Tauri event
         let reader_id = id.clone();
@@ -1791,6 +1805,7 @@ impl TerminalSession {
         let reader_grid_generation = grid_generation.clone();
         let reader_osc_title_tx = first_osc_title_tx.clone();
         let reader_coord_session_id = coord_session_id.clone();
+        let reader_agent_status_last = agent_status_last.clone();
         // Per-session OSC 9999 coalescer — see
         // `terminal::agent_status_sideband::SidebandRateLimiter`. Lives on the
         // reader thread (plus its deferred-flush tasks), NOT in a
@@ -2088,6 +2103,7 @@ impl TerminalSession {
                                     crate::terminal::agent_status_sideband::dispatch(
                                         &reader_id,
                                         &reader_coord_session_id,
+                                        &reader_agent_status_last,
                                         &reader_agent_status_limiter,
                                         payload,
                                     );
@@ -2288,6 +2304,8 @@ impl TerminalSession {
             first_osc_title_tx,
             first_osc_title_rx,
             coord_session_id,
+            agent_status_last,
+            grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit,
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
@@ -4100,6 +4118,153 @@ impl TerminalSession {
         self.grid.clone()
     }
 
+    /// The rendered grid as `(lines, cursor_row)` — the input every idle
+    /// predicate reads. Lock-poison tolerant (reads the inner value) so a
+    /// poisoned grid never wedges a caller; the guard never crosses an await.
+    pub fn grid_text(&self) -> (Vec<String>, u16) {
+        let grid = self.grid();
+        let guard = grid.lock().unwrap_or_else(|e| e.into_inner());
+        let snap = guard.text_snapshot();
+        (snap.lines, snap.cursor_row)
+    }
+
+    /// Debounced idle gate: the grid looks idle
+    /// ([`qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle`]), and
+    /// after `debounce` it still looks idle AND renders identical text — nothing
+    /// streamed in between.
+    pub async fn looks_idle_quiescent(&self, debounce: std::time::Duration) -> bool {
+        self.quiescent_idle_read(debounce).await.0
+    }
+
+    /// [`Self::looks_idle_quiescent`] plus the grid generation read before the
+    /// first snapshot and after the last one, for continuity tracking.
+    async fn quiescent_idle_read(&self, debounce: std::time::Duration) -> (bool, u64, u64) {
+        use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
+
+        let generation_before = self.grid_generation();
+        let (lines_a, cursor_a) = self.grid_text();
+        if !snapshot_looks_idle(&lines_a, cursor_a) {
+            return (false, generation_before, self.grid_generation());
+        }
+        tokio::time::sleep(debounce).await;
+        let (lines_b, cursor_b) = self.grid_text();
+        let generation_after = self.grid_generation();
+        let idle =
+            snapshot_looks_idle(&lines_b, cursor_b) && lines_a == lines_b && cursor_a == cursor_b;
+        (idle, generation_before, generation_after)
+    }
+
+    /// One wind-down grid observation: the debounced idle gate folded through
+    /// this pane's [`qontinui_runner_lib::wind_down::GridIdleTracker`], so an
+    /// idle result carries how long the pane has provably been idle.
+    /// `observed_at_ms` is when the observation began. A poisoned tracker is
+    /// `GridIdle::Unknown`, never a fresh window.
+    pub async fn observe_grid_idle(
+        &self,
+        debounce: std::time::Duration,
+        observed_at_ms: i64,
+    ) -> qontinui_runner_lib::wind_down::GridIdle {
+        let (idle, before, after) = self.quiescent_idle_read(debounce).await;
+        match self.grid_idle_tracker.lock() {
+            Ok(mut tracker) => tracker.observe(idle, before, after, observed_at_ms),
+            Err(_) => qontinui_runner_lib::wind_down::GridIdle::Unknown,
+        }
+    }
+
+    /// The last state-bearing OSC 9999 payload this pane reported. `Ok(None)`
+    /// means it never reported one; `Err` means the slot could not be read.
+    pub fn last_agent_status(&self) -> Result<Option<ObservedAgentState>, String> {
+        self.agent_status_last
+            .lock()
+            .map(|slot| slot.clone())
+            .map_err(|e| format!("agent-status slot poisoned: {e}"))
+    }
+
+    /// Gracefully exit the `claude` in this pane, then close the tab (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, D5). Types `/exit`
+    /// through [`Self::write`], waits up to `deadline` for every `claude` in
+    /// the pane's subtree to leave, and only then closes the tab — which by
+    /// then holds a bare shell. If `claude` outlives the deadline the outcome
+    /// is `ExitStuck` and the process is LEFT RUNNING: this never kills a live
+    /// `claude`. See [`crate::terminal::graceful_exit`].
+    ///
+    /// The close here is this session's own [`Self::close`]; a caller that
+    /// must also drop the pane from `TerminalManager` passes that close to
+    /// [`Self::graceful_exit_then`] instead.
+    pub async fn graceful_exit(
+        self: &Arc<Self>,
+        deadline: std::time::Duration,
+    ) -> crate::terminal::graceful_exit::GracefulExitOutcome {
+        let session = Arc::clone(self);
+        self.graceful_exit_then(deadline, move || async move {
+            let id = session.id.clone();
+            if let Err(e) =
+                qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    session.close()
+                })
+                .await
+            {
+                warn!(terminal_id = %id, error = %e, "graceful_exit: tab close task failed");
+            }
+        })
+        .await
+    }
+
+    /// [`Self::graceful_exit`] with a caller-supplied tab close, invoked only
+    /// once no `claude` is left in the pane's subtree.
+    pub async fn graceful_exit_then<C, CF>(
+        &self,
+        deadline: std::time::Duration,
+        close_tab: C,
+    ) -> crate::terminal::graceful_exit::GracefulExitOutcome
+    where
+        C: FnOnce() -> CF,
+        CF: std::future::Future<Output = ()>,
+    {
+        let root = self.child_pid;
+        self.graceful_exit_driven(
+            deadline,
+            crate::terminal::graceful_exit::POLL_INTERVAL,
+            move || crate::terminal::graceful_exit::probe_claude_under(root),
+            close_tab,
+        )
+        .await
+    }
+
+    /// The seam the invariant tests drive: everything but the process probe is
+    /// the production path.
+    async fn graceful_exit_driven<P, PF, C, CF>(
+        &self,
+        deadline: std::time::Duration,
+        poll: std::time::Duration,
+        probe: P,
+        close_tab: C,
+    ) -> crate::terminal::graceful_exit::GracefulExitOutcome
+    where
+        P: FnMut() -> PF,
+        PF: std::future::Future<Output = crate::terminal::graceful_exit::ClaudeProbe>,
+        C: FnOnce() -> CF,
+        CF: std::future::Future<Output = ()>,
+    {
+        use crate::terminal::graceful_exit::{drive, GracefulExitOutcome};
+
+        info!(
+            terminal_id = %self.id,
+            deadline_s = deadline.as_secs(),
+            "graceful_exit: typing /exit"
+        );
+        let outcome = drive(|bytes| self.write(bytes), probe, close_tab, deadline, poll).await;
+        match &outcome {
+            GracefulExitOutcome::ExitStuck { claude_pids, .. } => warn!(
+                terminal_id = %self.id,
+                pids = ?claude_pids,
+                "graceful_exit: claude outlived the deadline — left RUNNING, tab not closed"
+            ),
+            other => info!(terminal_id = %self.id, outcome = ?other, "graceful_exit: done"),
+        }
+        outcome
+    }
+
     /// Check if the shell process is still alive.
     pub fn is_alive(&self) -> bool {
         self.is_alive.load(Ordering::Relaxed)
@@ -4802,6 +4967,8 @@ mod tests {
             first_osc_title_tx: Arc::new(Mutex::new(Some(osc_title_tx))),
             first_osc_title_rx: Arc::new(Mutex::new(Some(osc_title_rx))),
             coord_session_id: Arc::new(Mutex::new(None)),
+            agent_status_last: Arc::new(Mutex::new(None)),
+            grid_idle_tracker: Mutex::new(qontinui_runner_lib::wind_down::GridIdleTracker::new()),
             on_exit: Arc::new(Mutex::new(None)),
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             // No real Tauri app in unit fixtures — the input-line warn
@@ -4847,6 +5014,177 @@ mod tests {
             // intends.
             self.0.is_alive.store(false, Ordering::Relaxed);
         }
+    }
+
+    // ---- graceful_exit: never kill a live claude (plan 2026-09-13, D5) ----
+
+    /// A pane whose only observable effect is how many times it was killed.
+    #[derive(Default)]
+    struct KillCountingPaneIo(std::sync::atomic::AtomicUsize);
+
+    impl KillCountingPaneIo {
+        fn kills(&self) -> usize {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::terminal::pane_io::PaneIo for KillCountingPaneIo {
+        fn reader(&self) -> Result<Box<dyn Read + Send>, String> {
+            Ok(Box::new(std::io::empty()))
+        }
+        fn writer(&self) -> Result<Box<dyn Write + Send>, String> {
+            Ok(Box::new(std::io::sink()))
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+        fn wait(&self) -> Result<i32, String> {
+            Ok(0)
+        }
+        fn kill(&self, _budget: Duration) -> Result<(), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn set_paused(&self, _paused: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        fn credential_scrub(&self) -> crate::terminal::pane_io::CredentialScrub {
+            crate::terminal::pane_io::CredentialScrub::NoChildEnv
+        }
+        fn release(&self, _budget: Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A LIVE session fixture whose pane counts kills.
+    fn live_session_counting_kills(
+        buf: Arc<Mutex<Vec<u8>>>,
+    ) -> (Arc<TerminalSession>, Arc<KillCountingPaneIo>) {
+        let io = Arc::new(KillCountingPaneIo::default());
+        let mut session = make_test_session(buf);
+        let pane: Arc<dyn crate::terminal::pane_io::PaneIo> = io.clone();
+        session.io = pane;
+        session.is_alive.store(true, Ordering::Relaxed);
+        (Arc::new(session), io)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_never_kills_a_claude_that_outlives_the_deadline() {
+        use crate::terminal::graceful_exit::{ClaudeProbe, GracefulExitOutcome, EXIT_COMMAND};
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (session, io) = live_session_counting_kills(buf.clone());
+        let closer = Arc::clone(&session);
+        let outcome = session
+            .graceful_exit_driven(
+                Duration::from_secs(60),
+                Duration::from_millis(500),
+                || std::future::ready(ClaudeProbe::Live(vec![4242])),
+                move || async move { closer.close() },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, GracefulExitOutcome::ExitStuck { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(io.kills(), 0, "a live claude's pane was killed");
+        assert!(session.is_alive(), "the pane must be left running");
+        assert_eq!(buf.lock().unwrap().as_slice(), EXIT_COMMAND);
+
+        // Let the fixture drop without its Drop-time close.
+        session.is_alive.store(false, Ordering::Relaxed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_closes_the_tab_only_after_claude_left() {
+        use crate::terminal::graceful_exit::{ClaudeProbe, GracefulExitOutcome, EXIT_COMMAND};
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (session, io) = live_session_counting_kills(buf.clone());
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let io_for_probe = Arc::clone(&io);
+        let closer = Arc::clone(&session);
+        let outcome = session
+            .graceful_exit_driven(
+                Duration::from_secs(60),
+                Duration::from_millis(500),
+                || {
+                    // Every probe that still sees claude must see an unkilled pane.
+                    assert_eq!(io_for_probe.kills(), 0, "killed while claude was live");
+                    let n = probes.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(if n < 3 {
+                        ClaudeProbe::Live(vec![4242])
+                    } else {
+                        ClaudeProbe::Gone
+                    })
+                },
+                move || async move { closer.close() },
+            )
+            .await;
+
+        assert!(
+            matches!(outcome, GracefulExitOutcome::Exited { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(io.kills(), 1, "the bare shell is closed exactly once");
+        assert!(!session.is_alive());
+        assert_eq!(buf.lock().unwrap().as_slice(), EXIT_COMMAND);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn graceful_exit_on_an_exited_pane_fails_the_write_and_closes_nothing() {
+        use crate::terminal::graceful_exit::{ClaudeProbe, GracefulExitOutcome};
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let (session, io) = live_session_counting_kills(buf.clone());
+        session.is_alive.store(false, Ordering::Relaxed);
+        let closer = Arc::clone(&session);
+        let outcome = session
+            .graceful_exit_driven(
+                Duration::from_secs(60),
+                Duration::from_millis(500),
+                || std::future::ready(ClaudeProbe::Live(vec![4242])),
+                move || async move { closer.close() },
+            )
+            .await;
+        assert!(
+            matches!(outcome, GracefulExitOutcome::WriteFailed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(io.kills(), 0);
+        assert!(buf.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn observe_grid_idle_extends_only_while_the_grid_is_unchanged() {
+        use qontinui_runner_lib::wind_down::GridIdle;
+
+        let session = make_test_session(Arc::new(Mutex::new(Vec::new())));
+        {
+            let grid = session.grid();
+            let mut g = grid.lock().unwrap();
+            let mut parser = vte::Parser::new();
+            g.feed(&mut parser, "done.\r\n\u{276f} ".as_bytes());
+        }
+        let debounce = Duration::from_millis(10);
+        assert_eq!(
+            session.observe_grid_idle(debounce, 1_000).await,
+            GridIdle::Idle { since_ms: 1_000 }
+        );
+        assert_eq!(
+            session.observe_grid_idle(debounce, 9_000).await,
+            GridIdle::Idle { since_ms: 1_000 }
+        );
+        // A grid mutation between observations restarts the window.
+        session.grid_generation.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            session.observe_grid_idle(debounce, 20_000).await,
+            GridIdle::Idle { since_ms: 20_000 }
+        );
     }
 
     /// Drive a `SyncFrameCoalescer` across a sequence of `(data, offset,

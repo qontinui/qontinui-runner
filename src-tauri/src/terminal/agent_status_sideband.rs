@@ -182,6 +182,49 @@ pub fn parse_sideband(raw: &str) -> Option<AgentStatus> {
     Some(status)
 }
 
+// ---- Runner-local last state ----------------------------------------------
+
+/// The most recent `state` a terminal reported over this sideband, and when it
+/// arrived. Runner-local and in-memory: it dies with the terminal.
+///
+/// Read by wind-down eligibility (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, D4 condition (b)): a
+/// `working` state rules a session out, and a later non-working state restarts
+/// the grace clock. A payload with no `state` (tool name / digest only) does
+/// not touch the slot — it says nothing about working vs not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedAgentState {
+    /// Canonical coord vocabulary: `working | blocked | stalled |
+    /// waiting_human | finished`.
+    pub state: String,
+    /// Unix millis at which the runner parsed it.
+    pub set_at_ms: i64,
+}
+
+impl ObservedAgentState {
+    pub fn is_working(&self) -> bool {
+        self.state == "working"
+    }
+}
+
+/// Latest-wins update of a terminal's last-state slot. A poisoned slot is left
+/// as is: its reader reports it as unreadable rather than stale.
+pub fn record_observed_state(
+    slot: &Mutex<Option<ObservedAgentState>>,
+    status: &AgentStatus,
+    now_ms: i64,
+) {
+    let Some(state) = &status.state else {
+        return;
+    };
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(ObservedAgentState {
+            state: state.clone(),
+            set_at_ms: now_ms,
+        });
+    }
+}
+
 // ---- Rate limiting -------------------------------------------------------
 
 /// What the caller must do with an offered status.
@@ -261,24 +304,32 @@ impl SidebandRateLimiter {
 /// `tauri::async_runtime::spawn` detachment `context_watcher` uses to keep
 /// coord round-trips off the grid tick.
 ///
-/// Silently drops the payload when the terminal has no coord mirror
-/// (`coord_session_id` still `None` — registration never happened or failed).
-/// No error, no retry: there is nowhere to send it.
+/// Every state-bearing payload first updates the terminal's runner-local
+/// `last_state` slot ([`record_observed_state`]) — before the coord mirror
+/// check and before the rate limiter, because wind-down eligibility reads the
+/// LATEST state the terminal reported whether or not coord can be told.
+///
+/// The coord push is then silently dropped when the terminal has no coord
+/// mirror (`coord_session_id` still `None` — registration never happened or
+/// failed). No error, no retry: there is nowhere to send it.
 pub fn dispatch(
     terminal_id: &str,
     coord_session_id: &Arc<Mutex<Option<Uuid>>>,
+    last_state: &Mutex<Option<ObservedAgentState>>,
     limiter: &Arc<Mutex<SidebandRateLimiter>>,
     raw: String,
 ) {
-    let Some(coord_id) = coord_session_id.lock().ok().and_then(|slot| *slot) else {
-        return;
-    };
     // NB: `raw` is untrusted PTY bytes and is never logged.
     let Some(status) = parse_sideband(&raw) else {
         debug!(
             terminal = %terminal_id,
             "agent_status_sideband: OSC 9999 payload dropped (unparseable or no usable field)"
         );
+        return;
+    };
+    record_observed_state(last_state, &status, chrono::Utc::now().timestamp_millis());
+
+    let Some(coord_id) = coord_session_id.lock().ok().and_then(|slot| *slot) else {
         return;
     };
 
@@ -364,6 +415,35 @@ mod tests {
             state: Some(state.to_string()),
             ..Default::default()
         }
+    }
+
+    // ---- runner-local last state -----------------------------------------
+
+    #[test]
+    fn last_state_is_latest_wins_and_ignores_stateless_payloads() {
+        let slot = Mutex::new(None);
+        record_observed_state(&slot, &status("working"), 100);
+        assert_eq!(
+            *slot.lock().unwrap(),
+            Some(ObservedAgentState {
+                state: "working".into(),
+                set_at_ms: 100
+            })
+        );
+        assert!(slot.lock().unwrap().as_ref().unwrap().is_working());
+
+        // A tool-name-only payload says nothing about working vs not.
+        let stateless = AgentStatus {
+            tool_name: Some("Bash".into()),
+            ..Default::default()
+        };
+        record_observed_state(&slot, &stateless, 200);
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().set_at_ms, 100);
+
+        record_observed_state(&slot, &status("finished"), 300);
+        let last = slot.lock().unwrap().clone().unwrap();
+        assert_eq!((last.state.as_str(), last.set_at_ms), ("finished", 300));
+        assert!(!last.is_working());
     }
 
     // ---- parsing ---------------------------------------------------------

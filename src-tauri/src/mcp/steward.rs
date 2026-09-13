@@ -174,6 +174,19 @@ fn steward_meta_store() -> &'static Mutex<HashMap<String, StewardMeta>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Terminal ids of every steward session this runner started and still
+/// tracks — the steward half of wind-down's session-kind resolution
+/// (`mcp/restart_readiness.rs`). May name a terminal that has since exited;
+/// callers join it against live terminals. A poisoned store yields an empty
+/// set, which classifies every session as an ordinary terminal session — the
+/// strictest kind, since it alone must be declared `finished`.
+pub(crate) fn steward_terminal_ids() -> std::collections::HashSet<String> {
+    steward_meta_store()
+        .lock()
+        .map(|guard| guard.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 /// Kinds whose `start` is currently in flight.
 ///
 /// The single-instance guard cannot be enforced by the metadata store alone:
