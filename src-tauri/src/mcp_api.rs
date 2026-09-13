@@ -3204,6 +3204,19 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// by a human hitting `-32601`, and a correction door that answers `-32601` is
 /// indistinguishable, from inside a session, from one that does not exist.
 ///
+/// `coord_repoint_gate` is IN for the gate-verb family's reason, one verb later
+/// (qontinui-coord#2056, plan
+/// `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-a-fifo-queue-and-a-gate-that-cannot-be-re-armed`
+/// Phase 3a). It moves an OPEN gate's predicate to where a superseded PR went,
+/// carrying the continuation, and withdraws the source — the ONLY way to re-arm a
+/// superseded watch, because `continuation_spawn` is write-once at registration.
+/// coord grants it on the device floor and its core enforces the REGISTRANT rule
+/// (the same floor `coord_withdraw_gate`, already here, rests on), so forwarding it
+/// reaches only gates this device registered. Withheld, the remedy
+/// `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names would
+/// answer `-32601` from inside the product — the supersede would keep losing its
+/// arm silently, which is the defect the verb exists to end.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -3273,6 +3286,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_register_gate",
     "coord_reject_gate",
     "coord_reopen_gate",
+    "coord_repoint_gate",
     "coord_report_status",
     "coord_request_handoff",
     "coord_resolve_origin",
@@ -12420,6 +12434,9 @@ mod coord_mcp_body_gate_tests {
             // forwards.
             "coord_force_clear_gate",
             "coord_set_gate_audience",
+            // The registrant-only re-point (coord#2056): the only way to carry a
+            // superseded gate's continuation onto the replacement PR.
+            "coord_repoint_gate",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
