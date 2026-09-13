@@ -137,9 +137,24 @@
 # 404 reads misleadingly like "no gates at all".)
 name: CI Integrity
 
+# NO BASE-BRANCH FILTER, deliberately. This used to read
+# `pull_request_target: branches: [main]`, which produces NO run at all on a
+# STACKED PR whose base is another feature branch — and this repo actively
+# stacks PRs (stacked-pr-fastlane.yml). That meant a PR editing a gating
+# workflow, or `scripts/check_untimed_subprocess.py`, got no integrity signal
+# for as long as it sat in a stack. Re-targeting it to `main` later does NOT
+# rescue that: a re-target fires the `edited` activity type, and a
+# `pull_request_target` trigger with no explicit `types:` listens only for
+# `opened`, `synchronize` and `reopened`. So the guard would only ever fire on
+# the next PUSH to the stacked branch, if one happened at all.
+#
+# forbid-untimed-subprocess.yml delegates its entire verdict to a guarded
+# SCRIPT and cites this guard as its self-protection, so the filter became
+# load-bearing and is removed rather than reasoned around. The job is an API
+# read of one PR's changed-file list; running it on stacked PRs too costs
+# seconds. (qontinui-runner#1253)
 on:
   pull_request_target:
-    branches: [main]
     paths:
       - '.github/workflows/**'
       # Composite actions are gate logic too: a gating workflow that delegates a
@@ -147,6 +162,15 @@ on:
       # inside required contexts. Without this glob a PR touching ONLY an action
       # would not even trigger this guard.
       - '.github/actions/**'
+      # Same argument one level out: forbid-untimed-subprocess.yml delegates its
+      # entire verdict to a script in scripts/. A PR that edits ONLY that script
+      # — narrowing BLOCKING_WAITS, loosening the receiver resolver, widening
+      # what suppresses a finding — would not match either glob above, so the
+      # guard would never even run. Listed explicitly rather than globbing
+      # scripts/**, which is full of non-gating tooling. The scope filter in the
+      # job body carries the same path as a `case` arm — a `paths:` entry alone
+      # would trigger the run and then be silently dropped by that filter.
+      - 'scripts/check_untimed_subprocess.py'
 
 permissions:
   contents: read
@@ -237,6 +261,10 @@ jobs:
             [ -z "${f}" ] && continue
             case "${f}" in
               .github/workflows/*|.github/actions/*) ;;
+              # The one script that IS a gate: forbid-untimed-subprocess.yml's
+              # whole verdict lives in it. Kept in step with the `paths:`
+              # trigger above — either half alone guards nothing.
+              scripts/check_untimed_subprocess.py) ;;
               *) continue ;;
             esac
             if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi
