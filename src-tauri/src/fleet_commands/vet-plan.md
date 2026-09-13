@@ -70,20 +70,32 @@ a session launched outside the runner will not have them.
 >   for a hand-`POST`ed row) — and **read `corpus_health`**: a `plan_count` far
 >   below the `ls-tree` count is a FROZEN corpus, and the sentence to write is
 >   that observation. Never `q=<stem>`: it matches title and body, not the slug.
->   Then read **`corpus_health.scan_roots`** for the plan's scan source — the
->   `source_repo` of where the plan sits on `origin`, as `<repo>/<dir>` (a plan
->   under `qontinui-dev-notes/plans/` is `qontinui-dev-notes/plans`). A plan
->   absent from the corpus stays UNKNOWN, not absent, when `corpus_health` is
->   `null` (quote its `corpus_health_unavailable_reason`), when
->   `scan_roots.state` is `unknown` (`read_failed:` or `no_observation:` — its
->   `by_source_repo` is then `[]`, which is not "nothing to check"), when
->   `by_source_repo` holds no roll-up for that source, or when that roll-up
->   reads `unknown`, has a `null` `min_behind`, or a `min_behind` above 0 (a
->   lower bound unless `min_behind_is_floor` is `false`). Even an exact 0 holds
->   only as of the `ref_sha` its least-behind feeders counted against (in
->   `scan_roots.rows`), never the live tip: call the plan absent only when its
->   commit on `origin` is an ancestor of that ref —
->   `git -C qontinui-dev-notes merge-base --is-ancestor "$(git -C qontinui-dev-notes log -1 --format=%H origin/main -- plans/<stem>.md)" <ref_sha>`.
+>   Then read **`corpus_health.scan_roots`** (under `data.` on the runner door)
+>   for the plan's scan source — the `source_repo` of where the plan sits on
+>   `origin`, as `<repo>/<dir>` (a plan under `qontinui-dev-notes/plans/` is
+>   `qontinui-dev-notes/plans`). A plan the corpus does not hold is **absent
+>   only when ALL of these hold**, and UNKNOWN otherwise:
+>   1. `corpus_health` and its `scan_roots` are both present — a backend
+>      predating either omits the key, and `/candidates` can serve
+>      `corpus_health: null` with `corpus_health_unavailable_reason` beside it —
+>      and `scan_roots.state` is not `unknown` (`read_failed:` and
+>      `no_observation:` serve `by_source_repo: []`, which is not "nothing to
+>      check");
+>   2. `scan_roots.rows` holds a comparable feeder for that source (`source_repo`
+>      equal to it, `reported_state: measured`, `observation_fresh: true`,
+>      `last_report_applied: true`) whose `head_sha` contains the commit that
+>      ADDED the plan. After `git -C qontinui-dev-notes fetch`, run
+>      `git -C qontinui-dev-notes merge-base --is-ancestor "$(git -C qontinui-dev-notes log --diff-filter=A --format=%H origin/main -- plans/<stem>.md | tail -1)" <head_sha>`:
+>      exit 0 is contained, 1 is not, anything else (an empty `$(…)`, a sha this
+>      clone lacks) is UNKNOWN;
+>   3. and the counts the next bullet requires agree — a feeder tree holding the
+>      plan is necessary, not proof: that feeder's body sync and the tenant's
+>      `plan_capture` dial must also have been on.
+>
+>   The source's `by_source_repo` roll-up says how much is in doubt: a
+>   `min_behind` above 0 (a lower bound unless `min_behind_is_floor` is
+>   `false`), or a roll-up reading `unknown`, means plans newer than its
+>   feeders' trees may be missing. Quote it beside any UNKNOWN.
 > * **A zero is UNKNOWN until a count says otherwise.** The body sync that fills
 >   `agent.work_artifacts` is a property of each writing device's runner build
 >   (opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before plan
