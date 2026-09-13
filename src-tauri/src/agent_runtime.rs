@@ -1483,6 +1483,19 @@ fn spawn_run_task(payload: LaunchPayload) {
         agent_id,
         payload.worktrees.len()
     );
+    // A DUPLICATE delivery of a launch this runner is already running (coord
+    // re-dispatches on reconnect) is refused HERE, before `agent_stops` is
+    // touched: inserting would overwrite the live run's stop token, and every
+    // refusal arm below removes the entry — which would strip the RUNNING
+    // copy's token and make it unstoppable. It is NOT reported as spawn-failed:
+    // the original run is alive, and a failure post would tell coord otherwise.
+    if launch_delivery_is_duplicate(agent_id) {
+        info!(
+            "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate delivery \
+             of a launch already live on this runner — ignored, original run left untouched"
+        );
+        return;
+    }
     let stop = tokio_util::sync::CancellationToken::new();
     agent_stops().lock().unwrap().insert(agent_id, stop.clone());
     tokio::spawn(async move {
@@ -1550,7 +1563,18 @@ fn spawn_run_task(payload: LaunchPayload) {
             &crate::resource_guard::thread_pressure,
         ) {
             Ok(slot) => slot,
-            Err(reason) => {
+            Err(LaunchRefusal::Duplicate) => {
+                // A copy of this agent_id was admitted between the synchronous
+                // duplicate check above and here. The stop-token entry now
+                // belongs to that live copy, so it is left in place, and
+                // nothing is reported: that run is alive.
+                info!(
+                    "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate \
+                     delivery (admitted concurrently) — ignored, original run left untouched"
+                );
+                return;
+            }
+            Err(LaunchRefusal::Deferred(reason)) => {
                 info!(
                     "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
                      machine load, NOT launched — {reason}"
@@ -2254,7 +2278,7 @@ fn evaluate_continuation_guard(
     // Admitted coord LAUNCHES count toward the same cap: both populations are
     // unattended coord-dispatched sessions spending the same machine, and a cap
     // that one of them can walk past is not a bound on the box.
-    let live_count = live_count + admitted_launch_count(None);
+    let live_count = live_count + admitted_launch_count();
 
     // Thread pressure next, then the count cap — shared with the launch path
     // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
@@ -2275,7 +2299,7 @@ fn evaluate_continuation_guard(
 /// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
 /// then the live-session count cap. Shared by the gate-continuation guard
 /// ([`evaluate_continuation_guard`], which runs its anchor dedup first) and the
-/// coord launch guard ([`evaluate_launch_guard`]), so the two paths can never
+/// coord launch guard ([`admit_launch`]), so the two paths can never
 /// disagree about when the machine is too loaded to take another unattended
 /// session.
 #[derive(Debug, PartialEq, Eq)]
@@ -2333,30 +2357,51 @@ fn evaluate_load_guard(
     LoadGuard::Proceed
 }
 
-/// Process-wide set of coord LAUNCHES (`spawn_requested` payloads) that passed
-/// [`evaluate_launch_guard`] and whose run task has not finished. Distinct from
+/// Process-wide registry of coord LAUNCHES (`spawn_requested` payloads) that
+/// passed [`admit_launch`] and whose run task has not finished, keyed by
+/// `agent_id` and valued by the admitting slot's unique token. Distinct from
 /// [`agent_stops`], which is populated synchronously in the WS pump BEFORE the
 /// guard runs: counting that map would make every launch of a burst see the
 /// whole burst and refuse all of it. Only ADMITTED launches count.
-fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashSet<uuid::Uuid>> {
-    static LAUNCHES: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>> =
-        std::sync::OnceLock::new();
-    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+///
+/// The token is what makes a release exact: an [`AdmittedLaunchSlot`] removes
+/// the entry only while it still carries ITS token, so a release can never
+/// free a slot another run holds under the same `agent_id`.
+fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>> {
+    static LAUNCHES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>,
+    > = std::sync::OnceLock::new();
+    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Count of admitted launches, excluding `except` (a launch re-evaluating
-/// itself must not count its own slot).
-fn admitted_launch_count(except: Option<uuid::Uuid>) -> usize {
-    let set = lock_recover(admitted_launches(), "admitted_launches");
-    match except {
-        Some(id) if set.contains(&id) => set.len() - 1,
-        _ => set.len(),
+/// Source of [`AdmittedLaunchSlot`] tokens; unique for the process lifetime.
+static NEXT_ADMITTED_LAUNCH_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Count of admitted launches.
+fn admitted_launch_count() -> usize {
+    lock_recover(admitted_launches(), "admitted_launches").len()
+}
+
+/// Release the admitted slot `token` holds for `agent_id` — a no-op when the
+/// entry is absent or carries a different token (it is not this slot's).
+fn release_admitted_launch(agent_id: uuid::Uuid, token: u64) {
+    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
+    if launches.get(&agent_id) == Some(&token) {
+        launches.remove(&agent_id);
     }
 }
 
-/// Release a launch's admitted slot once its run task has finished.
-fn release_admitted_launch(agent_id: uuid::Uuid) {
-    lock_recover(admitted_launches(), "admitted_launches").remove(&agent_id);
+/// Is a launch delivery for `agent_id` a DUPLICATE of one already live on this
+/// runner? True when the id holds an admitted slot, or a stop token (a copy
+/// still in spawn authorization, not yet admitted). `spawn_run_task` asks this
+/// before it touches [`agent_stops`], so a duplicate can neither overwrite nor
+/// remove the live copy's stop token.
+fn launch_delivery_is_duplicate(agent_id: uuid::Uuid) -> bool {
+    if lock_recover(admitted_launches(), "admitted_launches").contains_key(&agent_id) {
+        return true;
+    }
+    lock_recover(agent_stops(), "agent_stops").contains_key(&agent_id)
 }
 
 /// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
@@ -2369,29 +2414,6 @@ fn release_admitted_launch(agent_id: uuid::Uuid) {
 /// `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
 /// Phase 1c. Rewording it silently turns every deferral into a terminal failure.
 const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
-
-/// The pre-spawn guard for a coord LAUNCH: prune dead continuations, then the
-/// shared [`evaluate_load_guard`] over every live unattended session
-/// (continuations plus other admitted launches). On `Proceed` the launch is
-/// recorded in [`admitted_launches`] so later launches count it; the caller
-/// releases it with [`release_admitted_launch`] when the run task ends.
-///
-/// No anchor dedup: a launch payload is already deduped by coord per
-/// `agent_id`, and has no anchor key.
-fn evaluate_launch_guard(
-    agent_id: uuid::Uuid,
-    is_live: &dyn Fn(&str) -> bool,
-    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> LoadGuard {
-    prune_dead_continuations(is_live);
-    let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
-    let live = continuations + admitted_launch_count(Some(agent_id));
-    let verdict = evaluate_load_guard(live, thread_pressure);
-    if verdict == LoadGuard::Proceed {
-        lock_recover(admitted_launches(), "admitted_launches").insert(agent_id);
-    }
-    verdict
-}
 
 /// The `spawn-failed` reason for a load-refused launch, or `None` when the
 /// verdict admits it.
@@ -2414,31 +2436,68 @@ fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
 }
 
 /// RAII hold on an admitted launch's slot in [`admitted_launches`]. Dropping it
-/// releases the slot on every exit route, a panic unwinding the run task
-/// included.
+/// releases the slot exactly once on every exit route, a panic unwinding the
+/// run task included — and only its OWN entry (matched by `token`).
 #[derive(Debug)]
-struct AdmittedLaunchSlot(uuid::Uuid);
+struct AdmittedLaunchSlot {
+    agent_id: uuid::Uuid,
+    token: u64,
+}
 
 impl Drop for AdmittedLaunchSlot {
     fn drop(&mut self) {
-        release_admitted_launch(self.0);
+        release_admitted_launch(self.agent_id, self.token);
     }
 }
 
+/// Why [`admit_launch`] refused a launch.
+#[derive(Debug, PartialEq, Eq)]
+enum LaunchRefusal {
+    /// `agent_id` already holds an admitted slot: a duplicate delivery of a
+    /// live run. Not reported to coord — the original run is alive.
+    Duplicate,
+    /// The machine-load guard refused; carries the `deferred_load:` reason to
+    /// report as a re-offerable `spawn-failed`.
+    Deferred(String),
+}
+
 /// The launch admission decision `spawn_run_task` takes before
-/// `run_agent_subprocess`: `Ok(slot)` admits (the slot is held until dropped),
-/// `Err(reason)` refuses with the `deferred_load:` reason to report, holding
-/// no slot.
+/// `run_agent_subprocess`: prune dead continuations, then — under ONE hold of
+/// the [`admitted_launches`] lock — refuse a duplicate `agent_id`, count every
+/// live unattended session (continuations plus admitted launches), run the
+/// shared [`evaluate_load_guard`], and on `Proceed` insert this launch's slot.
+/// Count and insert share the hold, so two launches racing for the last slot
+/// cannot both be admitted.
+///
+/// That hold spans the thread reading `evaluate_load_guard` takes. Accepted:
+/// the lock is contended only by other launch admissions, slot releases and the
+/// continuation guard's count read — never by the WS pump — and exactness is
+/// what the hold buys. Lock order is `admitted_launches` then
+/// `continuation_sessions`; the continuation guard releases its registry lock
+/// before reading the launch count, so the two never invert.
+///
+/// No anchor dedup: a launch payload has no anchor key; its identity is
+/// `agent_id`.
+///
+/// `Ok(slot)` admits (held until dropped); `Err` refuses holding no slot.
 fn admit_launch(
     agent_id: uuid::Uuid,
     is_live: &dyn Fn(&str) -> bool,
     thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> Result<AdmittedLaunchSlot, String> {
-    let verdict = evaluate_launch_guard(agent_id, is_live, thread_pressure);
-    match launch_deferral_reason(&verdict) {
-        None => Ok(AdmittedLaunchSlot(agent_id)),
-        Some(reason) => Err(reason),
+) -> Result<AdmittedLaunchSlot, LaunchRefusal> {
+    prune_dead_continuations(is_live);
+    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
+    if launches.contains_key(&agent_id) {
+        return Err(LaunchRefusal::Duplicate);
     }
+    let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
+    let verdict = evaluate_load_guard(continuations + launches.len(), thread_pressure);
+    if let Some(reason) = launch_deferral_reason(&verdict) {
+        return Err(LaunchRefusal::Deferred(reason));
+    }
+    let token = NEXT_ADMITTED_LAUNCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    launches.insert(agent_id, token);
+    Ok(AdmittedLaunchSlot { agent_id, token })
 }
 
 /// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
@@ -10182,18 +10241,10 @@ mod tests {
         let live_all = |_id: &str| true;
         let agent = uuid::Uuid::now_v7();
 
-        let verdict = evaluate_launch_guard(agent, &live_all, &|| thread_verdict(Some(300)));
-        assert!(
-            matches!(
-                verdict,
-                LoadGuard::ThreadPressure {
-                    severity: "warn",
-                    ..
-                }
-            ),
-            "300 threads must defer a launch, got {verdict:?}"
-        );
-        let reason = launch_deferral_reason(&verdict).expect("a refusal has a reason");
+        let reason = match admit_launch(agent, &live_all, &|| thread_verdict(Some(300))) {
+            Err(LaunchRefusal::Deferred(reason)) => reason,
+            other => panic!("300 threads must defer a launch, got {other:?}"),
+        };
         assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
         assert_eq!(reason, "deferred_load:thread_pressure:warn:300_over_256");
         assert!(
@@ -10201,7 +10252,7 @@ mod tests {
             "the wire reason carries no whitespace"
         );
         assert_eq!(
-            admitted_launch_count(None),
+            admitted_launch_count(),
             0,
             "a refused launch must not hold a slot"
         );
@@ -10224,20 +10275,22 @@ mod tests {
             thread_verdict(Some(540))
         });
         assert_eq!(
-            refused.as_ref().err().map(String::as_str),
-            Some("deferred_load:thread_pressure:critical:540_over_400")
+            refused.err(),
+            Some(LaunchRefusal::Deferred(
+                "deferred_load:thread_pressure:critical:540_over_400".into()
+            ))
         );
-        assert_eq!(admitted_launch_count(None), 0);
+        assert_eq!(admitted_launch_count(), 0);
 
         let agent = uuid::Uuid::now_v7();
         let result = std::panic::catch_unwind(|| {
             let _slot = admit_launch(agent, &live_all, &calm).expect("calm machine admits");
-            assert_eq!(admitted_launch_count(None), 1, "the admitted slot is held");
+            assert_eq!(admitted_launch_count(), 1, "the admitted slot is held");
             panic!("simulated run-task panic");
         });
         assert!(result.is_err());
         assert_eq!(
-            admitted_launch_count(None),
+            admitted_launch_count(),
             0,
             "a panic must not leak the admitted slot"
         );
@@ -10263,9 +10316,8 @@ mod tests {
         );
     }
 
-    /// Phase 1c: the count lane binds launches — continuations and other
-    /// admitted launches both count, the launch's own slot does not, and a
-    /// released slot re-admits.
+    /// Phase 1c: the count lane binds launches — continuations and admitted
+    /// launches both count, and a released slot re-admits.
     #[test]
     fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
         let _env_lock = env_lock();
@@ -10277,23 +10329,18 @@ mod tests {
 
         register_continuation_session("cont-1".into(), Some("anchor-1".into()), None);
         let first = uuid::Uuid::now_v7();
-        assert_eq!(
-            evaluate_launch_guard(first, &live_all, &calm),
-            LoadGuard::Proceed,
-            "1 live of cap 2 admits"
-        );
+        let first_slot = admit_launch(first, &live_all, &calm).expect("1 live of cap 2 admits");
         assert_eq!(launch_deferral_reason(&LoadGuard::Proceed), None);
-        // Re-evaluating an already-admitted launch does not count itself.
-        assert_eq!(
-            evaluate_launch_guard(first, &live_all, &calm),
-            LoadGuard::Proceed
-        );
 
         let second = uuid::Uuid::now_v7();
-        let verdict = evaluate_launch_guard(second, &live_all, &calm);
-        assert_eq!(verdict, LoadGuard::AtCap { cap: 2, live: 2 });
         assert_eq!(
-            launch_deferral_reason(&verdict).as_deref(),
+            admit_launch(second, &live_all, &calm).err(),
+            Some(LaunchRefusal::Deferred(
+                "deferred_load:at_cap:2_of_2".into()
+            ))
+        );
+        assert_eq!(
+            launch_deferral_reason(&LoadGuard::AtCap { cap: 2, live: 2 }).as_deref(),
             Some("deferred_load:at_cap:2_of_2")
         );
 
@@ -10303,12 +10350,112 @@ mod tests {
             ContinuationGuard::AtCap(2)
         );
 
-        release_admitted_launch(first);
+        drop(first_slot);
+        let second_slot = admit_launch(second, &live_all, &calm)
+            .expect("a released slot re-admits the deferred launch");
+        drop(second_slot);
+        assert_eq!(admitted_launch_count(), 0);
+        clear_continuation_registry();
+    }
+
+    /// Round-2 review: a DUPLICATE delivery of a live launch (coord re-dispatch
+    /// on reconnect) is refused without sharing, freeing, or displacing the
+    /// live copy's state — its stop token survives, it is not admitted a
+    /// second time, and the count stays exact.
+    #[test]
+    fn duplicate_launch_delivery_is_refused_and_keeps_the_live_stop_token() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let agent = uuid::Uuid::now_v7();
+
+        // A stop token registered but not yet admitted (authorization window)
+        // already makes a second delivery a duplicate.
+        let live_stop = tokio_util::sync::CancellationToken::new();
+        agent_stops()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, live_stop.clone());
+        assert!(launch_delivery_is_duplicate(agent));
+
+        // The first copy is admitted and running.
+        let live_slot = admit_launch(agent, &live_all, &calm).expect("first copy admits");
+        assert!(launch_delivery_is_duplicate(agent));
+
+        // The duplicate delivery is refused as a duplicate, not deferred, and
+        // is not admitted into a second slot.
         assert_eq!(
-            evaluate_launch_guard(second, &live_all, &calm),
-            LoadGuard::Proceed,
-            "a released slot re-admits the deferred launch"
+            admit_launch(agent, &live_all, &calm).err(),
+            Some(LaunchRefusal::Duplicate)
         );
+        assert_eq!(admitted_launch_count(), 1, "one live run, one slot");
+
+        // The live copy's stop token is still the registered one.
+        {
+            let stops = agent_stops().lock().unwrap_or_else(|p| p.into_inner());
+            let registered = stops.get(&agent).expect("live stop token still present");
+            registered.cancel();
+        }
+        assert!(
+            live_stop.is_cancelled(),
+            "the registered token is the live copy's own"
+        );
+
+        drop(live_slot);
+        agent_stops()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&agent);
+        assert_eq!(admitted_launch_count(), 0);
+        assert!(!launch_delivery_is_duplicate(agent));
+        clear_continuation_registry();
+    }
+
+    /// Round-2 review: releases stay balanced and exact. Every admission path
+    /// ends with the count back at 0, and a slot's release removes only its
+    /// OWN entry — a stale slot for the same `agent_id` cannot free a newer
+    /// run's slot.
+    #[test]
+    fn admitted_launch_releases_stay_balanced_and_token_exact() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let agent = uuid::Uuid::now_v7();
+
+        // Admitted then duplicate-refused: both paths end, count returns to 0.
+        let slot = admit_launch(agent, &live_all, &calm).expect("admits");
+        let dup = admit_launch(agent, &live_all, &calm);
+        assert_eq!(dup.as_ref().err(), Some(&LaunchRefusal::Duplicate));
+        drop(dup);
+        assert_eq!(
+            admitted_launch_count(),
+            1,
+            "a refused duplicate frees nothing"
+        );
+        let stale_token = slot.token;
+        drop(slot);
+        assert_eq!(admitted_launch_count(), 0);
+
+        // A later run under the same id is not freed by a stale release.
+        let newer = admit_launch(agent, &live_all, &calm).expect("re-admits");
+        assert_ne!(newer.token, stale_token);
+        drop(AdmittedLaunchSlot {
+            agent_id: agent,
+            token: stale_token,
+        });
+        assert_eq!(
+            admitted_launch_count(),
+            1,
+            "a stale slot's release must not remove the newer run's entry"
+        );
+        drop(newer);
+        assert_eq!(admitted_launch_count(), 0);
         clear_continuation_registry();
     }
 
