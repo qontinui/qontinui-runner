@@ -1419,7 +1419,11 @@ async fn observe_verify_with_base<L: RegistryTokenLookup + ?Sized>(
         stderr: String::new(),
     };
 
-    let client = CoordInstallClient::new(coord_base.to_string())?;
+    // Phase 6 — the install's own checkout names the tenant. `repo_path` is
+    // empty only on the degraded no-PreContext path, where the scope is
+    // honestly unresolved rather than the machine default.
+    let scope = crate::repo_detection::tenant_scope_for_path(&repo_path).await;
+    let client = CoordInstallClient::new(coord_base.to_string(), scope)?;
     // No registry creds are injected for the observe probes here — interception
     // observes the agent's already-authed install; the agent's shell owns its
     // registry config (plan §4 Phase-4 note). An empty env is correct.
@@ -1620,6 +1624,11 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
             let registry_env_owned = registry_env.clone();
             let req_for_declare = req.clone();
             tokio::spawn(async move {
+                // Phase 6 — resolved HERE, inside the deferred task, never on
+                // the request the agent's shell is blocked on: it costs a `git`
+                // probe and, on a cold cache, a coord read, and "observe never
+                // blocks" is this path's whole contract.
+                let scope = crate::repo_detection::tenant_scope_for_path(&repo_path_buf).await;
                 let ground_truth = {
                     let rp = repo_path_buf.clone();
                     let pkgs = packages.clone();
@@ -1670,7 +1679,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
                 // BEST-EFFORT (the §6 change): declare/predict errors are LOGGED
                 // here, never surfaced — a coord-down observe install must still
                 // proceed and record best-effort.
-                let client = match CoordInstallClient::new(coord_base_owned) {
+                let client = match CoordInstallClient::new(coord_base_owned, scope) {
                     Ok(c) => c,
                     Err(e) => {
                         warn!(
@@ -1740,6 +1749,14 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         }));
     }
 
+    // Phase 6 — the tenant that owns the checkout being installed into, for
+    // every coord write the synchronous path makes. Resolved only NOW: after
+    // the OFF short-circuit (which makes no coord write at all) and after the
+    // observe fast path (which resolves it inside its own deferred task), so
+    // neither of those pays a `git` probe or a cold coord read, and
+    // `effective_mode` above is read before this function's first await.
+    let scope = crate::repo_detection::tenant_scope_for_path(repo_path).await;
+
     // ---- Phase 2: read-only dry-run + native-audit probes --------------------
     // Shell out the package manager's own `--dry-run` (+ `audit`) on a blocking
     // thread and feed the captured output to the pure parsers. Best-effort: a
@@ -1792,7 +1809,7 @@ async fn run_with_base<L: RegistryTokenLookup + ?Sized>(
         .unwrap_or_default();
 
     // ---- declare + predict-and-check FIRST (both load-bearing) ---------------
-    let client = CoordInstallClient::new(coord_base.to_string())?;
+    let client = CoordInstallClient::new(coord_base.to_string(), scope)?;
     let declare_req = build_declare(
         pm,
         &req,
@@ -1976,6 +1993,9 @@ async fn observe_and_verify(
         let fs_req = FsObservationsRequest {
             correlation_id: Some(ctx.correlation_id),
             repo: Some(ctx.repo.clone()),
+            // Filled from the client's resolved scope inside
+            // `push_fs_observations` — one derivation, one source.
+            tenant_id: None,
             observations: fs_observations,
         };
         client.push_fs_observations(&fs_req).await;
@@ -3631,6 +3651,28 @@ mod tests {
         assert!(paths.contains(&"Cargo.lock"), "{paths:?}");
         // Each carries a post_sha.
         assert!(obs.iter().all(|o| o["post_sha"].is_string()));
+    }
+
+    /// Phase 6: the FS push declares the install repo's OWNING tenant, and
+    /// declares NOTHING when the repo cannot name one. A tempdir is not a git
+    /// checkout, so the scope is `Unresolved` — and the honest wire answer is
+    /// an absent `tenant_id`, never the machine's default binding. Declaring
+    /// the default here would attribute the row to whichever tenant this box
+    /// happens to be pinned to, which is the misattribution this plan closes.
+    #[test]
+    fn fs_observations_declare_no_tenant_when_the_repo_has_no_owner() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("Cargo.toml"), "[package]\nname=\"x\"").unwrap();
+        std::fs::write(d.path().join("Cargo.lock"), "version = 3\n").unwrap();
+        let (base, hits, _sd) = spawn_coord_mock(proceed_resolution(), vec![]);
+        run(cargo_req(&d.path().display().to_string()), &base).unwrap();
+
+        assert_eq!(hits.fs_obs.load(Ordering::SeqCst), 1, "fs push fired");
+        let fs = hits.fs_json();
+        assert!(
+            fs.get("tenant_id").is_none(),
+            "an unresolved repo must declare no tenant at all, got {fs:?}"
+        );
     }
 
     #[test]

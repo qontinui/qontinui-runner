@@ -226,14 +226,19 @@ fn governed_canonical_checkouts(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-/// Read `active_tenant_id` from `~/.qontinui/machine.json` — Phase 8b
-/// semantics: the DEVICE-LEVEL DEFAULT binding (default-for-new-sessions),
-/// not the-only-tenant. Correct here because the backstop is a
-/// device-scoped surface: it scans CANONICAL checkouts (never allocate-
-/// stamped agent worktrees, whose tenant lives on their coord row). `None`
-/// for single-tenant operators, which is fine. Mirrors
+/// Read `active_tenant_id` from `~/.qontinui/machine.json` — the DEVICE-LEVEL
+/// DEFAULT binding (default-for-new-sessions), not the-only-tenant. `None` for
+/// an operator who never pinned one, which is fine. Mirrors
 /// `census::resolve_tenant_id` (which is private; the read is trivial and
 /// tenant attribution is best-effort).
+///
+/// **Phase 6 demoted this from the answer to the FALLBACK.** A drift row is
+/// keyed by a canonical checkout, and which tenant owns that checkout is a
+/// property of the repo, not of the machine — on a multi-project box the
+/// machine default is simply a guess, which is why D3 rejects it as a tenancy
+/// source. It survives only through
+/// [`crate::auth::TenantScope::or_device_default`], i.e. only on a
+/// single-bound device, where it is not a guess at all.
 fn resolve_tenant_id() -> Option<uuid::Uuid> {
     let path = dirs::home_dir()?.join(".qontinui").join("machine.json");
     let bytes = std::fs::read(path).ok()?;
@@ -325,7 +330,11 @@ fn resolve_head_sha(checkout: &Path) -> Option<String> {
 /// POST a built [`CanonicalDriftRequest`] to coord's existing fs-observations
 /// ingest. Best-effort: any transport error / non-2xx logs and returns — the
 /// backstop never surfaces a coord failure.
-async fn post_canonical_drift(coord_base: &str, body: &CanonicalDriftRequest) {
+async fn post_canonical_drift(
+    coord_base: &str,
+    body: &CanonicalDriftRequest,
+    scope: crate::auth::TenantScope,
+) {
     let url = format!("{}/coord/fs/observations", coord_base.trim_end_matches('/'));
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -337,10 +346,11 @@ async fn post_canonical_drift(coord_base: &str, body: &CanonicalDriftRequest) {
             return;
         }
     };
-    // Attach the device-JWT bearer when available (same write-path attach the
-    // fs_observer producer uses; collapses to an anonymous send when unpaired).
-    // coord-tenant-scope(work-owed): a machine-wide scan of the shared canonical checkouts, one row per dirty repo and no session by construction; CanonicalDriftRequest.tenant_id is filled from machine.json::active_tenant_id -- machine-global, wrong on a multi-project box. Phase 6.
-    let req = crate::auth::attach_device_auth(client.post(&url));
+    // Phase 6 — the bearer states the tenant the BODY declares. Coord's
+    // `post_fs_observations` takes no auth extractor at all, so the body is
+    // the sole carrier of this row's tenancy and the bearer is a metric; they
+    // are still derived from ONE scope so the two can never disagree (D1).
+    let req = crate::auth::attach_device_auth_for(client.post(&url), scope);
     match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -419,7 +429,7 @@ pub async fn tick_once() -> Result<(), String> {
         .await
         .map_err(|e| format!("fs_backstop scan panicked: {e}"))?;
 
-    let tenant_id = resolve_tenant_id();
+    let device_default = resolve_tenant_id();
 
     for c in candidates {
         // Claim lookup — an ERROR / coord-unreachable SUPPRESSES (can't prove
@@ -445,6 +455,16 @@ pub async fn tick_once() -> Result<(), String> {
             );
             continue;
         }
+        // Phase 6 — the checkout's OWN repo names the tenant. `c.repo` is a
+        // directory name, not coord's `owner/name` key, so resolve from the
+        // path (cached: one `git remote` probe and one coord read per repo per
+        // TTL, however many checkouts this tick walks). An unresolved repo
+        // falls back to the device default only on a single-bound device,
+        // where that default IS the owner and dropping it would delete a
+        // correct attribution for nothing.
+        let scope = crate::repo_detection::tenant_scope_for_path(&c.canonical_path)
+            .await
+            .or_device_default(device_default);
         let body = CanonicalDriftRequest {
             source: CANONICAL_DRIFT_SOURCE,
             device_id: device_id.clone(),
@@ -452,10 +472,10 @@ pub async fn tick_once() -> Result<(), String> {
             canonical_path: super::worktree_resource_key(&c.canonical_path),
             head_sha: c.head_sha,
             current_branch: c.current_branch,
-            tenant_id,
+            tenant_id: scope.declared_tenant(),
             observations: c.observations,
         };
-        post_canonical_drift(&coord_base, &body).await;
+        post_canonical_drift(&coord_base, &body, scope).await;
     }
     Ok(())
 }

@@ -80,8 +80,13 @@ fn repo_basename(repo_path: &str) -> Option<String> {
 
 /// Build a [`CommitObservation`] from a `commit`-kind supervision event's
 /// payload. Returns `None` when the payload lacks a usable `sha` (without a
-/// head SHA there is nothing to record). `agent_id` / `correlation_id` /
-/// `tenant_id` are `None` in Phase 1 — the watcher doesn't know them.
+/// head SHA there is nothing to record). `agent_id` and `correlation_id` stay
+/// `None` — the watcher doesn't know them.
+///
+/// `tenant_id` is left `None` HERE and filled by [`forward_commit_event`] from
+/// the checkout's repo: it is an async lookup and this mapper is pure, so
+/// resolving it inside would drag a coord read into a function whose whole
+/// value is being testable without one.
 fn commit_observation_from_payload(payload: &serde_json::Value) -> Option<CommitObservation> {
     let head_sha = payload.get("sha").and_then(|v| v.as_str())?.to_string();
     if head_sha.is_empty() {
@@ -150,7 +155,11 @@ fn commit_observation_from_payload(payload: &serde_json::Value) -> Option<Commit
 /// POST a single [`CommitObservation`] to coord. Best-effort: any transport
 /// error or non-2xx logs at `debug`/`warn` and returns — never surfaces a
 /// coord failure to the caller.
-async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation) {
+async fn post_commit_observation(
+    coord_http_base: &str,
+    body: &CommitObservation,
+    scope: crate::auth::TenantScope,
+) {
     let url = format!(
         "{}/coord/commits/observations",
         coord_http_base.trim_end_matches('/')
@@ -172,8 +181,9 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
     // `qontinui_runner_lib::auth` — this module compiles into the bin target,
     // and the lib path would bump the lib crate's separate counter statics,
     // invisible to the bin's `DATA_PLANE_TOTAL/AUTHED` coverage readout.
-    // coord-tenant-scope(work-owed): a git-watcher ring event for a repo on this box -- the mapper sets agent_id: None and tenant_id: None (:135, :146); there is no session to ask and the body is coord's sole carrier. Phase 6.
-    let req = crate::auth::attach_device_auth(client.post(&url));
+    // Phase 6 — the observation's own repo names the tenant, and the body
+    // declares it. Both halves come off one scope so they cannot disagree (D1).
+    let req = crate::auth::attach_device_auth_for(client.post(&url), scope);
     match req.json(body).send().await {
         Ok(resp) => {
             let status = resp.status();
@@ -217,7 +227,7 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
         return;
     }
 
-    let body = match commit_observation_from_payload(&event.payload) {
+    let mut body = match commit_observation_from_payload(&event.payload) {
         Some(b) => b,
         None => {
             debug!(
@@ -228,6 +238,20 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
         }
     };
 
+    // Phase 6 — resolve the owning tenant from the watched checkout the commit
+    // landed in. The mapper left `tenant_id: None` because Phase 1 had nothing
+    // to ask; there is still no session here, but the REPO is knowable and it
+    // is what owns the row. No device-default fallback: this body has always
+    // sent `None`, so falling back would introduce a guess rather than
+    // preserve a value, which `TenantScope::declared_tenant` exists to refuse.
+    let scope = match event.payload.get("repo_path").and_then(|v| v.as_str()) {
+        Some(p) if !p.is_empty() => {
+            crate::repo_detection::tenant_scope_for_path(std::path::Path::new(p)).await
+        }
+        _ => crate::auth::TenantScope::Unresolved,
+    };
+    body.tenant_id = scope.declared_tenant().map(|t| t.to_string());
+
     // Resolve the coord HTTP base via the shared tier-aware policy fn
     // (`COORD_HTTP_URL` env → active profile `coord_url` ws→http → prod
     // default on a hosted qontinui_account-tier runner → dev-localhost guess
@@ -235,7 +259,7 @@ pub async fn forward_commit_event(event: &GitSupervisionEvent) {
     // honored — the policy fn is the single decision point.
     let (coord_base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
 
-    post_commit_observation(&coord_base, &body).await;
+    post_commit_observation(&coord_base, &body, scope).await;
 }
 
 /// Spawn the best-effort forward on the current Tokio runtime so the ring /
