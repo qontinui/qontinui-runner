@@ -3899,6 +3899,32 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         mcp::session_compliance::finalize_on_close(csid, &store);
                     });
                 }
+                // Session FINISHED marker → coord (plan
+                // `2026-09-01-session-finished-marker-and-unfinished-resume`
+                // §5.2). `set_finished` is the one funnel both the Tauri
+                // command and `POST /sessions/{id}/finish` go through; its
+                // observer enqueues the `Finished` outbox row (or, on an
+                // unmark, a `working` progress row), and the drain's
+                // ACK stamps `finish_synced` back so the boot reconcile can
+                // tell a synced mark from one coord has not seen. Weak handles
+                // for the same Arc-cycle reason as the close observer above.
+                {
+                    let reg = std::sync::Arc::downgrade(&ai_coord_registrar);
+                    lifecycle_store.attach_finish_observer(move |rec| {
+                        if let Some(r) = reg.upgrade() {
+                            match rec.finished_at {
+                                Some(at) => r.finish_session(&rec.claude_session_id, Some(at)),
+                                None => r.unfinish_session(&rec.claude_session_id),
+                            };
+                        }
+                    });
+                    let store = std::sync::Arc::downgrade(&lifecycle_store);
+                    coord_sync_facade.attach_finished_ack_observer(move |csid, finished_at| {
+                        if let Some(s) = store.upgrade() {
+                            s.mark_finish_synced(csid, finished_at);
+                        }
+                    });
+                }
                 // Append-only session-snapshot HISTORY (session-restore
                 // shim-fix plan, Phase 4): a durable JSONL audit of the full
                 // session set, written on every layout-meaningful registry
