@@ -715,9 +715,74 @@ describe("the proxy advertises the same action surface as a mounted pane (item 5
     // "node"`), so its descriptor is read from source. A capability that exists
     // on only one path is the defect — `paste` was mounted-only, so it appeared
     // and vanished as a pane scrolled through a virtualized flow grid.
+    //
+    // Comment lines are allowed between the key and its `id` — the entries
+    // carry per-action `effect` rationale as of 2026-09-11 — but ONLY comment
+    // and blank lines, so the assertion still binds `<action>: {` to that same
+    // entry's `id` rather than sliding into a neighbour's.
     expect(sourceOf("TerminalInstance.tsx")).toMatch(
-      new RegExp(`\\n\\s+${action}: \\{\\n\\s+id: "${action}"`),
+      new RegExp(`\\n\\s+${action}: \\{\\n(?:\\s*(?://|/\\*|\\*).*\\n)*\\s+id: "${action}"`),
     );
+  });
+});
+
+// Plan `2026-09-04-effect-calculus-joins-the-component-action-registry`,
+// Design decision 4 step 3. `CustomAction.effect` became reachable when the SDK
+// widened its element projections from bare names to `ElementActionInfo`
+// objects; these panes are the fleet's sharpest case for it, so the
+// classification is pinned rather than left to drift.
+//
+// Why source-reading rather than a descriptor read: the classification must
+// hold on BOTH paths, and `TerminalInstance` cannot be imported here (see
+// above). Reading both from source is the only way to compare them.
+describe("every element custom action declares a safety class (effect calculus)", () => {
+  // A raw PTY write goes into a live shell or a live agent session. It has no
+  // undo (dimension 1), the state belongs to another party (dimension 2), and
+  // on a proxy pane there is no rendered view to notice it (dimension 3) —
+  // silent AND irreversible, the worst quadrant served policy `operating-rules`
+  // `what-makes-an-action-destructive` names. `write` would be a fail-open lie.
+  const PTY_WRITES = ["sendKeys", "writeToTerminal", "paste", "pasteText"] as const;
+  // Observers. `focus`/`blur` on a proxy always throw, so they mutate nothing
+  // either.
+  const READS = ["getScrollback"] as const;
+
+  function declaresEffect(source: string, action: string, effect: string): boolean {
+    return new RegExp(
+      `\\n\\s+${action}: \\{\\n(?:\\s*(?://|/\\*|\\*).*\\n)*\\s+id: "${action}",\\n\\s+effect: "${effect}",`,
+    ).test(source);
+  }
+
+  it.each(PATHS.flatMap((f) => PTY_WRITES.map((a) => [f, a])))(
+    "%s declares %s as destructive",
+    (file, action) => {
+      expect(declaresEffect(sourceOf(file), action, "destructive")).toBe(true);
+    },
+  );
+
+  it.each(PATHS.flatMap((f) => READS.map((a) => [f, a])))(
+    "%s declares %s as read",
+    (file, action) => {
+      expect(declaresEffect(sourceOf(file), action, "read")).toBe(true);
+    },
+  );
+
+  it("the proxy's always-throwing focus/blur refusals are classified read", () => {
+    const source = sourceOf("TerminalBridgeProxies.tsx");
+    expect(declaresEffect(source, "focus", "read")).toBe(true);
+    expect(declaresEffect(source, "blur", "read")).toBe(true);
+  });
+
+  it("no PTY write is ever classified merely `write`", () => {
+    // The fail-open shape this whole step exists to prevent: `write` reads as
+    // "reversible mutation of state you own", and a write into someone else's
+    // live shell is neither.
+    for (const file of PATHS) {
+      const source = sourceOf(file);
+      for (const action of PTY_WRITES) {
+        expect(declaresEffect(source, action, "write")).toBe(false);
+        expect(declaresEffect(source, action, "read")).toBe(false);
+      }
+    }
   });
 });
 

@@ -1749,7 +1749,27 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
           actions: ["focus", "blur"],
           customActions: {
             sendKeys: {
+              /**
+               * `destructive` — raw bytes into a LIVE PTY.
+               *
+               * Three-dimension test [policy: operating-rules
+               * `what-makes-an-action-destructive`]:
+               *  1. RECONSTRUCTABLE? No. There is no undo for a PTY write: the
+               *     bytes are in the process's stdin and may already have been
+               *     executed. An observer can always tell it happened.
+               *  2. WHO OWNS THE STATE? Not this session. These panes host the
+               *     operator's shells and LIVE agent sessions, so this writes
+               *     into another party's in-flight work — the dimension the
+               *     policy says "frequently dominates" reversibility.
+               *  3. NOTICED? The pane is mounted, so the write itself is
+               *     visible; its CONSEQUENCES (a command that ran) are
+               *     discovered later.
+               *
+               * Deciding dimension: 2, compounded by 1. `write` would be wrong
+               * — that class is for reversible mutation of state you own.
+               */
               id: "sendKeys",
+              effect: "destructive",
               description:
                 "Send key sequences to the terminal. Accepts `keys` as a raw string " +
                 '(written verbatim), an array of key names (["Enter"]), or the SDK\'s ' +
@@ -1769,7 +1789,27 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             },
             writeToTerminal: {
+              /**
+               * `destructive` — raw bytes into a LIVE PTY.
+               *
+               * Three-dimension test [policy: operating-rules
+               * `what-makes-an-action-destructive`]:
+               *  1. RECONSTRUCTABLE? No. There is no undo for a PTY write: the
+               *     bytes are in the process's stdin and may already have been
+               *     executed. An observer can always tell it happened.
+               *  2. WHO OWNS THE STATE? Not this session. These panes host the
+               *     operator's shells and LIVE agent sessions, so this writes
+               *     into another party's in-flight work — the dimension the
+               *     policy says "frequently dominates" reversibility.
+               *  3. NOTICED? The pane is mounted, so the write itself is
+               *     visible; its CONSEQUENCES (a command that ran) are
+               *     discovered later.
+               *
+               * Deciding dimension: 2, compounded by 1. `write` would be wrong
+               * — that class is for reversible mutation of state you own.
+               */
               id: "writeToTerminal",
+              effect: "destructive",
               description:
                 "Write text directly to the PTY (no keyboard events). Fails with " +
                 "WRITE_TEXT_INVALID when `text` is not a string, and with TERMINAL_EXITED " +
@@ -1789,7 +1829,27 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             },
             paste: {
+              /**
+               * `destructive` — raw bytes into a LIVE PTY.
+               *
+               * Three-dimension test [policy: operating-rules
+               * `what-makes-an-action-destructive`]:
+               *  1. RECONSTRUCTABLE? No. There is no undo for a PTY write: the
+               *     bytes are in the process's stdin and may already have been
+               *     executed. An observer can always tell it happened.
+               *  2. WHO OWNS THE STATE? Not this session. These panes host the
+               *     operator's shells and LIVE agent sessions, so this writes
+               *     into another party's in-flight work — the dimension the
+               *     policy says "frequently dominates" reversibility.
+               *  3. NOTICED? The pane is mounted, so the write itself is
+               *     visible; its CONSEQUENCES (a command that ran) are
+               *     discovered later.
+               *
+               * Deciding dimension: 2, compounded by 1. `write` would be wrong
+               * — that class is for reversible mutation of state you own.
+               */
               id: "paste",
+              effect: "destructive",
               description: "Read clipboard and write to PTY (same as Ctrl+V)",
               handler: async () => {
                 const text = await navigator.clipboard.readText().catch(() => "");
@@ -1804,7 +1864,27 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             },
             pasteText: {
+              /**
+               * `destructive` — raw bytes into a LIVE PTY.
+               *
+               * Three-dimension test [policy: operating-rules
+               * `what-makes-an-action-destructive`]:
+               *  1. RECONSTRUCTABLE? No. There is no undo for a PTY write: the
+               *     bytes are in the process's stdin and may already have been
+               *     executed. An observer can always tell it happened.
+               *  2. WHO OWNS THE STATE? Not this session. These panes host the
+               *     operator's shells and LIVE agent sessions, so this writes
+               *     into another party's in-flight work — the dimension the
+               *     policy says "frequently dominates" reversibility.
+               *  3. NOTICED? The pane is mounted, so the write itself is
+               *     visible; its CONSEQUENCES (a command that ran) are
+               *     discovered later.
+               *
+               * Deciding dimension: 2, compounded by 1. `write` would be wrong
+               * — that class is for reversible mutation of state you own.
+               */
               id: "pasteText",
+              effect: "destructive",
               description:
                 "Paste literal text through the Ctrl+V path (bracketed-paste aware); no " +
                 "clipboard/keyboard. Fails with PASTE_TEXT_INVALID when `text` is not a " +
@@ -1826,7 +1906,23 @@ const TerminalInstanceInner = forwardRef<TerminalInstanceHandle, TerminalInstanc
               },
             },
             getScrollback: {
+              /**
+               * `read` — observes the scrollback buffer and mutates nothing.
+               *
+               * Three-dimension test [policy: operating-rules
+               * `what-makes-an-action-destructive`]: dimensions 1 and 3 do not
+               * engage because no state changes, and the policy is explicit that
+               * "reads are free and stay free". Deciding dimension: 1 — there is
+               * nothing to reconstruct because nothing is lost.
+               *
+               * Scoped deliberately to the EFFECT axis. This is still a
+               * disclosure surface (a terminal's contents), but `IREffect`
+               * grades mutation and blast radius, not confidentiality, and
+               * overloading it would make the one class an autonomous walk keys
+               * on mean two different things.
+               */
               id: "getScrollback",
+              effect: "read",
               description:
                 "Read the terminal scrollback buffer as plain text. Fails with " +
                 "SCROLLBACK_MAX_LINES_INVALID when `maxLines` is not a positive integer.",

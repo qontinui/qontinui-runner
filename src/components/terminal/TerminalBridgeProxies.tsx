@@ -218,7 +218,20 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
           // (`isElementActionAllowed`) treats an EMPTY action list as
           // permissive. Refusing here does not depend on either.
           focus: {
+            /**
+             * `read` — this handler ALWAYS throws; it changes nothing.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]: deciding dimension 1 — a
+             * refusal leaves no state to reconstruct. It is registered rather
+             * than omitted precisely so it cannot mutate anything: a
+             * customAction SHADOWS the same-named built-in, which is what stops
+             * the SDK reaching `element.focus()` on the hidden textarea.
+             * Classifying it `read` lets an autonomous walk try it and receive
+             * the honest refusal, which is the intended behaviour.
+             */
             id: "focus",
+            effect: "read",
             description:
               "REFUSED on a pane with no mounted view: there is nothing focusable. " +
               "Scroll or select the pane so its TerminalInstance mounts, then focus it.",
@@ -227,14 +240,47 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             },
           },
           blur: {
+            /**
+             * `read` — this handler ALWAYS throws; it changes nothing.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]: deciding dimension 1 — a
+             * refusal leaves no state to reconstruct. It is registered rather
+             * than omitted precisely so it cannot mutate anything: a
+             * customAction SHADOWS the same-named built-in, which is what stops
+             * the SDK reaching `element.focus()` on the hidden textarea.
+             * Classifying it `read` lets an autonomous walk try it and receive
+             * the honest refusal, which is the intended behaviour.
+             */
             id: "blur",
+            effect: "read",
             description: "REFUSED on a pane with no mounted view: nothing here can hold focus.",
             handler: async () => {
               throw noMountedView("blur", terminalId);
             },
           },
           sendKeys: {
+            /**
+             * `destructive` — raw bytes into a LIVE PTY on a pane with NO
+             * MOUNTED VIEW.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]:
+             *  1. RECONSTRUCTABLE? No — a PTY write has no undo.
+             *  2. WHO OWNS THE STATE? Another party's: these proxies exist only
+             *     for virtualized panes, which are live Claude/PowerShell
+             *     sessions doing real work.
+             *  3. NOTICED? NO. There is no rendered view, so nothing on screen
+             *     changes when this fires. Silent AND irreversible is the worst
+             *     quadrant the policy names, and it says so explicitly: treat it
+             *     as prohibited absent an operator order.
+             *
+             * Deciding dimension: 3. The mounted twin is already `destructive`
+             * on ownership alone; undetectability is what makes this one the
+             * policy's named worst case rather than merely its equal.
+             */
             id: "sendKeys",
+            effect: "destructive",
             description:
               "Send key sequences to the terminal by id (no mounted view). Accepts `keys` " +
               'as a raw string (written verbatim), an array of key names (["Enter"]), or ' +
@@ -269,7 +315,27 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             },
           },
           writeToTerminal: {
+            /**
+             * `destructive` — raw bytes into a LIVE PTY on a pane with NO
+             * MOUNTED VIEW.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]:
+             *  1. RECONSTRUCTABLE? No — a PTY write has no undo.
+             *  2. WHO OWNS THE STATE? Another party's: these proxies exist only
+             *     for virtualized panes, which are live Claude/PowerShell
+             *     sessions doing real work.
+             *  3. NOTICED? NO. There is no rendered view, so nothing on screen
+             *     changes when this fires. Silent AND irreversible is the worst
+             *     quadrant the policy names, and it says so explicitly: treat it
+             *     as prohibited absent an operator order.
+             *
+             * Deciding dimension: 3. The mounted twin is already `destructive`
+             * on ownership alone; undetectability is what makes this one the
+             * policy's named worst case rather than merely its equal.
+             */
             id: "writeToTerminal",
+            effect: "destructive",
             description:
               "Write text directly to the PTY by id (no mounted view). Fails with " +
               "WRITE_TEXT_INVALID when `text` is not a string, and with TERMINAL_EXITED " +
@@ -287,7 +353,27 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             },
           },
           paste: {
+            /**
+             * `destructive` — raw bytes into a LIVE PTY on a pane with NO
+             * MOUNTED VIEW.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]:
+             *  1. RECONSTRUCTABLE? No — a PTY write has no undo.
+             *  2. WHO OWNS THE STATE? Another party's: these proxies exist only
+             *     for virtualized panes, which are live Claude/PowerShell
+             *     sessions doing real work.
+             *  3. NOTICED? NO. There is no rendered view, so nothing on screen
+             *     changes when this fires. Silent AND irreversible is the worst
+             *     quadrant the policy names, and it says so explicitly: treat it
+             *     as prohibited absent an operator order.
+             *
+             * Deciding dimension: 3. The mounted twin is already `destructive`
+             * on ownership alone; undetectability is what makes this one the
+             * policy's named worst case rather than merely its equal.
+             */
             id: "paste",
+            effect: "destructive",
             description:
               "Read clipboard and write to the PTY by id (same as Ctrl+V, no mounted view).",
             handler: async () => {
@@ -308,7 +394,27 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             },
           },
           pasteText: {
+            /**
+             * `destructive` — raw bytes into a LIVE PTY on a pane with NO
+             * MOUNTED VIEW.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]:
+             *  1. RECONSTRUCTABLE? No — a PTY write has no undo.
+             *  2. WHO OWNS THE STATE? Another party's: these proxies exist only
+             *     for virtualized panes, which are live Claude/PowerShell
+             *     sessions doing real work.
+             *  3. NOTICED? NO. There is no rendered view, so nothing on screen
+             *     changes when this fires. Silent AND irreversible is the worst
+             *     quadrant the policy names, and it says so explicitly: treat it
+             *     as prohibited absent an operator order.
+             *
+             * Deciding dimension: 3. The mounted twin is already `destructive`
+             * on ownership alone; undetectability is what makes this one the
+             * policy's named worst case rather than merely its equal.
+             */
             id: "pasteText",
+            effect: "destructive",
             description:
               "Paste literal text to the PTY by id (no mounted view), through the same " +
               "bracketed-paste-aware path as the mounted pane: the PTY's DEC 2004 state is " +
@@ -331,7 +437,23 @@ const TerminalBridgeProxy = memo(function TerminalBridgeProxy({
             },
           },
           getScrollback: {
+            /**
+             * `read` — observes the scrollback buffer and mutates nothing.
+             *
+             * Three-dimension test [policy: operating-rules
+             * `what-makes-an-action-destructive`]: dimensions 1 and 3 do not
+             * engage because no state changes, and the policy is explicit that
+             * "reads are free and stay free". Deciding dimension: 1 — there is
+             * nothing to reconstruct because nothing is lost.
+             *
+             * Scoped deliberately to the EFFECT axis. This is still a
+             * disclosure surface (a terminal's contents), but `IREffect`
+             * grades mutation and blast radius, not confidentiality, and
+             * overloading it would make the one class an autonomous walk keys
+             * on mean two different things.
+             */
             id: "getScrollback",
+            effect: "read",
             description:
               "Read the terminal's scrollback as plain text. With no mounted xterm this " +
               "comes from the Rust PTY ring rather than the rendered buffer, with escape " +
