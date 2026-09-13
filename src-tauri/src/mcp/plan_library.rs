@@ -251,20 +251,37 @@ fn coded_error(
 
 /// Layer 1 refused: no registered proxy nonce on the request.
 ///
-/// The exact envelope the `/coord-mcp` proxy answers
-/// (`mcp_api::coord_mcp_proxy_handler`) — same cause text, same recovery hint,
-/// same `code` — and the same rotation-forensics line, so a client dying on a
-/// stale key at THIS door joins the trail the proxy's rejects already write.
+/// The envelope the `/coord-mcp` proxy answers
+/// (`mcp_api::coord_mcp_proxy_handler`) — same `code`, same rotation-forensics
+/// line, so a client dying on a key at THIS door joins the trail the proxy's
+/// rejects already write.
+///
+/// ## The two arms say different things
+///
+/// The `Option` was already in hand and already fed the forensics log, but the
+/// prose used to be IDENTICAL on both arms: a request that sent no header got a
+/// cause diagnosing a STALE nonce, followed by a recovery list written for the
+/// MCP CLIENT — another coord door, a new session, `claude mcp logout`. Two of
+/// those three read as "the door is shut", which is the false conclusion
+/// dossier `plan-library-capture-loop` tracks: 21 recorded occurrences of a
+/// session concluding capture is impossible from a refusal it had misdiagnosed.
+/// The list's closing sentence does name the header spelling; a reader working
+/// the ordered steps never gets there.
+///
+/// So `None` gets [`crate::coord_mcp::missing_proxy_key_error`] — one step, the
+/// step that works — and `Some` keeps the stale-key story, which is correct
+/// exactly when a key WAS sent. Sibling precedent for a door-specific cause:
+/// `NON_DEVICE_PROXY_KEY_CAUSE` and `AGENT_GONE_PROXY_CAUSE`.
 fn nonce_unauthorized_error(nonce: Option<&str>) -> (StatusCode, Json<ApiResponse<()>>) {
     crate::coord_mcp::spawn_log_proxy_nonce_rejected(
         nonce,
         "missing, unregistered, or expired proxy key on the plan-library write door (401)",
     );
-    coded_error(
-        StatusCode::UNAUTHORIZED,
-        CODE_PROXY_UNAUTHORIZED,
-        crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE),
-    )
+    let error = match nonce {
+        None => crate::coord_mcp::missing_proxy_key_error(),
+        Some(_) => crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE),
+    };
+    coded_error(StatusCode::UNAUTHORIZED, CODE_PROXY_UNAUTHORIZED, error)
 }
 
 /// Layer 2 refused: the machine's kill switch is engaged. Names the variable
@@ -1651,6 +1668,58 @@ mod tests {
         assert!(msg.contains("/plan-library/search"), "{msg}");
     }
 
+    /// **The 401's two arms say different things**, because a request that sent
+    /// NO key and one whose key went stale have opposite remedies.
+    ///
+    /// Both used to emit the stale-key story. A caller that forgot the header
+    /// therefore got a cause about a key "not registered with the runner
+    /// currently listening on this port" — it was never sent — followed by
+    /// `PROXY_KEY_RECOVERY_HINT`, whose ordered steps are written for the MCP
+    /// client (another coord door / a NEW session / `claude mcp logout`) and
+    /// read, to anyone else, as "the door is shut". That is the false
+    /// conclusion dossier `plan-library-capture-loop` tracks.
+    #[tokio::test]
+    async fn the_401_distinguishes_a_missing_key_from_a_stale_one() {
+        let (code, body) = nonce_unauthorized_error(None);
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        assert_eq!(body.0.code.as_deref(), Some(CODE_PROXY_UNAUTHORIZED));
+        let missing = body.0.error.clone().unwrap();
+
+        let (code, body) = nonce_unauthorized_error(Some("deadbeef"));
+        assert_eq!(code, StatusCode::UNAUTHORIZED);
+        // Same machine-readable code on both arms: the LAYER is the same, only
+        // the diagnosis differs. A client branching on `code` must not have to
+        // care which arm it took.
+        assert_eq!(body.0.code.as_deref(), Some(CODE_PROXY_UNAUTHORIZED));
+        let stale = body.0.error.clone().unwrap();
+
+        assert_ne!(
+            missing, stale,
+            "the whole point: a request that sent nothing must not be told its key went stale"
+        );
+
+        // The missing-key arm names the header, and only the header.
+        assert!(
+            missing.contains("Authorization: Bearer <nonce>"),
+            "{missing}"
+        );
+        assert!(missing.contains(".mcp.json"), "{missing}");
+        assert!(
+            !missing.contains(crate::coord_mcp::PROXY_KEY_RECOVERY_HINT),
+            "the MCP client's ordered recovery is not this caller's: {missing}"
+        );
+        // …and heads off the two misreadings that ARE the dossier.
+        assert!(missing.contains(PLAN_LIBRARY_WRITE_FLAG), "{missing}");
+        assert!(missing.contains("/admin/coord/plan-library"), "{missing}");
+
+        // The stale arm is untouched — it is correct for a key that WAS sent.
+        assert_eq!(
+            stale,
+            crate::coord_mcp::stale_proxy_key_error(crate::coord_mcp::STALE_PROXY_KEY_CAUSE),
+            "the Some arm must keep the shared proxy story, byte for byte"
+        );
+    }
+
     // ---- the payload ---------------------------------------------------
 
     /// The security invariant: a caller-supplied organization is a
@@ -2889,10 +2958,15 @@ mod tests {
             assert_eq!(body["code"], serde_json::json!(CODE_PROXY_UNAUTHORIZED));
             let err = body["error"].as_str().unwrap();
             assert!(err.contains("proxy key"), "{uri}: {err}");
+            // These requests carry NO key at all, so the answer is the
+            // missing-key arm, not the stale-key one — see
+            // `the_401_distinguishes_a_missing_key_from_a_stale_one`. Its
+            // recovery is the one step that works here.
             assert!(
-                err.contains("/coord-revive"),
-                "the recovery hint rides along: {err}"
+                err.contains("Authorization: Bearer <nonce>"),
+                "the recovery hint rides along: {uri}: {err}"
             );
+            assert!(err.contains(".mcp.json"), "{uri}: {err}");
         }
     }
 

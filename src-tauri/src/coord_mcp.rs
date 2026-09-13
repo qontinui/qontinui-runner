@@ -679,6 +679,59 @@ pub(crate) const NON_DEVICE_PROXY_KEY_CAUSE: &str =
     "missing, stale, or non-device coord-mcp proxy key: this route injects the \
      device identity, so it serves device-bound nonces only";
 
+/// The request carried NO proxy key at all — a DIFFERENT fact from a stale one,
+/// and on the plan-library write door it is the likelier of the two.
+///
+/// ## Why this is its own cause rather than [`STALE_PROXY_KEY_CAUSE`]
+///
+/// `authorize_write` has the `Option<String>` in hand and already passes it to
+/// the forensics log, but every door used to emit the stale-key story on BOTH
+/// arms. A caller that simply forgot the header therefore got a CAUSE
+/// diagnosing a key that had gone stale ("not registered with the runner
+/// currently listening on this port" — it was never sent) and a three-step
+/// recovery written for a different actor entirely: [`PROXY_KEY_RECOVERY_HINT`]
+/// addresses the MCP CLIENT, whose headers are snapshotted at launch, so its
+/// steps are "work through another coord door", "start a NEW session" and
+/// "`claude mcp logout`". None of those is what a caller curling this route
+/// needs, and two of them read as "the door is shut" — the false conclusion
+/// dossier `plan-library-capture-loop` exists to stop.
+///
+/// (That hint's LAST sentence does name the header spelling, so this is not a
+/// message with no useful byte in it. The defect is that everything before that
+/// sentence is addressed to someone else, and a reader who follows the ordered
+/// list never reaches it.)
+///
+/// `None` here is not only a missing header: a request that sent a JWT in
+/// `Authorization` also lands here, because [`proxy_nonce_from_authorization`]
+/// deliberately refuses the static-bearer shape. The text names both.
+pub(crate) const NO_PROXY_KEY_CAUSE: &str = "no coord-mcp proxy key on the request: this \
+     door authorizes on the session's loopback nonce, and the request carried neither an \
+     `Authorization: Bearer <nonce>` header nor the legacy `X-Coord-Mcp-Proxy-Key` (a JWT in \
+     `Authorization` also lands here — this door takes the proxy nonce, not a bearer token)";
+
+/// The recovery tail for [`NO_PROXY_KEY_CAUSE`].
+///
+/// Deliberately NOT [`PROXY_KEY_RECOVERY_HINT`]: that one is written for a key
+/// that WAS sent and has died, so its remedies are all about obtaining a fresh
+/// one. Here a valid key almost certainly already exists on disk and was simply
+/// not sent, so the whole recovery is one step.
+pub(crate) const NO_PROXY_KEY_RECOVERY_HINT: &str = "Read the `coord-mcp` server entry in \
+     THIS session's .mcp.json — its `headers` carry the nonce, as `Authorization: Bearer \
+     <nonce>` or `X-Coord-Mcp-Proxy-Key` — and resend the request with that header. Do not \
+     open a fresh session, do not restart the runner, and do not read this as the write door \
+     being switched off: an ENGAGED kill switch answers 403 naming \
+     QONTINUI_PLAN_LIBRARY_WRITE, and a closed tenant dial answers 403 pointing at \
+     /admin/coord/plan-library — this is a 401, which is neither. The ungated \
+     GET /plan-library/search reports all three layers if you want to confirm before \
+     retrying. Only if the nonce IS present and still refused is this the stale-key case.";
+
+/// Join [`NO_PROXY_KEY_CAUSE`] with its own recovery tail, mirroring
+/// [`stale_proxy_key_error`] so the two 401 stories stay symmetric in shape
+/// while staying different in content.
+pub(crate) fn missing_proxy_key_error() -> String {
+    format!("{NO_PROXY_KEY_CAUSE}. {NO_PROXY_KEY_RECOVERY_HINT}")
+}
+
 /// The `AGENT_TOKENS`-slot-gone variant: the nonce IS registered, but the agent
 /// it is bound to no longer has a live token slot.
 pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =

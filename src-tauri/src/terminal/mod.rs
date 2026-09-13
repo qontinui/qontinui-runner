@@ -586,38 +586,59 @@ summary via POST http://127.0.0.1:{api_port}/sessions/spawn."
 ///
 /// What it may contain: what to save (the closed `kind` vocabulary — the API
 /// accepts `investigation_report`, never "findings report"), when to save it,
-/// BOTH doors that reach the store and what a 403 from the loopback one means,
-/// and the instruction to record the provenance edge. What it may NOT contain:
-/// policy prose, rationale, kind-selection heuristics, or any tenant/agent
-/// identity. The long form is the `agent_playbook/plan-capture` coord prompt
+/// BOTH doors that reach the store, HOW THE LOOPBACK DOOR IS AUTHORIZED (the
+/// coord-mcp proxy nonce, as `Authorization: Bearer <nonce>`, and the
+/// `401 COORD_MCP_PROXY_UNAUTHORIZED` a request without one takes), what each
+/// refusal from it means, and the instruction to record the provenance edge.
+/// What it may NOT contain: policy prose, rationale, kind-selection heuristics,
+/// or any tenant/agent identity. The long form is the
+/// `agent_playbook/plan-capture` coord prompt
 /// document this clause links to, so editing it never requires a runner
 /// release (the pull-first lean protocol this whole briefing follows).
 ///
 /// Plan: `2026-09-02-plan-capture-briefing-names-a-door-that-is-off`.
 pub(crate) const PLAN_CAPTURE_CLAUSE_TEMPLATE: &str =
     "Plan-library capture is ON for this fleet. Save the work artifacts you \
-author to the plan library: investigation prompts, plan-authoring prompts, \
-implementation prompts, investigation reports, handoffs and plans — `kind` \
-is exactly one of `investigation_prompt | plan_authoring_prompt | \
-implementation_prompt | investigation_report | handoff | plan`; nothing else \
-is accepted. Write each one when you author it, and again when its status \
-changes; record the provenance edge every time, not only the artifact. Two \
-doors reach the same store. Runner door: `POST \
-{{runner_api_base}}/plan-library/artifacts` records an artifact (edges may \
-ride inline), `POST {{runner_api_base}}/plan-library/links` records an edge \
-between two existing artifacts. If that door answers 403 naming \
-`QONTINUI_PLAN_LIBRARY_WRITE`, this machine's write door is switched off — \
-never set the flag yourself; use the backend door it forwards to, with the \
-device JWT the runner holds (`~/.qontinui/coord-device-jwt`, or minted from \
-the runner's UI Bridge): `POST {{web_api_base}}/api/v1/plan-library` (upsert \
-on kind+slug+source_repo; the artifact comes back nested under `artifact`) \
-and `POST {{web_api_base}}/api/v1/plan-library/<artifact id>/edges`. A \
-refusal from either door is DEFERRED-WITH-CAUSE, recorded in a finding \
-[policy: coordination `briefing-mandated-door-that-answers-disabled`] — \
-never a sentence in a PR body saying capture is impossible. The write \
-contract, what each refusal means, and the silent-failure traps: \
-`coord_get_prompt_document(kind=\"agent_playbook\", name=\"plan-capture\")`, or \
-`GET \
+author to the plan library: investigation prompts, plan-authoring \
+prompts, implementation prompts, investigation reports, diagnostics, \
+handoffs and plans — `kind` is exactly one of `investigation_prompt | \
+plan_authoring_prompt | implementation_prompt | investigation_report | \
+diagnostic | handoff | plan`; nothing else is accepted. Write each one \
+when you author it, and again when its status changes; record the \
+provenance edge every time, not only the artifact. The runner's loopback \
+door is the PRIMARY route: `POST \
+{{runner_api_base}}/plan-library/artifacts` records an artifact (edges \
+may ride inline), `POST {{runner_api_base}}/plan-library/links` records \
+an edge between two existing artifacts. The proxy nonce is that door's \
+authorization — send this session's coord-mcp proxy nonce from its \
+`.mcp.json` as `Authorization: Bearer <nonce>`. A request without a \
+registered nonce answers `401 COORD_MCP_PROXY_UNAUTHORIZED`, which means \
+the header is missing or stale, NOT that capture is off. The door \
+publishes its own live contract on the ungated read `GET \
+{{runner_api_base}}/plan-library/search` — `writeEnabled`, \
+`writeRequiresNonce`, `writeKillSwitchEngaged`, `writeDialLevel`, \
+`writeInstruction`, `writeContract` — so every refusal below can be \
+diagnosed without taking one, and when that block and this clause \
+disagree, it is current and this clause is stale. A `403` naming \
+`QONTINUI_PLAN_LIBRARY_WRITE` is this machine's kill switch; a `403` \
+pointing at `/admin/coord/plan-library` is the tenant dial. Never set \
+the flag yourself. If no runner door is reachable at all, the backend \
+door it forwards to takes the same writes with the device JWT the runner \
+holds (`~/.qontinui/coord-device-jwt`, or minted from the runner's UI \
+Bridge): `POST {{web_api_base}}/api/v1/plan-library` (the artifact text \
+field is `body`; upsert on kind+slug+source_repo; the artifact comes \
+back nested under `artifact`) and `POST \
+{{web_api_base}}/api/v1/plan-library/<artifact id>/edges` (the far end \
+is `to_id`). Do NOT carry the runner's `/plan-library/artifacts` and \
+`/plan-library/links` paths across to that host — neither exists there, \
+both answer `405`, and reading that `405` as \"capture is impossible\" is \
+the exact false conclusion this clause exists to stop. A refusal from \
+both doors is DEFERRED-WITH-CAUSE, recorded in a finding [policy: \
+coordination `briefing-mandated-door-that-answers-disabled`] — never a \
+sentence in a PR body saying capture is impossible. The write contract, \
+what each refusal means, and the silent-failure traps: \
+`coord_get_prompt_document(kind=\"agent_playbook\", name=\"plan-capture\")`, \
+or `GET \
 {{coord_http_base}}/coord/agent-prompt-documents/agent_playbook/plan-capture`.";
 
 /// The compiled-in FALLBACK render of [`PLAN_CAPTURE_CLAUSE_TEMPLATE`]:
@@ -1190,15 +1211,26 @@ mod tests {
         assert!(!web.is_empty() && !web.ends_with('/'), "web base: {web:?}");
         assert!(briefing.contains(&format!("{web}/api/v1/plan-library")));
         assert!(briefing.contains(&format!("{web}/api/v1/plan-library/<artifact id>/edges")));
-        // What the switched-off loopback door looks like, by name.
+        // The loopback door is the PRIMARY route, and its authorization is
+        // stated: without the nonce header a session takes a 401 the old
+        // wording never described, and reported as a shut door.
+        assert!(briefing.contains("PRIMARY route"));
+        assert!(briefing.contains("Authorization: Bearer <nonce>"));
+        assert!(briefing.contains("401 COORD_MCP_PROXY_UNAUTHORIZED"));
+        // Both 403s, by name, so neither is guessed at.
         assert!(briefing.contains("QONTINUI_PLAN_LIBRARY_WRITE"));
-        // WHAT to save — all six kinds, in prose AND as the API's own `kind`
+        assert!(briefing.contains("/admin/coord/plan-library"));
+        // And the warning that keeps the backend fallback from manufacturing a
+        // false "capture is impossible" out of a 405.
+        assert!(briefing.contains("405"));
+        // WHAT to save — every kind, in prose AND as the API's own `kind`
         // vocabulary. "findings report" was never a kind the API accepted.
         for kind in [
             "investigation prompts",
             "plan-authoring prompts",
             "implementation prompts",
             "investigation reports",
+            "diagnostics",
             "handoffs",
             "plans",
         ] {
@@ -1206,7 +1238,7 @@ mod tests {
         }
         assert!(briefing.contains(
             "`investigation_prompt | plan_authoring_prompt | implementation_prompt \
-             | investigation_report | handoff | plan`"
+             | investigation_report | diagnostic | handoff | plan`"
         ));
         assert!(!briefing.contains("findings report"));
         // WHEN — on authoring and on status change.
@@ -1620,7 +1652,7 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// place of the three literals. Pinned here as PROSE, independently of the
     /// template constant, so a reword of the template is a visible diff in two
     /// places rather than a test that follows the code.
-    const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, investigation reports, handoffs and plans — `kind` is exactly one of `investigation_prompt | plan_authoring_prompt | implementation_prompt | investigation_report | handoff | plan`; nothing else is accepted. Write each one when you author it, and again when its status changes; record the provenance edge every time, not only the artifact. Two doors reach the same store. Runner door: `POST http://127.0.0.1:9876/plan-library/artifacts` records an artifact (edges may ride inline), `POST http://127.0.0.1:9876/plan-library/links` records an edge between two existing artifacts. If that door answers 403 naming `QONTINUI_PLAN_LIBRARY_WRITE`, this machine's write door is switched off — never set the flag yourself; use the backend door it forwards to, with the device JWT the runner holds (`~/.qontinui/coord-device-jwt`, or minted from the runner's UI Bridge): `POST __WEB__/api/v1/plan-library` (upsert on kind+slug+source_repo; the artifact comes back nested under `artifact`) and `POST __WEB__/api/v1/plan-library/<artifact id>/edges`. A refusal from either door is DEFERRED-WITH-CAUSE, recorded in a finding [policy: coordination `briefing-mandated-door-that-answers-disabled`] — never a sentence in a PR body saying capture is impossible. The write contract, what each refusal means, and the silent-failure traps: `coord_get_prompt_document(kind="agent_playbook", name="plan-capture")`, or `GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture`."#;
+    const TODAYS_CLAUSE_BODY: &str = r#"Plan-library capture is ON for this fleet. Save the work artifacts you author to the plan library: investigation prompts, plan-authoring prompts, implementation prompts, investigation reports, diagnostics, handoffs and plans — `kind` is exactly one of `investigation_prompt | plan_authoring_prompt | implementation_prompt | investigation_report | diagnostic | handoff | plan`; nothing else is accepted. Write each one when you author it, and again when its status changes; record the provenance edge every time, not only the artifact. The runner's loopback door is the PRIMARY route: `POST http://127.0.0.1:9876/plan-library/artifacts` records an artifact (edges may ride inline), `POST http://127.0.0.1:9876/plan-library/links` records an edge between two existing artifacts. The proxy nonce is that door's authorization — send this session's coord-mcp proxy nonce from its `.mcp.json` as `Authorization: Bearer <nonce>`. A request without a registered nonce answers `401 COORD_MCP_PROXY_UNAUTHORIZED`, which means the header is missing or stale, NOT that capture is off. The door publishes its own live contract on the ungated read `GET http://127.0.0.1:9876/plan-library/search` — `writeEnabled`, `writeRequiresNonce`, `writeKillSwitchEngaged`, `writeDialLevel`, `writeInstruction`, `writeContract` — so every refusal below can be diagnosed without taking one, and when that block and this clause disagree, it is current and this clause is stale. A `403` naming `QONTINUI_PLAN_LIBRARY_WRITE` is this machine's kill switch; a `403` pointing at `/admin/coord/plan-library` is the tenant dial. Never set the flag yourself. If no runner door is reachable at all, the backend door it forwards to takes the same writes with the device JWT the runner holds (`~/.qontinui/coord-device-jwt`, or minted from the runner's UI Bridge): `POST __WEB__/api/v1/plan-library` (the artifact text field is `body`; upsert on kind+slug+source_repo; the artifact comes back nested under `artifact`) and `POST __WEB__/api/v1/plan-library/<artifact id>/edges` (the far end is `to_id`). Do NOT carry the runner's `/plan-library/artifacts` and `/plan-library/links` paths across to that host — neither exists there, both answer `405`, and reading that `405` as "capture is impossible" is the exact false conclusion this clause exists to stop. A refusal from both doors is DEFERRED-WITH-CAUSE, recorded in a finding [policy: coordination `briefing-mandated-door-that-answers-disabled`] — never a sentence in a PR body saying capture is impossible. The write contract, what each refusal means, and the silent-failure traps: `coord_get_prompt_document(kind="agent_playbook", name="plan-capture")`, or `GET __COORD__/coord/agent-prompt-documents/agent_playbook/plan-capture`."#;
 
     fn expected_briefing_body() -> String {
         let (coord_url, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
