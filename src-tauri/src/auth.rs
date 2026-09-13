@@ -1395,9 +1395,19 @@ impl AuthManager {
 
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
     /// deterministic order. Never fatal — an unreadable store yields an
-    /// empty list.
+    /// empty list, which is therefore AMBIGUOUS; see
+    /// [`Self::try_list_tenant_device_jwt_tenants`].
     pub fn list_tenant_device_jwt_tenants(&self) -> Vec<Uuid> {
         self.secure_storage.list_tenant_device_jwt_tenants()
+    }
+
+    /// The un-collapsed enumeration: `Err` when the store could not be read,
+    /// which a destructive caller must treat as UNKNOWN rather than as "no
+    /// slots".
+    pub fn try_list_tenant_device_jwt_tenants(&self) -> Result<Vec<Uuid>> {
+        self.secure_storage
+            .try_list_tenant_device_jwt_tenants()
+            .context("Failed to enumerate per-tenant device-JWT slots")
     }
 }
 
@@ -1604,25 +1614,84 @@ fn warn_once_per_tenant_slot_miss(tenant: &Uuid) {
     }
 }
 
+/// What a read of `paired_user.json`'s default binding actually established.
+///
+/// The three states are kept apart because a caller that ACTS on the answer
+/// needs to tell "this device is legitimately unbound" from "this device's
+/// binding could not be read". Collapsing them is the same defect the legacy
+/// posture branch avoids by probing `probe_access_token()` instead of
+/// `get_access_token()`: an unreadable store is UNKNOWN, never absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindingTenantRead {
+    /// `paired_user.json` was read, parsed, and names this default tenant.
+    Bound(Uuid),
+    /// MEASURED absence: the file is not there (an unpaired device), or it is
+    /// well-formed and names no tenant. Safe to act on.
+    Unbound,
+    /// The read or the parse FAILED, or the file names something that is not a
+    /// UUID. Nothing was established.
+    Unknown,
+}
+
 /// The device's DEFAULT binding tenant, read from `paired_user.json`
 /// (v2 `default_tenant_id`, legacy `tenant_id` fallback). Kept as a local
 /// minimal reader because `auth` compiles into BOTH the lib and bin crates
 /// while `pair` (the canonical v2-aware reader) is lib-only — same
 /// documented duplication pattern as the census/backstop `machine.json`
 /// readers. `None` on any failure (unpaired runner).
+///
+/// Callers that DESTROY something on the strength of this answer must use
+/// [`default_binding_tenant_probe`] instead — `None` here is ambiguous.
 pub(crate) fn default_binding_tenant() -> Option<Uuid> {
+    match default_binding_tenant_probe() {
+        BindingTenantRead::Bound(t) => Some(t),
+        BindingTenantRead::Unbound | BindingTenantRead::Unknown => None,
+    }
+}
+
+/// [`default_binding_tenant`] without the collapse.
+pub(crate) fn default_binding_tenant_probe() -> BindingTenantRead {
     let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
-    let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")));
+    // No storage dir resolvable at all — a machine that cannot say where its
+    // own state lives has not established anything.
+    let Some(base) = base else {
+        return BindingTenantRead::Unknown;
+    };
+    default_binding_tenant_in(&base)
+}
+
+/// Pure-over-a-path core of [`default_binding_tenant_probe`], so the
+/// absent-vs-unreadable distinction is testable against a real tempdir with no
+/// process-global env mutation.
+pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenantRead {
+    let bytes = match std::fs::read(base.join("paired_user.json")) {
+        Ok(b) => b,
+        // MEASURED absence: there is no pairing file, so this device has no
+        // default binding. That is a fact, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BindingTenantRead::Unbound,
+        // Permissions, a partial write, an I/O blip: nothing established.
+        Err(_) => return BindingTenantRead::Unknown,
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return BindingTenantRead::Unknown;
+    };
     let raw = value
         .get("default_tenant_id")
         .and_then(|v| v.as_str())
-        .or_else(|| value.get("tenant_id").and_then(|v| v.as_str()))?;
-    Uuid::parse_str(raw.trim()).ok()
+        .or_else(|| value.get("tenant_id").and_then(|v| v.as_str()));
+    match raw {
+        // Well-formed and names no tenant — measured, and safe.
+        None => BindingTenantRead::Unbound,
+        // Names SOMETHING we cannot read. Not absence.
+        Some(s) => match Uuid::parse_str(s.trim()) {
+            Ok(t) => BindingTenantRead::Bound(t),
+            Err(_) => BindingTenantRead::Unknown,
+        },
+    }
 }
 
 /// How many tenant bindings this device holds, per `paired_user.json`.
