@@ -33,9 +33,10 @@
 # passing under pwsh 7 "would green-light a regression that still breaks the
 # real thing", which readers took to mean 7 is uninformative here. It is not.
 # When this suite first ran on the Windows gate it died on its FIRST call into
-# Compare-CapabilityManifests, and both defects behind that reproduce verbatim
-# under pwsh 7 on Linux -- same exception type, same message, same function,
-# same assertion. Neither was version-specific:
+# Compare-CapabilityManifests; fixing that exposed a SECOND defect, in
+# Format-ParityReportText, which nothing had ever reached. Both reproduce
+# verbatim under pwsh 7 on Linux -- same exception type, same message, same
+# function. Neither was version-specific:
 #
 #   * `@($x)` where $x is a PSObject-wrapped List[Object] throws
 #     `ArgumentException: Argument types do not match` out of the DLR binder
@@ -296,6 +297,30 @@ $text7 = Format-ParityReportText -Result $r7
 Assert-True "report prints the allowlist entry" ($text7 -match 'designed debug-vs-release difference')
 $text1 = Format-ParityReportText -Result $r1
 Assert-True "report says the allowlist is empty" ($text1 -match 'allowlist: \(empty\)')
+
+# The three report blocks NO EXISTING CASE RENDERS. Measured with breakpoint
+# hit-counts over this suite: the defect-detail lines and the published-only
+# line were executed ZERO times, because every result the file handed to
+# Format-ParityReportText had no `defect` / `only_in_dev` row and no
+# `only_in_published` row. That is why a defect that made those exact lines
+# throw survived here undetected -- the gate rendered a report that never
+# reached them. The results below already exist further up the file; only the
+# assertions are new, so this costs three renders and closes the hole.
+$textDefect = Format-ParityReportText -Result $r2
+Assert-True "defect block prints the dev leg"        ($textDefect -match 'dev       : operator_checkout')
+Assert-True "defect block prints the published leg"  ($textDefect -match 'published : unresolved')
+# workspace_root carries resolved_path in the fixture, so this also covers the
+# TRUE arm of the `$(if ($r.DevPath))` suffix on both of those lines.
+Assert-True "defect block prints the resolved path"  ($textDefect -match 'operator_checkout  <- /')
+
+# only_in_dev: the published row is ABSENT, which is the other arm -- the
+# `<row absent>` sentinel plus the empty-string suffix.
+$textOnlyDev = Format-ParityReportText -Result $r6
+Assert-True "absent published row is named"          ($textOnlyDev -match 'published : <row absent>')
+
+# only_in_published renders its own block, from a separate line.
+$textPubOnly = Format-ParityReportText -Result $r6c
+Assert-True "published-only block names the row"     ($textPubOnly -match 'workspace_root: published=operator_checkout')
 
 # ---------------------------------------------------------------------------
 # 8. THE SHIPPED ALLOWLIST. Measured 2026-09-02: no CAPABILITY_SPECS row is
