@@ -90,27 +90,35 @@ a session launched outside the runner will not have them.
 >   (`qontinui-dev-notes/plans` for a hit on `origin/main:plans/<stem>.md`)
 >   reads `state: measured` with `min_behind: 0` and
 >   `min_behind_is_floor: false`, and the file exists at the shared `ref_sha`
->   (after a `git fetch`, `git cat-file -e <ref_sha>:plans/<stem>.md` exits 0;
+>   (after a `git fetch`,
+>   `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits 0;
 >   any other exit, including an object this clone lacks, is UNKNOWN). Read
 >   `ref_sha` off `scan_roots.rows[]` for an id in `least_behind_device_ids`,
 >   since the roll-up carries none. Anything else makes the miss UNKNOWN: no
 >   `corpus_health` or no `scan_roots` (on `/candidates`,
 >   `corpus_health_unavailable_reason` names why), `scan_roots.state: unknown`
 >   with a `no_observation:` or `read_failed:` detail, no roll-up for the key
->   (an archived plan's `.../plans/archive` and the prompts root are never
->   measured), an `unknown` roll-up, `min_behind` above 0, or a file absent at
->   that ref. Even in the one case, the 0 says only that a feeder's HEAD held
->   that ref's commits when it took its reading (up to ~45 min before you read
->   it, against a ref fetched up to 6 h before that): not that the working tree
->   its body sync scans still held the plan (a commit of its own or uncommitted
->   work can remove it), nor that the sync pushed it (a push not yet made, a
->   paused or failing sync, a file its scan skips for having no heading or not
->   being UTF-8, or a capture dial shut within the last 45 min all leave the
->   reading in place). `min_behind` counts default-branch commits, never
->   missing plans, and a writer that posts no reading — e.g. the web UI, a hand
->   `POST`, the runner's write door, `qontinui-pr plan-library-backfill`, a
->   secondary or temp runner instance, a runner build predating the report —
->   is never measured.
+>   (an archived plan's `.../plans/archive`; the archive and prompts scan roots
+>   are never measured), an `unknown` roll-up, `min_behind` above 0, or a file
+>   absent at that ref. Even in the one case, the 0 says only that a feeder's
+>   HEAD held that ref's commits when it took its reading (up to ~45 min, plus
+>   one reconcile tick, before you read it, against a ref fetched up to 6 h
+>   before that): not that the working tree its body sync scans still held the
+>   plan (a commit of its own or uncommitted work can remove it), nor that the
+>   sync wrote it under `kind=plan` — a push not yet made; a paused or failing
+>   sync; a runner that stopped, or a capture dial shut, within the last
+>   45 min; a file its scan skips (no line starting with `#` and no
+>   `> **Status:` stamp, or unreadable, including not UTF-8); a kind fork,
+>   which writes nothing; or a row whose kind was locked away from `plan`,
+>   which a `kind=plan` read never returns (retry with `slug=<stem>` and no
+>   `kind`). It also settles only whether a row with that slug should exist,
+>   not which copy's body or status it holds: any other device the roll-up
+>   lists can write its own copy over it, so a miss from `/candidates` or a
+>   `status` or `q` filter stays UNKNOWN. `min_behind` counts default-branch
+>   commits, never missing plans, and a writer that posts no reading — e.g.
+>   the web UI, a hand `POST`, the runner's write door,
+>   `qontinui-pr plan-library-backfill`, a secondary or temp runner instance,
+>   a runner build predating the report — is never measured.
 > * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
 >   PowerShell interpreter (`pwsh` on Linux via
 >   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
