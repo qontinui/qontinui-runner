@@ -1617,6 +1617,46 @@ live_exit() {
   else
     echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
   fi
+  # ── The closeout-spool drain (plan
+  # 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, R2.3)
+  #
+  # Only the two rungs that yield a BEARER. L1/L2 are the loopback proxy, and a
+  # live proxy means a live RUNNER, whose own drain owns that file — draining it
+  # from here would be a second writer where the first one is healthy. L3's
+  # acting bearer and L6's web host reach neither /coord/work-units nor
+  # /coord/agent-findings, so neither can carry these rows.
+  #
+  # The bearer is resolved BY TRANSPORT rather than carried in a variable set at
+  # each probe: a variable set before a probe that then FAILED would still be
+  # holding a dead token when a later rung wins, and handing the drainer the
+  # wrong credential would produce a 401 it would report as a refusal of the
+  # rows. The names below are the ones the winning rung actually populated.
+  if [ "${COORD_REVIVE_NO_DRAIN:-}" != "1" ]; then
+    local drain_bearer=""
+    case "$transport" in
+      https-device-jwt-env)      drain_bearer="${ENVJWT:-}" ;;
+      https-device-jwt-file)     drain_bearer="${FILEJWT:-}" ;;
+      https-device-jwt)          drain_bearer="${MJWT:-}" ;;
+      https-bootstrap-agent-jwt) drain_bearer="${BOOT_TOKEN:-}" ;;
+    esac
+    if [ -n "$drain_bearer" ]; then
+      local drainer="" drain_hdr="$TMPD/drainhdr"
+      # Resolved beside this skill the same way every other sibling here is, so
+      # a checkout that does not ship the drainer says so instead of silently
+      # skipping. An absent drainer is a statement about THIS checkout.
+      drainer="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../scripts" 2>/dev/null && pwd)/drain-closeout-spool.sh"
+      { printf 'Authorization: Bearer %s\n' "$drain_bearer" > "$drain_hdr"; } 2>/dev/null
+      if [ ! -s "$drain_hdr" ]; then
+        echo "DRAIN: header staging failed under $TMPD - the spool was NOT drained. LOCAL fault; it says nothing about coord or about whether rows are pending."
+      elif [ ! -x "$drainer" ]; then
+        echo "DRAIN: not attempted - $drainer is absent or not executable in this checkout. NOT a statement that the spool is empty; run scripts/drain-closeout-spool.sh by hand from a checkout that has it."
+      else
+        echo "DRAIN: replaying unacked closeout rows over this door (push-only; nothing is written to any outbox or cursor). \$COORD_REVIVE_NO_DRAIN=1 opts out."
+        "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
+      fi
+      rm -f "$drain_hdr"
+    fi
+  fi
   # The table rides on LIVE too: a door that answered at L1 has said nothing
   # about L3-L6, and the rows below it read UNPROBED, which is the truth.
   axes_block
@@ -3605,7 +3645,9 @@ done
 #
 # L5's only input is a FILE ON DISK: a device_id, POSTed anonymously to coord's
 # dedicated credential route. Anonymous is not a re-opened hole — it is the
-# pair_via_browser carve-out shape sanctioned by the SHIPPED plan
+# device-pairing carve-out shape (post_pair_start / post_pair_complete /
+# post_pair_cli in routes_phase3.rs, registered ungated at
+# /coord/devices/pair-start|pair-complete|pair-cli) sanctioned by the SHIPPED plan
 # 2026-08-14-runner-unauthenticated-coord-writers: a credential-minting route is
 # anonymous BECAUSE requiring a credential would be circular, and that plan's
 # coord_auth_pin.rs guard objects to an unauthenticated WRITE, not to using an
