@@ -79,6 +79,22 @@ a session launched outside the runner will not have them.
 >   is byte-identical to "no such plan". Record `corpus_health` (or the two
 >   counts) beside the zero, and never write a cause for a door that did not
 >   answer — settle one against a second independent instance first.
+> * **The scan-root roll-up can widen a miss to UNKNOWN; it never proves one
+>   absent.** The same list result carries `corpus_health.scan_roots.by_source_repo`,
+>   one roll-up per scanned source (`qontinui-dev-notes/plans` for plans). A
+>   miss is UNKNOWN when the plan's source has no roll-up (the list holds only
+>   other sources or the `null` group, or is empty), when `scan_roots.state` is
+>   `unknown` (`no_observation:` / `read_failed:`), when that source's roll-up
+>   reads `state: unknown` (no comparable reading, or a floor of 0), when its
+>   `min_behind` is above 0 — and, on `/candidates`, when `corpus_health` is
+>   `null` beside a `read_failed:` reason. `min_behind` counts commits the
+>   least-behind comparable feeder's tree lacks, never missing plans, and is
+>   exact (`min_behind_is_floor: false`) only against that shared `ref_sha`,
+>   fetched within six hours of a reading, never the live tip. Even an exact 0
+>   says only that a feeder's TREE held what that ref held: not that its body
+>   sync pushed the plan (a feeder whose pushes fail keeps reporting), and
+>   nothing about a plan whose commit that ref lacks. The archive and prompts
+>   roots, and writers that are not scanners, are never measured at all.
 > * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
 >   PowerShell interpreter (`pwsh` on Linux via
 >   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
