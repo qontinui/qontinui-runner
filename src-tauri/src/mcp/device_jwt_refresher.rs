@@ -1900,21 +1900,118 @@ pub(crate) fn evict_unwritable_upstream_buckets(
     dropped
 }
 
-/// Resolve this machine's writable slot keys and run the sweep. The I/O half
-/// of [`evict_unwritable_upstream_buckets`], called once per refresher pass
-/// from BOTH branches — the tenant-slot pass and the legacy one — because a
-/// re-pair can happen from either shape.
-fn sweep_unwritable_upstream_buckets(tenant_slots: &[uuid::Uuid]) {
+/// The writable-key set, or the reason it could not be established.
+///
+/// Eviction is DESTRUCTIVE and its three inputs all fail OPEN — each one
+/// silently degrades to "absent" on failure — so the set must be FULLY
+/// MEASURED before anything is deleted. A shrunken set does not mean "fewer
+/// tenants are reachable"; it means the question was not answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WritableSlotKeys {
+    Measured(std::collections::HashSet<String>),
+    /// Nothing established. Names the input that failed, for the log.
+    Unknown(&'static str),
+}
+
+/// Compose the three reads into a writable-key set, ABORTING on any UNKNOWN.
+///
+/// # Why every input aborts rather than contributing nothing
+///
+/// Each read collapses a failure into an absence:
+///
+/// * `list_tenant_device_jwt_tenants()` is `load_tokens().map(…).unwrap_or_default()`
+///   — a present-but-undecryptable store, a partial write, an I/O blip or
+///   contention with a concurrent writer all return an EMPTY Vec,
+///   indistinguishable from "this runner has no tenant slots". The caller now
+///   passes [`crate::auth::AuthManager::try_list_tenant_device_jwt_tenants`]'s
+///   verdict instead, and `None` here is its `Err`.
+/// * `default_binding_tenant()` was `.ok()?` on both the file read and the
+///   JSON parse; [`crate::auth::BindingTenantRead`] now separates a MEASURED
+///   `Unbound` (no pairing file — a legitimately unbound device, safe) from
+///   `Unknown`.
+/// * `TenantPin::Unresolvable` is the machine saying it cannot state its
+///   tenant. It is not "no pin".
+///
+/// With any of them unmeasured, a bucket could be evicted for a tenant that is
+/// in fact still reachable — and eviction DELETES the streak rather than
+/// filtering it, so the posture does not merely pause: it collapses to `live`
+/// on the next pass and fires *"Coord access restored"* at a runner that never
+/// healed, with recovery gated on three fresh rejections that a quiet box may
+/// take arbitrarily long to produce. Deferring an eviction costs nothing — the
+/// abstain arm holds the posture meanwhile — while evicting on unmeasured
+/// inputs destroys evidence. Fail-closed is free here; fail-open is not.
+///
+/// This is the standard this module already applies twice: the legacy posture
+/// branch probes `probe_access_token()` precisely so an undecryptable store
+/// does not read as "no credential", and `refresh_tenant_slots` has an
+/// explicit *"slot unreadable — UNKNOWN, not cleared"* arm. The sweep had
+/// reintroduced the collapse and attached a destructive action to it.
+pub(crate) fn resolve_writable_slot_keys(
+    tenant_slots: Option<&[uuid::Uuid]>,
+    default_binding: crate::auth::BindingTenantRead,
+    pin: crate::session::tenant_pin::TenantPin,
+) -> WritableSlotKeys {
+    let Some(slots) = tenant_slots else {
+        return WritableSlotKeys::Unknown("tenant device-JWT slot store unreadable");
+    };
     let mut writable: std::collections::HashSet<String> =
-        tenant_slots.iter().map(|t| t.to_string()).collect();
-    if let Some(t) = crate::auth::default_binding_tenant() {
-        writable.insert(t.to_string());
+        slots.iter().map(|t| t.to_string()).collect();
+    match default_binding {
+        crate::auth::BindingTenantRead::Bound(t) => {
+            writable.insert(t.to_string());
+        }
+        // MEASURED: this device has no default binding. Contributes nothing,
+        // and that is a fact rather than a gap.
+        crate::auth::BindingTenantRead::Unbound => {}
+        crate::auth::BindingTenantRead::Unknown => {
+            return WritableSlotKeys::Unknown("paired_user.json unreadable or malformed");
+        }
     }
-    if let crate::session::tenant_pin::TenantPin::Pinned(t) =
-        crate::session::tenant_pin::resolve_tenant_pin()
-    {
-        writable.insert(t.to_string());
+    match pin {
+        crate::session::tenant_pin::TenantPin::Pinned(t) => {
+            writable.insert(t.to_string());
+        }
+        // MEASURED: machine.json is readable and carries no active tenant.
+        crate::session::tenant_pin::TenantPin::Unpinned => {}
+        crate::session::tenant_pin::TenantPin::Unresolvable => {
+            return WritableSlotKeys::Unknown("machine.json tenant pin unresolvable");
+        }
     }
+    WritableSlotKeys::Measured(writable)
+}
+
+/// Prefix for the latch entries that keep a skipped-sweep warning from
+/// repeating every pass. Namespaced so it cannot collide with a slot key.
+const SWEEP_SKIP_LATCH: &str = "\u{0}sweep-skip:";
+
+/// Resolve this machine's writable slot keys and run the sweep — or SKIP it,
+/// leaving every bucket intact, when any input is UNKNOWN.
+///
+/// `tenant_slots` is `None` when the slot store could not be read.
+fn sweep_unwritable_upstream_buckets(tenant_slots: Option<&[uuid::Uuid]>) {
+    let writable = resolve_writable_slot_keys(
+        tenant_slots,
+        crate::auth::default_binding_tenant_probe(),
+        crate::session::tenant_pin::resolve_tenant_pin(),
+    );
+    let writable = match writable {
+        WritableSlotKeys::Measured(w) => w,
+        WritableSlotKeys::Unknown(reason) => {
+            // Latched: a persistently undecryptable store would otherwise warn
+            // every five minutes forever.
+            if latch_orphan_warning(&format!("{SWEEP_SKIP_LATCH}{reason}")) {
+                warn!(
+                    "device_jwt_refresher: SKIPPING the upstream-bucket eviction sweep — \
+                     {reason}. Eviction deletes evidence, so it runs only on a fully \
+                     measured writable set; every bucket is left intact and the posture \
+                     stands until the read succeeds."
+                );
+            }
+            return;
+        }
+    };
+    // The set was measured, so any earlier skip is over — re-arm its warning.
+    with_orphan_warned(|s| s.retain(|k| !k.starts_with(SWEEP_SKIP_LATCH)));
     let dropped = evict_unwritable_upstream_buckets(&writable);
     if !dropped.is_empty() {
         info!(
@@ -3229,14 +3326,27 @@ async fn refresher_loop(
         // before the decision match so the Idle arm (legacy JWT fresh)
         // still ticks the tenant slots each cadence/kick. Runners with no
         // tenant slots (never paired post-8a) skip in one storage read.
-        let tenant_slots = auth_manager.list_tenant_device_jwt_tenants();
+        // The UN-COLLAPSED read, because the sweep below is destructive: an
+        // unreadable store must not read as "no tenant slots" there. The
+        // BRANCH choice keeps its historical collapse — an unreadable store
+        // takes the legacy arm, which does its own tri-state
+        // `probe_access_token()` — so only the eviction's failure direction
+        // changes.
+        let tenant_slots_read = auth_manager.try_list_tenant_device_jwt_tenants();
+        let tenant_slots: Vec<uuid::Uuid> = tenant_slots_read.as_ref().cloned().unwrap_or_default();
         let has_tenant_slots = !tenant_slots.is_empty();
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
         // shape, and it is the IMPOSSIBILITY half of retiring an orphan's
         // evidence — the half that replaced a guessed clock.
-        sweep_unwritable_upstream_buckets(&tenant_slots);
+        //
+        // FOLLOW-UPS, deliberately not fixed here: this does synchronous
+        // filesystem I/O on the async executor once per pass
+        // (`default_binding_tenant_probe` reads `paired_user.json`,
+        // `resolve_tenant_pin` reads `machine.json`) where the surrounding code
+        // pushes `AuthManager` reads to the blocking pool.
+        sweep_unwritable_upstream_buckets(tenant_slots_read.as_ref().ok().map(|v| v.as_slice()));
         if has_tenant_slots {
             let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
                 .ok()
@@ -6614,6 +6724,193 @@ mod tenant_slot_refresh_tests {
             "the DEFAULT key is never evicted"
         );
         reset_posture();
+    }
+
+    /// **THE ROUND-5 BLOCKER**: the sweep's three inputs all fail OPEN, and
+    /// eviction is DESTRUCTIVE, so one transient read failure deleted live
+    /// evidence and the posture collapsed to `live` with a false recovery.
+    ///
+    /// Slots A and B, both files naming A, coord refusing B. Pass N:
+    /// `load_tokens()` hiccups once → the old sweep saw `writable = {A}` and
+    /// REMOVED bucket B. Pass N+1 with the store readable again: both slots
+    /// observed, both `exp` future, and no upstream evidence exists anywhere
+    /// because the streak was DELETED rather than filtered → `Nothing` → falls
+    /// through to `worst` → `live`, and `should_notify_posture(Some(Dark),
+    /// Live)` fires *"Coord access restored"*. Nothing healed, and recovery
+    /// needs three fresh rejections that a quiet box may take arbitrarily long
+    /// to produce.
+    #[test]
+    fn an_unreadable_slot_store_defers_the_sweep_instead_of_deleting_evidence() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let a = tenant(0);
+        let b = tenant(1);
+        let slot = |t: uuid::Uuid| SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        };
+        let slots = [slot(a), slot(b)];
+        for _ in 0..5 {
+            note_coord_upstream_verdict(Some(b), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "B is refused, so the box is dark before the hiccup"
+        );
+
+        // PASS N — the store cannot be read. The sweep must DEFER, not shrink.
+        sweep_unwritable_upstream_buckets(None);
+        assert_eq!(
+            upstream_signal_for(Some(&b.to_string())).consecutive_rejections,
+            5,
+            "an unreadable store is UNKNOWN, and UNKNOWN may not delete evidence"
+        );
+
+        // PASS N+1 — store readable again, nothing else changed.
+        let transitions_before = recorded_posture_transitions().len();
+        assert_eq!(
+            derive_and_publish_posture(&slots, now + 5 * 60),
+            None,
+            "nothing healed between the two passes, so nothing may transition"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.posture,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)
+        );
+        assert!(!published.posture.can_answer());
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(b.to_string().as_str()),
+            "and it still names B, the slot an operator has to fix"
+        );
+        assert_eq!(
+            recorded_posture_transitions().len(),
+            transitions_before,
+            "no `Coord access restored` may be emitted by a failed READ"
+        );
+        reset_posture();
+    }
+
+    /// Each of the three inputs, failing on its own and all at once. This is
+    /// the composition where the fail-open actually lived — the pure eviction
+    /// half was already covered with an injected `writable`, which is exactly
+    /// why the defect passed 9616 green.
+    #[test]
+    fn the_sweep_aborts_on_any_unmeasured_input_and_only_evicts_when_fully_measured() {
+        use crate::auth::BindingTenantRead;
+        use crate::session::tenant_pin::TenantPin;
+        let a = tenant(0);
+        let slots = [a];
+
+        // (1) Slot store unreadable.
+        assert!(matches!(
+            resolve_writable_slot_keys(None, BindingTenantRead::Bound(a), TenantPin::Pinned(a)),
+            WritableSlotKeys::Unknown(_)
+        ));
+        // (2) paired_user.json unreadable or malformed.
+        assert!(matches!(
+            resolve_writable_slot_keys(
+                Some(&slots),
+                BindingTenantRead::Unknown,
+                TenantPin::Pinned(a)
+            ),
+            WritableSlotKeys::Unknown(_)
+        ));
+        // (3) The machine cannot state its tenant.
+        assert!(matches!(
+            resolve_writable_slot_keys(
+                Some(&slots),
+                BindingTenantRead::Bound(a),
+                TenantPin::Unresolvable
+            ),
+            WritableSlotKeys::Unknown(_)
+        ));
+        // All three at once — the pass on which EVERY tenant bucket used to go.
+        assert!(matches!(
+            resolve_writable_slot_keys(None, BindingTenantRead::Unknown, TenantPin::Unresolvable),
+            WritableSlotKeys::Unknown(_)
+        ));
+
+        // MEASURED absence is not a gap: an unpaired device and an unpinned
+        // machine are facts, and the sweep proceeds on them.
+        let b = tenant(1);
+        let c = tenant(2);
+        match resolve_writable_slot_keys(
+            Some(&slots),
+            BindingTenantRead::Unbound,
+            TenantPin::Unpinned,
+        ) {
+            WritableSlotKeys::Measured(w) => {
+                assert_eq!(w, [a.to_string()].into_iter().collect());
+            }
+            other => panic!("measured inputs must yield a set, got {other:?}"),
+        }
+        // …and all three contributing routes land in the set.
+        match resolve_writable_slot_keys(
+            Some(&slots),
+            BindingTenantRead::Bound(b),
+            TenantPin::Pinned(c),
+        ) {
+            WritableSlotKeys::Measured(w) => {
+                assert_eq!(
+                    w,
+                    [a.to_string(), b.to_string(), c.to_string()]
+                        .into_iter()
+                        .collect()
+                );
+            }
+            other => panic!("expected a measured set, got {other:?}"),
+        }
+    }
+
+    /// The `paired_user.json` read, against a REAL tempdir: an absent file is
+    /// a measured `Unbound`, while an unreadable or malformed one is `Unknown`
+    /// — the distinction the sweep's fail-closed arm is built on, and the one
+    /// `.ok()?` erased.
+    #[test]
+    fn the_binding_read_separates_a_missing_file_from_an_unreadable_one() {
+        use crate::auth::{default_binding_tenant_in, BindingTenantRead};
+        let dir =
+            std::env::temp_dir().join(format!("qontinui_binding_probe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("paired_user.json");
+
+        // MEASURED absence: an unpaired device. Safe to sweep on.
+        assert_eq!(default_binding_tenant_in(&dir), BindingTenantRead::Unbound);
+
+        let t = tenant(0);
+        std::fs::write(&path, format!(r#"{{"default_tenant_id":"{t}"}}"#)).expect("write");
+        assert_eq!(
+            default_binding_tenant_in(&dir),
+            BindingTenantRead::Bound(t),
+            "the v2 key"
+        );
+        std::fs::write(&path, format!(r#"{{"tenant_id":"{t}"}}"#)).expect("write");
+        assert_eq!(
+            default_binding_tenant_in(&dir),
+            BindingTenantRead::Bound(t),
+            "the legacy key"
+        );
+
+        // Well-formed and names nobody — still MEASURED.
+        std::fs::write(&path, r#"{"user":"someone"}"#).expect("write");
+        assert_eq!(default_binding_tenant_in(&dir), BindingTenantRead::Unbound);
+
+        // Present but unreadable: a partial write / corrupt file. NOT absence.
+        std::fs::write(&path, b"{ this is not json").expect("write");
+        assert_eq!(default_binding_tenant_in(&dir), BindingTenantRead::Unknown);
+        // Names SOMETHING we cannot read — also not absence.
+        std::fs::write(&path, r#"{"default_tenant_id":"not-a-uuid"}"#).expect("write");
+        assert_eq!(default_binding_tenant_in(&dir), BindingTenantRead::Unknown);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The backstop, and the direction it fails in.
