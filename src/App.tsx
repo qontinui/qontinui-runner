@@ -812,6 +812,7 @@ function AppContent() {
                     onAddPage={terminalPages.addPage}
                     onRemovePage={terminalPages.removePage}
                     onRenamePage={terminalPages.renamePage}
+                    onReorderPage={terminalPages.reorderPage}
                     onReorganize={() => setShowReorganize(true)}
                     isPinned={terminalPages.isPinned}
                     onPopOut={() => {

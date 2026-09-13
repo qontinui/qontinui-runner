@@ -277,6 +277,38 @@ export function resolveProjectPage(
   return { pageId: id, pages: [...pages, page], created: true };
 }
 
+/**
+ * Pure: move `sourceId` to sit immediately before `targetId`, preserving
+ * every other page's relative order. Backs the tab bar's drag-to-reorder
+ * gesture (`TerminalPageTabBar`).
+ *
+ * Returns the SAME array reference when the move is a no-op — source and
+ * target are the same id, or either id is absent from `pages` — same
+ * contract as `reconcilePages` / `applyPageDefaultWorkingDir`, so callers can
+ * skip a redundant persist / re-render.
+ *
+ * Exported so the reorder logic is unit-testable without React or a DOM drag
+ * event (same precedent as every other page mutation in this module).
+ */
+export function reorderPagesArray(
+  pages: TerminalPageConfig[],
+  sourceId: string,
+  targetId: string,
+): TerminalPageConfig[] {
+  if (sourceId === targetId) return pages;
+  const sourceIdx = pages.findIndex((p) => p.id === sourceId);
+  const targetIdx = pages.findIndex((p) => p.id === targetId);
+  if (sourceIdx < 0 || targetIdx < 0) return pages;
+
+  const next = pages.slice();
+  const [moved] = next.splice(sourceIdx, 1);
+  // Re-locate the target in `next` (its index may have shifted by one when
+  // `moved` sat before it) rather than reusing `targetIdx`.
+  const insertAt = next.findIndex((p) => p.id === targetId);
+  next.splice(insertAt, 0, moved);
+  return next;
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
@@ -437,6 +469,22 @@ export function useTerminalPages() {
     setPages((prev) => {
       const updated = prev.map((p) => (p.id === id ? { ...p, name } : p));
       savePages(updated);
+      return updated;
+    });
+  }, []);
+
+  /**
+   * Move the `sourceId` tab to sit immediately before the `targetId` tab —
+   * the drop side of the tab bar's drag-to-reorder gesture. No-op (no
+   * persist, no re-render) when the two ids are the same or either is
+   * unknown; see `reorderPagesArray`.
+   */
+  const reorderPage = useCallback((sourceId: string, targetId: string) => {
+    setPages((prev) => {
+      const updated = reorderPagesArray(prev, sourceId, targetId);
+      if (updated === prev) return prev;
+      savePages(updated);
+      allPagesRef.current = updated;
       return updated;
     });
   }, []);
@@ -685,6 +733,7 @@ export function useTerminalPages() {
     openPage,
     removePage,
     renamePage,
+    reorderPage,
     setPageDefaultWorkingDir,
     ensureProjectPage,
     /** True in a page-pinned pop-out window (shows one fixed page, minimal chrome). */
