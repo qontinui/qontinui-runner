@@ -4056,6 +4056,15 @@ async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifte
         }
     };
     let url = format!("{}/coord/agent-findings", coord_base.trim_end_matches('/'));
+    // coord-auth-exempt(forwarder): the same proxy-hop posture as this file's
+    // other three. `bearer` is the credential the `tools/list` that OBSERVED
+    // this drift actually presented (the re-selected one, when the first was
+    // refused), so the finding is attributed to the principal whose grant the
+    // drift is measured against. `attach_device_auth` would post it under the
+    // DEVICE identity instead — a different principal from the one whose
+    // allowlist gap is being reported, which would make the finding's own
+    // subject unreadable. Fail-soft either way: a refused post is warned and
+    // left unmarked, so the next observation offers it again.
     match client
         .post(&url)
         .bearer_auth(bearer)

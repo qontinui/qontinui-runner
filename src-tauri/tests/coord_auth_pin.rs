@@ -189,7 +189,13 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     ("mcp/device_jwt_refresher.rs", "self-refresh", 2),
     ("mcp/session_compliance.rs", "device-jwt-required", 1),
     ("mcp/session_message_poller.rs", "device-jwt-required", 2),
-    ("mcp_api.rs", "forwarder", 3),
+    // 3 -> 4 on 2026-09-13: the Phase-2 drift-finding POST in
+    // `post_coord_mcp_drift_finding` (plan
+    // `2026-09-03-coord-mcp-403-names-its-own-cause`). Same forwarder posture as
+    // the other three — it presents the bearer the observing `tools/list` used,
+    // because the finding reports that principal's allowlist gap and a device-JWT
+    // post would name the wrong subject.
+    ("mcp_api.rs", "forwarder", 4),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
