@@ -37,6 +37,7 @@
 pub mod body_push;
 pub mod parser;
 pub mod push;
+pub mod ref_scan;
 pub mod trigger;
 
 // Phase 4 parity proof — `#[cfg(test)]` only (a proof, not shipped code).
