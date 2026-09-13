@@ -147,13 +147,14 @@ pub struct TrunkToolPolicy {
     /// The commit whose `mcp_api.rs` was parsed — the resolved trunk tip when
     /// `git show` could reach it.
     pub trunk_sha: String,
-    /// Unix millis when the read completed.
+    /// Unix millis when the read completed. Rendered as `trunkReadAt` in the
+    /// refusal, so a reader can age `cause` the way it ages
+    /// `buildDrift.checkedAt`.
     pub read_at: i64,
     /// `fetched` when `git fetch origin <trunk>` succeeded on this tick, else
     /// `local-ref` — the object came from the last fetch someone else did, so
     /// `trunk_sha` may trail the remote. Reported, never hidden.
     pub source: &'static str,
-    /// Rendered as `trunkReadAt` in the refusal, so a reader can age `cause`.
     pub policy: ParsedToolPolicy,
 }
 
@@ -216,32 +217,46 @@ pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
     })
 }
 
-/// Read trunk's `mcp_api.rs` and parse its tool policy. Every git call is
-/// bounded ([`git_output`] / [`run_probe`]). The fetch touches the
-/// remote-tracking ref only: `--no-write-fetch-head` keeps it from rewriting
-/// the source checkout's per-worktree `FETCH_HEAD` (a peer mid-`git pull`
-/// there would otherwise merge OUR fetch), `gc.auto=0` keeps a 60 s tree-kill
-/// from interrupting a gc it triggered, and a refused terminal prompt keeps an
-/// unauthenticated remote from eating the whole timeout. Whether or not the
-/// fetch succeeded, `trunk_sha` is what `origin/<trunk>` resolves to AFTER
-/// the attempt — never a pre-fetch guess wearing a `fetched` label — and
-/// `source` records only the fetch verdict, so a possibly-trailing local ref
-/// is visible in the refusal rather than collapsing into `unknown`.
 /// Where the drift tick's fetch lands. Private to this module by name, so no
 /// peer operation in the shared checkout ever contends with it.
 const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
 
-fn read_trunk_tool_policy(repo: &Path) -> Option<TrunkToolPolicy> {
+/// Resolve trunk's tip, fetching it into [`TRUNK_PRIVATE_REF`] first.
+///
+/// Returns `(trunk_sha, source)` — `source` is `"fetched"` when THIS call's
+/// fetch succeeded and `"local-ref"` when it fell back to an object someone
+/// else left behind, so a possibly-trailing ref is visible in the refusal
+/// rather than collapsing into `unknown`. `trunk_sha` is always resolved AFTER
+/// the fetch attempt, never a pre-fetch guess wearing a `fetched` label.
+///
+/// This is split from [`read_trunk_tool_policy`] so a tool-policy PARSE
+/// failure cannot also destroy the drift COUNT: the two were independent
+/// before the caches were unified and must stay independent. A trunk that
+/// reformats `mcp_api.rs` past the hand-rolled parser is a case
+/// [`parse_tool_policy_consts`] plans for; it must degrade `cause` to
+/// `unknown`, not blank `commitsBehind` on every box in the fleet.
+///
+/// Every git call is bounded ([`git_output`] / [`run_probe_quiet`]) and
+/// inherits the fleet's single-source credential posture from
+/// [`crate::process_helpers::no_window`] — never a second copy here.
+/// `--no-write-fetch-head` keeps the fetch from rewriting the source
+/// checkout's per-worktree `FETCH_HEAD` (git writes it even for a refspec
+/// with a destination ref, and a peer mid-`git pull` there would otherwise
+/// merge OUR fetch); `gc.auto=0` keeps a 60 s tree-kill from interrupting a
+/// gc it triggered.
+fn resolve_trunk_tip(repo: &Path) -> Option<(String, &'static str)> {
     let branch = crate::git_trunk::resolve_trunk_branch(repo).unwrap_or_else(|| "main".to_string());
     // A quiet fetch prints nothing on success, which `git_output` would read
-    // as `None`, so the outcome is taken from `run_probe` directly.
+    // as `None`, so the outcome is taken from `run_probe_quiet` directly.
     // The fetch lands on a RUNNER-PRIVATE ref, never on `origin/<trunk>`: a
     // timeout is a hard kill that skips git's lock cleanup, and a stale
     // `refs/remotes/origin/<trunk>.lock` in the shared source checkout would
     // fail every peer's fetch/pull there until a human removed it. A stale
     // lock under `refs/build-drift/` blocks only this tick's successor.
-    // Quiet: the outcome is already surfaced as `trunkSource`, so an offline
-    // box does not get a second WARN per tick beside ls-remote's.
+    // Quiet: the outcome is already surfaced as `trunkSource`. The FAILURE's
+    // diagnosis is not lost, it just lives at DEBUG (`run_probe_quiet` logs
+    // status + stderr there, and still WARNs on a timeout) — `trunkSource`
+    // says the fetch failed, never why.
     let fetched = {
         let mut cmd = crate::process_helpers::no_window("git");
         cmd.args([
@@ -253,28 +268,47 @@ fn read_trunk_tool_policy(repo: &Path) -> Option<TrunkToolPolicy> {
             "origin",
             &format!("+refs/heads/{branch}:{TRUNK_PRIVATE_REF}"),
         ])
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_ASKPASS", "")
         .current_dir(repo);
         matches!(
             run_probe_quiet(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git fetch"),
             ProbeOutcome::Captured(_)
         )
     };
-    let source = if fetched { "fetched" } else { "local-ref" };
-    let trunk_ref = if fetched {
-        TRUNK_PRIVATE_REF.to_string()
-    } else {
-        format!("origin/{branch}")
-    };
-    let trunk_sha = git_output(repo, &["rev-parse", &trunk_ref]).filter(|s| looks_like_sha(s))?;
+    if fetched {
+        if let Some(sha) =
+            git_output(repo, &["rev-parse", TRUNK_PRIVATE_REF]).filter(|s| looks_like_sha(s))
+        {
+            return Some((sha, "fetched"));
+        }
+    }
+    // Fallback order matters: the private ref is THIS runner's copy from the
+    // last successful tick and is usually fresher than `origin/<trunk>` in a
+    // shared checkout — and on an install whose checkout nothing else fetches
+    // it may be the only trunk ref that exists at all. Either way the verdict
+    // stays `local-ref`, so nothing is mislabelled.
+    for r in [TRUNK_PRIVATE_REF, &format!("origin/{branch}")] {
+        if let Some(sha) = git_output(repo, &["rev-parse", r]).filter(|s| looks_like_sha(s)) {
+            return Some((sha, "local-ref"));
+        }
+    }
+    None
+}
+
+/// Read trunk's `mcp_api.rs` at an already-resolved tip and parse its tool
+/// policy. `None` when the file is unreadable at that sha or the consts do
+/// not parse — the caller keeps the sha regardless (see
+/// [`resolve_trunk_tip`]).
+fn read_trunk_tool_policy(
+    repo: &Path,
+    trunk_sha: &str,
+    source: &'static str,
+) -> Option<TrunkToolPolicy> {
     let source_text = TOOL_POLICY_SOURCE_PATHS
         .iter()
         .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
     let policy = parse_tool_policy_consts(&source_text)?;
     Some(TrunkToolPolicy {
-        trunk_sha,
+        trunk_sha: trunk_sha.to_string(),
         read_at: chrono::Utc::now().timestamp_millis(),
         source,
         policy,
@@ -340,14 +374,7 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = crate::process_helpers::no_window("git");
     // A credential prompt would sit until `DRIFT_GIT_TIMEOUT` reaps it, every
     // tick; refuse the prompt so an unauthenticated remote fails fast instead.
-    cmd.args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        // Git Credential Manager's GUI prompt is not governed by
-        // GIT_TERMINAL_PROMPT; a headless Windows box with a credential miss
-        // would otherwise sit until the timeout reaps it.
-        .env("GCM_INTERACTIVE", "never")
-        .env("GIT_ASKPASS", "")
-        .current_dir(repo);
+    cmd.args(args).current_dir(repo);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git")
     else {
         return None;
@@ -476,15 +503,25 @@ fn check_once_blocking() -> BuildDriftStatus {
         return status;
     };
 
-    // Trunk's tool policy is read FIRST, and when its fetch succeeded the
-    // drift verdict below is computed from that same fetched commit — one
-    // clock for `cause` and `commitsBehind`. Only when the fetch failed (or
-    // the consts could not be parsed) does the verdict fall back to
-    // `ls-remote` / the local `origin/<trunk>` ref, and then `trunkSource:
-    // local-ref` says the two may trail each other.
-    let policy = read_trunk_tool_policy(&repo);
-    let main_sha = match &policy {
-        Some(p) if p.source == "fetched" => Some(p.trunk_sha.clone()),
+    // Trunk's tip is resolved FIRST, by a fetch into this module's private
+    // ref. When that fetch succeeded the drift verdict below is computed from
+    // that same fetched commit — one clock for `cause` and `commitsBehind`,
+    // and the object is local so `rev-list --count` can actually run. Only
+    // when the fetch failed does the verdict fall back to `ls-remote`, and
+    // then `trunkSource: local-ref` says the two may trail each other.
+    //
+    // The tool-policy PARSE is deliberately downstream of the sha: a trunk
+    // that reformats `mcp_api.rs` past the hand-rolled parser degrades `cause`
+    // to `unknown` and must NOT also blank `commitsBehind`. The two readings
+    // were independent before the caches were unified; unifying the STORE
+    // must not couple the failures.
+    let tip = resolve_trunk_tip(&repo);
+    let policy = tip
+        .as_ref()
+        .filter(|(_, source)| *source == "fetched")
+        .and_then(|(sha, source)| read_trunk_tool_policy(&repo, sha, source));
+    let main_sha = match &tip {
+        Some((sha, "fetched")) => Some(sha.clone()),
         _ => resolve_trunk_sha(&repo),
     };
     let policy = if main_sha.is_some() { policy } else { None };
@@ -535,19 +572,29 @@ fn store_both(policy: Option<TrunkToolPolicy>, status: BuildDriftStatus) {
 /// every [`CHECK_INTERVAL`]. WARNs on each tick that finds non-zero drift.
 pub async fn run_periodic() {
     loop {
-        let status = spawn_blocking_tracked(check_once_blocking)
-            .await
-            .unwrap_or_else(|e| {
+        // A panicked tick must clear BOTH caches, not just the status. The
+        // fallback below is an all-null status; pairing it with the previous
+        // tick's surviving `trunkSha` / `trunkReadAt` is exactly the
+        // cross-tick pairing the unified store exists to prevent, so the
+        // panic arm stores `None` for the policy too. On the normal arm
+        // `check_once_blocking` has already stored both and nothing more is
+        // owed here.
+        let status = match spawn_blocking_tracked(check_once_blocking).await {
+            Ok(status) => status,
+            Err(e) => {
                 warn!(error = %e, "build drift: check task panicked");
-                BuildDriftStatus {
+                let status = BuildDriftStatus {
                     checked_at: chrono::Utc::now().timestamp_millis(),
                     main_sha: None,
                     behind: None,
                     commits_behind: None,
                     divergent: None,
                     commits_ahead: None,
-                }
-            });
+                };
+                store_both(None, status.clone());
+                status
+            }
+        };
 
         match (status.behind, status.main_sha.as_deref()) {
             (Some(true), Some(main)) => warn!(
@@ -578,7 +625,6 @@ pub async fn run_periodic() {
             ),
         }
 
-        store_latest(status);
         tokio::time::sleep(CHECK_INTERVAL).await;
     }
 }
