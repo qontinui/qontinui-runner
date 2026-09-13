@@ -2046,6 +2046,7 @@ mod tests {
             SessionEventKind::GateRegistration,
             SessionEventKind::FindingPosted,
             SessionEventKind::Finished,
+            SessionEventKind::CoordTransportRung,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(

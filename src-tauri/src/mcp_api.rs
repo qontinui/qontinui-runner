@@ -10521,26 +10521,11 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        event_lane_terminal_leg,
-        select_lifecycle_caller,
-        select_lifecycle_caller_censused,
-        select_terminal_caller,
-        self_id_health_snapshot,
-        self_id_miss_sample_dirs,
-        self_id_miss_samples,
-        settle_ambiguity,
-        settle_lifecycle_selection,
-        terminal_leg,
-        terminal_leg_verdict,
-        AmbiguousKey,
-        EventLaneLeg,
-        EventLaneMiss,
-        LifecycleMiss,
-        LifecycleMissCensus,
-        SelfIdOutcome,
-        TerminalLaneProbe,
-        TerminalLeg,
-        TerminalMiss,
+        event_lane_terminal_leg, select_lifecycle_caller, select_lifecycle_caller_censused,
+        select_terminal_caller, self_id_health_snapshot, self_id_miss_sample_dirs,
+        self_id_miss_samples, settle_ambiguity, settle_lifecycle_selection, terminal_leg,
+        terminal_leg_verdict, AmbiguousKey, EventLaneLeg, EventLaneMiss, LifecycleMiss,
+        LifecycleMissCensus, SelfIdOutcome, TerminalLaneProbe, TerminalLeg, TerminalMiss,
         SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
