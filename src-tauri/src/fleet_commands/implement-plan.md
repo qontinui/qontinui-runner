@@ -89,7 +89,8 @@ settings; a session launched outside the runner will not have them.
 >     `work_unit_slug`, `repo`, `intent_ref` or `since` filter — stays
 >     UNKNOWN whatever the roll-up says: any writer can replace a row's body
 >     or its metadata (`status`, `work_unit_slug`, `repos`, ...) without the
->     file changing, and a scanner never writes an unchanged file back.
+>     file changing, and nothing puts the file's values back until a scanner
+>     re-sends it (a runner start, or a change to its path settings).
 >   - **Even when (a) and (b) hold,** the roll-up only stops adding doubt; the
 >     miss is no stronger than the doors that produced it. The reading can be
 >     up to ~45 min old when you read it (plus one reconcile tick), and the
@@ -101,8 +102,8 @@ settings; a session launched outside the runner will not have them.
 >     shut, within the last 45 min; a file its scan skips (no line whose first
 >     non-blank character is `#` and no `> **Status:` stamp, or unreadable,
 >     including not UTF-8); a kind fork, which writes nothing; or a row whose
->     kind was locked away from `plan` (retry with `slug=<stem>` and no
->     `kind`).
+>     kind another write moved away from `plan`, locked or not (retry with
+>     `slug=<stem>` and no `kind`).
 >   - **Never measured:** `min_behind` counts default-branch commits, never
 >     missing plans. The archive and prompts scan roots have no reading, and
 >     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
