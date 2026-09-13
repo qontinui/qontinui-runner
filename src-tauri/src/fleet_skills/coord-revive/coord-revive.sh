@@ -1617,6 +1617,69 @@ live_exit() {
   else
     echo "Re-issue the lost call over this door, then VERIFY BY READ (a \"no output\" write is presumed LOST - findings 2026-07-26 section 3)."
   fi
+  # ── The closeout-spool drain (plan
+  # 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, R2.3)
+  #
+  # Only the two rungs that yield a BEARER. L1/L2 are the loopback proxy, and a
+  # live proxy means a live RUNNER, whose own drain owns that file — draining it
+  # from here would be a second writer where the first one is healthy. L3's
+  # acting bearer and L6's web host reach neither /coord/work-units nor
+  # /coord/agent-findings, so neither can carry these rows.
+  #
+  # The bearer is resolved BY TRANSPORT rather than carried in a variable set at
+  # each probe: a variable set before a probe that then FAILED would still be
+  # holding a dead token when a later rung wins, and handing the drainer the
+  # wrong credential would produce a 401 it would report as a refusal of the
+  # rows. The names below are the ones the winning rung actually populated.
+  if [ "${COORD_REVIVE_NO_DRAIN:-}" != "1" ]; then
+    local drain_bearer=""
+    case "$transport" in
+      https-device-jwt-env)      drain_bearer="${ENVJWT:-}" ;;
+      https-device-jwt-file)     drain_bearer="${FILEJWT:-}" ;;
+      https-device-jwt)          drain_bearer="${MJWT:-}" ;;
+      https-bootstrap-agent-jwt) drain_bearer="${BOOT_TOKEN:-}" ;;
+    esac
+    if [ -n "$drain_bearer" ]; then
+      local drainer="" drain_hdr="$TMPD/drainhdr" drain_rc=""
+      # Found through the ONE fleet-script resolver, exactly like the L3/L4/L5
+      # helpers. A fixed `$(dirname "$0")/../../../scripts` resolves only where
+      # this `.claude/` IS the config repo's (directly, or via the
+      # <workspace-root>/.claude symlink, which bash's `cd` rescues by falling
+      # back to the physical path). From every checkout carrying its OWN real
+      # `.claude/` copy -- a runner-provisioned worktree of any other repo, and
+      # the runner-bundled skill -- it names `<that repo>/scripts/`, where the
+      # drainer never is, so the drain never ran. The resolver's walk reaches a
+      # config checkout from there -- which still has to be new enough to ship
+      # the drainer (a shared primary checkout routinely lags main). An absent
+      # drainer is a statement about THE CHECKOUTS IN REACH, and says what it
+      # searched.
+      __resolve_fleet_script "drain-closeout-spool.sh"; drainer="$__RFS_PATH"
+      { printf 'Authorization: Bearer %s\n' "$drain_bearer" > "$drain_hdr"; } 2>/dev/null
+      if [ ! -s "$drain_hdr" ]; then
+        echo "DRAIN: header staging failed under $TMPD - the spool was NOT drained. LOCAL fault; it says nothing about coord or about whether rows are pending."
+      elif [ -z "$drainer" ]; then
+        echo "DRAIN: not attempted - scripts/drain-closeout-spool.sh not found ($(__fleet_script_searched "drain-closeout-spool.sh")). NOT a statement that the spool is empty; run it by hand from a qontinui-claude-config checkout."
+      else
+        echo "DRAIN: replaying unacked closeout rows over this door (push-only; nothing is written to any outbox or cursor). \$COORD_REVIVE_NO_DRAIN=1 opts out."
+        # `bash <path>`, never `"$path"`: the resolver admits a readable file
+        # without the exec bit (routinely dropped on Windows/MSYS checkouts).
+        bash "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
+        # The pipe to sed spends the drainer's status, and the indented table
+        # does not carry it. Its precedence matters when reading it: 4 wins
+        # over 5, so a run with BOTH a refused and an undelivered row exits 4 --
+        # which is why the 4 line below still points at the table.
+        drain_rc="${PIPESTATUS[0]}"
+        case "$drain_rc" in
+          0) echo "DRAIN: exit 0 - every eligible row accepted, or none pending." ;;
+          3) echo "DRAIN: exit 3 - no readable spool on THIS box, or no python to parse one; read the drainer's own line above. Absence or a LOCAL fault - not delivery, and not a coord verdict." ;;
+          4) echo "DRAIN: exit 4 - at least one row REFUSED by coord (4xx) or UNSENDABLE (no buildable URL), neither retried; other rows in this run may still be UNDELIVERED and retryable - read the table above." ;;
+          5) echo "DRAIN: exit 5 - at least one row UNDELIVERED (transport or 5xx) and none refused; retryable, re-run coord-revive or the drainer." ;;
+          *) echo "DRAIN: exit $drain_rc - unexpected drainer status; treat every row as UNKNOWN." ;;
+        esac
+      fi
+      rm -f "$drain_hdr"
+    fi
+  fi
   # The table rides on LIVE too: a door that answered at L1 has said nothing
   # about L3-L6, and the rows below it read UNPROBED, which is the truth.
   axes_block
@@ -3605,7 +3668,9 @@ done
 #
 # L5's only input is a FILE ON DISK: a device_id, POSTed anonymously to coord's
 # dedicated credential route. Anonymous is not a re-opened hole — it is the
-# pair_via_browser carve-out shape sanctioned by the SHIPPED plan
+# device-pairing carve-out shape (post_pair_start / post_pair_complete /
+# post_pair_cli in routes_phase3.rs, registered ungated at
+# /coord/devices/pair-start|pair-complete|pair-cli) sanctioned by the SHIPPED plan
 # 2026-08-14-runner-unauthenticated-coord-writers: a credential-minting route is
 # anonymous BECAUSE requiring a credential would be circular, and that plan's
 # coord_auth_pin.rs guard objects to an unauthenticated WRITE, not to using an

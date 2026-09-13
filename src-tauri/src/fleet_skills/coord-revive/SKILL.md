@@ -407,13 +407,17 @@ carry it, exactly as `_gate-registration`'s transport-floor rule already
 requires, and **name the verdict L5 actually returned**. **That is a materially
 different report from "coord is down."**
 
-**Why the shape is right even though it does not work yet.** The design question
+**Why the shape is right — and it DOES work.** (This heading read "even though
+it does not work yet" until 2026-09-13; L5 has answered `200` from three boxes
+since 2026-09-04.) The design question
 this rung answers is whether a *credential-minting* route may be anonymous at
 all. Shipped plan `2026-08-14-runner-unauthenticated-coord-writers` drove bare
 coord writes 63 → 0 and left `src-tauri/tests/coord_auth_pin.rs` as the durable
 guard — and it sanctioned exactly one carve-out shape,
-`pair.rs::pair_via_browser`, which is anonymous **because it mints the
-credential, so requiring one is circular.** A credential-only route is that
+coord's own anonymous device-pairing surfaces — `post_pair_start` / `post_pair_complete` / `post_pair_cli` (`crates/coord/src/routes_phase3.rs`), registered ungated at `/coord/devices/pair-start|pair-complete|pair-cli` in `crates/coord/src/routes.rs`, which are anonymous **because they mint the
+credential, so requiring one is circular.** (That sentence cited
+`pair.rs::pair_via_browser` until 2026-09-13; no such symbol exists in coord —
+verify a route by name in `routes.rs` before citing it as precedent.) A credential-only route is that
 shape, and the pin objects to an unauthenticated *write*, not to *using an issued
 token*: everything L5 would do after a mint carries a bearer. The exposure that
 remains open is a property of the **sibling** `/agents/allocate` route, not of
@@ -427,7 +431,7 @@ scopes.) Plan
 surfaced that and refused to close it; the gate above is the escalation that
 asks for the ruling. Full chain and citations:
 `knowledge-base/qontinui-specific/coord-gates-and-access.md` → "The
-`/agents/allocate` exposure and its open ruling".
+`/agents/allocate` exposure, and why it stays prohibited".
 
 **The credential is verified with a control read before L5 is called LIVE — and
 that arm now runs for real.** (Measured 2026-09-04: mint `200`, control read
@@ -505,7 +509,7 @@ client's mask):
 | `DEVICE_JWT_UNAUTHORIZED` | L4: coord rejected a device JWT | Expired, or bound to another tenant. From a **static** source this is expected and **not terminal** — the cascade falls through to the next source |
 | `BOOTSTRAP_NO_DEVICE_ID` | L5: no `device_id` resolvable — `$QONTINUI_MACHINE_ID` unset **and** `~/.qontinui/machine.json` absent or unreadable. A statement of **absence**, and a LOCAL one | Nothing about coord. Export `$QONTINUI_MACHINE_ID`, or pair this machine so the runner writes `machine.json`. Nothing is sent — an empty `device_id` would draw a 4xx this script would then blame on coord |
 | `BOOTSTRAP_MACHINE_FILE_MALFORMED` | L5: `~/.qontinui/machine.json` is readable but carries neither a `device_id` nor the legacy `machine_id` (or is not JSON) | Also LOCAL, and kept apart from the row above on purpose: "the file is not there" and "the file is there and says nothing" have different fixes. Repair the file; nothing was sent |
-| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is open operator ruling `ece99898-30c6-4f8c-be8e-1de5f09abebc`. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
+| `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is **UNKNOWN, not an open ruling**: gate `ece99898-30c6-4f8c-be8e-1de5f09abebc` was **withdrawn** 2026-09-02 as over-broad — four of its five arms were resolved by policy (`security-and-autonomy` `implement_tier: proceed`, "tightening is ordinary work"; `decision_record/operational-work-is-autonomous`); the dedicated route and the anonymous-mint tightening are qontinui-coord#1850 (ff-landed, `5dd99cc3`); the ONE arm still the operator's is gate `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (arm (b), `agent_tool_access` rows), which gates no cascade rung. UNKNOWN is not permission. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
 | `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405 (an unknown or unregistered `device_id`, or a malformed UUID) | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
 | `BOOTSTRAP_NO_TOKEN_IN_RESPONSE` | L5: the route answered `2xx` but the body carried no JWT-shaped token (3 dot-separated base64url parts) | The route's response shape changed, or something else answers on that host. NOT sent onward — an unshaped bearer would draw a 401 this script would then report against coord |
 | `BOOTSTRAP_TOKEN_UNVERIFIED` | L5: a token WAS minted, and the control read `GET /coord/agent-findings?limit=1` did not answer `200`. **The whole point of the rung's verification half** | Never report LIVE on this. A mint is not an authentication: say the mint succeeded AND the credential did not verify, and name the control read's status — the two facts together are the diagnosis |
@@ -1168,6 +1172,16 @@ times** — and it is the artifact that makes a coord-mcp 401 *provable* instead
 of merely plausible. Read it before you reach for any door, and certainly
 before you name a cause.
 
+> ⚠️ **Cheapest discriminator first, and it needs no log at all: compare the
+> workdir `.mcp.json`'s MTIME to this session's start.** If the file is NEWER,
+> the MCP CLIENT is holding a key it read at spawn while the file on disk
+> carries a fresher one — the client's cache is stale, the proxy is fine. L1 and
+> L2 read the FILE's key and speak raw JSON-RPC to `/coord-mcp`, so that key
+> still works and the verdict is **"client cache stale"**, never "proxy dead".
+> The raw workdir-key path is not a rung to add — it IS L1, and `/gate` Step 2 —
+> so say so rather than reaching for a new door. (Dossier contribution
+> `9206bde5-2d3e-4cf4-ab7c-c5d526b6d995`, "Mechanism 4".)
+
 ```
 ~/.local/share/qontinui-runner/dev-logs/coord-mcp-rotations.jsonl
 ```
@@ -1371,6 +1385,42 @@ evict a live peer and will not unlatch your client. Use
   `ece99898-30c6-4f8c-be8e-1de5f09abebc`, reads withdrawn (re-verify with
   `coord_gate_inspect`), and so does its successor `3c9b18ca`; UNKNOWN is not
   permission.
+- **A LIVE bearer rung DRAINS the closeout spool before it exits.** When the
+  winning transport is L4 (a device JWT, from any of its three sources) or L5
+  (the bootstrap credential), `live_exit` runs
+  `scripts/drain-closeout-spool.sh` over that same bearer and prints its table
+  under the verdict. That is the whole point of the rung on the box this skill
+  exists for: a session whose runner is GONE has its gates and findings sitting
+  unsent in `~/.qontinui/runner/session-outbox.jsonl` — and every named
+  `instance-*/` sibling — with nothing left that will ever replay them.
+
+  The drainer is **push-only**: it never writes the outbox and never advances
+  the cursor. Advancing it fails twice over, both silently — `local_store.rs`
+  `validate_cursor_locked` RESETS a cursor whose anchor no longer matches, and a
+  wedged-but-alive runner still holds its cursor in memory, so writing the file
+  races it. Safety comes from the SINK instead: coord de-duplicates an identical
+  live finding (`findings::post`) and an identical gate (`register_gate_core`),
+  which makes *every* replayer free rather than careful, the runner's own drain
+  after a partial ACK included. So a row shows up again on the next run and
+  re-sending it is not a second row.
+
+  **L1/L2 do NOT run it, by design** — a live loopback proxy means a live
+  runner, whose own drain owns that file; draining from here would be a second
+  writer where the first one is healthy. L3 and L6 reach neither
+  `/coord/work-units` nor `/coord/agent-findings`, so neither could carry the
+  rows. `COORD_REVIVE_NO_DRAIN=1` opts out. The drainer is found through the
+  same fleet-script resolver as the L3/L4/L5 helpers, so from a checkout
+  carrying its own `.claude/` copy (a worktree of any other repo) it walks up to
+  a config checkout, as well as resolving from the config repo and the
+  workspace-root symlink — provided that checkout is new enough to ship the
+  drainer. When none in reach does, the script prints `DRAIN: not attempted`
+  with what it searched — a statement about THE CHECKOUTS IN REACH, never about
+  whether the spool is empty. After a run it prints the drainer's exit code with
+  its meaning, because the indented table alone does not carry it: `3` no
+  readable spool or no python to parse one; `4` at least one row refused (4xx)
+  or unsendable — and since 4 outranks 5, other rows may still be undelivered,
+  so read the table; `5` at least one row undelivered and none refused
+  (retryable).
 - **Reaching L5 is COUNTED, and the counter is local.** Two `guard_decide`
   records per run into `~/.qontinui/logs/guard-decisions.log` (see the L5
   section's table). A counter that had to reach coord would be missing in
