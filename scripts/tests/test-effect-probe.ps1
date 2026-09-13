@@ -31,7 +31,17 @@ $Expected = @{ "list-tabs" = "read"; "switch-tab" = "write" }
 # produces for a serializer that dropped the field, not a null-valued property.
 function Surface {
     param([string]$Name, [string]$ActionsJson)
-    return @{ Name = $Name; Actions = @($ActionsJson | ConvertFrom-Json) }
+    # ASSIGN, then wrap. `@($ActionsJson | ConvertFrom-Json)` is NOT
+    # engine-portable: Windows PowerShell 5.1's ConvertFrom-Json emits a JSON
+    # array as a SINGLE Object[] item rather than enumerating it into the
+    # pipeline, so `@(pipeline)` collects that one item into a NESTED array
+    # there while pwsh 7 yields a flat one. Every action then resolved to the
+    # inner array -- `$_.id` still matched by member enumeration, which is why
+    # the failure looked like a stripped field rather than a malformed fixture.
+    # Assigning first collapses the difference: `@($var)` on an existing array
+    # is a no-op on both engines.
+    $parsed = $ActionsJson | ConvertFrom-Json
+    return @{ Name = $Name; Actions = @($parsed) }
 }
 
 $GOOD_ACTIONS = @'
@@ -59,46 +69,6 @@ function Assert-Problems {
         $script:failures++
     }
 }
-
-# --- TEMPORARY DIAGNOSTIC ---------------------------------------------------
-# Windows PowerShell 5.1 reports "has NO effect key" for EVERY action the probe
-# successfully finds, while `$_.id` matches on that same object and the
-# genuinely-absent case fires correctly. Two fixes aimed at
-# `PSObject.Properties` spelling have now failed to move that, so the shape of
-# `$action` under 5.1 is UNKNOWN rather than diagnosed. This block prints it.
-# DELETE THIS BLOCK once the divergence is identified and fixed.
-function Show-Diag {
-    param([string]$Label, $Value)
-    Write-Host ("  DIAG {0,-22} {1}" -f $Label, $Value)
-}
-Write-Host "test-effect-probe: DIAGNOSTIC"
-Show-Diag "PSVersion" "$($PSVersionTable.PSVersion) edition=$($PSVersionTable.PSEdition)"
-$diagSurface = Surface 'diag' $GOOD_ACTIONS
-Show-Diag "surface type" $diagSurface.GetType().FullName
-$diagActions = @($diagSurface.Actions)
-Show-Diag "actions.Count" $diagActions.Count
-Show-Diag "actions type" $diagActions.GetType().FullName
-$a0 = $diagActions[0]
-if ($null -eq $a0) {
-    Show-Diag "actions[0]" "<null>"
-} else {
-    Show-Diag "actions[0] type" $a0.GetType().FullName
-    Show-Diag "actions[0] props" (@($a0.PSObject.Properties | ForEach-Object { $_.Name }) -join ',')
-    Show-Diag "actions[0] json" ($a0 | ConvertTo-Json -Compress)
-}
-$picked = $diagActions | Where-Object { $_.id -eq 'switch-tab' } | Select-Object -First 1
-if ($null -eq $picked) {
-    Show-Diag "picked" "<null>"
-} else {
-    Show-Diag "picked type" $picked.GetType().FullName
-    Show-Diag "picked props" (@($picked.PSObject.Properties | ForEach-Object { $_.Name }) -join ',')
-    Show-Diag "picked.id" "[$($picked.id)]"
-    Show-Diag "picked.effect" "[$($picked.effect)]"
-    Show-Diag "picked json" ($picked | ConvertTo-Json -Compress)
-    Show-Diag "Members['effect']" "$($null -ne $picked.PSObject.Members['effect'])"
-}
-Write-Host ""
-# --- END TEMPORARY DIAGNOSTIC -----------------------------------------------
 
 Write-Host "test-effect-probe: Get-EffectProbeProblems"
 
@@ -181,6 +151,20 @@ Assert-Problems "empty actions array -> 1 problem, not a pass" 1 (
 Assert-Problems "one expected effect, one action, all good -> 0 problems" 0 (
     Get-EffectProbeProblems -Surfaces @((Surface 'components-list' '[{"id":"list-tabs","effect":"read"}]')) `
         -ExpectedEffects @{ "list-tabs" = "read" })
+
+# --- The nested-array fixture shape (Windows PowerShell 5.1) ----------------
+# `@($json | ConvertFrom-Json)` yields a NESTED array on 5.1 and a flat one on
+# pwsh 7, so for two CI runs every action on the Windows lane resolved to the
+# inner ARRAY. `$_.id` still matched it (member enumeration returns the id
+# list, and `-eq` on an array returns the matching elements, which is truthy),
+# so the probe sailed past the absent check and then reported "stripped by
+# serializeComponent" for a serializer that had done nothing wrong -- a
+# confident wrong verdict that cost two failed fixes aimed at the wrong file.
+# `Surface` no longer builds this shape; this pins the guard that names it if
+# any future caller does.
+$nestedSurface = @{ Name = 'components-list'; Actions = @(, (@($GOOD_ACTIONS | ConvertFrom-Json))) }
+Assert-Problems "nested action array is NAMED, not mistaken for a strip" 2 (
+    Get-EffectProbeProblems -Surfaces @($nestedSurface) -ExpectedEffects $Expected) "COLLECTION"
 
 Write-Host ""
 if ($failures -gt 0) {
