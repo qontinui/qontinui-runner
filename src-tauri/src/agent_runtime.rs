@@ -1545,15 +1545,56 @@ fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
 /// [`LaunchStop`]: while the stop entry is held no re-delivery of the same
 /// agent_id can register, so this teardown can never strip a newer run's
 /// token, nonces or daemons.
-#[derive(Debug)]
-struct AgentRunTeardown(uuid::Uuid);
+///
+/// Holds the three maps it tears down by reference so the drop runs through
+/// [`teardown_in`], which a test can drive over poisoned LOCAL maps.
+/// Production builds it with [`AgentRunTeardown::global`].
+#[allow(clippy::type_complexity)]
+struct AgentRunTeardown<'a> {
+    agent_id: uuid::Uuid,
+    tokens: &'a std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
+    >,
+    nonces: &'a std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    daemons: &'a std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
+    >,
+}
 
-impl Drop for AgentRunTeardown {
-    fn drop(&mut self) {
-        crate::coord_mcp::remove_agent_token(self.0);
-        crate::coord_mcp::revoke_agent_proxy_nonces(self.0);
-        crate::agent_daemons::stop_for_agent(self.0);
+impl AgentRunTeardown<'static> {
+    /// The production teardown, over the process-global maps.
+    fn global(agent_id: uuid::Uuid) -> Self {
+        AgentRunTeardown {
+            agent_id,
+            tokens: crate::coord_mcp::agent_tokens(),
+            nonces: crate::coord_mcp::proxy_nonces(),
+            daemons: crate::agent_daemons::registry(),
+        }
     }
+}
+
+impl Drop for AgentRunTeardown<'_> {
+    fn drop(&mut self) {
+        teardown_in(self.tokens, self.nonces, self.daemons, self.agent_id);
+    }
+}
+
+/// The per-agent teardown over explicit maps: live-token removal, proxy-nonce
+/// revoke, daemon stop. Every lock it takes recovers a poisoned mutex.
+#[allow(clippy::type_complexity)]
+fn teardown_in(
+    tokens: &std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
+    >,
+    nonces: &std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    daemons: &std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
+    >,
+    agent_id: uuid::Uuid,
+) {
+    crate::coord_mcp::remove_agent_token_in(tokens, agent_id);
+    crate::coord_mcp::revoke_agent_proxy_nonces_in(nonces, agent_id);
+    crate::agent_daemons::stop_for_agent_in(daemons, agent_id);
 }
 
 fn spawn_run_task(payload: LaunchPayload) {
@@ -1571,7 +1612,8 @@ fn spawn_run_task(payload: LaunchPayload) {
     let Some(stop_registration) = register_launch_stop(agent_id) else {
         info!(
             "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate delivery \
-             of a launch already live on this runner — ignored, original run left untouched"
+             of a launch already live or finishing on this runner — ignored, original run \
+             left untouched"
         );
         return;
     };
@@ -1658,7 +1700,7 @@ fn spawn_run_task(payload: LaunchPayload) {
         // Armed from admission on: `run_agent_subprocess` may register a proxy
         // nonce, a live agent token and daemons, and a panic inside it must not
         // leak them. See [`AgentRunTeardown`].
-        let teardown = AgentRunTeardown(agent_id);
+        let teardown = AgentRunTeardown::global(agent_id);
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
@@ -10473,23 +10515,82 @@ mod tests {
         assert!(!lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
     }
 
-    /// Round-4 review: dropping an `AgentRunTeardown` while a panic unwinds
-    /// does not abort. A panic inside a drop during unwinding aborts the whole
-    /// test binary, so this test passing is the evidence. The poisoned-lock arm
-    /// of each teardown call is covered through its explicit-map seam
-    /// (`coord_mcp::teardown_poison_tests`, `agent_daemons::teardown_poison_tests`),
-    /// because poisoning the shared process-global maps here would break
-    /// parallel tests that `expect` on them.
+    /// Round-5 review: an `AgentRunTeardown` built over POISONED maps, dropped
+    /// while a panic unwinds, neither aborts nor leaks. All three maps are LOCAL
+    /// copies (poisoning the process-global ones would break parallel tests that
+    /// `expect` on them), each holding an entry for the agent and each poisoned
+    /// before the drop. A panic from any helper inside a drop during unwinding
+    /// aborts the test binary, so this test fails if any teardown helper goes
+    /// back to `expect` on its lock.
     #[test]
-    fn agent_run_teardown_drops_during_a_panic_unwind_without_aborting() {
+    fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
         let agent = uuid::Uuid::now_v7();
-        let result = std::panic::catch_unwind(|| {
-            let _teardown = AgentRunTeardown(agent);
+
+        let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =
+            Mutex::new(HashMap::new());
+        tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            agent,
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+                token: "teardown-test-token".into(),
+                jti: uuid::Uuid::now_v7(),
+                exp: 0,
+                health: Default::default(),
+            })),
+        );
+        let nonces: Mutex<HashMap<String, crate::coord_mcp::NonceBinding>> =
+            Mutex::new(HashMap::new());
+        let nonce = format!("teardown-test-nonce-{agent}");
+        nonces.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            nonce.clone(),
+            crate::coord_mcp::teardown_poison_tests::agent_nonce_binding(agent),
+        );
+        let daemons: Mutex<HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>> =
+            Mutex::new(HashMap::new());
+        daemons
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, Default::default());
+
+        crate::coord_mcp::teardown_poison_tests::poison(&tokens);
+        crate::coord_mcp::teardown_poison_tests::poison(&nonces);
+        crate::coord_mcp::teardown_poison_tests::poison(&daemons);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _teardown = AgentRunTeardown {
+                agent_id: agent,
+                tokens: &tokens,
+                nonces: &nonces,
+                daemons: &daemons,
+            };
             panic!("simulated run-task panic");
-        });
+        }));
         assert!(
             result.is_err(),
-            "the panic propagates; the drop did not abort"
+            "the panic propagates; the drop over poisoned maps did not abort"
+        );
+
+        assert!(
+            !tokens
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&agent),
+            "the live-token entry is removed"
+        );
+        assert!(
+            !nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&nonce),
+            "the agent's proxy nonce is revoked"
+        );
+        assert!(
+            !daemons
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&agent),
+            "the agent's daemons are stopped"
         );
     }
 

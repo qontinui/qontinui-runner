@@ -163,7 +163,7 @@ const EPHEMERAL_NONCE_TTL: std::time::Duration = std::time::Duration::from_secs(
 /// into, the identity ([`ProxyPrincipal`]) whose bearer the proxy may inject for
 /// it, and its [`NonceLifetime`] (which decides expiry, persistence, and grace).
 #[derive(Clone, Debug)]
-struct NonceBinding {
+pub(crate) struct NonceBinding {
     workdir: String,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
@@ -935,7 +935,9 @@ static PROXY_NONCES: OnceLock<Mutex<HashMap<String, NonceBinding>>> = OnceLock::
 static AGENT_TOKENS: OnceLock<Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>> =
     OnceLock::new();
 
-fn agent_tokens() -> &'static Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> {
+/// `pub(crate)` so `agent_runtime::AgentRunTeardown` can bind the global map
+/// into its explicit-map teardown seam.
+pub(crate) fn agent_tokens() -> &'static Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> {
     AGENT_TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1009,9 +1011,10 @@ pub(crate) fn remove_agent_token(agent_id: Uuid) {
     remove_agent_token_in(agent_tokens(), agent_id);
 }
 
-/// [`remove_agent_token`] over an explicit map — the seam its poison test uses,
-/// so the test never poisons the process-global map other tests `expect` on.
-fn remove_agent_token_in(
+/// [`remove_agent_token`] over an explicit map — the seam its poison tests
+/// (here and in `agent_runtime`) use, so a test never poisons the
+/// process-global map other tests `expect` on.
+pub(crate) fn remove_agent_token_in(
     map: &Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>,
     agent_id: Uuid,
 ) {
@@ -1035,7 +1038,9 @@ static PROXY_NONCES_RESTORED: OnceLock<()> = OnceLock::new();
 /// the actual restore still available to a later enabled one.
 static PROXY_NONCES_RESTORE_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
 
-fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
+/// `pub(crate)` so `agent_runtime::AgentRunTeardown` can bind the global map
+/// into its explicit-map teardown seam.
+pub(crate) fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -4199,9 +4204,19 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 /// already panic-free in production (the census gate treats a poisoned lock as
 /// "emit", and the rotation-log write is best-effort).
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
+    revoke_agent_proxy_nonces_in(proxy_nonces(), agent_id);
+}
+
+/// [`revoke_agent_proxy_nonces`] over an explicit nonce map — the seam
+/// `agent_runtime::AgentRunTeardown` drops through, so its poison test can drive
+/// the full revoke (census and forensics included) against a poisoned LOCAL map.
+pub(crate) fn revoke_agent_proxy_nonces_in(
+    map: &Mutex<HashMap<String, NonceBinding>>,
+    agent_id: Uuid,
+) {
     // Collect (nonce, workdir) under the lock; emit the forensics lines after
     // releasing it (`log_rotation_event` does file I/O).
-    let (revoked, remaining) = take_agent_proxy_nonces_in(proxy_nonces(), agent_id);
+    let (revoked, remaining) = take_agent_proxy_nonces_in(map, agent_id);
     note_agent_binding_census(&remaining);
     for (nonce, workdir) in &revoked {
         log_rotation_event(
@@ -4252,15 +4267,28 @@ fn take_agent_proxy_nonces_in(
 /// the process-global maps would break every parallel test that `expect`s on
 /// them.
 #[cfg(test)]
-mod teardown_poison_tests {
+pub(crate) mod teardown_poison_tests {
     use super::*;
 
-    fn poison<T>(m: &Mutex<T>) {
+    pub(crate) fn poison<T>(m: &Mutex<T>) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _held = m.lock().unwrap_or_else(|p| p.into_inner());
             panic!("poison the lock");
         }));
         assert!(m.is_poisoned(), "test setup: the lock must be poisoned");
+    }
+
+    /// An AGENT-principal binding for `agent_id`, for teardown tests outside
+    /// this module (the binding's fields are private to it).
+    pub(crate) fn agent_nonce_binding(agent_id: Uuid) -> NonceBinding {
+        NonceBinding {
+            workdir: format!("/tmp/teardown-test-{agent_id}"),
+            principal: ProxyPrincipal::Agent { agent_id },
+            lifetime: NonceLifetime::Persistent,
+            session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            terminal_id: None,
+            minted_at: std::time::SystemTime::now(),
+        }
     }
 
     #[test]
