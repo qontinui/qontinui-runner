@@ -33,10 +33,11 @@
 //! 1. **Client-side** ([`ArtifactSyncState`]): a re-scan of an unchanged file
 //!    makes no HTTP call at all. This is what makes a 1,100-file reconcile tick
 //!    nearly free.
-//! 2. **Server-side**: an unchanged digest is a no-op that answers `200` with
-//!    `changed: false` and an `X-Artifact-Unchanged: true` header (**not** a
-//!    literal `304` — the caller still wants the row back to assert
-//!    `current_version` did not move).
+//! 2. **Server-side**: an unchanged digest never appends a version. When the
+//!    head metadata also matches it answers `200` with `changed: false` and an
+//!    `X-Artifact-Unchanged: true` header (**not** a literal `304` — the caller
+//!    still wants the row back to assert `current_version` did not move); a
+//!    differing `title`/`status`/… is still stored and answers `changed: true`.
 //!
 //! The digest we send is computed over *exactly* the bytes we send: the endpoint
 //! re-computes `sha256(body)` and **422s a disagreeing digest**, so a stale or
@@ -867,7 +868,8 @@ pub struct UpsertResult {
     /// The stored artifact's id — needed to hang edges off it. `None` only on
     /// the [`UpsertResult::ambiguous`] path, where nothing was written.
     pub id: Option<String>,
-    /// `false` on the no-op path (unchanged digest, `X-Artifact-Unchanged: true`).
+    /// `false` only when neither the body nor any head metadata moved
+    /// (`X-Artifact-Unchanged: true`).
     pub changed: bool,
     pub created: bool,
     /// The web side answered `409 ambiguous_kind_resolution`: this
@@ -972,9 +974,11 @@ impl ArtifactSyncState {
 pub enum BodyPushOutcome {
     /// The client-side digest memory matched — no HTTP call was made at all.
     SkippedUnchangedLocally,
-    /// The server reported `changed: false` (its own no-op path). Note the web
-    /// side deliberately does NOT rewrite metadata on this path — only a real
-    /// body change persists `title`/`status`/`repos`/…
+    /// The server reported `changed: false`: neither the body nor any head
+    /// metadata differed from what it stores. The web side DOES rewrite a
+    /// differing `title`/`status`/`repos`/… on an unchanged body (it skips only
+    /// the new version), and reports that as `changed: true` — [`Self::Updated`].
+    /// A differing heuristic kind is not moved on this path either.
     UnchangedRemotely,
     Created,
     Updated,
