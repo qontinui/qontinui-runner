@@ -721,10 +721,10 @@ mod tests {
             .expect("query");
 
         assert_eq!(rows.len(), 2, "expected 2 rows for this task_run");
-        let row0_path: String = rows[0].get(0);
-        let row0_wt: Option<String> = rows[0].get(1);
-        let row1_path: String = rows[1].get(0);
-        let row1_wt: Option<String> = rows[1].get(1);
+        let row0_path: String = rows[0].try_get(0).expect("row 0 file_path");
+        let row0_wt: Option<String> = rows[0].try_get(1).expect("row 0 worktree_id");
+        let row1_path: String = rows[1].try_get(0).expect("row 1 file_path");
+        let row1_wt: Option<String> = rows[1].try_get(1).expect("row 1 worktree_id");
 
         assert_eq!(row0_path, "/repo/main.rs");
         assert_eq!(row0_wt, None, "None worktree_id must round-trip as NULL");
@@ -762,7 +762,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let wt: Option<String> = row.get(0);
+        let wt: Option<String> = row.try_get(0).expect("worktree_id");
         assert_eq!(
             wt,
             Some("wt-promote".to_string()),
