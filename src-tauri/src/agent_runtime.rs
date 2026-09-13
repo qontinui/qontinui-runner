@@ -10522,10 +10522,19 @@ mod tests {
     /// before the drop. A panic from any helper inside a drop during unwinding
     /// aborts the test binary, so this test fails if any teardown helper goes
     /// back to `expect` on its lock.
+    ///
+    /// Global side effects: the revoke's census records the LOCAL map's result
+    /// in the process-global last-census record, so the test holds a
+    /// `census_record_guard` that restores the prior record on every exit,
+    /// a failed assertion included. Not reversible: when a forensics test has
+    /// switched the shared rotation log on, the revoke appends one `revoke`
+    /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
+    /// `agent_binding_census` line to that file.
     #[test]
     fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
         use std::collections::HashMap;
         use std::sync::Mutex;
+        let _census_restore = crate::coord_mcp::teardown_poison_tests::census_record_guard();
         let agent = uuid::Uuid::now_v7();
 
         let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =

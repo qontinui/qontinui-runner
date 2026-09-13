@@ -1040,6 +1040,8 @@ static PROXY_NONCES_RESTORE_DISABLED_LOGGED: OnceLock<()> = OnceLock::new();
 
 /// `pub(crate)` so `agent_runtime::AgentRunTeardown` can bind the global map
 /// into its explicit-map teardown seam.
+///
+/// Teardown seam only; mutate through the owning module's functions.
 pub(crate) fn proxy_nonces() -> &'static Mutex<HashMap<String, NonceBinding>> {
     PROXY_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -4276,6 +4278,32 @@ pub(crate) mod teardown_poison_tests {
             panic!("poison the lock");
         }));
         assert!(m.is_poisoned(), "test setup: the lock must be poisoned");
+    }
+
+    /// Snapshot of the process-global last-census record
+    /// ([`last_agent_census_cell`]), restored when dropped — on a test's normal
+    /// end and when it panics. For tests that drive a full revoke over a LOCAL
+    /// nonce map, whose census would otherwise leave that map's result in the
+    /// global record. Restores the snapshot rather than `None`: `None` would
+    /// make the next census anywhere in the binary emit again.
+    pub(crate) struct CensusRecordRestore(Option<Vec<AgentBindingCensusEntry>>);
+
+    impl Drop for CensusRecordRestore {
+        fn drop(&mut self) {
+            *last_agent_census_cell()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = self.0.take();
+        }
+    }
+
+    /// Take a [`CensusRecordRestore`] over the current global census record.
+    pub(crate) fn census_record_guard() -> CensusRecordRestore {
+        CensusRecordRestore(
+            last_agent_census_cell()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        )
     }
 
     /// An AGENT-principal binding for `agent_id`, for teardown tests outside
