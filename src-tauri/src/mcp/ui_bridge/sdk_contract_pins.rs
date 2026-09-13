@@ -29,8 +29,11 @@
 //! names are one decision (ours / theirs-for-another-quantity / theirs-renamed)
 //! and splitting them across two files is how one of them gets dropped in a
 //! later edit. Likewise, `screenshots.rs::visibility_tests` already covers the
-//! entry and report key names; genuinely new here are the snake_case alias
-//! pins, the SDK-only-key absence pins, the strict-`<` boundary and the handler
+//! entry and report key names, and
+//! `screenshots.rs::visibility_min_ratio_contract_tests` covers the snake_case
+//! aliases, the empty-object defaults and the validate-before-discover
+//! ordering; this module restates those. Genuinely new here are the
+//! SDK-only-key absence pins, the strict-`<` boundary and the handler
 //! status/default scrape. Overlap is cheap; a reader who believes there is none
 //! and finds some is the expensive outcome.
 //!
@@ -146,13 +149,14 @@ const USE_CONTROL_EVENTS_TS: &str =
 // ---------------------------------------------------------------------------
 
 /// `VisibilityRequest` carries `#[serde(rename_all = "camelCase")]`, so the
-/// wire names are `minRatio` / `includeExpected` — NOT the Rust field names.
-/// A dropped or edited `rename_all` would leave the struct compiling, the
-/// route answering `200`, and every caller's parameters silently ignored,
-/// because both fields are `#[serde(default)]`. That failure mode is invisible
-/// from the outside: the sweep just quietly runs at the default ratio.
+/// SDK's wire names are `minRatio` / `includeExpected`. The snake_case field
+/// names are ALSO accepted, as `serde(alias)` (aae5c6d4a). A dropped or edited
+/// `rename_all` would leave the struct compiling, the route answering `200`,
+/// and every SDK (camelCase) caller's parameters silently ignored, because both
+/// fields are `#[serde(default)]`. That failure mode is invisible from the
+/// outside: the sweep just quietly runs at the default ratio.
 #[test]
-fn visibility_request_deserializes_the_sdk_camelcase_names() {
+fn visibility_request_accepts_the_sdk_camelcase_names_and_snake_case_aliases() {
     let req: VisibilityRequest =
         serde_json::from_str(r#"{"minRatio":0.5,"includeExpected":true}"#).expect("camelCase body");
     assert_eq!(
@@ -193,10 +197,10 @@ fn visibility_request_deserializes_the_sdk_camelcase_names() {
         "same, for `include_expected`"
     );
 
-    // A bodyless POST is accepted. The SDK's manifest declares this route
-    // `bodyRequired: true` (types.ts UI_BRIDGE_ROUTES); the runner is
-    // deliberately MORE permissive, and that asymmetry is pinned so nobody
-    // "fixes" it into a 4xx that breaks the runner's own callers.
+    // An empty object means defaults. (The BODYLESS case is pinned by the
+    // `Option<Json<VisibilityRequest>>` handler scrape below: the SDK's
+    // manifest declares this route `bodyRequired: true` in types.ts
+    // UI_BRIDGE_ROUTES, and the runner is deliberately MORE permissive.)
     let empty: VisibilityRequest = serde_json::from_str("{}").expect("empty object");
     assert_eq!(empty.min_ratio, None);
     assert_eq!(empty.include_expected, None);
@@ -489,8 +493,8 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
 
     assert!(
         body.contains("body: Option<Json<VisibilityRequest>>"),
-        "the body is OPTIONAL: a bodyless POST /control/visibility must sweep \
-         at the defaults, not answer 415/422. The SDK manifest declares this \
+        "the body is OPTIONAL: a POST /control/visibility with no body and no \
+         Content-Type must sweep at the defaults, not be refused. The SDK manifest declares this \
          route bodyRequired:true and the runner is deliberately more \
          permissive — pinned so nobody tightens it into a break"
     );
@@ -505,12 +509,26 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
         "the SDK defaults includeExpected to false; a `true` default here \
          would change which occlusions a default call reports"
     );
+    // Scope: every status assertion below is about THIS HANDLER BODY. axum's
+    // `Json` extractor rejects some requests before the handler runs, and this
+    // scrape cannot see those: malformed JSON is a 400, a wrongly typed field
+    // (e.g. `{"minRatio":"x"}`) is a 422 with no INVALID_MIN_RATIO code, and a
+    // non-JSON Content-Type is a 415.
+    let unprocessable_at = body
+        .find("StatusCode::UNPROCESSABLE_ENTITY")
+        .expect("the handler must answer an out-of-range minRatio with a 422");
+    // Byte window, not a `&str` slice: a multi-byte char straddling the +200
+    // boundary must not panic on a char boundary.
+    let window_end = (unprocessable_at + 200).min(body.len());
     assert!(
-        body.contains("StatusCode::UNPROCESSABLE_ENTITY") && body.contains("\"INVALID_MIN_RATIO\""),
-        "an out-of-range or NaN minRatio is a 422 INVALID_MIN_RATIO (aae5c6d4a). \
-         That is a real caller error: minRatio lies in [0, 1] by construction, \
-         and before the check `minRatio: 2` answered 200 with a clear verdict \
-         the threshold itself guaranteed. A client should not retry it"
+        body.as_bytes()[unprocessable_at..window_end]
+            .windows(br#""INVALID_MIN_RATIO""#.len())
+            .any(|w| w == br#""INVALID_MIN_RATIO""#),
+        "an out-of-range minRatio (outside [0, 1]) is a 422 carrying \
+         INVALID_MIN_RATIO (aae5c6d4a). That is a real caller error: minRatio \
+         lies in [0, 1] by construction, and before the check `minRatio: 2` \
+         answered 200 with a clear verdict the threshold itself guaranteed. A \
+         client should not retry it"
     );
     let validate_at = body
         .find("validate_min_ratio(")
@@ -521,7 +539,8 @@ fn visibility_handler_pins_its_status_and_default_commitments() {
     assert_eq!(
         body.matches("StatusCode::UNPROCESSABLE_ENTITY").count(),
         1,
-        "exactly one 422 arm (INVALID_MIN_RATIO); any other failure is a 500"
+        "exactly one 422 arm in this handler body (INVALID_MIN_RATIO); its other \
+         failure arm is a 500"
     );
     assert!(
         validate_at < discover_at,
