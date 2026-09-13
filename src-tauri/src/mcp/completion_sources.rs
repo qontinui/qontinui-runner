@@ -838,8 +838,8 @@ mod tests {
             )
             .await
             .expect("insert plan");
-        let plan_id: String = plan_row.get(0);
-        let plan_version_hash: String = plan_row.get(1);
+        let plan_id: String = plan_row.try_get(0).expect("plan id");
+        let plan_version_hash: String = plan_row.try_get(1).expect("plan version_hash");
 
         let pr_url = "https://github.com/example/repo/pull/42";
         let task = pg
@@ -895,7 +895,7 @@ mod tests {
             )
             .await
             .expect("containment");
-        let ids: Vec<String> = resolved.iter().map(|r| r.get(0)).collect();
+        let ids: Vec<String> = resolved.iter().map(|r| r.try_get(0).expect("id")).collect();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], task.id);
 
