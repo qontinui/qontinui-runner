@@ -8251,22 +8251,25 @@ async fn forward_coord_write(
     // tests/coord_auth_pin.rs finds coord writes by builder verb (`.post(` /
     // `.delete(`), so a `.request(`-built write is invisible to that coverage
     // readout. Two annotated sites, one executes.
+    // `.bearer_auth(` stays ON THE VERB LINE in both arms, not hoisted to the
+    // shared builder below: `tests/coord_auth_pin.rs` only scores a `.post(` /
+    // `.delete(` as a reqwest write when a builder token sits in its window,
+    // and the egress guard between the branch and the builder pushes the
+    // nearest one out of reach — which reads as an UNANNOTATED coord write.
     let request = if method == reqwest::Method::DELETE {
         // coord-auth-exempt(forwarder): write-forwarder hop, DELETE arm (the
         // label door's retract verb) — `bearer` is the caller-resolved
         // credential passed in by the handler, not this device's.
-        client.delete(url)
+        client.delete(url).bearer_auth(bearer)
     } else {
         // coord-auth-exempt(forwarder): write-forwarder hop, POST arm — `bearer`
         // is the caller-resolved credential passed in by the handler, not this
         // device's.
-        client.post(url)
+        client.post(url).bearer_auth(bearer)
     };
     let upstream = {
         let _in_flight = egress::in_flight(EG);
-        let mut req = request
-            .bearer_auth(bearer)
-            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        let mut req = request.header(axum::http::header::CONTENT_TYPE, "application/json");
         // The RUNNER-resolved caller session only. The client's own copy of
         // the header never reaches here: this leg builds its headers from
         // scratch rather than passing the request's through.
