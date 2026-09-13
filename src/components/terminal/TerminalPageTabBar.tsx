@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { Plus, X, Shuffle, SquareArrowOutUpRight } from "lucide-react";
-import type { TerminalPageConfig } from "./useTerminalPages";
+import { keyboardReorderTarget, type TerminalPageConfig } from "./useTerminalPages";
 
 /**
  * Sentinel `dragOverId` value for the drop zone AFTER the last tab (the
@@ -178,18 +178,17 @@ export function TerminalPageTabBar({
               // requires for a drag-only interaction. Swaps the focused tab
               // with its immediate neighbor; focus follows it (React moves
               // rather than remounts a same-key element across a reorder).
+              // The index arithmetic lives in `keyboardReorderTarget`
+              // (unit-tested directly — see its doc comment for why).
               if (!onReorderPage || !e.altKey) return;
               if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
               e.preventDefault();
-              const i = pages.findIndex((p) => p.id === page.id);
-              if (i < 0) return;
-              if (e.key === "ArrowLeft") {
-                if (i > 0) onReorderPage(page.id, pages[i - 1].id);
-              } else if (i < pages.length - 1) {
-                // Moving right one slot means landing just before whatever is
-                // now two slots ahead — or the end, if there's nothing there.
-                onReorderPage(page.id, i + 2 < pages.length ? pages[i + 2].id : null);
-              }
+              const target = keyboardReorderTarget(
+                pages,
+                page.id,
+                e.key === "ArrowLeft" ? "left" : "right",
+              );
+              if (target !== undefined) onReorderPage(page.id, target);
             }}
             title={`Switch to ${page.name}${onReorderPage ? " (drag, or Alt+←/→, to reorder)" : ""}`}
           >

@@ -320,6 +320,43 @@ export function reorderPagesArray(
   return unchanged ? pages : next;
 }
 
+/**
+ * Pure: the `reorderPagesArray` target for moving `pageId` ONE SLOT in
+ * `direction` — the index arithmetic behind the tab bar's Alt+Arrow
+ * keyboard reorder (the non-dragging alternative WCAG 2.5.7 requires for a
+ * drag-only interaction). Moving right lands one slot further than moving
+ * left because `reorderPagesArray`'s "insert immediately before target"
+ * semantics need the element TWO positions ahead as the target to produce a
+ * plain adjacent swap; `null` is that same "append at end" sentinel when
+ * there's nothing two positions ahead.
+ *
+ * Returns:
+ *   - a page id or `null` — pass straight to `reorderPagesArray` /
+ *     `onReorderPage`.
+ *   - `undefined` — no legal move in that direction: `pageId` is unknown, or
+ *     already at that edge of `pages`.
+ *
+ * Exported so the arithmetic — the trickiest part of the keyboard path per
+ * code review, and the one piece a component-level (RTL) test would
+ * otherwise be needed to guard — is unit-testable directly. This repo's
+ * vitest runs `environment: "node"` with no RTL anywhere (see
+ * `LaunchMenu.test.tsx`); the established precedent is exporting the pure
+ * logic rather than standing up a React tree, which this follows.
+ */
+export function keyboardReorderTarget(
+  pages: TerminalPageConfig[],
+  pageId: string,
+  direction: "left" | "right",
+): string | null | undefined {
+  const i = pages.findIndex((p) => p.id === pageId);
+  if (i < 0) return undefined;
+  if (direction === "left") {
+    return i > 0 ? pages[i - 1].id : undefined;
+  }
+  if (i >= pages.length - 1) return undefined;
+  return i + 2 < pages.length ? pages[i + 2].id : null;
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
