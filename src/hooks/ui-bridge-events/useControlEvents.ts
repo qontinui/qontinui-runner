@@ -590,13 +590,26 @@ export function useControlEvents(
 
           try {
             const { resolveStableRef } = await import("@qontinui/ui-bridge/core");
+            // ui-bridge 0.25.0 (`90a0160`) changed this from
+            // `(ref) => RegisteredElement | null` to
+            // `(ref, options?) => StableRefResolution | null`, where
+            // `StableRefResolution` is `{ element, resolution }` — so the
+            // element moved one level down. `resolution` additionally names
+            // WHICH of the four fallback strategies won and how stable that
+            // class of evidence is; it is surfaced here because a caller that
+            // cannot tell a primary-id hit from a last-resort heuristic match
+            // cannot tell a solid answer from a lucky one.
             const resolved = resolveStableRef(stableRef as Parameters<typeof resolveStableRef>[0]);
             await sendResponse({
               requestId,
               type,
               success: true,
               data: resolved
-                ? { elementId: resolved.id, mounted: resolved.mounted }
+                ? {
+                    elementId: resolved.element.id,
+                    mounted: resolved.element.mounted,
+                    resolution: resolved.resolution,
+                  }
                 : { elementId: null },
               timestamp: Date.now(),
             });
