@@ -1,5 +1,5 @@
 ---
-description: One transport-agnostic door to register, attest, or withdraw a coord gate — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), REST writes through the runner's proxy-nonce write forwarder, or coord's generic remote MCP door (POST /mcp, device JWT), plus three residual file-independent credentials (an in-process proxy nonce minted from the local runner, which is the only mint that answers on a headless box; then a device JWT from the runner's UI Bridge; then an acting-bearer mint from $COORD_AGENT_JWT) — so you never touch ports, nonces, or proxies. Use it whenever coord_register_gate is not a visible tool.
+description: One transport-agnostic door to register, attest, or withdraw a coord gate — runs the native MCP tool, an auto-discovered loopback proxy (JSON-RPC), REST writes through the runner's proxy-nonce write forwarder, or coord's generic remote MCP door (POST /mcp, device JWT), plus four residual file-independent credentials (an in-process proxy nonce minted from the local runner, which is the only mint that answers on a headless box; then a device JWT from the runner's UI Bridge; then an acting-bearer mint from $COORD_AGENT_JWT; then Step 4b's bootstrap credential, an anonymous POST /agents/credential that needs no runner at all) — so you never touch ports, nonces, or proxies. Use it whenever coord_register_gate is not a visible tool.
 argument-hint: "register|attest|withdraw [args]"
 allowed-tools: Read, Bash, Glob, Grep, ToolSearch
 ---
@@ -24,6 +24,12 @@ family, and Step 3's residual covers all of them: an **in-process proxy nonce
 minted from the local runner** (`POST /coord-mcp/provision-session`), an
 explicitly exported `$COORD_AGENT_JWT`, and a **device JWT minted from the local
 runner's UI Bridge** (`:9876`), which holds no secret at rest.
+One further credential source is independent of the runner ENTIRELY: **Step
+4b's bootstrap credential**, an anonymous `POST $COORD_HTTP_URL/agents/credential`
+whose only input is a `device_id` read off disk. Every mint listed above is
+minted BY the runner — the nonce mint in-process, the UI-Bridge device JWT
+through its WebView — so one wedged runner takes them all down together. That
+rung is the one that survives it, and it is the only one that does.
 The cascade therefore buys protocol redundancy AND genuinely independent
 credential paths. **Step 4 is the one rung that is a genuinely different
 transport** — `POST $COORD_HTTP_URL/mcp`, coord's whole MCP tool surface over a
@@ -356,6 +362,16 @@ bearer, no TTL worry. **The catch:** the workspace-root `.mcp.json` is often
 **stale/mis-ported** (dead port or evicted nonce → 401) while a **sibling repo's**
 `.mcp.json` (e.g. `qontinui-coord/.mcp.json`) holds the **live** key/port. So
 **probe every candidate and use the first whose `tools/list` returns HTTP 200.**
+
+⚠️ **The MCP CLIENT's cached key and the FILE's key are different things — and
+the mtime tells them apart.** If the workdir `.mcp.json`'s mtime is NEWER than
+this session's start, the client is holding a key it read at spawn while the
+file on disk carries a fresher one. The file's key still works over raw JSON-RPC
+to `/coord-mcp` — which is exactly what this Step does — so the verdict there is
+**"client cache stale"**, never "proxy dead". Read the file's key rather than
+concluding from Step 1's masked/failing tool that the transport is gone; the raw
+workdir-key path IS this rung, and `/coord-revive`'s L1 and L2 are the same
+probe. (Dossier contribution `9206bde5-2d3e-4cf4-ab7c-c5d526b6d995`, "Mechanism 4".)
 
 Candidate order (cwd → repo root → siblings):
 
@@ -1011,9 +1027,180 @@ of the local mechanism, and the Step-5 block below must say so — naming every
 probe you actually ran, **and naming the ones you did not** as `not attempted`.
 An axis you skipped is not an axis that failed.
 
+### Step 4b — The bootstrap credential: the one rung that needs no runner (probe: `POST $COORD_HTTP_URL/agents/credential` → HTTP 200 with a JWT-shaped `token`)
+
+<!-- lint-gate-door-parity: allow attest
+     lint-gate-door-parity: allow withdraw
+     Same reason Step 3 carries its marker: this rung is reached ONLY after
+     Step 1 established that the native MCP door is absent from this session,
+     so naming that tool inside the fallback built for its absence inverts the
+     step's whole subject. The routes below are named because they are the ONLY
+     places this bearer may be spent. The tool names are deliberately NOT
+     written in this comment — spelling them would satisfy check #32's token
+     test on its own and quietly make these markers decorative. -->
+
+**This rung works, and it is the last one before Step 5's honest failure. Try it
+before you write that block.** Measured against production coord from
+`merytshost` on 2026-09-04, from the Windows operator box on 2026-09-06, and
+again from `merytshost` on **2026-09-13** (this file's own re-probe): the
+anonymous `POST $COORD_HTTP_URL/agents/credential` answered **`200`** with
+`{token, token_exp, token_jti}`, and the control read
+`GET $COORD_HTTP_URL/coord/agent-findings?limit=1` answered **`200`** over that
+bearer while answering **`401`** without it — so the `200` is the token's doing,
+not an open route.
+
+**The route is in coord's source, so this is not probe-only.**
+`pub async fn post_credential` (`crates/coord/src/agent_worktrees.rs`) is
+registered at `/agents/credential` in `crates/coord/src/routes.rs` on
+`qontinui-coord` `origin/main`, commit **`5dd99cc3`** (PR #1850, ff-landed).
+Cite the commit for *existence* and a dated probe for *reachability* — they go
+stale at different rates.
+
+**Why this rung is not a spelling of the four above.** Steps 1–4 are less
+independent than the numbering suggests: Step 2 *is* the runner, Step 3 is the
+runner's forwarder, and every mint in the Step-3/Step-4 credential cascade
+except the two static files is minted *by* the runner. One wedged runner takes
+all of them down at once, and the static files hold a **~4h** device JWT, so
+they are expired far more often than not. This rung's only input is a **file on
+disk**. Plan
+`2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline`.
+
+**The shape.** Resolve a `device_id` — `$QONTINUI_MACHINE_ID` first, else
+`~/.qontinui/machine.json` `"device_id"`, falling back to the legacy
+`"machine_id"` — and POST it **anonymously** (no `Authorization` header of any
+kind) to `$COORD_HTTP_URL/agents/credential`. This is the
+credential-mints-itself carve-out shape: a dedicated credential-only route is
+anonymous *because requiring a credential to obtain one is circular*. coord's
+own ungated-route list is the precedent to cite (`crates/coord/src/routes.rs`;
+the `operator_admin_writes` sub-router is the inverse — the routes explicitly
+fenced behind `require_role("admin")`).
+
+```bash
+# device_id — LOCAL only. An absent id is a statement about this box, never a
+# coord verdict, and nothing is sent: an empty device_id would draw a 4xx you
+# would then blame on coord.
+DEV="${QONTINUI_MACHINE_ID:-}"
+if [ -z "$DEV" ] && [ -r "$HOME/.qontinui/machine.json" ]; then
+  DEV=$("${PYTHON:-python3}" -c 'import json,os,sys
+try:
+    d=json.load(open(os.path.expanduser("~/.qontinui/machine.json")))
+    sys.stdout.write(d.get("device_id") or d.get("machine_id") or "")
+except Exception:
+    pass')
+fi
+[ -z "$DEV" ] && echo "BOOTSTRAP_NO_DEVICE_ID (local — nothing sent)" >&2
+
+# The token NEVER touches argv. Same rule, same reason, same mechanism as the
+# proxy nonce in Step 2: process cmdlines are world-readable on this
+# multi-session machine. Stage it in a private tempfile and pass `curl -H @file`.
+# `cygpath -w` for the SAME reason Step 2 converts its header path: a native
+# curl.exe cannot open mktemp's POSIX path when MSYS pathconv is off, and it
+# fails SILENTLY — exit 0, right http_code, body written where bash never looks.
+HDR=$(mktemp); chmod 600 "$HDR"
+BODY=$(mktemp)
+trap 'rm -f "$HDR" "$BODY"' EXIT
+# No shell positional anywhere: a `$` followed by a digit is a HARNESS
+# placeholder that is substituted before this body is injected. One reader per
+# path, exactly as Step 2's `hdrp` is written.
+hdrp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$HDR" || printf '%s' "$HDR"; }
+bodyp() { command -v cygpath >/dev/null 2>&1 && cygpath -w "$BODY" || printf '%s' "$BODY"; }
+CODE=$(curl -sS -o "$(bodyp)" -w '%{http_code}' -m 25 \
+  -X POST "$COORD_HTTP_URL/agents/credential" \
+  -H 'Content-Type: application/json' -d "{\"device_id\":\"$DEV\"}")
+# The token is read on STDIN, never handed to jq as an argument — same rule as
+# Step 2's `mcp_url`/`mcp_key` readers, and for the same MSYS reason.
+# jq is NOT guaranteed to exist — it is ABSENT on the Windows operator box
+# (verified 2026-08-06). With `jq ... 2>/dev/null` alone, a missing binary is
+# indistinguishable from an absent field: the header would be written with an
+# EMPTY bearer, the control read would 401, and this rung would report
+# BOOTSTRAP_TOKEN_UNVERIFIED about a mint that succeeded. Pick a reader up front
+# and fail LOUD, exactly as Step 2 does.
+if command -v jq >/dev/null 2>&1; then
+  read_token() { jq -r '.token // ""' < "$BODY"; }
+elif command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+  read_token() { "${PYTHON:-python3}" -c 'import json,sys
+try:
+    sys.stdout.write(json.load(sys.stdin).get("token") or "")
+except Exception:
+    pass' < "$BODY"; }
+else
+  echo "BOOTSTRAP reader missing: neither jq nor python is on PATH, so the mint response cannot be read. LOCAL fault — say so; it is not a coord verdict." >&2
+  read_token() { printf ''; }
+fi
+TOK=$(read_token)
+[ -z "$TOK" ] && echo "BOOTSTRAP_NO_TOKEN_IN_RESPONSE (HTTP $CODE, but no token field was readable)" >&2
+printf 'Authorization: Bearer %s\n' "$TOK" > "$HDR"
+# VERIFY BEFORE USE — a mint is not an authentication.
+curl -sS -o /dev/null -w '%{http_code}\n' -m 20 -H @"$(hdrp)" \
+  "$COORD_HTTP_URL/coord/agent-findings?limit=1"   # must be 200
+```
+
+**Then spend the bearer ONLY on the device-authed hand-written REST routes Step
+3 already spells out** — `POST $COORD_HTTP_URL/coord/work-units/upsert`,
+`POST $COORD_HTTP_URL/coord/work-units/<stem>/register-gate`,
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/attest`,
+`POST $COORD_HTTP_URL/coord/gates/<gate_id>/withdraw` — with the header FILE,
+never the token on argv. **Never carry it onto `POST $COORD_HTTP_URL/mcp`**:
+that door's device-JWT-only constraint is unchanged, and this bearer is
+`sub_type=agent` with a DEVICE subject (`sub=device:<uuid>`) and no `agent_id`
+claim. `coord-revive.sh`'s `PARTIAL_BOOTSTRAP` block states why in full; this
+rung and that one are the same door and must report in one spelling.
+
+**What the bearer is, measured.** EdDSA, `iss=qontinui-coord`,
+`sub=device:<device_id>`, `sub_type=agent`, tenant resolved server-side from
+`coord.devices`, **~4h** TTL (14400s), and every scope empty or false
+(`git_push []`, `merge_propose false`, `build_submit false`,
+`strategy_admin false`, `introspect false`, no NATS subjects) — narrower than
+the sibling `/agents/allocate` token. Use it for the write you came for and
+**discard it**: never persist it, never print it, never put it on any process's
+argv.
+
+**Verdict vocabulary — reuse `coord-revive.sh`'s L5 spellings verbatim** so
+`/gate` and `/coord-revive` report one failure in one spelling:
+`BOOTSTRAP_NO_DEVICE_ID`, `BOOTSTRAP_MACHINE_FILE_MALFORMED`,
+`BOOTSTRAP_ROUTE_ABSENT`, `BOOTSTRAP_DEVICE_REJECTED`,
+`BOOTSTRAP_NO_TOKEN_IN_RESPONSE`, `BOOTSTRAP_TOKEN_UNVERIFIED`,
+`BOOTSTRAP_UNREACHABLE`. Their full meanings are the verdict table in
+`.claude/skills/coord-revive/SKILL.md`. Two of them are worth restating here:
+
+- **`BOOTSTRAP_ROUTE_ABSENT` is now a REGRESSION, not a known-absent rung.** A
+  `405` is how an unregistered POST under `/agents/` reads on this router
+  (`POST /agents/definitely-not-a-route` returns the identical empty `405`,
+  measured 2026-09-02 and re-confirmed 2026-09-04), so "route absent" is spelled
+  405 here rather than 404 — but the same anonymous POST answered `200` on
+  2026-09-04, 2026-09-06 and 2026-09-13, so hitting this arm means a rollback or
+  a different deployment. Name the code you saw and report it as a regression.
+- **`BOOTSTRAP_TOKEN_UNVERIFIED` is never LIVE.** The mint succeeded and the
+  control read did not answer `200`. Report BOTH facts; a mint you did not
+  verify is not a credential.
+
+> ⚠️ **A failing route does NOT license `POST $COORD_HTTP_URL/agents/allocate`
+> as a substitute.** Step 3's prohibition is unqualified and three shipped
+> documents carry it. The gate once cited as live authority for the question —
+> coord gate **`ece99898-30c6-4f8c-be8e-1de5f09abebc`** (`operator_approval`,
+> `gate_class: security-surface`) — reads **`withdrawn`**, and so does its
+> successor `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (read 2026-09-11:
+> *"DECIDED, not escalated: do NOT clamp"*), which names allocate's anonymity as
+> the residual for the narrower MintCaller route. **Re-verify both with
+> `coord_gate_inspect` before citing either** — a withdrawn gate reads
+> identically to an open one in prose, which is why this pointer is mandatory
+> and this sentence is not a substitute for asking. So the allocate question is
+> **UNKNOWN — neither still-gated nor cleared — and UNKNOWN is not permission.**
+> Two further reasons the prohibition stands independently of any ruling: #1850
+> supplies the sanctioned door above and narrows allocate's anonymous scopes,
+> and every recovery through allocate manufactures an unreapable
+> `coord.agent_worktrees` row. The honest outcome of a failed Step 4b is **Step
+> 5 with its full staleness disclosure** — never a token from that door.
+
+**Record that you got this far.** Reaching Step 4b means every ordinary door
+failed, which is the condition the fleet most wants counted. `coord-revive.sh`
+writes two `guard_decide` breadcrumbs into
+`~/.qontinui/logs/guard-decisions.log` for exactly this; if you ran the cascade
+by hand, say so in your Step 5 block rather than leaving the reach unrecorded.
+
 ### Step 5 — Honest failure (never a silent no-op)
 
-If all four steps fail, **do not pretend**. Report exactly which link is missing
+If all five steps fail — Step 4b included — **do not pretend**. Report exactly which link is missing
 and point at the self-check:
 
 > **gate NOT registered.** No transport reached coord:
@@ -1027,6 +1214,11 @@ and point at the self-check:
 > unset / coord down); **generic remote MCP** `POST $COORD_HTTP_URL/mcp` → HTTP
 > CODE, or NO DEVICE JWT RESOLVABLE (say which — and never reach for an
 > `/agents/allocate` token to make this line go away);
+> **bootstrap credential** `POST $COORD_HTTP_URL/agents/credential` → HTTP CODE
+> or one of the `BOOTSTRAP_*` verdicts (say which — a `200` here was measured
+> 2026-09-04, 2026-09-06 and 2026-09-13, so a non-2xx is a REGRESSION worth
+> naming, not a known-absent route; and whatever the code, `/agents/allocate`
+> stays prohibited), or **NOT ATTEMPTED**;
 > **web-host axis** `GET https://api.qontinui.io/api/v1/plan-library?kind=plan&limit=1`
 > → HTTP CODE, or **NOT ATTEMPTED** (say which — `401` anonymous and `200` with
 > a `user_id`-bearing device JWT were both measured 2026-09-06, and either is a
@@ -1037,7 +1229,7 @@ and point at the self-check:
 > pasted verbatim — probe time, runner build, this box's load, one line per
 > door>.
 
-**All SEVEN lines must be true before you report this — and the block is not
+**All EIGHT lines must be true before you report this — and the block is not
 complete without the `FLOOR-CLAIM:` line under them.** That line is the only
 sanctioned form of "no transport reached coord": it carries the probe time, the
 runner build and the load the sample was taken under, so a reader a day later
@@ -1052,8 +1244,8 @@ would have worked: a rotated nonce 401s every `.mcp.json` at once while the
 runner itself is perfectly healthy. If you did not probe `:9876`, you have not
 exhausted the cascade — say "not attempted", never "unavailable".
 
-**The seventh line is a HOST axis, and it is the one this block spent its whole
-life without.** The first six are all `coord.qontinui.io` plus loopback — one
+**The eighth line is a HOST axis, and it is the one this block spent its whole
+life without.** The first seven are all `coord.qontinui.io` plus loopback — one
 host, one program — so every one of them can fail together for a single cause
 that says nothing about whether the fleet's serving plane answers. The exit
 criterion, stated here so it is checkable rather than assumed:

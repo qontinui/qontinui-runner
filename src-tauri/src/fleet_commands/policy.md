@@ -537,8 +537,10 @@ of a live policy body. Plan
 (`$QONTINUI_MACHINE_ID` first, else `~/.qontinui/machine.json` `"device_id"`,
 falling back to the legacy `"machine_id"`) and POST it **anonymously** to
 `$COORD_HTTP_URL/agents/credential` — a dedicated credential-only route, which is
-the `pair.rs::pair_via_browser` carve-out shape (anonymous *because it mints the
-credential, so requiring one is circular*). It answers `200` with a `token`
+the same carve-out shape as coord's own anonymous device-pairing surfaces — `post_pair_start` / `post_pair_complete` / `post_pair_cli` (`crates/coord/src/routes_phase3.rs`), registered ungated at `/coord/devices/pair-start|pair-complete|pair-cli` in `crates/coord/src/routes.rs` — anonymous *because it mints the
+credential, so requiring one is circular*. (`pair.rs::pair_via_browser`, cited
+here until 2026-09-13, does not exist in coord: verify a route by name in
+`routes.rs` before citing it as precedent.). It answers `200` with a `token`
 field: an EdDSA JWT, `sub=device:<device_id>`, `sub_type=agent`, tenant
 resolved, all scopes empty, ~4h TTL.
 
