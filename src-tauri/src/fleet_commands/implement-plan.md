@@ -55,32 +55,34 @@ settings; a session launched outside the runner will not have them.
 >   for a hand-`POST`ed row) — and **read `corpus_health`**: a `plan_count` far
 >   below the `ls-tree` count is a FROZEN corpus, and the sentence to write is
 >   that observation. Never `q=<stem>`: it matches title and body, not the slug.
->   Then read **`corpus_health.scan_roots`** (under `data.` on the runner door)
->   for the plan's scan source — the `source_repo` of where the plan sits on
->   `origin`, as `<repo>/<dir>` (a plan under `qontinui-dev-notes/plans/` is
->   `qontinui-dev-notes/plans`). A plan the corpus does not hold is **absent
->   only when ALL of these hold**, and UNKNOWN otherwise:
->   1. `corpus_health` and its `scan_roots` are both present — a backend
->      predating either omits the key, and `/candidates` can serve
->      `corpus_health: null` with `corpus_health_unavailable_reason` beside it —
->      and `scan_roots.state` is not `unknown` (`read_failed:` and
->      `no_observation:` serve `by_source_repo: []`, which is not "nothing to
->      check");
->   2. `scan_roots.rows` holds a comparable feeder for that source (`source_repo`
->      equal to it, `reported_state: measured`, `observation_fresh: true`,
->      `last_report_applied: true`) whose `head_sha` contains the commit that
->      ADDED the plan. After `git -C qontinui-dev-notes fetch`, run
->      `git -C qontinui-dev-notes merge-base --is-ancestor "$(git -C qontinui-dev-notes log --diff-filter=A --format=%H origin/main -- plans/<stem>.md | tail -1)" <head_sha>`:
->      exit 0 is contained, 1 is not, anything else (an empty `$(…)`, a sha this
->      clone lacks) is UNKNOWN;
->   3. and the counts the next bullet requires agree — a feeder tree holding the
->      plan is necessary, not proof: that feeder's body sync and the tenant's
->      `plan_capture` dial must also have been on.
->
->   The source's `by_source_repo` roll-up says how much is in doubt: a
->   `min_behind` above 0 (a lower bound unless `min_behind_is_floor` is
->   `false`), or a roll-up reading `unknown`, means plans newer than its
->   feeders' trees may be missing. Quote it beside any UNKNOWN.
+>   Then, for a stem the corpus does not hold, **ask `origin` first** — after a
+>   `git -C qontinui-dev-notes fetch` that succeeded, run
+>   `git -C qontinui-dev-notes ls-tree --name-only origin/main -- plans/<stem>.md`:
+>   * **It prints the path — the plan is NOT absent.** Read it through the git
+>     door and record that the corpus lacks it. Then say why, from
+>     **`corpus_health.scan_roots`** (under `data.` on the runner door). Take the
+>     rows for the plan's scan source (`source_repo` is `<repo>/<dir>` of where
+>     it sits on `origin`, e.g. `qontinui-dev-notes/plans`) that are comparable
+>     (`reported_state: measured`, `observation_fresh: true`,
+>     `last_report_applied: true`), and test each one with
+>     `git -C qontinui-dev-notes ls-tree --name-only <head_sha> -- plans/<stem>.md`.
+>     No comparable feeder whose HEAD held the file is **feeder lag**: quote the
+>     source's `by_source_repo` roll-up (`min_behind`, a lower bound unless
+>     `min_behind_is_floor` is `false`). A comparable feeder whose HEAD held it
+>     is a **capture gap**: its body sync, the tenant's `plan_capture` dial, the
+>     parse, or its working tree (the scanner reads the tree, not HEAD) did not
+>     deliver it — record what you can establish and assume none of them. A
+>     missing `corpus_health` or `scan_roots` (an older backend omits them;
+>     `/candidates` can serve `corpus_health: null` beside
+>     `corpus_health_unavailable_reason`), a `scan_roots.state` of `unknown`
+>     (`read_failed:` / `no_observation:`, with `by_source_repo: []`), or a
+>     `head_sha` this clone lacks (that `ls-tree` exits non-zero) leaves the
+>     REASON unknown — never the plan's existence.
+>   * **It prints nothing and exits 0 — the plan is not on `origin`.** The
+>     scan-root readings say nothing about it; whether it exists at all (a plan
+>     authored through the web UI never reaches git) is the next bullet's
+>     question.
+>   * **It exits non-zero** (no `origin/main`, a failed fetch) — UNKNOWN.
 > * **A zero is UNKNOWN until a count says otherwise.** The body sync that fills
 >   `agent.work_artifacts` is a property of each writing device's runner build
 >   (opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before plan
