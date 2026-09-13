@@ -22,11 +22,33 @@
 # `unknown` == `unknown` is classified as UNOBSERVED and never as agreement, and
 # that the verdict line refuses to let a 0 stand next to a thin denominator.
 #
-# RUN IT UNDER WINDOWS POWERSHELL 5.1, NOT pwsh 7
-# -----------------------------------------------
-# Same reasoning as scripts/tests/test-smoke-summary.ps1: the exactly-one-row
-# cases are where PS 5.1's scalar `Count` adapter returns $null for
-# PSCustomObject, and the real gate runs under `powershell -File`.
+# RUN IT UNDER WINDOWS POWERSHELL 5.1 -- BUT pwsh 7 IS NOT A WEAKER SIGNAL
+# ------------------------------------------------------------------------
+# 5.1 remains the interpreter this must pass under: the exactly-one-row cases
+# are where PS 5.1's scalar `Count` adapter returns $null for PSCustomObject
+# (same reasoning as scripts/tests/test-smoke-summary.ps1), and the real gate
+# runs under `powershell -File`. That much is unchanged.
+#
+# What an earlier revision of this comment got WRONG, at a real cost: it said
+# passing under pwsh 7 "would green-light a regression that still breaks the
+# real thing", which readers took to mean 7 is uninformative here. It is not.
+# When this suite first ran on the Windows gate it died on its FIRST call into
+# Compare-CapabilityManifests; fixing that exposed a SECOND defect, in
+# Format-ParityReportText, which nothing had ever reached. Both reproduce
+# verbatim under pwsh 7 on Linux -- same exception type, same message, same
+# function. Neither was version-specific:
+#
+#   * `@($x)` where $x is a PSObject-wrapped List[Object] throws
+#     `ArgumentException: Argument types do not match` out of the DLR binder
+#     (PSEnumerableBinder.MaybeDebase), on 5.1 and on 7 alike;
+#   * `$L.Add("..." -f $a, $b)` parses the comma as a METHOD-ARGUMENT
+#     separator, so the format string gets one argument and `-f` throws. Same
+#     grammar in both.
+#
+# So the accurate rule is DIRECTIONAL, not dismissive: a pwsh 7 failure is real
+# and costs one second to find on any box, while only a 5.1 run attests to the
+# `.Count` class. Reach for `pwsh -NoProfile -File` first when developing;
+# never let it SUBSTITUTE for the 5.1 gate.
 #
 # WHERE IT RUNS TODAY
 # -------------------
@@ -58,7 +80,15 @@ if (-not (Test-Path -LiteralPath $FixturePath)) {
     Write-Host "FATAL: missing fixture $FixturePath" -ForegroundColor Red
     exit 1
 }
-$FixtureText = Get-Content -LiteralPath $FixturePath -Raw
+# -Encoding UTF8 is load-bearing on the real gate. The fixture is UTF-8 with NO
+# BOM and carries non-ASCII on 9 lines (arrows and em-dashes inside `note` /
+# `detail`), and Windows PowerShell 5.1 defaults Get-Content to the ANSI
+# codepage -- so without this the 5.1 leg silently reads those fields as
+# mojibake. No assertion touches them today, which is exactly why it would have
+# gone unnoticed until the first assertion that did. The header above claims
+# this file is "a statement about the real wire format"; that is only true if
+# the bytes survive the read.
+$FixtureText = Get-Content -LiteralPath $FixturePath -Raw -Encoding UTF8
 
 $failures = 0
 $checks = 0
@@ -267,6 +297,30 @@ $text7 = Format-ParityReportText -Result $r7
 Assert-True "report prints the allowlist entry" ($text7 -match 'designed debug-vs-release difference')
 $text1 = Format-ParityReportText -Result $r1
 Assert-True "report says the allowlist is empty" ($text1 -match 'allowlist: \(empty\)')
+
+# The three report blocks NO EXISTING CASE RENDERS. Measured with breakpoint
+# hit-counts over this suite: the defect-detail lines and the published-only
+# line were executed ZERO times, because every result the file handed to
+# Format-ParityReportText had no `defect` / `only_in_dev` row and no
+# `only_in_published` row. That is why a defect that made those exact lines
+# throw survived here undetected -- the gate rendered a report that never
+# reached them. The results below already exist further up the file; only the
+# assertions are new, so this costs three renders and closes the hole.
+$textDefect = Format-ParityReportText -Result $r2
+Assert-True "defect block prints the dev leg"        ($textDefect -match 'dev       : operator_checkout')
+Assert-True "defect block prints the published leg"  ($textDefect -match 'published : unresolved')
+# workspace_root carries resolved_path in the fixture, so this also covers the
+# TRUE arm of the `$(if ($r.DevPath))` suffix on both of those lines.
+Assert-True "defect block prints the resolved path"  ($textDefect -match 'operator_checkout  <- /')
+
+# only_in_dev: the published row is ABSENT, which is the other arm -- the
+# `<row absent>` sentinel plus the empty-string suffix.
+$textOnlyDev = Format-ParityReportText -Result $r6
+Assert-True "absent published row is named"          ($textOnlyDev -match 'published : <row absent>')
+
+# only_in_published renders its own block, from a separate line.
+$textPubOnly = Format-ParityReportText -Result $r6c
+Assert-True "published-only block names the row"     ($textPubOnly -match 'workspace_root: published=operator_checkout')
 
 # ---------------------------------------------------------------------------
 # 8. THE SHIPPED ALLOWLIST. Measured 2026-09-02: no CAPABILITY_SPECS row is
