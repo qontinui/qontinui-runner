@@ -129,11 +129,13 @@ use crate::mcp::session_work_status::{self, SessionStatusSource, StatusFetch};
 use crate::mcp::types::ApiState;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
+use crate::session::wind_down_observer;
+use qontinui_runner_lib::wind_down::{self, WindDownView};
 
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -354,6 +356,14 @@ pub struct RestartReadiness {
     /// than "coord said nothing is finished". The two are indistinguishable
     /// from the counts alone, which is why this block exists.
     pub session_status_source: SessionStatusSource,
+    /// How many top-level terminal-hosted processes are wind-down `eligible`
+    /// right now — the count of `windDown.eligibility == "eligible"` across
+    /// `terminal_sessions.processes`. **DRY-RUN** (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 1): nothing acts on
+    /// it, and it is computed whether or not the runner is drained. `null` when
+    /// the terminal plane could not be determined — never `0`.
+    #[serde(rename = "windDownCandidates")]
+    pub wind_down_candidates: Option<usize>,
     pub boundary: &'static str,
 }
 
@@ -602,6 +612,8 @@ pub fn build_verdict(
         unknowns.push("the AI/task-run plane could not be determined".to_string());
     }
 
+    let wind_down_candidates = terminal.as_ref().map(wind_down_candidates_in);
+
     if !unknowns.is_empty() {
         return RestartReadiness {
             safe_to_restart: false,
@@ -613,6 +625,7 @@ pub fn build_verdict(
             drain,
             census,
             session_status_source: status_source,
+            wind_down_candidates,
             boundary: BOUNDARY,
         };
     }
@@ -764,8 +777,19 @@ pub fn build_verdict(
         drain,
         census,
         session_status_source: status_source,
+        wind_down_candidates,
         boundary: BOUNDARY,
     }
+}
+
+/// `windDownCandidates` for a resolved terminal plane: top-level processes
+/// whose dry-run wind-down verdict is `eligible`.
+pub fn wind_down_candidates_in(plane: &TerminalPlane) -> usize {
+    plane
+        .processes
+        .iter()
+        .filter(|p| p.wind_down.as_ref().is_some_and(WindDownView::is_eligible))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -898,7 +922,7 @@ pub async fn restart_readiness_handler(
     //    never latest(). The pass partitions the live `claude` set, so all
     //    three census-derived planes and the totals come from a single
     //    `compute` — there is no second census here (D1).
-    let pass = 'terminal: {
+    let mut pass = 'terminal: {
         let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
             unknowns.push(
                 "the terminal-session plane could not be determined: TerminalManager did not resolve"
@@ -951,6 +975,16 @@ pub async fn restart_readiness_handler(
             }
         }
     };
+
+    // ── Wind-down eligibility: DRY-RUN, reported only ─────────────────────
+    //
+    // The ONE observation entry point (`session::wind_down_observer`), which
+    // Phase 4's wind-down tick also calls. It reads THIS request's fresh
+    // work-status map, already resolved onto each process by `compute` —
+    // never the background census's empty one. Nothing acts on the result.
+    if let Some(p) = pass.as_mut() {
+        wind_down_observer::observe_and_apply(app, p, wind_down::grace_from_env(), now_ms).await;
+    }
 
     let terminal = pass
         .as_ref()
@@ -1368,6 +1402,7 @@ mod tests {
                 session_id: None,
                 session_status: None,
                 blocks_restart: true,
+                wind_down: None,
             }],
             tracked_dead: vec![TrackedDeadRecord {
                 claude_session_id: "ghost".to_string(),
@@ -2478,5 +2513,202 @@ mod tests {
         assert!(BOUNDARY.contains("PROCESS IS STILL RUNNING"));
         assert!(BOUNDARY.contains("NEVER \"not running\""));
         assert!(BOUNDARY.contains("ambiguous"));
+    }
+
+    // ---- wind-down (DRY-RUN) --------------------------------------------
+
+    use crate::session::wind_down_observer::{
+        apply_wind_down, terminal_ids_by_session, TerminalObservation,
+    };
+    use qontinui_runner_lib::wind_down::{GridIdle, SessionKind, Sideband};
+
+    fn wind_down_proc(
+        pid: u32,
+        session_id: Option<&str>,
+        status: Option<&str>,
+        nested: bool,
+        children: bool,
+    ) -> LiveClaudeProcess {
+        LiveClaudeProcess {
+            pid,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: Some(3_600),
+            cwd: None,
+            has_live_children: children,
+            nested_under_claude: nested,
+            session_id: session_id.map(str::to_string),
+            session_status: status.map(str::to_string),
+            blocks_restart: status != Some("finished"),
+            wind_down: None,
+        }
+    }
+
+    const IDLE_LONG_AGO: TerminalObservation = TerminalObservation {
+        sideband: Sideband::NeverReported,
+        grid: GridIdle::Idle { since_ms: 1_000 },
+    };
+
+    #[test]
+    fn wind_down_is_attached_per_top_level_terminal_process_and_counted() {
+        let now_ms = 1_000 + 3_600_000;
+        let grace = std::time::Duration::from_secs(600);
+        let open = vec![
+            record("sess-done", "t-done", 1),
+            record("sess-busy", "t-busy", 1),
+            record("sess-gone", "t-gone", 1),
+            record("sess-loop", "t-loop", 1),
+        ];
+        let mut processes = vec![
+            // finished + idle for an hour → eligible
+            wind_down_proc(10, Some("sess-done"), Some("finished"), false, false),
+            // its nested subagent → no windDown at all
+            wind_down_proc(11, Some("sess-done"), None, true, false),
+            // still working on the coord axis → ineligible, never eligible
+            wind_down_proc(20, Some("sess-busy"), Some("working"), false, false),
+            // pane not observable → unknown
+            wind_down_proc(30, Some("sess-gone"), Some("finished"), false, false),
+            // ambiguous attribution (no session id) → unknown
+            wind_down_proc(40, None, None, false, false),
+            // a looping agent needs no finished declaration
+            wind_down_proc(50, Some("sess-loop"), None, false, false),
+        ];
+        let observations: HashMap<String, TerminalObservation> = [
+            ("t-done".to_string(), IDLE_LONG_AGO),
+            ("t-busy".to_string(), IDLE_LONG_AGO),
+            ("t-loop".to_string(), IDLE_LONG_AGO),
+        ]
+        .into();
+        let loops: HashSet<String> = ["t-loop".to_string()].into();
+
+        apply_wind_down(
+            &mut processes,
+            &terminal_ids_by_session(&open),
+            &observations,
+            &HashSet::new(),
+            &loops,
+            grace,
+            now_ms,
+        );
+
+        let view = |i: usize| processes[i].wind_down.clone();
+        let done = view(0).expect("top-level process gets a view");
+        assert_eq!((done.eligibility, done.since), ("eligible", Some(1_000)));
+        assert_eq!(view(1), None, "nested subagent");
+        let busy = view(2).unwrap();
+        assert_eq!(
+            (busy.eligibility, busy.reason),
+            ("ineligible", Some("not_finished"))
+        );
+        let gone = view(3).unwrap();
+        assert_eq!(gone.eligibility, "unknown");
+        let ambiguous = view(4).unwrap();
+        assert_eq!(
+            (ambiguous.eligibility, ambiguous.reason),
+            ("unknown", Some("work_status_unknown"))
+        );
+        let looping = view(5).unwrap();
+        assert_eq!(
+            (looping.eligibility, looping.kind),
+            ("eligible", SessionKind::Looping)
+        );
+
+        let report = TrackingHealthReport {
+            live_claude_total: processes.len(),
+            tracked_open_total: open.len(),
+            terminal_hosted: processes,
+            ..empty_report(now_ms)
+        };
+        let v = verdict_from(
+            &report,
+            &open,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            vec![],
+            idle_drain(),
+            fresh_census(now_ms),
+            now_ms,
+        );
+        assert_eq!(v.wind_down_candidates, Some(2));
+
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["windDownCandidates"], 2);
+        let procs = json["terminal_sessions"]["processes"].as_array().unwrap();
+        assert_eq!(procs[0]["windDown"]["eligibility"], "eligible");
+        assert_eq!(procs[0]["windDown"]["since"], 1_000);
+        assert!(procs[1].get("windDown").is_none(), "nested omits windDown");
+    }
+
+    #[test]
+    fn wind_down_does_not_change_the_restart_verdict() {
+        // An eligible finished session is already discounted by the work
+        // axis; wind-down eligibility is a report beside the verdict and moves
+        // nothing in it.
+        let now_ms = 1_000 + 3_600_000;
+        let open = vec![record("sess-done", "t-done", 1)];
+        let mut with = vec![wind_down_proc(
+            10,
+            Some("sess-done"),
+            Some("working"),
+            false,
+            false,
+        )];
+        let without = with.clone();
+        apply_wind_down(
+            &mut with,
+            &terminal_ids_by_session(&open),
+            &[("t-done".to_string(), IDLE_LONG_AGO)].into(),
+            &HashSet::new(),
+            &HashSet::new(),
+            std::time::Duration::from_secs(600),
+            now_ms,
+        );
+        let verdict = |procs: Vec<LiveClaudeProcess>| {
+            let report = TrackingHealthReport {
+                live_claude_total: procs.len(),
+                tracked_open_total: 1,
+                terminal_hosted: procs,
+                ..empty_report(now_ms)
+            };
+            verdict_from(
+                &report,
+                &open,
+                Some(ai_plane_from(&[], &[], now_ms)),
+                vec![],
+                idle_drain(),
+                fresh_census(now_ms),
+                now_ms,
+            )
+        };
+        let (a, b) = (verdict(with), verdict(without));
+        assert_eq!(
+            (a.safe_to_restart, &a.reason),
+            (b.safe_to_restart, &b.reason)
+        );
+        assert_eq!(a.wind_down_candidates, Some(0));
+        assert_eq!(b.wind_down_candidates, Some(0));
+    }
+
+    #[test]
+    fn wind_down_candidates_are_null_when_the_terminal_plane_is_unknown() {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let v = build_verdict(
+            None,
+            None,
+            Some(ai_plane_from(&[], &[], now_ms)),
+            None,
+            vec!["the terminal-session plane could not be determined: test".to_string()],
+            idle_drain(),
+            fresh_census(now_ms),
+            clean_status_source(),
+        );
+        assert_eq!(v.wind_down_candidates, None);
+        assert!(serde_json::to_value(&v).unwrap()["windDownCandidates"].is_null());
+    }
+
+    #[test]
+    fn boundary_states_wind_down_is_a_dry_run() {
+        assert!(BOUNDARY.contains("DRY-RUN"));
+        assert!(BOUNDARY.contains("windDownCandidates"));
+        assert!(BOUNDARY.contains("whether or not the runner is drained"));
     }
 }

@@ -10565,6 +10565,13 @@ pub fn create_router(
     #[cfg(debug_assertions)]
     let base_router = base_router.merge(crate::mcp::debug_wedge::routes());
 
+    // Debug-only graceful-exit door (`POST /__debug/terminals/{id}/graceful-exit`)
+    // for the drained-runner Phase 1 falsification step: types `/exit` into a
+    // pane and reports whether `claude` left. Same cfg gate as its module
+    // declaration in `mcp/mod.rs`, so a release build has neither.
+    #[cfg(debug_assertions)]
+    let base_router = base_router.merge(crate::mcp::debug_graceful_exit::routes());
+
     // Canonical JSON 404 for unmatched routes. axum's default fallback returns
     // an empty body with no Content-Type, which both breaks the canonical
     // envelope contract and trips the debug envelope_audit layer (it sees a

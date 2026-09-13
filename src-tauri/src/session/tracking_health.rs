@@ -295,6 +295,13 @@ pub struct LiveClaudeProcess {
     /// holding memory, and a restart will still kill it. It means only that
     /// its session declared its work complete.
     pub blocks_restart: bool,
+    /// Wind-down eligibility — **DRY-RUN, reported only** (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 1). Filled by
+    /// `GET /restart-readiness` for top-level terminal-hosted processes; `None`
+    /// — and omitted from the JSON — everywhere else, including every
+    /// background census and `/health`. Nothing acts on it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wind_down: Option<qontinui_runner_lib::wind_down::WindDownView>,
 }
 
 /// An open lifecycle record whose terminal is gone or whose subtree contains
@@ -690,6 +697,7 @@ pub fn evaluate(
             session_status: status.map(|s| s.as_wire()),
             session_id,
             blocks_restart: blocks_restart(status),
+            wind_down: None,
         }
     };
 
@@ -1001,6 +1009,7 @@ mod tests {
             session_id: None,
             session_status: None,
             blocks_restart: true,
+            wind_down: None,
         }
     }
 
