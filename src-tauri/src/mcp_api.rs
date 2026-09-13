@@ -3561,13 +3561,23 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
             removed.push(name.to_string());
             false
         }
+        // Recorded under a placeholder so the caller re-serialises the
+        // shortened body (an empty `removed` would forward the upstream bytes
+        // with the nameless entry still in them); the DRIFT bookkeeping
+        // filters the placeholder out, since a nameless entry cannot be a
+        // tool coord grants BY NAME.
         None => {
-            removed.push("(unnamed)".to_string());
+            removed.push(UNNAMED_TOOL_PLACEHOLDER.to_string());
             false
         }
     });
     true
 }
+
+/// What a `tools/list` entry with no string `name` is recorded as in the
+/// withheld list — a marker for the response re-serialisation, never a drifted
+/// tool (see the drift bookkeeping in the proxy handler).
+const UNNAMED_TOOL_PLACEHOLDER: &str = "(unnamed)";
 
 /// The outcome is TYPED rather than an `Option` because three of its four cases
 /// forward the upstream bytes unchanged for entirely different reasons, and one
@@ -3805,8 +3815,9 @@ fn coord_mcp_refusal_cause(
         (
             CoordMcpRefusalCause::Drift,
             format!(
-                "add {tool} to COORD_MCP_ALLOWED_TOOLS in src-tauri/src/mcp_api.rs (trunk {} \
-                 neither allows it nor names it in COORD_MCP_DELIBERATE_EXCLUSIONS), or name \
+                "if coord lists {tool} in tools/list for this principal, add it to \
+                 COORD_MCP_ALLOWED_TOOLS in src-tauri/src/mcp_api.rs (trunk {} neither \
+                 allows it nor names it in COORD_MCP_DELIBERATE_EXCLUSIONS), or name \
                  it there if withholding it is the decision — then register a \
                  runner_served_sha gate for the landed sha, because a landed allowlist change \
                  is not delivered until this box rebuilds.",
@@ -3871,6 +3882,9 @@ fn coord_mcp_refusal_data_with(
         "inDeliberateExclusions": diagnosis.in_deliberate_exclusions,
         "trunkSha": diagnosis.trunk_sha,
         "trunkSource": diagnosis.trunk_source,
+        // When trunk was read (ms since epoch), so a reader can age the
+        // `cause` the same way it ages `probed_at`; null when trunk is unread.
+        "trunkReadAt": trunk.map(|t| t.read_at),
         "buildDrift": build_drift,
         "commitsBehind": commits_behind,
         "next_door": NEXT_DOOR,
@@ -3947,10 +3961,31 @@ fn record_observed_coord_mcp_drift_in(
     if set.is_empty() {
         return false;
     }
+    // A set is marked posted by the POST's 2xx arm, never here: "posted once
+    // per (build, set)" must mean POSTED, not attempted. A refused or failed
+    // post leaves the set unmarked, so the next `tools/list` that observes it
+    // tries again (one attempt per observation, still never a retry loop).
     posted
         .lock()
-        .map(|mut posted| posted.insert(set))
+        .map(|posted| !posted.contains(&set))
         .unwrap_or(false)
+}
+
+/// Mark a drifted set as posted — called from the POST's success arm only.
+fn mark_coord_mcp_drift_posted(drifted: &[String]) {
+    mark_coord_mcp_drift_posted_in(posted_drift_sets_cell(), drifted)
+}
+
+fn mark_coord_mcp_drift_posted_in(
+    posted: &std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+    drifted: &[String],
+) {
+    let mut set: Vec<String> = drifted.to_vec();
+    set.sort();
+    set.dedup();
+    if let Ok(mut posted) = posted.lock() {
+        posted.insert(set);
+    }
 }
 
 /// The drift observation as served on `/health` and `/coord-mcp/tool-policy`.
@@ -4025,6 +4060,7 @@ async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifte
         .await
     {
         Ok(resp) if resp.status().is_success() => {
+            mark_coord_mcp_drift_posted(&drifted);
             info!(drifted = %drifted.join(","), "coord-mcp drift finding posted to coord");
         }
         Ok(resp) => warn!(
@@ -5200,6 +5236,9 @@ async fn coord_mcp_proxy_handler(
     //    whose credential is genuinely gone — the load amplification a retry
     //    loop is famous for — and would also double coord's own 401 accounting.
     let mut upstream_retry: Option<&'static str> = None;
+    // The bearer that produced the response we end up forwarding: the drift
+    // finding below must ride THAT one, not a first bearer coord rejected.
+    let mut effective_bearer = bearer.clone();
     if matches!(upstream.status().as_u16(), 401 | 403)
         && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
     {
@@ -5229,6 +5268,7 @@ async fn coord_mcp_proxy_handler(
                             "coord-mcp proxy: retried once with a re-selected device bearer"
                         );
                         upstream = resp;
+                        effective_bearer = fresh.clone();
                     }
                     // The retry's transport failure must not erase coord's
                     // verdict from attempt 1, which is the more informative of
@@ -5560,6 +5600,9 @@ async fn coord_mcp_proxy_handler(
             let (drifted, deliberate): (Vec<&str>, Vec<&str>) = removed
                 .iter()
                 .map(String::as_str)
+                // The nameless placeholder is a re-serialisation marker, not
+                // a tool coord grants by name; it must never be posted as drift.
+                .filter(|n| *n != UNNAMED_TOOL_PLACEHOLDER)
                 .partition(|n| !coord_mcp_withholding_is_deliberate(n));
             if !deliberate.is_empty() {
                 // Working as intended. INFO, not debug — it is still a
@@ -5601,7 +5644,7 @@ async fn coord_mcp_proxy_handler(
                 let set: Vec<String> = drifted.iter().map(|s| s.to_string()).collect();
                 tokio::spawn(post_coord_mcp_drift_finding(
                     coord_base,
-                    bearer.clone(),
+                    effective_bearer.clone(),
                     set,
                 ));
             }
@@ -13125,6 +13168,7 @@ mod coord_mcp_body_gate_tests {
                 "probed_at",
                 "remedy",
                 "tool",
+                "trunkReadAt",
                 "trunkSha",
                 "trunkSource",
             ]
@@ -13231,6 +13275,45 @@ mod coord_mcp_body_gate_tests {
         );
     }
 
+    /// The disclosure bound holds on EVERY arm, not only `deliberate`: the
+    /// free-text `remedy` strings are where a word naming an upstream grant
+    /// would creep in.
+    #[test]
+    fn refusal_data_never_names_an_upstream_grant_in_any_arm() {
+        let rej = |tool: &str| super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some(tool.to_string()),
+        };
+        let stale = trunk_with(&["coord_not_here"], &[]);
+        let drift = trunk_with(&[], &[]);
+        let arms = [
+            super::coord_mcp_refusal_data_with(&rej("coord_create_pr"), None),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), None),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), Some(&stale)),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), Some(&drift)),
+            super::coord_mcp_refusal_data_with(&rej("coord_create_pr"), Some(&drift)),
+        ];
+        let causes: Vec<String> = arms.iter().map(|d| d["cause"].to_string()).collect();
+        assert!(
+            causes.contains(&"\"stale_binary\"".to_string()),
+            "{causes:?}"
+        );
+        assert!(causes.contains(&"\"drift\"".to_string()), "{causes:?}");
+        assert!(causes.contains(&"\"unknown\"".to_string()), "{causes:?}");
+        assert!(causes.contains(&"\"deliberate\"".to_string()), "{causes:?}");
+        for d in &arms {
+            let lower = d.to_string().to_ascii_lowercase();
+            for forbidden in ["upstream", "granted", "coord grants", "allowedupstream"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "data must not name an upstream grant on the {} arm: {forbidden}",
+                    d["cause"]
+                );
+            }
+        }
+    }
+
     /// Phase 2: one finding per distinct drifted set per process; a clean
     /// `tools/list` is RECORDED (so `/health` can say "observed clean") and
     /// never posts.
@@ -13244,8 +13327,16 @@ mod coord_mcp_body_gate_tests {
             &["coord_b", "coord_a"]
         ));
         assert!(
+            super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_a", "coord_b"]),
+            "an UNPOSTED set (the POST failed or was refused) is offered again"
+        );
+        super::mark_coord_mcp_drift_posted_in(
+            &posted,
+            &["coord_b".to_string(), "coord_a".to_string()],
+        );
+        assert!(
             !super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_a", "coord_b"]),
-            "the same set (any order) posts once"
+            "the same set (any order) posts once, once the POST succeeded"
         );
         assert!(
             super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_c"]),

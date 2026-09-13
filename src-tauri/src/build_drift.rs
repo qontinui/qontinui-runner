@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::process_helpers::{run_probe, ProbeOutcome};
+use crate::process_helpers::{run_probe, run_probe_quiet, ProbeOutcome};
 
 /// Budget for one build-drift git read.
 ///
@@ -102,10 +102,12 @@ fn latest_cell() -> &'static Mutex<Option<BuildDriftStatus>> {
 // what trunk's `COORD_MCP_ALLOWED_TOOLS` / `COORD_MCP_DELIBERATE_EXCLUSIONS`
 // say TODAY. This module already runs bounded git against the source checkout
 // on the drift tick to learn trunk's SHA, so it is the one producer that can
-// also read those two consts at that SHA — and then `cause` and
-// `commitsBehind` in the refusal come from the same clock and can never
-// disagree about the same binary (the reason `/coord-mcp/tool-policy` refuses
-// to re-derive drift). Nothing here runs on the request path.
+// also read those two consts at that SHA. When the tick's fetch succeeds the
+// drift verdict is computed from the SAME fetched ref the consts were read at,
+// so `cause` and `commitsBehind` describe one commit; on `trunkSource:
+// local-ref` (fetch failed) the two can trail each other, and the refusal
+// says so rather than claiming otherwise. Both caches are stored together at
+// the end of one tick. Nothing here runs on the request path.
 // ---------------------------------------------------------------------------
 
 /// The repo-relative path of the file that declares the four consts, tried in
@@ -151,6 +153,7 @@ pub struct TrunkToolPolicy {
     /// `local-ref` — the object came from the last fetch someone else did, so
     /// `trunk_sha` may trail the remote. Reported, never hidden.
     pub source: &'static str,
+    /// Rendered as `trunkReadAt` in the refusal, so a reader can age `cause`.
     pub policy: ParsedToolPolicy,
 }
 
@@ -224,10 +227,21 @@ pub fn parse_tool_policy_consts(source: &str) -> Option<ParsedToolPolicy> {
 /// the attempt — never a pre-fetch guess wearing a `fetched` label — and
 /// `source` records only the fetch verdict, so a possibly-trailing local ref
 /// is visible in the refusal rather than collapsing into `unknown`.
+/// Where the drift tick's fetch lands. Private to this module by name, so no
+/// peer operation in the shared checkout ever contends with it.
+const TRUNK_PRIVATE_REF: &str = "refs/build-drift/trunk";
+
 fn read_trunk_tool_policy(repo: &Path) -> Option<TrunkToolPolicy> {
     let branch = crate::git_trunk::resolve_trunk_branch(repo).unwrap_or_else(|| "main".to_string());
     // A quiet fetch prints nothing on success, which `git_output` would read
     // as `None`, so the outcome is taken from `run_probe` directly.
+    // The fetch lands on a RUNNER-PRIVATE ref, never on `origin/<trunk>`: a
+    // timeout is a hard kill that skips git's lock cleanup, and a stale
+    // `refs/remotes/origin/<trunk>.lock` in the shared source checkout would
+    // fail every peer's fetch/pull there until a human removed it. A stale
+    // lock under `refs/build-drift/` blocks only this tick's successor.
+    // Quiet: the outcome is already surfaced as `trunkSource`, so an offline
+    // box does not get a second WARN per tick beside ls-remote's.
     let fetched = {
         let mut cmd = crate::process_helpers::no_window("git");
         cmd.args([
@@ -237,18 +251,24 @@ fn read_trunk_tool_policy(repo: &Path) -> Option<TrunkToolPolicy> {
             "--quiet",
             "--no-write-fetch-head",
             "origin",
-            &branch,
+            &format!("+refs/heads/{branch}:{TRUNK_PRIVATE_REF}"),
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
         .current_dir(repo);
         matches!(
-            run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git fetch"),
+            run_probe_quiet(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git fetch"),
             ProbeOutcome::Captured(_)
         )
     };
     let source = if fetched { "fetched" } else { "local-ref" };
-    let trunk_sha = git_output(repo, &["rev-parse", &format!("origin/{branch}")])
-        .filter(|s| looks_like_sha(s))?;
+    let trunk_ref = if fetched {
+        TRUNK_PRIVATE_REF.to_string()
+    } else {
+        format!("origin/{branch}")
+    };
+    let trunk_sha = git_output(repo, &["rev-parse", &trunk_ref]).filter(|s| looks_like_sha(s))?;
     let source_text = TOOL_POLICY_SOURCE_PATHS
         .iter()
         .find_map(|p| git_output(repo, &["show", &format!("{trunk_sha}:{p}")]))?;
@@ -322,6 +342,11 @@ fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
     // tick; refuse the prompt so an unauthenticated remote fails fast instead.
     cmd.args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Git Credential Manager's GUI prompt is not governed by
+        // GIT_TERMINAL_PROMPT; a headless Windows box with a credential miss
+        // would otherwise sit until the timeout reaps it.
+        .env("GCM_INTERACTIVE", "never")
+        .env("GIT_ASKPASS", "")
         .current_dir(repo);
     let ProbeOutcome::Captured(stdout) = run_probe(cmd, DRIFT_GIT_TIMEOUT, "build_drift: git")
     else {
@@ -404,12 +429,14 @@ fn compute_divergent(embedded: &str, main_sha: Option<&str>) -> Option<bool> {
 ///    Measured on ONE unchanged binary, 15 minutes apart: `{"behind": true,
 ///    "commitsAhead": null, "commitsBehind": null, "divergent": true}` and
 ///    then `{"behind": true, "commitsAhead": 0, "commitsBehind": 117,
-///    "divergent": true}`. `check_once_blocking` learns the trunk tip from
-///    `git ls-remote` (network) but never FETCHES the object, so
-///    `rev-list --count embedded..tip` fails until something else fetches —
-///    i.e. the count is unmeasurable exactly when a box IS behind, and the
-///    same arm fires for a build strictly AHEAD of trunk with an unfetched
-///    tip. `run_periodic` then logged "this binary was NOT built from the
+///    "divergent": true}`. At the time, `check_once_blocking` learned the
+///    trunk tip from `git ls-remote` (network) but never FETCHED the object,
+///    so `rev-list --count embedded..tip` failed until something else fetched
+///    — the count was unmeasurable exactly when a box WAS behind, and the same
+///    arm fired for a build strictly AHEAD of trunk with an unfetched tip.
+///    (The tool-policy read now fetches the tip into a private ref first, so
+///    that null window closes whenever the fetch succeeds; the rule below
+///    still governs the `local-ref` case.) `run_periodic` then logged "this binary was NOT built from the
 ///    trunk's current commit — shipped fixes may not be running here" for a
 ///    branch build, which is the false drift signal this module's earlier fix
 ///    set out to remove.
@@ -437,8 +464,7 @@ fn check_once_blocking() -> BuildDriftStatus {
     let checked_at = chrono::Utc::now().timestamp_millis();
 
     let Some(repo) = candidate_repo_dir() else {
-        store_trunk_tool_policy(None);
-        return BuildDriftStatus {
+        let status = BuildDriftStatus {
             checked_at,
             main_sha: None,
             behind: None,
@@ -446,19 +472,22 @@ fn check_once_blocking() -> BuildDriftStatus {
             divergent: None,
             commits_ahead: None,
         };
+        store_both(None, status.clone());
+        return status;
     };
 
-    let main_sha = resolve_trunk_sha(&repo);
-    // Trunk's tool policy rides the same tick and the same SHA as the drift
-    // verdict, so a `/coord-mcp` refusal's `cause` and its `commitsBehind`
-    // describe one measurement. Stored here rather than returned: it is a
-    // second cache with its own reader (`trunk_tool_policy`), and an
-    // unresolvable trunk clears it to UNKNOWN instead of serving a stale read.
-    store_trunk_tool_policy(if main_sha.is_some() {
-        read_trunk_tool_policy(&repo)
-    } else {
-        None
-    });
+    // Trunk's tool policy is read FIRST, and when its fetch succeeded the
+    // drift verdict below is computed from that same fetched commit — one
+    // clock for `cause` and `commitsBehind`. Only when the fetch failed (or
+    // the consts could not be parsed) does the verdict fall back to
+    // `ls-remote` / the local `origin/<trunk>` ref, and then `trunkSource:
+    // local-ref` says the two may trail each other.
+    let policy = read_trunk_tool_policy(&repo);
+    let main_sha = match &policy {
+        Some(p) if p.source == "fetched" => Some(p.trunk_sha.clone()),
+        _ => resolve_trunk_sha(&repo),
+    };
+    let policy = if main_sha.is_some() { policy } else { None };
     let divergent = compute_divergent(embedded, main_sha.as_deref());
     // Count FIRST, then derive `behind` from the count. The old code decided
     // `behind` from the SHA mismatch and only then counted, which is how the
@@ -481,14 +510,25 @@ fn check_once_blocking() -> BuildDriftStatus {
     };
     let behind = reconcile_behind(divergent, commits_behind);
 
-    BuildDriftStatus {
+    let status = BuildDriftStatus {
         checked_at,
         main_sha,
         behind,
         commits_behind,
         divergent,
         commits_ahead,
-    }
+    };
+    // Both caches from one tick, stored together, so a refusal cannot pair
+    // this tick's `trunkSha` with the previous tick's `commitsBehind`.
+    // `run_periodic` stores the status again after logging — idempotent.
+    store_both(policy, status.clone());
+    status
+}
+
+/// Store the tick's two readings under one call (see [`check_once_blocking`]).
+fn store_both(policy: Option<TrunkToolPolicy>, status: BuildDriftStatus) {
+    store_trunk_tool_policy(policy);
+    store_latest(status);
 }
 
 /// Detached periodic drift check — runs once immediately at startup, then
