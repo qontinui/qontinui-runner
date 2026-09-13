@@ -56,6 +56,8 @@ static REGISTRY: OnceLock<Mutex<HashMap<Uuid, AgentDaemons>>> = OnceLock::new();
 /// The process-global registry, initialized on first use. `pub(crate)` so
 /// `agent_runtime::AgentRunTeardown` can bind it into its explicit-map
 /// teardown seam.
+///
+/// Teardown seam only; mutate through the owning module's functions.
 pub(crate) fn registry() -> &'static Mutex<HashMap<Uuid, AgentDaemons>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
