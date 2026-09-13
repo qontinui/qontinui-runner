@@ -42,9 +42,46 @@ jobs:
   produce:
     name: Per-file coverage -> coord
     runs-on: ubuntu-latest
-    # Generous budget for the per-file loop over 60+ test files; non-gating so
-    # the wall-clock never blocks anything.
-    timeout-minutes: 45
+    # Budget for the per-file loop over the test corpus; non-gating, so the
+    # wall-clock never blocks anything.
+    #
+    # SIZED AGAINST MEASURED JOB DURATIONS, not guessed. The previous value (45)
+    # was NOT generous — it sat at 1.01x the observed maximum, and the job spent
+    # most of September dying on it. Census of the last 40 runs of this workflow
+    # (2026-09-01 .. 2026-09-13), job-level started_at -> completed_at:
+    #
+    #   9 success:    2145 2192 2217 2335 2382 2561 2578 2613 2669 s
+    #                 = 35m45s .. 44m29s, median 39m42s
+    #   30 cancelled: 2714 .. 2724 s — a TEN-SECOND-WIDE cluster, i.e. the
+    #                 45-minute bound expiring, which GitHub renders as
+    #                 `cancelled`, never as `failure`
+    #   1 cancelled:  651 s — the only genuine `cancel-in-progress` supersede
+    #                 (run 33980851220)
+    #
+    # So 30 of the 31 cancellations were this bound, not infra noise and not the
+    # concurrency group: the healthy maximum was 2669 s and the bound was 2700 s,
+    # 31 seconds of headroom. Every run that ran marginally long was killed, and
+    # coord received no coverage map for it — the bound was defeating the
+    # producer's whole purpose rather than protecting anything.
+    #
+    # 90 = ~2.0x the observed maximum and ~2.3x the median.
+    #
+    # WHY THE BOUND WAS OVERTAKEN, AND WHEN 90 WILL BE. The header above used to
+    # say "60+ test files"; the real count on 2026-09-13 is 217, and the corpus
+    # is growing: 195 on 09-01, 208 on 09-07, 217 on 09-13 — about 1.8 files a
+    # day. The successful runs track it (35-37m in the first week of September,
+    # 42-44m in the second). At ~12 s per file, 5400 s is reached somewhere near
+    # 440 files, i.e. roughly four months out at the current rate. So this is
+    # headroom with an expiry date, not a permanent fix — RE-MEASURE rather than
+    # trusting the figure, and read a cancellation cluster tight around 90m as
+    # this same signal repeating, not as a new problem. The durable fix when that
+    # day comes is to stop paying per-file vitest startup 200+ times (shard the
+    # loop across a matrix, or batch files), not to keep moving the bound.
+    #
+    # Raising a bound is not weakening a check: this job is explicitly non-gating
+    # and its script is best-effort (exits 0 on any failure), so the bound asserts
+    # a wall-clock cap, never a correctness property.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout qontinui-runner
