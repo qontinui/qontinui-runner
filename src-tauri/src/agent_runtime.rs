@@ -1451,28 +1451,101 @@ fn parse_stop_agent_id(envelope: &serde_json::Value) -> Option<uuid::Uuid> {
 /// Per-agent cancellation registry. A coord `events.agent.stop_requested`
 /// frame cancels the token for that agent_id; `run_agent_subprocess` selects
 /// on it to kill the subprocess and break WITHOUT restarting. The entry is
-/// inserted in `spawn_run_task` and removed when the run task finishes.
+/// inserted by [`register_launch_stop`] and removed when its [`LaunchStop`]
+/// guard drops — on EVERY exit from the run task, a panic included.
+///
+/// Each entry carries the registering guard's unique token beside the
+/// cancellation token, so a guard only ever removes its OWN entry.
 #[allow(clippy::type_complexity)]
 fn agent_stops() -> &'static std::sync::Mutex<
-    std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+    std::collections::HashMap<uuid::Uuid, (u64, tokio_util::sync::CancellationToken)>,
 > {
     static AGENT_STOPS: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+            std::collections::HashMap<uuid::Uuid, (u64, tokio_util::sync::CancellationToken)>,
         >,
     > = std::sync::OnceLock::new();
     AGENT_STOPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Source of [`LaunchStop`] tokens; unique for the process lifetime.
+static NEXT_LAUNCH_STOP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Cancel a running agent's stop token. Returns true if the agent_id was
 /// running on this runner (idempotent: cancelling an already-cancelled token
 /// is a no-op).
 fn request_agent_stop(agent_id: uuid::Uuid) -> bool {
-    if let Some(tok) = agent_stops().lock().unwrap().get(&agent_id) {
+    if let Some((_, tok)) = lock_recover(agent_stops(), "agent_stops").get(&agent_id) {
         tok.cancel();
         true
     } else {
         false
+    }
+}
+
+/// A launch's registration in [`agent_stops`]. Created by
+/// [`register_launch_stop`] and moved into the run task; dropping it removes
+/// the entry exactly once, and only while the entry still carries THIS guard's
+/// token. Because the guard is a value the task owns, a panic that unwinds or
+/// aborts the task still releases the entry — without it, a panicked launch
+/// would leave its agent_id registered forever, every re-delivery would be
+/// refused as a duplicate, and coord's row would sit in `spawning`.
+#[derive(Debug)]
+struct LaunchStop {
+    agent_id: uuid::Uuid,
+    token: u64,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for LaunchStop {
+    fn drop(&mut self) {
+        let mut stops = lock_recover(agent_stops(), "agent_stops");
+        if stops.get(&self.agent_id).map(|(token, _)| *token) == Some(self.token) {
+            stops.remove(&self.agent_id);
+        }
+    }
+}
+
+/// Register a coord launch's stop token, refusing a DUPLICATE delivery.
+///
+/// The duplicate check and the insert happen under ONE hold of the
+/// [`agent_stops`] lock, so two deliveries of the same agent_id cannot both
+/// register. `None` means the agent_id is already live on this runner (coord
+/// re-dispatches on reconnect): the caller must not start it and must not
+/// report it, because the original run is alive. The entry lives exactly as
+/// long as the returned guard, which outlives the launch's admitted slot — so
+/// an agent_id holding a slot always holds an entry, and this check alone is
+/// the launch path's duplicate gate.
+fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
+    let mut stops = lock_recover(agent_stops(), "agent_stops");
+    if stops.contains_key(&agent_id) {
+        return None;
+    }
+    let token = NEXT_LAUNCH_STOP_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    stops.insert(agent_id, (token, cancel.clone()));
+    Some(LaunchStop {
+        agent_id,
+        token,
+        cancel,
+    })
+}
+
+/// Per-agent teardown owed once a launch has been ADMITTED (it may have
+/// materialized worktrees, a proxy nonce and daemons). Runs on drop, so the
+/// run task's panic path pays it as well as its normal end:
+/// drop the live-token slot so the proxy nonce hard-fails closed, revoke the
+/// nonce registration itself (credential-hygiene Task 5), and stop the
+/// per-agent durability + observability daemons. All three are synchronous
+/// and idempotent over an agent that registered nothing.
+#[derive(Debug)]
+struct AgentRunTeardown(uuid::Uuid);
+
+impl Drop for AgentRunTeardown {
+    fn drop(&mut self) {
+        crate::coord_mcp::remove_agent_token(self.0);
+        crate::coord_mcp::revoke_agent_proxy_nonces(self.0);
+        crate::agent_daemons::stop_for_agent(self.0);
     }
 }
 
@@ -1484,21 +1557,22 @@ fn spawn_run_task(payload: LaunchPayload) {
         payload.worktrees.len()
     );
     // A DUPLICATE delivery of a launch this runner is already running (coord
-    // re-dispatches on reconnect) is refused HERE, before `agent_stops` is
-    // touched: inserting would overwrite the live run's stop token, and every
-    // refusal arm below removes the entry — which would strip the RUNNING
-    // copy's token and make it unstoppable. It is NOT reported as spawn-failed:
-    // the original run is alive, and a failure post would tell coord otherwise.
-    if launch_delivery_is_duplicate(agent_id) {
+    // re-dispatches on reconnect) is refused HERE, atomically with the stop
+    // registration: a second insert would overwrite the live run's stop token
+    // and make it unstoppable. It is NOT reported as spawn-failed: the original
+    // run is alive, and a failure post would tell coord otherwise.
+    let Some(stop_registration) = register_launch_stop(agent_id) else {
         info!(
             "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate delivery \
              of a launch already live on this runner — ignored, original run left untouched"
         );
         return;
-    }
-    let stop = tokio_util::sync::CancellationToken::new();
-    agent_stops().lock().unwrap().insert(agent_id, stop.clone());
+    };
+    let stop = stop_registration.cancel.clone();
     tokio::spawn(async move {
+        // Owned by the task: its drop removes the stop entry on every exit
+        // route below, a panic unwinding the task included.
+        let stop_registration = stop_registration;
         // Agent-registry spawn authorization (plan
         // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served
         // clause `agent-spawn-authorization`). This is coord's primary
@@ -1525,7 +1599,7 @@ fn spawn_run_task(payload: LaunchPayload) {
                 authz.reason().unwrap_or("no reason recorded")
             );
             warn!("agent_runtime: coord spawn-request agent_id={agent_id} NOT launched — {reason}");
-            agent_stops().lock().unwrap().remove(&agent_id);
+            drop(stop_registration);
             // Report a TERMINAL outcome to coord. `run_agent_subprocess` is the
             // only thing that posts spawn_complete/spawn_failed, so returning
             // silently would leave coord's agent row in `spawning` forever and
@@ -1545,7 +1619,8 @@ fn spawn_run_task(payload: LaunchPayload) {
         // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
         // path rewrite, account resolution and worktree materialization all
         // happen — so a refused launch leaves no worktree, no daemon and no
-        // proxy nonce behind; only the stop-token entry exists, removed here.
+        // proxy nonce behind; only the stop-token entry exists, released when
+        // its guard drops.
         //
         // A launch payload has no deferred ack (continuations have
         // `continuation-deferred`; launches only `spawn-complete` /
@@ -1563,42 +1638,29 @@ fn spawn_run_task(payload: LaunchPayload) {
             &crate::resource_guard::thread_pressure,
         ) {
             Ok(slot) => slot,
-            Err(LaunchRefusal::Duplicate) => {
-                // A copy of this agent_id was admitted between the synchronous
-                // duplicate check above and here. The stop-token entry now
-                // belongs to that live copy, so it is left in place, and
-                // nothing is reported: that run is alive.
-                info!(
-                    "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate \
-                     delivery (admitted concurrently) — ignored, original run left untouched"
-                );
-                return;
-            }
-            Err(LaunchRefusal::Deferred(reason)) => {
+            Err(reason) => {
                 info!(
                     "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
                      machine load, NOT launched — {reason}"
                 );
-                agent_stops().lock().unwrap().remove(&agent_id);
+                drop(stop_registration);
                 report_launch_deferral(agent_id, &reason).await;
                 return;
             }
         };
+        // Armed from admission on: `run_agent_subprocess` may register a proxy
+        // nonce, a live agent token and daemons, and a panic inside it must not
+        // leak them. See [`AgentRunTeardown`].
+        let teardown = AgentRunTeardown(agent_id);
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // Drop the registry entries once the run task is fully done.
+        // The run task is fully done: release the slot, then the stop entry,
+        // then the per-agent teardown — the order the guards also follow when
+        // a panic drops them.
         drop(slot);
-        agent_stops().lock().unwrap().remove(&agent_id);
-        // Drop the agent's live-token slot so its proxy nonce hard-fails closed
-        // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
-        // — and revoke the nonce registration itself (credential-hygiene
-        // Task 5): a torn-down agent's nonce should disappear from the
-        // registry, not linger as a permanently-401ing entry.
-        crate::coord_mcp::remove_agent_token(agent_id);
-        crate::coord_mcp::revoke_agent_proxy_nonces(agent_id);
-        // Stop the per-agent durability + observability daemons (pusher/poller).
-        crate::agent_daemons::stop_for_agent(agent_id);
+        drop(stop_registration);
+        drop(teardown);
     });
 }
 
@@ -2392,18 +2454,6 @@ fn release_admitted_launch(agent_id: uuid::Uuid, token: u64) {
     }
 }
 
-/// Is a launch delivery for `agent_id` a DUPLICATE of one already live on this
-/// runner? True when the id holds an admitted slot, or a stop token (a copy
-/// still in spawn authorization, not yet admitted). `spawn_run_task` asks this
-/// before it touches [`agent_stops`], so a duplicate can neither overwrite nor
-/// remove the live copy's stop token.
-fn launch_delivery_is_duplicate(agent_id: uuid::Uuid) -> bool {
-    if lock_recover(admitted_launches(), "admitted_launches").contains_key(&agent_id) {
-        return true;
-    }
-    lock_recover(agent_stops(), "agent_stops").contains_key(&agent_id)
-}
-
 /// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
 ///
 /// **A wire value.** A launch payload has no deferred ack (only
@@ -2450,50 +2500,44 @@ impl Drop for AdmittedLaunchSlot {
     }
 }
 
-/// Why [`admit_launch`] refused a launch.
-#[derive(Debug, PartialEq, Eq)]
-enum LaunchRefusal {
-    /// `agent_id` already holds an admitted slot: a duplicate delivery of a
-    /// live run. Not reported to coord — the original run is alive.
-    Duplicate,
-    /// The machine-load guard refused; carries the `deferred_load:` reason to
-    /// report as a re-offerable `spawn-failed`.
-    Deferred(String),
-}
-
 /// The launch admission decision `spawn_run_task` takes before
-/// `run_agent_subprocess`: prune dead continuations, then — under ONE hold of
-/// the [`admitted_launches`] lock — refuse a duplicate `agent_id`, count every
-/// live unattended session (continuations plus admitted launches), run the
-/// shared [`evaluate_load_guard`], and on `Proceed` insert this launch's slot.
-/// Count and insert share the hold, so two launches racing for the last slot
-/// cannot both be admitted.
+/// `run_agent_subprocess`: prune dead continuations and take the thread reading
+/// FIRST, with no lock held — the reading is an OS-table read on a tokio
+/// worker, and taking it under a blocking std mutex would park every other
+/// admission and the continuation guard's count read behind it during exactly
+/// the burst this guard exists for. Then, under ONE hold of the
+/// [`admitted_launches`] lock: count every live unattended session
+/// (continuations plus admitted launches), apply the shared
+/// [`evaluate_load_guard`] over that count and the reading, and on `Proceed`
+/// insert this launch's slot. Count, cap and insert share the hold, so two
+/// launches racing for the last slot cannot both be admitted.
 ///
-/// That hold spans the thread reading `evaluate_load_guard` takes. Accepted:
-/// the lock is contended only by other launch admissions, slot releases and the
-/// continuation guard's count read — never by the WS pump — and exactness is
-/// what the hold buys. Lock order is `admitted_launches` then
-/// `continuation_sessions`; the continuation guard releases its registry lock
-/// before reading the launch count, so the two never invert.
+/// Lock order is `admitted_launches` then `continuation_sessions`; the
+/// continuation guard releases its registry lock before reading the launch
+/// count, so the two never invert.
 ///
-/// No anchor dedup: a launch payload has no anchor key; its identity is
-/// `agent_id`.
+/// No duplicate arm: [`register_launch_stop`] is the launch path's duplicate
+/// gate, and its entry outlives this slot, so an agent_id reaching here never
+/// already holds one. No anchor dedup: a launch payload has no anchor key.
 ///
-/// `Ok(slot)` admits (held until dropped); `Err` refuses holding no slot.
+/// `Ok(slot)` admits (held until dropped); `Err(reason)` refuses with the
+/// `deferred_load:` reason to report, holding no slot.
 fn admit_launch(
     agent_id: uuid::Uuid,
     is_live: &dyn Fn(&str) -> bool,
     thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
-) -> Result<AdmittedLaunchSlot, LaunchRefusal> {
+) -> Result<AdmittedLaunchSlot, String> {
     prune_dead_continuations(is_live);
+    let reading = thread_pressure();
     let mut launches = lock_recover(admitted_launches(), "admitted_launches");
-    if launches.contains_key(&agent_id) {
-        return Err(LaunchRefusal::Duplicate);
-    }
+    debug_assert!(
+        !launches.contains_key(&agent_id),
+        "register_launch_stop admits one live launch per agent_id"
+    );
     let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
-    let verdict = evaluate_load_guard(continuations + launches.len(), thread_pressure);
+    let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
     if let Some(reason) = launch_deferral_reason(&verdict) {
-        return Err(LaunchRefusal::Deferred(reason));
+        return Err(reason);
     }
     let token = NEXT_ADMITTED_LAUNCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     launches.insert(agent_id, token);
@@ -7279,7 +7323,7 @@ async fn post_spawn_failed(
         );
         return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id, persists no tenant and takes no auth extractor. Nothing to thread. Terminal.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. A 401/403 is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -10242,7 +10286,7 @@ mod tests {
         let agent = uuid::Uuid::now_v7();
 
         let reason = match admit_launch(agent, &live_all, &|| thread_verdict(Some(300))) {
-            Err(LaunchRefusal::Deferred(reason)) => reason,
+            Err(reason) => reason,
             other => panic!("300 threads must defer a launch, got {other:?}"),
         };
         assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
@@ -10276,9 +10320,7 @@ mod tests {
         });
         assert_eq!(
             refused.err(),
-            Some(LaunchRefusal::Deferred(
-                "deferred_load:thread_pressure:critical:540_over_400".into()
-            ))
+            Some("deferred_load:thread_pressure:critical:540_over_400".to_string())
         );
         assert_eq!(admitted_launch_count(), 0);
 
@@ -10335,9 +10377,7 @@ mod tests {
         let second = uuid::Uuid::now_v7();
         assert_eq!(
             admit_launch(second, &live_all, &calm).err(),
-            Some(LaunchRefusal::Deferred(
-                "deferred_load:at_cap:2_of_2".into()
-            ))
+            Some("deferred_load:at_cap:2_of_2".to_string())
         );
         assert_eq!(
             launch_deferral_reason(&LoadGuard::AtCap { cap: 2, live: 2 }).as_deref(),
@@ -10358,66 +10398,72 @@ mod tests {
         clear_continuation_registry();
     }
 
-    /// Round-2 review: a DUPLICATE delivery of a live launch (coord re-dispatch
-    /// on reconnect) is refused without sharing, freeing, or displacing the
-    /// live copy's state — its stop token survives, it is not admitted a
-    /// second time, and the count stays exact.
+    /// Round-3 review: `register_launch_stop` — the gate `spawn_run_task` uses
+    /// — refuses a second delivery of a live agent_id (`None`) and leaves the
+    /// ORIGINAL stop token registered, so the live run stays stoppable.
     #[test]
-    fn duplicate_launch_delivery_is_refused_and_keeps_the_live_stop_token() {
-        let _env_lock = env_lock();
-        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
-        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        clear_continuation_registry();
-        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
-        let live_all = |_id: &str| true;
+    fn register_launch_stop_refuses_a_duplicate_and_keeps_the_original_token() {
         let agent = uuid::Uuid::now_v7();
-
-        // A stop token registered but not yet admitted (authorization window)
-        // already makes a second delivery a duplicate.
-        let live_stop = tokio_util::sync::CancellationToken::new();
-        agent_stops()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(agent, live_stop.clone());
-        assert!(launch_delivery_is_duplicate(agent));
-
-        // The first copy is admitted and running.
-        let live_slot = admit_launch(agent, &live_all, &calm).expect("first copy admits");
-        assert!(launch_delivery_is_duplicate(agent));
-
-        // The duplicate delivery is refused as a duplicate, not deferred, and
-        // is not admitted into a second slot.
-        assert_eq!(
-            admit_launch(agent, &live_all, &calm).err(),
-            Some(LaunchRefusal::Duplicate)
-        );
-        assert_eq!(admitted_launch_count(), 1, "one live run, one slot");
-
-        // The live copy's stop token is still the registered one.
-        {
-            let stops = agent_stops().lock().unwrap_or_else(|p| p.into_inner());
-            let registered = stops.get(&agent).expect("live stop token still present");
-            registered.cancel();
-        }
+        let first = register_launch_stop(agent).expect("first delivery registers");
         assert!(
-            live_stop.is_cancelled(),
-            "the registered token is the live copy's own"
+            register_launch_stop(agent).is_none(),
+            "a second delivery of a live agent_id is a duplicate"
         );
-
-        drop(live_slot);
-        agent_stops()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&agent);
-        assert_eq!(admitted_launch_count(), 0);
-        assert!(!launch_delivery_is_duplicate(agent));
-        clear_continuation_registry();
+        // A stop request reaches the ORIGINAL run's token.
+        assert!(request_agent_stop(agent));
+        assert!(
+            first.cancel.is_cancelled(),
+            "the registered token is still the original run's"
+        );
+        assert_eq!(
+            lock_recover(agent_stops(), "agent_stops")
+                .get(&agent)
+                .map(|(token, _)| *token),
+            Some(first.token)
+        );
+        drop(first);
+        assert!(
+            !request_agent_stop(agent),
+            "the entry is gone with its guard"
+        );
     }
 
-    /// Round-2 review: releases stay balanced and exact. Every admission path
-    /// ends with the count back at 0, and a slot's release removes only its
-    /// OWN entry — a stale slot for the same `agent_id` cannot free a newer
-    /// run's slot.
+    /// Round-3 review: the stop entry is released when its guard is dropped
+    /// WITHOUT the run task's normal completion path (a panic unwinding past
+    /// it), so a panicked launch cannot make every re-delivery a duplicate —
+    /// and a stale guard never removes a newer registration's entry.
+    #[test]
+    fn launch_stop_guard_released_on_panic_and_token_exact() {
+        let agent = uuid::Uuid::now_v7();
+        let result = std::panic::catch_unwind(|| {
+            let _registration = register_launch_stop(agent).expect("registers");
+            assert!(lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
+            panic!("simulated run-task panic");
+        });
+        assert!(result.is_err());
+        assert!(
+            !lock_recover(agent_stops(), "agent_stops").contains_key(&agent),
+            "a panic must not leak the stop entry"
+        );
+        let redelivery = register_launch_stop(agent).expect("a re-delivery is not a duplicate");
+
+        // A stale guard for the same agent_id must not free the live entry.
+        drop(LaunchStop {
+            agent_id: agent,
+            token: redelivery.token.wrapping_sub(1),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        assert!(
+            lock_recover(agent_stops(), "agent_stops").contains_key(&agent),
+            "a stale guard's release must not remove the newer entry"
+        );
+        drop(redelivery);
+        assert!(!lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
+    }
+
+    /// Round-2 review: a slot's release removes only its OWN entry — a stale
+    /// slot for the same `agent_id` cannot free a newer run's slot — and the
+    /// count returns to 0.
     #[test]
     fn admitted_launch_releases_stay_balanced_and_token_exact() {
         let _env_lock = env_lock();
@@ -10428,16 +10474,8 @@ mod tests {
         let live_all = |_id: &str| true;
         let agent = uuid::Uuid::now_v7();
 
-        // Admitted then duplicate-refused: both paths end, count returns to 0.
         let slot = admit_launch(agent, &live_all, &calm).expect("admits");
-        let dup = admit_launch(agent, &live_all, &calm);
-        assert_eq!(dup.as_ref().err(), Some(&LaunchRefusal::Duplicate));
-        drop(dup);
-        assert_eq!(
-            admitted_launch_count(),
-            1,
-            "a refused duplicate frees nothing"
-        );
+        assert_eq!(admitted_launch_count(), 1);
         let stale_token = slot.token;
         drop(slot);
         assert_eq!(admitted_launch_count(), 0);
