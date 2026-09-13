@@ -83,7 +83,8 @@ a session launched outside the runner will not have them.
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
 >   runner door) has one roll-up per `source_repo` key: the
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
->   so `qontinui-dev-notes/plans` for a hit on `origin/main:plans/<stem>.md`.
+>   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>/plans`.
 >   - **No git door found the file** (after a `git fetch`): the roll-up has
 >     nothing to add.
 >   - **A git door found it, and you read by `slug=<stem>`:** the miss is
