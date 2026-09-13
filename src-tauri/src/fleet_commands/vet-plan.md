@@ -81,20 +81,31 @@ a session launched outside the runner will not have them.
 >   answer — settle one against a second independent instance first.
 > * **The scan-root roll-up can widen a miss to UNKNOWN; it never proves one
 >   absent.** The same list result carries `corpus_health.scan_roots.by_source_repo`,
->   one roll-up per scanned source (`qontinui-dev-notes/plans` for plans). A
->   miss is UNKNOWN when the plan's source has no roll-up (the list holds only
->   other sources or the `null` group, or is empty), when `scan_roots.state` is
->   `unknown` (`no_observation:` / `read_failed:`), when that source's roll-up
->   reads `state: unknown` (no comparable reading, or a floor of 0), when its
+>   one roll-up per reported `source_repo` (on this fleet
+>   `qontinui-dev-notes/plans`, the key of `paths.plans_dir`). A miss carries no
+>   `source_repo` of its own, so take the key from where the git door found the
+>   file (`<repo>/<dir relative to the repo root>`; an archived plan's is
+>   `.../plans/archive`). A miss is UNKNOWN when `corpus_health.scan_roots` is
+>   absent (a backend predating it), when `scan_roots.state` is `unknown`
+>   (`no_observation:` / `read_failed:`), when that key has no roll-up (the
+>   list holds only other sources or the `null` group), when its roll-up reads
+>   `state: unknown` (no comparable reading, or a floor of 0), when its
 >   `min_behind` is above 0 — and, on `/candidates`, when `corpus_health` is
->   `null` beside a `read_failed:` reason. `min_behind` counts commits the
->   least-behind comparable feeder's tree lacks, never missing plans, and is
->   exact (`min_behind_is_floor: false`) only against that shared `ref_sha`,
->   fetched within six hours of a reading, never the live tip. Even an exact 0
->   says only that a feeder's TREE held what that ref held: not that its body
->   sync pushed the plan (a feeder whose pushes fail keeps reporting), and
->   nothing about a plan whose commit that ref lacks. The archive and prompts
->   roots, and writers that are not scanners, are never measured at all.
+>   `null` beside a `read_failed:` reason. Outside those cases the roll-up
+>   settles nothing either way; the miss stays where the other doors put it.
+>   `min_behind` is a lower bound on how many of the ref's commits the
+>   least-behind comparable feeder's HEAD lacks — commits, never missing plans
+>   — and is exact (`min_behind_is_floor: false`) only against that shared
+>   `ref_sha`, fetched within six hours of a reading (so up to ~6 h 45 min old
+>   when you read it), never the live tip. Even an exact 0 says only that one
+>   feeder's HEAD, when it took its reading, contained that ref's commits: not
+>   that the working tree its body sync scans still held the plan (a commit of
+>   its own or uncommitted work can remove it), not that the sync pushed it (a
+>   feeder whose pushes fail keeps reporting), and nothing about a plan whose
+>   commit that ref lacks. The archive and prompts roots, and every writer that
+>   posts no scan-root reading — the web UI, hand `POST`s,
+>   `qontinui-pr plan-library-backfill`, a secondary or temp runner instance, a
+>   runner build predating the report — are never measured.
 > * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
 >   PowerShell interpreter (`pwsh` on Linux via
 >   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
