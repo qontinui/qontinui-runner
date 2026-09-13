@@ -3896,7 +3896,8 @@ fn coord_mcp_refusal_data_with(
         "trunkSha": diagnosis.trunk_sha,
         "trunkSource": diagnosis.trunk_source,
         // When trunk was read (ms since epoch), so a reader can age the
-        // `cause` the same way it ages `probed_at`; null when trunk is unread.
+        // `cause` the same way it ages `buildDrift.checkedAt` — both are epoch
+        // millis, unlike the RFC3339 `probed_at`. Null when trunk is unread.
         "trunkReadAt": trunk.map(|t| t.read_at),
         "buildDrift": build_drift,
         "commitsBehind": commits_behind,
@@ -3930,8 +3931,11 @@ static LAST_OBSERVED_COORD_MCP_DRIFT: std::sync::OnceLock<
     std::sync::Mutex<Option<ObservedCoordMcpDrift>>,
 > = std::sync::OnceLock::new();
 
-/// The sets this process has already posted a finding for, so a runner posts
-/// at most once per distinct drifted set per process lifetime.
+/// The sets this process has already SUCCESSFULLY posted a finding for. The
+/// rule is at most one SUCCESSFUL post per distinct drifted set per process
+/// lifetime — a refused or failed post leaves the set unmarked, so the next
+/// observation offers it again rather than losing it for the life of the
+/// process (one attempt per observation, never a retry loop).
 static POSTED_COORD_MCP_DRIFT_SETS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
 > = std::sync::OnceLock::new();
@@ -5646,9 +5650,10 @@ async fn coord_mcp_proxy_handler(
             // The WARN above gets a reader (plan
             // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 2): the
             // observation is kept for `/health` + `/coord-mcp/tool-policy`
-            // (empty = observed clean), and the FIRST time this process sees a
-            // given non-empty set it posts one coord finding with the bearer
-            // this request already selected — spawned off the request path,
+            // (empty = observed clean), and a non-empty set is offered for
+            // posting once per observation until ONE post succeeds — one coord
+            // finding per set per process, with the bearer this request
+            // already selected — spawned off the request path,
             // so a slow or refused post can neither delay nor fail this
             // `tools/list`.
             if record_observed_coord_mcp_drift(&drifted) {
