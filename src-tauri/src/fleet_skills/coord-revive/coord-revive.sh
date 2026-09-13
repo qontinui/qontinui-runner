@@ -3605,9 +3605,7 @@ done
 #
 # L5's only input is a FILE ON DISK: a device_id, POSTed anonymously to coord's
 # dedicated credential route. Anonymous is not a re-opened hole — it is the
-# device-pairing carve-out shape (post_pair_start / post_pair_complete /
-# post_pair_cli in routes_phase3.rs, registered ungated at
-# /coord/devices/pair-start|pair-complete|pair-cli) sanctioned by the SHIPPED plan
+# pair_via_browser carve-out shape sanctioned by the SHIPPED plan
 # 2026-08-14-runner-unauthenticated-coord-writers: a credential-minting route is
 # anonymous BECAUSE requiring a credential would be circular, and that plan's
 # coord_auth_pin.rs guard objects to an unauthenticated WRITE, not to using an
