@@ -266,7 +266,7 @@ function Compare-CapabilityManifests {
     foreach ($r in $devRows) { if ($null -ne $r -and $r.id -and -not $ids.Contains([string]$r.id)) { $ids.Add([string]$r.id) } }
     foreach ($r in $pubRows) { if ($null -ne $r -and $r.id -and -not $ids.Contains([string]$r.id)) { $ids.Add([string]$r.id) } }
 
-    $out = New-Object System.Collections.Generic.List[Object]
+    $out = [System.Collections.Generic.List[Object]]::new()
     foreach ($id in $ids) {
         $devRow = $null
         if ($devMap.ContainsKey($id)) { $devRow = $devMap[$id] }
@@ -404,10 +404,10 @@ function Format-ParityReportText {
 
     $L.Add("=== Published-build capability parity =========================================")
     $L.Add("")
-    $L.Add("  development build : {0}  git_sha={1}  build_id={2}  (door: {3})" -f $id.DevAppVersion, $id.DevGitSha, $id.DevBuildId, $id.DevDoor)
-    $L.Add("  published build   : {0}  git_sha={1}  build_id={2}  (door: {3})" -f $id.PublishedAppVersion, $id.PublishedGitSha, $id.PublishedBuildId, $id.PublishedDoor)
-    $L.Add("  schema_version    : dev={0}  published={1}" -f $id.DevSchemaVersion, $id.PublishedSchemaVersion)
-    $L.Add("  rows              : dev={0}  published={1}" -f $id.DevRowCount, $id.PublishedRowCount)
+    $L.Add(("  development build : {0}  git_sha={1}  build_id={2}  (door: {3})" -f $id.DevAppVersion, $id.DevGitSha, $id.DevBuildId, $id.DevDoor))
+    $L.Add(("  published build   : {0}  git_sha={1}  build_id={2}  (door: {3})" -f $id.PublishedAppVersion, $id.PublishedGitSha, $id.PublishedBuildId, $id.PublishedDoor))
+    $L.Add(("  schema_version    : dev={0}  published={1}" -f $id.DevSchemaVersion, $id.PublishedSchemaVersion))
+    $L.Add(("  rows              : dev={0}  published={1}" -f $id.DevRowCount, $id.PublishedRowCount))
     $L.Add("")
 
     if ($Result.SchemaRefusal) {
@@ -436,8 +436,8 @@ function Format-ParityReportText {
     } else {
         foreach ($r in $defects) {
             $L.Add("   * {0}" -f $r.Id)
-            $L.Add("       dev       : {0}{1}" -f $r.DevRung, $(if ($r.DevPath) { "  <- $($r.DevPath)" } else { "" }))
-            $L.Add("       published : {0}{1}" -f $(if ($null -eq $r.PublishedRung) { "<row absent>" } else { $r.PublishedRung }), $(if ($r.PublishedPath) { "  <- $($r.PublishedPath)" } else { "" }))
+            $L.Add(("       dev       : {0}{1}" -f $r.DevRung, $(if ($r.DevPath) { "  <- $($r.DevPath)" } else { "" })))
+            $L.Add(("       published : {0}{1}" -f $(if ($null -eq $r.PublishedRung) { "<row absent>" } else { $r.PublishedRung }), $(if ($r.PublishedPath) { "  <- $($r.PublishedPath)" } else { "" })))
             $L.Add("       {0}" -f $r.Note)
         }
     }
@@ -456,7 +456,7 @@ function Format-ParityReportText {
         $L.Add("              release build); no capability row is resolved by either today.")
     } else {
         foreach ($e in @($Result.Allowlist)) {
-            $L.Add("   allowlist: {0}  dev='{1}' published='{2}'" -f $e.Id, $e.DevRung, $e.PublishedRung)
+            $L.Add(("   allowlist: {0}  dev='{1}' published='{2}'" -f $e.Id, $e.DevRung, $e.PublishedRung))
             $L.Add("              {0}" -f $e.Reason)
         }
     }
@@ -466,7 +466,7 @@ function Format-ParityReportText {
         $L.Add("   matched this run: (none)")
     } else {
         foreach ($r in $matched) {
-            $L.Add("   * {0}: dev={1} published={2}" -f $r.Id, $r.DevRung, $r.PublishedRung)
+            $L.Add(("   * {0}: dev={1} published={2}" -f $r.Id, $r.DevRung, $r.PublishedRung))
             $L.Add("       {0}" -f $r.AllowlistReason)
         }
     }
@@ -484,7 +484,7 @@ function Format-ParityReportText {
         $L.Add("   (none)")
     } else {
         foreach ($r in $unobs) {
-            $L.Add("   * {0}: dev={1} published={2}" -f $r.Id, $r.DevRung, $r.PublishedRung)
+            $L.Add(("   * {0}: dev={1} published={2}" -f $r.Id, $r.DevRung, $r.PublishedRung))
         }
     }
     $L.Add("")
@@ -498,18 +498,18 @@ function Format-ParityReportText {
         $L.Add("   direction. Usually means the two legs are different commits.")
         $L.Add("")
         foreach ($r in @($Result.Rows | Where-Object { $_.Disposition -eq 'only_in_published' })) {
-            $L.Add("   * {0}: published={1}" -f $r.Id, $r.PublishedRung)
+            $L.Add(("   * {0}: published={1}" -f $r.Id, $r.PublishedRung))
         }
         $L.Add("")
     }
 
     # --- 5. Matched ----------------------------------------------------------
     $L.Add("-- In parity ({0}) -------------------------------------------------------------" -f $Result.MatchCount)
-    $matches = @($Result.Rows | Where-Object { $_.Disposition -eq 'match' })
-    if ($matches.Count -eq 0) {
+    $matchedRows = @($Result.Rows | Where-Object { $_.Disposition -eq 'match' })
+    if ($matchedRows.Count -eq 0) {
         $L.Add("   (none)")
     } else {
-        foreach ($r in $matches) { $L.Add("   * {0}: {1}" -f $r.Id, $r.DevRung) }
+        foreach ($r in $matchedRows) { $L.Add(("   * {0}: {1}" -f $r.Id, $r.DevRung)) }
     }
     $L.Add("")
     $L.Add((Format-ParityVerdictLine $Result))
