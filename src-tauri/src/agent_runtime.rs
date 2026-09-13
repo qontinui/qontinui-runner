@@ -1536,8 +1536,15 @@ fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
 /// run task's panic path pays it as well as its normal end:
 /// drop the live-token slot so the proxy nonce hard-fails closed, revoke the
 /// nonce registration itself (credential-hygiene Task 5), and stop the
-/// per-agent durability + observability daemons. All three are synchronous
-/// and idempotent over an agent that registered nothing.
+/// per-agent durability + observability daemons. All three are synchronous,
+/// idempotent over an agent that registered nothing, and POISON-TOLERANT: this
+/// drop also runs during a panic unwind, where a panic on a poisoned lock
+/// would abort the runner.
+///
+/// Keyed by `agent_id` with no token, so it must drop BEFORE the launch's
+/// [`LaunchStop`]: while the stop entry is held no re-delivery of the same
+/// agent_id can register, so this teardown can never strip a newer run's
+/// token, nonces or daemons.
 #[derive(Debug)]
 struct AgentRunTeardown(uuid::Uuid);
 
@@ -1655,12 +1662,17 @@ fn spawn_run_task(payload: LaunchPayload) {
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // The run task is fully done: release the slot, then the stop entry,
-        // then the per-agent teardown — the order the guards also follow when
-        // a panic drops them.
+        // The run task is fully done: per-agent teardown FIRST, then the slot,
+        // then the stop entry LAST — reverse declaration order, the order a
+        // panic drops them in too. The teardown is keyed by agent_id alone, so
+        // it must run while the stop entry still bars a re-delivery of this
+        // agent_id from registering; otherwise it could strip a newer run's
+        // token, nonces and daemons. Releasing the slot before the stop entry
+        // keeps `admit_launch`'s one-live-launch-per-agent_id debug_assert
+        // true: a re-delivery registers only once this run holds no slot.
+        drop(teardown);
         drop(slot);
         drop(stop_registration);
-        drop(teardown);
     });
 }
 
@@ -7323,7 +7335,7 @@ async fn post_spawn_failed(
         );
         return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. A 401/403 is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. Any 4xx (401/403, and coord's 404 for an unknown agent) is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -10459,6 +10471,26 @@ mod tests {
         );
         drop(redelivery);
         assert!(!lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
+    }
+
+    /// Round-4 review: dropping an `AgentRunTeardown` while a panic unwinds
+    /// does not abort. A panic inside a drop during unwinding aborts the whole
+    /// test binary, so this test passing is the evidence. The poisoned-lock arm
+    /// of each teardown call is covered through its explicit-map seam
+    /// (`coord_mcp::teardown_poison_tests`, `agent_daemons::teardown_poison_tests`),
+    /// because poisoning the shared process-global maps here would break
+    /// parallel tests that `expect` on them.
+    #[test]
+    fn agent_run_teardown_drops_during_a_panic_unwind_without_aborting() {
+        let agent = uuid::Uuid::now_v7();
+        let result = std::panic::catch_unwind(|| {
+            let _teardown = AgentRunTeardown(agent);
+            panic!("simulated run-task panic");
+        });
+        assert!(
+            result.is_err(),
+            "the panic propagates; the drop did not abort"
+        );
     }
 
     /// Round-2 review: a slot's release removes only its OWN entry — a stale

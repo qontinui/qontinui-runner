@@ -999,10 +999,24 @@ pub(crate) async fn agent_token_health_snapshot() -> Vec<crate::agent_token::Age
 
 /// Drop the live-token slot for `agent_id` on teardown so a torn-down agent's
 /// nonce hard-fails closed. Idempotent.
+///
+/// POISON-TOLERANT, deliberately unlike its siblings: it runs from
+/// `agent_runtime::AgentRunTeardown::drop`, which also runs while a panicking
+/// run task unwinds, and a second panic there aborts the whole runner. A
+/// poisoned map still holds a usable `HashMap`; removing an entry from it is
+/// exactly as correct as from a clean one.
 pub(crate) fn remove_agent_token(agent_id: Uuid) {
-    agent_tokens()
-        .lock()
-        .expect("agent token map poisoned")
+    remove_agent_token_in(agent_tokens(), agent_id);
+}
+
+/// [`remove_agent_token`] over an explicit map — the seam its poison test uses,
+/// so the test never poisons the process-global map other tests `expect` on.
+fn remove_agent_token_in(
+    map: &Mutex<HashMap<Uuid, crate::agent_token::SharedToken>>,
+    agent_id: Uuid,
+) {
+    map.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(&agent_id);
 }
 
@@ -1245,7 +1259,7 @@ fn rotation_log_dir() -> Option<std::path::PathBuf> {
         ROTATION_LOG_DIR_OVERRIDE
             .get_or_init(|| Mutex::new(None))
             .lock()
-            .expect("rotation log override poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
     #[cfg(not(test))]
@@ -4178,27 +4192,16 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 /// are never graced nor persisted). Called at agent teardown alongside
 /// [`remove_agent_token`] so a torn-down agent's nonce disappears entirely
 /// instead of lingering as a permanently-401ing map entry.
+///
+/// POISON-TOLERANT for the same reason as [`remove_agent_token`]: it runs from
+/// `agent_runtime::AgentRunTeardown::drop`, including during a panic unwind,
+/// where a second panic aborts the runner. Everything else it reaches is
+/// already panic-free in production (the census gate treats a poisoned lock as
+/// "emit", and the rotation-log write is best-effort).
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
     // Collect (nonce, workdir) under the lock; emit the forensics lines after
     // releasing it (`log_rotation_event` does file I/O).
-    let (revoked, remaining): (Vec<(String, String)>, HashMap<String, NonceBinding>) = {
-        let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let mut revoked = Vec::new();
-        map.retain(|n, b| {
-            if b.principal == (ProxyPrincipal::Agent { agent_id }) {
-                revoked.push((n.clone(), b.workdir.clone()));
-                return false;
-            }
-            true
-        });
-        // Clone the surviving map for the census. Teardown does NOT go through
-        // `persist_proxy_nonces` (agent nonces are never persisted), so without
-        // this the newest census would keep naming bindings that are already
-        // gone — and the boot readback would then classify torn-down sessions.
-        // Same clone-a-snapshot idiom as `mint_and_register_nonce`, on a path
-        // that fires once per agent teardown.
-        (revoked, map.clone())
-    };
+    let (revoked, remaining) = take_agent_proxy_nonces_in(proxy_nonces(), agent_id);
     note_agent_binding_census(&remaining);
     for (nonce, workdir) in &revoked {
         log_rotation_event(
@@ -4213,6 +4216,67 @@ pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
             "coord_mcp: revoked {} agent proxy nonce(s) for agent {agent_id}",
             revoked.len()
         );
+    }
+}
+
+/// The under-lock half of [`revoke_agent_proxy_nonces`], over an explicit map:
+/// removes every binding owned by `agent_id` and returns the removed
+/// `(nonce, workdir)` pairs plus a snapshot of the survivors. Poison-tolerant.
+/// The seam its poison test uses, so the test never poisons the process-global
+/// map other tests `expect` on.
+#[allow(clippy::type_complexity)]
+fn take_agent_proxy_nonces_in(
+    map: &Mutex<HashMap<String, NonceBinding>>,
+    agent_id: Uuid,
+) -> (Vec<(String, String)>, HashMap<String, NonceBinding>) {
+    let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut revoked = Vec::new();
+    map.retain(|n, b| {
+        if b.principal == (ProxyPrincipal::Agent { agent_id }) {
+            revoked.push((n.clone(), b.workdir.clone()));
+            return false;
+        }
+        true
+    });
+    // Clone the surviving map for the census. Teardown does NOT go through
+    // `persist_proxy_nonces` (agent nonces are never persisted), so without
+    // this the newest census would keep naming bindings that are already
+    // gone — and the boot readback would then classify torn-down sessions.
+    // Same clone-a-snapshot idiom as `mint_and_register_nonce`, on a path
+    // that fires once per agent teardown.
+    (revoked, map.clone())
+}
+
+/// Round-4 review: the teardown-reached lock helpers survive a POISONED lock.
+/// They take an explicit map so these tests poison a LOCAL mutex — poisoning
+/// the process-global maps would break every parallel test that `expect`s on
+/// them.
+#[cfg(test)]
+mod teardown_poison_tests {
+    use super::*;
+
+    fn poison<T>(m: &Mutex<T>) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = m.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison the lock");
+        }));
+        assert!(m.is_poisoned(), "test setup: the lock must be poisoned");
+    }
+
+    #[test]
+    fn remove_agent_token_in_tolerates_a_poisoned_map() {
+        let map: Mutex<HashMap<Uuid, crate::agent_token::SharedToken>> = Mutex::new(HashMap::new());
+        poison(&map);
+        remove_agent_token_in(&map, Uuid::now_v7());
+    }
+
+    #[test]
+    fn take_agent_proxy_nonces_in_tolerates_a_poisoned_map() {
+        let map: Mutex<HashMap<String, NonceBinding>> = Mutex::new(HashMap::new());
+        poison(&map);
+        let (revoked, remaining) = take_agent_proxy_nonces_in(&map, Uuid::now_v7());
+        assert!(revoked.is_empty());
+        assert!(remaining.is_empty());
     }
 }
 
