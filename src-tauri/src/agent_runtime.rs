@@ -601,10 +601,12 @@ impl std::fmt::Debug for ConditionCheckPayload {
 enum SpawnPhase {
     Launched,
     Exited,
-    /// The spawn was REFUSED before a child existed, because workspace trust
+    /// The spawn was REFUSED before a child existed: either workspace trust
     /// could not be derived for the target and the tenant's autonomy dial
-    /// forbids minting it. Phase 2 of
-    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`.
+    /// forbids minting it (Phase 2 of
+    /// `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`), or a coord
+    /// launch was deferred under machine load (reason `deferred_load:…`, plan
+    /// `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`).
     Blocked,
 }
 
@@ -1449,29 +1451,150 @@ fn parse_stop_agent_id(envelope: &serde_json::Value) -> Option<uuid::Uuid> {
 /// Per-agent cancellation registry. A coord `events.agent.stop_requested`
 /// frame cancels the token for that agent_id; `run_agent_subprocess` selects
 /// on it to kill the subprocess and break WITHOUT restarting. The entry is
-/// inserted in `spawn_run_task` and removed when the run task finishes.
+/// inserted by [`register_launch_stop`] and removed when its [`LaunchStop`]
+/// guard drops — on EVERY exit from the run task, a panic included.
+///
+/// Each entry carries the registering guard's unique token beside the
+/// cancellation token, so a guard only ever removes its OWN entry.
 #[allow(clippy::type_complexity)]
 fn agent_stops() -> &'static std::sync::Mutex<
-    std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+    std::collections::HashMap<uuid::Uuid, (u64, tokio_util::sync::CancellationToken)>,
 > {
     static AGENT_STOPS: std::sync::OnceLock<
         std::sync::Mutex<
-            std::collections::HashMap<uuid::Uuid, tokio_util::sync::CancellationToken>,
+            std::collections::HashMap<uuid::Uuid, (u64, tokio_util::sync::CancellationToken)>,
         >,
     > = std::sync::OnceLock::new();
     AGENT_STOPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Source of [`LaunchStop`] tokens; unique for the process lifetime.
+static NEXT_LAUNCH_STOP_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Cancel a running agent's stop token. Returns true if the agent_id was
 /// running on this runner (idempotent: cancelling an already-cancelled token
 /// is a no-op).
 fn request_agent_stop(agent_id: uuid::Uuid) -> bool {
-    if let Some(tok) = agent_stops().lock().unwrap().get(&agent_id) {
+    if let Some((_, tok)) = lock_recover(agent_stops(), "agent_stops").get(&agent_id) {
         tok.cancel();
         true
     } else {
         false
     }
+}
+
+/// A launch's registration in [`agent_stops`]. Created by
+/// [`register_launch_stop`] and moved into the run task; dropping it removes
+/// the entry exactly once, and only while the entry still carries THIS guard's
+/// token. Because the guard is a value the task owns, a panic that unwinds or
+/// aborts the task still releases the entry — without it, a panicked launch
+/// would leave its agent_id registered forever, every re-delivery would be
+/// refused as a duplicate, and coord's row would sit in `spawning`.
+#[derive(Debug)]
+struct LaunchStop {
+    agent_id: uuid::Uuid,
+    token: u64,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl Drop for LaunchStop {
+    fn drop(&mut self) {
+        let mut stops = lock_recover(agent_stops(), "agent_stops");
+        if stops.get(&self.agent_id).map(|(token, _)| *token) == Some(self.token) {
+            stops.remove(&self.agent_id);
+        }
+    }
+}
+
+/// Register a coord launch's stop token, refusing a DUPLICATE delivery.
+///
+/// The duplicate check and the insert happen under ONE hold of the
+/// [`agent_stops`] lock, so two deliveries of the same agent_id cannot both
+/// register. `None` means the agent_id is already live on this runner (coord
+/// re-dispatches on reconnect): the caller must not start it and must not
+/// report it, because the original run is alive. The entry lives exactly as
+/// long as the returned guard, which outlives the launch's admitted slot — so
+/// an agent_id holding a slot always holds an entry, and this check alone is
+/// the launch path's duplicate gate.
+fn register_launch_stop(agent_id: uuid::Uuid) -> Option<LaunchStop> {
+    let mut stops = lock_recover(agent_stops(), "agent_stops");
+    if stops.contains_key(&agent_id) {
+        return None;
+    }
+    let token = NEXT_LAUNCH_STOP_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    stops.insert(agent_id, (token, cancel.clone()));
+    Some(LaunchStop {
+        agent_id,
+        token,
+        cancel,
+    })
+}
+
+/// Per-agent teardown owed once a launch has been ADMITTED (it may have
+/// materialized worktrees, a proxy nonce and daemons). Runs on drop, so the
+/// run task's panic path pays it as well as its normal end:
+/// drop the live-token slot so the proxy nonce hard-fails closed, revoke the
+/// nonce registration itself (credential-hygiene Task 5), and stop the
+/// per-agent durability + observability daemons. All three are synchronous,
+/// idempotent over an agent that registered nothing, and POISON-TOLERANT: this
+/// drop also runs during a panic unwind, where a panic on a poisoned lock
+/// would abort the runner.
+///
+/// Keyed by `agent_id` with no token, so it must drop BEFORE the launch's
+/// [`LaunchStop`]: while the stop entry is held no re-delivery of the same
+/// agent_id can register, so this teardown can never strip a newer run's
+/// token, nonces or daemons.
+///
+/// Holds the three maps it tears down by reference so the drop runs through
+/// [`teardown_in`], which a test can drive over poisoned LOCAL maps.
+/// Production builds it with [`AgentRunTeardown::global`].
+#[allow(clippy::type_complexity)]
+struct AgentRunTeardown<'a> {
+    agent_id: uuid::Uuid,
+    tokens: &'a std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
+    >,
+    nonces: &'a std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    daemons: &'a std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
+    >,
+}
+
+impl AgentRunTeardown<'static> {
+    /// The production teardown, over the process-global maps.
+    fn global(agent_id: uuid::Uuid) -> Self {
+        AgentRunTeardown {
+            agent_id,
+            tokens: crate::coord_mcp::agent_tokens(),
+            nonces: crate::coord_mcp::proxy_nonces(),
+            daemons: crate::agent_daemons::registry(),
+        }
+    }
+}
+
+impl Drop for AgentRunTeardown<'_> {
+    fn drop(&mut self) {
+        teardown_in(self.tokens, self.nonces, self.daemons, self.agent_id);
+    }
+}
+
+/// The per-agent teardown over explicit maps: live-token removal, proxy-nonce
+/// revoke, daemon stop. Every lock it takes recovers a poisoned mutex.
+#[allow(clippy::type_complexity)]
+fn teardown_in(
+    tokens: &std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_token::SharedToken>,
+    >,
+    nonces: &std::sync::Mutex<std::collections::HashMap<String, crate::coord_mcp::NonceBinding>>,
+    daemons: &std::sync::Mutex<
+        std::collections::HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>,
+    >,
+    agent_id: uuid::Uuid,
+) {
+    crate::coord_mcp::remove_agent_token_in(tokens, agent_id);
+    crate::coord_mcp::revoke_agent_proxy_nonces_in(nonces, agent_id);
+    crate::agent_daemons::stop_for_agent_in(daemons, agent_id);
 }
 
 fn spawn_run_task(payload: LaunchPayload) {
@@ -1481,9 +1604,24 @@ fn spawn_run_task(payload: LaunchPayload) {
         agent_id,
         payload.worktrees.len()
     );
-    let stop = tokio_util::sync::CancellationToken::new();
-    agent_stops().lock().unwrap().insert(agent_id, stop.clone());
+    // A DUPLICATE delivery of a launch this runner is already running (coord
+    // re-dispatches on reconnect) is refused HERE, atomically with the stop
+    // registration: a second insert would overwrite the live run's stop token
+    // and make it unstoppable. It is NOT reported as spawn-failed: the original
+    // run is alive, and a failure post would tell coord otherwise.
+    let Some(stop_registration) = register_launch_stop(agent_id) else {
+        info!(
+            "agent_runtime: coord spawn-request agent_id={agent_id} is a duplicate delivery \
+             of a launch already live or finishing on this runner — ignored, original run \
+             left untouched"
+        );
+        return;
+    };
+    let stop = stop_registration.cancel.clone();
     tokio::spawn(async move {
+        // Owned by the task: its drop removes the stop entry on every exit
+        // route below, a panic unwinding the task included.
+        let stop_registration = stop_registration;
         // Agent-registry spawn authorization (plan
         // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served
         // clause `agent-spawn-authorization`). This is coord's primary
@@ -1510,32 +1648,73 @@ fn spawn_run_task(payload: LaunchPayload) {
                 authz.reason().unwrap_or("no reason recorded")
             );
             warn!("agent_runtime: coord spawn-request agent_id={agent_id} NOT launched — {reason}");
-            agent_stops().lock().unwrap().remove(&agent_id);
+            drop(stop_registration);
             // Report a TERMINAL outcome to coord. `run_agent_subprocess` is the
             // only thing that posts spawn_complete/spawn_failed, so returning
             // silently would leave coord's agent row in `spawning` forever and
             // re-dispatch the same request on every reconnect — an endless
-            // dispatch/refuse loop. Unlike the gate-continuation path (whose
-            // row must stay PENDING and re-listable), a launch payload has no
-            // deferral shape: the honest answer is "this device will not run
-            // it, and here is why".
+            // dispatch/refuse loop. A registry refusal is a standing decision,
+            // so it is reported as a plain failure: "this device will not run
+            // it, and here is why". (A LOAD refusal, below, is not standing and
+            // is reported differently.)
             report_spawn_failed(agent_id, &reason, None, 0, None).await;
             return;
         }
+        // Machine-load backstop (plan
+        // `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
+        // Phase 1c): the SAME thread-pressure + live-session-cap guard the
+        // gate-continuation path applies (`evaluate_load_guard`), so a flood of
+        // coord launches cannot start more unattended sessions than the box can
+        // carry. Evaluated BEFORE `run_agent_subprocess`, which is where the
+        // path rewrite, account resolution and worktree materialization all
+        // happen — so a refused launch leaves no worktree, no daemon and no
+        // proxy nonce behind; only the stop-token entry exists, released when
+        // its guard drops.
+        //
+        // A launch payload has no deferred ack (continuations have
+        // `continuation-deferred`; launches only `spawn-complete` /
+        // `spawn-failed`). So a load refusal is posted as `spawn-failed` with a
+        // reason beginning `deferred_load:`, which coord treats as RE-OFFERABLE:
+        // it abandons the allocation and retires the dispatch dedup marker, so
+        // the work is offered again on a later pass rather than latched failed.
+        //
+        // The admitted slot is an RAII guard: it is released when this task
+        // ends by ANY route, including a panic unwinding the future — a leaked
+        // slot would permanently shrink both the launch and continuation caps.
+        let slot = match admit_launch(
+            agent_id,
+            &live_terminal_predicate(),
+            &crate::resource_guard::thread_pressure,
+        ) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                info!(
+                    "agent_runtime: coord spawn-request agent_id={agent_id} deferred under \
+                     machine load, NOT launched — {reason}"
+                );
+                drop(stop_registration);
+                report_launch_deferral(agent_id, &reason).await;
+                return;
+            }
+        };
+        // Armed from admission on: `run_agent_subprocess` may register a proxy
+        // nonce, a live agent token and daemons, and a panic inside it must not
+        // leak them. See [`AgentRunTeardown`].
+        let teardown = AgentRunTeardown::global(agent_id);
         if let Err(e) = run_agent_subprocess(payload, stop).await {
             error!("agent_runtime: run_agent_subprocess failed: {e:#}");
         }
-        // Drop the registry entry once the run task is fully done.
-        agent_stops().lock().unwrap().remove(&agent_id);
-        // Drop the agent's live-token slot so its proxy nonce hard-fails closed
-        // (the agent process is gone; any lingering `.mcp.json` nonce must 401)
-        // — and revoke the nonce registration itself (credential-hygiene
-        // Task 5): a torn-down agent's nonce should disappear from the
-        // registry, not linger as a permanently-401ing entry.
-        crate::coord_mcp::remove_agent_token(agent_id);
-        crate::coord_mcp::revoke_agent_proxy_nonces(agent_id);
-        // Stop the per-agent durability + observability daemons (pusher/poller).
-        crate::agent_daemons::stop_for_agent(agent_id);
+        // The run task is fully done: per-agent teardown FIRST, then the slot,
+        // then the stop entry LAST — reverse declaration order, the order a
+        // panic drops them in too. The teardown is keyed by agent_id alone, so
+        // it must run while the stop entry still bars a re-delivery of this
+        // agent_id from registering; otherwise it could strip a newer run's
+        // token, nonces and daemons. Releasing the slot before the stop entry
+        // keeps `admit_launch`'s one-live-launch-per-agent_id debug_assert
+        // true: a re-delivery registers only once this run holds no slot.
+        drop(teardown);
+        drop(slot);
+        drop(stop_registration);
     });
 }
 
@@ -2211,17 +2390,72 @@ fn evaluate_continuation_guard(
     // The count is read out above instead: it is a snapshot either way — see
     // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
     // and holding the lock longer would not make it one.
+    //
+    // Admitted coord LAUNCHES count toward the same cap: both populations are
+    // unattended coord-dispatched sessions spending the same machine, and a cap
+    // that one of them can walk past is not a bound on the box.
+    let live_count = live_count + admitted_launch_count();
 
-    // Thread pressure: ANY verdict that is not `Proceed` defers (see the
-    // asymmetry argument above). Taken HERE, after the dedup arm has had its
-    // chance to return, so a deduped row never pays for a thread snapshot at
-    // all — the cost-ordering argument on step 1. An unreadable thread sensor
-    // produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the
-    // fail-open doctrine this whole subsystem is built on — so a missing reading
-    // can never wedge the continuation queue shut.
+    // Thread pressure next, then the count cap — shared with the launch path
+    // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
+    // its chance to return, so a deduped row never pays for a thread snapshot.
+    match evaluate_load_guard(live_count, thread_pressure) {
+        LoadGuard::Proceed => ContinuationGuard::Proceed,
+        LoadGuard::ThreadPressure {
+            severity,
+            observation,
+        } => ContinuationGuard::ThreadPressure {
+            severity,
+            observation,
+        },
+        LoadGuard::AtCap { cap, .. } => ContinuationGuard::AtCap(cap),
+    }
+}
+
+/// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
+/// then the live-session count cap. Shared by the gate-continuation guard
+/// ([`evaluate_continuation_guard`], which runs its anchor dedup first) and the
+/// coord launch guard ([`admit_launch`]), so the two paths can never
+/// disagree about when the machine is too loaded to take another unattended
+/// session.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadGuard {
+    /// Clear to spawn.
+    Proceed,
+    /// The thread lane tripped (warn or critical). See
+    /// [`ContinuationGuard::ThreadPressure`].
+    ThreadPressure {
+        severity: &'static str,
+        observation: crate::resource_guard::GateObservation,
+    },
+    /// The live-session count is at or over the cap.
+    AtCap {
+        /// The configured cap ([`continuation_session_cap`]).
+        cap: usize,
+        /// The live count that was compared against it.
+        live: usize,
+    },
+}
+
+/// The load guard proper: thread pressure first, then the count cap. Pure over
+/// (`live_count`, the injected thread verdict, env cap).
+///
+/// Thread pressure: ANY verdict that is not `Proceed` defers (see the asymmetry
+/// argument on [`evaluate_continuation_guard`]). An unreadable thread sensor
+/// produces `Proceed` inside `evaluate_threads` — UNKNOWN ⇒ spawn, the fail-open
+/// doctrine this whole subsystem is built on — so a missing reading can never
+/// wedge the queue shut. The verdict is a closure so a caller that returns
+/// earlier (the continuation dedup arm) never pays for the reading.
+///
+/// A steady-state bound, not a semaphore — see
+/// [`DEFAULT_CONTINUATION_SESSION_CAP`].
+fn evaluate_load_guard(
+    live_count: usize,
+    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> LoadGuard {
     let verdict = thread_pressure();
     if let Some((severity, observation)) = verdict.tripped() {
-        return ContinuationGuard::ThreadPressure {
+        return LoadGuard::ThreadPressure {
             severity,
             observation: observation.clone(),
         };
@@ -2230,10 +2464,138 @@ fn evaluate_continuation_guard(
     // P4: at the cap → refuse.
     let cap = continuation_session_cap();
     if live_count >= cap {
-        return ContinuationGuard::AtCap(cap);
+        return LoadGuard::AtCap {
+            cap,
+            live: live_count,
+        };
     }
 
-    ContinuationGuard::Proceed
+    LoadGuard::Proceed
+}
+
+/// Process-wide registry of coord LAUNCHES (`spawn_requested` payloads) that
+/// passed [`admit_launch`] and whose run task has not finished, keyed by
+/// `agent_id` and valued by the admitting slot's unique token. Distinct from
+/// [`agent_stops`], which is populated synchronously in the WS pump BEFORE the
+/// guard runs: counting that map would make every launch of a burst see the
+/// whole burst and refuse all of it. Only ADMITTED launches count.
+///
+/// The token is what makes a release exact: an [`AdmittedLaunchSlot`] removes
+/// the entry only while it still carries ITS token, so a release can never
+/// free a slot another run holds under the same `agent_id`.
+fn admitted_launches() -> &'static std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>> {
+    static LAUNCHES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>,
+    > = std::sync::OnceLock::new();
+    LAUNCHES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Source of [`AdmittedLaunchSlot`] tokens; unique for the process lifetime.
+static NEXT_ADMITTED_LAUNCH_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Count of admitted launches.
+fn admitted_launch_count() -> usize {
+    lock_recover(admitted_launches(), "admitted_launches").len()
+}
+
+/// Release the admitted slot `token` holds for `agent_id` — a no-op when the
+/// entry is absent or carries a different token (it is not this slot's).
+fn release_admitted_launch(agent_id: uuid::Uuid, token: u64) {
+    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
+    if launches.get(&agent_id) == Some(&token) {
+        launches.remove(&agent_id);
+    }
+}
+
+/// Prefix of the `spawn-failed` reason a load-deferred coord launch reports.
+///
+/// **A wire value.** A launch payload has no deferred ack (only
+/// `spawn-complete` / `spawn-failed` exist for it), so a load refusal rides
+/// `spawn-failed`, and coord's handler recognises this prefix as RE-OFFERABLE:
+/// it abandons the allocation and retires the dispatch dedup marker so the work
+/// is offered again on a later pass instead of latching as a failure. Plan
+/// `2026-09-12-pr-fixer-spawns-default-on-bounded-and-coordinated-with-the-author`
+/// Phase 1c. Rewording it silently turns every deferral into a terminal failure.
+const DEFERRED_LOAD_REASON_PREFIX: &str = "deferred_load:";
+
+/// The `spawn-failed` reason for a load-refused launch, or `None` when the
+/// verdict admits it.
+///
+/// Shape: `deferred_load:<class>:<detail>`, with NO whitespace, so that the
+/// `<class>:<detail>` grammar this file's stamps follow (class = text before the
+/// first colon) still holds after coord strips the prefix:
+/// `deferred_load:thread_pressure:warn:300_over_256`,
+/// `deferred_load:at_cap:64_of_64` (`<live>_of_<cap>`).
+fn launch_deferral_reason(verdict: &LoadGuard) -> Option<String> {
+    let detail = match verdict {
+        LoadGuard::Proceed => return None,
+        LoadGuard::ThreadPressure {
+            severity,
+            observation,
+        } => thread_pressure_stamp_reason(severity, observation),
+        LoadGuard::AtCap { cap, live } => format!("at_cap:{live}_of_{cap}"),
+    };
+    Some(format!("{DEFERRED_LOAD_REASON_PREFIX}{detail}"))
+}
+
+/// RAII hold on an admitted launch's slot in [`admitted_launches`]. Dropping it
+/// releases the slot exactly once on every exit route, a panic unwinding the
+/// run task included — and only its OWN entry (matched by `token`).
+#[derive(Debug)]
+struct AdmittedLaunchSlot {
+    agent_id: uuid::Uuid,
+    token: u64,
+}
+
+impl Drop for AdmittedLaunchSlot {
+    fn drop(&mut self) {
+        release_admitted_launch(self.agent_id, self.token);
+    }
+}
+
+/// The launch admission decision `spawn_run_task` takes before
+/// `run_agent_subprocess`: prune dead continuations and take the thread reading
+/// FIRST, with no lock held — the reading is an OS-table read on a tokio
+/// worker, and taking it under a blocking std mutex would park every other
+/// admission and the continuation guard's count read behind it during exactly
+/// the burst this guard exists for. Then, under ONE hold of the
+/// [`admitted_launches`] lock: count every live unattended session
+/// (continuations plus admitted launches), apply the shared
+/// [`evaluate_load_guard`] over that count and the reading, and on `Proceed`
+/// insert this launch's slot. Count, cap and insert share the hold, so two
+/// launches racing for the last slot cannot both be admitted.
+///
+/// Lock order is `admitted_launches` then `continuation_sessions`; the
+/// continuation guard releases its registry lock before reading the launch
+/// count, so the two never invert.
+///
+/// No duplicate arm: [`register_launch_stop`] is the launch path's duplicate
+/// gate, and its entry outlives this slot, so an agent_id reaching here never
+/// already holds one. No anchor dedup: a launch payload has no anchor key.
+///
+/// `Ok(slot)` admits (held until dropped); `Err(reason)` refuses with the
+/// `deferred_load:` reason to report, holding no slot.
+fn admit_launch(
+    agent_id: uuid::Uuid,
+    is_live: &dyn Fn(&str) -> bool,
+    thread_pressure: &dyn Fn() -> crate::resource_guard::SpawnGate,
+) -> Result<AdmittedLaunchSlot, String> {
+    prune_dead_continuations(is_live);
+    let reading = thread_pressure();
+    let mut launches = lock_recover(admitted_launches(), "admitted_launches");
+    debug_assert!(
+        !launches.contains_key(&agent_id),
+        "register_launch_stop admits one live launch per agent_id"
+    );
+    let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
+    let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
+    if let Some(reason) = launch_deferral_reason(&verdict) {
+        return Err(reason);
+    }
+    let token = NEXT_ADMITTED_LAUNCH_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    launches.insert(agent_id, token);
+    Ok(AdmittedLaunchSlot { agent_id, token })
 }
 
 /// [`evaluate_continuation_guard`] with the thread verdict taken LIVE from
@@ -6954,8 +7316,46 @@ async fn report_spawn_failed_in_phase(
     push_ref: Option<&str>,
     spawn_phase: SpawnPhase,
 ) {
+    let _ = post_spawn_failed(
+        agent_id,
+        reason,
+        exit_code,
+        restarts_attempted,
+        push_ref,
+        spawn_phase,
+    )
+    .await;
+}
+
+/// What one `spawn-failed` POST attempt achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnReportOutcome {
+    /// coord accepted it (2xx).
+    Delivered,
+    /// coord answered with a client error (4xx): re-sending the same body
+    /// cannot succeed, so it is not retried.
+    Rejected,
+    /// Nothing reached coord or coord failed transiently: no connected base,
+    /// no HTTP client, a transport error, or a 5xx.
+    Undelivered,
+}
+
+/// One `spawn-failed` POST. Every non-delivery is logged at warn, including the
+/// two arms that used to return silently (no coord base, no client).
+async fn post_spawn_failed(
+    agent_id: uuid::Uuid,
+    reason: &str,
+    exit_code: Option<i64>,
+    restarts_attempted: u32,
+    push_ref: Option<&str>,
+    spawn_phase: SpawnPhase,
+) -> SpawnReportOutcome {
     let Some(base) = connected_coord_base() else {
-        return;
+        warn!(
+            "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no connected coord \
+             base; reason={reason}"
+        );
+        return SpawnReportOutcome::Undelivered;
     };
     let (phase, pr_context) = if spawn_outcome_enrichment_enabled() {
         (Some(spawn_phase), SpawnPrContext::from_push_ref(push_ref))
@@ -6971,9 +7371,13 @@ async fn report_spawn_failed_in_phase(
     };
     let url = format!("{base}/agents/{agent_id}/spawn-failed");
     let Some(client) = crate::coord_http::coord_client() else {
-        return;
+        warn!(
+            "agent_runtime: spawn-failed NOT posted agent_id={agent_id} — no coord HTTP client; \
+             reason={reason}"
+        );
+        return SpawnReportOutcome::Undelivered;
     };
-    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed likewise only sets status=abandoned by agent_id, persists no tenant and takes no auth extractor. Nothing to thread. Terminal.
+    // coord-tenant-scope(session-noop): agent_id is a parameter; spawn-failed only sets status=abandoned by agent_id and persists no tenant. Nothing to thread. Terminal. Credential: the runner sends attach_device_auth, i.e. the DEFAULT binding's device JWT — the agent token in LaunchPayload.jwt is not used on this path. Any 4xx (401/403, and coord's 404 for an unknown agent) is classed Rejected below and not retried. coord is moving to trust this report only from a matching device token, or an agent token whose agent_id matches; both pass today because the route never 401s, so a future credential change must keep one of the two.
     match crate::auth::attach_device_auth(client.post(&url))
         .timeout(Duration::from_secs(5))
         .json(&body)
@@ -6982,15 +7386,58 @@ async fn report_spawn_failed_in_phase(
     {
         Ok(resp) if resp.status().is_success() => {
             warn!("agent_runtime: spawn-failed posted agent_id={agent_id} reason={reason}");
+            SpawnReportOutcome::Delivered
         }
         Ok(resp) => {
-            warn!(
-                "agent_runtime: spawn-failed POST agent_id={agent_id} returned {}",
-                resp.status()
-            );
+            let status = resp.status();
+            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} returned {status}");
+            if status.is_client_error() {
+                SpawnReportOutcome::Rejected
+            } else {
+                SpawnReportOutcome::Undelivered
+            }
         }
-        Err(e) => warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}"),
+        Err(e) => {
+            warn!("agent_runtime: spawn-failed POST agent_id={agent_id} failed: {e:#}");
+            SpawnReportOutcome::Undelivered
+        }
     }
+}
+
+/// Maximum POST attempts for a launch's `deferred_load:` report. Bounded on
+/// purpose: an unreported deferral leaves coord counting the allocation as
+/// in-flight until its own horizon, but an unbounded retry would park a task
+/// per deferred launch on a box that is, by definition, already loaded.
+const LAUNCH_DEFERRAL_REPORT_ATTEMPTS: u32 = 3;
+
+/// Backoff before retry `attempt + 1` (0-based `attempt` that just failed):
+/// 2s, then 4s.
+fn launch_deferral_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(2u64 << attempt.min(4))
+}
+
+/// Whether a report with this outcome should be re-sent.
+fn launch_deferral_should_retry(outcome: SpawnReportOutcome) -> bool {
+    outcome == SpawnReportOutcome::Undelivered
+}
+
+/// Report a load-deferred launch to coord, with a bounded retry. Phase
+/// `blocked`: the launch was refused before any child existed.
+async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
+    for attempt in 0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
+        let outcome = post_spawn_failed(agent_id, reason, None, 0, None, SpawnPhase::Blocked).await;
+        if !launch_deferral_should_retry(outcome) {
+            return;
+        }
+        if attempt + 1 < LAUNCH_DEFERRAL_REPORT_ATTEMPTS {
+            tokio::time::sleep(launch_deferral_retry_delay(attempt)).await;
+        }
+    }
+    warn!(
+        "agent_runtime: launch deferral for agent_id={agent_id} NOT delivered after \
+         {LAUNCH_DEFERRAL_REPORT_ATTEMPTS} attempts — coord keeps counting the allocation \
+         in-flight until its own horizon; reason={reason}"
+    );
 }
 
 // =============================================================================
@@ -9870,6 +10317,332 @@ mod tests {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
+        // Admitted launches share the cap, so they are part of the same reset.
+        admitted_launches()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    const CAP_ENV_KEYS: &[&str] = &["QONTINUI_CONTINUATION_SESSION_CAP"];
+
+    /// Phase 1c: a coord launch under thread pressure is REFUSED, not admitted,
+    /// and its `spawn-failed` reason carries the re-offerable `deferred_load:`
+    /// prefix followed by the same thread-pressure stamp continuations use.
+    #[test]
+    fn launch_guard_defers_under_thread_pressure_with_deferred_load_reason() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let agent = uuid::Uuid::now_v7();
+
+        let reason = match admit_launch(agent, &live_all, &|| thread_verdict(Some(300))) {
+            Err(reason) => reason,
+            other => panic!("300 threads must defer a launch, got {other:?}"),
+        };
+        assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
+        assert_eq!(reason, "deferred_load:thread_pressure:warn:300_over_256");
+        assert!(
+            !reason.contains(char::is_whitespace),
+            "the wire reason carries no whitespace"
+        );
+        assert_eq!(
+            admitted_launch_count(),
+            0,
+            "a refused launch must not hold a slot"
+        );
+    }
+
+    /// Phase 1c: `admit_launch` — the decision `spawn_run_task` takes before
+    /// `run_agent_subprocess` — refuses with the `deferred_load:` reason and
+    /// holds no slot, and an admitted slot is released when dropped, a panic
+    /// unwinding past it included.
+    #[test]
+    fn admit_launch_refusal_holds_no_slot_and_admitted_slot_releases_on_panic() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+
+        let refused = admit_launch(uuid::Uuid::now_v7(), &live_all, &|| {
+            thread_verdict(Some(540))
+        });
+        assert_eq!(
+            refused.err(),
+            Some("deferred_load:thread_pressure:critical:540_over_400".to_string())
+        );
+        assert_eq!(admitted_launch_count(), 0);
+
+        let agent = uuid::Uuid::now_v7();
+        let result = std::panic::catch_unwind(|| {
+            let _slot = admit_launch(agent, &live_all, &calm).expect("calm machine admits");
+            assert_eq!(admitted_launch_count(), 1, "the admitted slot is held");
+            panic!("simulated run-task panic");
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            admitted_launch_count(),
+            0,
+            "a panic must not leak the admitted slot"
+        );
+    }
+
+    /// The deferral report retries only undelivered attempts, boundedly.
+    #[test]
+    fn launch_deferral_report_retry_is_bounded() {
+        assert!(launch_deferral_should_retry(
+            SpawnReportOutcome::Undelivered
+        ));
+        assert!(!launch_deferral_should_retry(SpawnReportOutcome::Delivered));
+        assert!(!launch_deferral_should_retry(SpawnReportOutcome::Rejected));
+        assert_eq!(LAUNCH_DEFERRAL_REPORT_ATTEMPTS, 3);
+        assert_eq!(launch_deferral_retry_delay(0), Duration::from_secs(2));
+        assert_eq!(launch_deferral_retry_delay(1), Duration::from_secs(4));
+        let total: Duration = (0..LAUNCH_DEFERRAL_REPORT_ATTEMPTS - 1)
+            .map(launch_deferral_retry_delay)
+            .sum();
+        assert!(
+            total <= Duration::from_secs(10),
+            "total backoff stays small"
+        );
+    }
+
+    /// Phase 1c: the count lane binds launches — continuations and admitted
+    /// launches both count, and a released slot re-admits.
+    #[test]
+    fn launch_guard_at_cap_counts_continuations_and_admitted_launches() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        let live_all = |_id: &str| true;
+
+        register_continuation_session("cont-1".into(), Some("anchor-1".into()), None);
+        let first = uuid::Uuid::now_v7();
+        let first_slot = admit_launch(first, &live_all, &calm).expect("1 live of cap 2 admits");
+        assert_eq!(launch_deferral_reason(&LoadGuard::Proceed), None);
+
+        let second = uuid::Uuid::now_v7();
+        assert_eq!(
+            admit_launch(second, &live_all, &calm).err(),
+            Some("deferred_load:at_cap:2_of_2".to_string())
+        );
+        assert_eq!(
+            launch_deferral_reason(&LoadGuard::AtCap { cap: 2, live: 2 }).as_deref(),
+            Some("deferred_load:at_cap:2_of_2")
+        );
+
+        // The admitted launch also binds the CONTINUATION guard (shared cap).
+        assert_eq!(
+            evaluate_continuation_guard(Some("anchor-2"), &live_all, &calm),
+            ContinuationGuard::AtCap(2)
+        );
+
+        drop(first_slot);
+        let second_slot = admit_launch(second, &live_all, &calm)
+            .expect("a released slot re-admits the deferred launch");
+        drop(second_slot);
+        assert_eq!(admitted_launch_count(), 0);
+        clear_continuation_registry();
+    }
+
+    /// Round-3 review: `register_launch_stop` — the gate `spawn_run_task` uses
+    /// — refuses a second delivery of a live agent_id (`None`) and leaves the
+    /// ORIGINAL stop token registered, so the live run stays stoppable.
+    #[test]
+    fn register_launch_stop_refuses_a_duplicate_and_keeps_the_original_token() {
+        let agent = uuid::Uuid::now_v7();
+        let first = register_launch_stop(agent).expect("first delivery registers");
+        assert!(
+            register_launch_stop(agent).is_none(),
+            "a second delivery of a live agent_id is a duplicate"
+        );
+        // A stop request reaches the ORIGINAL run's token.
+        assert!(request_agent_stop(agent));
+        assert!(
+            first.cancel.is_cancelled(),
+            "the registered token is still the original run's"
+        );
+        assert_eq!(
+            lock_recover(agent_stops(), "agent_stops")
+                .get(&agent)
+                .map(|(token, _)| *token),
+            Some(first.token)
+        );
+        drop(first);
+        assert!(
+            !request_agent_stop(agent),
+            "the entry is gone with its guard"
+        );
+    }
+
+    /// Round-3 review: the stop entry is released when its guard is dropped
+    /// WITHOUT the run task's normal completion path (a panic unwinding past
+    /// it), so a panicked launch cannot make every re-delivery a duplicate —
+    /// and a stale guard never removes a newer registration's entry.
+    #[test]
+    fn launch_stop_guard_released_on_panic_and_token_exact() {
+        let agent = uuid::Uuid::now_v7();
+        let result = std::panic::catch_unwind(|| {
+            let _registration = register_launch_stop(agent).expect("registers");
+            assert!(lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
+            panic!("simulated run-task panic");
+        });
+        assert!(result.is_err());
+        assert!(
+            !lock_recover(agent_stops(), "agent_stops").contains_key(&agent),
+            "a panic must not leak the stop entry"
+        );
+        let redelivery = register_launch_stop(agent).expect("a re-delivery is not a duplicate");
+
+        // A stale guard for the same agent_id must not free the live entry.
+        drop(LaunchStop {
+            agent_id: agent,
+            token: redelivery.token.wrapping_sub(1),
+            cancel: tokio_util::sync::CancellationToken::new(),
+        });
+        assert!(
+            lock_recover(agent_stops(), "agent_stops").contains_key(&agent),
+            "a stale guard's release must not remove the newer entry"
+        );
+        drop(redelivery);
+        assert!(!lock_recover(agent_stops(), "agent_stops").contains_key(&agent));
+    }
+
+    /// Round-5 review: an `AgentRunTeardown` built over POISONED maps, dropped
+    /// while a panic unwinds, neither aborts nor leaks. All three maps are LOCAL
+    /// copies (poisoning the process-global ones would break parallel tests that
+    /// `expect` on them), each holding an entry for the agent and each poisoned
+    /// before the drop. A panic from any helper inside a drop during unwinding
+    /// aborts the test binary, so this test fails if any teardown helper goes
+    /// back to `expect` on its lock.
+    ///
+    /// Global side effects: the revoke's census records the LOCAL map's result
+    /// in the process-global last-census record, so the test holds a
+    /// `census_record_guard` that restores the prior record on every exit,
+    /// a failed assertion included. Not reversible: when a forensics test has
+    /// switched the shared rotation log on, the revoke appends one `revoke`
+    /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
+    /// `agent_binding_census` line to that file.
+    #[test]
+    fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        let _census_restore = crate::coord_mcp::teardown_poison_tests::census_record_guard();
+        let agent = uuid::Uuid::now_v7();
+
+        let tokens: Mutex<HashMap<uuid::Uuid, crate::agent_token::SharedToken>> =
+            Mutex::new(HashMap::new());
+        tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            agent,
+            std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
+                token: "teardown-test-token".into(),
+                jti: uuid::Uuid::now_v7(),
+                exp: 0,
+                health: Default::default(),
+            })),
+        );
+        let nonces: Mutex<HashMap<String, crate::coord_mcp::NonceBinding>> =
+            Mutex::new(HashMap::new());
+        let nonce = format!("teardown-test-nonce-{agent}");
+        nonces.lock().unwrap_or_else(|p| p.into_inner()).insert(
+            nonce.clone(),
+            crate::coord_mcp::teardown_poison_tests::agent_nonce_binding(agent),
+        );
+        let daemons: Mutex<HashMap<uuid::Uuid, crate::agent_daemons::AgentDaemons>> =
+            Mutex::new(HashMap::new());
+        daemons
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, Default::default());
+
+        crate::coord_mcp::teardown_poison_tests::poison(&tokens);
+        crate::coord_mcp::teardown_poison_tests::poison(&nonces);
+        crate::coord_mcp::teardown_poison_tests::poison(&daemons);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _teardown = AgentRunTeardown {
+                agent_id: agent,
+                tokens: &tokens,
+                nonces: &nonces,
+                daemons: &daemons,
+            };
+            panic!("simulated run-task panic");
+        }));
+        assert!(
+            result.is_err(),
+            "the panic propagates; the drop over poisoned maps did not abort"
+        );
+
+        assert!(
+            !tokens
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&agent),
+            "the live-token entry is removed"
+        );
+        assert!(
+            !nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&nonce),
+            "the agent's proxy nonce is revoked"
+        );
+        assert!(
+            !daemons
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&agent),
+            "the agent's daemons are stopped"
+        );
+    }
+
+    /// Round-2 review: a slot's release removes only its OWN entry — a stale
+    /// slot for the same `agent_id` cannot free a newer run's slot — and the
+    /// count returns to 0.
+    #[test]
+    fn admitted_launch_releases_stay_balanced_and_token_exact() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+        let agent = uuid::Uuid::now_v7();
+
+        let slot = admit_launch(agent, &live_all, &calm).expect("admits");
+        assert_eq!(admitted_launch_count(), 1);
+        let stale_token = slot.token;
+        drop(slot);
+        assert_eq!(admitted_launch_count(), 0);
+
+        // A later run under the same id is not freed by a stale release.
+        let newer = admit_launch(agent, &live_all, &calm).expect("re-admits");
+        assert_ne!(newer.token, stale_token);
+        drop(AdmittedLaunchSlot {
+            agent_id: agent,
+            token: stale_token,
+        });
+        assert_eq!(
+            admitted_launch_count(),
+            1,
+            "a stale slot's release must not remove the newer run's entry"
+        );
+        drop(newer);
+        assert_eq!(admitted_launch_count(), 0);
+        clear_continuation_registry();
+    }
+
+    /// The prefix is a wire value coord matches on; pin its exact spelling.
+    #[test]
+    fn deferred_load_prefix_is_the_coord_wire_value() {
+        assert_eq!(DEFERRED_LOAD_REASON_PREFIX, "deferred_load:");
     }
 
     /// Poison-recovering (`unwrap_or_else(into_inner)`), matching the shared

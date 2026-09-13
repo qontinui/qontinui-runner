@@ -42,7 +42,7 @@ use crate::dirty_poller::{self, DirtyPollerHandle, DirtyPollerState};
 /// Both daemons for one agent. Dropping this stops both: each handle's
 /// `Drop` cancels and aborts its task, so both stop immediately.
 #[derive(Default)]
-struct AgentDaemons {
+pub(crate) struct AgentDaemons {
     pusher: Option<PusherHandle>,
     poller: Option<DirtyPollerHandle>,
 }
@@ -52,6 +52,15 @@ struct AgentDaemons {
 /// documents). Keyed by `agent_id` so a re-allocation replaces — and
 /// thereby stops — the prior daemons.
 static REGISTRY: OnceLock<Mutex<HashMap<Uuid, AgentDaemons>>> = OnceLock::new();
+
+/// The process-global registry, initialized on first use. `pub(crate)` so
+/// `agent_runtime::AgentRunTeardown` can bind it into its explicit-map
+/// teardown seam.
+///
+/// Teardown seam only; mutate through the owning module's functions.
+pub(crate) fn registry() -> &'static Mutex<HashMap<Uuid, AgentDaemons>> {
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 /// Spawn (and retain) the pusher + poller for one freshly-allocated
 /// agent, both sharing one refreshing token slot.
@@ -108,35 +117,76 @@ pub fn spawn_for_agent_with_token(
         None => info!("agent_daemons: agent_id={agent_id} poller skipped (no worktrees)"),
     }
 
-    let reg = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(mut g) = reg.lock() {
-        // Insert drops any prior AgentDaemons for this agent → both
-        // old daemons are cancelled and aborted on the spot.
-        g.insert(agent_id, daemons);
-        info!(
-            "agent_daemons: agent_id={agent_id} pusher+poller live (agents tracked={})",
-            g.len()
-        );
-    }
+    // Poison-tolerant, matching `stop_for_agent_in`: a poisoned registry used
+    // to make this `if let Ok` skip the insert, which DROPPED — and so stopped —
+    // the daemons just spawned, while removal already proceeds on poison.
+    let mut g = registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Insert drops any prior AgentDaemons for this agent → both
+    // old daemons are cancelled and aborted on the spot.
+    g.insert(agent_id, daemons);
+    info!(
+        "agent_daemons: agent_id={agent_id} pusher+poller live (agents tracked={})",
+        g.len()
+    );
 }
 
 /// Stop both per-agent daemons by removing the agent's entry from the
 /// registry — dropping the [`AgentDaemons`] signals each handle's task
 /// to stop immediately. Called from the spawn-wrapper completion
-/// path when the agent process is gone. Best-effort and defensive: a
-/// no-op if the registry is uninitialized (nothing was ever spawned) or
-/// the lock is poisoned (a teardown failure must never panic the runner).
+/// path when the agent process is gone — including while a panicking run
+/// task unwinds, where a second panic would abort the runner. Best-effort
+/// and defensive: a no-op if the registry is uninitialized (nothing was
+/// ever spawned), and POISON-TOLERANT — a poisoned lock still stops the
+/// agent's daemons rather than silently leaking them.
 pub fn stop_for_agent(agent_id: Uuid) {
     let Some(reg) = REGISTRY.get() else {
         return;
     };
-    let Ok(mut g) = reg.lock() else {
-        return;
-    };
+    stop_for_agent_in(reg, agent_id);
+}
+
+/// [`stop_for_agent`] over an explicit registry — the seam its poison tests
+/// (here and in `agent_runtime`) use, so a test never poisons the
+/// process-global registry.
+pub(crate) fn stop_for_agent_in(reg: &Mutex<HashMap<Uuid, AgentDaemons>>, agent_id: Uuid) {
+    let mut g = reg.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if g.remove(&agent_id).is_some() {
         info!(
             "agent_daemons: agent_id={agent_id} pusher+poller stopped (agents tracked={})",
             g.len()
+        );
+    }
+}
+
+/// Round-4 review: a POISONED registry still stops the agent's daemons.
+/// Poisons a LOCAL registry through the [`stop_for_agent_in`] seam, never
+/// the process-global one parallel tests share.
+#[cfg(test)]
+mod teardown_poison_tests {
+    use super::*;
+
+    #[test]
+    fn stop_for_agent_in_removes_the_entry_from_a_poisoned_registry() {
+        let reg: Mutex<HashMap<Uuid, AgentDaemons>> = Mutex::new(HashMap::new());
+        let agent = Uuid::now_v7();
+        reg.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(agent, AgentDaemons::default());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = reg.lock().unwrap_or_else(|p| p.into_inner());
+            panic!("poison the registry");
+        }));
+        assert!(reg.is_poisoned(), "test setup: the lock must be poisoned");
+
+        stop_for_agent_in(&reg, agent);
+
+        assert!(
+            !reg.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(&agent),
+            "a poisoned registry must still release the agent's daemons"
         );
     }
 }
