@@ -275,16 +275,16 @@ pub(crate) struct CiStep {
 
 /// How a sibling's commit is chosen.
 ///
-/// Both variants are the GitHub Actions lane's rule, not a third one. That
+/// Every variant is the GitHub Actions lane's rule, not a third one. That
 /// rule lives in `.github/actions/checkout-sibling/action.yml` (Phase A
-/// landed as `a543cc7e1`/#984; Phase B is PR #1008) and the two lanes must
-/// agree on which sibling tree a given change compiles against — otherwise
-/// "parity" means nothing.
+/// landed as `a543cc7e1`/#984; Phase B is PR #1008; the recorded pin is
+/// #1158) and the two lanes must agree on which sibling tree a given change
+/// compiles against — otherwise "parity" means nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum SiblingPin {
-    /// The Actions rule in full: the sibling tree is the **declared
-    /// adaptation PR** — the coord dep edge (`coord:downstream-of=` on the
+    /// The Actions rule for a sibling `.github/sibling-pins.conf` does not
+    /// list: the sibling tree is the **declared adaptation PR** — the coord dep edge (`coord:downstream-of=` on the
     /// dispatched PR, or `coord:upstream-of=` on a sibling PR) that the pair
     /// already has to declare for merge ordering — pinned to that PR's head
     /// SHA. A branch NAME is not an identity: it cannot be checked for having
@@ -293,7 +293,10 @@ pub(crate) enum SiblingPin {
     /// 2026-07-28 (a consumer gate went green against a branch with no PR).
     ///
     /// With no declaration — and, per the Actions action's property 3, with
-    /// no pull request at all — this resolves to [`CiSibling::branch`]. The
+    /// no pull request at all — this resolves to [`CiSibling::branch`],
+    /// which is the action's answer only for a sibling the pin file does not
+    /// list; for a listed one [`SiblingPin::PinFile`] is the action's rule.
+    /// The
     /// CI-node lane dispatches `refs/heads/merge-candidate/<proposal_id>`
     /// pushes, which is exactly the event class the Actions action resolves
     /// to the default branch WITHOUT an API call, and for the same reason:
@@ -308,6 +311,27 @@ pub(crate) enum SiblingPin {
     /// co-evolved with the dispatched repo, and for which no adaptation-PR
     /// protocol exists.
     DefaultBranch,
+    /// The Actions rule in full, INCLUDING its lowest-priority answer: when
+    /// no declaration resolves, the commit recorded for this sibling in
+    /// `.github/sibling-pins.conf` ([`super::sibling::SIBLING_PIN_FILE`]) —
+    /// the manifest `checkout-sibling` reads through its `pin-file` input and
+    /// the `sibling pin bump` workflow keeps current — rather than the tip of
+    /// [`CiSibling::branch`]. A declared adaptation still outranks the pin,
+    /// exactly as in the action, so cross-repo pairs still land.
+    ///
+    /// This is what stops the CI-node lane floating where the Actions lane
+    /// does not. A floating checkout let a sibling land red this repo's
+    /// `main` and hold the merge train for 5h+ on 2026-08-20 with no runner
+    /// commit involved; #1158 pinned the Actions lane, and until this variant
+    /// existed `.qontinui/ci.toml` could only DECLARE the divergence.
+    ///
+    /// Stricter than the action in two places, on purpose: the action floats a
+    /// sibling that is simply not listed (its pin is opt-in per entry, and the
+    /// file is the only place that opt-in can live), whereas this variant IS
+    /// the opt-in, so a manifest that lacks the entry — or no manifest at all
+    /// — is a hard error rather than a silent float. Float on purpose by
+    /// writing [`SiblingPin::DefaultBranch`], where a reader can see it.
+    PinFile,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1185,12 +1209,26 @@ required = true
         )
         .unwrap();
         assert_eq!(m.siblings[0].pin, SiblingPin::DefaultBranch);
-        let err = parse_and_validate(
-            "version = 1\n[[siblings]]\nrepo = \"o/r\"\npin = \"whatever-i-like\"\n\
+        let m = parse_and_validate(
+            "version = 1\n[[siblings]]\nrepo = \"o/r\"\npin = \"pin-file\"\n\
              [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n",
         )
-        .unwrap_err();
-        assert!(err.contains("parse error"), "got: {err}");
+        .unwrap();
+        assert_eq!(m.siblings[0].pin, SiblingPin::PinFile);
+        // Closed: a raw SHA is NOT a pin value. The recorded commit lives in
+        // `.github/sibling-pins.conf` so that both lanes read ONE file; a
+        // second copy here would be the divergence the pin-file exists to end.
+        for bad in [
+            "whatever-i-like",
+            "a543cc7e1fab11c83299b3f8648a4686f223a093",
+        ] {
+            let err = parse_and_validate(&format!(
+                "version = 1\n[[siblings]]\nrepo = \"o/r\"\npin = {bad:?}\n\
+                 [[steps]]\nname = \"x\"\ncommand = [\"true\"]\n"
+            ))
+            .unwrap_err();
+            assert!(err.contains("parse error"), "{bad}: got: {err}");
+        }
     }
 
     /// The slug becomes a clone URL AND a directory name, so it is validated

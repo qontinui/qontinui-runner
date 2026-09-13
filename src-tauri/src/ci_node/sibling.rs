@@ -85,6 +85,18 @@
 //!   is force-pushed and deleted as the proposal resolves. That event class
 //!   resolves to the sibling's branch with no API call at all, exactly as the
 //!   composite action does.
+//! * The action's LOWEST-priority answer is a **recorded pin**:
+//!   `.github/sibling-pins.conf` ([`SIBLING_PIN_FILE`]), consulted only when
+//!   no declaration resolved, on every one of the three no-declaration exits
+//!   (no pull request; no declaration; trailing declaration declined). A
+//!   `[[siblings]]` entry opts into it with `pin = "pin-file"`
+//!   ([`SiblingPin::PinFile`]), and [`lookup_pin`] parses the file
+//!   field-for-field as the action's `apply_pin` does — `#` strips a
+//!   comment, CRs are tolerated, exactly two fields, a 40-hex lowercase SHA,
+//!   a duplicate entry is ambiguous — so the two lanes cannot disagree about
+//!   what the file says. #1158 pinned the Actions lane after a floating
+//!   ui-bridge checkout held this repo's merge train for 5h+ on 2026-08-20;
+//!   this is the CI-node half of the same close.
 //!
 //! **Stronger than #1008 in one place, and only one.** #1008 fetches the
 //! declared PR's head SHA but the no-declaration path by BRANCH. Here both
@@ -514,6 +526,129 @@ pub(crate) fn sibling_dest(dispatch_root: &Path, sibling: &CiSibling) -> PathBuf
     dispatch_root.join(sibling.dir_name())
 }
 
+/// The recorded-pin manifest, repo-relative — the SAME file
+/// `.github/actions/checkout-sibling` reads through its `pin-file` input
+/// (whose default this is) and `.github/workflows/sibling-pin-bump.yml`
+/// keeps current. Deliberately a constant and not a `[[siblings]]` knob: a
+/// per-lane path would let the two lanes read two files, which is the
+/// divergence the pin exists to end.
+pub(crate) const SIBLING_PIN_FILE: &str = ".github/sibling-pins.conf";
+
+/// Look `repo` up in the text of [`SIBLING_PIN_FILE`].
+///
+/// `Ok(Some(sha))` — listed once, with a usable pin. `Ok(None)` — not listed
+/// at all. `Err` — listed, but the entry is not a pin: a duplicate, a missing
+/// SHA, trailing fields, or a SHA that is not 40 lowercase hex characters.
+/// "Not listed" and "listed but unusable" are kept apart because conflating
+/// them is a fail-open: a half-finished bump (old SHA deleted, new one never
+/// pasted) would otherwise read as "never pinned" and float, while LOOKING
+/// deliberate.
+///
+/// Field-for-field the action's `apply_pin` awk — `sub(/#.*/, "")`, `$1 ==
+/// repo`, `NF` carried out beside `$2`, the 40-hex lowercase glob, every
+/// match counted rather than the first taken — and the bump workflow's own
+/// parser, which the #1221 pre-PR review cross-checked against the action.
+/// Two programs already read this file and agree; this is the third, and it
+/// must not be the one that disagrees. The agreement is held by the tests
+/// below against a FIXTURE of that grammar, so a Rust-side drift fails
+/// `cargo test`; a change to either awk has to be mirrored here by hand.
+pub(crate) fn lookup_pin(manifest_text: &str, repo: &str) -> Result<Option<String>, String> {
+    let mut matches: Vec<(usize, Vec<&str>)> = Vec::new();
+    for (idx, raw) in manifest_text.lines().enumerate() {
+        // `lines()` strips `\r\n` as a unit, so a CRLF-committed file is
+        // already clean here; the trim covers a stray `\r` that `lines()`
+        // cannot pair with a `\n`, which the bump workflow's `tr -d '\r'`
+        // also removes.
+        let line = raw.trim_end_matches('\r');
+        let code = line.split_once('#').map_or(line, |(before, _)| before);
+        // Space and tab ONLY — awk's default `FS`. `split_whitespace` would
+        // also split on NBSP, form-feed and the Unicode separators, and then
+        // `repo<NBSP>sha` reads as pinned here while the action reads it as
+        // one unlisted token and floats, or `sha<NBSP>` reads as a clean SHA
+        // here while both awks red it. NBSP arrives by copy-paste from a
+        // rendered page, so this is not exotic.
+        let fields: Vec<&str> = code.split([' ', '\t']).filter(|f| !f.is_empty()).collect();
+        if fields.first().copied() == Some(repo) {
+            matches.push((idx + 1, fields));
+        }
+    }
+    let (lineno, fields) = match matches.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        many => {
+            let lines: Vec<String> = many.iter().map(|(n, _)| n.to_string()).collect();
+            return Err(format!(
+                "{SIBLING_PIN_FILE} lists {repo} {} times (lines {}). Exactly one tree can be \
+                 checked out, so the file is ambiguous about which commit CI builds against. \
+                 Keep one entry and delete the rest.",
+                many.len(),
+                lines.join(", ")
+            ));
+        }
+    };
+    match fields.len() {
+        1 => Err(format!(
+            "{SIBLING_PIN_FILE} line {lineno} lists {repo} with no commit SHA after it. Refusing \
+             to treat a half-finished entry as 'unpinned' and fall back to the default branch — \
+             that silently reinstates the floating checkout this file exists to remove. Record a \
+             full SHA, or delete the line and set pin = \"default-branch\" to float on purpose."
+        )),
+        2 => {
+            let pin = fields[1];
+            // Lowercase only — `is_full_sha` accepts either case because git
+            // does, but the action's glob and the bump workflow's both spell
+            // `[0-9a-f]`, and a pin the Actions lane would red must red here.
+            if is_full_sha(pin) && !pin.bytes().any(|b| b.is_ascii_uppercase()) {
+                Ok(Some(pin.to_string()))
+            } else {
+                Err(format!(
+                    "{SIBLING_PIN_FILE} line {lineno} pins {repo} to {pin:?}, which is not a \
+                     40-character lowercase hex commit SHA. Refusing to fall back to the default \
+                     branch — that is the floating clone this pin exists to remove."
+                ))
+            }
+        }
+        nf => Err(format!(
+            "{SIBLING_PIN_FILE} line {lineno}: {repo} has {nf} fields; expected exactly 2 \
+             (<owner>/<repo> <40-hex-sha>). Trailing text must be a '#' comment."
+        )),
+    }
+}
+
+/// Read `repo`'s recorded pin out of the dispatched repo's checkout.
+///
+/// Both absences are hard errors here, where the action floats: the action's
+/// opt-in IS the file (an unlisted sibling has simply not opted in), whereas a
+/// `[[siblings]]` entry that says `pin = "pin-file"` has — so a missing entry,
+/// or a missing file, contradicts the manifest that asked for it rather than
+/// declining an offer. The error names the two honest ways out.
+fn read_pin(worktree: &Path, repo: &str) -> Result<String, String> {
+    let path = worktree.join(SIBLING_PIN_FILE);
+    // Bytes, not `read_to_string`: both awks are byte-oriented and accept a
+    // Latin-1 `é` in a `#` comment, so an invalid UTF-8 byte must not red
+    // this lane alone. Lossy decoding cannot manufacture a 40-hex SHA.
+    let bytes = std::fs::read(&path).map_err(|e| {
+        format!(
+            "sibling '{repo}' is pinned with pin = \"pin-file\", but {SIBLING_PIN_FILE} could \
+             not be read from the dispatched checkout ({}): {e}. Refusing to resolve the sibling \
+             by default branch instead — that is the floating checkout #1158 removed. Restore the \
+             manifest, or set pin = \"default-branch\" to float on purpose.",
+            path.display()
+        )
+    })?;
+    let text = String::from_utf8_lossy(&bytes);
+    match lookup_pin(&text, repo)? {
+        Some(sha) => Ok(sha),
+        None => Err(format!(
+            "sibling '{repo}' is pinned with pin = \"pin-file\", but {SIBLING_PIN_FILE} does not \
+             list it. Refusing to resolve it by default branch instead — that is the floating \
+             checkout that held this repo's merge train for 5h+ on 2026-08-20. Add the entry \
+             (gh api repos/{repo}/commits/<default-branch> --jq .sha), or set \
+             pin = \"default-branch\" in .qontinui/ci.toml so the float is visible."
+        )),
+    }
+}
+
 /// Clone URL for a sibling slug. Public HTTPS only: the sibling repos this
 /// lane provisions are public, and reaching for a credential here would put
 /// the user's GitHub token on a network path the manifest chose.
@@ -781,33 +916,72 @@ pub(crate) struct ResolvedSibling {
     pub provenance: String,
 }
 
-/// Resolve one sibling to an exact commit.
+/// The no-declaration answer — the action's `emit()` → `apply_pin` funnel.
+///
+/// Every exit of [`resolve_one`] that found no declaration lands here with
+/// `why` saying which one, and the answer is then the recorded pin under
+/// [`SiblingPin::PinFile`] or the branch tip otherwise. ONE funnel rather
+/// than a pin check at each exit, for the reason the action gives for
+/// putting `apply_pin` inside `emit()`: three exits is three places to forget
+/// the pin, and the push-to-`main` build — the one that reds the repo — is
+/// the first of them.
+///
+/// The pin is read LAZILY, here, so a malformed manifest cannot red a
+/// dispatch whose declared adaptation would have outranked it — exactly the
+/// action's `if [ -n "${SHA}" ]; then return 0; fi`.
+async fn no_declaration(
+    cwd: &Path,
+    worktree: &Path,
+    sibling: &CiSibling,
+    why: &str,
+) -> Result<ResolvedSibling, String> {
+    if sibling.pin == SiblingPin::PinFile {
+        let sha = read_pin(worktree, &sibling.repo)?;
+        return Ok(ResolvedSibling {
+            repo: sibling.repo.clone(),
+            sha,
+            provenance: format!("pinned in {SIBLING_PIN_FILE} ({why}; no declaration applied)"),
+        });
+    }
+    let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
+    Ok(ResolvedSibling {
+        repo: sibling.repo.clone(),
+        sha,
+        provenance: format!("{}@{} ({why})", sibling.repo, sibling.branch),
+    })
+}
+
+/// Resolve one sibling to an exact commit. `worktree` is the dispatched
+/// repo's checkout — where [`SIBLING_PIN_FILE`] is read from, at the
+/// dispatched commit, exactly as `.qontinui/ci.toml` itself was.
 async fn resolve_one(
     cwd: &Path,
+    worktree: &Path,
     client: &reqwest::Client,
     token: Option<&str>,
     sibling: &CiSibling,
     this_repo: &str,
     pr_number: Option<u64>,
 ) -> Result<ResolvedSibling, String> {
-    let branch_fallback = |sha: String, why: &str| ResolvedSibling {
-        repo: sibling.repo.clone(),
-        sha,
-        provenance: format!("{}@{} ({why})", sibling.repo, sibling.branch),
-    };
-
     if sibling.pin == SiblingPin::DefaultBranch {
         let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
-        return Ok(branch_fallback(sha, "pin = default-branch"));
+        return Ok(ResolvedSibling {
+            repo: sibling.repo.clone(),
+            sha,
+            provenance: format!("{}@{} (pin = default-branch)", sibling.repo, sibling.branch),
+        });
     }
 
-    // Property 3: no pull request ⇒ the branch, with NO api call at all.
+    // Property 3: no pull request ⇒ no declaration probe, with NO api call
+    // at all — then the pin or the branch, as the action's emit() does.
     let Some(pr) = pr_number else {
-        let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
-        return Ok(branch_fallback(
-            sha,
+        return no_declaration(
+            cwd,
+            worktree,
+            sibling,
             "no pull request on this dispatch — no declaration probe",
-        ));
+        )
+        .await;
     };
 
     let this_labels = fetch_pr_labels(client, token, this_repo, pr).await?;
@@ -823,14 +997,12 @@ async fn resolve_one(
         sibling.accept_trailing_sibling,
         &inputs,
     )? {
-        DeclaredTarget::None => {
-            let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
-            Ok(branch_fallback(sha, "no declaration"))
-        }
+        DeclaredTarget::None => no_declaration(cwd, worktree, sibling, "no declaration").await,
         DeclaredTarget::TrailingSiblingDeclined { number, forms } => {
-            let sha = ls_remote_branch_sha(cwd, &sibling.repo, &sibling.branch).await?;
-            Ok(branch_fallback(
-                sha,
+            no_declaration(
+                cwd,
+                worktree,
+                sibling,
                 &format!(
                     "declaration {}#{number} (via {}) orders {} AFTER this side; \
                      this step does not accept a trailing sibling",
@@ -838,7 +1010,8 @@ async fn resolve_one(
                     forms_label(&forms),
                     short_name(&sibling.repo),
                 ),
-            ))
+            )
+            .await
         }
         DeclaredTarget::Pr { number, forms } => {
             let detail = fetch_sibling_pr_detail(client, token, &sibling.repo, number).await?;
@@ -911,13 +1084,14 @@ async fn materialise(dest: &Path, resolved: &ResolvedSibling) -> Result<(), Stri
 
 /// Provision every declared sibling into the dispatch-scoped parent.
 ///
-/// `worktree_dir_name` is the directory the dispatched repo occupies; a
-/// sibling that would land on it is rejected before any IO, because
-/// materialising over the worktree is the one collision the "destination
-/// already exists" refusal would report far too late to be legible.
+/// `worktree` is the dispatched repo's checkout: its directory name is what a
+/// sibling must not land on (rejected before any IO, because materialising
+/// over the worktree is the one collision the "destination already exists"
+/// refusal would report far too late to be legible), and it is where a
+/// `pin = "pin-file"` sibling's [`SIBLING_PIN_FILE`] is read from.
 pub(crate) async fn provision(
     dispatch_root: &Path,
-    worktree_dir_name: &str,
+    worktree: &Path,
     siblings: &[CiSibling],
     this_repo: &str,
     pr_number: Option<u64>,
@@ -928,6 +1102,10 @@ pub(crate) async fn provision(
     if siblings.is_empty() {
         return Ok(Vec::new());
     }
+    let worktree_dir_name = worktree
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
     for s in siblings {
         if s.dir_name() == worktree_dir_name {
             return Err(format!(
@@ -957,6 +1135,7 @@ pub(crate) async fn provision(
     for sibling in siblings {
         let resolved = resolve_one(
             dispatch_root,
+            worktree,
             &client,
             token.as_deref(),
             sibling,
@@ -1505,5 +1684,264 @@ mod tests {
             clone_url(SCHEMAS),
             "https://github.com/qontinui/qontinui-schemas.git"
         );
+    }
+
+    // ── the recorded pin (`.github/sibling-pins.conf`) ──────────────────
+
+    const UI_BRIDGE: &str = "qontinui/ui-bridge";
+    const PIN_A: &str = "0aedd171fc4ef777ab4da6c08b75fb806b0bd414";
+    const PIN_B: &str = "ec64cbb1e2d7174107bd753c704b730b34872833";
+
+    /// The shape the real manifest has: a comment header, blank lines, a
+    /// trailing `# …` after an entry, and CRLF line endings the action's
+    /// `tr -d '\r'` tolerates. Every one of those must parse to the SAME
+    /// answer the action reaches, or the two lanes disagree about one file.
+    #[test]
+    fn pin_lookup_reads_the_file_as_the_action_does() {
+        let text = format!(
+            "# header comment\r\n\r\n{UI_BRIDGE}      {PIN_A}   # trailing note\r\n\
+             qontinui/qontinui-web   {PIN_B}\r\n# {UI_BRIDGE} deadbeef (commented out)\r\n"
+        );
+        assert_eq!(
+            lookup_pin(&text, UI_BRIDGE).unwrap().as_deref(),
+            Some(PIN_A)
+        );
+        assert_eq!(
+            lookup_pin(&text, "qontinui/qontinui-web")
+                .unwrap()
+                .as_deref(),
+            Some(PIN_B)
+        );
+        // Not listed is a distinct answer from listed-but-unusable, and it is
+        // the ONLY absence this parser reports as `None`.
+        assert_eq!(lookup_pin(&text, SCHEMAS).unwrap(), None);
+        assert_eq!(lookup_pin("", UI_BRIDGE).unwrap(), None);
+        // `$1 == repo` is exact: a prefix, a different owner, or the short
+        // name alone is not the entry.
+        assert_eq!(lookup_pin(&text, "ui-bridge").unwrap(), None);
+        assert_eq!(lookup_pin(&text, "other/ui-bridge").unwrap(), None);
+        // awk's default FS is space and tab. An NBSP (the copy-paste
+        // separator) is NOT a separator to either awk, so `repo<NBSP>sha`
+        // is one token that equals no repo — unlisted, exactly as the action
+        // reads it — and never a pin.
+        assert_eq!(
+            lookup_pin(&format!("{UI_BRIDGE}\u{a0}{PIN_A}\n"), UI_BRIDGE).unwrap(),
+            None
+        );
+        // A tab IS a separator, as in the real file.
+        assert_eq!(
+            lookup_pin(&format!("{UI_BRIDGE}\t{PIN_A}\n"), UI_BRIDGE)
+                .unwrap()
+                .as_deref(),
+            Some(PIN_A)
+        );
+    }
+
+    /// The fail-open the action refuses, refused here too: a listed entry
+    /// whose value is not a pin is an ERROR, never `None` — otherwise the
+    /// ordinary "delete the old SHA, paste the new one" bump, with the paste
+    /// missed, floats the sibling while looking deliberate.
+    #[test]
+    fn pin_lookup_rejects_unusable_entries_instead_of_floating() {
+        let cases: [(&str, &str); 7] = [
+            (
+                "listed twice",
+                &format!("{UI_BRIDGE} {PIN_A}\n{UI_BRIDGE} {PIN_B}\n"),
+            ),
+            ("no sha", &format!("{UI_BRIDGE}\n")),
+            (
+                "sha commented out mid-edit",
+                &format!("{UI_BRIDGE}   # {PIN_A}\n"),
+            ),
+            ("three fields", &format!("{UI_BRIDGE} {PIN_A} extra\n")),
+            ("short sha", &format!("{UI_BRIDGE} 0aedd171f\n")),
+            (
+                "uppercase sha",
+                &format!("{UI_BRIDGE} {}\n", PIN_A.to_ascii_uppercase()),
+            ),
+            // Both awks read `sha<NBSP>` as a 41-byte second field that fails
+            // the 40-hex glob; `split_whitespace` would have eaten the NBSP
+            // and passed a pin the Actions lane reds.
+            (
+                "trailing NBSP glued to the sha",
+                &format!("{UI_BRIDGE} {PIN_A}\u{a0}\n"),
+            ),
+        ];
+        for (what, text) in cases {
+            let err = lookup_pin(text, UI_BRIDGE)
+                .expect_err(&format!("{what}: must be an error, not a float"));
+            assert!(
+                err.contains(SIBLING_PIN_FILE) && err.contains(UI_BRIDGE),
+                "{what}: the error must name the file and the sibling, got: {err}"
+            );
+        }
+        // A duplicate names every line it found, so the author can see the
+        // ambiguity rather than hunt for it.
+        let err = lookup_pin(
+            &format!("# x\n{UI_BRIDGE} {PIN_A}\n\n{UI_BRIDGE} {PIN_B}\n"),
+            UI_BRIDGE,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("2 times") && err.contains("lines 2, 4"),
+            "got: {err}"
+        );
+    }
+
+    /// `read_pin` is the opt-in's other half: under `pin = "pin-file"` the
+    /// file being absent, or the sibling being absent from it, contradicts
+    /// the manifest rather than declining an offer — so both are hard errors
+    /// that name the way out, where the action would float.
+    #[test]
+    fn pin_file_absence_is_an_error_under_pin_file_not_a_float() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_pin(dir.path(), UI_BRIDGE).unwrap_err();
+        assert!(
+            err.contains("could not be read") && err.contains("pin = \"default-branch\""),
+            "got: {err}"
+        );
+
+        let manifest = dir.path().join(SIBLING_PIN_FILE);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, format!("qontinui/qontinui-web {PIN_B}\n")).unwrap();
+        let err = read_pin(dir.path(), UI_BRIDGE).unwrap_err();
+        assert!(
+            err.contains("does not list it") && err.contains("pin = \"default-branch\""),
+            "got: {err}"
+        );
+
+        std::fs::write(
+            &manifest,
+            format!("qontinui/qontinui-web {PIN_B}\n{UI_BRIDGE} {PIN_A}\n"),
+        )
+        .unwrap();
+        assert_eq!(read_pin(dir.path(), UI_BRIDGE).unwrap(), PIN_A);
+    }
+
+    /// The no-declaration funnel: under `pin-file` every exit that found no
+    /// declaration answers with the recorded commit and says so in the
+    /// provenance, with NO network call — the branch is never consulted.
+    #[tokio::test]
+    async fn no_declaration_answers_with_the_recorded_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join(SIBLING_PIN_FILE);
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, format!("{UI_BRIDGE} {PIN_A}\n")).unwrap();
+
+        let mut sibling = sib(UI_BRIDGE);
+        sibling.pin = SiblingPin::PinFile;
+        // The SHA assertion below is what catches a regression that consulted
+        // the branch: `ls-remote` needs no repository cwd, so on a networked
+        // box it would answer with ui-bridge's real tip, which is not PIN_A.
+        let resolved = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
+            .await
+            .unwrap();
+        assert_eq!(resolved.sha, PIN_A);
+        assert_eq!(resolved.repo, UI_BRIDGE);
+        assert!(
+            resolved.provenance.contains(SIBLING_PIN_FILE)
+                && resolved.provenance.contains("no declaration"),
+            "got: {}",
+            resolved.provenance
+        );
+
+        // A half-finished bump reaches the dispatch as the manifest's own
+        // error, not as a float: the branch is still never consulted.
+        std::fs::write(&manifest, format!("{UI_BRIDGE}\n")).unwrap();
+        let err = no_declaration(dir.path(), dir.path(), &sibling, "no declaration")
+            .await
+            .unwrap_err();
+        assert!(err.contains("no commit SHA after it"), "got: {err}");
+    }
+
+    /// Lane parity on this repo's REAL files, so the audit the manifests ask
+    /// for in prose ("when ci.yml's clone list changes, change this list in
+    /// the same PR") fails `cargo test` instead of waiting for an incident:
+    ///
+    /// * `.qontinui/ci.toml` parses and validates as shipped;
+    /// * every `[[siblings]]` entry that says `pin-file` is listed in
+    ///   `.github/sibling-pins.conf` with a usable SHA, and no entry of any
+    ///   kind is listed there UNUSABLY (a half-finished bump on `main` would
+    ///   red the Actions lane too, so it is caught here first);
+    /// * every repo the pin file lists is a declared sibling here — a pin for
+    ///   a repo this lane never checks out is a pin nothing reads, i.e. the
+    ///   two lanes' sibling lists have drifted;
+    /// * every repo the pin file lists that this lane does NOT read the pin
+    ///   for (a listed sibling on `declared-adaptation` / `default-branch`)
+    ///   is named in [`KNOWN_DIVERGENT`] — the ci.toml block that records
+    ///   the divergence is prose, and this is what makes an UNRECORDED one
+    ///   red: a sibling the Actions lane pins and this lane floats, with no
+    ///   line here admitting it. When the two entries flip to `pin-file`
+    ///   the list empties, and it must, because an entry left in it that
+    ///   is no longer divergent is refused too.
+    ///
+    /// Read against the checked-in bytes (`include_str!`), never a copy:
+    /// a copy is the second source of truth this whole mechanism exists to
+    /// avoid.
+    #[test]
+    fn this_repo_manifests_agree_on_which_siblings_are_pinned() {
+        /// Siblings the pin file lists that `.qontinui/ci.toml` deliberately
+        /// does NOT read the pin for yet — its DECLARED DIVERGENCE block says
+        /// why (coord's allocate-lane reader must accept `pin-file` first).
+        /// Deleting the divergence deletes the entry here, in the same PR.
+        const KNOWN_DIVERGENT: &[&str] = &["qontinui/qontinui-web", "qontinui/ui-bridge"];
+
+        let ci_toml = include_str!("../../../.qontinui/ci.toml");
+        let pin_file = include_str!("../../../.github/sibling-pins.conf");
+        let manifest = super::super::manifest::parse_and_validate(ci_toml)
+            .expect("this repo's own .qontinui/ci.toml must parse and validate");
+        assert!(
+            !manifest.siblings.is_empty(),
+            "this repo declares siblings; an empty list means the wrong file was read"
+        );
+        for s in &manifest.siblings {
+            let pinned = lookup_pin(pin_file, &s.repo).unwrap_or_else(|e| {
+                panic!("{SIBLING_PIN_FILE} entry for {} is unusable: {e}", s.repo)
+            });
+            let reads_pin = s.pin == SiblingPin::PinFile;
+            let admitted = KNOWN_DIVERGENT.contains(&s.repo.as_str());
+            match (reads_pin, pinned.is_some(), admitted) {
+                (true, false, _) => panic!(
+                    "{} says pin = \"pin-file\" in .qontinui/ci.toml but {SIBLING_PIN_FILE} does \
+                     not list it — every dispatch would hard-fail on this sibling",
+                    s.repo
+                ),
+                (true, true, true) => panic!(
+                    "{} reads its pin now; drop it from KNOWN_DIVERGENT — the divergence it \
+                     admits no longer exists",
+                    s.repo
+                ),
+                (false, true, false) => panic!(
+                    "{SIBLING_PIN_FILE} pins {} but .qontinui/ci.toml resolves it by {:?}, and \
+                     nothing admits the divergence: the Actions lane compiles against the pinned \
+                     commit while this lane floats. Either set pin = \"pin-file\" or record why \
+                     not in ci.toml's DECLARED DIVERGENCE block AND in KNOWN_DIVERGENT here",
+                    s.repo, s.pin
+                ),
+                (false, false, true) => panic!(
+                    "{} is in KNOWN_DIVERGENT but {SIBLING_PIN_FILE} does not list it — there is \
+                     no pin to diverge from; drop the entry",
+                    s.repo
+                ),
+                (true, true, false) | (false, true, true) | (false, false, false) => {}
+            }
+        }
+        let declared: Vec<&str> = manifest.siblings.iter().map(|s| s.repo.as_str()).collect();
+        let listed: Vec<&str> = pin_file
+            .lines()
+            .map(|l| l.split_once('#').map_or(l, |(code, _)| code))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert!(
+            !listed.is_empty(),
+            "{SIBLING_PIN_FILE} lists no repos; an empty list means the wrong file was read"
+        );
+        for repo in listed {
+            assert!(
+                declared.contains(&repo),
+                "{SIBLING_PIN_FILE} pins {repo}, which .qontinui/ci.toml does not declare as a \
+                 sibling — the two lanes' sibling lists have drifted"
+            );
+        }
     }
 }
