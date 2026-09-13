@@ -1176,16 +1176,31 @@ impl SecureStorage {
     /// Enumerate the tenant ids that currently have a device-JWT slot, in
     /// deterministic (BTreeMap key) order. Unreadable stores and malformed
     /// keys yield an empty / filtered list — enumeration is never fatal.
+    ///
+    /// ⚠ The empty Vec is AMBIGUOUS: it means "no tenant slots" and "the store
+    /// could not be read" alike. That is fine for a caller choosing a code
+    /// path, and NOT fine for a caller about to do something destructive with
+    /// the answer — use [`Self::try_list_tenant_device_jwt_tenants`] there.
     pub fn list_tenant_device_jwt_tenants(&self) -> Vec<uuid::Uuid> {
-        self.load_tokens()
-            .map(|t| {
-                t.tenant_device_jwts
-                    .keys()
-                    .filter_map(|k| k.strip_prefix(TENANT_DEVICE_JWT_PREFIX))
-                    .filter_map(|s| uuid::Uuid::parse_str(s).ok())
-                    .collect()
-            })
+        self.try_list_tenant_device_jwt_tenants()
             .unwrap_or_default()
+    }
+
+    /// [`Self::list_tenant_device_jwt_tenants`] without the collapse: a store
+    /// that could not be read is `Err`, distinguishable from a store that
+    /// genuinely holds no tenant slots.
+    ///
+    /// A present-but-undecryptable store, a partial write, an I/O blip or
+    /// contention with a concurrent writer all reach the `Err` arm — states in
+    /// which a caller must not conclude "this runner has no tenant slots".
+    pub fn try_list_tenant_device_jwt_tenants(&self) -> Result<Vec<uuid::Uuid>> {
+        Ok(self
+            .load_tokens()?
+            .tenant_device_jwts
+            .keys()
+            .filter_map(|k| k.strip_prefix(TENANT_DEVICE_JWT_PREFIX))
+            .filter_map(|s| uuid::Uuid::parse_str(s).ok())
+            .collect())
     }
 
     /// Store the device-bound machine key (`dmk_<token>`). Minted by the
