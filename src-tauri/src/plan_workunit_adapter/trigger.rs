@@ -543,6 +543,64 @@ pub trait GitRefReader: Send + Sync {
         default_ref: &str,
         ref_sha: &str,
     ) -> Vec<Result<Option<i64>, String>>;
+
+    // ---- Phase 2 of `2026-09-10-the-plan-scanner-reads-a-parked-working-tree-not-a-ref`
+    // The three reads that let the scan take its bytes from a REF instead of
+    // the checked-out tree. Each returns `Err` for "could not ask", and the
+    // caller turns that into a cycle that PUBLISHES NOTHING rather than one
+    // that publishes a tree — a failed fetch must leave the previous corpus
+    // standing [policy: `unknown-must-not-render-as-a-default`].
+
+    /// Refresh `default_ref` from its remote before the scan reads it.
+    ///
+    /// Reading a ref is only ever as fresh as the last fetch, so the scan owns
+    /// the fetch rather than inheriting whatever some other process last did.
+    /// `Err` is NOT "scan the tree instead": it is this cycle declining to
+    /// publish.
+    fn fetch_default(&self, repo_root: &Path, default_ref: &str) -> Result<(), String>;
+
+    /// The blob entries of `<ref>:<rel_dir>`, **depth 1 only**.
+    ///
+    /// Non-recursive on purpose, matching [`read_plan_dir`]'s documented flat
+    /// contract and coord's `walk_root`. A recursive walk here would silently
+    /// add every subdirectory plan to the corpus as a side effect of a
+    /// scan-SOURCE change — two behaviour changes in one phase, and the wider
+    /// one unannounced. If those plans should be scanned that is its own
+    /// decision with its own blast radius.
+    ///
+    /// Trees and submodule links are skipped, not errors: a `plans/artifacts/`
+    /// subdirectory is an ordinary, expected entry that this walk does not
+    /// descend into.
+    fn list_ref_dir(
+        &self,
+        repo_root: &Path,
+        ref_name: &str,
+        rel_dir: &str,
+    ) -> Result<Vec<RefDirEntry>, String>;
+
+    /// Read many blobs by object id in ONE `git` invocation.
+    ///
+    /// One process, not one per file. The scan's own call site records the
+    /// active dir at ~1,100 files and the first cycle at five minutes; a
+    /// `git show` per entry would add that many spawns to a loop that already
+    /// dilates a single-worker runtime's time driver.
+    ///
+    /// Returns one entry per requested id, in the order requested, so a
+    /// caller can zip it against [`Self::list_ref_dir`]'s names without a
+    /// second lookup. A blob that cannot be read is `Err` in its own slot —
+    /// one unreadable file does not discard the other 1,099.
+    fn read_blobs(&self, repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>>;
+}
+
+/// One depth-1 blob in a ref's directory listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefDirEntry {
+    /// The entry's own name, with no directory part — `2026-09-10-foo.md`.
+    pub name: String,
+    /// The blob's object id, which is what [`GitRefReader::read_blobs`] reads.
+    /// Carried rather than re-deriving `<ref>:<dir>/<name>` per file so the
+    /// batch read needs no second path round-trip.
+    pub id: String,
 }
 
 /// What the refresh records say, taken together — see
@@ -953,6 +1011,35 @@ fn fetch_head_file_refreshed_at(
 /// the same posture as `git_status_subset`'s `GIT_TIMEOUT`.
 const SCAN_DIVERGENCE_GIT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Budget for the scan's `git fetch` — the one NETWORK call in this module,
+/// and so the one that must not inherit the local-plumbing budget above. A
+/// cold or slow fetch overrunning 20 s would report `TimedOut`, which the
+/// caller reads as `Unavailable`, which publishes nothing: a slow network
+/// would look exactly like a broken ref.
+const SCAN_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Budget for reading ONE plan blob — a local object read, like the probes
+/// above, so it carries their budget rather than the network one.
+const SCAN_BLOB_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Blob bodies already read, keyed by OBJECT ID.
+///
+/// A git object id is a content hash, so `id -> bytes` is a cache with no
+/// invalidation problem: the same id is provably the same bytes, forever and
+/// across repos. That is what makes the per-blob read affordable — the listing
+/// changes rarely, so after the first cycle nearly every id is a hit and the
+/// steady-state scan spawns NOTHING, which is strictly cheaper than the one
+/// `--batch` process this replaced.
+///
+/// It is pruned to the current listing on every read (see
+/// [`GitRefReader::read_blobs`] for `ProcessGit`), so it holds one corpus and
+/// not a growing history of one.
+fn blob_cache() -> &'static std::sync::Mutex<HashMap<String, String>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
 /// The production [`GitRefReader`]: shells out to `git`, always with an
 /// explicit `-C <dir>` so the probe can never pick up the runner's own cwd.
 ///
@@ -974,9 +1061,20 @@ impl ProcessGit {
         args: &[&str],
         label: &str,
     ) -> Result<String, crate::process_helpers::DegradeReason> {
+        Self::probe_within(dir, args, label, SCAN_DIVERGENCE_GIT_TIMEOUT)
+    }
+
+    /// [`Self::probe`] on an explicit budget, for the one call that is not a
+    /// local plumbing read — see [`SCAN_FETCH_TIMEOUT`].
+    fn probe_within(
+        dir: &Path,
+        args: &[&str],
+        label: &str,
+        budget: Duration,
+    ) -> Result<String, crate::process_helpers::DegradeReason> {
         let mut cmd = crate::process_helpers::no_window("git");
         cmd.arg("-C").arg(dir).args(args);
-        match crate::process_helpers::run_probe_quiet(cmd, SCAN_DIVERGENCE_GIT_TIMEOUT, label) {
+        match crate::process_helpers::run_probe_quiet(cmd, budget, label) {
             crate::process_helpers::ProbeOutcome::Captured(out) => {
                 Ok(String::from_utf8_lossy(&out).trim().to_string())
             }
@@ -987,7 +1085,20 @@ impl ProcessGit {
     /// [`Self::probe`] with every degrade flattened to a sentence — for the
     /// two reads whose non-zero exit carries no extra meaning.
     fn run(dir: &Path, args: &[&str], label: &str) -> Result<String, String> {
-        Self::probe(dir, args, label).map_err(|reason| Self::describe(args, &reason))
+        Self::run_within(dir, args, label, SCAN_DIVERGENCE_GIT_TIMEOUT)
+    }
+
+    /// [`Self::run`] on an explicit budget. The budget reaches
+    /// [`Self::describe`] too, so a timed-out fetch names the budget it
+    /// actually overran rather than the probe budget it never had.
+    fn run_within(
+        dir: &Path,
+        args: &[&str],
+        label: &str,
+        budget: Duration,
+    ) -> Result<String, String> {
+        Self::probe_within(dir, args, label, budget)
+            .map_err(|reason| Self::describe_within(args, &reason, budget))
     }
 
     /// One sentence for a probe that did not answer — worded WITHOUT per-run
@@ -998,13 +1109,22 @@ impl ProcessGit {
     /// a NEW reading every tick — a WARN and a scan-root POST per minute for
     /// what is one unchanging fault.
     fn describe(args: &[&str], reason: &crate::process_helpers::DegradeReason) -> String {
+        Self::describe_within(args, reason, SCAN_DIVERGENCE_GIT_TIMEOUT)
+    }
+
+    /// [`Self::describe`] for a probe that ran on a non-default budget.
+    fn describe_within(
+        args: &[&str],
+        reason: &crate::process_helpers::DegradeReason,
+        budget: Duration,
+    ) -> String {
         use crate::process_helpers::DegradeReason;
         let why = match reason {
             DegradeReason::Status => "it exited non-zero".to_string(),
             DegradeReason::SpawnError => "it could not be spawned (SpawnError)".to_string(),
             DegradeReason::TimedOut { reaped, .. } => format!(
                 "it overran its {}s budget and was killed (TimedOut{})",
-                SCAN_DIVERGENCE_GIT_TIMEOUT.as_secs(),
+                budget.as_secs(),
                 if *reaped { "" } else { ", not reaped" }
             ),
             DegradeReason::Truncated(t) => format!("its output was truncated ({t:?})"),
@@ -1092,6 +1212,56 @@ impl ProcessGit {
     }
 }
 
+impl ProcessGit {
+    /// Read ONE blob by object id, on a hard clock.
+    ///
+    /// ## Why one process per blob rather than one `cat-file --batch`
+    ///
+    /// A single `--batch` over the whole dir is one spawn instead of ~1,100,
+    /// and that is what this used to be. It cannot survive contact with the
+    /// bounded-subprocess rule: every sanctioned wrapper in
+    /// [`crate::process_helpers`] forces `stdin(null)` and caps captured
+    /// stdout at `MAX_CAPTURED_BYTES` (4 MiB), so a `--batch` can neither be
+    /// FED its ids through one nor return a plans dir's tens of megabytes
+    /// through one. Hand-rolling the spawn to get around that is precisely the
+    /// defect class `scripts/check_untimed_subprocess.py` exists to stop —
+    /// an unbounded `Child::wait()` on a tokio blocking-pool thread, which on
+    /// 2026-08-30 exhausted the 512-thread pool and took `/livez` dark.
+    ///
+    /// So the read is per blob, through `run_with_timeout_detailed`, and the
+    /// SPAWN COUNT is bought back by the cache above rather than by owning a
+    /// child. That trade also deletes the writer thread, the watchdog, the
+    /// `Arc<Mutex<Child>>` and the manual reap this function used to need —
+    /// none of which can be got wrong if none of them exists.
+    ///
+    /// A truncated read is an `Err`, never a short body: a plan body silently
+    /// cut at the byte cap would reach the corpus as a real plan with its
+    /// phases missing.
+    fn cat_file_blob(repo_root: &Path, id: &str) -> Result<Vec<u8>, String> {
+        let mut cmd = crate::process_helpers::no_window("git");
+        cmd.arg("-C").arg(repo_root).args(["cat-file", "blob", id]);
+        let run = crate::process_helpers::run_with_timeout_detailed(cmd, SCAN_BLOB_TIMEOUT)
+            .map_err(|e| format!("`git cat-file blob {id}` could not be spawned: {e}"))?;
+        if let Some(t) = run.truncation {
+            return Err(format!(
+                "blob {id} was read INCOMPLETELY ({t:?}); a short plan body must not reach the \
+                 corpus"
+            ));
+        }
+        match run.outcome {
+            crate::process_helpers::TimedOutput::Completed(o) if o.status.success() => Ok(o.stdout),
+            // A non-zero exit is git's own answer: no such object here.
+            crate::process_helpers::TimedOutput::Completed(_) => {
+                Err(format!("blob {id} is missing from this repo"))
+            }
+            crate::process_helpers::TimedOutput::TimedOut { reaped, .. } => Err(format!(
+                "blob {id} overran its {}s budget and was killed (reaped={reaped})",
+                SCAN_BLOB_TIMEOUT.as_secs()
+            )),
+        }
+    }
+}
+
 impl GitRefReader for ProcessGit {
     fn work_tree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
         const ARGS: [&str; 2] = ["rev-parse", "--show-toplevel"];
@@ -1173,6 +1343,134 @@ impl GitRefReader for ProcessGit {
         let mut stamps = Self::fetch_head_stamps(repo_root, default_ref, ref_sha);
         stamps.push(Self::reflog_refreshed_at(repo_root, default_ref));
         stamps
+    }
+
+    fn fetch_default(&self, repo_root: &Path, default_ref: &str) -> Result<(), String> {
+        // `origin/main` -> remote `origin`, branch `main`. Split rather than
+        // assuming "origin" so this stays correct if `default_ref` ever stops
+        // resolving through `refs/remotes/origin/HEAD` — which is what it
+        // reads today, so the split is defensive rather than load-bearing.
+        let (remote, branch) = match default_ref.split_once('/') {
+            Some((r, b)) if !r.is_empty() && !b.is_empty() => (r, b),
+            _ => {
+                return Err(format!(
+                    "default ref `{default_ref}` is not `<remote>/<branch>`, so no fetch target can be derived"
+                ))
+            }
+        };
+        // `-c gc.auto=0`: this is a WRITE, once a minute, into a checkout
+        // other agents are working in. git runs `gc --auto` after a fetch by
+        // default, and a repack fired off by the scan loop is a side effect on
+        // a shared resource the scan has no business causing.
+        // `--no-tags`: the scan reads one branch; tag traffic is pure cost.
+        Self::run_within(
+            repo_root,
+            &[
+                "-c",
+                "gc.auto=0",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                remote,
+                branch,
+            ],
+            "plan adapter: scan fetch",
+            SCAN_FETCH_TIMEOUT,
+        )
+        .map(|_| ())
+    }
+
+    fn list_ref_dir(
+        &self,
+        repo_root: &Path,
+        ref_name: &str,
+        rel_dir: &str,
+    ) -> Result<Vec<RefDirEntry>, String> {
+        // No `-r`: depth 1, which IS the contract. `<ref>:<dir>` addresses the
+        // directory's own tree, so entries come back bare-named.
+        let spec = format!("{ref_name}:{rel_dir}");
+        let args = ["ls-tree", "-z", spec.as_str()];
+        let out =
+            Self::probe(repo_root, &args, "plan adapter: scan ref listing").map_err(|reason| {
+                match reason {
+                    // A non-zero exit here is git's own ANSWER — that path is not
+                    // in that ref — and it is a real, permanent configuration
+                    // rather than a fault to repair: a plans dir that is
+                    // gitignored, or that exists only on a feature branch. Naming
+                    // it separately is what stops an operator hunting a broken
+                    // fetch that never happened.
+                    crate::process_helpers::DegradeReason::Status => format!(
+                        "`{spec}` does not exist in that ref (an unpushed or ignored plans dir is \
+                     not discoverable work)"
+                    ),
+                    other => Self::describe(&args, &other),
+                }
+            })?;
+        let mut entries = Vec::new();
+        for rec in out.split('\0') {
+            if rec.is_empty() {
+                continue;
+            }
+            // `<mode> SP <type> SP <id> TAB <name>`
+            let (meta, name) = match rec.split_once('\t') {
+                Some(v) => v,
+                None => continue,
+            };
+            let mut f = meta.split_whitespace();
+            let (mode, kind, id) = match (f.next(), f.next(), f.next()) {
+                (Some(a), Some(b), Some(c)) => (a, b, c),
+                _ => continue,
+            };
+            // Trees and commit links (submodules) are skipped, not errors.
+            //
+            // Mode `120000` is a SYMLINK, which `ls-tree` also reports as a
+            // blob — and whose blob content is the link TARGET STRING, not the
+            // file. Reading it would put a one-line path into the corpus and
+            // parse it as a plan. `read_plan_dir` follows the link and reads
+            // the target; nothing here can, so the parity-preserving answer is
+            // to skip it rather than to publish the wrong bytes.
+            if kind != "blob" || mode == "120000" {
+                continue;
+            }
+            entries.push(RefDirEntry {
+                name: name.to_string(),
+                id: id.to_string(),
+            });
+        }
+        Ok(entries)
+    }
+
+    fn read_blobs(&self, repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let mut cache = blob_cache().lock().unwrap_or_else(|p| p.into_inner());
+        let out: Vec<Result<String, String>> = ids
+            .iter()
+            .map(|id| match cache.get(id) {
+                // A git object id is a CONTENT HASH, so a hit is not a guess
+                // that the bytes are unchanged — it is a proof of it. That is
+                // the whole reason this cache needs no invalidation rule.
+                Some(hit) => Ok(hit.clone()),
+                None => {
+                    let body = Self::cat_file_blob(repo_root, id)?;
+                    // STRICT UTF-8, not `from_utf8_lossy`: `read_plan_dir`'s
+                    // `read_to_string` SKIPS a non-UTF-8 file, and a silently
+                    // mangled body here would be a plan the two arms disagree
+                    // about — the opposite of the parity this phase claims.
+                    let text = String::from_utf8(body)
+                        .map_err(|e| format!("blob {id} is not valid UTF-8: {e}"))?;
+                    cache.insert(id.clone(), text.clone());
+                    Ok(text)
+                }
+            })
+            .collect();
+        // Bounded by ONE corpus: anything not in this listing is unreachable
+        // from the next scan too (a rewritten plan gets a new id), so keeping
+        // it would be an unbounded leak in a process that runs for weeks.
+        let keep: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        cache.retain(|id, _| keep.contains(id.as_str()));
+        out
     }
 }
 
@@ -1365,6 +1663,63 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
     match root {
         Some(r) if !r.is_empty() => format!("{r}/{name}"),
         _ => name,
+    }
+}
+
+/// The scan source for one cycle: the REF where there is one, the working tree
+/// only where the plans dir is not in a repo at all.
+///
+/// `Err` means **publish nothing this cycle** — the ref could not be
+/// established, refreshed or read, so the previous corpus stands. That is the
+/// whole point of Phase 2: a scan that cannot read its ref must not substitute
+/// a working tree, because the substitution IS the defect
+/// [policy: `unknown-must-not-render-as-a-default`].
+///
+/// The reason is RETURNED rather than logged here. A permanently unreadable
+/// ref (a clone with no `origin/HEAD`; a gitignored plans dir) is ONE
+/// unchanging fault, and a WARN per minute for it is how the line that matters
+/// gets missed — the same rule [`ProcessGit::describe`] strips pids for. Only
+/// the caller holds enough state to dedup it.
+///
+/// The parsed shape is identical on both arms — same slug, same
+/// `source_path` — so moving the source does not churn a single coord row.
+/// `read_plans_for_cycle_arms_agree` pins that by construction.
+pub fn read_plans_for_cycle(
+    dir: &Path,
+    conv: &PlanConvention,
+    git: &dyn GitRefReader,
+) -> Result<Vec<ParsedWorkUnit>, String> {
+    use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
+    match resolve_scan_source(git, dir) {
+        ScanSource::WorkTree => Ok(read_plan_dir(dir, conv)),
+        ScanSource::Unavailable { reason } => Err(reason),
+        ScanSource::Ref {
+            repo_root,
+            ref_name,
+            rel_dir,
+        } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
+            Ok(files) => {
+                // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
+                // ancestor chain for a `.git` and every entry shares the answer.
+                let source_root = super::body_push::derive_source_repo(dir);
+                Ok(files
+                    .into_iter()
+                    .map(|f| {
+                        // The path a unit RECORDS is the one the tree scan
+                        // would have recorded — the ref is where the bytes
+                        // came from, not a different plan corpus.
+                        let path = dir.join(&f.name);
+                        let source_path = relative_source_path(source_root.as_deref(), &path);
+                        let slug = slug_from_filename(&path.to_string_lossy());
+                        parse_work_unit(&slug, &source_path, &f.body, conv)
+                    })
+                    .collect())
+            }
+            Err(e) => Err(format!(
+                "could not read `{ref_name}:{rel_dir}` in {}: {e}",
+                repo_root.display()
+            )),
+        },
     }
 }
 
@@ -1943,6 +2298,11 @@ struct LoopState {
     /// checks, so a deps-only 403 must not retire the whole unit. See
     /// [`AdapterMetrics::deps_forbidden_total`].
     forbidden_deps: HashSet<String>,
+    /// The `Unavailable` reason last WARNed for, so one unchanging fault —
+    /// a clone with no `origin/HEAD`, a plans dir absent from the ref — costs
+    /// one line rather than one per minute. Cleared by any cycle that reads,
+    /// so a recurrence after a recovery is news again.
+    last_scan_unavailable: Option<String>,
     /// The git reader the per-cycle scan-divergence measurement uses.
     /// [`ProcessGit`] in production; injected in tests so a tick neither
     /// shells out to a real `git` nor needs a real repo on disk.
@@ -1980,6 +2340,7 @@ impl LoopState {
             last_applied: HashMap::new(),
             last_deps: HashMap::new(),
             warned_disappeared: HashSet::new(),
+            last_scan_unavailable: None,
             forbidden: HashSet::new(),
             forbidden_deps: HashSet::new(),
             bulk_seeded: false,
@@ -2270,19 +2631,81 @@ impl LoopState {
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
         let units = {
-            let dir = dir.clone();
+            let scan_dir = dir.clone();
             let conv = self.conv.clone();
-            match tokio::task::spawn_blocking(move || read_plan_dir(&dir, &conv)).await {
-                Ok(u) => u,
+            // The loop's OWN git reader, not a hardcoded `ProcessGit`: the
+            // divergence probe two statements up already uses it, and a scan
+            // that can look at a different reader than the probe measuring it
+            // is a reading of nothing. It is also the only thing that makes
+            // the publish-nothing arm reachable from a test.
+            let git = std::sync::Arc::clone(&self.git);
+            match tokio::task::spawn_blocking(move || {
+                read_plans_for_cycle(&scan_dir, &conv, git.as_ref())
+            })
+            .await
+            {
+                Ok(Ok(u)) => u,
+                // Phase 2: `Err` is the ref saying it could not be read. It is
+                // NOT an empty corpus — publishing `Vec::new()` here would let
+                // reconcile treat every plan as disappeared.
+                Ok(Err(reason)) => {
+                    if self.last_scan_unavailable.as_deref() != Some(reason.as_str()) {
+                        tracing::warn!(
+                            dir = %dir.display(),
+                            reason = %reason,
+                            "plan adapter: scan source unavailable; publishing nothing this \
+                             cycle (the previous corpus stands)"
+                        );
+                        self.last_scan_unavailable = Some(reason);
+                    }
+                    // A cycle that publishes NOTHING is the one that most needs
+                    // to say so to the read side, or its last `measured` row
+                    // keeps being quoted until it ages out — the same reason
+                    // the cleared-plans-dir arm above reports while idle, and
+                    // the reason the scan-root report sits ahead of the
+                    // breaker pause and the `artifacts.is_empty()` return.
+                    if let Some(bs) = self.body_sync.as_mut() {
+                        bs.report_while_idle(metrics).await;
+                    }
+                    metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "plan adapter: plans-dir scan task failed; skipping this cycle"
+                    // The SAME shape as the arm above, and for the same three
+                    // reasons — this arm is a cycle that publishes nothing too.
+                    //
+                    // Deduped on the STABLE half: a `JoinError`'s `Display`
+                    // carries a per-run task id (see
+                    // [`probe_task_failure_detail`], which exists for exactly
+                    // this), so a repeatedly panicking scan task would
+                    // otherwise be a NEW warn string every 60 s — the
+                    // per-minute volume the dedup is here to stop. The full
+                    // error still reaches the line that does get logged.
+                    let reason = format!(
+                        "the plans-dir scan task did not complete: {}",
+                        probe_task_failure_detail(&e)
                     );
-                    Vec::new()
+                    if self.last_scan_unavailable.as_deref() != Some(reason.as_str()) {
+                        tracing::warn!(
+                            error = %e,
+                            "plan adapter: plans-dir scan task failed; publishing nothing this \
+                             cycle (the previous corpus stands)"
+                        );
+                        self.last_scan_unavailable = Some(reason);
+                    }
+                    if let Some(bs) = self.body_sync.as_mut() {
+                        bs.report_while_idle(metrics).await;
+                    }
+                    // Counted like every other cycle: a FROZEN `cycles_total`
+                    // reads as "the loop is dead", which is a different and
+                    // much louder claim than "the loop is failing".
+                    metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
             }
         };
+        // Read something, so the next unavailability is news again.
+        self.last_scan_unavailable = None;
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
             &units,
@@ -3192,6 +3615,13 @@ mod tests {
         counts: Result<(u64, u64), String>,
         /// The canned per-source answers to `ref_refresh_stamps`.
         refresh_stamps: Vec<Result<Option<i64>, String>>,
+        /// Phase 2: whether the pre-scan fetch succeeds. `Err` is the arm that
+        /// must make a cycle publish NOTHING.
+        fetch: Result<(), String>,
+        /// Phase 2: the canned depth-1 listing of `<ref>:<dir>`.
+        ref_dir: Result<Vec<RefDirEntry>, String>,
+        /// Phase 2: blob id -> its bytes, for `read_blobs`.
+        blobs: HashMap<String, Result<String, String>>,
     }
 
     /// The fixed "now" every pure measurement in this module is taken at.
@@ -3213,6 +3643,9 @@ mod tests {
                 .collect(),
                 counts: Ok((behind, ahead)),
                 refresh_stamps: vec![Ok(Some(NOW - 60))],
+                fetch: Ok(()),
+                ref_dir: Ok(Vec::new()),
+                blobs: HashMap::new(),
             }
         }
 
@@ -3263,6 +3696,302 @@ mod tests {
         ) -> Vec<Result<Option<i64>, String>> {
             self.refresh_stamps.clone()
         }
+
+        fn fetch_default(&self, _repo_root: &Path, _default_ref: &str) -> Result<(), String> {
+            self.fetch.clone()
+        }
+
+        fn list_ref_dir(
+            &self,
+            _repo_root: &Path,
+            _ref_name: &str,
+            _rel_dir: &str,
+        ) -> Result<Vec<RefDirEntry>, String> {
+            self.ref_dir.clone()
+        }
+
+        fn read_blobs(&self, _repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+            ids.iter()
+                .map(|id| {
+                    self.blobs
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| Err(format!("fake has no blob {id}")))
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn ref_scan_falls_back_to_the_tree_only_when_there_is_no_repo() {
+        // A plans dir outside any repo is a SUPPORTED layout, not a
+        // degradation: there is no ref to read, so the tree is the only source
+        // and reading it is correct.
+        let git = FakeGit {
+            root: Ok(None),
+            ..FakeGit::healthy(0, 0)
+        };
+        assert_eq!(
+            super::super::ref_scan::resolve_scan_source(&git, Path::new("/plans")),
+            super::super::ref_scan::ScanSource::WorkTree
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_publishes_nothing_rather_than_falling_back_to_the_tree() {
+        // THE load-bearing arm of Phase 2. Falling back here would reinstate
+        // the exact defect the phase removes, and would do it precisely when
+        // the ref is least trustworthy.
+        let git = FakeGit {
+            root: Ok(Some(PathBuf::from("/repo"))),
+            fetch: Err("network is unreachable".to_string()),
+            ..FakeGit::healthy(0, 0)
+        };
+        match super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")) {
+            super::super::ref_scan::ScanSource::Unavailable { reason } => {
+                assert!(
+                    reason.contains("network is unreachable"),
+                    "the cause must survive into the reason: {reason}"
+                );
+            }
+            other => panic!("a failed fetch must not yield {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_default_branch_is_unavailable_not_a_guess_at_origin_main() {
+        let git = FakeGit {
+            default_ref: Err("no origin/HEAD".to_string()),
+            ..FakeGit::healthy(0, 0)
+        };
+        assert!(matches!(
+            super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")),
+            super::super::ref_scan::ScanSource::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_healthy_clone_scans_the_ref_at_the_repo_relative_dir() {
+        let git = FakeGit::healthy(0, 0);
+        assert_eq!(
+            super::super::ref_scan::resolve_scan_source(&git, Path::new("/repo/plans")),
+            super::super::ref_scan::ScanSource::Ref {
+                repo_root: PathBuf::from("/repo"),
+                ref_name: "origin/main".to_string(),
+                rel_dir: "plans".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_ref_walk_is_depth_one_and_md_only_and_survives_one_bad_blob() {
+        use super::super::trigger::RefDirEntry;
+        let git = FakeGit {
+            ref_dir: Ok(vec![
+                RefDirEntry {
+                    name: "b.md".into(),
+                    id: "idb".into(),
+                },
+                RefDirEntry {
+                    name: "a.md".into(),
+                    id: "ida".into(),
+                },
+                // Not markdown — skipped, as the tree walk skips it.
+                RefDirEntry {
+                    name: "notes.txt".into(),
+                    id: "idt".into(),
+                },
+                // A blob that will not read: skipped with a warning, never
+                // fatal — one bad entry must not discard the rest.
+                RefDirEntry {
+                    name: "bad.md".into(),
+                    id: "idx".into(),
+                },
+            ]),
+            blobs: [
+                ("ida".to_string(), Ok("# A".to_string())),
+                ("idb".to_string(), Ok("# B".to_string())),
+                ("idx".to_string(), Err("corrupt".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("listing succeeded");
+        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        // Sorted, markdown only, the unreadable one dropped. `notes.txt` never
+        // appears, and NOTHING from a subdirectory can appear because the
+        // listing itself is depth 1.
+        assert_eq!(names, vec!["a.md", "b.md"]);
+    }
+
+    #[test]
+    fn an_unreadable_listing_publishes_nothing() {
+        let git = FakeGit {
+            ref_dir: Err("bad object".to_string()),
+            ..FakeGit::healthy(0, 0)
+        };
+        assert!(super::super::ref_scan::read_ref_dir(
+            &git,
+            Path::new("/repo"),
+            "origin/main",
+            "plans"
+        )
+        .is_err());
+    }
+
+    /// A batch read that fails WHOLESALE is an error, not an empty corpus.
+    ///
+    /// Per file an unreadable blob is a skip — one bad object must not discard
+    /// the other 1,099, which the test above pins. ALL of them at once is a
+    /// different event: a `git` that would not spawn, a batch killed by its
+    /// watchdog, a severed pipe. `read_blobs` cannot tell the two apart (it
+    /// fans one batch failure across every slot, and must, since per-slot they
+    /// are identical), so the whole-batch judgement belongs here — and without
+    /// it `Ok(vec![])` hands reconcile an empty corpus and marks every plan in
+    /// the fleet disappeared.
+    ///
+    /// Neuter check: delete the `out.is_empty()` guard in `read_ref_dir` and
+    /// this fails.
+    #[test]
+    fn a_wholesale_blob_failure_is_an_error_not_an_empty_corpus() {
+        let git = FakeGit {
+            ref_dir: Ok(vec![
+                RefDirEntry {
+                    name: "a.md".into(),
+                    id: "ida".into(),
+                },
+                RefDirEntry {
+                    name: "b.md".into(),
+                    id: "idb".into(),
+                },
+            ]),
+            // No canned blobs at all — every slot fails, which is what
+            // `read_blobs` produces when the batch process itself never ran.
+            blobs: HashMap::new(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let err =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect_err("every blob failing is ONE broken read, not an empty dir");
+        assert!(err.contains("none of the 2"), "got: {err}");
+    }
+
+    /// `.md` alone is not a plan on EITHER arm. `read_plan_dir`'s
+    /// `extension()` is `None` for it; a bare `ends_with(".md")` here said yes.
+    /// The claim this phase makes is that the two arms scan the SAME set, and
+    /// an unexamined one-file difference is how that claim stops being true.
+    #[test]
+    fn a_file_named_only_md_is_not_a_plan_at_the_ref() {
+        let git = FakeGit {
+            ref_dir: Ok(vec![
+                RefDirEntry {
+                    name: ".md".into(),
+                    id: "idh".into(),
+                },
+                RefDirEntry {
+                    name: "real.md".into(),
+                    id: "idr".into(),
+                },
+            ]),
+            blobs: [
+                ("idh".to_string(), Ok("# hidden".to_string())),
+                ("idr".to_string(), Ok("# real".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("listing succeeded");
+        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["real.md"]);
+    }
+
+    /// **The commit's headline claim, and the one nothing asserted before:**
+    /// both arms of [`read_plans_for_cycle`] produce the SAME
+    /// [`ParsedWorkUnit`] for the same bytes. If the ref arm derived a
+    /// different slug or `source_path`, moving the scan source would churn
+    /// every coord row in the corpus on the cycle it shipped — a 1,100-row
+    /// rewrite dressed as a source change.
+    ///
+    /// Neuter check: change the ref arm's `dir.join(&f.name)` to
+    /// `PathBuf::from(&f.name)` and this fails on `source_path`.
+    #[test]
+    fn read_plans_for_cycle_arms_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "# A plan\n\n> **Status: VETTED**\n\nBody.\n";
+        std::fs::write(tmp.path().join("2026-01-01-a-plan.md"), body).unwrap();
+
+        // Tree arm: not in a repo, so the working tree is the only source.
+        let tree = read_plans_for_cycle(
+            tmp.path(),
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                root: Ok(None),
+                ..FakeGit::healthy(0, 0)
+            },
+        )
+        .expect("the tree arm reads");
+
+        // Ref arm: the same dir IS the repo root, and the ref serves the same
+        // bytes under the same name.
+        let refd = read_plans_for_cycle(
+            tmp.path(),
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                root: Ok(Some(tmp.path().to_path_buf())),
+                ref_dir: Ok(vec![RefDirEntry {
+                    name: "2026-01-01-a-plan.md".into(),
+                    id: "ida".into(),
+                }]),
+                blobs: [("ida".to_string(), Ok(body.to_string()))]
+                    .into_iter()
+                    .collect(),
+                ..FakeGit::healthy(0, 0)
+            },
+        )
+        .expect("the ref arm reads");
+
+        assert_eq!(tree.len(), 1, "the fixture holds exactly one plan");
+        assert_eq!(
+            tree, refd,
+            "same bytes must parse to the same unit, or the source move churns coord"
+        );
+    }
+
+    /// The no-fallback contract at the function that IMPLEMENTS it.
+    ///
+    /// `a_failed_fetch_publishes_nothing_rather_than_falling_back_to_the_tree`
+    /// pins `resolve_scan_source`'s VARIANT and would still pass if this arm
+    /// were changed back to `read_plan_dir(dir, conv)` — reinstating the whole
+    /// defect. This one puts a perfectly readable plan on disk and demands it
+    /// NOT come back.
+    ///
+    /// Neuter check: replace the `Unavailable` arm with
+    /// `Ok(read_plan_dir(dir, conv))` and this fails.
+    #[test]
+    fn an_unavailable_source_publishes_nothing_even_with_a_readable_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("2026-01-01-a-plan.md"),
+            "# A\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let err = read_plans_for_cycle(
+            tmp.path(),
+            &PlanConvention::operator_default(),
+            &FakeGit {
+                root: Ok(Some(tmp.path().to_path_buf())),
+                fetch: Err("no route to host".to_string()),
+                ..FakeGit::healthy(0, 0)
+            },
+        )
+        .expect_err("a failed fetch must not fall back to the tree");
+        assert!(err.contains("no route to host"), "got: {err}");
     }
 
     /// State 1 of 4. A machine with no `paths.plans_dir` scans NOTHING, and
@@ -4069,6 +4798,296 @@ mod tests {
 
     /// The plain case on real git output: a clone that has just fetched reads
     /// a refresh within seconds of now — through the reflog AND `FETCH_HEAD`.
+    /// A real clone with a real `plans/` tree at `origin/main`, for the
+    /// [`ProcessGit`] half of the ref scan — the `-z`/TAB/mode parser,
+    /// `cat_file_blob` and `fetch_default`. None of it is reachable from
+    /// [`FakeGit`], which returns canned answers and so cannot observe a single
+    /// one of these properties: `list_ref_dir` ignoring its arguments means a
+    /// fake-only suite passes identically if `ls-tree` grows an `-r`.
+    ///
+    /// Returns the clone root. `plans/` holds, deliberately:
+    /// a normal plan, a ZERO-BYTE plan, a SYMLINK named `.md`, a non-markdown
+    /// file, a file named exactly `.md`, and a SUBDIRECTORY holding a plan.
+    fn ref_scan_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let clone = tmp.path().join("clone");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&clone).unwrap();
+        real_git(&origin, &["init", "-q", "--bare", "-b", "main"], None);
+        real_git(&clone, &["init", "-q", "-b", "main"], None);
+        real_git(
+            &clone,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+            None,
+        );
+        let plans = clone.join("plans");
+        std::fs::create_dir_all(plans.join("archive")).unwrap();
+        std::fs::write(
+            plans.join("2026-01-01-normal.md"),
+            "# Normal\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        std::fs::write(plans.join("2026-01-02-empty.md"), "").unwrap();
+        std::fs::write(plans.join("notes.txt"), "not a plan\n").unwrap();
+        std::fs::write(plans.join(".md"), "# not a plan either\n").unwrap();
+        std::fs::write(plans.join("archive/2026-01-03-nested.md"), "# Nested\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("2026-01-01-normal.md", plans.join("2026-01-04-link.md"))
+            .unwrap();
+        real_git(&clone, &["add", "-A"], None);
+        real_git(&clone, &["commit", "-q", "-m", "plans"], None);
+        real_git(&clone, &["push", "-q", "origin", "main"], None);
+        // `fetch_default` is what the scan relies on to create this ref; using
+        // it here is the only coverage it gets.
+        ProcessGit
+            .fetch_default(&clone, "origin/main")
+            .expect("the scan's own fetch creates `origin/main`");
+        // A checkout built by `init` + `remote add` has NO `origin/HEAD`, and
+        // `default_ref` refuses to guess one — so without this the scan is
+        // permanently dark here. That is not fixture noise: it is the shape of
+        // the `Unavailable` state this phase introduces, and
+        // `a_permanent_scan_fault_warns_once_not_every_tick` is its test. A
+        // real `git clone` sets the ref; these fixtures have to do it by hand.
+        real_git(&clone, &["remote", "set-head", "origin", "-a"], None);
+        tmp
+    }
+
+    /// The `ls-tree -z` parser against real git output, for the four
+    /// properties `FakeGit` structurally cannot observe.
+    ///
+    /// Neuter checks, each independently: add `-r` to the `ls-tree` args and
+    /// `archive/2026-01-03-nested.md` appears; drop the `mode == "120000"` arm
+    /// and `2026-01-04-link.md` appears.
+    #[test]
+    fn process_git_lists_a_real_ref_dir_at_depth_one_skipping_symlinks() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let entries = ProcessGit
+            .list_ref_dir(&clone, "origin/main", "plans")
+            .expect("a pushed-and-fetched plans dir lists");
+        let mut names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        names.sort_unstable();
+
+        // The TREE `archive` is skipped (not an error, and not descended into);
+        // the symlink is skipped because its blob is a path, not a plan. Both
+        // non-`.md` entries are still listed here — the `.md` filter belongs to
+        // `read_ref_dir`, and keeping the two separable is what lets each be
+        // tested for what it actually does.
+        assert_eq!(
+            names,
+            vec![
+                ".md",
+                "2026-01-01-normal.md",
+                "2026-01-02-empty.md",
+                "notes.txt"
+            ],
+            "depth 1, no trees, no symlinks"
+        );
+        assert!(
+            entries.iter().all(|e| e.id.len() >= 40),
+            "every entry carries a real object id: {entries:?}"
+        );
+
+        // The symlink half of this test is VACUOUS off Unix: the fixture only
+        // creates the link under `cfg(unix)`, so on Windows the file is simply
+        // absent, the assertion above passes unchanged, and dropping the
+        // `mode == "120000"` arm would go undetected with no signal that
+        // coverage was lost. Saying so here is the honest form — a neuter check
+        // that silently stops neutering is worse than no neuter check, because
+        // the suite still reports green.
+        #[cfg(unix)]
+        {
+            assert!(
+                !names.contains(&"2026-01-04-link.md"),
+                "the symlink IS in the fixture's tree at this ref and must not be listed: \
+                 {names:?}"
+            );
+            let listed = real_git(&clone, &["ls-tree", "-z", "origin/main:plans"], None);
+            assert!(
+                listed.contains("2026-01-04-link.md"),
+                "guard: git itself must report the symlink, or this test proves nothing about \
+                 the mode filter; got: {listed}"
+            );
+        }
+        #[cfg(not(unix))]
+        eprintln!(
+            "NOTE: the symlink assertion did not run on this platform; the `120000` mode \
+             filter is UNTESTED here"
+        );
+    }
+
+    /// Blob reads against real git: one slot per id, in the order asked, with
+    /// a ZERO-BYTE blob distinguished from a MISSING one.
+    ///
+    /// The empty case is the one that had a defect: the batch reader
+    /// represented both as an empty `Vec`, so an empty `.md` — which
+    /// `read_plan_dir` parses without complaint — read back as "empty or
+    /// missing" and left the corpus. The two arms must agree, and a plan whose
+    /// body is empty is a plan.
+    ///
+    /// This is also the only coverage `cat_file_blob` has, including its
+    /// non-zero-exit arm (the absent object below) — so it now pins the
+    /// bounded read that replaced the hand-rolled `--batch` child.
+    ///
+    /// Neuter check: make `cat_file_blob`'s success arm return
+    /// `Err` for an empty stdout and the empty-plan assertion fails.
+    #[test]
+    fn process_git_reads_blobs_in_order_and_separates_empty_from_missing() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let entries = ProcessGit
+            .list_ref_dir(&clone, "origin/main", "plans")
+            .expect("lists");
+        let id_of = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the listing"))
+                .id
+                .clone()
+        };
+        let ids = vec![
+            id_of("2026-01-01-normal.md"),
+            id_of("2026-01-02-empty.md"),
+            // A well-formed object id that is not in this repo.
+            "0".repeat(40),
+        ];
+        let got = ProcessGit.read_blobs(&clone, &ids);
+
+        assert_eq!(got.len(), 3, "one slot per id, in the order asked");
+        assert!(
+            got[0].as_deref().unwrap_or("").starts_with("# Normal"),
+            "got: {:?}",
+            got[0]
+        );
+        assert_eq!(
+            got[1].as_deref(),
+            Ok(""),
+            "a zero-byte plan is a READABLE plan with an empty body, not a failure"
+        );
+        let missing = got[2].as_ref().expect_err("an absent object cannot read");
+        assert!(missing.contains("missing"), "got: {missing}");
+    }
+
+    /// The blob cache is keyed on the OBJECT ID, so a second read of the same
+    /// id must not touch git at all — which is what buys back the spawn count
+    /// the per-blob read costs, and the reason the steady-state scan is now
+    /// CHEAPER than the `--batch` process it replaced.
+    ///
+    /// Proved by deleting the repository out from under the second read: a
+    /// cache miss would have to shell out, and `git cat-file` cannot answer
+    /// from a directory that no longer exists. Same bytes back = the answer
+    /// came from memory.
+    ///
+    /// Neuter check: delete the `Some(hit) => Ok(hit.clone())` arm and this
+    /// fails, because the second read reaches a `git` with no repo.
+    #[test]
+    fn a_blob_already_read_is_not_read_again() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let entries = ProcessGit
+            .list_ref_dir(&clone, "origin/main", "plans")
+            .expect("lists");
+        let id = entries
+            .iter()
+            .find(|e| e.name == "2026-01-01-normal.md")
+            .expect("the normal plan is listed")
+            .id
+            .clone();
+        let ids = vec![id];
+
+        let first = ProcessGit.read_blobs(&clone, &ids);
+        assert!(
+            first[0].as_deref().unwrap_or("").starts_with("# Normal"),
+            "got: {:?}",
+            first[0]
+        );
+
+        // The repo is gone; only the cache can answer now.
+        std::fs::remove_dir_all(&clone).expect("the fixture clone is removable");
+        let second = ProcessGit.read_blobs(&clone, &ids);
+        assert_eq!(
+            second[0], first[0],
+            "a content-addressed hit must not re-shell to a repo that is gone"
+        );
+    }
+
+    /// `read_ref_dir` over the real reader, end to end: the `.md` filter, the
+    /// empty plan surviving, and the sort.
+    #[test]
+    fn read_ref_dir_over_real_git_keeps_markdown_and_an_empty_plan() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let files =
+            super::super::ref_scan::read_ref_dir(&ProcessGit, &clone, "origin/main", "plans")
+                .expect("a real plans dir reads");
+        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["2026-01-01-normal.md", "2026-01-02-empty.md"],
+            "markdown only, sorted; `.md`, `notes.txt`, the symlink and the subdir are all out"
+        );
+        assert_eq!(
+            files[1].body, "",
+            "the empty plan survives with an empty body"
+        );
+    }
+
+    /// A plans dir that is not in the ref is git's own ANSWER, and it is named
+    /// as one: a gitignored dir, or one that exists only on a feature branch,
+    /// is an unpushed corpus rather than a broken fetch. It still publishes
+    /// nothing — it is just not reported as a fault to repair.
+    #[test]
+    fn a_dir_absent_from_the_ref_says_so_rather_than_reading_as_a_broken_scan() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let err = ProcessGit
+            .list_ref_dir(&clone, "origin/main", "no-such-dir")
+            .expect_err("a dir that is not in the ref cannot be listed");
+        assert!(
+            err.contains("does not exist in that ref"),
+            "the reason must name the configuration, not a generic probe failure; got: {err}"
+        );
+    }
+
+    /// The whole ref arm over real git, at [`read_plans_for_cycle`]: the
+    /// parked-tree defect's actual fix.
+    ///
+    /// The working tree is moved OFF `main` and a plan is added there that is
+    /// not in the ref. The scan must publish `origin/main`'s plans and not the
+    /// checked-out branch's — which is the entire point of Phase 2, and the
+    /// one thing no fake can demonstrate.
+    ///
+    /// Neuter check: change the `Ref` arm to `read_plan_dir(dir, conv)` and the
+    /// parked-branch plan appears.
+    #[test]
+    fn the_scan_reads_the_ref_not_the_branch_the_checkout_is_parked_on() {
+        let tmp = ref_scan_fixture();
+        let clone = tmp.path().join("clone");
+        let plans = clone.join("plans");
+        real_git(&clone, &["checkout", "-q", "-b", "parked"], None);
+        std::fs::write(
+            plans.join("2026-01-09-only-on-the-parked-branch.md"),
+            "# Parked\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        real_git(&clone, &["add", "-A"], None);
+        real_git(&clone, &["commit", "-q", "-m", "parked"], None);
+
+        let units = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
+            .expect("a healthy clone scans");
+        let slugs: Vec<_> = units.iter().map(|u| u.slug.as_str()).collect();
+        assert!(
+            !slugs.contains(&"2026-01-09-only-on-the-parked-branch"),
+            "the parked branch's private plan must NOT reach the corpus: {slugs:?}"
+        );
+        assert!(
+            slugs.contains(&"2026-01-01-normal"),
+            "the ref's plans must: {slugs:?}"
+        );
+    }
+
     #[test]
     fn process_git_reads_a_just_fetched_ref_as_refreshed_now() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6786,6 +7805,25 @@ mod tests {
         }
     }
 
+    /// A [`LoopState`] whose git reader answers "not in a work tree", so the
+    /// scan takes the WorkTree arm DETERMINISTICALLY.
+    ///
+    /// Since Phase 2 the scan resolves its source through `self.git`, so a
+    /// tick over a `tempfile::tempdir()` asks a real `git` where that dir
+    /// lives. On this box `/tmp` is outside any repo and the answer is the one
+    /// these tests want — but on a machine whose `TMPDIR` sits INSIDE a git
+    /// repo the Ref arm is taken, `<ref>:tmp/…` does not resolve, and the tick
+    /// returns early: a previously hermetic suite would start failing on a
+    /// property of the host. Injecting the answer removes the host from it.
+    fn tick_state(reader: PathReader) -> LoopState {
+        LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate).with_git(
+            std::sync::Arc::new(FakeGit {
+                root: Ok(None),
+                ..FakeGit::healthy(0, 0)
+            }),
+        )
+    }
+
     /// The phase's headline acceptance criterion, pinned at the TICK — the
     /// only place it can actually be pinned.
     ///
@@ -6872,7 +7910,7 @@ mod tests {
         let (_cell, reader) = switchable_paths();
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
 
@@ -6917,7 +7955,7 @@ mod tests {
         let (cell, reader) = switchable_paths();
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         // Tick 1: nothing configured — idle, and the gauges say so.
         state.tick(&sink, &metrics).await;
@@ -6969,6 +8007,114 @@ mod tests {
         );
     }
 
+    /// **The no-fallback contract at the TICK** — the level the question is
+    /// actually asked at: does the RUNNING LOOP publish nothing?
+    ///
+    /// A readable plan sits in the dir and the fetch fails. Three assertions,
+    /// because they are one behaviour:
+    ///
+    /// - **nothing is published.** `upsert_calls == 0` while a parseable plan
+    ///   is right there. This is what `read_plans_for_cycle`'s unit test
+    ///   cannot reach, because the call site is where `&ProcessGit` used to be
+    ///   hardcoded past the injected reader.
+    /// - **the cycle still COUNTS.** A frozen `cycles_total` reads as "the
+    ///   loop is dead", which is a different and much louder claim than "the
+    ///   loop is failing".
+    /// - **the scan-root report still goes out.** A cycle that publishes
+    ///   nothing is the one that MOST needs to say so, or the read side keeps
+    ///   quoting its last `measured` row until it ages out — the property the
+    ///   scan-root report is deliberately sequenced ahead of the breaker pause
+    ///   and the `artifacts.is_empty()` return for.
+    ///
+    /// Neuter check: delete the `report_while_idle` call in the `Ok(Err(..))`
+    /// arm and the report assertion fails; delete the `fetch_add` and the
+    /// cycle assertion fails.
+    #[tokio::test]
+    async fn an_unavailable_scan_source_publishes_nothing_but_still_reports() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            // A sink is what makes the loop BUILD a body sync at all; the
+            // recording reporter below is what it actually reports through, so
+            // this address is never dialled.
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(std::sync::Arc::new(|| true) as ScanReportGate)
+        .with_scan_reporter(reporter.clone())
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            fetch: Err("could not reach origin".to_string()),
+            ..FakeGit::healthy(0, 0)
+        }));
+
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            0,
+            "a parseable plan is in the dir and must NOT be published from it"
+        );
+        assert_eq!(
+            metrics.snapshot().cycles_total,
+            1,
+            "a cycle that publishes nothing is still a cycle"
+        );
+        assert!(
+            !reporter.states().is_empty(),
+            "the cycle that refreshes nothing is the one that must still report"
+        );
+    }
+
+    /// One unchanging fault costs ONE warn, not one per minute.
+    ///
+    /// A clone with no `origin/HEAD`, or a plans dir absent from the ref, is a
+    /// permanent configuration — and this module already strips pids from
+    /// probe text specifically so such a fault does not produce a WARN and a
+    /// scan-root POST every 60 s. The new publish-nothing arm must hold to the
+    /// same rule, and it is also how the ONE line that matters stays findable.
+    ///
+    /// Neuter check: drop the `last_scan_unavailable` comparison and this
+    /// reports 3.
+    #[tokio::test]
+    async fn a_permanent_scan_fault_warns_once_not_every_tick() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_git(std::sync::Arc::new(FakeGit {
+                root: Ok(Some(dir.path().to_path_buf())),
+                default_ref: Err("no `origin/HEAD` in this clone".to_string()),
+                ..FakeGit::healthy(0, 0)
+            }));
+
+        for _ in 0..3 {
+            state.tick(&sink, &metrics).await;
+        }
+
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("scan source unavailable").count(),
+            1,
+            "one unchanging fault is one line, not one per tick; got: {logged}"
+        );
+        assert_eq!(
+            metrics.snapshot().cycles_total,
+            3,
+            "all three cycles are still counted"
+        );
+    }
+
     /// The reverse transition: clearing the setting stops the scan on the
     /// next tick, and the OFF line is logged exactly ONCE — per transition,
     /// never per tick, however many idle ticks follow.
@@ -6980,7 +8126,7 @@ mod tests {
         *cell.lock().unwrap() = plans_dir_input(dir.path());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
         assert_eq!(
@@ -7052,7 +8198,7 @@ mod tests {
             .unwrap()
             .insert("2026-01-01-one-plan".to_string(), "shipped".to_string());
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
 
@@ -7096,7 +8242,7 @@ mod tests {
         *cell.lock().unwrap() = plans_dir_input(dir.path());
         let sink = FakeSink::default(); // bulk: None
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
 
@@ -7131,7 +8277,7 @@ mod tests {
             ..Default::default()
         };
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
         assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
@@ -7163,7 +8309,7 @@ mod tests {
         *cell.lock().unwrap() = plans_dir_input(first.path());
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
-        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate);
+        let mut state = tick_state(reader);
 
         state.tick(&sink, &metrics).await;
         *cell.lock().unwrap() = plans_dir_input(second.path());
