@@ -972,9 +972,10 @@ impl ArtifactSyncState {
 pub enum BodyPushOutcome {
     /// The client-side digest memory matched — no HTTP call was made at all.
     SkippedUnchangedLocally,
-    /// The server reported `changed: false` (its own no-op path). Note the web
-    /// side deliberately does NOT rewrite metadata on this path — only a real
-    /// body change persists `title`/`status`/`repos`/…
+    /// The server reported `changed: false`: neither the body nor any head
+    /// metadata differed from what it stores. The web side DOES rewrite a
+    /// differing `title`/`status`/`repos`/… on an unchanged body (it skips only
+    /// the new version), and reports that as `changed: true` — [`Self::Updated`].
     UnchangedRemotely,
     Created,
     Updated,
