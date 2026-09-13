@@ -195,7 +195,15 @@ const EXPECTED_EXEMPTIONS: &[(&str, &str, usize)] = &[
     // the other three — it presents the bearer the observing `tools/list` used,
     // because the finding reports that principal's allowlist gap and a device-JWT
     // post would name the wrong subject.
-    ("mcp_api.rs", "forwarder", 4),
+    //
+    // 4 -> 5 with the label door (plan
+    // `2026-08-27-coord-pr-label-write-path-single-door`): the write forwarder
+    // is now VERB-SHAPED, because the door's retract verb is a DELETE with a
+    // JSON body. Two annotated sites where there was one — a DELETE arm and a
+    // POST arm, one of which executes — spelled as two builder calls rather
+    // than `client.request(method, url)` precisely so this scan can still see
+    // them.
+    ("mcp_api.rs", "forwarder", 5),
     ("memory/memory_synthesis.rs", "not-coord", 2),
     ("memory/tenant_sync.rs", "not-coord", 1),
     (
