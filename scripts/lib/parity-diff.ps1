@@ -346,7 +346,7 @@ function Compare-CapabilityManifests {
         SchemaRefusal            = $false
         SchemaRefusalReason      = $null
         Identity                 = $identity
-        Rows                     = @($out)
+        Rows                     = $out.ToArray()
         Allowlist                = @($Allowlist)
         # The metric's integer, as an explicit sum of its two contributing classes.
         ParityDefectCount        = ($rungDiffer + $onlyDev)
