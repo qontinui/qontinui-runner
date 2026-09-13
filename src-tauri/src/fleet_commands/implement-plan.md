@@ -90,7 +90,8 @@ settings; a session launched outside the runner will not have them.
 >     UNKNOWN whatever the roll-up says: any writer can replace a row's body
 >     or its metadata (`status`, `work_unit_slug`, `repos`, ...) without the
 >     file changing, and nothing puts the file's values back until a scanner
->     re-sends it (a runner start, or a change to its path settings).
+>     re-sends it (a runner start or scan-loop restart, a change to its plans,
+>     archive or prompts dir, or a `qontinui-pr plan-library-backfill` run).
 >   - **Even when (a) and (b) hold,** the roll-up only stops adding doubt; the
 >     miss is no stronger than the doors that produced it. The reading can be
 >     up to ~45 min old when you read it (plus one reconcile tick), and the
