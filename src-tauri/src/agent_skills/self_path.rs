@@ -56,6 +56,17 @@ use once_cell::sync::Lazy;
 use qontinui_types::agent_text_units::AgentTextUnitFiles;
 use regex::Regex;
 
+/// Ceiling on how many violations one scan reports.
+///
+/// The caller ([`crate::agent_skills::validate_override`]) only needs
+/// `is_empty()`, but it JOINS what it gets into one message and logs it. A unit
+/// may legitimately be `MAX_UNIT_BYTES` (4 MB) of text with up to
+/// `MAX_FILES_PER_UNIT` scripts, and arms C and D match per (line x script) —
+/// so an uncapped scan builds a hundreds-of-megabyte string on the thread a
+/// session spawn is blocked on. The list is therefore a SAMPLE that proves the
+/// refusal, not an exhaustive report; the scan stops as soon as it is full.
+pub const MAX_REPORTED_VIOLATIONS: usize = 20;
+
 /// Per-line opt-out for an audited residual, matching check #22's marker
 /// exactly. Unused by the shipped corpus; present so the two guards stay
 /// interchangeable.
@@ -186,7 +197,10 @@ fn token_prefix(line: &str, start: usize) -> String {
 /// see [`skill_self_path_violations`].
 #[cfg(test)]
 fn skill_invocation_prefixes(line: &str, script_name: &str) -> Vec<String> {
-    prefixes_with(&invocation_re(script_name), line)
+    match invocation_re(script_name) {
+        Some(re) => prefixes_with(&re, line),
+        None => Vec::new(),
+    }
 }
 
 /// Capture group 1 of every match of `re` in `line` — the path prefix.
@@ -198,12 +212,18 @@ fn prefixes_with(re: &Regex, line: &str) -> Vec<String> {
     re.captures_iter(line).map(|c| c[1].to_string()).collect()
 }
 
-fn invocation_re(script_name: &str) -> Regex {
+/// `None` when the pattern does not compile. The script name is remote text, so
+/// this is the one place account content reaches a regex compiler on a spawn
+/// path; `regex::escape` makes a failure practically impossible, and returning
+/// `None` makes "no panic" structural rather than argued. A skipped arm is the
+/// fail-soft direction: the unit is provisioned, not refused on a scan that
+/// could not run.
+fn invocation_re(script_name: &str) -> Option<Regex> {
     Regex::new(&format!(
         r#"\b(?:{INTERPRETERS})\s+(?:(?:-{{1,2}}[A-Za-z][\w-]*)\s+)*['"]?([^\s'"`|;&]*){}\b"#,
         regex::escape(script_name)
     ))
-    .expect("arm C regex")
+    .ok()
 }
 
 /// Every path prefix `line` puts in front of `sibling` at a USE site.
@@ -219,15 +239,19 @@ fn invocation_re(script_name: &str) -> Regex {
 /// same way arm C does.
 #[cfg(test)]
 fn sibling_use_prefixes(line: &str, sibling: &str) -> Vec<String> {
-    prefixes_with(&sibling_use_re(sibling), line)
+    match sibling_use_re(sibling) {
+        Some(re) => prefixes_with(&re, line),
+        None => Vec::new(),
+    }
 }
 
-fn sibling_use_re(sibling: &str) -> Regex {
+/// `None` when the pattern does not compile — see [`invocation_re`].
+fn sibling_use_re(sibling: &str) -> Option<Regex> {
     Regex::new(&format!(
         r#"(?:=|\b(?:{INTERPRETERS}|source)\s+|(?:^|[\s;&|(])\.\s+)['"]?([^\s'"`|;&]{{0,120}}?){}\b"#,
         regex::escape(sibling)
     ))
-    .expect("arm D regex")
+    .ok()
 }
 
 /// The scripts a unit *ships*: top-level `files` keys with a script suffix.
@@ -246,11 +270,17 @@ fn shipped_scripts(files: &AgentTextUnitFiles) -> Vec<&str> {
     scripts
 }
 
-/// Every way this bundle would fail to reach its own files once provisioned.
+/// Every way this bundle would fail to reach its own files once provisioned, up
+/// to [`MAX_REPORTED_VIOLATIONS`] of them.
 ///
 /// Empty means the unit is safe to write into `<workdir>/.claude/skills/<name>/`
 /// as far as self-reference goes. Pure: no filesystem, no network, so the
 /// caller can run it on fetched content before anything touches disk.
+///
+/// **A full list is a SAMPLE, not a census** — the scan stops the moment it is
+/// full. Nothing here consumes the count, only `is_empty()`, and an uncapped
+/// scan over a `MAX_UNIT_BYTES` unit is a denial-of-service the caller would
+/// then stringify into a log line.
 pub fn skill_self_path_violations(files: &AgentTextUnitFiles) -> Vec<SelfPathViolation> {
     let scripts = shipped_scripts(files);
     // Compiled ONCE per script for the whole bundle, not once per line. Arms C
@@ -258,8 +288,14 @@ pub fn skill_self_path_violations(files: &AgentTextUnitFiles) -> Vec<SelfPathVio
     // `Regex::new` dominated everything else here — measured at over a minute
     // to validate the shipped 9-skill bundle, on a path a session spawn waits
     // on.
-    let invoke: Vec<(&str, Regex)> = scripts.iter().map(|s| (*s, invocation_re(s))).collect();
-    let sibling_use: Vec<(&str, Regex)> = scripts.iter().map(|s| (*s, sibling_use_re(s))).collect();
+    let invoke: Vec<(&str, Regex)> = scripts
+        .iter()
+        .filter_map(|s| invocation_re(s).map(|re| (*s, re)))
+        .collect();
+    let sibling_use: Vec<(&str, Regex)> = scripts
+        .iter()
+        .filter_map(|s| sibling_use_re(s).map(|re| (*s, re)))
+        .collect();
     let mut violations = Vec::new();
 
     for (path, text) in files {
@@ -275,6 +311,9 @@ pub fn skill_self_path_violations(files: &AgentTextUnitFiles) -> Vec<SelfPathVio
                     line: lineno,
                     reason,
                 });
+                if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                    return violations;
+                }
             }
             // Arm C.
             for (script, re) in &invoke {
@@ -290,6 +329,9 @@ pub fn skill_self_path_violations(files: &AgentTextUnitFiles) -> Vec<SelfPathVio
                              `{SKILL_DIR_PREFIX}{script}`"
                         ),
                     });
+                    if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                        return violations;
+                    }
                 }
             }
         }
@@ -320,6 +362,9 @@ pub fn skill_self_path_violations(files: &AgentTextUnitFiles) -> Vec<SelfPathVio
                              __file__), never from the cwd or a workspace path"
                         ),
                     });
+                    if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                        return violations;
+                    }
                 }
             }
         }
@@ -537,6 +582,24 @@ mod tests {
         let hits = skill_self_path_violations(&bundle);
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].line, 2);
+    }
+
+    /// The scan STOPS at [`MAX_REPORTED_VIOLATIONS`] rather than reporting every
+    /// match. The caller only needs `is_empty()`, but it stringifies whatever it
+    /// is handed — so an uncapped scan over a multi-megabyte unit is a
+    /// denial-of-service on a session spawn path, not a thorough report.
+    #[test]
+    fn the_violation_list_is_capped() {
+        let bad_line = "bash ~/qontinui-root/.claude/skills/x/y.sh\n";
+        let body = format!("# probe\n{}", bad_line.repeat(MAX_REPORTED_VIOLATIONS * 5));
+        let hits = skill_self_path_violations(&files(&[("SKILL.md", &body)]));
+        assert_eq!(
+            hits.len(),
+            MAX_REPORTED_VIOLATIONS,
+            "the scan must stop once the sample is full"
+        );
+        // Still a refusal, which is the only thing the caller reads.
+        assert!(!hits.is_empty());
     }
 
     /// A bundle with no scripts and no rooted paths is clean — the common case

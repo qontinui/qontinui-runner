@@ -31,9 +31,10 @@
 #     fleet_agents             unknown
 #     agent_definitions        unknown
 #     agent_commands_registry  unknown
+#     agent_skills_registry    unknown
 #     slash_commands           unknown
 #
-# EIGHT of nine rows are `unknown`. Not "resolved by a low rung" -- unknown, the
+# ALL BUT ONE row is `unknown`. Not "resolved by a low rung" -- unknown, the
 # manifest's word for "nothing observed this capability here". The six
 # provisioning/registry rows fill from the Phase 3 session ledger, which only
 # fills at SESSION SPAWN; a cold flag invocation has spawned nothing.
@@ -101,11 +102,12 @@
 # metric.
 #
 # $ParityExpectedDifferences is therefore a first-class, per-row allowlist -- and
-# measured 2026-09-02 it is EMPTY, because NONE of the nine CAPABILITY_SPECS rows
+# measured 2026-09-02 it is EMPTY, because NONE of the CAPABILITY_SPECS rows
 # is resolved by a cfg-gated module:
 #
-#   workspace_root  bundled_resources  spec_pages  fleet_commands  fleet_skills
-#   fleet_agents    agent_definitions  agent_commands_registry     slash_commands
+#   workspace_root  bundled_resources      spec_pages  fleet_commands  fleet_skills
+#   fleet_agents    agent_definitions      agent_commands_registry
+#   agent_skills_registry                  slash_commands
 #
 # and neither debug-only surface above appears in `UI_BRIDGE_ROUTES` either, so
 # the behavioural axis does not see them as a route delta.

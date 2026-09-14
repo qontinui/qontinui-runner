@@ -35,7 +35,7 @@
 #   GET /capability-manifest       the RUNNING door. Same renderer, same bytes,
 #                                  but a live process holding an AppHandle.
 #
-# Measured 2026-09-02, dev build, cold CLI door: EIGHT of the nine rows report
+# Measured 2026-09-02, dev build, cold CLI door: EIGHT of the then-nine rows report
 # `unknown`.
 #
 #     workspace_root           operator_checkout
@@ -46,9 +46,10 @@
 #     fleet_agents             unknown
 #     agent_definitions        unknown
 #     agent_commands_registry  unknown
+#     agent_skills_registry    unknown
 #     slash_commands           unknown
 #
-# A cold-vs-cold comparison therefore compares ONE row and finds the other eight
+# A cold-vs-cold comparison therefore compares ONE row and finds the others
 # "equal" only in the sense that neither side was read. See lib/parity-diff.ps1
 # for why that must never be counted as parity.
 #
@@ -72,8 +73,9 @@
 # =============================================================================
 #
 # Even over the HTTP door, a freshly booted instance has not spawned an agent
-# session. Six of the nine rows -- fleet_commands, fleet_skills, fleet_agents,
-# agent_definitions, agent_commands_registry, slash_commands -- are filled by
+# session. Seven of the ten rows -- fleet_commands, fleet_skills, fleet_agents,
+# agent_definitions, agent_commands_registry, agent_skills_registry,
+# slash_commands -- are filled by
 # the Phase 3 provisioning ledger, which records at SESSION SPAWN. No spawn, no
 # reading. They will report `unknown` on BOTH legs and land in the `unobserved`
 # bucket.
@@ -495,7 +497,7 @@ Write-Host ""
 
 if ($Door -eq 'cli') {
     Write-Host "WARNING: the cold CLI door observes at most one capability row on either leg." -ForegroundColor Yellow
-    Write-Host "         Eight of nine rows report 'unknown' there and land in 'unobserved'." -ForegroundColor Yellow
+    Write-Host "         All but one row report 'unknown' there and land in 'unobserved'." -ForegroundColor Yellow
     Write-Host ""
 }
 
@@ -522,7 +524,8 @@ $result = Compare-CapabilityManifests -Dev $devRead.Manifest -Published $pubRead
 # cannot state: WHY a row is out of reach for this harness.
 # ---------------------------------------------------------------------------
 $sessionLedgerRows = @('fleet_commands', 'fleet_skills', 'fleet_agents',
-                       'agent_definitions', 'agent_commands_registry', 'slash_commands')
+                       'agent_definitions', 'agent_commands_registry',
+                       'agent_skills_registry', 'slash_commands')
 $unobservedBoth = @($result.Rows | Where-Object { -not $_.DevObserved -and -not $_.PublishedObserved } | ForEach-Object { $_.Id })
 $observability = [PSCustomObject]@{
     door                       = $Door

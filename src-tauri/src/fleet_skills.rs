@@ -104,6 +104,11 @@ pub(crate) const PROVISIONED_FILE_MODE: u32 = 0o644;
 /// entry per immediate subdirectory of [`FLEET_SKILLS`], carrying every file
 /// underneath it at its tree-relative path.
 ///
+/// Only immediate SUBDIRECTORIES are skills, so a file sitting at the root of
+/// `src/fleet_skills/` is not part of any bundle and is not provisioned;
+/// [`tests::embedded_skills_mirror_the_include_dir_tree`] fails loudly if one
+/// appears. Today's tree has none.
+///
 /// A file whose bytes are not UTF-8 is DROPPED with a warning rather than
 /// guessed at: the served half of this corpus is a `files` map of
 /// `path -> text`, so a non-text file has no representation in the layer this
@@ -279,9 +284,23 @@ fn embedded_skill_file_count() -> usize {
 /// **Every name and relative path is re-validated here** even though
 /// [`crate::agent_skills::validate_override`] already did: this function takes
 /// any registry, so the traversal refusal has to hold at the layer that
-/// actually joins the path. A skill with a bad name or any bad path is skipped
-/// ENTIRELY rather than partially written — a half-written skill is a skill
-/// whose `SKILL.md` cites files that are not there.
+/// actually joins the path. A skill with a bad name, any bad path, or a key
+/// that is another key's directory prefix is skipped ENTIRELY rather than
+/// partially written — a half-written skill is a skill whose `SKILL.md` cites
+/// files that are not there.
+///
+/// Two rules it deliberately does NOT re-check, because only the resolver can:
+/// `is_invocable` and `SKILL.md` presence. A served unit passed both in
+/// [`crate::agent_skills::validate_override`]; the embedded floor does not go
+/// through that function at all, so an embedded directory named `_foo` WOULD be
+/// provisioned as an invocable project skill. That is caught at test time by
+/// [`tests::embedded_skills_are_provisionable`], which runs the served
+/// validator over the shipped bundle.
+///
+/// **A per-FILE failure is a skip, not an abort.** Only the creation of
+/// `skills_dir` itself propagates; everything after it degrades the one file
+/// and continues, so a single unwritable path cannot cost a session every skill
+/// that sorts after it.
 ///
 /// **Fail-soft, and this is a hard requirement.** The tracked probe
 /// ([`crate::provision_guard::TrackedPaths::probe`]) resolves EVERY failure — an
@@ -319,13 +338,17 @@ fn provision_fleet_skills_into(
     ));
 
     for skill in &resolved {
+        // A whole-skill refusal is recorded as `<name>/*`, not as the bare
+        // name: every OTHER entry in `skipped` is a file path, and a reader
+        // grouping by `unit` must be able to tell "this skill" from "this file
+        // of that skill".
         if let Err(e) = validate_agent_text_unit_name(&skill.name) {
             warn!(
                 "fleet_skills: refusing to provision skill {:?} — {e}",
                 skill.name
             );
             out.skip(
-                skill.name.clone(),
+                format!("{}/*", skill.name),
                 capability_manifest::SkipReason::Rejected(e.to_string()),
             );
             continue;
@@ -341,9 +364,27 @@ fn provision_fleet_skills_into(
                 skill.name
             );
             out.skip(
-                skill.name.clone(),
+                format!("{}/*", skill.name),
                 capability_manifest::SkipReason::Rejected(format!(
                     "file path {bad:?} is not a safe relative path"
+                )),
+            );
+            continue;
+        }
+        // A key that is also another key's directory prefix is individually
+        // valid and jointly unwritable — `a` lands as a file and
+        // `create_dir_all("a")` then fails EEXIST, mid-bundle, with half the
+        // skill on disk. Refused as a whole rather than discovered at the write.
+        if let Some((file, child)) = crate::agent_skills::colliding_path_prefix(&skill.files) {
+            warn!(
+                "fleet_skills: refusing to provision skill {:?} — file {file:?} is also the \
+                 directory prefix of {child:?}",
+                skill.name
+            );
+            out.skip(
+                format!("{}/*", skill.name),
+                capability_manifest::SkipReason::Rejected(format!(
+                    "file {file:?} is also the directory prefix of {child:?}"
                 )),
             );
             continue;
@@ -354,9 +395,8 @@ fn provision_fleet_skills_into(
             // the skills dir — which is exactly what `TrackedPaths` reports.
             let relative = Path::new(skill.dir_name()).join(rel_path);
             let dst = skills_dir.join(&relative);
-            if let Some(parent) = dst.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+            // Before `create_dir_all`: a skill whose every file is tracked must
+            // not leave a new empty directory in the repository's working tree.
             if tracked.should_skip(&dst, &relative) {
                 info!(
                     "fleet_skills: skipping {} — it is tracked by the enclosing git \
@@ -370,8 +410,22 @@ fn provision_fleet_skills_into(
                 );
                 continue;
             }
-            std::fs::write(&dst, text)?;
-            apply_mode(&dst, skill.source)?;
+            // Per-FILE IO failures are skips, never `?`. Propagating here would
+            // abandon every skill not yet reached — and `all()` puts the
+            // embedded floor first, so one unwritable file would cost a session
+            // most of its corpus. The failure is recorded against the file that
+            // caused it rather than against the destination directory.
+            if let Err(e) = write_provisioned_file(&dst, text, skill.source) {
+                warn!(
+                    "fleet_skills: could not write {} ({e}) — continuing with the rest",
+                    dst.display()
+                );
+                out.skip(
+                    relative.display().to_string(),
+                    capability_manifest::SkipReason::WriteFailed(e.to_string()),
+                );
+                continue;
+            }
             out.record_written();
         }
     }
@@ -382,6 +436,22 @@ fn provision_fleet_skills_into(
         out.set_rung(capability_manifest::Rung::Unresolved);
     }
     Ok(out)
+}
+
+/// Create `path`'s parent, write `text`, and set the mode for `source`.
+///
+/// One fallible unit so the caller can turn any of the three failures into a
+/// single per-file skip.
+fn write_provisioned_file(
+    path: &Path,
+    text: &str,
+    source: crate::agent_skills::AgentSkillSource,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, text)?;
+    apply_mode(path, source)
 }
 
 /// Set the provisioned file's mode: `0o755` for a shell script THIS BINARY
@@ -1008,9 +1078,10 @@ mod tests {
         registry
     }
 
-    /// A served override REPLACES the embedded default of the same name, whole
-    /// bundle and all — the default's sibling helper scripts do not survive as
-    /// orphans beside it on a fresh provision.
+    /// A served override REPLACES the embedded default of the same name: the
+    /// override's bundle is the whole resolved bundle for that skill, so on a
+    /// fresh destination the default's sibling helper scripts are never
+    /// written.
     #[test]
     fn a_served_override_replaces_the_embedded_skill_by_name() {
         let tmp = tempfile::tempdir().expect("create tempdir");
@@ -1031,11 +1102,138 @@ mod tests {
         );
         assert!(
             !dir.join("coord-revive.sh").exists(),
-            "an override replaces the default's WHOLE bundle; a partial merge would \
-             leave the default's stale sibling scripts beside the new SKILL.md"
+            "the override's bundle is the whole resolved bundle, so the default's \
+             helper script is never written to a fresh destination"
         );
         // Every OTHER embedded skill is untouched by the override.
         assert!(skills_dir.join("preflight").join(SKILL_MANIFEST).exists());
+    }
+
+    /// **The replacement is per-FILE, not per-DIRECTORY — stated, not implied.**
+    ///
+    /// The provisioner is deliberately not a mirror (see
+    /// [`provision_fleet_skills_into`]), so a destination already provisioned
+    /// from the embedded floor keeps the default's helper script beside the
+    /// override's new `SKILL.md`. The same-directory assertion in the test above
+    /// holds only because that destination is fresh, and a reader is entitled to
+    /// know which of the two facts they are looking at.
+    ///
+    /// This is a documented consequence, not a defect to fix by deletion:
+    /// removing files from a session's `.claude/skills/` on the strength of a
+    /// remote list is a much larger hazard than a stale sibling — and the stale
+    /// sibling here is EMBEDDED content, reviewed in this repository, which is
+    /// also why it legitimately keeps its `0o755`.
+    #[test]
+    fn a_stale_embedded_sibling_survives_a_later_override() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+
+        // Pass 1: the embedded floor, including `coord-revive/coord-revive.sh`.
+        provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new()).expect("pass 1");
+        let helper = skills_dir.join("coord-revive").join("coord-revive.sh");
+        assert!(
+            helper.exists(),
+            "the embedded helper script should have landed"
+        );
+
+        // Pass 2: an override whose bundle is SKILL.md only.
+        let registry = registry_with(vec![skill_unit(
+            "coord-revive",
+            bundle(&[("SKILL.md", "# my own coord-revive\n")]),
+        )]);
+        provision_fleet_skills_into(&skills_dir, &registry).expect("pass 2");
+
+        assert_eq!(
+            std::fs::read_to_string(skills_dir.join("coord-revive").join(SKILL_MANIFEST)).unwrap(),
+            "# my own coord-revive\n",
+            "the override still replaces the file it names"
+        );
+        assert!(
+            helper.exists(),
+            "and the default's helper script REMAINS — the provisioner is not a mirror. \
+             If this ever starts failing, a pruning step was added: update this test and \
+             `provision_fleet_skills_into`'s doc together."
+        );
+    }
+
+    /// **Falsification gate for the prefix-collision class.** A served bundle
+    /// may carry both `a` and `a/b.md`: each key passes every per-key validator,
+    /// and `AgentTextUnitFiles` is a `BTreeMap`, so `a` is written FIRST as a
+    /// regular file and `create_dir_all("a")` then fails `EEXIST` — half the
+    /// skill on disk and, before this was refused, every later skill abandoned.
+    #[test]
+    fn a_file_that_is_also_a_directory_prefix_is_refused_whole() {
+        let files = bundle(&[
+            ("SKILL.md", "# probe\n"),
+            ("a", "i am a file\n"),
+            ("a/b.md", "i need `a` to be a directory\n"),
+        ]);
+        // The resolver refuses it, so it never becomes an override at all.
+        let err = crate::agent_skills::validate_override(
+            &skill_unit("probe", files.clone()),
+            AgentSkillSource::Served,
+        )
+        .expect_err("a prefix collision must be refused");
+        assert!(err.contains("directory prefix"), "{err}");
+
+        // And the provisioner refuses it a second time, when handed one
+        // directly — the layer that actually joins the path.
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        let mut registry = AgentSkillRegistry::from_embedded(&[]);
+        registry.set_unvalidated_overrides(vec![ResolvedSkill {
+            name: "probe".to_string(),
+            files,
+            source: AgentSkillSource::Served,
+        }]);
+        let out = provision_fleet_skills_into(&skills_dir, &registry).expect("provision");
+        assert_eq!(out.written, 0, "nothing of the skill may land");
+        assert!(
+            !skills_dir.join("probe").join(SKILL_MANIFEST).exists(),
+            "not even the good half"
+        );
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].unit, "probe/*");
+    }
+
+    /// **One unwritable file must not cost the session every skill after it.**
+    ///
+    /// Driven through a destination the provisioner cannot write: a
+    /// pre-existing DIRECTORY where a file belongs. Every other skill still
+    /// lands, and the failure is recorded against the file that caused it.
+    #[test]
+    fn one_unwritable_file_is_skipped_and_the_rest_still_land() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let skills_dir = tmp.path().join(".claude").join("skills");
+        // `coord-pr-label` sorts first in the embedded bundle, so a naive `?`
+        // here abandoned everything.
+        let blocked = skills_dir.join("coord-pr-label").join(SKILL_MANIFEST);
+        std::fs::create_dir_all(&blocked).expect("occupy the destination with a directory");
+
+        let out = provision_fleet_skills_into(&skills_dir, &AgentSkillRegistry::new())
+            .expect("the pass must not abort");
+
+        assert_eq!(
+            out.skipped.len(),
+            1,
+            "exactly the blocked file: {:?}",
+            out.skipped
+        );
+        assert!(matches!(
+            out.skipped[0].reason,
+            crate::capability_manifest::SkipReason::WriteFailed(_)
+        ));
+        assert!(out.skipped[0].unit.ends_with(SKILL_MANIFEST));
+        assert!(
+            out.written >= embedded_skill_file_count() - 1,
+            "every other embedded file must still land, got {} of {}",
+            out.written,
+            embedded_skill_file_count()
+        );
+        assert!(
+            skills_dir.join("preflight").join(SKILL_MANIFEST).exists(),
+            "a skill sorting AFTER the failure must still be provisioned"
+        );
     }
 
     /// A served skill with no embedded counterpart is additive.
