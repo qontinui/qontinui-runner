@@ -48,10 +48,29 @@ jobs:
           for name, job in wf['jobs'].items():
               if 'CLORINDE_AUTOCOMMIT_TOKEN' in yaml.safe_dump(job) and name != 'push':
                   bad.append(name)
-          perms = wf['jobs']['compute'].get('permissions', {})
+          compute = wf['jobs']['compute']
+          perms = compute.get('permissions', {})
           if perms != {'contents': 'read'}:
               bad.append('compute permissions %r' % perms)
+          # compute must never execute the PR's tree: no step may run in, or read
+          # the toolchain file of, the PR checkout, and no cache action may run there.
+          for st in compute['steps']:
+              if st.get('working-directory', '').startswith('runner'):
+                  bad.append('compute step runs inside the PR tree: %s' % st.get('name'))
+              if 'cache' in str(st.get('uses', '')):
+                  bad.append('compute step uses a cache action: %s' % st.get('name'))
+              if 'runner/rust-toolchain.toml' in yaml.safe_dump(st):
+                  bad.append('compute reads the PR toolchain file: %s' % st.get('name'))
+          push_if = str(wf['jobs']['push'].get('if', ''))
+          if '!cancelled()' not in push_if or 'always()' in push_if:
+              bad.append('push must use !cancelled(), not always(): %r' % push_if)
+          detect_if = str(wf['jobs']['detect']['steps'][0].get('if', ''))
+          if "github.event.sender.login == 'qontinui-merge-orchestrator[bot]'" not in detect_if:
+              bad.append('detect must dispatch only on a coord App label strip')
+          push_run = yaml.safe_dump(wf['jobs']['push']['steps'])
+          if 'toJSON(matrix.item)' not in push_run:
+              bad.append('push must take its targets from the trusted plan item')
           if bad:
               print('PAT or write scope outside the push job:', bad); sys.exit(1)
-          print('ok: PAT only in push; compute is contents: read')
+          print('ok: PAT only in push; compute read-only and PR-code-free; push trusted + !cancelled(); detect coord-only')
           PY

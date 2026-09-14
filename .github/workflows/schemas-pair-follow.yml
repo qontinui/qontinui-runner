@@ -14,18 +14,26 @@ name: schemas pair-follow
 # makes that move.
 #
 # SHAPE (each split is load-bearing):
-#   detect   pull_request `unlabeled`. It only dispatches this workflow from main
-#            with GITHUB_TOKEN. It never runs PR code and never holds the PAT.
+#   detect   pull_request `unlabeled`, and only when the coord App removed the
+#            label. It only dispatches this workflow from main with GITHUB_TOKEN.
+#            It never runs PR code and never holds the PAT.
 #   plan     schedule/dispatch, main's code. Scans both declaration forms and
 #            decides FOLLOW / SKIP / UNKNOWN for each candidate. It reads four
 #            coord claims and never touches a PR with a live claim.
-#   compute  UNPRIVILEGED (contents: read, no secrets). Merges main into the PR
-#            head, moves the pin, refreshes Cargo.lock, and uploads a bundle. It
-#            executes the PR's tree (cargo honours its .cargo/config.toml), so it
-#            holds nothing worth stealing.
-#   push     PRIVILEGED, and runs ONLY main's code. It re-verifies the bundle's
-#            structure and file scope, re-reads the PR head, and pushes with
-#            --force-with-lease on the head it built on (PAT). Then it comments.
+#   compute  UNPRIVILEGED (contents: read, no secrets, no cache actions). Merges
+#            main into the PR head, moves the pin, refreshes Cargo.lock, and uploads
+#            a bundle. It executes NO code from the PR's tree. cargo runs from
+#            outside the checkout with main's toolchain, so the tree's
+#            rust-toolchain.toml and .cargo/config.toml are not honoured, and
+#            checkout-sibling comes from main. This job runs in main's cache scope,
+#            which is why it must not run PR code.
+#   push     PRIVILEGED, and runs ONLY main's code. The artifact is UNTRUSTED.
+#            Every target comes from the plan item (matrix), and the artifact
+#            supplies only a commit id. It re-verifies the merge tree, that the
+#            pin equals A exactly, and that Cargo.lock registry entries are
+#            unchanged. It re-reads the PR (state, repo, ref, base, head) and its
+#            claims, then pushes with --force-with-lease on the head it built on
+#            (PAT). Then it comments.
 #   verdict  Red on any UNKNOWN or failed leg. A refusal is a named SKIP; an
 #            unanswerable read is never "nothing to do".
 #
@@ -64,8 +72,11 @@ jobs:
       # Step-level guards, so this job's check reports success rather than
       # `skipped`. A fork PR's GITHUB_TOKEN is read-only, so the dispatch would 403.
       - name: Dispatch the follow run from main
+        # Only a coord App strip is a landed partner. An author withdrawing the
+        # label by hand is not.
         if: >-
           startsWith(github.event.label.name, 'coord:downstream-of=') &&
+          github.event.sender.login == 'qontinui-merge-orchestrator[bot]' &&
           github.event.pull_request.head.repo.full_name == github.repository &&
           vars.SCHEMAS_PAIR_FOLLOW != 'off'
         env:
@@ -142,8 +153,8 @@ jobs:
     if: needs.plan.result == 'success' && needs.plan.outputs.followups != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # No secrets are referenced here, and the token is read-only: this job executes
-    # the PR's tree.
+    # No secrets are referenced here, and the token is read-only. The job must
+    # also never execute the PR's tree (see the header).
     permissions:
       contents: read
     strategy:
@@ -189,16 +200,25 @@ jobs:
           path: ${{ github.workspace }}/qontinui-schemas
           pin-file: ${{ github.workspace }}/runner/.github/sibling-pins.conf
 
-      - name: Install the PR's pinned Rust toolchain
+      # MAIN's channel, installed by name. The PR's rust-toolchain.toml is never read.
+      - name: Install main's Rust toolchain
         if: steps.pin.outputs.MODE == 'FOLLOW'
-        working-directory: runner
+        id: toolchain
+        working-directory: main
         shell: bash
-        run: rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal
+        run: |
+          set -euo pipefail
+          chan="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          [ -n "$chan" ] || { echo "::error::no channel in main's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$chan" --profile minimal
+          echo "channel=$chan" >> "$GITHUB_OUTPUT"
 
       - name: Refresh Cargo.lock and commit
         if: steps.pin.outputs.MODE == 'FOLLOW' || steps.pin.outputs.MODE == 'MERGE_ONLY'
         env:
           MODE: ${{ steps.pin.outputs.MODE }}
+          GH_TOKEN: ${{ github.token }}
+          SPF_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
         shell: bash
         run: bash main/scripts/schemas-pair-follow.sh lock-and-commit runner "$RUNNER_TEMP/decide.json" "$RUNNER_TEMP/out" "$MODE"
 
@@ -214,7 +234,9 @@ jobs:
   push:
     name: "Push the pair-follow commits (main's code) #${{ matrix.item.pr }}"
     needs: [plan, compute]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.followups != '[]'
+    # !cancelled(), not always(): cancelling the run is the emergency stop, and a
+    # run that is already in flight cannot see the kill-switch variable.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.followups != '[]' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -249,8 +271,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SPF_KILL_SWITCH: ${{ vars.SCHEMAS_PAIR_FOLLOW }}
           SPF_PUSH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN }}
+          COORD_CLAIMS_READ_TOKEN: ${{ secrets.COORD_CLAIMS_READ_TOKEN }}
+          # The TRUSTED plan item. The artifact contributes only a commit id.
+          PLAN_ITEM: ${{ toJSON(matrix.item) }}
         shell: bash
-        run: bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
+        run: |
+          set -euo pipefail
+          printf '%s' "$PLAN_ITEM" > "$RUNNER_TEMP/plan-item.json"
+          bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/plan-item.json" "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
 
       # No bundle means the compute leg skipped (merge conflict, already
       # contained) or failed. Its own log names which; the verdict job reds on a
