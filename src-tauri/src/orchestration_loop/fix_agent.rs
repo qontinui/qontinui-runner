@@ -132,6 +132,11 @@ pub async fn run_fix_agent(
     let authz = crate::agent_authorization::authorize_spawn(
         Some("orchestration-fix-agent"),
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        // The fix step of an orchestration loop that is already running; the
+        // loop's own new work (its fan-out) is what the device drain defers.
+        crate::agent_authorization::DrainAdmission::Exempt {
+            why: "orchestration-loop fix step of a loop that is already running",
+        },
     )
     .await;
     if let Some(refusal) = authz.refusal() {

@@ -923,6 +923,21 @@ async fn materialize(
     sources: &MaterializedSources,
     handoff: &PendingHandoff,
 ) -> Result<(), HandoffError> {
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): materializing a handoff starts a session on this device on coord's
+    // say-so, so it is a coord dispatch and is deferred while the drain holds.
+    // Before any fetch, so the source stays intact and the pending handoff
+    // replays on the next push/catch-up.
+    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+            &format!("handoff:{}", handoff.source_session_id),
+        )
+    {
+        return Err(HandoffError::Session(format!(
+            "deferred by the coord device drain: {reason}"
+        )));
+    }
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
 
     let intent = build_child_intent(&state, HANDOFF_CONTINUATION_NOTE)?;

@@ -511,14 +511,68 @@ pub async fn steward_status_handler(
 /// server-side, mirroring `create_terminal_handler`
 /// (`mcp/terminals.rs:137`). Refuses with 409 if a steward **of this kind** is
 /// already running; different kinds coexist by design.
+///
+/// An HTTP caller is AUTONOMOUS under coord's device drain (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, D3): while the device is
+/// drained, or its drain state is unknown, this answers 409 and starts nothing.
+/// The runner UI starts stewards through the [`steward_start`] Tauri command
+/// instead, which is an operator action and is never deferred.
 pub async fn steward_start_handler(
     State(state): State<Arc<ApiState>>,
     Path(kind): Path<String>,
     Json(request): Json<StewardStartRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    start_steward(
+        state.app_handle.clone(),
+        kind,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Steward,
+    )
+    .await
+}
+
+/// `steward_start` — the runner UI's own start button. An operator sitting at
+/// this runner (D3), so the coord device drain never defers it; the UI shows the
+/// draining banner instead. Same validation, single-instance guard and launch as
+/// `POST /steward/{kind}/start`. Returns that route's `data` object, or the
+/// refusal text (prefixed with its HTTP status) as the error.
+#[tauri::command]
+pub async fn steward_start(
+    app_handle: tauri::AppHandle,
+    kind: String,
+    mode: Option<String>,
+    interval: Option<String>,
+) -> Result<serde_json::Value, String> {
+    match start_steward(
+        app_handle,
+        kind,
+        StewardStartRequest { mode, interval },
+        crate::coord_drain_state::SpawnOrigin::OperatorTerminal,
+    )
+    .await
+    {
+        Ok(Json(resp)) => Ok(resp.data.unwrap_or(serde_json::Value::Null)),
+        Err((status, Json(err))) => Err(format!(
+            "{}: {}",
+            status.as_u16(),
+            err.error
+                .unwrap_or_else(|| "steward start refused".to_string())
+        )),
+    }
+}
+
+/// The shared start path behind the HTTP route and the Tauri command. `origin`
+/// decides how the coord device drain applies: `Steward` (autonomous) is
+/// deferred while the drain holds, `OperatorTerminal` is not.
+async fn start_steward(
+    app_handle: tauri::AppHandle,
+    kind: String,
+    request: StewardStartRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let spec = steward_spec(&kind).ok_or_else(|| unknown_kind_error(&kind))?;
-    let terminal_manager = get_terminal_manager(&state);
-    let app_handle = state.app_handle.clone();
+    let terminal_manager: Arc<TerminalManager> =
+        app_handle.state::<Arc<TerminalManager>>().inner().clone();
 
     // Resolve and validate BEFORE taking the start claim or spawning anything,
     // so a malformed body is a clean 400 with no side effects — it neither
@@ -540,6 +594,16 @@ pub async fn steward_start_handler(
             );
             return Err((StatusCode::BAD_REQUEST, Json(api_error(detail))));
         }
+    }
+
+    // Coord device drain (D3). After validation, so a malformed body is still a
+    // clean 400; before the start claim, so a deferral occupies nothing. The
+    // deferral is counted on the draining banner, keyed by steward kind.
+    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+        crate::coord_drain_state::drain_gate_for_work(origin, &format!("steward:{}", spec.kind))
+    {
+        warn!("HTTP: Not starting {} — {reason}", spec.skill);
+        return Err((StatusCode::CONFLICT, Json(api_error(reason))));
     }
 
     // Claim the start slot BEFORE the running-check, and hold it for the rest

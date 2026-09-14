@@ -1568,6 +1568,9 @@ async fn spawn_instance(
     let authz = crate::agent_authorization::authorize_spawn(
         Some("runner-instance"),
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        crate::agent_authorization::DrainAdmission::Exempt {
+            why: "a runner instance process, not an agent session",
+        },
     )
     .await;
     if let Some(refusal) = authz.refusal() {

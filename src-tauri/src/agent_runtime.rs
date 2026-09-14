@@ -1657,9 +1657,20 @@ fn spawn_run_task(payload: LaunchPayload) {
         // synchronously above (so an immediate stop request still finds the
         // agent) and is removed here on refusal; nothing else has been
         // created yet, so there is no other state to unwind.
+        //
+        // Coord-dispatched, so autonomous (plan
+        // `2026-09-13-drained-runner-never-reaches-idle` D3). Coord's own seam
+        // already withholds `spawn_requested` from a drained device; this is
+        // defence in depth for a frame published just before the drain landed.
+        // A launch payload has no deferral shape, so a drain deferral takes the
+        // same terminal `spawn_failed` report below, naming the drain.
         let authz = crate::agent_authorization::authorize_spawn(
             None,
             crate::agent_authorization::SpawnPath::StandingContinuation,
+            crate::agent_authorization::DrainAdmission::work(
+                crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+                format!("agent:{agent_id}"),
+            ),
         )
         .await;
         if !authz.allows_spawn() {
@@ -1926,6 +1937,68 @@ enum SpawnDecision {
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
     SpawnDespiteClaimError { cause: String },
+    /// A [`SpawnDecision::SpawnDespiteClaimError`] while autonomous spawns are
+    /// paused by coord's device drain (drained, or drain state unknown): do NOT
+    /// spawn; leave the row pending for the backstop poll, like `AtCap`.
+    /// Produced only by [`apply_drain_to_claim`].
+    DeferClaimErrorByDrain { cause: String, reason: String },
+}
+
+/// PURE: fold the device drain into a claim decision. Only the "spawn anyway"
+/// arm changes; a clean `Spawn` (coord accepted the claim while the drain was
+/// clear enough to reach it) and a `SkipCancelled` are left alone.
+fn apply_drain_to_claim(
+    decision: SpawnDecision,
+    drain: &crate::coord_drain_state::CoordDrainState,
+) -> SpawnDecision {
+    match decision {
+        SpawnDecision::SpawnDespiteClaimError { cause } => {
+            match crate::coord_drain_state::gate_for(
+                drain,
+                crate::coord_drain_state::SpawnOrigin::GateContinuation,
+            ) {
+                crate::coord_drain_state::DrainGate::Allow => {
+                    SpawnDecision::SpawnDespiteClaimError { cause }
+                }
+                crate::coord_drain_state::DrainGate::Defer { reason } => {
+                    SpawnDecision::DeferClaimErrorByDrain { cause, reason }
+                }
+            }
+        }
+        other => other,
+    }
+}
+
+/// The drain admission for a delivered continuation: a work-unit dispatch when
+/// it carries a `dispatch_id`, otherwise a gate continuation, keyed by its id.
+fn continuation_drain_admission(
+    gate_id: Option<uuid::Uuid>,
+    dispatch_id: Option<uuid::Uuid>,
+) -> crate::agent_authorization::DrainAdmission {
+    use crate::coord_drain_state::SpawnOrigin;
+    match (dispatch_id, gate_id) {
+        (Some(d), _) => crate::agent_authorization::DrainAdmission::work(
+            SpawnOrigin::UnitContinuation,
+            format!("dispatch:{d}"),
+        ),
+        (None, Some(g)) => crate::agent_authorization::DrainAdmission::work(
+            SpawnOrigin::GateContinuation,
+            format!("gate:{g}"),
+        ),
+        (None, None) => SpawnOrigin::GateContinuation.into(),
+    }
+}
+
+/// [`continuation_drain_admission`] from the consume target the inner run
+/// already resolved.
+fn continuation_drain_admission_for(
+    consume_target: ConsumeTarget,
+) -> crate::agent_authorization::DrainAdmission {
+    match consume_target {
+        ConsumeTarget::Gate(g) => continuation_drain_admission(Some(g), None),
+        ConsumeTarget::Dispatch(d) => continuation_drain_admission(None, Some(d)),
+        ConsumeTarget::None => continuation_drain_admission(None, None),
+    }
 }
 
 /// Decode coord's claim response into a [`SpawnDecision`] (pure — no I/O).
@@ -2137,6 +2210,14 @@ enum ClaimOutcome {
     /// coord refused. The log is written and the local claim settled; the
     /// caller returns without spawning.
     Skip,
+    /// coord could not answer the claim AND autonomous spawns are paused by
+    /// the device drain (drained, or the drain state unknown, which is what a
+    /// coord outage becomes). The row is left PENDING for the backstop poll —
+    /// the `AtCap` shape, not a spawn and not a terminal skip. The log is
+    /// written here; the caller awaits `defer_continuation_unclaimed`, which
+    /// posts the deferred stamp and releases the local claim, so this arm
+    /// deliberately does NOT settle it.
+    DeferUnclaimed,
 }
 
 /// Log coord's claim answer, settle the in-process dispatch claim, and say
@@ -2196,6 +2277,19 @@ fn settle_claim_decision(
             // settle point for both skips.
             settle_skipped_claim(decision, consume_target);
             ClaimOutcome::Skip
+        }
+        SpawnDecision::DeferClaimErrorByDrain { cause, reason } => {
+            // Availability-over-consistency is suspended while autonomous
+            // spawns are not allowed: a claim error during a drain (or an
+            // unknown drain state, which is what a coord outage becomes) is a
+            // leave-pending deferral, the `AtCap` shape, not a spawn.
+            warn!(
+                "agent_runtime: continuation claim error while autonomous spawns are \
+                 paused — deferring, row left pending: {cause}; {reason} (gate_id={gate_id})"
+            );
+            // NOT settled here: `defer_continuation_unclaimed` at the call site
+            // releases the local claim after posting the deferred stamp.
+            ClaimOutcome::DeferUnclaimed
         }
         SpawnDecision::SkipSuperseded { winner_gate_id } => {
             info!(
@@ -3610,9 +3704,14 @@ async fn dispatch_gate_continuation(
     // resolves against the per-path row. `crate::agent_authorization::SpawnDecision`
     // is spelled out because this module has its OWN unrelated `SpawnDecision`
     // (coord's claim verdict) — do not import it.
+    //
+    // The drain is checked first inside `authorize_spawn`: a continuation on a
+    // drained device is deferred exactly like a registry refusal — no claim,
+    // row left pending, a non-consuming stamp naming the drain.
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        continuation_drain_admission(payload.gate_id, payload.dispatch_id),
     )
     .await;
     if !authz.allows_spawn() {
@@ -3636,7 +3735,7 @@ async fn dispatch_gate_continuation(
                 post_continuation_deferred(
                     gate_id,
                     device_id,
-                    spawn_authorization_stamp_reason(authz.label()),
+                    authorization_deferral_stamp_reason(&authz),
                 )
                 .await;
             }
@@ -4069,9 +4168,27 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 /// No `coord_http_base` (legacy / no coord configured) → proceed: there is no
 /// claim surface to consult, so the in-process dedupe is the only guard, as
 /// before.
+///
+/// **Drain (plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3):**
+/// every error arm — no coord base, no client, a failed POST, an unexpected
+/// status — goes through [`apply_drain_to_claim`], so while the device is
+/// drained or its drain state is unknown the "spawn anyway" becomes
+/// [`SpawnDecision::DeferClaimErrorByDrain`], a leave-pending deferral.
 async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
+    apply_drain_to_claim(
+        claim_before_spawn(gate_id, device_id).await,
+        &crate::coord_drain_state::current(),
+    )
+}
+
+/// The claim request itself, before the drain is applied.
+async fn claim_before_spawn(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> SpawnDecision {
     let Some(base) = connected_coord_base() else {
-        return SpawnDecision::Spawn;
+        // Proceed as before — there is no claim surface to consult — but as an
+        // error arm, so a drain still turns it into a deferral.
+        return SpawnDecision::SpawnDespiteClaimError {
+            cause: "no coord base configured — there is no claim surface to consult".to_string(),
+        };
     };
     let url = format!("{base}/coord/gates/{gate_id}/continuation-consumed");
     let Some(client) = crate::coord_http::coord_client() else {
@@ -4432,6 +4549,25 @@ fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
 /// The `reason` a concurrency-cap deferral stamps.
 fn at_cap_stamp_reason(cap: usize) -> String {
     format!("at_cap:{cap}")
+}
+
+/// The `reason` a coord-device-drain deferral stamps: `device_drain:drained` or
+/// `device_drain:unknown` (the `<class>:<detail>` grammar), so coord can tell a
+/// drained runner's pending rows from a registry refusal or a full cap.
+fn drain_stamp_reason(state: &crate::coord_drain_state::CoordDrainState) -> String {
+    format!("device_drain:{}", state.label())
+}
+
+/// The stamp for an authorization that did not allow the spawn: the drain's
+/// own class for a drain deferral, the registry's otherwise.
+fn authorization_deferral_stamp_reason(
+    authz: &crate::agent_authorization::SpawnDecision,
+) -> String {
+    if authz.is_deferred_by_drain() {
+        drain_stamp_reason(&crate::coord_drain_state::current())
+    } else {
+        spawn_authorization_stamp_reason(authz.label())
+    }
 }
 
 /// The `reason` an agent-registry refusal stamps, from
@@ -4877,8 +5013,28 @@ async fn run_gate_continuation_inner(
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        continuation_drain_admission_for(consume_target),
     )
     .await;
+    if authz.is_deferred_by_drain() {
+        // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+        // the same leave-pending deferral as `AtCap` — the backstop poll
+        // re-delivers the row once the drain lifts.
+        warn!(
+            "agent_runtime: gate-continuation deferred: {} (anchor_key={:?})",
+            authz
+                .reason()
+                .unwrap_or("deferred by the coord device drain"),
+            payload.anchor_key
+        );
+        defer_continuation_unclaimed(
+            consume_target,
+            device_id,
+            drain_stamp_reason(&crate::coord_drain_state::current()),
+        )
+        .await;
+        return Ok(());
+    }
     if !authz.allows_spawn() {
         warn!(
             "agent_runtime: gate-continuation refused by the agent registry ({}): {} \
@@ -4899,12 +5055,28 @@ async fn run_gate_continuation_inner(
         // ONE wiring statement. Every per-decision behaviour — which skip
         // releases the local claim, which decision proceeds, and what each
         // logs — lives in `settle_claim_decision`, which the unit test drives
-        // for all four variants. The old shape spread it across match arms
+        // for all variants. The old shape spread it across match arms
         // here, where deleting the superseded arm's release call broke no test
         // and stranded the loser's gate id for the process lifetime.
+        //
+        // The drain deferral is the one outcome whose side effect cannot live
+        // in that fn: `defer_continuation_unclaimed` is async and posts to
+        // coord, while `settle_claim_decision` is pure-sync and unit-driven.
+        // So the DECISION (log + whether the claim is settled here) stays
+        // there and only the await lands at this call site.
         let decision = post_continuation_claim(gate_id, device_id).await;
-        if settle_claim_decision(&decision, consume_target, gate_id) == ClaimOutcome::Skip {
-            return Ok(());
+        match settle_claim_decision(&decision, consume_target, gate_id) {
+            ClaimOutcome::Spawn => {}
+            ClaimOutcome::Skip => return Ok(()),
+            ClaimOutcome::DeferUnclaimed => {
+                defer_continuation_unclaimed(
+                    consume_target,
+                    device_id,
+                    drain_stamp_reason(&crate::coord_drain_state::current()),
+                )
+                .await;
+                return Ok(());
+            }
         }
     }
 
@@ -5859,10 +6031,16 @@ async fn run_condition_check_terminal(
     // `agent-spawn-authorization`). A coord-dispatched condition check spawns
     // an AI terminal that outlives the request that scheduled it — the same
     // auto-dispatch class as a gate continuation, so it takes the same
-    // standing per-path opt-in.
+    // standing per-path opt-in. Coord-dispatched, so autonomous under the
+    // device drain; a deferral takes the same no-report path as a veto, and
+    // coord's condition scheduler dispatches the group again on its next tick.
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        crate::agent_authorization::DrainAdmission::work(
+            crate::coord_drain_state::SpawnOrigin::CoordDispatch,
+            format!("condition_run:{}", payload.run_id),
+        ),
     )
     .await;
     if !authz.allows_spawn() {
@@ -12172,7 +12350,7 @@ mod tests {
         // …and the WIRING: `settle_claim_decision` is the whole of step 2's
         // decision handling, so this drives the fn `run_gate_continuation_inner`
         // actually calls rather than a copy of a match arm. Outcome AND claim
-        // state, for all four variants — the superseded release is no longer a
+        // state, for all FIVE variants — the superseded release is no longer a
         // deletable statement at an untested call site.
         let gate = uuid::Uuid::now_v7();
 
@@ -12225,6 +12403,29 @@ mod tests {
             );
             release_gate_dispatch(claimed);
         }
+
+        // The drain deferral (plan `2026-09-13-drained-runner-never-reaches-idle`):
+        // neither a spawn nor a terminal skip. It must NOT settle the claim
+        // here — `defer_continuation_unclaimed` at the call site posts the
+        // deferred stamp and releases it, so a release in this fn would be a
+        // double release and would let a duplicate delivery spawn.
+        let deferred = SpawnDecision::DeferClaimErrorByDrain {
+            cause: "claim returned status 503".into(),
+            reason: "coord has drained this device".into(),
+        };
+        let funnel_deferred = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel_deferred));
+        assert_eq!(
+            settle_claim_decision(&deferred, ConsumeTarget::Gate(funnel_deferred), gate),
+            ClaimOutcome::DeferUnclaimed,
+            "a claim error under the drain must defer, not spawn and not skip"
+        );
+        assert!(
+            !claim_gate_dispatch(funnel_deferred),
+            "the deferral must KEEP the claim through the funnel — the caller's \
+             defer_continuation_unclaimed is the one release on this path"
+        );
+        release_gate_dispatch(funnel_deferred);
     }
 
     /// End-to-end sequencing of the incident fix at the unit level: a gate id
@@ -14479,5 +14680,107 @@ mod tests {
             Some(v) => std::env::set_var(AGENT_JWT_EXP_COMPRESS_ENV, v),
             None => std::env::remove_var(AGENT_JWT_EXP_COMPRESS_ENV),
         }
+    }
+}
+
+/// Plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3: the claim
+/// error arm honours the device drain.
+#[cfg(test)]
+mod drain_claim_tests {
+    use super::*;
+    use crate::coord_drain_state::CoordDrainState;
+
+    fn states_that_pause() -> Vec<CoordDrainState> {
+        vec![
+            CoordDrainState::Drained {
+                until: None,
+                reason: Some("rebuild".into()),
+            },
+            CoordDrainState::Unknown {
+                since: chrono::Utc::now(),
+                cause: "3 consecutive failed drain read(s)".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_claim_error_spawns_anyway_only_while_autonomous_spawns_run() {
+        for state in [
+            CoordDrainState::Clear,
+            CoordDrainState::NotEnrolled { why: "no coord" },
+        ] {
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(503, ""), &state),
+                SpawnDecision::SpawnDespiteClaimError {
+                    cause: "claim returned status 503".into()
+                }
+            );
+        }
+        for state in states_that_pause() {
+            match apply_drain_to_claim(decide_spawn(503, ""), &state) {
+                SpawnDecision::DeferClaimErrorByDrain { cause, reason } => {
+                    assert_eq!(cause, "claim returned status 503");
+                    assert!(reason.contains("gate_continuation"), "{reason}");
+                }
+                other => panic!("{state:?}: expected a deferral, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_granted_or_cancelled_claim_is_untouched_by_the_drain() {
+        for state in states_that_pause() {
+            assert_eq!(
+                apply_drain_to_claim(decide_spawn(200, "{}"), &state),
+                SpawnDecision::Spawn
+            );
+            assert_eq!(
+                apply_drain_to_claim(
+                    decide_spawn(409, r#"{"error":"cancelled","cancel_reason":"x"}"#),
+                    &state
+                ),
+                SpawnDecision::SkipCancelled {
+                    reason: Some("x".into())
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn drain_stamp_follows_the_class_detail_grammar() {
+        assert_eq!(
+            drain_stamp_reason(&CoordDrainState::Drained {
+                until: None,
+                reason: None
+            }),
+            "device_drain:drained"
+        );
+        assert_eq!(
+            drain_stamp_reason(&CoordDrainState::Unknown {
+                since: chrono::Utc::now(),
+                cause: "x".into()
+            }),
+            "device_drain:unknown"
+        );
+    }
+
+    #[test]
+    fn continuation_admission_keys_units_by_dispatch_and_gates_by_gate() {
+        use crate::agent_authorization::DrainAdmission;
+        use crate::coord_drain_state::SpawnOrigin;
+        let g = uuid::Uuid::from_u128(1);
+        let d = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            continuation_drain_admission(Some(g), Some(d)),
+            DrainAdmission::work(SpawnOrigin::UnitContinuation, format!("dispatch:{d}"))
+        );
+        assert_eq!(
+            continuation_drain_admission_for(ConsumeTarget::Gate(g)),
+            DrainAdmission::work(SpawnOrigin::GateContinuation, format!("gate:{g}"))
+        );
+        assert_eq!(
+            continuation_drain_admission_for(ConsumeTarget::None),
+            DrainAdmission::from(SpawnOrigin::GateContinuation)
+        );
     }
 }

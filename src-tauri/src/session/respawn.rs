@@ -184,6 +184,10 @@ pub enum RespawnError {
     Spawn(String),
     #[error("the Tauri app handle is not available — cannot spawn a PTY")]
     NoAppHandle,
+    /// Coord's device drain deferred this respawn. Not a failure: the durable
+    /// coord row stays pending and the next push/catch-up retries it.
+    #[error("deferred by the coord device drain: {0}")]
+    DeferredByDrain(String),
     #[error(transparent)]
     Coord(#[from] HandoffError),
 }
@@ -606,6 +610,20 @@ async fn materialize(
     coord_url: &str,
     respawn: &PendingRespawn,
 ) -> Result<String, RespawnError> {
+    // 0. Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    //    D3). A respawn is autonomous. Coord already withholds respawn rows from
+    //    a drained device; this is defence in depth for a push that raced the
+    //    drain. Checked before ANY work — no transcript fetch, no budget slot —
+    //    so the pending row replays untouched once the drain lifts.
+    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::Respawn,
+            &format!("respawn:{}", respawn.source_session_id),
+        )
+    {
+        return Err(RespawnError::DeferredByDrain(reason));
+    }
+
     // 1. The id being resumed. An explicit null is UNKNOWN — refuse.
     let claude_session_id = respawn
         .claude_code_session_id

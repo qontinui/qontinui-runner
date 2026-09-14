@@ -645,6 +645,13 @@ impl UnifiedAiSessionExecutor {
         let authz = crate::agent_authorization::authorize_spawn(
             None,
             crate::agent_authorization::SpawnPath::InSessionSubagent,
+            // A phase of a workflow run that is already going: the coord device
+            // drain touches nothing already running, and deferring a phase would
+            // fail the run rather than defer it. New runs are gated where they
+            // start (the scheduler tick, boot workflow resume).
+            crate::agent_authorization::DrainAdmission::Exempt {
+                why: "unified-workflow phase of a run that is already running",
+            },
         )
         .await;
         if let Some(refusal) = authz.refusal() {

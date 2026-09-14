@@ -312,6 +312,14 @@ pub struct DrainInfo {
     /// Always [`DRAIN_COVERS`].
     pub covers: &'static str,
     pub call: String,
+    /// Coord's DEVICE drain as this runner reads it (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 3) — a different
+    /// lever from the local `is_draining` above: coord's drain is reversible
+    /// and expiring, and defers this runner's AUTONOMOUS spawns; the local
+    /// `POST /drain` is terminal and acts on the AI-session plane. The two are
+    /// reported side by side and never merged.
+    #[serde(rename = "coordDrain")]
+    pub coord_drain: crate::coord_drain_state::CoordDrainSnapshot,
 }
 
 /// Age/health of the BACKGROUND `tracking_health` task.
@@ -1012,6 +1020,7 @@ pub async fn restart_readiness_handler(
         would_be_noop: already_drained || ai.as_ref().map(|p| p.count == 0).unwrap_or(false),
         covers: DRAIN_COVERS,
         call: format!("POST http://127.0.0.1:{port}/drain"),
+        coord_drain: crate::coord_drain_state::snapshot(),
     };
 
     let census = census_info(tracking_health::latest().as_ref(), now_ms);
@@ -1102,7 +1111,35 @@ mod tests {
             would_be_noop: true,
             covers: DRAIN_COVERS,
             call: "POST http://127.0.0.1:9876/drain".to_string(),
+            coord_drain: crate::coord_drain_state::snapshot_fixture(
+                &crate::coord_drain_state::CoordDrainState::Clear,
+            ),
         }
+    }
+
+    /// Plan `2026-09-13-drained-runner-never-reaches-idle`, Phase 3: coord's
+    /// device drain is reported beside the local drain, under its own key.
+    #[test]
+    fn drain_reports_coord_drain_beside_the_local_drain() {
+        let json = serde_json::to_value(idle_drain()).unwrap();
+        assert_eq!(json["is_draining"], false);
+        assert_eq!(json["coordDrain"]["state"], "clear");
+        assert_eq!(json["coordDrain"]["autonomousSpawnsAllowed"], true);
+        assert!(json.get("coord_drain").is_none(), "{json}");
+
+        let drained = DrainInfo {
+            coord_drain: crate::coord_drain_state::snapshot_fixture(
+                &crate::coord_drain_state::CoordDrainState::Drained {
+                    until: None,
+                    reason: Some("rebuild".into()),
+                },
+            ),
+            ..idle_drain()
+        };
+        let json = serde_json::to_value(drained).unwrap();
+        assert_eq!(json["is_draining"], false, "the local drain is untouched");
+        assert_eq!(json["coordDrain"]["state"], "drained");
+        assert_eq!(json["coordDrain"]["reason"], "rebuild");
     }
 
     /// A census pass with every class empty — an idle box.

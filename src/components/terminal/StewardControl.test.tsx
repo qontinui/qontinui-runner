@@ -15,6 +15,7 @@ import {
   buildStewardsUrl,
   formatRunningSummary,
   formatUptime,
+  invokeErrorDetail,
   readErrorDetail,
 } from "./StewardControl";
 
@@ -170,5 +171,19 @@ describe("formatRunningSummary", () => {
       2_000_000,
     );
     expect(summary).toBe("observe · 30m");
+  });
+});
+
+describe("invokeErrorDetail", () => {
+  it("surfaces a Tauri command's refusal string verbatim (steward_start)", () => {
+    expect(invokeErrorDetail("409: coord has drained this device")).toBe(
+      "409: coord has drained this device",
+    );
+  });
+
+  it("uses an Error's message and falls back for anything else", () => {
+    expect(invokeErrorDetail(new Error("network down"))).toBe("network down");
+    expect(invokeErrorDetail(undefined)).toBe("request failed");
+    expect(invokeErrorDetail("")).toBe("request failed");
   });
 });

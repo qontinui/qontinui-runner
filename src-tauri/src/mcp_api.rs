@@ -9099,6 +9099,25 @@ pub fn create_router(
             resume_enabled: true, // Let the function check per-task auto_continue
         };
 
+        // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+        // D3): resuming interrupted workflows restarts AI work autonomously, so
+        // it waits for a real drain read and then for the drain to lift. The
+        // interrupted rows are left exactly as they are meanwhile.
+        crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
+        if let crate::coord_drain_state::DrainGate::Defer { reason } =
+            crate::coord_drain_state::drain_gate_for_work(
+                crate::coord_drain_state::SpawnOrigin::BootResume,
+                "boot_resume:workflows",
+            )
+        {
+            warn!("Startup workflow resume deferred — {reason}");
+            crate::coord_drain_state::wait_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::BootResume,
+            )
+            .await;
+            info!("Startup workflow resume: the coord device drain lifted — resuming now");
+        }
+
         let count = crate::unified_workflow_executor::resume_interrupted_workflows(
             state_for_resume.app_state.clone(),
             resume_config_storage,
@@ -9144,12 +9163,29 @@ pub fn create_router(
                 warn!("Startup recovery: previous shutdown was NOT clean — this is crash recovery");
             }
 
-            let summary = crate::commands::ai_session::resume_ai_sessions(
-                chat_sm,
-                chat_handle.clone(),
-                crash_recovery,
-            )
-            .await;
+            // Plan `2026-09-13-drained-runner-never-reaches-idle` D2: decide
+            // against a real drain read, not the not-yet-read state. Bounded —
+            // on timeout the gate sees Unknown and defers, which is fail-closed.
+            crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
+            let summary = loop {
+                let summary = crate::commands::ai_session::resume_ai_sessions(
+                    chat_sm.clone(),
+                    chat_handle.clone(),
+                    crash_recovery,
+                )
+                .await;
+                if summary.deferred_by_drain.is_none() {
+                    break summary;
+                }
+                // Deferred, never discarded: tell the UI why nothing resumed
+                // yet, then resume the moment autonomous spawns may run again.
+                crate::commands::ai_session::emit_session_recovery_summary(&chat_handle, &summary);
+                crate::coord_drain_state::wait_until_allowed(
+                    crate::coord_drain_state::SpawnOrigin::BootResume,
+                )
+                .await;
+                info!("AI session resume: the coord device drain lifted — resuming now");
+            };
 
             if summary.resumed_count > 0 {
                 info!(
