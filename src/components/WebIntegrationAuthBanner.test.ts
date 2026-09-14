@@ -316,6 +316,57 @@ describe("credentialDarkPresentation", () => {
     expect(p.ctaLabel).toBe("Sign in");
   });
 
+  // Plan 2026-09-13-coord-credential-posture-residuals Phase 3: for every
+  // posture the button either performs what its label says, or its label says
+  // what it performs. The defect was a "Re-pair" button that kicked the
+  // refresher — the rung the terminal postures had already exhausted — so it
+  // completed with no error and the banner stayed.
+  describe("every CTA's label matches the command it invokes", () => {
+    it("sign_in (cognito_hard) → the interactive sign-in, labelled Sign in", () => {
+      const p = credentialDarkPresentation(
+        { ...darkExpired, cause: "cognito_hard", cta: "sign_in" },
+        stubTime,
+      );
+      expect(p.ctaAction).toBe("cognito_sign_in");
+      expect(p.ctaLabel).toBe("Sign in");
+    });
+
+    it.each(["absent", "unrefreshable", "upstream_401"])(
+      "re_pair (%s) → the sign-in that re-pairs, never the exhausted refresher",
+      (cause) => {
+        const p = credentialDarkPresentation({ ...darkExpired, cause, cta: "re_pair" }, stubTime);
+        expect(p.ctaAction).toBe("cognito_sign_in");
+        expect(p.ctaAction).not.toBe("kick_refresher");
+        expect(p.ctaLabel).toBe("Sign in to re-pair");
+      },
+    );
+
+    it("retry_refresh (expired) → the refresher, labelled Retry refresh now", () => {
+      const p = credentialDarkPresentation(
+        { ...darkExpired, cause: "expired", cta: "retry_refresh" },
+        stubTime,
+      );
+      expect(p.ctaAction).toBe("kick_refresher");
+      expect(p.ctaLabel).toBe("Retry refresh now");
+    });
+
+    it("null → no button at all, neither label nor action", () => {
+      const p = credentialDarkPresentation({ ...darkExpired, cta: null }, stubTime);
+      expect(p.ctaAction).toBeNull();
+      expect(p.ctaLabel).toBeNull();
+    });
+
+    it("an action labelled as sign-in always IS the sign-in, and vice versa", () => {
+      for (const cta of ["sign_in", "re_pair", "retry_refresh"] as const) {
+        const p = credentialDarkPresentation({ ...darkExpired, cta }, stubTime);
+        expect(p.ctaLabel?.startsWith("Sign in") ?? false).toBe(p.ctaAction === "cognito_sign_in");
+        expect(p.ctaLabel?.startsWith("Retry refresh") ?? false).toBe(
+          p.ctaAction === "kick_refresher",
+        );
+      }
+    });
+  });
+
   it("omits the time prefix when the runner did not say since when", () => {
     const p = credentialDarkPresentation({ ...darkExpired, since: null }, stubTime);
     expect(p.body.startsWith("Since")).toBe(false);
