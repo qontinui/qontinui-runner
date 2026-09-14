@@ -54,13 +54,13 @@ pub mod contexts;
 pub mod continuation_verdict;
 pub mod coordinator;
 pub mod debug_builder_prompt;
-/// Debug-only UI-thread wedge affordance. Absent from release builds — see the
-/// module docs for why the gate is load-bearing.
-/// Debug-only door onto `TerminalSession::graceful_exit` (plan
-/// `2026-09-13-drained-runner-never-reaches-idle` Phase 1). Absent from release
-/// builds.
+/// Debug-profile door onto `TerminalManager::graceful_exit` (plan
+/// `2026-09-13-drained-runner-never-reaches-idle` Phase 1). Present in every
+/// dev-profile runner, including supervisor-built ones; see the module docs.
 #[cfg(debug_assertions)]
 pub mod debug_graceful_exit;
+/// Debug-only UI-thread wedge affordance. Absent from release builds — see the
+/// module docs for why the gate is load-bearing.
 #[cfg(debug_assertions)]
 pub mod debug_wedge;
 pub mod decision_trail_api;

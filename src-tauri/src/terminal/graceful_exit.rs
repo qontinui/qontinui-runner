@@ -1,72 +1,342 @@
-//! Graceful exit of a terminal-hosted `claude` — type `/exit`, wait for the
-//! process to leave, only then close the tab (plan
+//! Graceful exit of a terminal-hosted `claude` — type `/exit` at an empty
+//! prompt, wait for the process to leave, only then close the tab (plan
 //! `2026-09-13-drained-runner-never-reaches-idle`, design decision D5).
 //!
 //! ## Why not `close`
 //!
-//! Every close in the runner ends in `TerminalSession::close_with_deadline` →
-//! `PaneIo::kill`, which is `taskkill /F /T` on Windows and a `SIGTERM` to the
-//! single shell pid on Unix — a kill of a live agent that can drop its
-//! transcript tail, and on Unix can orphan the `claude` child instead of
-//! ending it. Wind-down must never do that to a live `claude`.
+//! Every close in the runner ends in `TerminalSession::close_with_deadline`,
+//! which kills the pane's process (`taskkill /F /T` on Windows, a `SIGTERM` to
+//! the single shell pid on Unix) and releases the pty — a kill of a live agent
+//! that can drop its transcript tail. Wind-down must never do that to a live
+//! `claude`.
 //!
-//! ## The protocol
+//! ## The protocol ([`drive`])
 //!
-//! 1. Probe the pane's process subtree. No `claude` there → [`NoLiveClaude`],
-//!    and nothing is written (typing `/exit` into a bare shell is not a no-op).
-//!    An unreadable process table → [`ProbeUnavailable`], nothing written.
-//! 2. Write [`EXIT_COMMAND`] through `TerminalSession::write`, the single
-//!    input funnel — which keeps the primitive correct under the proposed
-//!    out-of-process PTY owner.
-//! 3. Poll the subtree every [`POLL_INTERVAL`] until no `claude` is left, up
-//!    to the deadline ([`DEFAULT_DEADLINE`]).
-//! 4. Gone → close the tab, which now holds a bare shell → [`Exited`].
-//!    Still there at the deadline → [`ExitStuck`], and the process is LEFT
-//!    RUNNING. There is no escalation to a kill anywhere in this module; the
-//!    tab-closing callback is reachable only from the "gone" arm, and the
-//!    tests below pin that.
+//! 1. **Probe the pane's process subtree.** No `claude` → `NoLiveClaude`, and
+//!    nothing is typed (typing into a bare shell is not a no-op). An
+//!    unreadable table → `ProbeUnavailable`. More than one `claude` (a nested
+//!    one would not leave with `/exit`), or a `claude` with child processes
+//!    attached → `Refused`.
+//! 2. **Check the screen** ([`exit_prompt_ready`]): the cursor sits at the
+//!    start of an empty `❯` input line, the screen looks idle, and no dialog is
+//!    showing. Otherwise `Refused` — typing `\r` into a permission dialog would
+//!    APPROVE a tool call, and typing `/exit` after an unsent draft would
+//!    submit `draft/exit`.
+//! 3. **Type `/exit`, confirm the echo** ([`exit_echoed`]) on the input line,
+//!    then submit with `\r`. No echo within [`ECHO_TIMEOUT`] → clear the line
+//!    (Ctrl-U) and `Refused`.
+//! 4. **Wait** up to the deadline, probing every [`POLL_INTERVAL`]. The
+//!    `claude` counts as gone only when [`GONE_PROBES_REQUIRED`] consecutive
+//!    probes find no `claude` in the subtree AND every `claude` identity ever
+//!    seen (pid plus start time, so a reused pid is not mistaken for it) is
+//!    absent from the WHOLE process table — a process re-parented out of the
+//!    subtree while still attached to the pty is still alive.
+//! 5. **Gone → close the tab → `Exited`.** Still there at the deadline →
+//!    `ExitStuck`, the process LEFT RUNNING and the tab left open.
 //!
-//! ## Evidence for the load-bearing assumption
+//! There is no kill anywhere in this module; the tab-closing callback is
+//! reachable only from the gone arm, and the tests below pin that. The one
+//! public entry point is `TerminalManager::graceful_exit`, whose close skips
+//! the kill entirely when the pane's own process (the `claude`, when it is the
+//! pane root) has already exited.
 //!
-//! Measured 2026-09-13 on a Linux box against Claude Code 2.1.270 (a pty
-//! harness spawning `claude --dangerously-skip-permissions`, no prompt sent):
-//! `/exit\r` written as ONE chunk after the input prompt rendered ended the
-//! process with exit code 0 in 3 of 3 trials, 0.85–0.93 s after the write; the
-//! same bytes split as `/exit`, 300 ms, `\r` also exited 3 of 3. An idle
-//! session's pty then carried no bytes at all for 55 s. The trials were fresh
-//! sessions with no transcript, so the 60 s deadline is sized for a long
-//! transcript flush, not for the measured latency.
+//! ## Evidence
 //!
-//! [`NoLiveClaude`]: GracefulExitOutcome::NoLiveClaude
-//! [`ProbeUnavailable`]: GracefulExitOutcome::ProbeUnavailable
-//! [`Exited`]: GracefulExitOutcome::Exited
-//! [`ExitStuck`]: GracefulExitOutcome::ExitStuck
+//! Measured 2026-09-13 against Claude Code 2.1.270 in a pty harness (`claude
+//! --dangerously-skip-permissions`, no prompt ever sent, 120×40):
+//!
+//! - `/exit` + `\r` ended the process with exit code 0 in every trial,
+//!   0.85–0.93 s after the `\r` (6 of 6 across one-write and split shapes, and
+//!   again in the echo-confirmed shape this module uses: 0.895 s).
+//! - An EMPTY prompt is not blank: it renders a placeholder
+//!   (`❯ Try "write a test for <filepath>"`) with the cursor at the input
+//!   start (column 2). An unsent draft renders the same way as text, but
+//!   leaves the cursor after the draft (column 21 for a 19-character draft).
+//!   The cursor column is therefore the discriminator, with the placeholder's
+//!   `Try "` prefix as a second check.
+//! - After typing `/exit` the input line reads `❯ /exit` with the cursor at
+//!   column 7, while a slash-command menu opens above the input box.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use serde::Serialize;
 
-/// The bytes typed into the pane. One chunk: the measured evidence (module
-/// docs) shows Claude Code submits it without a paste-window split.
-pub const EXIT_COMMAND: &[u8] = b"/exit\r";
+use crate::process_capture::process_tree::{claude_pids_in_inclusive_subtree, ProcessSnapshot};
+use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
 
-/// How long to wait for `claude` to leave before reporting [`GracefulExitOutcome::ExitStuck`].
+/// The command typed at the prompt. Submitted separately ([`SUBMIT`]) once it
+/// has echoed on the input line.
+pub const EXIT_TEXT: &[u8] = b"/exit";
+
+/// Enter.
+pub const SUBMIT: &[u8] = b"\r";
+
+/// Ctrl-U: clears the input line when `/exit` did not echo as expected.
+pub const CLEAR_INPUT_LINE: &[u8] = b"\x15";
+
+/// How long to wait for `claude` to leave before reporting `ExitStuck`.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(60);
 
-/// Spacing between process-table probes while waiting.
+/// Spacing between process-table probes while waiting. One probe snapshots the
+/// whole table: cheap `/proc` reads on Unix, but a PowerShell/CIM subprocess on
+/// Windows, so Windows probes at most once a second.
+#[cfg(windows)]
+pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Spacing between process-table probes while waiting (see the Windows twin).
+#[cfg(not(windows))]
 pub const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// One look at the pane's process subtree.
+/// How long typed `/exit` may take to appear on the input line.
+pub const ECHO_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Spacing between screen reads while waiting for the echo.
+pub const ECHO_POLL: Duration = Duration::from_millis(50);
+
+/// Consecutive "gone" probes required before the tab is closed.
+pub const GONE_PROBES_REQUIRED: u32 = 2;
+
+/// The placeholder Claude Code renders on an empty input line.
+const PLACEHOLDER_PREFIX: &str = "Try \"";
+
+/// Rows above the cursor scanned for a dialog when no input-box edge bounds
+/// the scan.
+const DIALOG_SCAN_ROWS: usize = 8;
+
+/// Case-insensitive text that marks a dialog rather than the input prompt.
+const DIALOG_MARKERS: &[&str] = &["do you want", "allow", "esc to cancel", "enter to confirm"];
+
+/// Timing knobs for [`drive`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExitTiming {
+    pub deadline: Duration,
+    pub poll: Duration,
+    pub echo_timeout: Duration,
+    pub echo_poll: Duration,
+}
+
+impl ExitTiming {
+    /// Production timing with the given deadline.
+    pub fn with_deadline(deadline: Duration) -> Self {
+        Self {
+            deadline,
+            poll: POLL_INTERVAL,
+            echo_timeout: ECHO_TIMEOUT,
+            echo_poll: ECHO_POLL,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Screen checks
+// ---------------------------------------------------------------------------
+
+/// The rendered grid as the screen checks read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenText {
+    pub lines: Vec<String>,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+}
+
+/// The `❯` input line on the cursor row: the marker's column and the text
+/// after it, trimmed (including a non-breaking space and a box edge `│`).
+struct PromptLine {
+    marker_col: usize,
+    input: String,
+}
+
+fn prompt_line(screen: &ScreenText) -> Option<PromptLine> {
+    let row = screen.lines.get(usize::from(screen.cursor_row))?;
+    let chars: Vec<char> = row.chars().collect();
+    let marker_col = chars.iter().position(|&c| c == '❯')?;
+    let rest: String = chars[marker_col + 1..].iter().collect();
+    let input = rest.trim().trim_end_matches('│').trim().to_string();
+    Some(PromptLine { marker_col, input })
+}
+
+/// The column typed input starts at: the marker, one separator, then input.
+fn input_start(line: &PromptLine) -> usize {
+    line.marker_col + 2
+}
+
+/// `1. Yes`-shaped: a numbered choice, after any leading marker or box edge.
+fn is_numbered_option(text: &str) -> bool {
+    let body = text.trim_start_matches(|c: char| c.is_whitespace() || c == '│' || c == '❯');
+    let digits = body.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && body[digits..].starts_with(". ")
+}
+
+/// Only box-drawing characters: the input box's top edge.
+fn is_box_edge(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
+}
+
+/// May `/exit` be typed now? `Ok` only for an idle screen whose cursor sits at
+/// the start of an empty `❯` input line with no dialog showing. The `Err`
+/// names what was seen.
+pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
+    let Some(line) = prompt_line(screen) else {
+        return Err("no `❯` input prompt on the cursor row".to_string());
+    };
+    if !snapshot_looks_idle(&screen.lines, screen.cursor_row) {
+        return Err("the screen does not look idle".to_string());
+    }
+    if is_numbered_option(&line.input) {
+        return Err("a numbered choice is selected — a dialog, not the input prompt".to_string());
+    }
+    let start = input_start(&line);
+    if usize::from(screen.cursor_col) != start {
+        return Err(format!(
+            "the input line holds unsent text (cursor at column {}, input starts at column {start})",
+            screen.cursor_col
+        ));
+    }
+    if !line.input.is_empty() && !line.input.starts_with(PLACEHOLDER_PREFIX) {
+        return Err(
+            "the input line holds text that is not the empty-prompt placeholder".to_string(),
+        );
+    }
+
+    // Dialog markers from the input box's top edge (when one sits just above
+    // the prompt) to the bottom of the screen. Rows above the box are
+    // transcript, where numbered lists are ordinary output. With no box edge
+    // there is no transcript boundary to trust, so the scan reaches
+    // DIALOG_SCAN_ROWS above the cursor instead — a dialog renders right above
+    // wherever the cursor is parked.
+    let cursor_row = usize::from(screen.cursor_row);
+    let first = (cursor_row.saturating_sub(2)..cursor_row)
+        .rev()
+        .find(|&r| screen.lines.get(r).is_some_and(|l| is_box_edge(l)))
+        .unwrap_or_else(|| cursor_row.saturating_sub(DIALOG_SCAN_ROWS));
+    for (r, text) in screen.lines.iter().enumerate().skip(first) {
+        if r == cursor_row {
+            continue;
+        }
+        if is_numbered_option(text) {
+            return Err(format!(
+                "a numbered choice is showing on row {r} — a dialog"
+            ));
+        }
+        let lower = text.to_lowercase();
+        if let Some(marker) = DIALOG_MARKERS.iter().find(|m| lower.contains(*m)) {
+            return Err(format!("dialog marker `{marker}` on row {r}"));
+        }
+    }
+    Ok(())
+}
+
+/// Has typed `/exit` echoed? The input line reads exactly `/exit` and the
+/// cursor sits right after it.
+pub fn exit_echoed(screen: &ScreenText) -> bool {
+    let Some(line) = prompt_line(screen) else {
+        return false;
+    };
+    let typed = std::str::from_utf8(EXIT_TEXT).unwrap_or_default();
+    line.input == typed && usize::from(screen.cursor_col) == input_start(&line) + typed.len()
+}
+
+// ---------------------------------------------------------------------------
+// Process probe
+// ---------------------------------------------------------------------------
+
+/// A process as the probe identifies it: pid plus start time, so a reused pid
+/// is not mistaken for the original. `started_at` is epoch seconds, `0` when
+/// the platform could not resolve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct ProcIdentity {
+    pub pid: u32,
+    pub started_at: i64,
+}
+
+/// One readable look at the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneProcesses {
+    /// `claude` processes in the pane's subtree, top-level first.
+    pub subtree_claude: Vec<ProcIdentity>,
+    /// Child processes of the top-level `claude` (0 when there is none).
+    pub top_level_children: usize,
+    /// Of the identities asked about, those alive ANYWHERE in the table.
+    pub tracked_alive: Vec<ProcIdentity>,
+}
+
+/// What a probe saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaudeProbe {
-    /// These `claude` pids are live in the subtree.
-    Live(Vec<u32>),
-    /// The table was read and holds no `claude` in the subtree.
-    Gone,
+    Readable(PaneProcesses),
     /// The table could not be read; says nothing either way.
     Unreadable(String),
 }
+
+/// Is `id` alive anywhere in `snapshot`? A pid absent from the table is not.
+/// A present pid whose start time differs from the recorded one is a reuse and
+/// is not. When either start time is unknown the process cannot be ruled out,
+/// so it counts as alive.
+pub fn alive_in(snapshot: &ProcessSnapshot, id: ProcIdentity) -> bool {
+    let present =
+        snapshot.creation_times.contains_key(&id.pid) || snapshot.names.contains_key(&id.pid);
+    if !present {
+        return false;
+    }
+    let now_start = snapshot.creation_times.get(&id.pid).copied().unwrap_or(0);
+    id.started_at <= 0 || now_start <= 0 || now_start == id.started_at
+}
+
+/// Pure probe over one snapshot of the whole process table.
+pub fn probe_from_snapshot(
+    root_pid: u32,
+    snapshot: &ProcessSnapshot,
+    tracked: &[ProcIdentity],
+) -> ClaudeProbe {
+    if snapshot.parent_map.is_empty() {
+        return ClaudeProbe::Unreadable(
+            "the process table is unreadable (empty parent map)".to_string(),
+        );
+    }
+    let pids = claude_pids_in_inclusive_subtree(root_pid, snapshot);
+    let subtree_claude: Vec<ProcIdentity> = pids
+        .iter()
+        .map(|&pid| ProcIdentity {
+            pid,
+            started_at: snapshot.creation_times.get(&pid).copied().unwrap_or(0),
+        })
+        .collect();
+    // Inclusive-subtree order is root first, then breadth-first, so the first
+    // `claude` has no `claude` ancestor inside the pane.
+    let top_level_children = pids
+        .first()
+        .and_then(|pid| snapshot.parent_map.get(pid))
+        .map_or(0, Vec::len);
+    let tracked_alive = tracked
+        .iter()
+        .copied()
+        .filter(|&id| alive_in(snapshot, id))
+        .collect();
+    ClaudeProbe::Readable(PaneProcesses {
+        subtree_claude,
+        top_level_children,
+        tracked_alive,
+    })
+}
+
+/// Probe the pane rooted at `root_pid` against a fresh snapshot of the whole
+/// process table.
+pub async fn probe_claude_under(root_pid: Option<u32>, tracked: Vec<ProcIdentity>) -> ClaudeProbe {
+    let Some(root) = root_pid else {
+        return ClaudeProbe::Unreadable(
+            "the pane has no local process id (a remote pane), so its subtree cannot be observed"
+                .to_string(),
+        );
+    };
+    let snapshot = crate::process_capture::process_tree::snapshot_process_table_public().await;
+    probe_from_snapshot(root, &snapshot, &tracked)
+}
+
+// ---------------------------------------------------------------------------
+// Outcome + driver
+// ---------------------------------------------------------------------------
 
 /// What a graceful exit did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -75,115 +345,169 @@ pub enum GracefulExitOutcome {
     /// `claude` left within the deadline and the tab was closed.
     Exited {
         waited_ms: u64,
-        /// The `claude` pids present when `/exit` was written.
+        /// The `claude` pids present when `/exit` was typed.
         claude_pids: Vec<u32>,
     },
-    /// `claude` was still there at the deadline. NOTHING was killed and the
+    /// `claude` was still alive at the deadline. NOTHING was killed and the
     /// tab was not closed.
     ExitStuck {
         waited_ms: u64,
-        /// The `claude` pids from the last readable probe.
+        /// The `claude` pids alive at the last readable probe.
         claude_pids: Vec<u32>,
-        /// The final probe could not read the process table.
         last_probe_unreadable: bool,
     },
-    /// No `claude` in the pane's subtree; nothing was written or closed.
+    /// The pane was not in a state where `/exit` is safe to type. Nothing was
+    /// submitted and nothing closed; `/exit` may have been typed and cleared.
+    Refused {
+        reason: String,
+        claude_pids: Vec<u32>,
+    },
+    /// No `claude` in the pane's subtree; nothing was typed or closed.
     NoLiveClaude,
-    /// The process table could not be read before starting; nothing was
-    /// written or closed.
+    /// The process table could not be read before starting; nothing was typed
+    /// or closed.
     ProbeUnavailable { detail: String },
-    /// Writing `/exit` failed; nothing was closed.
+    /// Writing to the pane failed; nothing was closed.
     WriteFailed {
         error: String,
         claude_pids: Vec<u32>,
     },
 }
 
-/// Drive the protocol over injected effects. `write` types into the pane,
-/// `probe` looks at its subtree, `close_tab` closes it; the pane itself is
-/// never touched any other way.
-pub async fn drive<W, P, PF, C, CF>(
-    write: W,
-    mut probe: P,
-    close_tab: C,
-    deadline: Duration,
-    poll: Duration,
-) -> GracefulExitOutcome
-where
-    W: FnOnce(&[u8]) -> Result<(), String>,
-    P: FnMut() -> PF,
-    PF: Future<Output = ClaudeProbe>,
-    C: FnOnce() -> CF,
-    CF: Future<Output = ()>,
-{
-    let initial = match probe().await {
-        ClaudeProbe::Live(pids) => pids,
-        ClaudeProbe::Gone => return GracefulExitOutcome::NoLiveClaude,
-        ClaudeProbe::Unreadable(detail) => return GracefulExitOutcome::ProbeUnavailable { detail },
-    };
-
-    if let Err(error) = write(EXIT_COMMAND) {
-        return GracefulExitOutcome::WriteFailed {
-            error,
-            claude_pids: initial,
-        };
-    }
-
-    let started = tokio::time::Instant::now();
-    let mut last_seen = initial.clone();
-    let mut last_probe_unreadable = false;
-    loop {
-        let elapsed = started.elapsed();
-        if elapsed >= deadline {
-            return GracefulExitOutcome::ExitStuck {
-                waited_ms: millis(elapsed),
-                claude_pids: last_seen,
-                last_probe_unreadable,
-            };
-        }
-        tokio::time::sleep(poll.min(deadline - elapsed)).await;
-        match probe().await {
-            ClaudeProbe::Live(pids) => {
-                last_seen = pids;
-                last_probe_unreadable = false;
-            }
-            ClaudeProbe::Gone => {
-                close_tab().await;
-                return GracefulExitOutcome::Exited {
-                    waited_ms: millis(started.elapsed()),
-                    claude_pids: initial,
-                };
-            }
-            ClaudeProbe::Unreadable(_) => last_probe_unreadable = true,
-        }
-    }
+fn pids_of(ids: &[ProcIdentity]) -> Vec<u32> {
+    ids.iter().map(|id| id.pid).collect()
 }
 
 fn millis(d: Duration) -> u64 {
     u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Probe the live `claude` processes in the inclusive subtree of `root_pid`
-/// (the pane's child process), with the same counting rules the restart
-/// census uses (`process_tree::claude_pids_in_inclusive_subtree`).
-pub async fn probe_claude_under(root_pid: Option<u32>) -> ClaudeProbe {
-    let Some(root) = root_pid else {
-        return ClaudeProbe::Unreadable(
-            "the pane has no local process id (a remote pane), so its subtree cannot be observed"
-                .to_string(),
-        );
+/// Drive the protocol over injected effects. `write` types into the pane,
+/// `screen` reads its rendered grid, `probe` looks at its processes (given the
+/// identities to check for anywhere in the table), `close_tab` closes it. The
+/// pane is reached no other way.
+pub async fn drive<W, S, P, PF, C, CF>(
+    mut write: W,
+    mut screen: S,
+    mut probe: P,
+    close_tab: C,
+    timing: ExitTiming,
+) -> GracefulExitOutcome
+where
+    W: FnMut(&[u8]) -> Result<(), String>,
+    S: FnMut() -> ScreenText,
+    P: FnMut(Vec<ProcIdentity>) -> PF,
+    PF: Future<Output = ClaudeProbe>,
+    C: FnOnce() -> CF,
+    CF: Future<Output = ()>,
+{
+    // (1) The pane's processes.
+    let initial = match probe(Vec::new()).await {
+        ClaudeProbe::Unreadable(detail) => return GracefulExitOutcome::ProbeUnavailable { detail },
+        ClaudeProbe::Readable(view) => view,
     };
-    let snap = crate::process_capture::process_tree::snapshot_process_table_public().await;
-    if snap.parent_map.is_empty() {
-        return ClaudeProbe::Unreadable(
-            "the process table is unreadable (empty parent map)".to_string(),
-        );
+    let claude_pids = pids_of(&initial.subtree_claude);
+    match initial.subtree_claude.len() {
+        0 => return GracefulExitOutcome::NoLiveClaude,
+        1 => {}
+        n => {
+            return GracefulExitOutcome::Refused {
+                reason: format!(
+                    "{n} claude processes in the pane — a nested claude does not leave with /exit"
+                ),
+                claude_pids,
+            }
+        }
     }
-    let pids = crate::process_capture::process_tree::claude_pids_in_inclusive_subtree(root, &snap);
-    if pids.is_empty() {
-        ClaudeProbe::Gone
-    } else {
-        ClaudeProbe::Live(pids)
+    if initial.top_level_children > 0 {
+        return GracefulExitOutcome::Refused {
+            reason: format!(
+                "the claude process has {} child process(es) attached",
+                initial.top_level_children
+            ),
+            claude_pids,
+        };
+    }
+
+    // (2) The screen.
+    if let Err(why) = exit_prompt_ready(&screen()) {
+        return GracefulExitOutcome::Refused {
+            reason: format!("not at an empty prompt: {why}"),
+            claude_pids,
+        };
+    }
+
+    // (3) Type, confirm the echo, submit.
+    if let Err(error) = write(EXIT_TEXT) {
+        return GracefulExitOutcome::WriteFailed { error, claude_pids };
+    }
+    let echo_started = tokio::time::Instant::now();
+    while !exit_echoed(&screen()) {
+        if echo_started.elapsed() >= timing.echo_timeout {
+            let cleared = match write(CLEAR_INPUT_LINE) {
+                Ok(()) => "the line was cleared".to_string(),
+                Err(e) => format!("clearing the line failed: {e}"),
+            };
+            return GracefulExitOutcome::Refused {
+                reason: format!(
+                    "typed /exit did not echo on the input line within {} ms; {cleared}",
+                    millis(timing.echo_timeout)
+                ),
+                claude_pids,
+            };
+        }
+        tokio::time::sleep(timing.echo_poll).await;
+    }
+    if let Err(error) = write(SUBMIT) {
+        return GracefulExitOutcome::WriteFailed { error, claude_pids };
+    }
+
+    // (4) Wait for every claude ever seen to be gone from the whole table.
+    let mut tracked: BTreeSet<ProcIdentity> = initial.subtree_claude.iter().copied().collect();
+    let mut last_alive = claude_pids.clone();
+    let mut last_probe_unreadable = false;
+    let mut gone_streak = 0u32;
+    let started = tokio::time::Instant::now();
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timing.deadline {
+            return GracefulExitOutcome::ExitStuck {
+                waited_ms: millis(elapsed),
+                claude_pids: last_alive,
+                last_probe_unreadable,
+            };
+        }
+        tokio::time::sleep(timing.poll.min(timing.deadline - elapsed)).await;
+        match probe(tracked.iter().copied().collect()).await {
+            ClaudeProbe::Readable(view) => {
+                last_probe_unreadable = false;
+                if view.subtree_claude.is_empty() && view.tracked_alive.is_empty() {
+                    gone_streak += 1;
+                    if gone_streak >= GONE_PROBES_REQUIRED {
+                        // (5) Gone.
+                        close_tab().await;
+                        return GracefulExitOutcome::Exited {
+                            waited_ms: millis(started.elapsed()),
+                            claude_pids,
+                        };
+                    }
+                } else {
+                    gone_streak = 0;
+                    tracked.extend(view.subtree_claude.iter().copied());
+                    let alive: BTreeSet<u32> = view
+                        .subtree_claude
+                        .iter()
+                        .chain(view.tracked_alive.iter())
+                        .map(|id| id.pid)
+                        .collect();
+                    last_alive = alive.into_iter().collect();
+                }
+            }
+            ClaudeProbe::Unreadable(_) => {
+                gone_streak = 0;
+                last_probe_unreadable = true;
+            }
+        }
     }
 }
 
@@ -192,28 +516,309 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    // ---- screen fixtures (rows 35-39 of a real 120x40 Claude Code 2.1.270
+    //      capture; see module docs) ---------------------------------------
+
+    fn edge() -> String {
+        "─".repeat(120)
+    }
+
+    fn screen(rows: Vec<String>, cursor_row: u16, cursor_col: u16) -> ScreenText {
+        ScreenText {
+            lines: rows,
+            cursor_row,
+            cursor_col,
+        }
+    }
+
+    /// An empty prompt showing its placeholder, cursor at the input start.
+    fn empty_prompt() -> ScreenText {
+        screen(
+            vec![
+                format!("{}● high · /effort", " ".repeat(102)),
+                edge(),
+                "❯\u{a0}Try \"write a test for <filepath>\"".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents".to_string(),
+            ],
+            2,
+            2,
+        )
+    }
+
+    fn draft_prompt() -> ScreenText {
+        screen(
+            vec![
+                format!("{}● high · /effort", " ".repeat(102)),
+                edge(),
+                "❯\u{a0}draft text not sent".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            2,
+            21,
+        )
+    }
+
+    fn echoed_prompt() -> ScreenText {
+        screen(
+            vec![
+                "  /exit                         Exit the CLI".to_string(),
+                "  /usage-credits                Configure usage credits".to_string(),
+                edge(),
+                "❯\u{a0}/exit".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle)".to_string(),
+            ],
+            3,
+            7,
+        )
+    }
+
+    fn permission_dialog() -> ScreenText {
+        screen(
+            vec![
+                " Bash command".to_string(),
+                "   rm -rf build".to_string(),
+                " Do you want to proceed?".to_string(),
+                " ❯ 1. Yes".to_string(),
+                "   2. Yes, and don't ask again for rm commands in this project".to_string(),
+                "   3. No, and tell Claude what to do differently (esc)".to_string(),
+            ],
+            3,
+            3,
+        )
+    }
+
+    #[test]
+    fn the_empty_prompt_placeholder_is_ready() {
+        assert_eq!(exit_prompt_ready(&empty_prompt()), Ok(()));
+        // A bare prompt with no placeholder, as older builds render it.
+        let bare = screen(vec!["done.".into(), "❯ ".into()], 1, 2);
+        assert_eq!(exit_prompt_ready(&bare), Ok(()));
+        // After Ctrl-U the transcript row above the box reads a hint; it is
+        // above the input box, so it is not scanned.
+        let mut cleared = empty_prompt();
+        cleared.lines[0] = format!("{}Ctrl+Y to paste deleted text", " ".repeat(90));
+        assert_eq!(exit_prompt_ready(&cleared), Ok(()));
+    }
+
+    #[test]
+    fn an_unsent_draft_is_refused() {
+        let why = exit_prompt_ready(&draft_prompt()).unwrap_err();
+        assert!(why.contains("unsent text"), "{why}");
+        // Even with the cursor moved back to the input start, draft text that
+        // is not the placeholder is refused.
+        let mut home = draft_prompt();
+        home.cursor_col = 2;
+        let why = exit_prompt_ready(&home).unwrap_err();
+        assert!(why.contains("not the empty-prompt placeholder"), "{why}");
+    }
+
+    #[test]
+    fn a_permission_dialog_is_refused() {
+        let why = exit_prompt_ready(&permission_dialog()).unwrap_err();
+        assert!(why.contains("numbered choice"), "{why}");
+        // The same dialog with the cursor parked on a plain `❯` row below it.
+        let mut parked = permission_dialog();
+        parked.lines.push("❯ ".to_string());
+        parked.cursor_row = 6;
+        parked.cursor_col = 2;
+        assert!(exit_prompt_ready(&parked).is_err());
+    }
+
+    #[test]
+    fn dialog_markers_inside_the_input_box_region_are_refused() {
+        let mut s = empty_prompt();
+        s.lines[4] = "  Enter to confirm · Esc to cancel".to_string();
+        let why = exit_prompt_ready(&s).unwrap_err();
+        assert!(why.contains("dialog marker"), "{why}");
+    }
+
+    #[test]
+    fn numbered_output_above_the_input_box_is_not_a_dialog() {
+        let mut s = empty_prompt();
+        s.lines[0] = "1. First, run the tests".to_string();
+        assert_eq!(exit_prompt_ready(&s), Ok(()));
+    }
+
+    #[test]
+    fn a_working_screen_or_a_missing_prompt_is_refused() {
+        let mut working = empty_prompt();
+        working.lines[0] = "✻ Compiling… (esc to interrupt)".to_string();
+        assert!(exit_prompt_ready(&working).is_err());
+        let mut elsewhere = empty_prompt();
+        elsewhere.cursor_row = 4;
+        let why = exit_prompt_ready(&elsewhere).unwrap_err();
+        assert!(why.contains("no `❯` input prompt"), "{why}");
+    }
+
+    #[test]
+    fn echo_detection() {
+        assert!(exit_echoed(&echoed_prompt()));
+        assert!(!exit_echoed(&empty_prompt()));
+        assert!(!exit_echoed(&draft_prompt()));
+        let mut early = echoed_prompt();
+        early.cursor_col = 5;
+        assert!(!exit_echoed(&early), "cursor not after the echo");
+        let mut prefixed = echoed_prompt();
+        prefixed.lines[3] = "❯\u{a0}draft/exit".to_string();
+        prefixed.cursor_col = 12;
+        assert!(!exit_echoed(&prefixed));
+    }
+
+    // ---- process probe ------------------------------------------------------
+
+    /// root 100 (shell) -> 200 (claude) ; unrelated 300 ; optional extras.
+    fn snapshot(entries: &[(u32, u32, &str, i64)]) -> ProcessSnapshot {
+        let mut snap = ProcessSnapshot::default();
+        for &(pid, ppid, name, started) in entries {
+            snap.parent_map.entry(ppid).or_default().push(pid);
+            snap.creation_times.insert(pid, started);
+            snap.names.insert(pid, name.to_string());
+        }
+        snap
+    }
+
+    fn id(pid: u32, started_at: i64) -> ProcIdentity {
+        ProcIdentity { pid, started_at }
+    }
+
+    #[tokio::test]
+    async fn a_pane_without_a_local_pid_is_unreadable() {
+        assert!(matches!(
+            probe_claude_under(None, vec![]).await,
+            ClaudeProbe::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn an_empty_process_table_is_unreadable() {
+        assert!(matches!(
+            probe_from_snapshot(100, &ProcessSnapshot::default(), &[id(200, 5)]),
+            ClaudeProbe::Unreadable(_)
+        ));
+    }
+
+    #[test]
+    fn probe_reports_subtree_claude_children_and_tracked_liveness() {
+        let snap = snapshot(&[
+            (100, 1, "bash", 10),
+            (200, 100, "claude", 20),
+            (210, 200, "node", 21),
+            (300, 1, "sshd", 5),
+        ]);
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &snap, &[id(200, 20)]) else {
+            panic!("readable");
+        };
+        assert_eq!(view.subtree_claude, vec![id(200, 20)]);
+        assert_eq!(view.top_level_children, 1);
+        assert_eq!(view.tracked_alive, vec![id(200, 20)]);
+    }
+
+    #[test]
+    fn a_claude_gone_from_the_subtree_but_alive_elsewhere_is_still_alive() {
+        // Re-parented to init (pid 1) while still running.
+        let snap = snapshot(&[(100, 1, "bash", 10), (200, 1, "claude", 20)]);
+        let ClaudeProbe::Readable(view) = probe_from_snapshot(100, &snap, &[id(200, 20)]) else {
+            panic!("readable");
+        };
+        assert!(view.subtree_claude.is_empty());
+        assert_eq!(view.tracked_alive, vec![id(200, 20)]);
+    }
+
+    #[test]
+    fn a_reused_pid_is_not_the_original_process() {
+        let snap = snapshot(&[(100, 1, "bash", 10), (200, 1, "vim", 99)]);
+        assert!(!alive_in(&snap, id(200, 20)));
+        // Unknown start time on either side cannot rule the process out.
+        assert!(alive_in(&snap, id(200, 0)));
+        let mut unknown = snapshot(&[(100, 1, "bash", 10), (200, 1, "vim", 99)]);
+        unknown.creation_times.insert(200, 0);
+        assert!(alive_in(&unknown, id(200, 20)));
+        assert!(!alive_in(&snap, id(4242, 20)));
+    }
+
+    // ---- driver --------------------------------------------------------------
+
     type Log = Arc<Mutex<Vec<String>>>;
+
+    fn timing() -> ExitTiming {
+        ExitTiming {
+            deadline: Duration::from_secs(60),
+            poll: Duration::from_millis(500),
+            echo_timeout: Duration::from_secs(2),
+            echo_poll: Duration::from_millis(50),
+        }
+    }
+
+    fn readable(subtree: &[ProcIdentity], children: usize, alive: &[ProcIdentity]) -> ClaudeProbe {
+        ClaudeProbe::Readable(PaneProcesses {
+            subtree_claude: subtree.to_vec(),
+            top_level_children: children,
+            tracked_alive: alive.to_vec(),
+        })
+    }
+
+    const CLAUDE: ProcIdentity = ProcIdentity {
+        pid: 42,
+        started_at: 1_000,
+    };
 
     /// A probe that replays `script`, repeating its last entry forever.
     fn scripted_probe(
         script: Vec<ClaudeProbe>,
         log: Log,
-    ) -> impl FnMut() -> std::future::Ready<ClaudeProbe> {
+    ) -> impl FnMut(Vec<ProcIdentity>) -> std::future::Ready<ClaudeProbe> {
         let mut i = 0usize;
-        move || {
+        move |tracked| {
             let p = script[i.min(script.len() - 1)].clone();
             i += 1;
-            log.lock().unwrap().push(format!("probe:{p:?}"));
+            log.lock()
+                .unwrap()
+                .push(format!("probe(tracked={})", tracked.len()));
             std::future::ready(p)
         }
     }
 
-    fn recording_write(log: Log) -> impl FnOnce(&[u8]) -> Result<(), String> {
-        move |bytes| {
-            log.lock()
-                .unwrap()
-                .push(format!("write:{}", String::from_utf8_lossy(bytes)));
-            Ok(())
+    /// A pane that echoes typed bytes onto its input line when `echoes`.
+    struct FakePane {
+        typed: Arc<Mutex<Vec<u8>>>,
+        echoes: bool,
+        initial: ScreenText,
+    }
+
+    impl FakePane {
+        fn new(initial: ScreenText, echoes: bool) -> Self {
+            Self {
+                typed: Arc::default(),
+                echoes,
+                initial,
+            }
+        }
+
+        fn write(&self, log: Log) -> impl FnMut(&[u8]) -> Result<(), String> {
+            let typed = Arc::clone(&self.typed);
+            move |bytes| {
+                typed.lock().unwrap().extend_from_slice(bytes);
+                log.lock()
+                    .unwrap()
+                    .push(format!("write:{:?}", String::from_utf8_lossy(bytes)));
+                Ok(())
+            }
+        }
+
+        fn screen(&self) -> impl FnMut() -> ScreenText {
+            let typed = Arc::clone(&self.typed);
+            let echoes = self.echoes;
+            let initial = self.initial.clone();
+            move || {
+                if echoes && typed.lock().unwrap().starts_with(EXIT_TEXT) {
+                    echoed_prompt()
+                } else {
+                    initial.clone()
+                }
+            }
         }
     }
 
@@ -229,89 +834,128 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn exits_then_closes_only_after_claude_is_gone() {
+    async fn exits_then_closes_only_after_two_consecutive_gone_probes() {
         let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
         let outcome = drive(
-            recording_write(log.clone()),
+            pane.write(log.clone()),
+            pane.screen(),
             scripted_probe(
                 vec![
-                    ClaudeProbe::Live(vec![42]),
-                    ClaudeProbe::Live(vec![42]),
-                    ClaudeProbe::Gone,
+                    readable(&[CLAUDE], 0, &[]),
+                    readable(&[], 0, &[]),
+                    readable(&[CLAUDE], 0, &[CLAUDE]),
+                    readable(&[], 0, &[]),
+                    readable(&[], 0, &[]),
                 ],
                 log.clone(),
             ),
             recording_close(log.clone()),
-            DEFAULT_DEADLINE,
-            POLL_INTERVAL,
+            timing(),
         )
         .await;
         assert_eq!(
             outcome,
             GracefulExitOutcome::Exited {
-                waited_ms: 1_000,
+                waited_ms: 2_000,
                 claude_pids: vec![42]
             }
         );
-        let log = entries(&log);
         assert_eq!(
-            log,
+            entries(&log),
             vec![
-                "probe:Live([42])",
-                "write:/exit\r",
-                "probe:Live([42])",
-                "probe:Gone",
+                "probe(tracked=0)",
+                "write:\"/exit\"",
+                "write:\"\\r\"",
+                "probe(tracked=1)",
+                "probe(tracked=1)",
+                "probe(tracked=1)",
+                "probe(tracked=1)",
                 "close",
             ]
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_claude_that_outlives_the_deadline_is_left_running_and_the_tab_is_not_closed() {
+    async fn a_claude_alive_elsewhere_in_the_table_blocks_the_close_until_the_deadline() {
         let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
         let outcome = drive(
-            recording_write(log.clone()),
-            scripted_probe(vec![ClaudeProbe::Live(vec![7, 8])], log.clone()),
+            pane.write(log.clone()),
+            pane.screen(),
+            scripted_probe(
+                vec![readable(&[CLAUDE], 0, &[]), readable(&[], 0, &[CLAUDE])],
+                log.clone(),
+            ),
             recording_close(log.clone()),
-            Duration::from_secs(60),
-            POLL_INTERVAL,
+            timing(),
         )
         .await;
         assert_eq!(
             outcome,
             GracefulExitOutcome::ExitStuck {
                 waited_ms: 60_000,
-                claude_pids: vec![7, 8],
+                claude_pids: vec![42],
                 last_probe_unreadable: false,
             }
         );
-        let log = entries(&log);
-        assert!(!log.iter().any(|e| e == "close"), "closed a live claude");
-        assert_eq!(log.iter().filter(|e| e.starts_with("write")).count(), 1);
+        assert!(!entries(&log).iter().any(|e| e == "close"));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn an_unreadable_table_while_waiting_never_reads_as_gone() {
+    async fn a_claude_that_outlives_the_deadline_is_left_running() {
         let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
         let outcome = drive(
-            recording_write(log.clone()),
+            pane.write(log.clone()),
+            pane.screen(),
+            scripted_probe(vec![readable(&[CLAUDE], 0, &[CLAUDE])], log.clone()),
+            recording_close(log.clone()),
+            timing(),
+        )
+        .await;
+        assert!(
+            matches!(
+                outcome,
+                GracefulExitOutcome::ExitStuck {
+                    waited_ms: 60_000,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(!entries(&log).iter().any(|e| e == "close"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unreadable_probe_breaks_the_gone_streak() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
+        let outcome = drive(
+            pane.write(log.clone()),
+            pane.screen(),
             scripted_probe(
                 vec![
-                    ClaudeProbe::Live(vec![9]),
+                    readable(&[CLAUDE], 0, &[]),
+                    readable(&[], 0, &[]),
+                    ClaudeProbe::Unreadable("boom".into()),
+                    readable(&[], 0, &[]),
                     ClaudeProbe::Unreadable("boom".into()),
                 ],
                 log.clone(),
             ),
             recording_close(log.clone()),
-            Duration::from_secs(5),
-            POLL_INTERVAL,
+            ExitTiming {
+                deadline: Duration::from_secs(5),
+                ..timing()
+            },
         )
         .await;
         assert_eq!(
             outcome,
             GracefulExitOutcome::ExitStuck {
                 waited_ms: 5_000,
-                claude_pids: vec![9],
+                claude_pids: vec![42],
                 last_probe_unreadable: true,
             }
         );
@@ -319,87 +963,149 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn no_claude_means_nothing_is_written_or_closed() {
-        let log: Log = Arc::default();
-        let outcome = drive(
-            recording_write(log.clone()),
-            scripted_probe(vec![ClaudeProbe::Gone], log.clone()),
-            recording_close(log.clone()),
-            DEFAULT_DEADLINE,
-            POLL_INTERVAL,
-        )
-        .await;
-        assert_eq!(outcome, GracefulExitOutcome::NoLiveClaude);
-        assert_eq!(entries(&log), vec!["probe:Gone"]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_unreadable_table_up_front_writes_nothing() {
-        let log: Log = Arc::default();
-        let outcome = drive(
-            recording_write(log.clone()),
-            scripted_probe(vec![ClaudeProbe::Unreadable("x".into())], log.clone()),
-            recording_close(log.clone()),
-            DEFAULT_DEADLINE,
-            POLL_INTERVAL,
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            GracefulExitOutcome::ProbeUnavailable {
-                detail: "x".to_string()
+    async fn refusals_before_typing_write_nothing() {
+        let cases: Vec<(ClaudeProbe, ScreenText, &str)> = vec![
+            (
+                readable(&[CLAUDE, id(43, 1_001)], 0, &[]),
+                empty_prompt(),
+                "2 claude processes",
+            ),
+            (
+                readable(&[CLAUDE], 3, &[]),
+                empty_prompt(),
+                "3 child process",
+            ),
+            (
+                readable(&[CLAUDE], 0, &[]),
+                draft_prompt(),
+                "not at an empty prompt",
+            ),
+            (
+                readable(&[CLAUDE], 0, &[]),
+                permission_dialog(),
+                "not at an empty prompt",
+            ),
+        ];
+        for (probe, initial, expect) in cases {
+            let log: Log = Arc::default();
+            let pane = FakePane::new(initial, true);
+            let outcome = drive(
+                pane.write(log.clone()),
+                pane.screen(),
+                scripted_probe(vec![probe], log.clone()),
+                recording_close(log.clone()),
+                timing(),
+            )
+            .await;
+            match &outcome {
+                GracefulExitOutcome::Refused { reason, .. } => {
+                    assert!(reason.contains(expect), "{reason} !~ {expect}")
+                }
+                other => panic!("expected Refused ({expect}), got {other:?}"),
             }
-        );
-        assert_eq!(entries(&log).len(), 1);
+            assert!(pane.typed.lock().unwrap().is_empty(), "{expect}: typed");
+            assert!(!entries(&log).iter().any(|e| e == "close"));
+        }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_failed_write_closes_nothing_and_stops_probing() {
+    async fn a_missing_echo_clears_the_line_and_never_submits() {
         let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), false);
+        let outcome = drive(
+            pane.write(log.clone()),
+            pane.screen(),
+            scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
+            recording_close(log.clone()),
+            timing(),
+        )
+        .await;
+        assert!(
+            matches!(&outcome, GracefulExitOutcome::Refused { reason, .. } if reason.contains("did not echo")),
+            "{outcome:?}"
+        );
+        assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\x15");
+        assert!(!entries(&log).iter().any(|e| e == "close"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_claude_or_an_unreadable_table_types_nothing() {
+        for (probe, expected) in [
+            (readable(&[], 0, &[]), GracefulExitOutcome::NoLiveClaude),
+            (
+                ClaudeProbe::Unreadable("x".into()),
+                GracefulExitOutcome::ProbeUnavailable {
+                    detail: "x".to_string(),
+                },
+            ),
+        ] {
+            let log: Log = Arc::default();
+            let pane = FakePane::new(empty_prompt(), true);
+            let outcome = drive(
+                pane.write(log.clone()),
+                pane.screen(),
+                scripted_probe(vec![probe], log.clone()),
+                recording_close(log.clone()),
+                timing(),
+            )
+            .await;
+            assert_eq!(outcome, expected);
+            assert_eq!(entries(&log).len(), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_closes_nothing() {
+        let log: Log = Arc::default();
+        let pane = FakePane::new(empty_prompt(), true);
         let outcome = drive(
             |_bytes: &[u8]| Err("terminal exited".to_string()),
-            scripted_probe(vec![ClaudeProbe::Live(vec![3])], log.clone()),
+            pane.screen(),
+            scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
             recording_close(log.clone()),
-            DEFAULT_DEADLINE,
-            POLL_INTERVAL,
+            timing(),
         )
         .await;
         assert_eq!(
             outcome,
             GracefulExitOutcome::WriteFailed {
                 error: "terminal exited".to_string(),
-                claude_pids: vec![3]
+                claude_pids: vec![42]
             }
         );
-        assert_eq!(entries(&log), vec!["probe:Live([3])"]);
+        assert_eq!(entries(&log), vec!["probe(tracked=0)"]);
     }
 
     #[test]
     fn outcome_wire_shape() {
-        let json = serde_json::to_value(GracefulExitOutcome::ExitStuck {
-            waited_ms: 60_000,
+        let json = serde_json::to_value(GracefulExitOutcome::Refused {
+            reason: "not at an empty prompt".into(),
             claude_pids: vec![1],
-            last_probe_unreadable: false,
         })
         .unwrap();
         assert_eq!(
             json,
             serde_json::json!({
-                "outcome": "exit_stuck", "waited_ms": 60000,
-                "claude_pids": [1], "last_probe_unreadable": false
+                "outcome": "refused", "reason": "not at an empty prompt", "claude_pids": [1]
             })
         );
     }
 
-    /// Structural pin on the invariant: this module never names a kill path.
-    /// `drive` can only reach the pane through the three injected effects, and
-    /// the production caller's `close_tab` is the ordinary tab close — so a
-    /// kill of a live `claude` would have to be introduced HERE first.
+    #[test]
+    fn windows_probes_at_most_once_a_second() {
+        if cfg!(windows) {
+            assert!(POLL_INTERVAL >= Duration::from_secs(1));
+        } else {
+            assert_eq!(POLL_INTERVAL, Duration::from_millis(500));
+        }
+    }
+
+    /// Structural pin on the invariant: this module's code never names a kill
+    /// path. `drive` reaches the pane only through its injected effects, and
+    /// the production close is `TerminalManager::graceful_exit`'s.
     #[test]
     fn this_module_contains_no_kill_path() {
         let source = include_str!("graceful_exit.rs");
-        // Code only: the module docs deliberately NAME the kill path they
-        // explain the primitive avoids.
         let production: String = source
             .split("#[cfg(test)]")
             .next()

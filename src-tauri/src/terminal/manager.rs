@@ -612,6 +612,70 @@ impl TerminalManager {
         }
     }
 
+    /// Gracefully exit the `claude` in terminal `id`, then close the tab — the
+    /// ONE public graceful-exit entry point (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, D5; protocol in
+    /// [`crate::terminal::graceful_exit`]).
+    ///
+    /// Types `/exit` only at an empty prompt, waits up to `deadline` for every
+    /// `claude` it saw to be gone from the whole process table, and only then
+    /// removes the pane from this manager and closes it — without a kill when
+    /// the pane's own process already exited. A `claude` that outlives the
+    /// deadline is reported `ExitStuck` and LEFT RUNNING.
+    pub async fn graceful_exit(
+        self: &std::sync::Arc<Self>,
+        id: &str,
+        deadline: std::time::Duration,
+    ) -> Result<crate::terminal::graceful_exit::GracefulExitOutcome, String> {
+        let session = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal session not found: {}", id))?;
+        let manager = std::sync::Arc::clone(self);
+        let terminal_id = id.to_string();
+        Ok(session
+            .graceful_exit_then(deadline, move || async move {
+                let closing = terminal_id.clone();
+                match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+                    manager.close_after_graceful_exit(&closing)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close failed")
+                    }
+                    Err(e) => {
+                        tracing::warn!(terminal_id = %terminal_id, error = %e, "graceful_exit: tab close task failed")
+                    }
+                }
+            })
+            .await)
+    }
+
+    /// [`Self::close`], but through `TerminalSession::close_after_graceful_exit`
+    /// — reachable only from [`Self::graceful_exit`]'s gone arm.
+    fn close_after_graceful_exit(&self, id: &str) -> Result<(), String> {
+        let session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|e| format!("Sessions lock poisoned: {}", e))?;
+            sessions.remove(id)
+        };
+
+        if let Ok(mut map) = self.remote_identities.lock() {
+            map.remove(id);
+        }
+
+        match session {
+            Some(session) => {
+                session.close_after_graceful_exit();
+                Ok(())
+            }
+            None => Err(format!("Terminal session not found: {}", id)),
+        }
+    }
+
     /// List all terminal sessions with their info, sorted by creation time.
     pub fn list(&self) -> Vec<TerminalInfo> {
         let sessions = match self.sessions.lock() {

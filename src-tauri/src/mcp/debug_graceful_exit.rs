@@ -1,24 +1,23 @@
-//! Debug-only door onto `TerminalSession::graceful_exit` (plan
+//! Debug-profile door onto `TerminalManager::graceful_exit` (plan
 //! `2026-09-13-drained-runner-never-reaches-idle`, Phase 1 falsification step
-//! 2): `POST /__debug/terminals/{id}/graceful-exit?deadline_s=N` types `/exit`
-//! into that pane, waits for its `claude` to leave, closes the tab through
-//! `TerminalManager::close` only once it has, and answers the
+//! 2): `POST /__debug/terminals/{id}/graceful-exit?deadline_s=N` runs the
+//! graceful-exit protocol on that pane and answers the
 //! [`GracefulExitOutcome`].
 //!
 //! Nothing in the runner calls graceful exit on its own in Phase 1, so this is
-//! the one way to exercise the primitive against a real pane on a temp runner.
+//! the one way to exercise the primitive against a real pane.
 //!
-//! # It cannot ship
+//! # Where it exists
 //!
 //! Declared `#[cfg(debug_assertions)]` in `mcp/mod.rs` and merged under the
-//! same gate in `mcp_api`, following `mcp::debug_wedge`. A release build holds
-//! neither the handler nor the route.
-//!
-//! # It never kills a live `claude`
-//!
-//! The tab close is handed to `graceful_exit_then`, which invokes it only
-//! after the pane's subtree holds no `claude`. An `exit_stuck` answer means the
-//! process was left running and the tab left open.
+//! same gate in `mcp_api`, following `mcp::debug_wedge`. That keeps it out of
+//! release builds, but it is NOT test-only: the supervisor builds runners in
+//! the dev profile, so every supervisor-built runner, temporary ones included,
+//! serves this route. It adds no capability beyond what that runner's loopback
+//! API already offers unauthenticated — `POST /terminals/{id}/write` can type
+//! anything into a pane and `DELETE /terminals/{id}` closes one with a kill —
+//! and it is strictly more conservative than either: it refuses unless the
+//! pane sits at an empty prompt, and it never kills a live `claude`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,12 +27,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use tauri::Manager;
-use tracing::warn;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::terminal::graceful_exit::{GracefulExitOutcome, DEFAULT_DEADLINE};
 use crate::terminal::TerminalManager;
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
 /// Ceiling on a requested deadline, so a typo cannot hold a request open for
 /// an hour.
@@ -70,25 +67,10 @@ pub async fn graceful_exit_handler(
                 Json(api_error("TerminalManager is not available")),
             )
         })?;
-    let session = manager.get(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Terminal session not found: {id}"))),
-        )
-    })?;
-
-    let deadline = resolve_deadline(query.deadline_s);
-    let terminal_id = id.clone();
-    let outcome = session
-        .graceful_exit_then(deadline, move || async move {
-            let closing = terminal_id.clone();
-            match spawn_blocking_tracked(move || manager.close(&closing)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!(terminal_id = %terminal_id, error = %e, "graceful-exit: tab close failed"),
-                Err(e) => warn!(terminal_id = %terminal_id, error = %e, "graceful-exit: tab close task failed"),
-            }
-        })
-        .await;
+    let outcome = manager
+        .graceful_exit(&id, resolve_deadline(query.deadline_s))
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(api_error(e))))?;
     Ok(Json(ApiResponse::success(outcome)))
 }
 
