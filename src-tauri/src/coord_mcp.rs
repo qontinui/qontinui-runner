@@ -4500,32 +4500,17 @@ pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uui
     resolve_session_tenant(binding_pin, live_pin, device_jwt_claim_tenant)
 }
 
-/// The forwarder could name no tenant by ANY route: the machine pin is
-/// `Unresolvable` AND the device JWT carries no readable `tenant_id` claim.
-/// The forwarder turns this into [`tenant_unresolvable_error`] and refuses
-/// before any upstream call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TenantUnresolvable;
-
-/// The NON-LOGGING core of the authority order: which tenant the forwarder
-/// selects for a session, with no side effect beyond the one claim read.
-///
-/// This is the single authority for "which tenant key does coord's verdict
-/// file under", so it has two consumers that must never drift apart:
-///
-/// * the forwarder, through [`resolve_session_tenant`] (which adds the
-///   diagnostics and the typed refusal body);
-/// * the device-JWT refresher's upstream-bucket eviction sweep, which asks it
-///   for an UNPINNED session's tenant once per pass. It must not log: at one
-///   call per 5-minute pass the claim-fallback `warn!` would repeat forever.
+/// Pure-over-injected-parts core of [`session_tenant_or_refuse`], so the
+/// authority order is unit-testable without touching `$HOME`, the nonce
+/// registry, or the credential store.
 ///
 /// `jwt_claim_tenant` is called at most once, and only on the arm that needs
 /// it — it reads the credential store.
-pub(crate) fn select_session_tenant(
+pub(crate) fn resolve_session_tenant(
     binding_pin: crate::session::tenant_pin::TenantPin,
     live_pin: crate::session::tenant_pin::TenantPin,
     jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
-) -> Result<Option<Uuid>, TenantUnresolvable> {
+) -> Result<Option<Uuid>, (u16, String)> {
     use crate::session::tenant_pin::TenantPin;
 
     // Row 1. The ONE authority the binding keeps: an explicitly pinned session
@@ -4533,6 +4518,13 @@ pub(crate) fn select_session_tenant(
     // multi-tenant device it is the only thing that can tell two co-resident
     // sessions apart. It NAMES a tenant; it no longer selects a slot family.
     if let TenantPin::Pinned(t) = binding_pin {
+        if live_pin != binding_pin {
+            tracing::debug!(
+                "coord_mcp: session pinned to tenant {t} at mint time while this machine \
+                 now reads {live_pin:?} — honoring the session's own tenant (provenance \
+                 telemetry, not a credential-slot choice)"
+            );
+        }
         return Ok(Some(t));
     }
 
@@ -4543,57 +4535,32 @@ pub(crate) fn select_session_tenant(
     match live_pin {
         TenantPin::Pinned(t) => Ok(Some(t)),
         TenantPin::Unpinned => Ok(None),
-        // FAIL-CLOSED, and it stays that way. Second and last route to a
-        // tenant: the device JWT's own claim, which coord issued and which is
-        // authoritative. NEVER fall through to `Ok(None)` here — that would
-        // silently route an unresolvable device onto whichever slot happens to
-        // exist, which is the Phase-1 defect wearing a different hat.
-        TenantPin::Unresolvable => jwt_claim_tenant().map(Some).ok_or(TenantUnresolvable),
+        TenantPin::Unresolvable => {
+            // FAIL-CLOSED, and it stays that way. Second and last route to a
+            // tenant: the device JWT's own claim, which coord issued and which
+            // is authoritative. NEVER fall through to `Ok(None)` here — that
+            // would silently route an unresolvable device onto whichever slot
+            // happens to exist, which is the Phase-1 defect wearing a
+            // different hat.
+            match jwt_claim_tenant() {
+                Some(t) => {
+                    warn!(
+                        "coord_mcp: machine pin unresolvable; falling back to the \
+                         device JWT's tenant claim ({t}) — repair ~/.qontinui/machine.json"
+                    );
+                    Ok(Some(t))
+                }
+                None => {
+                    warn!(
+                        "coord_mcp: REFUSING proxy request — tenant unresolvable by \
+                         any route (no usable machine.json pin and no tenant_id claim \
+                         on the device JWT)"
+                    );
+                    Err(tenant_unresolvable_error())
+                }
+            }
+        }
     }
-}
-
-/// Pure-over-injected-parts core of [`session_tenant_or_refuse`], so the
-/// authority order is unit-testable without touching `$HOME`, the nonce
-/// registry, or the credential store.
-///
-/// The decision itself is [`select_session_tenant`]; this wrapper adds the
-/// forwarder's diagnostics and maps "unresolvable by any route" to the typed
-/// refusal the proxy returns verbatim.
-pub(crate) fn resolve_session_tenant(
-    binding_pin: crate::session::tenant_pin::TenantPin,
-    live_pin: crate::session::tenant_pin::TenantPin,
-    jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
-) -> Result<Option<Uuid>, (u16, String)> {
-    use crate::session::tenant_pin::TenantPin;
-
-    let selected = select_session_tenant(binding_pin, live_pin, jwt_claim_tenant);
-    match (binding_pin, selected) {
-        (TenantPin::Pinned(t), _) if live_pin != binding_pin => {
-            tracing::debug!(
-                "coord_mcp: session pinned to tenant {t} at mint time while this machine \
-                 now reads {live_pin:?} — honoring the session's own tenant (provenance \
-                 telemetry, not a credential-slot choice)"
-            );
-        }
-        // A pinned binding that agrees with the machine: nothing to say, and it
-        // must not fall through to the `Unresolvable` arms below.
-        (TenantPin::Pinned(_), _) => {}
-        (_, Ok(Some(t))) if live_pin == TenantPin::Unresolvable => {
-            warn!(
-                "coord_mcp: machine pin unresolvable; falling back to the \
-                 device JWT's tenant claim ({t}) — repair ~/.qontinui/machine.json"
-            );
-        }
-        (_, Err(TenantUnresolvable)) => {
-            warn!(
-                "coord_mcp: REFUSING proxy request — tenant unresolvable by \
-                 any route (no usable machine.json pin and no tenant_id claim \
-                 on the device JWT)"
-            );
-        }
-        _ => {}
-    }
-    selected.map_err(|TenantUnresolvable| tenant_unresolvable_error())
 }
 
 /// Async wrapper: resolve the session tenant AND read its bearer, or refuse.
@@ -4777,38 +4744,6 @@ mod session_tenant_resolution_tests {
             Ok(Some(t))
         );
     }
-
-    /// The non-logging core the refresher's eviction sweep uses must select
-    /// EXACTLY what the forwarder selects, on every arm — one authority for
-    /// "which tenant key does coord's verdict file under", so the sweep and the
-    /// forwarder cannot drift.
-    #[test]
-    fn the_non_logging_core_agrees_with_the_forwarder_on_every_arm() {
-        let a = tenant(0x33);
-        let b = tenant(0x44);
-        let pins = [
-            TenantPin::Pinned(a),
-            TenantPin::Unpinned,
-            TenantPin::Unresolvable,
-        ];
-        for binding in pins {
-            for live in [
-                TenantPin::Pinned(b),
-                TenantPin::Unpinned,
-                TenantPin::Unresolvable,
-            ] {
-                for claim in [Some(tenant(0x55)), None] {
-                    let core = select_session_tenant(binding, live, || claim);
-                    let forwarder = resolve_session_tenant(binding, live, || claim);
-                    match (core, forwarder) {
-                        (Ok(c), Ok(f)) => assert_eq!(c, f, "{binding:?}/{live:?}/{claim:?}"),
-                        (Err(TenantUnresolvable), Err((status, _))) => assert_eq!(status, 503),
-                        other => panic!("core and forwarder diverged: {other:?}"),
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// The `tenant_id` claim on whatever device JWT this runner currently holds.
@@ -4818,13 +4753,7 @@ mod session_tenant_resolution_tests {
 /// the existing unverified-payload decoder ([`qontinui_runner_lib::pair::tenant_id_from_oauth_claim`]);
 /// signature verification is coord's job, and the value is used only to pick a
 /// local credential slot, never as an authorization decision.
-///
-/// `None` is AMBIGUOUS, and callers that act destructively on it must treat it
-/// as UNKNOWN: it folds an absent store, an undecryptable store, a keychain
-/// failure, a token that is not a JWT, and a JWT with no `tenant_id` claim
-/// into one answer. The upstream-bucket eviction sweep
-/// (`device_jwt_refresher::resolve_writable_slot_keys`) therefore aborts on it.
-pub(crate) fn device_jwt_claim_tenant() -> Option<Uuid> {
+fn device_jwt_claim_tenant() -> Option<Uuid> {
     // The RAW slot, deliberately — NOT `device_bearer_for(None)`, which since
     // Phase 1a returns `None` for an expired or opaque token. Expiry
     // invalidates a token as a CREDENTIAL; it does not invalidate the

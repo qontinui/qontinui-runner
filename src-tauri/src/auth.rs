@@ -2920,6 +2920,42 @@ mod bearer_selection_tests {
         );
     }
 
+    /// PINS an invariant the device-JWT refresher's upstream-bucket eviction
+    /// sweep is BUILT on (`device_jwt_refresher::resolve_writable_slot_keys`):
+    /// a bearer — and therefore a coord verdict filed under a tenant's key —
+    /// exists only for a tenant with a slot or for the default binding. The
+    /// sweep treats every other tenant key as an orphan and evicts it.
+    ///
+    /// If a legacy-slot fallback is ever added here for a slotless NON-default
+    /// tenant (for example, a machine whose pin is unresolvable falling back to
+    /// the device JWT's `tenant_id` claim), that tenant's rejections would be
+    /// recorded under a key the sweep deletes — collapsing the posture to
+    /// `live` while coord refuses every call. Change the sweep's writable set
+    /// in the same change, or do not add the fallback.
+    #[test]
+    fn a_slotless_non_default_tenant_gets_no_bearer_even_beside_a_live_legacy_slot() {
+        let mgr = create_test_auth_manager("sweep_invariant_slotless_stranger");
+        let legacy = live_jwt("legacy.jwt");
+        mgr.store_tokens(&legacy, "").unwrap();
+        let stranger = tenant(0xC7);
+
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&stranger), None),
+            None,
+            "no default binding: a slotless tenant must not be served the legacy slot"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&stranger), Some(tenant(0xC8))),
+            None,
+            "a different default: a slotless tenant must not be served the legacy slot"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&stranger), Some(stranger)).as_deref(),
+            Some(legacy.as_str()),
+            "the ONE legacy route: the tenant IS the default binding"
+        );
+    }
+
     /// An empty/whitespace tenant-slot value counts as a miss and follows
     /// the same posture (default → legacy fallback; stranger → None).
     #[test]
