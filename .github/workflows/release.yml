@@ -284,10 +284,12 @@ jobs:
       #
       # Deliberately NOT using .github/actions/checkout-sibling here: a release
       # must be built against LANDED schemas, never against an unlanded PR head.
-      # Every other schemas checkout under .github/ now goes through that action
-      # — this clone is the ONLY survivor, and forbid-sibling-clone.yml
-      # allowlists this file BY NAME so that stays a deliberate exception rather
-      # than the first of a new crop.
+      # Every other schemas checkout under .github/ goes through that action.
+      # This step is the only survivor, and it does not clone: it fetches the
+      # commit pinned in .github/sibling-pins.conf by SHA, after checking that
+      # the commit has landed on schemas main. forbid-sibling-clone.yml no longer
+      # needs to exempt this file, because a pinned fetch does not match its
+      # pattern. A `git clone` re-added here would be caught.
       #
       # THE EXCLUSION IS A POLICY ABOUT RELEASE PROVENANCE — NOT a consequence
       # of how the action is keyed. It is worth being precise about that,
