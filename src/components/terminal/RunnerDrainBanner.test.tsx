@@ -24,6 +24,7 @@ function snap(over: Partial<CoordDrainSnapshot>): CoordDrainSnapshot {
     deferredCount: 0,
     deferredByOrigin: {},
     lastReadAt: "2026-09-14T10:00:00Z",
+    bootReadPending: false,
     ...over,
   };
 }
@@ -104,5 +105,25 @@ describe("autonomousResumeDetector", () => {
     expect(fired).toBe(1);
     feed(snap({ state: "clear" }));
     expect(fired).toBe(1);
+  });
+});
+
+describe("drainBannerModel — boot", () => {
+  it("does not flash the unknown banner while the boot read is in flight", () => {
+    expect(
+      drainBannerModel(
+        snap({
+          state: "unknown",
+          autonomousSpawnsAllowed: false,
+          cause: "coord drain state not read yet",
+          bootReadPending: true,
+        }),
+      ),
+    ).toBeNull();
+    expect(
+      drainBannerModel(
+        snap({ state: "unknown", autonomousSpawnsAllowed: false, bootReadPending: false }),
+      )?.heading,
+    ).toBe(UNKNOWN_HEADING);
   });
 });

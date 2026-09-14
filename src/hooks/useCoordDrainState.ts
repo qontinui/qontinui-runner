@@ -40,6 +40,8 @@ export interface CoordDrainSnapshot {
   deferredCount: number;
   deferredByOrigin: Record<string, number>;
   lastReadAt: string;
+  /** True while the boot read is still in flight and nothing has been read. */
+  bootReadPending: boolean;
 }
 
 const STATES: readonly string[] = ["clear", "drained", "unknown", "not_enrolled"];

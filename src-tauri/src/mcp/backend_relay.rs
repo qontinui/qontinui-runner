@@ -3883,7 +3883,7 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     // dispatch, not an operator sitting at this runner, so it is deferred while
     // the device is drained or its drain state is unknown. Refused BEFORE the
     // grant gate below, so a deferral spends no create grant.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
             &format!(
@@ -3896,7 +3896,9 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
     {
         return Some(serde_json::json!({
             "type": "error",
-            "code": "device_drained",
+            // `drain_unreadable` while the state is unknown, `device_drained`
+            // only when coord said drained.
+            "code": class.code(),
             "message": reason,
             "request_id": data.get("request_id"),
         }));

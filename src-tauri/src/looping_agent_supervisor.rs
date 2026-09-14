@@ -525,7 +525,7 @@ async fn supervise_one(
         // agent id), and logged at debug: this repeats every tick while the
         // drain holds, and the transition itself is logged by
         // `coord_drain_state`.
-        if let crate::coord_drain_state::DrainGate::Defer { reason } = &drain {
+        if let crate::coord_drain_state::DrainGate::Defer { reason, .. } = &drain {
             crate::coord_drain_state::record_deferral(
                 crate::coord_drain_state::SpawnOrigin::LoopingAgent,
                 &looping_agent_work_key(&rec.def.id),
@@ -1253,6 +1253,7 @@ mod drain_rewrite_tests {
     fn a_deferring_drain_turns_spawn_relaunch_and_nudge_into_none() {
         let defer = DrainGate::Defer {
             reason: "drained".into(),
+            class: crate::coord_drain_state::DeferClass::Drained,
         };
         for action in ACTIONS {
             assert_eq!(drain_rewrite(action, &defer), Action::None, "{action:?}");

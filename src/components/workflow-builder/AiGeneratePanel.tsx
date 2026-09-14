@@ -61,6 +61,7 @@ import {
 } from "@/lib/workflow-builder/buildSpecWorkflow";
 import type { UnifiedWorkflow } from "../../types/unified-workflow";
 import { createLogger } from "@/lib/logger";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 const log = createLogger("AiGeneratePanel");
 
@@ -416,16 +417,24 @@ export function AiGeneratePanel({
     ? batchEntries.some((e) => e.prompt.trim())
     : !!description.trim() || hasSpecsSelected;
 
+  /** The generate-async door's JSON body: the enveloped or the bare shape. */
+  type GenerateAsyncBody = {
+    error?: string;
+    task_run_id?: string;
+    data?: { task_run_id?: string };
+  };
+
   /** Fire a single generate-async request and return the task_run_id. */
   const fireGenerateRequest = async (request: Record<string, unknown>): Promise<string> => {
-    const resp = await tracedFetch(`${getApiBase()}/unified-workflows/generate-async`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-    });
-    const json = await resp.json();
-    if (!resp.ok) {
-      throw new Error(json.error || `HTTP ${resp.status}`);
+    // As an OPERATOR (the Tauri twin of POST /unified-workflows/generate-async),
+    // which coord's device drain never defers.
+    const reply = await invokeOperatorDoor<GenerateAsyncBody>(
+      "operator_generate_unified_workflow_async",
+      { request },
+    );
+    const json = reply.body;
+    if (!reply.ok) {
+      throw new Error(json.error || `HTTP ${reply.status}`);
     }
     const data = json.data ?? json;
     return data.task_run_id as string;

@@ -1758,7 +1758,9 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
     // contribute here (the primary keeps `last_seen_at` fresh), so it stays off
     // the wire entirely rather than sending a partial payload.
     if !machine_state_publish_allowed(crate::instance::owns_shared_root_state()) {
-        return Ok(HeartbeatOutcome::SecondaryInstance);
+        return Ok(HeartbeatOutcome::NotSent {
+            why: "a secondary instance sends no register payload",
+        });
     }
     let device = match load_device_file() {
         Some(d) => d,
@@ -1800,8 +1802,11 @@ pub async fn heartbeat_to_coord() -> Result<crate::coord_drain_state::HeartbeatO
         Some(b) => b,
         None => {
             warn_tenant_id_unresolvable_once();
-            return Ok(HeartbeatOutcome::NotEnrolled {
-                why: "no tenant binding — the runner is not paired",
+            // Still a coord device (machine.json + coord URL): coord can hold
+            // it drained, so this is a miss that trends to Unknown unless the
+            // device-JWT `me/drain` read answers — never NotEnrolled.
+            return Ok(HeartbeatOutcome::NotSent {
+                why: "no tenant binding — the register heartbeat was not sent",
             });
         }
     };

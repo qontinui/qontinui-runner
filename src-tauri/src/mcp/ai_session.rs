@@ -510,7 +510,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
         .without_v07_checks()
         .route("/stop-ai-analysis", post(stop_ai_analysis))
         .route("/restart-runner", post(restart_runner))
-        .route("/prompts/run", post(run_prompt))
+        .route("/prompts/run", post(run_prompt_http))
         .route("/sessions/idle-status", get(idle_status))
         .route("/auth/freshness", get(auth_freshness))
         .route(
@@ -1833,9 +1833,29 @@ components between the two apps.
 ///
 /// Optional image analysis: provide `image_paths`, `video_paths`, or `trace_path`
 /// to enhance the prompt with visual analysis data.
-pub async fn run_prompt(
+/// `POST /prompts/run`. An HTTP caller's reason is not this runner's to name,
+/// so it is autonomous (`unknown`) under coord's device drain (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`): 409 while the device is
+/// drained or its drain state is unknown. The runner UI calls
+/// [`run_prompt`] through the `operator_run_prompt` Tauri command instead.
+pub async fn run_prompt_http(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunPromptRequest>,
+) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    run_prompt(
+        state,
+        request,
+        crate::coord_drain_state::SpawnOrigin::Unknown,
+    )
+    .await
+}
+
+/// Run a prompt on behalf of `origin` — the HTTP door passes `unknown`, the
+/// runner UI's Tauri twin an operator origin.
+pub async fn run_prompt(
+    state: Arc<ApiState>,
+    request: RunPromptRequest,
+    origin: crate::coord_drain_state::SpawnOrigin,
 ) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Graceful-drain gate (Phase 2): refuse new AI turns once a planned
     // restart has begun draining, so we don't spawn work the imminent kill
@@ -1846,6 +1866,28 @@ pub async fn run_prompt(
             Json(api_error(
                 "runner is draining for a planned restart — new prompts are refused",
             )),
+        ));
+    }
+
+    // Coord's device drain: an autonomous caller is refused before any state,
+    // file or process exists.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            origin,
+            &format!(
+                "prompt:{}",
+                request
+                    .prompt_id
+                    .as_deref()
+                    .or(request.name.as_deref())
+                    .unwrap_or("ad-hoc")
+            ),
+        )
+    {
+        warn!("MCP API: refusing POST /prompts/run — {reason}");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
         ));
     }
 

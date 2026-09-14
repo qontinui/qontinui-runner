@@ -51,7 +51,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::ai_session_executor::{self, can_complete, WorkerSignal};
@@ -408,9 +408,35 @@ impl SignalSource for ManagerSignalSource {
 /// `task_run_id` + flips to `Working`). Tests inject a fake that records the
 /// dispatch and persists the transition itself, so readiness/cap/resume logic
 /// is exercised WITHOUT a live spawn.
+/// Why a dispatch did not produce a live worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    /// Coord's device drain deferred it (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`). TRANSIENT and expected
+    /// for as long as the drain holds: the subtask stays `Submitted` and a later
+    /// tick retries, so it is logged quietly rather than as a failure.
+    DeferredByDrain(String),
+    /// Anything else. The subtask also stays `Submitted` and is retried.
+    Failed(String),
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchError::DeferredByDrain(m) | DispatchError::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for DispatchError {
+    fn from(message: String) -> Self {
+        DispatchError::Failed(message)
+    }
+}
+
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
-    async fn dispatch(&self, run_id: Uuid, subtask: &Subtask) -> Result<Uuid, String>;
+    async fn dispatch(&self, run_id: Uuid, subtask: &Subtask) -> Result<Uuid, DispatchError>;
 
     /// Re-prompt an in-flight worker (step-5 recovery). The live impl POSTs to
     /// the runner's `submit-prompt` path; tests record the call.
@@ -426,7 +452,7 @@ pub struct AiSessionDispatcher {
 
 #[async_trait]
 impl Dispatcher for AiSessionDispatcher {
-    async fn dispatch(&self, run_id: Uuid, subtask: &Subtask) -> Result<Uuid, String> {
+    async fn dispatch(&self, run_id: Uuid, subtask: &Subtask) -> Result<Uuid, DispatchError> {
         ai_session_executor::dispatch_subtask(&self.app_handle, &self.pg, run_id, subtask).await
     }
 
@@ -893,6 +919,11 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
         if let Some(st) = by_id.get(tid.as_str()) {
             match dispatcher.dispatch(run_id, st).await {
                 Ok(trid) => info!("conductor: dispatched {tid} → worker {trid} (run {run_id})"),
+                // Expected for as long as coord's device drain holds; every
+                // tick would otherwise WARN once per queued subtask.
+                Err(DispatchError::DeferredByDrain(reason)) => {
+                    debug!("apply_tick: dispatch {tid} deferred by the device drain: {reason}");
+                }
                 Err(e) => {
                     // Dispatch failed before the worker was live; the subtask
                     // stays Submitted (dispatch_subtask only flips on success)
@@ -1409,7 +1440,7 @@ mod tests {
     }
     #[async_trait]
     impl Dispatcher for FakeDispatcher {
-        async fn dispatch(&self, _run_id: Uuid, subtask: &Subtask) -> Result<Uuid, String> {
+        async fn dispatch(&self, _run_id: Uuid, subtask: &Subtask) -> Result<Uuid, DispatchError> {
             self.dispatched
                 .lock()
                 .unwrap()

@@ -10,6 +10,23 @@
 //! mechanism coord's `spawn_admission_sites.txt` applies to coord's publish seam.
 //!
 //! Test-only: the whole module is `#[cfg(test)]` in `main.rs`.
+//!
+//! ## Known limits (a source scan, not a type check)
+//!
+//! * A `TerminalManager::create` is recognised by its RECEIVER's shape: any
+//!   binding or field whose name contains `terminal_manager`, the conventional
+//!   short names `tm` / `mgr` / `manager` / `create_manager`,
+//!   `get_terminal_manager(..).create(`, and `state::<Arc<TerminalManager>>()`
+//!   (optionally `.inner()`) `.create(`. A manager bound to an unrelated name and
+//!   then `.create(`-ed is not seen. The type-level fix — an admission token the
+//!   spawn primitives require — is a recorded follow-up.
+//! * A block comment is recognised when `/*` opens a line; a `/*` in the middle
+//!   of a code line is not tracked.
+//! * "Branches on the gate result" is judged per statement: a gate call is BARE
+//!   only when its statement is nothing but the (path-qualified) call, optionally
+//!   `.await`-ed, ending in `;` — or `let _ = …;`. Anything that consumes the
+//!   value (`if`, `if let`, `match`, `let name =`, `?`, an argument, a tail
+//!   expression) passes.
 
 use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +44,15 @@ const GATE_CALLS: &[&str] = &[
     "authorize_spawn(",
     "authorize_fanout_spawn(",
     "authorize_fanout_spawn_with_budget(",
+    // Holds: they block until autonomous spawns may run, so they cannot be
+    // "discarded" the way a verdict can.
+    "wait_until_allowed(",
+    "held_until_allowed(",
 ];
+
+/// The [`GATE_CALLS`] that HOLD rather than answer: a bare `.await;` of one is
+/// the whole point, not a discarded verdict.
+const HOLD_CALLS: &[&str] = &["wait_until_allowed(", "held_until_allowed("];
 
 /// Text that makes a gate call NOT a drain gate for an autonomous site.
 const GATE_DEFEATERS: &[&str] = &[
@@ -84,13 +109,36 @@ fn load_sources() -> Sources {
         .collect()
 }
 
-fn is_comment(line: &str) -> bool {
-    let s = line.trim_start();
-    s.starts_with("//") || s.starts_with('*') || s.starts_with("/*")
+/// Per line: is it a comment? `//` lines, and every line of a `/* … */` block
+/// that opens a line. A `*`-led CODE line (`*slot = tm.create(..)`) is code —
+/// only inside a block comment does a leading `*` mean a comment.
+fn comment_mask(lines: &[&str]) -> Vec<bool> {
+    let mut in_block = false;
+    lines
+        .iter()
+        .map(|line| {
+            let t = line.trim_start();
+            if in_block {
+                if t.contains("*/") {
+                    in_block = false;
+                }
+                return true;
+            }
+            if t.starts_with("//") {
+                return true;
+            }
+            if t.starts_with("/*") {
+                in_block = !t.contains("*/");
+                return true;
+            }
+            false
+        })
+        .collect()
 }
 
 /// Line spans covered by a `#[cfg(test)] mod … { … }`.
 fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
+    let comments = comment_mask(lines);
     let mut spans = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         if !line.trim_start().starts_with("#[cfg(test)]") {
@@ -103,7 +151,7 @@ fn test_spans(lines: &[&str]) -> Vec<(usize, usize)> {
         };
         let mut depth = 0usize;
         for (j, l) in lines.iter().enumerate().skip(open) {
-            if is_comment(l) {
+            if comments[j] {
                 continue;
             }
             depth += l.matches('{').count();
@@ -126,9 +174,20 @@ fn fn_decl_re() -> Regex {
 /// the next is still a call.
 fn primitive_res() -> Vec<Regex> {
     [
-        r"\b(?:terminal_manager|create_manager|tm|manager)\s*\.\s*create\s*\(",
+        // TerminalManager::create, by receiver shape (see the module's limits).
+        r"\b[A-Za-z_]*terminal_manager[A-Za-z0-9_]*\s*\.\s*create\s*\(",
+        r"\b(?:tm|mgr|manager|create_manager)\s*\.\s*create\s*\(",
+        r"\bget_terminal_manager\s*\([^)]*\)\s*\.\s*create\s*\(",
+        r"TerminalManager\s*>+\s*\(\s*\)\s*(?:\.\s*inner\s*\(\s*\)\s*)?\.\s*create\s*\(",
         r"\bcreate_tracked_terminal_session_backend\s*\(",
+        // AI-session and `claude` launches.
         r"\bClaudeSession::spawn\s*\(",
+        r"\brun_claude_session_with_retry\s*\(",
+        r"\bspawn_claude_child\s*\(",
+        r#""spawn-independent-claude\.py""#,
+        // Workflow runs.
+        r"\bspawn_workflow_with_panic_guard\s*\(",
+        r"\bspawn_sequence_with_panic_guard\s*\(",
     ]
     .iter()
     .map(|p| Regex::new(p).expect("primitive regex"))
@@ -160,13 +219,14 @@ fn scan_calls(sources: &Sources, patterns: &[Regex]) -> BTreeSet<(String, String
         }
         let lines: Vec<&str> = src.lines().collect();
         let spans = test_spans(&lines);
+        let comments = comment_mask(&lines);
         // Blank comment and test-module lines, keeping line numbering, so a
         // multi-line call can be matched on the joined text.
         let code: Vec<&str> = lines
             .iter()
             .enumerate()
             .map(|(i, l)| {
-                if is_comment(l) || spans.iter().any(|(s, e)| i >= *s && i < *e) {
+                if comments[i] || spans.iter().any(|(s, e)| i >= *s && i < *e) {
                     ""
                 } else {
                     *l
@@ -218,11 +278,11 @@ fn fn_body(src: &str, name: &str) -> Option<String> {
                 .is_some_and(|c| c[1].len() <= indent)
         })
         .unwrap_or(lines.len());
+    let comments = comment_mask(&lines);
     Some(
-        lines[start..end]
-            .iter()
-            .filter(|l| !is_comment(l))
-            .copied()
+        (start..end)
+            .filter(|&i| !comments[i])
+            .map(|i| lines[i])
             .collect::<Vec<_>>()
             .join("\n"),
     )
@@ -234,6 +294,70 @@ fn resolve_hop<'a>(hop: &'a str, site_file: &'a str) -> (&'a str, &'a str) {
         Some((file, func)) if file.ends_with(".rs") => (file, func),
         _ => (site_file, hop),
     }
+}
+
+/// The gate calls in `body` whose result is DISCARDED: the statement is
+/// nothing but the (path-qualified) call, optionally `.await`-ed, ending in
+/// `;` — or `let _ = …;`. Returns the offending call tokens.
+fn bare_gate_calls(body: &str) -> Vec<&'static str> {
+    let path_only =
+        Regex::new(r"^(?:let\s+_\s*=\s*)?(?:[A-Za-z_][A-Za-z0-9_]*::)*$").expect("path-only regex");
+    let mut bare = Vec::new();
+    for call in GATE_CALLS.iter().filter(|c| !HOLD_CALLS.contains(c)) {
+        for m in token_re(call).find_iter(body) {
+            // Statement start: the last `;`, `{` or `}` that ends its line.
+            let before = &body[..m.start()];
+            let start = before
+                .char_indices()
+                .rev()
+                .find(|&(i, c)| {
+                    matches!(c, ';' | '{' | '}')
+                        && body[i + 1..]
+                            .split('\n')
+                            .next()
+                            .is_some_and(|rest| rest.trim().is_empty())
+                })
+                .map(|(i, _)| i + 1)
+                .unwrap_or(0);
+            // Back up over the path qualifier the token regex left out.
+            let mut qual_start = m.start();
+            while qual_start > 0 {
+                let c = body[..qual_start].chars().next_back().expect("non-empty");
+                if c.is_alphanumeric() || c == '_' || c == ':' {
+                    qual_start -= c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            if !path_only.is_match(body[start..qual_start].trim()) {
+                continue;
+            }
+            // Statement end: past the matching `)`, an optional `.await`, then `;`.
+            let open = m.end() - 1;
+            let mut depth = 0usize;
+            let mut close = None;
+            for (i, c) in body[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(open + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { continue };
+            let rest = body[close..].trim_start();
+            let rest = rest.strip_prefix(".await").unwrap_or(rest).trim_start();
+            if rest.starts_with(';') {
+                bare.push(*call);
+            }
+        }
+    }
+    bare
 }
 
 /// Autonomous rows whose gate chain does not hold. PURE over the sources.
@@ -252,12 +376,18 @@ fn autonomous_sites_bypassing_the_gate(sources: &Sources, rows: &Rows) -> Vec<St
             ));
             continue;
         };
-        if !GATE_CALLS.iter().any(|c| gate_body.contains(c)) {
+        if !GATE_CALLS.iter().any(|c| token_re(c).is_match(&gate_body)) {
             out.push(format!("{file}:{func} (no drain gate call in {gate_fn})"));
             continue;
         }
         if let Some(d) = GATE_DEFEATERS.iter().find(|d| gate_body.contains(*d)) {
             out.push(format!("{file}:{func} ({gate_fn} gates with {d})"));
+            continue;
+        }
+        if let Some(call) = bare_gate_calls(&gate_body).first() {
+            out.push(format!(
+                "{file}:{func} ({gate_fn} discards the result of {call})"
+            ));
             continue;
         }
         // Each hop calls the next; the last hop calls the site unless it is it.
@@ -529,5 +659,92 @@ fn an_operator_row_must_be_a_tauri_command() {
     assert_eq!(
         operator_sites_not_tauri_commands(&sources, &rows),
         vec!["c.rs:http_door".to_string()]
+    );
+}
+
+#[test]
+fn a_bare_gate_call_whose_result_is_discarded_fails_the_guard() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "x.rs".to_string(),
+        "async fn bare() {\n    crate::coord_drain_state::drain_gate(o);\n    tm.create(a);\n}\n\
+         async fn ignored() {\n    let _ = crate::agent_authorization::authorize_spawn(n, p, o).await;\n    tm.create(a);\n}\n\
+         async fn branched() {\n    if let DrainGate::Defer { reason, class } =\n        crate::coord_drain_state::drain_gate_for_work(origin, &key)\n    {\n        return;\n    }\n    tm.create(a);\n}\n\
+         async fn bound() {\n    let authz = authorize_spawn(n, p, o).await;\n    if !authz.allows_spawn() { return; }\n    tm.create(a);\n}\n\
+         async fn closure_tail() {\n    let hold = hold(\n        || {\n            crate::agent_authorization::authorize_spawn(n, p, o)\n        },\n    )\n    .await;\n    tm.create(a);\n}\n\
+         async fn questioned() {\n    gate_or_err(drain_gate(o))?;\n    tm.create(a);\n}\n"
+            .to_string(),
+    );
+    let mut rows = BTreeMap::new();
+    for f in [
+        "bare",
+        "ignored",
+        "branched",
+        "bound",
+        "closure_tail",
+        "questioned",
+    ] {
+        rows.insert(
+            ("x.rs".to_string(), f.to_string()),
+            Row {
+                class: "autonomous".into(),
+                detail: f.into(),
+            },
+        );
+    }
+    assert_eq!(
+        autonomous_sites_bypassing_the_gate(&sources, &rows),
+        vec![
+            "x.rs:bare (bare discards the result of drain_gate()".to_string(),
+            "x.rs:ignored (ignored discards the result of authorize_spawn()".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn a_manager_reached_through_any_receiver_shape_is_a_site() {
+    let mut sources = BTreeMap::new();
+    sources.insert(
+        "doors.rs".to_string(),
+        "fn via_getter(state: &S) {\n    let _ = get_terminal_manager(&state).create(a);\n}\n\
+         fn via_field(&self) {\n    let info = self\n        .terminal_manager\n        .create(a);\n}\n\
+         fn via_state(app: &A) {\n    app.state::<Arc<TerminalManager>>().inner().create(a);\n}\n\
+         fn via_star(slot: &mut Option<T>, tm: &M) {\n    *slot = tm.create(a);\n}\n\
+         fn via_script() {\n    let p = dir.join(\"spawn-independent-claude.py\");\n}\n\
+         fn in_block_comment() {\n    /*\n     * tm.create(a)\n     */\n}\n"
+            .to_string(),
+    );
+    let found: Vec<_> = scan_sites(&sources, &BTreeMap::new())
+        .into_iter()
+        .map(|(_, f)| f)
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            "via_field",
+            "via_getter",
+            "via_script",
+            "via_star",
+            "via_state"
+        ],
+        "every receiver shape is found; a block comment is not code"
+    );
+}
+
+#[test]
+fn a_star_led_code_line_is_code_and_a_block_comment_is_not() {
+    let lines = [
+        "fn f() {",
+        "    *slot = tm.create(a);",
+        "    /* one-line */",
+        "    /*",
+        "     * tm.create(b)",
+        "     */",
+        "    // tm.create(c)",
+        "}",
+    ];
+    assert_eq!(
+        comment_mask(&lines),
+        vec![false, false, true, true, true, true, true, false]
     );
 }

@@ -451,6 +451,13 @@ async fn connect_and_pump(
     // On-connect catch-up: replay anything that landed while we were
     // offline. Best-effort — a failure here doesn't abort the pump (the push
     // path still works, and the next tick or reconnect retries it).
+    //
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // a handoff or respawn materialized here is autonomous, so the catch-up
+    // decides against a real drain read, not the not-yet-read boot state.
+    // Rows it defers stay pending on coord and are replayed by the
+    // paused->allowed arm of the pump below.
+    crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
     run_all_catchups(
         CatchupPass::OnConnect,
         registry,
@@ -468,10 +475,33 @@ async fn connect_and_pump(
     // The first tick fires immediately; the on-connect catch-up just ran.
     catchup_tick.tick().await;
 
+    // A row the drain deferred is not pushed a second time, so without this arm
+    // it would wait for the next reconnect or tick.
+    let mut drain_rx = crate::coord_drain_state::subscribe();
+    let mut autonomous_allowed = crate::coord_drain_state::current().allows_autonomous_spawns();
+    let mut drain_rx_open = true;
+
     loop {
         tokio::select! {
             _ = catchup_tick.tick() => {
                 run_all_catchups(CatchupPass::Tick, registry, lifecycle_store, http, coord_url, device_id, sources).await;
+            }
+            changed = drain_rx.changed(), if drain_rx_open => {
+                if changed.is_err() {
+                    // The sender lives in a static and is never dropped; stop
+                    // polling a closed channel rather than spin on it.
+                    drain_rx_open = false;
+                    continue;
+                }
+                let now_allowed = drain_rx.borrow_and_update().allows_autonomous_spawns();
+                if resumed_after_drain(autonomous_allowed, now_allowed) {
+                    tracing::info!(
+                        "session handoff: autonomous spawns allowed again — replaying pending \
+                         handoffs and respawns the drain deferred"
+                    );
+                    run_all_catchups(CatchupPass::DrainResumed, registry, lifecycle_store, http, coord_url, device_id, sources).await;
+                }
+                autonomous_allowed = now_allowed;
             }
             maybe_msg = ws.next() => {
                 let Some(msg) = maybe_msg else {
@@ -531,6 +561,11 @@ pub(super) enum CatchupPass {
     OnConnect,
     /// A [`CATCHUP_TICK`] on a live socket.
     Tick,
+    /// Coord's device drain just lifted (paused -> allowed). Only the arms the
+    /// drain actually DEFERS need replaying: a row it deferred stays pending on
+    /// coord and is never pushed again, so nothing else would deliver it before
+    /// the next reconnect. Plan `2026-09-13-drained-runner-never-reaches-idle`.
+    DrainResumed,
 }
 
 /// The catch-up arms this one socket's (re)connect drives, each on its own
@@ -578,6 +613,11 @@ pub(super) fn catchups_for(pass: CatchupPass) -> &'static [CatchupKind] {
             CatchupKind::Create,
         ],
         CatchupPass::Tick => &[CatchupKind::Handoff, CatchupKind::Respawn],
+        // The same two arms as `Tick`, for a DIFFERENT reason, so it is spelled
+        // separately rather than aliased: these are the spawning arms the drain
+        // gate defers. `Attach` and `Create` mint grants rather than spawning,
+        // are never deferred, and so need no replay here.
+        CatchupPass::DrainResumed => &[CatchupKind::Handoff, CatchupKind::Respawn],
     }
 }
 
@@ -643,7 +683,15 @@ async fn run_all_catchups(
                 .await
             }
         }
+            }
+        }
     }
+}
+
+/// PURE: whether a drain-state change should replay the deferred catch-up —
+/// only a transition from paused (drained or unknown) to allowed.
+fn resumed_after_drain(was_allowed: bool, now_allowed: bool) -> bool {
+    !was_allowed && now_allowed
 }
 
 /// Run the one-shot handoff catch-up: GET the durable pending list and
@@ -928,7 +976,7 @@ async fn materialize(
     // say-so, so it is a coord dispatch and is deferred while the drain holds.
     // Before any fetch, so the source stays intact and the pending handoff
     // replays on the next push/catch-up.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::CoordDispatch,
             &format!("handoff:{}", handoff.source_session_id),
@@ -2044,5 +2092,13 @@ mod tests {
         // Empty / noise-only buffers yield nothing.
         assert!(latest_restore_record_from_sse("").is_none());
         assert!(latest_restore_record_from_sse("event: replay\ndata: {}\n\n").is_none());
+    }
+
+    #[test]
+    fn only_a_paused_to_allowed_transition_replays_the_deferred_catch_up() {
+        assert!(super::resumed_after_drain(false, true));
+        assert!(!super::resumed_after_drain(true, true));
+        assert!(!super::resumed_after_drain(true, false));
+        assert!(!super::resumed_after_drain(false, false));
     }
 }

@@ -231,7 +231,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
             // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
             // D3): this is the HTTP proxy of `terminal_create`, not the runner UI,
             // so its caller is autonomous and is deferred while the drain holds.
-            if let crate::coord_drain_state::DrainGate::Defer { reason } =
+            if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
                 crate::coord_drain_state::drain_gate_for_work(
                     crate::coord_drain_state::SpawnOrigin::Unknown,
                     &format!(

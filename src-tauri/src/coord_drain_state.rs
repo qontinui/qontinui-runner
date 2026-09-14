@@ -152,6 +152,34 @@ impl std::fmt::Display for SpawnOrigin {
     }
 }
 
+/// Why the drain deferred a spawn: coord said `drained`, or the state is
+/// unknown. Carried on the deferral itself so every surface reporting it (a
+/// 409 body, a continuation stamp) names the class the DECISION saw, never a
+/// later re-read that may already have moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferClass {
+    Drained,
+    Unknown,
+}
+
+impl DeferClass {
+    /// The refusal code, matching coord's own 409 vocabulary (contract C5).
+    pub fn code(self) -> &'static str {
+        match self {
+            DeferClass::Drained => "device_drained",
+            DeferClass::Unknown => "drain_unreadable",
+        }
+    }
+
+    /// The [`CoordDrainState::label`] of the state that deferred.
+    pub fn label(self) -> &'static str {
+        match self {
+            DeferClass::Drained => "drained",
+            DeferClass::Unknown => "unknown",
+        }
+    }
+}
+
 /// The drain gate's answer for one spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrainGate {
@@ -159,7 +187,7 @@ pub enum DrainGate {
     Allow,
     /// Do not spawn now; leave the work where it will be picked up again once
     /// the drain lifts. `reason` is operator-readable.
-    Defer { reason: String },
+    Defer { reason: String, class: DeferClass },
 }
 
 impl DrainGate {
@@ -188,11 +216,18 @@ pub fn drain_gate_for_work(origin: SpawnOrigin, work_key: &str) -> DrainGate {
 
 /// PURE: the gate for `origin` against `state`.
 pub fn gate_for(state: &CoordDrainState, origin: SpawnOrigin) -> DrainGate {
+    gate_for_at(state, origin, Utc::now())
+}
+
+/// PURE: [`gate_for`] at `now`. A drain whose `until` has passed is over, so it
+/// allows — whether or not a read has folded the expiry in yet.
+pub fn gate_for_at(state: &CoordDrainState, origin: SpawnOrigin, now: DateTime<Utc>) -> DrainGate {
     if !origin.is_autonomous() {
         return DrainGate::Allow;
     }
     match state {
         CoordDrainState::Clear | CoordDrainState::NotEnrolled { .. } => DrainGate::Allow,
+        CoordDrainState::Drained { until: Some(u), .. } if *u <= now => DrainGate::Allow,
         CoordDrainState::Drained { until, reason } => {
             let until = until
                 .map(|u| format!(" until {}", u.to_rfc3339()))
@@ -207,6 +242,7 @@ pub fn gate_for(state: &CoordDrainState, origin: SpawnOrigin) -> DrainGate {
                     "coord has drained this device{until}{reason} — the autonomous {origin} \
                      spawn is deferred and runs once the drain lifts"
                 ),
+                class: DeferClass::Drained,
             }
         }
         CoordDrainState::Unknown { cause, .. } => DrainGate::Defer {
@@ -214,6 +250,7 @@ pub fn gate_for(state: &CoordDrainState, origin: SpawnOrigin) -> DrainGate {
                 "coord drain state unknown ({cause}) — autonomous spawns paused, so the \
                  {origin} spawn is deferred until the state is read again"
             ),
+            class: DeferClass::Unknown,
         },
     }
 }
@@ -250,10 +287,6 @@ impl CoordDrainState {
             CoordDrainState::Unknown { .. } => "unknown",
             CoordDrainState::NotEnrolled { .. } => "not_enrolled",
         }
-    }
-
-    pub fn is_drained(&self) -> bool {
-        matches!(self, CoordDrainState::Drained { .. })
     }
 
     /// Whether AUTONOMOUS spawns may run — `Clear` or `NotEnrolled`.
@@ -470,9 +503,17 @@ pub fn effective_state(
     last_fold_at: DateTime<Utc>,
     stale_after: Duration,
     now: Instant,
+    now_utc: DateTime<Utc>,
 ) -> CoordDrainState {
     if matches!(tracked, CoordDrainState::Unknown { .. }) {
         return tracked.clone();
+    }
+    // An expired drain is over the moment its deadline passes, not a heartbeat
+    // later.
+    if let CoordDrainState::Drained { until: Some(u), .. } = tracked {
+        if *u <= now_utc {
+            return CoordDrainState::Clear;
+        }
     }
     let age = now.saturating_duration_since(last_fold);
     if age > stale_after {
@@ -500,6 +541,8 @@ struct Inner {
     /// The state the last event carried, so staleness transitions that happen
     /// between folds are still emitted by the next getter-driven check.
     last_emitted: Option<CoordDrainState>,
+    /// Whether any read (or failed read) has been folded since boot.
+    folded_once: bool,
 }
 
 struct Global {
@@ -522,6 +565,7 @@ fn global() -> &'static Global {
                 last_fold_at: now,
                 deferred: BTreeSet::new(),
                 last_emitted: None,
+                folded_once: false,
             }),
             tx,
             boot_read_done: tokio::sync::Notify::new(),
@@ -560,6 +604,7 @@ fn current_locked(inner: &Inner) -> CoordDrainState {
         inner.last_fold_at,
         stale_after(),
         Instant::now(),
+        Utc::now(),
     )
 }
 
@@ -605,6 +650,10 @@ pub struct CoordDrainSnapshot {
     pub deferred_by_origin: BTreeMap<String, usize>,
     /// When the state was last folded from a coord read (or a failed one).
     pub last_read_at: DateTime<Utc>,
+    /// `true` while the boot read has not finished AND nothing has been folded
+    /// yet — the `unknown` it reports is "not read yet", which the banner does
+    /// not flash at boot.
+    pub boot_read_pending: bool,
 }
 
 fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
@@ -630,6 +679,10 @@ fn snapshot_of(state: &CoordDrainState, inner: &Inner) -> CoordDrainSnapshot {
         deferred_count: inner.deferred.len(),
         deferred_by_origin: by_origin,
         last_read_at: inner.last_fold_at,
+        boot_read_pending: !inner.folded_once
+            && !global()
+                .boot_read_finished
+                .load(std::sync::atomic::Ordering::SeqCst),
     }
 }
 
@@ -643,6 +696,7 @@ pub fn snapshot_fixture(state: &CoordDrainState) -> CoordDrainSnapshot {
         last_fold_at: DateTime::<Utc>::UNIX_EPOCH,
         deferred: BTreeSet::new(),
         last_emitted: None,
+        folded_once: true,
     };
     snapshot_of(state, &inner)
 }
@@ -676,6 +730,7 @@ fn fold(f: impl FnOnce(&mut DrainTracker, DateTime<Utc>) -> Transition) -> Trans
         let mut inner = lock_inner();
         let before = current_locked(&inner);
         let transition = f(&mut inner.tracker, now);
+        inner.folded_once = true;
         inner.last_fold = Instant::now();
         inner.last_fold_at = now;
         let after = current_locked(&inner);
@@ -753,6 +808,33 @@ pub async fn wait_until_allowed(origin: SpawnOrigin) {
     }
 }
 
+/// Run `fut` once autonomous spawns of `origin` may run: a HOLD, never a
+/// refusal. For fire-once autonomous launches that have nowhere to leave the
+/// work pending (workflow triggers): while the device is drained or its drain
+/// state is unknown the future waits, counted on the banner under `work_key`,
+/// and starts the moment the drain lifts. Nothing inside `fut` runs — no
+/// `claude` process exists — until then.
+pub async fn held_until_allowed<F: std::future::Future>(
+    origin: SpawnOrigin,
+    work_key: String,
+    fut: F,
+) -> F::Output {
+    if let DrainGate::Defer { reason, .. } = drain_gate_for_work(origin, &work_key) {
+        info!("coord_drain_state: holding {work_key} — {reason}");
+        wait_until_allowed(origin).await;
+        info!("coord_drain_state: releasing {work_key} — autonomous spawns allowed again");
+    }
+    fut.await
+}
+
+/// The HTTP refusal body for a drain deferral: the reason, with the
+/// `device_drained` / `drain_unreadable` code the deferring state implies.
+pub fn api_refusal(reason: &str, class: DeferClass) -> crate::mcp::types::ApiResponse<()> {
+    let mut body = crate::mcp::types::api_error(reason.to_string());
+    body.code = Some(class.code().to_string());
+    body
+}
+
 // ---------------------------------------------------------------------------
 // Coord reads
 // ---------------------------------------------------------------------------
@@ -762,10 +844,13 @@ pub async fn wait_until_allowed(origin: SpawnOrigin) {
 pub enum HeartbeatOutcome {
     /// Coord accepted the register POST; its body's `drain` object.
     Registered { drain: DrainObservation },
-    /// This instance does not own the machine payload (a secondary), so it sent
-    /// no heartbeat — it still shares the device, so it reads `me/drain`.
-    SecondaryInstance,
-    /// No heartbeat is possible because this runner is not a coord device.
+    /// No register POST was sent although this runner IS a coord device: a
+    /// secondary instance (the primary owns the machine payload), or a device
+    /// with no tenant binding yet. It still reads `me/drain` on its device JWT;
+    /// a failed read is a miss that trends to `Unknown`, never `NotEnrolled`.
+    NotSent { why: &'static str },
+    /// No heartbeat is possible because this runner is not a coord device: no
+    /// `machine.json` or no coord URL.
     NotEnrolled { why: &'static str },
 }
 
@@ -775,12 +860,12 @@ fn enrollment() -> Result<String, &'static str> {
     if uuid::Uuid::parse_str(&device.device_id).is_err() {
         return Err("machine.json device_id is not a UUID");
     }
-    let base = qontinui_runner_lib::profiles::connected_coord_base()
-        .ok_or("the active profile has no coord_url")?;
-    if crate::fleet::resolve_binding_set().is_none() {
-        return Err("no tenant binding — the runner is not paired");
-    }
-    Ok(base)
+    // A tenant binding is NOT required: a device with `machine.json` and a coord
+    // URL is a coord device coord can drain, and `me/drain` answers on the
+    // device JWT alone. Treating an unpaired device as not-enrolled would let
+    // it spawn autonomously while coord holds it drained.
+    qontinui_runner_lib::profiles::connected_coord_base()
+        .ok_or("the active profile has no coord_url")
 }
 
 /// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
@@ -817,13 +902,13 @@ pub async fn note_heartbeat(outcome: HeartbeatOutcome) {
                 refresh_reason().await;
             }
         }
-        HeartbeatOutcome::SecondaryInstance => match enrollment() {
+        HeartbeatOutcome::NotSent { why } => match enrollment() {
             Ok(base) => match read_me_drain(&base).await {
                 Ok(obs) => {
                     fold(|tr, now| tr.observe(obs, now));
                 }
                 Err(e) => {
-                    fold(|tr, now| tr.miss(&e, now));
+                    fold(|tr, now| tr.miss(&format!("{why}; me/drain: {e}"), now));
                 }
             },
             Err(why) => {
@@ -988,7 +1073,8 @@ mod tests {
             }
         }
         match gate_for(&drained, SpawnOrigin::Steward) {
-            DrainGate::Defer { reason } => {
+            DrainGate::Defer { reason, class } => {
+                assert_eq!(class, DeferClass::Drained);
                 assert!(
                     reason.contains("rebuild") && reason.contains("steward"),
                     "{reason}"
@@ -1177,7 +1263,7 @@ mod tests {
         tr.observe(d, t0());
         tr.miss("x", t0());
         tr.miss("x", t0());
-        assert!(tr.state().is_drained());
+        assert!(matches!(tr.state(), CoordDrainState::Drained { .. }));
         tr.miss("x", t0());
         assert!(matches!(tr.state(), CoordDrainState::Unknown { .. }));
     }
@@ -1195,11 +1281,18 @@ mod tests {
         let stale = Duration::from_secs(95);
         let clear = CoordDrainState::Clear;
         assert_eq!(
-            effective_state(&clear, base, t0(), stale, base + Duration::from_secs(60)),
+            effective_state(
+                &clear,
+                base,
+                t0(),
+                stale,
+                base + Duration::from_secs(60),
+                t0()
+            ),
             clear
         );
         assert!(matches!(
-            effective_state(&clear, base, t0(), stale, base + Duration::from_secs(96)),
+            effective_state(&clear, base, t0(), stale, base + Duration::from_secs(96), t0()),
             CoordDrainState::Unknown { since, .. } if since == t0()
         ));
         let drained = CoordDrainState::Drained {
@@ -1207,7 +1300,14 @@ mod tests {
             reason: None,
         };
         assert!(matches!(
-            effective_state(&drained, base, t0(), stale, base + Duration::from_secs(200)),
+            effective_state(
+                &drained,
+                base,
+                t0(),
+                stale,
+                base + Duration::from_secs(200),
+                t0()
+            ),
             CoordDrainState::Unknown { .. }
         ));
     }
@@ -1226,6 +1326,7 @@ mod tests {
             .into_iter()
             .collect(),
             last_emitted: None,
+            folded_once: true,
         };
         let snap = snapshot_of(
             &CoordDrainState::Drained {
@@ -1241,5 +1342,60 @@ mod tests {
         assert_eq!(json["deferredCount"], 3);
         assert_eq!(json["deferredByOrigin"]["looping_agent"], 2);
         assert_eq!(json["deferredByOrigin"]["steward"], 1);
+    }
+
+    #[test]
+    fn a_drain_past_its_until_allows_before_any_read_folds_it() {
+        let until = Some(t0() + chrono::Duration::minutes(5));
+        let drained = CoordDrainState::Drained {
+            until,
+            reason: None,
+        };
+        assert!(!gate_for_at(&drained, SpawnOrigin::Steward, t0()).allows());
+        assert!(gate_for_at(
+            &drained,
+            SpawnOrigin::Steward,
+            t0() + chrono::Duration::minutes(5)
+        )
+        .allows());
+        let base = Instant::now();
+        assert_eq!(
+            effective_state(
+                &drained,
+                base,
+                t0(),
+                Duration::from_secs(95),
+                base,
+                t0() + chrono::Duration::minutes(6)
+            ),
+            CoordDrainState::Clear
+        );
+    }
+
+    #[test]
+    fn a_deferral_names_the_class_of_the_state_that_deferred_it() {
+        let unknown = CoordDrainState::Unknown {
+            since: t0(),
+            cause: "x".into(),
+        };
+        match gate_for(&unknown, SpawnOrigin::Scheduler) {
+            DrainGate::Defer { class, .. } => {
+                assert_eq!(class, DeferClass::Unknown);
+                assert_eq!(class.code(), "drain_unreadable");
+                assert_eq!(class.label(), "unknown");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(DeferClass::Drained.code(), "device_drained");
+        let body = serde_json::to_value(api_refusal("r", DeferClass::Unknown)).unwrap();
+        assert_eq!(body["code"], "drain_unreadable");
+        assert_eq!(body["error"], "r");
+    }
+
+    #[tokio::test]
+    async fn held_until_allowed_runs_the_future_at_once_when_nothing_defers() {
+        // A non-autonomous origin never defers, whatever the global state is.
+        let out = held_until_allowed(SpawnOrigin::OperatorChat, "k".into(), async { 7 }).await;
+        assert_eq!(out, 7);
     }
 }

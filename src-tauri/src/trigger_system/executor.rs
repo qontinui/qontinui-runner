@@ -380,33 +380,37 @@ pub async fn execute_triggered_workflow(
             file_registry,
             file_lock,
             deps.app_state.pg_db.clone(),
-            Box::pin(async move {
-                let mut controller = crate::unified_workflow_executor::LoopController::new(
-                    app_state,
-                    config_storage,
-                    app_handle.clone(),
-                    pid_tracker,
-                );
+            Box::pin(crate::coord_drain_state::held_until_allowed(
+                crate::coord_drain_state::SpawnOrigin::Orchestration,
+                format!("trigger:{trigger_name}"),
+                async move {
+                    let mut controller = crate::unified_workflow_executor::LoopController::new(
+                        app_state,
+                        config_storage,
+                        app_handle.clone(),
+                        pid_tracker,
+                    );
 
-                // Get session manager from app handle
-                let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
-                    .state::<Arc<crate::claude_session::SessionManager>>()
-                    .inner()
-                    .clone();
-                controller = controller.with_session_manager(session_manager);
+                    // Get session manager from app handle
+                    let session_manager: Arc<crate::claude_session::SessionManager> = app_handle
+                        .state::<Arc<crate::claude_session::SessionManager>>()
+                        .inner()
+                        .clone();
+                    controller = controller.with_session_manager(session_manager);
 
-                controller
-                    .run(
-                        loop_config,
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await
-            }),
+                    controller
+                        .run(
+                            loop_config,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                        .await
+                },
+            )),
         );
     }
 

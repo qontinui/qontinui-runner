@@ -2,6 +2,7 @@ import { useReducer, useCallback } from "react";
 import type { UnifiedWorkflow } from "../../types";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { createLogger } from "@/lib/logger";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 const log = createLogger("WorkflowBuilder");
 
@@ -89,8 +90,8 @@ export function useWorkflowExecution({
       try {
         log.debug("Running workflow:", runWorkflowId, workflowName);
 
-        const runUrl = `${getApiBase()}/unified-workflows/${runWorkflowId}/run`;
-
+        // Runs go through the OPERATOR twin of POST /unified-workflows/{id}/run,
+        // which coord's device drain never defers.
         const compareArchitectures = overrides?._compareArchitectures as string[] | undefined;
         if (compareArchitectures && compareArchitectures.length > 1) {
           log.debug("Comparing architectures:", compareArchitectures);
@@ -101,13 +102,12 @@ export function useWorkflowExecution({
             if (arch !== "traditional") {
               archOverrides.workflow_architecture = arch;
             }
-            tracedFetch(runUrl, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ overrides: archOverrides, force_fresh_start: true }),
+            invokeOperatorDoor("operator_run_unified_workflow", {
+              id: runWorkflowId,
+              request: { overrides: archOverrides, force_fresh_start: true },
             })
-              .then((response) => {
-                log.debug(`${arch} run response:`, response.status);
+              .then((reply) => {
+                log.debug(`${arch} run response:`, reply.status);
               })
               .catch((error) => {
                 console.error(`[WorkflowBuilder] ${arch} run error:`, error);
@@ -135,13 +135,12 @@ export function useWorkflowExecution({
             }
           }
 
-          tracedFetch(runUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(body),
+          invokeOperatorDoor("operator_run_unified_workflow", {
+            id: runWorkflowId,
+            request: body,
           })
-            .then((response) => {
-              log.debug("Workflow run response:", response.status);
+            .then((reply) => {
+              log.debug("Workflow run response:", reply.status);
             })
             .catch((error) => {
               console.error("[WorkflowBuilder] Workflow run error:", error);

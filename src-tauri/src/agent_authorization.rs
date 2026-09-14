@@ -378,7 +378,10 @@ pub enum SpawnDecision {
     /// Decided BEFORE the registry is consulted, and never lifted by the
     /// `QONTINUI_SPAWN_AUTHZ_DISABLED` break-glass: the drain is an operator's
     /// lever, not a fail-safe refusal of the gate.
-    DeferredByDrain { reason: String },
+    DeferredByDrain {
+        reason: String,
+        class: crate::coord_drain_state::DeferClass,
+    },
 }
 
 /// How a spawn stands towards coord's device drain.
@@ -436,8 +439,8 @@ pub fn decide_drain(
     };
     match crate::coord_drain_state::gate_for(state, *origin) {
         crate::coord_drain_state::DrainGate::Allow => None,
-        crate::coord_drain_state::DrainGate::Defer { reason } => {
-            Some(SpawnDecision::DeferredByDrain { reason })
+        crate::coord_drain_state::DrainGate::Defer { reason, class } => {
+            Some(SpawnDecision::DeferredByDrain { reason, class })
         }
     }
 }
@@ -504,7 +507,7 @@ impl SpawnDecision {
             SpawnDecision::DegradeToInline { reason }
             | SpawnDecision::Warn { reason }
             | SpawnDecision::Deny { reason }
-            | SpawnDecision::DeferredByDrain { reason } => Some(reason),
+            | SpawnDecision::DeferredByDrain { reason, .. } => Some(reason),
         }
     }
 
@@ -514,12 +517,24 @@ impl SpawnDecision {
         matches!(self, SpawnDecision::DeferredByDrain { .. })
     }
 
+    /// For a drain deferral, the class of the state that deferred it.
+    pub fn drain_class(&self) -> Option<crate::coord_drain_state::DeferClass> {
+        match self {
+            SpawnDecision::DeferredByDrain { class, .. } => Some(*class),
+            _ => None,
+        }
+    }
+
     /// A structured, machine-greppable refusal line for the call sites that
     /// must surface the decision as an error. `None` when the spawn may
     /// proceed (`Allow` / `Warn`).
     pub fn refusal(&self) -> Option<String> {
         if self.allows_spawn() {
             return None;
+        }
+        if let SpawnDecision::DeferredByDrain { reason, class } = self {
+            // `device_drained` / `drain_unreadable`, coord's own 409 vocabulary.
+            return Some(format!("{}: {reason}", class.code()));
         }
         self.reason()
             .map(|r| format!("spawn-authorization {}: {r}", self.label()))
@@ -1723,7 +1738,7 @@ pub async fn authorize_fanout_spawn_with_budget(
     let path = SpawnPath::ParallelFanout;
     // The drain first: a deferred spawn must neither cost a registry lookup
     // nor take (or queue for) a fan-out slot.
-    if let Some(SpawnDecision::DeferredByDrain { reason }) =
+    if let Some(SpawnDecision::DeferredByDrain { reason, .. }) =
         drain_admission(agent_name, path, &admission.into())
     {
         return FanoutAdmission::DeferredByDrain { reason };
@@ -3679,7 +3694,12 @@ mod drain_tests {
                 assert!(d.is_deferred_by_drain());
                 assert!(!d.allows_spawn(), "a deferral never authorizes the spawn");
                 assert_eq!(d.label(), "deferred_by_drain");
-                assert!(d.refusal().is_some_and(|r| r.contains("deferred_by_drain")));
+                let refusal = d.refusal().expect("a deferral carries a refusal line");
+                assert!(
+                    refusal.starts_with("device_drained:")
+                        || refusal.starts_with("drain_unreadable:"),
+                    "{refusal}"
+                );
             }
         }
     }
@@ -3728,5 +3748,18 @@ mod drain_tests {
                 work_key: Some("gate:1".into())
             }
         );
+    }
+
+    #[test]
+    fn the_refusal_code_follows_the_deferring_state() {
+        let unknown = decide_drain(&unknown(), &SpawnOrigin::Steward.into()).unwrap();
+        assert!(unknown.refusal().unwrap().starts_with("drain_unreadable: "));
+        assert_eq!(
+            unknown.drain_class(),
+            Some(crate::coord_drain_state::DeferClass::Unknown)
+        );
+        let drained = decide_drain(&drained(), &SpawnOrigin::Steward.into()).unwrap();
+        assert!(drained.refusal().unwrap().starts_with("device_drained: "));
+        assert_eq!(SpawnDecision::Allow.drain_class(), None);
     }
 }
