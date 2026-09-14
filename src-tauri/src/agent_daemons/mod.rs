@@ -177,6 +177,7 @@ mod tests {
                 parent_sha: "0".repeat(40),
                 worktree_path: std::env::temp_dir(),
                 push_ref: "refs/agent/m-a".into(),
+                parent_sha_provenance: Default::default(),
             }],
             token: token.to_string(),
             token_jti: Uuid::nil(),
