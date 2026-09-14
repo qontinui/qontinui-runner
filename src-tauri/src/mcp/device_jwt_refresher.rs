@@ -938,10 +938,11 @@ pub(crate) async fn try_refresh_once(
     // owned by coord, not by an OAuth refresh chain).
     match auth_manager.store_tokens(&resp.token, "") {
         Ok(()) => {
-            // M1: a NEW credential is in the slot, so every rejection coord
-            // recorded against the old one is spent. Without this the streak
-            // survives replacement and `dark` latches on a working token.
-            reset_upstream_rejections_for(None);
+            // M1: a NEW credential is in the slot — and, via the mirror, in
+            // its tenant's slot — so every rejection coord recorded against
+            // the old one is spent. Without this the streak survives
+            // replacement and `dark` latches on a working token.
+            retire_rejection_streaks_after_legacy_mint(&resp.token);
             RefreshOutcome::Replaced {
                 new_jwt: resp.token,
             }
@@ -1082,6 +1083,9 @@ pub(crate) async fn try_device_self_refresh(
     // device-JWT lifecycle is coord-owned, not an OAuth refresh chain).
     match auth_manager.store_tokens(&body.token, "") {
         Ok(()) => {
+            // M1: the old credential's rejections are spent evidence — for the
+            // default bucket and for the tenant slot the mirror just wrote.
+            retire_rejection_streaks_after_legacy_mint(&body.token);
             info!(
                 "device_jwt_refresher: device-JWT self-refreshed login-independently (len={})",
                 body.token.len()
@@ -2236,6 +2240,30 @@ pub(crate) fn retire_rejection_streaks_after_pairing(
     reset_upstream_rejections_for(Some(tenant));
     if default_binding == Some(tenant) {
         reset_upstream_rejections_for(None);
+    }
+}
+
+/// The refresher's OWN legacy-slot mints — the Cognito pair re-mint, the
+/// device self-refresh and the device-machine-key exchange — all persist
+/// through [`crate::auth::AuthManager::store_tokens`], which writes the legacy
+/// `access_token` slot AND mirrors the token into `device_jwt:<claim>` for the
+/// tenant coord stamped into it. So a fresh credential lands in TWO slots, and
+/// the M1 rule ([`reset_upstream_rejections_for`]) has to spend the evidence
+/// filed under both keys. Resetting only the default bucket left the mirrored
+/// tenant's streak standing: a pinned tenant's three 401s survived a legacy
+/// re-mint, the next slot pass observed the mirrored slot `SkippedFresh` as
+/// the sole slot, rung 5 read the stale streak, and the runner published
+/// `dark` on a credential coord had just minted — a transient false-dark plus
+/// a spurious *"Coord access restored"* pair once the first forwarded 2xx
+/// healed it. Same rule as [`retire_rejection_streaks_after_pairing`], keyed
+/// off the token itself because that is what the mirror keys off.
+///
+/// A token with no decodable `tenant_id` claim is mirrored nowhere, so only
+/// the default bucket is spent.
+pub(crate) fn retire_rejection_streaks_after_legacy_mint(token: &str) {
+    reset_upstream_rejections_for(None);
+    if let Some(tenant) = crate::auth::jwt_tenant_claim(token) {
+        reset_upstream_rejections_for(Some(tenant));
     }
 }
 
@@ -3455,6 +3483,9 @@ pub(crate) async fn try_device_machine_key_exchange(
     // device-JWT lifecycle is coord-owned).
     match auth_manager.store_tokens(&body.token, "") {
         Ok(()) => {
+            // M1: the old credential's rejections are spent evidence — for the
+            // default bucket and for the tenant slot the mirror just wrote.
+            retire_rejection_streaks_after_legacy_mint(&body.token);
             info!(
                 "device_jwt_refresher: device JWT re-minted via device-machine-key \
                  exchange (len={})",
@@ -8386,6 +8417,113 @@ mod tenant_slot_refresh_tests {
     fn iso8601_renders_a_z_terminated_second_precision_instant() {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    /// A device JWT of the shape coord issues: a `tenant_id` claim beside `exp`.
+    /// Unsigned — `jwt_tenant_claim` reads the payload only.
+    fn jwt_claiming(tenant: uuid::Uuid) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let exp = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"tenant_id":"{tenant}","exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    /// Post-merge follow-up to #1532 (review finding on the landed diff). The
+    /// refresher's legacy-slot mints persist through `store_tokens`, whose
+    /// mirror also writes `device_jwt:<claim>`; spending only the DEFAULT
+    /// bucket left the mirrored tenant's streak to re-darken a credential coord
+    /// had just minted. Both buckets are spent; a third tenant's evidence is
+    /// untouched.
+    #[test]
+    fn a_legacy_mint_retires_the_default_streak_and_the_mirrored_tenants() {
+        let _serialised = health_lock();
+        reset_posture();
+        let claimed = tenant(2);
+        let bystander = tenant(3);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+            note_coord_upstream_verdict(Some(claimed), true, 401, br#"{"code":"token_revoked"}"#);
+            note_coord_upstream_verdict(Some(bystander), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+
+        retire_rejection_streaks_after_legacy_mint(&jwt_claiming(claimed));
+
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            0,
+            "default spent"
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&claimed.to_string())).consecutive_rejections,
+            0,
+            "the tenant the mirror wrote is spent too"
+        );
+        assert_eq!(
+            upstream_signal_for(Some(&bystander.to_string())).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "a tenant the mint did not touch keeps its evidence"
+        );
+        reset_posture();
+    }
+
+    /// An opaque legacy bearer (no decodable `tenant_id`) is mirrored nowhere,
+    /// so only the default bucket is spent — a tenant bucket must not be
+    /// guessed at.
+    #[test]
+    fn a_legacy_mint_with_no_tenant_claim_retires_only_the_default_streak() {
+        let _serialised = health_lock();
+        reset_posture();
+        let t = tenant(2);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+            note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+
+        retire_rejection_streaks_after_legacy_mint("qontinui_runner_legacy_opaque");
+
+        assert_eq!(upstream_signal_for(None).consecutive_rejections, 0);
+        assert_eq!(
+            upstream_signal_for(Some(&t.to_string())).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "no claim, no mirror, no reset"
+        );
+        reset_posture();
+    }
+
+    /// WIRING, pinned at the source like the re-pair scan above: every
+    /// production `store_tokens(` write in this file (the three legacy mints)
+    /// is paired with a `retire_rejection_streaks_after_legacy_mint(` call, so
+    /// a fourth mint path cannot be added without spending the evidence, and
+    /// deleting a call while keeping the write fails here. Comment lines are
+    /// cut first, so a commented-out call does not count.
+    #[test]
+    fn every_legacy_mint_in_this_file_retires_the_stale_rejection_streaks() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/mcp/device_jwt_refresher.rs");
+        let text = std::fs::read_to_string(&path).expect("read this file");
+        // Production code only: everything before the first test MODULE.
+        let end = text
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("this file has test modules");
+        let production: String = text[..end]
+            .lines()
+            .map(|line| line.find("//").map_or(line, |i| &line[..i]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let writes = production.matches(".store_tokens(").count();
+        let retirements = production
+            .matches("retire_rejection_streaks_after_legacy_mint(")
+            .count()
+            // The definition itself is not a call.
+            .saturating_sub(1);
+        assert_eq!(writes, 3, "the three refresher-owned legacy mints");
+        assert_eq!(
+            retirements, writes,
+            "every legacy-slot write must retire the old credential's streaks"
+        );
     }
 }
 
