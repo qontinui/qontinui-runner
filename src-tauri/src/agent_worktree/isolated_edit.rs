@@ -495,9 +495,10 @@ async fn materialize_repos(
     }
 
     // Phase 2a: do NOT pin the primary checkout's HEAD. Send `parent_sha:
-    // None` and let coord's `decide_parent_sha` return its authoritative
-    // webhook-fresh `coord_main_sha` — the correct base even when this
-    // runner's primary is parked on a stale feature branch.
+    // None` and let coord's `decide_parent_sha` return its mirror's
+    // `coord_main_sha` — independent of this runner's primary (which may be
+    // parked on a stale feature branch), and only as fresh as coord's 120 s
+    // reconcile loop last left `mirror_state`, which no webhook writes.
     let repo_reqs: Vec<RepoRequest> = repos
         .iter()
         .map(|repo| RepoRequest {
@@ -578,6 +579,7 @@ async fn materialize_repos(
                     parent_sha: b.parent_sha,
                     worktree_path: b.checkout_path,
                     push_ref: b.push_ref,
+                    parent_sha_provenance: b.parent_sha_provenance,
                 })
                 .collect(),
             token: sb.token,
@@ -1248,6 +1250,7 @@ mod tests {
             parent_sha: "0".repeat(40),
             worktree_path,
             push_ref: format!("refs/agent/test-{repo}"),
+            parent_sha_provenance: super::super::ParentShaProvenance::default(),
         };
         let claim = ActiveClaim {
             kind: "worktree".to_string(),
