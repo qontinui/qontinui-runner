@@ -1408,9 +1408,19 @@ evict a live peer and will not unlatch your client. Use
   runner, whose own drain owns that file; draining from here would be a second
   writer where the first one is healthy. L3 and L6 reach neither
   `/coord/work-units` nor `/coord/agent-findings`, so neither could carry the
-  rows. `COORD_REVIVE_NO_DRAIN=1` opts out. A checkout that does not ship the
-  drainer prints `DRAIN: not attempted` naming the path — which is a statement
-  about THAT CHECKOUT, never about whether the spool is empty.
+  rows. `COORD_REVIVE_NO_DRAIN=1` opts out. The drainer is found through the
+  same fleet-script resolver as the L3/L4/L5 helpers, so from a checkout
+  carrying its own `.claude/` copy (a worktree of any other repo) it walks up to
+  a config checkout, as well as resolving from the config repo and the
+  workspace-root symlink — provided that checkout is new enough to ship the
+  drainer. When none in reach does, the script prints `DRAIN: not attempted`
+  with what it searched — a statement about THE CHECKOUTS IN REACH, never about
+  whether the spool is empty. After a run it prints the drainer's exit code with
+  its meaning, because the indented table alone does not carry it: `3` no
+  readable spool or no python to parse one; `4` at least one row refused (4xx)
+  or unsendable — and since 4 outranks 5, other rows may still be undelivered,
+  so read the table; `5` at least one row undelivered and none refused
+  (retryable).
 - **Reaching L5 is COUNTED, and the counter is local.** Two `guard_decide`
   records per run into `~/.qontinui/logs/guard-decisions.log` (see the L5
   section's table). A counter that had to reach coord would be missing in

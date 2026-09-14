@@ -1640,19 +1640,42 @@ live_exit() {
       https-bootstrap-agent-jwt) drain_bearer="${BOOT_TOKEN:-}" ;;
     esac
     if [ -n "$drain_bearer" ]; then
-      local drainer="" drain_hdr="$TMPD/drainhdr"
-      # Resolved beside this skill the same way every other sibling here is, so
-      # a checkout that does not ship the drainer says so instead of silently
-      # skipping. An absent drainer is a statement about THIS checkout.
-      drainer="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../scripts" 2>/dev/null && pwd)/drain-closeout-spool.sh"
+      local drainer="" drain_hdr="$TMPD/drainhdr" drain_rc=""
+      # Found through the ONE fleet-script resolver, exactly like the L3/L4/L5
+      # helpers. A fixed `$(dirname "$0")/../../../scripts` resolves only where
+      # this `.claude/` IS the config repo's (directly, or via the
+      # <workspace-root>/.claude symlink, which bash's `cd` rescues by falling
+      # back to the physical path). From every checkout carrying its OWN real
+      # `.claude/` copy -- a runner-provisioned worktree of any other repo, and
+      # the runner-bundled skill -- it names `<that repo>/scripts/`, where the
+      # drainer never is, so the drain never ran. The resolver's walk reaches a
+      # config checkout from there -- which still has to be new enough to ship
+      # the drainer (a shared primary checkout routinely lags main). An absent
+      # drainer is a statement about THE CHECKOUTS IN REACH, and says what it
+      # searched.
+      __resolve_fleet_script "drain-closeout-spool.sh"; drainer="$__RFS_PATH"
       { printf 'Authorization: Bearer %s\n' "$drain_bearer" > "$drain_hdr"; } 2>/dev/null
       if [ ! -s "$drain_hdr" ]; then
         echo "DRAIN: header staging failed under $TMPD - the spool was NOT drained. LOCAL fault; it says nothing about coord or about whether rows are pending."
-      elif [ ! -x "$drainer" ]; then
-        echo "DRAIN: not attempted - $drainer is absent or not executable in this checkout. NOT a statement that the spool is empty; run scripts/drain-closeout-spool.sh by hand from a checkout that has it."
+      elif [ -z "$drainer" ]; then
+        echo "DRAIN: not attempted - scripts/drain-closeout-spool.sh not found ($(__fleet_script_searched "drain-closeout-spool.sh")). NOT a statement that the spool is empty; run it by hand from a qontinui-claude-config checkout."
       else
         echo "DRAIN: replaying unacked closeout rows over this door (push-only; nothing is written to any outbox or cursor). \$COORD_REVIVE_NO_DRAIN=1 opts out."
-        "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
+        # `bash <path>`, never `"$path"`: the resolver admits a readable file
+        # without the exec bit (routinely dropped on Windows/MSYS checkouts).
+        bash "$drainer" --header-file "$drain_hdr" 2>&1 | sed 's/^/  /'
+        # The pipe to sed spends the drainer's status, and the indented table
+        # does not carry it. Its precedence matters when reading it: 4 wins
+        # over 5, so a run with BOTH a refused and an undelivered row exits 4 --
+        # which is why the 4 line below still points at the table.
+        drain_rc="${PIPESTATUS[0]}"
+        case "$drain_rc" in
+          0) echo "DRAIN: exit 0 - every eligible row accepted, or none pending." ;;
+          3) echo "DRAIN: exit 3 - no readable spool on THIS box, or no python to parse one; read the drainer's own line above. Absence or a LOCAL fault - not delivery, and not a coord verdict." ;;
+          4) echo "DRAIN: exit 4 - at least one row REFUSED by coord (4xx) or UNSENDABLE (no buildable URL), neither retried; other rows in this run may still be UNDELIVERED and retryable - read the table above." ;;
+          5) echo "DRAIN: exit 5 - at least one row UNDELIVERED (transport or 5xx) and none refused; retryable, re-run coord-revive or the drainer." ;;
+          *) echo "DRAIN: exit $drain_rc - unexpected drainer status; treat every row as UNKNOWN." ;;
+        esac
       fi
       rm -f "$drain_hdr"
     fi
