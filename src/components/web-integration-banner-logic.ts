@@ -188,9 +188,17 @@ export function shouldShowAuthBanner(
  * What the credential banner RENDERS for a given cause — kept here rather than
  * in the `.tsx` so every cause's wording and CTA is unit-testable in node.
  *
- * `ctaAction` names which existing Tauri command the button invokes:
- * `cognito_sign_in` for an interactive re-login, `kick_refresher` for the
- * headless retry (`kick_device_jwt_refresher_cmd`).
+ * `ctaAction` names which existing Tauri command the button invokes, and the
+ * label always says what that command does:
+ *
+ * - `cognito_sign_in` — the interactive sign-in, which binds the device and
+ *   mints a fresh device JWT. Serves BOTH `sign_in` ("Sign in") and `re_pair`
+ *   ("Sign in to re-pair"): the postures that ask for a re-pair (`absent`,
+ *   `unrefreshable`, `upstream_401`) have already exhausted the automatic
+ *   rungs, so re-running the refresher would complete with no error and leave
+ *   the banner standing. Sign-in is the only rung that can re-pair.
+ * - `kick_refresher` — the headless retry (`kick_device_jwt_refresher_cmd`),
+ *   for `retry_refresh` ("Retry refresh now") only.
  */
 export interface CredentialDarkPresentation {
   title: string;
@@ -217,8 +225,22 @@ const CREDENTIAL_DARK_TITLES: Record<string, string> = {
 
 const CREDENTIAL_DARK_CTA_LABELS: Record<CredentialDarkCta, string> = {
   sign_in: "Sign in",
-  re_pair: "Re-pair",
+  re_pair: "Sign in to re-pair",
   retry_refresh: "Retry refresh now",
+};
+
+/**
+ * Which command each CTA invokes. A `Record` so a new CTA cannot compile
+ * without an explicit action. See {@link CredentialDarkPresentation} for why
+ * `re_pair` goes to the sign-in rather than the refresher.
+ */
+const CREDENTIAL_DARK_CTA_ACTIONS: Record<
+  CredentialDarkCta,
+  NonNullable<CredentialDarkPresentation["ctaAction"]>
+> = {
+  sign_in: "cognito_sign_in",
+  re_pair: "cognito_sign_in",
+  retry_refresh: "kick_refresher",
 };
 
 /**
@@ -326,12 +348,7 @@ export function credentialDarkPresentation(
       ? `Since ${formatTime(signal.since)} — `
       : "";
   const body = `${prefix}${signal.message}`;
-  const ctaAction =
-    signal.cta === null
-      ? null
-      : signal.cta === "sign_in"
-        ? ("cognito_sign_in" as const)
-        : ("kick_refresher" as const);
+  const ctaAction = signal.cta === null ? null : CREDENTIAL_DARK_CTA_ACTIONS[signal.cta];
   return {
     title,
     body,
