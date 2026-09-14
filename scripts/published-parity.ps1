@@ -96,7 +96,7 @@
 #     bundled_resources    observed once the app handle exists
 #     spec_pages           observed only if the warm-up read succeeds
 #
-# and the other six are structurally out of reach until this harness can drive a
+# and the other seven are structurally out of reach until this harness can drive a
 # real session spawn on both legs. The report prints this per row, computed from
 # the data rather than asserted, so a reader can never mistake a thin
 # observation for a clean bill of health.
