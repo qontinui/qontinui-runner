@@ -54,8 +54,11 @@ therefore moved a whole crate out of coverage while the run still printed `OK`,
 with the shrunken list going only to `--list-roots`, i.e. to a log nobody diffs.
 The discovered list is now compared against `EXPECTED_SCAN_ROOTS` in this file
 on every check run, and a difference in either direction FAILS. Changing what is
-scanned is a deliberate two-line diff in a ci-integrity-guarded file, not a
-side-effect of a manifest edit.
+scanned is a deliberate two-line diff in this file, not a side-effect of a
+manifest edit. This file is NOT ci-integrity-guarded: ci-integrity.yml watches
+only `.github/workflows/**` and `.github/actions/**`, so an edit here gets
+ordinary PR review and nothing more (see the SELF-PROTECTION paragraph in
+`.github/workflows/forbid-untimed-subprocess.yml`).
 
 BOTH dependency spellings are followed:
 
@@ -485,9 +488,10 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 #:
 #: So the discovered list is compared against this one on every check run. A
 #: mismatch is a FAILURE, not a warning: adding or removing a linked crate is a
-#: real change to what this gate covers, and it is now a two-line diff in a file
-#: that ci-integrity.yml guards (`scripts/check_untimed_subprocess.py`) rather
-#: than an invisible consequence of a manifest edit.
+#: real change to what this gate covers, and it is now a visible two-line diff in
+#: this file (`scripts/check_untimed_subprocess.py`) rather than an invisible
+#: consequence of a manifest edit. This file is NOT ci-integrity-guarded, so that
+#: diff gets ordinary PR review only (see the module docstring).
 #:
 #: Update it in the same commit that changes the dependency, and say in the
 #: commit message why the coverage change is correct.
@@ -2797,7 +2801,7 @@ def main() -> int:
     #    this script lives in, so comparing it against a `--root`-supplied
     #    fixture would be meaningless (and would make every fixture run red).
     #    CI passes no `--root`, so the check always applies there — and the
-    #    workflow that would have to grow one is in ci-integrity.yml's GATING set.
+    #    workflow that would have to grow one is under ci-integrity.yml's trigger scope.
     problems: list[str] = scope_problems(root, scope) if root == DEFAULT_ROOT else []
 
     # 1. Unexempted sites.

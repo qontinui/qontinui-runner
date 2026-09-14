@@ -47,6 +47,19 @@ export function formatTimestamp(timestamp: string | undefined | null): string {
 /**
  * Format a timestamp as a relative time string (e.g., "2 hours ago").
  *
+ * An instant in the FUTURE is rendered as the absolute local date and time, not
+ * relatively. Every negative difference used to fall through `seconds < 60` and
+ * render as "just now" — with no lower bound, so a timestamp a week ahead read
+ * as the strongest possible freshness claim. A fleet machine whose clock runs
+ * fast writes exactly that, and the callers of this function are reporting
+ * heartbeats and last-activity, where "just now" is the one answer that must
+ * not be invented. Showing the raw instant says what is known and claims
+ * nothing about freshness. Date AND time, because a skew of minutes is
+ * invisible in a date alone.
+ *
+ * An unparseable timestamp still falls through to `toLocaleString`'s own
+ * "Invalid Date" — callers that must not render that should validate first.
+ *
  * @param timestamp - ISO 8601 timestamp string
  * @returns Relative time string
  */
@@ -56,6 +69,8 @@ export function formatRelativeTime(timestamp: string | undefined | null): string
   const date = new Date(timestamp);
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
+
+  if (diffMs < 0) return date.toLocaleString();
 
   const seconds = Math.floor(diffMs / 1000);
   if (seconds < 60) return "just now";

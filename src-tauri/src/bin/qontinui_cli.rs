@@ -59,7 +59,7 @@ use std::time::Duration;
 /// sync by shape, not by import" is the five-silent-readers failure mode that
 /// module was created to eliminate.
 use qontinui_runner_lib::coord_mcp_config::{
-    proxy_nonce_from_header_object, COORD_MCP_PROXY_KEY_HEADER_JSON,
+    effective_coord_mcp_entry, proxy_nonce_from_header_object, COORD_MCP_PROXY_KEY_HEADER_JSON,
 };
 
 const RUNNER_PORT_ENV: &str = "QONTINUI_RUNNER_API_PORT";
@@ -1273,7 +1273,20 @@ fn find_session_mcp_config(start: &Path) -> Option<SessionMcpConfig> {
 fn parse_mcp_json(text: &str) -> Option<SessionMcpConfig> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
     let servers = v.get("mcpServers")?.as_object()?;
-    for server in servers.values() {
+    for (name, server) in servers {
+        // The `coord-mcp` entry is read through the runner's own resolver: a
+        // stdio-shaped entry keeps its `url` and `headers` in the credential
+        // file it names, and a walk-up that read the entry raw would go dark in
+        // every workdir the runner wrote that shape into.
+        let resolved: Option<std::borrow::Cow<'_, serde_json::Value>> = if name == "coord-mcp" {
+            match effective_coord_mcp_entry(&v) {
+                Some(entry) => Some(entry),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        let server: &serde_json::Value = resolved.as_deref().unwrap_or(server);
         let url = server.get("url").and_then(|u| u.as_str()).unwrap_or("");
         if !url.contains("/coord-mcp") {
             continue;

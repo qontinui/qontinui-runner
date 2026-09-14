@@ -481,12 +481,64 @@ fn csp_permits_eval(csp: &str) -> bool {
 ///   is not the one asking. A caller that reads `canAnswer: true` and still gets
 ///   a 403 has the typed code telling it which handshake step failed.
 /// * `coordMcpForwarder` — the `/coord-mcp*` family (JSON-RPC proxy, the
-///   enumerated reads, the write forwarder). Every route is nonce-gated, so it
-///   answers whenever this process is serving; what it CANNOT do is hand a
-///   caller its first nonce — that is `provisionSessionMint`'s job.
-fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
+///   enumerated reads, the write forwarder). Every route is nonce-gated and
+///   in-process, so the door is always SERVING; what decides `canAnswer` is
+///   whether the device JWT it forwards is alive — the runner's
+///   [`crate::mcp::device_jwt_refresher::CoordCredentialPosture`]. This field
+///   used to be a hard-coded `true` describing the shape alone, which is
+///   exactly the false positive the paragraph above rejects for `evalMint`.
+///   What it CANNOT do, at any posture, is hand a caller its first nonce —
+///   that is `provisionSessionMint`'s job.
+fn credential_doors_health(
+    frontend_ready: bool,
+    device_jwt: serde_json::Value,
+) -> serde_json::Value {
+    credential_doors_health_with_posture(
+        frontend_ready,
+        crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.posture),
+        device_jwt,
+    )
+}
+
+/// The pure half of [`credential_doors_health`]: the posture is passed in
+/// rather than read from the process-global cell, so the forwarder's verdict
+/// can be asserted for every posture without a running refresher.
+///
+/// `posture: None` is UNKNOWN — no refresher pass has run in this process yet.
+/// It is NOT rendered as either verdict: `canAnswer` is `null` and the reason
+/// says so. Defaulting it to `true` is precisely the false positive that let a
+/// runner with a dead credential read healthy for ten hours; defaulting it to
+/// `false` would manufacture a fault out of a missing measurement.
+fn credential_doors_health_with_posture(
+    frontend_ready: bool,
+    posture: Option<crate::mcp::device_jwt_refresher::CoordCredentialPosture>,
+    device_jwt: serde_json::Value,
+) -> serde_json::Value {
     let marker = crate::coord_mcp::session_identity_marker_path();
     let marker_present = marker.as_ref().map(|p| p.exists()).unwrap_or(false);
+    let forwarder_can_answer = match posture {
+        Some(p) => serde_json::Value::Bool(p.can_answer()),
+        None => serde_json::Value::Null,
+    };
+    let forwarder_reason: String = match posture {
+        Some(p) if p.can_answer() => format!(
+            "in-process and nonce-gated; it forwards with a freshly-read device JWT \
+             (coord-credential posture: {}) and never emits one. It cannot issue your \
+             FIRST nonce — that is provisionSessionMint",
+            p.as_str()
+        ),
+        Some(p) => format!(
+            "the door is serving, but this runner's coord credential is {} — {} A call \
+             forwarded now returns coord's 401, which is the RUNNER's credential and NOT \
+             your nonce. See /health.coordCredential",
+            p.as_str(),
+            p.message()
+        ),
+        None => "the door is serving, but the coord-credential posture is UNKNOWN — no \
+                 device-JWT refresher pass has completed in this process yet. UNKNOWN is \
+                 not health: read /health.coordCredential again once a pass has run"
+            .to_string(),
+    };
     serde_json::json!({
         "evalMint": {
             "canAnswer": frontend_ready && csp_allows_eval(),
@@ -522,15 +574,26 @@ fn credential_doors_health(frontend_ready: bool) -> serde_json::Value {
             "requiresWebview": false,
         },
         "coordMcpForwarder": {
-            // Nonce-gated, in-process, no WebView: it answers whenever this
-            // process is serving /health at all.
-            "canAnswer": true,
+            // READS THE POSTURE. This was a hard-coded literal `true`, which
+            // described the door's SHAPE — nonce-gated, in-process, no WebView
+            // — and never whether the JWT it forwards is alive. On 2026-09-12
+            // a runner restored an already-expired coord slot at boot and this
+            // field read `true` for ten hours while every forwarded call came
+            // back 401. The doc comment above already argued against reporting
+            // `canAnswer` off shape alone; this completes that argument.
+            "canAnswer": forwarder_can_answer,
+            "posture": posture.map(|p| p.as_str()),
             "transport": "POST /coord-mcp, GET /coord-mcp/claims/*, GET /coord-mcp/agent-*, \
                           GET /coord-mcp/pr-merge/*, POST /coord-mcp/{gates,work-units}/*",
-            "reason": "in-process and nonce-gated; it forwards with a freshly-read device \
-                       JWT and never emits one. It cannot issue your FIRST nonce — that is \
-                       provisionSessionMint",
+            "reason": forwarder_reason,
             "requiresWebview": false,
+            // Phase 1e (plan 2026-09-02-steering-layers-unreadable-without-a-
+            // credential): LIVE reachability beside the inventory. `canAnswer`
+            // says the door exists; these two say whether its upstream
+            // answered recently and whether the bearer it would inject is
+            // usable right now. Neither carries a secret.
+            "lastForward": crate::coord_mcp::last_forward_health_json(),
+            "deviceJwt": device_jwt,
         },
     })
 }
@@ -1087,6 +1150,10 @@ async fn health(
         embedding_reachable: embedding_reachable_cached(),
         pg_reachable,
         relay_connected,
+        // M7: a credential-dark runner is DEGRADED, not healthy. `None` while
+        // no refresher pass has concluded — UNKNOWN, never health.
+        coord_credential_can_answer: crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .map(|s| s.posture.can_answer()),
     });
 
     // `frontendReady` is DERIVED, not latched (2026-08-05).
@@ -1176,6 +1243,12 @@ async fn health(
         .unwrap_or(serde_json::Value::Null);
     let window_swap_latch = serde_json::to_value(crate::webview_recovery::window_swap_report())
         .unwrap_or(serde_json::Value::Null);
+
+    // Phase 1e: the default device slot's presence / usability / expiry for
+    // `credentialDoors.coordMcpForwarder.deviceJwt`. A blocking-pool file read
+    // awaited here, so the executor is never blocked; the token itself never
+    // leaves the helper.
+    let device_jwt_health = crate::coord_mcp::device_jwt_health_json().await;
 
     let mut data = serde_json::json!({
         "status": status,
@@ -1341,7 +1414,27 @@ async fn health(
         // `page/evaluate` timeout and then drew the WRONG conclusion ("signed
         // out" for what is really a dead transport). This states the fact
         // instead of leaving it to be inferred from a timeout.
-        "credentialDoors": credential_doors_health(frontend_ready),
+        "credentialDoors": credential_doors_health(frontend_ready, device_jwt_health),
+        // The runner's own coord-credential POSTURE (plan
+        // 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+        // Phase 1): `live | expiring | expired | absent | unrefreshable | dark`,
+        // derived every device-JWT refresher pass from the per-tenant slot
+        // pass's outcomes and the verdicts coord actually returned. `null`
+        // means UNKNOWN — no pass has completed in this process — and is NOT
+        // health. A runner that boots holding a dead credential used to be
+        // indistinguishable here from a healthy one — `derived_status:
+        // healthy` while every session it spawns has no coord access. It is
+        // not any more: `can_answer() == false` feeds `derived_status` as a
+        // `degraded` input (M7, `HealthInputs::coord_credential_can_answer`),
+        // so the top-level verdict moves with this block.
+        "coordCredential": crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .map(|s| s.to_json())
+            .unwrap_or_else(|| serde_json::json!({
+                "posture": "unknown",
+                "state": "unknown",
+                "reason": "no device-JWT refresher pass has completed in this process yet \
+                           — UNKNOWN, never 'healthy'",
+            })),
         // Semantic recall (plan 2026-07-30, Phase 3): how each proxied
         // `coord_memory_search` ended — did it get a query vector or not.
         // Non-search traffic is neither touched nor counted, so `enriched`
@@ -1390,6 +1483,12 @@ async fn health(
         // check completes, and permanently null on a repo-less install.
         "mainSha": main_sha_json,
         "buildDrift": build_drift_json,
+        // The last `tools/list` drift observation the coord-mcp proxy made
+        // (see `observed_coord_mcp_drift_json`): `null` = no `tools/list` has
+        // passed through this process since boot — UNKNOWN, not zero;
+        // `{driftedTools: [], …}` = observed clean. Same producer as
+        // `/coord-mcp/tool-policy`'s field, never re-derived.
+        "coordMcpDrift": observed_coord_mcp_drift_json(),
         // Session-tracking health (see `crate::session::tracking_health`):
         // last cross-reference timestamp, live-but-untracked / tracked-but-
         // dead counts + detail, and the untracked-backend-spawn counter.
@@ -1484,7 +1583,9 @@ async fn health(
         "success": true,
         "data": data,
         "uiBridge": {
-            "appId": "qontinui-runner",
+            // Same constant the snapshot enricher stamps and `project.apps`
+            // is self-registered under — one id, never a second literal.
+            "appId": crate::spec_api::storage::RUNNER_APP_ID,
             "appName": "Qontinui Runner",
             "appType": "desktop",
             "framework": "tauri",
@@ -1592,6 +1693,30 @@ pub(crate) enum SelfIdOutcome {
     /// an identical header from all three success arms; the /health split
     /// keeps the resolving chain diagnosable per-plane.
     InjectedViaLifecycle,
+    /// The header was sent, resolved by the CALLER'S OWN assertion settling a
+    /// key the runner had narrowed to several candidates and could not settle
+    /// alone. The request's `X-Coord-Caller-Session` — the header
+    /// `coord-revive.sh call` (qontinui-runner#1432) and the config-repo
+    /// doors (qontinui-claude-config#865) now forward — is consumed as a
+    /// TIE-BREAK, never as an identity in its own right: it resolves only
+    /// when it names one of the runner's admitted candidates for the
+    /// terminal or workdir the nonce is bound to. A fourth success arm, kept
+    /// separate so the /health split says how much of the attribution is the
+    /// client's word narrowing the runner's proof, versus the runner's proof
+    /// alone — and split PER LEG, because leg 1's `terminal_leg` self-report
+    /// sums its own outcome family and a shared variant would let a settled
+    /// terminal read as leg 1 never engaging (the `ResolverStateMissing`
+    /// exclusion, from the other direction). See [`settle_ambiguity`].
+    ///
+    /// This one is leg 1: several open rows on the nonce's TERMINAL, the
+    /// assertion named one of them.
+    InjectedViaClientPickTerminal,
+    /// The leg-3 twin of [`SelfIdOutcome::InjectedViaClientPickTerminal`]:
+    /// several admitted sessions on the nonce's WORKDIR, the assertion named
+    /// one of them. This is the arm the 178 `ambiguous_workdir` misses on the
+    /// operator's box (2026-09-12) move into once the caller says which of
+    /// the workdir's sessions it is.
+    InjectedViaClientPickWorkdir,
     /// An agent-spawn session — out of scope by design; those carry their own
     /// scoped identity.
     NonDevicePrincipal,
@@ -1626,7 +1751,11 @@ pub(crate) enum SelfIdOutcome {
     /// rows, and in the dangerous window (a reused terminal between PTY spawn
     /// and the SessionStart hook's confirmation) the STALE row is the
     /// confirmed one — so authority-ranking would actively prefer the
-    /// PREVIOUS run's session id. See [`select_terminal_caller`].
+    /// PREVIOUS run's session id. See [`select_terminal_caller`]. A
+    /// client-asserted id naming one of those rows settles it (the live
+    /// session knows which row is its own — see
+    /// [`SelfIdOutcome::InjectedViaClientPickTerminal`]); this bucket is what
+    /// remains when the request asserted nothing.
     AmbiguousTerminal,
     /// The nonce is not in the live binding map.
     NoWorkdir,
@@ -1661,8 +1790,30 @@ pub(crate) enum SelfIdOutcome {
     /// workdir key (the workspace root hosts 13 open records). Deliberately
     /// resolved to no header rather than to an arbitrary winner — see
     /// [`select_lifecycle_caller`]. This is the honest residual the terminal
-    /// leg exists to shrink.
+    /// leg exists to shrink — and the one a client-asserted id may settle
+    /// (see [`SelfIdOutcome::InjectedViaClientPickWorkdir`]); this bucket is
+    /// what remains when the request asserted nothing.
     AmbiguousWorkdir,
+    /// The key was ambiguous (on either leg) AND the request asserted a
+    /// session id, but the asserted id is NOT one of the runner's admitted
+    /// candidates for that key — so it settled nothing and the call goes
+    /// headerless. Counted apart from the two `ambiguous_*` buckets because
+    /// it is a different fact: a session in this workdir/terminal is naming
+    /// itself and the runner holds no trusted record of it (a hand-launched
+    /// session with no lifecycle record, a `reconciled` anchor, or an
+    /// assertion naming a session elsewhere). Measured 0 before this arm
+    /// existed by construction; a non-zero reading here is the population
+    /// the runner's own record-keeping is blind to. Split per leg for the
+    /// same reason as the success twin. This one is leg 1 (the terminal's
+    /// rows); the `terminal_leg` block counts it as engagement, and the
+    /// asserted id is NOT carried in `recent_misses` — that ring is the
+    /// workdir leg's sample (it carries a workdir and a record census, which
+    /// a terminal key has no analogue of).
+    ClientPickNotCandidateTerminal,
+    /// Leg 3 (the workdir's admitted sessions). This one DOES land in
+    /// `recent_misses`, with `client_asserted` set to the id the session
+    /// claimed, beside the census of what the runner held for that workdir.
+    ClientPickNotCandidateWorkdir,
     /// The lifecycle store is absent from Tauri state, so the lifecycle leg
     /// could not run at all. Should read **0** in production: the store is
     /// managed at `main.rs:2786`. That is what makes this arm a useful
@@ -1701,6 +1852,10 @@ impl SelfIdOutcome {
             Self::AmbiguousWorkdir => "ambiguous_workdir",
             Self::ResolverStateMissing => "resolver_state_missing",
             Self::NoSession => "no_session",
+            Self::InjectedViaClientPickTerminal => "injected_via_client_pick_terminal",
+            Self::InjectedViaClientPickWorkdir => "injected_via_client_pick_workdir",
+            Self::ClientPickNotCandidateTerminal => "client_pick_not_candidate_terminal",
+            Self::ClientPickNotCandidateWorkdir => "client_pick_not_candidate_workdir",
         }
     }
 
@@ -1736,12 +1891,19 @@ impl SelfIdOutcome {
             Self::AmbiguousWorkdir => 13,
             Self::ResolverStateMissing => 14,
             Self::NoSession => 15,
+            // Appended, never interleaved: the slots above are the series
+            // operators have been reading since 2026-08, and renumbering them
+            // would make a counter silently change meaning across builds.
+            Self::InjectedViaClientPickTerminal => 16,
+            Self::InjectedViaClientPickWorkdir => 17,
+            Self::ClientPickNotCandidateTerminal => 18,
+            Self::ClientPickNotCandidateWorkdir => 19,
         }
     }
 
     /// Every outcome, in counter-slot order — `ALL[i].index() == i`, asserted
     /// in the tests so the two orderings cannot drift.
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Injected,
         Self::InjectedViaTerminal,
         Self::InjectedViaLifecycle,
@@ -1758,13 +1920,17 @@ impl SelfIdOutcome {
         Self::AmbiguousWorkdir,
         Self::ResolverStateMissing,
         Self::NoSession,
+        Self::InjectedViaClientPickTerminal,
+        Self::InjectedViaClientPickWorkdir,
+        Self::ClientPickNotCandidateTerminal,
+        Self::ClientPickNotCandidateWorkdir,
     ];
 }
 
 /// Per-outcome counters, indexed by [`SelfIdOutcome::index`] (which is the
 /// declaration order of [`SelfIdOutcome::ALL`]).
-fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 16] {
-    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 16]> =
+fn self_id_counters() -> &'static [std::sync::atomic::AtomicU64; 20] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 20]> =
         std::sync::OnceLock::new();
     COUNTERS.get_or_init(Default::default)
 }
@@ -1838,6 +2004,16 @@ struct SelfIdMissSample {
     open_dirs: Vec<String>,
     /// The undeduplicated counts behind the verdict.
     census: LifecycleMissCensus,
+    /// What the REQUEST said it was, when it said anything: the parsed
+    /// `X-Coord-Caller-Session` the client forwarded. `None` for a request
+    /// that asserted nothing (or asserted a non-UUID, which is the same
+    /// thing — see [`client_asserted_session`]). Beside `distinct_candidates`
+    /// this is what makes a `client_pick_not_candidate_workdir` miss
+    /// diagnosable: the operator can see the id the session claimed and ask
+    /// why the runner holds no trusted record naming it. This ring is the
+    /// WORKDIR leg's sample — a terminal-leg rejection is counted
+    /// (`client_pick_not_candidate_terminal`) but not sampled here.
+    client_asserted: Option<uuid::Uuid>,
 }
 
 /// The miss ring itself: newest at the back, capped at
@@ -1859,6 +2035,7 @@ fn record_self_id_miss_sample(
     candidate_dirs: Vec<String>,
     open_dirs: Vec<String>,
     census: LifecycleMissCensus,
+    client_asserted: Option<uuid::Uuid>,
 ) {
     let sample = SelfIdMissSample {
         gate: gate.label(),
@@ -1866,6 +2043,7 @@ fn record_self_id_miss_sample(
         candidate_dirs,
         open_dirs,
         census,
+        client_asserted,
     };
     let Ok(mut q) = self_id_miss_samples().lock() else {
         return;
@@ -1917,6 +2095,10 @@ fn self_id_miss_sample_entry_json(s: &SelfIdMissSample) -> serde_json::Value {
         "matched_record_count": s.census.matched,
         "admitted_record_count": s.census.admitted,
         "distinct_candidate_count": s.census.distinct_candidates,
+        // The request's own claim, or `null` — rendered even when absent so a
+        // reader can tell "asserted nothing" from "this build does not
+        // report it".
+        "client_asserted": s.client_asserted.map(|u| u.to_string()),
     })
 }
 
@@ -1961,12 +2143,19 @@ fn terminal_leg_no_terminal_counter() -> &'static std::sync::atomic::AtomicU64 {
 /// though leg 1 can emit it: the lifecycle leg emits it too, so counting it as
 /// leg-1 engagement would let a store-wiring fault on the OTHER leg report
 /// this one as healthy — the exact false-calm this surface exists to prevent.
-const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 5] = [
+///
+/// The two client-pick outcomes here are the TERMINAL-keyed ones only; their
+/// workdir twins are leg 3's, and a shared variant would have put leg 1 back
+/// in the same false-calm shape (a box whose every terminal-bound nonce is
+/// settled by pick would have read `engaged == 0`, verdict `inert`).
+const TERMINAL_LEG_OUTCOMES: [SelfIdOutcome; 7] = [
     SelfIdOutcome::InjectedViaTerminal,
     SelfIdOutcome::TerminalRecordMissing,
     SelfIdOutcome::TerminalRecordUnadmitted,
     SelfIdOutcome::TerminalAnchorNotUuid,
     SelfIdOutcome::AmbiguousTerminal,
+    SelfIdOutcome::InjectedViaClientPickTerminal,
+    SelfIdOutcome::ClientPickNotCandidateTerminal,
 ];
 
 /// The honest three-way reading of leg 1's health, from its two halves.
@@ -2002,6 +2191,10 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
         );
     }
     obj.insert("recent_misses".to_string(), self_id_miss_sample_json());
+    obj.insert(
+        "client_assertion_overridden".to_string(),
+        serde_json::json!(client_assertion_overridden_counter().load(Ordering::Relaxed)),
+    );
     let no_terminal = terminal_leg_no_terminal_counter().load(Ordering::Relaxed);
     let engaged: u64 = TERMINAL_LEG_OUTCOMES
         .iter()
@@ -2041,6 +2234,13 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 ///    names exactly one admitted session, and otherwise reports
 ///    [`SelfIdOutcome::AmbiguousWorkdir`] rather than picking one.
 ///
+/// `client_asserted` is the request's OWN `X-Coord-Caller-Session`, already
+/// parsed strictly ([`client_asserted_session`]). It never adds a candidate:
+/// it can only settle an ambiguity between candidates the runner derived
+/// itself, on legs 1 and 3 — see [`settle_ambiguity`] for the rule and its
+/// bound. A resolved leg ignores it (and counts the disagreement, see
+/// [`client_assertion_overridden_counter`]).
+///
 /// Every link is best-effort; a break anywhere yields `None` (the caller then
 /// omits the header and coord keeps its fuzzy fallback), and the break point
 /// is reported as a [`SelfIdOutcome`] so the chain is diagnosable from
@@ -2058,6 +2258,7 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 fn resolve_caller_session_id(
     state: &Arc<ApiState>,
     nonce: Option<&str>,
+    client_asserted: Option<uuid::Uuid>,
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     let Some(nonce) = nonce else {
         return (None, SelfIdOutcome::NoNonce);
@@ -2071,6 +2272,12 @@ fn resolve_caller_session_id(
     // workdir — see [`TerminalLeg`].
     match resolve_caller_via_terminal(state, nonce) {
         TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
+        // Several open rows on one terminal: the live session is the one
+        // that can say which row is its own. Still a terminal-leg verdict
+        // either way — never a fallthrough to the workdir chain.
+        TerminalLeg::Ambiguous(candidates) => {
+            return settle_ambiguity(&candidates, client_asserted, AmbiguousKey::Terminal);
+        }
         TerminalLeg::Miss(outcome) => return (None, outcome),
         TerminalLeg::NoTerminal => {
             // Count the FALLTHROUGH, not just the verdicts. `NoTerminal` ends
@@ -2115,10 +2322,146 @@ fn resolve_caller_session_id(
         // plane never has one), so resolve through the durable lifecycle
         // store instead: workdir → the single admitted open record → its own
         // anchor. Every miss arrives already typed as the gate that rejected.
-        None => match resolve_caller_via_lifecycle(state, &workdir) {
-            Ok(sid) => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
-            Err(outcome) => (None, outcome),
-        },
+        None => resolve_caller_via_lifecycle(state, &workdir, client_asserted),
+    }
+}
+
+/// The request's own `X-Coord-Caller-Session`, as the STRICT UUID it must be
+/// to name a `coord.agent_sessions` row — or `None`.
+///
+/// The SAME parse the runner applies to its own anchors
+/// ([`anchor_as_caller_session`]: trimmed, `Uuid::parse_str`, no repair), so
+/// the id a client asserts and the ids in `candidates` are compared in one
+/// namespace. A client that forwards a non-UUID has asserted nothing; it is
+/// neither counted as a pick nor logged, because the bundled `coord-revive.sh`
+/// and the config-repo doors already refuse to forward anything but a
+/// hyphenated UUID, so a malformed value here is a foreign client rather than
+/// a fleet bug. `HeaderMap::get` reads the FIRST value when the header is
+/// repeated — a second copy is ignored, not merged.
+fn client_asserted_session(headers: &axum::http::HeaderMap) -> Option<uuid::Uuid> {
+    let raw = headers
+        .get(crate::coord_mcp::CALLER_SESSION_HEADER)?
+        .to_str()
+        .ok()?;
+    anchor_as_caller_session(raw)
+}
+
+/// Which runner-owned key produced the ambiguity a client assertion is being
+/// asked to settle. Each maps to its own three outcomes, so the `/health`
+/// split — and leg 1's `terminal_leg` self-report in particular — keeps the
+/// leg provenance of every pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AmbiguousKey {
+    /// Leg 1: several open rows on the nonce's terminal.
+    Terminal,
+    /// Leg 3: several admitted sessions on the nonce's workdir.
+    Workdir,
+}
+
+impl AmbiguousKey {
+    /// Nothing asserted — the leg's own bucket, as before this arm existed.
+    const fn unsettled(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::AmbiguousTerminal,
+            Self::Workdir => SelfIdOutcome::AmbiguousWorkdir,
+        }
+    }
+    /// Asserted, and one of the runner's candidates.
+    const fn picked(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::InjectedViaClientPickTerminal,
+            Self::Workdir => SelfIdOutcome::InjectedViaClientPickWorkdir,
+        }
+    }
+    /// Asserted, and NOT one of the runner's candidates.
+    const fn rejected(self) -> SelfIdOutcome {
+        match self {
+            Self::Terminal => SelfIdOutcome::ClientPickNotCandidateTerminal,
+            Self::Workdir => SelfIdOutcome::ClientPickNotCandidateWorkdir,
+        }
+    }
+}
+
+/// Let the caller's own assertion settle an ambiguity the runner could not —
+/// and ONLY that.
+///
+/// The rule, in one line: the asserted id resolves iff it is one of
+/// `candidates`. `candidates` is the set the runner derived itself (the
+/// admitted, uuid-anchored open records on the nonce's terminal or workdir),
+/// so the client's word never ADDS an identity — it picks among identities
+/// the runner already vouches for on that key. That bound is what keeps the
+/// proxy's standing strip of the client header (see
+/// [`coord_mcp_forward_header_is_dropped`]) honest: a client still cannot
+/// name an arbitrary sibling on the device, only one the runner would have
+/// been willing to name had the key been 1:1.
+///
+/// Why this is the right bound and not a weakening. Every session in one
+/// workdir sharing an in-cwd `.mcp.json` already presents the SAME nonce and
+/// so the same principal; when that workdir held exactly one trusted record
+/// the runner already attributed EVERY holder of that nonce to it. The
+/// identity granularity the proxy could ever offer on the workdir key was
+/// therefore "a session of this workdir", and a pick among the workdir's own
+/// candidates stays inside it. coord then re-validates the id fail-closed
+/// against the device (`session_on_device`), and the JWT — not this header —
+/// remains the authorization boundary throughout.
+///
+/// Why it is needed at all. Measured on the operator's box 2026-09-12, since
+/// that runner booted: `ambiguous_workdir = 178`, `no_workdir = 69`,
+/// `no_lifecycle_record = 14`, every injected arm together = 10. The
+/// workspace root hosts a dozen open records, so the workdir key is ambiguous
+/// for most interactive calls — and the client-forwarded header that
+/// qontinui-runner#1432 / qontinui-claude-config#865 added was, until this
+/// arm, stripped by this proxy before it could settle any of them.
+///
+/// Three outcomes per key, each its own counter ([`AmbiguousKey`]):
+/// - asserted and a candidate → `picked()` (`injected_via_client_pick_*`);
+/// - asserted and NOT a candidate → `rejected()`
+///   (`client_pick_not_candidate_*`), headerless — the runner holds no
+///   trusted record for what the session says it is, and a wrong id is worse
+///   than no id;
+/// - nothing asserted → `unsettled()` (the leg's own `ambiguous_*` bucket),
+///   headerless, exactly as before.
+fn settle_ambiguity(
+    candidates: &[uuid::Uuid],
+    client_asserted: Option<uuid::Uuid>,
+    key: AmbiguousKey,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    match client_asserted {
+        Some(asserted) if candidates.contains(&asserted) => (Some(asserted), key.picked()),
+        Some(_) => (None, key.rejected()),
+        None => (None, key.unsettled()),
+    }
+}
+
+/// How often a request asserted a session id that DISAGREED with the one the
+/// runner resolved on its own (legs 1–3, single candidate). The runner's
+/// proof wins and the header carries the runner's id — this only counts.
+///
+/// It is the falsifier for the runner's own confidence. A single trusted
+/// record on a workdir makes leg 3 attribute every nonce-holder in that
+/// workdir to it, including a hand-launched session the store never saw; that
+/// session now says who it is, and this counter is the only place the
+/// contradiction becomes visible. Zero means the runner's records and the
+/// callers' self-reports agree; a climbing value names a population the
+/// lifecycle store is missing. Rendered as `client_assertion_overridden` in
+/// `GET /health` `selfId`.
+fn client_assertion_overridden_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(Default::default)
+}
+
+/// Count a resolved-vs-asserted disagreement, if there is one. Pure on its
+/// inputs apart from the counter bump; `true` iff it counted.
+fn note_client_assertion_disagreement(
+    resolved: Option<uuid::Uuid>,
+    client_asserted: Option<uuid::Uuid>,
+) -> bool {
+    match (resolved, client_asserted) {
+        (Some(r), Some(a)) if r != a => {
+            client_assertion_overridden_counter().fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -2136,7 +2479,7 @@ fn resolve_caller_session_id(
 /// and reports `RecordUnregistered`" only holds when the workdir hosts no
 /// OTHER admitted record; when it does, the guard is satisfied by the wrong
 /// session. The runner had the information to know better, and now uses it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TerminalLeg {
     /// The binding carries NO terminal (restore, adopt, the mint route, an
     /// in-cwd `.mcp.json`) — the majority of persisted nonces today. Fall
@@ -2144,9 +2487,42 @@ enum TerminalLeg {
     NoTerminal,
     /// The terminal named exactly one admitted open record with a uuid anchor.
     Resolved(uuid::Uuid),
+    /// The terminal named SEVERAL admitted open records with distinct uuid
+    /// anchors (a reused terminal whose stale rows never closed). The
+    /// runner cannot rank them — see [`select_terminal_caller`] — but the
+    /// request's own assertion may pick one of exactly these
+    /// ([`settle_ambiguity`]). Still a leg-1 verdict: it never falls through.
+    Ambiguous(Vec<uuid::Uuid>),
     /// The terminal IS known but did not resolve. STOP — never fall through:
     /// the workdir chain would answer with a DIFFERENT terminal's session.
     Miss(SelfIdOutcome),
+}
+
+/// Why [`select_terminal_caller`] produced no single caller. Mirrors
+/// [`LifecycleMiss`]: the ambiguous arm carries the candidates so the request's
+/// own assertion can settle it, and every arm maps to exactly one counted
+/// outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalMiss {
+    /// No OPEN record names this terminal.
+    RecordMissing,
+    /// Records name it, none with a trusted anchor origin.
+    RecordUnadmitted,
+    /// Admitted records exist, none with a uuid anchor.
+    AnchorNotUuid,
+    /// More than one distinct admitted uuid anchor on this terminal.
+    Ambiguous(Vec<uuid::Uuid>),
+}
+
+impl TerminalMiss {
+    fn outcome(&self) -> SelfIdOutcome {
+        match self {
+            Self::RecordMissing => SelfIdOutcome::TerminalRecordMissing,
+            Self::RecordUnadmitted => SelfIdOutcome::TerminalRecordUnadmitted,
+            Self::AnchorNotUuid => SelfIdOutcome::TerminalAnchorNotUuid,
+            Self::Ambiguous(_) => SelfIdOutcome::AmbiguousTerminal,
+        }
+    }
 }
 
 /// Leg 1: resolve the caller from the nonce's TERMINAL — the finest key the
@@ -2211,7 +2587,8 @@ fn terminal_leg(
     };
     match select_terminal_caller(records, terminal_id) {
         Ok(sid) => TerminalLeg::Resolved(sid),
-        Err(outcome) => TerminalLeg::Miss(outcome),
+        Err(TerminalMiss::Ambiguous(candidates)) => TerminalLeg::Ambiguous(candidates),
+        Err(miss) => TerminalLeg::Miss(miss.outcome()),
     }
 }
 
@@ -2247,7 +2624,7 @@ fn terminal_leg(
 fn select_terminal_caller(
     records: &[crate::session::session_lifecycle_store::TerminalSessionRecord],
     terminal_id: &str,
-) -> Result<uuid::Uuid, SelfIdOutcome> {
+) -> Result<uuid::Uuid, TerminalMiss> {
     let mut matched = 0usize;
     let mut admitted = 0usize;
     let mut candidates: Vec<uuid::Uuid> = Vec::new();
@@ -2268,15 +2645,15 @@ fn select_terminal_caller(
         }
     }
     if matched == 0 {
-        return Err(SelfIdOutcome::TerminalRecordMissing);
+        return Err(TerminalMiss::RecordMissing);
     }
     if admitted == 0 {
-        return Err(SelfIdOutcome::TerminalRecordUnadmitted);
+        return Err(TerminalMiss::RecordUnadmitted);
     }
     match candidates.len() {
-        0 => Err(SelfIdOutcome::TerminalAnchorNotUuid),
+        0 => Err(TerminalMiss::AnchorNotUuid),
         1 => Ok(candidates[0]),
-        _ => Err(SelfIdOutcome::AmbiguousTerminal),
+        _ => Err(TerminalMiss::Ambiguous(candidates)),
     }
 }
 
@@ -2296,15 +2673,22 @@ fn select_terminal_caller(
 /// The bounded `/health` miss sample is recorded HERE rather than inside the
 /// pure selector, so the selector stays a pure function and the sample costs
 /// nothing on the success path.
+///
+/// `client_asserted` settles an [`LifecycleMiss::Ambiguous`] verdict and
+/// nothing else — [`settle_ambiguity`]. The composition is
+/// [`settle_lifecycle_selection`], pure so the rule is testable without a
+/// Tauri app; this function only supplies the store snapshot and records the
+/// sample when the result is still a miss.
 fn resolve_caller_via_lifecycle(
     state: &Arc<ApiState>,
     workdir: &str,
-) -> Result<uuid::Uuid, SelfIdOutcome> {
+    client_asserted: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
     let Some(store) = state
         .app_handle
         .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     else {
-        return Err(SelfIdOutcome::ResolverStateMissing);
+        return (None, SelfIdOutcome::ResolverStateMissing);
     };
     let records = store.open_records(); // snapshot under the store lock
     let target_canon = std::fs::canonicalize(workdir).ok();
@@ -2314,13 +2698,34 @@ fn resolve_caller_via_lifecycle(
     // drift from the admission rules. See [`LifecycleMissCensus`].
     let (result, census) =
         select_lifecycle_caller_censused(&records, workdir, target_canon.as_deref());
-    result.map_err(|miss| {
-        let outcome = miss.outcome();
+    let (sid, outcome) = settle_lifecycle_selection(result, client_asserted);
+    if sid.is_none() {
         let (candidates, open) =
             self_id_miss_sample_dirs(&records, workdir, target_canon.as_deref());
-        record_self_id_miss_sample(outcome, workdir, candidates, open, census);
-        outcome
-    })
+        record_self_id_miss_sample(outcome, workdir, candidates, open, census, client_asserted);
+    }
+    (sid, outcome)
+}
+
+/// Leg 3's verdict from the selector's result and the request's assertion —
+/// the pure half of [`resolve_caller_via_lifecycle`].
+///
+/// A single candidate resolves as before and the assertion is not consulted;
+/// an [`LifecycleMiss::Ambiguous`] set is handed to [`settle_ambiguity`]; every
+/// other miss is the gate that rejected, untouched by the assertion (a client
+/// cannot talk its way past "no trusted record on this workdir" — that would
+/// be adding an identity, which the pick is bound never to do).
+fn settle_lifecycle_selection(
+    selection: Result<uuid::Uuid, LifecycleMiss>,
+    client_asserted: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    match selection {
+        Ok(sid) => (Some(sid), SelfIdOutcome::InjectedViaLifecycle),
+        Err(LifecycleMiss::Ambiguous(candidates)) => {
+            settle_ambiguity(&candidates, client_asserted, AmbiguousKey::Workdir)
+        }
+        Err(miss) => (None, miss.outcome()),
+    }
 }
 
 /// The caller-session id to put on `X-Coord-Caller-Session` for a session
@@ -2345,11 +2750,318 @@ fn anchor_as_caller_session(claude_session_id: &str) -> Option<uuid::Uuid> {
     uuid::Uuid::parse_str(claude_session_id.trim()).ok()
 }
 
+/// The `coord.sessions.id` to file this proxy call's `coord-transport-rung`
+/// event under — plan
+/// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+/// Phase 1.
+///
+/// ## Why this is NOT [`resolve_caller_session_id`]
+///
+/// Those two answer different questions and live in DIFFERENT ID SPACES, and
+/// conflating them is a silent-drop defect rather than a cosmetic one:
+///
+/// - `resolve_caller_session_id` answers "which coord **agent session** is
+///   calling?" and yields a `coord.agent_sessions.id` (the durable anchor —
+///   see [`anchor_as_caller_session`], which exists precisely because the
+///   other id was the wrong space for that header).
+/// - `coord.session_events.session_id` **REFERENCES `coord.sessions(id)`**, and
+///   coord's `POST /sessions/:id/events` resolves `:id` with a
+///   `SELECT … FROM coord.sessions WHERE id = $1`, answering **404** for
+///   anything else. A 404 there is a 4xx, which the drain classifies as a
+///   permanent failure and Ack-drops — so filing the event under the agent
+///   session id would write every row, drain every row, and land none, leaving
+///   the metric at a clean zero. That is the same class of failure as the
+///   missing `push_record` arm, arrived at from the other end.
+///
+/// So this resolves the per-boot `coord.sessions.id` instead, over the two legs
+/// that actually hold one, in the same order of determinism
+/// [`resolve_caller_session_id`] uses:
+///
+/// 1. **Terminal leg (exact).** nonce → terminal_id → that `TerminalSession`'s
+///    own `coord_session_id` — the value `terminal_create` stored when it
+///    mirrored the PTY into `coord.sessions`. This is the identical join
+///    [`crate::session::restore_record_emitter`] uses for its own
+///    session-events mirror, which is why that mirror lands.
+/// 2. **AI plane.** nonce → workdir → task_run_id → the `AiCoordRegistrar`'s
+///    registered `coord.sessions.id`. Here the registrar IS the value rather
+///    than merely a registered-ness filter, because this is the id space the
+///    registrar holds.
+///
+/// An `Err` — no event is emitted — when neither leg resolves. That is honest:
+/// a call with no `coord.sessions` row has nowhere for coord to hang the event,
+/// and inventing a lane would only produce 404s. It is NOT the untagged arm,
+/// which is about a caller declaring no transport and DOES emit.
+///
+/// ## A KNOWN terminal is answered by leg 1 or NOT AT ALL
+///
+/// Leg 1 is three-way for the same reason [`resolve_caller_via_terminal`] is
+/// (see [`TerminalLeg`]): a nonce that CARRIES a `terminal_id` whose terminal
+/// does not resolve must never reach leg 2. Leg 2 is keyed on the WORKDIR,
+/// which is 1:N — an agent worktree routinely hosts both a terminal and an AI
+/// task run — so falling through would file terminal `T1`'s call under the
+/// sibling task run's lane, silently, with the row looking perfectly valid.
+/// A wrong lane is worse than no row: the whole point of this event is that a
+/// low count is trustworthy, and a misattributed row corrupts two sessions'
+/// numbers at once while a dropped one only under-counts (visibly, via the
+/// `debug!` field set at the call site).
+fn resolve_event_lane_session_id(
+    state: &Arc<ApiState>,
+    nonce: Option<&str>,
+) -> Result<uuid::Uuid, EventLaneMiss> {
+    let Some(nonce) = nonce else {
+        return Err(EventLaneMiss::NoNonce);
+    };
+    // Leg 1 — the terminal key. Exact where the workdir leg is a guess, so it
+    // is tried first, and it is TERMINAL either way: a hit short-circuits, and
+    // so does every miss.
+    match event_lane_terminal_leg(
+        crate::coord_mcp::terminal_id_for_nonce(nonce).as_deref(),
+        |terminal_id| match state
+            .app_handle
+            .try_state::<Arc<crate::terminal::TerminalManager>>()
+        {
+            None => TerminalLaneProbe::NoManager,
+            Some(tm) => match tm.get(terminal_id) {
+                None => TerminalLaneProbe::Gone,
+                Some(t) => TerminalLaneProbe::Live(t.coord_session_id()),
+            },
+        },
+    ) {
+        EventLaneLeg::Resolved(sid) => return Ok(sid),
+        EventLaneLeg::Miss(miss) => return Err(miss),
+        // The ONLY arm that may continue: the binding carries no terminal at
+        // all (restore, adopt, the mint route, an in-cwd `.mcp.json`).
+        EventLaneLeg::NoTerminal => {}
+    }
+    // Leg 2 — the runner-managed AI plane, keyed on the nonce's workdir.
+    let workdir = crate::coord_mcp::workdir_for_nonce(nonce).ok_or(EventLaneMiss::NoWorkdir)?;
+    let task_run_id = state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::SessionManager>>()
+        .ok_or(EventLaneMiss::AiPlaneStateMissing)?
+        .task_run_id_for_workdir(&workdir)
+        .ok_or(EventLaneMiss::NoTaskRun)?;
+    state
+        .app_handle
+        .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+        .ok_or(EventLaneMiss::AiPlaneStateMissing)?
+        .session_id_for(&task_run_id)
+        .ok_or(EventLaneMiss::AiSessionUnregistered)
+}
+
+/// Why [`resolve_event_lane_session_id`] produced no lane. Each variant names
+/// the FIRST gate the call failed, so the dropped-observation log line says
+/// which leg missed instead of collapsing every drop into one unfielded
+/// `debug!` (the shape Finding 2 flagged: "40 rows out of 4000 calls" has to be
+/// diagnosable from the logs alone, since the typed `/health` counter is
+/// deliberately deferred to a follow-up).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLaneMiss {
+    /// The proxy call carried no nonce at all (the unauthenticated door).
+    NoNonce,
+    /// A KNOWN terminal, but no `TerminalManager` in Tauri state to ask.
+    NoTerminalManager,
+    /// A KNOWN terminal the manager no longer holds — it closed between the
+    /// call and this resolution.
+    TerminalGone,
+    /// A KNOWN, LIVE terminal that `terminal_create` never mirrored into
+    /// `coord.sessions` (coord unreachable at create), or whose row was GC'd
+    /// and not yet re-registered.
+    TerminalHasNoCoordSession,
+    /// Terminal-less binding, and the nonce no longer resolves to a workdir.
+    NoWorkdir,
+    /// Terminal-less binding, and the AI-plane state (`SessionManager` /
+    /// `AiCoordRegistrar`) is not installed on this host.
+    AiPlaneStateMissing,
+    /// Terminal-less binding whose workdir hosts no runner-managed task run —
+    /// the ordinary case for an interactive session with no terminal binding.
+    NoTaskRun,
+    /// The task run exists but never registered with coord, so it holds no
+    /// `coord.sessions.id`.
+    AiSessionUnregistered,
+}
+
+impl EventLaneMiss {
+    /// Stable log label.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoNonce => "no_nonce",
+            Self::NoTerminalManager => "no_terminal_manager",
+            Self::TerminalGone => "terminal_gone",
+            Self::TerminalHasNoCoordSession => "terminal_has_no_coord_session",
+            Self::NoWorkdir => "no_workdir",
+            Self::AiPlaneStateMissing => "ai_plane_state_missing",
+            Self::NoTaskRun => "no_task_run",
+            Self::AiSessionUnregistered => "ai_session_unregistered",
+        }
+    }
+
+    /// WHICH leg refused — so a log reader can tell a known-terminal refusal
+    /// (which by design never consults leg 2) from an AI-plane miss.
+    const fn leg(self) -> &'static str {
+        match self {
+            Self::NoNonce => "nonce",
+            Self::NoTerminalManager | Self::TerminalGone | Self::TerminalHasNoCoordSession => {
+                "terminal"
+            }
+            Self::NoWorkdir
+            | Self::AiPlaneStateMissing
+            | Self::NoTaskRun
+            | Self::AiSessionUnregistered => "ai_plane",
+        }
+    }
+}
+
+/// The three genuinely different things leg 1 of the EVENT-LANE resolver can
+/// say — the same three-way shape, and the same reason for it, as
+/// [`TerminalLeg`] on the caller-identity chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventLaneLeg {
+    /// The binding carries NO terminal. This is the only arm that may fall
+    /// through to the 1:N workdir leg.
+    NoTerminal,
+    /// The terminal's live session carried a `coord.sessions.id`.
+    Resolved(uuid::Uuid),
+    /// The terminal IS known and did not resolve. STOP — never fall through.
+    Miss(EventLaneMiss),
+}
+
+/// What the state-dependent half of leg 1 found for a KNOWN terminal — the only
+/// thing [`event_lane_terminal_leg`] needs out of Tauri state, so the
+/// "known terminal ⇒ never fall through" rule is asserted against the code
+/// production runs rather than re-derived in a test that cannot build an app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalLaneProbe {
+    /// No `TerminalManager` registered in Tauri state.
+    NoManager,
+    /// The manager holds no session for this terminal id.
+    Gone,
+    /// The terminal is live; `Some` iff it carries a `coord.sessions` mirror.
+    Live(Option<uuid::Uuid>),
+}
+
+/// The pure three-way leg-1 decision for the event lane (unit-testable without
+/// a Tauri app). `probe` is called at most once, and only for a KNOWN terminal.
+fn event_lane_terminal_leg(
+    terminal_id: Option<&str>,
+    probe: impl FnOnce(&str) -> TerminalLaneProbe,
+) -> EventLaneLeg {
+    let Some(terminal_id) = terminal_id else {
+        return EventLaneLeg::NoTerminal;
+    };
+    match probe(terminal_id) {
+        TerminalLaneProbe::NoManager => EventLaneLeg::Miss(EventLaneMiss::NoTerminalManager),
+        TerminalLaneProbe::Gone => EventLaneLeg::Miss(EventLaneMiss::TerminalGone),
+        TerminalLaneProbe::Live(None) => {
+            EventLaneLeg::Miss(EventLaneMiss::TerminalHasNoCoordSession)
+        }
+        TerminalLaneProbe::Live(Some(sid)) => EventLaneLeg::Resolved(sid),
+    }
+}
+
+/// The first 8 characters of a proxy nonce, for log FIELDS only.
+///
+/// The nonce is a CREDENTIAL — never log the whole value. 8 chars is plenty to
+/// correlate a dropped observation with a binding in the same log stream.
+fn nonce_log_prefix(nonce: &str) -> String {
+    nonce.chars().take(8).collect()
+}
+
+/// Record WHICH transport rung carried this proxied coord call — plan
+/// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+/// Phase 1. One `coord.session_events` row per proxied call, so
+/// `success_metric/coord-mcp-first-rung-reachability` has a population.
+///
+/// Mirrors [`record_self_id_outcome`]'s call-site posture exactly: a
+/// per-request recorder, called unconditionally on the proxy path, that can
+/// never fail the request it observes. Every miss — no lane session id, no
+/// installed emitter, an outbox write error — logs at `debug` and returns.
+///
+/// ## The untagged arm is VISIBLE, never skipped
+///
+/// A caller that declares no transport still gets a row
+/// (`transport: "unknown", reporter: "untagged"`). The metric's denominator has
+/// to include the calls nobody tagged, or "first-rung reachability" quietly
+/// becomes "reachability among callers that already cooperate".
+///
+/// ## Declared values are ADVISORY
+///
+/// Same posture the forwarding loop takes on the caller-session header: what
+/// the CLIENT sets is a claim, validated against a closed vocabulary and
+/// stripped from the upstream forward. What the RUNNER observed — that the call
+/// arrived at this door, under which session's nonce, for which JSON-RPC
+/// operation — is authoritative, and is what the row's lane and the
+/// runner-observed payload fields carry.
+fn record_coord_transport_rung(
+    state: &Arc<ApiState>,
+    headers: &axum::http::HeaderMap,
+    nonce: Option<&str>,
+    body: &[u8],
+    door: &str,
+    caller_session_id: Option<uuid::Uuid>,
+) {
+    use crate::session::coord_transport_rung as rung;
+
+    let Some(emitter) = rung::global() else {
+        // No session subsystem on this host (headless test runner, or a boot
+        // that never reached `main.rs`'s install). Nothing to record into.
+        return;
+    };
+    let lane = match resolve_event_lane_session_id(state, nonce) {
+        Ok(lane) => lane,
+        Err(miss) => {
+            // A dropped observation has to be IDENTIFIABLE, or "the runner
+            // emitted 40 rows out of 4000 calls" is undiagnosable — this line
+            // used to carry no fields at all. Fields only: the typed
+            // `LaneOutcome` counter on `/health` is deliberately deferred to a
+            // follow-up.
+            //
+            // The nonce is a credential, so only a PREFIX ever reaches a log
+            // ([`nonce_log_prefix`]). The terminal id is re-read here rather
+            // than threaded through the miss, because misses are the rare path
+            // and a stale read only affects a log field.
+            tracing::debug!(
+                door = %door,
+                leg = %miss.leg(),
+                reason = %miss.as_str(),
+                terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
+                nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
+                "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+                 observation not recorded"
+            );
+            return;
+        }
+    };
+    let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let obs = rung::RungObservation::from_declaration(
+        hdr(rung::TRANSPORT_HEADER),
+        hdr(rung::REPORTER_HEADER),
+        hdr(rung::REPORTER_STEP_HEADER),
+        hdr(rung::ATTEMPTED_HEADER),
+        // Runner-observed: this rung DID carry the call as far as this door.
+        // The row is written before the upstream forward on purpose — the
+        // metric asks whether the rung reached the door, and a row written
+        // after the hop would be missing exactly when the hop is what failed.
+        rung::OUTCOME_OK,
+        door,
+        rung::operation_for_body(body),
+        caller_session_id,
+    );
+    // The outbox append is group-committed and returns only once the line is
+    // DURABLE — an fsync. Cheap, but it is a blocking syscall, and this is the
+    // one producer on a per-coord-call hot path, so it goes to the blocking
+    // pool instead of parking a tokio worker mid-request. Detached on purpose:
+    // the proxied call must not wait on its own observation, and a runtime
+    // shutting down before the task runs loses one telemetry row, which is the
+    // correct trade against delaying a live coord call.
+    tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
+}
+
 /// Why the pure lifecycle selection produced no caller. Each variant names the
 /// FIRST gate a workdir's records failed, so the `/health` counters partition
 /// the misses instead of collapsing them into one bucket (they were a single
 /// `no_task_run` before, which is why 678 identical misses were undiagnosable).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum LifecycleMiss {
     /// No OPEN record's `working_dir` matched.
     NoRecord,
@@ -2358,17 +3070,19 @@ enum LifecycleMiss {
     Unregistered,
     /// Admitted records existed, none had a uuid anchor.
     AnchorNotUuid,
-    /// More than one admitted uuid candidate on this workdir.
-    Ambiguous,
+    /// More than one admitted uuid candidate on this workdir — carried, in
+    /// record order, so the request's own assertion can pick among exactly
+    /// these ([`settle_ambiguity`]).
+    Ambiguous(Vec<uuid::Uuid>),
 }
 
 impl LifecycleMiss {
-    const fn outcome(self) -> SelfIdOutcome {
+    fn outcome(&self) -> SelfIdOutcome {
         match self {
             Self::NoRecord => SelfIdOutcome::NoLifecycleRecord,
             Self::Unregistered => SelfIdOutcome::RecordUnregistered,
             Self::AnchorNotUuid => SelfIdOutcome::RecordAnchorNotUuid,
-            Self::Ambiguous => SelfIdOutcome::AmbiguousWorkdir,
+            Self::Ambiguous(_) => SelfIdOutcome::AmbiguousWorkdir,
         }
     }
 }
@@ -2522,7 +3236,7 @@ fn select_lifecycle_caller_censused(
         match candidates.len() {
             0 => Err(LifecycleMiss::AnchorNotUuid),
             1 => Ok(candidates[0]),
-            _ => Err(LifecycleMiss::Ambiguous),
+            _ => Err(LifecycleMiss::Ambiguous(candidates)),
         }
     };
     (result, census)
@@ -2803,6 +3517,31 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// by a human hitting `-32601`, and a correction door that answers `-32601` is
 /// indistinguishable, from inside a session, from one that does not exist.
 ///
+/// `coord_repoint_gate` is IN for the gate-verb family's reason, one verb later
+/// (qontinui-coord#2056, plan
+/// `2026-09-09-pr-fix-autodispatch-arms-into-a-thin-brief-a-fifo-queue-and-a-gate-that-cannot-be-re-armed`
+/// Phase 3a). It moves an OPEN gate's predicate to where a superseded PR went,
+/// carrying the continuation, and withdraws the source — the ONLY way to re-arm a
+/// superseded watch, because `continuation_spawn` is write-once at registration.
+/// coord grants it on the device floor and its core enforces the REGISTRANT rule
+/// (the same floor `coord_withdraw_gate`, already here, rests on), so forwarding it
+/// reaches only gates this device registered. Withheld, the remedy
+/// `coord_gate_doctor`'s `continuation_cancelled_not_rearmed` smell names would
+/// answer `-32601` from inside the product — the supersede would keep losing its
+/// arm silently, which is the defect the verb exists to end.
+/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+/// Phase 3). This list is compiled into the binary, so a PR that edits it is
+/// NOT in effect on any box until that box rebuilds from a sha containing the
+/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
+/// primary still served a build 101 commits behind on the 28th, refusing all
+/// nine tools it had added. The session that lands such a PR therefore
+/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
+/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
+/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
+/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
+/// clears, a `-32601` for the tool on that box carries `data.cause:
+/// "stale_binary"`, which is the refusal saying the same thing.
+///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
@@ -2872,6 +3611,7 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_register_gate",
     "coord_reject_gate",
     "coord_reopen_gate",
+    "coord_repoint_gate",
     "coord_report_status",
     "coord_request_handoff",
     "coord_resolve_origin",
@@ -2936,6 +3676,19 @@ fn coord_mcp_tool_is_allowed(name: &str) -> bool {
 /// This grants nothing and refuses nothing — [`coord_mcp_tool_is_allowed`]
 /// remains the sole gate. Membership here only changes how a withholding is
 /// REPORTED.
+///
+/// **Landed is not delivered** (plan `2026-09-03-coord-mcp-403-names-its-own-cause`
+/// Phase 3). This list is compiled into the binary, so a PR that edits it is
+/// NOT in effect on any box until that box rebuilds from a sha containing the
+/// change — measured 2026-08-24..28: runner#1127 landed on the 24th and the
+/// primary still served a build 101 commits behind on the 28th, refusing all
+/// nine tools it had added. The session that lands such a PR therefore
+/// registers a `runner_served_sha` gate PER DEVICE that must serve it —
+/// `{"kind": "runner_served_sha", "device_id": "<device>", "repo":
+/// "qontinui/qontinui-runner", "expected_sha": "<landed sha>"}`, the pattern
+/// gate `65292ba0` used for #1127 — and reports the gate_id in full. Until it
+/// clears, a `-32601` for the tool on that box carries `data.cause:
+/// "stale_binary"`, which is the refusal saying the same thing.
 ///
 /// MUST stay sorted — membership is a `binary_search`.
 const COORD_MCP_DELIBERATE_EXCLUSIONS: &[&str] = &[
@@ -3027,6 +3780,12 @@ fn coord_mcp_tool_policy_json() -> serde_json::Value {
         "buildId": env!("RUNNER_BUILD_ID"),
         "mainSha": main_sha,
         "buildDrift": build_drift,
+        // The drift WARN's reader (plan
+        // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 2): the last
+        // `tools/list` observation this process made, from the SAME producer
+        // as `/health`'s `coordMcpDrift`. `null` = no `tools/list` observed
+        // since boot (UNKNOWN, not zero); `{driftedTools: [], …}` = clean.
+        "coordMcpDrift": observed_coord_mcp_drift_json(),
         // Say what the numbers mean, in the response, because a reader who has
         // to go find the rule will assume the wrong one.
         "readThis": "These are the lists COMPILED INTO THE RUNNING BINARY. A -32601 from \
@@ -3103,13 +3862,18 @@ fn coord_mcp_request_is_tools_list(body: &[u8]) -> bool {
 /// The names are collected rather than merely counted so the caller can LOG
 /// them. A capability this door subtracts silently is the exact failure this
 /// whole function exists to stop being invisible.
-fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Vec<String>) {
+///
+/// Returns whether a `result.tools` ARRAY was present at all. A response
+/// without one (an upstream JSON-RPC error, a foreign shape) has nothing to
+/// filter — and, for the drift observation, nothing to OBSERVE: `false` here
+/// is what stops such an answer being recorded as "observed clean".
+fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Vec<String>) -> bool {
     let tools = match resp
         .pointer_mut("/result/tools")
         .and_then(|t| t.as_array_mut())
     {
         Some(t) => t,
-        None => return,
+        None => return false,
     };
     tools.retain(|t| match t.get("name").and_then(|n| n.as_str()) {
         Some(name) if coord_mcp_tool_is_allowed(name) => true,
@@ -3117,12 +3881,23 @@ fn coord_mcp_retain_allowed_tools(resp: &mut serde_json::Value, removed: &mut Ve
             removed.push(name.to_string());
             false
         }
+        // Recorded under a placeholder so the caller re-serialises the
+        // shortened body (an empty `removed` would forward the upstream bytes
+        // with the nameless entry still in them); the DRIFT bookkeeping
+        // filters the placeholder out, since a nameless entry cannot be a
+        // tool coord grants BY NAME.
         None => {
-            removed.push("(unnamed)".to_string());
+            removed.push(UNNAMED_TOOL_PLACEHOLDER.to_string());
             false
         }
     });
+    true
 }
+
+/// What a `tools/list` entry with no string `name` is recorded as in the
+/// withheld list — a marker for the response re-serialisation, never a drifted
+/// tool (see the drift bookkeeping in the proxy handler).
+const UNNAMED_TOOL_PLACEHOLDER: &str = "(unnamed)";
 
 /// The outcome is TYPED rather than an `Option` because three of its four cases
 /// forward the upstream bytes unchanged for entirely different reasons, and one
@@ -3137,6 +3912,12 @@ enum CoordMcpToolsListFilter {
     /// overwhelmingly common case. Forward the upstream bytes byte-identically;
     /// re-serialising a clean response is pure risk for no gain.
     Unchanged,
+    /// A `tools/list` answer carrying NO `result.tools` array — an upstream
+    /// JSON-RPC error, or a shape this door does not know. Forward untouched:
+    /// there is nothing to withhold, and — unlike `Unchanged` — nothing was
+    /// INSPECTED, so it must not be recorded as an observed-clean list
+    /// (plan `2026-09-03-coord-mcp-403-names-its-own-cause` review finding).
+    NoToolsArray,
     /// Non-allowlisted entries were dropped. Carries the shortened body and the
     /// dropped NAMES, so the caller can say which capabilities it withheld.
     Filtered { body: Vec<u8>, removed: Vec<String> },
@@ -3190,13 +3971,14 @@ fn coord_mcp_filter_tools_list_response(
         }
     };
     let mut removed: Vec<String> = Vec::new();
-    match &mut parsed {
-        serde_json::Value::Array(elems) => {
-            for elem in elems.iter_mut() {
-                coord_mcp_retain_allowed_tools(elem, &mut removed);
-            }
-        }
+    let inspected = match &mut parsed {
+        serde_json::Value::Array(elems) => elems.iter_mut().fold(false, |seen, elem| {
+            coord_mcp_retain_allowed_tools(elem, &mut removed) | seen
+        }),
         other => coord_mcp_retain_allowed_tools(other, &mut removed),
+    };
+    if !inspected {
+        return CoordMcpToolsListFilter::NoToolsArray;
     }
     if removed.is_empty() {
         return CoordMcpToolsListFilter::Unchanged;
@@ -3215,10 +3997,411 @@ fn coord_mcp_filter_tools_list_response(
 }
 
 /// A gate rejection: the JSON-RPC `id` to echo (Null when unparseable) plus a
-/// human-actionable message.
+/// human-actionable message, and — for a refused `tools/call` — the tool name,
+/// so the refusal can diagnose its own cause ([`coord_mcp_refusal_data`]).
 struct CoordMcpBodyRejection {
     id: serde_json::Value,
     message: String,
+    /// `Some` only when a `tools/call` named a tool this door does not
+    /// forward; `None` for a refused METHOD or an unparseable body.
+    tool: Option<String>,
+}
+
+// ===========================================================================
+// The refusal names its own cause (plan
+// `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 1; dossier
+// `coord-mcp-403-has-three-causes`, memory 76c18e3f).
+//
+// A `-32601` from this door has three causes and used to name none:
+//   stale_binary — trunk's `COORD_MCP_ALLOWED_TOOLS` has the name, this
+//                  binary predates it. Remedy: rebuild.
+//   drift        — trunk allows it nowhere and does not name it as deliberate.
+//                  Remedy: add it to the allowlist, or name it as deliberate.
+//   deliberate   — in `COORD_MCP_DELIBERATE_EXCLUSIONS` (here or on trunk).
+//                  Remedy: none; do not "fix" it.
+// Every input already existed server-side — `/coord-mcp/tool-policy` returns
+// the two lists beside `buildDrift` — and the refusal did not use them, so
+// the session read a bare code at the one moment it was about to guess. The
+// trunk half comes from `build_drift::trunk_tool_policy()`, read on the drift
+// tick at the same SHA as `commitsBehind`; when that read is absent the cause
+// is `unknown` with a reason, never a confident default (served policy
+// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+//
+// DISCLOSURE BOUND (security-and-autonomy content trigger 6). The fields say
+// only what THIS binary's compiled lists and TRUNK's compiled lists hold for
+// the name, plus the drift between the two — all of it already public through
+// the un-gated `/coord-mcp/tool-policy` plus a read of trunk. Nothing here says
+// whether coord grants the tool upstream; the -32601 code, message and HTTP
+// status are unchanged.
+// ===========================================================================
+
+/// Why this door refused a `tools/call`. The wire string is the snake_case
+/// name; the numeric order is meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordMcpRefusalCause {
+    StaleBinary,
+    Drift,
+    Deliberate,
+    Unknown,
+}
+
+impl CoordMcpRefusalCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            CoordMcpRefusalCause::StaleBinary => "stale_binary",
+            CoordMcpRefusalCause::Drift => "drift",
+            CoordMcpRefusalCause::Deliberate => "deliberate",
+            CoordMcpRefusalCause::Unknown => "unknown",
+        }
+    }
+}
+
+/// The diagnosis behind one refusal — pure data, built by
+/// [`coord_mcp_refusal_cause`] and rendered by [`coord_mcp_refusal_data`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoordMcpRefusalDiagnosis {
+    cause: CoordMcpRefusalCause,
+    /// `None` = trunk's list was not readable (UNKNOWN), never "no".
+    in_allowlist_on_trunk: Option<bool>,
+    /// THIS binary's `COORD_MCP_DELIBERATE_EXCLUSIONS` verdict.
+    in_deliberate_exclusions: bool,
+    /// The trunk commit the verdict was measured against, when one was read.
+    trunk_sha: Option<String>,
+    /// How trunk's source was obtained (`fetched` / `local-ref`), when read.
+    trunk_source: Option<&'static str>,
+    /// One sentence naming the exact action.
+    remedy: String,
+}
+
+/// Decide the cause of refusing `tool`, given trunk's tool policy when one is
+/// cached. Evaluation order: THIS binary's deliberate list first (a decision
+/// recorded here needs no trunk read), then trunk's two lists, then drift.
+fn coord_mcp_refusal_cause(
+    tool: &str,
+    trunk: Option<&crate::build_drift::TrunkToolPolicy>,
+) -> CoordMcpRefusalDiagnosis {
+    let in_deliberate_exclusions = coord_mcp_withholding_is_deliberate(tool);
+    if in_deliberate_exclusions {
+        return CoordMcpRefusalDiagnosis {
+            cause: CoordMcpRefusalCause::Deliberate,
+            in_allowlist_on_trunk: trunk.map(|t| t.policy.allows(tool)),
+            in_deliberate_exclusions,
+            trunk_sha: trunk.map(|t| t.trunk_sha.clone()),
+            trunk_source: trunk.map(|t| t.source),
+            remedy: format!(
+                "none — {tool} is withheld on purpose (COORD_MCP_DELIBERATE_EXCLUSIONS); do \
+                 not \"fix\" it. Reach coord's /mcp directly with a device JWT if the call \
+                 is genuinely yours to make."
+            ),
+        };
+    }
+    let Some(trunk) = trunk else {
+        return CoordMcpRefusalDiagnosis {
+            cause: CoordMcpRefusalCause::Unknown,
+            in_allowlist_on_trunk: None,
+            in_deliberate_exclusions,
+            trunk_sha: None,
+            trunk_source: None,
+            remedy: format!(
+                "unknown — this runner has no readable copy of trunk's allowlist (no source \
+                 checkout, no network, or the first drift tick has not run). Read GET \
+                 /coord-mcp/tool-policy for THIS binary's lists and buildDrift, then check \
+                 whether origin/main's COORD_MCP_ALLOWED_TOOLS names {tool}: present means \
+                 rebuild, absent means add it there or name it in \
+                 COORD_MCP_DELIBERATE_EXCLUSIONS."
+            ),
+        };
+    };
+    let on_trunk = trunk.policy.allows(tool);
+    let (cause, remedy) = if on_trunk {
+        (
+            CoordMcpRefusalCause::StaleBinary,
+            format!(
+                "rebuild this runner — trunk ({}) already allows {tool}; the running binary \
+                 predates that change.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    } else if trunk.policy.deliberately_excludes(tool) {
+        (
+            CoordMcpRefusalCause::Deliberate,
+            format!(
+                "none — trunk ({}) records {tool} as deliberately excluded; a rebuild will \
+                 report it as such. Do not \"fix\" it.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    } else {
+        (
+            CoordMcpRefusalCause::Drift,
+            format!(
+                "if coord lists {tool} in tools/list for this principal, add it to \
+                 COORD_MCP_ALLOWED_TOOLS in src-tauri/src/mcp_api.rs (trunk {} neither \
+                 allows it nor names it in COORD_MCP_DELIBERATE_EXCLUSIONS), or name \
+                 it there if withholding it is the decision — then register a \
+                 runner_served_sha gate for the landed sha, because a landed allowlist change \
+                 is not delivered until this box rebuilds.",
+                short_sha(&trunk.trunk_sha)
+            ),
+        )
+    };
+    CoordMcpRefusalDiagnosis {
+        cause,
+        in_allowlist_on_trunk: Some(on_trunk),
+        in_deliberate_exclusions,
+        trunk_sha: Some(trunk.trunk_sha.clone()),
+        trunk_source: Some(trunk.source),
+        remedy,
+    }
+}
+
+fn short_sha(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
+/// The `error.data` object for a `-32601` refusal. The `code` is unchanged
+/// (`COORD_MCP_PROXY_METHOD_NOT_ALLOWED`) so every consumer matching on it
+/// keeps working; everything else is additive. A refused METHOD carries only
+/// `cause: "method_not_allowed"` — there is no tool to diagnose.
+///
+/// `buildDrift` is [`crate::build_drift::health_fields`] verbatim — the same
+/// producer as `/health` and `/coord-mcp/tool-policy`, never re-derived — and
+/// `probed_at` is the wall-clock of THIS refusal, so a durable artifact quoting
+/// it carries the time it learned this (dossier `stale-capability-floor`).
+fn coord_mcp_refusal_data(rejection: &CoordMcpBodyRejection) -> serde_json::Value {
+    coord_mcp_refusal_data_with(rejection, crate::build_drift::trunk_tool_policy().as_ref())
+}
+
+/// [`coord_mcp_refusal_data`] over an EXPLICIT trunk read, so the wire shape
+/// can be pinned in tests without depending on whether a drift tick has
+/// filled the process-wide cache.
+fn coord_mcp_refusal_data_with(
+    rejection: &CoordMcpBodyRejection,
+    trunk: Option<&crate::build_drift::TrunkToolPolicy>,
+) -> serde_json::Value {
+    const CODE: &str = "COORD_MCP_PROXY_METHOD_NOT_ALLOWED";
+    const NEXT_DOOR: &str = "GET /coord-mcp/tool-policy";
+    let probed_at = chrono::Utc::now().to_rfc3339();
+    let Some(tool) = rejection.tool.as_deref() else {
+        return serde_json::json!({
+            "code": CODE,
+            "cause": "method_not_allowed",
+            "next_door": NEXT_DOOR,
+            "probed_at": probed_at,
+        });
+    };
+    let diagnosis = coord_mcp_refusal_cause(tool, trunk);
+    let (_, build_drift) = crate::build_drift::health_fields();
+    let commits_behind = crate::build_drift::latest().and_then(|s| s.commits_behind);
+    serde_json::json!({
+        "code": CODE,
+        "tool": tool,
+        "cause": diagnosis.cause.as_str(),
+        "remedy": diagnosis.remedy,
+        "inAllowlistOnTrunk": diagnosis.in_allowlist_on_trunk,
+        "inDeliberateExclusions": diagnosis.in_deliberate_exclusions,
+        "trunkSha": diagnosis.trunk_sha,
+        "trunkSource": diagnosis.trunk_source,
+        // When trunk was read (ms since epoch), so a reader can age the
+        // `cause` the same way it ages `buildDrift.checkedAt` — both are epoch
+        // millis, unlike the RFC3339 `probed_at`. Null when trunk is unread.
+        "trunkReadAt": trunk.map(|t| t.read_at),
+        "buildDrift": build_drift,
+        "commitsBehind": commits_behind,
+        "next_door": NEXT_DOOR,
+        "probed_at": probed_at,
+    })
+}
+
+// ===========================================================================
+// The drift WARN gets a reader (same plan, Phase 2).
+//
+// `coord_mcp_filter_tools_list_response`'s caller partitions the withheld
+// names into deliberate and DRIFTED on every `tools/list`, and until now the
+// drifted half went to a `warn!` nobody greps — measured 2026-08-28 firing
+// with `drifted_count=9` for days, unread. The last observation is kept here
+// so `/health` and `/coord-mcp/tool-policy` can serve it, and a NEW non-empty
+// set posts one coord finding per (binary, set) — a reader that pulls by
+// relevance, instead of a log that waits to be read.
+// ===========================================================================
+
+/// The last `tools/list` drift observation this process made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObservedCoordMcpDrift {
+    /// Withheld-but-not-deliberate names, sorted. Empty = observed clean.
+    drifted: Vec<String>,
+    /// Unix millis of the `tools/list` that produced it.
+    observed_at: i64,
+}
+
+static LAST_OBSERVED_COORD_MCP_DRIFT: std::sync::OnceLock<
+    std::sync::Mutex<Option<ObservedCoordMcpDrift>>,
+> = std::sync::OnceLock::new();
+
+/// The sets this process has already SUCCESSFULLY posted a finding for. The
+/// rule is at most one SUCCESSFUL post per distinct drifted set per process
+/// lifetime — a refused or failed post leaves the set unmarked, so the next
+/// observation offers it again rather than losing it for the life of the
+/// process (one attempt per observation, never a retry loop).
+static POSTED_COORD_MCP_DRIFT_SETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+> = std::sync::OnceLock::new();
+
+fn observed_drift_cell() -> &'static std::sync::Mutex<Option<ObservedCoordMcpDrift>> {
+    LAST_OBSERVED_COORD_MCP_DRIFT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn posted_drift_sets_cell() -> &'static std::sync::Mutex<std::collections::HashSet<Vec<String>>> {
+    POSTED_COORD_MCP_DRIFT_SETS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Record one `tools/list` observation. Returns `true` when `drifted` is
+/// non-empty AND this process has not yet posted a finding for exactly this
+/// set — i.e. when the caller should post one. Recording never fails the
+/// request: a poisoned lock just skips the bookkeeping.
+fn record_observed_coord_mcp_drift(drifted: &[&str]) -> bool {
+    record_observed_coord_mcp_drift_in(observed_drift_cell(), posted_drift_sets_cell(), drifted)
+}
+
+/// [`record_observed_coord_mcp_drift`] over EXPLICIT cells — the whole
+/// decision, with the process-wide globals passed in rather than reached for,
+/// so the dedup can be tested on private cells without racing another test
+/// that touches the globals.
+fn record_observed_coord_mcp_drift_in(
+    observed: &std::sync::Mutex<Option<ObservedCoordMcpDrift>>,
+    posted: &std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+    drifted: &[&str],
+) -> bool {
+    let mut set: Vec<String> = drifted.iter().map(|s| s.to_string()).collect();
+    set.sort();
+    set.dedup();
+    if let Ok(mut g) = observed.lock() {
+        *g = Some(ObservedCoordMcpDrift {
+            drifted: set.clone(),
+            observed_at: chrono::Utc::now().timestamp_millis(),
+        });
+    }
+    if set.is_empty() {
+        return false;
+    }
+    // A set is marked posted by the POST's 2xx arm, never here: "posted once
+    // per (build, set)" must mean POSTED, not attempted. A refused or failed
+    // post leaves the set unmarked, so the next `tools/list` that observes it
+    // tries again (one attempt per observation, still never a retry loop).
+    posted
+        .lock()
+        .map(|posted| !posted.contains(&set))
+        .unwrap_or(false)
+}
+
+/// Mark a drifted set as posted — called from the POST's success arm only.
+fn mark_coord_mcp_drift_posted(drifted: &[String]) {
+    mark_coord_mcp_drift_posted_in(posted_drift_sets_cell(), drifted)
+}
+
+fn mark_coord_mcp_drift_posted_in(
+    posted: &std::sync::Mutex<std::collections::HashSet<Vec<String>>>,
+    drifted: &[String],
+) {
+    let mut set: Vec<String> = drifted.to_vec();
+    set.sort();
+    set.dedup();
+    if let Ok(mut posted) = posted.lock() {
+        posted.insert(set);
+    }
+}
+
+/// The drift observation as served on `/health` and `/coord-mcp/tool-policy`.
+/// `null` means no `tools/list` has passed through this process yet — UNKNOWN,
+/// not zero; `{driftedTools: [], …}` is an observed-clean answer.
+fn observed_coord_mcp_drift_json() -> serde_json::Value {
+    render_observed_coord_mcp_drift(
+        observed_drift_cell()
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .as_ref(),
+    )
+}
+
+/// The wire shape of one observation — pure, so null-vs-observed can be
+/// pinned without depending on what the process-wide cell holds.
+fn render_observed_coord_mcp_drift(observed: Option<&ObservedCoordMcpDrift>) -> serde_json::Value {
+    match observed {
+        Some(o) => serde_json::json!({
+            "driftedTools": o.drifted,
+            "driftedCount": o.drifted.len(),
+            "observedAt": o.observed_at,
+        }),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// Post the one-per-set drift finding to coord's device-authed findings door.
+/// Body shape pinned to `qontinui-coord` `findings.rs` `PostFindingBody`
+/// (`deny_unknown_fields`; identity fields are a 400, so none are sent).
+/// Best-effort and bounded: one attempt, 10 s, a failure is logged once —
+/// this is bookkeeping and must never block or retry inside a `tools/list`.
+async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifted: Vec<String>) {
+    let git_sha = env!("QONTINUI_GIT_SHA");
+    let body = serde_json::json!({
+        "title": format!(
+            "coord-mcp allowlist drift on runner build {git_sha}: {} tool(s) coord grants \
+             are withheld and not recorded as deliberate",
+            drifted.len()
+        ),
+        "body": format!(
+            "This runner's compiled COORD_MCP_ALLOWED_TOOLS neither allows nor names as \
+             deliberate these tools coord grants its principal: {}. Either the allowlist \
+             fell behind coord's grant (add them in src-tauri/src/mcp_api.rs) or the \
+             exclusion is real and unrecorded (name them in COORD_MCP_DELIBERATE_EXCLUSIONS). \
+             A -32601 on any of them from this build carries `data.cause` naming which. \
+             Posted once per (build, set) by the runner itself; GET /coord-mcp/tool-policy \
+             on this box serves the live observation.",
+            drifted.join(", ")
+        ),
+        "kind": "caveat",
+        "topic": "coord-mcp",
+        "resource_keys": ["qontinui-runner/src-tauri/src/mcp_api.rs"],
+    });
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "coord-mcp drift finding: reqwest client build failed; not posted");
+            return;
+        }
+    };
+    let url = format!("{}/coord/agent-findings", coord_base.trim_end_matches('/'));
+    // coord-auth-exempt(forwarder): the same proxy-hop posture as this file's
+    // other three. `bearer` is the credential the `tools/list` that OBSERVED
+    // this drift actually presented (the re-selected one, when the first was
+    // refused), so the finding is attributed to the principal whose grant the
+    // drift is measured against. `attach_device_auth` would post it under the
+    // DEVICE identity instead — a different principal from the one whose
+    // allowlist gap is being reported, which would make the finding's own
+    // subject unreadable. Fail-soft either way: a refused post is warned and
+    // left unmarked, so the next observation offers it again.
+    match client
+        .post(&url)
+        .bearer_auth(bearer)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            mark_coord_mcp_drift_posted(&drifted);
+            info!(drifted = %drifted.join(","), "coord-mcp drift finding posted to coord");
+        }
+        Ok(resp) => warn!(
+            status = %resp.status(),
+            "coord-mcp drift finding: coord refused the post; not retried"
+        ),
+        Err(e) => warn!(error = %e, "coord-mcp drift finding: post failed; not retried"),
+    }
 }
 
 /// Allowlist gate over the `/coord-mcp` proxy's JSON-RPC body (credential-
@@ -3234,6 +4417,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
             return Err(CoordMcpBodyRejection {
                 id: serde_json::Value::Null,
                 message: format!("request body is not valid JSON-RPC: {e}"),
+                tool: None,
             });
         }
     };
@@ -3243,6 +4427,7 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
                 return Err(CoordMcpBodyRejection {
                     id: serde_json::Value::Null,
                     message: "empty JSON-RPC batch".to_string(),
+                    tool: None,
                 });
             }
             for elem in elems {
@@ -3257,31 +4442,40 @@ fn coord_mcp_body_gate(body: &[u8]) -> Result<(), CoordMcpBodyRejection> {
 /// Gate ONE JSON-RPC request object. See [`coord_mcp_body_gate`].
 fn coord_mcp_request_gate_one(req: &serde_json::Value) -> Result<(), CoordMcpBodyRejection> {
     let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let reject = |message: String| {
+    // `tool` is `Some` ONLY for a `tools/call` naming a tool this door does
+    // not forward — the one rejection whose cause can be diagnosed
+    // ([`coord_mcp_refusal_data`]). Every other rejection is about the body
+    // or the method, and carries no tool.
+    let reject = |message: String, tool: Option<String>| {
         Err(CoordMcpBodyRejection {
             id: id.clone(),
             message,
+            tool,
         })
     };
     let method = match req.get("method").and_then(|m| m.as_str()) {
         Some(m) => m,
-        None => return reject("JSON-RPC request has no string `method`".to_string()),
+        None => return reject("JSON-RPC request has no string `method`".to_string(), None),
     };
     if COORD_MCP_ALLOWED_METHODS.binary_search(&method).is_err() {
-        return reject(format!(
-            "JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"
-        ));
+        return reject(
+            format!("JSON-RPC method {method:?} is not on the /coord-mcp proxy allowlist"),
+            None,
+        );
     }
     if method == "tools/call" {
         let tool = match req.pointer("/params/name").and_then(|n| n.as_str()) {
             Some(t) => t,
-            None => return reject("tools/call has no string `params.name`".to_string()),
+            None => return reject("tools/call has no string `params.name`".to_string(), None),
         };
         if !coord_mcp_tool_is_allowed(tool) {
-            return reject(format!(
-                "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
-                 device/agent sessions"
-            ));
+            return reject(
+                format!(
+                    "tool {tool:?} is not on the /coord-mcp proxy allowlist for \
+                     device/agent sessions"
+                ),
+                Some(tool.to_string()),
+            );
         }
     }
     Ok(())
@@ -3767,6 +4961,20 @@ async fn enrich_memory_search_body_with(
 /// live per-request JWT this handler selects; the caller-session header is
 /// authoritative only when the RUNNER sets it, or a client could name a sibling
 /// session to spoof its identity.)
+///
+/// The client's copy of the caller-session header is still never FORWARDED.
+/// It is READ, before this loop, as an input to the runner's own resolution —
+/// and honoured only as a tie-break among candidates the runner derived
+/// itself ([`settle_ambiguity`]); whatever the runner concludes is what goes
+/// upstream, under the runner's own header write below.
+///
+/// The transport-declaration family
+/// ([`crate::session::coord_transport_rung::DECLARATION_HEADERS`], plan
+/// 2026-09-07) is dropped for the SAME reason as the caller-session header, not
+/// merely for tidiness: it is CALLER-SELF-REPORTED, the runner records it as an
+/// advisory claim in its own `coord-transport-rung` event, and letting it reach
+/// coord verbatim would let a client dress a claim up as something coord had
+/// observed.
 fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
     matches!(
         name,
@@ -3778,6 +4986,7 @@ fn coord_mcp_forward_header_is_dropped(name: &str) -> bool {
             | "authorization"
     ) || name == crate::coord_mcp::COORD_MCP_PROXY_KEY_HEADER
         || name == crate::coord_mcp::CALLER_SESSION_HEADER
+        || crate::session::coord_transport_rung::is_declaration_header(name)
 }
 
 /// Spool a `coord_post_finding` tools/call the `/coord-mcp` proxy could not
@@ -3863,9 +5072,22 @@ async fn coord_mcp_proxy_handler(
     {
         Some(p) => p,
         None => {
+            // Phase 1b + 1d (plan 2026-09-02-steering-layers-unreadable-
+            // without-a-credential): resolve WHAT this key used to be —
+            // superseded, grace expired, revoked, never registered, or no key
+            // at all — synchronously (three uncontended map reads, no I/O),
+            // so the 401 body and the forensics line tell the same story. The
+            // body used to be the one generic sentence for every arm, and it
+            // reached the agent as "requires re-authorization (token
+            // expired)", which names credentials for a failure that is not
+            // one.
+            let attr =
+                crate::coord_mcp::reject_attribution_for_nonce(nonce.as_deref().unwrap_or(""));
+            let cause = crate::coord_mcp::attributed_proxy_key_cause(&attr);
             warn!(
-                "coord-mcp proxy: {}",
-                crate::coord_mcp::STALE_PROXY_KEY_CAUSE
+                attribution = attr.attribution,
+                workdir = %attr.workdir,
+                "coord-mcp proxy: {cause}"
             );
             // Rotation forensics: THE transport-death event. Everything the
             // rotation log records up to here is what the runner did to a key;
@@ -3875,15 +5097,42 @@ async fn coord_mcp_proxy_handler(
                 nonce.as_deref(),
                 "missing, unregistered, or expired proxy key (401)",
             );
+            // ONE shape for `COORD_MCP_PROXY_UNAUTHORIZED` (plan
+            // 2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported,
+            // Phase 2 runner sub-task). This lookup-MISS path used to return a
+            // bare `{success, error, code}` body while the `proxy_request_gate`
+            // refusal below returned the full `proxy_failure_envelope` for the
+            // SAME code — so any consumer keying on `layer` (the field the
+            // envelope exists for) silently missed the 401 that matters most:
+            // the absent / unregistered / evicted nonce, i.e. the transport-death
+            // event itself. `error` and `code` pass through byte-identical (the
+            // envelope's own contract); `layer` / `cause` / `next_door` /
+            // `probed_at` are added. Coord was never dialed here, so the layer is
+            // `runner-nonce` by construction.
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": crate::coord_mcp::stale_proxy_key_error(
-                        crate::coord_mcp::STALE_PROXY_KEY_CAUSE,
-                    ),
-                    "code": "COORD_MCP_PROXY_UNAUTHORIZED",
-                })),
+                // Supersedes `stale_proxy_key_unauthorized_body()` (the
+                // generic-cause envelope landed on main while this branch was
+                // stranded — same shape, same layer, same code): this carries
+                // the attributed cause plus the attribution/workdir/terminal_id
+                // fields on top of it, so it is a strict superset, not a
+                // parallel fix. `stale_proxy_key_unauthorized_body` now has no
+                // production caller.
+                Json(crate::coord_mcp::proxy_failure_envelope(
+                    crate::coord_mcp::attributed_proxy_key_error(&attr),
+                    "COORD_MCP_PROXY_UNAUTHORIZED",
+                    // Refused HERE. coord was never dialed — the body says so.
+                    crate::coord_mcp::ProxyFailureLayer::RunnerNonce,
+                    cause,
+                    &[
+                        ("attribution", serde_json::Value::from(attr.attribution)),
+                        ("workdir", serde_json::Value::from(attr.workdir.clone())),
+                        (
+                            "terminal_id",
+                            serde_json::Value::from(attr.terminal_id.clone()),
+                        ),
+                    ],
+                )),
             )
                 .into_response();
         }
@@ -3896,7 +5145,20 @@ async fn coord_mcp_proxy_handler(
     // ("method not found") deliberately does not disclose whether the tool
     // exists upstream.
     if let Err(reject) = coord_mcp_body_gate(&body) {
+        // The refusal names its own cause (plan
+        // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 1): `data`
+        // says whether THIS binary is stale against trunk, the allowlist has
+        // drifted, or the withholding is deliberate — and `unknown` when
+        // trunk could not be read. Same `-32601`, same message, same 403;
+        // the `code` inside `data` is unchanged. See
+        // [`coord_mcp_refusal_data`] for the disclosure bound.
+        let data = coord_mcp_refusal_data(&reject);
         warn!(
+            cause = data
+                .get("cause")
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown"),
+            tool = ?reject.tool,
             "coord-mcp proxy: refused non-allowlisted JSON-RPC request: {}",
             reject.message
         );
@@ -3908,13 +5170,18 @@ async fn coord_mcp_proxy_handler(
                 "error": {
                     "code": -32601,
                     "message": reject.message,
-                    "data": { "code": "COORD_MCP_PROXY_METHOD_NOT_ALLOWED" },
+                    "data": data,
                 },
             })),
         )
             .into_response();
     }
 
+    // C3/M2: the tenant whose DEVICE slot supplied the bearer, hoisted out of
+    // the `Device` arm so the upstream verdict below can be filed against the
+    // right credential. Stays `None` for an AGENT principal, whose bearer is
+    // that agent's own token and says nothing about this runner's credential.
+    let mut device_tenant: Option<uuid::Uuid> = None;
     // Pick the bearer by principal:
     //  - Device → the live device JWT read from AuthManager (filesystem I/O, so
     //    off the async executor), the same fresh token `backend_relay` reads.
@@ -3953,6 +5220,7 @@ async fn coord_mcp_proxy_handler(
                             .into_response();
                     }
                 };
+            device_tenant = session_tenant;
             // The live device JWT was read alongside the pin decision above
             // (same blocking pool, same freshness as `backend_relay`'s read).
             let mut tok = initial_tok;
@@ -4086,13 +5354,32 @@ async fn coord_mcp_proxy_handler(
     // the authorization boundary, and the strip of any CLIENT-supplied copy
     // below is likewise unconditional, so no client can spoof a sibling
     // session's identity.
+    //
+    // The client's copy IS read, though — as a tie-break and nothing more.
+    // `coord-revive.sh call` (qontinui-runner#1432) and the config-repo doors
+    // (qontinui-claude-config#865) forward the session's own id on this
+    // header, and the runner honours it only when its own resolution ended
+    // in several candidates it could not rank, and the asserted id is one of
+    // them. It never adds an identity the runner does not already vouch for
+    // on that key — see `settle_ambiguity`. Read once, here, so the strip in
+    // the forwarding loop stays unconditional.
+    let client_asserted = client_asserted_session(&headers);
     let (caller_session_id, self_id_outcome) =
         if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
-            resolve_caller_session_id(&state, nonce.as_deref())
+            resolve_caller_session_id(&state, nonce.as_deref(), client_asserted)
         } else {
             (None, SelfIdOutcome::NonDevicePrincipal)
         };
     record_self_id_outcome(self_id_outcome);
+    if note_client_assertion_disagreement(caller_session_id, client_asserted) {
+        tracing::debug!(
+            "coord-mcp proxy: caller-session header carries the runner's {:?} \
+             ({}), not the client's asserted {:?}",
+            caller_session_id,
+            self_id_outcome.label(),
+            client_asserted
+        );
+    }
 
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
@@ -4125,6 +5412,19 @@ async fn coord_mcp_proxy_handler(
     // 2026-07-16-runner-prod-coord-base-default-and-502-self-diagnosis, D3) —
     // a bare 502 that names neither cost real diagnostic time in the incident.
     let (url, coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
+
+    // Plan 2026-09-07 Phase 1 — the durable per-call record of WHICH transport
+    // rung carried this coord call. Placed here, after the door URL is known
+    // and BEFORE the forward, so the row exists even when the hop that follows
+    // dies. Best-effort telemetry: it cannot fail or slow the proxied call.
+    record_coord_transport_rung(
+        &state,
+        &headers,
+        nonce.as_deref(),
+        &body,
+        &url,
+        caller_session_id,
+    );
 
     // One request builder, used by both attempts, so the retry cannot drift
     // from the first send in headers, body or attribution — the whole risk of
@@ -4178,6 +5478,9 @@ async fn coord_mcp_proxy_handler(
             "coord-mcp proxy: forward to {url} failed \
              (coord_base_source={coord_base_source}): {chain} egress={egress}"
         );
+        // Phase 1e: the hop did not complete — recorded with no status so
+        // `/health` can show "last forward: unreachable at <t>".
+        crate::coord_mcp::record_last_forward(None, "unreachable");
         (
             axum::http::StatusCode::BAD_GATEWAY,
             Json(crate::coord_mcp::proxy_failure_envelope(
@@ -4288,6 +5591,9 @@ async fn coord_mcp_proxy_handler(
     //    whose credential is genuinely gone — the load amplification a retry
     //    loop is famous for — and would also double coord's own 401 accounting.
     let mut upstream_retry: Option<&'static str> = None;
+    // The bearer that produced the response we end up forwarding: the drift
+    // finding below must ride THAT one, not a first bearer coord rejected.
+    let mut effective_bearer = bearer.clone();
     if matches!(upstream.status().as_u16(), 401 | 403)
         && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
     {
@@ -4317,6 +5623,7 @@ async fn coord_mcp_proxy_handler(
                             "coord-mcp proxy: retried once with a re-selected device bearer"
                         );
                         upstream = resp;
+                        effective_bearer = fresh.clone();
                     }
                     // The retry's transport failure must not erase coord's
                     // verdict from attempt 1, which is the more informative of
@@ -4362,6 +5669,9 @@ async fn coord_mcp_proxy_handler(
     }
 
     let status = upstream.status().as_u16();
+    // Phase 1e: coord answered (whatever it said) — the fact `/health` needs
+    // to tell a live forwarder from one that has not been exercised.
+    crate::coord_mcp::record_last_forward(Some(status), "answered");
     let status_code =
         axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::OK);
     let upstream_content_type = upstream
@@ -4417,6 +5727,25 @@ async fn coord_mcp_proxy_handler(
                 .into_response();
         }
     };
+
+    // C3 — THE highest-volume credential consumer. This handler carried the
+    // richest 401 handling in the file (kick the refresher, re-select once,
+    // attribute the rejection to a workdir) and yet told the posture nothing:
+    // 50 `coord_*` tool calls could all 401 `token_expired` while the streak
+    // sat at 0 and `/health` read `live`.
+    //
+    // DEVICE principal only, for the same reason the retry arm above is: an
+    // AGENT bearer comes from that agent's own token slot, so coord's verdict
+    // on it is not a verdict on this runner's credential. `/coord/mcp` is a
+    // genuinely guarded route, so `authenticating` is unconditionally true.
+    if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+            device_tenant,
+            true,
+            status,
+            &bytes,
+        );
+    }
 
     // A 5xx is the other half of the retryable class (same shared classifier as
     // the write forwarder): coord did not reach a verdict on the content. A
@@ -4603,7 +5932,14 @@ async fn coord_mcp_proxy_handler(
     // rewrites anything; the other three forward the upstream bytes untouched,
     // and they are kept distinct because one of them is a failure to check.
     let out_body = match coord_mcp_filter_tools_list_response(&body, &bytes) {
-        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::Unchanged => {
+        CoordMcpToolsListFilter::NotApplicable | CoordMcpToolsListFilter::NoToolsArray => {
+            axum::body::Body::from(bytes)
+        }
+        CoordMcpToolsListFilter::Unchanged => {
+            // A `tools/list` that withheld nothing is an OBSERVED-CLEAN
+            // answer, and recording it is what lets `/health`'s
+            // `coordMcpDrift` distinguish "clean" from "never looked".
+            record_observed_coord_mcp_drift(&[]);
             axum::body::Body::from(bytes)
         }
         CoordMcpToolsListFilter::Filtered {
@@ -4619,6 +5955,9 @@ async fn coord_mcp_proxy_handler(
             let (drifted, deliberate): (Vec<&str>, Vec<&str>) = removed
                 .iter()
                 .map(String::as_str)
+                // The nameless placeholder is a re-serialisation marker, not
+                // a tool coord grants by name; it must never be posted as drift.
+                .filter(|n| *n != UNNAMED_TOOL_PLACEHOLDER)
                 .partition(|n| !coord_mcp_withholding_is_deliberate(n));
             if !deliberate.is_empty() {
                 // Working as intended. INFO, not debug — it is still a
@@ -4645,6 +5984,25 @@ async fn coord_mcp_proxy_handler(
                      exclusions — COORD_MCP_ALLOWED_TOOLS has drifted from coord's grant; \
                      add them there, or name them in COORD_MCP_DELIBERATE_EXCLUSIONS"
                 );
+            }
+            // The WARN above gets a reader (plan
+            // `2026-09-03-coord-mcp-403-names-its-own-cause`, Phase 2): the
+            // observation is kept for `/health` + `/coord-mcp/tool-policy`
+            // (empty = observed clean), and a non-empty set is offered for
+            // posting once per observation until ONE post succeeds — one coord
+            // finding per set per process, with the bearer this request
+            // already selected — spawned off the request path,
+            // so a slow or refused post can neither delay nor fail this
+            // `tools/list`.
+            if record_observed_coord_mcp_drift(&drifted) {
+                let (coord_base, _coord_base_source) =
+                    crate::coord_mcp::coord_base_url_with_source();
+                let set: Vec<String> = drifted.iter().map(|s| s.to_string()).collect();
+                tokio::spawn(post_coord_mcp_drift_finding(
+                    coord_base,
+                    effective_bearer.clone(),
+                    set,
+                ));
             }
             axum::body::Body::from(filtered)
         }
@@ -4732,6 +6090,34 @@ impl ClaimsReadTarget {
             ClaimsReadTarget::WorkUnitDeps { slug } => {
                 format!("/coord/work-units/{slug}/deps")
             }
+        }
+    }
+
+    /// Does coord ACTUALLY verify the device bearer on this route?
+    ///
+    /// C1 — this is not a formality. Coord's two claims reads sit behind an
+    /// INFALLIBLE extractor (`qontinui-coord/crates/coord/src/
+    /// claims_read_observe.rs`, `type Rejection = Infallible`): an expired,
+    /// revoked or bad-signature JWT gets a **200**, the rejection being only a
+    /// Prometheus label. The enforcement arm is gated on
+    /// `COORD_CLAIMS_READ_AUTH_REQUIRED`, which is absent from
+    /// `deploy/taskdef.json` — so it is inert in production.
+    ///
+    /// A 200 from a route that never looked at the credential is NOT evidence
+    /// the credential works, so it must not reach
+    /// [`note_coord_upstream_verdict`] — with it counted, every claims poll
+    /// reset the rejection streak, a box that polls claims could never reach
+    /// `dark`, and `lastOkAt` claimed coord had accepted a credential coord
+    /// never checked.
+    ///
+    /// `WorkUnitDeps` is the exception INSIDE this family: it is served by
+    /// coord's `work_units_agent_authed` sub-router behind `require_jwt`, so a
+    /// verdict there is real. The flag is therefore per TARGET, not per
+    /// error-code family.
+    fn upstream_authenticates(&self) -> bool {
+        match self {
+            ClaimsReadTarget::List | ClaimsReadTarget::ByResource => false,
+            ClaimsReadTarget::WorkUnitDeps { .. } => true,
         }
     }
 
@@ -4849,11 +6235,13 @@ async fn coord_claims_read_proxy_handler(
     // Validate the dynamic segment (if any) up front, but do NOT emit its 400
     // yet — the shared body emits it only AFTER the nonce gate, so an
     // unauthenticated caller can never use the validator as an oracle.
+    let upstream_authenticates = target.upstream_authenticates();
     let validated_path = target.validate().map(|()| target.coord_path());
     nonce_gated_coord_get(
         validated_path,
         ReadProxyCodes::CLAIMS,
         "coord-mcp claims proxy",
+        upstream_authenticates,
         headers,
         raw_query,
     )
@@ -4879,6 +6267,10 @@ async fn nonce_gated_coord_get(
     validated_path: Result<String, (u16, &'static str, String)>,
     codes: ReadProxyCodes,
     door: &'static str,
+    // C1: does coord VERIFY the device bearer at this target? See
+    // [`ClaimsReadTarget::upstream_authenticates`] — a `false` keeps the
+    // answer out of the credential-posture streak in BOTH directions.
+    upstream_authenticates: bool,
     headers: axum::http::HeaderMap,
     raw_query: Option<String>,
 ) -> axum::response::Response {
@@ -4926,7 +6318,7 @@ async fn nonce_gated_coord_get(
     // does filesystem I/O, so the decision runs on the blocking pool.
     // Phase 3 (memory-injection plan): pin resolution + the fail-closed
     // refusal live in ONE helper shared by all four bearer-selection sites.
-    let (_session_tenant, bearer) =
+    let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
             Err((status, msg)) => {
@@ -4986,7 +6378,18 @@ async fn nonce_gated_coord_get(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = read_upstream_url(&coord_base, &coord_path, raw_query.as_deref());
-    forward_coord_get(&url, &bearer, coord_base_source, codes, door).await
+    forward_coord_get(
+        &url,
+        &bearer,
+        coord_base_source,
+        codes,
+        door,
+        // M2: the posture is PER TENANT because the credential is — this is the
+        // slot whose bearer we just presented.
+        session_tenant,
+        upstream_authenticates,
+    )
+    .await
 }
 
 /// Forward a claims read to coord and return coord's status + headers + body
@@ -5000,6 +6403,8 @@ async fn forward_claims_get(
     url: &str,
     bearer: &str,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
+    tenant: Option<uuid::Uuid>,
+    upstream_authenticates: bool,
 ) -> axum::response::Response {
     forward_coord_get(
         url,
@@ -5007,6 +6412,8 @@ async fn forward_claims_get(
         coord_base_source,
         ReadProxyCodes::CLAIMS,
         "coord-mcp claims proxy",
+        tenant,
+        upstream_authenticates,
     )
     .await
 }
@@ -5021,6 +6428,11 @@ async fn forward_coord_get(
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
     codes: ReadProxyCodes,
     door: &'static str,
+    // The tenant whose device slot supplied `bearer` — the credential the
+    // posture will be about (M2).
+    tenant: Option<uuid::Uuid>,
+    // Does coord verify the bearer at this upstream route (C1)?
+    upstream_authenticates: bool,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -5112,6 +6524,22 @@ async fn forward_coord_get(
                 .into_response();
         }
     };
+    // Coord-credential posture (plan 2026-09-12, Phase 1): coord's verdict on
+    // the DEVICE credential this door just presented. `proxy_request_gate`
+    // above admits only a device-bound nonce and a `sub_type == "device"`
+    // bearer, so a 401 here is genuinely about THIS RUNNER's credential — the
+    // input that makes a token with a future `exp` that coord refuses read
+    // `dark(upstream_401)` instead of `live`. A single answer never moves the
+    // posture; the threshold is a rate.
+    //
+    // `upstream_authenticates` is load-bearing: a 200 from a route coord does
+    // not gate is not evidence about the credential, and counting it was C1.
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(
+        tenant,
+        upstream_authenticates,
+        status,
+        &bytes,
+    );
     builder
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|e| {
@@ -5356,6 +6784,11 @@ async fn coord_read_proxy_handler(
         validated_path,
         ReadProxyCodes::COORD_READ,
         "coord-mcp coord-read proxy",
+        // Every route in this family is behind a real coord guard — the
+        // `/coord/agent-*` device-authed exceptions (`require_jwt`) and the
+        // `FleetPrincipal`-gated `/pr-merge/*` reads — so coord's answer here
+        // IS a verdict on this runner's credential.
+        true,
         headers,
         raw_query,
     )
@@ -5749,7 +7182,7 @@ async fn coord_write_proxy_handler(
     // does filesystem I/O, so the decision runs on the blocking pool.
     // Phase 3 (memory-injection plan): pin resolution + the fail-closed
     // refusal live in ONE helper shared by all four bearer-selection sites.
-    let (_session_tenant, bearer) =
+    let (session_tenant, bearer) =
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok(pair) => pair,
             Err((status, msg)) => {
@@ -5820,7 +7253,15 @@ async fn coord_write_proxy_handler(
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
-    forward_coord_write_post(&url, &bearer, body, coord_base_source, spool_plan.as_ref()).await
+    forward_coord_write_post(
+        &url,
+        &bearer,
+        body,
+        coord_base_source,
+        spool_plan.as_ref(),
+        session_tenant,
+    )
+    .await
 }
 
 /// The durable fallback a `WorkUnitRegisterGate` forward may take when coord is
@@ -5983,6 +7424,10 @@ async fn forward_coord_write_post(
     body: axum::body::Bytes,
     coord_base_source: qontinui_runner_lib::profiles::CoordBaseSource,
     spool: Option<&GateSpoolPlan>,
+    // The tenant whose device slot supplied `bearer` (M2). Every target on
+    // this forwarder is a real coord WRITE behind a real guard, so there is no
+    // `upstream_authenticates` question here — the answer is always yes.
+    tenant: Option<uuid::Uuid>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -6089,6 +7534,15 @@ async fn forward_coord_write_post(
                 .into_response();
         }
     };
+    // Coord-credential posture (plan 2026-09-12, Phase 1): coord's verdict on
+    // the DEVICE credential this door just presented. `proxy_request_gate`
+    // above admits only a device-bound nonce and a `sub_type == "device"`
+    // bearer, so a 401 here is genuinely about THIS RUNNER's credential — the
+    // input that makes a token with a future `exp` that coord refuses read
+    // `dark(upstream_401)` instead of `live`. A single answer never moves the
+    // posture; the threshold is a rate.
+    crate::mcp::device_jwt_refresher::note_coord_upstream_verdict(tenant, true, status, &bytes);
+
     // A 5xx is the OTHER half of the retryable class — coord (or a gateway in
     // front of it) did not reach a verdict on the content, so the write is
     // still worth keeping. A 4xx is NOT: that is coord refusing the body, and
@@ -7824,6 +9278,10 @@ pub fn create_router(
             // population whichever side of the reconcile the walk runs on. (The
             // comment that used to sit here claimed the opposite, and that claim
             // was the stated reason for the ordering.)
+            // Warm the stdio-shim selftest cache off the request path, so the
+            // first spawn after boot reads a verdict instead of running the
+            // probe inline on a tokio worker (`coord_mcp::cached_stdio_shim_probe`).
+            tokio::task::spawn_blocking(crate::coord_mcp::warm_stdio_shim_probe);
             let census_task = {
                 let open = workdirs.clone();
                 let all = all_record_workdirs;
@@ -9581,9 +11039,11 @@ mod window_getter_single_flight_tests {
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
-        select_lifecycle_caller, select_lifecycle_caller_censused, select_terminal_caller,
-        self_id_health_snapshot, self_id_miss_sample_dirs, self_id_miss_samples, terminal_leg,
-        terminal_leg_verdict, LifecycleMiss, LifecycleMissCensus, SelfIdOutcome, TerminalLeg,
+        event_lane_terminal_leg, select_lifecycle_caller, select_lifecycle_caller_censused,
+        select_terminal_caller, self_id_health_snapshot, self_id_miss_sample_dirs,
+        self_id_miss_samples, settle_ambiguity, settle_lifecycle_selection, terminal_leg,
+        terminal_leg_verdict, AmbiguousKey, EventLaneLeg, EventLaneMiss, LifecycleMiss,
+        LifecycleMissCensus, SelfIdOutcome, TerminalLaneProbe, TerminalLeg, TerminalMiss,
         SELF_ID_MISS_SAMPLE_CAP, TERMINAL_LEG_OUTCOMES,
     };
     use crate::session::session_lifecycle_store::{
@@ -9603,8 +11063,10 @@ mod self_id_chain_tests {
         );
         // 12 before the terminal-leg fix; +4 terminal-leg gates
         // (`terminal_record_missing`, `terminal_record_unadmitted`,
-        // `terminal_anchor_not_uuid`, `ambiguous_terminal`).
-        assert_eq!(SelfIdOutcome::ALL.len(), 16);
+        // `terminal_anchor_not_uuid`, `ambiguous_terminal`); +4 for the
+        // client-pick arm, two per leg (`injected_via_client_pick_*`,
+        // `client_pick_not_candidate_*`).
+        assert_eq!(SelfIdOutcome::ALL.len(), 20);
     }
 
     /// FIX 5: the counter slot is a compiler-checked `match`, not a search of
@@ -9658,8 +11120,9 @@ mod self_id_chain_tests {
                 outcome.label()
             );
         }
-        // Every counter series, plus the bounded diagnostic sample and the
-        // terminal-leg self-report.
+        // Every counter series, plus the bounded diagnostic sample, the
+        // terminal-leg self-report, and the client-assertion disagreement
+        // counter.
         assert!(
             obj["recent_misses"].is_array(),
             "the miss sample must be rendered as an array"
@@ -9673,16 +11136,21 @@ mod self_id_chain_tests {
                 "GET /health selfId.terminal_leg is missing `{key}`"
             );
         }
-        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 2);
+        assert!(
+            obj["client_assertion_overridden"].is_u64(),
+            "the resolved-vs-asserted disagreement counter must be a series of its own"
+        );
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 3);
     }
 
     #[test]
-    fn the_three_injected_arms_are_the_only_success_outcomes() {
+    fn the_five_injected_arms_are_the_only_success_outcomes() {
         // coord cannot distinguish the failure arms: from its side every
         // non-injected outcome is an identical `absent`. Guards against a
         // future variant being added as another "success" without the header
         // actually going. Phase 3 added `injected_via_lifecycle`; the
-        // terminal-keyed fix adds `injected_via_terminal`.
+        // terminal-keyed fix adds `injected_via_terminal`; the client-pick
+        // arm adds one per leg.
         let successes: Vec<&str> = SelfIdOutcome::ALL
             .iter()
             .filter(|o| {
@@ -9691,6 +11159,8 @@ mod self_id_chain_tests {
                     SelfIdOutcome::Injected
                         | SelfIdOutcome::InjectedViaTerminal
                         | SelfIdOutcome::InjectedViaLifecycle
+                        | SelfIdOutcome::InjectedViaClientPickTerminal
+                        | SelfIdOutcome::InjectedViaClientPickWorkdir
                 )
             })
             .map(|o| o.label())
@@ -9700,7 +11170,9 @@ mod self_id_chain_tests {
             vec![
                 "injected",
                 "injected_via_terminal",
-                "injected_via_lifecycle"
+                "injected_via_lifecycle",
+                "injected_via_client_pick_terminal",
+                "injected_via_client_pick_workdir"
             ]
         );
     }
@@ -9713,7 +11185,7 @@ mod self_id_chain_tests {
             LifecycleMiss::NoRecord,
             LifecycleMiss::Unregistered,
             LifecycleMiss::AnchorNotUuid,
-            LifecycleMiss::Ambiguous,
+            LifecycleMiss::Ambiguous(vec![]),
         ]
         .iter()
         .map(|m| m.outcome().label())
@@ -9856,7 +11328,10 @@ mod self_id_chain_tests {
         ];
         assert_eq!(
             select_lifecycle_caller(&mixed, "D:/repo", None),
-            Err(LifecycleMiss::Ambiguous)
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B)
+            ]))
         );
     }
 
@@ -9884,14 +11359,25 @@ mod self_id_chain_tests {
             rec(ANCHOR_B, Some("D:/repo"), 200),
         ];
         let got = select_lifecycle_caller(&records, "D:/repo", None);
-        assert_eq!(got, Err(LifecycleMiss::Ambiguous));
+        // The ambiguity CARRIES its candidates — that is what the request's
+        // own assertion gets to pick among, and nothing else.
+        assert_eq!(
+            got,
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B)
+            ]))
+        );
         assert_eq!(got.unwrap_err().outcome(), SelfIdOutcome::AmbiguousWorkdir);
 
         // Input order cannot smuggle a winner back in either.
         let reversed: Vec<_> = records.iter().rev().cloned().collect();
         assert_eq!(
             select_lifecycle_caller(&reversed, "D:/repo", None),
-            Err(LifecycleMiss::Ambiguous)
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_B),
+                uuid_of(ANCHOR_A)
+            ]))
         );
 
         // …but if only ONE of them is admissible, that one resolves exactly:
@@ -9940,12 +11426,20 @@ mod self_id_chain_tests {
         // Each gate is now its own typed outcome instead of a bare `None`.
         assert_eq!(
             select_terminal_caller(&records, "term-nope"),
-            Err(SelfIdOutcome::TerminalRecordMissing)
+            Err(TerminalMiss::RecordMissing)
+        );
+        assert_eq!(
+            TerminalMiss::RecordMissing.outcome(),
+            SelfIdOutcome::TerminalRecordMissing
         );
         let bad = vec![rec("not-a-uuid", Some("D:/repo"), 1)];
         assert_eq!(
             select_terminal_caller(&bad, "term-not-a-uuid"),
-            Err(SelfIdOutcome::TerminalAnchorNotUuid)
+            Err(TerminalMiss::AnchorNotUuid)
+        );
+        assert_eq!(
+            TerminalMiss::AnchorNotUuid.outcome(),
+            SelfIdOutcome::TerminalAnchorNotUuid
         );
     }
 
@@ -9974,11 +11468,12 @@ mod self_id_chain_tests {
             vec![stale.clone(), fresh.clone()],
             vec![fresh.clone(), stale.clone()],
         ] {
-            assert_eq!(
-                select_terminal_caller(&records, "term-reused"),
-                Err(SelfIdOutcome::AmbiguousTerminal),
-                "two open rows on one terminal must refuse, in EITHER input order"
+            let got = select_terminal_caller(&records, "term-reused");
+            assert!(
+                matches!(&got, Err(TerminalMiss::Ambiguous(c)) if c.len() == 2),
+                "two open rows on one terminal must refuse, in EITHER input order: {got:?}"
             );
+            assert_eq!(got.unwrap_err().outcome(), SelfIdOutcome::AmbiguousTerminal);
         }
 
         // Two rows naming the SAME session are one candidate, not an
@@ -10039,6 +11534,99 @@ mod self_id_chain_tests {
         );
     }
 
+    /// The SAME no-fallthrough rule on the EVENT-LANE resolver
+    /// (`resolve_event_lane_session_id`), which had collapsed it to two-way.
+    ///
+    /// Leg 2 there is keyed on the WORKDIR, and an agent worktree routinely
+    /// hosts both a terminal and an AI task run — so a known terminal that
+    /// fails to resolve must yield NO lane (and therefore NO row) rather than
+    /// the sibling task run's lane. A misattributed row is the worst outcome
+    /// available: it looks valid and corrupts two sessions' counts at once,
+    /// where a dropped one merely under-counts and says so in the log.
+    #[test]
+    fn known_terminal_never_falls_through_to_the_event_lane_workdir_leg() {
+        for (probe, expected) in [
+            // The terminal closed between the call and this resolution.
+            (TerminalLaneProbe::Gone, EventLaneMiss::TerminalGone),
+            // Live, but `terminal_create` never mirrored it into
+            // `coord.sessions` (coord unreachable then), or the row was GC'd.
+            (
+                TerminalLaneProbe::Live(None),
+                EventLaneMiss::TerminalHasNoCoordSession,
+            ),
+            // No `TerminalManager` in state at all.
+            (
+                TerminalLaneProbe::NoManager,
+                EventLaneMiss::NoTerminalManager,
+            ),
+        ] {
+            let leg = event_lane_terminal_leg(Some("T1"), |tid| {
+                assert_eq!(tid, "T1", "the probe must be asked about T1's terminal");
+                probe
+            });
+            assert_eq!(
+                leg,
+                EventLaneLeg::Miss(expected),
+                "a known-but-unresolvable terminal must be a typed miss, never a fallthrough"
+            );
+            // The property the fix exists for, stated structurally: whatever
+            // the miss, it is NEVER the one arm that continues to the workdir
+            // leg. A future probe variant cannot re-open the defect silently.
+            assert_ne!(leg, EventLaneLeg::NoTerminal);
+            assert!(matches!(leg, EventLaneLeg::Miss(_)));
+        }
+
+        // The ONLY fallthrough arm: the binding carries no terminal at all
+        // (restore, adopt, the mint route, an in-cwd `.mcp.json`). The probe
+        // must not even be consulted.
+        assert_eq!(
+            event_lane_terminal_leg(None, |_| unreachable!(
+                "no terminal ⇒ leg 1 must not probe state"
+            )),
+            EventLaneLeg::NoTerminal
+        );
+
+        // And a terminal that DOES carry a coord session short-circuits with
+        // its own lane.
+        let sid = uuid::Uuid::now_v7();
+        assert_eq!(
+            event_lane_terminal_leg(Some("T1"), |_| TerminalLaneProbe::Live(Some(sid))),
+            EventLaneLeg::Resolved(sid)
+        );
+    }
+
+    /// Every event-lane miss carries a distinct log label and names its leg —
+    /// the fields that make a dropped observation diagnosable without the
+    /// (deferred) `/health` counter.
+    #[test]
+    fn event_lane_miss_labels_are_distinct_and_name_their_leg() {
+        let all = [
+            EventLaneMiss::NoNonce,
+            EventLaneMiss::NoTerminalManager,
+            EventLaneMiss::TerminalGone,
+            EventLaneMiss::TerminalHasNoCoordSession,
+            EventLaneMiss::NoWorkdir,
+            EventLaneMiss::AiPlaneStateMissing,
+            EventLaneMiss::NoTaskRun,
+            EventLaneMiss::AiSessionUnregistered,
+        ];
+        let mut labels: Vec<&str> = all.iter().map(|m| m.as_str()).collect();
+        labels.sort_unstable();
+        let count = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), count, "event-lane miss labels must be unique");
+        for miss in all {
+            assert!(
+                matches!(miss.leg(), "nonce" | "terminal" | "ai_plane"),
+                "{} named an unknown leg {}",
+                miss.as_str(),
+                miss.leg()
+            );
+        }
+        assert_eq!(EventLaneMiss::TerminalGone.leg(), "terminal");
+        assert_eq!(EventLaneMiss::NoTaskRun.leg(), "ai_plane");
+    }
+
     /// The terminal leg applies the anchor-trust guard too. Being the UNIQUE
     /// record for a terminal does not make a guessed anchor correct: a
     /// `reconciled` id "may name a foreign session" by its own definition, so
@@ -10051,8 +11639,12 @@ mod self_id_chain_tests {
             r.origin = origin.clone();
             assert_eq!(
                 select_terminal_caller(&[r], &format!("term-{ANCHOR_A}")),
-                Err(SelfIdOutcome::TerminalRecordUnadmitted),
+                Err(TerminalMiss::RecordUnadmitted),
                 "a {origin:?}-origin anchor must NOT resolve, even as the terminal's only record"
+            );
+            assert_eq!(
+                TerminalMiss::RecordUnadmitted.outcome(),
+                SelfIdOutcome::TerminalRecordUnadmitted
             );
         }
         // FIX 3: both TRUSTED origins resolve on this leg — so the guard
@@ -10105,7 +11697,14 @@ mod self_id_chain_tests {
             rec(ANCHOR_C, Some("D:/repo"), 3),
         ];
         let (result, census) = select_lifecycle_caller_censused(&records, "D:/repo", None);
-        assert_eq!(result, Err(LifecycleMiss::Ambiguous));
+        assert_eq!(
+            result,
+            Err(LifecycleMiss::Ambiguous(vec![
+                uuid_of(ANCHOR_A),
+                uuid_of(ANCHOR_B),
+                uuid_of(ANCHOR_C)
+            ]))
+        );
 
         // The dir list — deduped by dir string — collapses to ONE entry, which
         // is exactly why it cannot explain a 3-way collision.
@@ -10225,6 +11824,7 @@ mod self_id_chain_tests {
                 admitted: 5,
                 distinct_candidates: 4,
             },
+            client_asserted: None,
         };
         let rendered = super::self_id_miss_sample_entry_json(&sample);
         assert_eq!(rendered["gate"], "ambiguous_workdir");
@@ -10232,6 +11832,251 @@ mod self_id_chain_tests {
         assert_eq!(rendered["matched_record_count"], 7);
         assert_eq!(rendered["admitted_record_count"], 5);
         assert_eq!(rendered["distinct_candidate_count"], 4);
+        // Asserted nothing renders as an explicit null, never as an absent
+        // key — "said nothing" and "this build does not report it" must not
+        // read the same.
+        assert!(rendered["client_asserted"].is_null());
+        assert!(rendered
+            .as_object()
+            .unwrap()
+            .contains_key("client_asserted"));
+
+        let asserted = super::SelfIdMissSample {
+            gate: SelfIdOutcome::ClientPickNotCandidateWorkdir.label(),
+            client_asserted: Some(uuid_of(ANCHOR_C)),
+            ..sample
+        };
+        let rendered = super::self_id_miss_sample_entry_json(&asserted);
+        assert_eq!(rendered["gate"], "client_pick_not_candidate_workdir");
+        assert_eq!(rendered["client_asserted"], ANCHOR_C);
+    }
+
+    // ── The client-pick arm (post-merge follow-up to #1432) ────────────
+
+    /// THE rule: the request's own assertion settles an ambiguity iff it names
+    /// one of the runner's candidates. It never adds one.
+    #[test]
+    fn a_client_assertion_settles_an_ambiguity_only_to_a_runner_candidate() {
+        let candidates = vec![uuid_of(ANCHOR_A), uuid_of(ANCHOR_B)];
+
+        // Names a candidate → resolves, and to THAT candidate.
+        assert_eq!(
+            settle_ambiguity(&candidates, Some(uuid_of(ANCHOR_B)), AmbiguousKey::Workdir),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        // Names a session the runner holds no trusted record for on this key
+        // → headerless, and counted APART from the plain ambiguity.
+        assert_eq!(
+            settle_ambiguity(&candidates, Some(uuid_of(ANCHOR_C)), AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        // Asserted nothing → the leg's own bucket, exactly as before.
+        assert_eq!(
+            settle_ambiguity(&candidates, None, AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::AmbiguousWorkdir)
+        );
+        assert_eq!(
+            settle_ambiguity(&candidates, None, AmbiguousKey::Terminal),
+            (None, SelfIdOutcome::AmbiguousTerminal)
+        );
+        // An EMPTY candidate set can never be settled by assertion — the
+        // client's word adds nothing.
+        assert_eq!(
+            settle_ambiguity(&[], Some(uuid_of(ANCHOR_A)), AmbiguousKey::Workdir),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        // The three outcomes of a key are distinct from each other and from
+        // the other key's — six counters, no collisions.
+        let mut all: Vec<&str> = [AmbiguousKey::Terminal, AmbiguousKey::Workdir]
+            .iter()
+            .flat_map(|k| [k.picked(), k.rejected(), k.unsettled()])
+            .map(|o| o.label())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), 6);
+    }
+
+    /// Leg 3 end to end through the pure composition: the shared-workdir
+    /// fixture that produced 178 `ambiguous_workdir` misses on the operator's
+    /// box now resolves when the caller says which of the workdir's sessions
+    /// it is — and ONLY then.
+    #[test]
+    fn a_client_assertion_resolves_the_shared_workdir_it_could_not_before() {
+        let records = vec![
+            rec(ANCHOR_A, Some("D:/repo"), 100),
+            rec(ANCHOR_B, Some("D:/repo"), 200),
+        ];
+        let selection = select_lifecycle_caller(&records, "D:/repo", None);
+        assert!(matches!(selection, Err(LifecycleMiss::Ambiguous(_))));
+
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_A))),
+            (
+                Some(uuid_of(ANCHOR_A)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_B))),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickWorkdir
+            )
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection.clone(), Some(uuid_of(ANCHOR_C))),
+            (None, SelfIdOutcome::ClientPickNotCandidateWorkdir)
+        );
+        assert_eq!(
+            settle_lifecycle_selection(selection, None),
+            (None, SelfIdOutcome::AmbiguousWorkdir)
+        );
+    }
+
+    /// The assertion is a tie-break, not an override: a single candidate
+    /// resolves to the RUNNER's id whatever the client says, and a non-ambiguous
+    /// miss stays that miss — a client cannot talk its way past "no trusted
+    /// record here".
+    #[test]
+    fn a_client_assertion_never_overrides_a_resolved_leg_or_a_gate_miss() {
+        // Single trusted candidate: the runner's proof wins — and an AGREEING
+        // assertion is still the leg's own outcome, not a client pick: the
+        // pick counters mean "the client's word decided", never "the client
+        // was consulted".
+        assert_eq!(
+            settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), Some(uuid_of(ANCHOR_B))),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+        assert_eq!(
+            settle_lifecycle_selection(Ok(uuid_of(ANCHOR_A)), Some(uuid_of(ANCHOR_A))),
+            (Some(uuid_of(ANCHOR_A)), SelfIdOutcome::InjectedViaLifecycle)
+        );
+        // No record / untrusted / non-uuid: the gate's verdict stands.
+        for miss in [
+            LifecycleMiss::NoRecord,
+            LifecycleMiss::Unregistered,
+            LifecycleMiss::AnchorNotUuid,
+        ] {
+            let expected = miss.outcome();
+            assert_eq!(
+                settle_lifecycle_selection(Err(miss), Some(uuid_of(ANCHOR_A))),
+                (None, expected),
+                "an assertion must not add an identity past a `{}` gate",
+                expected.label()
+            );
+        }
+        // …and the disagreement between a resolved id and the assertion is
+        // COUNTED, so the runner's confidence has a falsifier. This is the
+        // ONLY test that bumps this process-global counter; a second one
+        // would have to assert its own delta under the parallel runner rather
+        // than an absolute value.
+        let before = self_id_health_snapshot()["client_assertion_overridden"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert!(super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            Some(uuid_of(ANCHOR_B))
+        ));
+        // Agreement, no assertion, and no resolution are NOT disagreements.
+        assert!(!super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            Some(uuid_of(ANCHOR_A))
+        ));
+        assert!(!super::note_client_assertion_disagreement(
+            Some(uuid_of(ANCHOR_A)),
+            None
+        ));
+        assert!(!super::note_client_assertion_disagreement(
+            None,
+            Some(uuid_of(ANCHOR_B))
+        ));
+        let after = self_id_health_snapshot()["client_assertion_overridden"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert_eq!(after, before + 1);
+    }
+
+    /// Leg 1's ambiguity (several open rows on one reused terminal) is settled
+    /// the same way — and it is still a leg-1 verdict, never a fallthrough.
+    #[test]
+    fn a_client_assertion_settles_a_reused_terminal_without_falling_through() {
+        let mut stale = rec(ANCHOR_A, Some("D:/repo"), 100);
+        stale.terminal_id = "term-reused".to_string();
+        stale.confirmed_at = Some(50);
+        let mut fresh = rec(ANCHOR_B, Some("D:/repo"), 200);
+        fresh.terminal_id = "term-reused".to_string();
+        fresh.confirmed_at = None;
+        let records = vec![stale, fresh];
+
+        // The leg carries the candidates rather than a bare miss…
+        let leg = terminal_leg(&records, Some("term-reused"));
+        let TerminalLeg::Ambiguous(candidates) = &leg else {
+            panic!("expected TerminalLeg::Ambiguous, got {leg:?}");
+        };
+        assert_eq!(candidates.len(), 2);
+        // …and the live session (the UNCONFIRMED fresh row — the one
+        // authority-ranking would have lost) can name itself. The outcome is
+        // the TERMINAL-keyed one, which `terminal_leg.engaged` counts.
+        assert_eq!(
+            settle_ambiguity(candidates, Some(uuid_of(ANCHOR_B)), AmbiguousKey::Terminal),
+            (
+                Some(uuid_of(ANCHOR_B)),
+                SelfIdOutcome::InjectedViaClientPickTerminal
+            )
+        );
+        // A same-cwd sibling that is NOT on this terminal cannot be picked
+        // here: the bound is the terminal's own rows, not the workdir's.
+        assert_eq!(
+            settle_ambiguity(candidates, Some(uuid_of(ANCHOR_C)), AmbiguousKey::Terminal),
+            (None, SelfIdOutcome::ClientPickNotCandidateTerminal)
+        );
+        // Every non-ambiguous leg-1 miss is unchanged and still typed.
+        assert_eq!(
+            terminal_leg(&records, Some("term-absent")),
+            TerminalLeg::Miss(SelfIdOutcome::TerminalRecordMissing)
+        );
+    }
+
+    /// The header is read the way the runner's own anchors are read: strict
+    /// UUID or nothing. Whitespace is trimmed; anything else asserts nothing.
+    #[test]
+    fn the_client_assertion_is_a_strict_uuid_or_nothing() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert_eq!(super::client_asserted_session(&headers), None);
+
+        for bad in ["", "  ", "not-a-uuid", "term-123", "<uuid>"] {
+            headers.insert(
+                crate::coord_mcp::CALLER_SESSION_HEADER,
+                axum::http::HeaderValue::from_str(bad).expect("ascii"),
+            );
+            assert_eq!(
+                super::client_asserted_session(&headers),
+                None,
+                "{bad:?} must assert nothing"
+            );
+        }
+        headers.insert(
+            crate::coord_mcp::CALLER_SESSION_HEADER,
+            axum::http::HeaderValue::from_str(&format!("  {ANCHOR_A} ")).expect("ascii"),
+        );
+        assert_eq!(
+            super::client_asserted_session(&headers),
+            Some(uuid_of(ANCHOR_A))
+        );
+        // Case is not identity: the parse accepts upper-case hex and the
+        // resulting id compares equal to the anchor.
+        headers.insert(
+            crate::coord_mcp::CALLER_SESSION_HEADER,
+            axum::http::HeaderValue::from_str(&ANCHOR_A.to_uppercase()).expect("ascii"),
+        );
+        assert_eq!(
+            super::client_asserted_session(&headers),
+            Some(uuid_of(ANCHOR_A))
+        );
     }
 
     /// A detector that reports nothing when it is not running reports CALM.
@@ -10275,12 +12120,47 @@ mod self_id_chain_tests {
                 "terminal_record_unadmitted",
                 "terminal_anchor_not_uuid",
                 "ambiguous_terminal",
+                "injected_via_client_pick_terminal",
+                "client_pick_not_candidate_terminal",
             ]
         );
         assert!(
             !TERMINAL_LEG_OUTCOMES.contains(&SelfIdOutcome::ResolverStateMissing),
             "shared with the lifecycle leg — counting it would be false calm"
         );
+        // The client-pick outcomes are leg-keyed for the same reason: a
+        // settled TERMINAL ambiguity is leg-1 engagement and must count as
+        // such, while the workdir twins belong to leg 3 and must not.
+        for leg1 in [
+            SelfIdOutcome::InjectedViaClientPickTerminal,
+            SelfIdOutcome::ClientPickNotCandidateTerminal,
+        ] {
+            assert!(
+                TERMINAL_LEG_OUTCOMES.contains(&leg1),
+                "{} is leg 1",
+                leg1.label()
+            );
+        }
+        for leg3 in [
+            SelfIdOutcome::InjectedViaClientPickWorkdir,
+            SelfIdOutcome::ClientPickNotCandidateWorkdir,
+        ] {
+            assert!(
+                !TERMINAL_LEG_OUTCOMES.contains(&leg3),
+                "{} is leg 3 — counting it here would be false engagement",
+                leg3.label()
+            );
+        }
+        // …and every AmbiguousKey::Terminal verdict lands in that family, so
+        // a box whose every terminal-bound nonce is settled by pick cannot
+        // read `engaged == 0` / `inert`.
+        for outcome in [
+            AmbiguousKey::Terminal.picked(),
+            AmbiguousKey::Terminal.rejected(),
+            AmbiguousKey::Terminal.unsettled(),
+        ] {
+            assert!(TERMINAL_LEG_OUTCOMES.contains(&outcome));
+        }
 
         // `engaged` must be the sum of exactly those five series in the SAME
         // snapshot. Deliberately no counter bump here: these counters are
@@ -10311,18 +12191,39 @@ mod self_id_chain_tests {
                 vec![],
                 vec!["D:/root".to_string()],
                 super::LifecycleMissCensus::default(),
+                None,
             );
         }
+        // A workdir-leg rejection of a client pick lands in the same ring,
+        // carrying the id the session claimed — the diagnosable half of
+        // `client_pick_not_candidate_workdir`.
+        super::record_self_id_miss_sample(
+            SelfIdOutcome::ClientPickNotCandidateWorkdir,
+            "D:/repo/asserted",
+            vec!["D:/repo/asserted".to_string()],
+            vec!["D:/root".to_string()],
+            super::LifecycleMissCensus {
+                matched: 3,
+                admitted: 2,
+                distinct_candidates: 2,
+            },
+            Some(uuid_of(ANCHOR_C)),
+        );
         let q = self_id_miss_samples().lock().expect("miss ring poisoned");
         assert_eq!(q.len(), SELF_ID_MISS_SAMPLE_CAP, "the ring must be capped");
         let newest = q.back().expect("ring is non-empty");
-        assert_eq!(newest.gate, "no_lifecycle_record");
-        assert_eq!(newest.workdir, format!("D:/repo/{}", overflow - 1));
-        assert_eq!(newest.open_dirs, vec!["D:/root".to_string()]);
+        assert_eq!(newest.gate, "client_pick_not_candidate_workdir");
+        assert_eq!(newest.workdir, "D:/repo/asserted");
+        assert_eq!(newest.client_asserted, Some(uuid_of(ANCHOR_C)));
+        let previous = q.iter().rev().nth(1).expect("ring holds more than one");
+        assert_eq!(previous.gate, "no_lifecycle_record");
+        assert_eq!(previous.workdir, format!("D:/repo/{}", overflow - 1));
+        assert_eq!(previous.open_dirs, vec!["D:/root".to_string()]);
+        assert_eq!(previous.client_asserted, None);
         // Oldest entries were evicted, newest kept.
         assert_eq!(
             q.front().expect("ring is non-empty").workdir,
-            format!("D:/repo/{}", overflow - SELF_ID_MISS_SAMPLE_CAP)
+            format!("D:/repo/{}", overflow + 1 - SELF_ID_MISS_SAMPLE_CAP)
         );
     }
 
@@ -11277,17 +13178,19 @@ mod coord_mcp_body_gate_tests {
     /// result with no tools key — advertises nothing, so there is nothing to
     /// withhold and the upstream bytes go out byte-identically.
     #[test]
-    fn filter_leaves_shapeless_responses_unchanged() {
+    fn filter_forwards_shapeless_responses_untouched_but_not_as_observed_clean() {
         for resp in [
             br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.as_slice(),
             br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}"#.as_slice(),
         ] {
+            // Forwarded untouched, and typed apart from `Unchanged`: nothing was
+            // inspected, so nothing may be recorded as an observed-clean list.
             assert!(
                 matches!(
                     coord_mcp_filter_tools_list_response(TOOLS_LIST_REQ.as_bytes(), resp),
-                    CoordMcpToolsListFilter::Unchanged
+                    CoordMcpToolsListFilter::NoToolsArray
                 ),
-                "a response advertising no tools must forward untouched"
+                "a response advertising no tools array must forward untouched as NoToolsArray"
             );
         }
     }
@@ -11474,6 +13377,9 @@ mod coord_mcp_body_gate_tests {
             // forwards.
             "coord_force_clear_gate",
             "coord_set_gate_audience",
+            // The registrant-only re-point (coord#2056): the only way to carry a
+            // superseded gate's continuation onto the replacement PR.
+            "coord_repoint_gate",
             // P4's own addition: mutates nothing, so neither dial-governed nor
             // notifying.
             "coord_gate_doctor",
@@ -11575,6 +13481,352 @@ mod coord_mcp_body_gate_tests {
             "the offending element's id is echoed"
         );
         assert!(gate(serde_json::json!([])).is_err(), "empty batch refused");
+    }
+
+    // -- the refusal names its own cause (plan
+    // 2026-09-03-coord-mcp-403-names-its-own-cause, Phases 1 + 2) --
+
+    fn trunk_with(allowed: &[&str], deliberate: &[&str]) -> crate::build_drift::TrunkToolPolicy {
+        crate::build_drift::TrunkToolPolicy {
+            trunk_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            read_at: 0,
+            source: "fetched",
+            policy: crate::build_drift::ParsedToolPolicy {
+                allowed: allowed.iter().map(|s| s.to_string()).collect(),
+                allowed_prefixes: vec![],
+                deliberate: deliberate.iter().map(|s| s.to_string()).collect(),
+                deliberate_prefixes: vec![],
+            },
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The parser reads THIS file's four consts back exactly as they compiled.
+    /// A reformat that breaks the parser breaks this test, not production
+    /// (production degrades to `cause: "unknown"`), so the parser cannot rot
+    /// silently against the one file it exists to read.
+    #[test]
+    fn trunk_policy_parser_round_trips_this_files_consts() {
+        let p = crate::build_drift::parse_tool_policy_consts(include_str!("mcp_api.rs"))
+            .expect("mcp_api.rs parses");
+        assert_eq!(p.allowed, strings(COORD_MCP_ALLOWED_TOOLS));
+        assert_eq!(
+            p.allowed_prefixes,
+            strings(super::COORD_MCP_ALLOWED_TOOL_PREFIXES)
+        );
+        assert_eq!(p.deliberate, strings(COORD_MCP_DELIBERATE_EXCLUSIONS));
+        assert_eq!(
+            p.deliberate_prefixes,
+            strings(super::COORD_MCP_DELIBERATE_EXCLUSION_PREFIXES)
+        );
+        assert!(!p.allowed.is_empty() && !p.deliberate.is_empty());
+    }
+
+    /// (a) THIS binary's deliberate list decides without any trunk read.
+    #[test]
+    fn refusal_cause_deliberate_needs_no_trunk_read() {
+        let d = super::coord_mcp_refusal_cause("coord_create_pr", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert!(d.in_deliberate_exclusions);
+        assert_eq!(d.in_allowlist_on_trunk, None);
+        assert!(d.trunk_sha.is_none());
+        assert!(d.remedy.starts_with("none"), "{}", d.remedy);
+        // The prefix family counts as deliberate too.
+        let d = super::coord_mcp_refusal_cause("coord_onboarding_doctor", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+    }
+
+    /// (b) No trunk read ⇒ `unknown` with a reason, never a confident default.
+    #[test]
+    fn refusal_cause_is_unknown_when_trunk_was_not_read() {
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", None);
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Unknown);
+        assert_eq!(d.in_allowlist_on_trunk, None);
+        assert!(!d.in_deliberate_exclusions);
+        assert!(d.trunk_sha.is_none() && d.trunk_source.is_none());
+        assert!(d.remedy.contains("/coord-mcp/tool-policy"), "{}", d.remedy);
+    }
+
+    /// (c) Trunk allows it, this binary does not ⇒ `stale_binary`, remedy rebuild.
+    #[test]
+    fn refusal_cause_is_stale_binary_when_trunk_allows_the_tool() {
+        let t = trunk_with(&["coord_definitely_not_a_tool"], &[]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::StaleBinary);
+        assert_eq!(d.in_allowlist_on_trunk, Some(true));
+        assert_eq!(d.trunk_sha.as_deref(), Some(t.trunk_sha.as_str()));
+        assert_eq!(d.trunk_source, Some("fetched"));
+        assert!(d.remedy.starts_with("rebuild"), "{}", d.remedy);
+    }
+
+    /// (d) Trunk records it as deliberate although this binary does not yet.
+    #[test]
+    fn refusal_cause_is_deliberate_when_only_trunk_names_it() {
+        let t = trunk_with(&[], &["coord_definitely_not_a_tool"]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Deliberate);
+        assert_eq!(d.in_allowlist_on_trunk, Some(false));
+        assert!(!d.in_deliberate_exclusions);
+        assert!(d.remedy.contains("rebuild will"), "{}", d.remedy);
+    }
+
+    /// (e) Neither list on trunk knows the name ⇒ `drift`, and the remedy names
+    /// the delivery gate the Phase 3 convention requires.
+    #[test]
+    fn refusal_cause_is_drift_when_trunk_knows_nothing_of_the_tool() {
+        let t = trunk_with(&[], &[]);
+        let d = super::coord_mcp_refusal_cause("coord_definitely_not_a_tool", Some(&t));
+        assert_eq!(d.cause, super::CoordMcpRefusalCause::Drift);
+        assert_eq!(d.in_allowlist_on_trunk, Some(false));
+        assert!(d.remedy.contains("COORD_MCP_ALLOWED_TOOLS"), "{}", d.remedy);
+        assert!(d.remedy.contains("runner_served_sha"), "{}", d.remedy);
+    }
+
+    /// The `data` object for a refused TOOL: the unchanged `code`, the cause,
+    /// the remedy, and NOTHING that names coord's upstream grant — the key set
+    /// is pinned exactly so a field cannot be added without editing this test.
+    #[test]
+    fn refusal_data_for_a_tool_carries_cause_and_only_the_bounded_fields() {
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some("coord_create_pr".to_string()),
+        };
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
+        assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
+        assert_eq!(d["tool"], "coord_create_pr");
+        assert_eq!(d["cause"], "deliberate");
+        assert_eq!(d["inDeliberateExclusions"], true);
+        assert!(d["remedy"].as_str().unwrap().starts_with("none"));
+        assert_eq!(d["next_door"], "GET /coord-mcp/tool-policy");
+        assert!(
+            d["probed_at"].as_str().unwrap().ends_with('Z')
+                || d["probed_at"].as_str().unwrap().contains('+')
+        );
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "buildDrift",
+                "cause",
+                "code",
+                "commitsBehind",
+                "inAllowlistOnTrunk",
+                "inDeliberateExclusions",
+                "next_door",
+                "probed_at",
+                "remedy",
+                "tool",
+                "trunkReadAt",
+                "trunkSha",
+                "trunkSource",
+            ]
+        );
+        let lower = d.to_string().to_ascii_lowercase();
+        for forbidden in ["upstream", "granted", "coord grants", "allowedupstream"] {
+            assert!(
+                !lower.contains(forbidden),
+                "data must not name an upstream grant: {forbidden}"
+            );
+        }
+    }
+
+    /// The `unknown` arm renders `inAllowlistOnTrunk: null`, never a bool.
+    #[test]
+    fn refusal_data_unknown_arm_renders_null_not_false() {
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some("coord_definitely_not_a_tool".to_string()),
+        };
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
+        assert_eq!(d["cause"], "unknown");
+        assert!(d["inAllowlistOnTrunk"].is_null());
+        assert!(d["trunkSha"].is_null());
+        assert_eq!(d["inDeliberateExclusions"], false);
+        // And with a trunk read the same name renders a bool + the sha.
+        let t = trunk_with(&["coord_definitely_not_a_tool"], &[]);
+        let d = super::coord_mcp_refusal_data_with(&rej, Some(&t));
+        assert_eq!(d["cause"], "stale_binary");
+        assert_eq!(d["inAllowlistOnTrunk"], true);
+        assert_eq!(d["trunkSha"], t.trunk_sha);
+        assert_eq!(d["trunkSource"], "fetched");
+    }
+
+    /// A refused METHOD has no tool to diagnose: `method_not_allowed`, no
+    /// `tool`, no cause fields at all.
+    #[test]
+    fn refusal_data_for_a_method_says_method_not_allowed_and_carries_no_tool() {
+        let rej = super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: None,
+        };
+        let d = super::coord_mcp_refusal_data_with(&rej, None);
+        assert_eq!(d["cause"], "method_not_allowed");
+        assert_eq!(d["code"], "COORD_MCP_PROXY_METHOD_NOT_ALLOWED");
+        let mut keys: Vec<&str> = d.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["cause", "code", "next_door", "probed_at"]);
+    }
+
+    /// The gate hands the refused tool's NAME to the refusal, and only for a
+    /// `tools/call` — a refused method carries none.
+    #[test]
+    fn body_gate_names_the_refused_tool_and_not_a_refused_method() {
+        let e = coord_mcp_body_gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"coord_create_pr"}})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(e.tool.as_deref(), Some("coord_create_pr"));
+        let e = coord_mcp_body_gate(
+            serde_json::json!({"jsonrpc":"2.0","id":1,"method":"resources/list","params":{}})
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(e.tool.is_none());
+        let e = coord_mcp_body_gate(b"not json").unwrap_err();
+        assert!(e.tool.is_none());
+    }
+
+    /// A `tools/list` answer with no `result.tools` array — an upstream
+    /// JSON-RPC error — is NOT an observed-clean list. It forwards untouched
+    /// and is typed apart from `Unchanged`, which is what keeps `coordMcpDrift`
+    /// from reading "clean" off an error.
+    #[test]
+    fn tools_list_error_response_is_no_tools_array_not_unchanged() {
+        let req = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+        let err = serde_json::json!({"jsonrpc":"2.0","id":1,
+            "error":{"code":-32000,"message":"upstream unavailable"}})
+        .to_string();
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(req.as_bytes(), err.as_bytes()),
+            CoordMcpToolsListFilter::NoToolsArray
+        ));
+        let clean = serde_json::json!({"jsonrpc":"2.0","id":1,
+            "result":{"tools":[{"name": COORD_MCP_ALLOWED_TOOLS[0]}]}})
+        .to_string();
+        assert!(matches!(
+            coord_mcp_filter_tools_list_response(req.as_bytes(), clean.as_bytes()),
+            CoordMcpToolsListFilter::Unchanged
+        ));
+        let empty = serde_json::json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}}).to_string();
+        assert!(
+            matches!(
+                coord_mcp_filter_tools_list_response(req.as_bytes(), empty.as_bytes()),
+                CoordMcpToolsListFilter::Unchanged
+            ),
+            "an EMPTY tools array was inspected: observed clean, not uninspected"
+        );
+    }
+
+    /// The disclosure bound holds on EVERY arm, not only `deliberate`: the
+    /// free-text `remedy` strings are where a word naming an upstream grant
+    /// would creep in.
+    #[test]
+    fn refusal_data_never_names_an_upstream_grant_in_any_arm() {
+        let rej = |tool: &str| super::CoordMcpBodyRejection {
+            id: serde_json::json!(1),
+            message: "m".to_string(),
+            tool: Some(tool.to_string()),
+        };
+        let stale = trunk_with(&["coord_not_here"], &[]);
+        let drift = trunk_with(&[], &[]);
+        let arms = [
+            super::coord_mcp_refusal_data_with(&rej("coord_create_pr"), None),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), None),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), Some(&stale)),
+            super::coord_mcp_refusal_data_with(&rej("coord_not_here"), Some(&drift)),
+            super::coord_mcp_refusal_data_with(&rej("coord_create_pr"), Some(&drift)),
+        ];
+        let causes: Vec<String> = arms.iter().map(|d| d["cause"].to_string()).collect();
+        assert!(
+            causes.contains(&"\"stale_binary\"".to_string()),
+            "{causes:?}"
+        );
+        assert!(causes.contains(&"\"drift\"".to_string()), "{causes:?}");
+        assert!(causes.contains(&"\"unknown\"".to_string()), "{causes:?}");
+        assert!(causes.contains(&"\"deliberate\"".to_string()), "{causes:?}");
+        for d in &arms {
+            let lower = d.to_string().to_ascii_lowercase();
+            for forbidden in ["upstream", "granted", "coord grants", "allowedupstream"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "data must not name an upstream grant on the {} arm: {forbidden}",
+                    d["cause"]
+                );
+            }
+        }
+    }
+
+    /// Phase 2: one finding per distinct drifted set per process; a clean
+    /// `tools/list` is RECORDED (so `/health` can say "observed clean") and
+    /// never posts.
+    #[test]
+    fn drift_observation_posts_once_per_set_and_records_clean() {
+        let observed = std::sync::Mutex::new(None);
+        let posted = std::sync::Mutex::new(std::collections::HashSet::new());
+        assert!(super::record_observed_coord_mcp_drift_in(
+            &observed,
+            &posted,
+            &["coord_b", "coord_a"]
+        ));
+        assert!(
+            super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_a", "coord_b"]),
+            "an UNPOSTED set (the POST failed or was refused) is offered again"
+        );
+        super::mark_coord_mcp_drift_posted_in(
+            &posted,
+            &["coord_b".to_string(), "coord_a".to_string()],
+        );
+        assert!(
+            !super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_a", "coord_b"]),
+            "the same set (any order) posts once, once the POST succeeded"
+        );
+        assert!(
+            super::record_observed_coord_mcp_drift_in(&observed, &posted, &["coord_c"]),
+            "a changed set posts again"
+        );
+        assert!(
+            !super::record_observed_coord_mcp_drift_in(&observed, &posted, &[]),
+            "clean never posts"
+        );
+        let o = observed.lock().unwrap().clone().expect("recorded");
+        assert!(
+            o.drifted.is_empty(),
+            "the LAST observation wins, and it was clean"
+        );
+        assert!(o.observed_at > 0);
+    }
+
+    /// `null` until a `tools/list` has been observed, then a count — UNKNOWN
+    /// and zero are different answers.
+    #[test]
+    fn drift_json_is_null_until_observed_then_a_count() {
+        assert!(super::render_observed_coord_mcp_drift(None).is_null());
+        let o = super::ObservedCoordMcpDrift {
+            drifted: vec!["coord_x".to_string()],
+            observed_at: 7,
+        };
+        let v = super::render_observed_coord_mcp_drift(Some(&o));
+        assert_eq!(v["driftedCount"], 1);
+        assert_eq!(v["driftedTools"][0], "coord_x");
+        assert_eq!(v["observedAt"], 7);
+        let clean = super::ObservedCoordMcpDrift {
+            drifted: vec![],
+            observed_at: 8,
+        };
+        let v = super::render_observed_coord_mcp_drift(Some(&clean));
+        assert_eq!(v["driftedCount"], 0);
+        assert!(v["driftedTools"].as_array().unwrap().is_empty());
     }
 }
 
@@ -11880,6 +14132,7 @@ mod coord_claims_proxy_tests {
     /// route — query string present to prove the gate fires regardless.
     #[tokio::test]
     async fn claims_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for path in CLAIMS_ROUTES {
             let resp = claims_router()
                 .oneshot(
@@ -11946,6 +14199,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -11962,6 +14217,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -11972,6 +14229,151 @@ mod coord_claims_proxy_tests {
             std::str::from_utf8(&bytes).unwrap(),
             r#"{"detail":"tenant_not_resolved"}"#,
             "coord's body must come back verbatim"
+        );
+    }
+
+    /// **C1** — the review's first blocking finding, at the level that
+    /// actually shipped it: the WIRING, not the classifier.
+    ///
+    /// `forward_coord_get` called `note_coord_upstream_verdict` for every
+    /// response, and one of this door's targets is the claims read. Coord's
+    /// claims routes sit behind an INFALLIBLE extractor
+    /// (`qontinui-coord/crates/coord/src/claims_read_observe.rs`,
+    /// `type Rejection = Infallible`) whose enforcement arm is gated on
+    /// `COORD_CLAIMS_READ_AUTH_REQUIRED` — a variable absent from
+    /// `deploy/taskdef.json`, so inert in production. An expired, revoked or
+    /// bad-signature JWT gets a **200** there.
+    ///
+    /// So every claims poll used to reset the streak and stamp `lastOkAt`: a
+    /// box that polls claims could never reach `dark`, and `lastOkAt` claimed
+    /// coord had accepted a credential coord never looked at.
+    #[tokio::test]
+    async fn a_claims_read_never_moves_the_credential_posture() {
+        use crate::mcp::device_jwt_refresher as djr;
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The production shape: coord answers 200 WITHOUT having verified the
+        // bearer at all.
+        let app: Router = Router::new()
+            .route(
+                "/coord/claims/list",
+                get(|| async { axum::Json(serde_json::json!({"claims": []})) }),
+            )
+            .route(
+                "/coord/work-units/{slug}/deps",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        [(axum::http::header::CONTENT_TYPE, "application/json")],
+                        r#"{"error":"token expired","code":"token_expired"}"#,
+                    )
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        let base = format!("http://{addr}");
+        let tenant = uuid::Uuid::from_bytes([0x2a; 16]);
+
+        // Seed a real rejection, so "did not reset" is distinguishable from
+        // "was already zero".
+        djr::note_coord_upstream_verdict(Some(tenant), true, 401, br#"{"code":"token_expired"}"#);
+        assert_eq!(
+            djr::upstream_signal_for(Some(&tenant.to_string())).consecutive_rejections,
+            1
+        );
+
+        // Twenty claims polls, exactly as a live box produces them.
+        let url = claims_upstream_url(&base, ClaimsReadTarget::List, None);
+        for _ in 0..20 {
+            let resp = forward_claims_get(
+                &url,
+                "test-device-jwt",
+                qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+                Some(tenant),
+                ClaimsReadTarget::List.upstream_authenticates(),
+            )
+            .await;
+            assert_eq!(resp.status(), 200);
+        }
+        let sig = djr::upstream_signal_for(Some(&tenant.to_string()));
+        assert_eq!(
+            sig.consecutive_rejections, 1,
+            "a 200 from coord's UNGATED claims route must not reset the streak"
+        );
+        assert!(
+            sig.last_ok_at.is_none(),
+            "lastOkAt must not claim coord accepted a credential coord never checked"
+        );
+
+        // The work-unit deps read on the SAME door IS gated (`require_jwt` on
+        // coord's `work_units_agent_authed` sub-router), so its verdict counts.
+        // The flag is per TARGET, not per error-code family.
+        assert!(!ClaimsReadTarget::List.upstream_authenticates());
+        assert!(!ClaimsReadTarget::ByResource.upstream_authenticates());
+        let deps = ClaimsReadTarget::WorkUnitDeps {
+            slug: "a-plan".to_string(),
+        };
+        assert!(deps.upstream_authenticates());
+        let url = claims_upstream_url(&base, deps.clone(), None);
+        let resp = forward_claims_get(
+            &url,
+            "test-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            Some(tenant),
+            deps.upstream_authenticates(),
+        )
+        .await;
+        assert_eq!(resp.status(), 401);
+        assert_eq!(
+            djr::upstream_signal_for(Some(&tenant.to_string())).consecutive_rejections,
+            2,
+            "a refusal from a route coord DOES gate is a verdict on the credential"
+        );
+
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// **C3** — the `/coord-mcp` JSON-RPC proxy is the highest-volume
+    /// credential consumer in the runner (every `coord_*` MCP tool call), and
+    /// it had `status` and `bytes` in hand and told the posture nothing: 50
+    /// tool calls could all 401 `token_expired` while the streak sat at 0 and
+    /// `/health` read `live`.
+    ///
+    /// A behavioural test would need a registered proxy nonce plus a live
+    /// device JWT in the encrypted `AuthManager` slot, neither of which a unit
+    /// test can seed — so this pins the wiring at the source, the same
+    /// technique `ui_error`'s writer guard uses. It fails against a
+    /// `coord_mcp_proxy_handler` that does not make the call.
+    #[test]
+    fn the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture() {
+        // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
+        // from anywhere.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let start = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("coord_mcp_proxy_handler exists");
+        // The next top-level item ends the handler's body.
+        let end = text[start..]
+            .find("\n/// ")
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        let body = &text[start..end];
+        assert!(
+            body.contains("note_coord_upstream_verdict"),
+            "the highest-volume device-credential consumer must report coord's \
+             verdict to the posture, or a box whose every tool call 401s still \
+             reads `live`"
+        );
+        assert!(
+            body.contains("ProxyPrincipal::Device"),
+            "and it must be gated on the DEVICE principal — an agent bearer \
+             comes from that agent's own slot and says nothing about this \
+             runner's credential"
         );
     }
 
@@ -11993,6 +14395,8 @@ mod coord_claims_proxy_tests {
             &url,
             "test-device-jwt",
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            None,
+            false,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -12299,6 +14703,7 @@ mod coord_read_proxy_tests {
     /// query string present to prove the gate fires regardless.
     #[tokio::test]
     async fn coord_read_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for (_, path, _) in read_route_table() {
             let resp = read_router()
                 .oneshot(
@@ -12379,6 +14784,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -12396,6 +14803,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -12411,6 +14820,8 @@ mod coord_read_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
             ReadProxyCodes::COORD_READ,
             "test",
+            None,
+            true,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -12432,7 +14843,10 @@ mod coord_read_proxy_tests {
 /// credential store.
 #[cfg(test)]
 mod coord_provision_session_gate_tests {
-    use super::{coord_provision_session_handler, credential_doors_health, csp_allows_eval};
+    use super::{
+        coord_provision_session_handler, credential_doors_health_with_posture, csp_allows_eval,
+    };
+    use crate::mcp::device_jwt_refresher::{CoordCredentialPosture, DarkCause};
     use axum::{body::Body, http::Request, routing::post, Router};
     use tower::ServiceExt;
 
@@ -12455,6 +14869,7 @@ mod coord_provision_session_gate_tests {
     /// still the 403, not a 400 `_INVALID_BODY`.
     #[tokio::test]
     async fn no_handshake_is_403_before_the_body_is_parsed() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -12479,6 +14894,7 @@ mod coord_provision_session_gate_tests {
     /// different fixes, which is why they are different codes.
     #[tokio::test]
     async fn an_empty_handshake_header_is_no_handshake_not_a_mismatch() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -12503,6 +14919,7 @@ mod coord_provision_session_gate_tests {
     /// pinning: no key ⇒ nothing matches, never "anything goes".
     #[tokio::test]
     async fn a_wrong_handshake_is_403_mismatch_and_fails_closed_with_no_key() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -12529,6 +14946,7 @@ mod coord_provision_session_gate_tests {
     /// unreachable because the variant that produced it is deleted.
     #[tokio::test]
     async fn the_retired_master_flag_cannot_reopen_the_route() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = provision_router()
             .oneshot(
                 Request::builder()
@@ -12585,8 +15003,30 @@ mod coord_provision_session_gate_tests {
     /// answer — cheaply, and without ever emitting a secret.
     #[test]
     fn credential_doors_names_each_transport_and_never_leaks_a_secret() {
+        let _amb = crate::test_env::isolated_ambient();
         for frontend_ready in [true, false] {
-            let v = credential_doors_health(frontend_ready);
+            // The forwarder's verdict now READS the coord-credential posture,
+            // so the door summary is only meaningful against a posture. `live`
+            // is the case this assertion used to pin as a hard-coded literal.
+            let device_jwt = serde_json::json!({
+                "present": true,
+                "usable": false,
+                "expiresAt": "2026-09-02T00:00:00+00:00",
+            });
+            let v = credential_doors_health_with_posture(
+                frontend_ready,
+                Some(CoordCredentialPosture::Live),
+                device_jwt.clone(),
+            );
+
+            // Phase 1e: the forwarder entry carries live reachability beside
+            // the inventory, and the device-JWT block is passed through
+            // verbatim (the helper that builds it never includes the token).
+            assert_eq!(v["coordMcpForwarder"]["deviceJwt"], device_jwt);
+            assert!(
+                v["coordMcpForwarder"].get("lastForward").is_some(),
+                "lastForward must be present (null until the first proxied call)"
+            );
 
             // The eval mint is gated on the frontend AND on the shipped CSP.
             // The frontend half is the original point: a headless runner must
@@ -12624,7 +15064,9 @@ mod coord_provision_session_gate_tests {
             // their verdict must not move with the frontend.
             assert_eq!(v["provisionSessionMint"]["requiresWebview"], false);
             assert_eq!(v["coordMcpForwarder"]["requiresWebview"], false);
+            // A LIVE posture is the only thing that makes this `true` now.
             assert_eq!(v["coordMcpForwarder"]["canAnswer"], true);
+            assert_eq!(v["coordMcpForwarder"]["posture"], "live");
             assert_eq!(
                 v["provisionSessionMint"]["handshakeHeader"],
                 "X-Qontinui-Loopback-Key"
@@ -12646,6 +15088,78 @@ mod coord_provision_session_gate_tests {
             assert!(!rendered.contains("runner-loopback-key"), "{rendered}");
             assert!(!rendered.to_lowercase().contains("bearer "), "{rendered}");
         }
+    }
+
+    /// THE regression this plan exists for: `coordMcpForwarder.canAnswer` was
+    /// a hard-coded `true` describing the door's SHAPE. On 2026-09-12 a runner
+    /// restored an already-expired coord slot at boot and `/health` advertised
+    /// this door as answerable for ten hours while every forwarded call came
+    /// back 401. The verdict must now move with the posture.
+    #[test]
+    fn coord_mcp_forwarder_can_answer_follows_the_credential_posture() {
+        let answering = [
+            CoordCredentialPosture::Live,
+            CoordCredentialPosture::Expiring,
+        ];
+        for posture in answering {
+            let v =
+                credential_doors_health_with_posture(true, Some(posture), serde_json::Value::Null);
+            assert_eq!(
+                v["coordMcpForwarder"]["canAnswer"],
+                true,
+                "{} must advertise the forwarder",
+                posture.as_str()
+            );
+            assert_eq!(v["coordMcpForwarder"]["posture"], posture.as_str());
+        }
+
+        let dark = [
+            CoordCredentialPosture::Expired,
+            CoordCredentialPosture::Absent,
+            CoordCredentialPosture::Unrefreshable,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+        ];
+        for posture in dark {
+            let v =
+                credential_doors_health_with_posture(true, Some(posture), serde_json::Value::Null);
+            assert_eq!(
+                v["coordMcpForwarder"]["canAnswer"],
+                false,
+                "{} must NOT advertise the forwarder",
+                posture.as_str()
+            );
+            assert_eq!(v["coordMcpForwarder"]["posture"], posture.as_str());
+            let reason = v["coordMcpForwarder"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains(posture.as_str()),
+                "the refusal must NAME the posture, got: {reason}"
+            );
+            // The 2026-09-12 first diagnosis blamed the nonce. The reason must
+            // say outright that it is the runner's credential.
+            assert!(
+                reason.contains("RUNNER's credential") && reason.contains("NOT"),
+                "the refusal must not read as a nonce fault, got: {reason}"
+            );
+        }
+    }
+
+    /// UNKNOWN is neither verdict. No pass has run, so `canAnswer` is `null`
+    /// and the reason says why — defaulting it to `true` is the original
+    /// defect, and defaulting it to `false` invents a fault out of a missing
+    /// measurement.
+    #[test]
+    fn an_unknown_posture_renders_as_null_not_as_either_verdict() {
+        let v = credential_doors_health_with_posture(true, None, serde_json::Value::Null);
+        assert!(
+            v["coordMcpForwarder"]["canAnswer"].is_null(),
+            "UNKNOWN must not render as a default: {v}"
+        );
+        assert!(v["coordMcpForwarder"]["posture"].is_null());
+        let reason = v["coordMcpForwarder"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("UNKNOWN") && reason.contains("not health"),
+            "got: {reason}"
+        );
     }
 }
 
@@ -13079,6 +15593,7 @@ mod coord_write_proxy_tests {
     /// route.
     #[tokio::test]
     async fn write_routes_wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         for path in write_request_paths() {
             let resp = write_router()
                 .oneshot(
@@ -13158,6 +15673,7 @@ mod coord_write_proxy_tests {
             axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -13178,6 +15694,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
             None,
         )
         .await;
@@ -13211,6 +15728,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            None,
             None,
         )
         .await;
@@ -13358,6 +15876,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
             plan.as_ref(),
+            None,
         )
         .await;
 
@@ -13435,6 +15954,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
+            None,
         )
         .await;
         assert_eq!(resp.status(), 422);
@@ -13462,6 +15982,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
+            None,
         )
         .await;
         assert_eq!(resp.status(), 503, "coord's own status is preserved");
@@ -13723,6 +16244,7 @@ mod vcs_pr_proxy_tests {
     /// A wrong (unregistered) nonce → the same 401.
     #[tokio::test]
     async fn wrong_nonce_is_401() {
+        let _amb = crate::test_env::isolated_ambient();
         let resp = vcs_router()
             .oneshot(
                 Request::builder()
@@ -13747,6 +16269,7 @@ mod vcs_pr_proxy_tests {
     /// agent-gone 401 — proving it got PAST the old device-only rejection.
     #[tokio::test]
     async fn agent_nonce_passes_principal_gate_and_fails_closed_without_token_slot() {
+        let _amb = crate::test_env::isolated_ambient();
         let agent_id = uuid::Uuid::new_v4();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/vcs-pr-proxy-agent-nonce-test",
@@ -14481,6 +17004,7 @@ mod proxy_key_header_source_tests {
     /// agent-token lookup — i.e. the new header source authenticates.
     #[tokio::test]
     async fn authorization_bearer_carries_the_proxy_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-auth-header-source",
             uuid::Uuid::new_v4(),
@@ -14512,6 +17036,7 @@ mod proxy_key_header_source_tests {
     /// session the moment this ships.
     #[tokio::test]
     async fn legacy_custom_header_still_carries_the_proxy_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-legacy-header-source",
             uuid::Uuid::new_v4(),
@@ -14537,6 +17062,7 @@ mod proxy_key_header_source_tests {
     /// proved in both directions so the test cannot pass by accident.
     #[tokio::test]
     async fn authorization_wins_over_the_legacy_header_when_they_disagree() {
+        let _amb = crate::test_env::isolated_ambient();
         let good = crate::coord_mcp::register_agent_proxy_nonce(
             "/tmp/phase2-both-headers",
             uuid::Uuid::new_v4(),
@@ -14582,6 +17108,7 @@ mod proxy_key_header_source_tests {
     /// deprecates and told a 2am reader nothing.
     #[tokio::test]
     async fn every_door_preserves_its_typed_code_and_returns_the_actionable_message() {
+        let _amb = crate::test_env::isolated_ambient();
         let bad = unregistered_nonce();
         let auth = format!("Bearer {bad}");
 
@@ -14675,6 +17202,39 @@ mod proxy_key_header_source_tests {
         // ...and it is a drop-LIST, not a drop-everything: ordinary headers
         // still travel, or the proxy would stop being a proxy.
         for h in ["content-type", "accept", "user-agent", "x-request-id"] {
+            assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
+        }
+    }
+
+    /// Plan 2026-09-07 Phase 1 — the transport-declaration headers are
+    /// CALLER-SELF-REPORTED, so they are stripped from the upstream forward for
+    /// the same reason `CALLER_SESSION_HEADER` is: the runner records them as an
+    /// advisory claim in its own `coord-transport-rung` event, and a
+    /// client-supplied copy reaching coord verbatim would let a claim pass as
+    /// something coord observed.
+    #[test]
+    fn the_proxy_never_forwards_a_caller_declared_transport_claim() {
+        use crate::session::coord_transport_rung as rung;
+
+        assert!(
+            coord_mcp_forward_header_is_dropped(rung::TRANSPORT_HEADER),
+            "the declared transport must never reach coord"
+        );
+        assert!(
+            coord_mcp_forward_header_is_dropped(rung::REPORTER_HEADER),
+            "the declared reporter must never reach coord"
+        );
+        // The whole family, read from the ONE place it is declared, so adding a
+        // fifth declaration header cannot quietly start forwarding.
+        for h in rung::DECLARATION_HEADERS {
+            assert!(
+                coord_mcp_forward_header_is_dropped(h),
+                "{h} is a declaration header and must be dropped"
+            );
+        }
+        // Near-miss names are NOT dropped — this is a closed family, not a
+        // prefix sweep over `x-qontinui-*`.
+        for h in ["x-qontinui-transportation", "x-qontinui", "x-transport"] {
             assert!(!coord_mcp_forward_header_is_dropped(h), "{h} must forward");
         }
     }

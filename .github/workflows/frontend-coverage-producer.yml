@@ -5,12 +5,27 @@ name: Frontend Coverage Producer
 # This is a NON-GATING, main-only job. It runs `vitest run --coverage` once per
 # test file (vitest's default per-file isolation makes that attribution exact)
 # and POSTs the resulting per-file coverage map + JUnit results to coord's
-# existing ingest routes. Per-file vitest startup is slow (~5-15s each) and
-# there are 60+ test files, so a full run is several minutes — far too slow for
-# a PR gate, but fine here: the map is cached per (repo, head_sha) in coord and
-# PR lanes only consume it. It NEVER blocks a PR and the producer script itself
-# is best-effort (exits 0 on any failure), so this workflow going red cannot
-# break the merge pipeline. It is intentionally NOT a required check.
+# existing ingest routes. Per-file vitest startup dominates, measured at ~12 s
+# per file, and there are 217 test files as of 2026-09-13 (this figure moves --
+# it was 194 on 09-01; recount with `git ls-files 'src/**/*.test.ts*'
+# 'src/**/*.spec.ts*' | wc -l` rather than trusting it), so a full run is
+# THREE QUARTERS OF AN HOUR -- far too slow for a PR gate, but fine here: the
+# map is cached per (repo, head_sha) in coord and PR lanes only consume it.
+#
+# This paragraph used to say "60+ test files, so a full run is several minutes".
+# Both halves had gone stale by a factor of ~3.5, and that is not an
+# incidental inaccuracy: the job's `timeout-minutes` was sized against this
+# description rather than against a measurement, and the description aged while
+# the corpus grew until the bound landed inside the healthy distribution. See
+# the census on the bound below.
+#
+# It NEVER blocks a PR: `on:` is `push` to main plus `workflow_dispatch`, so it
+# cannot produce a check on a pull request at all, and it is absent from the
+# `main-merge-gates` ruleset's required contexts. The producer script is also
+# best-effort (every `main()` return is 0 and the top-level catch calls
+# `process.exit(0)`) -- though note the SETUP steps before it are not, so
+# `pnpm install` can still redden the job. It is intentionally NOT a required
+# check.
 #
 # Granularity note: vitest 4 + @vitest/coverage-v8 have no per-test-CASE
 # coverage contexts, so the resolved granularity is per-test-FILE; test_id is
@@ -42,9 +57,80 @@ jobs:
   produce:
     name: Per-file coverage -> coord
     runs-on: ubuntu-latest
-    # Generous budget for the per-file loop over 60+ test files; non-gating so
-    # the wall-clock never blocks anything.
-    timeout-minutes: 45
+    # Budget for the per-file loop over the test corpus; non-gating, so the
+    # wall-clock never blocks anything.
+    #
+    # SIZED AGAINST MEASURED JOB DURATIONS, not guessed. Census of the last 40
+    # runs (2026-09-01 .. 2026-09-13), job-level started_at -> completed_at from
+    # the Actions API -- NOT run-level created_at/updated_at, which includes
+    # queue time and would blur the very cluster this rests on:
+    #
+    #   9 success:    2145 2192 2217 2335 2382 2561 2578 2613 2669 s
+    #   30 cancelled: 2714 .. 2724 s — a TEN-SECOND-WIDE cluster
+    #   1 cancelled:   651 s — the only genuine `cancel-in-progress` supersede
+    #                  (run 33980851220, superseded by 33980836514's re-run)
+    #
+    # Thirty of the thirty-one cancellations sit in a 10-second band, which no
+    # infra kill and no concurrency group produces. It is `timeout-minutes: 45`
+    # expiring, which GitHub renders as `cancelled`, NEVER as `failure` — which
+    # is why this read as noise for twelve days. Step-level confirmation on run
+    # 34738108715: every setup step `success`, then `Produce per-file coverage`
+    # runs 04:40:35 -> 05:25:28 and is the single step marked `cancelled`. The
+    # band sits 14-24 s PAST the nominal 2700 s because the cancel has to
+    # propagate and the post-steps still run; do not read 2714 != 2700 as a
+    # contradiction.
+    #
+    # READ THE SAMPLE HONESTLY -- IT IS RIGHT-CENSORED. 31 of 40 runs hit the
+    # bound, so the duration distribution is cut off at 2700 s and the 9
+    # survivors are not a random sample of it. Two temptingly precise statements
+    # are therefore NOT available, and an earlier revision of this comment made
+    # both:
+    #
+    #   * "the healthy maximum was 2669 s, so there were 31 s of headroom."
+    #     2669 is not the maximum of anything. It is the largest value that FIT
+    #     under the censoring point, and by construction it must be just under
+    #     it. The true maximum is unknown and unmeasurable from this data.
+    #   * "90 is ~2.3x the median." 2382 is the median OF THE SURVIVORS. Since
+    #     77.5% of runs exceeded 2700 s, the true median is above 2700 s, so 90
+    #     is under 2.0x it.
+    #
+    # What IS true, and still supports the figure: 90 minutes is 2.0x the
+    # censoring point. That is a weaker claim than the one it replaces, and it
+    # is the one the data licenses. A comment whose whole thesis is that the
+    # previous author asserted "generous" without measuring does not get to
+    # overstate its own evidence.
+    #
+    # The distribution becomes measurable for the first time under this bound.
+    # RE-MEASURE after ~10 runs at 90 and resize from the uncensored data.
+    #
+    # WHY THE BOUND WAS OVERTAKEN, AND ROUGHLY WHEN 90 WILL BE. The corpus is
+    # growing. Counted at the last commit strictly before 00:00Z on each day
+    # (state the basis, because a per-day count moves by several files between
+    # a day's first and last commit and two figures on different bases are not
+    # a trend):
+    #
+    #     git ls-tree -r --name-only <sha> src | grep -cE '\.(test|spec)\.(ts|tsx)$'
+    #     2026-09-01  194      2026-09-07  208      2026-09-13  217
+    #
+    # ~1.9 files a day. The survivors track it (35-37m in the first week of
+    # September, 42-44m in the second). At ~12 s per file, 5400 s is reached
+    # somewhere near 440 files — order four months at the current rate, and an
+    # order of magnitude, not a date. So this is headroom with an expiry, not a
+    # permanent fix, and a cancellation cluster tight around 90m later is this
+    # same signal repeating rather than a new problem.
+    #
+    # The durable fix then is to stop paying per-file vitest startup 200+ times.
+    # That is NOT a workflow edit: coord's ingest is keyed per (repo, head_sha),
+    # so N shards each POSTing a partial map is the lane-partial-map problem
+    # plan 2026-06-04-ci-per-test-coverage-producer-plan already hit, and it
+    # needed a coord-side freshest-per-test UNION map read to solve. Design it
+    # cross-repo; do not bolt a matrix onto this file.
+    #
+    # Raising this bound weakens no gate. `on:` is push-to-main plus
+    # workflow_dispatch, so it never produces a PR check at all, and it is
+    # absent from the `main-merge-gates` ruleset's required contexts. The bound
+    # caps wall-clock; it asserts no correctness property.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout qontinui-runner

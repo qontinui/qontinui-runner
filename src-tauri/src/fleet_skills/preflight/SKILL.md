@@ -378,6 +378,41 @@ reporting a truncated walk as clean.
 outside the workspace root (another drive, another machine), `.gitignore`d
 files, and a peer's unsaved editor buffer. `--help` carries the same list.
 
+**Then RECORD THE BASELINE — same globs, one more command** *(plan
+`2026-09-05-a-verification-report-never-states-the-tree-it-read` Phase 5)*:
+
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/landed-since.sh record \
+     "<glob>" "<glob>" ...        # the same globs as the scan above
+```
+
+The scan above reads disk once, now. The question *"did a peer LAND work in my
+paths while I was building?"* needs a starting point taken before the work
+begins — a baseline recorded later silently excludes everything that landed
+before it. `/implement-plan` Step 0.45 carries the same command; this is it for
+every task that starts here instead (a post-merge follow-up, a no-plan
+dispatch), which otherwise reaches its rebase with no baseline at all.
+
+- **Record ONCE per session.** `record` overwrites the session's baseline file
+  unconditionally, so a second `record` (say `/preflight` here and then
+  `/implement-plan` Step 0.45 in the same session) moves the start FORWARD and
+  hides whatever landed in between. If this session already recorded one
+  (`test -f ~/.qontinui/landed-since/<session-id>.json`), skip this command.
+- `record` exits `0` when every glob's repo was fetched and pinned, `3`
+  (INCOMPLETE) when, e.g., a glob reached no checkout, a fetch failed or the file
+  could not be written — the baseline
+  then covers less than you asked, which is UNKNOWN rather than clear — and `2`
+  on usage errors, including **no session id**.
+- The matching `landed-since.sh check` (no globs: it reuses these) runs **before
+  every rebase**: exit `1` names the commits, files and PR numbers that landed
+  into your paths; exit `3` is INCOMPLETE and never an all-clear.
+- The baseline lives at `~/.qontinui/landed-since/<session-id>.json`, keyed on
+  `$QONTINUI_AGENT_SESSION_ID`, else `$CLAUDE_CODE_SESSION_ID`. A `check` from a
+  different session — or the same work under the other variable — reads no
+  baseline and exits `3`; with neither variable set both verbs exit `2`. Pass
+  `--baseline <path>` to name the recording session's file explicitly. Report
+  either outcome as UNKNOWN; never read it as clean.
+
 **Why this step exists.** Every registry read in steps 0–3 answers *"has a peer
 REGISTERED an interest?"*, not *"is anyone working here?"*. On 2026-08-19
 `who_is_working_on` returned `verdict: "clear"` **twice** for paths a peer held

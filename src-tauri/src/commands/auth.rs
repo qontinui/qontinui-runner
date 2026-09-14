@@ -406,6 +406,8 @@ async fn sign_out_full_impl() -> Result<(), AppError> {
 
     let auth_manager = AuthManager::new();
     auth_manager.clear_all_credentials()?;
+    // A pending GitHub connect is bound to the identity that just left.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     info!(
         "Full sign-out successful — autonomous terminal sessions stopped (Cognito session wiped)"
@@ -790,7 +792,20 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
         .map_err(String::from)
 }
 
-async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
+/// The body of [`get_access_token_for_websocket`], shared with the UI Bridge
+/// invoke proxy's in-process arm
+/// (`mcp::ui_bridge_invoke_handlers::in_process_get_access_token_for_websocket`)
+/// so the HTTP door and the Tauri command run the SAME function — plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1f.
+///
+/// What it returns is the signed-in OPERATOR's **Cognito access token**, not a
+/// coord device JWT: the fleet's `COORD_DEVICE_JWT` name for what the doors
+/// mint here is a misnomer that `coord-revive`'s SKILL.md already records.
+///
+/// `require_tier_2()` stays the FIRST statement: a Tier-0/1 runner answers the
+/// structured "Tier 0/1 …" error before any keychain read, so a headless
+/// caller never gets an empty 200 it could mistake for a token.
+pub(crate) async fn get_access_token_for_websocket_impl() -> Result<String, AppError> {
     require_tier_2()?;
     info!("Getting access token for WebSocket");
 
@@ -1212,6 +1227,12 @@ async fn finalize_signed_in(
             error!("finalize_signed_in: step 2 (store_oauth_tokens_fresh) failed: {e}");
             AppError::Raw(format!("persist Cognito tokens: {e}"))
         })?;
+    // The identity just changed: a pending GitHub connect (setup-wizard clone
+    // picker) minted its coord connect-state under the previous account, and
+    // coord asserts that account on the claim, so the new one must not reuse
+    // it. This is the identity-WRITE point, so it covers every sign-in path;
+    // the two full sign-out paths clear as well.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     // 3. Device identity from disk. Mint it first if a fresh install never
     //    ran `device init` (startup already does this, but sign-in self-heals
@@ -1464,6 +1485,10 @@ pub async fn qontinui_sign_out() -> Result<(), String> {
             e
         );
     }
+    // A pending GitHub connect (setup-wizard clone picker) holds a coord
+    // connect-state minted under the account that is leaving; the next
+    // account's click must mint its own rather than reuse it.
+    crate::commands::setup_wizard::clear_pending_connect();
 
     if crate::instance::is_secondary() {
         warn!(
@@ -1570,6 +1595,23 @@ pub async fn kick_device_jwt_refresher_cmd() -> Result<(), String> {
     Ok(())
 }
 
+/// Read the runner's current coord-credential POSTURE.
+///
+/// M4 — without this command the posture reached the UI only as a Tauri
+/// event, and Tauri's `emit` has no replay: the BOOT publish happens before
+/// the React tree has registered its `listen()`, so the one case the posture
+/// exists for (a runner that came up holding a dead credential) landed on no
+/// listener at all. A webview reload then cleared the banner permanently,
+/// because the posture had not CHANGED and so never re-fired.
+///
+/// Returns the same `coordCredential` object `/health` serves, or `null` when
+/// no refresher pass has concluded in this process yet. `null` is UNKNOWN,
+/// never health — the caller must not render it as "fine".
+#[tauri::command]
+pub async fn get_coord_credential_posture() -> Option<serde_json::Value> {
+    crate::mcp::device_jwt_refresher::coord_credential_posture().map(|s| s.to_json())
+}
+
 /// Build the Tauri plugin that registers this module's command handlers.
 ///
 /// See `commands/mod.rs` for the migration guide explaining the plugin pattern.
@@ -1593,6 +1635,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
             device_jwt_present,
             get_coord_device_token,
             kick_device_jwt_refresher_cmd,
+            get_coord_credential_posture,
         ])
         .build()
 }

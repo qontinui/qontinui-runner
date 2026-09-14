@@ -75,15 +75,66 @@ interface WebIntegrationStatus {
   } | null;
 }
 
-/** Shape of `test_web_integration_connection` response on success. */
+/**
+ * Shape of `test_web_integration_connection` response on success.
+ *
+ * The command is READ-ONLY as of 2026-09-12. It used to register a throwaway
+ * runner against `POST /api/v1/runners/register` and return its id; that
+ * endpoint was deleted from qontinui-web in April 2026, so the old
+ * `{ runnerId }` shape described a call that always 404'd. It now reports two
+ * independent facts — reachability and pairing — because they fail separately
+ * and the operator needs to know which one broke.
+ */
 interface WebIntegrationTestResult {
-  runnerId: string;
+  /** The backend answered its unauthenticated liveness route. */
+  reachable: boolean;
+  /** This runner holds a device JWT the backend accepted. */
+  paired: boolean;
+  /** Present iff `paired` — from `GET /api/v1/devices/me`. */
+  deviceId?: string | null;
+  userId?: string | null;
+  tenantId?: string | null;
+  /**
+   * LOCAL shape check on the CONFIGURED runner token; it is not sent anywhere.
+   * `null` = no token configured, which is normal for a runner paired through
+   * Cognito or a pair code — those paths never mint one, so absence is not a
+   * fault. `false` is the only actionable value.
+   */
+  tokenFormatValid: boolean | null;
+  /**
+   * Why identity is absent. Branch on this, NOT on `paired` alone — "never
+   * paired" and "your credential was rejected" are different problems.
+   */
+  identityFault:
+    | "none"
+    | "unpaired"
+    | "not_bound_backend"
+    | "rejected"
+    | "forbidden"
+    | "verifier_down"
+    | "unexpected";
+  /** One actionable line covering whichever arm was reached. */
+  detail: string;
 }
 
 interface TestConnectionUIState {
   state: "idle" | "testing" | "success" | "error";
-  runnerId?: string;
+  /** Set on a reachable-and-paired result. */
+  deviceId?: string;
+  /** Carried through so the render can tell the fault classes apart. */
+  identityFault?: WebIntegrationTestResult["identityFault"];
+  tokenFormatValid?: boolean | null;
+  detail?: string;
   error?: string;
+}
+
+/**
+ * Is this identity fault a benign "not checked / not yet done" (amber), or a
+ * real fault the operator must act on (red)? A rejected credential rendering
+ * the same as "never paired" is what this split exists to prevent.
+ */
+function isBenignIdentityFault(f: TestConnectionUIState["identityFault"]): boolean {
+  return f === "unpaired" || f === "not_bound_backend";
 }
 
 interface WebIntegrationSettingsProps {
@@ -465,9 +516,20 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
   const isConnected = Boolean(status?.wsConnected && status?.runnerId);
 
   // --- Handlers -------------------------------------------------------------
+  /**
+   * Clear a stale verdict when an input it was measured against changes. The
+   * result line names a device, never the URL it came from, so a green
+   * "Connected as device …" could otherwise sit under a backend URL the
+   * operator has since retyped to point somewhere else.
+   */
+  const clearStaleTestResult = () => {
+    setTestState((prev) => (prev.state === "idle" ? prev : { state: "idle" }));
+  };
+
   const handleBackendUrlChange = (value: string) => {
     setFormBackendUrl(value);
     setUrlError(validateBackendUrl(value));
+    clearStaleTestResult();
   };
 
   const handleWebBaseUrlChange = (value: string) => {
@@ -500,25 +562,32 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
     }
     // Use the edited token if provided, otherwise empty string. The backend
     // treats an empty token as "use persisted" when no new value is supplied.
+    //
+    // NO "enter a token first" gate. The probe's substantive half is the
+    // device-JWT identity check, which does not use the runner token at all —
+    // and `mask_runner_token` returns "" for an empty token, so
+    // `runnerTokenMasked` is falsy for every runner paired through Cognito or a
+    // pair code. Those paths never mint a `qontinui_runner_` token, so a gate
+    // on it locked exactly the modern population out of the probe written for
+    // them.
     const tokenForTest = tokenEdited ? formToken : "";
-    if (!tokenForTest && !status?.runnerTokenMasked) {
-      setTestState({
-        state: "error",
-        error: "Enter a runner token before testing.",
-      });
-      return;
-    }
     setTestState({ state: "testing" });
     try {
       const result = await invoke<WebIntegrationTestResult>("test_web_integration_connection", {
         backendUrl: formBackendUrl.trim(),
         runnerToken: tokenForTest,
       });
-      setTestState({ state: "success", runnerId: result.runnerId });
+      setTestState({
+        state: "success",
+        deviceId: result.deviceId ?? undefined,
+        identityFault: result.identityFault,
+        tokenFormatValid: result.tokenFormatValid,
+        detail: result.detail,
+      });
     } catch (err) {
       setTestState({ state: "error", error: String(err) });
     }
-  }, [formBackendUrl, formToken, tokenEdited, status?.runnerTokenMasked]);
+  }, [formBackendUrl, formToken, tokenEdited]);
 
   const handleSave = useCallback(async () => {
     const urlValidation = validateBackendUrl(formBackendUrl);
@@ -621,7 +690,22 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
         backendUrl: formBackendUrl.trim(),
         runnerToken: tokenEdited ? formToken : "",
       });
-      setTestState({ state: "success", runnerId: result.runnerId });
+      setTestState({
+        state: "success",
+        deviceId: result.deviceId ?? undefined,
+        identityFault: result.identityFault,
+        tokenFormatValid: result.tokenFormatValid,
+        detail: result.detail,
+      });
+      // A non-benign identity fault (rejected / forbidden / verifier_down) is a
+      // FAILED retry. The old code short-circuited here because such a response
+      // arrived as a thrown error; it now arrives as an Ok carrying the fault,
+      // so the stop has to be explicit — otherwise a 401 would fall through to
+      // the save below and emit a "Retrying…" success log line.
+      if (result.identityFault !== "none" && !isBenignIdentityFault(result.identityFault)) {
+        onLog("error", `Web integration retry failed: ${result.detail}`);
+        return;
+      }
       await invoke<void>("save_web_integration_settings", {
         enabled: formEnabled,
         backendUrl: formBackendUrl.trim(),
@@ -833,13 +917,44 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
             <Loader2 className="w-3.5 h-3.5 animate-spin" /> Testing…
           </div>
         );
-      case "success":
+      case "success": {
+        const fault = testState.identityFault;
+        // Three distinct outcomes, three distinct renderings. Collapsing the
+        // middle two into one amber line is what made a REJECTED credential
+        // look identical to "never paired yet".
+        if (fault && fault !== "none") {
+          const benign = isBenignIdentityFault(fault);
+          return (
+            <div
+              className={`flex items-center gap-1.5 text-xs ${
+                benign ? "text-yellow-500" : "text-destructive"
+              }`}
+              title={testState.detail}
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              {truncate(
+                testState.detail ??
+                  (benign
+                    ? "Backend reachable, identity not checked"
+                    : "Backend reachable, identity check failed"),
+                140,
+              )}
+            </div>
+          );
+        }
         return (
-          <div className="flex items-center gap-1.5 text-xs text-green-500">
+          <div className="flex items-center gap-1.5 text-xs text-green-500" title={testState.detail}>
             <CheckCircle2 className="w-3.5 h-3.5" />
-            Connected as <code className="font-mono">{testState.runnerId}</code>
+            Connected as device <code className="font-mono">{testState.deviceId}</code>
+            {testState.tokenFormatValid === false && (
+              <span className="text-yellow-500">
+                {" "}
+                · saved runner token is malformed
+              </span>
+            )}
           </div>
         );
+      }
       case "error":
         return (
           <div
@@ -1211,6 +1326,7 @@ export function WebIntegrationSettings({ onLog }: WebIntegrationSettingsProps) {
                 onChange={(e) => {
                   setFormToken(e.target.value);
                   setTokenEdited(true);
+                  clearStaleTestResult();
                 }}
                 placeholder={
                   status?.runnerTokenMasked && status.runnerTokenMasked.length > 0

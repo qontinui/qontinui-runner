@@ -721,10 +721,10 @@ mod tests {
             .expect("query");
 
         assert_eq!(rows.len(), 2, "expected 2 rows for this task_run");
-        let row0_path: String = rows[0].get(0);
-        let row0_wt: Option<String> = rows[0].get(1);
-        let row1_path: String = rows[1].get(0);
-        let row1_wt: Option<String> = rows[1].get(1);
+        let row0_path: String = rows[0].try_get(0).expect("row 0 file_path");
+        let row0_wt: Option<String> = rows[0].try_get(1).expect("row 0 worktree_id");
+        let row1_path: String = rows[1].try_get(0).expect("row 1 file_path");
+        let row1_wt: Option<String> = rows[1].try_get(1).expect("row 1 worktree_id");
 
         assert_eq!(row0_path, "/repo/main.rs");
         assert_eq!(row0_wt, None, "None worktree_id must round-trip as NULL");
@@ -762,7 +762,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let wt: Option<String> = row.get(0);
+        let wt: Option<String> = row.try_get(0).expect("worktree_id");
         assert_eq!(
             wt,
             Some("wt-promote".to_string()),
@@ -888,9 +888,17 @@ mod tests {
     /// Remove the floor or make `0` literal and this test fails.
     ///
     /// One test owns the variable rather than several, because `set_var`
-    /// mutates the whole process and cargo runs tests in parallel.
+    /// mutates the whole process and cargo runs tests in parallel — and it
+    /// holds the ONE shared env lock, so it is excluded from every other
+    /// env-touching test as well, not merely from a second copy of itself.
     #[test]
     fn env_override_can_never_breach_the_widest_reader_horizon() {
+        // The restore is declared AFTER the lock so it runs while the lock is
+        // still held, and it puts the operator's own value back on the panic
+        // path — the bare trailing `remove_var` this replaces did neither.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[RETENTION_ENV_VAR]);
         std::env::remove_var(RETENTION_ENV_VAR);
         assert_eq!(
             get_retention_days(),
@@ -947,8 +955,8 @@ mod tests {
                 );
             }
         }
-
-        std::env::remove_var(RETENTION_ENV_VAR);
+        // `_restore` drops here — putting back whatever the operator's own
+        // environment had, including on the panic path.
     }
 
     #[tokio::test]

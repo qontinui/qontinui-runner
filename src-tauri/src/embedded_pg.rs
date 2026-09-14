@@ -1422,7 +1422,8 @@ mod tests {
             )
             .await
             .expect("domain_knowledge.content_embedding should exist after schema apply")
-            .get(0);
+            .try_get(0)
+            .expect("data_type");
         assert_eq!(
             dtype, "bytea",
             "vector column should be transformed to bytea"
@@ -1437,7 +1438,8 @@ mod tests {
             )
             .await
             .unwrap()
-            .get(0);
+            .try_get(0)
+            .expect("table count");
         assert!(
             n > 100,
             "expected the full canonical schema (>100 tables), got {n}"
@@ -1489,7 +1491,8 @@ mod tests {
             .query_one("SELECT 1", &[])
             .await
             .expect("trivial query on second boot")
-            .get(0);
+            .try_get(0)
+            .expect("SELECT 1");
         assert_eq!(one, 1);
 
         drop(client);
@@ -1554,7 +1557,8 @@ mod tests {
             .query_one("SELECT 1", &[])
             .await
             .expect("trivial query over the attached connection")
-            .get(0);
+            .try_get(0)
+            .expect("SELECT 1");
         assert_eq!(one, 1);
         drop(client);
         let _ = conn.await;
@@ -1567,7 +1571,8 @@ mod tests {
             .query_one("SELECT 1", &[])
             .await
             .expect("the owner's cluster must still be up after the attached instance exits")
-            .get(0);
+            .try_get(0)
+            .expect("SELECT 1");
         assert_eq!(one, 1);
         drop(client);
         let _ = conn.await;
@@ -1637,7 +1642,8 @@ mod tests {
             .query_one("SELECT 1", &[])
             .await
             .expect("the peer's cluster must survive a failed boot next to it")
-            .get(0);
+            .try_get(0)
+            .expect("SELECT 1");
         assert_eq!(one, 1);
         drop(client);
         let _ = conn.await;

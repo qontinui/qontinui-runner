@@ -658,6 +658,7 @@ pub(crate) use crate::coord_mcp_config::{
     config_doc_has_static_authorization, config_doc_is_agent_marked, proxy_nonce_from_config_doc,
     proxy_nonce_from_header_object, proxy_nonce_from_request, COORD_MCP_PRINCIPAL_AGENT,
     COORD_MCP_PRINCIPAL_HEADER_JSON, COORD_MCP_PROXY_KEY_HEADER, COORD_MCP_PROXY_KEY_HEADER_JSON,
+    COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG, COORD_MCP_STDIO_SHIM_FILE,
     PROXY_AUTHORIZATION_HEADER_JSON, PROXY_BEARER_PREFIX,
 };
 
@@ -677,6 +678,59 @@ pub(crate) const STALE_PROXY_KEY_CAUSE: &str = "stale or unrecognized coord-mcp 
 pub(crate) const NON_DEVICE_PROXY_KEY_CAUSE: &str =
     "missing, stale, or non-device coord-mcp proxy key: this route injects the \
      device identity, so it serves device-bound nonces only";
+
+/// The request carried NO proxy key at all — a DIFFERENT fact from a stale one,
+/// and on the plan-library write door it is the likelier of the two.
+///
+/// ## Why this is its own cause rather than [`STALE_PROXY_KEY_CAUSE`]
+///
+/// `authorize_write` has the `Option<String>` in hand and already passes it to
+/// the forensics log, but every door used to emit the stale-key story on BOTH
+/// arms. A caller that simply forgot the header therefore got a CAUSE
+/// diagnosing a key that had gone stale ("not registered with the runner
+/// currently listening on this port" — it was never sent) and a three-step
+/// recovery written for a different actor entirely: [`PROXY_KEY_RECOVERY_HINT`]
+/// addresses the MCP CLIENT, whose headers are snapshotted at launch, so its
+/// steps are "work through another coord door", "start a NEW session" and
+/// "`claude mcp logout`". None of those is what a caller curling this route
+/// needs, and two of them read as "the door is shut" — the false conclusion
+/// dossier `plan-library-capture-loop` exists to stop.
+///
+/// (That hint's LAST sentence does name the header spelling, so this is not a
+/// message with no useful byte in it. The defect is that everything before that
+/// sentence is addressed to someone else, and a reader who follows the ordered
+/// list never reaches it.)
+///
+/// `None` here is not only a missing header: a request that sent a JWT in
+/// `Authorization` also lands here, because [`proxy_nonce_from_authorization`]
+/// deliberately refuses the static-bearer shape. The text names both.
+pub(crate) const NO_PROXY_KEY_CAUSE: &str = "no coord-mcp proxy key on the request: this \
+     door authorizes on the session's loopback nonce, and the request carried neither an \
+     `Authorization: Bearer <nonce>` header nor the legacy `X-Coord-Mcp-Proxy-Key` (a JWT in \
+     `Authorization` also lands here — this door takes the proxy nonce, not a bearer token)";
+
+/// The recovery tail for [`NO_PROXY_KEY_CAUSE`].
+///
+/// Deliberately NOT [`PROXY_KEY_RECOVERY_HINT`]: that one is written for a key
+/// that WAS sent and has died, so its remedies are all about obtaining a fresh
+/// one. Here a valid key almost certainly already exists on disk and was simply
+/// not sent, so the whole recovery is one step.
+pub(crate) const NO_PROXY_KEY_RECOVERY_HINT: &str = "Read the `coord-mcp` server entry in \
+     THIS session's .mcp.json — its `headers` carry the nonce, as `Authorization: Bearer \
+     <nonce>` or `X-Coord-Mcp-Proxy-Key` — and resend the request with that header. Do not \
+     open a fresh session, do not restart the runner, and do not read this as the write door \
+     being switched off: an ENGAGED kill switch answers 403 naming \
+     QONTINUI_PLAN_LIBRARY_WRITE, and a closed tenant dial answers 403 pointing at \
+     /admin/coord/plan-library — this is a 401, which is neither. The ungated \
+     GET /plan-library/search reports all three layers if you want to confirm before \
+     retrying. Only if the nonce IS present and still refused is this the stale-key case.";
+
+/// Join [`NO_PROXY_KEY_CAUSE`] with its own recovery tail, mirroring
+/// [`stale_proxy_key_error`] so the two 401 stories stay symmetric in shape
+/// while staying different in content.
+pub(crate) fn missing_proxy_key_error() -> String {
+    format!("{NO_PROXY_KEY_CAUSE}. {NO_PROXY_KEY_RECOVERY_HINT}")
+}
 
 /// The `AGENT_TOKENS`-slot-gone variant: the nonce IS registered, but the agent
 /// it is bound to no longer has a live token slot.
@@ -710,19 +764,109 @@ pub(crate) const AGENT_GONE_PROXY_CAUSE: &str =
 /// * Restarting the runner — forbidden outright (served policy
 ///   `production-and-cost` `runner-lifecycle`), and it orphans every OTHER
 ///   session's key, which is the incident this plan was written from.
-pub(crate) const PROXY_KEY_RECOVERY_HINT: &str = "The MCP client snapshots its headers at \
-     launch and never re-reads .mcp.json, so reconnecting this server cannot pick up a fresh \
-     key. Recovery, in order: (1) keep working through another coord door (/coord-revive), \
-     and verify any write by reading it back; (2) start a NEW session in this workdir — the \
-     runner writes a fresh key on every session spawn; NEVER restart the runner to force it; \
-     (3) only if the client reports needs-auth while sending ZERO requests, run `claude mcp \
-     logout <server>`, then start a new session. The key is accepted as \
-     `Authorization: Bearer <nonce>` or the legacy `X-Coord-Mcp-Proxy-Key`.";
+pub(crate) const PROXY_KEY_RECOVERY_HINT: &str = "Recovery depends on WHICH caller you are. \
+     A hand-rolled caller (curl, a script, the coord skill) re-reads the CURRENT key from \
+     this workdir's .mcp.json — the runner rewrites it on every session spawn — or runs \
+     /coord-revive, and verifies any write by reading it back. The native Claude Code MCP \
+     client snapshots its headers at launch and never re-reads .mcp.json, so reconnecting \
+     this server cannot pick up a fresh key: for it, start a NEW session in this workdir; \
+     NEVER restart the runner to force it. Only if the client reports needs-auth while \
+     sending ZERO requests, run `claude mcp logout <server>`, then start a new session. The \
+     key is accepted as `Authorization: Bearer <nonce>` or the legacy `X-Coord-Mcp-Proxy-Key`.";
+
+/// The one clause a runner-nonce refusal can state that an upstream failure
+/// cannot: the runner refused BEFORE dialing coord (plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1b).
+///
+/// Deliberately NOT "the transport is fine": the runner has not tested coord
+/// at this point and must not claim to have. What it can say honestly is what
+/// it did not do — and that this is not a credential failure, which is the
+/// misreading that cost the 2026-09-02 session an hour in the wrong subsystem
+/// (`requires re-authorization (token expired)` read as a dead device JWT).
+pub(crate) const RUNNER_REFUSED_BEFORE_FORWARD: &str = "The runner refused this request \
+     before dialing coord, so this is NOT an upstream or device-credential failure: \
+     coord's reachability and the device JWT were not tested here (GET /health \
+     credentialDoors.coordMcpForwarder reports both).";
 
 /// Join a door-specific cause with the shared recovery tail. One function so
 /// the five proxy doors cannot drift into five different 2am stories.
 pub(crate) fn stale_proxy_key_error(cause: &str) -> String {
     format!("{cause}. {PROXY_KEY_RECOVERY_HINT}")
+}
+
+/// The cause clause of a runner-nonce 401, chosen by what the runner actually
+/// knows about the key (Phase 1b + 1d). Every arm names the workdir when the
+/// tombstone has one, and the timestamps when they are known; a `bound` key
+/// (rejected by a later gate, not by the key itself) falls back to the generic
+/// [`STALE_PROXY_KEY_CAUSE`], since this function only describes the key.
+pub(crate) fn attributed_proxy_key_cause(attr: &RejectAttribution) -> String {
+    let when = |t: Option<std::time::SystemTime>| {
+        t.map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339())
+    };
+    let slot = || {
+        format!(
+            "workdir `{}`{}",
+            attr.workdir,
+            if attr.terminal_id == "none" || attr.terminal_id == ROTATION_UNKNOWN {
+                String::new()
+            } else {
+                format!(", terminal `{}`", attr.terminal_id)
+            }
+        )
+    };
+    match attr.attribution {
+        RejectAttribution::NO_KEY_PRESENTED => "no coord-mcp proxy key was presented: this \
+             request carried neither `Authorization: Bearer <nonce>` nor `X-Coord-Mcp-Proxy-Key`"
+            .to_string(),
+        RejectAttribution::NEVER_REGISTERED => "stale or unrecognized coord-mcp proxy key: the \
+             runner listening on this port has no record of this key — it was minted by an \
+             earlier runner process and not persisted, or it was never minted here"
+            .to_string(),
+        RejectAttribution::SUPERSEDED => format!(
+            "superseded coord-mcp proxy key: the runner minted a newer key for the same \
+             {}{} and this is the old one{}",
+            slot(),
+            when(attr.evicted_at)
+                .map(|t| format!(" at {t}"))
+                .unwrap_or_default(),
+            match when(attr.grace_until) {
+                Some(t) => format!(", whose grace window runs until {t}"),
+                None => format!(" ({} class: never graced)", attr.principal),
+            },
+        ),
+        RejectAttribution::GRACED_EXPIRED => format!(
+            "expired coord-mcp proxy key: superseded{} for {}, and its {}h grace window closed{}",
+            when(attr.evicted_at)
+                .map(|t| format!(" at {t}"))
+                .unwrap_or_default(),
+            slot(),
+            DEVICE_EVICTED_NONCE_GRACE_TTL.as_secs() / 3600,
+            when(attr.grace_until)
+                .map(|t| format!(" at {t}"))
+                .unwrap_or_default(),
+        ),
+        RejectAttribution::REVOKED => format!(
+            "revoked coord-mcp proxy key: revoked{} for {} ({})",
+            when(attr.evicted_at)
+                .map(|t| format!(" at {t}"))
+                .unwrap_or_default(),
+            slot(),
+            attr.evict_cause.as_deref().unwrap_or("revoked"),
+        ),
+        _ => STALE_PROXY_KEY_CAUSE.to_string(),
+    }
+}
+
+/// The full 401 body text for a runner-nonce refusal: the attributed cause,
+/// the "refused before forwarding" clause, and the shared per-caller recovery
+/// tail. Used at the ONE site that refuses on the key alone
+/// (`coord_mcp_proxy_handler`'s principal resolution); the later gates keep
+/// [`stale_proxy_key_error`], whose cause already names the failing check.
+pub(crate) fn attributed_proxy_key_error(attr: &RejectAttribution) -> String {
+    format!(
+        "{}. {RUNNER_REFUSED_BEFORE_FORWARD} {PROXY_KEY_RECOVERY_HINT}",
+        attributed_proxy_key_cause(attr)
+    )
 }
 
 /// Which side of the coord-mcp proxy hop a failure came from (plan
@@ -849,6 +993,18 @@ pub(crate) fn proxy_failure_envelope(
     }
     v
 }
+
+// `stale_proxy_key_unauthorized_body()` — the generic-cause
+// `COORD_MCP_PROXY_UNAUTHORIZED` envelope (plan
+// `2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported`,
+// Phase 2 runner sub-task) — was retired here: the nonce-lookup-MISS 401
+// handler in `mcp_api.rs` now builds `proxy_failure_envelope` directly with
+// `attributed_proxy_key_error` (plan
+// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1d),
+// a strict superset carrying the same `layer`/`code`/`cause` plus
+// attribution/workdir/terminal_id. It had exactly one production caller and
+// one test exercising it; both are gone rather than kept as a parallel body
+// nothing builds.
 
 /// Normalize a workdir on its way into a [`NonceBinding`] (Phase 3c).
 ///
@@ -1065,36 +1221,73 @@ const AGENT_NONCE_GRACE_TTL: std::time::Duration = std::time::Duration::from_sec
 const DEVICE_EVICTED_NONCE_GRACE_TTL: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
-/// A device nonce kept transiently valid after eviction, with its expiry.
+/// A device nonce kept transiently valid after eviction: its in-process expiry
+/// plus the binding it used to be, so the entry can be persisted across a
+/// restart and re-entered with its remaining window.
 struct GracedNonce {
+    /// The monotonic deadline the request path checks.
     expires_at: std::time::Instant,
+    /// The same deadline on the wall clock — what goes to disk. Kept beside the
+    /// `Instant` rather than derived from it because an `Instant` has no
+    /// wall-clock meaning and cannot be serialized.
+    grace_until: std::time::SystemTime,
+    /// The workdir the evicted binding was provisioned into.
+    workdir: String,
+    /// The terminal it was provisioned for, when there was one.
+    terminal_id: Option<String>,
 }
 
-/// Transient grace registry: an evicted DEVICE nonce → its expiry. Separate from
-/// [`PROXY_NONCES`] so the live map stays the single source of truth for a
-/// currently-provisioned nonce and grace never reaches disk (it is process-local
-/// and intentionally forgotten across a restart — Change 1's adopt-on-disk path
-/// owns cross-restart continuity).
+/// Transient grace registry: an evicted DEVICE nonce → its expiry and the
+/// binding it was. Separate from [`PROXY_NONCES`] so the live map stays the
+/// single source of truth for a currently-provisioned nonce.
+///
+/// **Persisted since plan
+/// `2026-09-02-steering-layers-unreadable-without-a-credential` Phase 1a.**
+/// This used to be process-local and "intentionally forgotten across a
+/// restart". Measured on the operator box 2026-09-02 (rotation log, 2916
+/// lines, 165 `reject` rows): of the 144 rejects that carried a key prefix,
+/// **61** were keys this runner had evicted AND graced, with a runner restart
+/// between the `grace` line and the `reject` — the grace set died with the
+/// process while every `.mcp.json` on disk still carried the key. Only **4**
+/// rejects hit an evicted key inside a live runner, and all four landed
+/// 6.07–6.98 h after eviction, i.e. AFTER the 6 h window closed honestly.
+/// Zero rejects hit an evicted key inside a live runner's window. So the
+/// same-session re-mint plus grace works within one process; what broke was
+/// the restart. The graced set therefore rides the same encrypted store as
+/// the persistent bindings ([`graced_nonce_snapshot`] → the nonce persist
+/// queue → [`restore_proxy_nonces_from`]), carrying its wall-clock deadline so
+/// a restored entry re-enters with exactly its REMAINING window, never a fresh
+/// one. Device-class, persistent-class, loopback-only — the same posture as
+/// persisting the live bindings themselves.
 static GRACED_NONCES: OnceLock<Mutex<HashMap<String, GracedNonce>>> = OnceLock::new();
 
 fn graced_nonces() -> &'static Mutex<HashMap<String, GracedNonce>> {
     GRACED_NONCES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Move DEVICE nonces just evicted for `_workdir` into the grace registry with a
+/// Move DEVICE bindings just evicted into the grace registry with a
 /// [`DEVICE_EVICTED_NONCE_GRACE_TTL`] expiry, opportunistically pruning expired
-/// entries so the map stays bounded. Only device nonces are passed here (the
+/// entries so the map stays bounded. Only device bindings are passed here (the
 /// caller filters); agent nonces are dropped outright to fail closed.
-fn grace_evicted_device_nonces(nonces: &[String]) {
-    if nonces.is_empty() {
+fn grace_evicted_device_nonces(evicted: &[(String, NonceBinding)]) {
+    if evicted.is_empty() {
         return;
     }
     let now = std::time::Instant::now();
     let expires_at = now + DEVICE_EVICTED_NONCE_GRACE_TTL;
+    let grace_until = std::time::SystemTime::now() + DEVICE_EVICTED_NONCE_GRACE_TTL;
     let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
     graced.retain(|_, g| g.expires_at > now);
-    for n in nonces {
-        graced.insert(n.clone(), GracedNonce { expires_at });
+    for (n, b) in evicted {
+        graced.insert(
+            n.clone(),
+            GracedNonce {
+                expires_at,
+                grace_until,
+                workdir: b.workdir.clone(),
+                terminal_id: b.terminal_id.clone(),
+            },
+        );
     }
 }
 
@@ -1110,6 +1303,216 @@ fn graced_nonce_is_valid(nonce: &str) -> bool {
             false
         }
         None => false,
+    }
+}
+
+/// Project the grace registry down to the shape the encrypted store persists
+/// (Phase 1a): every entry whose window is still open, keyed by nonce. Expired
+/// entries are dropped here as well as lazily on lookup, so the store never
+/// carries a dead window. Bounded by [`MAX_PERSISTED_DEVICE_NONCES`] like the
+/// binding snapshot — a grace entry outlives its binding by at most one
+/// window, so the two sets are the same order of size.
+fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGracedNonce> {
+    let now = std::time::Instant::now();
+    let graced = graced_nonces().lock().expect("graced nonce map poisoned");
+    let mut live: Vec<(&String, &GracedNonce)> =
+        graced.iter().filter(|(_, g)| g.expires_at > now).collect();
+    if live.len() > MAX_PERSISTED_DEVICE_NONCES {
+        // Latest deadline first: the entries with the most window left are the
+        // ones a restart is most likely to need.
+        live.sort_by(|(na, a), (nb, b)| b.grace_until.cmp(&a.grace_until).then_with(|| na.cmp(nb)));
+        live.truncate(MAX_PERSISTED_DEVICE_NONCES);
+    }
+    live.into_iter()
+        .map(|(n, g)| {
+            (
+                n.clone(),
+                crate::secure_storage::StoredGracedNonce {
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                    grace_until_unix: minted_at_to_unix(g.grace_until),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Re-enter persisted grace entries after a restart (Phase 1a): each one whose
+/// wall-clock deadline is still ahead goes back into the grace registry with
+/// its REMAINING window and into the tombstone map so a later reject can still
+/// be attributed. Returns the `(nonce, workdir)` pairs that re-entered, for
+/// the forensics lines the caller emits; entries already past their
+/// deadline are dropped silently (a TTL death is deterministic, not a
+/// rotation — the same rule the expired-ephemeral sweep follows).
+///
+/// Never overwrites a live entry: a grace this process already granted is at
+/// least as fresh as anything the previous process wrote.
+fn restore_graced_nonces(
+    persisted: HashMap<String, crate::secure_storage::StoredGracedNonce>,
+) -> Vec<(String, String)> {
+    let now_wall = std::time::SystemTime::now();
+    let now = std::time::Instant::now();
+    let mut restored = Vec::new();
+    {
+        let mut graced = graced_nonces().lock().expect("graced nonce map poisoned");
+        for (nonce, g) in persisted {
+            let grace_until = minted_at_from_unix(Some(g.grace_until_unix));
+            let Ok(remaining) = grace_until.duration_since(now_wall) else {
+                continue; // already expired — nothing to restore
+            };
+            if remaining.is_zero() || graced.contains_key(&nonce) {
+                continue;
+            }
+            graced.insert(
+                nonce.clone(),
+                GracedNonce {
+                    expires_at: now + remaining,
+                    grace_until,
+                    workdir: g.workdir.clone(),
+                    terminal_id: g.terminal_id.clone(),
+                },
+            );
+            restored.push((nonce, g.workdir, g.terminal_id, grace_until));
+        }
+    }
+    let mut out = Vec::with_capacity(restored.len());
+    for (nonce, workdir, terminal_id, grace_until) in restored {
+        record_nonce_tombstone(
+            &nonce,
+            NonceTombstone {
+                workdir: workdir.clone(),
+                terminal_id,
+                principal: "device",
+                kind: TombstoneKind::Superseded,
+                evicted_at: std::time::SystemTime::UNIX_EPOCH,
+                grace_until: Some(grace_until),
+                cause: "evicted before the previous runner exit; grace restored from the encrypted store".to_string(),
+            },
+        );
+        out.push((nonce, workdir));
+    }
+    out
+}
+
+// ============================================================================
+// Nonce tombstones (plan 2026-09-02-steering-layers-unreadable-without-a-
+// credential, Phase 1d) — what a rejected key USED to be
+// ============================================================================
+
+/// Why a nonce left the live registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstoneKind {
+    /// A newer key was minted for the same slot (re-mint), or the per-session
+    /// workdir it served was closed. Device keys ride grace; agent keys do not.
+    Superseded,
+    /// Revoked outright — session close, agent teardown, or an explicit
+    /// revoke. Never graced: revocation is total.
+    Revoked,
+}
+
+/// Everything a `reject` line can still say about a key that is no longer
+/// live. Written at every eviction and revocation site, read on the reject
+/// path. Process-local except for the graced subset, which
+/// [`restore_graced_nonces`] re-creates from the store after a restart.
+#[derive(Debug, Clone)]
+struct NonceTombstone {
+    workdir: String,
+    terminal_id: Option<String>,
+    /// `"device"` / `"agent"`.
+    principal: &'static str,
+    kind: TombstoneKind,
+    /// When the binding died. `UNIX_EPOCH` for a grace entry restored from the
+    /// store, whose eviction instant the previous process took with it.
+    evicted_at: std::time::SystemTime,
+    /// The end of the grace window, when there was one.
+    grace_until: Option<std::time::SystemTime>,
+    /// The forensics cause string the eviction/revoke line carried.
+    cause: String,
+}
+
+impl NonceTombstone {
+    /// The instant a tombstone ages FROM: the end of its grace window when it
+    /// had one, else the eviction. A grace entry restored from the store has
+    /// no eviction instant (`UNIX_EPOCH`) but a real deadline, and aging it
+    /// from the epoch would prune it on the very next insert — undoing the
+    /// restart survival Phase 1a exists for.
+    fn reference_time(&self) -> std::time::SystemTime {
+        self.grace_until.unwrap_or(self.evicted_at)
+    }
+}
+
+/// How long a tombstone is kept. Comfortably longer than the grace window, so
+/// a reject that lands after grace closes still reads `graced_expired` rather
+/// than degrading to `never_registered`; short enough that the map stays a
+/// few hundred entries on the busiest box.
+const NONCE_TOMBSTONE_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Hard cap on tombstones regardless of age (oldest dropped first).
+const MAX_NONCE_TOMBSTONES: usize = 1024;
+
+static NONCE_TOMBSTONES: OnceLock<Mutex<HashMap<String, NonceTombstone>>> = OnceLock::new();
+
+fn nonce_tombstones() -> &'static Mutex<HashMap<String, NonceTombstone>> {
+    NONCE_TOMBSTONES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one tombstone, pruning by age and by the hard cap. Safe to call
+/// under the registry lock (no I/O); the lock order everywhere is registry →
+/// grace → tombstones, and this takes only the last.
+fn record_nonce_tombstone(nonce: &str, tombstone: NonceTombstone) {
+    if nonce.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now();
+    let mut map = nonce_tombstones()
+        .lock()
+        .expect("nonce tombstone map poisoned");
+    map.retain(|_, t| {
+        now.duration_since(t.reference_time())
+            .map(|age| age < NONCE_TOMBSTONE_TTL)
+            // A future-dated entry (clock step) is kept: age unknown ≠ old.
+            .unwrap_or(true)
+    });
+    map.insert(nonce.to_string(), tombstone);
+    if map.len() > MAX_NONCE_TOMBSTONES {
+        let mut by_age: Vec<(String, std::time::SystemTime)> = map
+            .iter()
+            .map(|(n, t)| (n.clone(), t.reference_time()))
+            .collect();
+        by_age.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        for (n, _) in by_age.into_iter().take(map.len() - MAX_NONCE_TOMBSTONES) {
+            map.remove(&n);
+        }
+    }
+}
+
+/// Tombstone every binding in `evicted` under one cause. `graced` says
+/// whether the device entries were also placed in the grace registry (the
+/// caller decides that, since it depends on the binding class).
+fn record_nonce_tombstones(
+    evicted: &[(String, NonceBinding)],
+    kind: TombstoneKind,
+    graced: bool,
+    cause: &str,
+) {
+    if evicted.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now();
+    for (nonce, b) in evicted {
+        let is_device = b.principal == ProxyPrincipal::Device;
+        record_nonce_tombstone(
+            nonce,
+            NonceTombstone {
+                workdir: b.workdir.clone(),
+                terminal_id: b.terminal_id.clone(),
+                principal: if is_device { "device" } else { "agent" },
+                kind,
+                evicted_at: now,
+                grace_until: (graced && is_device).then(|| now + DEVICE_EVICTED_NONCE_GRACE_TTL),
+                cause: cause.to_string(),
+            },
+        );
     }
 }
 
@@ -1425,6 +1828,76 @@ pub(crate) fn rotation_log_health_json() -> serde_json::Value {
     }
 }
 
+// ============================================================================
+// Live forwarder reachability for `/health` (plan 2026-09-02-steering-layers-
+// unreadable-without-a-credential, Phase 1e)
+// ============================================================================
+
+/// The most recent proxied `/coord-mcp` call's upstream result.
+struct LastForward {
+    at: std::time::SystemTime,
+    /// Coord's HTTP status, or `None` when the hop never completed.
+    status: Option<u16>,
+    /// `answered` / `unreachable`.
+    outcome: &'static str,
+}
+
+static LAST_FORWARD: OnceLock<Mutex<Option<LastForward>>> = OnceLock::new();
+
+/// Record the upstream result of one proxied call. Called by the forwarder
+/// where it handles coord's response (or the failure to get one); never on
+/// a runner-nonce refusal, which does not dial coord.
+pub(crate) fn record_last_forward(status: Option<u16>, outcome: &'static str) {
+    if let Ok(mut slot) = LAST_FORWARD.get_or_init(|| Mutex::new(None)).lock() {
+        *slot = Some(LastForward {
+            at: std::time::SystemTime::now(),
+            status,
+            outcome,
+        });
+    }
+}
+
+/// `/health` `credentialDoors.coordMcpForwarder.lastForward`: `null` until the
+/// first proxied call since boot, else `{at, status, outcome}`. A reader that
+/// sees `canAnswer: true` can now tell a forwarder whose upstream answered
+/// a minute ago from one that has never been exercised or last saw a 401.
+pub(crate) fn last_forward_health_json() -> serde_json::Value {
+    let slot = LAST_FORWARD.get_or_init(|| Mutex::new(None)).lock();
+    match slot.as_deref() {
+        Ok(Some(f)) => serde_json::json!({
+            "at": system_time_json(Some(f.at)),
+            "status": f.status,
+            "outcome": f.outcome,
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// `/health` `credentialDoors.coordMcpForwarder.deviceJwt`: whether the
+/// DEFAULT device slot holds a token, whether that token passes the same
+/// usability predicate the forwarder's selection uses
+/// ([`crate::auth::slot_jwt_is_usable`]), and its decoded `exp` — **never the
+/// token**. Filesystem I/O, so it runs on the blocking pool exactly like
+/// [`read_usable_device_jwt`]; `/health` awaits it without blocking the
+/// executor.
+pub(crate) async fn device_jwt_health_json() -> serde_json::Value {
+    let raw = spawn_blocking_tracked(|| crate::auth::device_bearer_for(None))
+        .await
+        .ok()
+        .flatten()
+        .filter(|t| !t.trim().is_empty());
+    let expires_at = raw
+        .as_deref()
+        .and_then(crate::auth::decode_jwt_exp)
+        .and_then(|exp| chrono::DateTime::<chrono::Utc>::from_timestamp(exp, 0))
+        .map(|t| t.to_rfc3339());
+    serde_json::json!({
+        "present": raw.is_some(),
+        "usable": raw.as_deref().is_some_and(crate::auth::slot_jwt_is_usable),
+        "expiresAt": expires_at,
+    })
+}
+
 /// Minimum interval between `reject` forensics lines carrying the SAME key
 /// prefix. Every other event is a discrete runner action (a mint, an eviction,
 /// a file write) that cannot repeat in a tight loop; a reject fires on the
@@ -1484,15 +1957,67 @@ fn reject_throttle_admit(prefix: &str) -> Option<u64> {
 /// What a `reject` line can say about WHOSE key just died. Every field is
 /// populated or explicitly [`ROTATION_UNKNOWN`] — never left empty, so a reader
 /// can tell "the runner does not know" from "the runner did not fill this in".
-struct RejectAttribution {
+pub(crate) struct RejectAttribution {
     /// The bound workdir, or [`ROTATION_UNKNOWN`].
-    workdir: String,
+    pub(crate) workdir: String,
     /// `"device"` / `"agent"` / [`ROTATION_UNKNOWN`].
-    principal: String,
+    pub(crate) principal: String,
     /// The bound terminal, [`ROTATION_UNKNOWN`] for an unknown nonce, or
     /// `"none"` for a live binding that legitimately has no terminal (restored,
     /// adopted, mint-route, agent, in-cwd writer) — a real, distinct fact.
-    terminal_id: String,
+    pub(crate) terminal_id: String,
+    /// WHY this key does not validate — the join Phase 1d adds. See
+    /// [`RejectAttribution::ATTRIBUTIONS`] for the closed set.
+    pub(crate) attribution: &'static str,
+    /// When the binding died, for the superseded / expired / revoked arms.
+    /// `None` when the runner never knew the key, and for a grace entry
+    /// restored from the store (the previous process took the instant with
+    /// it).
+    pub(crate) evicted_at: Option<std::time::SystemTime>,
+    /// The end of the grace window, when there was one.
+    pub(crate) grace_until: Option<std::time::SystemTime>,
+    /// The eviction / revocation cause string, when the key is tombstoned.
+    pub(crate) evict_cause: Option<String>,
+}
+
+impl RejectAttribution {
+    /// The key is still registered — the reject came from a later gate
+    /// (bearer mismatch, agent slot gone), not from the key itself.
+    pub(crate) const BOUND: &'static str = "bound";
+    /// A newer key was minted for the same slot (or the per-session workdir
+    /// closed); a device key here is still inside its grace window, an agent
+    /// key fails closed immediately.
+    pub(crate) const SUPERSEDED: &'static str = "superseded";
+    /// Superseded, and the grace window has since closed.
+    pub(crate) const GRACED_EXPIRED: &'static str = "graced_expired";
+    /// Revoked outright: session close, agent teardown, or an explicit revoke.
+    pub(crate) const REVOKED: &'static str = "revoked";
+    /// This runner has no record of the key — minted by an earlier process
+    /// and not persisted, or never minted here at all.
+    pub(crate) const NEVER_REGISTERED: &'static str = "never_registered";
+    /// The request carried no key under either accepted header.
+    pub(crate) const NO_KEY_PRESENTED: &'static str = "no_key_presented";
+    /// Every value `attribution` can take, for readers that switch on it.
+    pub(crate) const ATTRIBUTIONS: &'static [&'static str] = &[
+        Self::BOUND,
+        Self::SUPERSEDED,
+        Self::GRACED_EXPIRED,
+        Self::REVOKED,
+        Self::NEVER_REGISTERED,
+        Self::NO_KEY_PRESENTED,
+    ];
+
+    fn unknown(attribution: &'static str) -> Self {
+        RejectAttribution {
+            workdir: ROTATION_UNKNOWN.to_string(),
+            principal: ROTATION_UNKNOWN.to_string(),
+            terminal_id: ROTATION_UNKNOWN.to_string(),
+            attribution,
+            evicted_at: None,
+            grace_until: None,
+            evict_cause: None,
+        }
+    }
 }
 
 /// Resolve everything a rejected nonce can still be attributed to, read WITHOUT
@@ -1501,23 +2026,22 @@ struct RejectAttribution {
 /// request path after the gate has already decided, so it must not change
 /// registry state.
 ///
-/// Two sources, live registry first then the grace map, because those are the
-/// two places a nonce the handler just saw can still be known. A graced nonce
-/// has no binding left (grace is keyed by nonce alone), so it can name its
-/// principal — always DEVICE, grace is device-only — and nothing else.
+/// Three sources, in order: the live registry, the tombstone map (Phase 1d —
+/// what the key USED to be, written at every eviction and revocation site),
+/// then the grace map for a graced key with no tombstone (only reachable if
+/// the tombstone aged out first). The tombstone is what turns the old
+/// `workdir: unknown` on every reject into a workdir plus an
+/// [`RejectAttribution::attribution`] a reader can act on.
 ///
-/// **Neither lock is held on return**, which is the point: the caller feeds
-/// this into [`log_rotation_event_with`], which does file I/O, and
+/// **No lock is held on return**, which is the point: the caller feeds this
+/// into [`log_rotation_event_with`], which does file I/O, and
 /// `log_rotation_event` documents that callers must not hold the registry lock
-/// across it. The clones are the price of that discipline.
-fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
-    let unknown = || RejectAttribution {
-        workdir: ROTATION_UNKNOWN.to_string(),
-        principal: ROTATION_UNKNOWN.to_string(),
-        terminal_id: ROTATION_UNKNOWN.to_string(),
-    };
+/// across it. The clones are the price of that discipline. Cheap enough to run
+/// synchronously on the 401 path — three uncontended mutex reads, no I/O —
+/// which is what lets the 401 BODY carry the same attribution as the log line.
+pub(crate) fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
     if nonce.is_empty() {
-        return unknown();
+        return RejectAttribution::unknown(RejectAttribution::NO_KEY_PRESENTED);
     }
     let live = {
         let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
@@ -1542,22 +2066,86 @@ fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
             workdir: normalize_binding_workdir(&workdir),
             principal,
             terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
+            attribution: RejectAttribution::BOUND,
+            evicted_at: None,
+            grace_until: None,
+            evict_cause: None,
+        };
+    }
+    let tombstone = nonce_tombstones()
+        .lock()
+        .expect("nonce tombstone map poisoned")
+        .get(nonce)
+        .cloned();
+    if let Some(t) = tombstone {
+        let now = std::time::SystemTime::now();
+        let attribution = match (t.kind, t.grace_until) {
+            (TombstoneKind::Revoked, _) => RejectAttribution::REVOKED,
+            (TombstoneKind::Superseded, Some(until)) if until <= now => {
+                RejectAttribution::GRACED_EXPIRED
+            }
+            (TombstoneKind::Superseded, _) => RejectAttribution::SUPERSEDED,
+        };
+        return RejectAttribution {
+            workdir: normalize_binding_workdir(&t.workdir),
+            principal: t.principal.to_string(),
+            terminal_id: t.terminal_id.unwrap_or_else(|| "none".to_string()),
+            attribution,
+            evicted_at: (t.evicted_at != std::time::SystemTime::UNIX_EPOCH).then_some(t.evicted_at),
+            grace_until: t.grace_until,
+            evict_cause: Some(t.cause),
         };
     }
     // Grace map fallback: only DEVICE nonces are ever graced, so a hit here
-    // pins the principal class even though the binding itself is gone.
-    if graced_nonces()
+    // pins the principal class and, since Phase 1a, the binding it was.
+    let graced = graced_nonces()
         .lock()
         .expect("graced nonce map poisoned")
-        .contains_key(nonce)
-    {
+        .get(nonce)
+        .map(|g| (g.workdir.clone(), g.terminal_id.clone(), g.grace_until));
+    if let Some((workdir, terminal_id, grace_until)) = graced {
         return RejectAttribution {
-            workdir: ROTATION_UNKNOWN.to_string(),
+            workdir: normalize_binding_workdir(&workdir),
             principal: "device".to_string(),
-            terminal_id: ROTATION_UNKNOWN.to_string(),
+            terminal_id: terminal_id.unwrap_or_else(|| "none".to_string()),
+            attribution: RejectAttribution::SUPERSEDED,
+            evicted_at: None,
+            grace_until: Some(grace_until),
+            evict_cause: None,
         };
     }
-    unknown()
+    RejectAttribution::unknown(RejectAttribution::NEVER_REGISTERED)
+}
+
+/// RFC 3339 rendering of an optional wall-clock instant for a log line or a
+/// response body; `None` renders as JSON `null`.
+fn system_time_json(t: Option<std::time::SystemTime>) -> serde_json::Value {
+    match t {
+        Some(t) => serde_json::Value::from(chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
+        None => serde_json::Value::Null,
+    }
+}
+
+/// The attribution fields every `reject` / `upstream-reject` line and the 401
+/// body carry, in one place so the log and the response cannot disagree.
+fn attribution_fields(attr: &RejectAttribution) -> Vec<(&'static str, serde_json::Value)> {
+    vec![
+        ("principal", serde_json::Value::from(attr.principal.clone())),
+        (
+            "terminal_id",
+            serde_json::Value::from(attr.terminal_id.clone()),
+        ),
+        ("attribution", serde_json::Value::from(attr.attribution)),
+        ("evicted_at", system_time_json(attr.evicted_at)),
+        ("grace_until", system_time_json(attr.grace_until)),
+        (
+            "evict_cause",
+            attr.evict_cause
+                .clone()
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null),
+        ),
+    ]
 }
 
 /// Record a coord-mcp proxy request REJECTED at the auth gate — the consumer
@@ -1598,10 +2186,7 @@ pub(crate) fn log_proxy_nonce_rejected(nonce: Option<&str>, cause: &str) {
         &attr.workdir,
         nonce,
         &cause,
-        &[
-            ("principal", serde_json::Value::from(attr.principal)),
-            ("terminal_id", serde_json::Value::from(attr.terminal_id)),
-        ],
+        &attribution_fields(&attr),
     );
 }
 
@@ -1649,21 +2234,13 @@ pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, caus
     } else {
         cause.to_string()
     };
-    log_rotation_event_with(
-        "upstream-reject",
-        &attr.workdir,
-        nonce,
-        &cause,
-        &[
-            ("principal", serde_json::Value::from(attr.principal)),
-            ("terminal_id", serde_json::Value::from(attr.terminal_id)),
-            ("upstream_status", serde_json::Value::from(status)),
-            (
-                "layer",
-                serde_json::Value::from(ProxyFailureLayer::CoordUpstream.as_str()),
-            ),
-        ],
-    );
+    let mut fields = attribution_fields(&attr);
+    fields.push(("upstream_status", serde_json::Value::from(status)));
+    fields.push((
+        "layer",
+        serde_json::Value::from(ProxyFailureLayer::CoordUpstream.as_str()),
+    ));
+    log_rotation_event_with("upstream-reject", &attr.workdir, nonce, &cause, &fields);
 }
 
 /// [`log_proxy_upstream_rejected`] for an ASYNC caller — same detached,
@@ -2730,15 +3307,23 @@ fn persist_proxy_nonces(map: &HashMap<String, NonceBinding>) {
 /// of spawns (a boot restore of 40 panes) pays ONE store rewrite instead of 40.
 const NONCE_PERSIST_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
+/// What one debounced write carries: the DEVICE bindings and (Phase 1a) the
+/// still-open grace entries, so a restart re-enters both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoncePersistSnapshot {
+    bindings: HashMap<String, crate::secure_storage::StoredNonceBinding>,
+    graced: HashMap<String, crate::secure_storage::StoredGracedNonce>,
+}
+
 /// Coalescing state for the debounced nonce persist.
 #[derive(Default)]
 struct NoncePersistQueue {
     /// The newest snapshot awaiting a write, if any.
-    pending: Option<HashMap<String, crate::secure_storage::StoredNonceBinding>>,
+    pending: Option<NoncePersistSnapshot>,
     /// Whether the flush thread is alive (it drains until `pending` is empty).
     flushing: bool,
     /// The last snapshot actually written, so an unchanged map costs nothing.
-    last_written: Option<HashMap<String, crate::secure_storage::StoredNonceBinding>>,
+    last_written: Option<NoncePersistSnapshot>,
     /// Consecutive failed write attempts for the CURRENT pending snapshot.
     /// Bounds the failure re-queue (see [`flush_nonce_persist_once`]) so a
     /// permanently broken store retries a few times instead of spinning the
@@ -2763,7 +3348,13 @@ static NONCE_PERSIST: once_cell::sync::Lazy<std::sync::Mutex<NoncePersistQueue>>
 /// re-mints (see [`crate::secure_storage::SecureStorage::load_coord_mcp_nonces`]).
 /// The in-memory registry stays authoritative for this process either way, so
 /// nothing a live session depends on rides the debounce.
-fn enqueue_nonce_persist(snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
+fn enqueue_nonce_persist(bindings: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
+    // The grace set rides every binding write (Phase 1a): a re-mint is exactly
+    // the event that adds a grace entry, so the two are never out of step.
+    let snapshot = NoncePersistSnapshot {
+        bindings,
+        graced: graced_nonce_snapshot(),
+    };
     let start_thread = {
         let mut q = match NONCE_PERSIST.lock() {
             Ok(q) => q,
@@ -2927,7 +3518,7 @@ fn flush_nonce_persist_once() {
     // Re-queue `snapshot` for another attempt, but never over a NEWER one a
     // concurrent `enqueue_nonce_persist` has already parked, and only while the
     // retry budget lasts.
-    fn requeue(snapshot: HashMap<String, crate::secure_storage::StoredNonceBinding>) {
+    fn requeue(snapshot: NoncePersistSnapshot) {
         let Ok(mut q) = NONCE_PERSIST.lock() else {
             return;
         };
@@ -2948,10 +3539,10 @@ fn flush_nonce_persist_once() {
         Ok(store) => {
             let to_write = snapshot_for_store(
                 &store,
-                snapshot.clone(),
+                snapshot.bindings.clone(),
                 PROXY_NONCES_RESTORED.get().is_some(),
             );
-            if let Err(e) = store.store_coord_mcp_nonces(&to_write) {
+            if let Err(e) = store.store_coord_mcp_nonce_sets(&to_write, &snapshot.graced) {
                 warn!("coord_mcp: failed to persist proxy nonces: {e}");
                 requeue(snapshot);
                 return;
@@ -2984,7 +3575,7 @@ fn persist_proxy_nonces_with_store(
 ) {
     // OQ3: persist DEVICE bindings only — agent nonces must never reach disk.
     let device_only = device_nonce_snapshot(map);
-    if let Err(e) = store.store_coord_mcp_nonces(&device_only) {
+    if let Err(e) = store.store_coord_mcp_nonce_sets(&device_only, &graced_nonce_snapshot()) {
         warn!("coord_mcp: failed to persist proxy nonces: {e}");
     }
 }
@@ -3052,7 +3643,7 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
     //     wrong, and costs one `OnceLock` to make right.
     if !nonce_persistence_enabled() {
         if PROXY_NONCES_RESTORE_DISABLED_LOGGED.set(()).is_ok() {
-            log_restore_event(0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
+            log_restore_event(0, 0, 0, "persistence disabled (COORD_MCP_PERSIST_NONCES=0)");
         }
         return NonceRestoreOutcome::default();
     }
@@ -3073,7 +3664,7 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
         Ok(s) => s,
         Err(e) => {
             warn!("coord_mcp: secure storage unavailable, cannot restore proxy nonces: {e}");
-            log_restore_event(0, 0, "secure storage unavailable");
+            log_restore_event(0, 0, 0, "secure storage unavailable");
             return NonceRestoreOutcome::default();
         }
     };
@@ -3098,7 +3689,7 @@ pub(crate) fn restore_proxy_nonces_from_store() -> NonceRestoreOutcome {
 /// sentinel to kill (671 production reject lines carried it, and none of them
 /// could be attributed), and an aggregate line is a *statement* that there is
 /// no single workdir — not a failure to record one.
-fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
+fn log_restore_event(restored: usize, skipped: usize, graced: usize, reason: &str) {
     if let Ok(mut slot) = LAST_BOOT_RESTORE.get_or_init(|| Mutex::new(None)).lock() {
         *slot = Some(BootRestoreRecord {
             restored,
@@ -3115,6 +3706,8 @@ fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
         &[
             ("restored", serde_json::Value::from(restored)),
             ("skipped", serde_json::Value::from(skipped)),
+            // Phase 1a: graced keys re-entered with their remaining window.
+            ("graced", serde_json::Value::from(graced)),
         ],
     );
 }
@@ -3129,6 +3722,21 @@ fn log_restore_event(restored: usize, skipped: usize, reason: &str) {
 /// ([`log_restore_event`]) — including the empty-store one, which is the
 /// signal a store-schema regression would show up as.
 fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> NonceRestoreOutcome {
+    // Phase 1a (plan 2026-09-02-steering-layers-unreadable-without-a-credential):
+    // the grace set restores whether or not any binding does — the measured
+    // failure was precisely a restart with keys still inside their window. One
+    // `grace` line per re-entered key, carrying the workdir, so the `key_prefix`
+    // join from a later `reject` lands on this process too.
+    let graced_restored = restore_graced_nonces(store.load_coord_mcp_graced_nonces());
+    for (nonce, workdir) in &graced_restored {
+        log_rotation_event(
+            "grace",
+            workdir,
+            nonce,
+            "restored from the encrypted store with its remaining window",
+        );
+    }
+    let graced = graced_restored.len();
     // A zero here is three different incidents, and the line must say which
     // (plan `2026-09-02-runner-persistent-proxy-bindings-not-restored-at-boot`
     // Phase 2): the old single reason read *"nothing to restore, or the store
@@ -3155,7 +3763,7 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 }
                 crate::secure_storage::NonceStoreLoad::Loaded(_) => unreachable!(),
             };
-            log_restore_event(0, 0, &reason);
+            log_restore_event(0, 0, graced, &reason);
             return NonceRestoreOutcome {
                 inserted: 0,
                 live_map_len: proxy_nonces()
@@ -3254,10 +3862,16 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
     // now returned SEPARATELY ([`NonceRestoreOutcome`]) so the summary can name
     // each for what it is.
     let skipped = persisted_total.saturating_sub(inserted);
-    log_restore_event(inserted, skipped, "boot restore from encrypted store");
+    log_restore_event(
+        inserted,
+        skipped,
+        graced,
+        "boot restore from encrypted store",
+    );
     info!(
         "coord_mcp: restored {inserted} persisted proxy nonce(s) from secure storage \
-         ({skipped} skipped as already-live; live map now {live_map_len})"
+         ({skipped} skipped as already-live; {graced} graced key(s) re-entered with their \
+         remaining window; live map now {live_map_len})"
     );
     NonceRestoreOutcome {
         inserted,
@@ -3455,14 +4069,8 @@ fn mint_and_register_nonce(
         // grace set into `evicted_graceable`, so the map is walked once under the
         // lock. Semantics are byte-for-byte the prior three passes — see this
         // fn's doc for the eviction rule.
-        // Each evicted entry carries the terminal its binding named (plan
-        // 2026-09-02-coord-access-dies-by-eviction-not-expiry Phase F4 §3):
-        // the rotation log's `evict` line must say WHICH slot was superseded,
-        // or the `(workdir, terminal_id)` grouping the eviction rule is keyed
-        // on is unreadable from the log — which is exactly what the F4
-        // measurement ran into.
-        let mut evicted_graceable: Vec<(String, Option<String>)> = Vec::new();
-        let mut evicted_agent: Vec<(String, Option<String>)> = Vec::new();
+        let mut evicted_graceable: Vec<(String, NonceBinding)> = Vec::new();
+        let mut evicted_agent: Vec<(String, NonceBinding)> = Vec::new();
         map.retain(|n, b| {
             // (1) Sweep EVERY expired ephemeral, whatever its workdir/class.
             // Because an ephemeral mint no longer evicts a prior same-workdir
@@ -3498,9 +4106,9 @@ fn mint_and_register_nonce(
                 && !b.lifetime.is_ephemeral()
             {
                 if b.principal == ProxyPrincipal::Device {
-                    evicted_graceable.push((n.clone(), b.terminal_id.clone()));
+                    evicted_graceable.push((n.clone(), b.clone()));
                 } else {
-                    evicted_agent.push((n.clone(), b.terminal_id.clone()));
+                    evicted_agent.push((n.clone(), b.clone()));
                 }
                 return false;
             }
@@ -3523,9 +4131,21 @@ fn mint_and_register_nonce(
                 minted_at: std::time::SystemTime::now(),
             },
         );
-        let graceable_names: Vec<String> =
-            evicted_graceable.iter().map(|(n, _)| n.clone()).collect();
-        grace_evicted_device_nonces(&graceable_names);
+        grace_evicted_device_nonces(&evicted_graceable);
+        // Phase 1d: the tombstone is what lets a later `reject` on either key
+        // name the workdir it belonged to and whether it was still graced.
+        record_nonce_tombstones(
+            &evicted_graceable,
+            TombstoneKind::Superseded,
+            true,
+            EVICT_CAUSE_REMINT,
+        );
+        record_nonce_tombstones(
+            &evicted_agent,
+            TombstoneKind::Superseded,
+            false,
+            EVICT_CAUSE_REMINT_AGENT,
+        );
         (map.clone(), evicted_graceable, evicted_agent)
     };
     // Rotation forensics (Phase 4/R6) — emitted AFTER the registry lock is
@@ -3542,26 +4162,29 @@ fn mint_and_register_nonce(
     // not a recording failure, and the `reject` line draws the same
     // distinction.
     let grace_cause = rotation_grace_cause();
-    for (n, evicted_terminal) in &evicted_device {
+    for (n, b) in &evicted_device {
         log_rotation_event_with(
             "evict",
             workdir,
             n,
-            "superseded by same-workdir+same-terminal persistent re-mint",
+            EVICT_CAUSE_REMINT,
             &[(
                 "terminal_id",
-                serde_json::Value::from(evicted_terminal.clone()),
+                serde_json::Value::from(b.terminal_id.clone()),
             )],
         );
         log_rotation_event("grace", workdir, n, &grace_cause);
     }
-    for (n, evicted_terminal) in &evicted_agent {
+    for (n, b) in &evicted_agent {
         log_rotation_event_with(
             "evict",
             workdir,
             n,
-            "superseded by same-workdir+same-terminal persistent re-mint (agent — fails closed, never graced)",
-            &[("terminal_id", serde_json::Value::from(evicted_terminal.clone()))],
+            EVICT_CAUSE_REMINT_AGENT,
+            &[(
+                "terminal_id",
+                serde_json::Value::from(b.terminal_id.clone()),
+            )],
         );
     }
     log_rotation_event_with(
@@ -3573,6 +4196,14 @@ fn mint_and_register_nonce(
     );
     (nonce, snapshot)
 }
+
+/// The `evict` cause for a persistent re-mint superseding a DEVICE key. One
+/// constant so the forensics line and the tombstone cannot drift.
+const EVICT_CAUSE_REMINT: &str = "superseded by same-workdir+same-terminal persistent re-mint";
+
+/// Same, for the AGENT class — which fails closed rather than riding grace.
+const EVICT_CAUSE_REMINT_AGENT: &str = "superseded by same-workdir+same-terminal persistent \
+     re-mint (agent — fails closed, never graced)";
 
 /// Evict every proxy nonce bound to `workdir` and persist the shrunken set.
 /// Close-time cleanup for PER-SESSION workdirs (relay chat): unlike the stable
@@ -3589,36 +4220,58 @@ fn mint_and_register_nonce(
 /// rules instead — the same "grace is for runner-initiated re-provisions of
 /// the persistent class only" invariant `mint_and_register_nonce` documents.
 pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
+    const CAUSE_DEVICE: &str = "per-session workdir closed";
+    const CAUSE_EPHEMERAL: &str =
+        "per-session workdir closed (ephemeral — never graced, kill switch stays enforceable)";
+    const CAUSE_AGENT: &str = "per-session workdir closed (agent — fails closed, never graced)";
     let (snapshot, evicted_device, evicted_ephemeral, evicted_agent) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
-        let evicted_device: Vec<String> = map
+        let evicted_device: Vec<(String, NonceBinding)> = map
             .iter()
             .filter(|(_, b)| {
                 b.workdir == workdir
                     && b.principal == ProxyPrincipal::Device
                     && !b.lifetime.is_ephemeral()
             })
-            .map(|(n, _)| n.clone())
+            .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
         if evicted_device.is_empty() && !map.values().any(|b| b.workdir == workdir) {
             return; // nothing bound to this workdir — skip the persist write
         }
-        let evicted_ephemeral: Vec<String> = map
+        let evicted_ephemeral: Vec<(String, NonceBinding)> = map
             .iter()
             .filter(|(_, b)| {
                 b.workdir == workdir
                     && b.principal == ProxyPrincipal::Device
                     && b.lifetime.is_ephemeral()
             })
-            .map(|(n, _)| n.clone())
+            .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
-        let evicted_agent: Vec<String> = map
+        let evicted_agent: Vec<(String, NonceBinding)> = map
             .iter()
             .filter(|(_, b)| b.workdir == workdir && b.principal != ProxyPrincipal::Device)
-            .map(|(n, _)| n.clone())
+            .map(|(n, b)| (n.clone(), b.clone()))
             .collect();
         map.retain(|_, b| b.workdir != workdir);
         grace_evicted_device_nonces(&evicted_device);
+        record_nonce_tombstones(
+            &evicted_device,
+            TombstoneKind::Superseded,
+            true,
+            CAUSE_DEVICE,
+        );
+        record_nonce_tombstones(
+            &evicted_ephemeral,
+            TombstoneKind::Superseded,
+            false,
+            CAUSE_EPHEMERAL,
+        );
+        record_nonce_tombstones(
+            &evicted_agent,
+            TombstoneKind::Superseded,
+            false,
+            CAUSE_AGENT,
+        );
         (
             map.clone(),
             evicted_device,
@@ -3628,25 +4281,15 @@ pub(crate) fn evict_proxy_nonces_for_workdir(workdir: &str) {
     };
     // Rotation forensics — outside the lock (see `mint_and_register_nonce`).
     let grace_cause = rotation_grace_cause();
-    for n in &evicted_device {
-        log_rotation_event("evict", workdir, n, "per-session workdir closed");
+    for (n, _) in &evicted_device {
+        log_rotation_event("evict", workdir, n, CAUSE_DEVICE);
         log_rotation_event("grace", workdir, n, &grace_cause);
     }
-    for n in &evicted_ephemeral {
-        log_rotation_event(
-            "evict",
-            workdir,
-            n,
-            "per-session workdir closed (ephemeral — never graced, kill switch stays enforceable)",
-        );
+    for (n, _) in &evicted_ephemeral {
+        log_rotation_event("evict", workdir, n, CAUSE_EPHEMERAL);
     }
-    for n in &evicted_agent {
-        log_rotation_event(
-            "evict",
-            workdir,
-            n,
-            "per-session workdir closed (agent — fails closed, never graced)",
-        );
+    for (n, _) in &evicted_agent {
+        log_rotation_event("evict", workdir, n, CAUSE_AGENT);
     }
     persist_proxy_nonces(&snapshot);
 }
@@ -4137,18 +4780,41 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
     }
     // Capture the revoked binding's workdir under the lock so the forensics
     // line below can name it — after the lock is released (file I/O).
-    let (snapshot, revoked_workdir) = {
+    let (snapshot, revoked_binding) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         match map.remove(nonce) {
             None => (None, None),
-            Some(b) => (Some(map.clone()), Some(b.workdir)),
+            Some(b) => (Some(map.clone()), Some(b)),
         }
     };
     let graced_removed = graced_nonces()
         .lock()
         .expect("graced nonce map poisoned")
-        .remove(nonce)
-        .is_some();
+        .remove(nonce);
+    if let Some(b) = &revoked_binding {
+        record_nonce_tombstones(
+            std::slice::from_ref(&(nonce.to_string(), b.clone())),
+            TombstoneKind::Revoked,
+            false,
+            "explicit revoke",
+        );
+    } else if let Some(g) = &graced_removed {
+        // The binding is long gone; the grace entry still knows the workdir.
+        record_nonce_tombstone(
+            nonce,
+            NonceTombstone {
+                workdir: g.workdir.clone(),
+                terminal_id: g.terminal_id.clone(),
+                principal: "device",
+                kind: TombstoneKind::Revoked,
+                evicted_at: std::time::SystemTime::now(),
+                grace_until: None,
+                cause: "explicit revoke (grace registry only)".to_string(),
+            },
+        );
+    }
+    let revoked_workdir = revoked_binding.map(|b| b.workdir);
+    let graced_removed = graced_removed.is_some();
     // Rotation forensics (Phase 3): an explicit revoke is the one way a key
     // dies that leaves NO other trace — no mint, no evict, no grace. Without
     // this line a revoked nonce's later `reject`s join to nothing.
@@ -4181,16 +4847,18 @@ pub(crate) fn revoke_proxy_nonce(nonce: &str) {
 pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
     // Collect (nonce, workdir) under the lock; emit the forensics lines after
     // releasing it (`log_rotation_event` does file I/O).
-    let (revoked, remaining): (Vec<(String, String)>, HashMap<String, NonceBinding>) = {
+    let cause = format!("agent teardown (agent {agent_id} — never graced, never persisted)");
+    let (revoked, remaining): (Vec<(String, NonceBinding)>, HashMap<String, NonceBinding>) = {
         let mut map = proxy_nonces().lock().expect("proxy nonce map poisoned");
         let mut revoked = Vec::new();
         map.retain(|n, b| {
             if b.principal == (ProxyPrincipal::Agent { agent_id }) {
-                revoked.push((n.clone(), b.workdir.clone()));
+                revoked.push((n.clone(), b.clone()));
                 return false;
             }
             true
         });
+        record_nonce_tombstones(&revoked, TombstoneKind::Revoked, false, &cause);
         // Clone the surviving map for the census. Teardown does NOT go through
         // `persist_proxy_nonces` (agent nonces are never persisted), so without
         // this the newest census would keep naming bindings that are already
@@ -4200,13 +4868,8 @@ pub(crate) fn revoke_agent_proxy_nonces(agent_id: Uuid) {
         (revoked, map.clone())
     };
     note_agent_binding_census(&remaining);
-    for (nonce, workdir) in &revoked {
-        log_rotation_event(
-            "revoke",
-            workdir,
-            nonce,
-            &format!("agent teardown (agent {agent_id} — never graced, never persisted)"),
-        );
+    for (nonce, b) in &revoked {
+        log_rotation_event("revoke", &b.workdir, nonce, &cause);
     }
     if !revoked.is_empty() {
         info!(
@@ -4250,14 +4913,20 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
         // Phase 4 join key. Resolved HERE because the binding is gone from the
         // map the moment `retain` returns — a later `terminal_id_for_nonce`
         // would find nothing and report every session-close revoke as unknown.
-        let mut revoked_bindings: Vec<(String, Option<String>)> = Vec::new();
+        let mut revoked_bindings: Vec<(String, NonceBinding)> = Vec::new();
         map.retain(|n, b| {
             if b.workdir == workdir {
-                revoked_bindings.push((n.clone(), b.terminal_id.clone()));
+                revoked_bindings.push((n.clone(), b.clone()));
                 return false;
             }
             true
         });
+        record_nonce_tombstones(
+            &revoked_bindings,
+            TombstoneKind::Revoked,
+            false,
+            "session close (last open session for this workdir)",
+        );
         let snapshot = (!revoked_bindings.is_empty()).then(|| map.clone());
         (revoked_bindings, snapshot)
     };
@@ -4278,7 +4947,7 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
     //
     // Emitted AFTER the map lock is released (the emitter does file I/O) and
     // BEFORE the persist, matching `revoke_agent_proxy_nonces`' discipline.
-    for (nonce, terminal_id) in &revoked_bindings {
+    for (nonce, b) in &revoked_bindings {
         log_rotation_event_with(
             "revoke",
             workdir,
@@ -4291,7 +4960,7 @@ pub(crate) fn release_workdir_on_session_close(workdir: &str) {
                     // Same spelling as the `reject` line's field: a
                     // terminal-less binding is the string "none", never JSON
                     // null, so the two lines join on one shape.
-                    terminal_id.clone().unwrap_or_else(|| "none".to_string()),
+                    b.terminal_id.clone().unwrap_or_else(|| "none".to_string()),
                 ),
             )],
         );
@@ -4786,7 +5455,14 @@ fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<Reusab
 /// that is the sibling kill this plan removed.
 pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
     let nonce = register_proxy_nonce(primary_wt, None);
-    write_mcp_json(primary_wt, &coord_mcp_proxy_config_json(bound_port, &nonce));
+    write_mcp_json(
+        primary_wt,
+        &coord_mcp_proxy_config_json(
+            bound_port,
+            &nonce,
+            ProxyConfigIdentity::device(primary_wt, None),
+        ),
+    );
 }
 
 /// Rewrite `workdir`'s `.mcp.json` through the canonical producer while
@@ -4813,7 +5489,476 @@ pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
 /// the rewrite in its own forensics line reports what happened rather than what
 /// it intended.
 fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) -> bool {
-    write_mcp_json(workdir, &coord_mcp_proxy_config_json(bound_port, nonce))
+    write_mcp_json(
+        workdir,
+        &coord_mcp_proxy_config_json(
+            bound_port,
+            nonce,
+            ProxyConfigIdentity::device(workdir, None),
+        ),
+    )
+}
+
+// ===========================================================================
+// The stdio shim arm — plan
+// 2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported,
+// Phase 3.
+// ===========================================================================
+
+/// Kill switch: `COORD_MCP_STDIO_SHIM=0` forces the http document on a box
+/// where the shim misbehaves. Read the way `COORD_MCP_PERSIST_NONCES` is
+/// ([`nonce_persistence_enabled`]): any value other than `0` is ON, and unset
+/// is ON in production but OFF inside `cfg!(test)` unless a test injects the
+/// gate. Ships ENABLED by default (`capability-ships-enabled`): the selftest
+/// gate is the safeguard, this is the preference switch, and they are
+/// separate mechanisms.
+pub(crate) const COORD_MCP_STDIO_SHIM_ENV: &str = "COORD_MCP_STDIO_SHIM";
+
+/// How long `--selftest` may take before the shim is treated as unprovisionable
+/// for this probe. Generous for a script that touches no network; tight enough
+/// that a wedged interpreter cannot stall a spawn.
+const STDIO_SHIM_SELFTEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The selftest verdict is cached per runner process and re-probed at most this
+/// often — a spawn must not pay a selftest each time, and a shim that appears
+/// (or breaks) mid-process is picked up within this window.
+const STDIO_SHIM_REPROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Subdirectory of `~/.qontinui` holding the shim credential files.
+const STDIO_SHIM_CREDENTIAL_DIR: &str = "coord-mcp-shim";
+
+/// Interpreters tried, in order, on the runner's inherited PATH.
+const STDIO_SHIM_INTERPRETERS: [&str; 2] = ["python3", "python"];
+
+/// Which principal a proxy config is being built for — the half of
+/// [`ProxyConfigIdentity`] that keys the credential file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProxyConfigPrincipal {
+    Device,
+    Agent(Uuid),
+}
+
+/// The session a proxy config is being built for. It decides WHICH
+/// runner-owned credential file the stdio shim reads, and therefore which
+/// later mint or rotation the shim follows:
+///
+/// * `workdir` + `Device` — one file per workdir, shared by the in-cwd
+///   `.mcp.json` write, the nonce-preserving rewrite and the terminal-less
+///   `--mcp-config` mint. A later mint for the same workdir (the one-slot
+///   eviction that killed sessions under the http shape) rewrites this file,
+///   and the shim of every session launched from it re-reads the fresh nonce.
+/// * `terminal_id` — when the mint is terminal-keyed (the identity seam), the
+///   file is too, matching [`mcp_config_file_name`]: two terminals in one cwd
+///   hold two nonces so caller self-identification stays deterministic, and a
+///   terminal-keyed nonce is only ever evicted by a re-mint of that terminal,
+///   which rewrites that terminal's file.
+/// * `Agent(id)` — keyed by the agent id, NOT by the bare `agent` class. Two
+///   agents spawned into one workdir must never share a file: the file names
+///   the nonce the proxy maps to THAT agent's JWT, and a shared file would let
+///   agent A present agent B's nonce after B's spawn — a principal crossing
+///   the shim is forbidden to introduce (plan Design decision 4: no principal
+///   is promoted). An evicted agent nonce therefore still 401s, and it is the
+///   shim's rung-2 fallthrough that carries that session, exactly as designed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyConfigIdentity<'a> {
+    pub(crate) workdir: &'a str,
+    pub(crate) principal: ProxyConfigPrincipal,
+    pub(crate) terminal_id: Option<&'a str>,
+}
+
+impl<'a> ProxyConfigIdentity<'a> {
+    pub(crate) fn device(workdir: &'a str, terminal_id: Option<&'a str>) -> Self {
+        Self {
+            workdir,
+            principal: ProxyConfigPrincipal::Device,
+            terminal_id,
+        }
+    }
+
+    pub(crate) fn agent(workdir: &'a str, agent_id: Uuid) -> Self {
+        Self {
+            workdir,
+            principal: ProxyConfigPrincipal::Agent(agent_id),
+            terminal_id: None,
+        }
+    }
+
+    /// `<sha256(workdir|principal[|terminal])[:16]>.json` — stable across
+    /// re-spawns of the same identity (so a rotation rewrites the SAME path the
+    /// live shim is reading), distinct across identities, and free of any
+    /// path-length or character hazard the raw workdir carries.
+    pub(crate) fn credential_file_name(&self) -> String {
+        use sha2::{Digest as _, Sha256};
+        let mut h = Sha256::new();
+        h.update(credential_workdir_key(self.workdir).as_bytes());
+        h.update(b"|");
+        match self.principal {
+            ProxyConfigPrincipal::Device => h.update(b"device"),
+            ProxyConfigPrincipal::Agent(id) => {
+                h.update(b"agent:");
+                h.update(id.as_simple().to_string().as_bytes());
+            }
+        }
+        if let Some(t) = self.terminal_id {
+            h.update(b"|");
+            h.update(t.as_bytes());
+        }
+        let digest = hex::encode(h.finalize());
+        format!("{}.json", &digest[..16])
+    }
+}
+
+/// The workdir as hashed into a credential file name. The four builder callers
+/// source the string differently (`primary_wt` at spawn, a census/record
+/// workdir on reconcile, `root.to_string_lossy()` for the shared root), and any
+/// spelling difference for ONE directory - a trailing separator, `\\` against
+/// `/`, drive-letter case on Windows - would make a rotation rewrite a
+/// DIFFERENT file from the one the live shim is reading: the stale-nonce-forever
+/// failure the stdio arm exists to end. So the key is spelling-insensitive:
+/// separators unified, trailing separators dropped (a bare root keeps its one),
+/// and case-folded on the case-insensitive filesystem.
+fn credential_workdir_key(workdir: &str) -> String {
+    let mut k = workdir.trim().replace('\\', "/");
+    while k.len() > 1 && k.ends_with('/') && !k.ends_with(":/") {
+        k.pop();
+    }
+    if cfg!(windows) {
+        k = k.to_lowercase();
+    }
+    k
+}
+
+/// The transport verdict the config builder acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StdioShimGate {
+    /// Emit the stdio document with this interpreter and shim.
+    Open {
+        interpreter: std::path::PathBuf,
+        shim: std::path::PathBuf,
+    },
+    /// `COORD_MCP_STDIO_SHIM=0` — the operator's preference, not a fault.
+    KillSwitch,
+    /// Inside `cfg!(test)` with the env var unset and no injected gate — the
+    /// http arm, silently, so the many config-writing unit tests never probe
+    /// the developer's PATH.
+    TestDefault,
+    /// The shim could not be provisioned, and here is why. The builder falls
+    /// open to the http document and records the reason.
+    Refused(String),
+}
+
+/// Test-only injection of the gate, so the config-shape tests can assert BOTH
+/// arms without depending on whether the machine running them has a python
+/// and a config checkout. `Probe` runs the REAL selftest path against a
+/// caller-supplied script, uncached — that is how the refused-selftest arms
+/// (missing interpreter, non-zero exit, timeout) are exercised for real.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+enum StdioShimGateOverride {
+    Fixed(StdioShimGate),
+    Probe {
+        shim: std::path::PathBuf,
+        interpreters: Vec<std::path::PathBuf>,
+        budget: std::time::Duration,
+    },
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDIO_SHIM_GATE_OVERRIDE: std::cell::RefCell<Option<StdioShimGateOverride>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII installer for [`STDIO_SHIM_GATE_OVERRIDE`]: thread-local, so parallel
+/// tests never see each other's gate, and cleared on drop (panic path
+/// included).
+#[cfg(test)]
+struct StdioShimGateGuard;
+
+#[cfg(test)]
+impl StdioShimGateGuard {
+    fn install(gate: StdioShimGateOverride) -> Self {
+        STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = Some(gate));
+        StdioShimGateGuard
+    }
+}
+
+#[cfg(test)]
+impl Drop for StdioShimGateGuard {
+    fn drop(&mut self) {
+        STDIO_SHIM_GATE_OVERRIDE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Resolve which transport the config builder emits. Order:
+///
+/// 1. the kill switch (`COORD_MCP_STDIO_SHIM=0`) — always wins;
+/// 2. a test-injected gate;
+/// 3. the `cfg!(test)` default when the env var is unset — http, silently;
+/// 4. the cached provisioning probe ([`cached_stdio_shim_probe`]).
+///
+/// Callers must not hold the nonce-registry lock: step 4 may spawn a process.
+pub(crate) fn stdio_shim_gate() -> StdioShimGate {
+    let switch = match std::env::var(COORD_MCP_STDIO_SHIM_ENV) {
+        Ok(v) => Some(v.trim() != "0"),
+        Err(_) => None,
+    };
+    if switch == Some(false) {
+        return StdioShimGate::KillSwitch;
+    }
+    #[cfg(test)]
+    if let Some(over) = STDIO_SHIM_GATE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return match over {
+            StdioShimGateOverride::Fixed(gate) => gate,
+            StdioShimGateOverride::Probe {
+                shim,
+                interpreters,
+                budget,
+            } => probe_stdio_shim(Some(shim), &interpreters, budget),
+        };
+    }
+    if switch.is_none() && cfg!(test) {
+        return StdioShimGate::TestDefault;
+    }
+    cached_stdio_shim_probe()
+}
+
+/// The per-process selftest cache behind [`stdio_shim_gate`].
+static STDIO_SHIM_PROBE: Mutex<Option<(std::time::Instant, StdioShimGate)>> = Mutex::new(None);
+
+/// Set while a background re-probe is running, so a stale cache spawns ONE
+/// refresh thread rather than one per concurrent spawn.
+static STDIO_SHIM_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Fill the selftest cache off the request path. Called once at boot from a
+/// `spawn_blocking`, so the first spawn after start reads a verdict instead of
+/// paying the probe inline on a tokio worker thread.
+pub(crate) fn warm_stdio_shim_probe() {
+    let _ = cached_stdio_shim_probe();
+}
+
+/// Probe the shim at most once per [`STDIO_SHIM_REPROBE_INTERVAL`].
+///
+/// This is reached inline from async spawn paths, so it must not park a tokio
+/// worker on a subprocess: a FRESH verdict is served from the cache; a STALE
+/// one is served as-is while a single background thread re-probes and refills
+/// the slot (the next caller after that reads the new verdict); only a COLD
+/// cache probes inline, and the boot warm-up makes that the exception.
+fn cached_stdio_shim_probe() -> StdioShimGate {
+    {
+        let slot = STDIO_SHIM_PROBE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((at, gate)) = slot.as_ref() {
+            if at.elapsed() < STDIO_SHIM_REPROBE_INTERVAL {
+                return gate.clone();
+            }
+            let stale = gate.clone();
+            drop(slot);
+            if !STDIO_SHIM_REFRESH_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let spawned = std::thread::Builder::new()
+                    .name("coord-mcp-stdio-shim-probe".into())
+                    .spawn(|| {
+                        let _ = probe_stdio_shim_and_store();
+                        STDIO_SHIM_REFRESH_IN_FLIGHT
+                            .store(false, std::sync::atomic::Ordering::Release);
+                    });
+                if spawned.is_err() {
+                    STDIO_SHIM_REFRESH_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            return stale;
+        }
+    }
+    probe_stdio_shim_and_store()
+}
+
+/// The uncached fill: probe, log the verdict, store it. The lock is held across
+/// the probe on purpose so concurrent COLD callers wait for one verdict rather
+/// than each paying their own selftest; a caller that finds the slot filled
+/// fresh under the lock returns that instead of probing again.
+fn probe_stdio_shim_and_store() -> StdioShimGate {
+    let mut slot = STDIO_SHIM_PROBE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, gate)) = slot.as_ref() {
+        if at.elapsed() < STDIO_SHIM_REPROBE_INTERVAL {
+            return gate.clone();
+        }
+    }
+    let interpreters: Vec<std::path::PathBuf> = STDIO_SHIM_INTERPRETERS
+        .iter()
+        .filter_map(|name| crate::automation_stack::which(name))
+        .collect();
+    let gate = probe_stdio_shim(
+        resolve_stdio_shim_path(),
+        &interpreters,
+        STDIO_SHIM_SELFTEST_BUDGET,
+    );
+    match &gate {
+        StdioShimGate::Open { interpreter, shim } => info!(
+            "coord_mcp: stdio shim provisionable — {} {} --selftest passed; emitting \
+             type=stdio coord-mcp configs for the next {}s",
+            interpreter.display(),
+            shim.display(),
+            STDIO_SHIM_REPROBE_INTERVAL.as_secs()
+        ),
+        StdioShimGate::Refused(reason) => warn!(
+            "coord_mcp: stdio shim NOT provisionable — {reason}; emitting type=http coord-mcp \
+             configs (fail-open) for the next {}s",
+            STDIO_SHIM_REPROBE_INTERVAL.as_secs()
+        ),
+        StdioShimGate::KillSwitch | StdioShimGate::TestDefault => {}
+    }
+    *slot = Some((std::time::Instant::now(), gate.clone()));
+    gate
+}
+
+/// `<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`, resolved
+/// the way the runner resolves that repo everywhere else (the workspace root),
+/// or `None` when no root resolves. Existence is the probe's business.
+fn resolve_stdio_shim_path() -> Option<std::path::PathBuf> {
+    Some(
+        qontinui_root_dir()?
+            .join("qontinui-claude-config")
+            .join("scripts")
+            .join(COORD_MCP_STDIO_SHIM_FILE),
+    )
+}
+
+/// The uncached probe: the shim must exist, and `<interpreter> <shim>
+/// --selftest` must exit 0 within `budget` for the FIRST interpreter that
+/// manages it. Every failure is a [`StdioShimGate::Refused`] naming what was
+/// tried, never an error — the builder's fail-open contract.
+fn probe_stdio_shim(
+    shim: Option<std::path::PathBuf>,
+    interpreters: &[std::path::PathBuf],
+    budget: std::time::Duration,
+) -> StdioShimGate {
+    let Some(shim) = shim else {
+        return StdioShimGate::Refused(format!(
+            "no workspace root resolved, so <root>/qontinui-claude-config/scripts/\
+             {COORD_MCP_STDIO_SHIM_FILE} cannot be located"
+        ));
+    };
+    if !shim.is_file() {
+        return StdioShimGate::Refused(format!("shim absent at {}", shim.display()));
+    }
+    if interpreters.is_empty() {
+        return StdioShimGate::Refused(format!(
+            "no {} on PATH",
+            STDIO_SHIM_INTERPRETERS.join(" or ")
+        ));
+    }
+    let mut refusals = Vec::with_capacity(interpreters.len());
+    for interpreter in interpreters {
+        match run_stdio_shim_selftest(interpreter, &shim, budget) {
+            Ok(()) => {
+                return StdioShimGate::Open {
+                    interpreter: interpreter.clone(),
+                    shim,
+                }
+            }
+            Err(why) => refusals.push(format!("{}: {why}", interpreter.display())),
+        }
+    }
+    StdioShimGate::Refused(format!(
+        "{} --selftest refused by every interpreter — {}",
+        shim.display(),
+        refusals.join("; ")
+    ))
+}
+
+/// Run `<interpreter> <shim> --selftest` with all three stdio streams closed
+/// and a hard deadline. `Err` names the failure class: spawn failure (the
+/// missing-interpreter arm), a non-zero exit, or no exit within the budget
+/// (the child is killed and reaped).
+fn run_stdio_shim_selftest(
+    interpreter: &Path,
+    shim: &Path,
+    budget: std::time::Duration,
+) -> Result<(), String> {
+    let mut cmd = crate::process_helpers::no_window(interpreter);
+    cmd.arg(shim)
+        .arg("--selftest")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("--selftest exited {status}"))
+                };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "--selftest did not exit within {:.1}s",
+                        budget.as_secs_f32()
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+    }
+}
+
+/// `~/.qontinui/coord-mcp-shim/` — outside every repo, so no workdir artifact
+/// exists and `MANAGED_REPO_EXCLUDES` is untouched (plan Design decision 3).
+fn stdio_shim_credential_dir() -> Option<std::path::PathBuf> {
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join(STDIO_SHIM_CREDENTIAL_DIR))
+}
+
+/// Write the flat `{url, headers}` credential object the shim reads, owner-only
+/// ([`crate::fs_perms::write_owner_only`] — the mode [`write_mcp_json`] uses),
+/// into a directory restricted to the owner BEFORE the write. Returns the
+/// file's absolute path for the document's `args`. Any failure is the
+/// caller's fall-open.
+fn write_stdio_shim_credential(
+    identity: ProxyConfigIdentity<'_>,
+    url: &serde_json::Value,
+    headers: &serde_json::Value,
+) -> std::io::Result<std::path::PathBuf> {
+    let dir = stdio_shim_credential_dir().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no home directory to derive ~/.qontinui from",
+        )
+    })?;
+    std::fs::create_dir_all(&dir)?;
+    // Load-bearing, not advisory: a directory this runner could not restrict is
+    // a reason to fall open to the http document, never a warning to write past.
+    crate::fs_perms::restrict_dir_to_owner(&dir).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("could not restrict {} to owner-only: {e}", dir.display()),
+        )
+    })?;
+    let name = identity.credential_file_name();
+    let path = dir.join(&name);
+    let body = serde_json::json!({ "url": url, "headers": headers });
+    let bytes = serde_json::to_string_pretty(&body)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // Atomic replace: the shim re-reads this file on EVERY call, so a call that
+    // lands mid-rotation must see the old document or the new one, never an
+    // empty or half-written one. Written owner-only to a sibling temp path,
+    // then renamed over the live name.
+    let tmp = dir.join(format!("{name}.tmp-{}", std::process::id()));
+    crate::fs_perms::write_owner_only(&tmp, bytes.as_bytes())?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(path)
 }
 
 /// THE coord-mcp proxy config document — the single writer of this JSON shape
@@ -4854,8 +5999,42 @@ fn rewrite_config_preserving_nonce(workdir: &str, bound_port: u16, nonce: &str) 
 /// `Authorization` comes back `[REDACTED]` — unchanged from before, not a
 /// regression, and the reason a later phase may drop the custom header once the
 /// config-repo layer accepts both.)
-fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
-    serde_json::json!({
+///
+/// ## The stdio arm (plan 2026-09-05 transport-death, Phase 3)
+///
+/// The MCP client SNAPSHOTS an http server's `headers` at launch and never
+/// re-reads the file, so a nonce rotated or evicted after launch kills every
+/// coord tool in that session for the rest of its life. When the fleet's stdio
+/// shim is provisionable ([`stdio_shim_gate`]), this builder emits
+/// `{"type":"stdio","command":<abs python>,"args":[<abs shim>,"--credential",<abs file>]}`
+/// instead, and writes the nonce into that runner-owned credential file
+/// ([`write_stdio_shim_credential`]) **in the same call** — so no caller can
+/// emit a stdio document without the file the shim reads, and every one of
+/// the four callers (in-cwd spawn write, nonce-preserving rewrite, the agent
+/// twin, the `--mcp-config` / `provision-session` mint) rewrites that file on
+/// every mint and rotation. The shim re-reads it per call, which is what makes
+/// rotation and eviction survivable.
+///
+/// **Fail-open, never fail-closed.** Any reason the stdio arm cannot be taken —
+/// gate closed, credential file unwritable — yields today's http document
+/// unchanged. A broken shim must never leave a session with NO coord tools;
+/// that would be worse than the defect. And it does NOT write the
+/// `.coord-mcp-status` breadcrumb: that file means "coord-mcp UNREACHABLE",
+/// and a session that fell open to the http door has coord-mcp.
+fn coord_mcp_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+) -> serde_json::Value {
+    proxy_config_json_for(bound_port, nonce, identity, false)
+}
+
+/// The http-transport document — today's shape, byte-for-byte — with the
+/// AGENT principal marker added to `headers` when `agent_marked`. This is the
+/// `{url, headers}` contract; the stdio arm carries exactly this object into
+/// the credential file rather than inline.
+fn http_proxy_config_json(bound_port: u16, nonce: &str, agent_marked: bool) -> serde_json::Value {
+    let mut doc = serde_json::json!({
         "mcpServers": {
             "coord-mcp": {
                 "type": "http",
@@ -4866,7 +6045,81 @@ fn coord_mcp_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Valu
                 }
             }
         }
-    })
+    });
+    if agent_marked {
+        if let Some(headers) = doc
+            .pointer_mut("/mcpServers/coord-mcp/headers")
+            .and_then(|h| h.as_object_mut())
+        {
+            headers.insert(
+                COORD_MCP_PRINCIPAL_HEADER_JSON.to_string(),
+                serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
+            );
+        }
+    }
+    doc
+}
+
+/// The one body behind both public builders: pick the transport, and under
+/// stdio write the credential file BEFORE emitting a document that names it.
+fn proxy_config_json_for(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+    agent_marked: bool,
+) -> serde_json::Value {
+    let http = http_proxy_config_json(bound_port, nonce, agent_marked);
+    let (interpreter, shim) = match stdio_shim_gate() {
+        StdioShimGate::Open { interpreter, shim } => (interpreter, shim),
+        StdioShimGate::TestDefault => return http,
+        StdioShimGate::KillSwitch => {
+            info!(
+                "coord_mcp: {COORD_MCP_STDIO_SHIM_ENV}=0 — emitting the http proxy document \
+                 for {} (stdio shim disabled by preference, not by fault)",
+                identity.workdir
+            );
+            return http;
+        }
+        StdioShimGate::Refused(reason) => {
+            note_stdio_fall_open(identity.workdir, nonce, &reason);
+            return http;
+        }
+    };
+    let entry = &http["mcpServers"]["coord-mcp"];
+    match write_stdio_shim_credential(identity, &entry["url"], &entry["headers"]) {
+        Ok(credential) => serde_json::json!({
+            "mcpServers": {
+                "coord-mcp": {
+                    "type": "stdio",
+                    "command": interpreter.to_string_lossy(),
+                    "args": [
+                        shim.to_string_lossy(),
+                        COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG,
+                        credential.to_string_lossy(),
+                    ],
+                }
+            }
+        }),
+        Err(e) => {
+            note_stdio_fall_open(
+                identity.workdir,
+                nonce,
+                &format!("credential file write failed: {e}"),
+            );
+            http
+        }
+    }
+}
+
+/// Record one fall-open to the http document: a `warn!` for the live log plus
+/// a rotation-log-style line, so "how often did the shim fall open, and why"
+/// is answerable from the forensics stream without asking a session.
+fn note_stdio_fall_open(workdir: &str, nonce: &str, reason: &str) {
+    warn!(
+        "coord_mcp: stdio shim unavailable — falling open to the http proxy document for \
+         {workdir}: {reason}"
+    );
+    log_rotation_event("fall-open", workdir, nonce, reason);
 }
 
 /// Write the AGENT-path `.mcp.json`: identical shape to
@@ -4905,7 +6158,11 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
     let nonce = register_agent_proxy_nonce(primary_wt, agent_id);
     write_mcp_json(
         primary_wt,
-        &coord_mcp_agent_proxy_config_json(bound_port, &nonce),
+        &coord_mcp_agent_proxy_config_json(
+            bound_port,
+            &nonce,
+            ProxyConfigIdentity::agent(primary_wt, agent_id),
+        ),
     );
 }
 
@@ -4927,18 +6184,18 @@ pub(crate) fn write_coord_mcp_agent_proxy_config(
 /// *what credential is this*, and exactly the wrong one for the guard asking
 /// *is this file mine to overwrite* — for which the marker is the only evidence
 /// on disk. See [`IntendedWrite`].
-fn coord_mcp_agent_proxy_config_json(bound_port: u16, nonce: &str) -> serde_json::Value {
-    let mut doc = coord_mcp_proxy_config_json(bound_port, nonce);
-    if let Some(headers) = doc
-        .pointer_mut("/mcpServers/coord-mcp/headers")
-        .and_then(|h| h.as_object_mut())
-    {
-        headers.insert(
-            COORD_MCP_PRINCIPAL_HEADER_JSON.to_string(),
-            serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
-        );
-    }
-    doc
+///
+/// Under the stdio arm there is no inline `headers` object; the marker rides
+/// in the credential file's `headers` instead (written by the shared body
+/// BEFORE the document is emitted), and every reader resolves it through
+/// [`crate::coord_mcp_config::effective_coord_mcp_entry`] — so the guard above
+/// sees it in both transports.
+fn coord_mcp_agent_proxy_config_json(
+    bound_port: u16,
+    nonce: &str,
+    identity: ProxyConfigIdentity<'_>,
+) -> serde_json::Value {
+    proxy_config_json_for(bound_port, nonce, identity, true)
 }
 
 /// Filename of the breadcrumb dropped into a session workdir when coord-mcp is
@@ -5023,9 +6280,19 @@ fn breadcrumb_stamp_json(workdir: &str, verdict: &str, port: Option<u16>) -> Str
 ///
 /// Two lines, and the split is load-bearing:
 ///
-/// 1. `coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate`
-///    — byte-compatible in shape with every breadcrumb ever written, so the
-///    prose readers and `/coord-revive`'s mechanical read keep working.
+/// 1. `coord-mcp UNREACHABLE ({reason}) — coord-mcp degraded; use /gate or /coord-revive`
+///    — the `coord-mcp UNREACHABLE (` prefix and the ` — ` separator are
+///    byte-compatible with every breadcrumb ever written, so the prose readers
+///    and `/coord-revive`'s mechanical read keep working. The remedy clause
+///    after the dash used to scope itself to gate registration (`gate
+///    registration degraded; use /gate`), which under-stated the outage — a
+///    dead transport loses EVERY coord tool, not one — and named one door
+///    where its sibling [`write_unprovisioned_breadcrumb`] already named two.
+///    Widened by plan
+///    `2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported`
+///    Phase 4 (the dossier's N+4 residual). Only the clause moved; `{reason}`
+///    and its call sites are owned by `scripts/breadcrumb-reason-drift.py`'s
+///    table and are untouched.
 /// 2. One JSON object ([`breadcrumb_stamp_json`]) carrying when/where/what.
 ///
 /// `verdict` is the uppercase cause token ([`ProbeVerdict::token`] for the probe
@@ -5037,7 +6304,9 @@ pub(crate) fn write_degraded_breadcrumb(
     verdict: &str,
     port: Option<u16>,
 ) {
-    let line1 = format!("coord-mcp UNREACHABLE ({reason}) — gate registration degraded; use /gate");
+    let line1 = format!(
+        "coord-mcp UNREACHABLE ({reason}) — coord-mcp degraded; use /gate or /coord-revive"
+    );
     let line2 = breadcrumb_stamp_json(workdir, verdict, port);
     let path = Path::new(workdir).join(COORD_MCP_STATUS_FILE);
     if let Err(e) = std::fs::write(&path, format!("{line1}\n{line2}\n")) {
@@ -6076,6 +7345,17 @@ fn existing_config_write_verdict(workdir: &str, intended: IntendedWrite) -> Exis
         // unparseable foreign file → do not clobber
         Err(_) => return ExistingConfigVerdict::Foreign,
     };
+    // A stdio-shaped config whose credential file is gone or unreadable
+    // resolves to NO effective entry, so every principal predicate below reads
+    // `false` - and `false` must never mean "permit anything" (see
+    // `config_doc_is_agent_marked`). An agent's file with a missing credential
+    // would otherwise be overwritten by a device reconcile. Refuse: the file is
+    // not ours to classify until its credential can be read.
+    if crate::coord_mcp_config::config_doc_is_stdio_shim(&parsed)
+        && crate::coord_mcp_config::effective_coord_mcp_entry(&parsed).is_none()
+    {
+        return ExistingConfigVerdict::Foreign;
+    }
     match parsed.get("mcpServers").and_then(|m| m.as_object()) {
         Some(servers) => {
             if servers.len() == 1 && servers.contains_key("coord-mcp") {
@@ -6144,9 +7424,9 @@ fn read_proxy_port(workdir: &str) -> Option<u16> {
 fn read_proxy_port_from(path: &Path) -> Option<u16> {
     let s = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&s).ok()?;
-    let url = v
-        .pointer("/mcpServers/coord-mcp/url")
-        .and_then(|u| u.as_str())?;
+    // Through the effective entry, so a stdio-shaped config (whose `url` lives
+    // in the credential file it names) reads back like an http one.
+    let url = crate::coord_mcp_config::effective_coord_mcp_url(&v)?;
     let rest = url.strip_prefix("http://127.0.0.1:")?;
     let port_str = rest.strip_suffix("/coord-mcp")?;
     port_str.parse::<u16>().ok()
@@ -6295,6 +7575,12 @@ fn classify_mcp_json_doc(doc: &serde_json::Value) -> McpJsonShape {
     };
     if servers.len() != 1 || !servers.contains_key("coord-mcp") {
         return McpJsonShape::Foreign;
+    }
+    // The stdio arm names the fleet shim in `args[0]` and is proxy-class by
+    // construction (the shim addresses the loopback proxy and nothing else);
+    // classifying it off `args` keeps this reader credential-free.
+    if crate::coord_mcp_config::config_doc_is_stdio_shim(doc) {
+        return McpJsonShape::OursProxy;
     }
     // Proxy shape iff the URL is our loopback proxy. Read through the same
     // `url` pointer `read_proxy_port_from` uses; nothing else about the entry
@@ -6627,11 +7913,12 @@ pub(crate) fn provision_coord_mcp_config_file(
 /// exactly the stale-:9879 config this plan's Phase-0 probe found in the wild).
 /// The route cannot bypass this: it has no port argument to pass.
 ///
-/// `lifetime` and `terminal_id` are the ONLY axes the two callers differ on —
+/// `lifetime` and `terminal_id` are the ONLY axes the two callers differed on —
 /// see [`NonceLifetime`] for why the mint route's nonces are bounded and the
 /// seam's are not, and [`NonceBinding::terminal_id`] for why only the seam can
-/// name a terminal (the route serves sessions the runner did not spawn, so the
-/// ephemeral arm below ignores the argument by construction).
+/// name a terminal. Since the stdio arm the mint route no longer comes through
+/// here ([`provision_session_proxy_config`] is pinned to the http shape); the
+/// ephemeral arm is kept for the route's nonce lifetime.
 fn mint_device_proxy_config(
     workdir: &str,
     lifetime: NonceLifetime,
@@ -6643,7 +7930,11 @@ fn mint_device_proxy_config(
     } else {
         register_proxy_nonce(workdir, terminal_id)
     };
-    Some(coord_mcp_proxy_config_json(bound_port, &nonce))
+    Some(coord_mcp_proxy_config_json(
+        bound_port,
+        &nonce,
+        ProxyConfigIdentity::device(workdir, terminal_id),
+    ))
 }
 
 /// Mint coord identity for a session the runner did NOT spawn: the
@@ -6666,8 +7957,26 @@ fn mint_device_proxy_config(
 /// Passes `terminal_id: None` — this route serves BARE sessions the runner did
 /// not spawn, so there is no terminal to bind (see
 /// [`register_session_proxy_nonce`]).
+///
+/// **Always the http shape, whatever [`stdio_shim_gate`] says.** This route's
+/// consumers are not MCP clients: `scripts/coord-provision-nonce.sh`,
+/// `scripts/lib/coord-credential.psm1` and, through them, `/coord-revive`'s L4
+/// source 3 and the `/gate` / `/policy` in-process-nonce rung read the nonce
+/// out of `.mcpServers["coord-mcp"].url` + `.headers` and replay it as an HTTP
+/// header themselves. A stdio document here (no `url`, no `headers`) would read
+/// as `PROVISION_SHAPE_UNRECOGNISED` and silently kill that rung on every
+/// machine the day the gate opened - the route is pinned to
+/// [`http_proxy_config_json`] and a test holds it there.
 pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
-    mint_device_proxy_config(workdir, NonceLifetime::ephemeral(), None)
+    let bound_port = resolve_bound_api_port()?;
+    Some(provision_session_proxy_config_at(workdir, bound_port))
+}
+
+/// [`provision_session_proxy_config`] over an explicit bound port (the part a
+/// test can reach without a listening API).
+fn provision_session_proxy_config_at(workdir: &str, bound_port: u16) -> serde_json::Value {
+    let nonce = register_session_proxy_nonce(workdir);
+    http_proxy_config_json(bound_port, &nonce, false)
 }
 
 /// Read the per-session proxy NONCE out of an existing coord-mcp `.mcp.json`, if
@@ -8117,6 +9426,7 @@ mod tests {
     /// process-env, `OnceLock` or home-dir mutation.
     #[test]
     fn session_identity_gate_requires_handshake_and_marker_and_defaults_denied() {
+        let _amb = crate::test_env::isolated_ambient();
         const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
         // No handshake ⇒ NoHandshake, regardless of the marker. The caller must
@@ -8232,6 +9542,7 @@ mod tests {
     /// the old env var name any more.
     #[test]
     fn the_master_env_flag_arm_is_deleted_not_deprecated() {
+        let _amb = crate::test_env::isolated_ambient();
         // Setting the retired flag must not change any verdict: the resolver
         // has no env input at all, and the live gate is closed in this process
         // because no handshake key was ever initialized.
@@ -8289,6 +9600,7 @@ mod tests {
     /// and neither can evict or revoke the other.
     #[test]
     fn ephemeral_nonce_is_revoked_by_the_gate_while_persistent_is_untouched() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-eph-{}", uuid::Uuid::now_v7()));
         let wd = dir.to_string_lossy().to_string();
 
@@ -8373,6 +9685,7 @@ mod tests {
     /// both survive the sweep.
     #[test]
     fn expired_ephemeral_nonces_are_swept_on_mint() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/sweep-test/{}", uuid::Uuid::now_v7());
 
         // Seed one already-expired ephemeral and one live ephemeral, both for a
@@ -8435,6 +9748,7 @@ mod tests {
     /// than waiting out [`EPHEMERAL_NONCE_TTL`].
     #[test]
     fn ephemeral_nonce_expires_and_evicts_while_persistent_never_expires() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/expiry-test/{}", uuid::Uuid::now_v7());
 
         // An already-expired ephemeral binding.
@@ -8480,6 +9794,7 @@ mod tests {
     /// available here.)
     #[test]
     fn terminal_id_for_nonce_returns_the_minted_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-terminal-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-{}", uuid::Uuid::now_v7());
 
@@ -8510,6 +9825,7 @@ mod tests {
     /// sibling-DoS the ephemeral class already had to fix.
     #[test]
     fn two_terminals_in_one_workdir_get_two_nonces_each_naming_its_own_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-two-terminals-{}", uuid::Uuid::now_v7());
         let t1 = format!("terminal-a-{}", uuid::Uuid::now_v7());
         let t2 = format!("terminal-b-{}", uuid::Uuid::now_v7());
@@ -8557,6 +9873,7 @@ mod tests {
     /// and neither may 401 a live terminal's client.
     #[test]
     fn terminalless_mint_has_no_terminal_and_still_evicts_its_own_class() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/selfid-terminalless-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-live-{}", uuid::Uuid::now_v7());
 
@@ -8594,6 +9911,7 @@ mod tests {
     /// The runner-spawn nonce in the same snapshot still persists.
     #[test]
     fn ephemeral_nonces_are_never_persisted() {
+        let _amb = crate::test_env::isolated_ambient();
         let (dir, store) = temp_store("ephemeral-never-persisted");
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
@@ -8622,7 +9940,11 @@ mod tests {
     /// from the runner-spawn path.
     #[test]
     fn proxy_config_json_is_one_shape_for_both_mint_paths() {
-        let v = coord_mcp_proxy_config_json(9877, "abc123");
+        let v = coord_mcp_proxy_config_json(
+            9877,
+            "abc123",
+            ProxyConfigIdentity::device("D:/one-shape", None),
+        );
         let server = &v["mcpServers"]["coord-mcp"];
         assert_eq!(server["type"], "http");
         assert_eq!(server["url"], "http://127.0.0.1:9877/coord-mcp");
@@ -8745,7 +10067,9 @@ mod tests {
     /// sibling tests that read the DEFAULT store (notably
     /// `auth::device_jwt_tests::needs_refresh_when_no_token`), which is why this
     /// module no longer touches global env at all.
-    fn temp_store(tag: &str) -> (std::path::PathBuf, crate::secure_storage::SecureStorage) {
+    pub(super) fn temp_store(
+        tag: &str,
+    ) -> (std::path::PathBuf, crate::secure_storage::SecureStorage) {
         let dir =
             std::env::temp_dir().join(format!("coord-mcp-{tag}-store-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -8764,7 +10088,7 @@ mod tests {
     /// triggers a restore, not only in the ones that read the log back.
     static RESTORE_FORENSICS_LOCK: Mutex<()> = Mutex::new(());
 
-    fn restore_forensics_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn restore_forensics_lock() -> std::sync::MutexGuard<'static, ()> {
         // A panicking peer test must not cascade into unrelated failures here:
         // the guard protects an ordering, not an invariant, so poison is
         // recovered rather than propagated.
@@ -8797,6 +10121,7 @@ mod tests {
     /// baked `Authorization` bearer (the proxy injects a live one per request).
     #[test]
     fn write_coord_mcp_proxy_config_emits_loopback_nonce_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp = std::env::temp_dir().join(format!("coord-mcp-proxy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let primary_wt = tmp.to_string_lossy().to_string();
@@ -8868,6 +10193,7 @@ mod tests {
     /// must never forward a non-device bearer.
     #[test]
     fn proxy_request_gate_forwards_only_nonce_plus_device_bearer() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let mk = |sub_type: &str| {
             let payload =
@@ -8950,6 +10276,7 @@ mod tests {
     ///    here for symmetry).
     #[test]
     fn proxy_request_gate_binds_agent_nonce_to_agent_bearer() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let mk = |sub_type: &str| {
             let payload =
@@ -9017,6 +10344,7 @@ mod tests {
     /// coord tool call retry; it cannot stall the session's local progress.
     #[test]
     fn missing_device_jwt_degrades_proxy_only_not_local_work() {
+        let _amb = crate::test_env::isolated_ambient();
         // (a) The degrade is an ACTIONABLE retry, distinct from the hard 401.
         let (status, msg) = device_jwt_refreshing_error();
         assert_eq!(status, 503, "transient credential gap → retryable, not 401");
@@ -9126,6 +10454,7 @@ mod tests {
     /// nonce's bound principal differs (Agent vs Device).
     #[test]
     fn write_coord_mcp_agent_proxy_config_emits_agent_bound_loopback_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp = std::env::temp_dir().join(format!("coord-mcp-aproxy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
@@ -9158,6 +10487,562 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -----------------------------------------------------------------------
+    // The stdio shim arm — plan 2026-09-05 transport-death, Phase 3.
+    // -----------------------------------------------------------------------
+
+    /// A fixture that OPENS the gate with a fake interpreter/shim (no probe)
+    /// and isolates `~/.qontinui` so the credential file lands in a temp dir.
+    /// Returns the ambient guard (which holds the env lock), the gate guard,
+    /// and the two fake paths the document must carry verbatim.
+    fn open_stdio_gate_for_test() -> (
+        qontinui_runner_lib::ambient::test_support::IsolatedAmbient,
+        StdioShimGateGuard,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let amb = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let interpreter = amb.dir().join("fake-python");
+        let shim = amb
+            .dir()
+            .join("fake-scripts")
+            .join(COORD_MCP_STDIO_SHIM_FILE);
+        let gate = StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+            interpreter: interpreter.clone(),
+            shim: shim.clone(),
+        }));
+        (amb, gate, interpreter, shim)
+    }
+
+    /// The `/coord-mcp/provision-session` route is pinned to the http shape:
+    /// its scripted consumers replay the nonce as an HTTP header and cannot
+    /// read a stdio document. Forced-Open gate, and the route still emits
+    /// `url` + `headers` and no `type`.
+    #[test]
+    fn provision_session_route_stays_http_under_an_open_stdio_gate() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shim = tmp.path().join("shim.py");
+        std::fs::write(&shim, "#").expect("shim");
+        let _gate =
+            StdioShimGateGuard::install(StdioShimGateOverride::Fixed(StdioShimGate::Open {
+                interpreter: std::path::PathBuf::from("/usr/bin/python3"),
+                shim,
+            }));
+        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), 9876);
+        let entry = &doc["mcpServers"]["coord-mcp"];
+        assert_ne!(
+            entry["type"], "stdio",
+            "route emitted the stdio spelling: {doc}"
+        );
+        assert_eq!(
+            entry["type"], "http",
+            "route emitted a non-http transport: {doc}"
+        );
+        assert_eq!(entry["url"], "http://127.0.0.1:9876/coord-mcp");
+        assert!(
+            entry["headers"].is_object(),
+            "route emitted no headers: {doc}"
+        );
+        assert!(
+            crate::coord_mcp_config::proxy_nonce_from_header_object(&entry["headers"]).is_some(),
+            "route emitted no replayable nonce: {doc}"
+        );
+    }
+
+    /// One directory, several spellings, ONE credential file: a rotation must
+    /// rewrite the file the live shim is reading.
+    #[test]
+    fn credential_file_name_is_spelling_insensitive_for_one_directory() {
+        let a =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo", None).credential_file_name();
+        let b =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo/", None).credential_file_name();
+        let c = ProxyConfigIdentity::device("/home/u/qontinui-root/repo//", None)
+            .credential_file_name();
+        let d = ProxyConfigIdentity::device("\\home\\u\\qontinui-root\\repo", None)
+            .credential_file_name();
+        assert_eq!(a, b);
+        assert_eq!(a, c);
+        assert_eq!(a, d);
+        let other =
+            ProxyConfigIdentity::device("/home/u/qontinui-root/repo2", None).credential_file_name();
+        assert_ne!(a, other);
+        assert_eq!(credential_workdir_key("/"), "/");
+        assert_eq!(
+            credential_workdir_key("C:\\"),
+            if cfg!(windows) { "c:/" } else { "C:/" }
+        );
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_owner_only(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "{} must be owner-only, got {mode:o}",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    fn assert_owner_only(_path: &Path) {}
+
+    /// With the env var unset, `cfg!(test)` defaults the gate CLOSED — which is
+    /// exactly why the two shape tests above still see `type: "http"` without
+    /// touching the developer's PATH or config checkout.
+    #[test]
+    fn stdio_shim_gate_defaults_to_http_inside_cfg_test() {
+        let _lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[COORD_MCP_STDIO_SHIM_ENV]);
+        std::env::remove_var(COORD_MCP_STDIO_SHIM_ENV);
+        assert_eq!(stdio_shim_gate(), StdioShimGate::TestDefault);
+    }
+
+    /// The DEVICE path under the stdio arm: the document names the interpreter,
+    /// the shim and the runner-owned credential file — and NOTHING else (no
+    /// url, no headers, no nonce anywhere in the workdir). The credential file
+    /// is owner-only, carries the SAME `{url, headers}` the http document
+    /// would have, no principal marker, and every runner-side reader resolves
+    /// the config through it. A re-provision rewrites the SAME file with the
+    /// fresh nonce — the rotation the shim survives by re-reading.
+    #[test]
+    fn write_coord_mcp_proxy_config_emits_the_stdio_shim_shape_when_the_gate_is_open() {
+        let (amb, _gate, interpreter, shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-stdio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        write_coord_mcp_proxy_config(&wd, 23457);
+
+        let mcp_path = tmp.join(".mcp.json");
+        let written = std::fs::read_to_string(&mcp_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "stdio", "{written}");
+        assert_eq!(server["command"], interpreter.to_string_lossy().as_ref());
+        let args = server["args"].as_array().expect("stdio args");
+        assert_eq!(args.len(), 3, "{written}");
+        assert_eq!(args[0], shim.to_string_lossy().as_ref());
+        assert_eq!(args[1], COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG);
+        let credential = std::path::PathBuf::from(args[2].as_str().unwrap());
+        assert!(credential.is_absolute(), "{}", credential.display());
+        assert!(
+            server.get("url").is_none() && server.get("headers").is_none(),
+            "the stdio document must carry no url and no headers: {written}"
+        );
+
+        // The credential file: under the isolated ~/.qontinui, owner-only,
+        // the flat `{url, headers}` the shim's `load_credential` reads.
+        assert!(
+            credential.starts_with(amb.dir().join(STDIO_SHIM_CREDENTIAL_DIR)),
+            "{} must live under the runner's own data dir, never a repo",
+            credential.display()
+        );
+        assert_owner_only(&credential);
+        let cred = read_json(&credential);
+        assert_eq!(cred["url"], "http://127.0.0.1:23457/coord-mcp");
+        let nonce = cred["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .expect("credential file must carry the nonce header");
+        assert!(proxy_nonce_is_valid(nonce), "the nonce in the file is live");
+        assert_eq!(
+            cred["headers"]["Authorization"],
+            serde_json::Value::from(format!("Bearer {nonce}"))
+        );
+        assert!(
+            cred["headers"]
+                .get(COORD_MCP_PRINCIPAL_HEADER_JSON)
+                .is_none(),
+            "the DEVICE credential file must not carry the agent marker: {cred}"
+        );
+        assert!(
+            !written.contains(nonce),
+            "the nonce must not appear in the workdir document: {written}"
+        );
+
+        // Every runner-side reader resolves the stdio config through the file.
+        assert_eq!(read_proxy_nonce(&mcp_path).as_deref(), Some(nonce));
+        assert_eq!(read_proxy_port(&wd), Some(23457));
+        assert!(read_static_authorization_presence(&mcp_path));
+        assert!(!read_agent_principal_marker(&mcp_path));
+        assert_eq!(classify_mcp_json_doc(&v), McpJsonShape::OursProxy);
+        assert!(workdir_declares_coord_mcp(&wd));
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, 23457).is_some(),
+            "the F4 no-mint reuse must still see the stdio config's nonce"
+        );
+
+        // A re-provision (the one-slot eviction) rewrites the SAME credential
+        // file with the fresh nonce; the document is unchanged in shape.
+        write_coord_mcp_proxy_config(&wd, 23457);
+        let v2 = read_json(&mcp_path);
+        assert_eq!(
+            v2["mcpServers"]["coord-mcp"]["args"][2],
+            credential.to_string_lossy().as_ref(),
+            "rotation must rewrite the path the live shim is already reading"
+        );
+        let rotated = read_json(&credential)["headers"]["X-Coord-Mcp-Proxy-Key"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(rotated, nonce, "a re-provision mints a fresh nonce");
+        assert!(proxy_nonce_is_valid(&rotated));
+        assert_owner_only(&credential);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The AGENT path under the stdio arm: the ONE byte-range the agent shape
+    /// differs in — `X-Coord-Mcp-Principal: agent` — rides in the credential
+    /// file (there is no inline `headers`), the marker reader sees it there,
+    /// and the device-write refusal (`RefusedAgentPrincipal`) is unchanged.
+    #[test]
+    fn write_coord_mcp_agent_proxy_config_puts_the_marker_in_the_credential_file() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-astdio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let agent_id = uuid::Uuid::new_v4();
+
+        write_coord_mcp_agent_proxy_config(&wd, 31338, agent_id);
+
+        let mcp_path = tmp.join(".mcp.json");
+        let v = read_json(&mcp_path);
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "stdio");
+        let credential = std::path::PathBuf::from(server["args"][2].as_str().unwrap());
+        let cred = read_json(&credential);
+        assert_eq!(
+            cred["headers"][COORD_MCP_PRINCIPAL_HEADER_JSON],
+            serde_json::Value::from(COORD_MCP_PRINCIPAL_AGENT),
+            "the agent credential file must carry the marker: {cred}"
+        );
+        let nonce = cred["headers"]["X-Coord-Mcp-Proxy-Key"].as_str().unwrap();
+        assert_eq!(
+            proxy_principal_for_nonce(nonce),
+            Some(ProxyPrincipal::Agent { agent_id })
+        );
+        assert!(read_agent_principal_marker(&mcp_path));
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Device),
+            ExistingConfigVerdict::AgentPrincipal,
+            "a device write must still refuse to land on an agent config under stdio"
+        );
+        assert_eq!(
+            existing_config_write_verdict(&wd, IntendedWrite::Agent),
+            ExistingConfigVerdict::Allowed
+        );
+
+        // The device and agent identities for ONE workdir are two files.
+        let device_name = ProxyConfigIdentity::device(&wd, None).credential_file_name();
+        assert_ne!(
+            credential.file_name().unwrap().to_string_lossy(),
+            device_name,
+            "agent and device credential files must never collide"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `COORD_MCP_STDIO_SHIM=0` forces the http document even when the gate
+    /// would otherwise open — the operator's kill switch beats everything.
+    #[test]
+    fn stdio_shim_kill_switch_forces_the_http_arm() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[COORD_MCP_STDIO_SHIM_ENV]);
+        std::env::set_var(COORD_MCP_STDIO_SHIM_ENV, "0");
+        assert_eq!(stdio_shim_gate(), StdioShimGate::KillSwitch);
+
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-kill-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        write_coord_mcp_proxy_config(&wd, 23458);
+        let v = read_json(&tmp.join(".mcp.json"));
+        assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http");
+        assert_eq!(
+            v["mcpServers"]["coord-mcp"]["url"],
+            "http://127.0.0.1:23458/coord-mcp"
+        );
+
+        // Any other value is ON: the injected open gate is honoured again.
+        std::env::set_var(COORD_MCP_STDIO_SHIM_ENV, "1");
+        assert!(matches!(stdio_shim_gate(), StdioShimGate::Open { .. }));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A refused `--selftest` — missing interpreter, non-zero exit, or a
+    /// timeout — yields the http document, NOT an error and NOT a
+    /// `.coord-mcp-status` breadcrumb. This drives the REAL probe path
+    /// (`probe_stdio_shim` / `run_stdio_shim_selftest`) against stub scripts.
+    #[test]
+    fn a_refused_selftest_falls_open_to_the_http_arm() {
+        let amb = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let scripts = amb.dir().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        let shim = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+        std::fs::write(&shim, "import sys\nsys.exit(0)\n").unwrap();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-refused-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        let assert_http_and_no_breadcrumb = |label: &str| {
+            write_coord_mcp_proxy_config(&wd, 23459);
+            let v = read_json(&tmp.join(".mcp.json"));
+            assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http", "{label}");
+            assert!(
+                !tmp.join(COORD_MCP_STATUS_FILE).exists(),
+                "{label}: a fall-open must never write the UNREACHABLE breadcrumb"
+            );
+        };
+
+        // (1) Shim absent entirely.
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: scripts.join("no-such-shim.py"),
+                interpreters: vec![std::path::PathBuf::from("irrelevant")],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("absent"))
+            );
+            assert_http_and_no_breadcrumb("absent shim");
+        }
+        // (2) No interpreter on PATH at all.
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: shim.clone(),
+                interpreters: vec![],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("on PATH"))
+            );
+            assert_http_and_no_breadcrumb("no interpreter");
+        }
+        // (3) An interpreter that does not exist (spawn failure).
+        {
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: shim.clone(),
+                interpreters: vec![amb.dir().join("no-such-python")],
+                budget: std::time::Duration::from_secs(1),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("spawn failed"))
+            );
+            assert_http_and_no_breadcrumb("missing interpreter");
+        }
+
+        // The remaining arms need a real python — one that actually RUNS a
+        // script (a Windows Store `python3.exe` alias resolves on PATH and
+        // exits non-zero, which is a refusal, not an interpreter). Without one
+        // they are covered by (3) and this test says so rather than silently
+        // passing.
+        let trivially_ok = scripts.join("ok.py");
+        std::fs::write(&trivially_ok, "import sys\nsys.exit(0)\n").unwrap();
+        let Some(python) = STDIO_SHIM_INTERPRETERS
+            .iter()
+            .filter_map(|name| crate::automation_stack::which(name))
+            .find(|py| {
+                run_stdio_shim_selftest(py, &trivially_ok, std::time::Duration::from_secs(10))
+                    .is_ok()
+            })
+        else {
+            eprintln!("no working python on PATH — exit-code and timeout arms not exercised here");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return;
+        };
+        // (4) Selftest exits non-zero.
+        {
+            let bad = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&bad, "import sys\nsys.exit(3)\n").unwrap();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: bad.clone(),
+                interpreters: vec![python.clone()],
+                budget: std::time::Duration::from_secs(10),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("exited"))
+            );
+            assert_http_and_no_breadcrumb("selftest exit 3");
+        }
+        // (5) Selftest hangs past the budget: killed, refused, fell open.
+        {
+            let slow = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&slow, "import time\ntime.sleep(30)\n").unwrap();
+            let started = std::time::Instant::now();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: slow.clone(),
+                interpreters: vec![python.clone()],
+                budget: std::time::Duration::from_millis(400),
+            });
+            assert!(
+                matches!(stdio_shim_gate(), StdioShimGate::Refused(ref r) if r.contains("did not exit"))
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the budget must bound the probe, not the child's sleep"
+            );
+            assert_http_and_no_breadcrumb("selftest timeout");
+        }
+        // (6) And the positive arm through the same real path: exit 0 opens.
+        {
+            let good = scripts.join(COORD_MCP_STDIO_SHIM_FILE);
+            std::fs::write(&good, "import sys\nsys.exit(0)\n").unwrap();
+            let _gate = StdioShimGateGuard::install(StdioShimGateOverride::Probe {
+                shim: good.clone(),
+                interpreters: vec![amb.dir().join("no-such-python"), python.clone()],
+                budget: std::time::Duration::from_secs(10),
+            });
+            assert_eq!(
+                stdio_shim_gate(),
+                StdioShimGate::Open {
+                    interpreter: python.clone(),
+                    shim: good.clone()
+                },
+                "the first interpreter that passes wins, after the one that could not spawn"
+            );
+            write_coord_mcp_proxy_config(&wd, 23459);
+            let v = read_json(&tmp.join(".mcp.json"));
+            assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "stdio");
+            assert_eq!(
+                v["mcpServers"]["coord-mcp"]["command"],
+                python.to_string_lossy().as_ref()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An unwritable credential file is the other fall-open: the gate is open,
+    /// but the document must not name a file that does not exist, so the
+    /// builder emits http instead.
+    #[test]
+    fn an_unwritable_credential_file_falls_open_to_the_http_arm() {
+        let (amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        // Pre-empt the credential DIR with a plain FILE: `create_dir_all` fails.
+        std::fs::write(amb.dir().join(STDIO_SHIM_CREDENTIAL_DIR), b"not a dir").unwrap();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-nocred-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+
+        write_coord_mcp_proxy_config(&wd, 23460);
+
+        let v = read_json(&tmp.join(".mcp.json"));
+        let server = &v["mcpServers"]["coord-mcp"];
+        assert_eq!(server["type"], "http", "{v}");
+        assert!(
+            proxy_nonce_from_config_doc(&v).is_some(),
+            "the http fall-open document is complete on its own"
+        );
+        assert!(!tmp.join(COORD_MCP_STATUS_FILE).exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The nonce-preserving rewrite (rotation / header upgrade / port move)
+    /// goes through the same builder, so under stdio it rewrites the
+    /// credential file with the PRESERVED nonce — the rotation path a live shim
+    /// follows without a mint.
+    #[test]
+    fn rewrite_config_preserving_nonce_rewrites_the_stdio_credential_file() {
+        let (_amb, _gate, _interpreter, _shim) = open_stdio_gate_for_test();
+        let tmp = std::env::temp_dir().join(format!("coord-mcp-rw-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let wd = tmp.to_string_lossy().to_string();
+        let nonce = register_proxy_nonce(&wd, None);
+
+        assert!(rewrite_config_preserving_nonce(&wd, 23461, &nonce));
+
+        let mcp_path = tmp.join(".mcp.json");
+        let v = read_json(&mcp_path);
+        assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "stdio");
+        assert_eq!(read_proxy_nonce(&mcp_path).as_deref(), Some(nonce.as_str()));
+        assert_eq!(read_proxy_port(&wd), Some(23461));
+
+        // Same identity ⇒ same file as the spawn writer would use.
+        let credential =
+            std::path::PathBuf::from(v["mcpServers"]["coord-mcp"]["args"][2].as_str().unwrap());
+        assert_eq!(
+            credential.file_name().unwrap().to_string_lossy(),
+            ProxyConfigIdentity::device(&wd, None).credential_file_name()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The credential file name is stable per identity and distinct across
+    /// workdir, principal and terminal — the property that makes a rotation
+    /// land on the file a live shim is reading and never on a neighbour's.
+    #[test]
+    fn stdio_credential_file_name_is_stable_and_identity_distinct() {
+        let a1 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
+        let a2 = ProxyConfigIdentity::device("D:/repo/one", None).credential_file_name();
+        let b = ProxyConfigIdentity::device("D:/repo/two", None).credential_file_name();
+        let t = ProxyConfigIdentity::device("D:/repo/one", Some("term-1")).credential_file_name();
+        let id = uuid::Uuid::new_v4();
+        let g1 = ProxyConfigIdentity::agent("D:/repo/one", id).credential_file_name();
+        let g2 =
+            ProxyConfigIdentity::agent("D:/repo/one", uuid::Uuid::new_v4()).credential_file_name();
+        assert_eq!(a1, a2, "stable across calls");
+        assert_ne!(a1, b, "distinct across workdirs");
+        assert_ne!(a1, t, "a terminal-keyed identity is its own file");
+        assert_ne!(a1, g1, "agent and device never share a file");
+        assert_ne!(g1, g2, "two agents in one workdir never share a file");
+        assert_eq!(a1.len(), 16 + ".json".len());
+        assert!(a1.ends_with(".json") && a1[..16].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The stdio-aware readers over LITERAL documents: a stdio entry that is
+    /// not the fleet shim is not ours, an http entry is untouched, and a stdio
+    /// entry whose credential file is missing reads as "no proxy config"
+    /// rather than panicking or inventing a nonce.
+    #[test]
+    fn stdio_config_readers_resolve_only_the_fleet_shim_shape() {
+        use crate::coord_mcp_config::{
+            config_doc_is_stdio_shim, effective_coord_mcp_url, stdio_shim_credential_path,
+        };
+        let http = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "http", "url": "http://127.0.0.1:9876/coord-mcp",
+            "headers": {"Authorization": "Bearer n0", "X-Coord-Mcp-Proxy-Key": "n0"}}}});
+        assert!(!config_doc_is_stdio_shim(&http));
+        assert_eq!(stdio_shim_credential_path(&http), None);
+        assert_eq!(proxy_nonce_from_config_doc(&http).as_deref(), Some("n0"));
+        assert_eq!(
+            effective_coord_mcp_url(&http).as_deref(),
+            Some("http://127.0.0.1:9876/coord-mcp")
+        );
+
+        let foreign_stdio = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "stdio", "command": "node", "args": ["server.js", "--credential", "/x"]}}});
+        assert!(!config_doc_is_stdio_shim(&foreign_stdio));
+        assert_eq!(stdio_shim_credential_path(&foreign_stdio), None);
+        assert_eq!(
+            classify_mcp_json_doc(&foreign_stdio),
+            McpJsonShape::OursStaticBearer
+        );
+
+        let missing = std::env::temp_dir().join(format!("no-cred-{}.json", uuid::Uuid::new_v4()));
+        let ours = serde_json::json!({"mcpServers": {"coord-mcp": {
+            "type": "stdio", "command": "/usr/bin/python3",
+            "args": ["/root/qontinui-claude-config/scripts/coord-mcp-shim.py", "--credential", missing.to_string_lossy()]}}});
+        assert!(config_doc_is_stdio_shim(&ours));
+        assert_eq!(
+            stdio_shim_credential_path(&ours).as_deref(),
+            Some(missing.as_path())
+        );
+        assert_eq!(classify_mcp_json_doc(&ours), McpJsonShape::OursProxy);
+        assert_eq!(proxy_nonce_from_config_doc(&ours), None);
+        assert_eq!(effective_coord_mcp_url(&ours), None);
+        assert!(!config_doc_has_static_authorization(&ours));
+        assert!(!config_doc_is_agent_marked(&ours));
     }
 
     /// Layer 14's shape classifier, arm by arm, against LITERAL documents.
@@ -9647,6 +11532,7 @@ mod tests {
     /// neither boot resolver is anywhere in that path.
     #[test]
     fn device_writes_are_refused_over_an_agent_marked_proxy_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("qr-agentmark-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
@@ -9709,6 +11595,7 @@ mod tests {
     /// existing baked-agent-JWT config.
     #[test]
     fn provision_with_jwt_orchestration() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         // Build an unsigned JWT (`h.<payload>.s`) carrying just the `sub_type`
         // claim — all the device-arm orchestration inspects.
@@ -9873,6 +11760,7 @@ mod tests {
     /// write must not).
     #[test]
     fn device_path_with_bound_port_writes_proxy_and_no_synchronous_breadcrumb() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         let dev = {
             let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
@@ -10291,7 +12179,9 @@ mod tests {
             let line1 = read_crumb(&d).lines().next().unwrap().to_string();
             assert_eq!(
                 line1,
-                format!("coord-mcp UNREACHABLE ({needle}) — gate registration degraded; use /gate"),
+                format!(
+                    "coord-mcp UNREACHABLE ({needle}) — coord-mcp degraded; use /gate or /coord-revive"
+                ),
                 "{verdict:?}"
             );
         }
@@ -10448,7 +12338,10 @@ mod tests {
         let old = register_proxy_nonce(&wd, None);
         let _newer = register_proxy_nonce(&wd, None); // evicts + graces `old`
         assert!(proxy_nonce_is_valid(&old) && live_binding(&old).is_none());
-        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &old));
+        write_mcp_json(
+            &wd,
+            &coord_mcp_proxy_config_json(19876, &old, ProxyConfigIdentity::device(&wd, None)),
+        );
         provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(
@@ -10481,7 +12374,10 @@ mod tests {
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        write_mcp_json(&wd, &coord_mcp_proxy_config_json(19876, &stranger));
+        write_mcp_json(
+            &wd,
+            &coord_mcp_proxy_config_json(19876, &stranger, ProxyConfigIdentity::device(&wd, None)),
+        );
         provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(minted, stranger);
@@ -10614,7 +12510,7 @@ mod tests {
         std::fs::write(
             d.join(COORD_MCP_STATUS_FILE),
             format!(
-                "coord-mcp UNREACHABLE (stale) — gate registration degraded; use /gate\n\
+                "coord-mcp UNREACHABLE (stale) — coord-mcp degraded; use /gate or /coord-revive\n\
                  {{\"written_at\":\"{ancient}\",\"workdir\":\"{wd}\",\"port\":9876,\
                  \"verdict\":\"TIMEOUT\",\"build_id\":\"old\",\"schema\":1}}\n"
             ),
@@ -10851,6 +12747,7 @@ mod tests {
 
     #[test]
     fn persisted_nonce_survives_restore_round_trip() {
+        let _amb = crate::test_env::isolated_ambient();
         // Emits a `restore` forensics line, which is unfilterable by workdir —
         // serialize against the test that reads those lines back.
         let _serial = restore_forensics_lock();
@@ -10903,6 +12800,7 @@ mod tests {
     /// hard-fails closed across a restart.
     #[test]
     fn agent_nonce_is_not_persisted_device_nonce_is() {
+        let _amb = crate::test_env::isolated_ambient();
         let (store_dir, store) = temp_store("agent-nonce");
 
         // Mint an AGENT nonce, then persist the snapshot to the injected store.
@@ -10963,6 +12861,7 @@ mod tests {
     /// against `D:\qontinui-root` on 2026-08-19.
     #[test]
     fn restored_nonces_keep_their_terminal_so_a_remint_evicts_only_one_slot() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("terminal-slot");
 
@@ -11070,6 +12969,7 @@ mod tests {
     /// on the next boot, i.e. reproduce the incident this plan closes.
     #[test]
     fn legacy_bare_string_nonce_store_restores_without_migration() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("legacy-nonce");
 
@@ -11120,6 +13020,7 @@ mod tests {
     /// quietly leak one.
     #[test]
     fn device_nonce_snapshot_drops_agent_and_ephemeral_nonces() {
+        let _amb = crate::test_env::isolated_ambient();
         let wd = format!("D:/snapshot-filter-wt-{}", uuid::Uuid::now_v7());
         let term = format!("term-{}", uuid::Uuid::now_v7());
         let (device, _) = mint_and_register_nonce(
@@ -11264,6 +13165,7 @@ mod tests {
     /// test passing anyway.
     #[test]
     fn restored_bindings_carry_their_persisted_age_not_the_restore_instant() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("nonce-age");
 
@@ -11434,6 +13336,7 @@ mod tests {
     /// the gate is the only behavior worth pinning here.
     #[test]
     fn persistence_disabled_skips_default_store_write() {
+        let _amb = crate::test_env::isolated_ambient();
         // Under cfg(test) with the env var unset, persistence is OFF by default
         // (see `nonce_persistence_enabled`), so `register_proxy_nonce`'s
         // default-store mirror is a guaranteed no-op — minting touches only the
@@ -11508,6 +13411,7 @@ mod tests {
     /// recovered count.
     #[test]
     fn restore_reports_what_it_recovered_not_the_live_map_size() {
+        let _amb = crate::test_env::isolated_ambient();
         let _serial = restore_forensics_lock();
         let (store_dir, store) = temp_store("restore-honest");
         let wd = store_dir.join("already-live").to_string_lossy().to_string();
@@ -11685,7 +13589,7 @@ mod tests {
     /// an agent (static-bearer) config are left untouched.
     #[test]
     fn reconcile_session_configs_rewrites_stale_leaves_agent() {
-        let _env_lock = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         // Nonce strings are per-run unique: the live registry is process-global
         // and shared with every parallel test, so literals would let a peer's
@@ -11902,6 +13806,7 @@ mod tests {
     /// end-to-end reconcile leaves the nonce unregistered.
     #[test]
     fn an_agent_marked_config_is_never_adopted() {
+        let _amb = crate::test_env::isolated_ambient();
         let tmp =
             std::env::temp_dir().join(format!("coord-mcp-agentmark-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&tmp).unwrap();
@@ -12054,6 +13959,7 @@ mod tests {
     /// live workdir.
     #[test]
     fn session_configs_are_adopted_unrewritten_and_age_ordered_at_fleet_scale() {
+        let _amb = crate::test_env::isolated_ambient();
         // Deliberately over the cap so the cut actually engages: 256 + 44.
         const N: usize = MAX_PERSISTED_DEVICE_NONCES + 44;
 
@@ -12278,6 +14184,7 @@ mod tests {
     /// port + live nonce, absent file, foreign static-bearer).
     #[test]
     fn reconcile_root_config_self_heals_stale_root_mcp_json() {
+        let _amb = crate::test_env::isolated_ambient();
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
         // --- Case 1: stale PORT → Rewrite (client must reconnect anyway). ---
@@ -12432,6 +14339,7 @@ mod tests {
     /// still clobbered.
     #[test]
     fn secondary_instance_never_self_heals_the_shared_root_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let root = std::env::temp_dir().join(format!("coord-mcp-sec-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         // A HEALTHY root config naming the primary's port — precisely what a
@@ -12788,6 +14696,7 @@ mod tests {
     /// old one, which is the failure the whole plan is about.
     #[test]
     fn upgrade_in_place_adds_authorization_without_rotating_the_nonce() {
+        let _amb = crate::test_env::isolated_ambient();
         // Installed FIRST: file emission is off until some test asks for the
         // shared dir, so a forensics assertion at the end of a test that armed
         // it in the middle would read a file missing its own earlier lines.
@@ -12909,6 +14818,7 @@ mod tests {
     /// nonce. Mirrors the restart-survival contract at the unit level.
     #[test]
     fn adopt_on_disk_nonce_reregisters_exact_string_as_device() {
+        let _amb = crate::test_env::isolated_ambient();
         let workdir = format!("D:/adopt-wt-{}", uuid::Uuid::now_v7());
         let nonce = format!("ondisk-{}", uuid::Uuid::new_v4().simple());
         assert!(
@@ -12934,6 +14844,7 @@ mod tests {
     /// through), while the fresh nonce is live. An AGENT nonce is NEVER graced.
     #[test]
     fn remint_graces_evicted_device_nonce_but_never_agent() {
+        let _amb = crate::test_env::isolated_ambient();
         // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
         let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
         let a = register_proxy_nonce(&wd, None);
@@ -12976,12 +14887,16 @@ mod tests {
     /// bound), while an evicted AGENT nonce never even ENTERS the grace map.
     #[test]
     fn graced_nonce_expires_and_is_lazily_evicted() {
+        let _amb = crate::test_env::isolated_ambient();
         // Arm 1 — lazy expiry (unchanged by the split).
         let nonce = format!("expired-{}", uuid::Uuid::new_v4().simple());
         graced_nonces().lock().unwrap().insert(
             nonce.clone(),
             GracedNonce {
                 expires_at: std::time::Instant::now(),
+                grace_until: std::time::SystemTime::now(),
+                workdir: "D:/grace-expired-wt".to_string(),
+                terminal_id: None,
             },
         );
         assert!(
@@ -13058,6 +14973,7 @@ mod tests {
     /// ever carries a full nonce — only the 8-char prefix.
     #[test]
     fn rotation_forensics_one_line_per_event_and_prefix_only() {
+        let _amb = crate::test_env::isolated_ambient();
         // Shared across every file-asserting forensics test (see
         // `rotation_log_test_dir`) — peer tests append lines for OTHER
         // workdirs, so every assertion below filters by this test's own.
@@ -13079,7 +14995,14 @@ mod tests {
         let wt = std::env::temp_dir().join(format!("coord-mcp-rot-wt-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&wt).unwrap();
         let wt_str = wt.to_string_lossy().to_string();
-        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &adopted));
+        write_mcp_json(
+            &wt_str,
+            &coord_mcp_proxy_config_json(
+                9876,
+                &adopted,
+                ProxyConfigIdentity::device(&wt_str, None),
+            ),
+        );
 
         let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
         let mine: Vec<serde_json::Value> = raw
@@ -13128,6 +15051,7 @@ mod tests {
     /// nonce is still bound, and leak no more key material than any other line.
     #[test]
     fn rotation_forensics_reject_line_joins_to_the_evicting_workdir() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-reject-wt-{}", uuid::Uuid::now_v7());
@@ -13186,6 +15110,7 @@ mod tests {
     /// all, so the 2026-08-19 incident could not be pinned to a session.
     #[test]
     fn rotation_reject_line_carries_workdir_principal_and_terminal() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         // Arm 1 — a live DEVICE nonce minted for a named terminal.
@@ -13261,6 +15186,7 @@ mod tests {
     /// (one `adopt` line, zero restores, in 5,486 lines).
     #[test]
     fn rotation_restore_event_reports_restored_and_skipped_counts() {
+        let _amb = crate::test_env::isolated_ambient();
         // The restore line is an AGGREGATE: it carries no single workdir and no
         // key prefix (both read `ROTATION_UNKNOWN` — a STATEMENT that there is
         // none, never `""`, which reads as "the runner failed to populate it"),
@@ -13398,6 +15324,7 @@ mod tests {
     /// a later `reject` carrying that prefix joins to something.
     #[test]
     fn rotation_revoke_line_is_emitted_for_device_and_agent() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-revoke-wt-{}", uuid::Uuid::now_v7());
@@ -13450,6 +15377,7 @@ mod tests {
     /// reconstruction needed and could not do.
     #[test]
     fn rotation_revoke_line_is_emitted_on_session_close() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-close-wt-{}", uuid::Uuid::now_v7());
@@ -13579,6 +15507,7 @@ mod tests {
     /// total; grace only survives supersession, never an explicit revoke).
     #[test]
     fn revoked_nonce_no_longer_validates_including_grace() {
+        let _amb = crate::test_env::isolated_ambient();
         // Live revoke.
         let wd = format!("D:/revoke-wt-{}", uuid::Uuid::now_v7());
         let nonce = register_proxy_nonce(&wd, None);
@@ -13620,6 +15549,7 @@ mod tests {
     /// name-keyed reap therefore missed.
     #[test]
     fn release_workdir_on_session_close_revokes_and_reaps() {
+        let _amb = crate::test_env::isolated_ambient();
         let cfg_body = |nonce: &str| {
             format!(
                 r#"{{"mcpServers":{{"coord-mcp":{{"type":"http","url":"http://127.0.0.1:9876/coord-mcp","headers":{{"X-Coord-Mcp-Proxy-Key":"{nonce}"}}}}}}}}"#
@@ -13667,6 +15597,7 @@ mod tests {
     /// (another runner owns it); garbage is reaped.
     #[test]
     fn reaper_drops_dead_port_and_unregistered_nonce_configs() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-reap-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let bound_port = 9876u16;
@@ -13723,6 +15654,7 @@ mod tests {
     /// leaves every terminal-keyed sibling on disk.
     #[test]
     fn revoked_nonce_reap_matches_terminal_keyed_configs_not_just_the_workdir_name() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("coord-mcp-revreap-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_body = |nonce: &str| {
@@ -13811,11 +15743,16 @@ mod phase2_proxy_header_shape_tests {
     /// failure.
     #[test]
     fn proxy_config_emits_both_header_shapes() {
+        let _amb = crate::test_env::isolated_ambient();
         let nonce = register_proxy_nonce(
             &format!("D:/phase2-emit-{}", uuid::Uuid::now_v7()),
             Some("terminal-emit"),
         );
-        let doc = coord_mcp_proxy_config_json(9876, &nonce);
+        let doc = coord_mcp_proxy_config_json(
+            9876,
+            &nonce,
+            ProxyConfigIdentity::device("D:/phase2-emit", None),
+        );
         let headers = &doc["mcpServers"]["coord-mcp"]["headers"];
         assert_eq!(
             headers["Authorization"],
@@ -13844,6 +15781,7 @@ mod phase2_proxy_header_shape_tests {
     /// produces.
     #[test]
     fn read_proxy_nonce_resolves_every_shape_the_writer_can_produce() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-read-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
@@ -13852,7 +15790,11 @@ mod phase2_proxy_header_shape_tests {
         // (a) The real emitter's output, round-tripped through the real writer.
         write_mcp_json(
             &dir.to_string_lossy(),
-            &coord_mcp_proxy_config_json(9876, &nonce),
+            &coord_mcp_proxy_config_json(
+                9876,
+                &nonce,
+                ProxyConfigIdentity::device(&dir.to_string_lossy(), None),
+            ),
         );
         assert_eq!(
             read_proxy_nonce(&path).as_deref(),
@@ -13897,6 +15839,7 @@ mod phase2_proxy_header_shape_tests {
     /// config with an unregistered nonce is adopted, not silently ignored.
     #[test]
     fn resolve_root_reconcile_still_self_heals_a_new_shape_config() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-reconcile-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
@@ -13970,13 +15913,17 @@ mod phase2_proxy_header_shape_tests {
     /// 2026-08-19 incident reconstructible at all.
     #[test]
     fn rotation_write_line_carries_a_non_empty_key_prefix_for_the_new_shape() {
+        let _amb = crate::test_env::isolated_ambient();
         let log_dir = rotation_log_test_dir();
         let wt = std::env::temp_dir().join(format!("phase2-write-line-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&wt).unwrap();
         let wt_str = wt.to_string_lossy().to_string();
 
         let nonce = register_proxy_nonce(&wt_str, Some("terminal-write-line"));
-        write_mcp_json(&wt_str, &coord_mcp_proxy_config_json(9876, &nonce));
+        write_mcp_json(
+            &wt_str,
+            &coord_mcp_proxy_config_json(9876, &nonce, ProxyConfigIdentity::device(&wt_str, None)),
+        );
 
         let raw = std::fs::read_to_string(log_dir.join(ROTATION_LOG_FILE)).unwrap();
         let writes: Vec<serde_json::Value> = raw
@@ -14005,6 +15952,7 @@ mod phase2_proxy_header_shape_tests {
     /// session's richer agent credential".
     #[test]
     fn safe_to_write_keeps_a_nonce_bearing_proxy_config_refreshable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = std::env::temp_dir().join(format!("phase2-safe-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
@@ -14014,7 +15962,12 @@ mod phase2_proxy_header_shape_tests {
         // The real emitter's output — Authorization present, value a nonce.
         std::fs::write(
             &mcp,
-            serde_json::to_string_pretty(&coord_mcp_proxy_config_json(9876, &nonce)).unwrap(),
+            serde_json::to_string_pretty(&coord_mcp_proxy_config_json(
+                9876,
+                &nonce,
+                ProxyConfigIdentity::device(&wd, None),
+            ))
+            .unwrap(),
         )
         .unwrap();
         assert!(
@@ -14234,6 +16187,7 @@ mod agent_binding_census_tests {
     /// (absent) terminal and its mint time.
     #[test]
     fn agent_mint_emits_a_census_line_with_the_binding_fields() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = rotation_log_test_dir();
         let agent_id = uuid::Uuid::now_v7();
         let wd = format!("D:/census-wt-{}", uuid::Uuid::now_v7());
@@ -14932,6 +16886,7 @@ mod proxy_failure_layer_tests {
 /// Phase 3c — one sentinel, not two.
 #[cfg(test)]
 mod reject_row_workdir_sentinel_tests {
+    use super::tests::{restore_forensics_lock, temp_store};
     use super::*;
 
     /// The measured defect: of 1,049 `reject` rows on the operator box
@@ -15014,6 +16969,7 @@ mod reject_row_workdir_sentinel_tests {
     /// real mint and the real attribution read.
     #[test]
     fn a_binding_minted_without_a_workdir_attributes_as_unknown() {
+        let _amb = crate::test_env::isolated_ambient();
         let (nonce, _) =
             mint_and_register_nonce("", ProxyPrincipal::Device, NonceLifetime::Persistent, None);
         let attr = reject_attribution_for_nonce(&nonce);
@@ -15028,6 +16984,257 @@ mod reject_row_workdir_sentinel_tests {
             .lock()
             .expect("proxy nonce map poisoned")
             .remove(&nonce);
+    }
+
+    /// Phase 1d (plan 2026-09-02-steering-layers-unreadable-without-a-
+    /// credential): every way a key can stop validating attributes to a
+    /// distinct value, and the tombstoned arms name the workdir the key was
+    /// bound to — the join every `reject` row used to lack (165 of 165 read
+    /// `workdir: unknown` on the operator box).
+    #[test]
+    fn reject_attribution_names_every_arm_and_the_workdir() {
+        // no_key_presented / never_registered: nothing to join.
+        assert_eq!(
+            reject_attribution_for_nonce("").attribution,
+            RejectAttribution::NO_KEY_PRESENTED
+        );
+        let stranger = reject_attribution_for_nonce("never-minted-anywhere");
+        assert_eq!(stranger.attribution, RejectAttribution::NEVER_REGISTERED);
+        assert_eq!(stranger.workdir, ROTATION_UNKNOWN);
+
+        // bound: a live key rejected by a later gate still names itself.
+        let wd = format!("D:/attr-wt-{}", uuid::Uuid::now_v7());
+        let term = format!("term-{}", uuid::Uuid::now_v7());
+        let first = register_proxy_nonce(&wd, Some(&term));
+        let live = reject_attribution_for_nonce(&first);
+        assert_eq!(live.attribution, RejectAttribution::BOUND);
+        assert_eq!(live.workdir, wd);
+
+        // superseded: a same-slot re-mint tombstones the old key WITH its
+        // workdir, terminal and grace deadline.
+        let second = register_proxy_nonce(&wd, Some(&term));
+        let sup = reject_attribution_for_nonce(&first);
+        assert_eq!(sup.attribution, RejectAttribution::SUPERSEDED);
+        assert_eq!(sup.workdir, wd);
+        assert_eq!(sup.terminal_id, term);
+        assert_eq!(sup.principal, "device");
+        assert!(sup.evicted_at.is_some(), "a live eviction records when");
+        assert!(
+            sup.grace_until.is_some(),
+            "a device eviction records its window"
+        );
+        assert_eq!(sup.evict_cause.as_deref(), Some(EVICT_CAUSE_REMINT));
+        assert!(
+            proxy_nonce_is_valid(&first),
+            "precondition: still inside grace, so the key still validates"
+        );
+
+        // graced_expired: the same tombstone, once its window is behind us.
+        {
+            let mut map = nonce_tombstones().lock().unwrap();
+            let t = map
+                .get_mut(&first)
+                .expect("tombstone for the superseded key");
+            t.grace_until = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        }
+        let expired = reject_attribution_for_nonce(&first);
+        assert_eq!(expired.attribution, RejectAttribution::GRACED_EXPIRED);
+        assert_eq!(expired.workdir, wd, "the workdir survives grace expiry");
+
+        // revoked: an explicit revoke of the live key is a different story
+        // from supersession, and says so.
+        revoke_proxy_nonce(&second);
+        let rev = reject_attribution_for_nonce(&second);
+        assert_eq!(rev.attribution, RejectAttribution::REVOKED);
+        assert_eq!(rev.workdir, wd);
+        assert!(rev.grace_until.is_none(), "revocation is total — no window");
+
+        // agent: superseded, never graced, still attributable.
+        let awd = format!("D:/attr-agent-wt-{}", uuid::Uuid::now_v7());
+        let agent_id = uuid::Uuid::new_v4();
+        let a1 = register_agent_proxy_nonce(&awd, agent_id);
+        let _a2 = register_agent_proxy_nonce(&awd, agent_id);
+        let agent = reject_attribution_for_nonce(&a1);
+        assert_eq!(agent.attribution, RejectAttribution::SUPERSEDED);
+        assert_eq!(agent.principal, "agent");
+        assert_eq!(agent.workdir, awd);
+        assert!(agent.grace_until.is_none(), "agent keys are never graced");
+
+        // Every value the field can take is in the published closed set.
+        for a in [&stranger, &live, &sup, &expired, &rev, &agent] {
+            assert!(RejectAttribution::ATTRIBUTIONS.contains(&a.attribution));
+        }
+        // Leave the process-global maps as we found them.
+        revoke_proxy_nonce(&first);
+        revoke_agent_proxy_nonces(agent_id);
+        for n in [&first, &second, &a1] {
+            nonce_tombstones().lock().unwrap().remove(n.as_str());
+        }
+    }
+
+    /// Phase 1b: the 401 body names the arm, the workdir, that the runner
+    /// refused BEFORE dialing coord, and a recovery per caller class — and
+    /// never the one that is forbidden.
+    #[test]
+    fn attributed_error_names_the_arm_the_refusal_point_and_both_callers() {
+        let wd = format!("D:/attr-msg-wt-{}", uuid::Uuid::now_v7());
+        let first = register_proxy_nonce(&wd, Some("term-msg"));
+        let _second = register_proxy_nonce(&wd, Some("term-msg"));
+        let sup = reject_attribution_for_nonce(&first);
+        let msg = attributed_proxy_key_error(&sup);
+        assert!(msg.starts_with("superseded coord-mcp proxy key"), "{msg}");
+        assert!(msg.contains(&wd), "names the workdir: {msg}");
+        assert!(
+            msg.contains("terminal `term-msg`"),
+            "names the terminal: {msg}"
+        );
+
+        let never = attributed_proxy_key_error(&reject_attribution_for_nonce("nope"));
+        assert!(never.contains("no record of this key"), "{never}");
+        let none = attributed_proxy_key_error(&reject_attribution_for_nonce(""));
+        assert!(
+            none.contains("no coord-mcp proxy key was presented"),
+            "{none}"
+        );
+
+        for m in [&msg, &never, &none] {
+            // The clause only a runner-nonce refusal may make.
+            assert!(m.contains(RUNNER_REFUSED_BEFORE_FORWARD));
+            assert!(m.contains("before dialing coord"));
+            // …but never the overclaim that coord is fine.
+            assert!(!m.contains("transport is healthy"), "{m}");
+            // Recovery per caller class.
+            assert!(m.contains("hand-rolled caller"), "{m}");
+            assert!(m.contains("re-reads the CURRENT key"), "{m}");
+            assert!(m.contains("/coord-revive"), "{m}");
+            assert!(m.contains("never re-reads .mcp.json"), "{m}");
+            assert!(m.contains("start a NEW session"), "{m}");
+            assert!(m.contains("NEVER restart the runner"), "{m}");
+            assert!(!m.contains("provision-session"), "{m}");
+            // Wire text: no run of spaces, no newline.
+            assert!(!m.contains("  "), "{m:?}");
+            assert!(!m.contains('\n'), "{m:?}");
+        }
+        assert!(!RUNNER_REFUSED_BEFORE_FORWARD.contains("  "));
+        revoke_proxy_nonce(&first);
+        nonce_tombstones().lock().unwrap().remove(first.as_str());
+    }
+
+    /// Phase 1a: the grace set survives a restart with its REMAINING window.
+    /// This is the measured failure — 61 of 144 attributable rejects were
+    /// graced keys whose grace died with the previous process.
+    #[test]
+    fn graced_set_survives_a_restore_round_trip_with_its_remaining_window() {
+        let _serial = restore_forensics_lock();
+        let (store_dir, store) = temp_store("graced");
+        let wd = store_dir.join("graced-wd").to_string_lossy().to_string();
+        let term = format!("term-{}", uuid::Uuid::now_v7());
+
+        let (old, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term),
+        );
+        let (_new, snapshot) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term),
+        );
+        assert!(
+            proxy_nonce_is_valid(&old),
+            "precondition: graced, still valid"
+        );
+        persist_proxy_nonces_with_store(&store, &snapshot);
+
+        // On disk, with its wall-clock deadline and its binding.
+        let persisted = store.load_coord_mcp_graced_nonces();
+        let g = persisted.get(&old).expect("the graced key is persisted");
+        assert_eq!(g.workdir, wd);
+        assert_eq!(g.terminal_id.as_deref(), Some(term.as_str()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            g.grace_until_unix > now
+                && g.grace_until_unix <= now + DEVICE_EVICTED_NONCE_GRACE_TTL.as_secs(),
+            "the persisted deadline is the real one, not a fresh window"
+        );
+
+        // Simulate a restart: the process-local grace and tombstone maps are
+        // gone; the key no longer validates.
+        graced_nonces().lock().unwrap().remove(&old);
+        nonce_tombstones().lock().unwrap().remove(&old);
+        assert!(
+            !proxy_nonce_is_valid(&old),
+            "precondition: grace lost with the process"
+        );
+        assert_eq!(
+            reject_attribution_for_nonce(&old).attribution,
+            RejectAttribution::NEVER_REGISTERED,
+            "precondition: without the restore, the reject is unattributable"
+        );
+
+        restore_proxy_nonces_from(&store);
+        assert!(
+            proxy_nonce_is_valid(&old),
+            "a graced key must validate again after a restart inside its window"
+        );
+        let restored = graced_nonces()
+            .lock()
+            .unwrap()
+            .get(&old)
+            .map(|g| g.expires_at);
+        let restored = restored.expect("re-entered the grace registry");
+        assert!(
+            restored <= std::time::Instant::now() + DEVICE_EVICTED_NONCE_GRACE_TTL,
+            "re-entered with its REMAINING window, never a fresh one"
+        );
+        let attr = reject_attribution_for_nonce(&old);
+        assert_eq!(attr.attribution, RejectAttribution::SUPERSEDED);
+        assert_eq!(attr.workdir, wd, "attribution survives the restart too");
+
+        // An entry already past its deadline is dropped on load, never
+        // resurrected.
+        let dead = format!("dead-{}", uuid::Uuid::new_v4().simple());
+        store
+            .store_coord_mcp_nonce_sets(
+                &HashMap::new(),
+                &HashMap::from([(
+                    dead.clone(),
+                    crate::secure_storage::StoredGracedNonce {
+                        workdir: wd.clone(),
+                        terminal_id: None,
+                        grace_until_unix: now.saturating_sub(60),
+                    },
+                )]),
+            )
+            .unwrap();
+        assert!(restore_graced_nonces(store.load_coord_mcp_graced_nonces()).is_empty());
+        assert!(!proxy_nonce_is_valid(&dead));
+
+        // Leave the process-global maps as we found them.
+        release_workdir_on_session_close(&wd);
+        graced_nonces().lock().unwrap().remove(&old);
+        nonce_tombstones().lock().unwrap().remove(&old);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Phase 1e: the forwarder's last upstream result is reported, never a
+    /// secret, and `null` reads as "not exercised" rather than as a failure.
+    #[test]
+    fn last_forward_health_reports_the_most_recent_upstream_result() {
+        record_last_forward(Some(200), "answered");
+        let v = last_forward_health_json();
+        assert_eq!(v["status"], 200);
+        assert_eq!(v["outcome"], "answered");
+        assert!(v["at"].is_string());
+        record_last_forward(None, "unreachable");
+        let v = last_forward_health_json();
+        assert!(v["status"].is_null());
+        assert_eq!(v["outcome"], "unreachable");
     }
 }
 
@@ -15423,6 +17630,7 @@ mod coord_mcp_doctor_tests {
     /// route actually answers.
     #[test]
     fn the_live_report_is_total_and_discloses_no_credential() {
+        let _amb = crate::test_env::isolated_ambient();
         let r = report();
         for field in [
             "probed_at",

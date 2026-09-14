@@ -277,6 +277,86 @@ export function resolveProjectPage(
   return { pageId: id, pages: [...pages, page], created: true };
 }
 
+/**
+ * Pure: move `sourceId` to sit immediately before `targetId`, or to the END
+ * of the list when `targetId` is `null`, preserving every other page's
+ * relative order. Backs the tab bar's drag-to-reorder gesture
+ * (`TerminalPageTabBar`) — including dropping a tab past the last one, and
+ * the Alt+Arrow keyboard alternative (WCAG 2.5.7 requires a non-dragging path
+ * for a drag-only interaction).
+ *
+ * Returns the SAME array reference when the move is a no-op: source and
+ * target are the same id, either id is unknown, OR the move would not
+ * actually change the order (e.g. dropping a tab back adjacent to where it
+ * already sat) — same contract as `reconcilePages` /
+ * `applyPageDefaultWorkingDir`, so callers can skip a redundant persist /
+ * re-render.
+ *
+ * Exported so the reorder logic is unit-testable without React or a DOM drag
+ * event (same precedent as every other page mutation in this module).
+ */
+export function reorderPagesArray(
+  pages: TerminalPageConfig[],
+  sourceId: string,
+  targetId: string | null,
+): TerminalPageConfig[] {
+  if (sourceId === targetId) return pages;
+  const sourceIdx = pages.findIndex((p) => p.id === sourceId);
+  if (sourceIdx < 0) return pages;
+  if (targetId !== null && !pages.some((p) => p.id === targetId)) return pages;
+
+  const next = pages.slice();
+  const [moved] = next.splice(sourceIdx, 1);
+  // Re-locate the target in `next` (its index may have shifted by one when
+  // `moved` sat before it) rather than reusing a pre-removal index; `null`
+  // means "append at the end".
+  const insertAt = targetId === null ? next.length : next.findIndex((p) => p.id === targetId);
+  next.splice(insertAt, 0, moved);
+
+  // No-op guard: the splice above always allocates, even when the result is
+  // element-for-element identical to the input (dropping a tab back where it
+  // already was). Compare and return the original reference in that case.
+  const unchanged = next.length === pages.length && next.every((p, i) => p.id === pages[i].id);
+  return unchanged ? pages : next;
+}
+
+/**
+ * Pure: the `reorderPagesArray` target for moving `pageId` ONE SLOT in
+ * `direction` — the index arithmetic behind the tab bar's Alt+Arrow
+ * keyboard reorder (the non-dragging alternative WCAG 2.5.7 requires for a
+ * drag-only interaction). Moving right lands one slot further than moving
+ * left because `reorderPagesArray`'s "insert immediately before target"
+ * semantics need the element TWO positions ahead as the target to produce a
+ * plain adjacent swap; `null` is that same "append at end" sentinel when
+ * there's nothing two positions ahead.
+ *
+ * Returns:
+ *   - a page id or `null` — pass straight to `reorderPagesArray` /
+ *     `onReorderPage`.
+ *   - `undefined` — no legal move in that direction: `pageId` is unknown, or
+ *     already at that edge of `pages`.
+ *
+ * Exported so the arithmetic — the trickiest part of the keyboard path per
+ * code review, and the one piece a component-level (RTL) test would
+ * otherwise be needed to guard — is unit-testable directly. This repo's
+ * vitest runs `environment: "node"` with no RTL anywhere (see
+ * `LaunchMenu.test.tsx`); the established precedent is exporting the pure
+ * logic rather than standing up a React tree, which this follows.
+ */
+export function keyboardReorderTarget(
+  pages: TerminalPageConfig[],
+  pageId: string,
+  direction: "left" | "right",
+): string | null | undefined {
+  const i = pages.findIndex((p) => p.id === pageId);
+  if (i < 0) return undefined;
+  if (direction === "left") {
+    return i > 0 ? pages[i - 1].id : undefined;
+  }
+  if (i >= pages.length - 1) return undefined;
+  return i + 2 < pages.length ? pages[i + 2].id : null;
+}
+
 export function reconcilePages(
   persisted: TerminalPageConfig[],
   backendPageIds: Iterable<string>,
@@ -437,6 +517,23 @@ export function useTerminalPages() {
     setPages((prev) => {
       const updated = prev.map((p) => (p.id === id ? { ...p, name } : p));
       savePages(updated);
+      return updated;
+    });
+  }, []);
+
+  /**
+   * Move the `sourceId` tab to sit immediately before the `targetId` tab, or
+   * to the end of the list when `targetId` is `null` — the drop side of the
+   * tab bar's drag-to-reorder gesture (and its Alt+Arrow keyboard
+   * alternative). No-op (no persist, no re-render) when nothing would
+   * actually move; see `reorderPagesArray`.
+   */
+  const reorderPage = useCallback((sourceId: string, targetId: string | null) => {
+    setPages((prev) => {
+      const updated = reorderPagesArray(prev, sourceId, targetId);
+      if (updated === prev) return prev;
+      savePages(updated);
+      allPagesRef.current = updated;
       return updated;
     });
   }, []);
@@ -685,6 +782,7 @@ export function useTerminalPages() {
     openPage,
     removePage,
     renamePage,
+    reorderPage,
     setPageDefaultWorkingDir,
     ensureProjectPage,
     /** True in a page-pinned pop-out window (shows one fixed page, minimal chrome). */

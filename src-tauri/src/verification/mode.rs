@@ -166,49 +166,21 @@ pub fn show_screenshot_evidence() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::env_lock;
-
-    /// RAII guard that restores `key` to its pre-test value on drop,
-    /// including the panic path. Without this, a panic inside `f()` would
-    /// leave the env var pointing at the test's mutated value, leaking
-    /// state to any sibling test that reads the same key.
-    struct EnvRestore {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => env::set_var(self.key, v),
-                None => env::remove_var(self.key),
-            }
-        }
-    }
-
-    fn with_env<F: FnOnce()>(key: &'static str, value: Option<&str>, f: F) {
-        let _guard = env_lock();
-        let _restore = EnvRestore {
-            key,
-            prev: env::var(key).ok(),
-        };
-        match value {
-            Some(v) => env::set_var(key, v),
-            None => env::remove_var(key),
-        }
-        f();
-        // `_restore` drops here — runs whether or not `f()` panicked.
-    }
+    // `ENV_MODE` is a declared ambient key, so `isolated_ambient()` holds the
+    // env lock and restores the machine's value on drop, panic path included.
+    use crate::test_env::isolated_ambient;
 
     #[test]
     fn from_env_defaults_to_disabled() {
-        with_env(ENV_MODE, None, || {
-            let cfg = WsvConfig::from_env();
-            assert_eq!(cfg.mode, WsvMode::Disabled);
-        });
+        let _amb = isolated_ambient();
+        env::remove_var(ENV_MODE);
+        let cfg = WsvConfig::from_env();
+        assert_eq!(cfg.mode, WsvMode::Disabled);
     }
 
     #[test]
     fn from_env_parses_enabled_variants() {
+        let _amb = isolated_ambient();
         for v in [
             "enabled",
             "ENABLED",
@@ -218,28 +190,26 @@ mod tests {
             "yes",
             "  Enabled  ",
         ] {
-            with_env(ENV_MODE, Some(v), || {
-                assert_eq!(WsvConfig::from_env().mode, WsvMode::Enabled, "value={v}");
-            });
+            env::set_var(ENV_MODE, v);
+            assert_eq!(WsvConfig::from_env().mode, WsvMode::Enabled, "value={v}");
         }
     }
 
     #[test]
     fn from_env_parses_shadow() {
-        with_env(ENV_MODE, Some("shadow"), || {
-            assert_eq!(WsvConfig::from_env().mode, WsvMode::Shadow);
-        });
-        with_env(ENV_MODE, Some("SHADOW"), || {
-            assert_eq!(WsvConfig::from_env().mode, WsvMode::Shadow);
-        });
+        let _amb = isolated_ambient();
+        for v in ["shadow", "SHADOW"] {
+            env::set_var(ENV_MODE, v);
+            assert_eq!(WsvConfig::from_env().mode, WsvMode::Shadow, "value={v}");
+        }
     }
 
     #[test]
     fn from_env_garbage_values_fall_back_to_disabled() {
+        let _amb = isolated_ambient();
         for v in ["", "nope", "off", "0", "false", "shadowy"] {
-            with_env(ENV_MODE, Some(v), || {
-                assert_eq!(WsvConfig::from_env().mode, WsvMode::Disabled, "value={v}");
-            });
+            env::set_var(ENV_MODE, v);
+            assert_eq!(WsvConfig::from_env().mode, WsvMode::Disabled, "value={v}");
         }
     }
 

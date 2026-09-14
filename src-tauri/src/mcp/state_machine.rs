@@ -1053,8 +1053,7 @@ pub async fn save_compiled_state_machine(
 /// (see `mcp::extraction::get_extraction_screenshot`). Falls back to the
 /// current working directory when `dirs::home_dir()` is unavailable.
 fn quarantine_dir() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join(".qontinui").join("state-machine-quarantine")
+    qontinui_runner_lib::ambient::qontinui_dir_or_cwd().join("state-machine-quarantine")
 }
 
 /// POST body for `/state-machine/quarantine`. Matches the frontend's

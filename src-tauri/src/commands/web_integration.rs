@@ -10,10 +10,10 @@
 //! * [`get_web_integration_status`] — snapshot the current configuration
 //!   and live state (runner_id, last heartbeat, registration error) for
 //!   display in the Settings UI.
-//! * [`test_web_integration_connection`] — probe a candidate backend URL +
-//!   runner token pair without persisting: registers a throwaway runner
-//!   entry, reads the assigned runner_id, then immediately deletes it so
-//!   the test never leaves debris on the web side.
+//! * [`test_web_integration_connection`] — probe a candidate backend URL
+//!   without persisting. READ-ONLY: it reaches the backend's health route and
+//!   then, if the runner holds a device JWT, its own device identity. It
+//!   creates nothing and deletes nothing.
 //!
 //! After a successful `save_web_integration_settings` call the command
 //! emits a `web-integration-changed` Tauri event so live status views can
@@ -368,70 +368,169 @@ pub async fn save_web_integration_settings<R: Runtime>(
 // ---------------------------------------------------------------------------
 
 /// Response payload for [`test_web_integration_connection`].
+///
+/// Every field answers a DIFFERENT question, because "test connection" is not
+/// one question. Reachability, pairing and token shape fail independently and
+/// an operator needs to know which one broke.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TestConnectionResponse {
-    /// Runner ID assigned by the web backend for the throwaway probe entry.
-    /// Returned for debugging only — the entry is deleted before this
-    /// function returns, so the ID is not valid for any subsequent call.
-    pub runner_id: String,
+    /// The backend answered `GET /api/v1/health/live`. False is never reached
+    /// today (an unreachable backend is an `Err`), but the field is explicit so
+    /// the UI never infers reachability from the absence of an error.
+    pub reachable: bool,
+    /// Whether this runner holds a device JWT that the backend accepted.
+    /// `false` means reachable-but-unpaired, which is a normal first-run state
+    /// and NOT a configuration error.
+    pub paired: bool,
+    /// WHY the identity leg did not succeed. `paired: false` alone conflates
+    /// faults an operator must act on differently — "never paired yet" and
+    /// "your stored credential was rejected" are not the same problem, and a UI
+    /// branching only on `paired` shows them identically.
+    pub identity_fault: IdentityFault,
+    /// Device identity from `GET /api/v1/devices/me`. Present iff `paired`.
+    pub device_id: Option<String>,
+    pub user_id: Option<String>,
+    pub tenant_id: Option<String>,
+    /// Whether the CONFIGURED runner token has the expected `qontinui_runner_`
+    /// shape. `None` means no token is configured at all, which is the normal
+    /// state for a runner paired through Cognito or a pair code — those paths
+    /// never mint a `qontinui_runner_` token, so absence is not a fault and
+    /// must not be rendered as one. `Some(false)` is the only actionable value.
+    /// A LOCAL shape check only — see the note on
+    /// [`test_web_integration_connection`] for why the token is not sent.
+    pub token_format_valid: Option<bool>,
+    /// One line an operator can act on, covering whichever arm was reached.
+    pub detail: String,
 }
 
-#[derive(Serialize)]
-struct ProbeRegisterRequest {
-    name: String,
-    hostname: String,
-    port: u16,
-    capabilities: Vec<String>,
-    server_mode: bool,
-    restate_enabled: bool,
-    restate_healthy: bool,
+/// Why the identity leg of [`test_web_integration_connection`] did not produce
+/// an identity. Distinct variants because each wants a different operator
+/// action; collapsing them is what sends someone to re-paste a credential when
+/// coord's verifier is the thing that is down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityFault {
+    /// The identity check succeeded.
+    None,
+    /// No device JWT is stored — this runner has never paired. A normal
+    /// first-run state, not a misconfiguration.
+    Unpaired,
+    /// The probed URL is not the backend this runner is bound to, so the
+    /// identity leg was deliberately SKIPPED rather than presenting this
+    /// runner's live credential to an unbound host. See the security note on
+    /// [`test_web_integration_connection`].
+    NotBoundBackend,
+    /// 401 — the stored device JWT was rejected (stale, revoked, or minted for
+    /// another backend). Re-pair.
+    Rejected,
+    /// 403 — understood, but not permitted here.
+    Forbidden,
+    /// 503 — the backend could not reach coord's JWKS to verify the token. A
+    /// coord-tier fault that says nothing about this runner's credential.
+    VerifierDown,
+    /// A 2xx whose body did not decode, or any other unexpected status.
+    Unexpected,
 }
 
+/// Response of `GET /api/v1/devices/me`.
 #[derive(Deserialize)]
-struct ProbeRegisterResponse {
-    runner_id: String,
+struct DeviceIdentityResponse {
+    device_id: String,
+    user_id: String,
+    tenant_id: String,
 }
 
-async fn delete_probe_runner(
-    client: &reqwest::Client,
-    backend_url: &str,
-    token: &str,
-    runner_id: &str,
-) {
-    let del_url = format!("{}/api/v1/runners/{}", backend_url, runner_id);
-    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/runners/*`, with the
-    // web backend's own token.
-    match client.delete(&del_url).bearer_auth(token).send().await {
-        Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
-            // 404 is fine — it means the entry was already cleaned up by the
-            // backend (e.g. transient race) so there's nothing to remove.
-        }
-        Ok(r) => {
-            let status = r.status();
-            let body = r.text().await.unwrap_or_default();
-            warn!(
-                "test_web_integration_connection cleanup: DELETE returned {} ({})",
-                status,
-                body.chars().take(200).collect::<String>()
-            );
-        }
-        Err(e) => {
-            warn!(
-                "test_web_integration_connection cleanup: DELETE network error: {}",
-                e
-            );
-        }
+/// The prefix every runner token minted by web's `/connect-runner` flow
+/// carries. Checked locally so an obvious paste error is caught without a
+/// round-trip; see [`test_web_integration_connection`] for why that is the only
+/// check this command can honestly make.
+const RUNNER_TOKEN_PREFIX: &str = "qontinui_runner_";
+
+/// Is `candidate` the backend this runner is BOUND to — the origin
+/// `api_config::get_api_base_url()` resolves to, which is what
+/// `mcp::backend_relay` dials and what the stored device JWT was minted for?
+///
+/// Compared on ORIGIN (scheme + host + port), not on the raw string, so a
+/// trailing slash or a case difference in the host does not read as a different
+/// backend. Anything that does not parse compares unequal — fail closed, since
+/// the consequence of a false positive is presenting a live credential to an
+/// unbound host.
+fn is_bound_backend(candidate: &str) -> bool {
+    fn origin(raw: &str) -> Option<(String, String, Option<u16>)> {
+        let u = reqwest::Url::parse(raw.trim()).ok()?;
+        let host = u.host_str()?.to_ascii_lowercase();
+        Some((
+            u.scheme().to_ascii_lowercase(),
+            host,
+            u.port_or_known_default(),
+        ))
+    }
+    match (
+        origin(candidate),
+        origin(&crate::api_config::get_api_base_url()),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
     }
 }
 
-/// Validate a `(backend_url, runner_token)` pair by performing a register +
-/// immediate delete round-trip against the web backend. Never mutates
-/// runner settings and never spawns background tasks — purely a probe.
+/// Validate a candidate `(backend_url, runner_token)` pair WITHOUT persisting
+/// anything and WITHOUT mutating the backend. Purely a probe.
 ///
-/// The probe runner uses a unique name (`test-connection-<timestamp>`) so
-/// a partial failure leaves easily-identifiable debris. The DELETE is
-/// issued from a `Drop`-ish guard: even if the registration body fails to
-/// parse after the server allocated the entry, the runner is cleaned up.
+/// # Why this no longer registers a throwaway runner
+///
+/// Until 2026-09-12 this command did a register + immediate delete round-trip
+/// against `POST /api/v1/runners/register`. That endpoint was deleted from
+/// qontinui-web in `ad3692e6c` (2026-04-28) — "delete legacy fleet endpoints" —
+/// and the whole `/api/v1/runners` router followed in `1574bd036`. There is no
+/// `register` route anywhere in the web tree today and no alias, so this probe
+/// had been returning 404 to every operator who pressed "Test connection" for
+/// months. The replacement for registration is PAIRING, not a different
+/// register URL, so there is nothing to repoint it at.
+///
+/// # What it checks instead
+///
+/// Two read-only steps, reported independently so the operator learns which one
+/// failed:
+///
+/// 1. `GET {backend}/api/v1/health/live` — unauthenticated, no dependency
+///    checks, 200 whenever the process is up. This isolates "wrong URL / server
+///    down" from every credential question.
+/// 2. `GET {backend}/api/v1/devices/me` with the runner's OWN device JWT from
+///    [`crate::auth::AuthManager`]'s `access_token` slot. That is the credential
+///    the backend relay actually presents, so this proves the thing the runner
+///    will really do. 200 yields `{device_id, user_id, tenant_id}`; 401 means
+///    the stored JWT is stale or foreign; 503 means coord's JWKS is unreachable
+///    and says nothing about this runner.
+///
+/// # The identity leg only runs against the BOUND backend
+///
+/// Step 2 presents this runner's live, 4-hour, coord-issued device JWT. That
+/// credential is minted for one backend, and this command's `backend_url` is
+/// caller-supplied — the command is on the UI-Bridge invoke allowlist, so a
+/// local HTTP caller supplies it directly with no operator in the loop. Sending
+/// the JWT to whatever host was typed would hand a live credential to an
+/// arbitrary, attacker-choosable origin, and the `/health/live` gate is no
+/// protection because any host can answer 200.
+///
+/// So the identity leg runs ONLY when the probed origin matches the persisted
+/// backend (`api_config::get_api_base_url`) — the same origin
+/// `mcp::backend_relay` dials. Any other URL still gets its reachability
+/// answered and comes back [`IdentityFault::NotBoundBackend`], which is an
+/// honest "not checked", never a pass. The predecessor sent the legacy runner
+/// token here; upgrading the credential without narrowing the destination would
+/// have widened the blast radius while fixing the 404.
+///
+/// # Why the runner token is not sent anywhere
+///
+/// `runner_token` is no longer a qontinui-web credential. Since the unified
+/// devices migration it is presented on exactly one route — coord's `pair-cli`
+/// — where it is exchanged for a device JWT. Exercising it would therefore mean
+/// performing a real pairing and minting a real credential, which is a mutation
+/// and not something a "Test connection" button should do. So the token is
+/// checked for its `qontinui_runner_` shape locally, and `token_format_valid`
+/// says exactly that much and no more.
 #[tauri::command]
 pub async fn test_web_integration_connection(
     backend_url: String,
@@ -442,9 +541,8 @@ pub async fn test_web_integration_connection(
     // string. The Settings UI clears its in-memory token field after a
     // successful Save (so it never holds the secret longer than needed),
     // which previously made a follow-up "Test connection" send an empty
-    // token and 422 with "runner_token is required". Resolving against the
-    // persisted value here means Save-then-Test works as the operator
-    // expects without re-typing the token.
+    // token. Resolving against the persisted value here means
+    // Save-then-Test works as the operator expects without re-typing it.
     let trimmed_token = {
         let from_arg = runner_token.trim().to_string();
         if from_arg.is_empty() {
@@ -460,99 +558,191 @@ pub async fn test_web_integration_connection(
     if trimmed_backend.is_empty() {
         return Err("backend_url is required".to_string());
     }
-    if trimmed_token.is_empty() {
-        return Err("runner_token is required".to_string());
-    }
+
+    // A missing token is no longer fatal: the probe's substantive half is the
+    // device-JWT identity check, which does not use the token at all. Report
+    // the shape rather than refusing to run — and report ABSENCE as absence
+    // (`None`), not as a malformed token, because a runner paired through
+    // Cognito or a pair code legitimately has none.
+    let token_format_valid = if trimmed_token.is_empty() {
+        None
+    } else {
+        Some(trimmed_token.starts_with(RUNNER_TOKEN_PREFIX))
+    };
 
     let client = build_http_client()?;
 
-    let timestamp_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let probe_name = format!("test-connection-{}", timestamp_ns);
+    // ---- Step 1: reachability (unauthenticated) ----
+    let health_url = format!("{}/api/v1/health/live", trimmed_backend);
+    // Not a coord call: `qontinui-web`'s own unauthenticated liveness route.
+    // No `coord-auth-exempt` marker — the coord-auth pin inventories WRITE verbs
+    // only (`.post(`/`.put(`/`.patch(`/`.delete(`), so a marker on a `.get(`
+    // would read as a pinned exemption while being invisible to the pin.
+    let health_resp = client.get(&health_url).send().await.map_err(|e| {
+        String::from(AppError::NetworkError(format!(
+            "cannot reach {} — check the backend URL: {}",
+            trimmed_backend, e
+        )))
+    })?;
+    if !health_resp.status().is_success() {
+        let status = health_resp.status();
+        let body = health_resp.text().await.unwrap_or_default();
+        return Err(String::from(AppError::HttpStatusError {
+            status: status.as_u16(),
+            body: format!(
+                "{} did not answer its liveness route: {}",
+                health_url,
+                body.chars().take(200).collect::<String>()
+            ),
+        }));
+    }
 
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "test".to_string());
+    // ---- Step 2: identity, with the credential the relay actually uses ----
+    //
+    // GATE FIRST, read the credential second. The bound-backend check must
+    // happen before the JWT is even loaded, so an unbound URL cannot reach the
+    // credential at all. See the security note on this function.
+    if !is_bound_backend(&trimmed_backend) {
+        return Ok(TestConnectionResponse {
+            reachable: true,
+            paired: false,
+            identity_fault: IdentityFault::NotBoundBackend,
+            device_id: None,
+            user_id: None,
+            tenant_id: None,
+            token_format_valid,
+            detail: format!(
+                "Backend reachable at {trimmed_backend}, but that is not the backend \
+                 this runner is bound to ({}). Identity was NOT checked — this \
+                 runner's device credential is only ever presented to its bound \
+                 backend. Save this URL and re-pair to bind to it.",
+                crate::api_config::get_api_base_url()
+            ),
+        });
+    }
 
-    let payload = ProbeRegisterRequest {
-        name: probe_name,
-        hostname,
-        port: 0,
-        capabilities: vec![],
-        server_mode: true,
-        restate_enabled: false,
-        restate_healthy: false,
+    // `get_access_token` is synchronous and can fall through to the OS keychain,
+    // which on Linux is a D-Bus Secret Service round-trip bounded at 3s
+    // (`auth::keychain_call_bounded`). That is a real stall of a tokio worker on
+    // an operator button press, and the unpaired case — the one this branch
+    // exists to report — is precisely the one that always reaches the keychain.
+    // Same treatment `redeem_pair_code` below already gives its blocking call.
+    let device_jwt = spawn_blocking_tracked(|| {
+        crate::auth::AuthManager::new()
+            .get_access_token()
+            .ok()
+            .filter(|j| !j.trim().is_empty())
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some(device_jwt) = device_jwt else {
+        return Ok(TestConnectionResponse {
+            reachable: true,
+            paired: false,
+            identity_fault: IdentityFault::Unpaired,
+            device_id: None,
+            user_id: None,
+            tenant_id: None,
+            token_format_valid,
+            detail: format!(
+                "Backend reachable at {trimmed_backend}. This runner holds no device \
+                 JWT yet, so it is not paired — complete pairing from the web UI's \
+                 /connect-runner flow."
+            ),
+        });
     };
 
-    let register_url = format!("{}/api/v1/runners/register", trimmed_backend);
-    // coord-auth-exempt(not-coord): `qontinui-web` `/api/v1/runners/register`,
-    // with the web backend's own token.
-    let resp = client
-        .post(&register_url)
-        .bearer_auth(&trimmed_token)
-        .json(&payload)
+    let me_url = format!("{}/api/v1/devices/me", trimmed_backend);
+    // Not a coord call: `qontinui-web`'s own route, presented with this runner's
+    // coord-ISSUED device JWT (coord mints it; the read goes to web). Read verb,
+    // so no `coord-auth-exempt` marker — see the note on the liveness call.
+    let me_resp = client
+        .get(&me_url)
+        .bearer_auth(&device_jwt)
         .send()
         .await
         .map_err(|e| {
             String::from(AppError::NetworkError(format!(
-                "network error contacting {}: {}",
+                "reached {} but the identity check failed: {}",
                 trimmed_backend, e
             )))
         })?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        let truncated_body = body.chars().take(200).collect::<String>();
-        let msg = if status.as_u16() == 401 || status.as_u16() == 403 {
-            String::from(AppError::AuthError(format!(
-                "auth failed ({}): {}",
-                status, truncated_body
-            )))
-        } else {
-            String::from(AppError::HttpStatusError {
-                status: status.as_u16(),
-                body: truncated_body,
-            })
+    let status = me_resp.status();
+    if !status.is_success() {
+        let body = me_resp.text().await.unwrap_or_default();
+        let truncated = body.chars().take(200).collect::<String>();
+        // These are genuinely different faults. Collapsing them into one "auth
+        // failed" is what sends an operator to re-paste a token when coord's
+        // JWKS is the thing that is down.
+        let (fault, detail) = match status.as_u16() {
+            401 => (
+                IdentityFault::Rejected,
+                "the stored device JWT was rejected (stale, revoked, or issued \
+                 for another backend) — re-pair this runner"
+                    .to_string(),
+            ),
+            403 => (
+                IdentityFault::Forbidden,
+                "the device JWT was understood but is not permitted here".to_string(),
+            ),
+            503 => (
+                IdentityFault::VerifierDown,
+                "the backend could not reach coord's JWKS to verify the device \
+                 JWT — a coord-tier fault that says nothing about this runner's \
+                 credential"
+                    .to_string(),
+            ),
+            _ => (
+                IdentityFault::Unexpected,
+                format!("unexpected status from {me_url}"),
+            ),
         };
-        return Err(msg);
+        return Ok(TestConnectionResponse {
+            reachable: true,
+            paired: false,
+            identity_fault: fault,
+            device_id: None,
+            user_id: None,
+            tenant_id: None,
+            token_format_valid,
+            detail: format!(
+                "Backend reachable. Identity check failed ({status}): {detail}. {truncated}"
+            ),
+        });
     }
 
-    // Parse the response; on decode failure we still want to attempt
-    // cleanup. We first pull the raw body so we can log + attempt decode
-    // without re-requesting.
-    let body_text = resp.text().await.map_err(|e| {
+    let body_text = me_resp.text().await.map_err(|e| {
         String::from(AppError::NetworkError(format!(
-            "failed to read register response body: {}",
+            "failed to read identity response body: {}",
             e
         )))
     })?;
-    let parsed: Result<ProbeRegisterResponse, _> = serde_json::from_str(&body_text);
-
-    match parsed {
-        Ok(body) => {
-            // Best-effort cleanup regardless of success or subsequent error.
-            delete_probe_runner(&client, &trimmed_backend, &trimmed_token, &body.runner_id).await;
-            Ok(TestConnectionResponse {
-                runner_id: body.runner_id,
-            })
-        }
+    match serde_json::from_str::<DeviceIdentityResponse>(&body_text) {
+        Ok(id) => Ok(TestConnectionResponse {
+            reachable: true,
+            paired: true,
+            identity_fault: IdentityFault::None,
+            detail: format!(
+                "Connected to {} as device {} (tenant {}).",
+                trimmed_backend, id.device_id, id.tenant_id
+            ),
+            device_id: Some(id.device_id),
+            user_id: Some(id.user_id),
+            tenant_id: Some(id.tenant_id),
+            token_format_valid,
+        }),
         Err(e) => {
-            // We got 2xx but can't parse the body. The web backend
-            // allocated a runner entry we can't identify, so we can't
-            // clean it up — emit a clear warning but surface the parse
-            // failure to the caller.
             warn!(
-                "test_web_integration_connection: 2xx response body did not parse: {} body={}",
+                "test_web_integration_connection: /devices/me returned 2xx but did not \
+                 parse: {} body={}",
                 e,
                 body_text.chars().take(200).collect::<String>()
             );
             Err(format!(
-                "register returned 2xx but body did not decode as \
-                 RegistrationResponse: {}",
-                e
+                "identity check returned 2xx but the body did not decode as \
+                 DeviceIdentityResponse: {e}"
             ))
         }
     }
@@ -804,6 +994,11 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 mod ipc_wire_contract_tests {
     use serde::Deserialize;
 
+    // The probe's own constants/types. This module deliberately does NOT
+    // `use super::*` — it mirrors the Tauri wire shapes rather than exercising
+    // the module — so the few real items the probe tests touch are named.
+    use super::{is_bound_backend, IdentityFault, TestConnectionResponse, RUNNER_TOKEN_PREFIX};
+
     /// Mirror of what Tauri generates for `save_web_integration_settings`
     /// argument extraction. Top-level args are renamed camelCase → snake_case.
     /// Kept in sync with the live command signature — update this struct AND
@@ -933,5 +1128,110 @@ mod ipc_wire_contract_tests {
         let args: TestConnectionArgs = serde_json::from_str(payload).expect("must deserialize");
         assert_eq!(args.backend_url, "http://x");
         assert_eq!(args.runner_token, "tok");
+    }
+
+    /// The Settings UI reads `reachable` / `paired` / `deviceId` / `detail` off
+    /// this payload. Tauri does not rename for us, so the `rename_all` attribute
+    /// is load-bearing: drop it and every field silently reads `undefined` in
+    /// the UI rather than failing anywhere.
+    #[test]
+    fn test_connection_response_is_camel_case_on_the_wire() {
+        let resp = TestConnectionResponse {
+            reachable: true,
+            paired: true,
+            identity_fault: IdentityFault::None,
+            device_id: Some("dev-1".to_string()),
+            user_id: Some("user-1".to_string()),
+            tenant_id: Some("tenant-1".to_string()),
+            token_format_valid: Some(true),
+            detail: "ok".to_string(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&resp).expect("serializes");
+        let obj = v.as_object().expect("object");
+        for key in [
+            "reachable",
+            "paired",
+            "identityFault",
+            "deviceId",
+            "userId",
+            "tenantId",
+            "tokenFormatValid",
+            "detail",
+        ] {
+            assert!(obj.contains_key(key), "missing `{key}` in {v}");
+        }
+        for key in [
+            "device_id",
+            "user_id",
+            "tenant_id",
+            "token_format_valid",
+            "identity_fault",
+        ] {
+            assert!(!obj.contains_key(key), "snake_case `{key}` leaked in {v}");
+        }
+    }
+
+    /// The fault variants are a wire contract the UI branches on, so their
+    /// spelling is pinned. `snake_case` on the VALUES even though the fields
+    /// are camelCase — that is what `rename_all` on the enum produces.
+    #[test]
+    fn identity_fault_variants_serialize_as_named() {
+        for (v, want) in [
+            (IdentityFault::None, "\"none\""),
+            (IdentityFault::Unpaired, "\"unpaired\""),
+            (IdentityFault::NotBoundBackend, "\"not_bound_backend\""),
+            (IdentityFault::Rejected, "\"rejected\""),
+            (IdentityFault::Forbidden, "\"forbidden\""),
+            (IdentityFault::VerifierDown, "\"verifier_down\""),
+            (IdentityFault::Unexpected, "\"unexpected\""),
+        ] {
+            assert_eq!(serde_json::to_string(&v).unwrap(), want);
+        }
+    }
+
+    /// The security gate: a URL that is not the bound backend must never reach
+    /// the identity leg, because that leg presents a live device credential.
+    /// Anything unparseable compares unequal — fail closed.
+    #[test]
+    fn is_bound_backend_fails_closed_on_junk() {
+        assert!(!is_bound_backend(""));
+        assert!(!is_bound_backend("not-a-url"));
+        assert!(!is_bound_backend("https://evil.example"));
+    }
+
+    /// `token_format_valid` is a LOCAL shape check and nothing more — the token
+    /// is not sent anywhere, so this is the only statement the probe can
+    /// honestly make about it. Pin the prefix so the check cannot quietly widen
+    /// into "any non-empty string is fine".
+    #[test]
+    fn runner_token_prefix_is_the_only_local_check() {
+        // Absence is reported as `None`, never as a malformed token: a runner
+        // paired through Cognito or a pair code legitimately has no
+        // `qontinui_runner_` token at all.
+        assert!("qontinui_runner_deadbeef".starts_with(RUNNER_TOKEN_PREFIX));
+        assert!(!"qontinui_device_deadbeef".starts_with(RUNNER_TOKEN_PREFIX));
+        assert!(!"".starts_with(RUNNER_TOKEN_PREFIX));
+        assert!(!"deadbeef".starts_with(RUNNER_TOKEN_PREFIX));
+    }
+
+    /// Regression pin for the 2026-09-12 rewrite. `POST /api/v1/runners/register`
+    /// was deleted from qontinui-web in `ad3692e6c`; the whole `/api/v1/runners`
+    /// router went in `1574bd036`, with no alias. A probe that drifts back to it
+    /// 404s on every press of "Test connection" with no local error, which is
+    /// exactly the failure this command shipped with for months. The route
+    /// strings this command may build are pinned here.
+    #[test]
+    fn probe_targets_live_routes_only() {
+        let backend = "https://api.qontinui.io";
+        let health = format!("{backend}/api/v1/health/live");
+        let me = format!("{backend}/api/v1/devices/me");
+        for url in [&health, &me] {
+            assert!(
+                !url.contains("/api/v1/runners"),
+                "probe must not target the retired runners router: {url}"
+            );
+        }
+        assert!(health.ends_with("/api/v1/health/live"));
+        assert!(me.ends_with("/api/v1/devices/me"));
     }
 }

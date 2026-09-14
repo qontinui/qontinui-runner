@@ -108,6 +108,9 @@ impl Transport for ClaudeCliTransport {
                         // the lane, the headroom and the floor, which is what
                         // the requester sees and can retry on.
                         false,
+                        // The operator (or the frontend pre-fill) types `claude`
+                        // afterwards; the account is chosen then.
+                        crate::terminal::TrustArm::AccountChosenLater,
                     )
                     .map_err(TransportError::Runtime)?;
 

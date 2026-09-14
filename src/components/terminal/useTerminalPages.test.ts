@@ -18,6 +18,8 @@ import { instanceStorage } from "@/lib/instance-storage";
 import { resolveSpawnWorkingDir } from "./useTerminalManager";
 import {
   reconcilePages,
+  reorderPagesArray,
+  keyboardReorderTarget,
   computeVisiblePages,
   pageIdsFromTerminals,
   pageIdsFromSessions,
@@ -137,6 +139,109 @@ describe("reconcilePages", () => {
     const out = reconcilePages([DEFAULT], ["a", "b"]);
     const names = out.filter((p) => p.id !== "default").map((p) => p.name);
     expect(names).toEqual(["Page 1", "Page 2"]);
+  });
+});
+
+describe("reorderPagesArray (drag-to-reorder)", () => {
+  const A: TerminalPageConfig = { id: "a", name: "A", createdAt: 1 };
+  const B: TerminalPageConfig = { id: "b", name: "B", createdAt: 2 };
+  const C: TerminalPageConfig = { id: "c", name: "C", createdAt: 3 };
+
+  it("moves a page forward to sit immediately before the target", () => {
+    const out = reorderPagesArray([A, B, C], "a", "c");
+    expect(out.map((p) => p.id)).toEqual(["b", "a", "c"]);
+  });
+
+  it("moves a page backward to sit immediately before the target", () => {
+    const out = reorderPagesArray([A, B, C], "c", "a");
+    expect(out.map((p) => p.id)).toEqual(["c", "a", "b"]);
+  });
+
+  it("is a no-op (same reference) when source and target are the same id", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "b", "b")).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when the source id is unknown", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "missing", "a")).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when the target id is unknown", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "a", "missing")).toBe(pages);
+  });
+
+  it("does not mutate the input array", () => {
+    const pages = [A, B, C];
+    const snapshot = [...pages];
+    reorderPagesArray(pages, "a", "c");
+    expect(pages).toEqual(snapshot);
+  });
+
+  it("preserves every page's own fields (only order changes)", () => {
+    const out = reorderPagesArray([A, B, C], "c", "a");
+    expect(out.find((p) => p.id === "c")).toEqual(C);
+  });
+
+  it("moves a page to the end when targetId is null", () => {
+    const out = reorderPagesArray([A, B, C], "a", null);
+    expect(out.map((p) => p.id)).toEqual(["b", "c", "a"]);
+  });
+
+  it("is a no-op (same reference) when the last page is dropped past itself (null target)", () => {
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "c", null)).toBe(pages);
+  });
+
+  it("is a no-op (same reference) when a drop would not change the order", () => {
+    // "a" is already immediately before "b" — dropping it there again must
+    // not allocate a new (element-wise identical) array.
+    const pages = [A, B, C];
+    expect(reorderPagesArray(pages, "a", "b")).toBe(pages);
+  });
+});
+
+describe("keyboardReorderTarget (Alt+Arrow index math)", () => {
+  // Deliberately 4 pages: the "moving right" arithmetic (target = 2 slots
+  // ahead, or end) only distinguishes itself from a naive "1 slot ahead"
+  // once there's a 4th page to expose the off-by-one.
+  const P = ["a", "b", "c", "d"].map((id, i) => ({ id, name: id, createdAt: i }));
+
+  it("left: targets the immediate predecessor, producing a one-slot move", () => {
+    // Moving "b" (index 1) left of "a" is exactly what reorderPagesArray
+    // does when told to insert "b" before "a".
+    expect(keyboardReorderTarget(P, "b", "left")).toBe("a");
+    const out = reorderPagesArray(P, "b", keyboardReorderTarget(P, "b", "left")!);
+    expect(out.map((p) => p.id)).toEqual(["b", "a", "c", "d"]);
+  });
+
+  it("left: no-op (undefined) at the first tab", () => {
+    expect(keyboardReorderTarget(P, "a", "left")).toBeUndefined();
+  });
+
+  it("right: targets two slots ahead, producing a one-slot move (not a two-slot jump)", () => {
+    // "b" (index 1) moving right should land just past "c" — a plain swap
+    // with "c" — which means the reorderPagesArray TARGET is "d" (index 3).
+    expect(keyboardReorderTarget(P, "b", "right")).toBe("d");
+    const out = reorderPagesArray(P, "b", keyboardReorderTarget(P, "b", "right")!);
+    expect(out.map((p) => p.id)).toEqual(["a", "c", "b", "d"]);
+  });
+
+  it("right: targets null (append-at-end) at the second-to-last tab", () => {
+    // "c" (index 2, second-to-last of 4) has nothing two slots ahead.
+    expect(keyboardReorderTarget(P, "c", "right")).toBeNull();
+    const out = reorderPagesArray(P, "c", keyboardReorderTarget(P, "c", "right")!);
+    expect(out.map((p) => p.id)).toEqual(["a", "b", "d", "c"]);
+  });
+
+  it("right: no-op (undefined) at the last tab", () => {
+    expect(keyboardReorderTarget(P, "d", "right")).toBeUndefined();
+  });
+
+  it("no-op (undefined) for an unknown page id, either direction", () => {
+    expect(keyboardReorderTarget(P, "missing", "left")).toBeUndefined();
+    expect(keyboardReorderTarget(P, "missing", "right")).toBeUndefined();
   });
 });
 

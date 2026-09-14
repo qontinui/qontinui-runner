@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -27,6 +28,26 @@ const DEFAULT_BACKEND_URL = "https://api.qontinui.io";
  *  fault). Drives whether the error view offers the sign-in button. */
 export function isAuthLoadError(raw: string): boolean {
   return raw.includes("401");
+}
+
+/** Tauri event the runner emits when a `qontinui://github-connected` deep-link
+ *  claim finishes, either way. Name and payload mirror
+ *  `wake_handler::GITHUB_CONNECT_RESULT_EVENT` (`src-tauri/src/wake_handler.rs`). */
+export const GITHUB_CONNECT_RESULT_EVENT = "github-connect-result";
+
+export interface GithubConnectResult {
+  ok: boolean;
+  message: string;
+}
+
+/** Narrow an untrusted event payload to the `{ ok, message }` contract. The
+ *  runner is the only emitter, but a shape check here means a drifted payload
+ *  renders as "no result" rather than as `undefined` in the UI. */
+export function parseGithubConnectResult(payload: unknown): GithubConnectResult | null {
+  if (typeof payload !== "object" || payload === null) return null;
+  const { ok, message } = payload as Record<string, unknown>;
+  if (typeof ok !== "boolean" || typeof message !== "string") return null;
+  return { ok, message };
 }
 
 /** Map a raw `github_list_repos` failure message to a specific, actionable headline.
@@ -144,6 +165,20 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   const [signingIn, setSigningIn] = useState(false);
   const [signInError, setSignInError] = useState<string | null>(null);
 
+  /** Outcome of the last runner-native connect (the `github-connected` deep
+   *  link), surfaced in the not_connected / connected views. Cleared when the
+   *  user starts another connect. */
+  const [connectResult, setConnectResult] = useState<GithubConnectResult | null>(null);
+  /** In-flight `github_connect_url` + browser open. The command now round-trips
+   *  to coord for a connect-state token, so the button is disabled meanwhile:
+   *  a second click would open a second browser tab whose flow can no longer
+   *  complete (the runner keeps one pending nonce — last click wins). */
+  const [connecting, setConnecting] = useState(false);
+  /** Same guard as `connecting`, but read synchronously: a ref latch does not
+   *  depend on React having flushed the `disabled` attribute before a second
+   *  click event dispatches. */
+  const connectingRef = useRef(false);
+
   const loadRepos = useCallback(async (): Promise<RepoListResponse | null> => {
     setLoading(true);
     setError(null);
@@ -167,6 +202,39 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- one-shot data load on mount
     void loadRepos();
+  }, [loadRepos]);
+
+  // P2 runner-native connect: the runner completes the claim itself when the
+  // `qontinui://github-connected` deep link arrives and reports the outcome on
+  // this event. The focus/visibility re-check below fires when the OS brings
+  // the window forward, which is BEFORE the async claim finishes, so without
+  // this listener a successful claim still showed "Connect GitHub" until the
+  // user clicked refresh — and a failed one (expired flow, sign-in needed,
+  // coord refusal) was only ever logged.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    const subscribe = async () => {
+      try {
+        const fn = await listen<unknown>(GITHUB_CONNECT_RESULT_EVENT, (event) => {
+          const result = parseGithubConnectResult(event.payload);
+          if (!result) return;
+          setConnectResult(result);
+          if (result.ok) void loadRepos();
+        });
+        // Unmounted (or StrictMode re-ran the effect) before `listen` resolved.
+        if (cancelled) fn();
+        else unlisten = fn;
+      } catch {
+        // Outside Tauri (tests, storybook) there is no event bus — the picker
+        // still works through the manual refresh.
+      }
+    };
+    void subscribe();
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
   }, [loadRepos]);
 
   // --- §4.3 refresh + auto-detect --------------------------------------------
@@ -254,12 +322,24 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
   // configured web origin; the page guarantees a signed-in qontinui.io session
   // so the post-install claim binds the org to the user's tenant. On failure,
   // surface it in the same error panel rather than silently doing nothing.
+  //
+  // `github_connect_url` also mints the coord connect-state the runner will
+  // claim with, so it can fail (not signed in, coord unreachable) — that
+  // failure belongs in the same panel, before the browser ever opens.
   const openConnect = useCallback(async () => {
+    if (connectingRef.current) return;
+    connectingRef.current = true;
+    setConnecting(true);
+    setConnectResult(null);
+    setError(null);
     try {
       const url = await invoke<string>("github_connect_url");
       await openUrl(url);
     } catch (err) {
       setError(`Couldn't open the GitHub connect page: ${err}`);
+    } finally {
+      connectingRef.current = false;
+      setConnecting(false);
     }
   }, []);
 
@@ -426,8 +506,13 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           <button
             className="btn-primary flex items-center gap-2"
             onClick={() => void openConnect()}
+            disabled={connecting}
           >
-            <ExternalLink className="w-4 h-4" />
+            {connecting ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <ExternalLink className="w-4 h-4" />
+            )}
             Connect GitHub
           </button>
           <button
@@ -441,6 +526,17 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
             I've connected — refresh
           </button>
         </div>
+        {/* A failed runner-native claim (expired flow, sign-in needed, coord
+            refusal). A successful one re-loads and leaves this view, so only
+            failures are ever rendered here. */}
+        {connectResult && !connectResult.ok && (
+          <p className="text-xs text-red-300 break-words whitespace-pre-wrap">
+            {connectResult.message}
+          </p>
+        )}
+        {/* `openConnect` reports into `error`, which the connected view owns;
+            without this the mint/open failure it sets was invisible from here. */}
+        {error && <p className="text-xs text-red-300 break-words whitespace-pre-wrap">{error}</p>}
       </div>
     );
   }
@@ -521,6 +617,12 @@ export function GithubRepoPicker({ onProjectsCloned }: GithubRepoPickerProps) {
           {destParent || <span className="text-muted-foreground">No destination selected</span>}
         </div>
       </div>
+
+      {connectResult?.ok && (
+        <div className="panel border-green-500/30 bg-green-500/10 p-3 text-sm text-green-300">
+          {connectResult.message}
+        </div>
+      )}
 
       {error && (
         <div className="panel border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300 whitespace-pre-wrap">

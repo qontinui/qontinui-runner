@@ -712,9 +712,7 @@ pub async fn get_extraction_screenshot(
     use axum::http::header;
 
     // Build path to screenshot file
-    let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let screenshot_path = home_dir
-        .join(".qontinui")
+    let screenshot_path = qontinui_runner_lib::ambient::qontinui_dir_or_cwd()
         .join("extraction")
         .join(&extraction_id)
         .join("screenshots")

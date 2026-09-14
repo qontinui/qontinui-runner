@@ -404,6 +404,26 @@ jobs:
       # camelCase / deny_unknown_fields drift from qontinui-schemas before
       # paying for `vite build`. Closes Item 4 of the
       # schemas-camelcase-cascade-2026-04-18 plan.
+      # Component-action `effect` boundary fixture (plan
+      # 2026-09-04-effect-calculus-joins-the-component-action-registry, Phase 1).
+      # Re-derives the /control/components body by running the REAL
+      # serializeComponent over the REAL Settings.tsx registration, and fails
+      # when it drifts from src-tauri/tests/fixtures/control-components-effect.json
+      # -- the fixture the Rust test `component_effect_fixture` reads. Node-only
+      # and sub-second, so it runs before the expensive steps.
+      - name: Verify component-action effect fixture
+        run: pnpm run effect:fixture:check
+
+      # Probe 2b's verdict logic (per-action `effect` round-trip), mutation-
+      # tested with no runner. Same placement rationale as the step above: ~1s,
+      # and a broken verdict should fail before a full exe boot. The verdict
+      # library was fixed for Windows PowerShell 5.1 in #1460, which landed
+      # after this branch was first cut -- this rebuild picks that up.
+      - name: Contract-smoke effect-probe verdict (PS 5.1)
+        if: matrix.platform == 'windows-latest'
+        run: powershell -File scripts/tests/test-effect-probe.ps1
+        shell: bash
+
       - name: Typecheck frontend code
         run: pnpm run typecheck
 
@@ -484,9 +504,18 @@ jobs:
       # Until the companion PR lands this step makes `Run Rust tests` RED —
       # that red is the plan's Phase 0 inventory running on CI, and the merge
       # train orders the two PRs by label. Separately, ANY edit under
-      # `.github/workflows/**` reds `ci-integrity` by design and needs the
-      # operator's review (plan 2026-08-30-runner-ci-has-no-flake-detection-
-      # so-one-flaky-test-freezes-the-train); expected, not a workaround target.
+      # `.github/workflows/**` reds `ci-integrity` by design on a main-based PR
+      # (plan 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-
+      # freezes-the-train); expected, not a workaround target. It does NOT need
+      # an operator's review — that arm was retired in favour of
+      # declare-and-verify. The author clears it: `ci:gate-change=declared` for
+      # a purely additive change — a whole new JOB, a new workflow FILE, or an
+      # edit that moves no surface at all, which includes a YAML-level
+      # comment-only edit like this one — or
+      # `ci:gate-change=alters-a-gate` plus a `Gate-Change: ci#<job-key>` line in
+      # the PR body when an existing job's surface moves — which includes adding
+      # or removing a STEP, and editing a shell comment inside a `run:` block.
+      # A deleted job takes `Gate-Removal:` instead. Then re-run the job.
       - name: Poison ambient state
         run: |
           set -euo pipefail

@@ -74,7 +74,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -151,7 +151,18 @@ struct CoordSyncInner {
     /// default dormant. The poll task ([`CoordSync::start_flag_poll_task`])
     /// refreshes it from coord's `/tenant-policy` endpoint.
     dual_write: DualWriteGate,
+    /// Invoked with the payload's `claude_session_id` and `finished_at` when coord ACKs a
+    /// `finished` record — main.rs attaches `SessionLifecycleStore::
+    /// mark_finish_synced` (plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2, "Clear
+    /// `finish_synced` on ACK"). Only a real `PushOutcome::Acked` counts; a
+    /// permanent failure is ACK-dropped from the outbox but NOT synced.
+    /// Unattached (tests, pre-wiring) → the flag is never stamped.
+    finished_ack_observer: OnceLock<FinishedAckObserver>,
 }
+
+/// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
+struct FinishedAckObserver(Box<dyn Fn(&str, Option<i64>) + Send + Sync>);
 
 impl std::fmt::Debug for CoordSync {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -197,6 +208,7 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
+                finished_ack_observer: OnceLock::new(),
             }),
         }
     }
@@ -225,6 +237,7 @@ impl CoordSync {
                 app_handle: Mutex::new(None),
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
+                finished_ack_observer: OnceLock::new(),
             }),
         }
     }
@@ -298,6 +311,23 @@ impl CoordSync {
             .lock()
             .expect("coord_sync registry slot poisoned");
         *slot = Some(Arc::downgrade(registry));
+    }
+
+    /// Attach the `finished`-ACK observer (once, at startup) — invoked with the
+    /// `claude_session_id` from a `finished` record's payload each time coord
+    /// ACKs one. See `CoordSyncInner::finished_ack_observer`.
+    pub fn attach_finished_ack_observer(
+        &self,
+        f: impl Fn(&str, Option<i64>) + Send + Sync + 'static,
+    ) {
+        if self
+            .inner
+            .finished_ack_observer
+            .set(FinishedAckObserver(Box::new(f)))
+            .is_err()
+        {
+            tracing::warn!("coord_sync: finished-ACK observer already attached — ignoring");
+        }
     }
 
     /// Start the drain task. Returns the [`JoinHandle`] so `main.rs` can
@@ -611,6 +641,7 @@ async fn push_chain(
             PushOutcome::Acked => {
                 out.succeeded.push((rec.session_id, rec.seq));
                 out.cleared.push((rec.session_id, rec.seq));
+                notify_finished_ack(&inner, &rec);
             }
             PushOutcome::Conflict { row } => {
                 out.succeeded.push((rec.session_id, rec.seq));
@@ -774,6 +805,33 @@ async fn run_drain_loop(inner: Arc<CoordSyncInner>) {
             backoff = TICK_BUSY;
             tokio::time::sleep(TICK_BUSY).await;
         }
+    }
+}
+
+/// Stamp `finish_synced` back onto the local record once coord has ACKed a
+/// `finished` row. A record whose payload carries no `claude_session_id` (none
+/// is written without one) is skipped rather than guessed at.
+fn notify_finished_ack(inner: &CoordSyncInner, rec: &OutboxRecord) {
+    if rec.event_kind != SessionEventKind::Finished.as_str() {
+        return;
+    }
+    let Some(obs) = inner.finished_ack_observer.get() else {
+        return;
+    };
+    match rec
+        .payload
+        .get("claude_session_id")
+        .and_then(|v| v.as_str())
+    {
+        Some(csid) => (obs.0)(
+            csid,
+            rec.payload.get("finished_at").and_then(|v| v.as_i64()),
+        ),
+        None => tracing::warn!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            "coord_sync: finished record ACKed without a claude_session_id — cannot mark synced"
+        ),
     }
 }
 
@@ -995,6 +1053,34 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "coord-transport-rung" => {
+            // WHICH transport rung carried one coord call (plan
+            // 2026-09-07-no-per-session-record-of-which-transport-rung-carried-
+            // a-coord-read, Phase 1). Same ingest and same body shape as
+            // "restore-record" above: POST /sessions/:id/events
+            // {seq, event_kind, payload}, which stores event_kind verbatim in
+            // coord.session_events and is idempotent on (session_id, seq), so
+            // the outbox may replay freely.
+            //
+            // ⚠️ THIS ARM IS LOAD-BEARING. Without it the kind falls to the
+            // `other` catch-all below, which ACKs and DROPS at debug level:
+            // the row would be written durably, drained, silently discarded
+            // and acked as delivered, and
+            // success_metric/coord-mcp-first-rung-reachability would read a
+            // clean zero with nothing erroring anywhere. That is the exact
+            // failure the phase exists to prevent — see
+            // `drain_pushes_coord_transport_rung_to_events_endpoint`, which
+            // fails if this arm is removed.
+            let url = format!("{base}/sessions/{}/events", rec.session_id);
+            let body = json!({
+                "seq": rec.seq,
+                "event_kind": rec.event_kind,
+                "payload": rec.payload,
+            });
+            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+                .send()
+                .await
+        }
         other => {
             // HandoffRequest is Phase 7 — defined now for wire shape, not
             // pushed yet. Quietly ACK so the file doesn't grow.
@@ -1040,25 +1126,84 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             if status.is_success() {
                 return PushOutcome::Acked;
             }
-            if kind == "restore-record"
+            if matches!(kind, "restore-record" | "coord-transport-rung")
                 && matches!(
                     status,
                     StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
                 )
             {
                 // Coord build without the session-events ingest route (the
-                // coord slice of Phase 4 ships it in parallel). The mirror is
-                // best-effort observability — drop quietly instead of
-                // error-spamming the PermanentFailure path. Note the emitter's
-                // debounce map already counted this record as emitted, so an
-                // UNCHANGED record will not re-emit until the runner restarts
-                // or the record materially changes — acceptable for a mirror
-                // whose readers always take the newest event.
+                // coord slice of Phase 4 ships it in parallel), or a
+                // `coord.sessions` row that has since been GC'd — the ingest
+                // 404s on an unknown :id rather than raising the raw FK
+                // violation. Both mirrors are best-effort observability, so
+                // drop quietly instead of error-spamming the PermanentFailure
+                // path. Note restore-record's emitter debounce map already
+                // counted the record as emitted, so an UNCHANGED record will
+                // not re-emit until the runner restarts or the record
+                // materially changes — acceptable for a mirror whose readers
+                // always take the newest event. `coord-transport-rung` has no
+                // debounce: it is one row per proxied call, so the next call
+                // simply produces the next row.
+                if kind == "coord-transport-rung" {
+                    // This mirror IS the population of
+                    // `success_metric/coord-mcp-first-rung-reachability`, so a
+                    // quiet `info` drop is exactly how "40 rows out of 4000
+                    // calls" becomes invisible. `warn` instead, and name WHICH
+                    // of the two causes it was — they need opposite fixes.
+                    //
+                    // The two causes get DIFFERENT log cadences, because they
+                    // are different KINDS of fact and this kind has no
+                    // debounce (one row per proxied call):
+                    //
+                    //   * 405 is a PROCESS-WIDE, persistent fact — the serving
+                    //     coord has no session-events ingest route, so EVERY
+                    //     row 405s until that coord slice lands. Warning once
+                    //     per call would emit thousands of identical lines and
+                    //     dominate the 15 other `warn!` sites in this file,
+                    //     burying them in `.dev-logs` — the fleet's first
+                    //     debugging surface and what `/review-logs` consumes.
+                    //     So: first occurrence, then every 1000th, carrying the
+                    //     running total so the under-count stays quantified.
+                    //   * 404 is PER-SESSION and should be genuinely rare (a
+                    //     lane resolved, but coord does not know that session
+                    //     id — a wrong lane, or a GC'd `coord.sessions` row).
+                    //     Per-occurrence detail is what makes it diagnosable,
+                    //     so it is NOT throttled.
+                    if status == StatusCode::METHOD_NOT_ALLOWED {
+                        static DROPPED_405: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(0);
+                        let n = DROPPED_405.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if n == 1 || n % 1000 == 0 {
+                            tracing::warn!(
+                                dropped_total = n,
+                                kind = %kind,
+                                status = %status,
+                                "coord_sync: transport-rung rows dropped — coord \
+                                 build lacks the session-events ingest route; \
+                                 first-rung reachability under-counts"
+                            );
+                        }
+                        return PushOutcome::Acked;
+                    }
+                    tracing::warn!(
+                        session = %rec.session_id,
+                        seq = rec.seq,
+                        kind = %kind,
+                        status = %status,
+                        cause = "coord does not know this session id (404 — wrong \
+                                 lane, or the coord.sessions row was GC'd)",
+                        "coord_sync: transport-rung row dropped — the first-rung \
+                         reachability metric will under-count"
+                    );
+                    return PushOutcome::Acked;
+                }
                 tracing::info!(
                     session = %rec.session_id,
                     seq = rec.seq,
+                    kind = %kind,
                     status = %status,
-                    "coord_sync: restore-record ingest unavailable — dropping mirror event"
+                    "coord_sync: session-events ingest unavailable — dropping mirror event"
                 );
                 return PushOutcome::Acked;
             }
@@ -1901,6 +2046,7 @@ mod tests {
             SessionEventKind::GateRegistration,
             SessionEventKind::FindingPosted,
             SessionEventKind::Finished,
+            SessionEventKind::CoordTransportRung,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -2287,6 +2433,7 @@ mod tests {
 
     #[test]
     fn dual_write_mirrors_when_flag_on() {
+        let _amb = crate::test_env::isolated_ambient();
         // Force the gate open via the DualWriteGate's apply path (the
         // poll loop's effect) and assert mirror_legacy_session registers
         // an external session + writes a Started outbox row.
@@ -2316,6 +2463,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_started_event_as_post_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2361,6 +2509,7 @@ mod tests {
     /// `{chunk_offset, payload_b64, stream}` and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_output_chunk_to_output_endpoint() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2410,12 +2559,111 @@ mod tests {
         .await;
     }
 
+    /// ANTI-TRAP TEST (plan
+    /// 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read,
+    /// Phase 1, the whole reason the phase exists).
+    ///
+    /// `push_record`'s `other =>` catch-all ACKs and DROPS: a kind added to
+    /// [`SessionEventKind`] with no arm of its own is written durably to the
+    /// outbox, drained, discarded at `debug` level and acked as delivered.
+    /// Nothing errors, and `success_metric/coord-mcp-first-rung-reachability`
+    /// reads a clean zero.
+    ///
+    /// So this asserts on the HTTP request coord actually receives, not on a
+    /// second list of handled kinds that could drift from the match: delete the
+    /// `"coord-transport-rung"` arm and the record falls to the catch-all,
+    /// which issues NO request at all, `g.events` stays empty and this test
+    /// fails at the `assert_eq!` below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_coord_transport_rung_to_events_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let machine_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let agent_session_id = Uuid::new_v4();
+        let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            Some("loopback_proxy"),
+            Some("policy"),
+            Some("2"),
+            Some("native_mcp"),
+            crate::session::coord_transport_rung::OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            crate::session::coord_transport_rung::OPERATION_READ,
+            Some(agent_session_id),
+        );
+        outbox
+            .record(
+                machine_id,
+                session_id,
+                SessionEventKind::CoordTransportRung,
+                obs.payload(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.events.is_empty()).unwrap_or(false)
+        })
+        .await;
+
+        let g = rec.lock().await;
+        assert_eq!(
+            g.events.len(),
+            1,
+            "exactly one POST /sessions/:id/events — an empty `events` here means \
+             push_record has no `coord-transport-rung` arm and the row was \
+             Ack-DROPPED by the catch-all"
+        );
+        let (posted_id, body) = &g.events[0];
+        assert_eq!(*posted_id, session_id, "the lane is the coord.sessions.id");
+        assert_eq!(body["event_kind"], json!("coord-transport-rung"));
+        assert!(
+            body["seq"].as_i64().is_some(),
+            "the outbox allocated the seq"
+        );
+        assert_eq!(body["payload"]["v"], json!(1));
+        assert_eq!(body["payload"]["transport"], json!("loopback_proxy"));
+        assert_eq!(body["payload"]["reporter"], json!("policy"));
+        assert_eq!(body["payload"]["reporter_step"], json!("2"));
+        assert_eq!(body["payload"]["attempted"], json!(["native_mcp"]));
+        assert_eq!(body["payload"]["operation"], json!("read"));
+        assert_eq!(body["payload"]["outcome"], json!("ok"));
+        assert_eq!(body["payload"]["off_cascade"], json!(false));
+        assert_eq!(
+            body["payload"]["agent_session_id"],
+            json!(agent_session_id.to_string()),
+            "the runner-observed agent-session anchor rides the payload — it is a \
+             DIFFERENT id space from the row's session_id"
+        );
+        // The row's own columns must not be duplicated into the payload.
+        assert!(body["payload"].get("session_id").is_none());
+        assert!(body["payload"].get("occurred_at").is_none());
+        drop(g);
+
+        // ACKed (at-least-once delivery confirmed).
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+    }
+
     /// Restore-registry mirror (plan 2026-07-09 §3.4, Phase 4) — a
     /// `restore-record` outbox row drains to `POST /sessions/:id/events`
     /// carrying `{seq, event_kind, payload}` with the binding payload
     /// verbatim, and is ACKed on 2xx.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_pushes_restore_record_to_events_endpoint() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2499,6 +2747,7 @@ mod tests {
     /// `POST /sessions` body verbatim (session-create goes explicit).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_forwards_explicit_session_tenant_in_create_body() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2609,6 +2858,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_treats_409_as_acked_for_started() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2646,6 +2896,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_retries_after_5xx() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2676,6 +2927,7 @@ mod tests {
     /// and trips the shared abort flag.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn transport_error_stops_the_chain_and_trips_the_abort_flag() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2800,6 +3052,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_emits_outbox_rows_for_active_sessions() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, _rec) = spawn_fake_coord().await;
@@ -2834,6 +3087,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heartbeat_records_patch_to_coord() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2858,12 +3112,110 @@ mod tests {
         .await;
     }
 
+    /// The round trip the source-text guards above cannot observe: a `finished`
+    /// row enqueued in the outbox drains to the path-addressed PATCH, and
+    /// coord's 2xx ACK reaches the observer with the row's `claude_session_id`
+    /// (plan `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn finished_row_drains_to_patch_and_its_ack_reaches_the_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let acked: Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>> = Default::default();
+        {
+            let acked = acked.clone();
+            coord.attach_finished_ack_observer(move |csid, at| {
+                acked.lock().unwrap().push((csid.to_string(), at))
+            });
+        }
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                session_id,
+                SessionEventKind::Finished,
+                json!({ "id": session_id, "claude_session_id": "csid-1", "finished_at": 42 }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(10), || {
+            acked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| *a == ("csid-1".to_string(), Some(42)))
+        })
+        .await;
+        let g = rec.lock().await;
+        assert!(
+            g.patches
+                .iter()
+                .any(|(id, b)| *id == session_id && b["progress"]["session_status"] == "finished"),
+            "the marker must reach coord as PATCH /sessions/:id: {:?}",
+            g.patches
+        );
+    }
+
+    /// A refused `finished` write is ACK-dropped from the outbox so the queue
+    /// moves, but it must NOT stamp `finish_synced` — coord never took it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_finished_row_never_reaches_the_ack_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.patch_returns_404 = true;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(100),
+            Duration::from_secs(60),
+        );
+        let acked: Arc<std::sync::Mutex<Vec<(String, Option<i64>)>>> = Default::default();
+        {
+            let acked = acked.clone();
+            coord.attach_finished_ack_observer(move |csid, at| {
+                acked.lock().unwrap().push((csid.to_string(), at))
+            });
+        }
+        let session_id = Uuid::new_v4();
+        outbox
+            .record(
+                Uuid::new_v4(),
+                session_id,
+                SessionEventKind::Finished,
+                json!({ "id": session_id, "claude_session_id": "csid-404" }),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(10), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(
+            !rec.lock().await.patches.is_empty(),
+            "the PATCH was attempted"
+        );
+        assert!(
+            acked.lock().unwrap().is_empty(),
+            "a 404-refused marker is dropped, never reported as synced"
+        );
+    }
+
     /// Plan A3 — an ABANDONED session (heartbeats ceased) must NOT
     /// self-delete. The runner leaves it for coord's own watcher to age;
     /// the sweep only flips local state to Stale (a UI affordance) and keeps
     /// emitting heartbeats. It must never emit a `closed`→DELETE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn abandoned_session_goes_stale_but_never_self_deletes() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -2945,6 +3297,7 @@ mod tests {
     /// so coord can join session rows to commit `Session-Id` trailers.
     #[test]
     fn rebuild_create_body_forwards_claude_code_session_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let with = OutboxRecord {
             machine_id: Uuid::nil(),
             session_id: Uuid::nil(),
@@ -2983,6 +3336,7 @@ mod tests {
     /// coord persists `coord.sessions.task_run_id`; absent → key omitted.
     #[test]
     fn rebuild_create_body_forwards_task_run_id() {
+        let _amb = crate::test_env::isolated_ambient();
         let with = OutboxRecord {
             machine_id: Uuid::nil(),
             session_id: Uuid::nil(),
@@ -3158,6 +3512,7 @@ mod tests {
     /// heartbeat).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_found_emits_activating_patch() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3184,6 +3539,7 @@ mod tests {
     /// fallback).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_404_is_not_found() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3202,6 +3558,7 @@ mod tests {
     /// `Unreachable` (drives the optimistic-resume path).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn probe_resume_transport_error_is_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         // Port 1 is reserved/unbindable — connection refused.
@@ -3219,6 +3576,7 @@ mod tests {
     /// id, no `Started` POST) and emits a `state_change` outbox row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_reuses_id_when_row_exists() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, _rec) = spawn_fake_coord().await;
@@ -3256,6 +3614,7 @@ mod tests {
     /// `register_external`: a NEW id + a `Started` POST row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_falls_back_to_fresh_on_404() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let (base, rec) = spawn_fake_coord().await;
@@ -3291,6 +3650,7 @@ mod tests {
     /// fail identically while coord is down).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resume_external_optimistic_when_unreachable() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox = build_outbox(dir.path());
         let coord = CoordSync::new_for_test(

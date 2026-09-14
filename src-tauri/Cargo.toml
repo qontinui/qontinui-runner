@@ -6,6 +6,10 @@ authors = ["Qontinui <contact@qontinui.org>"]
 edition = "2021"
 license = "AGPL-3.0-or-later"
 default-run = "qontinui-runner"
+# An application crate, never published. Its qontinui-schemas deps are bare
+# `path =` deps with no `version`, which `cargo publish` would refuse anyway;
+# this says so on purpose rather than by accident.
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -140,9 +144,9 @@ qontinui-spec-check = { path = "../crates/spec-check" }
 # crates/runner-win32/src/lib.rs for why the Win32 pieces went second.
 qontinui-runner-stats = { path = "../crates/runner-stats" }
 qontinui-runner-win32 = { path = "../crates/runner-win32" }
-qontinui-types = { path = "../../qontinui-schemas/rust", version = ">=0.1.2, <2.0.0" }
-qontinui-code-graph = { path = "../../qontinui-schemas/code-graph", version = ">=0.1.0, <2.0.0" }
-qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core", version = "^0.1.0" }
+qontinui-types = { path = "../../qontinui-schemas/rust" }
+qontinui-code-graph = { path = "../../qontinui-schemas/code-graph" }
+qontinui-vision-core = { path = "../../qontinui-schemas/rust-vision-core" }
 socket2 = "0.6"
 cron = "0.15"
 chrono-tz = "0.10"

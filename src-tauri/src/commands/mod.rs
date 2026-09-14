@@ -226,6 +226,7 @@ pub mod rag;
 pub mod recap; // Session recap overview
 pub mod regression; // UI Bridge regression suite + run + diagnosis + per-assertion exercise log persistence (Section 11 Phase A2)
 pub mod remote_attach; // Remote session tabs: accept_remote_attach preference + terminal_attach_remote (plan 2026-08-31-remote-session-tabs-in-runner-terminal, Phase 3c)
+pub mod remote_create; // Remote terminal CREATION: the accept_remote_create preference and the coord mirror that reconciles the runner-local dial with coord.devices.accept_remote_create (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod resource_guard_settings; // Settings > Resource Guard: session-protection floors + the ci_node floors (plan 2026-08-07-runner-resource-guard-and-session-protection Part B)
 pub mod saved_projects; // User-curated project registry (wizard-populated, consumed by UI Bridge panel)
 pub mod screenshot;
@@ -438,8 +439,12 @@ pub struct AppState {
     ///
     /// `Some` when [`crate::settings::WebIntegrationSettings::enabled`] is
     /// true and both `backend_url` and `runner_token` are set. Holds the
-    /// runner_id assigned by `/api/v1/runners/register` and the token needed
-    /// for authenticated POSTs to the web backend.
+    /// device_id the web backend returns in the `/api/v1/devices/ws`
+    /// handshake, plus the token needed for authenticated calls to it.
+    ///
+    /// The name `runner_id` is historical. It used to be assigned by
+    /// `POST /api/v1/runners/register`, an endpoint deleted in `ad3692e6c`
+    /// (2026-04-28); identity now arrives over the WS handshake instead.
     ///
     /// Wrapped in `Arc<RwLock<...>>` so the settings-save command can
     /// hot-reload the integration without restarting the runner: the command

@@ -42,9 +42,16 @@ use tracing::{info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
-/// Tabs with no live SSE listener whose last sign of life is older than this
-/// are evicted from the registry (lazily, on the next registry operation).
-/// Heartbeats arrive every 10s; 60s = 6 missed beats.
+/// Tabs with no live SSE listener are evicted from the registry once their
+/// last sign of life (`last_seen_ms`) is this old — inclusive: this is the
+/// FIRST age at which a disconnected tab is dropped, not the last age at which
+/// it survives (`evict_stale` retains while `age < STALE_TAB_EVICT_MS`, and
+/// `eviction_fires_when_the_age_reaches_the_bound_not_after` pins it).
+/// Eviction is lazy: it runs on the next registry read or upsert (listing,
+/// heartbeat, stream connect, dispatch), not on a disconnect or a result.
+/// Served to callers as `staleTabEvictMs` on `GET /ui-bridge/tabs`, beside
+/// the `lastSeen` it is measured against. Heartbeats arrive every 10s;
+/// 60s = 6 missed beats.
 pub const STALE_TAB_EVICT_MS: u64 = 60_000;
 
 /// Default await window for a dispatched command's result.
@@ -410,9 +417,11 @@ impl RelayRegistry {
     }
 }
 
-/// Remove tabs with no live SSE listener whose last sign of life is older
-/// than [`STALE_TAB_EVICT_MS`]. Connected tabs are never evicted — the SSE
-/// drop guard handles their lifecycle.
+/// Remove tabs with no live SSE listener whose last sign of life is at least
+/// [`STALE_TAB_EVICT_MS`] old — `age < bound` is retained, `age == bound` is
+/// dropped, which is the boundary `CONTRACT.md` states for `staleTabEvictMs`.
+/// Connected tabs are never evicted — the SSE drop guard handles their
+/// lifecycle.
 fn evict_stale(inner: &mut RegistryInner, now: u64) {
     inner.tabs.retain(|_, record| {
         record.listener.is_some() || now.saturating_sub(record.last_seen_ms) < STALE_TAB_EVICT_MS
@@ -590,7 +599,7 @@ pub async fn ui_bridge_relay_tabs_handler(
 /// renamed its own field to `tabActiveWindowMs` in @qontinui/ui-bridge 0.26.0,
 /// so keeping this name here would leave one key meaning two things across two
 /// products, which is the exact trap that rename closed.
-fn tabs_response_body(tabs: Vec<serde_json::Value>) -> serde_json::Value {
+pub(super) fn tabs_response_body(tabs: Vec<serde_json::Value>) -> serde_json::Value {
     serde_json::json!({
         "count": tabs.len(),
         "tabs": tabs,
@@ -1083,12 +1092,16 @@ mod tests {
         assert_eq!(body["tabs"][0]["tabId"], "tab-a");
         assert_eq!(body["staleTabEvictMs"], 60_000);
 
-        // The retired name must not come back. The SDK's relay emits
-        // `staleHeartbeatMs` for a DIFFERENT quantity, and one key meaning two
-        // things across two products is the trap #1392 closed.
+        // The retired name must not come back. It was OURS, for this field,
+        // before #1392 renamed it to `staleTabEvictMs`. The SDK also used the
+        // name once, for a DIFFERENT quantity, and renamed its own to
+        // `tabActiveWindowMs` in 0.26.0 — so at the pinned release the name
+        // belongs to neither product, and one key meaning two things across
+        // two products is the trap #1392 closed.
         assert!(
             body.get("staleHeartbeatMs").is_none(),
-            "staleHeartbeatMs is the SDK's key for another quantity — never ours"
+            "staleHeartbeatMs must never be ours: it is our own retired name for \
+             this field, and was separately the SDK's name for a different one"
         );
     }
 

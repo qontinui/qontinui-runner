@@ -1085,6 +1085,7 @@ mod tests {
     /// undetectable manager must still produce zero changes.
     #[test]
     fn no_detected_manager_yields_no_changes_even_with_confirm() {
+        let _amb = crate::test_env::isolated_ambient();
         let section = versions_section(
             json!({"node": "v24.14.0"}),
             json!({"node": "v20.9.0"}),
@@ -1175,6 +1176,7 @@ mod tests {
     /// `SkipRecord`'s own doc exists to forbid.
     #[test]
     fn an_all_unmeasured_section_is_not_reported_as_nothing_to_do() {
+        let _amb = crate::test_env::isolated_ambient();
         let section = versions_section_with_unknown(
             json!({"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)"}),
             json!({}),
@@ -1221,6 +1223,7 @@ mod tests {
     /// plans that action. The surfacing must not become a section-wide brake.
     #[test]
     fn an_unmeasured_key_does_not_block_its_measured_sibling() {
+        let _amb = crate::test_env::isolated_ambient();
         let section = versions_section_with_unknown(
             json!({"rustc": "rustc 1.82.0 (f6e511eec 2024-10-15)", "node": "v24.14.0"}),
             json!({}),
@@ -1316,6 +1319,7 @@ mod tests {
     /// report the section as applied.
     #[test]
     fn dry_run_previews_the_commands_and_changes_nothing() {
+        let _amb = crate::test_env::isolated_ambient();
         let section = versions_section(
             json!({"node": "v24.14.0"}),
             json!({"node": "v20.9.0"}),
@@ -1353,6 +1357,7 @@ mod tests {
 
     #[test]
     fn nothing_actionable_is_nothing_to_do() {
+        let _amb = crate::test_env::isolated_ambient();
         let section = versions_section(
             json!({"node": "v24.14.0"}),
             json!({"node": "v24.14.0"}),

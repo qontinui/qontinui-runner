@@ -1402,8 +1402,14 @@ mod tests {
 
     #[test]
     fn low_fraction_defaults_and_honours_a_valid_env_override() {
-        // The env is process-global; this test owns the variable and restores it.
-        let prior = std::env::var(LOW_FRACTION_ENV).ok();
+        // The env is process-global, so hold the ONE shared lock every
+        // env-touching test in this binary takes — owning the variable
+        // excludes nobody on its own. The restore is declared AFTER the lock so
+        // it runs while the lock is still held, and it survives the panic path,
+        // which the manual restore at the end of this body did not.
+        // Plan `2026-08-25-runner-test-suite-env-isolation`.
+        let _g = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[LOW_FRACTION_ENV]);
 
         std::env::remove_var(LOW_FRACTION_ENV);
         assert_eq!(low_fraction(), DEFAULT_LOW_FRACTION);
@@ -1425,10 +1431,7 @@ mod tests {
             );
         }
 
-        match prior {
-            Some(v) => std::env::set_var(LOW_FRACTION_ENV, v),
-            None => std::env::remove_var(LOW_FRACTION_ENV),
-        }
+        // `_restore` drops here, including on the panic path above.
     }
 
     // -- Histogram cap ------------------------------------------------------

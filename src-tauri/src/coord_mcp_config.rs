@@ -143,9 +143,108 @@ pub fn proxy_nonce_from_header_object(headers: &serde_json::Value) -> Option<Str
         .map(str::to_owned)
 }
 
-/// [`proxy_nonce_from_header_object`] over a whole `.mcp.json` document.
+/// Basename of the fleet's stdio MCP shim
+/// (`<qontinui-root>/qontinui-claude-config/scripts/coord-mcp-shim.py`) — the
+/// `args[0]` of a stdio-shaped `coord-mcp` entry. Plan
+/// `2026-09-05-coord-mcp-transport-death-must-fall-through-not-be-reported`,
+/// Phase 3.
+pub const COORD_MCP_STDIO_SHIM_FILE: &str = "coord-mcp-shim.py";
+
+/// The shim's ONE argv flag: the absolute path of the runner-owned credential
+/// file it re-reads on every call. Nothing else ever travels on its argv — no
+/// URL, no nonce, no door (plan Design decision 4).
+pub const COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG: &str = "--credential";
+
+/// The `mcpServers.coord-mcp` entry, whatever its transport.
+fn coord_mcp_entry(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+    doc.pointer("/mcpServers/coord-mcp")
+}
+
+/// True iff the `coord-mcp` entry is the STDIO shape whose `args[0]` is the
+/// fleet shim ([`COORD_MCP_STDIO_SHIM_FILE`]). Reads no value that could be a
+/// credential — the stdio document carries none; its credential lives in the
+/// file named after [`COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG`].
+pub fn config_doc_is_stdio_shim(doc: &serde_json::Value) -> bool {
+    let Some(entry) = coord_mcp_entry(doc) else {
+        return false;
+    };
+    if entry.get("type").and_then(serde_json::Value::as_str) != Some("stdio") {
+        return false;
+    }
+    entry
+        .get("args")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(serde_json::Value::as_str)
+        .and_then(|first| std::path::Path::new(first).file_name())
+        .map(|name| name == COORD_MCP_STDIO_SHIM_FILE)
+        .unwrap_or(false)
+}
+
+/// The credential-file path a stdio-shaped entry hands the shim (the value
+/// after [`COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG`] in `args`), or `None` for
+/// any other shape.
+pub fn stdio_shim_credential_path(doc: &serde_json::Value) -> Option<std::path::PathBuf> {
+    if !config_doc_is_stdio_shim(doc) {
+        return None;
+    }
+    let args = coord_mcp_entry(doc)?.get("args")?.as_array()?;
+    let mut it = args.iter().filter_map(serde_json::Value::as_str);
+    while let Some(arg) = it.next() {
+        if arg == COORD_MCP_STDIO_SHIM_CREDENTIAL_FLAG {
+            return it.next().map(std::path::PathBuf::from);
+        }
+    }
+    None
+}
+
+/// **THE object every config reader looks at**: the `{url, headers}` pair the
+/// proxy contract is about, resolved through whichever transport the document
+/// spells.
+///
+/// * `type: "http"` — the entry itself (`url` and `headers` are inline).
+/// * `type: "stdio"` (the fleet shim) — the runner-owned credential file the
+///   entry names, which is a flat `{url, headers}` object written by the same
+///   builder that wrote the document. An absent or unparseable credential file
+///   resolves to `None`, exactly as an absent `.mcp.json` does: the readers
+///   built on this (`read_proxy_nonce`, `read_proxy_port`, the header-shape
+///   and principal-marker probes) then answer "no proxy config here", which is
+///   the fail-closed arm each of them already had.
+///
+/// Without this indirection every reader that keyed on
+/// `/mcpServers/coord-mcp/headers` would have gone blind on the stdio shape —
+/// the boot reconcile would classify a healthy stdio config as non-proxy, the
+/// in-cwd nonce reuse would mint on every spawn, the rotation log would carry
+/// an empty `key_prefix`, and the agent-principal write refusal would stop
+/// seeing the marker. One resolver keeps one contract.
+pub fn effective_coord_mcp_entry(
+    doc: &serde_json::Value,
+) -> Option<std::borrow::Cow<'_, serde_json::Value>> {
+    let entry = coord_mcp_entry(doc)?;
+    match stdio_shim_credential_path(doc) {
+        None => Some(std::borrow::Cow::Borrowed(entry)),
+        Some(path) => {
+            let raw = std::fs::read_to_string(path).ok()?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            v.is_object().then_some(std::borrow::Cow::Owned(v))
+        }
+    }
+}
+
+/// The `url` the effective entry addresses — inline for http, from the
+/// credential file for stdio.
+pub fn effective_coord_mcp_url(doc: &serde_json::Value) -> Option<String> {
+    effective_coord_mcp_entry(doc)?
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// [`proxy_nonce_from_header_object`] over a whole `.mcp.json` document, through
+/// [`effective_coord_mcp_entry`] so the stdio shape reads back too.
 pub fn proxy_nonce_from_config_doc(doc: &serde_json::Value) -> Option<String> {
-    proxy_nonce_from_header_object(doc.pointer("/mcpServers/coord-mcp/headers")?)
+    let entry = effective_coord_mcp_entry(doc)?;
+    proxy_nonce_from_header_object(entry.get("headers")?)
 }
 
 /// True iff the `coord-mcp` entry's `headers` object carries an `Authorization`
@@ -163,11 +262,12 @@ pub fn proxy_nonce_from_config_doc(doc: &serde_json::Value) -> Option<String> {
 /// from "healthy but still legacy-shaped" (rewrite in place, same nonce). See
 /// `coord_mcp::RootReconcileAction::UpgradeHeaders`.
 pub fn config_doc_has_static_authorization(doc: &serde_json::Value) -> bool {
-    doc.pointer("/mcpServers/coord-mcp/headers")
-        .and_then(|h| h.as_object())
-        .map(|o| {
-            o.keys()
-                .any(|k| k.eq_ignore_ascii_case(PROXY_AUTHORIZATION_HEADER_JSON))
+    effective_coord_mcp_entry(doc)
+        .and_then(|entry| {
+            entry.get("headers").and_then(|h| h.as_object()).map(|o| {
+                o.keys()
+                    .any(|k| k.eq_ignore_ascii_case(PROXY_AUTHORIZATION_HEADER_JSON))
+            })
         })
         .unwrap_or(false)
 }
@@ -180,7 +280,11 @@ pub fn config_doc_has_static_authorization(doc: &serde_json::Value) -> bool {
 ///
 /// Three emitters produce a **byte-identical** proxy `.mcp.json` (they all
 /// funnel through `coord_mcp::coord_mcp_proxy_config_json`), and their nonces
-/// are three different security classes:
+/// are three different security classes. (Under the stdio arm of that builder
+/// — plan 2026-09-05 transport-death, Phase 3 — the `headers` object, marker
+/// included, lives in the runner-owned credential file the document names
+/// rather than inline; every reader here resolves it through
+/// [`effective_coord_mcp_entry`], so the marker keeps the same meaning.)
 ///
 /// | emitter | principal | persisted | re-registered after a restart |
 /// |---|---|---|---|
@@ -238,14 +342,15 @@ pub const COORD_MCP_PRINCIPAL_AGENT: &str = "agent";
 /// that this file cannot vouch for itself. Callers that need a safety property
 /// must treat `true` as "refuse", never `false` as "permit anything".
 pub fn config_doc_is_agent_marked(doc: &serde_json::Value) -> bool {
-    doc.pointer("/mcpServers/coord-mcp/headers")
-        .and_then(|h| h.as_object())
-        .map(|o| {
-            o.iter().any(|(k, v)| {
-                k.eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_HEADER_JSON)
-                    && v.as_str()
-                        .map(|s| s.trim().eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_AGENT))
-                        .unwrap_or(false)
+    effective_coord_mcp_entry(doc)
+        .and_then(|entry| {
+            entry.get("headers").and_then(|h| h.as_object()).map(|o| {
+                o.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_HEADER_JSON)
+                        && v.as_str()
+                            .map(|s| s.trim().eq_ignore_ascii_case(COORD_MCP_PRINCIPAL_AGENT))
+                            .unwrap_or(false)
+                })
             })
         })
         .unwrap_or(false)

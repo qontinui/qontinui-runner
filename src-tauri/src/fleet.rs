@@ -145,21 +145,28 @@ pub fn detect_resources() -> Resources {
 /// `device_id` is serde-aliased to `machine_id` so a pre-Phase-3
 /// machine.json (which used the old field name) still deserializes
 /// without manual migration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct DeviceFile {
-    #[serde(alias = "machine_id")]
     pub(crate) device_id: String,
     hostname: String,
 }
 
-fn device_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
+/// This machine's `machine.json`, through the ambient seam. `None` when the
+/// file is missing or malformed.
+pub(crate) fn load_machine_json() -> Option<qontinui_runner_lib::ambient::MachineJson> {
+    let machine = qontinui_runner_lib::ambient::read_machine_json();
+    machine.readable.then_some(machine)
 }
 
+/// [`load_machine_json`] narrowed to the shape the heartbeat, budget and tree
+/// publishers require: BOTH `device_id` and `hostname` present (a blank
+/// hostname counts as absent). They skip, with a warn, on `None`.
 pub(crate) fn load_device_file() -> Option<DeviceFile> {
-    let path = device_file_path()?;
-    let bytes = std::fs::read(&path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let machine = load_machine_json()?;
+    Some(DeviceFile {
+        device_id: machine.device_id?,
+        hostname: machine.hostname?,
+    })
 }
 
 /// Canonical hostname: read from `~/.qontinui/machine.json`, falling
@@ -328,7 +335,7 @@ fn warn_unknown_tenant_once() {
 /// coord is unreachable; lets operators verify "what was advertised" from
 /// the runner side without coord access. Path: `~/.qontinui/last_budget.json`.
 fn last_budget_cache_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("last_budget.json"))
+    qontinui_runner_lib::ambient::qontinui_dir().map(|d| d.join("last_budget.json"))
 }
 
 /// Wire shape of `POST /coord/devices/{device_id}/budget`.
@@ -2474,7 +2481,7 @@ const SKILL_PARITY_MECHANISM: &str = "fleet-skill-bundle-parity";
 ///
 /// `$QONTINUI_CAPABILITY_STATE_DIR` FIRST, because that is the variable
 /// `capability-doctor.sh` READS (`:107`); a writer that only ever wrote to
-/// `$HOME` would put the record somewhere the doctor is not looking, which is
+/// `~/.qontinui` would put the record somewhere the doctor is not looking, which is
 /// the writer/reader divergence that script's own header records as having
 /// survived undetected until 2026-09-04 — reintroduced from the other side.
 fn skill_parity_record_path() -> Option<PathBuf> {
@@ -2482,16 +2489,17 @@ fn skill_parity_record_path() -> Option<PathBuf> {
         std::env::var("QONTINUI_CAPABILITY_STATE_DIR")
             .ok()
             .as_deref(),
-        dirs::home_dir().as_deref(),
+        qontinui_runner_lib::ambient::qontinui_dir().as_deref(),
     )
 }
 
 /// Pure core of [`skill_parity_record_path`], so the precedence and the
 /// blank-value branch are testable without mutating the process environment
-/// that other tests in this binary read.
+/// that other tests in this binary read. `qontinui_dir` is the ambient
+/// `~/.qontinui` resolved by `ambient::qontinui_dir()` — the one seam.
 fn skill_parity_record_path_from(
     state_dir: Option<&str>,
-    home: Option<&std::path::Path>,
+    qontinui_dir: Option<&std::path::Path>,
 ) -> Option<PathBuf> {
     let file = format!("{SKILL_PARITY_MECHANISM}.json");
     if let Some(dir) = state_dir {
@@ -2499,7 +2507,7 @@ fn skill_parity_record_path_from(
             return Some(PathBuf::from(dir).join(&file));
         }
     }
-    home.map(|h| h.join(".qontinui").join("capability").join(file))
+    qontinui_dir.map(|d| d.join("capability").join(file))
 }
 
 fn join_rel(root: &std::path::Path, parts: &[&str]) -> PathBuf {
@@ -8249,30 +8257,34 @@ mod tests {",
     /// survived undetected once already.
     #[test]
     fn skill_parity_record_path_prefers_the_state_dir_the_doctor_reads() {
-        let home = std::path::Path::new("/home/u");
+        // The `<home>/.qontinui` shape is the seam's contract, pinned in
+        // `ambient`; this test injects it through the seam's pure twin.
+        let qdir = qontinui_runner_lib::ambient::qontinui_dir_from(None, Some("/home/u".into()))
+            .expect("a home yields a ~/.qontinui");
+        let qdir = qdir.as_path();
         assert_eq!(
-            skill_parity_record_path_from(Some("/state"), Some(home)),
+            skill_parity_record_path_from(Some("/state"), Some(qdir)),
             Some(std::path::PathBuf::from(
                 "/state/fleet-skill-bundle-parity.json"
             ))
         );
         assert_eq!(
-            skill_parity_record_path_from(None, Some(home)),
-            Some(home.join(".qontinui/capability/fleet-skill-bundle-parity.json"))
+            skill_parity_record_path_from(None, Some(qdir)),
+            Some(qdir.join("capability/fleet-skill-bundle-parity.json"))
         );
         // A blank or whitespace value is NOT a directory named "" — it falls
-        // through to $HOME rather than writing to the process cwd.
+        // through to `~/.qontinui` rather than writing to the process cwd.
         for blank in ["", "   "] {
             assert_eq!(
-                skill_parity_record_path_from(Some(blank), Some(home)),
-                Some(home.join(".qontinui/capability/fleet-skill-bundle-parity.json")),
+                skill_parity_record_path_from(Some(blank), Some(qdir)),
+                Some(qdir.join("capability/fleet-skill-bundle-parity.json")),
                 "a blank state dir must fall through, not resolve to cwd"
             );
         }
         assert_eq!(
             skill_parity_record_path_from(None, None),
             None,
-            "no state dir and no home is None, which the caller warns about"
+            "no state dir and no ~/.qontinui is None, which the caller warns about"
         );
     }
 }

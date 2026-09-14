@@ -61,6 +61,8 @@ pub mod claude_hook;
 pub mod claude_session_registry;
 pub mod closeout_spool; // Producer for the two closeout outbox kinds — the loopback coord-write forwarders spool here when coord is UNREACHABLE (plan 2026-08-28-closeout-has-no-durable-store-when-the-runner-is-offline, Phase 3)
 pub mod coord_sync;
+pub mod coord_transport_rung; // WHICH transport rung carried a coord call — the producer for `coord-transport-rung` session events (plan 2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read, Phase 1)
+pub mod create; // Remote-CREATE grants: the `create_request` directive arm + device-bound catch-up poll — the attach twin, so the target verifies a create grant itself instead of trusting the relay (plan 2026-09-11-headless-runner-parity-from-a-headed-runner, Phase 3b)
 pub mod dual_write;
 pub mod handoff;
 pub mod intent;
@@ -307,6 +309,39 @@ pub enum SessionEventKind {
     /// The WORK axis, orthogonal to the liveness `Heartbeat` and to `Closed`:
     /// a live session can be finished, and a closed one is usually not.
     Finished,
+    /// WHICH transport rung carried one coord call (plan
+    /// `2026-09-07-no-per-session-record-of-which-transport-rung-carried-a-coord-read`,
+    /// Phase 1). Written by [`coord_transport_rung::RungEmitter`] from the
+    /// runner's `/coord-mcp` proxy — one row per proxied call, so
+    /// `success_metric/coord-mcp-first-rung-reachability` has a population to
+    /// compute a baseline out of.
+    ///
+    /// Drained to `POST /sessions/:id/events {seq, event_kind, payload}`, the
+    /// same ingest [`Self::RestoreRecord`] uses, which stores `event_kind`
+    /// verbatim in `coord.session_events` and is idempotent on
+    /// `(session_id, seq)`. The lane's `session_id` must therefore be a
+    /// `coord.sessions.id` — the column that table references, NOT the
+    /// `coord.agent_sessions.id` the proxy's caller-self header carries. The
+    /// two are different id spaces; sending the wrong one 404s and the row is
+    /// dropped.
+    ///
+    /// The hyphenated wire form (`"coord-transport-rung"`) follows
+    /// [`Self::RestoreRecord`]'s precedent and stays inside coord's
+    /// `validate_event_kind` charset (`[A-Za-z0-9_-]`, ≤ 64 chars).
+    ///
+    /// Payload is the v1 shape
+    /// [`coord_transport_rung::RungObservation::payload`] builds. Two halves,
+    /// kept distinguishable on purpose: the CALLER-DECLARED (advisory)
+    /// `transport` / `reporter` / `reporter_step` / `attempted`, and the
+    /// RUNNER-OBSERVED `outcome` / `door` / `operation` / `agent_session_id`.
+    ///
+    /// ⚠️ A kind with no [`coord_sync`] `push_record` arm is ACK-DROPPED at
+    /// `debug` level by that function's catch-all — written durably, drained,
+    /// silently discarded, and acked as delivered, so the metric reads a clean
+    /// zero with nothing erroring anywhere. This kind HAS an arm; never remove
+    /// one without the other.
+    #[serde(rename = "coord-transport-rung")]
+    CoordTransportRung,
 }
 
 impl SessionEventKind {
@@ -328,6 +363,7 @@ impl SessionEventKind {
             SessionEventKind::GateRegistration => "gate_registration",
             SessionEventKind::FindingPosted => "finding_posted",
             SessionEventKind::Finished => "finished",
+            SessionEventKind::CoordTransportRung => "coord-transport-rung",
         }
     }
 }
@@ -1391,6 +1427,39 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// The `coord-transport-rung` wire spelling is a binding contract in three
+    /// places at once: `coord_sync::push_record`'s arm keys on it,
+    /// `coord.session_events.event_kind` stores it verbatim, and it becomes a
+    /// NATS subject token on coord's hot-tier fan-out. Pin all three
+    /// directions — the `as_str()` arm, and the serde rename both ways.
+    #[test]
+    fn coord_transport_rung_wire_spelling_is_pinned() {
+        assert_eq!(
+            SessionEventKind::CoordTransportRung.as_str(),
+            "coord-transport-rung"
+        );
+        assert_eq!(
+            serde_json::to_value(SessionEventKind::CoordTransportRung).unwrap(),
+            serde_json::json!("coord-transport-rung"),
+            "the #[serde(rename)] must match as_str(): the outbox row stores \
+             as_str(), while every serde-serialized copy of the enum (NATS \
+             subjects, the attach/handoff wire types) uses the rename — two \
+             spellings would fork the same event"
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionEventKind>(serde_json::json!("coord-transport-rung"))
+                .unwrap(),
+            SessionEventKind::CoordTransportRung,
+            "an outbox row written before a restart must still deserialize"
+        );
+        // Coord's own ingest validator: [A-Za-z0-9_-], 1..=64 chars.
+        let wire = SessionEventKind::CoordTransportRung.as_str();
+        assert!(!wire.is_empty() && wire.len() <= 64);
+        assert!(wire
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'));
+    }
+
     /// In-memory transport that records every call for test inspection.
     /// Doesn't talk to a real PTY / subprocess — that's the point: tests
     /// should not depend on Tauri runtime, OS shells, or external
@@ -1450,11 +1519,23 @@ mod tests {
         }
     }
 
-    /// Returns the registry plus the backing [`TempDir`]. The caller MUST
-    /// keep the `TempDir` alive for the test's duration: the outbox reopens
-    /// its file on every `record`, so a dropped temp dir (deleted on drop)
-    /// makes subsequent writes fail with `ENOENT`.
-    fn make_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
+    /// What every registry test must keep alive for its whole duration.
+    ///
+    /// The outbox reopens its file on every `record`, so a dropped `TempDir`
+    /// (deleted on drop) makes later writes fail with `ENOENT`. And `start`
+    /// stamps each session's tenant from `machine.json`
+    /// (`stamp_session_tenant`), so every registry test READS the ambient
+    /// seam — the `IsolatedAmbient` guard gives it its own, empty machine, and
+    /// a test that wants a pinned one writes it through `amb`.
+    struct RegistryFixture {
+        amb: crate::test_env::IsolatedAmbient,
+        _dir: tempfile::TempDir,
+    }
+
+    /// Returns the registry plus the [`RegistryFixture`] the caller MUST keep
+    /// alive for the test's duration.
+    fn make_registry() -> (Arc<SessionRegistry>, RegistryFixture) {
+        let amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox =
             Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -1473,7 +1554,7 @@ mod tests {
             },
             coord_sync,
         );
-        (registry, dir)
+        (registry, RegistryFixture { amb, _dir: dir })
     }
 
     fn shell_intent() -> Intent {
@@ -1501,7 +1582,7 @@ mod tests {
     /// `Unresolved` — never `Device`, because a session row has an owning tenant
     /// whether or not we can name it, and only `Unresolved` arms the D2 degrade.
     ///
-    /// ## Why this holds an `IsolatedAmbient`
+    /// ## Why every registry test holds an `IsolatedAmbient`
     ///
     /// The `bare` case below spawns a session with NO `tenant_id`, and
     /// [`stamp_session_tenant`] then fills it from
@@ -1514,13 +1595,19 @@ mod tests {
     /// deliberately under a poisoned `$HOME`: this was the ONE test in the
     /// whole suite that reddened, on both the ubuntu and the windows leg.
     ///
-    /// The fixture points `QONTINUI_HOME` at an empty temp dir, so "no tenant
-    /// stamped" is a property of the FIXTURE rather than of the machine.
+    /// The fixture (`make_registry` holds one for every registry test) points
+    /// `QONTINUI_HOME` at an empty temp dir, so "no tenant stamped" is a
+    /// property of the FIXTURE rather than of the machine.
     /// Plan `2026-09-03-runner-tests-read-ambient-machine-state`.
     #[test]
     fn tenant_scope_of_distinguishes_owned_from_both_unknowns() {
-        let _ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
-        let (registry, _dir) = make_registry();
+        let (registry, _fx) = make_registry();
+        // The "bare" case below only means anything if THIS test's machine
+        // has no default tenant to stamp: the fixture's home is empty, provably.
+        assert!(
+            !qontinui_runner_lib::ambient::read_machine_json().readable,
+            "the fixture must start with no machine.json"
+        );
         let tenant = Uuid::from_u128(0xD1);
 
         let mut stamped = shell_intent();
@@ -1561,11 +1648,9 @@ mod tests {
     /// case was under the test's control: both were whatever the box had.
     #[test]
     fn unstamped_session_takes_the_machine_json_tenant_from_the_fixture() {
-        let ambient = qontinui_runner_lib::ambient::test_support::IsolatedAmbient::new();
+        let (registry, fx) = make_registry();
         let device_default = Uuid::from_u128(0xD2);
-        ambient.write_active_tenant_id(device_default);
-
-        let (registry, _dir) = make_registry();
+        fx.amb.write_active_tenant_id(device_default);
 
         // No `tenant_id` on the intent — `stamp_session_tenant` must reach the
         // device default, and it must be the one we wrote.
@@ -1625,7 +1710,8 @@ mod tests {
         }
     }
 
-    fn make_tapping_registry() -> (Arc<SessionRegistry>, tempfile::TempDir) {
+    fn make_tapping_registry() -> (Arc<SessionRegistry>, RegistryFixture) {
+        let amb = crate::test_env::isolated_ambient();
         let dir = tempfile::tempdir().unwrap();
         let outbox =
             Arc::new(local_store::OutboxWriter::open(dir.path().join("outbox.jsonl")).unwrap());
@@ -1642,12 +1728,12 @@ mod tests {
             },
             coord_sync,
         );
-        (registry, dir)
+        (registry, RegistryFixture { amb, _dir: dir })
     }
 
     #[tokio::test]
     async fn share_output_spawns_pipe_and_close_aborts_it() {
-        let (reg, _dir) = make_tapping_registry();
+        let (reg, _fx) = make_tapping_registry();
         let mut intent = shell_intent();
         intent.share_output = true;
         let handle = reg.start(intent).unwrap();
@@ -1675,7 +1761,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_share_output_spawns_no_pipe() {
-        let (reg, _dir) = make_tapping_registry();
+        let (reg, _fx) = make_tapping_registry();
         // Default intent has share_output=false.
         let handle = reg.start(shell_intent()).unwrap();
         let id = handle.id();
@@ -1747,7 +1833,7 @@ mod tests {
 
     #[test]
     fn lifecycle_start_describe_close() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let desc = handle.describe().unwrap();
         assert_eq!(desc.kind, SessionKind::TerminalShell);
@@ -1765,7 +1851,7 @@ mod tests {
 
     #[test]
     fn close_is_idempotent() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let id = handle.id();
         handle.clone().close().unwrap();
@@ -1775,7 +1861,7 @@ mod tests {
 
     #[test]
     fn start_rejects_invalid_intent() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let mut intent = shell_intent();
         intent.purpose = "x".into();
         let err = reg.start(intent).unwrap_err();
@@ -1787,7 +1873,7 @@ mod tests {
         // Phase 10 dual-write: the mirror must NOT start a transport —
         // the real process is owned by the legacy path. We assert the
         // FakeTransport's `start` counter stays at zero across a mirror.
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let id = reg.register_external(shell_intent()).unwrap();
         let desc = reg.describe(id).unwrap();
         assert_eq!(desc.kind, SessionKind::TerminalShell);
@@ -1800,7 +1886,7 @@ mod tests {
     fn register_external_closeable_by_id_without_touching_real_process() {
         // Closing the mirror records a Closed event and never errors —
         // the no-op ExternalTransport's close is a clean Ok(()).
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let id = reg.register_external(shell_intent()).unwrap();
         reg.close_by_id(id).unwrap();
         let again = reg.describe(id).unwrap();
@@ -1816,7 +1902,7 @@ mod tests {
     /// drain loop in `coord_sync`.
     #[test]
     fn register_external_with_lineage_keys_the_record_by_the_override() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let id = reg
             .register_external_with_lineage(
                 shell_intent(),
@@ -1844,7 +1930,7 @@ mod tests {
     /// would fail the whole PATCH — heartbeat included — on the deserialize.
     #[test]
     fn confirm_claude_code_session_id_rekeys_the_record_and_emits_once() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let id = reg
             .register_external_with_lineage(
                 shell_intent(),
@@ -1913,7 +1999,7 @@ mod tests {
 
     #[test]
     fn register_external_rejects_invalid_intent() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let mut intent = shell_intent();
         intent.purpose = "x".into();
         let err = reg.register_external(intent).unwrap_err();
@@ -1922,7 +2008,7 @@ mod tests {
 
     #[test]
     fn steal_requires_long_reason() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let err = handle.steal("short").unwrap_err();
         assert!(matches!(
@@ -1936,7 +2022,7 @@ mod tests {
 
     #[test]
     fn focus_heartbeats_session() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let before = handle.describe().unwrap().last_heartbeat_at;
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1947,7 +2033,7 @@ mod tests {
 
     #[test]
     fn snapshot_lists_all_sessions() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let _a = reg.start(shell_intent()).unwrap();
         let _b = reg.start(shell_intent()).unwrap();
         let snap = reg.snapshot();
@@ -1958,7 +2044,7 @@ mod tests {
     fn transports_pick_routes_by_kind() {
         // FakeTransport rejects non-matching kinds, so this proves the
         // router picked the right transport.
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
 
         let mut shell = shell_intent();
         shell.kind = SessionKind::TerminalShell;
@@ -1975,7 +2061,7 @@ mod tests {
 
     #[test]
     fn description_serializes_with_snake_case_enums() {
-        let (reg, _dir) = make_registry();
+        let (reg, _fx) = make_registry();
         let handle = reg.start(shell_intent()).unwrap();
         let desc = handle.describe().unwrap();
         let json = serde_json::to_value(&desc).unwrap();

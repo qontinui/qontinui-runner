@@ -1,9 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
+  activityInstant,
   emptyReasonFor,
   isDegraded,
   groupByDevice,
   deviceLabel,
+  normalizeCoordInstant,
   type FleetSession,
   type FleetSessionsResponse,
 } from "./useFleetSessions";
@@ -39,7 +41,8 @@ function response(over: Partial<FleetSessionsResponse> = {}): FleetSessionsRespo
     callerDeviceId: "22222222-2222-2222-2222-222222222222",
     sessions: [],
     count: 0,
-    truncated: false,
+    limit: 100,
+    nextCursor: null,
     sessionBridgeColumnPresent: true,
     workAxisColumnsPresent: true,
     deviceIdentityColumnsPresent: true,
@@ -134,6 +137,103 @@ describe("groupByDevice", () => {
 
   it("is empty for no rows", () => {
     expect(groupByDevice([])).toEqual([]);
+  });
+
+  it("orders a device's sessions by ACTIVITY, not by the start order coord serves", () => {
+    // coord walks `started_at DESC` since qontinui-coord#2085, so this is the
+    // order rows ARRIVE in: `recent-start` started last, `old-start` days ago.
+    // `old-start` is the one heartbeating now, and it belongs on top.
+    const rows = [
+      session({
+        sessionId: "recent-start",
+        deviceId: "d1",
+        startedAt: "2026-09-12T09:00:00Z",
+        lastHeartbeatAt: "2026-09-12T09:05:00Z",
+      }),
+      session({
+        sessionId: "old-start",
+        deviceId: "d1",
+        startedAt: "2026-09-09T09:00:00Z",
+        lastHeartbeatAt: "2026-09-12T10:00:00Z",
+      }),
+    ];
+    expect(groupByDevice(rows)[0].sessions.map((s) => s.sessionId)).toEqual([
+      "old-start",
+      "recent-start",
+    ]);
+    // The caller's array is not reordered in place.
+    expect(rows.map((s) => s.sessionId)).toEqual(["recent-start", "old-start"]);
+  });
+
+  it("falls back to startedAt, sorts an undatable row last, and breaks ties by id", () => {
+    const rows = [
+      session({ sessionId: "undated", deviceId: "d1" }),
+      session({ sessionId: "b", deviceId: "d1", lastHeartbeatAt: "2026-09-12T10:00:00Z" }),
+      session({ sessionId: "a", deviceId: "d1", lastHeartbeatAt: "2026-09-12T10:00:00Z" }),
+      session({ sessionId: "started-only", deviceId: "d1", startedAt: "2026-09-12T11:00:00Z" }),
+      session({ sessionId: "garbage", deviceId: "d1", lastHeartbeatAt: "not a date" }),
+    ];
+    expect(groupByDevice(rows)[0].sessions.map((s) => s.sessionId)).toEqual([
+      "started-only",
+      "a",
+      "b",
+      "garbage",
+      "undated",
+    ]);
+  });
+
+  it("orders coord's real MICROSECOND timestamps, not just whole-second fixtures", () => {
+    // The wire form coord actually sends, so the ordering is exercised on it at
+    // all. This cannot catch the normalization being dropped: V8 parses six
+    // fractional digits anyway. The `Date.parse` spy below is what pins that.
+    const rows = [
+      session({
+        sessionId: "earlier",
+        deviceId: "d1",
+        lastHeartbeatAt: "2026-09-12T10:00:00.100999Z",
+      }),
+      session({
+        sessionId: "later",
+        deviceId: "d1",
+        lastHeartbeatAt: "2026-09-12T10:00:00.200001Z",
+      }),
+    ];
+    expect(groupByDevice(rows)[0].sessions.map((s) => s.sessionId)).toEqual(["later", "earlier"]);
+  });
+});
+
+describe("normalizeCoordInstant — coord's microseconds in the form every engine parses", () => {
+  it("trims a fraction longer than three digits to milliseconds", () => {
+    // The ordering test above cannot catch a regression here under node: V8
+    // parses six fractional digits anyway. The STRING is what this pins.
+    expect(normalizeCoordInstant("2026-09-12T10:00:00.123456Z")).toBe("2026-09-12T10:00:00.123Z");
+    expect(normalizeCoordInstant("2026-09-12T10:00:00.123456+02:00")).toBe(
+      "2026-09-12T10:00:00.123+02:00",
+    );
+  });
+
+  it("leaves a form that is already standard alone", () => {
+    for (const v of [
+      "2026-09-12T10:00:00Z",
+      "2026-09-12T10:00:00.1Z",
+      "2026-09-12T10:00:00.123Z",
+    ]) {
+      expect(normalizeCoordInstant(v)).toBe(v);
+    }
+  });
+
+  it("is what activityInstant actually hands to Date.parse", () => {
+    // The string tests above pin the helper; this pins that the helper is USED.
+    // Under node, dropping the call would still order correctly (V8 accepts six
+    // digits), so the only observable is the argument `Date.parse` receives.
+    const spy = vi.spyOn(Date, "parse");
+    try {
+      activityInstant(session({ lastHeartbeatAt: "2026-09-12T10:00:00.123456Z" }));
+      expect(spy).toHaveBeenCalledWith("2026-09-12T10:00:00.123Z");
+      expect(spy).not.toHaveBeenCalledWith("2026-09-12T10:00:00.123456Z");
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

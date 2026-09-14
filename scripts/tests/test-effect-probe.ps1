@@ -31,7 +31,17 @@ $Expected = @{ "list-tabs" = "read"; "switch-tab" = "write" }
 # produces for a serializer that dropped the field, not a null-valued property.
 function Surface {
     param([string]$Name, [string]$ActionsJson)
-    return @{ Name = $Name; Actions = @($ActionsJson | ConvertFrom-Json) }
+    # ASSIGN, then wrap. `@($ActionsJson | ConvertFrom-Json)` is NOT
+    # engine-portable: Windows PowerShell 5.1's ConvertFrom-Json emits a JSON
+    # array as a SINGLE Object[] item rather than enumerating it into the
+    # pipeline, so `@(pipeline)` collects that one item into a NESTED array
+    # there while pwsh 7 yields a flat one. Every action then resolved to the
+    # inner array -- `$_.id` still matched by member enumeration, which is why
+    # the failure looked like a stripped field rather than a malformed fixture.
+    # Assigning first collapses the difference: `@($var)` on an existing array
+    # is a no-op on both engines.
+    $parsed = $ActionsJson | ConvertFrom-Json
+    return @{ Name = $Name; Actions = @($parsed) }
 }
 
 $GOOD_ACTIONS = @'
@@ -141,6 +151,20 @@ Assert-Problems "empty actions array -> 1 problem, not a pass" 1 (
 Assert-Problems "one expected effect, one action, all good -> 0 problems" 0 (
     Get-EffectProbeProblems -Surfaces @((Surface 'components-list' '[{"id":"list-tabs","effect":"read"}]')) `
         -ExpectedEffects @{ "list-tabs" = "read" })
+
+# --- The nested-array fixture shape (Windows PowerShell 5.1) ----------------
+# `@($json | ConvertFrom-Json)` yields a NESTED array on 5.1 and a flat one on
+# pwsh 7, so for two CI runs every action on the Windows lane resolved to the
+# inner ARRAY. `$_.id` still matched it (member enumeration returns the id
+# list, and `-eq` on an array returns the matching elements, which is truthy),
+# so the probe sailed past the absent check and then reported "stripped by
+# serializeComponent" for a serializer that had done nothing wrong -- a
+# confident wrong verdict that cost two failed fixes aimed at the wrong file.
+# `Surface` no longer builds this shape; this pins the guard that names it if
+# any future caller does.
+$nestedSurface = @{ Name = 'components-list'; Actions = @(, (@($GOOD_ACTIONS | ConvertFrom-Json))) }
+Assert-Problems "nested action array is NAMED, not mistaken for a strip" 2 (
+    Get-EffectProbeProblems -Surfaces @($nestedSurface) -ExpectedEffects $Expected) "COLLECTION"
 
 Write-Host ""
 if ($failures -gt 0) {

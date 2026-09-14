@@ -2710,6 +2710,77 @@ pub struct RemoteAttachSettings {
     pub accept_remote_attach: AcceptRemoteAttach,
 }
 
+/// Who may ask this device to CREATE a terminal remotely (plan
+/// `2026-09-11-headless-runner-parity-from-a-headed-runner`, D2). A separate
+/// axis from [`AcceptRemoteAttach`] and **default `Off`**, deliberately: an
+/// attach drives a PTY the operator already opened, while a create SPAWNS one
+/// — and can allocate a worktree and take a coord claim. Reusing the attach
+/// preference would have silently widened every device that had already opted
+/// into attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AcceptRemoteCreate {
+    /// Nobody. The default: the target refuses every remote `terminal_create`
+    /// with `remote_create_disabled`, and coord refuses to mint a create grant.
+    #[default]
+    Off,
+    /// Only devices paired to the SAME user as this one.
+    SameUser,
+    /// Any device in the tenant.
+    Tenant,
+}
+
+impl AcceptRemoteCreate {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AcceptRemoteCreate::Off => "off",
+            AcceptRemoteCreate::SameUser => "same_user",
+            AcceptRemoteCreate::Tenant => "tenant",
+        }
+    }
+
+    /// Parse the wire spelling; `None` for anything else (never a default —
+    /// a typo must not silently widen or narrow who may create).
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "off" => Some(AcceptRemoteCreate::Off),
+            "same_user" => Some(AcceptRemoteCreate::SameUser),
+            "tenant" => Some(AcceptRemoteCreate::Tenant),
+            _ => None,
+        }
+    }
+}
+
+/// One directory a remote create may be spawned in, as THIS device declares
+/// it. `key` is the label a caller may name; `path` is the directory the
+/// target actually uses. A caller never supplies a path that is used — see
+/// [`crate::mcp::remote_terminal::resolve_create_working_dir`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCreateRoot {
+    pub key: String,
+    pub path: String,
+}
+
+/// Remote-create settings block. Every field is fail-closed by default:
+/// creation is `off`, no repo may be named as an edit intent, and with no
+/// operator allowlist the only directory a remote create can land in is this
+/// machine's own workspace root.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteCreateSettings {
+    #[serde(default)]
+    pub accept_remote_create: AcceptRemoteCreate,
+    /// The directories a remote create may name, in order; the FIRST is what
+    /// a create naming none lands in. Empty (the default) means "this
+    /// machine's workspace root, under the key `workspace_root`".
+    #[serde(default)]
+    pub allowed_working_dirs: Vec<RemoteCreateRoot>,
+    /// The `intent_repo` values a remote create may declare. Empty (the
+    /// default) means NONE: a remote create never allocates a worktree or
+    /// takes a coord claim until an operator lists a repo here.
+    #[serde(default)]
+    pub allowed_intent_repos: Vec<String>,
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2950,6 +3021,10 @@ pub struct Settings {
     /// sessions). See [`AcceptRemoteAttach`].
     #[serde(default)]
     pub remote_attach: RemoteAttachSettings,
+    /// Remote-create policy (who may ask this device to SPAWN a terminal, and
+    /// where it may land). See [`RemoteCreateSettings`]; default-off.
+    #[serde(default)]
+    pub remote_create: RemoteCreateSettings,
     /// Ask the cloud memory endpoint (`POST /api/v1/memory/query`) for the
     /// link-expansion retrieval arm — the third RRF arm that one-hop-expands
     /// over `coord.memory_links` (plan
@@ -5549,6 +5624,28 @@ pub fn save_remote_attach_preference(pref: AcceptRemoteAttach) -> Result<(), Str
         *cache = Some((std::time::Instant::now(), pref));
     }
     Ok(())
+}
+
+/// The remote-CREATE preference. Default [`AcceptRemoteCreate::Off`].
+///
+/// Deliberately uncached, unlike [`get_remote_attach_preference`]: that one is
+/// consulted per keystroke, this one at most once per spawned terminal. A
+/// cache here would buy nothing and would let a revoked opt-in keep spawning
+/// PTYs for up to its TTL.
+pub fn get_remote_create_preference() -> AcceptRemoteCreate {
+    load_settings().remote_create.accept_remote_create
+}
+
+/// The whole remote-create policy block — the preference plus the two
+/// allowlists the target resolves a remote create's working directory and
+/// `intent_repo` from.
+pub fn get_remote_create_settings() -> RemoteCreateSettings {
+    load_settings().remote_create
+}
+
+/// Persist the remote-create preference.
+pub fn save_remote_create_preference(pref: AcceptRemoteCreate) -> Result<(), String> {
+    update_settings(|settings| settings.remote_create.accept_remote_create = pref)
 }
 
 /// Get the cloud memory link-expansion arm flag. Default false — see

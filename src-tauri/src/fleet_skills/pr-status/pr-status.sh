@@ -319,6 +319,7 @@ fi
 # coord-mcp entry" (a message that blames the CONFIG), and the cascade print
 # VERDICT: DEAD over live doors. That is the missing-binary-reads-as-empty-field
 # bug this fix exists to kill, reintroduced one layer up. Smoke-test instead.
+# unstamped-floor-ok: a counterfactual about a missing JSON reader, not a measured floor 2026-09-11
 JSON_READER=""
 if command -v jq >/dev/null 2>&1; then
   JSON_READER=jq
@@ -412,6 +413,59 @@ try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
 r=d.get("result") if isinstance(d,dict) else None  # envelope-ok: a PRESENCE test, not a read - the value never leaves this function, only the exit status does
 sys.exit(0 if (isinstance(r,dict) and "content" in r and r.get("isError") is True) else 1)' >/dev/null 2>&1  # envelope-ok: same presence predicate, python arm
+  fi
+}
+
+# rpc_result_rows — reads a JSON-RPC body on STDIN; prints the ROW COUNT the
+# `result` carries under the FIRST PRESENT key of a closed list, or `-1` when
+# no listed key is present. Not a verdict by itself (plan
+# 2026-09-03-capability-floor-claims-carry-their-probe, D3): a 2xx whose list
+# is empty under a key the caller GUESSED is indistinguishable from an empty
+# corpus at the call site, and it fails toward a false negative about a
+# capability — occurrence 10 read `.records`/`.results` off a body whose key
+# was `.hits` and reported 0 hits four times, including for a bare `DOSSIER`.
+# So the rule is: zero rows under every known key is UNKNOWN(envelope) until a
+# control read against a known-present record confirms the key.
+#
+# An MCP tool result arrives boxed — `result.content[0].text` holding the
+# tool's JSON as a string — so that box is opened first when it is present; a
+# bare `result` object (tools/list's `tools`) is read directly. The closed
+# list, in order: hits, records, results, items, findings, documents,
+# work_units, gates, tools. Anything that is not an array under the matched key
+# is `-1`, never a count.
+rpc_result_rows() {
+  if [ "$JSON_READER" = jq ]; then
+    jq -r '
+      def rows: . as $r
+        | (["hits","records","results","items","findings","documents","work_units","gates","tools"]
+           | map(select(. as $k | $r | has($k)))) as $present
+        | if ($present | length) == 0 then -1
+          else ($r[$present[0]] | if type == "array" then length else -1 end) end;
+      (.result? // null) as $res
+      | if ($res | type) != "object" then -1
+        elif (($res.content? | type) == "array") and (($res.content[0]?.text? | type) == "string")
+          then (($res.content[0].text | try fromjson catch null) as $inner
+                | if ($inner | type) == "object" then ($inner | rows) else -1 end)
+        else ($res | rows) end' 2>/dev/null  # envelope-ok: a COUNT under the first present key of a closed list, -1 when none is present; no row value leaves it
+  else
+    "$JSON_READER" -c 'import json,sys
+KEYS=("hits","records","results","items","findings","documents","work_units","gates","tools")
+def rows(r):
+    for k in KEYS:
+        if k in r:
+            v=r[k]
+            return len(v) if isinstance(v,list) else -1
+    return -1
+try: d=json.load(sys.stdin)
+except Exception: print(-1); sys.exit(0)
+res=d.get("result") if isinstance(d,dict) else None  # envelope-ok: the PRESENCE/shape walk that picks a list to count; the count is the only value that leaves
+if not isinstance(res,dict): print(-1); sys.exit(0)
+c=res.get("content")
+if isinstance(c,list) and c and isinstance(c[0],dict) and isinstance(c[0].get("text"),str):
+    try: inner=json.loads(c[0]["text"])
+    except Exception: print(-1); sys.exit(0)
+    print(rows(inner) if isinstance(inner,dict) else -1); sys.exit(0)
+print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
   fi
 }
 
@@ -979,5 +1033,8 @@ fi
 
 # Name WHY, never just "unreachable": the collected notes distinguish a local
 # fault of this script's own plumbing from coord actually being unreachable.
-echo "error: coord_pr_status unreachable via loopback proxy or acting-bearer — call the native MCP tool from the session instead${FAILNOTE:+ [$FAILNOTE]}" >&2
+# And STAMP it: this line is a capability-floor claim, and a pasted one with
+# no probe time reads as present tense forever (check #60, plan
+# 2026-09-03-capability-floor-claims-carry-their-probe).
+echo "error: coord_pr_status unreachable via loopback proxy or acting-bearer (probed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)) — call the native MCP tool from the session instead${FAILNOTE:+ [$FAILNOTE]}" >&2
 exit 1

@@ -485,6 +485,22 @@ impl AiCoordRegistrar {
         // `current_agent_session_id` on the existing handle row.
         self.spawn_handle_register(claude_session_id, session_id, task_run_id, name_alias);
 
+        // A finished marker set while this session had no coord row in this
+        // process (before its first registration, or before a runner restart
+        // emptied the non-durable R4 index) enqueued nothing. Now that the row
+        // exists, deliver the write it still owes — queued AFTER `Started`, so
+        // the per-session seq chain PATCHes a row coord has created.
+        if let Some(rec) = self
+            .inner
+            .lifecycle_store
+            .get()
+            .and_then(|store| store.get(claude_session_id))
+        {
+            if rec.finished_at.is_some() && !rec.finish_synced {
+                self.finish_session(claude_session_id, rec.finished_at);
+            }
+        }
+
         Some(session_id)
     }
 
@@ -689,6 +705,101 @@ impl AiCoordRegistrar {
                 "ai_coord_register: interaction progress for {} (coord {})",
                 task_run_id, session_id
             );
+        }
+    }
+
+    /// Tell coord this session's WORK is finished — the producer for the
+    /// `Finished` outbox row (plan
+    /// `2026-09-01-session-finished-marker-and-unfinished-resume` §5.2).
+    ///
+    /// Called from the lifecycle store's finish observer after
+    /// `SessionLifecycleStore::set_finished` durably writes the local marker.
+    /// The row drains to the path-addressed `PATCH /sessions/:id
+    /// {progress:{session_status:"finished"}}`, and its payload carries
+    /// `claude_session_id` so the drain's ACK can stamp `finish_synced` back
+    /// onto the local record — the discriminator the boot reconcile turns on.
+    ///
+    /// `finished_at` rides in the payload too, so a late ACK for an older mark
+    /// cannot stamp a newer one synced (`mark_finish_synced`).
+    ///
+    /// Returns `false` when nothing was enqueued: the session has no R4 index
+    /// entry in this process (never registered since boot, or the
+    /// registration kill switch is on), or the outbox write failed. The local
+    /// marker then stays unsynced, which is the honest state — never a
+    /// fabricated ACK — and [`Self::register_inner`] re-enqueues it if the
+    /// session registers later. Best-effort; never disturbs the session.
+    pub fn finish_session(&self, claude_session_id: &str, finished_at: Option<i64>) -> bool {
+        let Some(session_id) = self.session_id_for(claude_session_id) else {
+            debug!(
+                "ai_coord_register: finished marker for unregistered session {} stays local-only",
+                claude_session_id
+            );
+            return false;
+        };
+        let payload = json!({
+            "id": session_id,
+            "claude_session_id": claude_session_id,
+            "finished_at": finished_at,
+        });
+        match self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::Finished,
+            payload,
+        ) {
+            Ok(_) => {
+                info!(
+                    "ai_coord_register: finished marker queued for {} (coord {})",
+                    claude_session_id, session_id
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: outbox Finished write failed for {} (best-effort): {}",
+                    claude_session_id, e
+                );
+                false
+            }
+        }
+    }
+
+    /// Tell coord an operator UNMARKED this session's finished marker, so
+    /// coord does not keep saying `finished` for a session the operator
+    /// declared unfinished (and a later boot reconcile does not re-mark it
+    /// from that stale coord reading).
+    ///
+    /// Rides the existing `Progress` row — `PATCH /sessions/:id
+    /// {progress:{session_status:"working"}}`, the same body
+    /// [`Self::progress_on_interaction`] sends — rather than a new event kind:
+    /// "working" is exactly the state an unfinished live session is in.
+    /// Returns `false` when nothing was enqueued (no R4 entry, or the outbox
+    /// write failed). Best-effort; never disturbs the session.
+    pub fn unfinish_session(&self, claude_session_id: &str) -> bool {
+        let Some(session_id) = self.session_id_for(claude_session_id) else {
+            return false;
+        };
+        let payload = json!({ "id": session_id, "session_status": "working" });
+        match self.inner.outbox.record(
+            self.inner.machine_id,
+            session_id,
+            SessionEventKind::Progress,
+            payload,
+        ) {
+            Ok(_) => {
+                info!(
+                    "ai_coord_register: unfinish (working) queued for {} (coord {}) — not yet delivered",
+                    claude_session_id, session_id
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    "ai_coord_register: outbox unfinish write failed for {} (best-effort): {}",
+                    claude_session_id, e
+                );
+                false
+            }
         }
     }
 
@@ -1436,6 +1547,52 @@ mod tests {
     }
 
     #[test]
+    fn finish_session_queues_a_finished_row_carrying_the_claude_session_id() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let csid = Uuid::new_v4().to_string();
+
+        assert!(
+            !reg.finish_session(&csid, Some(1)),
+            "an unregistered session enqueues nothing — its marker stays local-only"
+        );
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+
+        let coord_id = reg
+            .register_sniffed_session(&csid, "interactive", None)
+            .unwrap();
+        assert!(reg.finish_session(&csid, Some(1)));
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        let finished: Vec<_> = pending
+            .iter()
+            .filter(|r| r.event_kind == SessionEventKind::Finished.as_str())
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(
+            finished[0].session_id, coord_id,
+            "addressed to the coord row"
+        );
+        assert_eq!(
+            finished[0].payload["claude_session_id"],
+            json!(csid),
+            "the ACK needs the local key to stamp finish_synced"
+        );
+        assert_eq!(finished[0].payload["finished_at"], json!(1));
+
+        assert!(reg.unfinish_session(&csid));
+        let pending = reg.inner.outbox.pending().unwrap();
+        let last = pending.last().unwrap();
+        assert_eq!(last.event_kind, SessionEventKind::Progress.as_str());
+        assert_eq!(
+            last.payload["session_status"],
+            json!("working"),
+            "an unmark tells coord the session is working again"
+        );
+    }
+
+    #[test]
     fn pinned_register_also_forwards_claude_code_session_id() {
         // The addressability fix: coord's `create_session` upserts
         // `coord.agent_sessions(id = claude_code_session_id, device_id)`, and
@@ -1677,12 +1834,98 @@ mod tests {
     }
 
     #[test]
+    fn a_mark_made_before_registration_is_delivered_when_the_session_registers() {
+        // Review W2: a finished mark set while the session had no R4 entry
+        // enqueued nothing. Registration must deliver the write it still owes,
+        // queued after `Started`. A non-uuid anchor keeps the attached store's
+        // handle hook network-silent (it returns before spawning).
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
+        let (reg, _dir) = registrar();
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::session::session_lifecycle_store::SessionLifecycleStore::open(
+                store_dir.path().join("terminal-sessions.json"),
+            )
+            .unwrap(),
+        );
+        reg.attach_lifecycle_store(store.clone());
+        let csid = "not-a-uuid-marked-early";
+        store.record_open(
+            crate::session::session_lifecycle_store::TerminalSessionRecord {
+                claude_session_id: csid.to_string(),
+                config_dir: None,
+                working_dir: Some("C:/repo".to_string()),
+                page_id: "default".to_string(),
+                zone_index: 0,
+                title: Some("Terminal 1".to_string()),
+                terminal_id: "term-1".to_string(),
+                opened_at: 0,
+                last_seen_at: 0,
+                state: "open".to_string(),
+                closed_at: None,
+                close_reason: None,
+                provider: crate::session::session_lifecycle_store::DEFAULT_PROVIDER.to_string(),
+                origin: None,
+                restore_pending_at: None,
+                confirmed_at: None,
+                handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                task_run_id: None,
+                bypass_permissions: None,
+                restored_from_boot_at: None,
+                restore_tier: None,
+                finished_at: None,
+                finish_reason: None,
+                finish_synced: false,
+            },
+        );
+        let finished_at = store.set_finished(csid, true, None).unwrap().finished_at;
+
+        assert!(
+            reg.inner.outbox.pending().unwrap().is_empty(),
+            "no coord row yet — nothing can be enqueued"
+        );
+
+        let coord_id = reg
+            .register_sniffed_session(csid, "Terminal 1", None)
+            .unwrap();
+
+        let kinds: Vec<String> = reg
+            .inner
+            .outbox
+            .pending()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.session_id == coord_id)
+            .map(|r| r.event_kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SessionEventKind::Started.as_str().to_string(),
+                SessionEventKind::Finished.as_str().to_string(),
+            ],
+            "the owed Finished write follows Started"
+        );
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(
+            pending.last().unwrap().payload["finished_at"],
+            json!(finished_at)
+        );
+    }
+
+    #[test]
     fn store_close_observer_closes_sniffed_coord_row() {
         // Review W2 end-to-end (minus Tauri): wire a lifecycle store's close
         // observer to close_session the way main.rs does, register a sniffed
         // session, then record_close the record — the coord row must get a
         // Closed outbox row and the index must evict.
-        let _env = env_lock();
+        let _amb = crate::test_env::isolated_ambient();
         std::env::remove_var("QONTINUI_SESSION_AUTOMATION_REGISTER");
         let (reg, _dir) = registrar();
         let store_dir = tempfile::tempdir().unwrap();

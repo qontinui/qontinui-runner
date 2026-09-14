@@ -24,8 +24,20 @@
 # a push: it would add a check to every PR, and a self-hosted job with no
 # ubuntu-latest fallback simply QUEUES when the pool is busy — on a repo whose
 # merge train is candidate-CI-bound, a probe that can block is not worth its
-# information. It is also absent from ci-integrity.yml's GATING allowlist and
-# must stay absent: it gates nothing.
+# information. It gates nothing, so it stays out of the repo ruleset's required
+# contexts — but that is not a statement about ci-integrity.yml, and there is no
+# GATING allowlist left for it to be absent from. That hand-kept list was
+# replaced by the trigger itself (`.github/workflows/**`) minus an empty
+# NON_GATING list, so this file IS in ci-integrity's scope on a PR based on
+# `main` (the guard is `pull_request_target: branches: [main]`; a stacked PR
+# fires no run at all). Such a PR needs at least `ci:gate-change=declared`, a
+# comment-only edit included — and `ci:gate-change=alters-a-gate` plus a
+# `Gate-Change:` body line per altered item if it alters an existing surface:
+# `<stem>#<job-key>` for a job, `<stem>#workflow` for a change outside `jobs:`
+# (an edit to the `on:` block below is one), `Gate-Removal:` when a job is
+# deleted. "Comment-only" does NOT settle which: a YAML-level comment alters no
+# surface, but a shell comment inside a `run:` block is part of that scalar's
+# value and needs the stronger label — and this file has several.
 #
 # Delete this file once the pool's Python provisioning is covered by something
 # durable. It is a probe, not infrastructure.

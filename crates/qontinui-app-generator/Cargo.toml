@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "IR inversion: FunctionalSpec.ui_states (IrState) -> UI-Bridge-instrumented Expo screens"
+# An application crate, never published. Its qontinui-schemas deps are bare
+# `path =` deps with no `version`, which `cargo publish` would refuse anyway;
+# this says so on purpose rather than by accident.
+publish = false
 
 [dependencies]
 # The frozen v0 contract types (IrState / IrAssertion / FunctionalSpec / Profile /
 # endpoint_for). Path-dep mirrors the spec-check crate's convention; resolves to the
 # shared qontinui-schemas checkout (NOT a worktree-local copy).
-qontinui-types = { path = "../../../qontinui-schemas/rust", version = ">=0.1.3, <2.0.0" }
+qontinui-types = { path = "../../../qontinui-schemas/rust" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

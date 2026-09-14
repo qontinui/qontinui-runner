@@ -235,9 +235,9 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "test_web_integration_connection",
         dispatch: Dispatch::Frontend,
-        description: "Probe the given backend URL + runner token by making a throwaway runner-registration call and immediately deleting the created entry. Returns the transient runner id (for debugging only; do not reuse it).",
+        description: "Probe the given backend URL. READ-ONLY: reaches GET /api/v1/health/live for reachability, then — only when the URL is the backend this runner is BOUND to — GET /api/v1/devices/me for identity. Creates and deletes nothing. `identityFault` says why identity is absent: none | unpaired | not_bound_backend | rejected | forbidden | verifier_down | unexpected. `runnerToken` is shape-checked locally and never sent.",
         args_schema: "{ \"backendUrl\": string, \"runnerToken\": string }",
-        response_schema: "{ \"runner_id\": string }",
+        response_schema: "{ \"reachable\": boolean, \"paired\": boolean, \"identityFault\": string, \"deviceId\": string|null, \"userId\": string|null, \"tenantId\": string|null, \"tokenFormatValid\": boolean|null, \"detail\": string }",
         probe_with_empty_args: true,
         observe_projection: None,
     },
@@ -345,6 +345,17 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
         response_schema: r#"{"type":"null"}"#,
         // Destructive + takes empty args → probing it on startup would
         // clear the very crash dump we just surfaced to the user.
+        probe_with_empty_args: false,
+        observe_projection: None,
+    },
+    ProxyableCommand {
+        name: "get_access_token_for_websocket",
+        dispatch: Dispatch::InProcess,
+        description: "Return the signed-in operator's Cognito ACCESS token from the runner's keychain (already registered in Tauri — this entry allowlists it over HTTP so the fleet's credential doors can mint it WITHOUT `page/evaluate`, which the WebView CSP refuses). What it returns is the OPERATOR's Cognito access token, NOT a coord device JWT — the fleet's `COORD_DEVICE_JWT` name for it is a misnomer. Served in-process, so it answers on a headless runner. `require_tier_2()` runs FIRST: a Tier-0/1 runner answers the structured 'Tier 0/1 …' error and a signed-out Tier-2 runner 'Not authenticated…', both as a 500 `{ success: false, error }` envelope — never an empty 200. Success is `{ success: true, data: \"<token>\" }`.",
+        args_schema: "{}",
+        response_schema: "string",
+        // Minting a credential is not a boot probe — never call it with empty
+        // args on startup.
         probe_with_empty_args: false,
         observe_projection: None,
     },

@@ -259,11 +259,7 @@ pub const CLAUDE_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 /// that variation in its FILE NAME — which is why the settings file is named
 /// per [`StopHookRegistration`] variant.
 pub fn session_restore_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".qontinui")
-        .join("runner")
-        .join("session-restore")
+    qontinui_runner_lib::ambient::runner_dir_or_cwd().join("session-restore")
 }
 
 /// Materialize the bundled Claude SessionStart hook + its `--settings` file into
@@ -839,7 +835,29 @@ mod tests {
             .to_string_lossy()
             .starts_with(tmp_str.as_ref()));
         assert!(script_path.to_string_lossy().starts_with(tmp_str.as_ref()));
-        assert!(!settings_path.to_string_lossy().contains(".claude"));
+        // …and nothing the MATERIALIZER chose — the components BELOW the base —
+        // is a `.claude` dir. Checked below the base, never on the whole path:
+        // the base is a tempdir under `$TMPDIR`, which this test does not own.
+        // Under the Claude Code harness `$TMPDIR` is
+        // `~/.qontinui/scratch/.claude-<account>/…`, so the old substring check
+        // on the full path failed deterministically there while CI stayed green.
+        for path in [
+            settings_path,
+            script_path.as_path(),
+            stop_script_path.as_path(),
+            precompact_script_path.as_path(),
+            policy_script_path.as_path(),
+        ] {
+            let below = path.strip_prefix(tmp).unwrap_or_else(|_| {
+                panic!("{} is not under the base {}", path.display(), tmp.display())
+            });
+            assert!(
+                !below.components().any(|c| c.as_os_str() == ".claude"),
+                "{} puts a `.claude` dir under the base {}",
+                path.display(),
+                tmp.display()
+            );
+        }
 
         v
     }
@@ -1491,6 +1509,7 @@ mod tests {
 
     #[test]
     fn session_restore_dir_is_under_qontinui_runner_not_dot_claude() {
+        let _amb = crate::test_env::isolated_ambient();
         let dir = session_restore_dir();
         let s = dir.to_string_lossy();
         assert!(s.contains("runner"), "lives under ~/.qontinui/runner");

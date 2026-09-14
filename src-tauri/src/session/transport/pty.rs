@@ -86,6 +86,9 @@ impl Transport for PtyTransport {
                 // surfaces as `TransportError::Runtime` with the lane, the
                 // headroom and the floor in it.
                 false,
+                // A plain shell transport; the account is chosen after this
+                // point, if ever.
+                crate::terminal::TrustArm::AccountChosenLater,
             )
             .map_err(TransportError::Runtime)?;
 

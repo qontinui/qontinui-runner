@@ -18,7 +18,53 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::commands::ui_bridge::{ElementIdentifier, ElementRect, ElementState, UIBridgeElement};
+use crate::commands::ui_bridge::{
+    ElementActionInfo, ElementIdentifier, ElementRect, ElementState, UIBridgeElement,
+};
+use qontinui_types::ir::IrEffect;
+
+/// Classify the AWAS action behind an `awas_execute` custom action.
+///
+/// **This reads a declaration the AWAS app author already made; it does not
+/// infer one.** `AwasAction::side_effect` is part of the manifest format, and
+/// served policy `testing` `an-actions-safety-class-is-declared-not-re-derived`
+/// is explicit that an author's declaration is always preferred to a session's
+/// inference. Discarding it and emitting `None` for every action — as the
+/// pre-`ElementActionInfo` shape forced — throws away the only judgement anyone
+/// has made about these endpoints.
+///
+/// | `side_effect` | result |
+/// |---|---|
+/// | `Some(false)` | `Read` — the author declared no side effect |
+/// | `Some(true)` + `DELETE` | `Destructive` — the author chose DELETE, and removal is that method's own semantics |
+/// | `Some(true)` | `Write` — a declared mutation |
+/// | `None` | `None` — **UNCLASSIFIED, not safe** |
+///
+/// **The `None` arm is load-bearing and must not be "improved" into a
+/// method-derived default.** A method gives idempotency semantics, not blast
+/// radius: an arbitrary third-party `POST` is equally "add to cart" and "wire
+/// $10,000". Synthesising a class there would manufacture a confident answer
+/// nobody judged — the same fail-open shape `core/action-effect.ts` refuses for
+/// the SDK verb map, where a default rendered as a declaration is a lie on
+/// exactly the surface the annotation exists to protect. The existing
+/// `_ => "custom"` element-type arm proves unknown methods reach this function.
+///
+/// Known bound, recorded rather than silently resolved: `Some(true)` + `POST`
+/// maps to `Write`, not `Destructive`. Dimensions 2 (the state is an external
+/// party's) and 3 (a remote mutation is invisible in the local GUI) of
+/// `operating-rules` `what-makes-an-action-destructive` both argue for the
+/// stricter reading, but classifying every AWAS mutation `destructive` excludes
+/// the whole surface from automatic walks. Plan
+/// `2026-09-04-effect-calculus-joins-the-component-action-registry`,
+/// Design decision 4, flags this as a product call on the tenant's AWAS surface.
+fn awas_execute_effect(action: &AwasAction) -> Option<IrEffect> {
+    match action.side_effect {
+        Some(false) => Some(IrEffect::Read),
+        Some(true) if action.method.eq_ignore_ascii_case("DELETE") => Some(IrEffect::Destructive),
+        Some(true) => Some(IrEffect::Write),
+        None => None,
+    }
+}
 
 /// AWAS action as returned from manifest discovery
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +135,17 @@ pub fn awas_action_to_ui_bridge_element(
         element_type,
         label: action.name.clone().or_else(|| Some(action.id.clone())),
         actions,
-        custom_actions: Some(vec!["awas_execute".to_string()]),
+        // One custom action per AWAS element, now carrying the safety class the
+        // manifest already declared. See `awas_execute_effect` — an absent
+        // `side_effect` yields `effect: None`, which the schema defines as
+        // UNCLASSIFIED rather than safe.
+        custom_actions: Some(vec![ElementActionInfo {
+            id: "awas_execute".to_string(),
+            label: action.name.clone(),
+            description: action.intent.clone(),
+            param_schema: None,
+            effect: awas_execute_effect(action),
+        }]),
         identifier: ElementIdentifier {
             ui_id: None, // Not a UI Bridge registered element
             test_id: None,
@@ -190,6 +246,96 @@ mod tests {
         assert!(element.actions.contains(&"execute".to_string()));
         assert_eq!(element.identifier.awas_id, Some("login".to_string()));
         assert_eq!(element.identifier.selector, "[data-awas-action=\"login\"]");
+    }
+
+    fn awas(method: &str, side_effect: Option<bool>) -> AwasAction {
+        AwasAction {
+            id: "act".to_string(),
+            name: None,
+            method: method.to_string(),
+            endpoint: "/api/act".to_string(),
+            intent: None,
+            side_effect,
+            parameters: vec![],
+        }
+    }
+
+    /// The manifest's own `side_effect` declaration is READ, not re-derived.
+    #[test]
+    fn awas_execute_effect_reads_the_authors_declaration() {
+        assert_eq!(
+            awas_execute_effect(&awas("GET", Some(false))),
+            Some(IrEffect::Read)
+        );
+        assert_eq!(
+            awas_execute_effect(&awas("POST", Some(true))),
+            Some(IrEffect::Write)
+        );
+        assert_eq!(
+            awas_execute_effect(&awas("PUT", Some(true))),
+            Some(IrEffect::Write)
+        );
+        assert_eq!(
+            awas_execute_effect(&awas("DELETE", Some(true))),
+            Some(IrEffect::Destructive)
+        );
+        // Method casing is the manifest author's choice, not a contract.
+        assert_eq!(
+            awas_execute_effect(&awas("delete", Some(true))),
+            Some(IrEffect::Destructive)
+        );
+    }
+
+    /// **The load-bearing arm.** An absent `side_effect` is UNCLASSIFIED, and
+    /// must NEVER become a method-derived default: a method gives idempotency
+    /// semantics, not blast radius, so an arbitrary third-party POST is equally
+    /// "add to cart" and "wire $10,000". If someone later "improves" this into
+    /// a `match method` fallback, this test is what stops it.
+    #[test]
+    fn an_undeclared_side_effect_stays_unclassified_for_every_method() {
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "WEIRD", ""] {
+            assert_eq!(
+                awas_execute_effect(&awas(method, None)),
+                None,
+                "method {method:?} must not manufacture a class the manifest never declared"
+            );
+        }
+    }
+
+    /// A declared `read` must survive onto the element, because the whole point
+    /// of widening `custom_actions` was to make the class REACHABLE.
+    #[test]
+    fn the_declared_class_reaches_the_element_custom_action() {
+        let mut action = awas("GET", Some(false));
+        action.intent = Some("List invoices".to_string());
+        action.name = Some("List".to_string());
+
+        let element = awas_action_to_ui_bridge_element(&action, None);
+        let custom = element.custom_actions.expect("custom actions present");
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].id, "awas_execute");
+        assert_eq!(custom[0].effect, Some(IrEffect::Read));
+        assert_eq!(custom[0].label, Some("List".to_string()));
+        assert_eq!(custom[0].description, Some("List invoices".to_string()));
+    }
+
+    /// And an undeclared one reaches it ABSENT rather than defaulted.
+    #[test]
+    fn an_undeclared_class_reaches_the_element_absent() {
+        let element = awas_action_to_ui_bridge_element(&awas("POST", None), None);
+        let custom = element
+            .custom_actions
+            .as_ref()
+            .expect("custom actions present");
+        assert_eq!(custom[0].effect, None);
+
+        // Absent on the WIRE too — `skip_serializing_if` must keep it out, so a
+        // consumer reads "unclassified" rather than a class nobody chose.
+        let json = serde_json::to_string(&element).expect("serializes");
+        assert!(
+            !json.contains("\"effect\""),
+            "an unclassified action must not emit an `effect` key: {json}"
+        );
     }
 
     #[test]

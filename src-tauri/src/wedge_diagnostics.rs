@@ -76,90 +76,184 @@ pub const OVERFLOW_LANE_NAME: &str = "<other-threads>";
 /// Key reported for a thread with no name.
 pub const UNNAMED_LANE_NAME: &str = "<unnamed-thread>";
 
-/// In-flight tracked bodies, **one counter per spawning-thread name**.
+/// The lane counters, the lane names and the allocation lock, as ONE addressable
+/// thing.
 ///
-/// A single process-global counter would be a category error, and the record it
-/// fed was one: this process runs several INDEPENDENT tokio runtimes, each with
-/// its own blocking pool and its own `max_blocking_threads` ceiling. Verified in
-/// this crate, not assumed — the app's Tauri runtime (nothing ever calls
-/// `tauri::async_runtime::set`), the dedicated multi-thread `fleet-pub-rt` built
-/// in `main.rs` for the tree publisher / census / reclaim callers, the
-/// `fleet-heartbeat` current-thread runtime, and a further set of short-lived
-/// `new_current_thread` runtimes (`cognito`, `embedded_pg`, `env_agent`, `pair`,
-/// `agent_commands`, the CLI binaries). Summing their in-flight bodies into one
-/// number and printing it over ONE runtime's 512-slot ceiling produces readings
-/// that are not merely coarse but false in both directions: a genuinely
-/// saturated Tauri pool reads as `472/512` ("fine") once 40 bodies are charged
-/// to `fleet-pub-rt`, and two healthy pools at 300 and 250 read as `550/512`, an
-/// over-saturation that cannot happen.
-static LANE_COUNTS: [AtomicUsize; TOTAL_LANES] = [const { AtomicUsize::new(0) }; TOTAL_LANES];
-
-/// Lane name for each occupied index, published once and never changed.
+/// **Why this is a struct and not three bare statics.** A lane is a fixed,
+/// first-come, and *never released* resource (the names are `OnceLock`s), so any
+/// assertion on a lane NAME is really an assertion that a lane was still free
+/// when it ran — a property of the whole binary's population, not of the code
+/// under test. Under `cargo test` the names that register lanes are the TEST
+/// names, so merely ADDING a test anywhere in this binary could exhaust the
+/// [`MAX_BLOCKING_LANES`] lanes and turn the lane tests below red with everything
+/// charged to `<other-threads>` — on threading the new test never touched. That
+/// is not hypothetical: it reddened qontinui/qontinui-runner#1447, whose only
+/// relevant act was adding tests to `plan_workunit_adapter/trigger.rs`, and held
+/// #1448 and #1475 behind it.
 ///
-/// `OnceLock` so the READ side — which runs on the watchdog thread during a
-/// wedge — takes no lock at all. Registration is the only writer and happens at
-/// most once per thread.
-static LANE_NAMES: [OnceLock<String>; TOTAL_LANES] = [const { OnceLock::new() }; TOTAL_LANES];
+/// Giving the table an identity lets a test own a PRIVATE one, which no test
+/// population can saturate. Production is unchanged: it charges every body to the
+/// single [`LANES`] instance, through the same code paths as before.
+struct LaneTable {
+    /// In-flight tracked bodies, **one counter per spawning-thread name**.
+    ///
+    /// A single process-global counter would be a category error, and the record
+    /// it fed was one: this process runs several INDEPENDENT tokio runtimes, each
+    /// with its own blocking pool and its own `max_blocking_threads` ceiling.
+    /// Verified in this crate, not assumed — the app's Tauri runtime (nothing
+    /// ever calls `tauri::async_runtime::set`), the dedicated multi-thread
+    /// `fleet-pub-rt` built in `main.rs` for the tree publisher / census /
+    /// reclaim callers, the `fleet-heartbeat` current-thread runtime, and a
+    /// further set of short-lived `new_current_thread` runtimes (`cognito`,
+    /// `embedded_pg`, `env_agent`, `pair`, `agent_commands`, the CLI binaries).
+    /// Summing their in-flight bodies into one number and printing it over ONE
+    /// runtime's 512-slot ceiling produces readings that are not merely coarse
+    /// but false in both directions: a genuinely saturated Tauri pool reads as
+    /// `472/512` ("fine") once 40 bodies are charged to `fleet-pub-rt`, and two
+    /// healthy pools at 300 and 250 read as `550/512`, an over-saturation that
+    /// cannot happen.
+    counts: [AtomicUsize; TOTAL_LANES],
 
-/// Serialises lane ALLOCATION only. Never taken on the read path, and never
-/// taken twice by the same thread — a thread resolves its lane once and caches
-/// the index.
-static LANE_REGISTRATION: Mutex<()> = Mutex::new(());
+    /// Lane name for each occupied index, published once and never changed.
+    ///
+    /// `OnceLock` so the READ side — which runs on the watchdog thread during a
+    /// wedge — takes no lock at all. Registration is the only writer and happens
+    /// at most once per thread.
+    names: [OnceLock<String>; TOTAL_LANES],
+
+    /// Serialises lane ALLOCATION only. Never taken on the read path, and never
+    /// taken twice by the same thread — a thread resolves its lane once and
+    /// caches the index.
+    registration: Mutex<()>,
+}
+
+impl LaneTable {
+    const fn new() -> Self {
+        Self {
+            counts: [const { AtomicUsize::new(0) }; TOTAL_LANES],
+            names: [const { OnceLock::new() }; TOTAL_LANES],
+            registration: Mutex::new(()),
+        }
+    }
+
+    /// Find (or claim) the lane for `name`.
+    ///
+    /// Cold path: at most once per thread. The unlocked scan is the common case
+    /// once the lanes have filled; the lock covers the claim so two threads
+    /// racing on the same new name cannot take two lanes for it.
+    fn register_lane(&self, name: &str) -> usize {
+        for (i, slot) in self.names.iter().enumerate().take(MAX_BLOCKING_LANES) {
+            match slot.get() {
+                Some(n) if n == name => return i,
+                Some(_) => continue,
+                // Lanes fill in order under the lock, so the first empty one
+                // means "not registered yet" — fall through to claim it.
+                None => break,
+            }
+        }
+        let _guard = self
+            .registration
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (i, slot) in self.names.iter().enumerate().take(MAX_BLOCKING_LANES) {
+            match slot.get() {
+                Some(n) if n == name => return i,
+                Some(_) => continue,
+                None => {
+                    let _ = slot.set(name.to_string());
+                    return i;
+                }
+            }
+        }
+        OVERFLOW_LANE
+    }
+
+    /// The lane for an **explicitly passed** thread.
+    ///
+    /// The thread is a parameter rather than an ambient `thread::current()` read
+    /// so a caller can say which identity it means instead of inheriting
+    /// whatever the surrounding harness happened to name the running thread.
+    fn lane_for_thread(&self, thread: &std::thread::Thread) -> usize {
+        match thread.name() {
+            Some(n) => self.register_lane(n),
+            None => self.register_lane(UNNAMED_LANE_NAME),
+        }
+    }
+
+    /// Tracked bodies executing right now, summed across every lane.
+    fn in_flight(&self) -> usize {
+        self.counts.iter().map(|c| c.load(Ordering::SeqCst)).sum()
+    }
+
+    /// Tracked bodies executing right now, keyed by the thread that charged
+    /// them. Empty lanes are omitted: a zero carries no information and every
+    /// byte on this line is a byte a human reads during an incident.
+    fn by_thread(&self) -> BTreeMap<String, usize> {
+        let mut out = BTreeMap::new();
+        for (i, slot) in self.names.iter().enumerate().take(MAX_BLOCKING_LANES) {
+            let n = self.counts[i].load(Ordering::SeqCst);
+            if n == 0 {
+                continue;
+            }
+            match slot.get() {
+                Some(name) => {
+                    out.insert(name.clone(), n);
+                }
+                None => {
+                    // A lane counted before its name was published cannot happen
+                    // (registration sets the name before the index is returned),
+                    // but losing the count would be worse than naming it vaguely.
+                    *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += n;
+                }
+            }
+        }
+        let overflow = self.counts[OVERFLOW_LANE].load(Ordering::SeqCst);
+        if overflow > 0 {
+            *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += overflow;
+        }
+        out
+    }
+
+    /// Every lane name registered so far, in lane order.
+    ///
+    /// Test-only, and it exists for one job: the canary in
+    /// `the_lane_assertions_run_against_the_table_they_are_given`. The only way
+    /// to prove a fixture asserted against the table it was HANDED is to show
+    /// that table recorded the fixture's own names.
+    #[cfg(test)]
+    fn registered_names(&self) -> Vec<String> {
+        self.names
+            .iter()
+            .take(MAX_BLOCKING_LANES)
+            .filter_map(|slot| slot.get().cloned())
+            .collect()
+    }
+}
+
+/// The process-global lane table — the one every production body is charged to.
+static LANES: LaneTable = LaneTable::new();
 
 thread_local! {
-    /// This thread's lane index, resolved on first use.
+    /// This thread's lane index in [`LANES`], resolved on first use.
+    ///
+    /// The memo is deliberately global-only: it caches an answer *about one
+    /// table*, so a call against any other table must resolve afresh rather than
+    /// read a lane index that means nothing there.
     static MY_LANE: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Find (or claim) the lane for `name`.
-///
-/// Cold path: at most once per thread. The unlocked scan is the common case
-/// once the lanes have filled; the lock covers the claim so two threads racing
-/// on the same new name cannot take two lanes for it.
-fn register_lane(name: &str) -> usize {
-    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
-        match slot.get() {
-            Some(n) if n == name => return i,
-            Some(_) => continue,
-            // Lanes fill in order under the lock, so the first empty one means
-            // "not registered yet" — fall through to claim it.
-            None => break,
-        }
-    }
-    let _guard = LANE_REGISTRATION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
-        match slot.get() {
-            Some(n) if n == name => return i,
-            Some(_) => continue,
-            None => {
-                let _ = slot.set(name.to_string());
-                return i;
-            }
-        }
-    }
-    OVERFLOW_LANE
-}
-
-/// The calling thread's lane, cached in a thread-local after the first call.
+/// The calling thread's lane in [`LANES`], cached in a thread-local after the
+/// first call.
 ///
 /// Falls back to the overflow lane rather than panicking when the thread-local
 /// is already destroyed (a body charged during thread teardown), because nothing
 /// on this path may ever make a sick process sicker.
 fn current_thread_lane() -> usize {
-    let resolve = || {
-        let current = std::thread::current();
-        match current.name() {
-            Some(n) => register_lane(n),
-            None => register_lane(UNNAMED_LANE_NAME),
-        }
-    };
     MY_LANE
         .try_with(|cell| match cell.get() {
             Some(i) => i,
             None => {
-                let i = resolve();
+                let i = LANES.lane_for_thread(&std::thread::current());
                 cell.set(Some(i));
                 i
             }
@@ -211,6 +305,9 @@ pub const BLOCKING_POOL_DEFAULT_CAPACITY: usize = 512;
               (`let _slot = ...`), never `let _ = ...`, which drops it at once \
               and counts nothing"]
 pub struct BlockingSlot {
+    /// The table this slot was charged to, so `Drop` gives the count back to the
+    /// same place it took it from.
+    table: &'static LaneTable,
     lane: usize,
 }
 
@@ -226,7 +323,7 @@ impl BlockingSlot {
         Self::enter_lane(current_thread_lane())
     }
 
-    /// Take a slot charged to an explicit lane.
+    /// Take a slot charged to an explicit lane of the global [`LANES`] table.
     ///
     /// [`spawn_blocking_tracked`] resolves the lane on the SPAWNING thread and
     /// carries it into the body: that thread is the one whose runtime's pool the
@@ -234,8 +331,17 @@ impl BlockingSlot {
     /// threads carry tokio's default name) it is the only place that identity is
     /// still visible.
     fn enter_lane(lane: usize) -> Self {
-        LANE_COUNTS[lane].fetch_add(1, Ordering::SeqCst);
-        Self { lane }
+        Self::enter_lane_in(&LANES, lane)
+    }
+
+    /// Take a slot charged to an explicit lane of an explicit table.
+    ///
+    /// The table is a parameter for the reason [`LaneTable`]'s own doc gives: a
+    /// test that asserts on lane names must be able to use a table the rest of
+    /// the process cannot saturate.
+    fn enter_lane_in(table: &'static LaneTable, lane: usize) -> Self {
+        table.counts[lane].fetch_add(1, Ordering::SeqCst);
+        Self { table, lane }
     }
 }
 
@@ -244,9 +350,10 @@ impl Drop for BlockingSlot {
         // `fetch_update` rather than `fetch_sub`: a saturating floor at 0 means
         // a hypothetical unbalanced drop can never wrap to `usize::MAX` and
         // publish a nonsense 18446744073709551615.
-        let _ = LANE_COUNTS[self.lane].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-            Some(n.saturating_sub(1))
-        });
+        let _ =
+            self.table.counts[self.lane].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                Some(n.saturating_sub(1))
+            });
     }
 }
 
@@ -270,15 +377,64 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    // A PURE DELEGATION, and that is load-bearing rather than tidiness. Every
+    // line of logic lives in `spawn_blocking_tracked_in`, which the lane tests
+    // exercise against a private table — so the code the runner actually calls is
+    // the code those tests cover. While this wrapper carried its own
+    // `tokio::task::spawn_blocking` body, that body was covered by NOTHING: an
+    // independent review proved it by mutation, re-introducing the original
+    // defect here and watching the whole module stay green.
+    // `the_public_spawn_wrapper_only_delegates` pins the shape so it cannot drift
+    // back, and it pins it population-independently, which no runtime assertion
+    // against the global table can do.
+    spawn_blocking_tracked_in(&LANES, f)
+}
+
+/// [`spawn_blocking_tracked`] against an explicit table: resolve the lane on the
+/// SPAWNING thread, then charge the body to it.
+///
+/// Module-private on purpose — this crate's several hundred call sites must not
+/// be able to choose a table. The parameter exists so the lane tests can cover
+/// THIS function, the one that does the work, against a table the rest of the
+/// test binary cannot saturate. See [`LaneTable`].
+///
+/// `#[track_caller]` on every frame between the public wrapper and tokio's own
+/// `#[track_caller]` spawn, or the "there is no reactor running" panic is blamed
+/// on this file instead of the real call site — which is the single datum that
+/// identifies it. The `spawn_blocking_tracked_blames_its_caller_not_this_module`
+/// test below is what proves the chain actually holds.
+#[track_caller]
+fn spawn_blocking_tracked_in<F, R>(table: &'static LaneTable, f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
     // Resolved HERE, on the caller's thread — not inside the closure, which runs
     // on a pool thread whose name is tokio's default for every
     // `new_current_thread` runtime in the process and would merge them all into
     // one indistinguishable bucket.
-    let lane = current_thread_lane();
+    let lane = lane_for_current_thread_in(table);
     tokio::task::spawn_blocking(move || {
-        let _slot = BlockingSlot::enter_lane(lane);
+        let _slot = BlockingSlot::enter_lane_in(table, lane);
         f()
     })
+}
+
+/// The calling thread's lane in `table`.
+///
+/// [`current_thread_lane`]'s memo caches an answer about ONE table, so it may be
+/// used only for the global one; identity decides that, not equality — `ptr::eq`
+/// on a `&'static`. Keeping the memo matters: dropping it would trade one `Cell`
+/// read for up to [`MAX_BLOCKING_LANES`] string comparisons on every one of this
+/// crate's several hundred call sites, in a process that by the time anyone reads
+/// these counters is often already sick. The memo is also what supplies the
+/// thread-teardown fallback to the overflow lane instead of a panic.
+fn lane_for_current_thread_in(table: &'static LaneTable) -> usize {
+    if std::ptr::eq(table, &LANES) {
+        current_thread_lane()
+    } else {
+        table.lane_for_thread(&std::thread::current())
+    }
 }
 
 /// Tracked bodies executing right now, summed across every lane. Never blocks;
@@ -287,7 +443,7 @@ where
 /// A **lower bound** on blocking-pool pressure, not a measurement of it — see
 /// [`TrackedBlockingBodies`].
 pub fn tracked_blocking_in_flight() -> usize {
-    LANE_COUNTS.iter().map(|c| c.load(Ordering::SeqCst)).sum()
+    LANES.in_flight()
 }
 
 /// Tracked bodies executing right now, keyed by the thread that charged them.
@@ -295,29 +451,7 @@ pub fn tracked_blocking_in_flight() -> usize {
 /// Empty lanes are omitted: a zero carries no information and every byte on this
 /// line is a byte a human reads during an incident.
 pub fn tracked_blocking_by_thread() -> BTreeMap<String, usize> {
-    let mut out = BTreeMap::new();
-    for (i, slot) in LANE_NAMES.iter().enumerate().take(MAX_BLOCKING_LANES) {
-        let n = LANE_COUNTS[i].load(Ordering::SeqCst);
-        if n == 0 {
-            continue;
-        }
-        match slot.get() {
-            Some(name) => {
-                out.insert(name.clone(), n);
-            }
-            None => {
-                // A lane counted before its name was published cannot happen
-                // (registration sets the name before the index is returned), but
-                // losing the count would be worse than naming it vaguely.
-                *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += n;
-            }
-        }
-    }
-    let overflow = LANE_COUNTS[OVERFLOW_LANE].load(Ordering::SeqCst);
-    if overflow > 0 {
-        *out.entry(OVERFLOW_LANE_NAME.to_string()).or_insert(0) += overflow;
-    }
-    out
+    LANES.by_thread()
 }
 
 /// The PER-RUNTIME blocking-pool slot ceiling. See
@@ -447,7 +581,7 @@ pub const UNTRACKED_POOL_CONSUMERS: &[&str] = &[
 /// 1. **It spans runtimes.** The process runs several independent tokio
 ///    runtimes; `512` is ONE runtime's ceiling. Summing across pools and
 ///    printing the sum over one ceiling yields readings that are false in both
-///    directions (see [`LANE_COUNTS`]). Hence `by_spawning_thread`, and a
+///    directions (see [`LaneTable`]). Hence `by_spawning_thread`, and a
 ///    capacity field named for what it actually is.
 /// 2. **It is a lower bound.** Only bodies routed through this module are
 ///    counted; see [`UNTRACKED_POOL_CONSUMERS`].
@@ -1455,7 +1589,10 @@ mod tests {
                     || before.ends_with('{')
                     || before.ends_with('}'))
                     && (after.starts_with("BlockingSlot::enter();")
-                        || after.starts_with("BlockingSlot::enter_lane("));
+                        || after.starts_with("BlockingSlot::enter_lane(")
+                        // `enter_lane_in` takes the table explicitly; a bare
+                        // discard of it counts exactly as little as the others.
+                        || after.starts_with("BlockingSlot::enter_lane_in("));
                 if discarded_by_underscore || bare {
                     offenders.push(format!("{}", path.display()));
                 } else if before.ends_with("let_slot=")
@@ -1487,12 +1624,109 @@ mod tests {
         );
     }
 
+    /// **`spawn_blocking_tracked` must stay a PURE DELEGATION.**
+    ///
+    /// The lane tests cover `spawn_blocking_tracked_in` against a private table.
+    /// That only covers what the runner actually calls while the public wrapper
+    /// does nothing but delegate to it — the moment the wrapper grows a
+    /// `tokio::task::spawn_blocking` body of its own, that body is covered by
+    /// nothing, which is not hypothetical: an independent review re-introduced the
+    /// original defect in exactly that position and the whole module stayed green.
+    ///
+    /// A SOURCE pin rather than a behavioural test, deliberately. The behavioural
+    /// version would have to observe the global lane table, and on a saturated
+    /// table (which a suite this size plausibly always produces in CI) the
+    /// spawning thread and the pool thread collapse to the same overflow lane and
+    /// the observation proves nothing. This check is population-independent. Note
+    /// what it cannot do: if lane resolution ever moves INSIDE the closure within
+    /// `spawn_blocking_tracked_in`, the shape here is still correct and only the
+    /// behavioural test catches it — so that test stays primary, not this one.
+    ///
+    /// `include_str!` rather than a directory walk: the compiler resolves it, so
+    /// this pin cannot end up scanning the wrong tree and passing vacuously.
+    #[test]
+    fn the_public_spawn_wrapper_only_delegates() {
+        const SRC: &str = include_str!("wedge_diagnostics.rs");
+        const SIGNATURE: &str = "pub fn spawn_blocking_tracked<F, R>(f: F)";
+
+        // Search the PRODUCTION half only, via the same `prod_part` helper the
+        // sibling pin uses. `SIGNATURE` also occurs in this test's own `const`
+        // above, so a raw `SRC.find` would match THAT the moment the real wrapper
+        // is renamed: the "could not find" panic below could then never fire, the
+        // slice would run to the end of the test module, and the delegation
+        // assertion would pass off this very failure message's text. Measured by
+        // the reviewer who caught it — a 22,879-char pseudo-body that reddened
+        // only by accident and reported a false cause.
+        let src = prod_part(SRC);
+
+        // The POSITIVE half first. A pin that only asserts an absence passes the
+        // day the function is renamed — the same vacuity the `bindings` floor
+        // above exists to prevent.
+        let start = src.find(SIGNATURE).unwrap_or_else(|| {
+            panic!(
+                "this pin could not find `{SIGNATURE}` in the production half of this \
+                 module. If the wrapper was renamed or its signature reformatted, \
+                 update this pin in the same change — otherwise it silently stops \
+                 guarding anything."
+            )
+        });
+        let body_start = start
+            + src[start..]
+                .find('{')
+                .expect("the wrapper must have a body");
+        let body_end = body_start
+            + src[body_start..]
+                .find("\n}\n")
+                .expect("the wrapper's body must be closed at column 0");
+        let raw_body = &src[body_start..body_end];
+
+        // Comments are stripped BEFORE matching, for the same reason
+        // `no_call_site_discards_a_blocking_slot` does it: this wrapper's own body
+        // comment has to NAME the forbidden spelling in order to explain it, and a
+        // pin that cannot tell an explanation from a call site fails on the very
+        // documentation that justifies it. (It did: the first version of this pin
+        // reddened the clean tree, which is also why a pin must be proven to pass
+        // before its mutation verdict means anything.)
+        let body = squeezed_code(raw_body);
+
+        // BOTH bounds, because the two mis-parses are opposite and each one makes
+        // this pin useless in its own way: a collapsed slice asserts nothing, and a
+        // runaway slice swallowing the rest of the file is what let the positive
+        // half go unfireable. The real squeezed body is ~36 characters.
+        assert!(
+            (20..200).contains(&body.len()),
+            "the pin sliced a {}-char body out of the wrapper — it is mis-parsing, \
+             and in one direction or the other that leaves it vacuous. Raw \
+             slice:\n{raw_body}",
+            body.len()
+        );
+
+        assert!(
+            body.contains("spawn_blocking_tracked_in(&LANES,f)"),
+            "the public wrapper no longer delegates to \
+             `spawn_blocking_tracked_in(&LANES, f)`. If this is a deliberate \
+             signature change and the wrapper is STILL a pure delegation, update \
+             this pin's expected spelling in the same change. Body is \
+             now:\n{raw_body}"
+        );
+        assert!(
+            !body.contains("tokio::task::spawn_blocking("),
+            "the public wrapper has grown its own `tokio::task::spawn_blocking` \
+             body. Nothing covers that body: the lane tests exercise \
+             `spawn_blocking_tracked_in` against a private table, and a \
+             behavioural test against the global table cannot tell the spawning \
+             thread's lane from the pool thread's once the table is saturated. \
+             Keep the wrapper a delegation and put the logic where it is tested. \
+             Body:\n{raw_body}"
+        );
+    }
+
     // ---- blocking-pool counter ----
 
-    /// `BLOCKING_IN_FLIGHT` is a PROCESS-GLOBAL static, so two of these tests
-    /// running in parallel observe each other's slots and the before/after
-    /// assertions race. Same discipline (and same reason) as
-    /// `health_monitor`'s `SERIAL` guard around its global atomics.
+    /// [`LANES`] is a PROCESS-GLOBAL static, so two of these tests running in
+    /// parallel observe each other's slots and the before/after assertions race.
+    /// Same discipline (and same reason) as `health_monitor`'s `SERIAL` guard
+    /// around its global atomics.
     /// Poison-recovering, so a panicking test — and one of these panics ON
     /// PURPOSE — cannot cascade-fail the rest.
     static POOL_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1532,67 +1766,118 @@ mod tests {
         );
     }
 
-    #[test]
-    fn spawn_blocking_tracked_counts_the_running_body() {
-        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let before = tracked_blocking_in_flight();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        // `rt.enter()` rather than `block_on(async { .. })`: an async block whose
-        // value is itself a `JoinHandle` is the `async_yields_async` lint, and
-        // the handle here is deliberately NOT awaited yet — the point is to
-        // observe the counter while the body is still running.
-        let handle = {
-            let _guard = rt.enter();
-            spawn_blocking_tracked(move || {
-                let _ = entered_tx.send(tracked_blocking_in_flight());
-                let _ = release_rx.recv();
+    // ---- lane accounting ----
+    //
+    // READ THIS BEFORE CHANGING THE ASSERTIONS BELOW.
+    //
+    // These use a PRIVATE `LaneTable`, never the process-global `LANES`, and that
+    // is the whole point. Lanes are a fixed, first-come, never-released resource,
+    // and under `cargo test` the names that claim them are the TEST names — so an
+    // assertion against the global table is really an assertion about how many
+    // other tests share this binary. Both tests here used to do exactly that, and
+    // adding tests to an unrelated module reddened them with everything charged
+    // to `<other-threads>`, blaming a PR that never touched threading
+    // (qontinui/qontinui-runner#1447, which held #1448 and #1475 behind it).
+    // `the_lane_assertions_run_against_the_table_they_are_given` is the guard
+    // that keeps them honest.
+
+    /// A lane table nothing else in this process shares, so its lanes are free no
+    /// matter what the rest of the binary has registered.
+    fn fresh_lane_table() -> &'static LaneTable {
+        Box::leak(Box::new(LaneTable::new()))
+    }
+
+    /// Take a slot on `table`, charged to the calling thread's lane there.
+    ///
+    /// `#[must_use]` for the same reason [`BlockingSlot`] carries it: a slot that
+    /// is not HELD counts nothing.
+    #[must_use]
+    fn enter_in(table: &'static LaneTable) -> BlockingSlot {
+        BlockingSlot::enter_lane_in(table, table.lane_for_thread(&std::thread::current()))
+    }
+
+    /// A tracked body is charged to the lane of the thread that SPAWNED it, not
+    /// the pool thread that ran it.
+    ///
+    /// That is the whole point of resolving the lane before the closure: a
+    /// `new_current_thread` runtime's pool threads all carry tokio's default
+    /// name, so charging at execution time would merge every such runtime into
+    /// one indistinguishable bucket.
+    ///
+    /// The spawn runs on a thread this fixture NAMES, so the expected key is a
+    /// constant of the fixture rather than whatever the harness happened to call
+    /// the running thread.
+    ///
+    /// Neuter check: move `spawn_blocking_in_lane`'s `BlockingSlot::enter_lane_in`
+    /// so the lane is resolved INSIDE the closure, and this fails with the body
+    /// charged to `tokio-runtime-worker`.
+    fn assert_a_body_is_charged_to_its_spawner(table: &'static LaneTable) {
+        const SPAWNER: &str = "lane-fixture-spawner";
+        let observed = std::thread::Builder::new()
+            .name(SPAWNER.to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let before = table.in_flight();
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel::<usize>();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                // `rt.enter()` rather than `block_on(async { .. })`: an async
+                // block whose value is itself a `JoinHandle` is the
+                // `async_yields_async` lint, and the handle here is deliberately
+                // NOT awaited yet — the point is to observe the counter while the
+                // body is still running.
+                let handle = {
+                    let _guard = rt.enter();
+                    spawn_blocking_tracked_in(table, move || {
+                        let _ = entered_tx.send(table.in_flight());
+                        let _ = release_rx.recv();
+                    })
+                };
+                let seen = entered_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the body must run");
+                let during = table.by_thread();
+                let _ = release_tx.send(());
+                rt.block_on(handle).expect("join");
+                (before, seen, during, table.in_flight(), table.by_thread())
             })
-        };
-        let seen = entered_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the body must run");
+            .expect("spawn the named fixture thread")
+            .join()
+            .expect("fixture thread");
+        let (before, seen, during, after_total, after) = observed;
+
         assert_eq!(
             seen,
             before + 1,
             "the body did not hold a slot while it was executing"
         );
-        // ...and it is charged to the SPAWNING thread's lane, not the pool
-        // thread's. That is the whole point of resolving the lane before the
-        // closure: a `new_current_thread` runtime's pool threads all carry
-        // tokio's default name, so charging at execution time would merge every
-        // such runtime into one indistinguishable bucket.
-        let spawner = std::thread::current()
-            .name()
-            .unwrap_or(UNNAMED_LANE_NAME)
-            .to_string();
         assert_eq!(
-            tracked_blocking_by_thread().get(&spawner).copied(),
+            during.get(SPAWNER).copied(),
             Some(1),
-            "the body was not charged to the thread that spawned it; lanes: {:?}",
-            tracked_blocking_by_thread()
+            "the body was not charged to the thread that spawned it; lanes: {during:?}"
         );
-
-        let _ = release_tx.send(());
-        rt.block_on(handle).expect("join");
-        assert_eq!(tracked_blocking_in_flight(), before);
+        // Stronger than the assertion this replaces, which never checked that the
+        // POOL thread's lane was empty. The table is private to this fixture, so
+        // the only way another key appears is the defect the test exists to
+        // catch: charging at execution time, on tokio's pool thread.
         assert!(
-            !tracked_blocking_by_thread().contains_key(&spawner),
-            "a finished body left its lane occupied"
+            during.keys().all(|k| k.as_str() == SPAWNER),
+            "a lane other than the spawner's was charged; lanes: {during:?}"
+        );
+        assert_eq!(after_total, before);
+        assert!(
+            !after.contains_key(SPAWNER),
+            "a finished body left its lane occupied; lanes: {after:?}"
         );
     }
 
     /// Two threads, two lanes. The defect this replaces was a single global
     /// counter summed across every runtime in the process and printed over ONE
     /// runtime's 512-slot ceiling — a reading that is false in both directions.
-    #[test]
-    fn bodies_from_different_threads_land_in_different_lanes() {
-        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fn assert_two_threads_land_in_two_lanes(table: &'static LaneTable) {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
         let mut joins = Vec::new();
         let mut releases = Vec::new();
@@ -1607,7 +1892,7 @@ mod tests {
                 std::thread::Builder::new()
                     .name(name.to_string())
                     .spawn(move || {
-                        let _slot = BlockingSlot::enter();
+                        let _slot = enter_in(table);
                         let _ = entered.send(());
                         let _ = release_rx.recv();
                     })
@@ -1620,7 +1905,7 @@ mod tests {
                 .expect("both fixture bodies must start");
         }
 
-        let lanes = tracked_blocking_by_thread();
+        let lanes = table.by_thread();
         assert_eq!(
             lanes.get("lane-fixture-alpha").copied(),
             Some(1),
@@ -1638,12 +1923,189 @@ mod tests {
         for j in joins {
             j.join().expect("fixture thread");
         }
-        let lanes = tracked_blocking_by_thread();
+        let lanes = table.by_thread();
         assert!(
             !lanes.contains_key("lane-fixture-alpha"),
             "lanes: {lanes:?}"
         );
         assert!(!lanes.contains_key("lane-fixture-beta"), "lanes: {lanes:?}");
+    }
+
+    /// `POOL_SERIAL` here is NOT about the lanes — the table is private, so no
+    /// other test can perturb it, and that independence is the point of the fix.
+    /// It serialises against
+    /// `spawn_blocking_tracked_blames_its_caller_not_this_module`, which swaps
+    /// the PROCESS-GLOBAL panic hook: a fixture assertion firing while that hook
+    /// is installed would be recorded as THAT test's observation, turning one
+    /// failure into two misleading ones.
+    #[test]
+    fn spawn_blocking_tracked_counts_the_running_body() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_a_body_is_charged_to_its_spawner(fresh_lane_table());
+    }
+
+    #[test]
+    fn bodies_from_different_threads_land_in_different_lanes() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        assert_two_threads_land_in_two_lanes(fresh_lane_table());
+    }
+
+    /// The `ptr::eq` ROUTING in `lane_for_current_thread_in`: a private table is
+    /// resolved against ITSELF, never against the global memo.
+    ///
+    /// **This is the third attempt at covering the memo arm, and the two it
+    /// replaces are worth recording, because both READ as proof and were not.**
+    ///
+    /// The first asserted that the production wrapper charged the spawning
+    /// thread's global lane, comparing lane INDEXES to stay immune to lane
+    /// exhaustion. Withdrawn: on a saturated table the spawning thread and the
+    /// pool thread both resolve to `OVERFLOW_LANE`, so it passes WITH the defect
+    /// present — and with [`MAX_BLOCKING_LANES`] lanes and a suite this size, CI
+    /// is plausibly always in that case. Illusory coverage exactly where it
+    /// counted.
+    ///
+    /// The second asserted only that a thread's lane index was STABLE across
+    /// repeated calls. Withdrawn as near-vacuous: idempotency follows from
+    /// `register_lane` being deterministic per thread name plus `MY_LANE` being
+    /// thread-local, and both hold with the memo DELETED outright — so it would
+    /// have stayed green against the very thing it named. It also never checked
+    /// WHICH index, so a memo storing a wrong-but-stable answer passed too.
+    ///
+    /// What this one pins is the single decision unique to the routing: resolving
+    /// against an empty private table must register IN that table.
+    ///
+    /// **Which assertion is load-bearing, said plainly, because a future reader
+    /// might otherwise "simplify" away the half doing the work — the same shape of
+    /// mistake both withdrawn tests made.** `registered_names().len() == 1` is the
+    /// guard: a leaked global memo registers NOTHING in the handed table, so that
+    /// assertion fails deterministically whenever the routing is broken. The
+    /// `lane == 0` check is a corroborating detail and is order-dependent in
+    /// principle — an inverted `ptr::eq` could leak a global index that happens to
+    /// BE 0 if this test's thread were the first to register in [`LANES`], and
+    /// priming the memo first does not guarantee otherwise. So the deterministic
+    /// assertion is made FIRST, and reports first.
+    ///
+    /// **No `POOL_SERIAL` here, unlike the other lane tests, and one consequence
+    /// is worth naming rather than leaving as an apparent violation of this
+    /// module's own warning.** It asserts on a private table plus its own thread's
+    /// memo, so it races nothing on its own data. It does permanently consume one
+    /// global lane for its own test-thread name, which is unavoidable for anything
+    /// exercising the memo and is harmless precisely because — after this change —
+    /// nothing asserts on a global lane NAME any more. The residual: it can run
+    /// while `spawn_blocking_tracked_blames_its_caller_not_this_module` has the
+    /// process-global panic hook installed, so a failure here could be recorded as
+    /// that test's observation and redden two tests from one cause.
+    ///
+    /// Not covered, stated rather than implied: the memo's thread-TEARDOWN
+    /// fallback — `current_thread_lane()` answering `OVERFLOW_LANE` instead of
+    /// panicking once `MY_LANE` is already destroyed — is the one behaviour
+    /// genuinely unique to the memo path, and it needs a TLS-destructor fixture
+    /// that does not exist here.
+    #[test]
+    fn lane_resolution_routes_to_the_table_it_was_handed() {
+        // Prime the GLOBAL memo for this thread FIRST, so a leaked memo would hand
+        // back a global lane index instead of the private table's.
+        let global_lane = current_thread_lane();
+        let table = fresh_lane_table();
+        let lane = lane_for_current_thread_in(table);
+
+        // THE GUARD, asserted first: a leaked global memo registers nothing here.
+        let names = table.registered_names();
+        assert_eq!(
+            names.len(),
+            1,
+            "resolution registered {names:?} in the table it was handed; a leaked \
+             global memo registers NOTHING there, which is the defect this pins"
+        );
+        // Corroborating, and order-dependent in principle — see this test's doc.
+        assert_eq!(
+            lane, 0,
+            "the first name resolved against an EMPTY private table must take lane \
+             0, not {lane} (this thread's GLOBAL lane is {global_lane}) — the \
+             routing has leaked the global memo across tables"
+        );
+    }
+
+    /// The MECHANISM behind the trap, pinned so the next reader does not have to
+    /// re-derive it from a reddened PR: past [`MAX_BLOCKING_LANES`] distinct
+    /// names, a further name gets no lane of its own and is reported under
+    /// `<other-threads>`. This is the intended degradation — the total stays
+    /// honest — and it is exactly why the assertions above must not read a table
+    /// the rest of the binary can fill.
+    #[test]
+    fn a_saturated_lane_table_degrades_to_the_overflow_bucket() {
+        let table = fresh_lane_table();
+        for i in 0..MAX_BLOCKING_LANES {
+            assert_eq!(
+                table.register_lane(&format!("filler-{i}")),
+                i,
+                "each of the first {MAX_BLOCKING_LANES} distinct names must get its own lane"
+            );
+        }
+        let late = table.register_lane("one-name-too-many");
+        assert_eq!(
+            late, OVERFLOW_LANE,
+            "a name arriving past the lane count must land in the overflow lane"
+        );
+        let _slot = BlockingSlot::enter_lane_in(table, late);
+        let lanes = table.by_thread();
+        assert_eq!(
+            lanes.get(OVERFLOW_LANE_NAME).copied(),
+            Some(1),
+            "lanes: {lanes:?}"
+        );
+        assert!(
+            !lanes.contains_key("one-name-too-many"),
+            "a name with no lane of its own must not appear as a key; lanes: {lanes:?}"
+        );
+    }
+
+    /// **REGRESSION GUARD — adding an unrelated test must not redden this lane.**
+    ///
+    /// The trap was that these assertions read PROCESS-GLOBAL state, so the rest
+    /// of the binary's test population decided their verdict. The structural fix
+    /// is that each assertion runs against a table it is HANDED; this is the
+    /// canary that the fix stays in place. It proves each fixture actually used
+    /// the table it was given, so if anyone re-points them at [`LANES`] — or back
+    /// at `std::thread::current().name()` — the handed table stays pristine and
+    /// THIS test goes red while the two tests above still pass.
+    ///
+    /// Deliberately NOT written by saturating the real global table. That would
+    /// be a more literal simulation of "a PR added tests", but the saturation is
+    /// PERMANENT (the names are `OnceLock`s, never released) and this suite runs
+    /// multi-threaded, so it would leave a process-global side effect for every
+    /// later test in the binary and rest on a hand audit that none of them reads
+    /// a global lane name — a fresh instance of the very class of defect this
+    /// change exists to remove. The canary below proves the same property and
+    /// touches no shared state. The empirical form of the demonstration (add
+    /// throwaway tests to this binary, watch the lane stay green) belongs in the
+    /// change's verification record, not in a permanent test.
+    #[test]
+    fn the_lane_assertions_run_against_the_table_they_are_given() {
+        let _g = POOL_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+        let spawner_table = fresh_lane_table();
+        assert_a_body_is_charged_to_its_spawner(spawner_table);
+        assert!(
+            spawner_table
+                .registered_names()
+                .iter()
+                .any(|n| n == "lane-fixture-spawner"),
+            "the spawner fixture registered nothing of its own in the table it was \
+             handed (names: {:?}) — so it is asserting against some OTHER table, \
+             which is exactly the trap this module exists to keep closed",
+            spawner_table.registered_names()
+        );
+
+        let pair_table = fresh_lane_table();
+        assert_two_threads_land_in_two_lanes(pair_table);
+        let names = pair_table.registered_names();
+        assert!(
+            names.iter().any(|n| n == "lane-fixture-alpha")
+                && names.iter().any(|n| n == "lane-fixture-beta"),
+            "the two-thread fixture registered {names:?} in the table it was handed, \
+             not its own lane names — so it is asserting against some OTHER table"
+        );
     }
 
     /// `#[track_caller]` must actually PROPAGATE, not merely be written down.

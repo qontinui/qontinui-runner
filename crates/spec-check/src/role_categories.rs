@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn same_category_cross_category_false() {
         assert!(!same_category("button", "dialog")); // Widget vs Window
-        assert!(!same_category("article", "main"));  // Document vs Landmark
+        assert!(!same_category("article", "main")); // Document vs Landmark
     }
 
     #[test]
