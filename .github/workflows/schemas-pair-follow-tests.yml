@@ -1,0 +1,57 @@
+name: schemas pair-follow tests
+
+# Fixture tests for scripts/schemas-pair-follow.sh. They need no network: GitHub and
+# coord responses are files, and every git operation runs against local repos.
+# Plan: 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.7 (Phase 3.0).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/schemas-pair-follow.sh"
+      - "scripts/tests/schemas-pair-follow/**"
+      - ".github/workflows/schemas-pair-follow.yml"
+      - ".github/workflows/schemas-pair-follow-tests.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/schemas-pair-follow.sh"
+      - "scripts/tests/schemas-pair-follow/**"
+      - ".github/workflows/schemas-pair-follow.yml"
+      - ".github/workflows/schemas-pair-follow-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: schemas pair-follow selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Test the pair-follow decisions, build and push (fixtures, no network)
+        shell: bash
+        run: bash scripts/tests/schemas-pair-follow/run.sh
+
+      # Verification item from plan §7.7: the PAT is referenced only in the push job.
+      - name: The PAT appears only under the push job
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import yaml, sys
+          wf = yaml.safe_load(open('.github/workflows/schemas-pair-follow.yml'))
+          bad = []
+          for name, job in wf['jobs'].items():
+              if 'CLORINDE_AUTOCOMMIT_TOKEN' in yaml.safe_dump(job) and name != 'push':
+                  bad.append(name)
+          perms = wf['jobs']['compute'].get('permissions', {})
+          if perms != {'contents': 'read'}:
+              bad.append('compute permissions %r' % perms)
+          if bad:
+              print('PAT or write scope outside the push job:', bad); sys.exit(1)
+          print('ok: PAT only in push; compute is contents: read')
+          PY
