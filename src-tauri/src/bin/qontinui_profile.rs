@@ -1205,6 +1205,14 @@ fn cmd_device_pair(
                     }
                 }
             };
+            // NO upstream-rejection-streak reset here, deliberately. The streaks
+            // live in the RUNNER process's memory, and this CLI is a separate
+            // process, so it cannot reach them
+            // (`device_jwt_refresher::retire_rejection_streaks_after_pairing` is
+            // what the in-process sign-in and pair-code paths call). A running
+            // runner still heals: the first 2xx it forwards with the new
+            // credential resets that tenant's streak. A runner started after this
+            // pairing begins with no streak at all.
             if let Err(e) = persist_pairing(&resp, effective_tenant_id) {
                 eprintln!(
                     "error: pairing succeeded but persisting locally failed: {}",
