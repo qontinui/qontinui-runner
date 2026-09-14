@@ -5256,6 +5256,38 @@ fn maybe_spool_finding(
     )
 }
 
+/// `/coord-mcp` 401/403 retry outcomes, as reported in the upstream-rejected
+/// log row. Named because [`coord_mcp_verdict_tenant`] branches on two of
+/// them: a typo in a bare literal would compile and silently file the verdict
+/// under the wrong tenant.
+const UPSTREAM_RETRY_RECOVERED: &str = "retried-recovered";
+const UPSTREAM_RETRY_STILL_REJECTED: &str = "retried-still-rejected";
+const UPSTREAM_RETRY_TRANSPORT_FAILED: &str = "retry-transport-failed";
+const UPSTREAM_RETRY_NO_FRESHER_BEARER: &str = "no-fresher-bearer";
+const UPSTREAM_RETRY_RESELECTION_REFUSED: &str = "reselection-refused";
+
+/// The tenant whose credential bucket the `/coord-mcp` proxy files coord's
+/// verdict under, once the 401/403 retry arm has run.
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (b). The
+/// verdict recorded is the FINAL response's, so it belongs to the credential
+/// that produced that response. When the retry was actually sent and answered
+/// (`retried-recovered`, `retried-still-rejected`) that is the RE-SELECTION's
+/// tenant, which can differ from the first selection's — the machine pin is
+/// read per request. Every other outcome forwards attempt 1's response, so
+/// the first selection's tenant stands. Filing a re-selection's 2xx under the
+/// first tenant used to reset a streak coord never retired.
+fn coord_mcp_verdict_tenant(
+    first_selection: Option<uuid::Uuid>,
+    upstream_retry: Option<&str>,
+    reselected: Option<uuid::Uuid>,
+) -> Option<uuid::Uuid> {
+    match upstream_retry {
+        Some(UPSTREAM_RETRY_RECOVERED | UPSTREAM_RETRY_STILL_REJECTED) => reselected,
+        _ => first_selection,
+    }
+}
+
 async fn coord_mcp_proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
     headers: axum::http::HeaderMap,
@@ -5910,14 +5942,19 @@ async fn coord_mcp_proxy_handler(
         // the two attempts. A refusal here is not fatal: we still hold coord's
         // own answer from attempt 1 and returning it is strictly better than
         // replacing it with a second, less informative error.
+        // The re-selection's tenant: it names the credential the retry sent, so
+        // the verdict below is filed under it when the retry's response is the
+        // one forwarded (`coord_mcp_verdict_tenant`).
+        let mut reselected_tenant: Option<uuid::Uuid> = None;
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
-            Ok((_tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
+            Ok((tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
+                reselected_tenant = tenant;
                 match build_forward(&fresh).send().await {
                     Ok(resp) => {
                         upstream_retry = Some(if resp.status().is_success() {
-                            "retried-recovered"
+                            UPSTREAM_RETRY_RECOVERED
                         } else {
-                            "retried-still-rejected"
+                            UPSTREAM_RETRY_STILL_REJECTED
                         });
                         info!(
                             first_status = upstream.status().as_u16(),
@@ -5936,23 +5973,26 @@ async fn coord_mcp_proxy_handler(
                             "coord-mcp proxy: retry after upstream {} did not complete: {e}",
                             upstream.status().as_u16()
                         );
-                        upstream_retry = Some("retry-transport-failed");
+                        upstream_retry = Some(UPSTREAM_RETRY_TRANSPORT_FAILED);
                     }
                 }
             }
             // Same bearer back means the refresher has not produced a new one
             // yet. Saying so is the honest answer; re-sending it is not.
             Ok(_) => {
-                upstream_retry = Some("no-fresher-bearer");
+                upstream_retry = Some(UPSTREAM_RETRY_NO_FRESHER_BEARER);
             }
             Err((status, msg)) => {
                 warn!(
                     reselect_status = status,
                     "coord-mcp proxy: re-selection after upstream 401/403 refused: {msg}"
                 );
-                upstream_retry = Some("reselection-refused");
+                upstream_retry = Some(UPSTREAM_RETRY_RESELECTION_REFUSED);
             }
         }
+        // Phase 3 (b): the verdict below rides the response we forward, so it
+        // is filed under the tenant whose credential produced that response.
+        device_tenant = coord_mcp_verdict_tenant(device_tenant, upstream_retry, reselected_tenant);
 
         // 3c: attribute the upstream rejection to a workdir. The nonce is LIVE
         // here by construction (it passed the gate above), so this row carries
@@ -14991,6 +15031,88 @@ mod coord_claims_proxy_tests {
              comes from that agent's own slot and says nothing about this \
              runner's credential"
         );
+        // Phase 3 (b) wiring. Comment lines are dropped first, so a needle left
+        // behind in a comment cannot satisfy the assertion.
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("device_tenant = coord_mcp_verdict_tenant("),
+            "after the 401/403 retry arm the verdict tenant must be re-decided \
+             from the retry outcome, or a re-selection's response is filed under \
+             the first selection's tenant"
+        );
+    }
+
+    /// **Phase 3 (b)** of `2026-09-14-credential-posture-second-residuals`.
+    /// The 401/403 retry re-selects the bearer through the same door as
+    /// attempt 1, and the machine pin is read per request, so the re-selection
+    /// can name a DIFFERENT tenant. The forwarded response is then the retry's,
+    /// and its verdict must be filed under the re-selected tenant B, leaving
+    /// the first selection's tenant A untouched.
+    #[test]
+    fn a_401_retry_files_its_verdict_under_the_retried_tenant() {
+        use super::{
+            coord_mcp_verdict_tenant, UPSTREAM_RETRY_NO_FRESHER_BEARER, UPSTREAM_RETRY_RECOVERED,
+            UPSTREAM_RETRY_RESELECTION_REFUSED, UPSTREAM_RETRY_STILL_REJECTED,
+            UPSTREAM_RETRY_TRANSPORT_FAILED,
+        };
+        use crate::mcp::device_jwt_refresher as djr;
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let a = uuid::Uuid::from_bytes([0xA1; 16]);
+        let b = uuid::Uuid::from_bytes([0xB2; 16]);
+        // Seed A with a real rejection, so "untouched" is distinguishable from
+        // "was already zero".
+        djr::note_coord_upstream_verdict(Some(a), true, 401, br#"{"code":"token_expired"}"#);
+
+        // retried-recovered with a re-selection naming B: the 2xx goes to B.
+        let filed = coord_mcp_verdict_tenant(Some(a), Some(UPSTREAM_RETRY_RECOVERED), Some(b));
+        assert_eq!(filed, Some(b));
+        djr::note_coord_upstream_verdict(filed, true, 200, br#"{"jsonrpc":"2.0","result":{}}"#);
+        let sig_a = djr::upstream_signal_for(Some(&a.to_string()));
+        assert_eq!(
+            sig_a.consecutive_rejections, 1,
+            "a 2xx earned by B's credential must not retire A's streak"
+        );
+        assert!(sig_a.last_ok_at.is_none(), "nor stamp lastOkAt on A");
+        assert!(
+            djr::upstream_signal_for(Some(&b.to_string()))
+                .last_ok_at
+                .is_some(),
+            "the retry's 2xx is evidence about B's credential"
+        );
+
+        // retried-still-rejected: the retry's refusal is B's too.
+        assert_eq!(
+            coord_mcp_verdict_tenant(Some(a), Some(UPSTREAM_RETRY_STILL_REJECTED), Some(b)),
+            Some(b)
+        );
+        // A re-selection that resolved the default slot is honoured as such.
+        assert_eq!(
+            coord_mcp_verdict_tenant(Some(a), Some(UPSTREAM_RETRY_RECOVERED), None),
+            None
+        );
+
+        // Every outcome that forwards attempt 1's response keeps attempt 1's
+        // tenant, including a re-selection that named B and then failed to send.
+        for outcome in [
+            None,
+            Some(UPSTREAM_RETRY_TRANSPORT_FAILED),
+            Some(UPSTREAM_RETRY_NO_FRESHER_BEARER),
+            Some(UPSTREAM_RETRY_RESELECTION_REFUSED),
+        ] {
+            assert_eq!(
+                coord_mcp_verdict_tenant(Some(a), outcome, Some(b)),
+                Some(a),
+                "outcome {outcome:?} forwards attempt 1's response"
+            );
+        }
+
+        djr::reset_coord_credential_posture_for_test();
     }
 
     /// **Phase 3a wiring** (plan `2026-09-12-runner-loads-with-an-expired-
