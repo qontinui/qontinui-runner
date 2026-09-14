@@ -527,7 +527,8 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   keeps renewing the others; when no renewable row is left the loop ends, and
   `status` reads `STOLEN` if any row was stolen, otherwise `DEAD`.
   **Only `LIVE` means the claims are held.** The other five mean the claim is
-  **UNKNOWN**, which is a re-acquire and a line in the report, never a shrug — a
+  **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
+  anyway is harmless — a held claim answers `renewed`), which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After
   re-acquiring a key, **re-`add` it** with `--ttl` set to the new response's
   `ttl_seconds` — that overwrites its terminal row, and `start` alone does not —

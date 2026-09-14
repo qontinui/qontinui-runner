@@ -1492,7 +1492,8 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 
 `LIVE` (exit 0) is the only verdict that means the claims are held. `STALE`
 (3), `DEAD` (4), `STOLEN` (5), `LAPSED` (7) and `EMPTY` (8) each mean the claim
-is **UNKNOWN, not held**
+is **UNKNOWN, not held** (`STALE` usually self-heals on the next beat;
+re-acquiring anyway is harmless — a held claim answers `renewed`)
 — re-`acquire` the affected key, re-`add` it with `--ttl` set to the new
 response's `ttl_seconds` (a terminal row is renewed again only once `add`
 overwrites it), then run `start` (idempotent — `already-running` when the loop
@@ -2109,7 +2110,8 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 `LIVE` (exit 0) is the only verdict under which the claims this run already
 holds — the Step 0.48 plan reserve included — are actually held. `STALE` (3),
 `DEAD` (4), `STOLEN` (5), `LAPSED` (7) and `EMPTY` (8) each mean those claims
-are **UNKNOWN**, so
+are **UNKNOWN** (`STALE` usually self-heals on the next beat; re-acquiring
+anyway is harmless — a held claim answers `renewed`), so
 **re-`acquire` every key the ledger lists before launching this phase**
 (`kind=semantic_resource, plan:<stem>` and each live `kind=phase` row; on
 `EMPTY`, every key this run acquired), handle a
