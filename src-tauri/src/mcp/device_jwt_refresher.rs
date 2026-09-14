@@ -1878,6 +1878,48 @@ fn clear_orphan_warning(key: &str) {
     });
 }
 
+/// Has the orphan warning for `key` been emitted (and not re-armed since)?
+#[cfg(test)]
+pub(crate) fn orphan_warning_latched(key: &str) -> bool {
+    with_orphan_warned(|s| s.contains(key))
+}
+
+/// Log, LATCHED per key, that coord is refusing a credential filed under a
+/// slot key no observation in this pass describes.
+///
+/// The KEY is the one actionable fact the published posture cannot carry (the
+/// unattributable arm withholds `tenant_id`; a non-answering slot or pin that
+/// wins the publish names a different tenant), so it goes to the log. Latched,
+/// because the condition holds across every pass and an unlatched line would
+/// repeat every five minutes forever. A tenant UUID, never a credential.
+///
+/// `published` says which arm the pass took: `true` when this orphan IS the
+/// published nameless `dark`, `false` when a per-slot or pinned verdict that is
+/// already non-answering won the publish and the orphan would otherwise be
+/// silent.
+fn warn_unclaimed_orphan(orphan_key: &str, orphan_signal: &UpstreamSignal, published: bool) {
+    if !latch_orphan_warning(orphan_key) {
+        return;
+    }
+    let shown = if orphan_key.is_empty() {
+        "<default>"
+    } else {
+        orphan_key
+    };
+    let action = if published {
+        "publishing dark with no tenant"
+    } else {
+        "NOT published — a slot or the machine pin this pass observed is already \
+         non-answering and holds the posture — but coord is refusing this key too"
+    };
+    warn!(
+        "device_jwt_refresher: coord has refused the credential filed under slot key {:?} \
+         {} consecutive times, and NO slot this pass observed describes it — {action} \
+         (legacy-only install, a pin with no slot, or a slot this pass could not read)",
+        shown, orphan_signal.consecutive_rejections,
+    );
+}
+
 /// Drop every bucket that NOTHING CAN EVER WRITE AGAIN.
 ///
 /// A tenant-keyed bucket is only ever written by a forwarder that resolved
@@ -2070,8 +2112,25 @@ fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
 }
 
 impl SweepInputs {
-    /// The half of these inputs the POSTURE reads, too.
+    /// The half of these inputs the POSTURE reads, too — or
+    /// [`PosturePinInputs::UNPINNED`] when the slot store could not be read.
+    ///
+    /// An unreadable store takes the LEGACY arm (the branch choice collapses
+    /// `Err` to "no slots"), whose only observation is the `access_token` slot
+    /// with `tenant_id: None`. That observation can never name the pinned
+    /// tenant, so feeding the real pin through would call a pin `unserved` on a
+    /// multi-tenant box whose `device_jwt:<pin>` slot may be perfectly healthy —
+    /// one failed read publishes `absent(T)`, and the next good read fires
+    /// *"Coord access restored"*. An unreadable input is not evidence, so the
+    /// posture is derived from the observations alone, exactly as if no pin
+    /// existed. `UNPINNED` rather than a doctored `Unresolvable` pin because the
+    /// pin itself WAS read; what is missing is any measurement of whether a slot
+    /// serves it. A readable but EMPTY store (`Ok(vec![])`, a legacy-only
+    /// install) is a measured absence and keeps the real pins.
     fn posture_pin_inputs(&self) -> PosturePinInputs {
+        if self.tenant_slots.is_err() {
+            return PosturePinInputs::UNPINNED;
+        }
         PosturePinInputs {
             machine_pin: self.machine_pin,
             default_binding: self.default_binding,
@@ -2275,9 +2334,15 @@ fn upstream_rejection_is_fresh(s: &UpstreamSignal, now: i64) -> bool {
         .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_STALE_AFTER_SECS)
 }
 
+/// `unserved_pin_key` is the key of the pinned tenant the unserved-pin arm has
+/// already entered into the `worst` fold (see [`derive_and_publish_posture`]),
+/// or `None`. That arm reads its bucket under the tenant's own name, so the key
+/// counts as CLAIMED here — otherwise T's own streak would be reported a second
+/// time, as a nameless orphan.
 fn unclaimed_upstream_verdict(
     observations: &[SlotObservation],
     fold_default: bool,
+    unserved_pin_key: Option<&str>,
     now: i64,
 ) -> UnclaimedVerdict {
     let mut claimed: std::collections::HashSet<&str> = observations
@@ -2288,6 +2353,9 @@ fn unclaimed_upstream_verdict(
     if fold_default {
         // The sole observation already folded this bucket in.
         claimed.insert(DEFAULT_SLOT_KEY);
+    }
+    if let Some(key) = unserved_pin_key {
+        claimed.insert(key);
     }
     let worst = with_upstream_signals(|m| {
         m.iter()
@@ -2706,8 +2774,8 @@ pub(crate) fn derive_and_publish_posture(
     // One usable slot means the default-slot bucket describes the same
     // credential — see [`upstream_signal_for_observation`].
     let fold_default = observations.iter().filter(|o| !o.unknown).count() == 1;
-    let unserved_pin = pins.unserved_pin(observations).map(|t| {
-        let key = t.to_string();
+    let unserved_pin_key = pins.unserved_pin(observations).map(|t| t.to_string());
+    let unserved_pin = unserved_pin_key.clone().map(|key| {
         let signal = upstream_signal_for(Some(&key));
         let posture = if signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
             && upstream_rejection_is_fresh(&signal, now)
@@ -2746,30 +2814,26 @@ pub(crate) fn derive_and_publish_posture(
     // and the shapes beyond the default key that reach it.
     //
     // A per-slot verdict that is ALREADY non-answering wins over both arms
-    // below: it names a slot an operator can actually fix.
+    // below: it names a slot an operator can actually fix. The unserved pin
+    // counts as such a verdict — it names the tenant to re-pair — and its key
+    // is CLAIMED for the diff, so T's own streak is never also an orphan.
     let slot_already_non_answering = worst.as_ref().is_some_and(|c| !c.posture.can_answer());
-    if !slot_already_non_answering {
-        match unclaimed_upstream_verdict(observations, fold_default, now) {
+    // Computed UNCONDITIONALLY: when a slot or the pin wins the publish, a
+    // DIFFERENT orphan coord is refusing right now must still reach the log,
+    // or the actionable posture would silently hide it.
+    let unclaimed =
+        unclaimed_upstream_verdict(observations, fold_default, unserved_pin_key.as_deref(), now);
+    if slot_already_non_answering {
+        if let UnclaimedVerdict::Dark(orphan_key, orphan_signal) = &unclaimed {
+            warn_unclaimed_orphan(orphan_key, orphan_signal, false);
+        }
+        // `StaleEvidence` abstains only where it would otherwise let `worst`
+        // fall through to `live`; a non-answering `worst` cannot, so it is
+        // published as before.
+    } else {
+        match unclaimed {
             UnclaimedVerdict::Dark(orphan_key, orphan_signal) => {
-                // The KEY is the one actionable fact the published posture
-                // cannot carry (see below), so it goes to the log — LATCHED,
-                // because this condition holds across every pass and an
-                // unlatched line would repeat every five minutes forever.
-                // A tenant UUID, never a credential.
-                if latch_orphan_warning(&orphan_key) {
-                    warn!(
-                        "device_jwt_refresher: coord has refused the credential filed under \
-                         slot key {:?} {} consecutive times, and NO slot this pass observed \
-                         describes it — publishing dark with no tenant (legacy-only install, \
-                         a pin with no slot, or a slot this pass could not read)",
-                        if orphan_key.is_empty() {
-                            "<default>"
-                        } else {
-                            orphan_key.as_str()
-                        },
-                        orphan_signal.consecutive_rejections,
-                    );
-                }
+                warn_unclaimed_orphan(&orphan_key, &orphan_signal, true);
                 return publish_coord_credential_posture_with(
                     CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
                     // No tenant — deliberately, even when the orphan key IS a
@@ -2781,8 +2845,8 @@ pub(crate) fn derive_and_publish_posture(
                     // pass marked `unknown` (the slot exists, but the pass
                     // could not read it, so nothing here describes its state).
                     // Rather than sometimes-right, the field is withheld and
-                    // the key goes to the log line above, which is honest in
-                    // every shape.
+                    // the key goes to the log ([`warn_unclaimed_orphan`]),
+                    // which is honest in every shape.
                     None,
                     // Likewise no `exp`: the answer to "which slot's?" is none.
                     None,
@@ -7322,7 +7386,8 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// A live, pinned slot `Y` beside the pinned-but-unserved tenant `T`.
+    /// A live slot for tenant `Y` — a sibling slot, not the pin — beside the
+    /// pinned-but-unserved tenant `T`.
     fn live_slot(t: uuid::Uuid, now: i64) -> SlotObservation {
         SlotObservation {
             tenant_id: Some(t.to_string()),
@@ -7509,6 +7574,241 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
+    /// The legacy arm's observation: the `access_token` slot, holding a
+    /// credential with a future `exp` — what `SlotObservation::observed(None,
+    /// Some(jwt))` yields for a live token.
+    fn live_legacy_observation(now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: None,
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: None,
+        }
+    }
+
+    /// Review round 1, B-1. An UNREADABLE slot store collapses to the legacy
+    /// arm, whose one observation (`tenant_id: None`) can never name the pin.
+    /// Feeding the real pin through published `absent(T)` on a multi-tenant box
+    /// pinned to T and bound to B — off one failed read — and the next good
+    /// read fired "Coord access restored". The pins built from those inputs
+    /// abstain, so the posture is what the observation alone derives.
+    #[test]
+    fn an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let inputs = SweepInputs {
+            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+        };
+        let pins = inputs.posture_pin_inputs();
+        assert_eq!(
+            pins,
+            PosturePinInputs::UNPINNED,
+            "an unreadable input abstains"
+        );
+
+        let legacy = live_legacy_observation(now);
+        let without_a_pin =
+            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now);
+        assert!(
+            without_a_pin.can_answer(),
+            "precondition: the legacy slot answers"
+        );
+        assert_eq!(
+            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
+            Some(without_a_pin),
+            "no `absent(T)` off a store this pass could not read"
+        );
+        assert_eq!(
+            coord_credential_posture().expect("published").tenant_id,
+            None,
+            "the published posture is the legacy observation's, not the pin's"
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, B-1 — the other half. A READABLE but EMPTY store
+    /// (`Ok(vec![])`, a legacy-only install) is a MEASURED absence of slots, so
+    /// a pin the default binding does not serve is still published `absent`
+    /// under its own name.
+    #[test]
+    fn an_empty_readable_slot_store_still_synthesizes_the_unserved_pin() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let inputs = SweepInputs {
+            tenant_slots: Ok(vec![]),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+        };
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_legacy_observation(now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, S-1. T pinned and unserved with no streak publishes
+    /// `absent(T)` — the actionable verdict, and the documented precedence is
+    /// unchanged. A DIFFERENT unclaimed key O that coord is refusing right now
+    /// used to be skipped silently behind it; it must still reach the log.
+    #[test]
+    fn an_absent_pin_still_logs_a_different_fresh_orphan() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let orphan = tenant(5);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(orphan), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "the pin's actionable absent still wins the publish"
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert!(
+            orphan_warning_latched(&orphan.to_string()),
+            "the hidden orphan's warning fired"
+        );
+        assert!(!orphan_warning_latched(&pinned.to_string()));
+        reset_posture();
+    }
+
+    /// Review round 1, S-1 (i). T's own fresh streak is read by the
+    /// unserved-pin arm under T's name, so the unclaimed diff counts T as
+    /// CLAIMED: the posture is `dark` naming T, and T is never also warned
+    /// about as a nameless orphan.
+    #[test]
+    fn a_dark_pin_is_not_also_reported_as_an_orphan() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(pinned), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert!(
+            !orphan_warning_latched(&pinned.to_string()),
+            "T's streak is the pin's verdict, not an orphan"
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, S-2. The unserved-pin arm's `dark` needs BOTH a streak
+    /// at or over the threshold AND a fresh last rejection — the same clock the
+    /// unclaimed-bucket rung reads. Each boundary is pinned here: a stale streak
+    /// at the threshold is `absent`, a fresh streak one short is `absent`, and a
+    /// fresh streak exactly at the threshold is `dark` naming T.
+    #[test]
+    fn the_unserved_pin_is_dark_only_on_a_fresh_streak_at_the_threshold() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        let real_now = chrono::Utc::now().timestamp();
+        for (label, streak, eval_now, expected) in [
+            (
+                "stale streak at the threshold",
+                UPSTREAM_DARK_THRESHOLD,
+                real_now + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1,
+                CoordCredentialPosture::Absent,
+            ),
+            (
+                "fresh streak one short of the threshold",
+                UPSTREAM_DARK_THRESHOLD - 1,
+                real_now,
+                CoordCredentialPosture::Absent,
+            ),
+            (
+                "fresh streak exactly at the threshold",
+                UPSTREAM_DARK_THRESHOLD,
+                real_now,
+                CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            ),
+        ] {
+            reset_posture();
+            for _ in 0..streak {
+                note_coord_upstream_verdict(
+                    Some(pinned),
+                    true,
+                    401,
+                    br#"{"code":"token_revoked"}"#,
+                );
+            }
+            assert_eq!(
+                derive_and_publish_posture(&[live_slot(other_slot, eval_now)], pins, eval_now)
+                    .map(|t| t.to),
+                Some(expected),
+                "{label}"
+            );
+            assert_eq!(
+                coord_credential_posture()
+                    .expect("published")
+                    .tenant_id
+                    .as_deref(),
+                Some(pinned.to_string().as_str()),
+                "{label}: named T"
+            );
+        }
+        reset_posture();
+    }
+
     /// Re-review L-1: a read failure that repeats every pass is announced on
     /// the first failure and then at a bounded cadence — never every pass, and
     /// never once-then-silent.
@@ -7559,13 +7859,17 @@ mod tenant_slot_refresh_tests {
                 .find("\n}\n")
                 .map(|i| start + i)
                 .unwrap_or(text.len());
-            // Comment lines are removed before either needle is searched
-            // (trimmed text starting `//`, which also covers `///`), so a
-            // `// retire_rejection_streaks_after_pairing(` left behind after
-            // deleting the call cannot satisfy the scan.
+            // Line comments are cut before either needle is searched: each
+            // line is truncated at its first `//` (which also covers `///` and
+            // whole-line comments), so a `// retire_rejection_streaks_after_pairing(`
+            // left behind after deleting the call — on its own line OR trailing
+            // real code — cannot satisfy the scan. The body is sliced on the
+            // RAW text above. Accepted limit of a source scan: it still cannot
+            // see through string literals (a `"//"` truncates a line early, a
+            // needle inside a string still matches) or `/* */` block comments.
             let body: String = text[start..end]
                 .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.find("//").map_or(line, |i| &line[..i]))
                 .collect::<Vec<_>>()
                 .join("\n");
             let persisted = body
