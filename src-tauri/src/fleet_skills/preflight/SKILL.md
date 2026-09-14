@@ -516,15 +516,19 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   One line per row, each carrying a `state=`, plus a verdict on the **exit
   code**: `LIVE` (0) — pid alive and every row heartbeated within half its TTL;
   `STALE` (3) — pid alive but a row is past half its TTL, still inside it;
-  `DEAD` (4) — no loop at all; `STOLEN` (5) — a row's last answer named another
-  holder; `LAPSED` (7) — a row's grant is gone (its heartbeat came back `stolen`
-  with no holder, or it aged past its TTL). A `stolen` or `lapsed` row is marked
-  terminal and never beaten again, while the loop keeps renewing the others.
+  `DEAD` (4) — no loop at all; `STOLEN` (5) — a row's last answer did not rule
+  out another holder; `LAPSED` (7) — a row's grant is gone (an expired answer,
+  aged past its TTL, never confirmed, or a malformed TTL). A row the loop records
+  as `stolen` or `lapsed` is terminal and never beaten again, while the loop
+  keeps renewing the others; when no renewable row is left the loop ends, and
+  `status` reads `DEAD`.
   **Only `LIVE` means the claims are held.** The other four mean the claim is
   **UNKNOWN**, which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After
   re-acquiring a key, **re-`add` it** with `--ttl` set to the new response's
-  `ttl_seconds`: that overwrites its terminal row, and `start` alone does not.
+  `ttl_seconds` — that overwrites its terminal row, and `start` alone does not —
+  **then run `start`**: it is idempotent (`already-running` when the loop lives)
+  and required after `DEAD`, because a ledger with no renewable row ends the loop.
 
 - **Release symmetrically**: `remove` each glob row, then `stop` the loop, then
   release the claims. A loop still running past the release renews keys nobody

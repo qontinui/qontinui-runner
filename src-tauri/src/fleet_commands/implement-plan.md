@@ -1475,8 +1475,8 @@ started at Step 0.48 (`scripts/coord-claim-heartbeat.sh start`) covers every
 row added to `$CLAIM_LEDGER` — the plan reserve and each phase claim alike —
 re-heartbeating each row when it falls due, every max(its own TTL/3, 60 s),
 which for a 7200 s phase claim is one request per 2400 s. The spawned phase
-agent does not need to heartbeat its own claim, and a phase running longer than 2 hours is no longer
-a special case. The loop replays the owner token on every request; a hand
+agent does not need to heartbeat its own claim, and a phase running longer
+than 2 hours is no longer a special case. The loop replays the owner token on every request; a hand
 heartbeat must too, or it will not match and returns `not_held`.
 
 **Read `status` at every phase boundary.** The loop can die — a killed pid, a
@@ -1491,9 +1491,11 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 `LIVE` (exit 0) is the only verdict that means the claims are held. `STALE`
 (3), `DEAD` (4), `STOLEN` (5) and `LAPSED` (7) each mean the claim is
 **UNKNOWN, not held**
-— re-`acquire` the affected key and re-`add` it with `--ttl` set to the new
+— re-`acquire` the affected key, re-`add` it with `--ttl` set to the new
 response's `ttl_seconds` (a terminal row is renewed again only once `add`
-overwrites it) before launching, treat a foreign `held` on
+overwrites it), then run `start` (idempotent — `already-running` when the loop
+lives — and required after `DEAD`, since a ledger with no renewable row ends the
+loop) before launching, treat a foreign `held` on
 the re-acquire as the conflict flow above, and **say in the report which
 verdict you saw and what you re-acquired**. Silence here is the
 `silent-empty-is-unknown` failure: a dead loop looks exactly like a healthy
@@ -2110,8 +2112,9 @@ holds — the Step 0.48 plan reserve included — are actually held. `STALE` (3)
 foreign `held` through the Step 0.6 conflict flow, **re-`add` each re-acquired
 key** with `--ttl` set to that response's `ttl_seconds` (a `stolen` or `lapsed`
 row stays terminal until `add` overwrites it — `start` alone does not), and
-restart the loop with `start`. **Say so in the report**: which verdict was read, which keys were
-re-acquired, and what the re-acquire answered. A re-acquire that is not reported
+restart the loop with `start` (idempotent, and required after `DEAD`). **Say so
+in the report**: which verdict was read, which keys were re-acquired, and what
+the re-acquire answered. A re-acquire that is not reported
 is indistinguishable from a claim that never lapsed.
 
 **Agent token refresh (rule (b), per Step 0.48).** Also before each phase
