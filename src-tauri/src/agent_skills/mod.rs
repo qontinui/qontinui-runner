@@ -218,29 +218,77 @@ impl ResolvedSkill {
     }
 }
 
-/// A `files` key that is ALSO the directory prefix of another key, or `None`.
+/// Why this `files` map cannot be written as a directory tree, or `None`.
 ///
-/// `{"a": …, "a/b.md": …}` passes every per-key validator — neither the Rust
-/// validators nor qontinui-web's mirror rejects a key that is a strict path
-/// prefix of another — and is nonetheless unwritable: `a` is created as a
-/// regular file and `create_dir_all("a")` then fails `EEXIST`. Because
-/// `AgentTextUnitFiles` is a `BTreeMap`, `a` is always reached FIRST, so the
-/// failure lands mid-bundle with half the skill on disk.
+/// Two shapes, both of which pass every PER-KEY validator and are nonetheless
+/// jointly unwritable — neither the Rust validators nor qontinui-web's mirror
+/// looks at one key in the light of another:
 ///
-/// Refusing the whole unit here is what makes "a skill with any bad path is
-/// skipped ENTIRELY, never partially written" true for this input class. The
+/// 1. **A key that is also another key's directory prefix**, e.g. `{"a": …,
+///    "a/b.md": …}`. `a` is created as a regular file and `create_dir_all("a")`
+///    then fails `EEXIST`. Because `AgentTextUnitFiles` is a `BTreeMap`, `a` is
+///    always reached FIRST, so the failure lands mid-bundle with half the skill
+///    on disk.
+/// 2. **The same, or a bare duplicate, once case is folded** — `{"A": …,
+///    "a/b.md": …}` or `{"a.md": …, "A.md": …}`. Byte-distinct, so (1) misses
+///    them, and unwritable on a case-INSENSITIVE destination: `A` lands as a
+///    file and `create_dir_all` on `a` hits an existing non-directory
+///    (`std` only swallows `AlreadyExists` when the path `is_dir()`), while two
+///    keys differing only in case silently race to write one file and are
+///    counted twice.
+///
+/// **The case arm is enforced on every platform, not just Windows.** A bundle
+/// that provisions on Linux and half-writes on Windows is the worst of both —
+/// and it is the same reason `validate_agent_text_unit_file_path` already
+/// refuses backslashes, trailing dots and `nul.md` fleet-wide: the strictest
+/// destination governs. This fleet runs on Windows.
+///
+/// Refusing the whole unit is what makes "a skill with any bad path is skipped
+/// ENTIRELY, never partially written" true for these input classes. The
 /// provisioner re-checks it for the same reason it re-checks every other path
 /// rule.
 ///
-/// Uses `range` rather than a neighbour scan: keys sorting between `a` and
-/// `a/b.md` are possible (`a!x`, since `!` < `/`), so contiguity cannot be
-/// assumed.
-pub(crate) fn colliding_path_prefix(files: &AgentTextUnitFiles) -> Option<(String, String)> {
+/// The exact arm uses `range` rather than a neighbour scan: keys sorting
+/// between `a` and `a/b.md` are possible (`a!x`, since `!` < `/`), so
+/// contiguity cannot be assumed. The folded arm is O(n^2) over at most
+/// `MAX_FILES_PER_UNIT` keys, and iterates in `BTreeMap` order so its verdict
+/// is deterministic.
+pub(crate) fn unwritable_key_conflict(files: &AgentTextUnitFiles) -> Option<String> {
     for key in files.keys() {
         let prefix = format!("{key}/");
         if let Some((other, _)) = files.range(prefix.clone()..).next() {
             if other.starts_with(&prefix) {
-                return Some((key.clone(), other.clone()));
+                return Some(format!(
+                    "file {key:?} is also the directory prefix of {other:?} — one of the \
+                     two cannot exist, so the bundle is unwritable"
+                ));
+            }
+        }
+    }
+
+    let folded: Vec<(String, &String)> = files.keys().map(|k| (k.to_lowercase(), k)).collect();
+    for (i, (lower, key)) in folded.iter().enumerate() {
+        let prefix = format!("{lower}/");
+        for (j, (other_lower, other)) in folded.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if other_lower == lower {
+                if i < j {
+                    return Some(format!(
+                        "files {key:?} and {other:?} differ only in case — on a \
+                         case-insensitive filesystem they are one file, which two entries \
+                         would race to write"
+                    ));
+                }
+                continue;
+            }
+            if other_lower.starts_with(&prefix) {
+                return Some(format!(
+                    "file {key:?} is also the directory prefix of {other:?} once case is \
+                     folded — unwritable on a case-insensitive filesystem, and a bundle \
+                     must not provision on one platform and half-write on another"
+                ));
             }
         }
     }
@@ -286,11 +334,8 @@ pub(crate) fn validate_override(
     // relative path, no blank file, each file <= MAX_FILE_BYTES, the bundle
     // <= MAX_UNIT_BYTES, and `SKILL.md` present.
     validate_agent_text_unit_files(&unit.kind, name, &unit.files).map_err(|e| e.to_string())?;
-    if let Some((file, child)) = colliding_path_prefix(&unit.files) {
-        return Err(format!(
-            "file {file:?} is also the directory prefix of {child:?} — one of the two \
-             cannot exist, so the bundle is unwritable"
-        ));
+    if let Some(why) = unwritable_key_conflict(&unit.files) {
+        return Err(why);
     }
 
     let violations = self_path::skill_self_path_violations(&unit.files);
@@ -689,6 +734,23 @@ fn list_url(base_url: &str) -> String {
     )
 }
 
+/// Append `chunk` to `body`, or refuse with the size the body WOULD have
+/// reached.
+///
+/// Split out of [`fetch_skills_async`] so the ceiling has a falsification test:
+/// the async loop cannot be driven without an HTTP mock, and every other guard
+/// added alongside it is pinned at its boundary. Refusing leaves `body`
+/// untouched — the caller abandons it, but a partial append would make the
+/// error message's size claim wrong.
+fn push_bounded(body: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), usize> {
+    let would_be = body.len().saturating_add(chunk.len());
+    if would_be > max {
+        return Err(would_be);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// GET the resolved skill units with the stored bearer.
 async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
     let auth = crate::auth::AuthManager::new();
@@ -730,20 +792,19 @@ async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
     loop {
         match resp.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                if let Err(would_be) = push_bounded(&mut body, &chunk, MAX_RESPONSE_BYTES) {
                     return FetchOutcome::Unavailable(format!(
-                        "GET {url} returned more than {MAX_RESPONSE_BYTES} bytes — refusing \
-                         to buffer it"
+                        "GET {url} would exceed the {MAX_RESPONSE_BYTES}-byte ceiling \
+                         ({would_be} bytes and still arriving) — refusing to buffer it"
                     ));
                 }
-                body.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             Err(e) => return FetchOutcome::Unavailable(format!("GET {url} body read failed: {e}")),
         }
     }
     match serde_json::from_slice::<AgentTextUnitListResponse>(&body) {
-        Ok(body) => FetchOutcome::Fresh(body.items),
+        Ok(parsed) => FetchOutcome::Fresh(parsed.items),
         Err(e) => FetchOutcome::Unavailable(format!("GET {url} returned an unreadable body: {e}")),
     }
 }
@@ -1359,9 +1420,14 @@ pub(crate) mod tests {
                 "probe",
                 bundle(&[("SKILL.md", "# probe\n"), (parent, "x\n"), (child, "y\n")]),
             );
-            let err = validate_override(&unit, AgentSkillSource::Served)
-                .expect_err("{parent:?}/{child:?} must be refused");
-            assert!(err.contains("directory prefix"), "{err}");
+            let err = match validate_override(&unit, AgentSkillSource::Served) {
+                Ok(_) => panic!("{parent:?} + {child:?} must be refused"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("directory prefix"),
+                "{parent:?} + {child:?}: {err}"
+            );
         }
     }
 
@@ -1369,27 +1435,95 @@ pub(crate) mod tests {
     /// order. `a!x` sorts between `a` and `a/b.md` (`!` is 0x21, `/` is 0x2F),
     /// so a neighbour-only scan would miss the pair entirely.
     #[test]
-    fn the_prefix_detector_does_not_assume_adjacency() {
-        let files = bundle(&[
+    fn the_conflict_detector_does_not_assume_adjacency() {
+        let why = unwritable_key_conflict(&bundle(&[
             ("SKILL.md", "# probe\n"),
             ("a", "x\n"),
             ("a!x", "y\n"),
             ("a/b.md", "z\n"),
-        ]);
+        ]))
+        .expect("a non-adjacent prefix collision must still be found");
+        assert!(why.contains("directory prefix"), "{why}");
+        assert!(why.contains("\"a\"") && why.contains("\"a/b.md\""), "{why}");
+    }
+
+    /// **The negative half.** A detector that refused ordinary bundles would
+    /// take every skill in the corpus down with it, and the corpus cannot
+    /// falsify that on its own — so state it on the near-misses: a key that
+    /// merely SHARES a prefix (`ab` vs `a/b.md`), an ordinary nested layout, and
+    /// two files whose names differ by more than case.
+    #[test]
+    fn ordinary_bundles_report_no_conflict() {
         assert_eq!(
-            colliding_path_prefix(&files),
-            Some(("a".to_string(), "a/b.md".to_string()))
-        );
-        // And a bundle with no collision reports none, including the near-miss
-        // where one key merely SHARES a prefix with another.
-        assert_eq!(
-            colliding_path_prefix(&bundle(&[
+            unwritable_key_conflict(&bundle(&[
                 ("SKILL.md", "# probe\n"),
                 ("ab", "x\n"),
                 ("a/b.md", "y\n"),
                 ("reference/one.md", "z\n"),
+                ("reference/two.md", "z\n"),
+                ("Reference.md", "z\n"),
             ])),
             None
+        );
+        // And every skill this binary actually ships.
+        for skill in crate::fleet_skills::embedded_skills() {
+            assert_eq!(
+                unwritable_key_conflict(&skill.files),
+                None,
+                "embedded skill {:?} must not be refused by this detector",
+                skill.name
+            );
+        }
+    }
+
+    /// **The case-folded arm, enforced on every platform.** `A` + `a/b.md` is
+    /// byte-distinct, so the exact arm misses it, and it is unwritable on a
+    /// case-insensitive destination — which is what the Windows half of this
+    /// fleet runs on. A bundle that provisions on Linux and half-writes on
+    /// Windows is the outcome this refuses.
+    #[test]
+    fn case_folded_collisions_are_rejected_on_every_platform() {
+        let why = unwritable_key_conflict(&bundle(&[
+            ("SKILL.md", "# probe\n"),
+            ("A", "x\n"),
+            ("a/b.md", "y\n"),
+        ]))
+        .expect("a case-folded prefix collision must be refused");
+        assert!(why.contains("case is folded"), "{why}");
+
+        // Two keys differing ONLY in case are one file on such a destination,
+        // and two entries would race to write it.
+        let why = unwritable_key_conflict(&bundle(&[
+            ("SKILL.md", "# probe\n"),
+            ("a.md", "x\n"),
+            ("A.md", "y\n"),
+        ]))
+        .expect("a case-only duplicate must be refused");
+        assert!(why.contains("differ only in case"), "{why}");
+
+        // The verdict is deterministic: same input, same answer, and it names
+        // the pair in `BTreeMap` order rather than whichever was seen first.
+        let files = bundle(&[("SKILL.md", "# probe\n"), ("a.md", "x\n"), ("A.md", "y\n")]);
+        assert_eq!(
+            unwritable_key_conflict(&files),
+            unwritable_key_conflict(&files)
+        );
+
+        // And it reaches the resolver, not just the helper.
+        let mut reg = registry();
+        assert_eq!(
+            reg.set_overrides(
+                vec![skill_unit(
+                    "coord-revive",
+                    bundle(&[("SKILL.md", "# x\n"), ("A", "y\n"), ("a/b.md", "z\n")])
+                )],
+                AgentSkillSource::Served
+            ),
+            0
+        );
+        assert_eq!(
+            reg.get("coord-revive").unwrap().source,
+            AgentSkillSource::Builtin
         );
     }
 
@@ -1409,6 +1543,45 @@ pub(crate) mod tests {
             "without invocable_only the copy-source specs are written to disk: {url}"
         );
         assert!(url.contains(&format!("limit={FETCH_LIMIT}")), "{url}");
+    }
+
+    /// The fetched body is bounded, at exactly the stated ceiling.
+    ///
+    /// The per-unit caps are enforced only AFTER parsing, so without this an
+    /// unbounded body exhausts memory before any validator runs — on the thread
+    /// a session spawn is blocked on.
+    #[test]
+    fn the_response_body_is_bounded_at_its_stated_ceiling() {
+        // Exactly the ceiling is accepted, in one chunk and across chunks.
+        let mut body = Vec::new();
+        assert_eq!(push_bounded(&mut body, &vec![b'x'; 10], 10), Ok(()));
+        assert_eq!(body.len(), 10);
+
+        let mut body = Vec::new();
+        assert_eq!(push_bounded(&mut body, &vec![b'x'; 6], 10), Ok(()));
+        assert_eq!(push_bounded(&mut body, &vec![b'x'; 4], 10), Ok(()));
+        assert_eq!(body.len(), 10);
+
+        // One byte over is refused, and the refusal reports what the body WOULD
+        // have reached rather than what it holds.
+        let mut body = Vec::new();
+        assert_eq!(push_bounded(&mut body, &vec![b'x'; 11], 10), Err(11));
+        assert!(
+            body.is_empty(),
+            "a refused chunk must not be partially appended"
+        );
+
+        // The refusal is what bounds a stream that never ends: once full, the
+        // next chunk is rejected however many follow it.
+        let mut body = Vec::new();
+        assert_eq!(push_bounded(&mut body, &vec![b'x'; 10], 10), Ok(()));
+        assert_eq!(push_bounded(&mut body, &[b'x'], 10), Err(11));
+        assert_eq!(body.len(), 10);
+
+        assert!(
+            MAX_RESPONSE_BYTES > 0,
+            "a zero ceiling would refuse every fetch"
+        );
     }
 
     // -- cache ---------------------------------------------------------------

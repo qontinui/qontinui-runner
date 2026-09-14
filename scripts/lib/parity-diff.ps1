@@ -35,12 +35,12 @@
 #     slash_commands           unknown
 #
 # ALL BUT ONE row is `unknown`. Not "resolved by a low rung" -- unknown, the
-# manifest's word for "nothing observed this capability here". The six
+# manifest's word for "nothing observed this capability here". The seven
 # provisioning/registry rows fill from the Phase 3 session ledger, which only
 # fills at SESSION SPAWN; a cold flag invocation has spawned nothing.
 # `bundled_resources` needs a Tauri `AppHandle` that does not exist pre-GUI.
 #
-# So on a cold-CLI-vs-cold-CLI comparison, eight rows read `unknown` on BOTH
+# So on a cold-CLI-vs-cold-CLI comparison, nine rows read `unknown` on BOTH
 # sides. A naive row diff finds them equal, reports ZERO differences, and emits
 # parity count 0 -- certifying parity while having observed essentially nothing.
 # That false green is strictly worse than the blindness this plan exists to end.
