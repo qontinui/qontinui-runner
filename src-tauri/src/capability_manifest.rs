@@ -2776,7 +2776,7 @@ mod tests {
         }
 
         // Everything the driver cannot observe from here stays `unknown` AND
-        // names its anchor. With an empty ledger that is the other six rows;
+        // names its anchor. With an empty ledger that is the other seven rows;
         // nothing outside this module's own tests records them, so they are
         // deterministic.
         for id in [
@@ -2785,6 +2785,7 @@ mod tests {
             "fleet_agents",
             "agent_definitions",
             "agent_commands_registry",
+            "agent_skills_registry",
             "slash_commands",
         ] {
             let row = manifest.row(id).expect("row present");
