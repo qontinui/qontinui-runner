@@ -697,7 +697,9 @@ refuse_for_human() {
     gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow could not finish this PR by itself. \`qontinui/qontinui-schemas#$n\` landed as \`${a:0:9}\`, and moving this PR's pin there needs a \`Cargo.lock\` change pair-follow is not allowed to make: $why. Please move the pin in \`.github/sibling-pins.conf\` to \`$a\` and refresh \`Cargo.lock\` in the same commit (\`cargo metadata --format-version 1\` with that schemas commit checked out beside the runner). $marker" ||
       { err "could not post the refusal comment"; exit 3; }
   fi
-  if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::#$m needs a human: $why"; fi
+  # To stderr: stdout carries only the RESULT= line the caller reads (the runner
+  # still parses workflow commands on either stream).
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::#$m needs a human: $why" >&2; fi
   echo "RESULT=REFUSED lock-registry-change"
 }
 
