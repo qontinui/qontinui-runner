@@ -1283,6 +1283,17 @@ async fn finalize_signed_in(
         AppError::Raw(format!("persist pairing: {e}"))
     })?;
 
+    // 5a. A NEW credential is in `tenant_id`'s slot (and in the legacy slot when
+    //     that tenant is the default), so every rejection coord recorded
+    //     against the OLD one is spent. Without this, "Sign in to re-pair" on
+    //     `dark(upstream_401)` stores a working credential and the next
+    //     refresher pass re-reads the stale streak and republishes `dark`. The
+    //     refresher is kicked in step 6.
+    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+        tenant_id,
+        crate::auth::default_binding_tenant(),
+    );
+
     // 5b. The sign-in has now GENUINELY succeeded (Cognito tokens stored, device
     //     bound, device JWT persisted), so end any interactive logout. Deliberate
     //     ordering: doing this right after step 2 (`store_oauth_tokens`) meant a
