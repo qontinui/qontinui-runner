@@ -35,8 +35,11 @@
 //!    work axis is not even consulted for them, so an unreadable coord does
 //!    not make a loop `Unknown`.
 //! 6. **Grace.** Eligible once `now >= since + grace`, where `since` is the
-//!    later of the grid-idle-since time and the sideband set-time; before
-//!    that, [`Eligibility::NotYet`] with the instant it would become eligible.
+//!    latest of the grid-idle-since time, the sideband set-time and — for a
+//!    terminal session whose coord row carried it — the time the `finished`
+//!    declaration was made; before that, [`Eligibility::NotYet`] with the
+//!    instant it would become eligible. When coord serves no transition time
+//!    the declaration does not bound the window.
 //!
 //! ## A sideband that never reported is not an unknown
 //!
@@ -146,6 +149,12 @@ pub struct EligibilityInputs {
     pub grid: GridIdle,
     /// `None` when the process snapshot could not answer.
     pub has_live_children: Option<bool>,
+    /// When coord's row became `finished` (unix millis), when coord served the
+    /// transition time. Bounds the grace window for a terminal session: idleness
+    /// observed BEFORE the declaration does not count towards it, so a stale
+    /// `finished` cannot inherit an old idle window. `None` (an older coord, or
+    /// a null `since`) falls back to not bounding the window by it.
+    pub finished_at_ms: Option<i64>,
     pub grace: Duration,
 }
 
@@ -287,8 +296,14 @@ pub fn eligibility(inputs: &EligibilityInputs, now_ms: i64) -> Eligibility {
         };
     }
 
-    // (6) Grace, from the later of the two clocks.
-    let since_ms = sideband_set_at.map_or(grid_since, |s| s.max(grid_since));
+    // (6) Grace, from the latest of the clocks: grid idle, the sideband report,
+    // and (terminal sessions only) the `finished` declaration.
+    let mut since_ms = sideband_set_at.map_or(grid_since, |s| s.max(grid_since));
+    if finished_required {
+        if let Some(finished_at) = inputs.finished_at_ms {
+            since_ms = since_ms.max(finished_at);
+        }
+    }
     let grace_ms = i64::try_from(inputs.grace.as_millis()).unwrap_or(i64::MAX);
     let until_ms = since_ms.saturating_add(grace_ms);
     if now_ms >= until_ms {
@@ -354,7 +369,17 @@ pub struct GridIdleTracker {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TrackedObservation {
     generation: u64,
+    observed_at_ms: i64,
     idle_since_ms: Option<i64>,
+}
+
+impl TrackedObservation {
+    fn verdict(&self) -> GridIdle {
+        match self.idle_since_ms {
+            Some(since_ms) => GridIdle::Idle { since_ms },
+            None => GridIdle::Busy,
+        }
+    }
 }
 
 impl GridIdleTracker {
@@ -364,9 +389,15 @@ impl GridIdleTracker {
 
     /// Record one observation and return what it shows.
     ///
-    /// `generation_before` is the grid generation read before the first grid
-    /// snapshot, `generation_after` after the last one; `looks_idle` is the
-    /// debounced idle verdict; `observed_at_ms` is when the observation began.
+    /// `generation_before` is the grid generation read immediately before the
+    /// grid snapshot, `generation_after` immediately after it; `looks_idle` is
+    /// the idle verdict over that snapshot; `observed_at_ms` is when the
+    /// snapshot was read.
+    ///
+    /// An observation that is OLDER than the last one recorded — a lower
+    /// starting generation, or an earlier timestamp — is a late arrival from a
+    /// concurrent observer, and is ignored: the previous verdict is returned
+    /// unchanged, so `since` can never move backwards.
     pub fn observe(
         &mut self,
         looks_idle: bool,
@@ -374,9 +405,15 @@ impl GridIdleTracker {
         generation_after: u64,
         observed_at_ms: i64,
     ) -> GridIdle {
+        if let Some(last) = self.last {
+            if generation_before < last.generation || observed_at_ms < last.observed_at_ms {
+                return last.verdict();
+            }
+        }
         if !looks_idle {
             self.last = Some(TrackedObservation {
                 generation: generation_after,
+                observed_at_ms,
                 idle_since_ms: None,
             });
             return GridIdle::Busy;
@@ -387,6 +424,7 @@ impl GridIdleTracker {
                 Some(TrackedObservation {
                     generation,
                     idle_since_ms: Some(_),
+                    ..
                 }) if generation == generation_before
             );
         let since_ms = match (continuous, self.last) {
@@ -401,6 +439,7 @@ impl GridIdleTracker {
         };
         self.last = Some(TrackedObservation {
             generation: generation_after,
+            observed_at_ms,
             idle_since_ms: Some(since_ms),
         });
         GridIdle::Idle { since_ms }
@@ -422,6 +461,7 @@ mod tests {
             sideband: Sideband::NeverReported,
             grid: GridIdle::Idle { since_ms: 1_000 },
             has_live_children: Some(false),
+            finished_at_ms: None,
             grace: GRACE,
         }
     }
@@ -831,5 +871,81 @@ mod tests {
         t.observe(true, 5, 5, 100);
         assert_eq!(t.observe(false, 5, 5, 200), GridIdle::Busy);
         assert_eq!(t.observe(true, 5, 5, 300), GridIdle::Idle { since_ms: 300 });
+    }
+
+    #[test]
+    fn tracker_ignores_an_observation_from_an_older_generation() {
+        let mut t = GridIdleTracker::new();
+        t.observe(true, 9, 9, 1_000);
+        // A concurrent observer's late snapshot of generation 7 must neither
+        // restart nor backdate the window.
+        assert_eq!(
+            t.observe(true, 7, 7, 2_000),
+            GridIdle::Idle { since_ms: 1_000 }
+        );
+        assert_eq!(
+            t.observe(false, 7, 8, 2_000),
+            GridIdle::Idle { since_ms: 1_000 }
+        );
+        assert_eq!(
+            t.observe(true, 9, 9, 3_000),
+            GridIdle::Idle { since_ms: 1_000 }
+        );
+    }
+
+    #[test]
+    fn tracker_ignores_an_observation_older_in_time_so_since_never_moves_back() {
+        let mut t = GridIdleTracker::new();
+        t.observe(false, 4, 4, 5_000);
+        assert_eq!(
+            t.observe(true, 4, 4, 6_000),
+            GridIdle::Idle { since_ms: 6_000 }
+        );
+        // Same generation, earlier timestamp: a late arrival, ignored.
+        assert_eq!(
+            t.observe(true, 4, 4, 5_500),
+            GridIdle::Idle { since_ms: 6_000 }
+        );
+        assert_eq!(
+            t.observe(true, 4, 4, 9_000),
+            GridIdle::Idle { since_ms: 6_000 }
+        );
+    }
+
+    // ---- finished_at bounds the window (terminal sessions) ------------------
+
+    #[test]
+    fn a_finished_declaration_after_the_idle_window_opened_restarts_grace() {
+        let mut i = eligible_terminal();
+        i.finished_at_ms = Some(400_000);
+        assert_eq!(
+            eligibility(&i, 1_000 + GRACE_MS),
+            Eligibility::NotYet {
+                since_ms: 400_000,
+                until_ms: 400_000 + GRACE_MS
+            }
+        );
+        assert!(eligibility(&i, 400_000 + GRACE_MS).is_eligible());
+    }
+
+    #[test]
+    fn a_finished_declaration_before_the_idle_window_does_not_move_it() {
+        let mut i = eligible_terminal();
+        i.grid = GridIdle::Idle { since_ms: 50_000 };
+        i.finished_at_ms = Some(10);
+        assert_eq!(
+            eligibility(&i, 50_000 + GRACE_MS),
+            Eligibility::Eligible { since_ms: 50_000 }
+        );
+    }
+
+    #[test]
+    fn finished_at_is_ignored_for_exempt_kinds() {
+        for kind in [SessionKind::Looping, SessionKind::Steward] {
+            let mut i = eligible_terminal();
+            i.kind = kind;
+            i.finished_at_ms = Some(900_000);
+            assert!(eligibility(&i, 1_000 + GRACE_MS).is_eligible(), "{kind:?}");
+        }
     }
 }

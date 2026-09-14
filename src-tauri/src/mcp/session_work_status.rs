@@ -103,6 +103,11 @@ struct WireRow {
     /// `None` = the row exists and its work axis is unset. A real observation,
     /// and still UNKNOWN for our purposes — never "not finished".
     session_status: Option<String>,
+    /// When the work axis last genuinely transitioned (coord's
+    /// `state_started_at`) — for a `finished` row, the honest `finished_at`.
+    /// RFC 3339. Absent on a coord that predates the field.
+    #[serde(default)]
+    since: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +141,12 @@ pub struct StatusFetch {
     /// `claude_session_id` → the work axis coord served for it. Absent ⇒
     /// UNKNOWN ⇒ blocks.
     pub by_session_id: HashMap<String, SessionWorkStatus>,
+    /// `claude_session_id` → unix millis at which coord's row became
+    /// `finished`, for rows that read `finished` AND carried a parseable
+    /// `since`. Absent ⇒ the time is unknown (an older coord, or a null
+    /// `since`), and wind-down falls back to not bounding the idle window by
+    /// it. Never consulted by the restart verdict.
+    pub finished_at_by_session_id: HashMap<String, i64>,
     /// `"coord"` when the door answered, `"unavailable"` when it did not,
     /// `"not_needed"` when there was nothing to ask about.
     pub source: &'static str,
@@ -160,6 +171,7 @@ impl StatusFetch {
     fn degraded(requested: usize, note: impl Into<String>) -> Self {
         Self {
             by_session_id: HashMap::new(),
+            finished_at_by_session_id: HashMap::new(),
             source: "unavailable",
             degraded: true,
             note: note.into(),
@@ -244,6 +256,31 @@ fn map_from_body(body: &WireResponse) -> (HashMap<String, SessionWorkStatus>, St
     (out, notes.join("; "))
 }
 
+/// `claude_session_id` → unix millis of coord's `since` for every row that
+/// reads `finished` (including the legacy `done`) and carries a parseable RFC
+/// 3339 `since`. Pure. A body with `sessionBridgeColumnPresent: false` yields
+/// nothing, exactly like [`map_from_body`].
+fn finished_at_from_body(body: &WireResponse) -> HashMap<String, i64> {
+    if !body.session_bridge_column_present {
+        return HashMap::new();
+    }
+    body.statuses
+        .iter()
+        .filter(|(_, row)| {
+            row.session_status
+                .as_deref()
+                .map(SessionWorkStatus::parse)
+                .is_some_and(|s| s == SessionWorkStatus::Finished)
+        })
+        .filter_map(|(id, row)| {
+            let since = row.since.as_deref()?;
+            chrono::DateTime::parse_from_rfc3339(since)
+                .ok()
+                .map(|dt| (id.clone(), dt.timestamp_millis()))
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // The read
 // ---------------------------------------------------------------------------
@@ -253,6 +290,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
     if ids.is_empty() {
         return StatusFetch {
             by_session_id: HashMap::new(),
+            finished_at_by_session_id: HashMap::new(),
             source: "not_needed",
             degraded: false,
             note: String::new(),
@@ -382,6 +420,7 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
         resolved, "restart-readiness: coord work-axis read completed"
     );
     StatusFetch {
+        finished_at_by_session_id: finished_at_from_body(&body),
         by_session_id,
         source: "coord",
         degraded: false,
@@ -425,6 +464,32 @@ mod tests {
         // coord's own parser accepts "done" as Finished; so must this mirror.
         assert_eq!(m.get("f"), Some(&SessionWorkStatus::Finished));
         assert!(note.is_empty(), "clean read carries no note: {note}");
+    }
+
+    #[test]
+    fn finished_at_is_read_only_from_finished_rows_with_a_parseable_since() {
+        let b = body(serde_json::json!({
+            "statuses": {
+                "done-new": {"session_status": "finished", "since": "2026-09-13T10:00:00Z"},
+                "done-alias": {"session_status": "done", "since": "2026-09-13T10:00:01+00:00"},
+                "working": {"session_status": "working", "since": "2026-09-13T10:00:00Z"},
+                "no-since": {"session_status": "finished"},
+                "bad-since": {"session_status": "finished", "since": "yesterday"},
+            },
+            "unknown": [], "invalid": [], "accepted": 5, "truncated": false,
+            "sessionBridgeColumnPresent": true
+        }));
+        let m = finished_at_from_body(&b);
+        assert_eq!(m.len(), 2, "{m:?}");
+        assert_eq!(m.get("done-new"), Some(&1_789_293_600_000));
+        assert_eq!(m.get("done-alias"), Some(&1_789_293_601_000));
+
+        let absent = body(serde_json::json!({
+            "statuses": {"x": {"session_status": "finished", "since": "2026-09-13T10:00:00Z"}},
+            "unknown": [], "invalid": [], "accepted": 1, "truncated": false,
+            "sessionBridgeColumnPresent": false
+        }));
+        assert!(finished_at_from_body(&absent).is_empty());
     }
 
     #[test]

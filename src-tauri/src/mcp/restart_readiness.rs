@@ -983,7 +983,12 @@ pub async fn restart_readiness_handler(
     // work-status map, already resolved onto each process by `compute` —
     // never the background census's empty one. Nothing acts on the result.
     if let Some(p) = pass.as_mut() {
-        wind_down_observer::observe_and_apply(app, p, wind_down::grace_from_env(), now_ms).await;
+        wind_down_observer::observe_and_apply(
+            app,
+            p,
+            &status_fetch.finished_at_by_session_id,
+            wind_down::grace_from_env(),
+        );
     }
 
     let terminal = pass
@@ -2585,6 +2590,7 @@ mod tests {
             &mut processes,
             &terminal_ids_by_session(&open),
             &observations,
+            &HashMap::new(),
             &HashSet::new(),
             &loops,
             grace,
@@ -2657,6 +2663,7 @@ mod tests {
             &mut with,
             &terminal_ids_by_session(&open),
             &[("t-done".to_string(), IDLE_LONG_AGO)].into(),
+            &HashMap::new(),
             &HashSet::new(),
             &HashSet::new(),
             std::time::Duration::from_secs(600),
