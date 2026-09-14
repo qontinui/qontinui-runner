@@ -472,10 +472,10 @@ bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
 
 ```
 # ttl_seconds=900 is deliberate: the file_glob kind defaults to 90s, and the
-# heartbeat below renews each row every max(its ttl/3, 60 s) — so accepting
-# the 90s grant would mean one request PER GLOB every 60 s for the whole run,
-# a rate that scales with N globs across the fleet. Requesting 900s makes it
-# one request per glob every 300 s.
+# heartbeat below renews each row every min(max(its ttl/3, 60 s), ttl/2) — so
+# accepting the 90s grant would mean one request PER GLOB every 45 s for the
+# whole run, a rate that scales with N globs across the fleet. Requesting 900s
+# makes it one request per glob every 300 s.
 coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   # one per path
 ```
 
@@ -492,9 +492,10 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   CLAIM_LEDGER="$HOME/.qontinui/claim-ledger/${AGENT_SESSION_ID:-nosession}.ledger"
 
   # One `add` per glob. --ttl is the `ttl_seconds` THAT glob's acquire response
-  # returned — the TTL coord granted, never a guess. A ledger TTL longer than
-  # the grant paces the loop too slowly and the claim lapses before its first
-  # beat; `add` refuses without --ttl.
+  # returned — the TTL coord granted, never a guess. A ledger TTL larger than
+  # the grant can pace the loop past the grant, so the claim lapses before its
+  # first beat (the cap is half the LEDGER ttl, not the grant); `add` refuses
+  # without --ttl.
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
     --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl "<ttl_seconds>"
 
@@ -502,7 +503,8 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   ```
 
   `start` detaches a background loop that re-heartbeats each row when THAT row
-  falls due, every max(its own TTL/3, 60 s). The trade `ttl_seconds=900` buys: a
+  falls due, every min(max(its own TTL/3, 60 s), TTL/2). The trade
+  `ttl_seconds=900` buys: a
   helper that dies leaves a `file_glob` claim lingering up to 15 minutes instead
   of 90 seconds — bounded
   by `stop` in your try/finally and by the helper's own `--max-runtime`.
@@ -518,17 +520,21 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   
   `STALE` (3) — pid alive but a row is past half its TTL, still inside it;
   `DEAD` (4) — no loop at all; `STOLEN` (5) — a row's last answer did not rule
   out another holder; `LAPSED` (7) — a row's grant is gone (an expired answer,
-  aged past its TTL, never confirmed, or a malformed TTL). A row the loop records
+  aged past its TTL, never confirmed, or a malformed TTL); `EMPTY` (8) — the
+  loop lives but the ledger holds no rows, so nothing is renewed (an `add` was
+  refused or never ran). A row the loop records
   as `stolen` or `lapsed` is terminal and never beaten again, while the loop
   keeps renewing the others; when no renewable row is left the loop ends, and
-  `status` reads `DEAD`.
-  **Only `LIVE` means the claims are held.** The other four mean the claim is
+  `status` reads `STOLEN` if any row was stolen, otherwise `DEAD`.
+  **Only `LIVE` means the claims are held.** The other five mean the claim is
   **UNKNOWN**, which is a re-acquire and a line in the report, never a shrug — a
   dead loop and a healthy one look identical to anything that never asks. After
   re-acquiring a key, **re-`add` it** with `--ttl` set to the new response's
   `ttl_seconds` — that overwrites its terminal row, and `start` alone does not —
   **then run `start`**: it is idempotent (`already-running` when the loop lives)
-  and required after `DEAD`, because a ledger with no renewable row ends the loop.
+  and required whenever the loop has ended (`DEAD`, or `STOLEN` with no live
+  pid), because a ledger with no renewable row ends the loop — then re-read
+  `status` and require `LIVE` before launching.
 
 - **Release symmetrically**: `remove` each glob row, then `stop` the loop, then
   release the claims. A loop still running past the release renews keys nobody
