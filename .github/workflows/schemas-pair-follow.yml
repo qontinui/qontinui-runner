@@ -1,0 +1,313 @@
+name: schemas pair-follow
+
+# Moves a runner PR's qontinui-schemas pin (and Cargo.lock) to the land commit of
+# the schemas PR it adapts to, once that partner LANDS. Plan:
+# qontinui-dev-notes plans/2026-08-31-schemas-releases-strand-consumer-cargo-locks.md
+# §7.7 (Phase 3.0). Logic and its refusals: scripts/schemas-pair-follow.sh. Fixtures:
+# scripts/tests/schemas-pair-follow/run.sh (schemas-pair-follow-tests.yml).
+#
+# WHY: CI compiles the schemas commit pinned in .github/sibling-pins.conf. A
+# declared schemas-leads pair compiles against its partner while the partner is
+# open. Once the partner lands, coord strips the label, and a merge-candidate
+# push reads no declaration at all. From then on the adaptation PR builds the
+# OLD pin and stays red until someone moves the pin inside it. This workflow
+# makes that move.
+#
+# SHAPE (each split is load-bearing):
+#   detect   pull_request `unlabeled`, and only when the coord App removed the
+#            label. It only dispatches this workflow from main with GITHUB_TOKEN.
+#            It never runs PR code and never holds the PAT.
+#   plan     schedule/dispatch, main's code. Scans both declaration forms and
+#            decides FOLLOW / SKIP / UNKNOWN for each candidate. It reads four
+#            coord claims and never touches a PR with a live claim.
+#   compute  UNPRIVILEGED (contents: read, no secrets, no cache actions). Merges
+#            main into the PR head, moves the pin, refreshes Cargo.lock, and uploads
+#            a bundle. It executes NO code from the PR's tree. cargo runs from
+#            outside the checkout with main's toolchain, so the tree's
+#            rust-toolchain.toml and .cargo/config.toml are not honoured, and
+#            checkout-sibling comes from main. This job runs in main's cache scope,
+#            which is why it must not run PR code.
+#   push     PRIVILEGED, and runs ONLY main's code. The artifact is UNTRUSTED.
+#            Every target comes from the plan item (matrix), and the artifact
+#            supplies only a commit id. It re-verifies the merge tree, that the
+#            pin equals A exactly, and that Cargo.lock registry entries are
+#            unchanged. It re-reads the PR (state, repo, ref, base, head) and its
+#            claims, then pushes with --force-with-lease on the head it built on
+#            (PAT). Then it comments.
+#   verdict  Red on any UNKNOWN or failed leg. A refusal is a named SKIP; an
+#            unanswerable read is never "nothing to do".
+#
+# KILL SWITCH: repository variable SCHEMAS_PAIR_FOLLOW=off. Unset = on.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [unlabeled]
+  schedule:
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Runner PR to follow (empty = scan every candidate)"
+        required: false
+        default: ""
+      partner:
+        description: "Its qontinui-schemas partner PR number (required with pr)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Dispatch pair-follow for a stripped schemas declaration
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write # gh workflow run; same scope ci-rerun-on-declaration.yml uses
+    steps:
+      # Step-level guards, so this job's check reports success rather than
+      # `skipped`. A fork PR's GITHUB_TOKEN is read-only, so the dispatch would 403.
+      - name: Dispatch the follow run from main
+        # Only a coord App strip is a landed partner. An author withdrawing the
+        # label by hand is not.
+        if: >-
+          startsWith(github.event.label.name, 'coord:downstream-of=') &&
+          github.event.sender.login == 'qontinui-merge-orchestrator[bot]' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          vars.SCHEMAS_PAIR_FOLLOW != 'off'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          re='^coord:downstream-of=(qontinui/)?qontinui-schemas#([0-9]+)$'
+          if [[ ! "$LABEL_NAME" =~ $re ]]; then
+            echo "Removed label '$LABEL_NAME' is not a qontinui-schemas declaration; nothing to follow."
+            exit 0
+          fi
+          partner="${BASH_REMATCH[2]}"
+          gh workflow run schemas-pair-follow.yml -R "$REPO" --ref main -f pr="$PR_NUMBER" -f partner="$partner"
+          echo "Dispatched pair-follow for #$PR_NUMBER <- qontinui/qontinui-schemas#$partner."
+
+  plan:
+    name: Decide which runner PRs need a pair-follow
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      followups: ${{ steps.decide.outputs.followups }}
+      unknowns: ${{ steps.decide.outputs.unknowns }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Scan and decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPF_KILL_SWITCH: ${{ vars.SCHEMAS_PAIR_FOLLOW }}
+          COORD_CLAIMS_READ_TOKEN: ${{ secrets.COORD_CLAIMS_READ_TOKEN }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_PARTNER: ${{ inputs.partner }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_PR:-}" ]; then
+            [[ "$INPUT_PR" =~ ^[0-9]+$ && "${INPUT_PARTNER:-}" =~ ^[0-9]+$ ]] ||
+              { echo "::error::inputs pr and partner must both be numbers"; exit 1; }
+            cands="$INPUT_PR $INPUT_PARTNER"
+          else
+            cands="$(bash scripts/schemas-pair-follow.sh scan)"
+          fi
+          results='[]'
+          while read -r m n; do
+            [ -n "${m:-}" ] || continue
+            r="$(bash scripts/schemas-pair-follow.sh decide "$m" "$n")"
+            echo "$r"
+            results="$(jq -c --argjson r "$r" '. + [$r]' <<<"$results")"
+          done <<<"$cands"
+          {
+            echo "### schemas pair-follow decisions"
+            echo ""
+            echo "| PR | partner | action | mode | reason |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | "| #\(.pr) | qontinui-schemas#\(.partner) | \(.action) | \(.mode) | \(.reason) |"' <<<"$results"
+          } >> "$GITHUB_STEP_SUMMARY"
+          followups="$(jq -c '[.[] | select(.action == "FOLLOW")]' <<<"$results")"
+          unknowns="$(jq '[.[] | select(.action == "UNKNOWN")] | length' <<<"$results")"
+          echo "followups=$followups" >> "$GITHUB_OUTPUT"
+          echo "unknowns=$unknowns" >> "$GITHUB_OUTPUT"
+
+  compute:
+    name: "Build the pair-follow commits (unprivileged) #${{ matrix.item.pr }}"
+    needs: plan
+    if: needs.plan.result == 'success' && needs.plan.outputs.followups != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No secrets are referenced here, and the token is read-only. The job must
+    # also never execute the PR's tree (see the header).
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.plan.outputs.followups) }}
+    concurrency:
+      group: schemas-pair-follow-compute-${{ matrix.item.pr }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out main's pair-follow tooling
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: main
+          persist-credentials: false
+
+      - name: Check out the runner PR head
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.item.head_sha }}
+          path: runner
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge main and move the pin
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          META: ${{ toJSON(matrix.item) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$META" > "$RUNNER_TEMP/decide.json"
+          bash main/scripts/schemas-pair-follow.sh merge-and-pin runner "$RUNNER_TEMP/decide.json" | tee -a "$GITHUB_OUTPUT"
+
+      # main's checkout-sibling, reading the PR's rewritten conf. There is no PR
+      # number in this run, so the action goes straight to apply_pin.
+      - name: Check out the new qontinui-schemas pin
+        if: steps.pin.outputs.MODE == 'FOLLOW'
+        uses: ./main/.github/actions/checkout-sibling
+        with:
+          path: ${{ github.workspace }}/qontinui-schemas
+          pin-file: ${{ github.workspace }}/runner/.github/sibling-pins.conf
+
+      # MAIN's channel, installed by name. The PR's rust-toolchain.toml is never read.
+      - name: Install main's Rust toolchain
+        if: steps.pin.outputs.MODE == 'FOLLOW'
+        id: toolchain
+        working-directory: main
+        shell: bash
+        run: |
+          set -euo pipefail
+          chan="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          [ -n "$chan" ] || { echo "::error::no channel in main's rust-toolchain.toml"; exit 1; }
+          rustup toolchain install "$chan" --profile minimal
+          echo "channel=$chan" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh Cargo.lock and commit
+        if: steps.pin.outputs.MODE == 'FOLLOW' || steps.pin.outputs.MODE == 'MERGE_ONLY'
+        env:
+          MODE: ${{ steps.pin.outputs.MODE }}
+          GH_TOKEN: ${{ github.token }}
+          SPF_TOOLCHAIN: ${{ steps.toolchain.outputs.channel }}
+        shell: bash
+        run: bash main/scripts/schemas-pair-follow.sh lock-and-commit runner "$RUNNER_TEMP/decide.json" "$RUNNER_TEMP/out" "$MODE"
+
+      - name: Upload the pair-follow bundle
+        if: steps.pin.outputs.MODE == 'FOLLOW' || steps.pin.outputs.MODE == 'MERGE_ONLY'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pair-follow-${{ matrix.item.pr }}
+          path: ${{ runner.temp }}/out/
+          retention-days: 3
+          if-no-files-found: error
+
+  push:
+    name: "Push the pair-follow commits (main's code) #${{ matrix.item.pr }}"
+    needs: [plan, compute]
+    # !cancelled(), not always(): cancelling the run is the emergency stop, and a
+    # run that is already in flight cannot see the kill-switch variable.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.followups != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write # remove the stale form-2 label, post the one comment
+    strategy:
+      fail-fast: false
+      matrix:
+        item: ${{ fromJSON(needs.plan.outputs.followups) }}
+    concurrency:
+      group: schemas-pair-follow-push-${{ matrix.item.pr }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out main's pair-follow tooling
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: main
+          persist-credentials: false
+
+      - name: Download the pair-follow bundle
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: pair-follow-${{ matrix.item.pr }}
+          path: ${{ runner.temp }}/out
+
+      - name: Verify, re-read the head, push
+        if: steps.dl.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SPF_KILL_SWITCH: ${{ vars.SCHEMAS_PAIR_FOLLOW }}
+          SPF_PUSH_TOKEN: ${{ secrets.CLORINDE_AUTOCOMMIT_TOKEN }}
+          COORD_CLAIMS_READ_TOKEN: ${{ secrets.COORD_CLAIMS_READ_TOKEN }}
+          # The TRUSTED plan item. The artifact contributes only a commit id.
+          PLAN_ITEM: ${{ toJSON(matrix.item) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$PLAN_ITEM" > "$RUNNER_TEMP/plan-item.json"
+          bash main/scripts/schemas-pair-follow.sh push "$RUNNER_TEMP/plan-item.json" "$RUNNER_TEMP/out" "$RUNNER_TEMP/verify"
+
+      # No bundle means the compute leg skipped (merge conflict, already
+      # contained) or failed. Its own log names which; the verdict job reds on a
+      # failed compute leg.
+      - name: No bundle for this PR
+        if: steps.dl.outcome != 'success'
+        shell: bash
+        run: echo "No pair-follow bundle for #${{ matrix.item.pr }} — see the compute leg."
+
+  verdict:
+    name: Pair-follow verdict
+    needs: [plan, compute, push]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Red on UNKNOWN or a failed leg
+        env:
+          PLAN: ${{ needs.plan.result }}
+          COMPUTE: ${{ needs.compute.result }}
+          PUSH: ${{ needs.push.result }}
+          UNKNOWNS: ${{ needs.plan.outputs.unknowns }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "plan=$PLAN compute=$COMPUTE push=$PUSH unknowns=${UNKNOWNS:-?}"
+          [ "$PLAN" = "success" ] || { echo "::error::plan did not succeed"; exit 1; }
+          [ "${UNKNOWNS:-0}" = "0" ] || { echo "::error::$UNKNOWNS candidate(s) decided UNKNOWN — see the plan job"; exit 1; }
+          for r in "$COMPUTE" "$PUSH"; do
+            [ "$r" = "failure" ] && { echo "::error::a compute or push leg failed"; exit 1; }
+          done
+          exit 0

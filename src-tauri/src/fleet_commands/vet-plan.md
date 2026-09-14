@@ -56,7 +56,14 @@ a session launched outside the runner will not have them.
 >      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
 >      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
 >      enumerate. Authoring layer only (a plan authored through the web UI is
->      invisible here), exact stem match, `origin/main` as of the last fetch.
+>      invisible here), exact stem match, `origin/main` as of the last fetch —
+>      so fetch first:
+>      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      exit code read unpiped (a bare `fetch origin main` in a clone whose
+>      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
+>      When that fetch was skipped or exited non-zero, a git-door MISS is
+>      UNKNOWN (the ref may predate the plan); a hit still shows the plan
+>      reached `origin/main`, but its body may lag it.
 >   3. **The deployed door — a coord DEVICE JWT.**
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
@@ -69,7 +76,10 @@ a session launched outside the runner will not have them.
 >   unfiltered page (`work_unit_slug=<stem>` is the older exact door; it is null
 >   for a hand-`POST`ed row) — and **read `corpus_health`**: a `plan_count` far
 >   below the `ls-tree` count is a FROZEN corpus, and the sentence to write is
->   that observation. Never `q=<stem>`: it matches title and body, not the slug.
+>   that observation. An `ls-tree` count taken after a skipped or failed fetch
+>   describes an older `origin/main`, not the current one: it can hide a frozen
+>   corpus or suggest one that is not there, so record it as UNKNOWN.
+>   Never `q=<stem>`: it matches title and body, not the slug.
 > * **A zero is UNKNOWN until a count says otherwise.** The body sync that fills
 >   `agent.work_artifacts` is a property of each writing device's runner build
 >   (opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before plan
@@ -77,7 +87,8 @@ a session launched outside the runner will not have them.
 >   Phase 3, on by default after it) and is gated per cycle on the tenant's
 >   `plan_capture` dial, so a `200` carrying an empty list from a frozen corpus
 >   is byte-identical to "no such plan". Record `corpus_health` (or the two
->   counts) beside the zero, and never write a cause for a door that did not
+>   counts, with the fetch's exit status beside the `ls-tree` one) beside the
+>   zero, and never write a cause for a door that did not
 >   answer — settle one against a second independent instance first.
 > * **The scan-root roll-up can make a miss UNKNOWN; it never proves a plan
 >   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
@@ -85,8 +96,9 @@ a session launched outside the runner will not have them.
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
 >   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
 >   the key `<repo>/plans`.
->   - **No git door found the file** (after a `git fetch`): the roll-up has
->     nothing to add.
+>   - **No git door found the file:** the roll-up has nothing to add; the miss
+>     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
+>     and even then it speaks for the authoring layer only.
 >   - **A git door found it, and you read by `slug=<stem>`:** the miss is
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is

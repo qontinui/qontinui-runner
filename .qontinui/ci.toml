@@ -43,25 +43,39 @@ repo = "qontinui/qontinui-schemas"
 pin = "declared-adaptation"
 
 # ===========================================================================
-# DECLARED DIVERGENCE FROM ci.yml — the two entries below still float.
+# DECLARED DIVERGENCE FROM ci.yml — the two entries below still float, and
+# the flip that ends it is ONE LINE EACH, gated on a coord deploy.
 #
-# The Actions lane stopped floating on these two: ci.yml now routes them
+# The Actions lane stopped floating on these two in #1158: ci.yml routes them
 # through .github/actions/checkout-sibling at a commit recorded in
 # .github/sibling-pins.conf, because a floating checkout let a ui-bridge land
 # red this repo's main and hold the merge train for 5h+ on 2026-08-20 with no
 # runner commit involved.
 #
-# This lane CANNOT express that yet. `SiblingPin` (src-tauri/src/ci_node/
-# manifest.rs) is a closed kebab-case enum — `declared-adaptation` |
-# `default-branch` — with a test asserting its closure, and the struct is
-# `deny_unknown_fields`, so `pin = "<sha>"` is a parse error, not a config
-# choice. Closing the gap needs a Rust change (a third variant reading the
-# same manifest file) and is therefore a separate PR, not a line edit here.
+# This lane CAN now express that: `pin = "pin-file"` (`SiblingPin::PinFile`,
+# src-tauri/src/ci_node/manifest.rs) is the action's rule in full — a declared
+# adaptation PR outranks the pin, and with no declaration the sibling resolves
+# to the commit recorded in .github/sibling-pins.conf, read from THIS checkout
+# at the dispatched commit and parsed field-for-field as the action's
+# `apply_pin` parses it (src-tauri/src/ci_node/sibling.rs `lookup_pin`). The
+# SHA is deliberately never restated here: one file, three readers, and the
+# `sibling pin bump` workflow moves it for both lanes at once. Stricter than
+# the action in two places: a sibling that says `pin-file` here but is absent
+# from that file, or a missing file, is a hard error, not a float — here the
+# opt-in is this line.
 #
-# Recorded rather than left silent: the parity rule above says the two lanes
-# must stay auditable against each other, and an undocumented divergence is
-# exactly what that rule exists to prevent. Until the Rust change lands, the
-# ci_node lane remains exposed to the defect the Actions lane just closed.
+# WHY THE TWO LINES BELOW STILL SAY `default-branch`: this file has a THIRD
+# reader. coord's agent-allocation lane (`POST /agents/allocate`,
+# qontinui-coord crates/coord/src/ci_siblings.rs) parses these same
+# [[siblings]] blocks to provision a worktree's sibling build deps, with its
+# own CLOSED `pin` enum — and a value it does not know fails OPEN to "no
+# siblings declared", so every allocated qontinui-runner worktree would
+# silently lose its qontinui-schemas checkout (the exact defect coord's reader
+# was added to end). Flip these two lines to `pin = "pin-file"` only once a
+# coord build that accepts `pin-file` is DEPLOYED — merged is not enough, the
+# reader runs in production at allocate time. Until then, `default-branch`
+# here is a recorded divergence, and the ci_node lane stays exposed to the
+# defect the Actions lane closed.
 # ===========================================================================
 
 [[siblings]]
@@ -75,8 +89,11 @@ pin = "declared-adaptation"
 # added this note; it is removed here too rather than left contradicting the
 # lane it is supposed to mirror.
 #
-# `default-branch`: see the DECLARED DIVERGENCE block above. The Actions lane
-# pins this to a recorded commit; this lane cannot yet.
+# `default-branch`: see the DECLARED DIVERGENCE block above — flip to
+# `pin-file` once coord's reader accepts it. Pinned in the Actions lane only
+# to make it inert as a red-main source while its vestigiality is confirmed;
+# deleting the checkout outright (here AND in ci.yml, in one PR) is the better
+# end state.
 repo = "qontinui/qontinui-web"
 pin = "default-branch"
 
@@ -88,9 +105,10 @@ pin = "default-branch"
 # SDK-vs-runner drift would go unflagged — a vacuous green, which is why the
 # sibling is declared rather than left to chance.
 #
-# `default-branch`: see the DECLARED DIVERGENCE block above. This is the exact
-# edge that caused the 2026-08-20 outage; the Actions lane now pins it and this
-# lane does not.
+# `default-branch`: see the DECLARED DIVERGENCE block above — flip to
+# `pin-file` once coord's reader accepts it. This is the exact edge that
+# caused the 2026-08-20 outage; the Actions lane pins it and this lane, for
+# the one reason recorded above, does not yet.
 repo = "qontinui/ui-bridge"
 pin = "default-branch"
 

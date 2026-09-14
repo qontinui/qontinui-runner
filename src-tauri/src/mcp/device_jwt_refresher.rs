@@ -1861,12 +1861,13 @@ fn clear_orphan_warning(key: &str) {
 /// Drop every bucket that NOTHING CAN EVER WRITE AGAIN.
 ///
 /// A tenant-keyed bucket is only ever written by a forwarder that resolved
-/// that tenant and presented a credential for it. The three routes to such a
-/// resolution are the per-tenant slots
-/// ([`crate::auth::AuthManager::list_tenant_device_jwt_tenants`]), the device's
-/// DEFAULT binding ([`crate::auth::default_binding_tenant`], which
-/// `select_device_bearer` serves out of the legacy slot) and the live machine
-/// pin ([`crate::session::tenant_pin::resolve_tenant_pin`]). A key in none of them
+/// that tenant and presented a credential for it, and a credential exists for
+/// exactly two routes: the per-tenant slots
+/// ([`crate::auth::AuthManager::list_tenant_device_jwt_tenants`]) and the
+/// device's DEFAULT binding ([`crate::auth::default_binding_tenant`], which
+/// `select_device_bearer` serves out of the legacy slot). See
+/// [`resolve_writable_slot_keys`] for the invariant, with its call sites, and
+/// for why the machine pin is not a third route. A key in neither of them
 /// belongs to a tenant this runner has been re-paired or unpaired away from:
 /// its streak can never be contradicted by a 2xx, because no call will ever
 /// present that credential again.
@@ -1902,7 +1903,7 @@ pub(crate) fn evict_unwritable_upstream_buckets(
 
 /// The writable-key set, or the reason it could not be established.
 ///
-/// Eviction is DESTRUCTIVE and its three inputs all fail OPEN — each one
+/// Eviction is DESTRUCTIVE and its two inputs both fail OPEN — each one
 /// silently degrades to "absent" on failure — so the set must be FULLY
 /// MEASURED before anything is deleted. A shrunken set does not mean "fewer
 /// tenants are reachable"; it means the question was not answered.
@@ -1913,7 +1914,7 @@ pub(crate) enum WritableSlotKeys {
     Unknown(&'static str),
 }
 
-/// Compose the three reads into a writable-key set, ABORTING on any UNKNOWN.
+/// Compose the two reads into a writable-key set, ABORTING on any UNKNOWN.
 ///
 /// # Why every input aborts rather than contributing nothing
 ///
@@ -1929,10 +1930,8 @@ pub(crate) enum WritableSlotKeys {
 ///   JSON parse; [`crate::auth::BindingTenantRead`] now separates a MEASURED
 ///   `Unbound` (no pairing file — a legitimately unbound device, safe) from
 ///   `Unknown`.
-/// * `TenantPin::Unresolvable` is the machine saying it cannot state its
-///   tenant. It is not "no pin".
 ///
-/// With any of them unmeasured, a bucket could be evicted for a tenant that is
+/// With either of them unmeasured, a bucket could be evicted for a tenant that is
 /// in fact still reachable — and eviction DELETES the streak rather than
 /// filtering it, so the posture does not merely pause: it collapses to `live`
 /// on the next pass and fires *"Coord access restored"* at a runner that never
@@ -1946,10 +1945,65 @@ pub(crate) enum WritableSlotKeys {
 /// does not read as "no credential", and `refresh_tenant_slots` has an
 /// explicit *"slot unreadable — UNKNOWN, not cleared"* arm. The sweep had
 /// reintroduced the collapse and attached a destructive action to it.
+///
+/// # The bearer set, and why the machine pin can only SPARE
+///
+/// A bucket is keyed by the tenant a forwarder presented a device BEARER for,
+/// and a bearer exists only for a slot tenant or the default binding:
+///
+/// * Every production writer of a bucket keys it on the tenant that
+///   [`crate::auth::device_bearer_for`] returned a non-empty bearer for, or on
+///   `None` (the default key). The coord-mcp proxy binds that tenant
+///   (`mcp_api.rs:5223`), degrades to `COORD_MCP_PROXY_CREDENTIAL_REFRESHING`
+///   with no bearer before any upstream call (`mcp_api.rs:5238-5262`), and
+///   records under the first selection's tenant (`mcp_api.rs:5742`). The
+///   claims-read and write proxies pass `proxy_request_gate`, which refuses a
+///   missing bearer (`coord_mcp.rs:5138-5146`), before they record
+///   (`mcp_api.rs:6537`, `mcp_api.rs:7544`). Nothing outside `mcp_api.rs`
+///   records a verdict.
+/// * [`crate::auth::select_device_bearer`] (`auth.rs:1512-1540`) returns a
+///   bearer for tenant `t` only when `device_jwt:<t>` holds a usable JWT — the
+///   same map [`crate::auth::AuthManager::try_list_tenant_device_jwt_tenants`]
+///   enumerates — or when `t` is the default binding (the legacy slot). It has
+///   NO legacy fallback for any other tenant, and `crate::auth`'s test
+///   `a_slotless_non_default_tenant_gets_no_bearer_even_beside_a_live_legacy_slot`
+///   fails if one is added.
+///
+/// So bucket keys ⊆ slots ∪ default binding ∪ `""`. The machine pin and the
+/// device-JWT claim only choose WHICH tenant the forwarder asks a bearer for; a
+/// tenant outside that union gets none, is refused or degraded, and writes no
+/// bucket. The claim is therefore not read here at all. Reading the pin and the
+/// claim as ABORTING inputs added no writable key and one failure mode: a box
+/// with no `machine.json` and an unreadable or claimless legacy slot aborted the
+/// sweep on every pass, so an orphan bucket pinned the posture dark forever.
+///
+/// A key that WAS reachable when coord answered and is not now (its slot was
+/// cleared, or the device re-paired) can no longer be written: nothing can
+/// present that credential again, so nothing can contradict its streak.
+///
+/// # The machine pin is a SPARE-only input
+///
+/// `machine_pin` can only KEEP a key; it never aborts the sweep.
+///
+/// * `Pinned(t)` adds `t`. Coord revokes `t`, `clear_and_rederive_tenant_slot`
+///   clears `t`'s slot and the re-derive fails: `t` is now neither a slot nor
+///   the default, so by the bearer set alone its streak would be evicted.
+///   Nothing would then observe `t`, the posture could publish `live` and
+///   *"Coord access restored"*, and every `t`-pinned session would keep getting
+///   `COORD_MCP_PROXY_CREDENTIAL_REFRESHING`. Sparing the pinned tenant's
+///   bucket leaves it for [`UnclaimedVerdict`] to read as dark — which is true:
+///   this machine still asks for `t` and cannot get a bearer for it.
+/// * `Unpinned` and `Unresolvable` add NOTHING and never abort. Omitting a key
+///   only PERMITS evicting a bucket that, by the invariant above, can no longer
+///   be written, so an unmeasured pin cannot destroy live evidence and a box
+///   with no `machine.json` still retires its orphans.
+///
+/// An extra kept key can only hold the posture dark (the acceptable direction);
+/// it can never announce a recovery.
 pub(crate) fn resolve_writable_slot_keys(
     tenant_slots: Option<&[uuid::Uuid]>,
     default_binding: crate::auth::BindingTenantRead,
-    pin: crate::session::tenant_pin::TenantPin,
+    machine_pin: crate::session::tenant_pin::TenantPin,
 ) -> WritableSlotKeys {
     let Some(slots) = tenant_slots else {
         return WritableSlotKeys::Unknown("tenant device-JWT slot store unreadable");
@@ -1967,33 +2021,91 @@ pub(crate) fn resolve_writable_slot_keys(
             return WritableSlotKeys::Unknown("paired_user.json unreadable or malformed");
         }
     }
-    match pin {
-        crate::session::tenant_pin::TenantPin::Pinned(t) => {
-            writable.insert(t.to_string());
-        }
-        // MEASURED: machine.json is readable and carries no active tenant.
-        crate::session::tenant_pin::TenantPin::Unpinned => {}
-        crate::session::tenant_pin::TenantPin::Unresolvable => {
-            return WritableSlotKeys::Unknown("machine.json tenant pin unresolvable");
-        }
+    // SPARE-only (see above): a pinned tenant is kept; no pin state aborts.
+    if let crate::session::tenant_pin::TenantPin::Pinned(t) = machine_pin {
+        writable.insert(t.to_string());
     }
     WritableSlotKeys::Measured(writable)
+}
+
+/// Every input the eviction sweep reads from disk, gathered in ONE hop to the
+/// blocking pool so none of it runs on the async executor.
+struct SweepInputs {
+    /// The UN-COLLAPSED slot enumeration. The sweep reads its `Err` as
+    /// UNKNOWN; the refresher's branch choice keeps the historical collapse
+    /// (unreadable → no slots → the legacy arm).
+    tenant_slots: anyhow::Result<Vec<uuid::Uuid>>,
+    default_binding: crate::auth::BindingTenantRead,
+    /// SPARE-only — see [`resolve_writable_slot_keys`].
+    machine_pin: crate::session::tenant_pin::TenantPin,
+}
+
+/// Blocking: reads the slot store, `paired_user.json` and `machine.json`.
+fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
+    SweepInputs {
+        tenant_slots: auth_manager.try_list_tenant_device_jwt_tenants(),
+        default_binding: crate::auth::default_binding_tenant_probe(),
+        machine_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+    }
+}
+
+/// Pure: compose already-read [`SweepInputs`] into the writable-key set.
+fn writable_slot_keys_from(inputs: &SweepInputs) -> WritableSlotKeys {
+    resolve_writable_slot_keys(
+        inputs.tenant_slots.as_ref().ok().map(|v| v.as_slice()),
+        inputs.default_binding,
+        inputs.machine_pin,
+    )
+}
+
+/// How often a REPEATING blocking-pool read failure is re-announced: on the
+/// first failure, then every this-many consecutive failures — hourly at the
+/// 5-minute refresher cadence. A panic that recurs every pass must neither
+/// flood the log nor be announced once and then go silent.
+const SWEEP_JOIN_FAILURE_REWARN_EVERY: u32 = 12;
+
+/// Whether the `consecutive`-th consecutive read failure is announced.
+fn should_warn_sweep_join_failure(consecutive: u32) -> bool {
+    // `0.is_multiple_of(n)` is true, and zero failures is not a failure.
+    consecutive == 1
+        || (consecutive > 0 && consecutive.is_multiple_of(SWEEP_JOIN_FAILURE_REWARN_EVERY))
+}
+
+/// A fresh PAIRING (an interactive sign-in, a pair-code redeem) replaced the
+/// credential for `tenant`, so every rejection coord recorded against the OLD
+/// one is spent evidence — the same M1 rule the refresher's own mint paths
+/// apply through [`reset_upstream_rejections_for`].
+///
+/// Without this, "Sign in to re-pair" on `dark(upstream_401)` stores a working
+/// credential, the next pass observes it fresh, and rung 5 re-reads the stale
+/// streak and republishes `dark` behind a banner that cannot be dismissed.
+///
+/// `default_binding` is `paired_user.json`'s default AFTER the pairing was
+/// persisted. `pair::persist_pairing_with` writes the legacy `access_token` slot
+/// exactly when the paired tenant is (or becomes) the default, so equality is
+/// the "the credential also landed in the legacy slot" test, and only then is
+/// the DEFAULT bucket spent too. An unreadable default (`None`) leaves that
+/// bucket standing — stuck-dark, the acceptable direction.
+pub(crate) fn retire_rejection_streaks_after_pairing(
+    tenant: uuid::Uuid,
+    default_binding: Option<uuid::Uuid>,
+) {
+    reset_upstream_rejections_for(Some(tenant));
+    if default_binding == Some(tenant) {
+        reset_upstream_rejections_for(None);
+    }
 }
 
 /// Prefix for the latch entries that keep a skipped-sweep warning from
 /// repeating every pass. Namespaced so it cannot collide with a slot key.
 const SWEEP_SKIP_LATCH: &str = "\u{0}sweep-skip:";
 
-/// Resolve this machine's writable slot keys and run the sweep — or SKIP it,
-/// leaving every bucket intact, when any input is UNKNOWN.
+/// Run the sweep over an already-resolved writable set — or SKIP it, leaving
+/// every bucket intact, when the set is UNKNOWN.
 ///
-/// `tenant_slots` is `None` when the slot store could not be read.
-fn sweep_unwritable_upstream_buckets(tenant_slots: Option<&[uuid::Uuid]>) {
-    let writable = resolve_writable_slot_keys(
-        tenant_slots,
-        crate::auth::default_binding_tenant_probe(),
-        crate::session::tenant_pin::resolve_tenant_pin(),
-    );
+/// Does no I/O: the inputs were read on the blocking pool by
+/// [`read_sweep_inputs`] and composed by [`resolve_writable_slot_keys`].
+fn sweep_unwritable_upstream_buckets(writable: WritableSlotKeys) {
     let writable = match writable {
         WritableSlotKeys::Measured(w) => w,
         WritableSlotKeys::Unknown(reason) => {
@@ -2048,8 +2160,13 @@ fn sweep_unwritable_upstream_buckets(tenant_slots: Option<&[uuid::Uuid]>) {
 ///   observation with `tenant_id: None` — which reads the DEFAULT bucket.
 ///   Bucket `X` climbs forever, unread; the legacy `exp` is in the future, so
 ///   rung 6 says `live` while coord refuses every call.
-/// * **A pin with no slot**: tenant slots for Y and Z, `machine.json` pinned
-///   to X. Same shape, same silence.
+/// * **A pinned tenant whose slot was cleared**: tenant slots for Y and Z,
+///   `machine.json` pinned to X, and X's slot cleared after coord revoked it
+///   (a failed re-derive). X's bucket was written while its slot existed; no
+///   bearer can refresh it now, but the eviction sweep SPARES it because the
+///   pin still names X (see [`resolve_writable_slot_keys`]). No observation
+///   claims X, so without this diff the bucket would be read by nobody while
+///   every X-pinned session is refused. Same shape, same silence.
 ///
 /// Diffing the map against what the observations claim closes the CLASS, so
 /// the next key source — whatever it turns out to be — is covered without a
@@ -3286,12 +3403,18 @@ async fn refresher_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     mut kick_rx: watch::Receiver<u64>,
 ) {
-    let auth_manager = crate::auth::AuthManager::new();
+    // `Arc` so the eviction sweep's input read can move a handle onto the
+    // blocking pool; every `&auth_manager` below deref-coerces unchanged.
+    let auth_manager = std::sync::Arc::new(crate::auth::AuthManager::new());
     info!("Device-JWT refresher started (check interval = 5m, threshold = 80m)");
 
     // Phase 2: carries the transient-failure backoff + the credential-dark
     // notify-once dedup across iterations.
     let mut backoff = RefreshBackoff::default();
+    // Consecutive blocking-pool read failures, for the skipped-pass warning's
+    // bounded re-announcement (`should_warn_sweep_join_failure`). Reset on a
+    // successful read.
+    let mut sweep_join_failures: u32 = 0;
 
     loop {
         if *shutdown_rx.borrow() {
@@ -3326,27 +3449,56 @@ async fn refresher_loop(
         // before the decision match so the Idle arm (legacy JWT fresh)
         // still ticks the tenant slots each cadence/kick. Runners with no
         // tenant slots (never paired post-8a) skip in one storage read.
-        // The UN-COLLAPSED read, because the sweep below is destructive: an
-        // unreadable store must not read as "no tenant slots" there. The
-        // BRANCH choice keeps its historical collapse — an unreadable store
-        // takes the legacy arm, which does its own tri-state
+        // Every input the eviction sweep needs — the slot store and
+        // `paired_user.json` — is read in ONE blocking-pool hop, then composed
+        // on this side.
+        //
+        // The slot read is the UN-COLLAPSED one, because the sweep below is
+        // destructive: an unreadable store must not read as "no tenant slots"
+        // there. The BRANCH choice keeps its historical collapse — an
+        // unreadable store takes the legacy arm, which does its own tri-state
         // `probe_access_token()` — so only the eviction's failure direction
-        // changes.
-        let tenant_slots_read = auth_manager.try_list_tenant_device_jwt_tenants();
-        let tenant_slots: Vec<uuid::Uuid> = tenant_slots_read.as_ref().cloned().unwrap_or_default();
-        let has_tenant_slots = !tenant_slots.is_empty();
+        // differs.
+        //
+        // A JOIN failure is not that case: nothing at all was read, so neither
+        // branch is honest — the legacy arm would publish a legacy-only posture
+        // over a multi-tenant box. Skip the whole pass and try again next
+        // cadence (or kick).
+        let auth_for_sweep = std::sync::Arc::clone(&auth_manager);
+        let sweep_inputs = match spawn_blocking_tracked(move || read_sweep_inputs(&auth_for_sweep))
+            .await
+        {
+            Ok(inputs) => {
+                sweep_join_failures = 0;
+                inputs
+            }
+            Err(join_err) => {
+                sweep_join_failures = sweep_join_failures.saturating_add(1);
+                if should_warn_sweep_join_failure(sweep_join_failures) {
+                    warn!(
+                        "device_jwt_refresher: credential-store read task failed \
+                         ({join_err}; {sweep_join_failures} consecutive) — skipping this \
+                         pass rather than deriving a posture from nothing"
+                    );
+                }
+                if wait_with_signals(REFRESH_CHECK_INTERVAL, &mut shutdown_rx, &mut kick_rx).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let has_tenant_slots = sweep_inputs
+            .tenant_slots
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let writable = writable_slot_keys_from(&sweep_inputs);
         // Retire every upstream-verdict bucket this runner can no longer write
         // (a re-pair or an unpair), BEFORE the posture is derived from what is
         // left. Runs in BOTH branches because a re-pair can happen from either
         // shape, and it is the IMPOSSIBILITY half of retiring an orphan's
         // evidence — the half that replaced a guessed clock.
-        //
-        // FOLLOW-UPS, deliberately not fixed here: this does synchronous
-        // filesystem I/O on the async executor once per pass
-        // (`default_binding_tenant_probe` reads `paired_user.json`,
-        // `resolve_tenant_pin` reads `machine.json`) where the surrounding code
-        // pushes `AuthManager` reads to the blocking pool.
-        sweep_unwritable_upstream_buckets(tenant_slots_read.as_ref().ok().map(|v| v.as_slice()));
+        sweep_unwritable_upstream_buckets(writable);
         if has_tenant_slots {
             let mt_device_id = std::env::var("QONTINUI_MACHINE_ID")
                 .ok()
@@ -6660,8 +6812,9 @@ mod tenant_slot_refresh_tests {
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
 
-        // The re-pair: `gone` is in no slot, is not the default binding and is
-        // not the live pin, so nothing can ever write its bucket again.
+        // The re-pair: `gone` is in no slot and is not the default binding, so
+        // no bearer can ever be presented for it again — and `machine.json`
+        // does not pin it, so nothing spares its bucket.
         let writable: std::collections::HashSet<String> =
             [y.to_string(), z.to_string()].into_iter().collect();
         assert_eq!(
@@ -6682,8 +6835,9 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// The eviction predicate's three writable routes, and the one key that is
-    /// never evicted.
+    /// The eviction predicate's kept keys — the two BEARER routes (a tenant
+    /// slot, the default binding), the tenant the SPARE-only machine pin names
+    /// — and the one key that is never evicted.
     #[test]
     fn eviction_spares_every_key_a_credential_can_still_reach() {
         let _serialised = health_lock();
@@ -6764,7 +6918,13 @@ mod tenant_slot_refresh_tests {
         );
 
         // PASS N — the store cannot be read. The sweep must DEFER, not shrink.
-        sweep_unwritable_upstream_buckets(None);
+        // The default binding is healthy and names A, so the slot store is the
+        // ONLY thing unmeasured.
+        sweep_unwritable_upstream_buckets(resolve_writable_slot_keys(
+            None,
+            crate::auth::BindingTenantRead::Bound(a),
+            crate::session::tenant_pin::TenantPin::Pinned(a),
+        ));
         assert_eq!(
             upstream_signal_for(Some(&b.to_string())).consecutive_rejections,
             5,
@@ -6797,10 +6957,12 @@ mod tenant_slot_refresh_tests {
         reset_posture();
     }
 
-    /// Each of the three inputs, failing on its own and all at once. This is
-    /// the composition where the fail-open actually lived — the pure eviction
-    /// half was already covered with an injected `writable`, which is exactly
-    /// why the defect passed 9616 green.
+    /// Each of the two ABORTING inputs, failing on its own and both at once —
+    /// and the spare-only pin, which neither rescues an unmeasured set nor
+    /// makes a measured one UNKNOWN. This is the composition where the
+    /// fail-open actually lived — the pure eviction half was already covered
+    /// with an injected `writable`, which is exactly why the defect passed 9616
+    /// green.
     #[test]
     fn the_sweep_aborts_on_any_unmeasured_input_and_only_evicts_when_fully_measured() {
         use crate::auth::BindingTenantRead;
@@ -6808,50 +6970,43 @@ mod tenant_slot_refresh_tests {
         let a = tenant(0);
         let slots = [a];
 
-        // (1) Slot store unreadable.
-        assert!(matches!(
-            resolve_writable_slot_keys(None, BindingTenantRead::Bound(a), TenantPin::Pinned(a)),
-            WritableSlotKeys::Unknown(_)
-        ));
-        // (2) paired_user.json unreadable or malformed.
-        assert!(matches!(
-            resolve_writable_slot_keys(
-                Some(&slots),
-                BindingTenantRead::Unknown,
-                TenantPin::Pinned(a)
-            ),
-            WritableSlotKeys::Unknown(_)
-        ));
-        // (3) The machine cannot state its tenant.
-        assert!(matches!(
-            resolve_writable_slot_keys(
-                Some(&slots),
-                BindingTenantRead::Bound(a),
-                TenantPin::Unresolvable
-            ),
-            WritableSlotKeys::Unknown(_)
-        ));
-        // All three at once — the pass on which EVERY tenant bucket used to go.
-        assert!(matches!(
-            resolve_writable_slot_keys(None, BindingTenantRead::Unknown, TenantPin::Unresolvable),
-            WritableSlotKeys::Unknown(_)
-        ));
+        for pin in [
+            TenantPin::Pinned(a),
+            TenantPin::Unpinned,
+            TenantPin::Unresolvable,
+        ] {
+            // (1) Slot store unreadable. Even a pin naming `a` cannot rescue it.
+            assert!(matches!(
+                resolve_writable_slot_keys(None, BindingTenantRead::Bound(a), pin),
+                WritableSlotKeys::Unknown(_)
+            ));
+            // (2) paired_user.json unreadable or malformed.
+            assert!(matches!(
+                resolve_writable_slot_keys(Some(&slots), BindingTenantRead::Unknown, pin),
+                WritableSlotKeys::Unknown(_)
+            ));
+            // Both at once — the pass on which EVERY tenant bucket used to go.
+            assert!(matches!(
+                resolve_writable_slot_keys(None, BindingTenantRead::Unknown, pin),
+                WritableSlotKeys::Unknown(_)
+            ));
+        }
 
-        // MEASURED absence is not a gap: an unpaired device and an unpinned
-        // machine are facts, and the sweep proceeds on them.
+        // MEASURED absence is not a gap: an unpaired device is a fact, and so is
+        // a machine that pins nothing or cannot state its pin — the pin never
+        // aborts, it can only spare.
         let b = tenant(1);
         let c = tenant(2);
-        match resolve_writable_slot_keys(
-            Some(&slots),
-            BindingTenantRead::Unbound,
-            TenantPin::Unpinned,
-        ) {
-            WritableSlotKeys::Measured(w) => {
-                assert_eq!(w, [a.to_string()].into_iter().collect());
+        for pin in [TenantPin::Unpinned, TenantPin::Unresolvable] {
+            match resolve_writable_slot_keys(Some(&slots), BindingTenantRead::Unbound, pin) {
+                WritableSlotKeys::Measured(w) => {
+                    assert_eq!(w, [a.to_string()].into_iter().collect());
+                }
+                other => panic!("measured inputs must yield a set, got {other:?}"),
             }
-            other => panic!("measured inputs must yield a set, got {other:?}"),
         }
-        // …and all three contributing routes land in the set.
+        // …and every kept route lands in the set: a slot, the default binding,
+        // and the tenant the pin names.
         match resolve_writable_slot_keys(
             Some(&slots),
             BindingTenantRead::Bound(b),
@@ -6867,6 +7022,348 @@ mod tenant_slot_refresh_tests {
             }
             other => panic!("expected a measured set, got {other:?}"),
         }
+    }
+
+    /// Re-review W-1. `machine.json` pins T; coord revokes T; the slot pass
+    /// clears T's slot and the re-derive fails. T is now neither a slot nor the
+    /// default binding, so by the bearer set alone its streak would be evicted,
+    /// nothing would observe T, and the posture could publish `live` while
+    /// every T-pinned session is refused. The SPARE-only pin keeps the bucket,
+    /// and the unclaimed-bucket rung keeps the box dark.
+    #[test]
+    fn a_pinned_tenant_with_no_slot_keeps_its_dark_streak() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let slots = [SlotObservation {
+            tenant_id: Some(other_slot.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        }];
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(pinned), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+
+        let writable = resolve_writable_slot_keys(
+            Some(&[other_slot]),
+            crate::auth::BindingTenantRead::Unbound,
+            TenantPin::Pinned(pinned),
+        );
+        sweep_unwritable_upstream_buckets(writable);
+        assert_eq!(
+            upstream_signal_for(Some(&pinned.to_string())).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "the pinned tenant's streak is SPARED even though it has no slot"
+        );
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "and the box stays dark — never `Coord access restored` over a refused pin"
+        );
+        reset_posture();
+    }
+
+    /// Re-review L-1: a read failure that repeats every pass is announced on
+    /// the first failure and then at a bounded cadence — never every pass, and
+    /// never once-then-silent.
+    #[test]
+    fn a_repeating_sweep_read_failure_is_re_announced_at_a_bounded_cadence() {
+        assert!(!should_warn_sweep_join_failure(0));
+        assert!(should_warn_sweep_join_failure(1), "the first failure warns");
+        for n in 2..SWEEP_JOIN_FAILURE_REWARN_EVERY {
+            assert!(!should_warn_sweep_join_failure(n), "pass {n} is silent");
+        }
+        assert!(should_warn_sweep_join_failure(
+            SWEEP_JOIN_FAILURE_REWARN_EVERY
+        ));
+        assert!(!should_warn_sweep_join_failure(
+            SWEEP_JOIN_FAILURE_REWARN_EVERY + 1
+        ));
+        assert!(should_warn_sweep_join_failure(
+            3 * SWEEP_JOIN_FAILURE_REWARN_EVERY
+        ));
+    }
+
+    /// Re-review W-3. Deleting the post-pairing streak retirement from either
+    /// in-process re-pair path kept every behavioural test green, because a
+    /// Tauri command that runs a browser login or a network redeem cannot be
+    /// driven from a unit test. So this pins the wiring at the source — the
+    /// same technique `mcp_api.rs`'s
+    /// `the_coord_mcp_proxy_reports_its_upstream_verdict_to_the_posture` uses —
+    /// and requires the call to come AFTER `persist_pairing`.
+    #[test]
+    fn every_in_process_re_pair_path_retires_the_stale_rejection_streak() {
+        for (file, item) in [
+            ("src/commands/auth.rs", "async fn finalize_signed_in("),
+            (
+                "src/commands/web_integration.rs",
+                "pub async fn redeem_pair_code(",
+            ),
+        ] {
+            // From CARGO_MANIFEST_DIR, never the CWD: a test binary can be run
+            // from anywhere.
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {file}: {e}"));
+            let start = text
+                .find(item)
+                .unwrap_or_else(|| panic!("{item} exists in {file}"));
+            // A top-level fn body ends at the first unindented closing brace.
+            let end = text[start..]
+                .find("\n}\n")
+                .map(|i| start + i)
+                .unwrap_or(text.len());
+            let body = &text[start..end];
+            let persisted = body
+                .find("persist_pairing(")
+                .unwrap_or_else(|| panic!("{item} persists a pairing"));
+            let retired = body
+                .find("retire_rejection_streaks_after_pairing(")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{item} in {file} must retire the old credential's rejection \
+                         streak after persisting a pairing, or a re-pair on \
+                         `dark(upstream_401)` is republished dark by the next pass"
+                    )
+                });
+            assert!(
+                retired > persisted,
+                "{item}: the retirement must come AFTER persist_pairing succeeds"
+            );
+        }
+    }
+
+    /// Plan `2026-09-13-coord-credential-posture-residuals` Phase 1.
+    ///
+    /// A box with NO `machine.json` (pin `Unresolvable`) and a stale orphan
+    /// bucket for a tenant that is neither a slot nor the default binding. The
+    /// pin used to be an ABORTING sweep input, so this box aborted on every pass
+    /// and the orphan pinned the posture dark forever. The writable set is now
+    /// the BEARER set (slots ∪ default) plus a spare-only pin, which no
+    /// machine-pin state can make UNKNOWN: the orphan is evicted, and the live
+    /// slot tenant's bucket, the default binding's bucket and the `""` bucket
+    /// are all spared.
+    #[test]
+    fn a_box_with_no_machine_json_evicts_an_orphan_and_spares_every_live_bucket() {
+        let _serialised = health_lock();
+        reset_posture();
+        let live_slot = tenant(3);
+        let default_binding = tenant(4);
+        let orphan = tenant(5);
+        for t in [Some(live_slot), Some(default_binding), Some(orphan), None] {
+            for _ in 0..UPSTREAM_DARK_THRESHOLD {
+                note_coord_upstream_verdict(t, true, 401, br#"{"code":"token_revoked"}"#);
+            }
+        }
+
+        let writable = resolve_writable_slot_keys(
+            Some(&[live_slot]),
+            crate::auth::BindingTenantRead::Bound(default_binding),
+            crate::session::tenant_pin::TenantPin::Unresolvable,
+        );
+        assert!(
+            matches!(writable, WritableSlotKeys::Measured(_)),
+            "an unresolvable pin must not abort the sweep: {writable:?}"
+        );
+        sweep_unwritable_upstream_buckets(writable);
+
+        assert_eq!(
+            upstream_signal_for(Some(&orphan.to_string())).consecutive_rejections,
+            0,
+            "the orphan is retired — no bearer can ever be presented for it again"
+        );
+        for t in [live_slot, default_binding] {
+            assert_eq!(
+                upstream_signal_for(Some(&t.to_string())).consecutive_rejections,
+                UPSTREAM_DARK_THRESHOLD,
+                "a tenant that still has a bearer keeps its evidence"
+            );
+        }
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "the DEFAULT key is never evicted"
+        );
+        reset_posture();
+    }
+
+    /// Phase 2: the pure composition over already-read inputs keeps the slot
+    /// store's `Err` as UNKNOWN for the sweep.
+    #[test]
+    fn composed_sweep_inputs_keep_an_unreadable_slot_store_unknown() {
+        let a = tenant(0);
+        let unreadable = SweepInputs {
+            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
+            default_binding: crate::auth::BindingTenantRead::Bound(a),
+            machine_pin: crate::session::tenant_pin::TenantPin::Pinned(a),
+        };
+        assert!(matches!(
+            writable_slot_keys_from(&unreadable),
+            WritableSlotKeys::Unknown(_)
+        ));
+        let readable = SweepInputs {
+            tenant_slots: Ok(vec![a]),
+            default_binding: crate::auth::BindingTenantRead::Unbound,
+            machine_pin: crate::session::tenant_pin::TenantPin::Unresolvable,
+        };
+        assert_eq!(
+            writable_slot_keys_from(&readable),
+            WritableSlotKeys::Measured([a.to_string()].into_iter().collect())
+        );
+    }
+
+    /// Phase 2 WIRING, through the production reads: [`read_sweep_inputs`]
+    /// against a real secure-storage directory holding one tenant slot and a
+    /// real `paired_user.json` naming a different default — first with NO
+    /// `machine.json` at all, then with one that pins a third tenant. Rewiring
+    /// the read onto another store, collapsing it, dropping the pin read, or
+    /// making a missing `machine.json` abort fails here, where the pure tests
+    /// above cannot notice.
+    #[test]
+    fn read_sweep_inputs_measures_the_bearer_set_from_disk_without_machine_json() {
+        use crate::session::tenant_pin::TenantPin;
+        let slot = tenant(1);
+        let default_binding = tenant(2);
+        let pinned = tenant(3);
+        // The ambient fixture is released before anything else is locked, so
+        // this test never holds the env lock and the posture lock together.
+        let (unpinned_inputs, pinned_inputs) = {
+            let amb = crate::test_env::isolated_ambient();
+            assert!(
+                !amb.machine_json_path().exists(),
+                "the fixture must start with no machine.json"
+            );
+            std::fs::write(
+                amb.dir().join("paired_user.json"),
+                format!(r#"{{"default_tenant_id":"{default_binding}"}}"#),
+            )
+            .expect("write paired_user.json");
+            let am = crate::auth::AuthManager::new();
+            am.store_tenant_device_jwt(&slot, "jwt.for.slot")
+                .expect("store a tenant slot");
+            let without_machine_json = read_sweep_inputs(&am);
+            amb.write_active_tenant_id(pinned);
+            (without_machine_json, read_sweep_inputs(&am))
+        };
+
+        assert_eq!(
+            unpinned_inputs.default_binding,
+            crate::auth::BindingTenantRead::Bound(default_binding)
+        );
+        assert_eq!(
+            unpinned_inputs.tenant_slots.as_ref().ok().cloned(),
+            Some(vec![slot])
+        );
+        assert_eq!(unpinned_inputs.machine_pin, TenantPin::Unresolvable);
+        assert_eq!(
+            writable_slot_keys_from(&unpinned_inputs),
+            WritableSlotKeys::Measured(
+                [slot.to_string(), default_binding.to_string()]
+                    .into_iter()
+                    .collect()
+            ),
+            "a missing machine.json neither aborts nor adds a key"
+        );
+
+        assert_eq!(pinned_inputs.machine_pin, TenantPin::Pinned(pinned));
+        assert_eq!(
+            writable_slot_keys_from(&pinned_inputs),
+            WritableSlotKeys::Measured(
+                [
+                    slot.to_string(),
+                    default_binding.to_string(),
+                    pinned.to_string()
+                ]
+                .into_iter()
+                .collect()
+            ),
+            "the pinned tenant is spared"
+        );
+    }
+
+    /// Review W1. "Sign in to re-pair" on `dark(upstream_401)` persists a fresh
+    /// pairing, but the streak recorded against the OLD credential survived
+    /// it: the next pass observed a fresh slot, rung 5 re-read the stale streak
+    /// and republished `dark`. The post-pairing retirement is what lets the
+    /// posture heal.
+    #[test]
+    fn a_fresh_pairing_retires_the_stale_rejection_streak_so_the_posture_heals() {
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let t = tenant(2);
+        let slots = [SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        }];
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(t), true, 401, br#"{"code":"token_revoked"}"#);
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        assert_eq!(
+            derive_and_publish_posture(&slots, now).map(|x| x.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "coord refused the old credential, so the box is dark before the sign-in"
+        );
+
+        // The sign-in persisted t's slot, and t is the default (legacy slot too).
+        retire_rejection_streaks_after_pairing(t, Some(t));
+
+        derive_and_publish_posture(&slots, now + 60);
+        let published = coord_credential_posture().expect("published");
+        assert!(
+            published.posture.can_answer(),
+            "a freshly paired credential must not be held dark by the old \
+             credential's streak, got {:?}",
+            published.posture
+        );
+        reset_posture();
+    }
+
+    /// The DEFAULT bucket is spent only when the pairing's credential also
+    /// landed in the legacy slot — i.e. the paired tenant is the default. A
+    /// pairing for a non-default tenant leaves the legacy slot holding the
+    /// other default's credential, whose evidence is still live.
+    #[test]
+    fn a_fresh_pairing_retires_the_default_bucket_only_when_it_is_the_default() {
+        let _serialised = health_lock();
+        reset_posture();
+        let paired = tenant(2);
+        let other_default = tenant(3);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(paired), true, 401, br#"{"code":"token_revoked"}"#);
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+        }
+
+        retire_rejection_streaks_after_pairing(paired, Some(other_default));
+        assert_eq!(
+            upstream_signal_for(Some(&paired.to_string())).consecutive_rejections,
+            0
+        );
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "the legacy slot still holds the OTHER default's credential"
+        );
+
+        retire_rejection_streaks_after_pairing(paired, None);
+        assert_eq!(
+            upstream_signal_for(None).consecutive_rejections,
+            UPSTREAM_DARK_THRESHOLD,
+            "an unreadable default is not proof the legacy slot was replaced"
+        );
+
+        retire_rejection_streaks_after_pairing(paired, Some(paired));
+        assert_eq!(upstream_signal_for(None).consecutive_rejections, 0);
+        reset_posture();
     }
 
     /// The `paired_user.json` read, against a REAL tempdir: an absent file is

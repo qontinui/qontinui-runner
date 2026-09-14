@@ -529,13 +529,9 @@ async fn provision(
     let tool_dirs = super::tools::provision(root, &manifest.tools, &mut log).await?;
 
     let dispatch_root = super::checkout::ci_dispatch_root(root, &payload.dispatch_id);
-    let worktree_dir_name = worktree
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
     super::sibling::provision(
         &dispatch_root,
-        &worktree_dir_name,
+        worktree,
         &manifest.siblings,
         &payload.repo,
         payload.pr_number,

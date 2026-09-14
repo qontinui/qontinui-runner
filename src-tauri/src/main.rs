@@ -23,6 +23,11 @@ mod agent_claims;
 // user's own commands.
 mod agent_commands;
 mod agent_daemons;
+// Resolution of the SKILLS provisioned into a spawned session's
+// `.claude/skills/` — `fresh fetch -> disk cache -> embedded default`, the
+// exact sibling of `agent_commands`. Named `agent_skills`, never `skills`:
+// `crate::skills` is the automation-template registry.
+mod agent_skills;
 // One process-wide pooled `reqwest::Client` for the per-agent coord
 // daemons. Replaces per-request `Client::new()` on the tick paths, which
 // reuses no connection and burned the machine's whole ephemeral port

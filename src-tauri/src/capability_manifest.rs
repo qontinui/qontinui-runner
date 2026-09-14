@@ -57,6 +57,7 @@
 //! |---|---|---|
 //! | `WorkspaceRootKind` (`Declared`/`Discovered`/`HomeDefault`/`Unresolved`) | `qontinui_types::paths` | [`impl From<WorkspaceRootKind> for Rung`](#impl-From<WorkspaceRootKind>-for-Rung) |
 //! | `CommandSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_commands`] | [`impl From<CommandSource> for Rung`](#impl-From<CommandSource>-for-Rung) |
+//! | `AgentSkillSource` (`Builtin`/`Served`/`DiskCache`) | [`crate::agent_skills`] | [`Rung::from_agent_skill_source`] |
 //! | `SkillSource` (`Builtin`/`User`/`Community`/`Other`) | [`crate::skills`] | [`rung_for_skill_source`] |
 //! | `ProbeScopeKind` | [`crate::env_agent::collectors`] | *(scope of a toolchain probe, not an asset rung — deliberately NOT converted; see below)* |
 //! | `embedded_pg::db_arm()` → `/health` `database.arm` | [`crate::embedded_pg`] | *(cited as the shape precedent; the DB arm is not an asset rung)* |
@@ -466,6 +467,34 @@ impl Rung {
             CommandSource::DiskCache => (Rung::DiskCache, None),
         }
     }
+
+    /// The same one-to-one mapping for [`crate::agent_skills::AgentSkillSource`],
+    /// whose three variants are `CommandSource`'s three arms applied to the
+    /// SKILL corpus (`GET /api/v1/agent-text-units?kind=skill`, else
+    /// `agent-skills-cache.json`, else the `include_dir!` floor).
+    ///
+    /// A separate function rather than a shared generic because the two upstream
+    /// enums are separate types on purpose: `agent_skills` resolves a different
+    /// corpus over a different endpoint with a different cache file, and either
+    /// may be stale while the other is fresh. Exhaustive with no `_` arm, for
+    /// the same reason as above.
+    #[must_use]
+    pub fn from_agent_skill_source(source: crate::agent_skills::AgentSkillSource) -> Rung {
+        use crate::agent_skills::AgentSkillSource;
+        match source {
+            AgentSkillSource::Builtin => Rung::Embedded,
+            AgentSkillSource::Served => Rung::Served,
+            AgentSkillSource::DiskCache => Rung::DiskCache,
+        }
+    }
+}
+
+impl From<crate::agent_skills::AgentSkillSource> for Rung {
+    /// Map [`crate::agent_skills::AgentSkillSource`] into the manifest
+    /// vocabulary. See [`Rung::from_agent_skill_source`].
+    fn from(source: crate::agent_skills::AgentSkillSource) -> Rung {
+        Rung::from_agent_skill_source(source)
+    }
 }
 
 /// Map [`crate::skills::SkillSource`] into the manifest vocabulary.
@@ -652,12 +681,14 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
         description: "The agent SKILLS written into a spawned session's \
                       `<cwd>/.claude/skills/<name>/SKILL.md`. Embedded via \
                       `include_dir!` — a whole directory tree per skill, helper scripts \
-                      included. Embedded-only today: the served-override half of plan \
-                      2026-08-20-fleet-served-agent-skills is qontinui-web#1071, which \
-                      has not landed, so a `served` reading on this row would itself be \
-                      a finding.",
+                      included — and, since qontinui-web#1071 landed (2026-09-02), \
+                      optionally REPLACED by name from the account layer. This row is \
+                      about the WRITE, so it reports `embedded` whenever anything landed \
+                      and `unresolved` when nothing did; which layer supplied the bodies \
+                      is the separate `agent_skills_registry` row, exactly as \
+                      `fleet_commands` and `agent_commands_registry` are split.",
         expected_rungs: &[Rung::Embedded, Rung::Unresolved],
-        anchor: "fleet_skills::provision_fleet_skills_into over FLEET_SKILLS / embedded_skill_count",
+        anchor: "fleet_skills::provision_fleet_skills_into over agent_skills::resolve_registry",
     },
     CapabilitySpec {
         id: "fleet_agents",
@@ -701,6 +732,22 @@ pub const CAPABILITY_SPECS: &[CapabilitySpec] = &[
                       kind of verdict.",
         expected_rungs: &[Rung::Served, Rung::DiskCache, Rung::Embedded],
         anchor: "agent_commands::resolve_registry (fetch_overrides_blocking / read_cache_at / builtin)",
+    },
+    CapabilitySpec {
+        id: "agent_skills_registry",
+        class: "served_registry",
+        description: "The account-versioned override registry for the agent SKILLS: fetch \
+                      `GET {base}/api/v1/agent-text-units?kind=skill&invocable_only=true`, \
+                      else the on-disk `agent-skills-cache.json`, else the `include_dir!` \
+                      floor. The sibling of `agent_commands_registry`, and the row that \
+                      says whether the embedded skill bundle is what a session actually \
+                      read: an `embedded` reading on a signed-in device means the served \
+                      half did not answer, which is precisely the state a drifted bundle \
+                      is invisible in. Skill units carry a `files` MAP rather than one \
+                      body, so a multi-file skill is one row — the property that made this \
+                      layer possible at all.",
+        expected_rungs: &[Rung::Served, Rung::DiskCache, Rung::Embedded],
+        anchor: "agent_skills::resolve_registry (fetch_skills_blocking / read_cache_at / embedded_skills)",
     },
     CapabilitySpec {
         id: "slash_commands",
@@ -880,6 +927,17 @@ pub enum SkipReason {
     /// workspace root, no sibling checkout, no source directory. The
     /// checkout-bound case a published install hits by default.
     Unresolved(String),
+    /// The unit RESOLVED but was REFUSED by the provisioner's own validation —
+    /// an unsafe name, a `files` key that is not a safe relative path, or any
+    /// other rule the layer that joins the path enforces a second time.
+    ///
+    /// Distinct from [`SkipReason::WriteFailed`] on purpose: a write that
+    /// failed is a fact about this machine, while a refusal is a fact about the
+    /// CONTENT — and content arrives from the account layer, so conflating the
+    /// two would hide a hostile or malformed served unit inside the disk-error
+    /// bucket. Nothing here is an error value: the pass continues and the spawn
+    /// proceeds, the session simply lacks that skill.
+    Rejected(String),
 }
 
 impl SkipReason {
@@ -890,6 +948,7 @@ impl SkipReason {
             SkipReason::GitTracked => "git_tracked",
             SkipReason::WriteFailed(_) => "write_failed",
             SkipReason::Unresolved(_) => "unresolved",
+            SkipReason::Rejected(_) => "rejected",
         }
     }
 
@@ -902,6 +961,7 @@ impl SkipReason {
             }
             SkipReason::WriteFailed(why) => format!("write failed: {why}"),
             SkipReason::Unresolved(why) => format!("source rung did not resolve: {why}"),
+            SkipReason::Rejected(why) => format!("refused by validation: {why}"),
         }
     }
 }
@@ -1269,6 +1329,8 @@ pub struct ManifestInputs {
     pub agent_definitions: Option<CapabilityObservation>,
     /// `agent_commands_registry` — observed by [`crate::agent_commands`].
     pub agent_commands_registry: Option<CapabilityObservation>,
+    /// `agent_skills_registry` — observed by [`crate::agent_skills`].
+    pub agent_skills_registry: Option<CapabilityObservation>,
     /// `slash_commands` — observed by [`crate::slash_commands`].
     pub slash_commands: Option<CapabilityObservation>,
 }
@@ -1295,6 +1357,7 @@ impl ManifestInputs {
             fleet_agents: None,
             agent_definitions: None,
             agent_commands_registry: None,
+            agent_skills_registry: None,
             slash_commands: None,
         }
     }
@@ -1319,6 +1382,7 @@ impl ManifestInputs {
         inputs.fleet_agents = latest_observation("fleet_agents");
         inputs.agent_definitions = latest_observation("agent_definitions");
         inputs.agent_commands_registry = latest_observation("agent_commands_registry");
+        inputs.agent_skills_registry = latest_observation("agent_skills_registry");
         inputs.slash_commands = latest_observation("slash_commands");
         inputs
     }
@@ -1381,6 +1445,7 @@ impl ManifestInputs {
             "fleet_agents" => self.fleet_agents.as_ref(),
             "agent_definitions" => self.agent_definitions.as_ref(),
             "agent_commands_registry" => self.agent_commands_registry.as_ref(),
+            "agent_skills_registry" => self.agent_skills_registry.as_ref(),
             "slash_commands" => self.slash_commands.as_ref(),
             _ => None,
         }
@@ -1400,6 +1465,7 @@ impl ManifestInputs {
                 | "fleet_agents"
                 | "agent_definitions"
                 | "agent_commands_registry"
+                | "agent_skills_registry"
                 | "slash_commands"
         )
     }
@@ -1761,6 +1827,7 @@ mod tests {
             fleet_agents: None,
             agent_definitions: None,
             agent_commands_registry: None,
+            agent_skills_registry: None,
             slash_commands: None,
         }
     }
@@ -2326,6 +2393,7 @@ mod tests {
                 "fleet_agents",
                 "agent_definitions",
                 "agent_commands_registry",
+                "agent_skills_registry",
                 "slash_commands",
             ]
         );
@@ -2708,7 +2776,7 @@ mod tests {
         }
 
         // Everything the driver cannot observe from here stays `unknown` AND
-        // names its anchor. With an empty ledger that is the other six rows;
+        // names its anchor. With an empty ledger that is the other seven rows;
         // nothing outside this module's own tests records them, so they are
         // deterministic.
         for id in [
@@ -2717,6 +2785,7 @@ mod tests {
             "fleet_agents",
             "agent_definitions",
             "agent_commands_registry",
+            "agent_skills_registry",
             "slash_commands",
         ] {
             let row = manifest.row(id).expect("row present");
