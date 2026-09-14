@@ -5047,7 +5047,10 @@ pub(crate) mod teardown_poison_tests {
             let _guard = RecordOnDrop(&map);
             panic!("simulated teardown panic");
         }));
-        assert!(result.is_err(), "the panic propagates; the drop did not abort");
+        assert!(
+            result.is_err(),
+            "the panic propagates; the drop did not abort"
+        );
         assert!(
             map.lock()
                 .unwrap_or_else(|p| p.into_inner())
