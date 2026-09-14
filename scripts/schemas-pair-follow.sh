@@ -52,7 +52,7 @@
 #     Verify the bundle against the TRUSTED plan item, re-read the PR and its
 #     claims, and push with --force-with-lease. Print RESULT=.
 #
-# Exit codes: 0 = a named outcome (FOLLOW / MERGE_ONLY / SKIP / ABORT / PUSHED);
+# Exit codes: 0 = a named outcome (FOLLOW / MERGE_ONLY / SKIP / ABORT / PUSHED / REFUSED);
 #             3 = UNKNOWN or refused (the lane goes red); 2 = usage.
 #
 # ENV
@@ -77,6 +77,8 @@ COORD="${SPF_COORD_URL:-https://coord.qontinui.io}"
 # and strips waiting-side dep labels (DepLabelStripHook).
 COORD_BOT="qontinui-merge-orchestrator[bot]"
 TRAILER_KEY="Schemas-Pair-Follow"
+# Posted once when a follow needs a human (a lock change pair-follow will not make).
+refused_marker() { printf '<!-- schemas-pair-follow:refused a=%s -->' "$1"; }
 BOT_NAME="github-actions[bot]"
 BOT_EMAIL="41898283+github-actions[bot]@users.noreply.github.com"
 
@@ -344,6 +346,15 @@ cmd_decide() {
   if ! held="$(first_held_claim "$m" "$head_ref")"; then unknown "claim read unknown"; return; fi
   if [ -n "$held" ]; then skip "live-claim:$held"; return; fi
 
+  # Already refused for this same land commit and handed to a human: do not
+  # recompute and re-refuse every cycle (that would red the lane forever).
+  local pr_comments
+  pr_comments="$(gh_get "repos/$RUNNER/issues/$m/comments?per_page=100")" || { unknown "read $RUNNER#$m comments failed"; return; }
+  if jq -r --arg bot "$BOT_NAME" '.[] | select(.user.login == $bot) | .body' <<<"$pr_comments" | grep -qF "$(refused_marker "$a")"; then
+    skip refused-awaiting-human
+    return
+  fi
+
   action=FOLLOW
   reason="$SCHEMAS#$n landed as ${a:0:9}"
   emit
@@ -592,7 +603,10 @@ cmd_push() {
       cmp -s "$t/want" "$t/got" || { rm -rf "$t"; err "patch-scope: pin commit $c does not set the pin to exactly $a"; exit 3; }
       rm -rf "$t"
       local why
-      why="$(lock_ok "$prev" "$c")" || { err "patch-scope: $why"; exit 3; }
+      if ! why="$(lock_ok "$prev" "$c")"; then
+        refuse_for_human "$m" "$n" "$a" "$why"
+        return 0
+      fi
       git log -1 --format=%B "$c" | grep -qx "$TRAILER_KEY: $SCHEMAS#$n" ||
         { err "patch-scope: pin commit $c lacks the $TRAILER_KEY trailer"; exit 3; }
       pins=$((pins + 1))
@@ -669,6 +683,22 @@ cmd_push() {
   gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow: \`qontinui/qontinui-schemas#$n\` landed, and this PR adapts to it. Its merge-candidate build compiles the commit pinned in \`.github/sibling-pins.conf\`, not this PR's declaration, so the pin (and \`Cargo.lock\`) were moved to the land commit \`${a:0:9}\` in \`${new:0:9}\` (mode $mode, on top of \`${head:0:9}\`). Plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.7; kill switch: repository variable SCHEMAS_PAIR_FOLLOW=off." ||
     err "comment failed (the push itself succeeded)"
   echo "RESULT=PUSHED $new"
+}
+
+# refuse_for_human M N A WHY -> the follow needs a Cargo.lock change pair-follow
+# will not make (a registry entry moved: the partner changed a schemas crate's
+# dependencies). Tell the PR ONCE with a marker `decide` honours, and end with
+# a named outcome rather than red, so one such PR cannot red the lane every cycle.
+refuse_for_human() {
+  local m="$1" n="$2" a="$3" why="$4" marker comments
+  marker="$(refused_marker "$a")"
+  comments="$(gh_get "repos/$RUNNER/issues/$m/comments?per_page=100")" || { err "read $RUNNER#$m comments failed"; exit 3; }
+  if ! jq -r '.[].body' <<<"$comments" | grep -qF "$marker"; then
+    gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow could not finish this PR by itself. \`qontinui/qontinui-schemas#$n\` landed as \`${a:0:9}\`, and moving this PR's pin there needs a \`Cargo.lock\` change pair-follow is not allowed to make: $why. Please move the pin in \`.github/sibling-pins.conf\` to \`$a\` and refresh \`Cargo.lock\` in the same commit (\`cargo metadata --format-version 1\` with that schemas commit checked out beside the runner). $marker" ||
+      { err "could not post the refusal comment"; exit 3; }
+  fi
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::warning::#$m needs a human: $why"; fi
+  echo "RESULT=REFUSED lock-registry-change"
 }
 
 # restore_labels M LABEL... -> put back labels removed before a push that did not land.
