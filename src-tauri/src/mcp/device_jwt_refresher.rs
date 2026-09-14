@@ -1896,7 +1896,9 @@ pub(crate) fn orphan_warning_latched(key: &str) -> bool {
 /// `published` says which arm the pass took: `true` when this orphan IS the
 /// published nameless `dark`, `false` when a per-slot or pinned verdict that is
 /// already non-answering won the publish and the orphan would otherwise be
-/// silent.
+/// silent. One latch serves both arms: a key first logged as NOT published
+/// stays latched if it later becomes the published nameless `dark`, so the log
+/// names each key once per episode rather than once per arm.
 fn warn_unclaimed_orphan(orphan_key: &str, orphan_signal: &UpstreamSignal, published: bool) {
     if !latch_orphan_warning(orphan_key) {
         return;
@@ -7761,24 +7763,23 @@ mod tenant_slot_refresh_tests {
             machine_pin: TenantPin::Pinned(pinned),
             default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
         };
-        let real_now = chrono::Utc::now().timestamp();
-        for (label, streak, eval_now, expected) in [
+        for (label, streak, stale, expected) in [
             (
                 "stale streak at the threshold",
                 UPSTREAM_DARK_THRESHOLD,
-                real_now + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1,
+                true,
                 CoordCredentialPosture::Absent,
             ),
             (
                 "fresh streak one short of the threshold",
                 UPSTREAM_DARK_THRESHOLD - 1,
-                real_now,
+                false,
                 CoordCredentialPosture::Absent,
             ),
             (
                 "fresh streak exactly at the threshold",
                 UPSTREAM_DARK_THRESHOLD,
-                real_now,
+                false,
                 CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
             ),
         ] {
@@ -7791,6 +7792,16 @@ mod tenant_slot_refresh_tests {
                     br#"{"code":"token_revoked"}"#,
                 );
             }
+            // Read the clock AFTER the rejections are stamped: every stamp is
+            // then <= `recorded`, so the stale case is strictly past the bound
+            // (and the fresh cases never read a negative age) however the
+            // second boundary falls.
+            let recorded = chrono::Utc::now().timestamp();
+            let eval_now = if stale {
+                recorded + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1
+            } else {
+                recorded
+            };
             assert_eq!(
                 derive_and_publish_posture(&[live_slot(other_slot, eval_now)], pins, eval_now)
                     .map(|t| t.to),
