@@ -58,10 +58,10 @@ The agent command procedures written into a spawned session's `<cwd>/.claude/com
 
 ### 5. `fleet_skills`
 
-The agent SKILLS written into a spawned session's `<cwd>/.claude/skills/<name>/SKILL.md`. Embedded via `include_dir!` — a whole directory tree per skill, helper scripts included. Embedded-only today: the served-override half of plan 2026-08-20-fleet-served-agent-skills is qontinui-web#1071, which has not landed, so a `served` reading on this row would itself be a finding.
+The agent SKILLS written into a spawned session's `<cwd>/.claude/skills/<name>/SKILL.md`. Embedded via `include_dir!` — a whole directory tree per skill, helper scripts included — and, since qontinui-web#1071 landed (2026-09-02), optionally REPLACED by name from the account layer. This row is about the WRITE, so it reports `embedded` whenever anything landed and `unresolved` when nothing did; which layer supplied the bodies is the separate `agent_skills_registry` row, exactly as `fleet_commands` and `agent_commands_registry` are split.
 
 - Class: `session_provisioning`
-- Resolved by: `fleet_skills::provision_fleet_skills_into over FLEET_SKILLS / embedded_skill_count`
+- Resolved by: `fleet_skills::provision_fleet_skills_into over agent_skills::resolve_registry`
 - Expected rungs: embedded, unresolved
 
 ### 6. `fleet_agents`
@@ -88,7 +88,15 @@ The account-versioned override registry for the agent command procedures: fetch 
 - Resolved by: `agent_commands::resolve_registry (fetch_overrides_blocking / read_cache_at / builtin)`
 - Expected rungs: served, disk_cache, embedded
 
-### 9. `slash_commands`
+### 9. `agent_skills_registry`
+
+The account-versioned override registry for the agent SKILLS: fetch `GET {base}/api/v1/agent-text-units?kind=skill&invocable_only=true`, else the on-disk `agent-skills-cache.json`, else the `include_dir!` floor. The sibling of `agent_commands_registry`, and the row that says whether the embedded skill bundle is what a session actually read: an `embedded` reading on a signed-in device means the served half did not answer, which is precisely the state a drifted bundle is invisible in. Skill units carry a `files` MAP rather than one body, so a multi-file skill is one row — the property that made this layer possible at all.
+
+- Class: `served_registry`
+- Resolved by: `agent_skills::resolve_registry (fetch_skills_blocking / read_cache_at / embedded_skills)`
+- Expected rungs: served, disk_cache, embedded
+
+### 10. `slash_commands`
 
 Import of `<workspace-root>/qontinui-claude-config/.claude/commands/*.md` as runner workflows. Purely a sibling-checkout scan with no embedded or bundled fallback of any kind, so on any device without that repo it returns `Err` and the workflows simply do not exist. The clearest instance of the class in the roster: it is not that this degrades on a published install, it is that it cannot run at all there.
 
