@@ -5665,22 +5665,48 @@ pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecis
 /// hiccup away from presenting tenant A's credential. An unresolved measurement
 /// renders as unresolved (the same rule `/health`'s `activeTenantPin` follows),
 /// never as the default (review W2, 2026-09-19).
+///
+/// It refuses with the same [`tenant_unresolvable_error`] the `Unresolvable`
+/// arm of [`resolve_session_tenant`] returns — see [`session_selection_from_join`].
 pub(crate) async fn session_bearer_and_tenant_or_refuse(
     nonce: Option<String>,
 ) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
-    match spawn_blocking_tracked(move || {
-        session_tenant_or_refuse(nonce.as_deref())
-            .map(|t| (t, crate::auth::device_bearer_for(t.as_ref())))
-    })
-    .await
-    {
+    session_selection_from_join(
+        spawn_blocking_tracked(move || {
+            session_tenant_or_refuse(nonce.as_deref())
+                .map(|t| (t, crate::auth::device_bearer_for(t.as_ref())))
+        })
+        .await,
+    )
+}
+
+/// The join-result half of [`session_bearer_and_tenant_or_refuse`], pure so the
+/// refusal is unit-testable with a real [`tokio::task::JoinError`].
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (a). A join
+/// failure used to degrade to `Ok((None, None))`, "rather than manufacturing a
+/// refusal out of an executor hiccup". That tuple is not neutral: `None` is
+/// the TENANT, and every caller hands it to `await_device_jwt_remint_for` on
+/// the bearer-miss arm, where `device_bearer_for(None)` selects the default /
+/// legacy slot. So a non-default-pinned session whose selection panicked
+/// presented ANOTHER tenant's credential — the cross-tenant shape the whole
+/// fail-closed rule exists to remove.
+///
+/// Refuse instead of retrying the blocking read. Deciding priority:
+/// **robustness** — a panic in that read is not transient evidence, and "no
+/// tenant was resolved" is exactly what a join failure means.
+fn session_selection_from_join(
+    joined: Result<Result<(Option<Uuid>, Option<String>), (u16, String)>, tokio::task::JoinError>,
+) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
+    match joined {
         Ok(res) => res,
-        Err(e) => Err((
-            503,
-            format!(
-                "tenant resolution did not complete (blocking task failed: {e}); refusing rather than falling back to the machine's default credential slot"
-            ),
-        )),
+        Err(e) => {
+            warn!(
+                "coord_mcp: REFUSING proxy request — the blocking tenant/bearer selection \
+                 did not complete ({e}); no tenant was resolved, so no bearer is presented"
+            );
+            Err(tenant_unresolvable_error())
+        }
     }
 }
 
@@ -5751,6 +5777,59 @@ mod session_tenant_resolution_tests {
             legacy_slot: Ok(true),
         };
         move |t| spawn_tenant_admission(t, &held)
+    }
+
+    /// Phase 3 (a) of `2026-09-14-credential-posture-second-residuals`. A
+    /// PANICKING blocking selection yields a real `JoinError`, and that must
+    /// refuse with the tenant-unresolvable error. The old `Ok((None, None))`
+    /// handed callers a `None` tenant, which the bearer-miss arm turns into the
+    /// default slot's credential: another tenant's bearer for a pinned session.
+    #[tokio::test]
+    async fn a_panicked_selection_refuses_rather_than_selecting_the_default_slot() {
+        type Selection = Result<(Option<Uuid>, Option<String>), (u16, String)>;
+        let joined = spawn_blocking_tracked(|| -> Selection {
+            panic!("injected: the blocking tenant/bearer selection panicked")
+        })
+        .await;
+        assert!(
+            joined.is_err(),
+            "the injected panic must surface as a JoinError"
+        );
+        assert_eq!(
+            session_selection_from_join(joined),
+            Err(tenant_unresolvable_error()),
+            "a join failure resolved no tenant, so it must refuse, never Ok((None, None))"
+        );
+
+        // A completed selection passes through unchanged, refusal or not.
+        let t = tenant(0xD4);
+        let ok: Selection = Ok((Some(t), Some("bearer".to_string())));
+        assert_eq!(session_selection_from_join(Ok(ok.clone())), ok);
+        let refused: Selection = Err(tenant_unresolvable_error());
+        assert_eq!(session_selection_from_join(Ok(refused.clone())), refused);
+
+        // Wiring: the async door the four `mcp_api` sites call routes its join
+        // result through the mapping. Comment lines are dropped first, so a
+        // needle left in a comment cannot satisfy it.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
+        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        let start = text
+            .find("async fn session_bearer_and_tenant_or_refuse(")
+            .expect("session_bearer_and_tenant_or_refuse exists");
+        let end = text[start..]
+            .find("\n}\n")
+            .map(|i| start + i)
+            .expect("its body ends");
+        let code: String = text[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("session_selection_from_join("),
+            "session_bearer_and_tenant_or_refuse must map its JoinError through \
+             session_selection_from_join"
+        );
     }
 
     /// A `Pinned` binding NAMES the session's own tenant, and keeps naming it
