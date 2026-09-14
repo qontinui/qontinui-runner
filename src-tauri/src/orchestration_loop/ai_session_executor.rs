@@ -212,7 +212,7 @@ pub async fn dispatch_subtask(
     pg: &Arc<crate::database::pg::PgDb>,
     run_id: Uuid,
     subtask: &Subtask,
-) -> Result<Uuid, String> {
+) -> Result<Uuid, super::conductor::DispatchError> {
     let task_run_id = Uuid::new_v4();
     info!(
         "dispatch_subtask: run={} task_id={} -> task_run_id={} (repo={:?})",
@@ -311,7 +311,7 @@ pub async fn dispatch_subtask(
                     subtask.task_id
                 );
             }
-            return Err(refusal);
+            return Err(refusal.into());
         }
         crate::agent_authorization::FanoutAdmission::SlotUnavailable { bound, waited, .. } => {
             // TRANSIENT, deliberately unlike the refusal above: the bound is
@@ -325,18 +325,19 @@ pub async fn dispatch_subtask(
                  tick retries.",
                 subtask.task_id,
                 waited.as_millis()
-            ));
+            )
+            .into());
         }
         crate::agent_authorization::FanoutAdmission::DeferredByDrain { reason } => {
             // TRANSIENT, like the bound above: coord has drained this device (or
             // its drain state is unknown). The subtask stays `Submitted` — the
             // work is deferred, never failed — and a later tick dispatches it
-            // once the drain lifts.
-            return Err(format!(
+            // once the drain lifts. Typed so the conductor logs it quietly.
+            return Err(super::conductor::DispatchError::DeferredByDrain(format!(
                 "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask stays \
                  queued and a later tick retries.",
                 subtask.task_id
-            ));
+            )));
         }
     };
 

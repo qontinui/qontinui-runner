@@ -244,7 +244,7 @@ pub async fn create_terminal_handler(
     // while the device is drained (or its drain state is unknown) the door
     // answers 409 before allocating anything. The runner UI's own "new
     // terminal" is the `terminal_create` Tauri command, which is never deferred.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Unknown,
             &format!(
@@ -254,7 +254,10 @@ pub async fn create_terminal_handler(
         )
     {
         warn!("HTTP: refusing terminal create — {reason}");
-        return Err((StatusCode::CONFLICT, Json(api_error(reason))));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
     }
 
     // The other half of D6: a `workingDir` the runner cannot use must come

@@ -599,11 +599,14 @@ async fn start_steward(
     // Coord device drain (D3). After validation, so a malformed body is still a
     // clean 400; before the start claim, so a deferral occupies nothing. The
     // deferral is counted on the draining banner, keyed by steward kind.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
         crate::coord_drain_state::drain_gate_for_work(origin, &format!("steward:{}", spec.kind))
     {
         warn!("HTTP: Not starting {} — {reason}", spec.skill);
-        return Err((StatusCode::CONFLICT, Json(api_error(reason))));
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::coord_drain_state::api_refusal(&reason, class)),
+        ));
     }
 
     // Claim the start slot BEFORE the running-check, and hold it for the rest

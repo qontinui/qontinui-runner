@@ -1511,7 +1511,7 @@ pub fn terminal_session_list_open(
     // set is withheld and the response says so. Nothing is closed or consumed;
     // the frontend re-runs the restore on `coord-drain-state-changed` once
     // autonomous spawns may run again.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::BootResume,
             "boot_resume:terminal_tabs",

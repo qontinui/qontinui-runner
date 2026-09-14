@@ -191,6 +191,26 @@ pub async fn resume_interrupted_workflows(
     pid_tracker: Arc<std::sync::Mutex<Vec<u32>>>,
     config: ResumeConfig,
 ) -> usize {
+    // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3): resuming interrupted workflows restarts AI work autonomously. Decide
+    // against a real drain read, then HOLD while the device is drained or its
+    // state is unknown — the interrupted rows are left exactly as they are and
+    // resume the moment autonomous spawns may run again.
+    crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::BootResume,
+            "boot_resume:workflows",
+        )
+    {
+        tracing::warn!("Startup workflow resume deferred — {reason}");
+        crate::coord_drain_state::wait_until_allowed(
+            crate::coord_drain_state::SpawnOrigin::BootResume,
+        )
+        .await;
+        tracing::info!("Startup workflow resume: the coord device drain lifted — resuming now");
+    }
+
     // Each runner instance only resumes tasks tagged with its own runner_port.
     // Different runners bind different ports, so this is the natural per-runner
     // exclusion: two restarting runners can't double-claim the same task.

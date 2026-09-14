@@ -9285,25 +9285,6 @@ pub fn create_router(
             resume_enabled: true, // Let the function check per-task auto_continue
         };
 
-        // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
-        // D3): resuming interrupted workflows restarts AI work autonomously, so
-        // it waits for a real drain read and then for the drain to lift. The
-        // interrupted rows are left exactly as they are meanwhile.
-        crate::coord_drain_state::await_boot_read(std::time::Duration::from_secs(15)).await;
-        if let crate::coord_drain_state::DrainGate::Defer { reason } =
-            crate::coord_drain_state::drain_gate_for_work(
-                crate::coord_drain_state::SpawnOrigin::BootResume,
-                "boot_resume:workflows",
-            )
-        {
-            warn!("Startup workflow resume deferred — {reason}");
-            crate::coord_drain_state::wait_until_allowed(
-                crate::coord_drain_state::SpawnOrigin::BootResume,
-            )
-            .await;
-            info!("Startup workflow resume: the coord device drain lifted — resuming now");
-        }
-
         let count = crate::unified_workflow_executor::resume_interrupted_workflows(
             state_for_resume.app_state.clone(),
             resume_config_storage,

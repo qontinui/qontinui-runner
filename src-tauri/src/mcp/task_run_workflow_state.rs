@@ -894,6 +894,19 @@ pub async fn resume_task_run(
 
     info!("Resume task run request: {}", id);
 
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`):
+    // an HTTP-shaped caller is autonomous (`unknown`), refused before the row is
+    // reopened. The routed door is `mcp/task_runs.rs`'s; this twin is gated the
+    // same way so no path to a workflow spawn stays ungated.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, class } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::Unknown,
+            &format!("resume_task_run:{id}"),
+        )
+    {
+        return Err((StatusCode::CONFLICT, format!("{}: {reason}", class.code())));
+    }
+
     // Get the task run
     let task_run = pg_get_task_run(&state, &id)
         .await

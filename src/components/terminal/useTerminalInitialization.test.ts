@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 import {
   fetchOpenRecords,
   fetchRestoreSet,
+  mayClaimRecordedZone,
   claimInitForPage,
   buildResumeCmd,
   runVerifiedResume,
@@ -765,5 +766,43 @@ describe("fetchRestoreSet — coord device drain", () => {
       data: { sessions: [], deferredByDrain: { reason: "x" } },
     });
     expect(await fetchOpenRecords("default")).toEqual([]);
+  });
+});
+
+describe("mayClaimRecordedZone — drain re-run merges with existing tabs", () => {
+  it("lets a first restore claim any recorded zone", () => {
+    expect(mayClaimRecordedZone(false, 2, "t-new", { 2: "t-operator" })).toBe(true);
+  });
+
+  it("never lets a drain re-run take a zone an operator tab holds", () => {
+    expect(mayClaimRecordedZone(true, 2, "t-new", { 2: "t-operator" })).toBe(false);
+    expect(mayClaimRecordedZone(true, 2, "t-new", {})).toBe(true);
+    expect(mayClaimRecordedZone(true, 2, "t-same", { 2: "t-same" })).toBe(true);
+  });
+
+  it("never claims an unzoned record", () => {
+    expect(mayClaimRecordedZone(false, -1, "t", {})).toBe(false);
+  });
+});
+
+describe("reportTreeReset — drain deferral", () => {
+  beforeEach(() => {
+    mockInvoke.mockReset();
+  });
+
+  it("reports the open-record count as unknown while the drain withholds the set", async () => {
+    mockInvoke.mockImplementation((cmd: unknown) =>
+      cmd === "terminal_session_list_open"
+        ? Promise.resolve({
+            success: true,
+            data: { sessions: [], deferredByDrain: { state: "drained", reason: "x" } },
+          })
+        : Promise.resolve({ success: true, message: null, data: null }),
+    );
+    await reportTreeReset({ mountNumber: 2, pageIds: ["default"] });
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "terminal_report_tree_reset",
+      expect.objectContaining({ mountNumber: 2, openRecordCount: undefined }),
+    );
   });
 });

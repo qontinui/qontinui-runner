@@ -4,6 +4,7 @@ import { getErrorMessage } from "@/lib/utils";
 import type { MainTabId } from "./tab-types";
 
 import type { TaskRun } from "@/types/aiData";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 interface UseRunLastWorkflowReturn {
   isRunningLastWorkflow: boolean;
@@ -58,10 +59,9 @@ export function useRunLastWorkflow(
       const workflow = workflows.find((w: { name: string }) => w.name === lastRun.workflow_name);
 
       if (workflow?.id) {
-        tracedFetch(`${getApiBase()}/unified-workflows/${workflow.id}/run`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+        invokeOperatorDoor("operator_run_unified_workflow", {
+          id: workflow.id,
+          request: {},
         }).catch((error) => {
           console.error("[APP] Failed to run workflow:", error);
         });
@@ -88,10 +88,8 @@ export function useRunLastWorkflow(
         }
 
         if (inlinePayload && inlinePayload.name === rawName) {
-          tracedFetch(`${getApiBase()}/unified-workflows/execute-inline`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(inlinePayload),
+          invokeOperatorDoor("operator_execute_inline_workflow", {
+            request: inlinePayload,
           }).catch((error) => {
             console.error("[APP] Failed to re-execute inline workflow:", error);
           });

@@ -215,6 +215,7 @@ pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
 pub mod mobile_settings; // Mobile settings (ADB path, device config)
 pub mod new_project; // New Project flow — GitHub provisioning + local scaffold (plan 2026-07-18)
 pub mod new_project_templates; // Embedded templates for the New Project flow
+pub mod operator_doors; // Operator twins of the HTTP spawn doors (drained-runner review round 1)
 pub mod orchestration_loop_configs; // Orchestration loop saved config CRUD
 pub mod otel_settings; // OpenTelemetry settings (endpoint, sampling, enable/disable)
 pub mod page_spec_store; // User-saved page specs (persist generated specs to app data dir)

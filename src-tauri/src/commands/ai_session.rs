@@ -1738,7 +1738,7 @@ pub async fn resume_ai_sessions(
     // deferral neither resumes a session nor marks one failed — the rows stay
     // `running`, and the boot task waits for the drain to lift and calls this
     // again.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::BootResume,
             "boot_resume:ai_sessions",

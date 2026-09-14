@@ -233,6 +233,9 @@ pub fn execute_review_subtask(
     );
 
     let exec_id = review_id.clone();
+    // Held, never discarded, while coord's device drain defers autonomous
+    // spawns (plan `2026-09-13-drained-runner-never-reaches-idle`).
+    let exec_id_for_hold = review_id.clone();
     let wf_name = review_name;
     let url_lock = Some(deps.app_state.url_lock_manager.clone());
     let file_registry = Some(deps.app_state.file_registry_manager.clone());
@@ -245,19 +248,23 @@ pub fn execute_review_subtask(
         file_registry,
         file_lock,
         deps.app_state.pg_db.clone(),
-        Box::pin(async move {
-            controller
-                .run(
-                    loop_config,
-                    Vec::new(), // setup automation steps
-                    Vec::new(), // setup prompt steps
-                    Vec::new(), // verification steps (review has none)
-                    Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
-                    Vec::new(), // completion automation steps
-                    Vec::new(), // completion prompt steps
-                )
-                .await
-        }),
+        Box::pin(crate::coord_drain_state::held_until_allowed(
+            crate::coord_drain_state::SpawnOrigin::Orchestration,
+            format!("review_subtask:{exec_id_for_hold}"),
+            async move {
+                controller
+                    .run(
+                        loop_config,
+                        Vec::new(), // setup automation steps
+                        Vec::new(), // setup prompt steps
+                        Vec::new(), // verification steps (review has none)
+                        Vec::new(), // agentic steps (prompt is in loop_config.base_prompt)
+                        Vec::new(), // completion automation steps
+                        Vec::new(), // completion prompt steps
+                    )
+                    .await
+            },
+        )),
     );
 
     tracing::info!("Review subtask '{}' spawned", review_id);

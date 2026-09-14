@@ -300,7 +300,7 @@ pub async fn run_task_now(
     State(_state): State<Arc<ApiState>>,
     Path(id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::scheduler_service::run_task_now(&id)
+    crate::scheduler_service::run_task_now(&id, crate::coord_drain_state::SpawnOrigin::Unknown)
         .await
         .map_err(|e| {
             (

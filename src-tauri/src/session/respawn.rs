@@ -615,7 +615,7 @@ async fn materialize(
     //    a drained device; this is defence in depth for a push that raced the
     //    drain. Checked before ANY work — no transcript fetch, no budget slot —
     //    so the pending row replays untouched once the drain lifts.
-    if let crate::coord_drain_state::DrainGate::Defer { reason } =
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
         crate::coord_drain_state::drain_gate_for_work(
             crate::coord_drain_state::SpawnOrigin::Respawn,
             &format!("respawn:{}", respawn.source_session_id),

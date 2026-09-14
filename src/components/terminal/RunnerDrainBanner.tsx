@@ -53,6 +53,9 @@ export function drainBannerModel(s: CoordDrainSnapshot | null): DrainBannerModel
       deferredLabel: deferredLabel(s.deferredCount),
     };
   }
+  // At boot the state is "not read yet" until the first drain read lands; that
+  // is not news, so the banner does not flash for it.
+  if (s.state === "unknown" && s.bootReadPending) return null;
   if (s.state === "unknown") {
     return {
       status: "error",

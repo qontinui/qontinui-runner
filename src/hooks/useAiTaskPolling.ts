@@ -10,6 +10,7 @@ import type { TaskRun, RunPromptRequest, RunPromptResponse } from "../types/task
 import { isTaskFinished } from "../types/taskRun";
 import { getApiBase, tracedFetch } from "@/lib/runner-api";
 import { useTaskRunProgress } from "@/hooks/graphql";
+import { invokeOperatorDoor } from "@/lib/operatorDoors";
 
 // Polling is now fallback only - GraphQL subscription is primary
 const DEFAULT_POLL_INTERVAL_MS = 15000; // Relaxed from 5s since subscription handles real-time
@@ -231,13 +232,12 @@ export function useAiTaskPolling(options: UseAiTaskPollingOptions = {}): UseAiTa
       setIsRunning(true);
 
       try {
-        const response = await tracedFetch(`${getApiBase()}/prompts/run`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(request),
+        // The runner UI starts prompts as an OPERATOR (the Tauri twin of
+        // POST /prompts/run), which coord's device drain never defers.
+        const reply = await invokeOperatorDoor<RunPromptResponse>("operator_run_prompt", {
+          request,
         });
-
-        const result: RunPromptResponse = await response.json();
+        const result: RunPromptResponse = reply.body;
 
         if (!result.success) {
           const errorMsg = result.error || "Failed to trigger AI analysis";
@@ -354,13 +354,11 @@ export async function executeAiTask(
   const { pollIntervalMs = DEFAULT_POLL_INTERVAL_MS, timeoutMs = DEFAULT_TIMEOUT_MS } = options;
 
   // Trigger the task
-  const triggerResponse = await tracedFetch(`${getApiBase()}/prompts/run`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request),
+  const triggerReply = await invokeOperatorDoor<RunPromptResponse>("operator_run_prompt", {
+    request,
   });
 
-  const result: RunPromptResponse = await triggerResponse.json();
+  const result: RunPromptResponse = triggerReply.body;
 
   if (!result.success) {
     throw new Error(result.error || "Failed to trigger AI analysis");
