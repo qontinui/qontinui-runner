@@ -504,6 +504,24 @@ pub(crate) struct CoordCredentialBag {
     pub tenant_id: Option<String>,
     /// Decoded `exp` of the credential the posture is about, unix seconds.
     pub exp: Option<i64>,
+    /// How old this report may get before a reader must stop trusting it:
+    /// [`COORD_CREDENTIAL_STALE_AFTER_PASSES`] × [`REFRESH_CHECK_INTERVAL`], in
+    /// seconds. Coord's status upsert replaces `details` wholesale and stamps
+    /// `updated_at`, so the row's age IS this bag's age — and a runner that went
+    /// offline while `ok: true` would otherwise read `live` forever. Declared
+    /// here, beside the cadence it is derived from, so the console keeps no
+    /// constant of its own (the fleet-health `sample_stale_after_secs` pattern).
+    pub stale_after_secs: u64,
+}
+
+/// How many refresher passes a published credential report outlives before it
+/// is stale. Three tolerates one skipped pass plus transient backoff jitter.
+const COORD_CREDENTIAL_STALE_AFTER_PASSES: u64 = 3;
+
+/// The staleness bound every published bag declares — see
+/// [`CoordCredentialBag::stale_after_secs`].
+fn coord_credential_stale_after_secs() -> u64 {
+    COORD_CREDENTIAL_STALE_AFTER_PASSES * REFRESH_CHECK_INTERVAL.as_secs()
 }
 
 /// Render unix seconds as the ISO-8601 string the bag's `since` must carry.
@@ -534,6 +552,7 @@ pub(crate) fn coord_credential_bag(
             since: iso8601(p.since),
             tenant_id: p.tenant_id.clone(),
             exp: p.exp,
+            stale_after_secs: coord_credential_stale_after_secs(),
         },
         None => CoordCredentialBag {
             ok: fallback.ok,
@@ -542,6 +561,7 @@ pub(crate) fn coord_credential_bag(
             since: iso8601(chrono::Utc::now().timestamp()),
             tenant_id: None,
             exp: None,
+            stale_after_secs: coord_credential_stale_after_secs(),
         },
     }
 }
@@ -1858,6 +1878,50 @@ fn clear_orphan_warning(key: &str) {
     });
 }
 
+/// Has the orphan warning for `key` been emitted (and not re-armed since)?
+#[cfg(test)]
+pub(crate) fn orphan_warning_latched(key: &str) -> bool {
+    with_orphan_warned(|s| s.contains(key))
+}
+
+/// Log, LATCHED per key, that coord is refusing a credential filed under a
+/// slot key no observation in this pass describes.
+///
+/// The KEY is the one actionable fact the published posture cannot carry (the
+/// unattributable arm withholds `tenant_id`; a non-answering slot or pin that
+/// wins the publish names a different tenant), so it goes to the log. Latched,
+/// because the condition holds across every pass and an unlatched line would
+/// repeat every five minutes forever. A tenant UUID, never a credential.
+///
+/// `published` says which arm the pass took: `true` when this orphan IS the
+/// published nameless `dark`, `false` when a per-slot or pinned verdict that is
+/// already non-answering won the publish and the orphan would otherwise be
+/// silent. One latch serves both arms: a key first logged as NOT published
+/// stays latched if it later becomes the published nameless `dark`, so the log
+/// names each key once per episode rather than once per arm.
+fn warn_unclaimed_orphan(orphan_key: &str, orphan_signal: &UpstreamSignal, published: bool) {
+    if !latch_orphan_warning(orphan_key) {
+        return;
+    }
+    let shown = if orphan_key.is_empty() {
+        "<default>"
+    } else {
+        orphan_key
+    };
+    let action = if published {
+        "publishing dark with no tenant"
+    } else {
+        "NOT published — a slot or the machine pin this pass observed is already \
+         non-answering and holds the posture — but coord is refusing this key too"
+    };
+    warn!(
+        "device_jwt_refresher: coord has refused the credential filed under slot key {:?} \
+         {} consecutive times, and NO slot this pass observed describes it — {action} \
+         (legacy-only install, a pin with no slot, or a slot this pass could not read)",
+        shown, orphan_signal.consecutive_rejections,
+    );
+}
+
 /// Drop every bucket that NOTHING CAN EVER WRITE AGAIN.
 ///
 /// A tenant-keyed bucket is only ever written by a forwarder that resolved
@@ -2049,6 +2113,85 @@ fn read_sweep_inputs(auth_manager: &crate::auth::AuthManager) -> SweepInputs {
     }
 }
 
+impl SweepInputs {
+    /// The half of these inputs the POSTURE reads, too — or
+    /// [`PosturePinInputs::UNPINNED`] when the slot store could not be read.
+    ///
+    /// An unreadable store takes the LEGACY arm (the branch choice collapses
+    /// `Err` to "no slots"), whose only observation is the `access_token` slot
+    /// with `tenant_id: None`. That observation can never name the pinned
+    /// tenant, so feeding the real pin through would call a pin `unserved` on a
+    /// multi-tenant box whose `device_jwt:<pin>` slot may be perfectly healthy —
+    /// one failed read publishes `absent(T)`, and the next good read fires
+    /// *"Coord access restored"*. An unreadable input is not evidence, so the
+    /// posture is derived from the observations alone, exactly as if no pin
+    /// existed. `UNPINNED` rather than a doctored `Unresolvable` pin because the
+    /// pin itself WAS read; what is missing is any measurement of whether a slot
+    /// serves it. A readable but EMPTY store (`Ok(vec![])`, a legacy-only
+    /// install) is a measured absence and keeps the real pins.
+    fn posture_pin_inputs(&self) -> PosturePinInputs {
+        if self.tenant_slots.is_err() {
+            return PosturePinInputs::UNPINNED;
+        }
+        PosturePinInputs {
+            machine_pin: self.machine_pin,
+            default_binding: self.default_binding,
+        }
+    }
+}
+
+/// What the posture needs to know about the tenant this machine ASKS for,
+/// beyond the slots a pass observed: `machine.json`'s pin and
+/// `paired_user.json`'s default binding, already read by
+/// [`read_sweep_inputs`] and passed in rather than re-read.
+///
+/// Without it, a pinned tenant whose slot was cleared BEFORE any rejection
+/// streak formed was observed by nothing and remembered by no bucket, so a
+/// healthy sibling slot published `live` and *"Coord access restored"* while
+/// every session pinned to that tenant was refused. See
+/// [`derive_and_publish_posture`]'s unserved-pin arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PosturePinInputs {
+    pub machine_pin: crate::session::tenant_pin::TenantPin,
+    pub default_binding: crate::auth::BindingTenantRead,
+}
+
+impl PosturePinInputs {
+    /// No pin: the posture is derived from the observations alone, exactly as
+    /// before the pin was an input. For callers (and tests) with no
+    /// `machine.json` to speak of.
+    pub(crate) const UNPINNED: Self = Self {
+        machine_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+        default_binding: crate::auth::BindingTenantRead::Unknown,
+    };
+
+    /// The tenant `machine.json` pins, iff that pin is POSITIVELY unserved by
+    /// this pass: no observation — an unreadable one included — names it, and
+    /// the default binding is MEASURED to be something else.
+    ///
+    /// Every unmeasured input abstains. `Unpinned`/`Unresolvable` name no
+    /// tenant; an unreadable binding might be the pin itself (a legacy-only
+    /// install serves its pinned default from the `access_token` slot, which no
+    /// tenant observation names); an unreadable slot might hold a working
+    /// credential. An unmeasured input is not evidence, and the unclaimed-bucket
+    /// rung still covers a pin with a streak.
+    fn unserved_pin(self, observations: &[SlotObservation]) -> Option<uuid::Uuid> {
+        let crate::session::tenant_pin::TenantPin::Pinned(pinned) = self.machine_pin else {
+            return None;
+        };
+        let binding_is_elsewhere = match self.default_binding {
+            crate::auth::BindingTenantRead::Bound(b) => b != pinned,
+            crate::auth::BindingTenantRead::Unbound => true,
+            crate::auth::BindingTenantRead::Unknown => false,
+        };
+        let key = pinned.to_string();
+        let observed = observations
+            .iter()
+            .any(|o| o.tenant_id.as_deref() == Some(key.as_str()));
+        (binding_is_elsewhere && !observed).then_some(pinned)
+    }
+}
+
 /// Pure: compose already-read [`SweepInputs`] into the writable-key set.
 fn writable_slot_keys_from(inputs: &SweepInputs) -> WritableSlotKeys {
     resolve_writable_slot_keys(
@@ -2184,9 +2327,24 @@ pub(crate) enum UnclaimedVerdict {
     StaleEvidence(String),
 }
 
+/// Is a bucket's last rejection recent enough to be a verdict about NOW? The
+/// one staleness rule for every bucket no observation describes — the
+/// unclaimed-bucket rung and the unserved-pin posture both read it, so the two
+/// cannot drift onto different clocks.
+fn upstream_rejection_is_fresh(s: &UpstreamSignal, now: i64) -> bool {
+    s.last_rejection_at
+        .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_STALE_AFTER_SECS)
+}
+
+/// `unserved_pin_key` is the key of the pinned tenant the unserved-pin arm has
+/// already entered into the `worst` fold (see [`derive_and_publish_posture`]),
+/// or `None`. That arm reads its bucket under the tenant's own name, so the key
+/// counts as CLAIMED here — otherwise T's own streak would be reported a second
+/// time, as a nameless orphan.
 fn unclaimed_upstream_verdict(
     observations: &[SlotObservation],
     fold_default: bool,
+    unserved_pin_key: Option<&str>,
     now: i64,
 ) -> UnclaimedVerdict {
     let mut claimed: std::collections::HashSet<&str> = observations
@@ -2198,6 +2356,9 @@ fn unclaimed_upstream_verdict(
         // The sole observation already folded this bucket in.
         claimed.insert(DEFAULT_SLOT_KEY);
     }
+    if let Some(key) = unserved_pin_key {
+        claimed.insert(key);
+    }
     let worst = with_upstream_signals(|m| {
         m.iter()
             .filter(|(k, _)| !claimed.contains(k.as_str()))
@@ -2208,10 +2369,7 @@ fn unclaimed_upstream_verdict(
     match worst {
         None => UnclaimedVerdict::Nothing,
         Some((k, s)) => {
-            let fresh = s
-                .last_rejection_at
-                .is_some_and(|t| now - t <= UPSTREAM_ORPHAN_STALE_AFTER_SECS);
-            if fresh {
+            if upstream_rejection_is_fresh(&s, now) {
                 UnclaimedVerdict::Dark(k, s)
             } else {
                 UnclaimedVerdict::StaleEvidence(k)
@@ -2579,51 +2737,105 @@ fn publish_coord_credential_posture_with(
 /// both and has merely gone silent makes the pass ABSTAIN rather than publish
 /// `live`: see [`UPSTREAM_ORPHAN_STALE_AFTER_SECS`] for why the age-as-primary
 /// version was itself a healthy-while-dead defect.
+///
+/// # The UNSERVED-PIN arm
+///
+/// `machine.json` pins tenant T, the pass observes no slot for T, and the
+/// default binding is measured to be another tenant (see
+/// [`PosturePinInputs::unserved_pin`]). Every T-pinned session is then refused,
+/// whatever the other slots hold — so T enters the `worst` fold itself, under
+/// its own name, rather than only when a rejection streak happens to exist for
+/// the unclaimed-bucket rung to find. A slot cleared on a LOCAL expiry or a
+/// refresh-token 401 records no streak at all, and without this arm a healthy
+/// sibling slot published `live` and *"Coord access restored"* over it.
+///
+/// T's posture honours its own bucket: a fresh streak at or over
+/// [`UPSTREAM_DARK_THRESHOLD`] is `dark(upstream_401)`, anything else is
+/// `absent` (the pass that cleared the slot already published
+/// `unrefreshable`; a later pass that finds no slot at all is exactly absent).
+/// It is NOT a synthetic observation fed through the ladder: rung 4 answers
+/// `absent` before rung 5 reads the streak, which would downgrade a dark pin.
+///
+/// The fold's `fold_default` is still computed from the REAL observations
+/// only: an extra entry would change which credential the default-slot bucket
+/// is folded onto.
 pub(crate) fn derive_and_publish_posture(
     observations: &[SlotObservation],
+    pins: PosturePinInputs,
     now: i64,
 ) -> Option<PostureTransition> {
+    /// One entry in the `worst` fold, carrying everything the publish needs.
+    struct Candidate {
+        posture: CoordCredentialPosture,
+        tenant_id: Option<String>,
+        exp: Option<i64>,
+        outcome: Option<TenantSlotOutcome>,
+        signal: UpstreamSignal,
+    }
+
     // One usable slot means the default-slot bucket describes the same
     // credential — see [`upstream_signal_for_observation`].
     let fold_default = observations.iter().filter(|o| !o.unknown).count() == 1;
-    let worst = observations
-        .iter()
-        .filter(|o| !o.unknown)
-        .map(|o| {
+    let unserved_pin_key = pins.unserved_pin(observations).map(|t| t.to_string());
+    let unserved_pin = unserved_pin_key.clone().map(|key| {
+        let signal = upstream_signal_for(Some(&key));
+        let posture = if signal.consecutive_rejections >= UPSTREAM_DARK_THRESHOLD
+            && upstream_rejection_is_fresh(&signal, now)
+        {
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)
+        } else {
+            CoordCredentialPosture::Absent
+        };
+        Candidate {
+            posture,
+            tenant_id: Some(key),
+            exp: None,
+            outcome: None,
+            signal,
+        }
+    });
+    // The unserved pin goes FIRST: `max_by_key` keeps the last of equal
+    // maxima, so a real slot at the same severity still wins the tie, exactly
+    // as it did before the pin was an input.
+    let worst = unserved_pin
+        .into_iter()
+        .chain(observations.iter().filter(|o| !o.unknown).map(|o| {
             let signal = upstream_signal_for_observation(o.tenant_id.as_deref(), fold_default);
-            (derive_coord_credential_posture(o, signal, now), o)
-        })
-        .max_by_key(|(p, _)| p.severity());
+            Candidate {
+                posture: derive_coord_credential_posture(o, signal, now),
+                tenant_id: o.tenant_id.clone(),
+                exp: o.exp,
+                outcome: o.outcome,
+                signal,
+            }
+        }))
+        .max_by_key(|c| c.posture.severity());
 
     // N1 — the unattributable arm, as a MAP DIFF rather than a special case
     // for the default key. See [`unclaimed_upstream_verdict`] for the class
     // and the shapes beyond the default key that reach it.
     //
     // A per-slot verdict that is ALREADY non-answering wins over both arms
-    // below: it names a slot an operator can actually fix.
-    let slot_already_non_answering = worst.as_ref().is_some_and(|(p, _)| !p.can_answer());
-    if !slot_already_non_answering {
-        match unclaimed_upstream_verdict(observations, fold_default, now) {
+    // below: it names a slot an operator can actually fix. The unserved pin
+    // counts as such a verdict — it names the tenant to re-pair — and its key
+    // is CLAIMED for the diff, so T's own streak is never also an orphan.
+    let slot_already_non_answering = worst.as_ref().is_some_and(|c| !c.posture.can_answer());
+    // Computed UNCONDITIONALLY: when a slot or the pin wins the publish, a
+    // DIFFERENT orphan coord is refusing right now must still reach the log,
+    // or the actionable posture would silently hide it.
+    let unclaimed =
+        unclaimed_upstream_verdict(observations, fold_default, unserved_pin_key.as_deref(), now);
+    if slot_already_non_answering {
+        if let UnclaimedVerdict::Dark(orphan_key, orphan_signal) = &unclaimed {
+            warn_unclaimed_orphan(orphan_key, orphan_signal, false);
+        }
+        // `StaleEvidence` abstains only where it would otherwise let `worst`
+        // fall through to `live`; a non-answering `worst` cannot, so it is
+        // published as before.
+    } else {
+        match unclaimed {
             UnclaimedVerdict::Dark(orphan_key, orphan_signal) => {
-                // The KEY is the one actionable fact the published posture
-                // cannot carry (see below), so it goes to the log — LATCHED,
-                // because this condition holds across every pass and an
-                // unlatched line would repeat every five minutes forever.
-                // A tenant UUID, never a credential.
-                if latch_orphan_warning(&orphan_key) {
-                    warn!(
-                        "device_jwt_refresher: coord has refused the credential filed under \
-                         slot key {:?} {} consecutive times, and NO slot this pass observed \
-                         describes it — publishing dark with no tenant (legacy-only install, \
-                         a pin with no slot, or a slot this pass could not read)",
-                        if orphan_key.is_empty() {
-                            "<default>"
-                        } else {
-                            orphan_key.as_str()
-                        },
-                        orphan_signal.consecutive_rejections,
-                    );
-                }
+                warn_unclaimed_orphan(&orphan_key, &orphan_signal, true);
                 return publish_coord_credential_posture_with(
                     CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
                     // No tenant — deliberately, even when the orphan key IS a
@@ -2635,8 +2847,8 @@ pub(crate) fn derive_and_publish_posture(
                     // pass marked `unknown` (the slot exists, but the pass
                     // could not read it, so nothing here describes its state).
                     // Rather than sometimes-right, the field is withheld and
-                    // the key goes to the log line above, which is honest in
-                    // every shape.
+                    // the key goes to the log ([`warn_unclaimed_orphan`]),
+                    // which is honest in every shape.
                     None,
                     // Likewise no `exp`: the answer to "which slot's?" is none.
                     None,
@@ -2665,13 +2877,13 @@ pub(crate) fn derive_and_publish_posture(
         }
     }
 
-    let (posture, obs) = worst?;
+    let worst = worst?;
     publish_coord_credential_posture_with(
-        posture,
-        obs.tenant_id.clone(),
-        obs.exp,
-        obs.outcome.map(tenant_slot_outcome_token),
-        upstream_signal_for_observation(obs.tenant_id.as_deref(), fold_default),
+        worst.posture,
+        worst.tenant_id,
+        worst.exp,
+        worst.outcome.map(tenant_slot_outcome_token),
+        worst.signal,
     )
 }
 
@@ -2840,12 +3052,18 @@ async fn clear_and_rederive_tenant_slot(
 /// `app` is the Tauri handle the credential banner is emitted on. `None`
 /// (every hermetic test, and any caller with no window) still derives and
 /// publishes the posture — it simply cannot show it to a user.
+///
+/// `pins` is the machine pin and default binding the loop already read on the
+/// blocking pool; both posture publishes read it, so a pinned tenant with no
+/// slot is named rather than silently skipped (see
+/// [`derive_and_publish_posture`]).
 pub(crate) async fn refresh_tenant_slots(
     auth_manager: &crate::auth::AuthManager,
     coord_base: &str,
     web_base: &str,
     device_id: &str,
     app: Option<&tauri::AppHandle>,
+    pins: PosturePinInputs,
 ) -> Vec<(uuid::Uuid, TenantSlotOutcome)> {
     let tenants = auth_manager.list_tenant_device_jwt_tenants();
     let mut outcomes = Vec::with_capacity(tenants.len());
@@ -2889,7 +3107,7 @@ pub(crate) async fn refresh_tenant_slots(
                 Err(_) => SlotObservation::unreadable(Some(t.to_string())),
             })
             .collect();
-        if let Some(transition) = derive_and_publish_posture(&boot_obs, now) {
+        if let Some(transition) = derive_and_publish_posture(&boot_obs, pins, now) {
             notify_posture_transition(app, transition);
         }
     }
@@ -3139,7 +3357,7 @@ pub(crate) async fn refresh_tenant_slots(
             }
         })
         .collect();
-    if let Some(transition) = derive_and_publish_posture(&observations, now) {
+    if let Some(transition) = derive_and_publish_posture(&observations, pins, now) {
         notify_posture_transition(app, transition);
     }
     outcomes
@@ -3449,9 +3667,11 @@ async fn refresher_loop(
         // before the decision match so the Idle arm (legacy JWT fresh)
         // still ticks the tenant slots each cadence/kick. Runners with no
         // tenant slots (never paired post-8a) skip in one storage read.
-        // Every input the eviction sweep needs — the slot store and
-        // `paired_user.json` — is read in ONE blocking-pool hop, then composed
-        // on this side.
+        // Every input the eviction sweep needs — the slot store,
+        // `paired_user.json` and `machine.json` — is read in ONE blocking-pool
+        // hop, then composed on this side. The pin and the default binding
+        // also feed the POSTURE (see [`PosturePinInputs`]): a pinned tenant
+        // with no slot must be published under its own name, never skipped.
         //
         // The slot read is the UN-COLLAPSED one, because the sweep below is
         // destructive: an unreadable store must not read as "no tenant slots"
@@ -3520,6 +3740,7 @@ async fn refresher_loop(
                         &slot_web_base,
                         &did,
                         Some(&api_state.app_handle),
+                        sweep_inputs.posture_pin_inputs(),
                     )
                     .await;
                     if !outcomes.is_empty() {
@@ -3565,9 +3786,11 @@ async fn refresher_loop(
                     SlotObservation::unreadable(None)
                 }
             };
-            if let Some(transition) =
-                derive_and_publish_posture(&[obs], chrono::Utc::now().timestamp())
-            {
+            if let Some(transition) = derive_and_publish_posture(
+                &[obs],
+                sweep_inputs.posture_pin_inputs(),
+                chrono::Utc::now().timestamp(),
+            ) {
                 notify_posture_transition(Some(&api_state.app_handle), transition);
             }
         }
@@ -5220,7 +5443,8 @@ mod tenant_slot_refresh_tests {
 
         let (base, cap, _shutdown) = spawn_mock(vec![]);
         // Empty `web_base`: this pass must never need the re-derive path.
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5261,7 +5485,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&tb, &jwt_b).expect("slot b");
 
         let (base, cap, _shutdown) = spawn_mock(vec![(jwt_a.clone(), 500)]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5300,7 +5525,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&tb, &expired).expect("slot b");
 
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5343,7 +5569,8 @@ mod tenant_slot_refresh_tests {
             .expect("slot a");
 
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5372,7 +5599,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
 
         let (base, cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 401)]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5407,7 +5635,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
 
         let (base, _cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 403)]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             outcomes,
@@ -5436,7 +5665,8 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&ta, &jwt).expect("slot a");
 
         let (base, _cap, _shutdown) = spawn_mock(vec![(jwt.clone(), 503)]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
         assert_eq!(
@@ -5482,7 +5712,15 @@ mod tenant_slot_refresh_tests {
             drop(l);
             format!("http://127.0.0.1:{port}")
         };
-        let outcomes = refresh_tenant_slots(&mgr, &dead_base, &dead_base, DID, None).await;
+        let outcomes = refresh_tenant_slots(
+            &mgr,
+            &dead_base,
+            &dead_base,
+            DID,
+            None,
+            PosturePinInputs::UNPINNED,
+        )
+        .await;
 
         assert_eq!(
             outcomes,
@@ -5537,7 +5775,7 @@ mod tenant_slot_refresh_tests {
         mgr.store_tenant_device_jwt(&tb, &expired).expect("slot b");
 
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
-        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         let health = tenant_slot_health().expect("a pass publishes health");
         assert_eq!(health.slots.len(), 2);
@@ -5564,7 +5802,8 @@ mod tenant_slot_refresh_tests {
         let _serialised = health_lock();
         let mgr = test_auth_manager("multi_slot_empty_noop");
         let (base, cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
         assert!(outcomes.is_empty());
         assert!(cap.bearers_seen.lock().unwrap().is_empty());
     }
@@ -5608,7 +5847,7 @@ mod tenant_slot_refresh_tests {
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
         // Empty web_base: the device-machine-key re-derive is unavailable, so
         // the automatic exit cannot heal it — the terminal state.
-        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         let transitions = recorded_posture_transitions();
         assert!(
@@ -5793,7 +6032,15 @@ mod tenant_slot_refresh_tests {
             drop(l);
             format!("http://127.0.0.1:{port}")
         };
-        let outcomes = refresh_tenant_slots(&mgr, &dead_base, &dead_base, DID, None).await;
+        let outcomes = refresh_tenant_slots(
+            &mgr,
+            &dead_base,
+            &dead_base,
+            DID,
+            None,
+            PosturePinInputs::UNPINNED,
+        )
+        .await;
         assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::KeptExisting)]);
 
         let transitions = recorded_posture_transitions();
@@ -5880,7 +6127,10 @@ mod tenant_slot_refresh_tests {
         reset_posture();
         let now = chrono::Utc::now().timestamp();
         let unreadable = SlotObservation::unreadable(Some("t".into()));
-        assert_eq!(derive_and_publish_posture(&[unreadable], now), None);
+        assert_eq!(
+            derive_and_publish_posture(&[unreadable], PosturePinInputs::UNPINNED, now),
+            None
+        );
         assert!(
             coord_credential_posture().is_none(),
             "UNKNOWN must leave the posture UNKNOWN"
@@ -6189,7 +6439,8 @@ mod tenant_slot_refresh_tests {
         );
 
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
         assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::Refreshed)]);
 
         assert_eq!(
@@ -6214,7 +6465,11 @@ mod tenant_slot_refresh_tests {
             outcome: Some(TenantSlotOutcome::SkippedFresh),
         };
         assert_eq!(
-            derive_and_publish_posture(std::slice::from_ref(&fresh_obs), now),
+            derive_and_publish_posture(
+                std::slice::from_ref(&fresh_obs),
+                PosturePinInputs::UNPINNED,
+                now
+            ),
             None,
             "still live — no transition, and above all no relapse to dark"
         );
@@ -6256,7 +6511,8 @@ mod tenant_slot_refresh_tests {
         );
 
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
         assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::Refreshed)]);
 
         assert_eq!(
@@ -6280,7 +6536,11 @@ mod tenant_slot_refresh_tests {
             outcome: Some(TenantSlotOutcome::SkippedFresh),
         };
         assert_eq!(
-            derive_and_publish_posture(std::slice::from_ref(&fresh_obs), now),
+            derive_and_publish_posture(
+                std::slice::from_ref(&fresh_obs),
+                PosturePinInputs::UNPINNED,
+                now
+            ),
             None,
             "no relapse to dark on a freshly minted credential"
         );
@@ -6311,7 +6571,7 @@ mod tenant_slot_refresh_tests {
         }
 
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
-        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let _ = refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
 
         assert_eq!(
             upstream_signal_for(None).consecutive_rejections,
@@ -6376,7 +6636,8 @@ mod tenant_slot_refresh_tests {
 
         // The published posture is the WORST slot, and it names A — not
         // whichever slot `max_by_key` happened to visit last.
-        let transition = derive_and_publish_posture(&[slot(a), slot(b)], now);
+        let transition =
+            derive_and_publish_posture(&[slot(a), slot(b)], PosturePinInputs::UNPINNED, now);
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
@@ -6396,7 +6657,7 @@ mod tenant_slot_refresh_tests {
             note_coord_upstream_verdict(Some(a), true, 401, br#"{"code":"token_expired"}"#);
             note_coord_upstream_verdict(Some(b), true, 200, br#"{"ok":true}"#);
         }
-        let _ = derive_and_publish_posture(&[slot(b), slot(a)], now);
+        let _ = derive_and_publish_posture(&[slot(b), slot(a)], PosturePinInputs::UNPINNED, now);
         assert_eq!(
             coord_credential_posture()
                 .expect("published")
@@ -6428,7 +6689,11 @@ mod tenant_slot_refresh_tests {
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
         }
-        let transition = derive_and_publish_posture(std::slice::from_ref(&slot), now);
+        let transition = derive_and_publish_posture(
+            std::slice::from_ref(&slot),
+            PosturePinInputs::UNPINNED,
+            now,
+        );
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
@@ -6452,7 +6717,8 @@ mod tenant_slot_refresh_tests {
             tenant_id: Some(tenant(3).to_string()),
             ..slot.clone()
         };
-        let transition = derive_and_publish_posture(&[slot, other], now);
+        let transition =
+            derive_and_publish_posture(&[slot, other], PosturePinInputs::UNPINNED, now);
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
@@ -6501,14 +6767,14 @@ mod tenant_slot_refresh_tests {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
         }
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Live),
             "two transient 401s on an unattributable credential are not a verdict"
         );
 
         // The threshold'th consecutive rejection IS the verdict.
         note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
-        let transition = derive_and_publish_posture(&slots, now);
+        let transition = derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now);
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
@@ -6535,7 +6801,11 @@ mod tenant_slot_refresh_tests {
             exp: Some(now - 60),
             ..healthy_slot(tenant(1))
         };
-        let _ = derive_and_publish_posture(&[healthy_slot(tenant(0)), dead], now);
+        let _ = derive_and_publish_posture(
+            &[healthy_slot(tenant(0)), dead],
+            PosturePinInputs::UNPINNED,
+            now,
+        );
         let published = coord_credential_posture().expect("published");
         assert_eq!(published.posture, CoordCredentialPosture::Expired);
         assert_eq!(
@@ -6551,7 +6821,7 @@ mod tenant_slot_refresh_tests {
         }
         note_coord_upstream_verdict(None, true, 200, br#"{"ok":true}"#);
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Live)
         );
         reset_posture();
@@ -6617,7 +6887,11 @@ mod tenant_slot_refresh_tests {
         // is empty, and the observation's own key IS the default one.
         assert_eq!(upstream_signal_for(None).consecutive_rejections, 0);
 
-        let transition = derive_and_publish_posture(std::slice::from_ref(&legacy_obs), now);
+        let transition = derive_and_publish_posture(
+            std::slice::from_ref(&legacy_obs),
+            PosturePinInputs::UNPINNED,
+            now,
+        );
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
@@ -6660,7 +6934,7 @@ mod tenant_slot_refresh_tests {
             0
         );
 
-        let transition = derive_and_publish_posture(&slots, now);
+        let transition = derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now);
         assert_eq!(
             transition.map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
@@ -6677,7 +6951,7 @@ mod tenant_slot_refresh_tests {
         for _ in 0..UPSTREAM_DARK_THRESHOLD {
             note_coord_upstream_verdict(Some(tenant(1)), true, 401, br#"{"code":"token_revoked"}"#);
         }
-        let _ = derive_and_publish_posture(&slots, now);
+        let _ = derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now);
         assert_eq!(
             coord_credential_posture()
                 .expect("published")
@@ -6728,7 +7002,12 @@ mod tenant_slot_refresh_tests {
         // t+5min — dark, correctly.
         let t5 = t0 + 5 * 60;
         assert_eq!(
-            derive_and_publish_posture(std::slice::from_ref(&legacy_obs), t5).map(|t| t.to),
+            derive_and_publish_posture(
+                std::slice::from_ref(&legacy_obs),
+                PosturePinInputs::UNPINNED,
+                t5
+            )
+            .map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
 
@@ -6736,7 +7015,11 @@ mod tenant_slot_refresh_tests {
         let transitions_before = recorded_posture_transitions().len();
         for minutes in [35i64, 90, 6 * 60, 24 * 60] {
             let later = t0 + minutes * 60;
-            let transition = derive_and_publish_posture(std::slice::from_ref(&legacy_obs), later);
+            let transition = derive_and_publish_posture(
+                std::slice::from_ref(&legacy_obs),
+                PosturePinInputs::UNPINNED,
+                later,
+            );
             assert_eq!(
                 transition, None,
                 "t+{minutes}min: nothing healed, so nothing may transition"
@@ -6769,8 +7052,12 @@ mod tenant_slot_refresh_tests {
         // time, with no clock involved.
         note_coord_upstream_verdict(Some(x), true, 200, br#"{"ok":true}"#);
         assert_eq!(
-            derive_and_publish_posture(std::slice::from_ref(&legacy_obs), t0 + 48 * 60 * 60)
-                .map(|t| t.to),
+            derive_and_publish_posture(
+                std::slice::from_ref(&legacy_obs),
+                PosturePinInputs::UNPINNED,
+                t0 + 48 * 60 * 60
+            )
+            .map(|t| t.to),
             Some(CoordCredentialPosture::Live),
             "a 2xx on the orphan key retires its evidence the honest way"
         );
@@ -6808,7 +7095,7 @@ mod tenant_slot_refresh_tests {
         // Before the sweep it is a live orphan and MUST darken: at this point
         // the box has not been re-paired, it is simply unattributable.
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
 
@@ -6828,7 +7115,7 @@ mod tenant_slot_refresh_tests {
         );
 
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Live),
             "a re-paired runner with two live slots is live"
         );
@@ -6912,7 +7199,7 @@ mod tenant_slot_refresh_tests {
             note_coord_upstream_verdict(Some(b), true, 401, br#"{"code":"token_revoked"}"#);
         }
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
             "B is refused, so the box is dark before the hiccup"
         );
@@ -6934,7 +7221,7 @@ mod tenant_slot_refresh_tests {
         // PASS N+1 — store readable again, nothing else changed.
         let transitions_before = recorded_posture_transitions().len();
         assert_eq!(
-            derive_and_publish_posture(&slots, now + 5 * 60),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now + 5 * 60),
             None,
             "nothing healed between the two passes, so nothing may transition"
         );
@@ -7061,10 +7348,475 @@ mod tenant_slot_refresh_tests {
             "the pinned tenant's streak is SPARED even though it has no slot"
         );
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
             "and the box stays dark — never `Coord access restored` over a refused pin"
         );
+        assert_eq!(
+            coord_credential_posture().expect("published").tenant_id,
+            None,
+            "without the pin as an input, only the unclaimed-bucket rung sees it — nameless"
+        );
+
+        // Plan 2026-09-14 Phase 1: with the pin as an input, the SAME pass is
+        // still dark — the unserved-pin arm honours the streak rather than
+        // downgrading it to `absent` — and now names the tenant to re-pair.
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Unbound,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins, now),
+            None,
+            "still dark, so no transition — and never a recovery"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert_eq!(
+            published.posture,
+            CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)
+        );
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str()),
+            "the banner names T, the pin every refused session asks for"
+        );
+        assert_eq!(published.exp, None, "no slot, so no exp to report");
+        assert!(
+            published.last_401_at.is_some(),
+            "the published timestamps are T's own bucket's"
+        );
+        reset_posture();
+    }
+
+    /// A live slot for tenant `Y` — a sibling slot, not the pin — beside the
+    /// pinned-but-unserved tenant `T`.
+    fn live_slot(t: uuid::Uuid, now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: Some(t.to_string()),
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: Some(TenantSlotOutcome::SkippedFresh),
+        }
+    }
+
+    /// Plan 2026-09-14 Phase 1 (finding `7abcb51a` M-1) — THE false recovery.
+    /// `machine.json` pins T; T's slot was cleared on a LOCAL expiry (or a
+    /// refresh-token 401), neither of which records a bucket verdict, and the
+    /// re-derive minted for the default tenant instead. So T has NO slot and NO
+    /// streak, the unclaimed-bucket rung has nothing to read, and Y is live.
+    /// The posture used to publish `live` with *"Coord access restored"* while
+    /// every T-pinned session got `COORD_MCP_PROXY_CREDENTIAL_REFRESHING`.
+    #[test]
+    fn a_pinned_tenant_cleared_before_any_streak_publishes_absent_under_its_own_name() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        assert_eq!(
+            upstream_signal_for(Some(&pinned.to_string())).consecutive_rejections,
+            0,
+            "precondition: T has no streak at all"
+        );
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+
+        let transition = derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now);
+        assert_eq!(
+            transition.map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "a pin no slot serves is absent — never `live` off the sibling slot"
+        );
+        let published = coord_credential_posture().expect("published");
+        assert!(!published.posture.can_answer());
+        assert_eq!(
+            published.tenant_id.as_deref(),
+            Some(pinned.to_string().as_str()),
+            "and it names T, not the healthy Y"
+        );
+        assert_eq!(published.exp, None);
+        assert_eq!(published.last_refresh_outcome, None);
+        reset_posture();
+    }
+
+    /// Plan 2026-09-14 Phase 1: a pin the DEFAULT binding serves is not
+    /// unserved — the legacy `access_token` slot answers for it (the
+    /// legacy-only install), so no tenant observation naming it proves
+    /// nothing. The posture is exactly what the observations alone derive.
+    #[test]
+    fn a_pin_served_by_the_default_binding_synthesizes_nothing() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let slots = [live_slot(other_slot, now)];
+        let today = derive_coord_credential_posture(&slots[0], UpstreamSignal::default(), now);
+        assert!(today.can_answer(), "precondition: Y alone answers");
+
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(pinned),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+            Some(today)
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(other_slot.to_string().as_str())
+        );
+        reset_posture();
+    }
+
+    /// Plan 2026-09-14 Phase 1: every UNMEASURED pin input abstains — an
+    /// unresolvable `machine.json`, no pin at all, an unreadable default
+    /// binding, and a pinned tenant whose slot this pass could not read (it
+    /// may hold a working credential). None of them is evidence the pin is
+    /// unserved, so each publishes exactly what the observations derive.
+    #[test]
+    fn an_unresolvable_pin_or_an_unmeasured_input_synthesizes_nothing() {
+        use crate::auth::BindingTenantRead;
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let live = live_slot(other_slot, now);
+        let today = derive_coord_credential_posture(&live, UpstreamSignal::default(), now);
+        let unreadable_pin_slot = SlotObservation::unreadable(Some(pinned.to_string()));
+
+        for (label, machine_pin, default_binding, slots) in [
+            (
+                "unresolvable pin",
+                TenantPin::Unresolvable,
+                BindingTenantRead::Unbound,
+                vec![live.clone()],
+            ),
+            (
+                "no pin",
+                TenantPin::Unpinned,
+                BindingTenantRead::Unbound,
+                vec![live.clone()],
+            ),
+            (
+                "unreadable binding",
+                TenantPin::Pinned(pinned),
+                BindingTenantRead::Unknown,
+                vec![live.clone()],
+            ),
+            (
+                "the pinned slot is unreadable",
+                TenantPin::Pinned(pinned),
+                BindingTenantRead::Unbound,
+                vec![live.clone(), unreadable_pin_slot.clone()],
+            ),
+        ] {
+            reset_posture();
+            let pins = PosturePinInputs {
+                machine_pin,
+                default_binding,
+            };
+            assert_eq!(
+                derive_and_publish_posture(&slots, pins, now).map(|t| t.to),
+                Some(today),
+                "{label}: no synthesis"
+            );
+            assert_eq!(
+                coord_credential_posture()
+                    .expect("published")
+                    .tenant_id
+                    .as_deref(),
+                Some(other_slot.to_string().as_str()),
+                "{label}: the published tenant is the observed one"
+            );
+        }
+        reset_posture();
+    }
+
+    /// Plan 2026-09-14 Phase 1, step 4: `fold_default` counts the REAL
+    /// observations only. One real slot Y folds the default-slot bucket onto
+    /// itself; were the unserved pin counted, Y would stop folding it, read
+    /// `live`, and the pin's `absent` would hide the dark default credential.
+    #[test]
+    fn the_unserved_pin_does_not_change_which_credential_the_default_bucket_folds_onto() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Unbound,
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
+            "Y still folds the default bucket, so Y is dark and outranks the pin's absent"
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(other_slot.to_string().as_str())
+        );
+        reset_posture();
+    }
+
+    /// The legacy arm's observation: the `access_token` slot, holding a
+    /// credential with a future `exp` — what `SlotObservation::observed(None,
+    /// Some(jwt))` yields for a live token.
+    fn live_legacy_observation(now: i64) -> SlotObservation {
+        SlotObservation {
+            tenant_id: None,
+            exp: Some(now + 3 * 60 * 60),
+            present: true,
+            unknown: false,
+            outcome: None,
+        }
+    }
+
+    /// Review round 1, B-1. An UNREADABLE slot store collapses to the legacy
+    /// arm, whose one observation (`tenant_id: None`) can never name the pin.
+    /// Feeding the real pin through published `absent(T)` on a multi-tenant box
+    /// pinned to T and bound to B — off one failed read — and the next good
+    /// read fired "Coord access restored". The pins built from those inputs
+    /// abstain, so the posture is what the observation alone derives.
+    #[test]
+    fn an_unreadable_slot_store_synthesizes_no_pin_posture_on_the_legacy_arm() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let inputs = SweepInputs {
+            tenant_slots: Err(anyhow::anyhow!("undecryptable store")),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+        };
+        let pins = inputs.posture_pin_inputs();
+        assert_eq!(
+            pins,
+            PosturePinInputs::UNPINNED,
+            "an unreadable input abstains"
+        );
+
+        let legacy = live_legacy_observation(now);
+        let without_a_pin =
+            derive_coord_credential_posture(&legacy, UpstreamSignal::default(), now);
+        assert!(
+            without_a_pin.can_answer(),
+            "precondition: the legacy slot answers"
+        );
+        assert_eq!(
+            derive_and_publish_posture(&[legacy], pins, now).map(|t| t.to),
+            Some(without_a_pin),
+            "no `absent(T)` off a store this pass could not read"
+        );
+        assert_eq!(
+            coord_credential_posture().expect("published").tenant_id,
+            None,
+            "the published posture is the legacy observation's, not the pin's"
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, B-1 — the other half. A READABLE but EMPTY store
+    /// (`Ok(vec![])`, a legacy-only install) is a MEASURED absence of slots, so
+    /// a pin the default binding does not serve is still published `absent`
+    /// under its own name.
+    #[test]
+    fn an_empty_readable_slot_store_still_synthesizes_the_unserved_pin() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let bound = tenant(4);
+        let inputs = SweepInputs {
+            tenant_slots: Ok(vec![]),
+            default_binding: crate::auth::BindingTenantRead::Bound(bound),
+            machine_pin: TenantPin::Pinned(pinned),
+        };
+        assert_eq!(
+            derive_and_publish_posture(
+                &[live_legacy_observation(now)],
+                inputs.posture_pin_inputs(),
+                now
+            )
+            .map(|t| t.to),
+            Some(CoordCredentialPosture::Absent)
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, S-1. T pinned and unserved with no streak publishes
+    /// `absent(T)` — the actionable verdict, and the documented precedence is
+    /// unchanged. A DIFFERENT unclaimed key O that coord is refusing right now
+    /// used to be skipped silently behind it; it must still reach the log.
+    #[test]
+    fn an_absent_pin_still_logs_a_different_fresh_orphan() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let orphan = tenant(5);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(orphan), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Absent),
+            "the pin's actionable absent still wins the publish"
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert!(
+            orphan_warning_latched(&orphan.to_string()),
+            "the hidden orphan's warning fired"
+        );
+        assert!(!orphan_warning_latched(&pinned.to_string()));
+        reset_posture();
+    }
+
+    /// Review round 1, S-1 (i). T's own fresh streak is read by the
+    /// unserved-pin arm under T's name, so the unclaimed diff counts T as
+    /// CLAIMED: the posture is `dark` naming T, and T is never also warned
+    /// about as a nameless orphan.
+    #[test]
+    fn a_dark_pin_is_not_also_reported_as_an_orphan() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        reset_posture();
+        let now = chrono::Utc::now().timestamp();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        for _ in 0..UPSTREAM_DARK_THRESHOLD {
+            note_coord_upstream_verdict(Some(pinned), true, 401, br#"{"code":"token_revoked"}"#);
+        }
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        assert_eq!(
+            derive_and_publish_posture(&[live_slot(other_slot, now)], pins, now).map(|t| t.to),
+            Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
+        );
+        assert_eq!(
+            coord_credential_posture()
+                .expect("published")
+                .tenant_id
+                .as_deref(),
+            Some(pinned.to_string().as_str())
+        );
+        assert!(
+            !orphan_warning_latched(&pinned.to_string()),
+            "T's streak is the pin's verdict, not an orphan"
+        );
+        reset_posture();
+    }
+
+    /// Review round 1, S-2. The unserved-pin arm's `dark` needs BOTH a streak
+    /// at or over the threshold AND a fresh last rejection — the same clock the
+    /// unclaimed-bucket rung reads. Each boundary is pinned here: a stale streak
+    /// at the threshold is `absent`, a fresh streak one short is `absent`, and a
+    /// fresh streak exactly at the threshold is `dark` naming T.
+    #[test]
+    fn the_unserved_pin_is_dark_only_on_a_fresh_streak_at_the_threshold() {
+        use crate::session::tenant_pin::TenantPin;
+        let _serialised = health_lock();
+        let pinned = tenant(3);
+        let other_slot = tenant(4);
+        let pins = PosturePinInputs {
+            machine_pin: TenantPin::Pinned(pinned),
+            default_binding: crate::auth::BindingTenantRead::Bound(other_slot),
+        };
+        for (label, streak, stale, expected) in [
+            (
+                "stale streak at the threshold",
+                UPSTREAM_DARK_THRESHOLD,
+                true,
+                CoordCredentialPosture::Absent,
+            ),
+            (
+                "fresh streak one short of the threshold",
+                UPSTREAM_DARK_THRESHOLD - 1,
+                false,
+                CoordCredentialPosture::Absent,
+            ),
+            (
+                "fresh streak exactly at the threshold",
+                UPSTREAM_DARK_THRESHOLD,
+                false,
+                CoordCredentialPosture::Dark(DarkCause::UpstreamRejected),
+            ),
+        ] {
+            reset_posture();
+            for _ in 0..streak {
+                note_coord_upstream_verdict(
+                    Some(pinned),
+                    true,
+                    401,
+                    br#"{"code":"token_revoked"}"#,
+                );
+            }
+            // Read the clock AFTER the rejections are stamped: every stamp is
+            // then <= `recorded`, so the stale case is strictly past the bound
+            // (and the fresh cases never read a negative age) however the
+            // second boundary falls.
+            let recorded = chrono::Utc::now().timestamp();
+            let eval_now = if stale {
+                recorded + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1
+            } else {
+                recorded
+            };
+            assert_eq!(
+                derive_and_publish_posture(&[live_slot(other_slot, eval_now)], pins, eval_now)
+                    .map(|t| t.to),
+                Some(expected),
+                "{label}"
+            );
+            assert_eq!(
+                coord_credential_posture()
+                    .expect("published")
+                    .tenant_id
+                    .as_deref(),
+                Some(pinned.to_string().as_str()),
+                "{label}: named T"
+            );
+        }
         reset_posture();
     }
 
@@ -7118,7 +7870,19 @@ mod tenant_slot_refresh_tests {
                 .find("\n}\n")
                 .map(|i| start + i)
                 .unwrap_or(text.len());
-            let body = &text[start..end];
+            // Line comments are cut before either needle is searched: each
+            // line is truncated at its first `//` (which also covers `///` and
+            // whole-line comments), so a `// retire_rejection_streaks_after_pairing(`
+            // left behind after deleting the call — on its own line OR trailing
+            // real code — cannot satisfy the scan. The body is sliced on the
+            // RAW text above. Accepted limit of a source scan: it still cannot
+            // see through string literals (a `"//"` truncates a line early, a
+            // needle inside a string still matches) or `/* */` block comments.
+            let body: String = text[start..end]
+                .lines()
+                .map(|line| line.find("//").map_or(line, |i| &line[..i]))
+                .collect::<Vec<_>>()
+                .join("\n");
             let persisted = body
                 .find("persist_pairing(")
                 .unwrap_or_else(|| panic!("{item} persists a pairing"));
@@ -7309,7 +8073,7 @@ mod tenant_slot_refresh_tests {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_revoked"}"#);
         }
         assert_eq!(
-            derive_and_publish_posture(&slots, now).map(|x| x.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now).map(|x| x.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected)),
             "coord refused the old credential, so the box is dark before the sign-in"
         );
@@ -7317,7 +8081,7 @@ mod tenant_slot_refresh_tests {
         // The sign-in persisted t's slot, and t is the default (legacy slot too).
         retire_rejection_streaks_after_pairing(t, Some(t));
 
-        derive_and_publish_posture(&slots, now + 60);
+        derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, now + 60);
         let published = coord_credential_posture().expect("published");
         assert!(
             published.posture.can_answer(),
@@ -7437,14 +8201,14 @@ mod tenant_slot_refresh_tests {
 
         // Fresh: fires, and that is the posture on record.
         assert_eq!(
-            derive_and_publish_posture(&slots, real_now).map(|t| t.to),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, real_now).map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
 
         // A week and a second later, with nothing else changed: ABSTAIN.
         let later = real_now + UPSTREAM_ORPHAN_STALE_AFTER_SECS + 1;
         assert_eq!(
-            derive_and_publish_posture(&slots, later),
+            derive_and_publish_posture(&slots, PosturePinInputs::UNPINNED, later),
             None,
             "ancient evidence is not a verdict — and publishing `live` off it \
              would announce a recovery that never happened"
@@ -7466,7 +8230,12 @@ mod tenant_slot_refresh_tests {
             note_coord_upstream_verdict(None, true, 401, br#"{"code":"token_expired"}"#);
         }
         assert_eq!(
-            derive_and_publish_posture(&slots, chrono::Utc::now().timestamp()).map(|t| t.to),
+            derive_and_publish_posture(
+                &slots,
+                PosturePinInputs::UNPINNED,
+                chrono::Utc::now().timestamp()
+            )
+            .map(|t| t.to),
             Some(CoordCredentialPosture::Dark(DarkCause::UpstreamRejected))
         );
         reset_posture();
@@ -7562,11 +8331,21 @@ mod tenant_slot_refresh_tests {
             assert!(v["ok"].is_boolean());
             // `reason` is emitted as null rather than omitted.
             assert!(v.as_object().expect("object").contains_key("reason"));
+            // Plan 2026-09-14 Phase 4: the report declares its own staleness
+            // bound — three refresher passes, derived from the cadence, under
+            // exactly the key qontinui-web reads.
+            assert_eq!(bag.stale_after_secs, 3 * REFRESH_CHECK_INTERVAL.as_secs());
+            assert_eq!(v["stale_after_secs"], 3 * REFRESH_CHECK_INTERVAL.as_secs());
         }
 
         // No pass has concluded: UNKNOWN. The posture is not the source and
         // says so, and an absent measurement does not manufacture a fault.
         let unknown = coord_credential_bag(&fallback, None);
+        assert_eq!(
+            unknown.stale_after_secs,
+            3 * REFRESH_CHECK_INTERVAL.as_secs(),
+            "an UNKNOWN report goes stale on the same bound"
+        );
         assert_eq!(unknown.posture, "unknown");
         assert!(unknown.ok, "UNKNOWN keeps the decision-derived answer");
         let bad = coord_credential_health(Decision::IdleWrongTier, None);
@@ -7587,7 +8366,8 @@ mod tenant_slot_refresh_tests {
             .expect("slot a");
 
         let (base, _cap, _shutdown) = spawn_mock(vec![]);
-        let outcomes = refresh_tenant_slots(&mgr, &base, "", DID, None).await;
+        let outcomes =
+            refresh_tenant_slots(&mgr, &base, "", DID, None, PosturePinInputs::UNPINNED).await;
         assert_eq!(outcomes, vec![(ta, TenantSlotOutcome::Refreshed)]);
 
         let published = coord_credential_posture().expect("published");
