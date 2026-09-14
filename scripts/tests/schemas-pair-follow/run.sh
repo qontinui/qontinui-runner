@@ -61,6 +61,7 @@ setup_base() {
   gh_fx "repos/$R/contents/.github/sibling-pins.conf?ref=$MAIN" "$(conf_json "$OLD")"
   gh_fx "repos/$R/contents/.github/sibling-pins.conf?ref=$HEAD" "$(conf_json "$OLD")"
   gh_fx "repos/$SC/compare/$A...$OLD" '{"status":"behind"}'
+  gh_fx "repos/$R/issues/100/comments?per_page=100" '[]'
 }
 
 LAST=""
@@ -210,6 +211,14 @@ setup_base prreaderr
 gh_fx "repos/$R/pulls/100" "__ERR__"
 expect_decide "runner PR unreadable -> UNKNOWN" UNKNOWN "read $R#100"
 
+setup_base refused
+gh_fx "repos/$R/issues/100/comments?per_page=100" "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"needs a human <!-- schemas-pair-follow:refused a=$A -->\"}]"
+expect_decide "already refused for this land commit -> SKIP (no re-refusal every cycle)" SKIP refused-awaiting-human
+
+setup_base refusedother
+gh_fx "repos/$R/issues/100/comments?per_page=100" "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"<!-- schemas-pair-follow:refused a=$K -->\"},{\"user\":{\"login\":\"an-author\"},\"body\":\"<!-- schemas-pair-follow:refused a=$A -->\"}]"
+expect_decide "refusal marker for another commit, or not posted by the bot -> still FOLLOW" FOLLOW ""
+
 setup_base stacked
 gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"agent/parent\"},\"labels\":[]}"
 expect_decide "stacked runner PR (base is not main) -> SKIP" SKIP pr-not-on-main
@@ -279,6 +288,7 @@ git_setup() {
   gh_fx "repos/$SC/compare/$A...$OLD" '{"status":"behind"}'
   gh_fx "repos/$SC/compare/$A...$NEWER" '{"status":"behind"}'
   gh_fx "repos/$SC/compare/$A...$M2" '{"status":"ahead"}'
+  gh_fx "repos/$R/issues/100/comments?per_page=100" '[]'
   gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[]}"
 }
 spf_git() { SPF_FIXTURES="$FX" SPF_LOCK_CMD="${LOCK_CMD:-sed -i 's/^version = \"1.9.0\"$/version = \"2.0.0\"/' Cargo.lock}" SPF_FETCH_URL="file://$G/remote.git" SPF_PUSH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" bash "$SUT" "$@"; }
@@ -414,7 +424,13 @@ if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr";
 git_setup reglock plain
 spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
 LOCK_CMD="sed -i 's/^checksum = \"abc\"$/checksum = \"evil\"/' Cargo.lock" spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
-if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "a registry lock change must be refused"; else grep -q "registry/git package" "$FX/stderr" && ok "Cargo.lock registry entry changed -> refused" || bad "reglock reason" "$(cat "$FX/stderr")"; fi
+before="$(remote_tip)"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -eq 0 ] && [ "$pr" = "RESULT=REFUSED lock-registry-change" ] && [ "$(remote_tip)" = "$before" ] && ok "Cargo.lock registry entry changed -> REFUSED (named, not red), nothing pushed" || bad "reglock" "rc=$rc $pr $(cat "$FX/stderr")"
+grep -c "schemas-pair-follow:refused a=$A" "$FX/writes.log" 2>/dev/null | grep -qx 1 && ok "  ...the PR is told once, with the marker decide honours" || bad "  ...refusal comment" "$(cat "$FX/writes.log" 2>/dev/null)"
+gh_fx "repos/$R/issues/100/comments?per_page=100" "[{\"user\":{\"login\":\"github-actions[bot]\"},\"body\":\"x <!-- schemas-pair-follow:refused a=$A -->\"}]"
+spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>&1
+[ "$(grep -c "schemas-pair-follow:refused a=$A" "$FX/writes.log")" -eq 1 ] && ok "  ...a second refusal does not comment again" || bad "  ...duplicate refusal comment"
 
 # The PR changed since the plan (closed, retargeted, ref changed) -> ABORT.
 for variant in closed retarget; do
