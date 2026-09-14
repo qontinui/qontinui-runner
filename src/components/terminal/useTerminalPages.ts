@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { COORD_DRAIN_STATE_EVENT } from "@/hooks/useCoordDrainState";
 import { instanceStorage } from "@/lib/instance-storage";
 import { getPageBindings, subscribePageBindings } from "@/lib/pageBindings";
 
@@ -725,7 +726,10 @@ export function useTerminalPages() {
       }, 400);
     };
 
-    for (const event of ["terminal-created", "terminal-exit"]) {
+    // `coord-drain-state-changed` too: while coord's device drain holds,
+    // `terminal_session_list_open` withholds the restorable set, so the durable
+    // page ids it contributes come back only on a re-read after the drain lifts.
+    for (const event of ["terminal-created", "terminal-exit", COORD_DRAIN_STATE_EVENT]) {
       listen(event, schedule).then((fn) => {
         if (disposed) {
           fn();

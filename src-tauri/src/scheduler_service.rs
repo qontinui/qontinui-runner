@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use walkdir::WalkDir;
 
 // ============================================================================
@@ -237,6 +237,27 @@ impl SchedulerService {
             }
         });
 
+        // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+        // Phase 3): tasks that spawn an AI session are held while autonomous
+        // spawns are paused. Nothing about them is recorded — no execution row,
+        // no `next_run` change — so they stay due and run on the first tick
+        // after the drain lifts. Tasks that spawn nothing keep running.
+        let (due_tasks, held) = partition_for_drain(
+            due_tasks,
+            &crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::Scheduler),
+            |task: &ScheduledTask| task_spawns_ai_session(&task.task),
+        );
+        for task in &held {
+            crate::coord_drain_state::record_deferral(
+                crate::coord_drain_state::SpawnOrigin::Scheduler,
+                &format!("scheduled_task:{}", task.id),
+            );
+            debug!(
+                "Scheduler: holding task '{}' — it spawns an AI session and the coord device \
+                 drain has paused autonomous spawns",
+                task.name
+            );
+        }
         // Check concurrent task limit
         let running = self.running_tasks.read().await;
         let running_count = running.len() as u32;
@@ -1184,16 +1205,14 @@ impl SchedulerService {
         let client = reqwest::Client::new();
         let base_url = self.self_base_url();
 
-        let mut request_body = serde_json::json!({
-            "prompt_id": prompt_id
-        });
-
-        if let Some(max_sess) = max_sessions {
-            request_body["max_sessions"] = serde_json::json!(max_sess);
-        }
+        // The runner registers ONE prompt-run route, `POST /prompts/run`
+        // (`mcp/ai_session.rs`), which runs a saved prompt when the body names
+        // its `prompt_id`. This used to POST `/prompts/{id}/run`, which no
+        // router registers, so every scheduled Prompt task failed to launch.
+        let (path, request_body) = saved_prompt_run_request(prompt_id, max_sessions);
 
         let response = client
-            .post(format!("{}/prompts/{}/run", base_url, prompt_id))
+            .post(format!("{}{}", base_url, path))
             .json(&request_body)
             .send()
             .await
@@ -1209,10 +1228,7 @@ impl SchedulerService {
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        response_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
+        run_prompt_session_id(&response_json)
             .ok_or_else(|| "Prompt run endpoint omitted session_id".to_string())
     }
 
@@ -1274,10 +1290,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
             .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
-        response_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(String::from)
+        run_prompt_session_id(&response_json)
             .ok_or_else(|| "Auto-fix run endpoint omitted session_id".to_string())
     }
 
@@ -1376,16 +1389,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
         // `{ "success": bool, "data": { ... } }` (see ApiResponse). We accept
         // either a top-level `session_id` or `data.session_id` so the
         // contract is the same as `launch_auto_fix`'s `Value::get` path.
-        let session_id_opt = response_json
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                response_json
-                    .get("data")
-                    .and_then(|d| d.get("session_id"))
-                    .and_then(|v| v.as_str())
-            })
-            .map(String::from);
+        let session_id_opt = run_prompt_session_id(&response_json);
 
         match session_id_opt {
             Some(sid) => {
@@ -2005,6 +2009,24 @@ impl SchedulerService {
     ) -> Result<(), String> {
         let pg = self.pg()?;
 
+        // Coord device drain: a catch-up of an AI-spawning task is autonomous.
+        // Returning before `find_missed_slots` records nothing, so the missed
+        // slots are found again — and enqueued — once the drain lifts.
+        if task_spawns_ai_session(&task.task) {
+            if let crate::coord_drain_state::DrainGate::Defer { reason } =
+                crate::coord_drain_state::drain_gate_for_work(
+                    crate::coord_drain_state::SpawnOrigin::Scheduler,
+                    &format!("scheduled_task:{}", task.id),
+                )
+            {
+                debug!(
+                    task_id = %task.id,
+                    "scheduler reconciler: catch-up held — {reason}"
+                );
+                return Ok(());
+            }
+        }
+
         let grace = chrono::Duration::seconds(task.catch_up_grace_seconds as i64);
         let window_end = now - grace;
 
@@ -2268,6 +2290,18 @@ pub async fn run_task_now(task_id: &str) -> Result<(), String> {
         return Err("Task is already running".to_string());
     }
 
+    // Coord device drain: this is reached from the HTTP `run now` route, whose
+    // caller this runner cannot name — autonomous (`unknown`), so an AI-spawning
+    // task is refused while autonomous spawns are paused. Its schedule is
+    // untouched.
+    if task_spawns_ai_session(&task.task) {
+        if let crate::coord_drain_state::DrainGate::Defer { reason } =
+            crate::coord_drain_state::drain_gate(crate::coord_drain_state::SpawnOrigin::Unknown)
+        {
+            return Err(reason);
+        }
+    }
+
     // Execute in background
     tokio::spawn(async move {
         service.execute_task(task).await;
@@ -2279,6 +2313,63 @@ pub async fn run_task_now(task_id: &str) -> Result<(), String> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Whether running `task` spawns an AI (Claude) session — the scheduler arms
+/// coord's device drain holds (plan `2026-09-13-drained-runner-never-reaches-idle`,
+/// Phase 3). A unified workflow (`workflow_id`), a prompt, an auto-fix, a remote
+/// agent and a watcher (whose evaluation POSTs `/prompts/run`) do; a legacy
+/// config-path workflow runs automation through `action_service`, and background
+/// capture spawns nothing.
+fn task_spawns_ai_session(task: &ScheduledTaskType) -> bool {
+    match task {
+        ScheduledTaskType::Workflow { workflow_id, .. } => workflow_id.is_some(),
+        ScheduledTaskType::Prompt { .. }
+        | ScheduledTaskType::AutoFix { .. }
+        | ScheduledTaskType::RemoteAgent { .. }
+        | ScheduledTaskType::Watcher { .. } => true,
+        ScheduledTaskType::BackgroundCapture { .. } => false,
+    }
+}
+
+/// PURE: split due items into `(runnable, held)` under the drain gate. Under
+/// `Allow` nothing is held; under `Defer` every item for which `spawns_ai` is
+/// true is held. Order is preserved within each half.
+fn partition_for_drain<T>(
+    items: Vec<T>,
+    gate: &crate::coord_drain_state::DrainGate,
+    spawns_ai: impl Fn(&T) -> bool,
+) -> (Vec<T>, Vec<T>) {
+    if gate.allows() {
+        return (items, Vec::new());
+    }
+    items.into_iter().partition(|item| !spawns_ai(item))
+}
+
+/// PURE: the route and body that run a SAVED prompt. The runner registers one
+/// prompt-run route, `POST /prompts/run` (`mcp/ai_session.rs`), whose mode 1 is
+/// a body naming `prompt_id`; there is no `/prompts/{id}/run`.
+fn saved_prompt_run_request(
+    prompt_id: &str,
+    max_sessions: Option<u32>,
+) -> (&'static str, serde_json::Value) {
+    let mut body = serde_json::json!({ "prompt_id": prompt_id });
+    if let Some(max) = max_sessions {
+        body["max_sessions"] = serde_json::json!(max);
+    }
+    ("/prompts/run", body)
+}
+
+/// PURE: the session id out of a `/prompts/run` response. The route answers in
+/// the `ApiResponse` envelope (`{success, data: {session_id, …}}`); a bare
+/// top-level `session_id` is accepted too.
+fn run_prompt_session_id(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("data")
+        .and_then(|d| d.get("session_id"))
+        .or_else(|| response.get("session_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2396,6 +2487,120 @@ mod tests {
             .header("content-type", "application/json")
             .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    /// Scheduler defect fixed in plan `2026-09-13-drained-runner-never-reaches-idle`
+    /// Phase 3: `launch_prompt` POSTed `/prompts/{id}/run`, which no router
+    /// registers. The mock registers ONLY `/prompts/run` (the real route) and
+    /// answers in the real `ApiResponse` envelope, so this is red against the
+    /// old path and the old top-level-only session-id read.
+    #[tokio::test]
+    async fn test_launch_prompt_runs_a_saved_prompt_through_the_registered_route() {
+        let _env_lock = env_lock();
+        let _env = restore_port();
+
+        let envelope = serde_json::to_value(crate::mcp::types::ApiResponse::success(
+            serde_json::json!({ "session_id": "sid-saved", "task_run_id": "sid-saved" }),
+        ))
+        .unwrap();
+        let (port, captured) = spawn_prompts_run_mock(ok_response(envelope)).await;
+        std::env::set_var("QONTINUI_PORT", port.to_string());
+
+        let service = SchedulerService::new(None);
+        let result = service.launch_prompt("prompt-42", Some(3)).await;
+
+        assert_eq!(result.unwrap(), "sid-saved");
+        let body = captured.lock().await.clone().expect("no body captured");
+        assert_eq!(body["prompt_id"], "prompt-42");
+        assert_eq!(body["max_sessions"], 3);
+    }
+
+    #[test]
+    fn saved_prompt_run_request_matches_the_run_prompt_route_contract() {
+        let (path, body) = saved_prompt_run_request("p1", None);
+        assert_eq!(path, "/prompts/run");
+        assert_eq!(body, serde_json::json!({ "prompt_id": "p1" }));
+        // The body deserializes as the route's own request type, mode 1.
+        let req: crate::mcp::ai_session::RunPromptRequest =
+            serde_json::from_value(saved_prompt_run_request("p1", Some(2)).1).unwrap();
+        assert_eq!(req.prompt_id.as_deref(), Some("p1"));
+        assert_eq!(req.max_sessions, Some(2));
+        // And that route is the one the runner actually registers.
+        let routes = include_str!("mcp/ai_session.rs");
+        assert!(routes.contains(r#".route("/prompts/run", post(run_prompt))"#));
+    }
+
+    #[test]
+    fn run_prompt_session_id_reads_the_envelope_and_a_bare_body() {
+        assert_eq!(
+            run_prompt_session_id(
+                &serde_json::json!({"success": true, "data": {"session_id": "a"}})
+            ),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            run_prompt_session_id(&serde_json::json!({"session_id": "b"})),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            run_prompt_session_id(&serde_json::json!({"success": true})),
+            None
+        );
+    }
+
+    #[test]
+    fn only_ai_spawning_task_types_are_held_by_the_drain() {
+        let spawning = [
+            ScheduledTaskType::Prompt {
+                prompt_id: "p".into(),
+                max_sessions: None,
+            },
+            ScheduledTaskType::AutoFix {
+                check_findings: true,
+                force_run: false,
+            },
+            ScheduledTaskType::Watcher {
+                watcher_id: "w".into(),
+            },
+            ScheduledTaskType::Workflow {
+                workflow_name: "wf".into(),
+                config_path: None,
+                monitor_index: None,
+                workflow_id: Some("id".into()),
+            },
+        ];
+        let quiet = [
+            ScheduledTaskType::Workflow {
+                workflow_name: "legacy".into(),
+                config_path: Some("c.json".into()),
+                monitor_index: None,
+                workflow_id: None,
+            },
+            ScheduledTaskType::BackgroundCapture {
+                monitor_index: None,
+                capture_interval_secs: 60,
+                capture_on_focus_change: true,
+            },
+        ];
+        assert!(spawning.iter().all(task_spawns_ai_session));
+        assert!(!quiet.iter().any(task_spawns_ai_session));
+
+        let items: Vec<ScheduledTaskType> = spawning.iter().chain(quiet.iter()).cloned().collect();
+        let (runnable, held) = partition_for_drain(
+            items.clone(),
+            &crate::coord_drain_state::DrainGate::Allow,
+            task_spawns_ai_session,
+        );
+        assert_eq!((runnable.len(), held.len()), (6, 0));
+        let (runnable, held) = partition_for_drain(
+            items,
+            &crate::coord_drain_state::DrainGate::Defer {
+                reason: "drained".into(),
+            },
+            task_spawns_ai_session,
+        );
+        assert_eq!((runnable.len(), held.len()), (2, 4));
+        assert!(!runnable.iter().any(task_spawns_ai_session));
     }
 
     #[tokio::test]

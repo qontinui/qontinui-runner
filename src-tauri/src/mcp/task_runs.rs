@@ -2331,10 +2331,17 @@ pub async fn create_ai_session(
     let authz = crate::agent_authorization::authorize_spawn(
         None,
         crate::agent_authorization::SpawnPath::InSessionSubagent,
+        // An HTTP door: autonomous (`unknown`), deferred by the coord device drain.
+        crate::coord_drain_state::SpawnOrigin::Unknown,
     )
     .await;
     if let Some(refusal) = authz.refusal() {
-        return Err((StatusCode::FORBIDDEN, refusal));
+        let status = if authz.is_deferred_by_drain() {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return Err((status, refusal));
     }
 
     let task_run_id = uuid::Uuid::new_v4().to_string();

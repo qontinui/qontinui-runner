@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
+import { autonomousResumeDetector, subscribeCoordDrainState } from "@/hooks/useCoordDrainState";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LAYOUT_PRESETS, FLOW_GRID_ID } from "./useZoneLayout";
@@ -41,15 +42,52 @@ export async function fetchOpenRecords(
   pageId: string,
   opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
 ): Promise<TerminalSessionRecord[]> {
+  return (await fetchRestoreSet(pageId, opts)).records;
+}
+
+/** The restore set for a page, or the coord device drain's deferral of it. */
+export interface RestoreSet {
+  records: TerminalSessionRecord[];
+  /**
+   * Non-null when coord's device drain DEFERRED the restore (plan
+   * `2026-09-13-drained-runner-never-reaches-idle`, Phase 3): restoring tabs
+   * respawns sessions autonomously, so the backend withheld the set. This is
+   * NOT "no sessions" — the records are untouched and the restore must re-run
+   * once autonomous spawns are allowed again.
+   */
+  deferredByDrain: string | null;
+}
+
+/**
+ * {@link fetchOpenRecords}, keeping the drain deferral distinguishable from an
+ * empty restore set. Exported for unit tests.
+ */
+export async function fetchRestoreSet(
+  pageId: string,
+  opts?: { knownPageIds?: readonly string[]; adoptOrphans?: boolean },
+): Promise<RestoreSet> {
   let resp: CommandResponse | null;
   try {
     resp = await invoke<CommandResponse>("terminal_session_list_open");
   } catch (err) {
     console.warn("[TerminalPage] terminal_session_list_open failed:", err);
-    return [];
+    return { records: [], deferredByDrain: null };
   }
-  const sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
-  if (!Array.isArray(sessions)) return [];
+  const data = resp?.data as
+    | { sessions?: TerminalSessionRecord[]; deferredByDrain?: { reason?: unknown } | null }
+    | undefined;
+  if (data?.deferredByDrain && typeof data.deferredByDrain === "object") {
+    const reason = data.deferredByDrain.reason;
+    return {
+      records: [],
+      deferredByDrain:
+        typeof reason === "string" && reason.length > 0
+          ? reason
+          : "deferred by the coord device drain",
+    };
+  }
+  const sessions = data?.sessions;
+  if (!Array.isArray(sessions)) return { records: [], deferredByDrain: null };
   const byId = new Map<string, TerminalSessionRecord>();
   for (const rec of sessions) {
     if (!rec || typeof rec.claudeSessionId !== "string") continue;
@@ -60,7 +98,7 @@ export async function fetchOpenRecords(
     }
     if (!byId.has(rec.claudeSessionId)) byId.set(rec.claudeSessionId, rec);
   }
-  return [...byId.values()];
+  return { records: [...byId.values()], deferredByDrain: null };
 }
 
 /**
@@ -819,6 +857,18 @@ export function useTerminalInitialization({
   // auto-save runs in the single page instance for whichever page is active.
   const restoreCompletePages = useRef<Set<string>>(new Set());
 
+  // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+  // Phase 3): bumped each time autonomous spawns become allowed again. The init
+  // effect below depends on it, so a restore the drain deferred (which released
+  // its page guard) re-runs; a page whose restore already ran stays a no-op via
+  // `claimInitForPage`.
+  const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
+  useEffect(
+    () =>
+      subscribeCoordDrainState(autonomousResumeDetector(() => setDrainResumeEpoch((n) => n + 1))),
+    [],
+  );
+
   useEffect(() => {
     if (!claimInitForPage(didInitPages.current, pageId)) return;
     const initPageId = pageId;
@@ -887,10 +937,28 @@ export function useTerminalInitialization({
         //    pins / focusedZone / scrollback) — matched by zoneIndex.
         const adoptOrphans = !didClaimOrphanAdoption.current;
         didClaimOrphanAdoption.current = true;
-        const openRecords = await fetchOpenRecords(pageId, {
+        const restoreSet = await fetchRestoreSet(pageId, {
           knownPageIds: loadKnownPageIds(),
           adoptOrphans,
         });
+        if (restoreSet.deferredByDrain !== null) {
+          // Coord device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+          // Phase 3): the backend withheld the restore set because restoring
+          // tabs respawns sessions autonomously. Same shape as the
+          // indeterminate-reconnect abort above — nothing spawned, records
+          // untouched, auto-save gate left closed — and the once-per-page guard
+          // plus the orphan-adoption claim are released, so the restore re-runs
+          // when `drainResumeEpoch` moves (autonomous spawns allowed again).
+          restoreAborted = true;
+          didInitPages.current.delete(initPageId);
+          if (adoptOrphans) didClaimOrphanAdoption.current = false;
+          console.warn(
+            `[TerminalPage] restore for page "${initPageId}" deferred by the coord device ` +
+              `drain: ${restoreSet.deferredByDrain} — it re-runs when the drain lifts.`,
+          );
+          return;
+        }
+        const openRecords = restoreSet.records;
 
         // P1 defect (b): before ANY cold `claude --resume`, read which session
         // ids are ALREADY hosted by a live Claude process (Claude Code's own
@@ -1313,6 +1381,7 @@ export function useTerminalInitialization({
     })();
   }, [
     pageId,
+    drainResumeEpoch,
     reconnectToExistingSessions,
     createTerminal,
     createPlanTab,

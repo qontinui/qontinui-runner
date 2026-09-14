@@ -265,10 +265,20 @@ async fn spawn_session(
     let decision = crate::agent_authorization::authorize_spawn(
         req.role.as_deref().filter(|r| !r.is_empty()),
         crate::agent_authorization::SpawnPath::StandingContinuation,
+        // An HTTP door: the caller's reason is not this runner's to name, so it
+        // is `unknown` — autonomous, and deferred by the coord device drain.
+        crate::coord_drain_state::SpawnOrigin::Unknown,
     )
     .await;
     if let Some(refusal) = decision.refusal() {
-        return Err((StatusCode::FORBIDDEN, refusal));
+        // A drain deferral is "not now", not "forbidden": 409 so a caller can
+        // retry after the drain lifts.
+        let status = if decision.is_deferred_by_drain() {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        return Err((status, refusal));
     }
     let authz_warning = match &decision {
         crate::agent_authorization::SpawnDecision::Warn { reason } => Some(reason.clone()),

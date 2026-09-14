@@ -371,6 +371,117 @@ pub enum SpawnDecision {
     Warn { reason: String },
     /// Do not spawn; the work is blocked.
     Deny { reason: String },
+    /// Do not spawn NOW: coord has drained this device (or its drain state is
+    /// unknown) and the spawn is autonomous. **Transient, not a refusal of the
+    /// work** — the caller leaves the work where it is picked up again once the
+    /// drain lifts (plan `2026-09-13-drained-runner-never-reaches-idle`, D3).
+    /// Decided BEFORE the registry is consulted, and never lifted by the
+    /// `QONTINUI_SPAWN_AUTHZ_DISABLED` break-glass: the drain is an operator's
+    /// lever, not a fail-safe refusal of the gate.
+    DeferredByDrain { reason: String },
+}
+
+/// How a spawn stands towards coord's device drain.
+///
+/// Every call to [`authorize_spawn`] / [`authorize_fanout_spawn`] names one, so
+/// no call site can reach the registry without first saying whether the drain
+/// applies to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrainAdmission {
+    /// A new unit of work with this origin. Autonomous origins are deferred
+    /// while the device is drained or its drain state is unknown.
+    /// `work_key` identifies the work for the draining banner's count (a gate
+    /// id, an agent id); `None` counts the call site as one item.
+    Origin {
+        origin: crate::coord_drain_state::SpawnOrigin,
+        work_key: Option<String>,
+    },
+    /// NOT new work: a request-scoped helper of a run that is already going
+    /// (a workflow phase, a loop's fix step), or a spawn that creates no agent
+    /// session. The drain touches nothing already running, so it never defers
+    /// these. `why` is logged.
+    Exempt { why: &'static str },
+}
+
+impl DrainAdmission {
+    /// An origin plus a key naming the deferred work.
+    pub fn work(
+        origin: crate::coord_drain_state::SpawnOrigin,
+        work_key: impl Into<String>,
+    ) -> Self {
+        DrainAdmission::Origin {
+            origin,
+            work_key: Some(work_key.into()),
+        }
+    }
+}
+
+impl From<crate::coord_drain_state::SpawnOrigin> for DrainAdmission {
+    fn from(origin: crate::coord_drain_state::SpawnOrigin) -> Self {
+        DrainAdmission::Origin {
+            origin,
+            work_key: None,
+        }
+    }
+}
+
+/// PURE: the drain half of an authorization — `Some(DeferredByDrain)` when the
+/// drain defers this admission under `state`, `None` when the registry decides.
+pub fn decide_drain(
+    state: &crate::coord_drain_state::CoordDrainState,
+    admission: &DrainAdmission,
+) -> Option<SpawnDecision> {
+    let DrainAdmission::Origin { origin, .. } = admission else {
+        return None;
+    };
+    match crate::coord_drain_state::gate_for(state, *origin) {
+        crate::coord_drain_state::DrainGate::Allow => None,
+        crate::coord_drain_state::DrainGate::Defer { reason } => {
+            Some(SpawnDecision::DeferredByDrain { reason })
+        }
+    }
+}
+
+/// Run the drain half against the live state: on a deferral, record the work
+/// for the banner and log (edge-triggered, like the registry verdicts).
+fn drain_admission(
+    agent_name: Option<&str>,
+    spawn_path: SpawnPath,
+    admission: &DrainAdmission,
+) -> Option<SpawnDecision> {
+    if let DrainAdmission::Exempt { why } = admission {
+        tracing::debug!(
+            agent = agent_name.unwrap_or("-"),
+            spawn_path = spawn_path.as_wire(),
+            "spawn authorization: drain-exempt ({why})"
+        );
+        return None;
+    }
+    let decision = decide_drain(&crate::coord_drain_state::current(), admission)?;
+    if let DrainAdmission::Origin { origin, work_key } = admission {
+        let key = work_key
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", spawn_path.as_wire(), agent_name.unwrap_or("-")));
+        crate::coord_drain_state::record_deferral(*origin, &key);
+    }
+    let agent = agent_name.unwrap_or("-");
+    if verdict_changed(agent, spawn_path, "coord-device-drain", decision.label()) {
+        warn!(
+            agent,
+            spawn_path = spawn_path.as_wire(),
+            decision = decision.label(),
+            "spawn authorization: {}",
+            decision.reason().unwrap_or("")
+        );
+    } else {
+        tracing::debug!(
+            agent,
+            spawn_path = spawn_path.as_wire(),
+            decision = decision.label(),
+            "spawn authorization: unchanged (deferred by drain)"
+        );
+    }
+    Some(decision)
 }
 
 impl SpawnDecision {
@@ -392,8 +503,15 @@ impl SpawnDecision {
             SpawnDecision::Allow | SpawnDecision::SerializeToBound { .. } => None,
             SpawnDecision::DegradeToInline { reason }
             | SpawnDecision::Warn { reason }
-            | SpawnDecision::Deny { reason } => Some(reason),
+            | SpawnDecision::Deny { reason }
+            | SpawnDecision::DeferredByDrain { reason } => Some(reason),
         }
+    }
+
+    /// True for [`SpawnDecision::DeferredByDrain`] — the one non-spawning
+    /// outcome a caller must treat as "later", never as a failure.
+    pub fn is_deferred_by_drain(&self) -> bool {
+        matches!(self, SpawnDecision::DeferredByDrain { .. })
     }
 
     /// A structured, machine-greppable refusal line for the call sites that
@@ -415,6 +533,7 @@ impl SpawnDecision {
             SpawnDecision::DegradeToInline { .. } => "degrade_to_inline",
             SpawnDecision::Warn { .. } => "warn_proceed",
             SpawnDecision::Deny { .. } => "deny",
+            SpawnDecision::DeferredByDrain { .. } => "deferred_by_drain",
         }
     }
 }
@@ -948,6 +1067,9 @@ fn annotate(decision: SpawnDecision, note: &str) -> SpawnDecision {
         // gate, after the matrix has already run), so there is nothing to
         // annotate.
         d @ SpawnDecision::SerializeToBound { .. } => d,
+        // Nor this one: the drain is decided before the registry matrix runs,
+        // and registry staleness says nothing about the drain.
+        d @ SpawnDecision::DeferredByDrain { .. } => d,
         SpawnDecision::DegradeToInline { reason } => SpawnDecision::DegradeToInline {
             reason: format!("{reason} [{note}]"),
         },
@@ -1564,6 +1686,10 @@ pub enum FanoutAdmission {
         bound: u32,
         waited: Duration,
     },
+    /// Coord's device drain deferred this spawn. **Transient**, like
+    /// `SlotUnavailable`: never a task failure — retry once the drain lifts.
+    /// Decided before the gate is touched, so no slot is taken.
+    DeferredByDrain { reason: String },
 }
 
 /// Authorize ONE `parallel_fanout` spawn and admit it against the declared
@@ -1573,8 +1699,11 @@ pub enum FanoutAdmission {
 /// `authorize_spawn` runs the matrix but does no fan-out accounting, so it
 /// cannot honour the bound. **Callers on a reconcile loop want
 /// [`authorize_fanout_spawn_with_budget`] instead** — see the budget's docs.
-pub async fn authorize_fanout_spawn(agent_name: Option<&str>) -> FanoutAdmission {
-    authorize_fanout_spawn_with_budget(agent_name, FANOUT_WAIT_BUDGET).await
+pub async fn authorize_fanout_spawn(
+    agent_name: Option<&str>,
+    admission: impl Into<DrainAdmission>,
+) -> FanoutAdmission {
+    authorize_fanout_spawn_with_budget(agent_name, FANOUT_WAIT_BUDGET, admission).await
 }
 
 /// [`authorize_fanout_spawn`] with an explicit queueing budget.
@@ -1589,8 +1718,16 @@ pub async fn authorize_fanout_spawn(agent_name: Option<&str>) -> FanoutAdmission
 pub async fn authorize_fanout_spawn_with_budget(
     agent_name: Option<&str>,
     wait_budget: Duration,
+    admission: impl Into<DrainAdmission>,
 ) -> FanoutAdmission {
     let path = SpawnPath::ParallelFanout;
+    // The drain first: a deferred spawn must neither cost a registry lookup
+    // nor take (or queue for) a fan-out slot.
+    if let Some(SpawnDecision::DeferredByDrain { reason }) =
+        drain_admission(agent_name, path, &admission.into())
+    {
+        return FanoutAdmission::DeferredByDrain { reason };
+    }
     let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
     let verdict = decide(resolved.as_resolution(), agent_name, path);
     log_verdict(&verdict, agent_name, path);
@@ -1687,7 +1824,19 @@ async fn admit_fanout(
 /// decision in the matrix (see the module docs). Every decision is logged with
 /// the rule that fired and the disposition (if any), because the clause
 /// requires the session to say which one applied.
-pub async fn authorize_spawn(agent_name: Option<&str>, spawn_path: SpawnPath) -> SpawnDecision {
+///
+/// `admission` states how the spawn stands towards coord's device drain (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, Phase 3). It is checked
+/// FIRST: an autonomous origin on a drained (or drain-unknown) device returns
+/// [`SpawnDecision::DeferredByDrain`] without consulting the registry.
+pub async fn authorize_spawn(
+    agent_name: Option<&str>,
+    spawn_path: SpawnPath,
+    admission: impl Into<DrainAdmission>,
+) -> SpawnDecision {
+    if let Some(deferred) = drain_admission(agent_name, spawn_path, &admission.into()) {
+        return deferred;
+    }
     let resolved = CACHE.resolve_at(Instant::now(), fetch_effective).await;
     let verdict = decide(resolved.as_resolution(), agent_name, spawn_path);
     log_verdict(&verdict, agent_name, spawn_path);
@@ -3498,5 +3647,86 @@ mod tests {
         ));
         drop(live);
         drop(take_now(&gate, "live", 1).await);
+    }
+}
+
+/// The drain half of the authorization (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, Phase 3).
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::coord_drain_state::{CoordDrainState, SpawnOrigin};
+
+    fn drained() -> CoordDrainState {
+        CoordDrainState::Drained {
+            until: None,
+            reason: Some("rebuild".into()),
+        }
+    }
+
+    fn unknown() -> CoordDrainState {
+        CoordDrainState::Unknown {
+            since: chrono::Utc::now(),
+            cause: "3 consecutive failed drain read(s)".into(),
+        }
+    }
+
+    #[test]
+    fn an_autonomous_origin_is_deferred_while_drained_or_unknown() {
+        for state in [drained(), unknown()] {
+            for origin in SpawnOrigin::ALL.into_iter().filter(|o| o.is_autonomous()) {
+                let d = decide_drain(&state, &origin.into()).expect("deferred");
+                assert!(d.is_deferred_by_drain());
+                assert!(!d.allows_spawn(), "a deferral never authorizes the spawn");
+                assert_eq!(d.label(), "deferred_by_drain");
+                assert!(d.refusal().is_some_and(|r| r.contains("deferred_by_drain")));
+            }
+        }
+    }
+
+    #[test]
+    fn operator_origins_and_exempt_admissions_are_never_deferred() {
+        for state in [drained(), unknown()] {
+            assert_eq!(
+                decide_drain(&state, &SpawnOrigin::OperatorTerminal.into()),
+                None
+            );
+            assert_eq!(
+                decide_drain(&state, &SpawnOrigin::OperatorChat.into()),
+                None
+            );
+            assert_eq!(
+                decide_drain(
+                    &state,
+                    &DrainAdmission::Exempt {
+                        why: "workflow phase"
+                    }
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn clear_and_not_enrolled_leave_the_decision_to_the_registry() {
+        for state in [
+            CoordDrainState::Clear,
+            CoordDrainState::NotEnrolled { why: "no coord" },
+        ] {
+            for origin in SpawnOrigin::ALL {
+                assert_eq!(decide_drain(&state, &origin.into()), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_keyed_admission_carries_its_work_key() {
+        assert_eq!(
+            DrainAdmission::work(SpawnOrigin::GateContinuation, "gate:1"),
+            DrainAdmission::Origin {
+                origin: SpawnOrigin::GateContinuation,
+                work_key: Some("gate:1".into())
+            }
+        );
     }
 }

@@ -244,6 +244,10 @@ pub async fn dispatch_subtask(
     let fanout_slot = match crate::agent_authorization::authorize_fanout_spawn_with_budget(
         None,
         FANOUT_ADMISSION_WAIT,
+        crate::agent_authorization::DrainAdmission::work(
+            crate::coord_drain_state::SpawnOrigin::Orchestration,
+            format!("subtask:{}", subtask.task_id),
+        ),
     )
     .await
     {
@@ -321,6 +325,17 @@ pub async fn dispatch_subtask(
                  tick retries.",
                 subtask.task_id,
                 waited.as_millis()
+            ));
+        }
+        crate::agent_authorization::FanoutAdmission::DeferredByDrain { reason } => {
+            // TRANSIENT, like the bound above: coord has drained this device (or
+            // its drain state is unknown). The subtask stays `Submitted` — the
+            // work is deferred, never failed — and a later tick dispatches it
+            // once the drain lifts.
+            return Err(format!(
+                "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask stays \
+                 queued and a later tick retries.",
+                subtask.task_id
             ));
         }
     };
