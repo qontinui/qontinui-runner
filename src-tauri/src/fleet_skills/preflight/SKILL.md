@@ -471,7 +471,12 @@ bash qontinui-claude-config/scripts/custody-intent-write.sh <this worktree> \
 ### 6. Acquire `file_glob` claims in globset path form — and heartbeat them
 
 ```
-coord_claim_acquire(kind="file_glob", resource_key="<glob>")   # one per path
+# ttl_seconds=900 is deliberate: the file_glob kind defaults to 90s, and the
+# heartbeat below renews each row every max(its ttl/3, 60 s) — so accepting
+# the 90s grant would mean one request PER GLOB every 60 s for the whole run,
+# a rate that scales with N globs across the fleet. Requesting 900s makes it
+# one request per glob every 300 s.
+coord_claim_acquire(kind="file_glob", resource_key="<glob>", ttl_seconds=900)   # one per path
 ```
 
 - Use **globset path form** (`qontinui-runner/src-tauri/src/session/*.rs`),
@@ -486,18 +491,20 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>")   # one per path
   ```bash
   CLAIM_LEDGER="$HOME/.qontinui/claim-ledger/${AGENT_SESSION_ID:-nosession}.ledger"
 
-  # One `add` per glob. --ttl 900 is deliberate: the file_glob kind defaults to
-  # 90s, and coord re-arms a heartbeat to the REQUEST's ttl_seconds — so a 90s
-  # row would force a 30s cadence PER GLOB for the whole run.
+  # One `add` per glob. --ttl is the `ttl_seconds` THAT glob's acquire response
+  # returned — the TTL coord granted, never a guess. A ledger TTL longer than
+  # the grant paces the loop too slowly and the claim lapses before its first
+  # beat; `add` refuses without --ttl.
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
-    --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl 900
+    --ledger "$CLAIM_LEDGER" --kind file_glob --key "<glob>" --ttl "<ttl_seconds>"
 
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
   ```
 
-  `start` detaches a background loop that re-heartbeats every row at min(row
-  TTL)/3 with a 60 s floor. The trade `--ttl 900` buys: a helper that dies leaves
-  a `file_glob` claim lingering up to 15 minutes instead of 90 seconds — bounded
+  `start` detaches a background loop that re-heartbeats each row when THAT row
+  falls due, every max(its own TTL/3, 60 s). The trade `ttl_seconds=900` buys: a
+  helper that dies leaves a `file_glob` claim lingering up to 15 minutes instead
+  of 90 seconds — bounded
   by `stop` in your try/finally and by the helper's own `--max-runtime`.
 
 - **`status` is the contract — read it, do not assume the loop lives.**
@@ -506,14 +513,18 @@ coord_claim_acquire(kind="file_glob", resource_key="<glob>")   # one per path
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"
   ```
 
-  One line per row plus a verdict on the **exit code**: `LIVE` (0) — pid alive
-  and every row heartbeated within half its TTL; `STALE` (3) — pid alive but a
-  row has gone quiet; `DEAD` (4) — no loop at all; `STOLEN` (5) — a row's last
-  answer was `stolen`, and the loop exited rather than re-arm a claim now held by
-  someone else. **Only `LIVE` means the claims are held.** The other three mean
-  the claim is **UNKNOWN**, which is a re-acquire and a line in the report, never
-  a shrug — a dead loop and a healthy one look identical to anything that never
-  asks.
+  One line per row, each carrying a `state=`, plus a verdict on the **exit
+  code**: `LIVE` (0) — pid alive and every row heartbeated within half its TTL;
+  `STALE` (3) — pid alive but a row is past half its TTL, still inside it;
+  `DEAD` (4) — no loop at all; `STOLEN` (5) — a row's last answer named another
+  holder; `LAPSED` (7) — a row's grant is gone (its heartbeat came back `stolen`
+  with no holder, or it aged past its TTL). A `stolen` or `lapsed` row is marked
+  terminal and never beaten again, while the loop keeps renewing the others.
+  **Only `LIVE` means the claims are held.** The other four mean the claim is
+  **UNKNOWN**, which is a re-acquire and a line in the report, never a shrug — a
+  dead loop and a healthy one look identical to anything that never asks. After
+  re-acquiring a key, **re-`add` it** with `--ttl` set to the new response's
+  `ttl_seconds`: that overwrites its terminal row, and `start` alone does not.
 
 - **Release symmetrically**: `remove` each glob row, then `stop` the loop, then
   release the claims. A loop still running past the release renews keys nobody

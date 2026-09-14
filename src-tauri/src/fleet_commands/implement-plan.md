@@ -689,19 +689,26 @@ this key, and a second loop only doubles the request rate against it.
 # Ledger path — resolve ONCE here; Step 0.6, Step 1 and Step 6 all reuse it.
 CLAIM_LEDGER="$HOME/.qontinui/claim-ledger/${AGENT_SESSION_ID:-nosession}.ledger"
 
+# --ttl is the `ttl_seconds` coord GRANTED, copied off the reserve response
+# this step just received (both doors return it) -- never a guess. The
+# loop's cadence is derived from it and `add` refuses without it.
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
   --ledger "$CLAIM_LEDGER" \
   --kind semantic_resource \
-  --key "plan:<plan-stem>"
+  --key "plan:<plan-stem>" \
+  --ttl "<ttl_seconds>"
 bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh start --ledger "$CLAIM_LEDGER"
 ```
 
-`start` detaches a background loop that re-heartbeats every row in the ledger at
-min(row TTL)/3 with a 60 s floor, replaying the owner token
+`start` detaches a background loop that re-heartbeats each row in the
+ledger when THAT row falls due — every max(its own TTL/3, 60 s) since its last
+ok, so a short-TTL row added to a loop already sleeping on long rows is still
+renewed inside its grant — replaying the owner token
 `<machine_id>:<agent_session_id>` on every request — coord matches on that pair,
 so a heartbeat without it renews nothing, answers `not_held`, and lets the claim
 age out anyway. `status --ledger "$CLAIM_LEDGER"` prints one line per row and a
-verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5).
+verdict on its exit code: `LIVE` (0), `STALE` (3), `DEAD` (4), `STOLEN` (5),
+`LAPSED` (7).
 Anything but `LIVE` means the claim is **UNKNOWN, not held**.
 
 #### Refresh the agent token — (b) before every phase launch, (c) before every closeout write
@@ -1185,13 +1192,16 @@ snake_case-tagged. Parse it:
   against this claim via `/claims/heartbeat`). **Add the claim to the
   heartbeat ledger** — on `renewed` as well as `claimed`, because unlike
   the plan reserve a phase claim is only ever renewed by this same session,
-  so there is no outer owner to defer to:
+  so there is no outer owner to defer to. Pass the response's `ttl_seconds`
+  as `--ttl`: it is the TTL coord granted, the loop's cadence is derived
+  from it, and `add` refuses without it — never substitute a guessed value:
 
   ```bash
   bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh add \
     --ledger "$CLAIM_LEDGER" \
     --kind phase \
-    --key "plan:<plan-stem>:phase:<n>"
+    --key "plan:<plan-stem>:phase:<n>" \
+    --ttl "<ttl_seconds>"
   ```
 
   `$CLAIM_LEDGER` is the path Step 0.48 resolved; the loop it started picks
@@ -1449,7 +1459,8 @@ The release endpoint is idempotent, but **`"not_held"` is evidence the claim
 LAPSED, not a clean no-op** — it used to be the expected answer for any phase
 running past its TTL, because nothing heartbeated. With the ledger loop above
 running, it no longer is: reaching it means the loop died, the claim was
-stolen, or the row was never added. Report it, and read
+stolen, the row lapsed (marked terminal — see `status` exit 7), or the row was
+never added. Report it, and read
 `bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh status --ledger "$CLAIM_LEDGER"` to say
 since when. Treat release as
 try/finally semantics: release MUST fire even on phase-agent failure,
@@ -1462,14 +1473,15 @@ Phase claims have a 7200s (2 hour) default TTL per `claims.rs:121`.
 **This skill DOES auto-heartbeat between phase launches.** The ledger loop
 started at Step 0.48 (`scripts/coord-claim-heartbeat.sh start`) covers every
 row added to `$CLAIM_LEDGER` — the plan reserve and each phase claim alike —
-re-heartbeating at min(row TTL)/3 with a 60 s floor, which for a 7200 s phase
-claim is one request per 2400 s. The spawned phase agent does not need to
-heartbeat its own claim, and a phase running longer than 2 hours is no longer
+re-heartbeating each row when it falls due, every max(its own TTL/3, 60 s),
+which for a 7200 s phase claim is one request per 2400 s. The spawned phase
+agent does not need to heartbeat its own claim, and a phase running longer than 2 hours is no longer
 a special case. The loop replays the owner token on every request; a hand
 heartbeat must too, or it will not match and returns `not_held`.
 
 **Read `status` at every phase boundary.** The loop can die — a killed pid, a
-`stolen` result that made it exit deliberately, a box that slept. So before
+box that slept. A single `stolen` or `lapsed` row no longer ends it: that row
+is marked terminal and the loop keeps renewing the others. So before
 launching the NEXT phase, run:
 
 ```bash
@@ -1477,8 +1489,11 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 ```
 
 `LIVE` (exit 0) is the only verdict that means the claims are held. `STALE`
-(3), `DEAD` (4) and `STOLEN` (5) each mean the claim is **UNKNOWN, not held**
-— re-`acquire` the affected key before launching, treat a foreign `held` on
+(3), `DEAD` (4), `STOLEN` (5) and `LAPSED` (7) each mean the claim is
+**UNKNOWN, not held**
+— re-`acquire` the affected key and re-`add` it with `--ttl` set to the new
+response's `ttl_seconds` (a terminal row is renewed again only once `add`
+overwrites it) before launching, treat a foreign `held` on
 the re-acquire as the conflict flow above, and **say in the report which
 verdict you saw and what you re-acquired**. Silence here is the
 `silent-empty-is-unknown` failure: a dead loop looks exactly like a healthy
@@ -2088,11 +2103,14 @@ bash <workspace-root>/qontinui-claude-config/scripts/coord-claim-heartbeat.sh st
 
 `LIVE` (exit 0) is the only verdict under which the claims this run already
 holds — the Step 0.48 plan reserve included — are actually held. `STALE` (3),
-`DEAD` (4) and `STOLEN` (5) each mean those claims are **UNKNOWN**, so
+`DEAD` (4), `STOLEN` (5) and `LAPSED` (7) each mean those claims are
+**UNKNOWN**, so
 **re-`acquire` every key the ledger lists before launching this phase**
 (`kind=semantic_resource, plan:<stem>` and each live `kind=phase` row), handle a
-foreign `held` through the Step 0.6 conflict flow, and restart the loop with
-`start`. **Say so in the report**: which verdict was read, which keys were
+foreign `held` through the Step 0.6 conflict flow, **re-`add` each re-acquired
+key** with `--ttl` set to that response's `ttl_seconds` (a `stolen` or `lapsed`
+row stays terminal until `add` overwrites it — `start` alone does not), and
+restart the loop with `start`. **Say so in the report**: which verdict was read, which keys were
 re-acquired, and what the re-acquire answered. A re-acquire that is not reported
 is indistinguishable from a claim that never lapsed.
 
