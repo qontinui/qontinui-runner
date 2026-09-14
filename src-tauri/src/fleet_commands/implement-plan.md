@@ -42,6 +42,17 @@ launched outside the runner will not have it.
 >      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
 >      enumerate. Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch.
+>      **Fetch first; a failed fetch skips both git doors.** Run
+>      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`
+>      and read its exit code unpiped (a pipe reports the last command's). The
+>      explicit destination matters: in a clone whose fetch refspec does not
+>      cover `main`, a bare `fetch origin main` exits 0 and moves only
+>      `FETCH_HEAD`. On a non-zero exit read neither git door and go on to
+>      door 3: `origin/main` stays at the last good fetch, `ls-tree` still exits
+>      0 against it, and a plan pushed since then reads as absent — in a body
+>      read, an enumeration, or the `ls-tree` count below, which is then
+>      unavailable. A door-3 row whose `slug` equals the stem resolves the
+>      plan; no such row is UNKNOWN, never absent.
 >   3. **The deployed door — a coord DEVICE JWT.**
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
@@ -70,12 +81,12 @@ launched outside the runner will not have it.
 >   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
 >   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
 >   the key `<repo>/plans`.
->   - **No git door found the file** (after a `git fetch`): the roll-up has
->     nothing to add.
+>   - **No git door found the file** (after the door-2 fetch exited 0): the
+>     roll-up has nothing to add.
 >   - **A git door found it, and you read by `slug=<stem>`:** the miss is
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
->     then always `false`); (b) after a `git fetch`,
+>     then always `false`); (b) after the door-2 fetch exited 0,
 >     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
 >     0 (any other exit, including an object this clone lacks, is UNKNOWN).
 >     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
