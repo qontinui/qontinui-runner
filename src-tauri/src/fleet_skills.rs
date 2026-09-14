@@ -371,21 +371,19 @@ fn provision_fleet_skills_into(
             );
             continue;
         }
-        // A key that is also another key's directory prefix is individually
-        // valid and jointly unwritable — `a` lands as a file and
-        // `create_dir_all("a")` then fails EEXIST, mid-bundle, with half the
-        // skill on disk. Refused as a whole rather than discovered at the write.
-        if let Some((file, child)) = crate::agent_skills::colliding_path_prefix(&skill.files) {
+        // Keys that are individually valid and JOINTLY unwritable — one key
+        // that is another's directory prefix, or the same once case is folded.
+        // `a` lands as a file and `create_dir_all("a")` then fails, mid-bundle,
+        // with half the skill on disk. Refused as a whole rather than
+        // discovered at the write.
+        if let Some(why) = crate::agent_skills::unwritable_key_conflict(&skill.files) {
             warn!(
-                "fleet_skills: refusing to provision skill {:?} — file {file:?} is also the \
-                 directory prefix of {child:?}",
+                "fleet_skills: refusing to provision skill {:?} — {why}",
                 skill.name
             );
             out.skip(
                 format!("{}/*", skill.name),
-                capability_manifest::SkipReason::Rejected(format!(
-                    "file {file:?} is also the directory prefix of {child:?}"
-                )),
+                capability_manifest::SkipReason::Rejected(why),
             );
             continue;
         }

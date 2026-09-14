@@ -198,7 +198,7 @@ fn token_prefix(line: &str, start: usize) -> String {
 #[cfg(test)]
 fn skill_invocation_prefixes(line: &str, script_name: &str) -> Vec<String> {
     match invocation_re(script_name) {
-        Some(re) => prefixes_with(&re, line),
+        Some(re) => prefixes_with(&re, line).collect(),
         None => Vec::new(),
     }
 }
@@ -208,8 +208,12 @@ fn skill_invocation_prefixes(line: &str, script_name: &str) -> Vec<String> {
 /// Split out from the two arm wrappers so the scan can hoist the compile: a
 /// `Regex::new` per LINE per script made the shipped 9-skill bundle take over a
 /// minute to validate, and this runs on a session spawn path.
-fn prefixes_with(re: &Regex, line: &str) -> Vec<String> {
-    re.captures_iter(line).map(|c| c[1].to_string()).collect()
+///
+/// LAZY, so [`MAX_REPORTED_VIOLATIONS`] really does stop the scan. Collecting
+/// first would materialise every match on a line before the cap could fire, and
+/// a unit is allowed to be one 4 MB line.
+fn prefixes_with<'a>(re: &'a Regex, line: &'a str) -> impl Iterator<Item = String> + 'a {
+    re.captures_iter(line).map(|c| c[1].to_string())
 }
 
 /// `None` when the pattern does not compile. The script name is remote text, so
@@ -240,7 +244,7 @@ fn invocation_re(script_name: &str) -> Option<Regex> {
 #[cfg(test)]
 fn sibling_use_prefixes(line: &str, sibling: &str) -> Vec<String> {
     match sibling_use_re(sibling) {
-        Some(re) => prefixes_with(&re, line),
+        Some(re) => prefixes_with(&re, line).collect(),
         None => Vec::new(),
     }
 }
