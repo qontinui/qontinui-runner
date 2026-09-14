@@ -42,10 +42,13 @@ launched outside the runner will not have it.
 >      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
 >      enumerate. Authoring layer only (a plan authored through the web UI is
 >      invisible here), exact stem match, `origin/main` as of the last fetch —
->      so `git -C qontinui-dev-notes fetch origin` first, and when that fetch
->      was skipped or exited non-zero a git-door MISS is UNKNOWN (the ref may
->      predate the plan); a hit still shows the plan reached `origin/main`, but
->      its body may lag it.
+>      so fetch first:
+>      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      exit code read unpiped (a bare `fetch origin main` in a clone whose
+>      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
+>      When that fetch was skipped or exited non-zero, a git-door MISS is
+>      UNKNOWN (the ref may predate the plan); a hit still shows the plan
+>      reached `origin/main`, but its body may lag it.
 >   3. **The deployed door — a coord DEVICE JWT.**
 >      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
 >      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
@@ -79,9 +82,8 @@ launched outside the runner will not have it.
 >   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
 >   the key `<repo>/plans`.
 >   - **No git door found the file:** the roll-up has nothing to add; the miss
->     is UNKNOWN on its own unless it came after that
->     `git -C qontinui-dev-notes fetch origin` exiting 0, and even then it
->     speaks for the authoring layer only.
+>     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
+>     and even then it speaks for the authoring layer only.
 >   - **A git door found it, and you read by `slug=<stem>`:** the miss is
 >     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
 >     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
