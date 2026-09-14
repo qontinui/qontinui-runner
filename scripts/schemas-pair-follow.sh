@@ -11,53 +11,61 @@
 # WHY
 # ---------------------------------------------------------------------------
 # qontinui-schemas is pinned in .github/sibling-pins.conf. A schemas-leads
-# adaptation pair is a runner PR M adapting to a breaking schemas PR N. It is
-# declared either as `coord:downstream-of=[qontinui/]qontinui-schemas#N` on M
-# (form 2) or as `coord:upstream-of=[qontinui/]qontinui-runner#M` on N (form 1).
-# Once N lands, three things line up against M:
+# adaptation pair is a runner PR M adapting to a breaking schemas PR N, declared
+# as `coord:downstream-of=[qontinui/]qontinui-schemas#N` on M (form 2) or
+# `coord:upstream-of=[qontinui/]qontinui-runner#M` on N (form 1). Once N lands:
 #   - coord strips M's label;
-#   - checkout-sibling refuses a declaration that is not open;
-#   - a merge-candidate push carries no PR number, so it reads no declaration
-#     at all.
-# So M's rerun and its candidate build both compile the OLD pin and stay red,
-# until someone moves the pin and Cargo.lock inside M. This script makes that
+#   - checkout-sibling refuses a declaration that is no longer open;
+#   - a merge-candidate push carries no PR number, so it reads no declaration at all.
+# M's rerun and its candidate build therefore compile the OLD pin, and M stays
+# red until someone moves the pin and Cargo.lock inside M. This script makes that
 # one move, and refuses whenever it cannot prove the move is safe.
+#
+# ---------------------------------------------------------------------------
+# TRUST
+# ---------------------------------------------------------------------------
+# `decide` and `scan` run main's code over API reads, and their output is the
+# TRUSTED plan item. `merge-and-pin` and `lock-and-commit` run in an unprivileged
+# job. They execute no code from the PR's tree: git merges data, cargo runs from
+# outside the checkout with main's toolchain (so neither the tree's
+# rust-toolchain.toml nor its .cargo/config.toml is honoured), and
+# checkout-sibling comes from main. `push` treats that job's artifact as
+# UNTRUSTED. It takes every target (PR, ref, head, main, land commit) from the
+# trusted plan item and only a candidate commit id from the artifact. It then
+# re-derives and re-verifies everything before pushing.
 #
 # ---------------------------------------------------------------------------
 # SUBCOMMANDS
 # ---------------------------------------------------------------------------
 #   scan
-#       Print one "M N" candidate per line, from both declaration forms.
+#     Print one "M N" candidate per line, from both forms.
 #   decide <M> <N>
-#       Print ONE JSON object whose action is FOLLOW / SKIP / UNKNOWN. Always
-#       exits 0; the caller counts UNKNOWNs and fails red on them.
-#   merge-and-pin <runner-dir> <meta.json>
-#       UNPRIVILEGED compute job. Merges runner main into M's head, then moves
-#       the pin to A unless the merge already contains it. Prints MODE= and
-#       REASON= lines.
-#   lock-and-commit <runner-dir> <meta.json> <out-dir> <MODE>
-#       UNPRIVILEGED compute job. Refreshes Cargo.lock resolve-only, asserts
-#       the file scope, commits, and writes <out-dir>/pair-follow.bundle and
-#       <out-dir>/meta.json.
-#   push <out-dir> <scratch-dir>
-#       PRIVILEGED push job, running main's code only. Re-verifies the bundle
-#       structure and scope, re-reads M's head, removes a still-present form-2
-#       label, pushes with --force-with-lease on the head it built on, and
-#       comments once. Prints RESULT=.
+#     Print ONE JSON object: FOLLOW / SKIP / UNKNOWN. Always exits 0; the caller
+#     counts UNKNOWNs.
+#   merge-and-pin <runner-dir> <plan-item.json>
+#     Merge runner main into M's head, then move the pin to A unless the merge
+#     already contains it. Print MODE= and REASON=.
+#   lock-and-commit <runner-dir> <plan-item.json> <out-dir> <MODE>
+#     Refresh Cargo.lock, assert scope, commit, and write
+#     <out-dir>/pair-follow.bundle and <out-dir>/meta.json.
+#   push <plan-item.json> <out-dir> <scratch-dir>
+#     Verify the bundle against the TRUSTED plan item, re-read the PR and its
+#     claims, and push with --force-with-lease. Print RESULT=.
 #
 # Exit codes: 0 = a named outcome (FOLLOW / MERGE_ONLY / SKIP / ABORT / PUSHED);
-#             3 = UNKNOWN (the lane must go red); 2 = usage error.
+#             3 = UNKNOWN or refused (the lane goes red); 2 = usage.
 #
 # ENV
 #   SPF_FIXTURES             fixture root (gh/<name>, coord/<name>, writes.log); no network
-#   SPF_KILL_SWITCH          the repository variable SCHEMAS_PAIR_FOLLOW; 'off' disables
-#   COORD_CLAIMS_READ_TOKEN  optional bearer for coord claim reads (see plan §7.7)
+#   SPF_KILL_SWITCH          repository variable SCHEMAS_PAIR_FOLLOW; 'off' disables
+#   COORD_CLAIMS_READ_TOKEN  optional bearer for coord claim reads (plan §7.7)
 #   SPF_COORD_URL            default https://coord.qontinui.io
 #   SPF_RUNNER_REPO          default qontinui/qontinui-runner
-#   SPF_LOCK_CMD             lock refresh (default: cargo metadata, then --locked)
+#   SPF_TOOLCHAIN            rust toolchain for the lock refresh (main's channel)
+#   SPF_LOCK_CMD             test override for the lock refresh (runs in the runner dir)
 #   SPF_PUSH_TOKEN           PAT for the push (CLORINDE_AUTOCOMMIT_TOKEN)
 #   SPF_PUSH_URL / SPF_FETCH_URL  remotes (default https://github.com/<runner>.git)
-#   SPF_FETCH_FILTER         clone filter for the push job's verify clone (default blob:none; '' = none)
+#   SPF_FETCH_FILTER         verify-clone filter (default blob:none; '' = none)
 set -euo pipefail
 
 RUNNER="${SPF_RUNNER_REPO:-qontinui/qontinui-runner}"
@@ -65,8 +73,9 @@ RUNNER_NAME="${RUNNER#*/}"
 SCHEMAS="qontinui/qontinui-schemas"
 CONF=".github/sibling-pins.conf"
 COORD="${SPF_COORD_URL:-https://coord.qontinui.io}"
-# The coord GitHub App that posts the land announcement (render_ff_land_comment).
-LAND_BOT="qontinui-merge-orchestrator[bot]"
+# The coord GitHub App: it posts the land announcement (render_ff_land_comment)
+# and strips waiting-side dep labels (DepLabelStripHook).
+COORD_BOT="qontinui-merge-orchestrator[bot]"
 TRAILER_KEY="Schemas-Pair-Follow"
 BOT_NAME="github-actions[bot]"
 BOT_EMAIL="41898283+github-actions[bot]@users.noreply.github.com"
@@ -74,6 +83,8 @@ BOT_EMAIL="41898283+github-actions[bot]@users.noreply.github.com"
 err() { printf 'schemas-pair-follow: %s\n' "$*" >&2; }
 fxname() { printf '%s' "$1" | sed 's#[^A-Za-z0-9._-]#_#g'; }
 is_sha() { [[ "$1" =~ ^[0-9a-f]{40}$ ]]; }
+is_num() { [[ "$1" =~ ^[0-9]+$ ]]; }
+form2_re() { printf '^coord:downstream-of=(qontinui/)?qontinui-schemas#%s$' "$1"; }
 
 # --- GitHub reads ----------------------------------------------------------
 # gh_get PATH -> body on stdout. rc 0 = ok, 44 = HTTP 404, 1 = any other failure.
@@ -107,6 +118,7 @@ gh_write() {
   local method="$1" path="$2"
   shift 2
   if [ -n "${SPF_FIXTURES:-}" ]; then
+    if [ -f "$SPF_FIXTURES/write-fail" ]; then return 1; fi
     printf '%s %s %s\n' "$method" "$path" "$*" >>"$SPF_FIXTURES/writes.log"
     return 0
   fi
@@ -144,13 +156,25 @@ claim_state() {
       return 3 ;;
   esac
   local holder
-  # No `-e`: a free claim IS `"holder": null`, and `jq -e` exits 1 on a null result.
-  # A wrong shape still fails, through error().
+  # No `-e`: a free claim IS `"holder": null`, and `jq -e` exits 1 on a null
+  # result. A wrong shape still fails, through error().
   if ! holder="$(printf '%s' "$body" | jq -c 'if type == "object" and has("holder") then .holder else error("shape") end' 2>/dev/null)"; then
     err "claim read $kind/$key: unparseable body. UNKNOWN, not 'no claim'."
     return 3
   fi
   if [ "$holder" = "null" ]; then echo free; else echo held; fi
+}
+
+# first_held_claim M REF -> prints the held kind, or nothing. rc 3 = UNKNOWN.
+first_held_claim() {
+  local m="$1" ref="$2" kind key st kind_key
+  for kind_key in "branch_name|$ref" "ci_wait|$RUNNER_NAME#$m" "ci_wait|$RUNNER#$m" "repo_branch|$RUNNER_NAME:$ref"; do
+    kind="${kind_key%%|*}"
+    key="${kind_key#*|}"
+    st="$(claim_state "$kind" "$key")" || return 3
+    if [ "$st" = "held" ]; then echo "$kind"; return 0; fi
+  done
+  return 0
 }
 
 # --- pins, landing, containment --------------------------------------------
@@ -165,8 +189,8 @@ conf_at() {
 }
 
 # contains A PIN -> rc 0 when PIN contains A, 1 when not, 3 UNKNOWN.
-# compare/<base>...<head> reports HEAD relative to BASE, so PIN (head) containing
-# A (base) reads `ahead` or `identical`.
+# compare/<base>...<head> reports HEAD relative to BASE, so a PIN (head) that
+# contains A (base) reads `ahead` or `identical`.
 contains() {
   local a="$1" pin="$2" st
   [ "$a" = "$pin" ] && return 0
@@ -190,7 +214,7 @@ landed_state() {
     else "abandoned" end' <<<"$1"
 }
 
-# land_commit N_JSON -> the full sha of N's land commit A, verified on schemas main. rc 3 UNKNOWN.
+# land_commit N_JSON -> full sha of N's land commit A, verified on schemas main. rc 3 UNKNOWN.
 land_commit() {
   local nj="$1" n sha="" short closed st
   n="$(jq -r .number <<<"$nj")"
@@ -199,7 +223,7 @@ land_commit() {
   else
     local comments
     comments="$(gh_get "repos/$SCHEMAS/issues/$n/comments?per_page=100")" || return 3
-    short="$(jq -r --arg bot "$LAND_BOT" '
+    short="$(jq -r --arg bot "$COORD_BOT" '
       [.[] | select(.user.login == $bot) | .body
        | capture("Landed on `main` by coord(\\*\\*)? as `(?<s>[0-9a-f]{7,40})`")? | .s] | last // empty' <<<"$comments")"
     if [ -n "$short" ]; then
@@ -224,6 +248,12 @@ land_commit() {
 label_names() { jq -r '[.labels[]?.name] | .[]' <<<"$1"; }
 has_label_re() { label_names "$1" | grep -Eq "$2"; }
 
+# stripped_by_coord EVENTS_JSON RE -> rc 0 when the coord App removed a label matching RE.
+# A label an author withdrew by hand is NOT a declaration (plan §7.7).
+stripped_by_coord() {
+  jq -r --arg bot "$COORD_BOT" '.[] | select(.event == "unlabeled" and (.actor.login // "") == $bot) | .label.name' <<<"$1" | grep -Eq "$2"
+}
+
 # --- decide ----------------------------------------------------------------
 cmd_decide() {
   local m="$1" n="$2"
@@ -238,7 +268,7 @@ cmd_decide() {
   skip() { action=SKIP; reason="$1"; emit; }
   unknown() { action=UNKNOWN; reason="$1"; emit; }
 
-  [[ "$m" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]] || { err "decide: M and N must be numbers"; exit 2; }
+  is_num "$m" && is_num "$n" || { err "decide: M and N must be numbers"; exit 2; }
   if [ "${SPF_KILL_SWITCH:-}" = "off" ]; then skip kill-switch; return; fi
 
   local nj mj
@@ -247,7 +277,7 @@ cmd_decide() {
 
   # Declaration: which form, if any, pairs M with N with schemas LEADING.
   local re_f1="^coord:upstream-of=(qontinui/)?$RUNNER_NAME#$m\$"
-  local re_f2="^coord:downstream-of=(qontinui/)?qontinui-schemas#$n\$"
+  local re_f2; re_f2="$(form2_re "$n")"
   local re_t_m="^coord:upstream-of=(qontinui/)?qontinui-schemas#$n\$"
   local re_t_n="^coord:downstream-of=(qontinui/)?$RUNNER_NAME#$m\$"
   local leads=false
@@ -256,7 +286,7 @@ cmd_decide() {
   if [ "$leads" != true ]; then
     local events
     events="$(gh_get "repos/$RUNNER/issues/$m/events?per_page=100")" || { unknown "read $RUNNER#$m events failed"; return; }
-    if jq -r '.[] | select(.event == "labeled") | .label.name' <<<"$events" | grep -Eq "$re_f2"; then leads=true; fi
+    stripped_by_coord "$events" "$re_f2" && leads=true
   fi
   if [ "$leads" != true ]; then
     if has_label_re "$mj" "$re_t_m" || has_label_re "$nj" "$re_t_n"; then skip trailing-declaration; else skip no-declaration; fi
@@ -271,6 +301,8 @@ cmd_decide() {
   esac
   [ "$(jq -r .state <<<"$mj")" = "open" ] || { skip pr-not-open; return; }
   [ "$(jq -r '.head.repo.full_name // ""' <<<"$mj")" = "$RUNNER" ] || { skip fork-pr; return; }
+  # A stacked PR would get main merged into its branch: its base is not ours to widen.
+  [ "$(jq -r '.base.ref // ""' <<<"$mj")" = "main" ] || { skip pr-not-on-main; return; }
 
   main_sha="$(gh_get "repos/$RUNNER/commits/main" | jq -r '.sha // empty')" || { unknown "read runner main failed"; return; }
   is_sha "$main_sha" || { unknown "runner main sha unresolvable"; return; }
@@ -308,13 +340,9 @@ cmd_decide() {
     *) unknown "containment of runner main's pin unknown"; return ;;
   esac
 
-  local kind key st
-  for kind_key in "branch_name|$head_ref" "ci_wait|$RUNNER_NAME#$m" "ci_wait|$RUNNER#$m" "repo_branch|$RUNNER_NAME:$head_ref"; do
-    kind="${kind_key%%|*}"
-    key="${kind_key#*|}"
-    if ! st="$(claim_state "$kind" "$key")"; then unknown "claim read $kind unknown"; return; fi
-    if [ "$st" = "held" ]; then skip "live-claim:$kind"; return; fi
-  done
+  local held
+  if ! held="$(first_held_claim "$m" "$head_ref")"; then unknown "claim read unknown"; return; fi
+  if [ -n "$held" ]; then skip "live-claim:$held"; return; fi
 
   action=FOLLOW
   reason="$SCHEMAS#$n landed as ${a:0:9}"
@@ -324,23 +352,32 @@ cmd_decide() {
 # --- scan ------------------------------------------------------------------
 cmd_scan() {
   if [ "${SPF_KILL_SWITCH:-}" = "off" ]; then err "kill switch SCHEMAS_PAIR_FOLLOW=off"; return 0; fi
-  local open page=1 all="[]" chunk
+  local page=1 open="[]" chunk
   while :; do
     chunk="$(gh_get "repos/$RUNNER/pulls?state=open&per_page=100&page=$page")" || { err "list open runner PRs failed"; exit 3; }
-    all="$(jq -c --argjson c "$chunk" '. + $c' <<<"$all")"
-    [ "$(jq length <<<"$chunk")" -lt 100 ] && break
+    open="$(jq -c --argjson c "$chunk" '. + $c' <<<"$open")"
+    if [ "$(jq length <<<"$chunk")" -lt 100 ]; then break; fi
     page=$((page + 1))
   done
-  open="$all"
   [ "$(jq length <<<"$open")" -gt 0 ] || return 0
   local oldest numbers
   oldest="$(jq -r '[.[].created_at] | min' <<<"$open")"
   numbers="$(jq -r '.[].number' <<<"$open")"
 
   {
-    # Form 2: open runner PRs still labelled (a strip not reached yet, or a missed event).
+    # Form 2, still labelled (a strip the reconciler has not reached yet).
     jq -r '.[] | .number as $m | .labels[]?.name
       | capture("^coord:downstream-of=(qontinui/)?qontinui-schemas#(?<n>[0-9]+)$")? | "\($m) \(.n)"' <<<"$open"
+
+    # Form 2, already stripped by coord, recovering a missed detector dispatch
+    # (kill switch off at strip time, a 403, the workflow not yet on main).
+    local m events
+    for m in $numbers; do
+      events="$(gh_get "repos/$RUNNER/issues/$m/events?per_page=100")" || { err "read $RUNNER#$m events failed"; exit 3; }
+      jq -r --arg bot "$COORD_BOT" --arg m "$m" '
+        .[] | select(.event == "unlabeled" and (.actor.login // "") == $bot) | .label.name
+        | capture("^coord:downstream-of=(qontinui/)?qontinui-schemas#(?<n>[0-9]+)$")? | "\($m) \(.n)"' <<<"$events"
+    done
 
     # Form 1: landed schemas PRs naming an open runner PR. The window reaches back
     # to the oldest open runner PR, not a fixed number of days.
@@ -363,7 +400,8 @@ cmd_scan() {
 # --- compute: merge-and-pin -------------------------------------------------
 meta_get() { jq -r ".$2 // empty" "$1"; }
 
-rewrite_pin() { # conf new
+# rewrite_pin CONF NEW -> replace the SHA token on the schemas line only.
+rewrite_pin() {
   local conf="$1" new="$2" tmp
   tmp="$(mktemp)"
   awk -v s="$SCHEMAS" -v new="$new" '
@@ -378,7 +416,7 @@ cmd_merge_and_pin() {
   local dir="$1" meta="$2" head main a n m pin c
   head="$(meta_get "$meta" head_sha)"; main="$(meta_get "$meta" main_sha)"
   a="$(meta_get "$meta" a)"; n="$(meta_get "$meta" partner)"; m="$(meta_get "$meta" pr)"
-  is_sha "$head" && is_sha "$main" && is_sha "$a" || { err "merge-and-pin: bad meta"; exit 3; }
+  is_sha "$head" && is_sha "$main" && is_sha "$a" || { err "merge-and-pin: bad plan item"; exit 3; }
   cd "$dir"
   [ "$(git rev-parse HEAD)" = "$head" ] || { err "checkout is not at the decided head $head"; exit 3; }
   if ! git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" merge --no-edit --no-ff -q "$main" \
@@ -411,16 +449,27 @@ cmd_merge_and_pin() {
 
 # --- compute: lock-and-commit ----------------------------------------------
 cmd_lock_and_commit() {
-  local dir="$1" meta="$2" out="$3" mode="$4" head a n m new changed
-  head="$(meta_get "$meta" head_sha)"; a="$(meta_get "$meta" a)"
-  n="$(meta_get "$meta" partner)"; m="$(meta_get "$meta" pr)"
+  local dir="$1" meta="$2" out="$3" mode="$4" head a n new changed
+  head="$(meta_get "$meta" head_sha)"; a="$(meta_get "$meta" a)"; n="$(meta_get "$meta" partner)"
   mkdir -p "$out"
   out="$(cd "$out" && pwd)"
+  dir="$(cd "$dir" && pwd)"
   cd "$dir"
   case "$mode" in
     FOLLOW)
-      bash -c "${SPF_LOCK_CMD:-cargo metadata --format-version 1 > /dev/null && cargo metadata --locked --format-version 1 > /dev/null}" ||
-        { err "lock refresh failed"; exit 3; }
+      if [ -n "${SPF_LOCK_CMD:-}" ]; then
+        bash -c "$SPF_LOCK_CMD" || { err "lock refresh failed"; exit 3; }
+      else
+        [ -n "${SPF_TOOLCHAIN:-}" ] || { err "SPF_TOOLCHAIN (main's rust channel) is required for the lock refresh"; exit 3; }
+        # From OUTSIDE the checkout, with an explicit toolchain: rustup's override
+        # and cargo's config discovery both key on the working directory, so the
+        # PR's rust-toolchain.toml and .cargo/config.toml are not honoured.
+        # `cargo metadata` runs no build scripts. Resolve-only, then --locked.
+        (cd "${RUNNER_TEMP:-${TMPDIR:-/tmp}}" &&
+          cargo "+$SPF_TOOLCHAIN" metadata --manifest-path "$dir/Cargo.toml" --format-version 1 >/dev/null &&
+          cargo "+$SPF_TOOLCHAIN" metadata --locked --manifest-path "$dir/Cargo.toml" --format-version 1 >/dev/null) ||
+          { err "lock refresh failed"; exit 3; }
+      fi
       changed="$(git status --porcelain --untracked-files=no | awk '{print $2}' | LC_ALL=C sort | tr '\n' ' ')"
       case "$changed" in
         # LC_ALL=C order: `.github/…` sorts before `Cargo.lock`.
@@ -428,7 +477,7 @@ cmd_lock_and_commit() {
         *) err "unexpected working-tree changes: '$changed'"; exit 3 ;;
       esac
       git add -- "$CONF"
-      [ -n "$(git status --porcelain -- Cargo.lock)" ] && git add -- Cargo.lock
+      if [ -n "$(git status --porcelain -- Cargo.lock)" ]; then git add -- Cargo.lock; fi
       git -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -q \
         -m "chore: follow qontinui-schemas#$n — pin qontinui-schemas to its land commit ${a:0:9}" \
         -m "qontinui/qontinui-schemas#$n landed as $a. This PR adapts to it, so its merge-candidate build must compile that commit rather than the pin it branched with. Moved by .github/workflows/schemas-pair-follow.yml (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.7)." \
@@ -440,20 +489,61 @@ cmd_lock_and_commit() {
   [ "$new" != "$head" ] || { err "nothing was committed"; exit 3; }
   git bundle create -q "$out/pair-follow.bundle" "$head..HEAD" 2>/dev/null ||
     git bundle create "$out/pair-follow.bundle" "$head..HEAD" >/dev/null
-  jq --arg new "$new" --arg mode "$mode" '. + {new_sha:$new, mode:$mode}' "$meta" >"$out/meta.json"
+  jq -n --arg new "$new" '{new_sha:$new}' >"$out/meta.json"
   echo "NEW_SHA=$new"
+}
+
+# --- push: verification helpers -------------------------------------------
+# lock_ok PREV C -> rc 0 when Cargo.lock at C differs from PREV only in path
+# (source-less) packages' versions and dependency lists. Every registry or git
+# package entry must be byte-for-byte identical, as must the set of path packages
+# and the top-level keys. A partner that adds a registry dependency is therefore
+# refused, and a human finishes that follow.
+lock_ok() {
+  local prev="$1" c="$2" t rc=0
+  t="$(mktemp -d)"
+  git show "$prev:Cargo.lock" >"$t/a" 2>/dev/null || : >"$t/a"
+  git show "$c:Cargo.lock" >"$t/b" 2>/dev/null || : >"$t/b"
+  python3 - "$t/a" "$t/b" <<'PY' || rc=$?
+import json, sys, tomllib
+def load(p):
+    with open(p, 'rb') as f:
+        return tomllib.load(f)
+def split(d):
+    pk = d.get('package', [])
+    reg = sorted(json.dumps(p, sort_keys=True) for p in pk if 'source' in p)
+    path = sorted(p.get('name', '') for p in pk if 'source' not in p)
+    top = {k: v for k, v in d.items() if k != 'package'}
+    return top, reg, path
+try:
+    a, b = load(sys.argv[1]), load(sys.argv[2])
+except Exception as e:
+    print('Cargo.lock does not parse: %s' % e); sys.exit(1)
+ta, ra, pa = split(a); tb, rb, pb = split(b)
+if ta != tb: print('Cargo.lock top-level keys changed'); sys.exit(1)
+if ra != rb: print('a registry/git package entry in Cargo.lock changed'); sys.exit(1)
+if pa != pb: print('the set of path packages in Cargo.lock changed'); sys.exit(1)
+PY
+  rm -rf "$t"
+  return "$rc"
 }
 
 # --- push -----------------------------------------------------------------
 cmd_push() {
-  local out="$1" scratch="$2" meta m n head ref main new mode url fetch_url
+  local trusted="$1" out="$2" scratch="$3"
+  local m n a head ref main new url fetch_url
+  # TRUSTED: the plan item (main's code over API reads). UNTRUSTED: the artifact,
+  # from which only a candidate commit id is taken.
+  m="$(meta_get "$trusted" pr)"; n="$(meta_get "$trusted" partner)"; a="$(meta_get "$trusted" a)"
+  head="$(meta_get "$trusted" head_sha)"; ref="$(meta_get "$trusted" head_ref)"; main="$(meta_get "$trusted" main_sha)"
+  is_num "$m" && is_num "$n" && is_sha "$a" && is_sha "$head" && is_sha "$main" || { err "push: bad plan item"; exit 3; }
+  if [ -z "$ref" ] || [[ "$ref" == -* || "$ref" == *:* ]] || ! git check-ref-format "refs/heads/$ref"; then
+    err "push: head ref '$ref' is not a safe branch name"
+    exit 3
+  fi
   out="$(cd "$out" && pwd)"
-  meta="$out/meta.json"
-  m="$(meta_get "$meta" pr)"; n="$(meta_get "$meta" partner)"; head="$(meta_get "$meta" head_sha)"
-  ref="$(meta_get "$meta" head_ref)"; main="$(meta_get "$meta" main_sha)"
-  new="$(meta_get "$meta" new_sha)"; mode="$(meta_get "$meta" mode)"
-  [[ "$m" =~ ^[0-9]+$ && "$n" =~ ^[0-9]+$ ]] && is_sha "$head" && is_sha "$main" && is_sha "$new" && [ -n "$ref" ] ||
-    { err "push: bad meta"; exit 3; }
+  new="$(jq -r '.new_sha // empty' "$out/meta.json" 2>/dev/null)"
+  is_sha "$new" || { err "push: artifact carries no commit id"; exit 3; }
   if [ "${SPF_KILL_SWITCH:-}" = "off" ]; then echo "RESULT=SKIP kill-switch"; return 0; fi
 
   fetch_url="${SPF_FETCH_URL:-https://github.com/$RUNNER.git}"
@@ -465,17 +555,18 @@ cmd_push() {
     git clone -q --bare "$fetch_url" "$scratch"
   fi
   cd "$scratch"
-  git fetch -q origin "$head" "$main" 2>/dev/null || git fetch -q "$fetch_url" "$head" "$main"
-  git bundle verify -q "$out/pair-follow.bundle" >/dev/null 2>&1 || { err "bundle does not verify against $head"; exit 3; }
-  git fetch -q "$out/pair-follow.bundle" "HEAD:refs/pf/new" || { err "bundle fetch failed"; exit 3; }
-  [ "$(git rev-parse refs/pf/new)" = "$new" ] || { err "bundle tip is not the recorded new_sha"; exit 3; }
+  git fetch -q origin "$head" "$main" 2>/dev/null || { err "cannot fetch the trusted head and main"; exit 3; }
+  git bundle verify -q "$out/pair-follow.bundle" >/dev/null 2>&1 || { err "patch-scope: bundle does not verify against the trusted head"; exit 3; }
+  git fetch -q "$out/pair-follow.bundle" "HEAD:refs/pf/new" || { err "patch-scope: bundle fetch failed"; exit 3; }
+  [ "$(git rev-parse refs/pf/new)" = "$new" ] || { err "patch-scope: bundle tip is not the artifact's commit id"; exit 3; }
+  git merge-base --is-ancestor "$head" "$new" || { err "patch-scope: $new does not descend from the trusted head $head"; exit 3; }
 
-  # Structure: at most one merge commit (parents head, main; tree = git's own
-  # merge of the two), then, for FOLLOW, exactly one pin commit touching only the
-  # conf (and Cargo.lock) and carrying the trailer. Anything else is refused.
-  local prev="$head" merges=0 pins=0 c parents np names tree want
-  # --first-parent: the merge's second parent pulls main's own commits into
-  # head..new, and those are verified by the merge-tree check, not listed as ours.
+  # Structure: at most one merge commit (parents trusted head and trusted main;
+  # tree = git's own merge of the two), then at most one pin commit that sets the
+  # pin to exactly A, keeps Cargo.lock's registry entries identical, and carries
+  # the trailer. --first-parent: the merge's second parent pulls main's own
+  # commits into head..new, and those are covered by the merge-tree check.
+  local prev="$head" merges=0 pins=0 c parents np names want tree t
   for c in $(git rev-list --reverse --first-parent "$head..$new"); do
     parents="$(git rev-list --parents -n 1 "$c" | cut -d' ' -f2-)"
     np="$(wc -w <<<"$parents")"
@@ -488,75 +579,113 @@ cmd_push() {
       [ "$tree" = "$want" ] || { err "patch-scope: merge commit $c is not git's merge of $prev and main"; exit 3; }
       merges=$((merges + 1))
     elif [ "$np" -eq 1 ] && [ "$parents" = "$prev" ]; then
+      [ "$pins" -eq 0 ] || { err "patch-scope: more than one pin commit"; exit 3; }
       names="$(git diff --name-only "$prev" "$c" | LC_ALL=C sort | tr '\n' ' ')"
       case "$names" in
         "$CONF " | "$CONF Cargo.lock ") ;;
         *) err "patch-scope: pin commit $c touches '$names'"; exit 3 ;;
       esac
+      t="$(mktemp -d)"
+      git show "$prev:$CONF" >"$t/want"
+      rewrite_pin "$t/want" "$a"
+      git show "$c:$CONF" >"$t/got"
+      cmp -s "$t/want" "$t/got" || { rm -rf "$t"; err "patch-scope: pin commit $c does not set the pin to exactly $a"; exit 3; }
+      rm -rf "$t"
+      local why
+      why="$(lock_ok "$prev" "$c")" || { err "patch-scope: $why"; exit 3; }
       git log -1 --format=%B "$c" | grep -qx "$TRAILER_KEY: $SCHEMAS#$n" ||
         { err "patch-scope: pin commit $c lacks the $TRAILER_KEY trailer"; exit 3; }
       pins=$((pins + 1))
-      [ "$pins" -eq 1 ] || { err "patch-scope: more than one pin commit"; exit 3; }
     else
       err "patch-scope: commit $c has unexpected parents"
       exit 3
     fi
     prev="$c"
   done
-  case "$mode" in
-    FOLLOW) [ "$pins" -eq 1 ] || { err "patch-scope: FOLLOW without a pin commit"; exit 3; } ;;
-    MERGE_ONLY) [ "$pins" -eq 0 ] && [ "$merges" -eq 1 ] || { err "patch-scope: MERGE_ONLY must be one merge commit"; exit 3; } ;;
-    *) err "patch-scope: mode '$mode'"; exit 3 ;;
-  esac
+  [ "$prev" = "$new" ] || { err "patch-scope: first-parent walk did not reach $new"; exit 3; }
+  [ $((merges + pins)) -ge 1 ] || { err "patch-scope: nothing to push"; exit 3; }
+  local mode=MERGE_ONLY
+  [ "$pins" -eq 1 ] && mode=FOLLOW
+  # The mode comes from content, never from the artifact: the pushed tip's pin must contain A.
+  local tip_pin cc=0
+  tip_pin="$(git show "$new:$CONF" | pin_of)"
+  [ -n "$tip_pin" ] || { err "patch-scope: pushed tip has no schemas pin"; exit 3; }
+  contains "$a" "$tip_pin" || cc=$?
+  [ "$cc" -eq 0 ] || { err "patch-scope: the pushed tip's pin $tip_pin does not contain $a"; exit 3; }
 
-  # Re-read the head immediately before touching anything.
-  local mj cur
+  # Re-read the PR immediately before touching anything.
+  local mj
   mj="$(gh_get "repos/$RUNNER/pulls/$m")" || { err "re-read $RUNNER#$m failed"; exit 3; }
+  if [ "$(jq -r .state <<<"$mj")" != "open" ] ||
+    [ "$(jq -r '.head.repo.full_name // ""' <<<"$mj")" != "$RUNNER" ] ||
+    [ "$(jq -r '.head.ref // ""' <<<"$mj")" != "$ref" ] ||
+    [ "$(jq -r '.base.ref // ""' <<<"$mj")" != "main" ]; then
+    echo "RESULT=ABORT pr-changed"
+    return 0
+  fi
+  local cur
   cur="$(jq -r '.head.sha' <<<"$mj")"
   if [ "$cur" != "$head" ]; then echo "RESULT=ABORT head-moved ($head -> $cur)"; return 0; fi
+  local held
+  held="$(first_held_claim "$m" "$ref")" || { err "claim re-read unknown"; exit 3; }
+  if [ -n "$held" ]; then echo "RESULT=ABORT live-claim:$held"; return 0; fi
 
   # A still-present form-2 label would red the pushed head on checkout-sibling's
-  # not-open refusal. Removed with GITHUB_TOKEN, which triggers no rerun.
-  local lbl enc
+  # not-open refusal. It is removed with GITHUB_TOKEN (which triggers no rerun)
+  # and put back if the push is then refused.
+  local removed=() lbl enc
   while read -r lbl; do
     [ -n "$lbl" ] || continue
     enc="$(jq -rn --arg k "$lbl" '$k|@uri')"
     gh_write DELETE "repos/$RUNNER/issues/$m/labels/$enc" || { err "could not remove label '$lbl'"; exit 3; }
-  done < <(label_names "$mj" | grep -E "^coord:downstream-of=(qontinui/)?qontinui-schemas#$n\$" || true)
+    removed+=("$lbl")
+  done < <(label_names "$mj" | grep -E "$(form2_re "$n")" || true)
 
   local pushcfg=()
   case "$url" in
     https://*)
-      [ -n "${SPF_PUSH_TOKEN:-}" ] || { err "no push token: CLORINDE_AUTOCOMMIT_TOKEN is required (a GITHUB_TOKEN push fires no pull_request CI)"; exit 3; }
+      [ -n "${SPF_PUSH_TOKEN:-}" ] || { err "no push token: CLORINDE_AUTOCOMMIT_TOKEN is required (a GITHUB_TOKEN push fires no pull_request CI)"; restore_labels "$m" "${removed[@]+"${removed[@]}"}"; exit 3; }
       local auth
       auth="$(printf 'x-access-token:%s' "$SPF_PUSH_TOKEN" | base64 -w0)"
-      [ -n "${GITHUB_ACTIONS:-}" ] && echo "::add-mask::$auth"
+      if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::add-mask::$auth"; fi
       pushcfg=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth") ;;
   esac
   local perr
   perr="$(mktemp)"
-  if ! git "${pushcfg[@]}" push --force-with-lease="refs/heads/$ref:$head" "$url" "$new:refs/heads/$ref" 2>"$perr"; then
+  if ! git "${pushcfg[@]+"${pushcfg[@]}"}" push --force-with-lease="refs/heads/$ref:$head" "$url" "$new:refs/heads/$ref" 2>"$perr"; then
     if grep -qiE 'stale info|fetch first|rejected' "$perr"; then
       rm -f "$perr"
+      restore_labels "$m" "${removed[@]+"${removed[@]}"}" || exit 3
       echo "RESULT=ABORT lease-rejected"
       return 0
     fi
-    err "push failed: $(tr '\n' ' ' <"$perr")"
+    err "push failed: $(sed 's/basic [A-Za-z0-9+/=]*/basic ***/g' "$perr" | tr '\n' ' ')"
     rm -f "$perr"
+    restore_labels "$m" "${removed[@]+"${removed[@]}"}" || true
     exit 3
   fi
   rm -f "$perr"
 
-  gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow: \`qontinui/qontinui-schemas#$n\` landed, and this PR adapts to it. Its merge-candidate build compiles the commit pinned in \`.github/sibling-pins.conf\`, not this PR's declaration, so the pin (and \`Cargo.lock\`) were moved to the land commit in \`${new:0:9}\` (mode $mode, on top of \`${head:0:9}\`). Plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.7; kill switch: repository variable SCHEMAS_PAIR_FOLLOW=off." ||
+  gh_write POST "repos/$RUNNER/issues/$m/comments" -f "body=Schemas pair-follow: \`qontinui/qontinui-schemas#$n\` landed, and this PR adapts to it. Its merge-candidate build compiles the commit pinned in \`.github/sibling-pins.conf\`, not this PR's declaration, so the pin (and \`Cargo.lock\`) were moved to the land commit \`${a:0:9}\` in \`${new:0:9}\` (mode $mode, on top of \`${head:0:9}\`). Plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.7; kill switch: repository variable SCHEMAS_PAIR_FOLLOW=off." ||
     err "comment failed (the push itself succeeded)"
   echo "RESULT=PUSHED $new"
+}
+
+# restore_labels M LABEL... -> put back labels removed before a push that did not land.
+restore_labels() {
+  local m="$1" lbl
+  shift
+  for lbl in "$@"; do
+    gh_write POST "repos/$RUNNER/issues/$m/labels" -f "labels[]=$lbl" || { err "could not restore label '$lbl' on #$m — restore it by hand"; return 1; }
+  done
+  return 0
 }
 
 case "${1:-}" in
   scan) cmd_scan ;;
   decide) [ $# -eq 3 ] || { err "usage: decide <M> <N>"; exit 2; }; cmd_decide "$2" "$3" ;;
-  merge-and-pin) [ $# -eq 3 ] || { err "usage: merge-and-pin <runner-dir> <meta.json>"; exit 2; }; cmd_merge_and_pin "$2" "$3" ;;
-  lock-and-commit) [ $# -eq 5 ] || { err "usage: lock-and-commit <runner-dir> <meta.json> <out-dir> <MODE>"; exit 2; }; cmd_lock_and_commit "$2" "$3" "$4" "$5" ;;
-  push) [ $# -eq 3 ] || { err "usage: push <out-dir> <scratch-dir>"; exit 2; }; cmd_push "$2" "$3" ;;
-  *) err "usage: schemas-pair-follow.sh {scan | decide M N | merge-and-pin DIR META | lock-and-commit DIR META OUT MODE | push OUT SCRATCH}"; exit 2 ;;
+  merge-and-pin) [ $# -eq 3 ] || { err "usage: merge-and-pin <runner-dir> <plan-item.json>"; exit 2; }; cmd_merge_and_pin "$2" "$3" ;;
+  lock-and-commit) [ $# -eq 5 ] || { err "usage: lock-and-commit <runner-dir> <plan-item.json> <out-dir> <MODE>"; exit 2; }; cmd_lock_and_commit "$2" "$3" "$4" "$5" ;;
+  push) [ $# -eq 4 ] || { err "usage: push <plan-item.json> <out-dir> <scratch-dir>"; exit 2; }; cmd_push "$2" "$3" "$4" ;;
+  *) err "usage: schemas-pair-follow.sh {scan | decide M N | merge-and-pin DIR ITEM | lock-and-commit DIR ITEM OUT MODE | push ITEM OUT SCRATCH}"; exit 2 ;;
 esac

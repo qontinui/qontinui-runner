@@ -51,8 +51,8 @@ new_fx() { FX="$TMP/fx-$1"; rm -rf "$FX"; mkdir -p "$FX/gh" "$FX/coord"; }
 setup_base() {
   new_fx "$1"
   gh_fx "repos/$SC/pulls/50" '{"number":50,"state":"closed","merged_at":null,"merge_commit_sha":null,"closed_at":"2026-09-10T00:00:00Z","base":{"ref":"main"},"labels":[{"name":"coord:landed"}]}'
-  gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[]}"
-  gh_fx "repos/$R/issues/100/events?per_page=100" '[{"event":"labeled","label":{"name":"coord:downstream-of=qontinui-schemas#50"}},{"event":"unlabeled","label":{"name":"coord:downstream-of=qontinui-schemas#50"}}]'
+  gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[]}"
+  gh_fx "repos/$R/issues/100/events?per_page=100" '[{"event":"labeled","label":{"name":"coord:downstream-of=qontinui-schemas#50"}},{"event":"unlabeled","actor":{"login":"qontinui-merge-orchestrator[bot]"},"label":{"name":"coord:downstream-of=qontinui-schemas#50"}}]'
   gh_fx "repos/$SC/issues/50/comments?per_page=100" '[{"user":{"login":"someone"},"body":"lgtm"},{"user":{"login":"qontinui-merge-orchestrator[bot]"},"body":"✅ **Landed on `main` by coord** as `aaaaaaaaa` (rebase fast-forward)."}]'
   gh_fx "repos/$SC/commits/aaaaaaaaa" "{\"sha\":\"$A\"}"
   gh_fx "repos/$SC/commits/main" "{\"sha\":\"$K\"}"
@@ -101,7 +101,7 @@ expect_decide "form 1 on the schemas PR (owner-qualified) -> FOLLOW" FOLLOW ""
 
 setup_base merged
 gh_fx "repos/$R/issues/100/events?per_page=100" '[]'
-gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"}]}"
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"}]}"
 gh_fx "repos/$SC/pulls/50" "{\"number\":50,\"state\":\"closed\",\"merged_at\":\"2026-09-10T00:00:00Z\",\"merge_commit_sha\":\"$A\",\"closed_at\":\"2026-09-10T00:00:00Z\",\"base\":{\"ref\":\"main\"},\"labels\":[]}"
 expect_decide "partner MERGED (not ff-landed), form-2 label still present -> FOLLOW" FOLLOW ""
 expect_field "  ...A is merge_commit_sha" .a "$A"
@@ -190,7 +190,7 @@ KILL=off expect_decide "kill switch SCHEMAS_PAIR_FOLLOW=off -> SKIP" SKIP kill-s
 
 setup_base trailing
 gh_fx "repos/$R/issues/100/events?per_page=100" '[]'
-gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[{\"name\":\"coord:upstream-of=qontinui-schemas#50\"}]}"
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[{\"name\":\"coord:upstream-of=qontinui-schemas#50\"}]}"
 expect_decide "runner-leads (trailing) declaration -> SKIP" SKIP trailing-declaration
 
 setup_base nodecl
@@ -210,12 +210,24 @@ setup_base prreaderr
 gh_fx "repos/$R/pulls/100" "__ERR__"
 expect_decide "runner PR unreadable -> UNKNOWN" UNKNOWN "read $R#100"
 
+setup_base stacked
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"agent/parent\"},\"labels\":[]}"
+expect_decide "stacked runner PR (base is not main) -> SKIP" SKIP pr-not-on-main
+
+setup_base withdrawn
+gh_fx "repos/$R/issues/100/events?per_page=100" '[{"event":"labeled","label":{"name":"coord:downstream-of=qontinui-schemas#50"}},{"event":"unlabeled","actor":{"login":"an-author"},"label":{"name":"coord:downstream-of=qontinui-schemas#50"}}]'
+expect_decide "label withdrawn by the author (not a coord strip) -> SKIP" SKIP no-declaration
+
 echo "# scan"
 new_fx scan
-gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" '[{"number":100,"created_at":"2026-09-01T00:00:00Z","labels":[]},{"number":101,"created_at":"2026-09-05T00:00:00Z","labels":[{"name":"coord:downstream-of=qontinui/qontinui-schemas#60"}]}]'
+gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" '[{"number":100,"created_at":"2026-09-01T00:00:00Z","labels":[]},{"number":101,"created_at":"2026-09-05T00:00:00Z","labels":[{"name":"coord:downstream-of=qontinui/qontinui-schemas#60"}]},{"number":102,"created_at":"2026-09-06T00:00:00Z","labels":[]},{"number":103,"created_at":"2026-09-06T00:00:00Z","labels":[]}]'
+gh_fx "repos/$R/issues/100/events?per_page=100" '[]'
+gh_fx "repos/$R/issues/101/events?per_page=100" '[]'
+gh_fx "repos/$R/issues/102/events?per_page=100" '[{"event":"unlabeled","actor":{"login":"qontinui-merge-orchestrator[bot]"},"label":{"name":"coord:downstream-of=qontinui-schemas#70"}}]'
+gh_fx "repos/$R/issues/103/events?per_page=100" '[{"event":"unlabeled","actor":{"login":"an-author"},"label":{"name":"coord:downstream-of=qontinui-schemas#80"}}]'
 gh_fx "repos/$SC/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1" '[{"number":52,"updated_at":"2026-09-11T00:00:00Z","labels":[{"name":"coord:upstream-of=qontinui-runner#999"}]},{"number":50,"updated_at":"2026-09-10T00:00:00Z","labels":[{"name":"coord:landed"},{"name":"coord:upstream-of=qontinui-runner#100"}]},{"number":51,"updated_at":"2026-08-01T00:00:00Z","labels":[{"name":"coord:upstream-of=qontinui-runner#100"}]}]'
 got="$(SPF_FIXTURES="$FX" bash "$SUT" scan 2>"$FX/stderr" | tr '\n' ';')"
-[ "$got" = "100 50;101 60;" ] && ok "scan: form 1 within the window + form 2 still labelled; closed PR for a non-open runner PR and pre-window PR excluded" || bad "scan candidates" "got '$got'; stderr: $(cat "$FX/stderr")"
+[ "$got" = "100 50;101 60;102 70;" ] && ok "scan: form 1 in window + form 2 labelled + form 2 stripped by coord; non-open, pre-window and author-withdrawn excluded" || bad "scan candidates" "got '$got'; stderr: $(cat "$FX/stderr")"
 got="$(SPF_FIXTURES="$FX" SPF_KILL_SWITCH=off bash "$SUT" scan 2>/dev/null | tr '\n' ';')"
 [ -z "$got" ] && ok "scan: kill switch -> no candidates" || bad "scan kill switch" "got '$got'"
 gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" "__ERR__"
@@ -238,7 +250,7 @@ git_setup() {
   git -C "$w" config user.name t
   mkdir -p "$w/.github"
   printf '# pins\nqontinui/ui-bridge %s\nqontinui/qontinui-schemas %s\n' "$NEWER" "$OLD" >"$w/.github/sibling-pins.conf"
-  printf 'lock v1\n' >"$w/Cargo.lock"
+  printf 'version = 4\n\n[[package]]\nname = "qontinui-types"\nversion = "1.9.0"\n\n[[package]]\nname = "serde"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "abc"\n' >"$w/Cargo.lock"
   printf 'line one\n' >"$w/src.txt"
   git -C "$w" add -A && git -C "$w" commit -qm base
   git -C "$w" checkout -q -b agent/x
@@ -267,9 +279,9 @@ git_setup() {
   gh_fx "repos/$SC/compare/$A...$OLD" '{"status":"behind"}'
   gh_fx "repos/$SC/compare/$A...$NEWER" '{"status":"behind"}'
   gh_fx "repos/$SC/compare/$A...$M2" '{"status":"ahead"}'
-  gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[]}"
+  gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[]}"
 }
-spf_git() { SPF_FIXTURES="$FX" SPF_LOCK_CMD="printf 'lock v2\n' > Cargo.lock" SPF_FETCH_URL="file://$G/remote.git" SPF_PUSH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" bash "$SUT" "$@"; }
+spf_git() { SPF_FIXTURES="$FX" SPF_LOCK_CMD="${LOCK_CMD:-sed -i 's/^version = \"1.9.0\"$/version = \"2.0.0\"/' Cargo.lock}" SPF_FETCH_URL="file://$G/remote.git" SPF_PUSH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" bash "$SUT" "$@"; }
 remote_tip() { git -C "$G/remote.git" rev-parse refs/heads/agent/x; }
 
 # FOLLOW, end to end.
@@ -277,11 +289,11 @@ git_setup follow plain
 mp="$(spf_git merge-and-pin "$G/compute" "$G/decide.json" 2>"$FX/stderr")"
 grep -qx "MODE=FOLLOW" <<<"$mp" && ok "merge-and-pin: stale pin -> MODE=FOLLOW" || bad "merge-and-pin FOLLOW" "$mp $(cat "$FX/stderr")"
 lc="$(spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW 2>"$FX/stderr")" && ok "lock-and-commit FOLLOW" || bad "lock-and-commit FOLLOW" "$(cat "$FX/stderr")"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 case "$pr" in RESULT=PUSHED*) ok "push: verified bundle pushed with lease" ;; *) bad "push FOLLOW" "$pr $(cat "$FX/stderr")" ;; esac
 tip="$(remote_tip)"
 [ "$(git -C "$G/remote.git" show "$tip:.github/sibling-pins.conf" | awk '$1=="qontinui/qontinui-schemas"{print $2}')" = "$A" ] && ok "  ...remote branch now pins A" || bad "  ...remote pin"
-[ "$(git -C "$G/remote.git" show "$tip:Cargo.lock")" = "lock v2" ] && ok "  ...Cargo.lock moved in the same commit" || bad "  ...lock"
+git -C "$G/remote.git" show "$tip:Cargo.lock" | grep -qx 'version = "2.0.0"' && ok "  ...Cargo.lock moved in the same commit" || bad "  ...lock"
 git -C "$G/remote.git" log -1 --format=%B "$tip" | grep -qx "Schemas-Pair-Follow: $SC#50" && ok "  ...pin commit carries the provenance trailer" || bad "  ...trailer"
 [ "$(git -C "$G/remote.git" rev-list --parents -n 1 "$tip^" | wc -w)" -eq 3 ] && ok "  ...main was merged first" || bad "  ...merge commit"
 grep -q "^POST repos/$R/issues/100/comments" "$FX/writes.log" 2>/dev/null && ok "  ...one explanatory comment" || bad "  ...comment"
@@ -296,7 +308,7 @@ git_setup pinmoved pinmoved
 mp="$(spf_git merge-and-pin "$G/compute" "$G/decide.json" 2>"$FX/stderr")"
 grep -qx "MODE=FOLLOW" <<<"$mp" && ok "pin moved on main -> merge then FOLLOW" || bad "pinmoved merge-and-pin" "$mp $(cat "$FX/stderr")"
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>"$FX/stderr" || bad "pinmoved lock-and-commit" "$(cat "$FX/stderr")"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 case "$pr" in RESULT=PUSHED*) ok "  ...pushed" ;; *) bad "pinmoved push" "$pr $(cat "$FX/stderr")" ;; esac
 git clone -q "$G/remote.git" "$G/rebase" && git -C "$G/rebase" config user.email t@t && git -C "$G/rebase" config user.name t
 git -C "$G/rebase" checkout -q agent/x
@@ -314,16 +326,16 @@ git_setup mergeonly mainpin
 mp="$(spf_git merge-and-pin "$G/compute" "$G/decide.json" 2>"$FX/stderr")"
 grep -qx "MODE=MERGE_ONLY" <<<"$mp" && ok "main's pin contains A -> MODE=MERGE_ONLY" || bad "merge-only" "$mp $(cat "$FX/stderr")"
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" MERGE_ONLY >/dev/null 2>"$FX/stderr" || bad "merge-only lock-and-commit" "$(cat "$FX/stderr")"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 case "$pr" in RESULT=PUSHED*) ok "  ...merge commit alone pushed" ;; *) bad "merge-only push" "$pr $(cat "$FX/stderr")" ;; esac
 
 # Head moved before the push: ABORT, remote untouched.
 git_setup moved plain
 spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
-gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[]}"
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$HEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[]}"
 before="$(remote_tip)"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 case "$pr" in RESULT=ABORT\ head-moved*) ok "head moved before push -> ABORT" ;; *) bad "head moved" "$pr $(cat "$FX/stderr")" ;; esac
 [ "$(remote_tip)" = "$before" ] && ok "  ...nothing pushed" || bad "  ...remote moved"
 
@@ -333,7 +345,7 @@ spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
 git -C "$G/work" checkout -q agent/x && printf 'author pushed\n' >"$G/work/author.txt" && git -C "$G/work" add -A && git -C "$G/work" commit -qm author && git -C "$G/work" push -q "$G/remote.git" agent/x
 authored="$(remote_tip)"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 case "$pr" in RESULT=ABORT\ lease-rejected*) ok "branch moved under a stale API read -> lease rejects -> ABORT" ;; *) bad "lease" "$pr $(cat "$FX/stderr")" ;; esac
 [ "$(remote_tip)" = "$authored" ] && ok "  ...the author's commit survives" || bad "  ...author commit clobbered"
 
@@ -341,8 +353,8 @@ case "$pr" in RESULT=ABORT\ lease-rejected*) ok "branch moved under a stale API 
 git_setup label plain
 spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
-gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"},{\"name\":\"unrelated\"}]}"
-pr="$(spf_git push "$G/out" "$G/verify" 2>"$FX/stderr")"
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"},{\"name\":\"unrelated\"}]}"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
 grep -q "^DELETE repos/$R/issues/100/labels/coord%3Adownstream-of%3Dqontinui-schemas%2350" "$FX/writes.log" 2>/dev/null && ok "form-2 label still present -> removed before the push" || bad "label removal" "$(cat "$FX/writes.log" 2>/dev/null) $pr"
 grep -q "labels/unrelated" "$FX/writes.log" 2>/dev/null && bad "  ...an unrelated label was removed" || ok "  ...unrelated labels untouched"
 
@@ -355,7 +367,7 @@ git -C "$G/compute" -c user.email=t@t -c user.name=t commit -qam "Schemas-Pair-F
 git -C "$G/compute" bundle create -q "$G/out/pair-follow.bundle" "$GHEAD..HEAD" 2>/dev/null || git -C "$G/compute" bundle create "$G/out/pair-follow.bundle" "$GHEAD..HEAD" >/dev/null 2>&1
 jq --arg n "$(git -C "$G/compute" rev-parse HEAD)" '.new_sha = $n' "$G/out/meta.json" >"$G/out/m2" && mv "$G/out/m2" "$G/out/meta.json"
 before="$(remote_tip)"
-if spf_git push "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "extra file in the patch must be refused"; else grep -q patch-scope "$FX/stderr" && ok "patch touching a file beyond the conf and Cargo.lock -> refused" || bad "scope refusal reason" "$(cat "$FX/stderr")"; fi
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "extra file in the patch must be refused"; else grep -q patch-scope "$FX/stderr" && ok "patch touching a file beyond the conf and Cargo.lock -> refused" || bad "scope refusal reason" "$(cat "$FX/stderr")"; fi
 [ "$(remote_tip)" = "$before" ] && ok "  ...nothing pushed" || bad "  ...remote moved"
 
 # A forged merge commit (not git's own merge of head and main) is refused.
@@ -371,15 +383,86 @@ printf '# pins\nqontinui/ui-bridge %s\nqontinui/qontinui-schemas %s\n' "$NEWER" 
 git -C "$G/compute" -c user.email=t@t -c user.name=t commit -qam "pin" -m "Schemas-Pair-Follow: $SC#50"
 git -C "$G/compute" bundle create -q "$G/out/pair-follow.bundle" "$GHEAD..HEAD" 2>/dev/null || git -C "$G/compute" bundle create "$G/out/pair-follow.bundle" "$GHEAD..HEAD" >/dev/null 2>&1
 jq --arg n "$(git -C "$G/compute" rev-parse HEAD)" '.new_sha = $n' "$G/out/meta.json" >"$G/out/m2" && mv "$G/out/m2" "$G/out/meta.json"
-if spf_git push "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "forged merge commit must be refused"; else grep -q "not git's merge" "$FX/stderr" && ok "forged merge commit (extra file hidden in the merge) -> refused" || bad "forged merge reason" "$(cat "$FX/stderr")"; fi
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "forged merge commit must be refused"; else grep -q "not git's merge" "$FX/stderr" && ok "forged merge commit (extra file hidden in the merge) -> refused" || bad "forged merge reason" "$(cat "$FX/stderr")"; fi
+
+# The artifact is untrusted: a forged meta.json cannot redirect the push.
+git_setup forgedmeta plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+jq '. + {pr: 999, head_ref: "main", head_sha: "'"$GMAIN"'", main_sha: "'"$GHEAD"'", mode: "MERGE_ONLY"}' "$G/out/meta.json" >"$G/out/m2" && mv "$G/out/m2" "$G/out/meta.json"
+mainbefore="$(git -C "$G/remote.git" rev-parse refs/heads/main)"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
+case "$pr" in RESULT=PUSHED*) ok "forged artifact meta (pr/head_ref/head/main/mode) is ignored; targets come from the plan item" ;; *) bad "forged meta" "$pr $(cat "$FX/stderr")" ;; esac
+[ "$(git -C "$G/remote.git" rev-parse refs/heads/main)" = "$mainbefore" ] && ok "  ...runner main untouched" || bad "  ...main moved"
+
+# A bundle that does not descend from the trusted head (built on main) is refused.
+git_setup offhead plain
+git -C "$G/compute" checkout -q --detach "$GMAIN"
+printf '# pins\nqontinui/ui-bridge %s\nqontinui/qontinui-schemas %s\n' "$NEWER" "$A" >"$G/compute/.github/sibling-pins.conf"
+git -C "$G/compute" -c user.email=t@t -c user.name=t commit -qam pin -m "Schemas-Pair-Follow: $SC#50"
+mkdir -p "$G/out" && git -C "$G/compute" bundle create -q "$G/out/pair-follow.bundle" "$GMAIN..HEAD" 2>/dev/null || git -C "$G/compute" bundle create "$G/out/pair-follow.bundle" "$GMAIN..HEAD" >/dev/null 2>&1
+jq -n --arg n "$(git -C "$G/compute" rev-parse HEAD)" '{new_sha:$n}' >"$G/out/meta.json"
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "bundle not descending from the trusted head must be refused"; else grep -q patch-scope "$FX/stderr" && ok "bundle not descending from the trusted head -> refused" || bad "offhead reason" "$(cat "$FX/stderr")"; fi
+
+# A pin commit that pins anything other than exactly A is refused.
+git_setup wrongpin plain
+LOCK_CMD="printf '# pins\nqontinui/ui-bridge %s\nqontinui/qontinui-schemas %s\n' $NEWER $K > .github/sibling-pins.conf" spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+LOCK_CMD="printf '# pins\nqontinui/ui-bridge %s\nqontinui/qontinui-schemas %s\n' $NEWER $K > .github/sibling-pins.conf" spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "a pin other than A must be refused"; else grep -q "exactly $A" "$FX/stderr" && ok "pin commit setting a pin other than A -> refused" || bad "wrong pin reason" "$(cat "$FX/stderr")"; fi
+
+# A Cargo.lock change to a registry entry is refused.
+git_setup reglock plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+LOCK_CMD="sed -i 's/^checksum = \"abc\"$/checksum = \"evil\"/' Cargo.lock" spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "a registry lock change must be refused"; else grep -q "registry/git package" "$FX/stderr" && ok "Cargo.lock registry entry changed -> refused" || bad "reglock reason" "$(cat "$FX/stderr")"; fi
+
+# The PR changed since the plan (closed, retargeted, ref changed) -> ABORT.
+for variant in closed retarget; do
+  git_setup "pr$variant" plain
+  spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+  spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+  if [ "$variant" = closed ]; then st=closed; base=main; else st=open; base=agent/parent; fi
+  gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"$st\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"$base\"},\"labels\":[]}"
+  before="$(remote_tip)"
+  pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
+  [ "$pr" = "RESULT=ABORT pr-changed" ] && [ "$(remote_tip)" = "$before" ] && ok "PR $variant since the plan -> ABORT, nothing pushed" || bad "pr $variant" "$pr $(cat "$FX/stderr")"
+done
+
+# A claim taken between plan and push -> ABORT at push time.
+git_setup claimatpush plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+coord_fx repo_branch "qontinui-runner:agent/x" 200 '{"holder":{"machine_id":"m"},"last_release":null}'
+before="$(remote_tip)"
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
+[ "$pr" = "RESULT=ABORT live-claim:repo_branch" ] && [ "$(remote_tip)" = "$before" ] && ok "claim taken after the plan -> ABORT at push, nothing pushed" || bad "claim at push" "$pr $(cat "$FX/stderr")"
+coord_fx branch_name agent/x 503 'down'
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"; rc=$?
+[ "$rc" -ne 0 ] && ok "claim re-read unknown at push -> red" || bad "claim unknown at push" "$pr"
+
+# An unsafe head ref in the plan item is refused before anything else.
+git_setup badref plain
+jq '.head_ref = "-delete:main"' "$G/decide.json" >"$G/d2" && mv "$G/d2" "$G/decide.json"
+mkdir -p "$G/out" && jq -n --arg n "$GHEAD" '{new_sha:$n}' >"$G/out/meta.json"
+if spf_git push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then bad "unsafe head ref must be refused"; else grep -q "not a safe branch name" "$FX/stderr" && ok "unsafe head ref in the plan item -> refused" || bad "badref reason" "$(cat "$FX/stderr")"; fi
+
+# Lease rejected after the label was removed -> the label is put back.
+git_setup restore plain
+spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
+spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
+gh_fx "repos/$R/pulls/100" "{\"number\":100,\"state\":\"open\",\"head\":{\"sha\":\"$GHEAD\",\"ref\":\"agent/x\",\"repo\":{\"full_name\":\"$R\"}},\"base\":{\"ref\":\"main\"},\"labels\":[{\"name\":\"coord:downstream-of=qontinui-schemas#50\"}]}"
+git -C "$G/work" checkout -q agent/x && printf 'author\n' >"$G/work/a2.txt" && git -C "$G/work" add -A && git -C "$G/work" commit -qm author2 && git -C "$G/work" push -q "$G/remote.git" agent/x
+pr="$(spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>"$FX/stderr")"
+[ "$pr" = "RESULT=ABORT lease-rejected" ] && ok "lease rejected with the label removed -> ABORT" || bad "restore abort" "$pr $(cat "$FX/stderr")"
+grep -q "^POST repos/$R/issues/100/labels -f labels\[\]=coord:downstream-of=qontinui-schemas#50" "$FX/writes.log" 2>/dev/null && ok "  ...the removed label is restored" || bad "  ...label not restored" "$(cat "$FX/writes.log" 2>/dev/null)"
 
 # Kill switch re-checked at push time; no PAT on an https remote fails red.
 git_setup pushkill plain
 spf_git merge-and-pin "$G/compute" "$G/decide.json" >/dev/null 2>&1
 spf_git lock-and-commit "$G/compute" "$G/decide.json" "$G/out" FOLLOW >/dev/null 2>&1
-pr="$(SPF_KILL_SWITCH=off spf_git push "$G/out" "$G/verify" 2>/dev/null)"
+pr="$(SPF_KILL_SWITCH=off spf_git push "$G/decide.json" "$G/out" "$G/verify" 2>/dev/null)"
 [ "$pr" = "RESULT=SKIP kill-switch" ] && ok "push: kill switch re-checked -> SKIP" || bad "push kill switch" "$pr"
-if SPF_FIXTURES="$FX" SPF_FETCH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" SPF_PUSH_TOKEN="" bash "$SUT" push "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then
+if SPF_FIXTURES="$FX" SPF_FETCH_URL="file://$G/remote.git" SPF_FETCH_FILTER="" SPF_PUSH_TOKEN="" bash "$SUT" push "$G/decide.json" "$G/out" "$G/verify" >/dev/null 2>"$FX/stderr"; then
   bad "push without a PAT to GitHub must fail red"
 else
   grep -q CLORINDE_AUTOCOMMIT_TOKEN "$FX/stderr" && ok "push: no PAT for an https remote -> red, naming CLORINDE_AUTOCOMMIT_TOKEN" || bad "no-PAT message" "$(cat "$FX/stderr")"
