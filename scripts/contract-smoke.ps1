@@ -42,7 +42,9 @@ param(
     [switch]$Rebuild,
     [switch]$DryRun,
     [int]$WaitTimeoutSecs = 180,
-    [string]$SdkTypesPath = "D:/qontinui-root/ui-bridge/packages/ui-bridge/src/server/types.ts",
+    # Derived, not hardcoded: $QONTINUI_ROOT if set, else the grandparent of this
+    # script (<root>/qontinui-runner/scripts). An explicit -SdkTypesPath still wins.
+    [string]$SdkTypesPath = (Join-Path $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName }) 'ui-bridge/packages/ui-bridge/src/server/types.ts'),
     [string]$SupervisorBase = "http://localhost:9875",
     [string]$DirectExe = $null,
     [ValidateSet("dev", "ci")]

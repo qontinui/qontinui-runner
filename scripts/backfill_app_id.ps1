@@ -20,14 +20,19 @@
 # require the runner or Postgres to be up — this is a pure-disk migration.
 #
 # Usage:
-#   pwsh -File D:/qontinui-root/qontinui-runner/scripts/backfill_app_id.ps1
+#   pwsh -File <workspace-root>/qontinui-runner/scripts/backfill_app_id.ps1
 
 $ErrorActionPreference = 'Stop'
 
+# Workspace root: $QONTINUI_ROOT if set, else the grandparent of this script
+# (<root>/qontinui-runner/scripts). Replaces three hardcoded operator-drive
+# paths, which resolved on exactly one machine.
+$qontinuiRoot = $(if ($env:QONTINUI_ROOT) { $env:QONTINUI_ROOT } else { (Get-Item $PSScriptRoot).Parent.Parent.FullName })
+
 $apps = @(
-    @{ id = 'qontinui-runner';     specsRoot = 'D:/qontinui-root/qontinui-runner/specs/pages' }
-    @{ id = 'qontinui-web';        specsRoot = 'D:/qontinui-root/qontinui-web/frontend/specs/pages' }
-    @{ id = 'qontinui-supervisor'; specsRoot = 'D:/qontinui-root/qontinui-supervisor/frontend/specs/pages' }
+    @{ id = 'qontinui-runner';     specsRoot = (Join-Path $qontinuiRoot 'qontinui-runner/specs/pages') }
+    @{ id = 'qontinui-web';        specsRoot = (Join-Path $qontinuiRoot 'qontinui-web/frontend/specs/pages') }
+    @{ id = 'qontinui-supervisor'; specsRoot = (Join-Path $qontinuiRoot 'qontinui-supervisor/frontend/specs/pages') }
 )
 
 $totalUpdated = 0
