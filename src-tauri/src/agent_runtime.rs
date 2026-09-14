@@ -10591,7 +10591,9 @@ mod tests {
     /// a failed assertion included. Not reversible: when a forensics test has
     /// switched the shared rotation log on, the revoke appends one `revoke`
     /// line (this test's unique `teardown-test-<agent>` workdir) and at most one
-    /// `agent_binding_census` line to that file.
+    /// `agent_binding_census` line to that file. The revoke also records a
+    /// tombstone for the nonce in the process-global tombstone map; the test
+    /// asserts it and then removes it.
     #[test]
     fn agent_run_teardown_over_poisoned_maps_drops_during_a_panic_unwind_and_removes_entries() {
         use std::collections::HashMap;
@@ -10655,6 +10657,15 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains_key(&nonce),
             "the agent's proxy nonce is revoked"
+        );
+        // The nonce was never in the GLOBAL registry, so this attribution can
+        // only come from the tombstone the teardown recorded.
+        let attribution = crate::coord_mcp::reject_attribution_for_nonce(&nonce).attribution;
+        crate::coord_mcp::teardown_poison_tests::remove_global_tombstone(&nonce);
+        assert_eq!(
+            attribution,
+            crate::coord_mcp::RejectAttribution::REVOKED,
+            "the teardown records a revoked tombstone for the agent's nonce"
         );
         assert!(
             !daemons

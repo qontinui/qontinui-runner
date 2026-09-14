@@ -1481,13 +1481,24 @@ fn nonce_tombstones() -> &'static Mutex<HashMap<String, NonceTombstone>> {
 /// under the registry lock (no I/O); the lock order everywhere is registry →
 /// grace → tombstones, and this takes only the last.
 fn record_nonce_tombstone(nonce: &str, tombstone: NonceTombstone) {
+    record_nonce_tombstone_in(nonce_tombstones(), nonce, tombstone);
+}
+
+/// [`record_nonce_tombstone`] over an explicit map — the seam its poison test
+/// uses, so the test never poisons the process-global map the reject path
+/// reads.
+fn record_nonce_tombstone_in(
+    tombstones: &Mutex<HashMap<String, NonceTombstone>>,
+    nonce: &str,
+    tombstone: NonceTombstone,
+) {
     if nonce.is_empty() {
         return;
     }
     let now = std::time::SystemTime::now();
     // Poison-tolerant: launch teardown records tombstones during a panic
     // unwind, and a tombstone is diagnostic state that is safe to keep using.
-    let mut map = nonce_tombstones()
+    let mut map = tombstones
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.retain(|_, t| {
@@ -2095,9 +2106,10 @@ pub(crate) fn reject_attribution_for_nonce(nonce: &str) -> RejectAttribution {
             evict_cause: None,
         };
     }
+    // Poison-tolerant, matching the writer: a tombstone is diagnostic state.
     let tombstone = nonce_tombstones()
         .lock()
-        .expect("nonce tombstone map poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(nonce)
         .cloned();
     if let Some(t) = tombstone {
@@ -4884,8 +4896,9 @@ pub(crate) fn revoke_agent_proxy_nonces_in(
     map: &Mutex<HashMap<String, NonceBinding>>,
     agent_id: Uuid,
 ) {
-    // Collect (nonce, workdir) under the lock; emit the forensics lines after
-    // releasing it (`log_rotation_event` does file I/O).
+    // Collect (nonce, binding) and record their tombstones under the lock;
+    // emit the forensics lines after releasing it (`log_rotation_event` does
+    // file I/O).
     let cause = format!("agent teardown (agent {agent_id} — never graced, never persisted)");
     let (revoked, remaining) = take_agent_proxy_nonces_in(map, agent_id, &cause);
     note_agent_binding_census(&remaining);
@@ -5001,6 +5014,55 @@ pub(crate) mod teardown_poison_tests {
         let (revoked, remaining) = take_agent_proxy_nonces_in(&map, Uuid::now_v7(), "test");
         assert!(revoked.is_empty());
         assert!(remaining.is_empty());
+    }
+
+    /// The tombstone writer survives a POISONED lock when it runs inside a drop
+    /// during a panic unwind — the way launch teardown reaches it. A panic in a
+    /// drop during unwinding aborts the test binary, so reverting the writer to
+    /// `expect` on its lock fails this test loudly. The map is LOCAL: the
+    /// process-global one is read by the reject path and other tests.
+    #[test]
+    fn record_nonce_tombstone_in_tolerates_a_poisoned_map_during_an_unwind() {
+        let map: Mutex<HashMap<String, NonceTombstone>> = Mutex::new(HashMap::new());
+        poison(&map);
+        struct RecordOnDrop<'a>(&'a Mutex<HashMap<String, NonceTombstone>>);
+        impl Drop for RecordOnDrop<'_> {
+            fn drop(&mut self) {
+                record_nonce_tombstone_in(
+                    self.0,
+                    "poisoned-tombstone-nonce",
+                    NonceTombstone {
+                        workdir: "/tmp/poisoned-tombstone".to_string(),
+                        terminal_id: None,
+                        principal: "agent",
+                        kind: TombstoneKind::Revoked,
+                        evicted_at: std::time::SystemTime::now(),
+                        grace_until: None,
+                        cause: "test".to_string(),
+                    },
+                );
+            }
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RecordOnDrop(&map);
+            panic!("simulated teardown panic");
+        }));
+        assert!(result.is_err(), "the panic propagates; the drop did not abort");
+        assert!(
+            map.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key("poisoned-tombstone-nonce"),
+            "the tombstone is recorded through the poisoned lock"
+        );
+    }
+
+    /// Removes one tombstone from the process-global map, so a test that drives
+    /// a real revoke leaves nothing behind.
+    pub(crate) fn remove_global_tombstone(nonce: &str) {
+        nonce_tombstones()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(nonce);
     }
 }
 
