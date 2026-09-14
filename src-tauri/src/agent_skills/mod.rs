@@ -132,6 +132,12 @@ const CACHE_FILE: &str = "agent-skills-cache.json";
 /// on a guess.
 const CACHE_VERSION: u32 = 1;
 
+/// Ceiling on the fetched body, in bytes. Generous against the real corpus
+/// (~200 KB, measured 2026-08-22) and far below what `FETCH_LIMIT` units at
+/// `MAX_UNIT_BYTES` each could theoretically be — the point is a bound that
+/// exists at all, not a tight one. See [`fetch_skills_async`].
+const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Resolved skills
 // ---------------------------------------------------------------------------
@@ -212,6 +218,35 @@ impl ResolvedSkill {
     }
 }
 
+/// A `files` key that is ALSO the directory prefix of another key, or `None`.
+///
+/// `{"a": …, "a/b.md": …}` passes every per-key validator — neither the Rust
+/// validators nor qontinui-web's mirror rejects a key that is a strict path
+/// prefix of another — and is nonetheless unwritable: `a` is created as a
+/// regular file and `create_dir_all("a")` then fails `EEXIST`. Because
+/// `AgentTextUnitFiles` is a `BTreeMap`, `a` is always reached FIRST, so the
+/// failure lands mid-bundle with half the skill on disk.
+///
+/// Refusing the whole unit here is what makes "a skill with any bad path is
+/// skipped ENTIRELY, never partially written" true for this input class. The
+/// provisioner re-checks it for the same reason it re-checks every other path
+/// rule.
+///
+/// Uses `range` rather than a neighbour scan: keys sorting between `a` and
+/// `a/b.md` are possible (`a!x`, since `!` < `/`), so contiguity cannot be
+/// assumed.
+pub(crate) fn colliding_path_prefix(files: &AgentTextUnitFiles) -> Option<(String, String)> {
+    for key in files.keys() {
+        let prefix = format!("{key}/");
+        if let Some((other, _)) = files.range(prefix.clone()..).next() {
+            if other.starts_with(&prefix) {
+                return Some((key.clone(), other.clone()));
+            }
+        }
+    }
+    None
+}
+
 /// Validate one fetched unit into a [`ResolvedSkill`], or explain why it is
 /// unusable. A rejected unit falls back to the embedded default for its name.
 ///
@@ -251,6 +286,12 @@ pub(crate) fn validate_override(
     // relative path, no blank file, each file <= MAX_FILE_BYTES, the bundle
     // <= MAX_UNIT_BYTES, and `SKILL.md` present.
     validate_agent_text_unit_files(&unit.kind, name, &unit.files).map_err(|e| e.to_string())?;
+    if let Some((file, child)) = colliding_path_prefix(&unit.files) {
+        return Err(format!(
+            "file {file:?} is also the directory prefix of {child:?} — one of the two \
+             cannot exist, so the bundle is unwritable"
+        ));
+    }
 
     let violations = self_path::skill_self_path_violations(&unit.files);
     if !violations.is_empty() {
@@ -667,7 +708,7 @@ async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
         Err(e) => return FetchOutcome::Unavailable(format!("could not build an HTTP client: {e}")),
     };
     let url = list_url(base_url);
-    let resp = match client.get(&url).bearer_auth(&token).send().await {
+    let mut resp = match client.get(&url).bearer_auth(&token).send().await {
         Ok(r) => r,
         Err(e) => return FetchOutcome::Unavailable(format!("GET {url} failed: {e}")),
     };
@@ -678,7 +719,30 @@ async fn fetch_skills_async(base_url: &str) -> FetchOutcome {
     if !status.is_success() {
         return FetchOutcome::Unavailable(format!("GET {url} returned HTTP {status}"));
     }
-    match resp.json::<AgentTextUnitListResponse>().await {
+
+    // Read the body in CHUNKS against a ceiling rather than `resp.json()`,
+    // which buffers whatever arrives. The per-unit caps are enforced after
+    // parsing, so without this a backend answering with an unbounded body
+    // exhausts memory before any validator runs — on the thread a session spawn
+    // is blocked on. `Content-Length` is not the gate: a wrong or absent one is
+    // exactly the case this has to survive, so the accumulated length is.
+    let mut body: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                    return FetchOutcome::Unavailable(format!(
+                        "GET {url} returned more than {MAX_RESPONSE_BYTES} bytes — refusing \
+                         to buffer it"
+                    ));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => return FetchOutcome::Unavailable(format!("GET {url} body read failed: {e}")),
+        }
+    }
+    match serde_json::from_slice::<AgentTextUnitListResponse>(&body) {
         Ok(body) => FetchOutcome::Fresh(body.items),
         Err(e) => FetchOutcome::Unavailable(format!("GET {url} returned an unreadable body: {e}")),
     }
@@ -1280,6 +1344,52 @@ pub(crate) mod tests {
         assert_eq!(
             reg.get("coord-revive").unwrap().source,
             AgentSkillSource::Builtin
+        );
+    }
+
+    /// **A `files` key that is also another key's directory prefix is refused
+    /// whole.** Both keys pass every per-key validator, and the pair is
+    /// unwritable: `a` lands as a regular file and `create_dir_all("a")` then
+    /// fails `EEXIST` — mid-bundle, because a `BTreeMap` always reaches `a`
+    /// first.
+    #[test]
+    fn a_file_that_is_also_a_directory_prefix_is_rejected() {
+        for (parent, child) in [("a", "a/b.md"), ("dir", "dir/sub/deep.md")] {
+            let unit = skill_unit(
+                "probe",
+                bundle(&[("SKILL.md", "# probe\n"), (parent, "x\n"), (child, "y\n")]),
+            );
+            let err = validate_override(&unit, AgentSkillSource::Served)
+                .expect_err("{parent:?}/{child:?} must be refused");
+            assert!(err.contains("directory prefix"), "{err}");
+        }
+    }
+
+    /// The detector does not assume the colliding keys are ADJACENT in sort
+    /// order. `a!x` sorts between `a` and `a/b.md` (`!` is 0x21, `/` is 0x2F),
+    /// so a neighbour-only scan would miss the pair entirely.
+    #[test]
+    fn the_prefix_detector_does_not_assume_adjacency() {
+        let files = bundle(&[
+            ("SKILL.md", "# probe\n"),
+            ("a", "x\n"),
+            ("a!x", "y\n"),
+            ("a/b.md", "z\n"),
+        ]);
+        assert_eq!(
+            colliding_path_prefix(&files),
+            Some(("a".to_string(), "a/b.md".to_string()))
+        );
+        // And a bundle with no collision reports none, including the near-miss
+        // where one key merely SHARES a prefix with another.
+        assert_eq!(
+            colliding_path_prefix(&bundle(&[
+                ("SKILL.md", "# probe\n"),
+                ("ab", "x\n"),
+                ("a/b.md", "y\n"),
+                ("reference/one.md", "z\n"),
+            ])),
+            None
         );
     }
 
