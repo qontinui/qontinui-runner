@@ -1884,7 +1884,11 @@ mod tests {
         /// does NOT read the pin for yet — its DECLARED DIVERGENCE block says
         /// why (coord's allocate-lane reader must accept `pin-file` first).
         /// Deleting the divergence deletes the entry here, in the same PR.
-        const KNOWN_DIVERGENT: &[&str] = &["qontinui/qontinui-web", "qontinui/ui-bridge"];
+        const KNOWN_DIVERGENT: &[&str] = &[
+            "qontinui/qontinui-schemas",
+            "qontinui/qontinui-web",
+            "qontinui/ui-bridge",
+        ];
 
         let ci_toml = include_str!("../../../.qontinui/ci.toml");
         let pin_file = include_str!("../../../.github/sibling-pins.conf");

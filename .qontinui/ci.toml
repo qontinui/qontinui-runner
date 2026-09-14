@@ -39,6 +39,16 @@ version = 1
 # breaking types change can go green as a declared pair instead of
 # deadlocking. A branch NAME resolves nothing: matching on one let an un-PR'd
 # scratch branch satisfy the mirror gate in production on 2026-07-28.
+#
+# DECLARED DIVERGENCE (since plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks
+# Phase 3): the Actions lane now PINS qontinui-schemas in .github/sibling-pins.conf,
+# while this lane, with no declared adaptation PR, still resolves the default
+# branch. It stays `declared-adaptation` for the same reason as the two entries
+# below: coord's allocate-lane reader must accept `pin = "pin-file"` in a DEPLOYED
+# build first (that plan's follow-up F4), and every CI-node runner must be at or
+# past be5d87af8, whose closed `SiblingPin` enum is the first to know `pin-file`
+# (an older one refuses the whole manifest). Flip it together with them, and drop it
+# from `KNOWN_DIVERGENT` in src-tauri/src/ci_node/sibling.rs in the same PR.
 repo = "qontinui/qontinui-schemas"
 pin = "declared-adaptation"
 
