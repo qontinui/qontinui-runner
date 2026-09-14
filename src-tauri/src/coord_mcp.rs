@@ -5063,6 +5063,42 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
         .unwrap_or(TenantPin::Unpinned)
 }
 
+/// A typed tenant/bearer-selection refusal: HTTP status, stable `code`, whether
+/// the client may retry, and the human message.
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (review
+/// round 1). The four `mcp_api` bearer-selection sites used to receive a bare
+/// `(u16, String)` and hardcode `code` and `retryable` beside it, so a second
+/// refusal kind could only ever be reported under the first one's code and
+/// retryability. Every site now builds its body from this one value
+/// ([`ProxyRefusal::json_body`]), so the code and the retry advice cannot
+/// disagree with the refusal that produced them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProxyRefusal {
+    pub(crate) status: u16,
+    pub(crate) code: &'static str,
+    pub(crate) retryable: bool,
+    pub(crate) message: String,
+}
+
+impl ProxyRefusal {
+    /// The JSON body every refusal site returns: `success`, `error`, `code`,
+    /// `retryable` — the shape those sites carried before this type existed.
+    pub(crate) fn json_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "success": false,
+            "error": self.message,
+            "code": self.code,
+            "retryable": self.retryable,
+        })
+    }
+}
+
+/// [`tenant_unresolvable_error`]'s code.
+pub(crate) const TENANT_UNRESOLVABLE_CODE: &str = "COORD_MCP_PROXY_TENANT_UNRESOLVABLE";
+/// [`tenant_selection_failed_error`]'s code.
+pub(crate) const TENANT_SELECTION_FAILED_CODE: &str = "COORD_MCP_PROXY_TENANT_SELECTION_FAILED";
+
 /// Typed refusal for a session whose tenant cannot be resolved by ANY route.
 ///
 /// Shaped like [`device_jwt_refreshing_error`] — a structured, diagnosable
@@ -5071,16 +5107,51 @@ pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant
 /// machine cannot say who it is, and waiting will not change that". A bare 401
 /// here would read as a dead transport and send the operator down the
 /// `/coord-revive` path for a configuration problem.
-pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
-    (
-        503,
-        "COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine cannot resolve its tenant \
+///
+/// It is a CONFIGURATION verdict. A selection that never finished is not one —
+/// that is [`tenant_selection_failed_error`].
+pub(crate) fn tenant_unresolvable_error() -> ProxyRefusal {
+    ProxyRefusal {
+        status: 503,
+        code: TENANT_UNRESOLVABLE_CODE,
+        retryable: false,
+        message: "COORD_MCP_PROXY_TENANT_UNRESOLVABLE: this machine cannot resolve its tenant \
          — ~/.qontinui/machine.json is missing or malformed AND the device JWT \
          carries no tenant_id claim. Coord memory and other tenant-scoped writes \
          are refused rather than attributed to the default tenant. Fix by \
          repairing machine.json or re-pairing the device."
             .to_string(),
-    )
+    }
+}
+
+/// Typed refusal for a tenant/bearer selection that did not COMPLETE: its
+/// blocking task panicked or was cancelled.
+///
+/// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (a), review
+/// round 1. Deliberately distinct from [`tenant_unresolvable_error`]: that body
+/// blames `machine.json` and says waiting will not help, which is the wrong
+/// diagnosis for a decision that was simply never made. Nothing here says the
+/// machine is misconfigured, so it is **retryable**, and it names which of the
+/// two join failures occurred so a reader knows whether to look for a panic.
+/// Like every refusal, no bearer is presented.
+pub(crate) fn tenant_selection_failed_error(e: &tokio::task::JoinError) -> ProxyRefusal {
+    // A JoinError is a panic or a cancellation; `is_panic` decides, so nothing
+    // that is not a panic is ever reported as one.
+    let (how, look_for) = if e.is_panic() {
+        ("panicked", "the panic")
+    } else {
+        ("cancelled", "why the blocking task was cancelled")
+    };
+    ProxyRefusal {
+        status: 503,
+        code: TENANT_SELECTION_FAILED_CODE,
+        retryable: true,
+        message: format!(
+            "{TENANT_SELECTION_FAILED_CODE}: the runner's tenant/bearer selection did not \
+             complete ({how}); no credential was presented. Retry; if it persists, read \
+             the runner log for {look_for}."
+        ),
+    }
 }
 
 /// Resolve the tenant to select a DEVICE bearer for — or refuse.
@@ -5137,8 +5208,9 @@ pub(crate) fn tenant_unresolvable_error() -> (u16, String) {
 /// default-tenant write on a machine that is genuinely broken.
 ///
 /// Returns the tenant to pass to [`crate::auth::device_bearer_for`] (`None`
-/// meaning "the default slot"), or a typed refusal to return verbatim.
-pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uuid>, (u16, String)> {
+/// meaning "the default slot"), or a typed [`ProxyRefusal`] whose body the
+/// caller returns via [`ProxyRefusal::json_body`].
+pub(crate) fn session_tenant_or_refuse(nonce: Option<&str>) -> Result<Option<Uuid>, ProxyRefusal> {
     use crate::session::tenant_pin::TenantPin;
     let binding_pin = nonce
         .map(proxy_session_pin_for_nonce)
@@ -5159,7 +5231,7 @@ pub(crate) fn resolve_session_tenant(
     binding_pin: crate::session::tenant_pin::TenantPin,
     live_pin: crate::session::tenant_pin::TenantPin,
     jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
-) -> Result<Option<Uuid>, (u16, String)> {
+) -> Result<Option<Uuid>, ProxyRefusal> {
     let decision = decide_session_tenant(binding_pin, live_pin, jwt_claim_tenant);
     match &decision {
         SessionTenantDecision::BindingPin {
@@ -5205,7 +5277,7 @@ pub(crate) enum SessionTenantDecision {
 impl SessionTenantDecision {
     /// The proxy's answer: the tenant to select (`None` = the default slot), or
     /// the typed refusal.
-    pub(crate) fn into_result(self) -> Result<Option<Uuid>, (u16, String)> {
+    pub(crate) fn into_result(self) -> Result<Option<Uuid>, ProxyRefusal> {
         match self {
             SessionTenantDecision::BindingPin { tenant, .. }
             | SessionTenantDecision::LivePin(tenant)
@@ -5269,20 +5341,26 @@ pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecis
 
 /// Async wrapper: resolve the session tenant AND read its bearer, or refuse.
 ///
-/// The four `mcp_api` sites all need both halves — the tenant to hand to
-/// `await_device_jwt_remint_for` on the degrade path, and the bearer itself —
-/// so returning both keeps the call sites to one `await` and one `match`.
+/// The four `mcp_api` sites all need both halves: the bearer, and the tenant
+/// naming the slot it came from. The two sites with a bearer-miss arm — the
+/// coord-mcp proxy handler and `vcs_create_pull_request_handler` — also hand
+/// that tenant to `await_device_jwt_remint_for`. The claims read proxy
+/// (`nonce_gated_coord_get`) and the write proxy (`coord_write_proxy_handler`)
+/// have no such arm: a missing bearer goes to [`proxy_request_gate`], which
+/// answers 401. Returning both keeps the call sites to one `await` and one
+/// `match`.
 ///
 /// `AuthManager` does filesystem I/O and the `Unresolvable` arm reads a JWT, so
 /// the whole decision runs on the blocking pool, exactly where the per-site
 /// `device_bearer_for` call used to run.
 ///
-/// A join failure (panic or cancellation) REFUSES, with the same
-/// [`tenant_unresolvable_error`] the `Unresolvable` arm of
-/// [`resolve_session_tenant`] returns — see [`session_selection_from_join`].
+/// A join failure (panic or cancellation) REFUSES with
+/// [`tenant_selection_failed_error`] — a retryable 503, unlike the
+/// configuration refusal the `Unresolvable` arm of [`resolve_session_tenant`]
+/// returns. See [`session_selection_from_join`].
 pub(crate) async fn session_bearer_and_tenant_or_refuse(
     nonce: Option<String>,
-) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
+) -> Result<(Option<Uuid>, Option<String>), ProxyRefusal> {
     session_selection_from_join(
         spawn_blocking_tracked(move || {
             session_tenant_or_refuse(nonce.as_deref())
@@ -5298,18 +5376,24 @@ pub(crate) async fn session_bearer_and_tenant_or_refuse(
 /// Plan: `2026-09-14-credential-posture-second-residuals` Phase 3 (a). A join
 /// failure used to degrade to `Ok((None, None))`, "rather than manufacturing a
 /// refusal out of an executor hiccup". That tuple is not neutral: `None` is
-/// the TENANT, and every caller hands it to `await_device_jwt_remint_for` on
-/// the bearer-miss arm, where `device_bearer_for(None)` selects the default /
-/// legacy slot. So a non-default-pinned session whose selection panicked
-/// presented ANOTHER tenant's credential — the cross-tenant shape the whole
-/// fail-closed rule exists to remove.
+/// the TENANT, and the two sites with a bearer-miss arm — the coord-mcp proxy
+/// handler and `vcs_create_pull_request_handler` — hand it to
+/// `await_device_jwt_remint_for`, where `device_bearer_for(None)` selects the
+/// default / legacy slot. So a non-default-pinned session whose selection
+/// panicked presented ANOTHER tenant's credential — the cross-tenant shape the
+/// whole fail-closed rule exists to remove. (The claims read and write proxies
+/// have no such arm: they pass the `None` bearer to [`proxy_request_gate`],
+/// which answers 401.)
 ///
-/// Refuse instead of retrying the blocking read. Deciding priority:
-/// **robustness** — a panic in that read is not transient evidence, and "no
-/// tenant was resolved" is exactly what a join failure means.
+/// Refuse here rather than retry the blocking read in-process, and refuse with
+/// [`tenant_selection_failed_error`] — a retryable 503 naming panicked vs
+/// cancelled — not [`tenant_unresolvable_error`], whose body blames
+/// `machine.json` and says waiting will not help. Deciding priority:
+/// **robustness** — no tenant was resolved, so no bearer is presented, and the
+/// CLIENT is told honestly that a retry may succeed.
 fn session_selection_from_join(
-    joined: Result<Result<(Option<Uuid>, Option<String>), (u16, String)>, tokio::task::JoinError>,
-) -> Result<(Option<Uuid>, Option<String>), (u16, String)> {
+    joined: Result<Result<(Option<Uuid>, Option<String>), ProxyRefusal>, tokio::task::JoinError>,
+) -> Result<(Option<Uuid>, Option<String>), ProxyRefusal> {
     match joined {
         Ok(res) => res,
         Err(e) => {
@@ -5317,7 +5401,7 @@ fn session_selection_from_join(
                 "coord_mcp: REFUSING proxy request — the blocking tenant/bearer selection \
                  did not complete ({e}); no tenant was resolved, so no bearer is presented"
             );
-            Err(tenant_unresolvable_error())
+            Err(tenant_selection_failed_error(&e))
         }
     }
 }
@@ -5344,24 +5428,39 @@ mod session_tenant_resolution_tests {
 
     /// Phase 3 (a) of `2026-09-14-credential-posture-second-residuals`. A
     /// PANICKING blocking selection yields a real `JoinError`, and that must
-    /// refuse with the tenant-unresolvable error. The old `Ok((None, None))`
-    /// handed callers a `None` tenant, which the bearer-miss arm turns into the
-    /// default slot's credential: another tenant's bearer for a pinned session.
+    /// refuse. The old `Ok((None, None))` handed callers a `None` tenant, which
+    /// the bearer-miss arm turns into the default slot's credential: another
+    /// tenant's bearer for a pinned session. Review round 1: the refusal is
+    /// its OWN retryable one, not the non-retryable `machine.json` verdict.
     #[tokio::test]
     async fn a_panicked_selection_refuses_rather_than_selecting_the_default_slot() {
-        type Selection = Result<(Option<Uuid>, Option<String>), (u16, String)>;
+        type Selection = Result<(Option<Uuid>, Option<String>), ProxyRefusal>;
         let joined = spawn_blocking_tracked(|| -> Selection {
             panic!("injected: the blocking tenant/bearer selection panicked")
         })
         .await;
         assert!(
-            joined.is_err(),
-            "the injected panic must surface as a JoinError"
+            joined.as_ref().is_err_and(|e| e.is_panic()),
+            "the injected panic must surface as a panic JoinError"
         );
-        assert_eq!(
-            session_selection_from_join(joined),
-            Err(tenant_unresolvable_error()),
-            "a join failure resolved no tenant, so it must refuse, never Ok((None, None))"
+        let refusal = session_selection_from_join(joined).expect_err(
+            "a join failure resolved no tenant, so it must refuse, never Ok((None, None))",
+        );
+        assert_eq!(refusal.status, 503);
+        assert_eq!(refusal.code, "COORD_MCP_PROXY_TENANT_SELECTION_FAILED");
+        assert!(
+            refusal.retryable,
+            "a selection that never finished says nothing about configuration — retry may succeed"
+        );
+        assert!(
+            refusal.message.contains("panicked"),
+            "the refusal must say WHICH join failure occurred: {}",
+            refusal.message
+        );
+        assert!(
+            !refusal.message.contains("machine.json"),
+            "and must not blame machine.json for a panic: {}",
+            refusal.message
         );
 
         // A completed selection passes through unchanged, refusal or not.
@@ -5392,6 +5491,71 @@ mod session_tenant_resolution_tests {
             code.contains("session_selection_from_join("),
             "session_bearer_and_tenant_or_refuse must map its JoinError through \
              session_selection_from_join"
+        );
+    }
+
+    /// A CANCELLED selection refuses the same way, and says "cancelled" — never
+    /// "panicked", which would send a reader hunting for a panic that is not in
+    /// the log.
+    #[tokio::test]
+    async fn a_cancelled_selection_refuses_retryably_and_says_cancelled() {
+        type Selection = Result<(Option<Uuid>, Option<String>), ProxyRefusal>;
+        let handle = tokio::spawn(std::future::pending::<Selection>());
+        handle.abort();
+        let joined = handle.await;
+        assert!(
+            joined.as_ref().is_err_and(|e| e.is_cancelled()),
+            "an aborted pending task must surface as a cancelled JoinError"
+        );
+        let refusal =
+            session_selection_from_join(joined).expect_err("a cancelled selection refuses");
+        assert_eq!(refusal.status, 503);
+        assert_eq!(refusal.code, TENANT_SELECTION_FAILED_CODE);
+        assert!(refusal.retryable);
+        assert!(refusal.message.contains("cancelled"), "{}", refusal.message);
+        assert!(!refusal.message.contains("panicked"), "{}", refusal.message);
+    }
+
+    /// Every refusal body carries the refusal's OWN code and retryability, in
+    /// the four-field shape the `mcp_api` sites always returned — and those
+    /// sites build it from the struct rather than hardcoding a code.
+    #[tokio::test]
+    async fn every_refusal_body_carries_its_own_code_and_retryability() {
+        let joined = spawn_blocking_tracked(|| panic!("injected")).await;
+        let join_err = joined.expect_err("the injected panic is a JoinError");
+        let failed = tenant_selection_failed_error(&join_err);
+        let unresolvable = tenant_unresolvable_error();
+
+        for (refusal, code, retryable) in [
+            (&unresolvable, "COORD_MCP_PROXY_TENANT_UNRESOLVABLE", false),
+            (&failed, "COORD_MCP_PROXY_TENANT_SELECTION_FAILED", true),
+        ] {
+            assert_eq!(refusal.status, 503);
+            assert_eq!(
+                refusal.json_body(),
+                serde_json::json!({
+                    "success": false,
+                    "error": refusal.message,
+                    "code": code,
+                    "retryable": retryable,
+                }),
+                "body for {code}"
+            );
+        }
+
+        // Wiring: no `mcp_api` refusal site hardcodes the old code any more,
+        // and the four refusal sites return the struct's body. The needle is
+        // split so this test's own source cannot satisfy it.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let hardcoded = concat!("\"COORD_MCP_PROXY_", "TENANT_UNRESOLVABLE\"");
+        assert!(
+            !text.contains(hardcoded),
+            "mcp_api.rs must build refusal bodies from ProxyRefusal, not hardcode {hardcoded}"
+        );
+        assert!(
+            text.matches("refusal.json_body()").count() >= 4,
+            "each of the four bearer-selection sites returns refusal.json_body()"
         );
     }
 
@@ -5495,11 +5659,19 @@ mod session_tenant_resolution_tests {
     fn unresolvable_with_no_claim_refuses() {
         let got = resolve_session_tenant(TenantPin::Unpinned, TenantPin::Unresolvable, no_claim);
         match got {
-            Err((status, body)) => {
-                assert_eq!(status, 503);
+            Err(refusal) => {
+                assert_eq!(refusal.status, 503);
+                assert_eq!(refusal.code, "COORD_MCP_PROXY_TENANT_UNRESOLVABLE");
                 assert!(
-                    body.contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE"),
-                    "refusal must stay typed: {body}"
+                    !refusal.retryable,
+                    "a configuration verdict: waiting will not change it"
+                );
+                assert!(
+                    refusal
+                        .message
+                        .contains("COORD_MCP_PROXY_TENANT_UNRESOLVABLE"),
+                    "refusal must stay typed: {}",
+                    refusal.message
                 );
             }
             other => panic!("expected a typed refusal, got {other:?}"),
@@ -9059,7 +9231,7 @@ fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
     }
     match session_tenant_decision(Some(nonce)).into_result() {
         Ok(tenant) => CredentialTenantRead::Resolved(tenant),
-        Err((_, body)) => CredentialTenantRead::Refused(body),
+        Err(refusal) => CredentialTenantRead::Refused(refusal.message),
     }
 }
 
