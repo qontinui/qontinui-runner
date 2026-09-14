@@ -516,6 +516,76 @@ jobs:
             fi
           fi
 
+      # qontinui-schemas is a CARGO path dependency, so its pin cannot move
+      # without Cargo.lock (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks
+      # §7.4 Phase 3):
+      # - Cargo.lock records the path crates' versions;
+      # - ci.yml's `test` job runs `cargo metadata --locked` against the pinned
+      #   tree, so a pin bumped alone would red this PR on that check.
+      # So when the scan moves the schemas line, these steps check the new commit
+      # out beside the runner and refresh the lock resolve-only, and the PR step
+      # commits both files in one commit. They are skipped when schemas did not
+      # move.
+      - name: Detect a moving qontinui-schemas pin
+        id: schemas
+        if: steps.scan.outputs.self_heal == 'true'
+        shell: bash
+        env:
+          MANIFEST: .github/sibling-pins.conf
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: chore/sibling-pin-bump
+        run: |
+          set -euo pipefail
+          # A READY bump PR is never force-pushed (the PR step comments instead),
+          # so a lock refresh here would be discarded work that can still fail
+          # the run and cost the ui-bridge/web bumps their comment. Skip it.
+          # No `|| true`: an unreadable PR list must not read as "no PR".
+          ready_num="$(gh pr list --repo "$REPO" --head "$BRANCH" --base main --state open --json number,isDraft --jq '[.[] | select(.isDraft == false)][0].number // empty')"
+          if [ -n "$ready_num" ]; then
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+            echo "Bump PR #$ready_num is ready for review; the PR step will not force-push, so the lock refresh is skipped."
+            exit 0
+          fi
+          read_pin() { tr -d '\r' < "$1" | awk '{ sub(/#.*/, "") } $1 == "qontinui/qontinui-schemas" && NF == 2 { print $2 }'; }
+          old="$(read_pin "$MANIFEST")"
+          new="$(read_pin "$RUNNER_TEMP/sibling-pins.fresh.conf")"
+          if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+            # checkout-sibling reads the manifest from the workspace, so stage
+            # the fresh one there first. The PR step copies it again (a no-op).
+            cp "$RUNNER_TEMP/sibling-pins.fresh.conf" "$MANIFEST"
+            echo "moved=true" >> "$GITHUB_OUTPUT"
+            echo "qontinui-schemas pin moves $old -> $new; Cargo.lock is refreshed in the same commit."
+          else
+            echo "moved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out the new qontinui-schemas pin
+        if: steps.schemas.outputs.moved == 'true'
+        uses: ./.github/actions/checkout-sibling
+
+      - name: Refresh Cargo.lock against the new qontinui-schemas pin
+        if: steps.schemas.outputs.moved == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # rustup ships on ubuntu-latest; rust-toolchain.toml pins the channel.
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" --profile minimal
+          # Resolve-only, WITHOUT --locked: cargo rewrites only the lock entries
+          # the new sibling tree forces. `cargo update -p qontinui-types` unlocks
+          # more than that (finding b45b88c7 measured unrelated windows-sys /
+          # socket2 churn from it in this repo's lock).
+          cargo metadata --format-version 1 > /dev/null
+          # The exact check ci.yml's `test` job runs on the resulting PR.
+          cargo metadata --locked --format-version 1 > /dev/null
+          # LC_ALL=C: under a UTF-8 collation `Cargo.lock` sorts BEFORE
+          # `.github/…`, which would fail every lock-changing bump below.
+          changed="$(git status --porcelain | awk '{print $2}' | LC_ALL=C sort | tr '\n' ' ')"
+          case "$changed" in
+            ".github/sibling-pins.conf " | ".github/sibling-pins.conf Cargo.lock ") ;;
+            *) echo "::error::Unexpected working-tree changes after the lock refresh: '$changed'"; git status --porcelain; exit 1 ;;
+          esac
+
       # One long-lived branch, force-rebuilt from the triggering commit every
       # run, so N days of sibling movement converge on ONE pull request rather
       # than N. Pins current => this step is skipped entirely, so a quiet day
@@ -637,8 +707,12 @@ jobs:
           git checkout -B "$BRANCH" "$GITHUB_SHA"
           cp "$RUNNER_TEMP/sibling-pins.fresh.conf" "$MANIFEST"
 
-          # Explicit path, never `git add -A`.
+          # Explicit paths, never `git add -A`. Cargo.lock is present only when
+          # the schemas pin moved (the refresh step above wrote it).
           git add -- "$MANIFEST"
+          if [ -n "$(git status --porcelain -- Cargo.lock)" ]; then
+            git add -- Cargo.lock
+          fi
           if git diff --cached --quiet; then
             # Contradiction guard. This step only runs when the scan found a
             # differing head, and the rewrite above changes the SHA token on

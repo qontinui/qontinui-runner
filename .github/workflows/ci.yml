@@ -243,6 +243,31 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Cargo.lock must match the PINNED qontinui-schemas tree (plan
+      # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3).
+      # Cargo.lock records a path crate's version but no commit. The commit comes
+      # from .github/sibling-pins.conf, and sibling-pin-bump.yml moves the pin and
+      # the lock in one commit.
+      # Without --locked, every cargo command below silently rewrites a stale lock
+      # and goes green on it, which is how this repo's lock sat stale across
+      # qontinui-types releases while coord's gated lock went red.
+      # Resolve-only (no compile). It runs before the first cargo build, so it
+      # cannot pass vacuously on a lock cargo has already rewritten.
+      - name: Cargo.lock is in sync with the pinned qontinui-schemas
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          if cargo metadata --locked --format-version 1 > /dev/null; then
+            exit 0
+          fi
+          echo "::error title=Cargo.lock is stale::Committed Cargo.lock does not match the graph resolved against the checked-out qontinui-schemas sibling."
+          cargo metadata --format-version 1 > /dev/null || true
+          git --no-pager diff -- Cargo.lock || true
+          echo "Fix: move the schemas pin (.github/sibling-pins.conf) and Cargo.lock in the SAME commit. With the pinned schemas checked out beside this repo, run: cargo metadata --format-version 1 > /dev/null"
+          echo "On a declared schemas pair, this sibling is the partner PR's head: commit the lock change it forces with your adaptation."
+          git checkout -- Cargo.lock || true
+          exit 1
+
       # Bounded because an unbounded apt hang here stalls the whole REPO, not
       # just this run. Run 32302655587 (2026-08-19, branch
       # merge-candidate/01a01bdd-…) sat `in_progress` in this step for 4h24m

@@ -284,24 +284,46 @@ jobs:
       #
       # Deliberately NOT using .github/actions/checkout-sibling here: a release
       # must be built against LANDED schemas, never against an unlanded PR head.
-      # Every other schemas checkout under .github/ now goes through that action
-      # — this clone is the ONLY survivor, and forbid-sibling-clone.yml
-      # allowlists this file BY NAME so that stays a deliberate exception rather
-      # than the first of a new crop.
+      # Every other schemas checkout under .github/ goes through that action.
+      # This step is the only survivor, and it does not clone: it fetches the
+      # commit pinned in .github/sibling-pins.conf by SHA, after checking that
+      # the commit has landed on schemas main. forbid-sibling-clone.yml no longer
+      # needs to exempt this file, because a pinned fetch does not match its
+      # pattern. A `git clone` re-added here would be caught.
       #
-      # THE EXCLUSION IS A POLICY ABOUT RELEASE PROVENANCE — NOT a consequence
-      # of how the action is keyed. It is worth being precise about that,
-      # because the "in practice" version of this note goes stale every time the
-      # action's key changes, and a stale reason invites a future session to
-      # "tidy up" the exclusion. The action resolves only in a `pull_request`
-      # context; this workflow is tag-push / workflow_dispatch and has none, so
-      # wiring it up WOULD resolve to the default branch anyway — but that
-      # coincidence is not the reason, and if it ever stopped being true the
-      # exclusion would still stand.
+      # RELEASE PROVENANCE is enforced by the landed check in this step, not by a
+      # forbid-sibling-clone exclusion. The release builds only a commit that has
+      # landed on schemas main, never a PR head. This step also keeps a third copy
+      # of the pin parser: the awk below duplicates checkout-sibling's `apply_pin`
+      # and sibling-pin-bump.yml's scan, and fails closed (a missing, duplicated,
+      # or malformed entry exits 1 and never falls back to the default branch).
+      # Change all three together.
+      #
+      # PINNED (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4):
+      # the release builds the schemas commit recorded in .github/sibling-pins.conf.
+      # That is the tree CI compiled, and the one Cargo.lock was refreshed against.
+      # The pin is CHECKED to have landed on schemas main, so the provenance rule
+      # above is enforced rather than assumed. A default-branch clone here would
+      # ship a schemas tree no CI run built after any schemas release.
       - name: Checkout sibling repos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          sha="$(tr -d '\r' < .github/sibling-pins.conf | awk '{ sub(/#.*/, "") } $1 == "qontinui/qontinui-schemas" && NF == 2 { print $2 }')"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::No single valid qontinui/qontinui-schemas pin in .github/sibling-pins.conf (got '$sha')."; exit 1; }
+          status="$(gh api "repos/qontinui/qontinui-schemas/compare/$sha...main" --jq .status)"
+          case "$status" in
+            identical|ahead) ;;
+            *) echo "::error::Pinned qontinui-schemas $sha is '$status' relative to schemas main — not landed. Refusing to release against it."; exit 1 ;;
+          esac
           cd "$GITHUB_WORKSPACE/.."
-          git clone --depth 1 https://github.com/qontinui/qontinui-schemas.git
+          rm -rf qontinui-schemas
+          mkdir qontinui-schemas
+          git -C qontinui-schemas init -q
+          git -C qontinui-schemas fetch -q --depth 1 https://github.com/qontinui/qontinui-schemas.git "$sha"
+          git -C qontinui-schemas -c advice.detachedHead=false checkout -q FETCH_HEAD
+          echo "qontinui-schemas pinned at $sha (compare: $status)"
         shell: bash
 
       - name: Setup pnpm

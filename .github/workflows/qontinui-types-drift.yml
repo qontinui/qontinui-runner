@@ -193,6 +193,14 @@ jobs:
         with:
           path: ${{ github.workspace }}/qontinui-schemas
           accept-trailing-sibling: 'true'
+          # FLOATING ON PURPOSE (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks
+          # §7.4): compile sites build the commit pinned in .github/sibling-pins.conf,
+          # but this is a PAIR site. Pinned, a runner-leads pair (runner type lands,
+          # then schemas' regenerated bindings land) would red runner main here until
+          # the next pin bump, because the pinned schemas tree lacks the new bindings.
+          # So undeclared runs keep comparing against schemas main, exactly as
+          # before the pin.
+          pin-file: ''
 
       # generate_types.sh runs `cargo build --bin export_schemas` which
       # links the runner lib (Tauri-dependent). Tauri 2.x on Linux probes

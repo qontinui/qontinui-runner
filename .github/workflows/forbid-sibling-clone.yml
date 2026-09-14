@@ -64,14 +64,13 @@ jobs:
             # The sanctioned materialiser itself. Everything under `.github/`
             # is supposed to go through this.
             ':!.github/actions/checkout-sibling/'
-            # release.yml is NOT a consumer and must stay that way (plan §4.2):
-            # a release must be built against LANDED schemas, never an unlanded
-            # PR head. Its triggers are `push: tags` and `workflow_dispatch`, so
-            # it carries no PR number and has no declaration to read either way
-            # — but the exclusion is a POLICY about release provenance, not a
-            # consequence of how the action is keyed. Its clone of the default
-            # branch is correct and deliberate.
-            ':!.github/workflows/release.yml'
+            # release.yml is NOT excluded any more (plan
+            # 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4). It
+            # still bypasses the action on purpose, because a release builds
+            # LANDED schemas and never a PR head. But it now fetches the pinned,
+            # verified-landed commit by SHA instead of cloning the default branch,
+            # and that fetch does not match PATTERN. Keeping the name-exclusion
+            # would only let a `git clone` slip back in unnoticed.
             # Self-reference: this file contains the pattern strings as part of
             # its own definition.
             ':!.github/workflows/forbid-sibling-clone.yml'
