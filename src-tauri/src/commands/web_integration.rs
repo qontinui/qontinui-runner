@@ -860,6 +860,16 @@ pub async fn redeem_pair_code(
 
     persist_pairing(&resp, tenant_id).map_err(|e| format!("persist pairing: {}", e))?;
 
+    // A NEW credential is in `tenant_id`'s slot (and in the legacy slot when that
+    // tenant is the default), so every rejection coord recorded against the OLD
+    // one is spent. Without this, re-pairing by code on `dark(upstream_401)`
+    // stores a working credential and the next refresher pass re-reads the stale
+    // streak and republishes `dark`. Same derivation as `finalize_signed_in`.
+    crate::mcp::device_jwt_refresher::retire_rejection_streaks_after_pairing(
+        tenant_id,
+        crate::auth::default_binding_tenant(),
+    );
+
     // Redeeming a pair code IS an explicit interactive credential acquisition —
     // the operator typed a code that a signed-in web session minted — so it ends
     // any interactive logout, exactly like a Cognito sign-in does.
