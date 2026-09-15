@@ -387,6 +387,7 @@ coord.agent_user_prefs
 coord.agent_worktrees
 coord.alerts
 coord.alerts_id_seq
+coord.attach_grants
 coord.attempt_audits
 coord.auth_observations
 coord.auth_observations_id_seq
@@ -394,6 +395,10 @@ coord.build_events
 coord.canonical_repos
 coord.ci_baselines
 coord.ci_dispatches
+coord.ci_job_observations
+coord.ci_pool_eligibility_baselines
+coord.ci_runner_probes
+coord.ci_runner_quarantines
 coord.ci_runs
 coord.claims_audit
 coord.claude_account_usage
@@ -421,6 +426,7 @@ coord.coordinator_decisions
 coord.coordinator_leader
 coord.coordinator_shadow_decisions
 coord.correlation_topics
+coord.create_grants
 coord.dependency_observations
 coord.dependency_observations_id_seq
 coord.dependency_resolution_observations
@@ -439,6 +445,7 @@ coord.device_resource_samples
 coord.device_resource_samples_id_seq
 coord.device_status
 coord.devices
+coord.displaced_pr_rows
 coord.edit_verifications
 coord.edit_verifications_id_seq
 coord.error_observations
@@ -522,7 +529,9 @@ coord.page_spec_paths
 coord.pending_installations
 coord.pending_pr_dependencies
 coord.policy_clauses
+coord.policy_rule_proposals
 coord.policy_rule_resolutions
+coord.policy_rule_seed_undo
 coord.policy_rules
 coord.pr_author_nudges
 coord.pr_check_runs
@@ -532,11 +541,14 @@ coord.pr_events
 coord.pr_files
 coord.pr_labels
 coord.pr_unlandable_attempts
+coord.prepaid_balances
+coord.primary_tree_branch_events
 coord.primary_trees
 coord.priority_sets
 coord.process_session_output
 coord.process_session_output_id_seq
 coord.process_sessions
+coord.prompt_document_claim_states
 coord.prompt_document_kind_tiers
 coord.prompt_document_proposals
 coord.prompt_document_publications
@@ -561,6 +573,7 @@ coord.scheduler_ticks
 coord.scheduler_ticks_id_seq
 coord.schema_drift_events
 coord.schema_drift_events_id_seq
+coord.schema_read_surfaces
 coord.session_compliance
 coord.session_compliance_config
 coord.session_compliance_config_versions
