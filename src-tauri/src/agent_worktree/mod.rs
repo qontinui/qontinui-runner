@@ -768,9 +768,11 @@ pub fn worktree_mode_enabled() -> bool {
 /// `parent_sha` is `Option`:
 /// - `None` (the default, omitted from the wire JSON via
 ///   `skip_serializing_if`) → coord deserializes it as `None` and runs
-///   `decide_parent_sha`, returning its authoritative webhook-fresh
-///   `coord_main_sha`. This is the right base even when this runner's
-///   primary checkout is parked on a stale feature branch.
+///   `decide_parent_sha`, returning its mirror's `coord_main_sha` — a base
+///   independent of this runner's primary checkout (which may be parked
+///   on a stale feature branch), but only as fresh as coord's 120 s
+///   reconcile loop last left `mirror_state`; the response's
+///   [`ParentShaProvenance`] says how fresh that was.
 /// - `Some(sha)` → coord honors it verbatim (no re-resolve). Used only as
 ///   the local-`origin/<default>` fallback when coord can't decide a base
 ///   (repo not registered → HTTP 409 [`AllocateError::RepoNotRegistered`]).
@@ -779,6 +781,97 @@ pub struct RepoRequest {
     pub repo: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_sha: Option<String>,
+}
+
+/// How fresh the `parent_sha` coord stamped on an allocated worktree row
+/// was, as coord itself judged it (plan
+/// `2026-09-13-coord-allocate-serves-a-stale-mirror-sha-as-a-fresh-parent`
+/// D3). Coord's `mirror_state` has no webhook writer — it is refreshed only
+/// by the 120 s reconcile loop — so the sha it serves can be behind GitHub,
+/// and this is the field that says so.
+///
+/// `Unknown` is the default AND the `#[serde(other)]` arm on purpose: a row
+/// from an older coord (field absent) or a coord speaking a newer vocabulary
+/// (string unrecognised) must never read as `Fresh`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentShaFreshness {
+    /// Coord fetched the default branch from GitHub inside its freshness
+    /// window before deciding the sha.
+    Fresh,
+    /// Coord served the sha knowing its mirror was behind (a failed or
+    /// timed-out refresh, a bare repo behind the served GitHub tip, …); the
+    /// `parent_sha_basis` names which.
+    Stale,
+    /// The caller pinned `parent_sha` itself, so coord did not decide it and
+    /// has nothing to say about its age.
+    CallerPinned,
+    /// Coord could not judge, or said nothing at all. Last on purpose:
+    /// serde requires the `other` arm to be the final variant.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl ParentShaFreshness {
+    /// The wire spelling, for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParentShaFreshness::Fresh => "fresh",
+            ParentShaFreshness::Stale => "stale",
+            ParentShaFreshness::Unknown => "unknown",
+            ParentShaFreshness::CallerPinned => "caller_pinned",
+        }
+    }
+}
+
+/// The four freshness fields coord emits on every `/agents/allocate`
+/// worktree row (D3), flattened into the row on the wire. Every field
+/// defaults, so a body from a coord that predates them reads
+/// `Unknown` / `None` — never `Fresh`, never an age of `0`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default)]
+pub struct ParentShaProvenance {
+    #[serde(default)]
+    pub parent_sha_freshness: ParentShaFreshness,
+    /// RFC 3339 instant coord last observed the sha's ref, when it has one.
+    #[serde(default)]
+    pub parent_sha_observed_at: Option<String>,
+    /// Seconds between that observation and the allocate; `None` when
+    /// unmeasured (coord never emits `0` to mean "unknown").
+    #[serde(default)]
+    pub parent_sha_age_secs: Option<i64>,
+    /// Coord's ASCII reason for the verdict — `fetched`, `fetch_failed`,
+    /// `no_fetch_stamp`, `refresh_timeout`, `bare_behind_served_github`,
+    /// `diverged`, `caller_pinned`, …
+    #[serde(default)]
+    pub parent_sha_basis: Option<String>,
+}
+
+impl ParentShaProvenance {
+    /// WARN when coord did not vouch for the sha as fresh. This is the
+    /// runner's whole response to a stale parent (D6): it is logged, never
+    /// fast-forwarded — a client-side fast-forward would disagree with the
+    /// `parent_sha` coord stamped on `coord.agent_worktrees` and with
+    /// `fs_observer`'s diff base, so the worktree forks off the sha exactly
+    /// as served and the log line is what an operator reads.
+    pub fn warn_if_not_fresh(&self, repo: &str, parent_sha: &str) {
+        if self.parent_sha_freshness == ParentShaFreshness::Fresh {
+            return;
+        }
+        warn!(
+            "allocate: parent_sha not vouched fresh by coord (forking off it as served, \
+             no client-side fast-forward): repo={} parent_sha={} freshness={} basis={} \
+             observed_at={} age_secs={}",
+            repo,
+            parent_sha,
+            self.parent_sha_freshness.as_str(),
+            self.parent_sha_basis.as_deref().unwrap_or("<none>"),
+            self.parent_sha_observed_at.as_deref().unwrap_or("<none>"),
+            self.parent_sha_age_secs
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "<unmeasured>".to_string()),
+        );
+    }
 }
 
 /// A single materialized worktree as returned by
@@ -798,6 +891,9 @@ pub struct MaterializedWorktree {
     /// response; [`remote_agent_ref`] recomputes it as a fallback
     /// when talking to a pre-Phase-5 coord.
     pub push_ref: String,
+    /// How fresh coord judged `parent_sha` to be, as served on the row.
+    #[serde(flatten)]
+    pub parent_sha_provenance: ParentShaProvenance,
 }
 
 /// Mirror of `qontinui-coord::ref_namespace::remote_agent_ref` — kept
@@ -1008,6 +1104,8 @@ pub struct SharedBranchRepo {
     /// cwd is this path, NOT a separate worktree dir).
     pub checkout_path: PathBuf,
     pub push_ref: String,
+    #[serde(flatten)]
+    pub parent_sha_provenance: ParentShaProvenance,
 }
 
 /// Result of an [`Isolation::Wait`] directive — nothing materialized.
@@ -1073,6 +1171,10 @@ struct CoordAllocatedWorktree {
     /// `.qontinui/ci.toml` `[[siblings]]`). Absent on an older coord.
     #[serde(default)]
     origin: Option<String>,
+    /// D3 — the four `parent_sha_*` freshness fields, flattened. Each
+    /// defaults, so an older coord's row reads `Unknown` / `None`.
+    #[serde(flatten)]
+    parent_sha_provenance: ParentShaProvenance,
 }
 
 /// Error variants returned by [`allocate_and_materialize_with_claim`]. Distinct
@@ -1504,6 +1606,13 @@ pub async fn allocate_and_materialize_with_claim(
         coord_resp.worktrees.len(),
         isolation
     );
+    // D3/D6 — the first read of every row: say so when coord did not vouch
+    // for the parent sha, before any locality fetch or `worktree add` acts
+    // on it. The sha itself is used exactly as served.
+    for w in &coord_resp.worktrees {
+        w.parent_sha_provenance
+            .warn_if_not_fresh(&w.repo, &w.parent_sha);
+    }
 
     // `wait` — coord declined to materialize. Surface a typed Wait
     // outcome WITHOUT touching the disk; the caller logs / retries. We do
@@ -1749,6 +1858,7 @@ pub async fn allocate_and_materialize_with_claim(
             parent_sha: w.parent_sha,
             worktree_path: target,
             push_ref,
+            parent_sha_provenance: w.parent_sha_provenance,
         });
     }
 
@@ -1912,6 +2022,7 @@ fn checkout_shared_branches(
             parent_sha: w.parent_sha.clone(),
             checkout_path: (*canonical).clone(),
             push_ref,
+            parent_sha_provenance: w.parent_sha_provenance.clone(),
         });
     }
     Ok(branches)
@@ -2018,6 +2129,71 @@ pub fn coord_ws_to_http(coord_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // D3 — the four `parent_sha_*` freshness fields on the allocate row
+    // (plan `2026-09-13-coord-allocate-serves-a-stale-mirror-sha-as-a-fresh-parent`
+    // Phase 4). The property under test: a row that says nothing, or says
+    // something this build does not recognise, reads `Unknown` — never
+    // `Fresh`, never an age of `0`.
+    // =======================================================================
+
+    #[test]
+    fn coord_allocated_worktree_without_freshness_fields_reads_unknown() {
+        let row: CoordAllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"agent-worktrees/a/qontinui-runner","status":"allocated"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            row.parent_sha_provenance.parent_sha_freshness,
+            ParentShaFreshness::Unknown
+        );
+        assert_eq!(row.parent_sha_provenance.parent_sha_age_secs, None);
+        assert_eq!(row.parent_sha_provenance.parent_sha_observed_at, None);
+        assert_eq!(row.parent_sha_provenance.parent_sha_basis, None);
+    }
+
+    #[test]
+    fn coord_allocated_worktree_round_trips_a_stale_verdict() {
+        let row: CoordAllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"agent-worktrees/a/qontinui-runner","status":"allocated",
+                "parent_sha_freshness":"stale","parent_sha_age_secs":1234,
+                "parent_sha_basis":"fetch_failed",
+                "parent_sha_observed_at":"2026-09-13T03:47:11Z"}"#,
+        )
+        .unwrap();
+        let p = &row.parent_sha_provenance;
+        assert_eq!(p.parent_sha_freshness, ParentShaFreshness::Stale);
+        assert_eq!(p.parent_sha_age_secs, Some(1234));
+        assert_eq!(p.parent_sha_basis.as_deref(), Some("fetch_failed"));
+        assert_eq!(
+            p.parent_sha_observed_at.as_deref(),
+            Some("2026-09-13T03:47:11Z")
+        );
+        // The other two known spellings read as themselves, not as `other`.
+        let fresh: ParentShaFreshness = serde_json::from_str(r#""fresh""#).unwrap();
+        assert_eq!(fresh, ParentShaFreshness::Fresh);
+        let pinned: ParentShaFreshness = serde_json::from_str(r#""caller_pinned""#).unwrap();
+        assert_eq!(pinned, ParentShaFreshness::CallerPinned);
+    }
+
+    #[test]
+    fn coord_allocated_worktree_unrecognised_freshness_reads_unknown() {
+        let row: CoordAllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"agent-worktrees/a/qontinui-runner","status":"allocated",
+                "parent_sha_freshness":"extremely_fresh","parent_sha_age_secs":5}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            row.parent_sha_provenance.parent_sha_freshness,
+            ParentShaFreshness::Unknown
+        );
+        // The unrecognised verdict does not poison its neighbours.
+        assert_eq!(row.parent_sha_provenance.parent_sha_age_secs, Some(5));
+    }
 
     /// Cancelling must end the heartbeat task, not merely ask it nicely.
     ///
@@ -2593,6 +2769,7 @@ mod tests {
             status: "allocated".to_string(),
             push_ref: String::new(),
             origin: Some("requested".to_string()),
+            parent_sha_provenance: ParentShaProvenance::default(),
         };
         let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
 
@@ -2647,6 +2824,7 @@ mod tests {
             status: "allocated".to_string(),
             push_ref: String::new(),
             origin: Some("requested".to_string()),
+            parent_sha_provenance: ParentShaProvenance::default(),
         };
         let (w1, w2) = (row("r1", &sha1), row("r2", &sha2));
 
