@@ -86,6 +86,13 @@ const CLAUDE_HOOK_SETTINGS_ENV: &str = "QONTINUI_CLAUDE_HOOK_SETTINGS";
 /// fallback, then append nothing (fail-open).
 const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 
+/// Env var carrying the sha256 of the policy body a `claude` received in its
+/// system prompt at spawn (plan
+/// `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`). Mirrors
+/// `session::spawn_prompt::POLICY_DELIVERED_SHA_ENV` in the runner bin crate,
+/// which this bin cannot import. See [`keeps_policy_delivered_sha`].
+const POLICY_DELIVERED_SHA_ENV: &str = "QONTINUI_POLICY_DELIVERED_SHA";
+
 /// The runner's session coord-identity mint route (plan
 /// `2026-07-17-universal-coord-device-identity-for-any-session` §1). POST
 /// `{"cwd": "<abs dir>"}`; a 200's BODY IS the `.mcp.json` document.
@@ -265,6 +272,23 @@ pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -
         }
         _ => Vec::new(),
     }
+}
+
+/// Does this `claude` launch keep an inherited [`POLICY_DELIVERED_SHA_ENV`]?
+///
+/// Only when its own argv carries `--append-system-prompt-file` — the carrier
+/// the policy body rides. The marker tells the runner's SessionStart policy
+/// hook that the body is already in this session's system prompt, so the hook
+/// sends a short confirmation instead of the body. It is inherited by every
+/// descendant process, and this shim is exactly what delivers the hook
+/// (`--settings`) to a NESTED `claude` typed inside a session; keeping the
+/// marker there would tell that nested session it holds a body it was never
+/// given. So everything else drops it. Gemini never keeps it (no such flag).
+pub fn keeps_policy_delivered_sha(tool: IdentityTool, args: &[String]) -> bool {
+    tool == IdentityTool::Claude
+        && args.iter().any(|a| {
+            a == "--append-system-prompt-file" || a.starts_with("--append-system-prompt-file=")
+        })
 }
 
 /// The universal coord-mcp `--mcp-config` args: tool==claude AND the env path is
@@ -542,7 +566,12 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     }
 
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
-    let code = exec_real(&real, tool.program(), &final_args);
+    let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args) {
+        &[]
+    } else {
+        &[POLICY_DELIVERED_SHA_ENV]
+    };
+    let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
     // any earlier would delete the file before `claude` reads it at launch.
@@ -982,6 +1011,18 @@ fn exec_real(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32>
 /// Unix.) A spawn failure fails open to a non-fatal surrogate code so the shell
 /// is never bricked.
 fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Option<i32> {
+    exec_real_child_env(real, name, args, &[])
+}
+
+/// [`exec_real_child`] with `env_remove` variables stripped from the child's
+/// inherited environment (the identity straddle's policy-marker rule, see
+/// [`keeps_policy_delivered_sha`]).
+fn exec_real_child_env(
+    real: &Option<PathBuf>,
+    name: &str,
+    args: &[String],
+    env_remove: &[&str],
+) -> Option<i32> {
     let mut cmd = match real {
         Some(p) => Command::new(p),
         // No resolved real tool: dispatch by name and let the OS PATH find it.
@@ -989,6 +1030,9 @@ fn exec_real_child(real: &Option<PathBuf>, name: &str, args: &[String]) -> Optio
         // re-entry to a pure passthrough — no infinite loop.)
         None => Command::new(name),
     };
+    for var in env_remove {
+        cmd.env_remove(var);
+    }
     cmd.args(args)
         .env(GUARD_ENV, "1")
         .stdin(Stdio::inherit())
@@ -1406,6 +1450,34 @@ mod tests {
         assert!(identity_settings_args(IdentityTool::Claude, Some("")).is_empty());
         assert!(identity_settings_args(IdentityTool::Claude, Some("  ")).is_empty());
         assert!(identity_settings_args(IdentityTool::Claude, None).is_empty());
+    }
+
+    /// The policy marker survives ONLY on a claude launch that itself carries
+    /// the file carrier (the interactive wrapper's spelling, both forms). A
+    /// nested `claude` typed inside a session inherits the marker but not the
+    /// body, so it must lose it — or the policy hook would skip a body that
+    /// session never received.
+    #[test]
+    fn policy_delivered_sha_is_kept_only_with_the_file_carrier() {
+        let with_file = strs(&["--append-system-prompt-file", "/x/spawn-1.md", "-p", "hi"]);
+        let attached = strs(&["--append-system-prompt-file=/x/spawn-1.md"]);
+        let inline = strs(&["--append-system-prompt", "briefing"]);
+        let bare = strs(&["-p", "hi"]);
+        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &with_file));
+        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &attached));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &inline));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &bare));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &[]));
+        // A near-miss token is not the flag.
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &strs(&["--append-system-prompt-files", "x"])
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Gemini,
+            &with_file
+        ));
+        assert_eq!(POLICY_DELIVERED_SHA_ENV, "QONTINUI_POLICY_DELIVERED_SHA");
     }
 
     #[test]

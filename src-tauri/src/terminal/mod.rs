@@ -324,6 +324,12 @@ pub const RUNNER_CONTEXT_SOURCE_MARKER: &str = concat!(
 ///     inject it into the argv directly via
 ///     `agent_runtime::build_continuation_claude_command`.
 ///
+/// On BOTH paths the text may instead reach `claude` inside a composed
+/// `--append-system-prompt-file` that appends the tenant's cached policy body
+/// after it ([`crate::session::spawn_prompt`]). That composition happens in the
+/// CARRIER, never here: this function's output is unchanged and still carries
+/// no policy content.
+///
 /// Pull-first lean protocol (session-autonomy-fabric Phase 5): this briefing
 /// carries PROTOCOL + LINKS, never policy content. Policy/playbook bodies live
 /// in coord's versioned prompt documents and are fetched on demand, so editing

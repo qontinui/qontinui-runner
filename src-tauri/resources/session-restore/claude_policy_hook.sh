@@ -67,6 +67,9 @@
 #   QONTINUI_RUNNER_API_PORT         the runner's :9876 loopback API port
 #   QONTINUI_INSTALL_INTERCEPT_PORT  fallback port (same server by default)
 #   QONTINUI_TERMINAL_ID             the per-PTY terminal id
+#   QONTINUI_POLICY_DELIVERED_SHA    sha256 of the policy body this `claude`
+#                                    received in its SYSTEM PROMPT at spawn
+#                                    (set only when it did — see below)
 #
 # NOTE: there is deliberately NO env kill-switch read here (unlike
 # `claude_stop_hook.sh`'s `QONTINUI_STOP_HOOK_CONTINUATION` short-circuit).
@@ -147,8 +150,24 @@ case "$src" in
   *) src="" ;;
 esac
 
-# Both params are shape-constrained above, so neither needs encoding: `src` is
-# one of four literals and `csid` is hex-and-hyphens.
+# The spawn-time delivery marker (plan
+# `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`). The
+# policy body now normally reaches the session through its system prompt, and
+# the runner exports the sha256 of the exact body it composed on the `claude`
+# process that got it. Forwarded so the route can send a short confirmation
+# INSTEAD of the ~11 KB body — but only when that sha equals the hash of the
+# body it has just fetched; any other value, or none, gets the full body. The
+# script decides nothing: it forwards, the route judges. Constrained to 64 hex
+# characters (a sha256), so it needs no encoding and a garbage value is simply
+# not sent.
+dsha="${QONTINUI_POLICY_DELIVERED_SHA:-}"
+case "$dsha" in
+  *[!0-9a-fA-F]*) dsha="" ;;
+esac
+[ "${#dsha}" -eq 64 ] || dsha=""
+
+# Every param is shape-constrained above, so none needs encoding: `src` is one
+# of four literals, `csid` is hex-and-hyphens, `dsha` is hex.
 url="http://127.0.0.1:${port}/sessions/${sid}/policy-context"
 sep="?"
 if [ -n "$src" ]; then
@@ -157,6 +176,10 @@ if [ -n "$src" ]; then
 fi
 if [ -n "$csid" ]; then
   url="${url}${sep}claude_session_id=${csid}"
+  sep="&"
+fi
+if [ -n "$dsha" ]; then
+  url="${url}${sep}delivered_sha=${dsha}"
 fi
 
 # The route fetches from coord, so allow more headroom than the loopback trip

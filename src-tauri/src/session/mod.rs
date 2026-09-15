@@ -82,6 +82,7 @@ pub mod session_lifecycle_store;
 pub mod session_transcript_tailer; // Interactive-pane Claude Code transcript -> coord transcript stream (plan 2026-08-26-claude-code-session-repository-in-qontinui-web, Phase 2)
 pub mod shutdown_marker;
 pub mod snapshot_history;
+pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file (briefing + policy body) via --append-system-prompt-file (plan 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel, Phase 1)
 // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
 // can read the same pin the proxy does — see the lib declaration for why.
 // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.

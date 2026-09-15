@@ -53,6 +53,13 @@ PROMPT="%{$(printf '\033]633;A\007')%}${PROMPT}%{$(printf '\033]633;B\007')%}"
 # SINGLE SOURCE OF TRUTH rendered by the runner (Rust `terminal::runner_context`)
 # and delivered via $QONTINUI_RUNNER_CONTEXT. Fail-open: an empty value launches
 # claude unmodified.
+#
+# When the runner composed a spawn file ($QONTINUI_RUNNER_CONTEXT_FILE: the same
+# briefing plus the tenant's policy body — plan
+# 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel) and it still
+# exists, it is passed via --append-system-prompt-file INSTEAD of the inline
+# flag; Claude Code refuses both together, and a missing file is a fatal start,
+# hence the existence check.
 if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
     claude() {
         case "${1:-}" in
@@ -60,10 +67,29 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                 command claude "$@"
                 ;;
             *)
-                if [ -n "${QONTINUI_RUNNER_CONTEXT}" ]; then
-                    command claude --append-system-prompt "$QONTINUI_RUNNER_CONTEXT" "$@"
+                # A caller-supplied system-prompt flag wins, untouched: Claude
+                # Code refuses the inline and file flags together, so adding
+                # ours beside theirs could only stop the launch.
+                local __q_own_prompt=0 __q_arg
+                for __q_arg in "$@"; do
+                    case "$__q_arg" in
+                        --append-system-prompt|--append-system-prompt=*|--append-system-prompt-file|--append-system-prompt-file=*)
+                            __q_own_prompt=1; break ;;
+                    esac
+                done
+                if [ "$__q_own_prompt" = "0" ] && [ -n "${QONTINUI_RUNNER_CONTEXT_FILE:-}" ] \
+                    && [ -f "${QONTINUI_RUNNER_CONTEXT_FILE}" ]; then
+                    # The composed spawn file: briefing + the tenant's policy
+                    # body. QONTINUI_POLICY_DELIVERED_SHA rides along untouched
+                    # — it names exactly that body.
+                    command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
+                elif [ "$__q_own_prompt" = "0" ] && [ -n "${QONTINUI_RUNNER_CONTEXT:-}" ]; then
+                    # Inline fall-back (no file, or it was pruned): no policy
+                    # body reached this child, so its delivered-SHA marker is
+                    # BLANKED — the policy hook then sends the full body.
+                    QONTINUI_POLICY_DELIVERED_SHA= command claude --append-system-prompt "$QONTINUI_RUNNER_CONTEXT" "$@"
                 else
-                    command claude "$@"
+                    QONTINUI_POLICY_DELIVERED_SHA= command claude "$@"
                 fi
                 ;;
         esac

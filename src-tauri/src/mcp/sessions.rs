@@ -938,6 +938,12 @@ struct PolicyContextQuery {
     source: Option<String>,
     #[serde(default)]
     claude_session_id: Option<String>,
+    /// The session's spawn-time delivered-SHA marker
+    /// (`QONTINUI_POLICY_DELIVERED_SHA`, forwarded by the hook script). Parsed
+    /// strictly; anything but a 64-hex SHA-256 is no marker and gets the full
+    /// render.
+    #[serde(default)]
+    delivered_sha: Option<String>,
 }
 
 /// `GET /sessions/{id}/policy-context` — the SessionStart policy-injection
@@ -975,7 +981,15 @@ async fn policy_context(
     // reads as fact. An unparseable id is simply no id.
     let attribution =
         crate::mcp::policy_context::parse_attribution_session(q.claude_session_id.as_deref());
-    match crate::mcp::policy_context::policy_context(&key, q.source.as_deref(), attribution).await {
+    let delivered_sha = crate::mcp::policy_context::parse_delivered_sha(q.delivered_sha.as_deref());
+    match crate::mcp::policy_context::policy_context(
+        &key,
+        q.source.as_deref(),
+        attribution,
+        delivered_sha.as_deref(),
+    )
+    .await
+    {
         Some(envelope) => Json(envelope).into_response(),
         None => StatusCode::OK.into_response(),
     }

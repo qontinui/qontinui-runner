@@ -479,6 +479,7 @@ pub(crate) fn spawn_resumed_pane(
     // plus the `--settings <hook file>` pair below.
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
     let command = crate::claude_session::launch_spec::render_argv(
         &crate::claude_session::launch_spec::LaunchSpec {
             permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
@@ -493,7 +494,15 @@ pub(crate) fn spawn_resumed_pane(
             // old context but not the policies as they now stand
             // ([`crate::mcp::policy_context`]). Empty on a materialize failure
             // ⇒ no flag, which is the pre-existing behaviour.
-            extra_required: crate::session::claude_hook::direct_spawn_settings_args(),
+            //
+            // Plus the policy body at spawn (plan
+            // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
+            // this respawn has no briefing, so it carries a BODY-ONLY composed
+            // file when the tenant's cache exists, and nothing otherwise.
+            extra_required: resume_respawn_extra_required(
+                crate::session::claude_hook::direct_spawn_settings_args(),
+                prompt_carrier.as_ref(),
+            ),
             ..Default::default()
         },
         &launch_cfg,
@@ -517,6 +526,11 @@ pub(crate) fn spawn_resumed_pane(
         // to report `work_completed` for work it goes on to finish.
         gate_identity: spec.gate_identity,
         coord_lineage: spec.coord_lineage,
+        // From the SAME carrier the argv above was built from.
+        policy_delivered_sha: prompt_carrier
+            .as_ref()
+            .and_then(|c| c.policy_sha())
+            .map(str::to_string),
     };
     crate::commands::terminal::create_tracked_terminal_session_backend(
         terminal_manager,
@@ -533,6 +547,20 @@ pub(crate) fn spawn_resumed_pane(
         Some(spec.page_id),
         spec.resource_override,
     )
+}
+
+/// The verbatim `extra_required` tail of the `--resume` respawn: the hook
+/// carrier's `--settings` pair, then the system-prompt carrier's pair when
+/// there is one. Pure, so the argv shape is assertable without a PTY.
+fn resume_respawn_extra_required(
+    settings_args: Vec<String>,
+    carrier: Option<&crate::session::spawn_prompt::SystemPromptCarrier>,
+) -> Vec<String> {
+    let mut out = settings_args;
+    if let Some(carrier) = carrier {
+        out.extend(carrier.argv());
+    }
+    out
 }
 
 /// Perform the migration mechanics: transcript copy → close old pane →
@@ -768,6 +796,30 @@ fn emit_skipped(app: &tauri::AppHandle, record: &TerminalSessionRecord, src: &st
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `--resume` respawn carries the hook carrier and, with a cached body,
+    /// the body-only file — and never the inline flag, since it has no briefing.
+    #[test]
+    fn resume_respawn_tail_carries_settings_then_the_body_file_only_when_resolved() {
+        use crate::session::spawn_prompt::{SystemPromptCarrier, APPEND_SYSTEM_PROMPT_FLAG};
+        let settings = vec!["--settings".to_string(), "/h/s.json".to_string()];
+        let file = SystemPromptCarrier::File {
+            path: std::path::PathBuf::from("/h/spawn-prompts/spawn-1.md"),
+            policy_sha: "cd".repeat(32),
+        };
+        assert_eq!(
+            resume_respawn_extra_required(settings.clone(), Some(&file)),
+            vec![
+                "--settings",
+                "/h/s.json",
+                "--append-system-prompt-file",
+                "/h/spawn-prompts/spawn-1.md"
+            ]
+        );
+        let bare = resume_respawn_extra_required(settings.clone(), None);
+        assert_eq!(bare, settings, "no cached body ⇒ exactly today's tail");
+        assert!(!bare.iter().any(|a| a == APPEND_SYSTEM_PROMPT_FLAG));
+    }
 
     #[test]
     fn migration_cap_allows_then_blocks() {

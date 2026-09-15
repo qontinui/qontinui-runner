@@ -4423,7 +4423,11 @@ pub(crate) fn build_continuation_claude_command(
     pinned_session_id: &str,
     add_dir_args: Vec<String>,
     prompt: String,
-    system_prompt: Option<String>,
+    // The system-prompt carrier: the composed `--append-system-prompt-file`
+    // (briefing + policy body) or the inline `--append-system-prompt` briefing,
+    // from [`crate::session::spawn_prompt::resolve_system_prompt_carrier`].
+    // ONE carrier, never both flags — Claude Code refuses the pair.
+    system_prompt: Option<crate::session::spawn_prompt::SystemPromptCarrier>,
     // The `--settings <path>` pair delivering the runner's bundled Claude hook
     // block, from
     // [`crate::session::claude_hook::direct_spawn_settings_args`]. Empty ⇒ no
@@ -4441,11 +4445,15 @@ pub(crate) fn build_continuation_claude_command(
     // `extra_required` is the caller-authoritative, verbatim tail — never
     // reordered or deduped by the seam. It carries, IN ORDER:
     //
-    //  - the canonical runner-context briefing as `--append-system-prompt <sp>`.
-    //    Autonomous spawns exec `claude` directly (no shell wrapping), so unlike
-    //    interactive panes they never pick up the shell-integration wrapper's
-    //    briefing; injecting it here gives fleet/gate-continuation sessions the
-    //    same capability + guardrail context an operator's pane gets.
+    //  - the system-prompt carrier: the canonical runner-context briefing,
+    //    either composed with the tenant's policy body into ONE
+    //    `--append-system-prompt-file <path>` or, when no composed file is
+    //    available, inline as `--append-system-prompt <sp>`. Never both: Claude
+    //    Code refuses the pair and would not start. Autonomous spawns exec
+    //    `claude` directly (no shell wrapping), so unlike interactive panes they
+    //    never pick up the shell-integration wrapper's briefing; injecting it
+    //    here gives fleet/gate-continuation sessions the same capability +
+    //    guardrail context an operator's pane gets.
     //  - the `--settings <hook file>` pair, for the SAME reason and from the
     //    same blind spot: the identity shim is what appends it for a hand-typed
     //    `claude`, and a direct exec has no shim in the chain, so an autonomous
@@ -4465,9 +4473,8 @@ pub(crate) fn build_continuation_claude_command(
     // between — with no operator config the output is byte-identical to the
     // historical hand-built argv.
     let mut extra_required = Vec::with_capacity(add_dir_args.len() + hook_settings_args.len() + 4);
-    if let Some(sp) = system_prompt {
-        extra_required.push("--append-system-prompt".to_string());
-        extra_required.push(sp);
+    if let Some(carrier) = system_prompt {
+        extra_required.extend(carrier.argv());
     }
     extra_required.extend(hook_settings_args);
     extra_required.extend(add_dir_args);
@@ -4677,7 +4684,7 @@ async fn run_continuation_terminal(
         uuid::Uuid::new_v4().to_string()
     });
 
-    let capture_hint = crate::commands::terminal::SessionCaptureHint {
+    let mut capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: selected_config_dir,
         working_dir: workdir.to_string(),
         title: title.clone(),
@@ -4704,6 +4711,8 @@ async fn run_continuation_terminal(
         coord_lineage: Some(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
+        // Settled below, from the SAME carrier the argv is built from.
+        policy_delivered_sha: None,
     };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -4729,21 +4738,34 @@ async fn run_continuation_terminal(
     // immediately above is what decides. Only the RENDER moved — provisioning
     // still runs exactly where it did, after the account-credential abort, so no
     // aborted continuation gains a `.mcp.json` it never had before.
+    //
+    // Phase 1b: the generic runner context PLUS coord's dispatch-time brief.
+    // This is the TERMINAL presentation arm; the HEADLESS arm is the other half
+    // of the same seam and composes the brief into its prompt in
+    // `run_gate_continuation_inner` (it has no `--append-system-prompt` seam of
+    // its own). A brief appended at only one of them reaches only one spawn
+    // path. The briefing is then composed with the tenant's cached policy body
+    // into one `--append-system-prompt-file` when that cache exists (plan
+    // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`), and
+    // stays inline otherwise.
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
+        compose_continuation_system_prompt(
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+            payload.brief.as_ref(),
+        ),
+    ));
+    // The marker the policy hook's route trusts as proof of delivery — taken
+    // from the very carrier the argv uses, never recomputed.
+    capture_hint.policy_delivered_sha = prompt_carrier
+        .as_ref()
+        .and_then(|c| c.policy_sha())
+        .map(str::to_string);
     let command = Some(build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
         add_dir_args,
         payload.initial_prompt.clone(),
-        // Phase 1b: the generic runner context PLUS coord's dispatch-time
-        // brief. This is the TERMINAL presentation arm; the HEADLESS arm is the
-        // other half of the same seam and composes the brief into its prompt in
-        // `run_gate_continuation_inner` (it has no `--append-system-prompt`
-        // seam of its own). A brief appended at only one of them reaches only
-        // one spawn path.
-        Some(compose_continuation_system_prompt(
-            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
-            payload.brief.as_ref(),
-        )),
+        prompt_carrier,
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
         // with no SessionStart/PreCompact/Stop hook at all.
@@ -5330,11 +5352,7 @@ async fn run_condition_check_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
-    let command = Some(build_continuation_claude_command(
-        claude_bin,
-        &pinned_session_id,
-        Vec::new(),
-        payload.initial_prompt.clone(),
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
         // UNKNOWN, and honestly so: this function does NO coord-mcp
         // provisioning of its own — it relies entirely on the downstream PTY
         // identity seam, which decides the outcome long after this argv is
@@ -5347,10 +5365,23 @@ async fn run_condition_check_terminal(
         // `ConditionCheckPayload`: a different `source` discriminator, published
         // by a different coord path, carrying no `brief` key at all. The gate
         // continuation's second spawn path is the HEADLESS arm below.
-        Some(crate::terminal::runner_context(
+        crate::terminal::runner_context(
             crate::terminal::spawn_seam_api_port(),
             crate::coord_mcp::CoordMcpDelivery::Unknown,
-        )),
+        ),
+    ));
+    // Carried to the child env by the capture hint below; from the SAME
+    // carrier the argv uses.
+    let policy_delivered_sha = prompt_carrier
+        .as_ref()
+        .and_then(|c| c.policy_sha())
+        .map(str::to_string);
+    let command = Some(build_continuation_claude_command(
+        claude_bin,
+        &pinned_session_id,
+        Vec::new(),
+        payload.initial_prompt.clone(),
+        prompt_carrier,
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
         // with no SessionStart/PreCompact/Stop hook at all.
@@ -5399,6 +5430,8 @@ async fn run_condition_check_terminal(
         coord_lineage: Some(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
+        // From the SAME carrier the argv above was built from.
+        policy_delivered_sha,
     };
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's
@@ -8218,7 +8251,9 @@ mod tests {
             "abc-123",
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
-            Some("You are inside the Qontinui Runner.".to_string()),
+            Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
+                "You are inside the Qontinui Runner.".to_string(),
+            )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
@@ -8270,7 +8305,9 @@ mod tests {
             "abc-123",
             vec![],
             "do the thing".to_string(),
-            Some(briefing),
+            Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
+                briefing,
+            )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
@@ -8304,7 +8341,9 @@ mod tests {
             "abc-123",
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
-            Some("briefing".to_string()),
+            Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
+                "briefing".to_string(),
+            )),
             vec![
                 "--settings".to_string(),
                 "C:/hooks/claude_hook_settings.json".to_string(),
@@ -8360,7 +8399,9 @@ mod tests {
             "abc-123",
             vec!["--add-dir=D:/wt/coord".to_string()],
             "do the thing".to_string(),
-            Some("briefing".to_string()),
+            Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
+                "briefing".to_string(),
+            )),
             vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
             &crate::claude_session::launch_spec::LaunchConfig::default(),
         );
@@ -8372,6 +8413,78 @@ mod tests {
                 "--add-dir=D:/wt/coord|--|do the thing"
             )
         );
+    }
+
+    /// THE CARRIER CONSTRAINT. Claude Code refuses `--append-system-prompt`
+    /// together with `--append-system-prompt-file` (`Error: Cannot use both …`,
+    /// verified on v2.1.272), so the composed-file carrier REPLACES the inline
+    /// flag rather than joining it. A regression here does not degrade a
+    /// session — it stops every autonomous spawn from starting at all.
+    #[test]
+    fn continuation_command_file_carrier_replaces_the_inline_flag_before_terminator() {
+        let carrier = crate::session::spawn_prompt::SystemPromptCarrier::File {
+            path: std::path::PathBuf::from("C:/rt/session-restore/spawn-prompts/spawn-1.md"),
+            policy_sha: "ab".repeat(32),
+        };
+        let cmd = build_continuation_claude_command(
+            "claude".to_string(),
+            "abc-123",
+            vec!["--add-dir=D:/wt/coord".to_string()],
+            "do the thing".to_string(),
+            Some(carrier),
+            vec!["--settings".to_string(), "C:/hooks/s.json".to_string()],
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+        );
+        assert_eq!(
+            cmd.join("|"),
+            concat!(
+                "claude|--dangerously-skip-permissions|--session-id|abc-123|",
+                "--append-system-prompt-file|C:/rt/session-restore/spawn-prompts/spawn-1.md|",
+                "--settings|C:/hooks/s.json|--add-dir=D:/wt/coord|--|do the thing"
+            )
+        );
+        assert!(
+            !cmd.iter().any(|a| a == "--append-system-prompt"),
+            "never both carriers: {cmd:?}"
+        );
+    }
+
+    /// Both carriers, one rule: at most ONE system-prompt flag, always ahead of
+    /// the `--` terminator, alongside the hook carrier.
+    #[test]
+    fn continuation_command_never_emits_both_system_prompt_flags() {
+        use crate::session::spawn_prompt::SystemPromptCarrier;
+        for carrier in [
+            Some(SystemPromptCarrier::Inline("briefing".to_string())),
+            Some(SystemPromptCarrier::File {
+                path: std::path::PathBuf::from("/rt/spawn-prompts/spawn-2.md"),
+                policy_sha: "cd".repeat(32),
+            }),
+            None,
+        ] {
+            let cmd = build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                vec![],
+                "do the thing".to_string(),
+                carrier.clone(),
+                vec!["--settings".to_string(), "/h/s.json".to_string()],
+                &crate::claude_session::launch_spec::LaunchConfig::default(),
+            );
+            let flags: Vec<usize> = cmd
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| {
+                    *a == "--append-system-prompt" || *a == "--append-system-prompt-file"
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let term = cmd.iter().position(|a| a == "--").unwrap();
+            assert!(flags.len() <= 1, "{carrier:?}: {cmd:?}");
+            assert_eq!(flags.len(), usize::from(carrier.is_some()), "{carrier:?}");
+            assert!(flags.iter().all(|&f| f < term), "{carrier:?}: {cmd:?}");
+            assert!(cmd.iter().position(|a| a == "--settings").unwrap() < term);
+        }
     }
 
     #[test]
@@ -9248,9 +9361,8 @@ mod tests {
             "abc-123",
             Vec::new(),
             "run /babysit-prs".to_string(),
-            Some(compose_continuation_system_prompt(
-                "RUNNER CONTEXT".to_string(),
-                Some(&brief),
+            Some(crate::session::spawn_prompt::SystemPromptCarrier::Inline(
+                compose_continuation_system_prompt("RUNNER CONTEXT".to_string(), Some(&brief)),
             )),
             Vec::new(),
             &crate::claude_session::launch_spec::LaunchConfig::default(),

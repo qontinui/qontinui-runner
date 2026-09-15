@@ -54,6 +54,22 @@
 //! `current_version` rides every index entry deliberately — it is what lets a
 //! session tell a stale memory from a current one.
 //!
+//! ## The body normally arrives at SPAWN, not here
+//!
+//! Since plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`
+//! the protocol body rides the system prompt: spawn seams compose it into one
+//! `--append-system-prompt-file` ([`crate::session::spawn_prompt`]) from a
+//! per-tenant cache THIS route writes after each successful fetch. The hook
+//! batch is the boundary a phantom auto-submitted turn was localized to, and an
+//! ~11 KB render was the largest thing crossing it.
+//!
+//! This route still makes the SAME attributed coord read on every start — that
+//! read is the compliance record — and only its render shrinks: a short
+//! confirmation plus the index, and ONLY when the session's delivered-SHA marker
+//! equals the hash of the body just fetched ([`render_for_session`]). No marker,
+//! a stale spawn-time copy, or a cold cache all get the full body, exactly as
+//! before. The runner never claims a delivery it cannot prove.
+//!
 //! ## Fires on every `source`
 //!
 //! `startup | resume | compact` all inject. A resumed session carries its old
@@ -380,50 +396,42 @@ fn header(source: &str, fetched_at: &str) -> String {
     )
 }
 
-/// Render the `additionalContext` for a successful (or partially successful)
-/// pull.
+/// The spawn-time policy body: an intro paragraph plus the delimited
+/// `policy/session-protocol` text. `None` when the fetch carried no body.
 ///
-/// Pure: everything time- or network-dependent is a parameter, so the exact
-/// injected text is asserted in tests against a fixed payload.
-pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str) -> String {
-    let mut out = String::with_capacity(16 * 1024);
-    out.push_str(&header(source, fetched_at));
-    out.push_str("\n\n");
+/// This is the EXACT byte sequence the runner delivers in both channels — the
+/// per-tenant cache ([`crate::session::spawn_prompt::write_policy_body_cache`])
+/// the spawn seams compose into the system prompt, and the body section of the
+/// full hook render ([`render_injection`]). It is therefore also what
+/// [`crate::session::spawn_prompt::policy_body_sha`] hashes on both sides of
+/// the delivered-SHA check, which is why it is deterministic: no fetch time,
+/// no `source`, nothing that differs between two renders of one version.
+pub fn render_policy_body(payload: &PolicyPayload) -> Option<String> {
+    let body = payload.protocol_body.as_deref()?;
+    let version = version_label(payload.protocol_version);
+    let mut out = String::with_capacity(body.len() + 1024);
+    out.push_str(&format!(
+        "[qontinui-runner] This is the canonical text of `policy/{PROTOCOL_DOC_NAME}` \
+         ({version}), pulled from coord `GET /coord/agent-prompt-documents` and delivered \
+         by the runner so that Step 0 of the session protocol is satisfied for this session \
+         without you fetching it. Treat it as the authority. You do NOT need to re-read \
+         `{PROTOCOL_DOC_NAME}`; you DO still need to read the category bodies it names — the \
+         policy document index (`kind={KIND}`) lists every one with its current version.\n\n"
+    ));
+    out.push_str(&format!(
+        "===== policy/{PROTOCOL_DOC_NAME} ({version}) =====\n\n"
+    ));
+    out.push_str(body.trim_end());
+    out.push('\n');
+    Some(out)
+}
 
-    match payload.protocol_body.as_deref() {
-        Some(body) => {
-            out.push_str(&format!(
-                "This is the canonical, freshly-pulled text of `policy/{PROTOCOL_DOC_NAME}` \
-                 ({}), delivered by the runner so that Step 0 of the session protocol is \
-                 satisfied for this session without you fetching it. Treat it as the \
-                 authority. You do NOT need to re-read `{PROTOCOL_DOC_NAME}`; you DO still \
-                 need to read the category bodies it names — the index below lists every \
-                 one with its current version.\n\n",
-                version_label(payload.protocol_version)
-            ));
-            out.push_str(&format!(
-                "===== policy/{PROTOCOL_DOC_NAME} ({}) =====\n\n",
-                version_label(payload.protocol_version)
-            ));
-            out.push_str(body.trim_end());
-            out.push_str("\n\n");
-        }
-        None => {
-            // Partial: the index came back but the body did not. Say so
-            // plainly — an index alone silently missing the protocol would
-            // read as "the protocol has nothing in it".
-            out.push_str(&format!(
-                "The runner could not retrieve the body of `policy/{PROTOCOL_DOC_NAME}` on \
-                 this attempt, so Step 0 is NOT satisfied for this session. Fetch it \
-                 yourself before substantive work: \
-                 `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, \
-                 or `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}` over the \
-                 device-authed HTTP door. The document index below did load and is \
-                 current.\n\n"
-            ));
-        }
-    }
-
+/// Append the versioned policy index section to `out`.
+///
+/// Shared by the full render and the short confirmation: the index is small
+/// (tens of lines) and is what lets a session tell a stale memory of any
+/// document from a current one, so it rides the hook in BOTH shapes.
+fn push_index(out: &mut String, payload: &PolicyPayload) {
     out.push_str(&format!(
         "===== Policy document index (kind={KIND}, {} document{}) =====\n\n",
         payload.index.len(),
@@ -438,7 +446,7 @@ pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str)
              read, not as an empty policy set, and list them yourself with \
              `coord_list_prompt_documents(kind=\"policy\")`.\n",
         );
-        return out;
+        return;
     }
     out.push_str(&format!(
         "Read a body with `coord_get_prompt_document(kind=\"{KIND}\", name=\"<name>\")`, or \
@@ -464,7 +472,118 @@ pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str)
             ));
         }
     }
+}
+
+/// Render the FULL `additionalContext` for a successful (or partially
+/// successful) pull: header, the [`render_policy_body`] section, and the index.
+///
+/// This is what every session got before the spawn-time carrier existed, and
+/// it is still what a session gets whenever the runner cannot PROVE the body
+/// already reached its system prompt — see [`render_for_session`].
+///
+/// Pure: everything time- or network-dependent is a parameter, so the exact
+/// injected text is asserted in tests against a fixed payload.
+pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str) -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str(&header(source, fetched_at));
+    out.push_str("\n\n");
+
+    match render_policy_body(payload) {
+        Some(body) => {
+            out.push_str(&body);
+            out.push('\n');
+        }
+        None => {
+            // Partial: the index came back but the body did not. Say so
+            // plainly — an index alone silently missing the protocol would
+            // read as "the protocol has nothing in it".
+            out.push_str(&format!(
+                "The runner could not retrieve the body of `policy/{PROTOCOL_DOC_NAME}` on \
+                 this attempt, so Step 0 is NOT satisfied for this session. Fetch it \
+                 yourself before substantive work: \
+                 `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, \
+                 or `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}` over the \
+                 device-authed HTTP door. The document index below did load and is \
+                 current.\n\n"
+            ));
+        }
+    }
+
+    push_index(&mut out, payload);
     out
+}
+
+/// Render the SHORT `additionalContext`: the body was verifiably delivered at
+/// spawn, so only a confirmation and the index cross the hook boundary.
+///
+/// Names the protocol version and a short prefix of `delivered_sha` so that a
+/// session holding a spawn-time copy for a long time (many `compact` cycles)
+/// can match the copy in its system prompt against what this hook vouched for.
+pub fn render_confirmation(
+    payload: &PolicyPayload,
+    delivered_sha: &str,
+    source: &str,
+    fetched_at: &str,
+) -> String {
+    let version = version_label(payload.protocol_version);
+    let short_sha: String = delivered_sha.chars().take(12).collect();
+    let mut out = String::with_capacity(2 * 1024);
+    out.push_str(&header(source, fetched_at));
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "The canonical text of `policy/{PROTOCOL_DOC_NAME}` ({version}, sha256 {short_sha}…) \
+         was delivered into this session's SYSTEM PROMPT at spawn, and the runner verified \
+         that the delivered copy is byte-identical to the body coord serves right now — so \
+         Step 0 of the session protocol is satisfied for this session and the body is not \
+         repeated here. It is the block headed `===== policy/{PROTOCOL_DOC_NAME} ({version}) \
+         =====`. If you cannot find that block, treat Step 0 as NOT satisfied and fetch it \
+         yourself: `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, \
+         or `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}`. You DO still need \
+         to read the category bodies it names.\n\n"
+    ));
+    push_index(&mut out, payload);
+    out
+}
+
+/// Choose the render for one session — the honesty decision, pure.
+///
+/// The short confirmation is sent ONLY when the session's delivered-SHA marker
+/// equals [`crate::session::spawn_prompt::policy_body_sha`] of the body this
+/// call just fetched. Every other case gets the full render:
+///
+/// - **no marker** — the session was not given the file carrier (cold cache at
+///   spawn, a write failure, a wrapper fall-back, a seam that has none), and the
+///   presence of a cache file NOW says nothing about what it received THEN;
+/// - **a different SHA** — the spawn-time copy is stale (coord versioned the
+///   document since the pane or process started);
+/// - **no body fetched** — nothing to compare, and the partial render says so.
+///
+/// Returns the text and whether it was the confirmation.
+pub fn render_for_session(
+    payload: &PolicyPayload,
+    delivered_sha: Option<&str>,
+    source: &str,
+    fetched_at: &str,
+) -> (String, bool) {
+    if let (Some(marker), Some(body)) = (delivered_sha, render_policy_body(payload)) {
+        let current = crate::session::spawn_prompt::policy_body_sha(&body);
+        if marker == current {
+            return (
+                render_confirmation(payload, &current, source, fetched_at),
+                true,
+            );
+        }
+    }
+    (render_injection(payload, source, fetched_at), false)
+}
+
+/// Parse the hook-forwarded delivered-SHA marker. Strict: exactly 64 hex
+/// characters, normalized to lower case. Anything else is no marker — the
+/// route then renders in full, which is the safe direction.
+pub fn parse_delivered_sha(raw: Option<&str>) -> Option<String> {
+    let raw = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    (raw.len() == 64 && raw.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| raw.to_ascii_lowercase())
 }
 
 /// Render the `additionalContext` for a pull that failed outright.
@@ -899,10 +1018,18 @@ fn now_stamp() -> String {
 /// Every failure resolves to `Some(envelope(fail-open notice))`, because a
 /// session that silently receives nothing is in exactly the pre-plan state this
 /// module exists to end.
+///
+/// `delivered_sha` is the session's spawn-time marker
+/// ([`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`], already parsed
+/// by [`parse_delivered_sha`]). It changes only the RENDER
+/// ([`render_for_session`]) — the attributed coord read happens identically
+/// either way, so `coord.session_policy_reads` keeps its
+/// `session_start_injection` row for every session.
 pub async fn policy_context(
     session_key: &str,
     source: Option<&str>,
     attribution: Option<uuid::Uuid>,
+    delivered_sha: Option<&str>,
 ) -> Option<Value> {
     let mode = Mode::from_env();
     let source = normalize_source(source);
@@ -929,9 +1056,18 @@ pub async fn policy_context(
     // `coord_client_parts` is the shared accessor `continuation_verdict` and
     // `session_compliance` both use — same credential, same coord base. Its
     // error is the honest "unpaired" reason, which the notice renders verbatim.
+    let mut confirmed = false;
     let text = match crate::mcp::continuation_verdict::coord_client_parts() {
-        Ok((base, _jwt)) => match fetch_payload(&base, attribution).await {
-            Ok(payload) => render_injection(&payload, source, &fetched_at),
+        Ok((base, jwt)) => match fetch_payload(&base, attribution).await {
+            Ok(payload) => {
+                if mode == Mode::On {
+                    persist_policy_body_cache(&jwt, &payload);
+                }
+                let (text, is_confirmation) =
+                    render_for_session(&payload, delivered_sha, source, &fetched_at);
+                confirmed = is_confirmation;
+                text
+            }
             Err(reason) => {
                 warn!(session = %session_key, source, reason = %reason, "policy-context: pull failed — injecting the fail-open notice");
                 render_failure_notice(&reason, source, &fetched_at)
@@ -964,9 +1100,75 @@ pub async fn policy_context(
         source,
         mode = mode.as_str(),
         bytes = text.len(),
+        delivered_marker = delivered_sha.is_some(),
+        confirmed_spawn_delivery = confirmed,
         "policy-context: injecting fleet policy at SessionStart"
     );
     Some(envelope(&text))
+}
+
+// ===========================================================================
+// Spawn-time body cache (the source the spawn seams compose from)
+// ===========================================================================
+
+/// The tenant a device JWT names, from its unverified `tenant_id` claim.
+///
+/// Used only to NAME a local cache file, never to authorize anything — the
+/// same posture `coord_mcp::device_jwt_claim_tenant` takes. The policy body
+/// this runner fetches is the tenant coord resolves from this same bearer, so
+/// the claim is the right scope for the file.
+fn tenant_of_jwt(jwt: &str) -> Option<uuid::Uuid> {
+    let raw = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())?;
+    uuid::Uuid::parse_str(&raw).ok()
+}
+
+/// Write the rendered body to the per-tenant spawn cache, best-effort.
+///
+/// Called by the route after each successful fetch (no extra coord read — see
+/// [`crate::session::spawn_prompt`] for why a background refresher was
+/// rejected). A payload with no body writes nothing, so a transient body
+/// failure never blanks a good cache. No resolvable tenant ⇒ nothing is
+/// written: there is deliberately no unscoped name a prompt could cross
+/// tenants through.
+fn persist_policy_body_cache(jwt: &str, payload: &PolicyPayload) {
+    let Some(body) = render_policy_body(payload) else {
+        return;
+    };
+    let Some(tenant) = tenant_of_jwt(jwt) else {
+        debug!(
+            "policy-context: device JWT carries no tenant_id claim — spawn body cache not written"
+        );
+        return;
+    };
+    let dir = crate::session::claude_hook::session_restore_dir();
+    if let Err(e) = crate::session::spawn_prompt::write_policy_body_cache(&dir, &tenant, &body) {
+        warn!(
+            error = %e,
+            dir = %dir.display(),
+            "policy-context: spawn body cache write failed — spawns keep the inline briefing \
+             and the body keeps riding this hook"
+        );
+    }
+}
+
+/// The policy body a spawn seam should compose into the system prompt, or
+/// `None` for "stay inline".
+///
+/// Local I/O only, never a coord call: the injection flag must be `on`
+/// (`off`/`observe` inject nothing, and a system prompt is an injection), the
+/// runner's device JWT must name a tenant, and that tenant's cache must exist.
+/// Reading the JWT is a local secure-storage read — the same one the terminal
+/// seam's coord-mcp provisioning already makes on this path.
+pub fn spawn_policy_body() -> Option<String> {
+    if Mode::from_env() != Mode::On {
+        return None;
+    }
+    let jwt = crate::auth::AuthManager::new().get_access_token().ok()?;
+    let tenant = tenant_of_jwt(&jwt)?;
+    crate::session::spawn_prompt::read_policy_body_cache(
+        &crate::session::claude_hook::session_restore_dir(),
+        &tenant,
+    )
 }
 
 // ===========================================================================
@@ -1308,6 +1510,152 @@ mod tests {
             text.contains("treat it as a failed read, not as an empty policy set"),
             "an empty list must never read as 'this tenant has no policies': {text}"
         );
+    }
+
+    // ── Spawn-time body + the honesty decision ──────────────────────────
+
+    /// The cached/composed body is deterministic and is byte-for-byte the body
+    /// section of the full hook render — so the SHA the spawn side computes and
+    /// the SHA the route computes are over the same bytes.
+    #[test]
+    fn render_policy_body_is_deterministic_and_embedded_verbatim_in_the_full_render() {
+        let body = render_policy_body(&sample_payload()).expect("a body was fetched");
+        assert_eq!(Some(&body), render_policy_body(&sample_payload()).as_ref());
+        assert!(body.contains("===== policy/session-protocol (v6) ====="));
+        assert!(body.contains("Step 0 — read the policies, fresh."));
+        // No per-render values: a fetch time or source would change the SHA on
+        // every start and the confirmation branch could never fire.
+        assert!(!body.contains("source:"));
+        assert!(!body.contains("2026-08-19T12:00:00Z"));
+
+        let full = render_injection(&sample_payload(), "startup", "2026-08-19T12:00:00Z");
+        assert!(
+            full.contains(&body),
+            "the full render carries the same bytes"
+        );
+
+        let no_body = PolicyPayload {
+            protocol_body: None,
+            ..sample_payload()
+        };
+        assert_eq!(render_policy_body(&no_body), None);
+    }
+
+    #[test]
+    fn a_matching_marker_gets_the_short_confirmation_without_the_body() {
+        let payload = sample_payload();
+        let sha =
+            crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
+        let (text, confirmed) =
+            render_for_session(&payload, Some(&sha), "resume", "2026-08-19T12:00:00Z");
+        assert!(confirmed);
+        // Still attributable, still versioned.
+        assert!(text.starts_with("[qontinui-runner]"));
+        assert!(text.contains("source: resume"));
+        assert!(text.contains("SYSTEM PROMPT at spawn"));
+        assert!(text.contains(&format!("v6, sha256 {}", &sha[..12])));
+        // The body is NOT repeated — that is the whole point.
+        assert!(!text.contains("Step 0 — read the policies, fresh."));
+        // The index still rides the hook.
+        assert!(text.contains("(kind=policy, 2 documents)"));
+        assert!(text.contains("- escalation-bar — Escalation Bar (v4)"));
+        // And it tells a session that cannot find the block what to do.
+        assert!(text.contains("treat Step 0 as NOT satisfied"));
+
+        // At a realistic body size (~8 KB, as measured for session-protocol)
+        // the confirmation is a fraction of the full render — the point of
+        // moving the body off the hook. (The one-line sample body above is
+        // shorter than the confirmation's own prose, so it cannot show this.)
+        let real = PolicyPayload {
+            protocol_body: Some("policy clause text. ".repeat(400)),
+            ..sample_payload()
+        };
+        let real_sha =
+            crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&real).unwrap());
+        let (short, confirmed) =
+            render_for_session(&real, Some(&real_sha), "resume", "2026-08-19T12:00:00Z");
+        assert!(confirmed);
+        let full = render_injection(&real, "resume", "2026-08-19T12:00:00Z");
+        assert!(
+            short.len() * 3 < full.len(),
+            "confirmation {} bytes vs full {} bytes",
+            short.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn a_missing_or_stale_marker_gets_the_full_body() {
+        let payload = sample_payload();
+        let full = render_injection(&payload, "startup", "2026-08-19T12:00:00Z");
+
+        // No marker: the session was not given the file carrier.
+        let (text, confirmed) =
+            render_for_session(&payload, None, "startup", "2026-08-19T12:00:00Z");
+        assert!(!confirmed);
+        assert_eq!(text, full);
+
+        // A marker for an OLDER body: the spawn-time copy is stale.
+        let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
+        let (text, confirmed) =
+            render_for_session(&payload, Some(&stale), "startup", "2026-08-19T12:00:00Z");
+        assert!(!confirmed);
+        assert_eq!(text, full);
+
+        // No body fetched: nothing to compare, the partial render stands.
+        let partial = PolicyPayload {
+            protocol_body: None,
+            ..sample_payload()
+        };
+        let (text, confirmed) =
+            render_for_session(&partial, Some(&stale), "startup", "2026-08-19T12:00:00Z");
+        assert!(!confirmed);
+        assert!(text.contains("Step 0 is NOT satisfied"));
+    }
+
+    #[test]
+    fn delivered_sha_parses_only_a_full_sha256_hex() {
+        let sha = "AB".repeat(32);
+        assert_eq!(parse_delivered_sha(Some(&sha)), Some("ab".repeat(32)));
+        assert_eq!(
+            parse_delivered_sha(Some(&format!(" {} ", "0f".repeat(32)))),
+            Some("0f".repeat(32))
+        );
+        for bad in [
+            "",
+            "   ",
+            "abc",
+            &"g".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
+            assert_eq!(parse_delivered_sha(Some(bad)), None, "{bad:?}");
+        }
+        assert_eq!(parse_delivered_sha(None), None);
+    }
+
+    #[test]
+    fn tenant_of_jwt_reads_the_claim_and_rejects_non_uuids() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let tenant = uuid::Uuid::new_v4();
+        let jwt_with = |claims: serde_json::Value| {
+            format!(
+                "h.{}.s",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            )
+        };
+        assert_eq!(
+            tenant_of_jwt(&jwt_with(
+                serde_json::json!({"tenant_id": tenant.to_string()})
+            )),
+            Some(tenant)
+        );
+        assert_eq!(
+            tenant_of_jwt(&jwt_with(serde_json::json!({"tenant_id": "acme"}))),
+            None
+        );
+        assert_eq!(tenant_of_jwt(&jwt_with(serde_json::json!({}))), None);
+        assert_eq!(tenant_of_jwt("opaque-token"), None);
     }
 
     // ── Fail-open notice ────────────────────────────────────────────────

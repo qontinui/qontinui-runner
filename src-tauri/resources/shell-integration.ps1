@@ -63,6 +63,12 @@ function global:Prompt {
 # `terminal::runner_context`) and delivered via $env:QONTINUI_RUNNER_CONTEXT —
 # this wrapper no longer authors its own copy. Fail-open: if the env var is
 # empty we launch claude unmodified.
+#
+# When the runner composed a spawn file ($env:QONTINUI_RUNNER_CONTEXT_FILE: the
+# same briefing plus the tenant's policy body — plan
+# 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel) and it still
+# exists, it is passed via --append-system-prompt-file INSTEAD of the inline
+# flag; Claude Code refuses both together, and a missing file is a fatal start.
 if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
     function global:claude {
         # Subcommands that do not accept --append-system-prompt
@@ -74,10 +80,35 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
             return
         }
         $ctx = $env:QONTINUI_RUNNER_CONTEXT
-        if (($args.Count -gt 0 -and $skip -contains $args[0]) -or [string]::IsNullOrEmpty($ctx)) {
+        $ctxFile = $env:QONTINUI_RUNNER_CONTEXT_FILE
+        if ($args.Count -gt 0 -and $skip -contains $args[0]) {
             & $exe @args
-        } else {
-            & $exe --append-system-prompt $ctx @args
+            return
+        }
+        # A caller-supplied system-prompt flag wins, untouched: Claude Code
+        # refuses the inline and file flags together.
+        $ownPrompt = $false
+        foreach ($a in $args) {
+            if ("$a" -match '^--append-system-prompt(-file)?(=.*)?$') { $ownPrompt = $true; break }
+        }
+        if (-not $ownPrompt -and -not [string]::IsNullOrEmpty($ctxFile) -and (Test-Path -LiteralPath $ctxFile -PathType Leaf)) {
+            # The composed spawn file (briefing + policy body); the
+            # delivered-SHA marker rides along untouched — it names that body.
+            & $exe --append-system-prompt-file $ctxFile @args
+            return
+        }
+        # Inline fall-back or no briefing: no policy body reaches this child, so
+        # its delivered-SHA marker is BLANKED for the call and restored after.
+        $savedSha = $env:QONTINUI_POLICY_DELIVERED_SHA
+        $env:QONTINUI_POLICY_DELIVERED_SHA = $null
+        try {
+            if (-not $ownPrompt -and -not [string]::IsNullOrEmpty($ctx)) {
+                & $exe --append-system-prompt $ctx @args
+            } else {
+                & $exe @args
+            }
+        } finally {
+            $env:QONTINUI_POLICY_DELIVERED_SHA = $savedSha
         }
     }
 }

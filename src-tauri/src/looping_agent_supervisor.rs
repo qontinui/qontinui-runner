@@ -1035,15 +1035,24 @@ async fn spawn_looping_agent_terminal(
     let launch_cfg = crate::claude_session::launch_spec::LaunchConfig::from_settings(
         selected_config_dir.as_deref(),
     );
+    // The briefing, composed with the tenant's cached policy body into one
+    // `--append-system-prompt-file` when that cache exists, inline otherwise
+    // (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`).
+    let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(Some(
+        crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), coord_mcp),
+    ));
+    // Carried to the child env by the capture hint below; from the SAME
+    // carrier the argv uses.
+    let policy_delivered_sha = prompt_carrier
+        .as_ref()
+        .and_then(|c| c.policy_sha())
+        .map(str::to_string);
     let command = Some(crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
         Vec::new(),
         prompt,
-        Some(crate::terminal::runner_context(
-            crate::terminal::spawn_seam_api_port(),
-            coord_mcp,
-        )),
+        prompt_carrier,
         // Direct exec — no identity shim in the chain to append `--settings`,
         // so the hook carrier has to be spelled out here or this session runs
         // with no SessionStart/PreCompact/Stop hook at all.
@@ -1090,6 +1099,8 @@ async fn spawn_looping_agent_terminal(
         coord_lineage: Some(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
+        // From the SAME carrier the argv above was built from.
+        policy_delivered_sha,
     };
 
     // The PTY seam derives workspace trust for `selected_config_dir` through

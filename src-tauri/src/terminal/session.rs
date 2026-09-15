@@ -1205,7 +1205,10 @@ impl TerminalSession {
         let opened = LocalPty::open(&id, cols, rows)?;
 
         // Build the PTY child command: an explicit program+args override
-        // (Decision 3) when supplied, else the interactive shell.
+        // (Decision 3) when supplied, else the interactive shell. Whether it
+        // IS the shell is kept: only a shell pane gets a composed spawn-prompt
+        // file below — a direct exec's argv already settled its own carrier.
+        let is_shell_pane = command.as_ref().is_none_or(|parts| parts.is_empty());
         let mut cmd = Self::build_command_from(command);
 
         // Set working directory
@@ -1310,10 +1313,28 @@ impl TerminalSession {
         // purely additive + fail-open — an empty/unset value simply means no
         // briefing. It is still set BEFORE `finalize_child_env`, so the
         // credential scrub remains the last env mutation on this path.
-        cmd.env(
-            "QONTINUI_RUNNER_CONTEXT",
-            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), seam.coord_mcp),
-        );
+        let runner_context =
+            crate::terminal::runner_context(crate::terminal::spawn_seam_api_port(), seam.coord_mcp);
+        // The spawn-time policy carrier for a SHELL pane (plan
+        // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
+        // compose the briefing + the tenant's cached policy body into ONE file
+        // and export its path plus the body's SHA, which the shell wrapper turns
+        // into `--append-system-prompt-file` (Claude Code refuses it beside the
+        // inline flag). No cache or a failed write REMOVES both, so the wrapper
+        // stays on the inline briefing and no inherited marker can vouch for a
+        // body this pane never got. A direct exec is skipped: its argv carrier
+        // and its marker were settled together by the caller (`extra_env`).
+        if is_shell_pane {
+            for (name, value) in
+                crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context)
+            {
+                match value {
+                    Some(v) => cmd.env(name, v),
+                    None => cmd.env_remove(name),
+                }
+            }
+        }
+        cmd.env("QONTINUI_RUNNER_CONTEXT", runner_context);
 
         // ---- Install-interception PATH-shim seam (plan §4 Phase 1) ----------
         // Behind the master flag `QONTINUI_INSTALL_INTERCEPT_ENABLED` (default

@@ -60,7 +60,10 @@
 //! synchronously at spawn (the §3b determinism mechanism). What is NOT
 //! redundant is the second `SessionStart` command in the same block — the policy
 //! injection ([`crate::mcp::policy_context`]) — and the `Stop` / `PreCompact`
-//! hooks, none of which have a spawn-time equivalent.
+//! hooks. The policy BODY now also has a spawn-time carrier
+//! ([`crate::session::spawn_prompt`]), but the policy hook still runs on every
+//! start: its attributed coord read is the compliance record, and it re-sends
+//! the body whenever it cannot verify the spawn-time copy is current.
 //!
 //! ## Materialization
 //!

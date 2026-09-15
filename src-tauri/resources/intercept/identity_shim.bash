@@ -122,6 +122,27 @@ for a in "$@"; do
   esac
 done
 
+# ---------------------------------------------------------------------------
+# Spawn-time policy delivery marker (plan
+# 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel).
+# QONTINUI_POLICY_DELIVERED_SHA tells the runner's policy hook that THIS
+# `claude` received the policy body in its system prompt, so the hook may skip
+# re-sending it. It is inherited by every descendant, but only a `claude` whose
+# argv carries --append-system-prompt-file actually received a body. This shim
+# is what delivers the hook (--settings) to a nested `claude` typed inside a
+# session, so it is where an inherited marker must be dropped — otherwise that
+# nested session would be told it has a body it was never given.
+if [ "$TOOL" = "claude" ]; then
+  keep_policy_sha=0
+  for a in "$@"; do
+    case "$a" in
+      --append-system-prompt-file|--append-system-prompt-file=*)
+        keep_policy_sha=1; break ;;
+    esac
+  done
+  [ "$keep_policy_sha" = "1" ] || unset QONTINUI_POLICY_DELIVERED_SHA
+fi
+
 # Best-effort confirmation/liveness POST to the runner loopback (the existing
 # install-effects server on the seam-injected port). Identity is ALREADY pinned
 # + recorded at spawn; this is the "hook fired" signal, never load-bearing.
