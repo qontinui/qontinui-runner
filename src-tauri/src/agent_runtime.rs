@@ -1881,6 +1881,18 @@ enum SpawnDecision {
     /// was withdrawn upstream; SKIP the spawn. Carries the cancel reason (if any)
     /// for the INFO log.
     SkipCancelled { reason: Option<String> },
+    /// Claim refused (HTTP 409 `{"error":"superseded","winner_gate_id",
+    /// "winner_state","supersession_key"}`) → coord folded this follow-up
+    /// behind a sibling continuation for the same landed PR (the WINNER) and
+    /// stamped the deferral itself; SKIP the spawn and RELEASE the local
+    /// dispatch claim, because the row stays pending on coord and is
+    /// re-listed (it proceeds later if the winner is released). Carries the
+    /// winner's gate id when the body names one.
+    ///
+    /// Unrelated to [`OutcomeAck::Superseded`], which is about the OUTCOME
+    /// write after a spawn not landing; this is the CLAIM before a spawn
+    /// being refused.
+    SkipSuperseded { winner_gate_id: Option<uuid::Uuid> },
     /// Network failure / timeout / any other non-2xx → PROCEED to spawn anyway
     /// (availability over consistency; the in-process dedupe still guards).
     /// Carries a human-readable cause for the WARN log.
@@ -1892,7 +1904,10 @@ enum SpawnDecision {
 /// - 2xx → [`SpawnDecision::Spawn`].
 /// - 409 with a JSON body whose `error == "cancelled"` →
 ///   [`SpawnDecision::SkipCancelled`] (reason from `cancel_reason`).
-/// - any other status (incl. a 409 that ISN'T the cancelled shape) →
+/// - 409 with a JSON body whose `error == "superseded"` →
+///   [`SpawnDecision::SkipSuperseded`] (winner from `winner_gate_id`, when it
+///   parses as a UUID).
+/// - any other status (incl. a 409 that is NEITHER of those shapes) →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency).
 ///
 /// `status` is the HTTP status code; `body` is the response body text (may be
@@ -1911,11 +1926,21 @@ fn decide_spawn(status: u16, body: &str) -> SpawnDecision {
                     .map(|s| s.to_string());
                 return SpawnDecision::SkipCancelled { reason };
             }
+            // The supersession shape: `{"error":"superseded","winner_gate_id":
+            // <uuid>,"winner_state":<string>,"supersession_key":<string>}`.
+            if v.get("error").and_then(|e| e.as_str()) == Some("superseded") {
+                let winner_gate_id = v
+                    .get("winner_gate_id")
+                    .and_then(|w| w.as_str())
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                return SpawnDecision::SkipSuperseded { winner_gate_id };
+            }
         }
-        // A 409 that is NOT the cancelled contract (e.g. some other conflict):
-        // proceed rather than silently drop the continuation.
+        // A 409 that is NEITHER the cancelled nor the superseded contract (e.g.
+        // some other conflict): proceed rather than silently drop the
+        // continuation.
         return SpawnDecision::SpawnDespiteClaimError {
-            cause: format!("claim returned 409 without a cancelled body: {body}"),
+            cause: format!("claim returned 409 without a cancelled or superseded body: {body}"),
         };
     }
     SpawnDecision::SpawnDespiteClaimError {
@@ -3572,6 +3597,7 @@ async fn poll_pending_unit_dispatches(device_id: uuid::Uuid) {
 ///
 /// - 200 → [`SpawnDecision::Spawn`].
 /// - 409 `{"error":"cancelled", cancel_reason}` → [`SpawnDecision::SkipCancelled`].
+/// - 409 `{"error":"superseded", winner_gate_id, …}` → [`SpawnDecision::SkipSuperseded`].
 /// - 5s timeout / network failure / any other non-2xx →
 ///   [`SpawnDecision::SpawnDespiteClaimError`] (availability over consistency —
 ///   preserves the pre-restructure behavior; the in-process dedupe still guards).
@@ -3599,8 +3625,8 @@ async fn post_continuation_claim(gate_id: uuid::Uuid, device_id: uuid::Uuid) -> 
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            // Body is needed only to distinguish the 409 cancelled shape; read
-            // it unconditionally (small) and tolerate a read error.
+            // Body is needed only to distinguish the 409 cancelled / superseded
+            // shapes; read it unconditionally (small) and tolerate a read error.
             let text = resp.text().await.unwrap_or_default();
             decide_spawn(status, &text)
         }
@@ -4222,6 +4248,25 @@ async fn run_gate_continuation_inner(
                 // with 409 cancelled, so the row is TERMINAL there (never
                 // re-listed). Keeping the id claimed cheaply absorbs any
                 // in-flight duplicate delivery of the same cancelled gate.
+                return Ok(());
+            }
+            SpawnDecision::SkipSuperseded { winner_gate_id } => {
+                info!(
+                    "agent_runtime: continuation superseded by a sibling follow-up for the \
+                     same landed PR — skipping spawn (gate_id={gate_id} winner_gate_id={})",
+                    winner_gate_id
+                        .map(|w| w.to_string())
+                        .unwrap_or_else(|| "(not named)".to_string())
+                );
+                // RELEASED, unlike the cancelled arm: coord did NOT stamp this row
+                // consumed — it stamped `continuation_deferred_reason =
+                // superseded_by:<winner>` and the row stays pending and re-listed,
+                // so the loser proceeds on a later claim if the winner is
+                // released (spawn_failed / work_abandoned / work_unreported).
+                // Keeping the id claimed would strand it for the process
+                // lifetime (see `release_gate_dispatch`). No deferred stamp is
+                // posted from here: coord wrote it in the refusing transaction.
+                release_local_dispatch_claim(consume_target);
                 return Ok(());
             }
             SpawnDecision::SpawnDespiteClaimError { cause } => {
@@ -10131,6 +10176,36 @@ mod tests {
         assert!(claim_dispatch_dispatch(d), "dispatch id was released");
     }
 
+    /// A 409 `superseded` claim refusal RELEASES the in-process gate-id claim
+    /// (unlike `cancelled`, which keeps it): coord left the row pending and
+    /// re-lists it, so a later delivery of the SAME gate id must claim again
+    /// and reach the consume claim — otherwise the loser is stranded for the
+    /// process lifetime once the winner is released. Drives the same
+    /// decision→release sequence `run_gate_continuation_inner` step 2 runs,
+    /// keyed on [`decide_spawn`] so a decoding regression fails here too.
+    #[test]
+    fn superseded_skip_releases_local_dispatch_claim_so_relist_reclaims() {
+        let gate = uuid::Uuid::now_v7();
+        let winner = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(gate), "delivery 1 claims the id");
+        let body = format!(
+            r#"{{"error":"superseded","winner_gate_id":"{winner}","winner_state":"live","supersession_key":"k"}}"#
+        );
+        let consume_target = ConsumeTarget::Gate(gate);
+        match decide_spawn(409, &body) {
+            SpawnDecision::SkipSuperseded { winner_gate_id } => {
+                assert_eq!(winner_gate_id, Some(winner));
+                release_local_dispatch_claim(consume_target);
+            }
+            other => panic!("expected SkipSuperseded, got {other:?}"),
+        }
+        assert!(
+            claim_gate_dispatch(gate),
+            "after a superseded skip, the re-listed gate id claims again"
+        );
+        release_gate_dispatch(gate);
+    }
+
     /// End-to-end sequencing of the incident fix at the unit level: a gate id
     /// claimed by the dispatcher, then rejected AtCap by the guard, is
     /// RELEASED — so when a slot frees, the next delivery of the SAME gate id
@@ -11596,6 +11671,44 @@ mod tests {
             decide_spawn(409, body),
             SpawnDecision::SkipCancelled {
                 reason: Some("taken over by session abc".to_string())
+            }
+        );
+    }
+
+    /// 409 with the superseded contract → SkipSuperseded, carrying the winner's
+    /// gate id (plan 2026-09-13 …two-gate-anchors, D4/D5).
+    #[test]
+    fn decide_spawn_on_409_superseded_skips_with_winner() {
+        let winner = uuid::Uuid::now_v7();
+        let body = format!(
+            r#"{{"error":"superseded","winner_gate_id":"{winner}","winner_state":"live","supersession_key":"pr_merged:qontinui/qontinui-web:1331"}}"#
+        );
+        assert_eq!(
+            decide_spawn(409, &body),
+            SpawnDecision::SkipSuperseded {
+                winner_gate_id: Some(winner)
+            }
+        );
+    }
+
+    /// 409 superseded whose `winner_gate_id` is absent or not a UUID → still
+    /// SkipSuperseded (the refusal is authoritative; the winner id is only for
+    /// the log), with `None` for the winner.
+    #[test]
+    fn decide_spawn_on_409_superseded_without_winner_still_skips() {
+        assert_eq!(
+            decide_spawn(409, r#"{"error":"superseded","winner_state":"pending"}"#),
+            SpawnDecision::SkipSuperseded {
+                winner_gate_id: None
+            }
+        );
+        assert_eq!(
+            decide_spawn(
+                409,
+                r#"{"error":"superseded","winner_gate_id":"not-a-uuid"}"#
+            ),
+            SpawnDecision::SkipSuperseded {
+                winner_gate_id: None
             }
         );
     }
