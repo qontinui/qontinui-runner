@@ -67,6 +67,7 @@ rem ---- did the user already choose a session? then don't double-pin --------
 set "USER_CHOSE=0"
 set "KEEP_POLICY_SHA=0"
 set "PREV_APF=0"
+set "REPLACEMENT_PROMPT=0"
 for %%A in (%*) do (
   set "TOK=%%~A"
   if /I "!TOK!"=="--session-id" set "USER_CHOSE=1"
@@ -78,6 +79,8 @@ for %%A in (%*) do (
   if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
   set "PREV_APF=0"
   if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
+  if /I "!TOK!"=="--system-prompt" set "REPLACEMENT_PROMPT=1"
+  if /I "!TOK!"=="--system-prompt-file" set "REPLACEMENT_PROMPT=1"
 )
 
 rem ---- spawn-time policy delivery marker -------------------------------------
@@ -88,7 +91,12 @@ rem --append-system-prompt-file did; an inherited marker on a nested claude
 rem (bare, or with its own --append-system-prompt-file) would make the policy
 rem hook skip a body that session never got. (The `for` above splits
 rem `--append-system-prompt-file=x` on `=`, so the file is the token after the
-rem flag in both spellings.)
+rem flag in both spellings.) A REPLACEMENT prompt (--system-prompt[-file])
+rem withholds it as well: whether Claude Code still applies the append file
+rem beside one is not behaviourally verified. (This batch scan does not stop at
+rem `--`, so a prompt token spelled like the flag also withholds it — the
+rem conservative direction.)
+if /I "%TOOL%"=="claude" if "%REPLACEMENT_PROMPT%"=="1" set "KEEP_POLICY_SHA=0"
 if /I "%TOOL%"=="claude" if not "%KEEP_POLICY_SHA%"=="1" (
   set "QONTINUI_POLICY_DELIVERED_SHA="
   set "QONTINUI_POLICY_DELIVERED_FILE="

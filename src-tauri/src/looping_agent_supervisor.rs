@@ -1049,7 +1049,7 @@ async fn spawn_looping_agent_terminal(
     let policy_delivery = prompt_carrier
         .as_ref()
         .and_then(|c| c.policy_delivery());
-    let command = Some(crate::agent_runtime::build_continuation_claude_command(
+    let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
         Vec::new(),
@@ -1060,7 +1060,11 @@ async fn spawn_looping_agent_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
-    ));
+    );
+    // Withheld when an operator template adds a replacement prompt.
+    let policy_delivery =
+        crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
+    let command = Some(argv);
 
     if selected_config_dir.is_none()
         && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()

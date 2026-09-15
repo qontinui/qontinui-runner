@@ -18,7 +18,7 @@
 //!
 //! Claude Code refuses `--append-system-prompt` and
 //! `--append-system-prompt-file` together (`Error: Cannot use both …`, verified
-//! against v2.1.272), and every seam that delivers the hook already passes the
+//! against the Claude Code CLI in use when this landed), and every seam that delivers the hook already passes the
 //! briefing inline. So a spawn composes ONE file — the
 //! [`crate::terminal::runner_context`] briefing, a blank line, then the policy
 //! body — and passes it via `--append-system-prompt-file` INSTEAD of the inline
@@ -397,6 +397,38 @@ impl SystemPromptCarrier {
             }),
         }
     }
+}
+
+/// Is `token` a REPLACEMENT system-prompt flag (`--system-prompt` or
+/// `--system-prompt-file`, either spelling)?
+pub fn is_replacement_prompt_flag(token: &str) -> bool {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    name == "--system-prompt" || name == "--system-prompt-file"
+}
+
+/// Does `argv` carry a replacement system-prompt flag ahead of its `--`
+/// terminator?
+///
+/// THE one rule every path applies to the delivered-policy marker: whether
+/// Claude Code still applies an `--append-system-prompt-file` beside a
+/// replacement prompt is not behaviourally verified, so a child whose effective
+/// argv carries one never receives the marker, and the policy hook serves the
+/// full body. The direct-exec seams ([`delivery_unless_replacement`]), the
+/// identity shims and the shell wrappers all implement it.
+pub fn argv_carries_replacement_prompt(argv: &[String]) -> bool {
+    argv.iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| is_replacement_prompt_flag(a))
+}
+
+/// `delivery`, unless the spawn's final rendered `argv` carries a replacement
+/// prompt (an operator launch template can add one) — see
+/// [`argv_carries_replacement_prompt`].
+pub fn delivery_unless_replacement(
+    delivery: Option<PolicyDelivery>,
+    argv: &[String],
+) -> Option<PolicyDelivery> {
+    delivery.filter(|_| !argv_carries_replacement_prompt(argv))
 }
 
 /// The delivered-policy marker for one `claude` child: [`POLICY_DELIVERED_SHA_ENV`]
@@ -802,6 +834,37 @@ mod tests {
         }
     }
 
+    /// The uniform replacement-prompt rule: a replacement flag before `--`
+    /// (either spelling) withholds the marker; after `--` it is prompt text.
+    #[test]
+    fn a_replacement_prompt_in_the_argv_withholds_the_delivery() {
+        let delivery = PolicyDelivery {
+            sha: "ab".repeat(32),
+            file: "/x/spawn-1.md".to_string(),
+        };
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for with in [
+            argv(&["claude", "--system-prompt", "x", "--append-system-prompt-file", "/x/spawn-1.md"]),
+            argv(&["claude", "--system-prompt=x"]),
+            argv(&["claude", "--system-prompt-file", "/t.md"]),
+            argv(&["claude", "--system-prompt-file=/t.md", "--", "p"]),
+        ] {
+            assert!(argv_carries_replacement_prompt(&with), "{with:?}");
+            assert_eq!(delivery_unless_replacement(Some(delivery.clone()), &with), None);
+        }
+        for without in [
+            argv(&["claude", "--append-system-prompt-file", "/x/spawn-1.md", "--", "--system-prompt"]),
+            argv(&["claude", "--system-prompts", "x"]),
+            argv(&["claude"]),
+        ] {
+            assert!(!argv_carries_replacement_prompt(&without), "{without:?}");
+            assert_eq!(
+                delivery_unless_replacement(Some(delivery.clone()), &without),
+                Some(delivery.clone())
+            );
+        }
+    }
+
     /// A direct-exec child gets the SHA and the exact argv path together, or
     /// both blank — never omitted.
     #[test]
@@ -1000,7 +1063,7 @@ mod script_tests {
         }
 
         // A caller `--system-prompt[-file]` STARTS beside the append file flag
-        // (probed on v2.1.272), so ours is still passed — but whether its
+        // (verified against the Claude Code CLI in use when this landed), so ours is still passed — but whether its
         // content is still applied is unverified, so the marker is BLANKED and
         // the hook serves the full body.
         for (args, tail) in [
@@ -1238,6 +1301,8 @@ mod script_tests {
         for args in [
             vec!["--append-system-prompt-file", composed, "-p", "hi"],
             vec![flag_attached.as_str(), "-p", "hi"],
+            // A replacement flag spelled after `--` is prompt text.
+            vec!["--append-system-prompt-file", composed, "--", "--system-prompt"],
         ] {
             let got = run_identity_shim(composed, &args);
             assert!(
@@ -1251,6 +1316,9 @@ mod script_tests {
             vec!["--append-system-prompt-file", "./eval.md", composed],
             vec!["--append-system-prompt", "x"],
             vec!["-p", "hi"],
+            // The composed file beside a REPLACEMENT prompt: withheld.
+            vec!["--append-system-prompt-file", composed, "--system-prompt", "x"],
+            vec!["--system-prompt-file=./s.md", flag_attached.as_str()],
         ] {
             let got = run_identity_shim(composed, &args);
             assert!(got.starts_with("SHA=[]\nFILE=[]\n"), "{args:?}: {got}");

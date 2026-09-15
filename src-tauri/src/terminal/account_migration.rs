@@ -529,10 +529,12 @@ pub(crate) fn spawn_resumed_pane(
         // to report `work_completed` for work it goes on to finish.
         gate_identity: spec.gate_identity,
         coord_lineage: spec.coord_lineage,
-        // From the SAME carrier the argv above was built from.
-        policy_delivery: prompt_carrier
-            .as_ref()
-            .and_then(|c| c.policy_delivery()),
+        // From the SAME carrier the argv above was built from — withheld when
+        // an operator template put a replacement prompt in that argv.
+        policy_delivery: crate::session::spawn_prompt::delivery_unless_replacement(
+            prompt_carrier.as_ref().and_then(|c| c.policy_delivery()),
+            &command,
+        ),
     };
     crate::commands::terminal::create_tracked_terminal_session_backend(
         terminal_manager,

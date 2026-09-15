@@ -381,13 +381,13 @@ fn is_claude_command(s: &str) -> bool {
 /// Claude Code's two APPEND system-prompt flags, which behave as ONE
 /// mutually-exclusive group rather than two independent flags: the CLI refuses
 /// `--append-system-prompt` beside `--append-system-prompt-file` (`Error: Cannot
-/// use both …`, verified against v2.1.272), so a template's inline prompt
+/// use both …`, verified against the Claude Code CLI in use when this landed), so a template's inline prompt
 /// layered next to a caller's composed-file carrier (plan
 /// `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`) would stop
 /// the spawn outright. Exact-name dedup cannot see that collision.
 ///
 /// `--system-prompt` / `--system-prompt-file` are deliberately NOT members:
-/// probed on the same version, either one starts fine beside either append
+/// probed against the same CLI, either one starts fine beside either append
 /// flag, so an operator's replacement prompt is layered in as before. (The
 /// replacement pair refuses each other, but the runner's carrier is never a
 /// replacement flag, so that pair cannot collide with it.)
@@ -755,7 +755,8 @@ mod tests {
     }
 
     /// A template REPLACEMENT prompt combines with the append carrier (probed
-    /// on v2.1.272), so it is no longer dropped.
+    /// against the Claude Code CLI in use when this landed), so it is no longer
+    /// dropped.
     #[test]
     fn template_replacement_prompt_survives_a_caller_append_carrier() {
         let mut s = spec();

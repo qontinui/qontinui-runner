@@ -293,6 +293,13 @@ pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -
 /// given — including a nested `claude --append-system-prompt-file ./eval.md`,
 /// whose file is not the composed one. So everything else drops it. No
 /// inherited file, or Gemini (no such flag), never keeps it.
+///
+/// A launch whose argv also carries a REPLACEMENT prompt (`--system-prompt` /
+/// `--system-prompt-file`, either spelling, ahead of `--`) never keeps it
+/// either: whether Claude Code still applies the append file beside a
+/// replacement is not behaviourally verified, so the conservative rule every
+/// path shares (`session::spawn_prompt::argv_carries_replacement_prompt` in the
+/// runner) withholds the marker and the hook serves the full body.
 pub fn keeps_policy_delivered_sha(
     tool: IdentityTool,
     args: &[String],
@@ -302,7 +309,13 @@ pub fn keeps_policy_delivered_sha(
     let Some(file) = delivered_file.filter(|f| !f.is_empty()) else {
         return false;
     };
+    let replacement = args
+        .iter()
+        .take_while(|a| a.as_str() != "--")
+        .map(|a| a.split_once('=').map_or(a.as_str(), |(name, _)| name))
+        .any(|name| name == "--system-prompt" || name == "--system-prompt-file");
     tool == IdentityTool::Claude
+        && !replacement
         && args.iter().enumerate().any(|(i, a)| {
             (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
                 || a
@@ -1511,6 +1524,20 @@ mod tests {
             &strs(&["--append-system-prompt-files=/x/spawn-1.md"]),
             composed
         ));
+        // A replacement prompt beside the composed file: withheld (either
+        // spelling); the same token after `--` is prompt text.
+        for replacement in [
+            strs(&["--append-system-prompt-file", "/x/spawn-1.md", "--system-prompt", "x"]),
+            strs(&["--system-prompt-file=/t.md", "--append-system-prompt-file=/x/spawn-1.md"]),
+        ] {
+            assert!(
+                !keeps_policy_delivered_sha(IdentityTool::Claude, &replacement, composed),
+                "{replacement:?}"
+            );
+        }
+        let after_terminator =
+            strs(&["--append-system-prompt-file", "/x/spawn-1.md", "--", "--system-prompt"]);
+        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &after_terminator, composed));
         // No inherited file (or an empty one): nothing to match, never kept.
         assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, None));
         assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, Some("")));

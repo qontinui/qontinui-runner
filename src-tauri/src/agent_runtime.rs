@@ -4756,10 +4756,10 @@ async fn run_continuation_terminal(
     ));
     // The marker the policy hook's route trusts as proof of delivery — taken
     // from the very carrier the argv uses, never recomputed.
-    capture_hint.policy_delivery = prompt_carrier
+    let policy_delivery = prompt_carrier
         .as_ref()
         .and_then(|c| c.policy_delivery());
-    let command = Some(build_continuation_claude_command(
+    let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
         add_dir_args,
@@ -4770,7 +4770,12 @@ async fn run_continuation_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
-    ));
+    );
+    // ...unless an operator template put a replacement prompt in the final
+    // argv (the uniform rule, `spawn_prompt::argv_carries_replacement_prompt`).
+    capture_hint.policy_delivery =
+        crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
+    let command = Some(argv);
 
     // Bundle /vet-plan and /implement-plan into the session cwd so they resolve
     // as project slash commands regardless of the device's ~/.claude.
@@ -5374,7 +5379,7 @@ async fn run_condition_check_terminal(
     let policy_delivery = prompt_carrier
         .as_ref()
         .and_then(|c| c.policy_delivery());
-    let command = Some(build_continuation_claude_command(
+    let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
         Vec::new(),
@@ -5385,7 +5390,11 @@ async fn run_condition_check_terminal(
         // with no SessionStart/PreCompact/Stop hook at all.
         crate::session::claude_hook::direct_spawn_settings_args(),
         &launch_cfg,
-    ));
+    );
+    // Withheld when an operator template adds a replacement prompt.
+    let policy_delivery =
+        crate::session::spawn_prompt::delivery_unless_replacement(policy_delivery, &argv);
+    let command = Some(argv);
 
     if selected_config_dir.is_none()
         && !crate::ai_provider::oauth_refresh::default_location_has_valid_credentials()
@@ -8415,7 +8424,7 @@ mod tests {
 
     /// THE CARRIER CONSTRAINT. Claude Code refuses `--append-system-prompt`
     /// together with `--append-system-prompt-file` (`Error: Cannot use both …`,
-    /// verified on v2.1.272), so the composed-file carrier REPLACES the inline
+    /// verified against the Claude Code CLI in use when this landed), so the composed-file carrier REPLACES the inline
     /// flag rather than joining it. A regression here does not degrade a
     /// session — it stops every autonomous spawn from starting at all.
     #[test]
@@ -8444,6 +8453,42 @@ mod tests {
         assert!(
             !cmd.iter().any(|a| a == "--append-system-prompt"),
             "never both carriers: {cmd:?}"
+        );
+    }
+
+    /// An operator launch template that adds a REPLACEMENT prompt puts it in
+    /// the final argv beside the composed file, and the seam then withholds the
+    /// delivered-policy marker; without one the marker stands.
+    #[test]
+    fn a_template_replacement_prompt_withholds_the_seam_delivery() {
+        use crate::session::spawn_prompt::{delivery_unless_replacement, SystemPromptCarrier};
+        let carrier = SystemPromptCarrier::File {
+            path: std::path::PathBuf::from("/rt/spawn-prompts/spawn-1.md"),
+            policy_sha: "ab".repeat(32),
+        };
+        let build = |template: Option<&str>| {
+            build_continuation_claude_command(
+                "claude".to_string(),
+                "abc-123",
+                vec![],
+                "do the thing".to_string(),
+                Some(carrier.clone()),
+                vec![],
+                &crate::claude_session::launch_spec::LaunchConfig {
+                    default_template: template.map(str::to_string),
+                    account_command: None,
+                },
+            )
+        };
+        let with = build(Some("claude --system-prompt operator-prompt"));
+        assert!(with.iter().any(|a| a == "--system-prompt"), "{with:?}");
+        assert!(with.iter().any(|a| a == "--append-system-prompt-file"), "{with:?}");
+        assert_eq!(delivery_unless_replacement(carrier.policy_delivery(), &with), None);
+
+        let without = build(None);
+        assert_eq!(
+            delivery_unless_replacement(carrier.policy_delivery(), &without),
+            carrier.policy_delivery()
         );
     }
 

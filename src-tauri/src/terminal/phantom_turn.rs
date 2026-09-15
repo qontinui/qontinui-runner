@@ -85,43 +85,85 @@ pub struct OpenAnchor {
     pub wall: SystemTime,
 }
 
+/// The longest gap between a session's first open and a later one that still
+/// PAIRS them into one watch (the shim's pre-exec post and the SessionStart
+/// hook's post for the same launch). A later open past it, or one preceded by
+/// PTY input since the first, is a NEW launch in that pane — a quit and
+/// `claude --resume` — and gets its own watch and its own evidence anchor.
+pub const PHANTOM_TURN_PAIRING_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A watch's timing, split in two because the two uses want DIFFERENT opens:
 ///
-/// - `evidence` is the EARLIEST session-open. "Real input since open" and the
-///   turn-timestamp filter are judged against it: keystrokes typed after the
-///   shim's pre-exec open are real input even if the hook's open lands later,
-///   and a phantom stamped between the two opens must not be filtered out as
-///   history just because the hook's post was handled late.
-/// - `latest_open` is the LATEST session-open; the watch ends at it plus the
-///   window, so a later open extends the watch rather than being dropped.
+/// - `evidence` is the EARLIEST paired session-open. "Real input since open"
+///   and the turn-timestamp filter are judged against it: keystrokes typed
+///   after the shim's pre-exec open are real input even if the hook's open
+///   lands later, and a phantom stamped between the two opens must not be
+///   filtered out as history just because the hook's post was handled late.
+/// - `latest_open` is the LATEST paired session-open; the deadline runs from it
+///   ([`WatchState::deadline`]), so a later open extends the watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatchTiming {
     pub evidence: OpenAnchor,
     pub latest_open: Instant,
 }
 
-/// [`WatchTiming`] shared between a running watch and the registry, so a later
-/// session-open for the same session and terminal can extend it.
-pub type SharedTiming = std::sync::Arc<std::sync::Mutex<WatchTiming>>;
+/// Everything a running watch and the registry share about one watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchState {
+    pub timing: WatchTiming,
+    /// The watch window the deadline is computed from.
+    pub window: Duration,
+    /// The watch has decided to stop (a verdict, or its deadline). A later open
+    /// must start a new watch rather than extend one that is ending.
+    pub ending: bool,
+    /// A newer watch replaced this one in the registry (another terminal, or a
+    /// new launch in the same pane). The watch stops at its next tick without a
+    /// verdict, so it can neither double-report nor blame the wrong terminal.
+    pub superseded: bool,
+}
 
-/// A fresh [`SharedTiming`] for a watch whose only open so far is `open`.
+impl WatchState {
+    /// When the watch ends: the latest paired open plus the window, but never
+    /// later than the evidence anchor plus TWICE the window — a stream of
+    /// paired opens cannot keep one watch alive indefinitely.
+    pub fn deadline(&self) -> Instant {
+        std::cmp::min(
+            self.timing.latest_open + self.window,
+            self.timing.evidence.at + 2 * self.window,
+        )
+    }
+}
+
+/// [`WatchState`] shared between a running watch and the registry.
+pub type SharedTiming = std::sync::Arc<std::sync::Mutex<WatchState>>;
+
+/// A fresh [`SharedTiming`] for a watch whose only open so far is `open`, with
+/// the default window ([`SessionOpenWatch::new`] sets the watch's own).
 pub fn shared_timing(open: OpenAnchor) -> SharedTiming {
-    std::sync::Arc::new(std::sync::Mutex::new(WatchTiming {
-        evidence: open,
-        latest_open: open.at,
+    std::sync::Arc::new(std::sync::Mutex::new(WatchState {
+        timing: WatchTiming {
+            evidence: open,
+            latest_open: open.at,
+        },
+        window: PHANTOM_TURN_WATCH_WINDOW,
+        ending: false,
+        superseded: false,
     }))
 }
 
-fn read_timing(timing: &SharedTiming) -> WatchTiming {
-    *timing.lock().unwrap_or_else(|e| e.into_inner())
+fn lock_state(shared: &SharedTiming) -> std::sync::MutexGuard<'_, WatchState> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One registry entry: the claim's identity, the terminal it watches, and the
-/// timing its watch reads.
+fn read_timing(shared: &SharedTiming) -> WatchTiming {
+    lock_state(shared).timing
+}
+
+/// One registry entry: the terminal it watches and the state its watch reads.
+/// The `Arc` itself is the claim's identity.
 struct ActiveWatch {
-    claimed: Instant,
     terminal_id: String,
-    timing: SharedTiming,
+    shared: SharedTiming,
 }
 
 /// Process-global registry of ACTIVE watches, keyed by session id. One fresh
@@ -133,11 +175,12 @@ static ACTIVE_WATCHES: std::sync::Mutex<Option<std::collections::HashMap<String,
 
 /// What [`WatchClaim::claim_or_extend`] did.
 pub enum ClaimOutcome {
-    /// No live watch for this session and terminal: this caller owns a new one.
+    /// No pairable watch: this caller owns a new one (any previous watch for
+    /// the session was marked superseded).
     New(WatchClaim),
-    /// A watch for the same session AND terminal was live; its deadline now
-    /// runs from this open (its evidence anchor stays the earliest open). The
-    /// caller starts nothing.
+    /// A live watch for the same session AND terminal paired with this open;
+    /// its deadline now runs from it (its evidence anchor stays the earliest
+    /// open). The caller starts nothing.
     Extended,
 }
 
@@ -146,63 +189,75 @@ pub enum ClaimOutcome {
 /// replaced it.
 pub struct WatchClaim {
     session_id: String,
-    claimed: Instant,
-    timing: SharedTiming,
+    shared: SharedTiming,
 }
 
 impl WatchClaim {
-    /// Claim `session_id` for a watch of `terminal_id` opened at `open`, or —
-    /// while a watch for the same session AND terminal is live — EXTEND that
-    /// watch: its deadline moves to the later of the two opens plus the window,
-    /// and its evidence anchor keeps the earlier one ([`WatchTiming`]).
+    /// Claim `session_id` for a watch of `terminal_id` opened at `open`, or
+    /// EXTEND the live watch it pairs with. A later open pairs only when ALL of:
     ///
-    /// A live watch of a DIFFERENT terminal is replaced by a new one: the
-    /// session moved panes (a respawn, an account migration), and the old
-    /// watch's input evidence is the wrong terminal's. The old claim's drop then
-    /// leaves the replacement in place (the identity check in `Drop`).
+    /// - it is for the same terminal (another terminal means the session moved
+    ///   panes, and the old watch's input evidence is the wrong terminal's);
+    /// - the existing watch is not ending, not superseded, and its deadline has
+    ///   not passed (a watch about to return must not silently absorb it);
+    /// - it arrives within [`PHANTOM_TURN_PAIRING_INTERVAL`] of the evidence
+    ///   anchor;
+    /// - `last_input_at`, the terminal's latest PTY input, is not between the
+    ///   two opens (input there means the pane was used between two launches).
     ///
-    /// An entry whose latest open is older than the watch window plus a minute
-    /// is treated as abandoned and replaced, so a registry entry can never
-    /// suppress watches for a session forever.
-    pub fn claim_or_extend(session_id: &str, terminal_id: &str, open: OpenAnchor) -> ClaimOutcome {
+    /// Pairing moves the deadline to this open ([`WatchState::deadline`]) and
+    /// keeps the earlier open as the evidence anchor. Anything else starts a new
+    /// watch anchored at `open` and marks the old one superseded, so it stops
+    /// without a verdict; the old claim's drop then leaves the replacement in
+    /// place (`Arc::ptr_eq` in `Drop`).
+    pub fn claim_or_extend(
+        session_id: &str,
+        terminal_id: &str,
+        open: OpenAnchor,
+        last_input_at: Option<Instant>,
+        window: Duration,
+    ) -> ClaimOutcome {
         let mut guard = ACTIVE_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(Default::default);
         if let Some(active) = map.get(session_id) {
-            if active.terminal_id == terminal_id {
-                let mut current = active.timing.lock().unwrap_or_else(|e| e.into_inner());
-                let live = open.at.saturating_duration_since(current.latest_open)
-                    < PHANTOM_TURN_WATCH_WINDOW + Duration::from_secs(60);
-                if live {
-                    if open.at > current.latest_open {
-                        current.latest_open = open.at;
-                    }
-                    if open.at < current.evidence.at {
-                        current.evidence = open;
-                    }
-                    return ClaimOutcome::Extended;
+            let mut state = lock_state(&active.shared);
+            let first = state.timing.evidence.at;
+            let (lo, hi) = if open.at < first { (open.at, first) } else { (first, open.at) };
+            let pairs = active.terminal_id == terminal_id
+                && !state.ending
+                && !state.superseded
+                && Instant::now() < state.deadline()
+                && hi.saturating_duration_since(lo) <= PHANTOM_TURN_PAIRING_INTERVAL
+                && !last_input_at.is_some_and(|t| t > lo && t <= hi);
+            if pairs {
+                if open.at > state.timing.latest_open {
+                    state.timing.latest_open = open.at;
                 }
+                if open.at < state.timing.evidence.at {
+                    state.timing.evidence = open;
+                }
+                return ClaimOutcome::Extended;
             }
+            state.superseded = true;
         }
-        let claimed = Instant::now();
-        let timing = shared_timing(open);
+        let shared = shared_timing(open);
+        lock_state(&shared).window = window;
         map.insert(
             session_id.to_string(),
             ActiveWatch {
-                claimed,
                 terminal_id: terminal_id.to_string(),
-                timing: timing.clone(),
+                shared: shared.clone(),
             },
         );
         ClaimOutcome::New(Self {
             session_id: session_id.to_string(),
-            claimed,
-            timing,
+            shared,
         })
     }
 
-    /// The timing this claim's watch must read (and later opens extend).
+    /// The state this claim's watch must read (and later opens extend).
     pub fn timing(&self) -> SharedTiming {
-        self.timing.clone()
+        self.shared.clone()
     }
 }
 
@@ -210,11 +265,11 @@ impl Drop for WatchClaim {
     fn drop(&mut self) {
         let mut guard = ACTIVE_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(map) = guard.as_mut() {
-            // Only this claim's own entry: an abandoned claim that was replaced
-            // must not release its successor.
+            // Only this claim's own entry: a replaced claim must not release its
+            // successor. Identity is the shared state itself.
             if map
                 .get(&self.session_id)
-                .is_some_and(|a| a.claimed == self.claimed)
+                .is_some_and(|a| std::sync::Arc::ptr_eq(&a.shared, &self.shared))
             {
                 map.remove(&self.session_id);
             }
@@ -330,6 +385,10 @@ pub enum Verdict {
     ClearTypedTurn,
     /// No `typed` user text turn in these lines; keep watching.
     Undecided,
+    /// Returned only by [`SessionOpenWatch::run`], never by
+    /// [`detect_phantom_turn`]: a newer watch replaced this one, so it stopped
+    /// without judging or emitting anything.
+    Superseded,
 }
 
 /// The pure detector. Walks `lines` in order and returns on the first `typed`
@@ -432,10 +491,14 @@ impl AppendTail {
     fn from_recent(path: PathBuf) -> Self {
         let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let offset = len.saturating_sub(PHANTOM_TURN_TAIL_LOOKBACK_BYTES);
+        // The offset is already at a line start exactly when the byte before
+        // it is a newline; only otherwise is there a torn first record to skip.
+        // A byte that cannot be read is treated as torn (the safe direction).
+        let skip_to_line_start = offset > 0 && byte_at(&path, offset - 1) != Some(b'\n');
         Self {
             path,
             offset,
-            skip_to_line_start: offset > 0,
+            skip_to_line_start,
         }
     }
 
@@ -479,6 +542,16 @@ impl AppendTail {
     }
 }
 
+/// The single byte at `pos` in the file at `path`, if it can be read.
+fn byte_at(path: &std::path::Path, pos: u64) -> Option<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(pos)).ok()?;
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).ok()?;
+    Some(b[0])
+}
+
 /// Where each transcript tail starts reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailStart {
@@ -499,11 +572,9 @@ pub struct SessionOpenWatch {
     pub terminal_id: String,
     /// One append-only reader per candidate transcript path.
     tails: Vec<AppendTail>,
-    /// When session-open arrived ([`WatchTiming`]). Shared with the registry: a
-    /// later session-open for the same session and terminal extends the
-    /// deadline; the evidence anchor stays the earliest open.
+    /// The shared [`WatchState`]: timing a paired later open extends, and the
+    /// supersession flag a replacing watch sets.
     timing: SharedTiming,
-    pub window: Duration,
     pub poll: Duration,
 }
 
@@ -528,23 +599,25 @@ impl SessionOpenWatch {
             TailStart::CurrentEnd => AppendTail::new,
             TailStart::RecentTail => AppendTail::from_recent,
         };
+        lock_state(&timing).window = window;
         Self {
             session_id,
             terminal_id,
             tails: paths.into_iter().map(tail).collect(),
             timing,
-            window,
             poll,
         }
     }
 
-    /// Poll `paths` every `poll` until the latest open plus `window` — re-read
-    /// every tick, so a later open extends it — feeding newly appended lines,
+    /// Poll `paths` every `poll` until [`WatchState::deadline`] — re-read every
+    /// tick, so a paired later open extends it — feeding newly appended lines,
     /// the EARLIEST open as the evidence anchor, and a fresh `input_slots()`
     /// snapshot to [`detect_phantom_turn`]. File reads run on the blocking
     /// pool, never on an async worker. Emits at most
     /// once, then stops; stops early on a clear typed turn; otherwise ends
-    /// silently at the deadline. Returns the verdict it stopped on, for tests.
+    /// silently at the deadline. A superseded watch returns
+    /// [`Verdict::Superseded`] at its next tick without judging or emitting.
+    /// Returns the verdict it stopped on, for tests.
     ///
     /// `input_slots` returns `None` when the terminal cannot be resolved
     /// (closed, or not managed by this runner). The no-input half of the
@@ -561,10 +634,17 @@ impl SessionOpenWatch {
             })
             .await
             else {
+                lock_state(&self.timing).ending = true;
                 return Verdict::Undecided;
             };
             self.tails = tails;
-            let anchor = read_timing(&self.timing).evidence;
+            let anchor = {
+                let state = lock_state(&self.timing);
+                if state.superseded {
+                    return Verdict::Superseded;
+                }
+                state.timing.evidence
+            };
             if !lines.is_empty() {
                 let slots = input_slots();
                 let evidence = InputEvidence {
@@ -574,15 +654,39 @@ impl SessionOpenWatch {
                 };
                 match detect_phantom_turn(lines.iter().map(String::as_str), evidence) {
                     Verdict::Phantom(turn) => {
+                        {
+                            let mut state = lock_state(&self.timing);
+                            if state.superseded {
+                                return Verdict::Superseded;
+                            }
+                            state.ending = true;
+                        }
                         self.emit_detection(&turn, slots.as_ref(), anchor);
                         return Verdict::Phantom(turn);
                     }
-                    Verdict::ClearTypedTurn => return Verdict::ClearTypedTurn,
-                    Verdict::Undecided => {}
+                    Verdict::ClearTypedTurn => {
+                        let mut state = lock_state(&self.timing);
+                        if state.superseded {
+                            return Verdict::Superseded;
+                        }
+                        state.ending = true;
+                        return Verdict::ClearTypedTurn;
+                    }
+                    Verdict::Undecided | Verdict::Superseded => {}
                 }
             }
-            if Instant::now() >= read_timing(&self.timing).latest_open + self.window {
-                return Verdict::Undecided;
+            {
+                // Decided under the same lock `claim_or_extend` extends under,
+                // so an open either lands before this check (and extends) or
+                // sees `ending` (and starts a new watch) — never lost between.
+                let mut state = lock_state(&self.timing);
+                if state.superseded {
+                    return Verdict::Superseded;
+                }
+                if Instant::now() >= state.deadline() {
+                    state.ending = true;
+                    return Verdict::Undecided;
+                }
             }
             tokio::time::sleep(self.poll).await;
         }
@@ -690,16 +794,32 @@ pub fn spawn_watch(
         );
         return;
     }
-    // One watch per session: the shim (before exec) and the SessionStart hook
-    // (later) both post session-open for a fresh session. The claim rides into
-    // the task and is released when the watch ends.
-    let claim = match WatchClaim::claim_or_extend(&session_id, &terminal_id, open) {
+    // One watch per launch: the shim (before exec) and the SessionStart hook
+    // (later) both post session-open for a fresh session, and pair; a later
+    // launch replaces the watch. The claim rides into the task and is released
+    // when the watch ends.
+    // The terminal's latest PTY input, which decides whether this open pairs
+    // with an earlier one for the same launch.
+    let last_input_at = {
+        use tauri::Manager;
+        app_handle
+            .try_state::<std::sync::Arc<super::TerminalManager>>()
+            .and_then(|tm| tm.get(&terminal_id))
+            .and_then(|s| s.last_input().latest().map(|o| o.at))
+    };
+    let claim = match WatchClaim::claim_or_extend(
+        &session_id,
+        &terminal_id,
+        open,
+        last_input_at,
+        PHANTOM_TURN_WATCH_WINDOW,
+    ) {
         ClaimOutcome::New(claim) => claim,
         ClaimOutcome::Extended => {
             debug!(
                 session_id = %session_id,
                 terminal_id = %terminal_id,
-                "phantom-turn watch extended by a later session-open; no second watch"
+                "phantom-turn watch extended by a paired session-open; no second watch"
             );
             return;
         }
@@ -746,16 +866,22 @@ pub fn spawn_watch(
         }
         // Account unknown: discovery walks every account home on the box — a
         // blocking directory walk that belongs on neither the route nor an
-        // async worker, so it runs on the blocking pool. By the time it returns
-        // a length baseline could already contain the phantom turn, so the
-        // tails start a bounded look-back before the end and the
-        // turn-timestamp filter excludes the prior conversation instead.
+        // async worker, so it runs on the blocking pool — together with the
+        // tail construction, whose per-path `stat`s and boundary reads are file
+        // I/O as well. By the time it returns a length baseline could already
+        // contain the phantom turn, so the tails start a bounded look-back
+        // before the end and the turn-timestamp filter excludes the prior
+        // conversation instead.
         None => {
             tokio::spawn(async move {
-                let dirs = tokio::task::spawn_blocking(super::transcript::find_claude_config_dirs)
-                    .await
-                    .unwrap_or_default();
-                let watch = build(dirs, TailStart::RecentTail);
+                let Ok(watch) = tokio::task::spawn_blocking(move || {
+                    build(super::transcript::find_claude_config_dirs(), TailStart::RecentTail)
+                })
+                .await
+                else {
+                    lock_state(&claim.timing()).ending = true;
+                    return Verdict::Undecided;
+                };
                 let verdict = watch.run(input_slots).await;
                 drop(claim);
                 verdict
@@ -858,24 +984,29 @@ mod tests {
         }
     }
 
-    /// One watch per session and terminal: a LATER open extends the deadline
-    /// only, an earlier one moves the evidence anchor back, and the claim is
-    /// released on drop.
+    fn claim(sid: &str, tid: &str, open: OpenAnchor, input: Option<Instant>) -> ClaimOutcome {
+        WatchClaim::claim_or_extend(sid, tid, open, input, PHANTOM_TURN_WATCH_WINDOW)
+    }
+
+    fn open_after(first: OpenAnchor, d: Duration) -> OpenAnchor {
+        OpenAnchor {
+            at: first.at + d,
+            wall: first.wall + d,
+        }
+    }
+
+    /// A paired later open (same terminal, within the pairing interval, no
+    /// input between) extends the deadline only, keeping the earliest evidence;
+    /// the claim is released on drop.
     #[test]
-    fn a_later_session_open_extends_the_deadline_but_keeps_the_earliest_evidence() {
+    fn a_paired_session_open_extends_the_deadline_but_keeps_the_earliest_evidence() {
         let sid = format!("test-dedupe-{}", uuid::Uuid::new_v4());
         let first_open = anchor_now();
-        let ClaimOutcome::New(first) = WatchClaim::claim_or_extend(&sid, "t1", first_open) else {
+        let ClaimOutcome::New(first) = claim(&sid, "t1", first_open, None) else {
             panic!("first claim");
         };
-        let later = OpenAnchor {
-            at: first_open.at + Duration::from_secs(5),
-            wall: first_open.wall + Duration::from_secs(5),
-        };
-        assert!(matches!(
-            WatchClaim::claim_or_extend(&sid, "t1", later),
-            ClaimOutcome::Extended
-        ));
+        let later = open_after(first_open, Duration::from_secs(5));
+        assert!(matches!(claim(&sid, "t1", later, None), ClaimOutcome::Extended));
         assert_eq!(
             read_timing(&first.timing()),
             WatchTiming {
@@ -886,63 +1017,168 @@ mod tests {
         );
 
         assert!(matches!(
-            WatchClaim::claim_or_extend(&format!("{sid}-other"), "t1", anchor_now()),
+            claim(&format!("{sid}-other"), "t1", anchor_now(), None),
             ClaimOutcome::New(_)
         ));
         drop(first);
         assert!(
-            matches!(
-                WatchClaim::claim_or_extend(&sid, "t1", anchor_now()),
-                ClaimOutcome::New(_)
-            ),
+            matches!(claim(&sid, "t1", anchor_now(), None), ClaimOutcome::New(_)),
             "released when the watch finishes"
         );
     }
 
-    /// A later open from a DIFFERENT terminal replaces the watch rather than
-    /// extending it, and the replaced claim's drop leaves the replacement.
+    /// A later open from a DIFFERENT terminal replaces the watch, marks the old
+    /// one superseded, and the old claim's drop leaves the replacement.
     #[test]
-    fn a_session_open_from_another_terminal_replaces_the_watch() {
+    fn a_session_open_from_another_terminal_replaces_and_supersedes_the_watch() {
         let sid = format!("test-replace-{}", uuid::Uuid::new_v4());
-        let ClaimOutcome::New(old) = WatchClaim::claim_or_extend(&sid, "t1", anchor_now()) else {
+        let ClaimOutcome::New(old) = claim(&sid, "t1", anchor_now(), None) else {
             panic!("first claim");
         };
-        let ClaimOutcome::New(new) = WatchClaim::claim_or_extend(&sid, "t2", anchor_now()) else {
+        let ClaimOutcome::New(new) = claim(&sid, "t2", anchor_now(), None) else {
             panic!("another terminal must get its own watch");
         };
+        assert!(lock_state(&old.timing()).superseded);
+        assert!(!lock_state(&new.timing()).superseded);
         drop(old);
         assert!(
-            matches!(
-                WatchClaim::claim_or_extend(&sid, "t2", anchor_now()),
-                ClaimOutcome::Extended
-            ),
+            matches!(claim(&sid, "t2", anchor_now(), None), ClaimOutcome::Extended),
             "the replacement survives the old claim's drop"
         );
         drop(new);
+        assert!(matches!(claim(&sid, "t2", anchor_now(), None), ClaimOutcome::New(_)));
+    }
+
+    /// A quit and `claude --resume` in the same pane is its OWN launch: a later
+    /// open past the pairing interval, or one preceded by PTY input since the
+    /// first open, starts a fresh watch anchored at its own open.
+    #[test]
+    fn a_later_launch_in_the_same_pane_gets_a_fresh_evidence_anchor() {
+        // Past the pairing interval.
+        let sid = format!("test-relaunch-{}", uuid::Uuid::new_v4());
+        let first_open = anchor_now();
+        let ClaimOutcome::New(first) = claim(&sid, "t1", first_open, None) else {
+            panic!("first claim");
+        };
+        let late = open_after(first_open, PHANTOM_TURN_PAIRING_INTERVAL + Duration::from_secs(1));
+        let ClaimOutcome::New(second) = claim(&sid, "t1", late, None) else {
+            panic!("a launch past the pairing interval is a new watch");
+        };
+        assert_eq!(read_timing(&second.timing()).evidence, late);
+        assert!(lock_state(&first.timing()).superseded);
+        drop((first, second));
+
+        // Within the interval, but the pane saw input between the opens.
+        let sid = format!("test-relaunch-input-{}", uuid::Uuid::new_v4());
+        let first_open = anchor_now();
+        let ClaimOutcome::New(first) = claim(&sid, "t1", first_open, None) else {
+            panic!("first claim");
+        };
+        let resumed = open_after(first_open, Duration::from_secs(4));
+        let typed = first_open.at + Duration::from_secs(2);
+        let ClaimOutcome::New(second) = claim(&sid, "t1", resumed, Some(typed)) else {
+            panic!("input between the opens means a new launch");
+        };
+        assert_eq!(read_timing(&second.timing()).evidence, resumed);
+        assert!(lock_state(&first.timing()).superseded);
+        // Input BEFORE the first open does not break pairing.
+        let sid = format!("test-pair-prior-input-{}", uuid::Uuid::new_v4());
+        let first_open = anchor_now();
+        let ClaimOutcome::New(_held) = claim(&sid, "t1", first_open, None) else {
+            panic!("first claim");
+        };
+        let prior = first_open.at.checked_sub(Duration::from_millis(1)).unwrap_or(first_open.at);
         assert!(matches!(
-            WatchClaim::claim_or_extend(&sid, "t2", anchor_now()),
-            ClaimOutcome::New(_)
+            claim(&sid, "t1", open_after(first_open, Duration::from_secs(1)), Some(prior)),
+            ClaimOutcome::Extended
         ));
     }
 
-    /// Run one watch over `line` (appended after the watch is built) with the
-    /// timing a two-open session leaves behind.
-    async fn run_two_open_watch(
-        second_open_after: Duration,
-        line: String,
-        input: Option<PtyInputObservation>,
-    ) -> Verdict {
-        let sid = format!("test-two-open-{}", uuid::Uuid::new_v4());
-        let first = anchor_now();
-        let ClaimOutcome::New(claim) = WatchClaim::claim_or_extend(&sid, "t1", first) else {
+    /// An entry that is ending, or whose deadline has passed, never absorbs a
+    /// later open: a new watch starts.
+    #[test]
+    fn an_ending_or_expired_watch_is_not_extended() {
+        let sid = format!("test-ending-{}", uuid::Uuid::new_v4());
+        let ClaimOutcome::New(first) = claim(&sid, "t1", anchor_now(), None) else {
             panic!("first claim");
         };
-        let second = OpenAnchor {
-            at: first.at + second_open_after,
-            wall: first.wall + second_open_after,
+        lock_state(&first.timing()).ending = true;
+        assert!(matches!(claim(&sid, "t1", anchor_now(), None), ClaimOutcome::New(_)));
+
+        let sid = format!("test-expired-{}", uuid::Uuid::new_v4());
+        let ClaimOutcome::New(_short) =
+            WatchClaim::claim_or_extend(&sid, "t1", anchor_now(), None, Duration::from_millis(1))
+        else {
+            panic!("first claim");
+        };
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(matches!(claim(&sid, "t1", anchor_now(), None), ClaimOutcome::New(_)));
+    }
+
+    /// The deadline is the latest open plus the window, capped at the evidence
+    /// anchor plus twice the window.
+    #[test]
+    fn the_watch_deadline_is_capped_at_twice_the_window() {
+        let t = Instant::now();
+        let w = Duration::from_secs(25);
+        let state = |latest: Duration| WatchState {
+            timing: WatchTiming {
+                evidence: OpenAnchor {
+                    at: t,
+                    wall: SystemTime::now(),
+                },
+                latest_open: t + latest,
+            },
+            window: w,
+            ending: false,
+            superseded: false,
+        };
+        assert_eq!(state(Duration::ZERO).deadline(), t + w);
+        assert_eq!(state(Duration::from_secs(10)).deadline(), t + Duration::from_secs(35));
+        assert_eq!(state(Duration::from_secs(40)).deadline(), t + 2 * w);
+    }
+
+    /// A superseded watch yields no verdict — even with a phantom-shaped turn
+    /// sitting in its transcript.
+    #[tokio::test]
+    async fn a_superseded_watch_stops_without_a_verdict() {
+        let sid = format!("test-superseded-{}", uuid::Uuid::new_v4());
+        let ClaimOutcome::New(old) = claim(&sid, "t1", anchor_now(), None) else {
+            panic!("first claim");
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let watch = SessionOpenWatch::new(
+            sid.clone(),
+            "t1".into(),
+            vec![path.clone()],
+            TailStart::CurrentEnd,
+            old.timing(),
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+        );
+        let ClaimOutcome::New(_new) = claim(&sid, "t2", anchor_now(), None) else {
+            panic!("replacement");
+        };
+        let now = chrono::Utc::now().to_rfc3339();
+        std::fs::write(&path, format!("{}\n", user_line_at("is", "typed", Some(&now)))).unwrap();
+        let started = Instant::now();
+        let verdict = watch.run(|| Some(PtyInputSlots::default())).await;
+        assert_eq!(verdict, Verdict::Superseded);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Run one watch over `line` (appended after the watch is built) with the
+    /// timing a paired two-open launch leaves behind.
+    async fn run_two_open_watch(second_open_after: Duration, line: String) -> Verdict {
+        let sid = format!("test-two-open-{}", uuid::Uuid::new_v4());
+        let first = anchor_now();
+        let ClaimOutcome::New(held) = claim(&sid, "t1", first, None) else {
+            panic!("first claim");
         };
         assert!(matches!(
-            WatchClaim::claim_or_extend(&sid, "t1", second),
+            claim(&sid, "t1", open_after(first, second_open_after), None),
             ClaimOutcome::Extended
         ));
         let dir = tempfile::tempdir().unwrap();
@@ -953,41 +1189,14 @@ mod tests {
             "t1".into(),
             vec![path.clone()],
             TailStart::CurrentEnd,
-            claim.timing(),
+            held.timing(),
             Duration::from_millis(300),
             Duration::from_millis(10),
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
-        let verdict = watch
-            .run(move || {
-                Some(PtyInputSlots {
-                    last_write: input.clone(),
-                    ..PtyInputSlots::default()
-                })
-            })
-            .await;
-        drop(claim);
+        let verdict = watch.run(|| Some(PtyInputSlots::default())).await;
+        drop(held);
         verdict
-    }
-
-    /// Keystrokes typed after the shim's (first) open but before the hook's
-    /// (second) open are real input: a short typed turn does NOT fire.
-    #[tokio::test]
-    async fn input_between_the_two_opens_counts_as_real_input() {
-        let first_at = Instant::now();
-        let now = chrono::Utc::now().to_rfc3339();
-        let obs = PtyInputObservation {
-            caller: PtyWriteCaller::TauriTerminalWrite,
-            at: first_at + Duration::from_millis(500),
-            bytes: 2,
-        };
-        let verdict = run_two_open_watch(
-            Duration::from_secs(1),
-            user_line_at("ok", "typed", Some(&now)),
-            Some(obs),
-        )
-        .await;
-        assert_eq!(verdict, Verdict::ClearTypedTurn);
     }
 
     /// A slow second open (3 s after the first) does not push the timestamp
@@ -998,7 +1207,6 @@ mod tests {
         let verdict = run_two_open_watch(
             Duration::from_secs(3),
             user_line_at("is", "typed", Some(&between)),
-            None,
         )
         .await;
         assert!(
@@ -1007,8 +1215,31 @@ mod tests {
         );
     }
 
-    /// The running watch re-reads its timing: a later open extends the
-    /// deadline of the same task.
+    /// Input judged against the EARLIEST paired open: a keystroke after the
+    /// first open counts as real input, so a short typed turn does not fire.
+    #[test]
+    fn input_after_the_evidence_anchor_counts_as_real_input() {
+        let first = Instant::now();
+        let obs = PtyInputObservation {
+            caller: PtyWriteCaller::TauriTerminalWrite,
+            at: first + Duration::from_millis(500),
+            bytes: 2,
+        };
+        let now = chrono::Utc::now();
+        let evidence = InputEvidence {
+            session_open_at: first,
+            session_open_wall: now,
+            latest: Some(&obs),
+        };
+        let line = user_line_at("ok", "typed", Some(&now.to_rfc3339()));
+        assert_eq!(
+            detect_phantom_turn([line.as_str()], evidence),
+            Verdict::ClearTypedTurn
+        );
+    }
+
+    /// The running watch re-reads its state: a later open extends the deadline
+    /// of the same task.
     #[tokio::test]
     async fn a_later_open_extends_the_running_watch_deadline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1020,8 +1251,7 @@ mod tests {
         let mover = timing.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let mut t = mover.lock().unwrap();
-            t.latest_open += Duration::from_millis(400);
+            lock_state(&mover).timing.latest_open += Duration::from_millis(150);
         });
         let verdict = SessionOpenWatch::new(
             "sid".into(),
@@ -1036,7 +1266,7 @@ mod tests {
         .await;
         assert_eq!(verdict, Verdict::Undecided);
         assert!(
-            started.elapsed() >= Duration::from_millis(550),
+            started.elapsed() >= Duration::from_millis(340),
             "the deadline moved with the latest open: ended after {:?}",
             started.elapsed()
         );
@@ -1089,6 +1319,29 @@ mod tests {
             matches!(verdict, Verdict::Phantom(PhantomTurn { content_chars: 2, .. })),
             "{verdict:?}"
         );
+    }
+
+    /// When the look-back offset lands exactly on a line start (the byte before
+    /// it is a newline), that first line is whole and is NOT skipped.
+    #[test]
+    fn a_recent_tail_on_a_line_boundary_keeps_the_first_line() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aligned.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "older-record").unwrap();
+        // Exactly PHANTOM_TURN_TAIL_LOOKBACK_BYTES of 1024-byte lines.
+        let lines = (PHANTOM_TURN_TAIL_LOOKBACK_BYTES / 1024) as usize;
+        for i in 0..lines {
+            let head = format!("line-{i:04}-");
+            writeln!(f, "{head}{}", "y".repeat(1023 - head.len())).unwrap();
+        }
+        drop(f);
+        let mut tail = AppendTail::from_recent(path);
+        assert!(!tail.skip_to_line_start);
+        let got = tail.read_new_lines();
+        assert_eq!(got.len(), lines);
+        assert!(got[0].starts_with("line-0000-"), "{}", &got[0][..12]);
     }
 
     /// A multi-MB transcript is not read whole: the look-back starts within

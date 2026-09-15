@@ -134,11 +134,21 @@ done
 # ./eval.md` did not. This shim is what delivers the hook (--settings) to a
 # nested `claude` typed inside a session, so it is where an inherited marker
 # must be dropped — otherwise that nested session would be told it has a body
-# it was never given.
+# it was never given. A REPLACEMENT prompt (--system-prompt[-file], ahead of
+# `--`) drops it too: whether Claude Code still applies the append file beside
+# one is not behaviourally verified, so the rule every path shares withholds it.
 if [ "$TOOL" = "claude" ]; then
   keep_policy_sha=0
+  replacement_prompt=0
+  for a in "$@"; do
+    case "$a" in
+      --) break ;;
+      --system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*)
+        replacement_prompt=1; break ;;
+    esac
+  done
   delivered_file="${QONTINUI_POLICY_DELIVERED_FILE:-}"
-  if [ -n "$delivered_file" ]; then
+  if [ -n "$delivered_file" ] && [ "$replacement_prompt" = "0" ]; then
     prev_arg=""
     for a in "$@"; do
       if [ "$prev_arg" = "--append-system-prompt-file" ] && [ "$a" = "$delivered_file" ]; then
