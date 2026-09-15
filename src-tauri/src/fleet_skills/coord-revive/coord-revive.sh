@@ -1066,9 +1066,30 @@ budget_skip() {
 
 # seen_door <path> — 0 if this door was already probed (canonical-path dedup,
 # so a symlinked/re-spelled path can't burn extra probes); records it otherwise.
+#
+# Under Git Bash `realpath` does not settle ONE spelling for a file:
+#   * a path that crosses no link comes back in the spelling it was handed --
+#     L1's $OWN is built from $PWD (`/d/x`, `/tmp/x`), while L2's glob is built
+#     from $ROOT, which is drive-spelled both when `git rev-parse
+#     --path-format=absolute --git-common-dir` finds it (`D:/x/.git`) and when
+#     $QONTINUI_ROOT sets it (`C:\Users\...\x`);
+#   * a path that crosses a link (a junction) comes back as the TARGET in POSIX
+#     spelling (`/tmp/.../real/...`) even when it was handed `C:/...`.
+# Left alone, one file realpaths to two strings and L2 re-reads a door already
+# seen. So a `/`-leading answer is re-spelled with `cygpath -m`; a drive-spelled
+# answer costs no fork, and where cygpath is absent nothing changes.
+#
+# `-m` (C:/x), NOT `-u`: `-u` maps through the MSYS mount table, and with /tmp
+# mounted over the user Temp, `C:/Program Files/Git/tmp/x` and
+# `C:/Users/<u>/AppData/Local/Temp/x` BOTH print `/tmp/x` -- two different files
+# would dedup into one and the second door would never be read. `-m` keeps the
+# drive path. Paths that differ only in case are deliberately not folded.
+# Pinned by door-sweep-timeout-selftest.py property 10 (a junction fixture, with
+# a copy of this script that lacks the re-spell line as its mutant).
 seen_door() {
   local rp
   rp="$(realpath "$1" 2>/dev/null || printf '%s' "$1")"
+  case "$rp" in /*) if command -v cygpath >/dev/null 2>&1; then rp="$(cygpath -m "$rp" 2>/dev/null || printf '%s' "$rp")"; fi ;; esac
   case "$SEEN" in *"|$rp|"*) return 0 ;; esac
   SEEN="${SEEN}|$rp|"
   return 1
