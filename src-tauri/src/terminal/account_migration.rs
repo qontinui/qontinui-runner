@@ -340,7 +340,10 @@ pub(crate) fn spawn_prompt_when_idle(terminal_id: String, prompt: String, label:
                 // `prompt`/`label` seam (one impl for the migration nudge and the
                 // respawn prompt), with MAIN's `Ok(_)` — `submit_prompt` stopped
                 // returning `()` in fee48d4c, which now reports the neutralized body.
-                match session.submit_prompt(&prompt) {
+                match session.submit_prompt(
+                    &prompt,
+                    crate::terminal::session::PtyWriteCaller::AccountMigration,
+                ) {
                     Ok(_) => info!(terminal_id, label, "prompt-when-idle submitted"),
                     Err(e) => {
                         warn!(terminal_id, label, error = %e, "prompt-when-idle submit failed")

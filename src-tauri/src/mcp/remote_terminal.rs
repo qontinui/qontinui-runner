@@ -1765,7 +1765,10 @@ pub trait TerminalInputSink {
 impl TerminalInputSink for crate::terminal::TerminalManager {
     fn write_input(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), String> {
         match self.get(terminal_id) {
-            Some(session) => session.write(bytes),
+            Some(session) => session.write(
+                bytes,
+                crate::terminal::session::PtyWriteCaller::RemoteTerminalInput,
+            ),
             None => Err(format!("Terminal not found: {terminal_id}")),
         }
     }

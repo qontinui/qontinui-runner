@@ -333,7 +333,10 @@ pub async fn create_terminal_handler(
                     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                     if let Some(session) = mgr.get(&tid) {
                         let cmd = format!("{}\r\n", cmd);
-                        let _ = session.write(cmd.as_bytes());
+                        let _ = session.write(
+                            cmd.as_bytes(),
+                            crate::terminal::session::PtyWriteCaller::HttpCreateInitialCommand,
+                        );
                     }
                 });
             }
@@ -399,26 +402,28 @@ pub async fn write_terminal_handler(
         )
     })?;
 
-    session.write(&bytes).map_err(|e| {
-        // A dead PTY is not a runner fault -- it is an ACTION failure whose
-        // whole diagnosis is the typed `TERMINAL_EXITED: ...` envelope. 500
-        // would tell the caller to retry against a runner that is perfectly
-        // healthy; 400 + `ACTION_FAILED` tells it the request is unsatisfiable
-        // until the session is restarted, which is what the frontend's
-        // `buildWriteFailure` already reports for the same condition.
-        if e.starts_with(crate::terminal::session::TERMINAL_EXITED) {
-            warn!("HTTP: refused write to exited terminal {}: {}", id, e);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(terminal_exited_response(&id, &e, bytes.len())),
-            );
-        }
-        error!("HTTP: Failed to write to terminal {}: {}", id, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to write to terminal: {}", e))),
-        )
-    })?;
+    session
+        .write(&bytes, crate::terminal::session::PtyWriteCaller::HttpWrite)
+        .map_err(|e| {
+            // A dead PTY is not a runner fault -- it is an ACTION failure whose
+            // whole diagnosis is the typed `TERMINAL_EXITED: ...` envelope. 500
+            // would tell the caller to retry against a runner that is perfectly
+            // healthy; 400 + `ACTION_FAILED` tells it the request is unsatisfiable
+            // until the session is restarted, which is what the frontend's
+            // `buildWriteFailure` already reports for the same condition.
+            if e.starts_with(crate::terminal::session::TERMINAL_EXITED) {
+                warn!("HTTP: refused write to exited terminal {}: {}", id, e);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(terminal_exited_response(&id, &e, bytes.len())),
+                );
+            }
+            error!("HTTP: Failed to write to terminal {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to write to terminal: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(
         serde_json::json!({ "written": bytes.len() }),
@@ -527,13 +532,18 @@ pub async fn submit_prompt_handler(
     // shorter than it arrived. Taking the numbers from `submit_prompt`'s
     // return rather than recomputing them here also stops this route from
     // running the neutralizer over the same untrusted body twice.
-    let payload = session.submit_prompt(&request.message).map_err(|e| {
-        error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Failed to submit prompt: {}", e))),
+    let payload = session
+        .submit_prompt(
+            &request.message,
+            crate::terminal::session::PtyWriteCaller::HttpSubmitPrompt,
         )
-    })?;
+        .map_err(|e| {
+            error!("HTTP: Failed to submit prompt to terminal {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to submit prompt: {}", e))),
+            )
+        })?;
 
     Ok(Json(ApiResponse::success(serde_json::json!({
         "submitted": true,
@@ -803,7 +813,10 @@ async fn handle_ws_terminal(
                         Some("input") => {
                             if let Some(data) = msg.get("data").and_then(|d| d.as_str()) {
                                 if let Ok(bytes) = STANDARD.decode(data) {
-                                    if let Err(e) = session.write(&bytes) {
+                                    if let Err(e) = session.write(
+                                        &bytes,
+                                        crate::terminal::session::PtyWriteCaller::WebSocketInput,
+                                    ) {
                                         warn!("Failed to write to terminal {}: {}", terminal_id, e);
                                     }
                                 }

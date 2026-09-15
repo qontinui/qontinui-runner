@@ -103,7 +103,12 @@ impl Transport for PtyTransport {
             .manager
             .get(id)
             .ok_or_else(|| TransportError::Runtime(format!("terminal not found: {}", id)))?;
-        session.write(bytes).map_err(TransportError::Runtime)
+        session
+            .write(
+                bytes,
+                crate::terminal::session::PtyWriteCaller::PtyTransport,
+            )
+            .map_err(TransportError::Runtime)
     }
 
     fn resize(&self, handle: &TransportHandle, cols: u16, rows: u16) -> Result<(), TransportError> {

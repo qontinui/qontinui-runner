@@ -144,7 +144,12 @@ impl Transport for ClaudeCliTransport {
                 let session = self.terminal_manager.get(terminal_id).ok_or_else(|| {
                     TransportError::Runtime(format!("terminal not found: {}", terminal_id))
                 })?;
-                session.write(bytes).map_err(TransportError::Runtime)
+                session
+                    .write(
+                        bytes,
+                        crate::terminal::session::PtyWriteCaller::ClaudeCliTransport,
+                    )
+                    .map_err(TransportError::Runtime)
             }
             TransportHandle::ClaudeCli { .. } => {
                 // Agentic stream-json input is routed through

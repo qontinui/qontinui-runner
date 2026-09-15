@@ -177,7 +177,10 @@ impl WorkerSession {
                 )
             })?;
 
-        session.submit_prompt(message)?;
+        session.submit_prompt(
+            message,
+            crate::terminal::session::PtyWriteCaller::WorkerSession,
+        )?;
 
         self.state.store(STATE_PROCESSING, Ordering::Release);
         Ok(true)

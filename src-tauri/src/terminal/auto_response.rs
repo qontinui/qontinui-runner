@@ -463,7 +463,7 @@ mod scheduler {
                     // unified audit log ONLY when the submission actually
                     // landed. Best-effort + fire-and-forget (never blocks/fails
                     // the scheduler).
-                    if submit_to_session(&tid, &text).await {
+                    if submit_to_session(&tid, &rid, &text).await {
                         super::report::report_submit_prompt_injection(
                             &tid, &rid, &context, &context, &text,
                         )
@@ -488,7 +488,7 @@ mod scheduler {
                     .await
                     {
                         Some(text) => {
-                            submit_to_session(&tid, &text).await;
+                            submit_to_session(&tid, &rid, &text).await;
                         }
                         None => info!(
                             terminal_id = %tid,
@@ -511,7 +511,7 @@ mod scheduler {
     ///
     /// Returns `true` only when the prompt was actually submitted into a live
     /// session (so the caller can gate audit reporting on a real injection).
-    async fn submit_to_session(tid: &str, prompt: &str) -> bool {
+    async fn submit_to_session(tid: &str, rid: &str, prompt: &str) -> bool {
         use tauri::Manager;
 
         let Some(app) = crate::tauri_app_handle::current() else {
@@ -527,7 +527,12 @@ mod scheduler {
             );
             return false;
         };
-        if let Err(e) = session.submit_prompt(prompt) {
+        if let Err(e) = session.submit_prompt(
+            prompt,
+            crate::terminal::session::PtyWriteCaller::AutoResponse {
+                rule_id: rid.to_string(),
+            },
+        ) {
             warn!(
                 terminal_id = %tid,
                 error = %e,

@@ -315,7 +315,10 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 Ok(b) => b,
                 Err(e) => return TauriInvokeResponse::err(format!("Invalid base64 data: {}", e)),
             };
-            match session.write(&bytes) {
+            match session.write(
+                &bytes,
+                crate::terminal::session::PtyWriteCaller::TauriInvokeProxy,
+            ) {
                 Ok(()) => TauriInvokeResponse::ok(serde_json::json!({ "success": true })),
                 Err(e) => TauriInvokeResponse::err(e),
             }

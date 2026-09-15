@@ -954,7 +954,10 @@ fn schedule_initial_command(
         tokio::time::sleep(Duration::from_millis(300)).await;
         if let Some(session) = manager.get(&terminal_id) {
             let line = format!("{}\r\n", initial_command);
-            if let Err(e) = session.write(line.as_bytes()) {
+            if let Err(e) = session.write(
+                line.as_bytes(),
+                crate::terminal::session::PtyWriteCaller::LaunchInitialCommand,
+            ) {
                 warn!(
                     "launch session: failed to write initial command to {}: {}",
                     terminal_id, e

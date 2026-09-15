@@ -943,6 +943,137 @@ fn submit_payload_of(report: &SanitizeReport) -> SubmitPayload {
     }
 }
 
+/// WHO put bytes on a PTY — the caller tag every producer of
+/// [`TerminalSession::write`] and [`TerminalSession::submit_prompt`] passes.
+///
+/// Exists because of the 2026-09-15 phantom-turn incident (plan
+/// `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`, Phase
+/// 2): a two-character `is` turn appeared in restored sessions, and ruling
+/// out every runner write path took hours of log/transcript correlation,
+/// because neither choke point recorded which producer had written. The tag
+/// makes that question a grep.
+///
+/// An enum rather than a free `&'static str` so the producer roster is
+/// enumerable and a typo cannot mint a new, silently distinct tag. The one
+/// dynamic part — the auto-response rule id — rides a variant field, which is
+/// why this is not `Copy`: the rule id is operator/fleet configuration, not a
+/// compile-time constant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PtyWriteCaller {
+    // ---- `submit_prompt` producers --------------------------------------
+    /// `POST /terminals/{id}/submit-prompt` (`mcp/terminals.rs`) — the
+    /// caller-supplied route coord session-bus injection also uses.
+    HttpSubmitPrompt,
+    /// The looping-agent supervisor's journal nudge.
+    LoopingAgentNudge,
+    /// The account-migration resume nudge.
+    AccountMigration,
+    /// A regex/fleet auto-response rule firing, by rule id.
+    AutoResponse { rule_id: String },
+    /// `claude_session::worker_session`'s sender.
+    WorkerSession,
+    // ---- `write` producers ----------------------------------------------
+    /// The Tauri `terminal_write` command — the pane's own keystrokes.
+    TauriTerminalWrite,
+    /// The same command reached through the HTTP Tauri-invoke proxy.
+    TauriInvokeProxy,
+    /// A remote (coord-relayed) terminal's `terminal_input` frame.
+    RemoteTerminalInput,
+    /// `POST /terminals/{id}/write`.
+    HttpWrite,
+    /// The `/terminals/{id}/ws` socket's `input` frame.
+    WebSocketInput,
+    /// `session::transport::PtyTransport::write_input`.
+    PtyTransport,
+    /// `session::transport::ClaudeCliTransport::write_input` (PTY handle).
+    ClaudeCliTransport,
+    /// The dashboard launch buttons' deferred initial command line.
+    LaunchInitialCommand,
+    /// The HTTP terminal-create route's deferred initial command line.
+    HttpCreateInitialCommand,
+    /// The steward-launch route's deferred launch command line
+    /// (`mcp/steward.rs`).
+    StewardLaunchCommand,
+    /// Unit-test fixtures only.
+    #[cfg(test)]
+    Test,
+}
+
+impl PtyWriteCaller {
+    /// The stable, greppable tag string for this producer.
+    pub fn tag(&self) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        Cow::Borrowed(match self {
+            Self::HttpSubmitPrompt => "http_submit_prompt",
+            Self::LoopingAgentNudge => "looping_agent_nudge",
+            Self::AccountMigration => "account_migration",
+            Self::AutoResponse { rule_id } => {
+                return Cow::Owned(format!("auto_response:{rule_id}"))
+            }
+            Self::WorkerSession => "worker_session",
+            Self::TauriTerminalWrite => "tauri_terminal_write",
+            Self::TauriInvokeProxy => "tauri_invoke_proxy",
+            Self::RemoteTerminalInput => "remote_terminal_input",
+            Self::HttpWrite => "http_write",
+            Self::WebSocketInput => "websocket_input",
+            Self::PtyTransport => "pty_transport",
+            Self::ClaudeCliTransport => "claude_cli_transport",
+            Self::LaunchInitialCommand => "launch_initial_command",
+            Self::HttpCreateInitialCommand => "http_create_initial_command",
+            Self::StewardLaunchCommand => "steward_launch_command",
+            #[cfg(test)]
+            Self::Test => "test",
+        })
+    }
+}
+
+impl std::fmt::Display for PtyWriteCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.tag())
+    }
+}
+
+/// One observed PTY input event: which producer, when, and how many bytes.
+/// Never the bytes themselves — keystrokes are exactly what must not be kept.
+#[derive(Clone, Debug)]
+pub struct PtyInputObservation {
+    pub caller: PtyWriteCaller,
+    pub at: Instant,
+    pub bytes: usize,
+}
+
+/// The per-session "last input" slots, read by the phantom-turn detector
+/// (`terminal::phantom_turn`) to decide whether a real input event preceded a
+/// suspicious transcript turn.
+///
+/// Two slots rather than one because the two choke points answer different
+/// questions: `last_submit` is a whole prompt some runner producer injected,
+/// `last_write` is raw bytes (usually keystrokes). A detector wants either;
+/// an investigator reading them wants to know which.
+#[derive(Clone, Debug, Default)]
+pub struct PtyInputSlots {
+    pub last_write: Option<PtyInputObservation>,
+    pub last_submit: Option<PtyInputObservation>,
+}
+
+impl PtyInputSlots {
+    /// The more recent of the two slots, whichever choke point it came from.
+    pub fn latest(&self) -> Option<&PtyInputObservation> {
+        match (&self.last_write, &self.last_submit) {
+            (Some(w), Some(s)) => Some(if s.at >= w.at { s } else { w }),
+            (w, s) => w.as_ref().or(s.as_ref()),
+        }
+    }
+}
+
+/// The first 8 hex chars of `sha256(body)` — enough to correlate one submit
+/// across the runner log and a transcript without the body entering the log.
+fn short_body_hash(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body.as_bytes());
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Pure line-assembly core of the typed-input observer
 /// ([`TerminalSession::observe_input`]): walk one chunk of raw keystroke
 /// bytes, mutating the per-terminal line buffer, and return any lines this
@@ -1153,6 +1284,10 @@ pub struct TerminalSession {
     /// branch-mutating-git warn; typed claude resume sniff). Drained on
     /// CR/LF; see [`consume_input_bytes`]. Cheap on the hot path.
     input_line_buf: Arc<Mutex<String>>,
+    /// Who last wrote to this PTY, and when — through either choke point.
+    /// Written after bytes reach the wire; read by the phantom-turn detector
+    /// via [`Self::last_input`]. See [`PtyInputSlots`].
+    last_input: Mutex<PtyInputSlots>,
 }
 
 impl TerminalSession {
@@ -1996,6 +2131,7 @@ impl TerminalSession {
             isolated_edit_ctx: Arc::new(Mutex::new(None)),
             app_handle: Some(session_app_handle),
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            last_input: Mutex::new(PtyInputSlots::default()),
             pinned_session_id,
             wire_flow,
         })
@@ -3020,7 +3156,12 @@ impl TerminalSession {
     /// typed-input observer ([`Self::observe_input`]) covers every present
     /// and future write path. Observation happens AFTER the bytes hit the
     /// PTY and the writer lock is released — it never delays keystrokes.
-    pub fn write(&self, data: &[u8]) -> Result<(), String> {
+    ///
+    /// `caller` names the producer (see [`PtyWriteCaller`]). It is logged at
+    /// `debug!` only — most writes are single keystrokes, and an `info!` per
+    /// key would flood the log — and recorded in the `last_write` slot
+    /// ([`Self::last_input`]) once the bytes are on the wire.
+    pub fn write(&self, data: &[u8], caller: PtyWriteCaller) -> Result<(), String> {
         // -- LIVENESS GATE ------------------------------------------------
         //
         // The funnel is the only honest place for this. Writing to an exited
@@ -3060,8 +3201,44 @@ impl TerminalSession {
                 .map_err(|e| format!("Failed to flush PTY: {}", e))?;
         } // writer lock released before observation
 
+        debug!(
+            terminal_id = %self.id,
+            caller = %caller,
+            bytes = data.len(),
+            "terminal pty write"
+        );
+        self.record_input(
+            PtyInputObservation {
+                caller,
+                at: Instant::now(),
+                bytes: data.len(),
+            },
+            false,
+        );
         self.observe_input(data);
         Ok(())
+    }
+
+    /// A snapshot of who last wrote to this PTY, through either choke point.
+    pub fn last_input(&self) -> PtyInputSlots {
+        self.last_input
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// Store `obs` in the `last_submit` slot (`submit == true`) or the
+    /// `last_write` slot. A poisoned lock is recovered rather than skipped:
+    /// the slot is diagnostic evidence, and silently losing it on one panic
+    /// elsewhere would make the phantom-turn detector read "no input" — the
+    /// exact false positive it must not produce.
+    fn record_input(&self, obs: PtyInputObservation, submit: bool) {
+        let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
+        if submit {
+            slots.last_submit = Some(obs);
+        } else {
+            slots.last_write = Some(obs);
+        }
     }
 
     /// Observe raw typed input bytes — feed them through the per-terminal
@@ -3142,7 +3319,17 @@ impl TerminalSession {
     /// the write *and* the numbers would otherwise run the neutralizer over
     /// the same untrusted body twice, which is what
     /// `POST /terminals/{id}/submit-prompt` did.
-    pub fn submit_prompt(&self, message: &str) -> Result<SubmitPayload, String> {
+    ///
+    /// `caller` names the producer. Unlike [`Self::write`], every submit logs
+    /// one unconditional `info!` carrying the tag, the body's byte count and a
+    /// short hash of the body — a submit is a whole prompt, rare enough to log
+    /// every time, and the phantom-turn investigation showed that "which
+    /// producer wrote this turn, if any" is otherwise unanswerable.
+    pub fn submit_prompt(
+        &self,
+        message: &str,
+        caller: PtyWriteCaller,
+    ) -> Result<SubmitPayload, String> {
         // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
         // directly rather than routing through `write`, so it does NOT inherit
         // that gate — without this, `POST /terminals/{id}/submit-prompt` and
@@ -3192,6 +3379,23 @@ impl TerminalSession {
             );
         }
 
+        // The unconditional attribution line (plan
+        // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`
+        // Phase 2). The rewrite warn above fires only when the body CHANGED,
+        // so an ordinary submit left no trace of which producer sent it —
+        // which is what made ruling the runner out of the phantom `is` turn a
+        // multi-hour correlation. Same redaction posture as that warn: the
+        // body is untrusted and never logged; its length and a short digest
+        // of the sanitized body (what actually reaches the wire) are enough to
+        // match it against a transcript turn.
+        info!(
+            terminal_id = %self.id,
+            caller = %caller,
+            body_bytes = report.body.len(),
+            body_sha256_8 = %short_body_hash(&report.body),
+            "terminal submit_prompt"
+        );
+
         let block = paste_block_from_body(&report.body);
 
         // Phase 1: write the bracketed-paste block, flush, release the
@@ -3209,6 +3413,19 @@ impl TerminalSession {
                 .flush()
                 .map_err(|e| format!("Failed to flush PTY: {}", e))?;
         } // writer lock released
+
+        // The body is on the wire now, so this is an input event the PTY
+        // child can act on even if the trailing CR below fails — record it
+        // here rather than after the CR, or a half-written submit would read
+        // as "no input" to the phantom-turn detector.
+        self.record_input(
+            PtyInputObservation {
+                caller,
+                at: Instant::now(),
+                bytes: block.len(),
+            },
+            true,
+        );
 
         // Sleep so Claude Code's readline can fully process the paste
         // sequence BEFORE the submit byte arrives. Without this, the
@@ -4365,6 +4582,7 @@ mod tests {
             // hook no-ops when this is `None`.
             app_handle: None,
             input_line_buf: Arc::new(Mutex::new(String::new())),
+            last_input: Mutex::new(PtyInputSlots::default()),
             pinned_session_id: "test-pinned-session".to_string(),
         }
     }
@@ -5375,7 +5593,7 @@ mod tests {
         assert!(!session.is_alive(), "fixture precondition: pty is dead");
 
         let err = session
-            .submit_prompt("rm -rf /")
+            .submit_prompt("rm -rf /", PtyWriteCaller::Test)
             .expect_err("submit_prompt to an exited pty must be refused");
 
         assert!(err.starts_with(TERMINAL_EXITED), "got {err:?}");
@@ -5394,7 +5612,7 @@ mod tests {
         assert!(!session.is_alive(), "fixture precondition: pty is dead");
 
         let err = session
-            .write(b"rm -rf /\r")
+            .write(b"rm -rf /\r", PtyWriteCaller::Test)
             .expect_err("a write to an exited pty must be refused, not silently accepted");
 
         assert!(
@@ -5420,7 +5638,7 @@ mod tests {
         let session = LiveTestSession::new(buf.clone());
 
         session
-            .write(b"echo hi\r")
+            .write(b"echo hi\r", PtyWriteCaller::Test)
             .expect("a write to a live pty must still succeed");
 
         assert_eq!(
@@ -5438,7 +5656,9 @@ mod tests {
         let session = make_test_session(buf);
         *session.exit_code.lock().unwrap() = Some(137);
 
-        let err = session.write(b"x").expect_err("dead pty must refuse");
+        let err = session
+            .write(b"x", PtyWriteCaller::Test)
+            .expect_err("dead pty must refuse");
 
         assert!(
             err.contains("137"),
@@ -5453,7 +5673,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("before\x1b[201~after")
+            .submit_prompt("before\x1b[201~after", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
 
@@ -5489,7 +5709,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("ok\u{0}\u{7}\u{1b}zdone")
+            .submit_prompt("ok\u{0}\u{7}\u{1b}zdone", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
         // 'z' is not an escape introducer, so the ESC is a stray control byte.
@@ -5508,7 +5728,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("x\x1b[201~y")
+            .submit_prompt("x\x1b[201~y", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         assert_eq!(
             buf.lock().unwrap().clone(),
@@ -5596,7 +5816,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("before\x1b[200~after")
+            .submit_prompt("before\x1b[200~after", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
 
@@ -5624,7 +5844,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("\x1b]0;title")
+            .submit_prompt("\x1b]0;title", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         assert_eq!(
             buf.lock().unwrap().clone(),
@@ -5639,7 +5859,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         let payload = session
-            .submit_prompt(message)
+            .submit_prompt(message, PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
         (payload, written)
@@ -5864,7 +6084,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("hello")
+            .submit_prompt("hello", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
         assert_eq!(written, b"\x1b[200~hello\x1b[201~\r");
@@ -5879,7 +6099,7 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
         session
-            .submit_prompt("line1 line2")
+            .submit_prompt("line1 line2", PtyWriteCaller::Test)
             .expect("submit_prompt failed");
         let written = buf.lock().unwrap().clone();
         assert!(
@@ -5887,6 +6107,243 @@ mod tests {
             "submit_prompt must not emit LF bytes; got {:?}",
             written
         );
+    }
+
+    // ---- PTY-write attribution (plan
+    // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`
+    // Phase 2) ----------------------------------------------------------------
+
+    /// Run `f` under a scoped fmt subscriber at `level` and return everything
+    /// it logged. Scoped (`with_default`), not global: the harness runs tests
+    /// in parallel and a global subscriber can be installed once per process.
+    ///
+    /// Two guards against tracing's PROCESS-GLOBAL callsite caches, which a
+    /// scoped subscriber does not escape: a callsite's `Interest` and the
+    /// global max level are recomputed whenever any dispatcher registers, and
+    /// capture tests at different levels racing each other measurably lost a
+    /// whole log (an empty capture) under a parallel run. So the captures
+    /// here run one at a time, and each rebuilds the interest cache once its
+    /// own subscriber is the thread default, before `f` logs anything.
+    fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
+        static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
+        let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Captured::default();
+        let buf = sink.0.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink)
+            .with_ansi(false)
+            .with_max_level(level)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let bytes = buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Every production producer, so the per-producer tests below cannot
+    /// silently skip a variant added later without touching this list.
+    fn every_production_caller() -> Vec<PtyWriteCaller> {
+        vec![
+            PtyWriteCaller::HttpSubmitPrompt,
+            PtyWriteCaller::LoopingAgentNudge,
+            PtyWriteCaller::AccountMigration,
+            PtyWriteCaller::AutoResponse {
+                rule_id: "rule-7".to_string(),
+            },
+            PtyWriteCaller::WorkerSession,
+            PtyWriteCaller::TauriTerminalWrite,
+            PtyWriteCaller::TauriInvokeProxy,
+            PtyWriteCaller::RemoteTerminalInput,
+            PtyWriteCaller::HttpWrite,
+            PtyWriteCaller::WebSocketInput,
+            PtyWriteCaller::PtyTransport,
+            PtyWriteCaller::ClaudeCliTransport,
+            PtyWriteCaller::LaunchInitialCommand,
+            PtyWriteCaller::HttpCreateInitialCommand,
+            PtyWriteCaller::StewardLaunchCommand,
+        ]
+    }
+
+    /// Tags are spelled out literally: deriving them from `tag()` would
+    /// restate the implementation. Also pins that they are pairwise distinct —
+    /// two producers sharing a tag is the attribution failure itself.
+    #[test]
+    fn every_producer_has_a_distinct_literal_tag() {
+        let tags: Vec<String> = every_production_caller()
+            .iter()
+            .map(|c| c.tag().into_owned())
+            .collect();
+        assert_eq!(
+            tags,
+            vec![
+                "http_submit_prompt",
+                "looping_agent_nudge",
+                "account_migration",
+                "auto_response:rule-7",
+                "worker_session",
+                "tauri_terminal_write",
+                "tauri_invoke_proxy",
+                "remote_terminal_input",
+                "http_write",
+                "websocket_input",
+                "pty_transport",
+                "claude_cli_transport",
+                "launch_initial_command",
+                "http_create_initial_command",
+                "steward_launch_command",
+            ]
+        );
+        let distinct: BTreeSet<&String> = tags.iter().collect();
+        assert_eq!(distinct.len(), tags.len(), "duplicate tag in {tags:?}");
+    }
+
+    /// The unconditional `info!` inside `submit_prompt`: for EVERY producer,
+    /// the tag, byte count and hash reach the line — for an unaltered body,
+    /// which the older rewrite-only warn never logged at all.
+    #[test]
+    fn submit_prompt_logs_every_callers_tag_with_length_and_hash() {
+        for caller in every_production_caller() {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let session = LiveTestSession::new(buf);
+            let tag = caller.tag().into_owned();
+            let logs = capture_logs(tracing::Level::INFO, || {
+                session
+                    .submit_prompt("hello", caller)
+                    .expect("submit_prompt failed");
+            });
+            let line = logs
+                .lines()
+                .find(|l| l.contains("terminal submit_prompt"))
+                .unwrap_or_else(|| panic!("no submit_prompt line for {tag}; logs: {logs:?}"));
+            assert!(line.contains(&format!("caller={tag}")), "{line:?}");
+            assert!(line.contains("body_bytes=5"), "{line:?}");
+            // sha256("hello") = 2cf24dba5fb0a30e...
+            assert!(line.contains("body_sha256_8=2cf24dba"), "{line:?}");
+        }
+    }
+
+    /// The redaction half: the body itself must never reach the log.
+    #[test]
+    fn submit_prompt_log_never_carries_the_body() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf);
+        let logs = capture_logs(tracing::Level::TRACE, || {
+            session
+                .submit_prompt("hunter2-secret-body", PtyWriteCaller::HttpSubmitPrompt)
+                .expect("submit_prompt failed");
+        });
+        assert!(logs.contains("caller=http_submit_prompt"), "{logs:?}");
+        assert!(
+            !logs.contains("hunter2"),
+            "body leaked into the log: {logs:?}"
+        );
+    }
+
+    /// `write` logs the tag at DEBUG, for every producer — and at INFO emits
+    /// nothing, because an info line per keystroke would flood the log.
+    #[test]
+    fn write_logs_every_callers_tag_at_debug_only() {
+        for caller in every_production_caller() {
+            let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let session = LiveTestSession::new(buf);
+            let tag = caller.tag().into_owned();
+            let at_debug = capture_logs(tracing::Level::DEBUG, || {
+                session.write(b"k", caller.clone()).expect("write failed");
+            });
+            assert!(
+                at_debug
+                    .lines()
+                    .any(|l| l.contains("terminal pty write")
+                        && l.contains(&format!("caller={tag}"))),
+                "no debug write line for {tag}; logs: {at_debug:?}"
+            );
+            let at_info = capture_logs(tracing::Level::INFO, || {
+                session.write(b"k", caller).expect("write failed");
+            });
+            assert!(
+                !at_info.contains("terminal pty write"),
+                "write must not log at info; got {at_info:?}"
+            );
+        }
+    }
+
+    /// The slots Phase 3 reads: each choke point fills its own, and `latest`
+    /// picks whichever happened last.
+    #[test]
+    fn write_and_submit_update_their_own_last_input_slots() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf);
+        assert!(
+            session.last_input().latest().is_none(),
+            "fresh session has no input"
+        );
+
+        let before = Instant::now();
+        session
+            .write(b"abc", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        let slots = session.last_input();
+        let w = slots.last_write.as_ref().expect("write slot must be set");
+        assert_eq!(w.caller, PtyWriteCaller::TauriTerminalWrite);
+        assert_eq!(w.bytes, 3);
+        assert!(w.at >= before);
+        assert!(slots.last_submit.is_none());
+        assert_eq!(
+            slots.latest().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::TauriTerminalWrite)
+        );
+
+        session
+            .submit_prompt("hi", PtyWriteCaller::WorkerSession)
+            .expect("submit_prompt failed");
+        let slots = session.last_input();
+        let s = slots.last_submit.as_ref().expect("submit slot must be set");
+        assert_eq!(s.caller, PtyWriteCaller::WorkerSession);
+        // The paste block: begin marker + body + end marker.
+        assert_eq!(s.bytes, b"\x1b[200~hi\x1b[201~".len());
+        assert_eq!(
+            slots.last_write.as_ref().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::TauriTerminalWrite),
+            "a submit must not overwrite the write slot"
+        );
+        assert_eq!(
+            slots.latest().map(|o| o.caller.clone()),
+            Some(PtyWriteCaller::WorkerSession)
+        );
+    }
+
+    /// A REFUSED write put nothing on the wire, so it must not read as input —
+    /// otherwise a dead pane's rejected keystroke would mask a phantom turn.
+    #[test]
+    fn a_refused_write_leaves_the_last_input_slots_empty() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = make_test_session(buf);
+        let _ = session.write(b"x", PtyWriteCaller::HttpWrite);
+        let _ = session.submit_prompt("x", PtyWriteCaller::HttpSubmitPrompt);
+        let slots = session.last_input();
+        assert!(slots.last_write.is_none() && slots.last_submit.is_none());
     }
 
     #[test]
@@ -5940,14 +6397,18 @@ mod tests {
         // dispatch is skipped but line assembly still runs).
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let session = LiveTestSession::new(buf.clone());
-        session.write(b"claude --re").expect("write failed");
+        session
+            .write(b"claude --re", PtyWriteCaller::Test)
+            .expect("write failed");
         assert_eq!(
             session.input_line_buf.lock().unwrap().as_str(),
             "claude --re",
             "write() must feed the typed-input observer"
         );
         // Completing the line drains the buffer (the line was dispatched)...
-        session.write(b"sume\r").expect("write failed");
+        session
+            .write(b"sume\r", PtyWriteCaller::Test)
+            .expect("write failed");
         assert!(session.input_line_buf.lock().unwrap().is_empty());
         // ...and the PTY itself still received every byte, unchanged.
         assert_eq!(buf.lock().unwrap().as_slice(), b"claude --resume\r");

@@ -669,7 +669,10 @@ pub async fn steward_start_handler(
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 if let Some(session) = mgr.get(&tid) {
                     let cmd = format!("{}\r\n", cmd);
-                    let _ = session.write(cmd.as_bytes());
+                    let _ = session.write(
+                        cmd.as_bytes(),
+                        crate::terminal::session::PtyWriteCaller::StewardLaunchCommand,
+                    );
                 }
             });
 

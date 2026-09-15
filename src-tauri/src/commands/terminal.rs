@@ -437,7 +437,10 @@ pub fn terminal_write(
     // to answer; the frontend's `buildWriteFailure` reads that prefix off the
     // rejected invoke and classifies it as `TERMINAL_EXITED` even when this
     // pane has not yet seen its own `terminal-exit` event.
-    session.write(&bytes)?;
+    session.write(
+        &bytes,
+        crate::terminal::session::PtyWriteCaller::TauriTerminalWrite,
+    )?;
 
     Ok(CommandResponse {
         success: true,
