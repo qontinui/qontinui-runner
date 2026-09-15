@@ -898,6 +898,20 @@ pub(crate) enum ProxyFailureLayer {
     /// credentials, never a rejection of either — the distinction
     /// `verification-and-evidence` `silent-empty-is-unknown` exists to keep.
     RunnerTransport,
+    /// The runner refused BEFORE forwarding because **its own** coord
+    /// credential cannot answer (plan
+    /// `2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`,
+    /// Phase 3). The session's nonce is FINE and coord was never dialed.
+    ///
+    /// This is the fourth layer and it is the one the incident turned on. The
+    /// proxy used to accept every session's nonce and forward with a dead
+    /// device JWT, so every session received coord's `token_expired` — which
+    /// the MCP client, `/coord-revive` and the incident's own first diagnosis
+    /// all attribute to the NONCE. Neither existing layer says the true thing:
+    /// [`ProxyFailureLayer::RunnerNonce`] blames the caller's key, and
+    /// [`ProxyFailureLayer::CoordUpstream`] asserts a round trip that never
+    /// happened.
+    RunnerCredential,
 }
 
 impl ProxyFailureLayer {
@@ -909,6 +923,7 @@ impl ProxyFailureLayer {
             ProxyFailureLayer::RunnerNonce => "runner-nonce",
             ProxyFailureLayer::CoordUpstream => "coord-upstream",
             ProxyFailureLayer::RunnerTransport => "runner-transport",
+            ProxyFailureLayer::RunnerCredential => "runner-credential",
         }
     }
 
@@ -952,8 +967,248 @@ impl ProxyFailureLayer {
                  it persists, check coord's own reachability (GET $COORD_HTTP_URL/health) before \
                  touching any credential."
             }
+            // Same "a new session will NOT help" direction as `CoordUpstream`
+            // — the runner's device credential is device-wide and follows the
+            // session — but for a DIFFERENT reason, and it names the one thing
+            // the caller could otherwise never learn: the nonce is fine.
+            //
+            // That phrase is verbatim from `CoordUpstream`'s door ON PURPOSE:
+            // the caller's WRONG move is the same in both cases, and the two
+            // doors are read by the same recovery scripts. Pinned by
+            // `runner_credential_tests::the_runner_credential_layer_is_distinct_and_says_a_new_session_wont_help`.
+            ProxyFailureLayer::RunnerCredential => {
+                "Your loopback nonce is FINE and coord was never dialed — this RUNNER's own \
+                 coord credential cannot answer, so starting a new session will NOT help: it \
+                 mints a new nonce and fails identically. \
+                 Use a credential-free door (see `credential_free_doors`) or a \
+                 device JWT against coord directly; the runner's credential is healed by its \
+                 own refresher or by re-pairing this runner, neither of which a session can do. \
+                 GET /health .coordCredential for the posture and since-when."
+            }
         }
     }
+}
+
+/// The machine-readable `code` a locally-refused coord-mcp request carries when
+/// the RUNNER's own coord credential cannot answer — one per non-answering
+/// posture, `None` for the two that can.
+///
+/// **These four spellings are a cross-repo wire contract.** The fleet's readers
+/// (`/coord-revive`'s verdict table, `scripts/breadcrumb-reason-drift.py`,
+/// `/whereami`, the KB reason table in `qontinui-claude-config`) match on them
+/// verbatim, so they are an exhaustive `match` rather than a `format!` over
+/// [`CoordCredentialPosture::as_str`]: a new posture variant must fail to
+/// compile here and force a decision, not silently mint a fifth token nothing
+/// downstream knows.
+pub(crate) fn runner_credential_refusal_code(
+    posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+) -> Option<&'static str> {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+    match posture {
+        P::Live | P::Expiring => None,
+        P::Expired => Some("runner_credential_expired"),
+        P::Absent => Some("runner_credential_absent"),
+        P::Unrefreshable => Some("runner_credential_unrefreshable"),
+        P::Dark(_) => Some("runner_credential_dark"),
+    }
+}
+
+/// The UPPERCASE twin of [`runner_credential_refusal_code`]: the token stamped
+/// into the breadcrumb's line-2 `verdict` (and named in line 1), so one grep
+/// spans the 401 body, the breadcrumb and the session briefing.
+pub(crate) fn runner_credential_breadcrumb_verdict(
+    posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+) -> Option<&'static str> {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+    match posture {
+        P::Live | P::Expiring => None,
+        P::Expired => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
+        P::Absent => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_ABSENT),
+        P::Unrefreshable => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE),
+        P::Dark(_) => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_DARK),
+    }
+}
+
+/// The inverse of [`runner_credential_refusal_code`], for a reader that holds
+/// only the wire `code` — the loopback PROBE, which sees this runner's own
+/// local refusal as a plain 401 body and would otherwise classify it as a
+/// stale nonce ([`ProbeVerdict::ProxyUnauthorized`]), reproducing the exact
+/// misattribution this phase exists to end one layer down.
+pub(crate) fn runner_credential_verdict_for_code(code: &str) -> Option<&'static str> {
+    match code {
+        "runner_credential_expired" => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
+        "runner_credential_absent" => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_ABSENT),
+        "runner_credential_unrefreshable" => {
+            Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE)
+        }
+        "runner_credential_dark" => Some(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_DARK),
+        _ => None,
+    }
+}
+
+/// The one-line `remedy` the local 401 carries. It exists to stop the caller
+/// spending its recovery budget on the nonce: every line below names what the
+/// SESSION can actually do, and none of them says "restart the runner" (served
+/// policy `production-and-cost` `runner-lifecycle`).
+pub(crate) fn runner_credential_remedy(
+    posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+) -> &'static str {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+    match posture {
+        // Not reachable through the refusal path (both can answer), but the
+        // function stays total rather than panicking.
+        P::Live | P::Expiring => {
+            "No remedy needed — this runner's coord credential can answer; retry."
+        }
+        P::Expired => {
+            "The runner's coord credential is EXPIRED and its refresher has not replaced it \
+             yet. Your nonce is fine — do not re-provision. Retry shortly, or use a \
+             credential-free door / a device JWT straight against coord."
+        }
+        P::Absent => {
+            "This runner holds NO coord credential — it has never been paired, or its slot was \
+             cleared. Your nonce is fine. Pair the runner (operator action), or use a device \
+             JWT straight against coord meanwhile."
+        }
+        P::Unrefreshable => {
+            "The runner's coord credential expired and automatic refresh FAILED — no further \
+             automatic rung exists. Your nonce is fine and a new session will not help. \
+             Re-pair this runner (operator action); meanwhile use a credential-free door."
+        }
+        P::Dark(_) => {
+            "Coord is REJECTING this runner's credential even though it has not expired \
+             locally (revoked jti, rotated key, or a token bound to another tenant). Your \
+             nonce is fine. Re-pair this runner; meanwhile use a credential-free door."
+        }
+    }
+}
+
+/// The `credential_free_doors` catalogue as COORD last attached it to a refusal
+/// on this box. `None` = coord has not refused anything since this process
+/// started, which is UNKNOWN about the catalogue, never "there are no doors".
+///
+/// DD4 says the local refusal keeps this catalogue, and the runner cannot
+/// author it: it enumerates doors on COORD's side and coord versions it. So it
+/// is COPIED from the last coord answer that carried one rather than hardcoded
+/// — a compiled-in copy would age into a list of doors that no longer exist,
+/// which is the pinned-mutable-value defect this fleet keeps re-learning.
+static LAST_CREDENTIAL_FREE_DOORS: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
+
+/// How much of a coord body is scanned for the catalogue. Same budget and same
+/// reasoning as `device_jwt_refresher`'s upstream scan: `serde_json` sorts
+/// keys, so the catalogue sits near the front of a refusal body.
+const CREDENTIAL_FREE_DOORS_SCAN_BYTES: usize = 8192;
+
+/// Remember the `credential_free_doors` catalogue out of a coord answer, if it
+/// carried one. Best-effort and cheap: a body without the key leaves the
+/// previous catalogue standing (absence is not a statement that the doors are
+/// gone), and an unparseable body is ignored entirely.
+pub(crate) fn record_credential_free_doors(body: &[u8]) {
+    let scan = &body[..body.len().min(CREDENTIAL_FREE_DOORS_SCAN_BYTES)];
+    let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_slice::<serde_json::Value>(scan.as_ref())
+    else {
+        return;
+    };
+    let Some(doors) = map.get("credential_free_doors") else {
+        return;
+    };
+    if doors.is_null() {
+        return;
+    }
+    *LAST_CREDENTIAL_FREE_DOORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(doors.clone());
+}
+
+/// The catalogue to attach to a locally-built refusal, or `None` when coord has
+/// not supplied one yet in this process.
+pub(crate) fn last_credential_free_doors() -> Option<serde_json::Value> {
+    LAST_CREDENTIAL_FREE_DOORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_credential_free_doors_for_test() {
+    *LAST_CREDENTIAL_FREE_DOORS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// DD4's decision, as a pure function: should this coord-mcp request be
+/// REFUSED LOCALLY because the runner's own credential cannot answer?
+///
+/// `Some((code, body))` ⇒ answer `401` with `body` and do not dial coord.
+/// `None` ⇒ forward exactly as before. Three of the four `None` arms are
+/// load-bearing:
+///
+/// * **UNKNOWN is not a fault.** `posture: None` means no refresher pass has
+///   concluded in this process yet. Manufacturing a 401 from that would be the
+///   `silent-empty-is-unknown` defect pointed the other way — it would break
+///   every session on a freshly-started runner during the seconds before the
+///   first pass.
+/// * **`live` / `expiring` forward**, unchanged. `expiring` is inside the
+///   refresh window and still usable; refusing it would convert a routine
+///   rotation into an outage.
+/// * **AGENT principals forward.** An agent bearer comes from that agent's own
+///   token slot; this runner's device posture is not a statement about it, and
+///   refusing it here would fabricate a fault out of an unrelated credential.
+///   Same bound as the retry arm and `note_coord_upstream_verdict`'s.
+pub(crate) fn runner_credential_local_refusal(
+    principal: &ProxyPrincipal,
+    posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
+) -> Option<(&'static str, serde_json::Value)> {
+    if !matches!(principal, ProxyPrincipal::Device) {
+        return None;
+    }
+    let status = posture?;
+    let code = runner_credential_refusal_code(status.posture)?;
+    Some((code, runner_credential_refusal_body(code, status)))
+}
+
+/// The body of the local 401. The three keys DD4 names —
+/// `code` / `since` / `remedy` — are the contract; everything else is the
+/// standard envelope vocabulary so an existing consumer is not surprised.
+///
+/// `since` is ISO-8601 (RFC 3339, UTC) because it is read by humans and by the
+/// fleet's shell doors, not only by this process; the raw unix seconds ride
+/// along as `since_unix` for anything that would otherwise re-parse it.
+pub(crate) fn runner_credential_refusal_body(
+    code: &str,
+    status: &crate::mcp::device_jwt_refresher::CoordCredentialStatus,
+) -> serde_json::Value {
+    let since = chrono::DateTime::<chrono::Utc>::from_timestamp(status.since, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_default();
+    let mut v = serde_json::json!({
+        "success": false,
+        "code": code,
+        "since": since,
+        "remedy": runner_credential_remedy(status.posture),
+        "error": status.posture.message(),
+        "layer": ProxyFailureLayer::RunnerCredential.as_str(),
+        "cause": code,
+        "next_door": ProxyFailureLayer::RunnerCredential.next_door(),
+        "posture": status.posture.as_str(),
+        "posture_cause": status.posture.cause(),
+        "since_unix": status.since,
+        "probed_at": chrono::Utc::now().to_rfc3339(),
+        "retryable": matches!(
+            status.posture,
+            crate::mcp::device_jwt_refresher::CoordCredentialPosture::Expired
+        ),
+    });
+    // DD4: "the `credential_free_doors` catalogue coord attaches stays, copied
+    // from the last coord answer". Omitted rather than emitted empty when this
+    // process has never seen one — an empty list would read as "there are no
+    // doors", which is the opposite of UNKNOWN.
+    if let (Some(obj), Some(doors)) = (v.as_object_mut(), last_credential_free_doors()) {
+        obj.insert("credential_free_doors".to_string(), doors);
+    }
+    v
 }
 
 /// Build the typed failure envelope every coord-mcp proxy failure returns
@@ -2252,6 +2507,49 @@ pub(crate) fn spawn_log_proxy_nonce_rejected(nonce: Option<&str>, cause: impl In
 /// workdir here — which is precisely the attribution the `reject` rows usually
 /// cannot supply, and why this row is worth emitting separately.
 pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, cause: &str) {
+    log_proxy_upstream_rejected_as(
+        nonce,
+        status,
+        cause,
+        ProxyFailureLayer::CoordUpstream,
+        "upstream",
+    );
+}
+
+/// Record a coord-mcp proxy request the runner REFUSED LOCALLY because its own
+/// coord credential cannot answer (Phase 3a of the credential-posture plan).
+///
+/// Same `upstream-reject` EVENT as coord's own rejection — a caller reading the
+/// stream is asking "which requests did not get a coord answer?", and both
+/// belong to that question — but a different `layer` and a `cause` that opens
+/// with the `runner_credential_<posture>` code. That is what makes the join
+/// separate this case from an evicted nonce: a `reject` row means the runner
+/// refused the KEY, a `coord-upstream` row means coord refused the BEARER, and
+/// a `runner-credential` row means the runner refused on its OWN credential
+/// with the key intact and coord never dialed.
+pub(crate) fn log_proxy_runner_credential_rejected(nonce: Option<&str>, cause: &str) {
+    log_proxy_upstream_rejected_as(
+        nonce,
+        401,
+        cause,
+        ProxyFailureLayer::RunnerCredential,
+        // Its OWN throttle namespace, for the reason the `upstream:` one was
+        // namespaced: sharing a window would let these two silently suppress
+        // each other and re-create the conflation inside the throttle.
+        "credential",
+    );
+}
+
+/// The shared body of [`log_proxy_upstream_rejected`] and
+/// [`log_proxy_runner_credential_rejected`] — one emitter so the two rows can
+/// never drift in shape, only in `layer` and `cause`.
+fn log_proxy_upstream_rejected_as(
+    nonce: Option<&str>,
+    status: u16,
+    cause: &str,
+    layer: ProxyFailureLayer,
+    throttle_namespace: &str,
+) {
     let nonce = nonce.unwrap_or("");
     // NAMESPACED, and that is load-bearing. `reject_throttle_admit` is keyed by
     // the key prefix alone, so sharing it would let a runner-nonce `reject` and
@@ -2260,7 +2558,7 @@ pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, caus
     // conflation of the two layers this phase exists to end. `reject`'s own key
     // is left byte-identical so its behaviour and its test are unchanged.
     let prefix = rotation_key_prefix(nonce);
-    let Some(suppressed) = reject_throttle_admit(&format!("upstream:{prefix}")) else {
+    let Some(suppressed) = reject_throttle_admit(&format!("{throttle_namespace}:{prefix}")) else {
         return;
     };
     let attr = reject_attribution_for_nonce(nonce);
@@ -2271,10 +2569,7 @@ pub(crate) fn log_proxy_upstream_rejected(nonce: Option<&str>, status: u16, caus
     };
     let mut fields = attribution_fields(&attr);
     fields.push(("upstream_status", serde_json::Value::from(status)));
-    fields.push((
-        "layer",
-        serde_json::Value::from(ProxyFailureLayer::CoordUpstream.as_str()),
-    ));
+    fields.push(("layer", serde_json::Value::from(layer.as_str())));
     log_rotation_event_with("upstream-reject", &attr.workdir, nonce, &cause, &fields);
 }
 
@@ -2290,6 +2585,20 @@ pub(crate) fn spawn_log_proxy_upstream_rejected(
     let cause = cause.into();
     tokio::task::spawn_blocking(move || {
         log_proxy_upstream_rejected(nonce.as_deref(), status, &cause)
+    });
+}
+
+/// [`log_proxy_runner_credential_rejected`] for an ASYNC caller — same
+/// detached, fire-and-forget contract: the local 401 must never wait on
+/// forensics.
+pub(crate) fn spawn_log_proxy_runner_credential_rejected(
+    nonce: Option<&str>,
+    cause: impl Into<String>,
+) {
+    let nonce = nonce.map(str::to_owned);
+    let cause = cause.into();
+    tokio::task::spawn_blocking(move || {
+        log_proxy_runner_credential_rejected(nonce.as_deref(), &cause)
     });
 }
 
@@ -6430,6 +6739,57 @@ pub(crate) const BREADCRUMB_VERDICT_PORT_UNRESOLVABLE: &str = "PORT_UNRESOLVABLE
 /// Verdict token: an agent JWT with no parseable `sub` (agent_id) claim.
 pub(crate) const BREADCRUMB_VERDICT_AGENT_JWT_NO_SUB: &str = "AGENT_JWT_NO_SUB";
 
+// ---------------------------------------------------------------------------
+// The RUNNER-CREDENTIAL verdict family (plan
+// `2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`,
+// Phase 3b).
+//
+// **The novel combination these four name: the `.mcp.json` IS valid and WAS
+// written, and the session still cannot reach coord.** Every other verdict in
+// this file reports a config that is missing, foreign or un-probeable; these
+// report a config that is perfect and a RUNNER credential that is dead. Nothing
+// before them could say that, so a session spawned onto a credential-dark
+// runner was handed a healthy-looking workdir and no statement at all.
+//
+// **Cross-repo wire contract.** The fleet's readers match these spellings
+// verbatim (`/coord-revive`'s verdict table, `/whereami`,
+// `scripts/breadcrumb-reason-drift.py` and the KB reason table in
+// `qontinui-claude-config`). Do not re-spell them without landing the reader
+// side in the same window.
+// ---------------------------------------------------------------------------
+
+/// Verdict token: a valid `.mcp.json` was written and this runner's coord
+/// credential has EXPIRED, so nothing the session sends through it reaches
+/// coord.
+pub(crate) const BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED: &str = "RUNNER_CREDENTIAL_EXPIRED";
+/// Verdict token: as above, with the runner holding NO coord credential at all.
+pub(crate) const BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_ABSENT: &str = "RUNNER_CREDENTIAL_ABSENT";
+/// Verdict token: as above, and the automatic recovery rung already RAN and
+/// did not put a working credential back — the terminal state.
+pub(crate) const BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE: &str =
+    "RUNNER_CREDENTIAL_UNREFRESHABLE";
+/// Verdict token: as above, with a credential that looks alive locally and that
+/// coord repeatedly refuses.
+pub(crate) const BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_DARK: &str = "RUNNER_CREDENTIAL_DARK";
+
+/// The ONE line-1 wording the runner-credential family writes, repeated
+/// VERBATIM at both of its call sites (provision time and the loopback probe).
+///
+/// Deliberately one wording for four postures and two sites:
+/// `scripts/breadcrumb-reason-drift.py` keys the KB table on distinct reason
+/// literals, so a per-posture wording would be eight table rows describing one
+/// condition. The posture rides the `{}` that script already normalizes to
+/// `<VALUE>`, and the typed token lives in line 2's `verdict`.
+///
+/// This const is **not** what the call sites pass — that same script reads
+/// *the first string literal after each `write_degraded_breadcrumb(`* and exits
+/// 2 (UNKNOWN) on a reason handed in as a variable, which its own header warns
+/// about. So the literal is spelled out at each site and this const exists for
+/// [`runner_credential_tests::the_two_credential_breadcrumb_sites_share_one_literal`],
+/// which is what actually stops the two copies drifting.
+#[cfg(test)]
+pub(crate) const RUNNER_CREDENTIAL_BREADCRUMB_REASON: &str = "{} — this RUNNER's own coord credential cannot answer; the session's .mcp.json and proxy nonce are FINE and a new session will not help";
+
 /// Schema version of the breadcrumb's second line. Bumped whenever the JSON
 /// object's shape changes, so a reader can refuse to guess rather than
 /// misparsing a future shape as this one.
@@ -6614,6 +6974,18 @@ pub(crate) enum ProbeVerdict {
     Http200NotMcp,
     /// Anything left, carrying a truncated error string.
     Transport(String),
+    /// 401 whose body carries one of the `runner_credential_*` codes: THIS
+    /// runner refused its own probe because its coord credential cannot answer
+    /// (plan `2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`,
+    /// Phase 3a). Carries the uppercase verdict token.
+    ///
+    /// **It must not collapse into [`ProbeVerdict::ProxyUnauthorized`].** Both
+    /// are a 401 on the loopback port, and the two recoveries are opposite: a
+    /// stale nonce is fixed by a new session, and a dead runner credential
+    /// follows every new session. Reading this as a stale nonce would
+    /// reproduce, in the breadcrumb, exactly the misattribution Phase 3a
+    /// removes from the response.
+    RunnerCredential(String),
 }
 
 impl ProbeVerdict {
@@ -6628,6 +7000,7 @@ impl ProbeVerdict {
             ProbeVerdict::Http(code) => format!("HTTP_{code}"),
             ProbeVerdict::Http200NotMcp => "HTTP_200_NOT_MCP".to_string(),
             ProbeVerdict::Transport(_) => "TRANSPORT".to_string(),
+            ProbeVerdict::RunnerCredential(token) => token.clone(),
         }
     }
 }
@@ -6682,7 +7055,18 @@ fn body_carries_jsonrpc_envelope(body: &str) -> bool {
 /// nobody saw.
 pub(crate) fn verdict_for_response(status: u16, body: Option<&str>) -> ProbeVerdict {
     match status {
-        401 => ProbeVerdict::ProxyUnauthorized,
+        // A 401 the RUNNER wrote about its OWN credential is a different fact
+        // from a 401 about the caller's key, and only the body separates them.
+        // A 401 with no readable body stays `ProxyUnauthorized`, unchanged:
+        // absent evidence never promotes a verdict.
+        401 => match body
+            .and_then(crate::mcp::device_jwt_refresher::upstream_refusal_code)
+            .as_deref()
+            .and_then(runner_credential_verdict_for_code)
+        {
+            Some(token) => ProbeVerdict::RunnerCredential(token.to_string()),
+            None => ProbeVerdict::ProxyUnauthorized,
+        },
         503 => ProbeVerdict::CredentialRefreshing,
         s if (200..300).contains(&s) => match body {
             None => ProbeVerdict::Http(s),
@@ -6778,7 +7162,60 @@ pub(crate) fn apply_probe_verdict(
             &token,
             Some(port),
         ),
+        // The one arm whose reason does NOT open with `port :{port} probe` —
+        // deliberately. Nothing is wrong with the port, the config or the
+        // nonce; the proxy answered correctly and the fault is the runner's own
+        // credential. Wording it like the probe family would send the reader
+        // back to the transport. The literal is repeated verbatim at the
+        // provision-time site (see `RUNNER_CREDENTIAL_BREADCRUMB_REASON`) and
+        // must stay a LITERAL here — `breadcrumb-reason-drift.py` reads the
+        // first string literal after the call and exits UNKNOWN on a variable.
+        ProbeVerdict::RunnerCredential(_) => write_degraded_breadcrumb(
+            workdir,
+            &format!("{} — this RUNNER's own coord credential cannot answer; the session's .mcp.json and proxy nonce are FINE and a new session will not help", token),
+            &token,
+            Some(port),
+        ),
     }
+}
+
+/// Write the runner-credential breadcrumb into `workdir` when this runner's own
+/// coord credential cannot answer, and report whether it wrote one.
+///
+/// Called at PROVISION time, right after a valid `.mcp.json` has been written —
+/// which is the whole novelty. Every other breadcrumb in this file reports a
+/// config that is missing, foreign or un-probeable; this one reports a config
+/// that is perfect beside a credential that is dead, and before it existed that
+/// combination produced no artifact at all.
+///
+/// Three non-writes, each of which would be a lie:
+///
+/// * **UNKNOWN** (`None` — no refresher pass has concluded in this process)
+///   writes nothing. A breadcrumb minted from UNKNOWN would make every session
+///   spawned in the seconds after a runner start look credential-dark.
+/// * **`live` / `expiring`** write nothing: the credential can answer.
+/// * The AGENT provisioning arm does not call this at all — an agent session
+///   presents its own token, so the device posture is not about it.
+pub(crate) fn breadcrumb_runner_credential_if_dark(workdir: &str) -> bool {
+    let Some(status) = crate::mcp::device_jwt_refresher::coord_credential_posture() else {
+        return false;
+    };
+    let Some(verdict) = runner_credential_breadcrumb_verdict(status.posture) else {
+        return false;
+    };
+    warn!(
+        posture = status.posture.as_str(),
+        workdir = %workdir,
+        "coord_mcp: .mcp.json written for this session, but the RUNNER's coord credential \
+         cannot answer — breadcrumbing {verdict}"
+    );
+    write_degraded_breadcrumb(
+        workdir,
+        &format!("{} — this RUNNER's own coord credential cannot answer; the session's .mcp.json and proxy nonce are FINE and a new session will not help", verdict),
+        verdict,
+        None,
+    );
+    true
 }
 
 /// Fire the probe and return its typed verdict. Blocking; called only from the
@@ -6811,9 +7248,12 @@ fn probe_proxy_verdict(port: u16, nonce: &str) -> Option<ProbeVerdict> {
         {
             Ok(resp) => {
                 let status = resp.status().as_u16();
-                // Only a 2xx needs its body read; every other class is decided
-                // by the status alone.
-                let text = if (200..300).contains(&status) {
+                // A 2xx needs its body to tell an MCP envelope from something
+                // else answering on the port; a 401 now needs its body too, to
+                // tell the caller's stale nonce from THIS runner's own dead
+                // credential (`runner_credential_*`). Every other class is
+                // still decided by the status alone.
+                let text = if (200..300).contains(&status) || status == 401 {
                     resp.text().ok()
                 } else {
                     None
@@ -7151,6 +7591,15 @@ fn provision_coord_mcp_with_jwt(
             }
             None => write_coord_mcp_proxy_config(workdir, port),
         }
+        // Phase 3b — the config is FINE and the runner's own credential may not
+        // be. Written SYNCHRONOUSLY, before the probe below, so the artifact
+        // exists whether or not the detached probe ever concludes (a saturated
+        // box can take the full 12s budget, and the session is reading its
+        // workdir long before that). The probe then reaches the same verdict
+        // off its own 401 body and rewrites the same file, so the two agree
+        // rather than race: the probe cannot answer `Live` while the
+        // credential is dark, because this runner refuses its own probe.
+        breadcrumb_runner_credential_if_dark(workdir);
         // 1a — one-shot, non-blocking reachability probe; writes a breadcrumb
         // only on failure, nothing on success (discoverability without clutter).
         probe_and_breadcrumb_proxy(workdir, port);
@@ -17886,5 +18335,529 @@ mod coord_mcp_doctor_tests {
         assert_eq!(layer, "none");
         assert!(detail.contains("coord-ed25519-abc123"));
         assert!(detail.contains("until exp"));
+    }
+}
+
+/// Phase 3 of plan `2026-09-12-runner-loads-with-an-expired-coord-credential-
+/// and-tells-nobody`: the proxy and the spawn path stop attributing the
+/// RUNNER's credential fault to the caller's nonce.
+///
+/// Every test here fails against the parent commit, and each one pins a claim
+/// the incident disproved: a session on a credential-dark runner was told
+/// `token_expired` (which reads as "your nonce"), its workdir carried a valid
+/// `.mcp.json` and no breadcrumb at all, and its briefing said nothing.
+#[cfg(test)]
+mod runner_credential_tests {
+    use super::*;
+    use crate::mcp::device_jwt_refresher as djr;
+    use djr::{CoordCredentialPosture as P, DarkCause};
+
+    /// Publish `posture` into the process-global cell the way a refresher pass
+    /// would, and hand back the published status.
+    fn publish(posture: P) -> djr::CoordCredentialStatus {
+        djr::publish_coord_credential_posture(
+            posture,
+            Some("11111111-2222-3333-4444-555555555555".to_string()),
+            Some(1_700_000_000),
+            Some("cleared".to_string()),
+        );
+        djr::coord_credential_posture().expect("a publish always leaves a status")
+    }
+
+    /// The four NON-ANSWERING postures, in the order the ladder ranks them.
+    fn dark_postures() -> [P; 4] {
+        [
+            P::Expired,
+            P::Absent,
+            P::Unrefreshable,
+            P::Dark(DarkCause::UpstreamRejected),
+        ]
+    }
+
+    /// **The wire contract.** A sibling change in `qontinui-claude-config`
+    /// teaches `/coord-revive`, `/whereami`, the KB reason table and
+    /// `scripts/breadcrumb-reason-drift.py` these exact spellings; that script
+    /// compares source against docs and reds on a difference. Pinned here so a
+    /// rename fails in this repo's own suite rather than in the fleet's docs.
+    #[test]
+    fn the_four_wire_tokens_are_exactly_these_spellings() {
+        assert_eq!(
+            runner_credential_refusal_code(P::Expired),
+            Some("runner_credential_expired")
+        );
+        assert_eq!(
+            runner_credential_refusal_code(P::Absent),
+            Some("runner_credential_absent")
+        );
+        assert_eq!(
+            runner_credential_refusal_code(P::Unrefreshable),
+            Some("runner_credential_unrefreshable")
+        );
+        assert_eq!(
+            runner_credential_refusal_code(P::Dark(DarkCause::UpstreamRejected)),
+            Some("runner_credential_dark")
+        );
+        // The two that CAN answer have no code, because they are not refused.
+        assert_eq!(runner_credential_refusal_code(P::Live), None);
+        assert_eq!(runner_credential_refusal_code(P::Expiring), None);
+
+        assert_eq!(
+            BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED,
+            "RUNNER_CREDENTIAL_EXPIRED"
+        );
+        assert_eq!(
+            BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_ABSENT,
+            "RUNNER_CREDENTIAL_ABSENT"
+        );
+        assert_eq!(
+            BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_UNREFRESHABLE,
+            "RUNNER_CREDENTIAL_UNREFRESHABLE"
+        );
+        assert_eq!(
+            BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_DARK,
+            "RUNNER_CREDENTIAL_DARK"
+        );
+
+        // The uppercase token is the lowercase code, uppercased — asserted
+        // rather than assumed, because the two families are written out
+        // separately and a reader joins them by eye.
+        for p in dark_postures() {
+            let code = runner_credential_refusal_code(p).unwrap();
+            let verdict = runner_credential_breadcrumb_verdict(p).unwrap();
+            assert_eq!(verdict, code.to_ascii_uppercase());
+            // And the inverse map, which the probe depends on, round-trips.
+            assert_eq!(runner_credential_verdict_for_code(code), Some(verdict));
+        }
+        // Anything else is not this family. `token_expired` above all: that is
+        // COORD's code, the one the incident's readers mis-attributed.
+        assert_eq!(runner_credential_verdict_for_code("token_expired"), None);
+        assert_eq!(
+            runner_credential_verdict_for_code("runner_credential"),
+            None
+        );
+    }
+
+    /// DD4's core claim. A non-answering posture is refused HERE, with the
+    /// runner's own code; `live`/`expiring` forward untouched.
+    #[test]
+    fn a_non_answering_posture_refuses_locally_and_an_answering_one_forwards() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        for p in dark_postures() {
+            let status = publish(p);
+            let (code, body) =
+                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status))
+                    .unwrap_or_else(|| panic!("{p:?} must be refused locally"));
+            assert_eq!(code, runner_credential_refusal_code(p).unwrap());
+            assert_eq!(body["code"], code);
+            // The layer is the whole point: NOT `runner-nonce` (which blames
+            // the caller's key) and NOT `coord-upstream` (which asserts a
+            // round trip that never happened).
+            assert_eq!(body["layer"], "runner-credential");
+            assert_ne!(body["layer"], "runner-nonce");
+            assert_ne!(body["layer"], "coord-upstream");
+            djr::reset_coord_credential_posture_for_test();
+        }
+
+        for p in [P::Live, P::Expiring] {
+            let status = publish(p);
+            assert!(
+                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).is_none(),
+                "{p:?} can answer — refusing it would turn a routine rotation into an outage"
+            );
+            djr::reset_coord_credential_posture_for_test();
+        }
+    }
+
+    /// **UNKNOWN is not a fault.** No refresher pass has concluded yet (the
+    /// seconds after a runner start, and any build whose pass has not run):
+    /// the posture cell is `None`, and manufacturing a 401 out of that would
+    /// break every session on a healthy runner during its own boot.
+    #[test]
+    fn an_unknown_posture_never_fabricates_a_local_refusal() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+        assert!(
+            djr::coord_credential_posture().is_none(),
+            "the cell starts UNKNOWN"
+        );
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None).is_none(),
+            "UNKNOWN must forward, exactly as before this phase"
+        );
+    }
+
+    /// An AGENT bearer comes from that agent's own token slot, so this
+    /// runner's DEVICE posture is not a statement about it — the same bound
+    /// the retry arm and `note_coord_upstream_verdict` already carry.
+    #[test]
+    fn an_agent_principal_is_never_refused_on_the_devices_posture() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+        let status = publish(P::Unrefreshable);
+        let agent = ProxyPrincipal::Agent {
+            agent_id: uuid::Uuid::from_bytes([7; 16]),
+        };
+        assert!(
+            runner_credential_local_refusal(&agent, Some(&status)).is_none(),
+            "an agent session must not be refused on a credential it never presents"
+        );
+        // ...and the same status DOES refuse a device principal, so the
+        // assertion above is about the principal and not about the posture.
+        assert!(runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).is_some());
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// The body shape DD4 specifies: `code`, an ISO-8601 `since`, and a
+    /// one-line `remedy`. The remedy must never send the caller at its nonce.
+    #[test]
+    fn the_local_refusal_body_carries_code_since_and_a_remedy_that_clears_the_nonce() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+        let status = publish(P::Expired);
+        let (_code, body) =
+            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+
+        assert_eq!(body["code"], "runner_credential_expired");
+        let since = body["since"].as_str().expect("since is a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(since).is_ok(),
+            "since must be ISO-8601, got {since}"
+        );
+        assert_eq!(body["since_unix"], status.since);
+        let remedy = body["remedy"].as_str().expect("remedy is a string");
+        assert!(!remedy.trim().is_empty(), "remedy must say something");
+        assert!(
+            !remedy.lines().nth(1).is_some_and(|l| !l.trim().is_empty()),
+            "remedy is ONE line: {remedy}"
+        );
+        // The incident in one assertion: the answer must tell the caller its
+        // nonce is fine, and must never advise the act fleet policy forbids.
+        let next_door = body["next_door"].as_str().unwrap();
+        assert!(
+            next_door.contains("nonce is FINE"),
+            "the caller must learn the nonce is not the fault: {next_door}"
+        );
+        assert!(
+            !next_door.to_lowercase().contains("restart the runner"),
+            "never advise a runner restart (production-and-cost runner-lifecycle)"
+        );
+        assert_eq!(body["posture"], "expired");
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// DD4's tail: the catalogue coord attaches is KEPT, copied from the last
+    /// coord answer — and is OMITTED rather than emitted empty when coord has
+    /// never supplied one (an empty list would read as "there are no doors",
+    /// which is the opposite of UNKNOWN).
+    #[test]
+    fn the_local_refusal_keeps_coords_credential_free_doors_catalogue() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+        reset_credential_free_doors_for_test();
+
+        let status = publish(P::Dark(DarkCause::UpstreamRejected));
+        let (_c, before) =
+            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        assert!(
+            before.get("credential_free_doors").is_none(),
+            "never invent a catalogue this process has not seen"
+        );
+
+        // A coord answer carrying one, exactly as coord's refusal body shapes it.
+        record_credential_free_doors(
+            br#"{"error":"nope","code":"token_expired","credential_free_doors":{"guard_free":["/coord/agent-prompt-documents"]}}"#,
+        );
+        let (_c, after) =
+            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        assert_eq!(
+            after["credential_free_doors"]["guard_free"][0],
+            "/coord/agent-prompt-documents"
+        );
+
+        // A later coord answer WITHOUT the key leaves the catalogue standing:
+        // absence is not a statement that the doors are gone.
+        record_credential_free_doors(br#"{"error":"nope","code":"token_expired"}"#);
+        let (_c, still) =
+            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        assert!(still.get("credential_free_doors").is_some());
+
+        reset_credential_free_doors_for_test();
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// The PROBE half of the same misattribution. Once the proxy answers its
+    /// own 401, the loopback probe sees that 401 — and read as a bare status it
+    /// is `PROXY_UNAUTHORIZED`, i.e. "stale/evicted proxy nonce", which is the
+    /// fiction this phase exists to end, reproduced one layer down in a durable
+    /// artifact.
+    #[test]
+    fn the_probe_reads_a_runner_credential_401_as_the_runners_own_fault() {
+        for p in dark_postures() {
+            let code = runner_credential_refusal_code(p).unwrap();
+            let body =
+                format!(r#"{{"success":false,"code":"{code}","since":"2026-09-12T03:54:26Z"}}"#);
+            let verdict = verdict_for_response(401, Some(&body));
+            assert_eq!(
+                verdict,
+                ProbeVerdict::RunnerCredential(
+                    runner_credential_breadcrumb_verdict(p).unwrap().to_string()
+                ),
+                "a runner-credential 401 must not be read as a stale nonce"
+            );
+            assert_eq!(
+                verdict.token(),
+                runner_credential_breadcrumb_verdict(p).unwrap()
+            );
+        }
+
+        // Every OTHER 401 is unchanged — including coord's own `token_expired`
+        // relayed through, and a 401 whose body could not be read at all.
+        // Absent evidence never promotes a verdict.
+        assert_eq!(
+            verdict_for_response(401, None),
+            ProbeVerdict::ProxyUnauthorized
+        );
+        assert_eq!(
+            verdict_for_response(401, Some(r#"{"code":"token_expired"}"#)),
+            ProbeVerdict::ProxyUnauthorized
+        );
+        assert_eq!(
+            verdict_for_response(401, Some("stale proxy key")),
+            ProbeVerdict::ProxyUnauthorized
+        );
+    }
+
+    /// **The novel combination.** A valid `.mcp.json` IS written and the
+    /// session still cannot reach coord. Before this phase that produced no
+    /// artifact at all: the breadcrumb family only ever described a config
+    /// that was missing, foreign or un-probeable.
+    #[test]
+    fn a_dark_credential_breadcrumbs_even_though_the_config_is_fine() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        for p in dark_postures() {
+            let dir =
+                std::env::temp_dir().join(format!("coord-cred-crumb-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let wd = dir.to_string_lossy().to_string();
+
+            publish(p);
+            assert!(
+                breadcrumb_runner_credential_if_dark(&wd),
+                "{p:?} must breadcrumb"
+            );
+            let text = std::fs::read_to_string(dir.join(COORD_MCP_STATUS_FILE)).unwrap();
+            let verdict = runner_credential_breadcrumb_verdict(p).unwrap();
+            let (line1, line2) = text.split_once('\n').expect("two lines");
+            assert!(
+                line1.contains(verdict),
+                "line 1 must name the typed token: {line1}"
+            );
+            // The one sentence that stops the reader re-provisioning.
+            assert!(line1.contains("nonce are FINE"), "line 1: {line1}");
+            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            assert_eq!(stamp["verdict"], verdict);
+            assert!(
+                stamp["port"].is_null(),
+                "no port was addressed — this write made no probe"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+            djr::reset_coord_credential_posture_for_test();
+        }
+    }
+
+    /// The two silences, and they are different. `live` has nothing to report;
+    /// UNKNOWN has nothing KNOWN to report. Neither may mint an artifact — a
+    /// breadcrumb minted from UNKNOWN would make every session spawned in the
+    /// seconds after a runner start look credential-dark.
+    #[test]
+    fn a_live_or_unknown_posture_writes_no_credential_breadcrumb() {
+        let _serialised = djr::posture_test_lock();
+
+        for seed in [None, Some(P::Live), Some(P::Expiring)] {
+            djr::reset_coord_credential_posture_for_test();
+            let dir =
+                std::env::temp_dir().join(format!("coord-cred-quiet-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let wd = dir.to_string_lossy().to_string();
+            if let Some(p) = seed {
+                publish(p);
+            }
+            assert!(!breadcrumb_runner_credential_if_dark(&wd), "seed {seed:?}");
+            assert!(
+                !dir.join(COORD_MCP_STATUS_FILE).exists(),
+                "seed {seed:?} must leave the workdir with NO statement"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// End to end through the real provisioning seam, with a stand-in proxy on
+    /// the bound port that answers exactly what this runner now answers.
+    ///
+    /// It proves the combination in one run: the `.mcp.json` is written and
+    /// valid, the breadcrumb names the credential, and the detached probe —
+    /// which sees a bare 401 — does NOT overwrite it with the stale-nonce
+    /// verdict. Both writers agree, so there is nothing to race.
+    #[test]
+    fn provisioning_writes_the_config_and_still_breadcrumbs_the_credential() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        // A stand-in for this runner's own proxy: one connection, answering the
+        // local refusal body verbatim.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf);
+                let body = r#"{"success":false,"code":"runner_credential_expired","since":"2026-09-12T03:54:26Z","remedy":"x"}"#;
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = sock.flush();
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("coord-cred-prov-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().to_string();
+        let dev = {
+            let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
+            format!("h.{payload}.s")
+        };
+
+        publish(P::Expired);
+        let outcome = provision_coord_mcp_with_jwt(&wd, &dev, Some(port));
+        assert_eq!(
+            outcome,
+            CoordMcpDelivery::Provisioned,
+            "the credential does not stop provisioning — the config is FINE"
+        );
+        let cfg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
+        assert_eq!(
+            cfg["mcpServers"]["coord-mcp"]["url"],
+            format!("http://127.0.0.1:{port}/coord-mcp"),
+            "a VALID .mcp.json was written — that is the novel half"
+        );
+
+        // Wait for the probe to have had its say, then assert the artifact is
+        // still the credential verdict and never the stale-nonce one.
+        let crumb = dir.join(COORD_MCP_STATUS_FILE);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut saw_probe_write = false;
+        while std::time::Instant::now() < deadline {
+            let text =
+                std::fs::read_to_string(&crumb).expect("breadcrumb is written SYNCHRONOUSLY");
+            assert!(
+                text.contains(BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_EXPIRED),
+                "the breadcrumb must never become a stale-nonce story: {text}"
+            );
+            let line2 = text.lines().nth(1).unwrap_or_default();
+            let stamp: serde_json::Value = serde_json::from_str(line2.trim()).unwrap();
+            if stamp["port"].as_u64() == Some(port as u64) {
+                saw_probe_write = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            saw_probe_write,
+            "the probe should have reached a verdict against the stand-in proxy"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// The two `write_degraded_breadcrumb` call sites in this family carry the
+    /// SAME line-1 wording, spelled out as a literal at each because
+    /// `scripts/breadcrumb-reason-drift.py` reads the first string literal
+    /// after the call and exits 2 (UNKNOWN) on a variable. A const cannot
+    /// enforce that, so this test does: the KB table carries ONE row for this
+    /// condition, and two copies of a literal are exactly how that row silently
+    /// becomes two.
+    #[test]
+    fn the_two_credential_breadcrumb_sites_share_one_literal() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coord_mcp.rs");
+        let text = std::fs::read_to_string(&src).expect("read coord_mcp.rs");
+        let occurrences = text.matches(RUNNER_CREDENTIAL_BREADCRUMB_REASON).count();
+        assert_eq!(
+            occurrences, 3,
+            "expected the const itself plus EXACTLY two call-site literals — \
+             a third site, or a drifted copy, means the reason table this maps \
+             onto needs another row (or has silently lost one)"
+        );
+    }
+
+    /// The fourth layer must not collide with the three that shipped, and its
+    /// advice must be the OPPOSITE of the nonce layer's: a new session is the
+    /// whole recovery for a dead nonce and is useless here.
+    #[test]
+    fn the_runner_credential_layer_is_distinct_and_says_a_new_session_wont_help() {
+        assert_eq!(
+            ProxyFailureLayer::RunnerCredential.as_str(),
+            "runner-credential"
+        );
+        let tokens = [
+            ProxyFailureLayer::RunnerNonce.as_str(),
+            ProxyFailureLayer::CoordUpstream.as_str(),
+            ProxyFailureLayer::RunnerTransport.as_str(),
+            ProxyFailureLayer::RunnerCredential.as_str(),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for t in tokens {
+            assert!(seen.insert(t), "duplicate layer token: {t}");
+        }
+        let door = ProxyFailureLayer::RunnerCredential.next_door();
+        assert!(door.contains("will NOT help"), "{door}");
+        assert!(door.contains("nonce is FINE"), "{door}");
+    }
+
+    /// The rotation row: same `upstream-reject` EVENT (the reader's question is
+    /// "which requests got no coord answer?"), a `runner-credential` layer, and
+    /// a cause opening with the typed code — which is what lets the log's join
+    /// tell this apart from an evicted nonce.
+    #[test]
+    fn the_rotation_row_names_the_credential_not_an_eviction() {
+        let dir = rotation_log_test_dir();
+        let nonce = format!("cred-row-{}", uuid::Uuid::now_v7());
+        log_proxy_runner_credential_rejected(
+            Some(&nonce),
+            "runner_credential_unrefreshable — refused locally",
+        );
+        let log = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap_or_default();
+        let row = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| {
+                v["key_prefix"] == serde_json::Value::from(rotation_key_prefix(&nonce))
+                    && v["event"] == "upstream-reject"
+            })
+            .expect("an upstream-reject row for this key");
+        assert_eq!(row["layer"], "runner-credential");
+        assert_eq!(row["upstream_status"], 401);
+        assert!(
+            row["cause"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("runner_credential_unrefreshable"),
+            "the cause must open with the typed code: {}",
+            row["cause"]
+        );
     }
 }

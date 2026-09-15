@@ -508,10 +508,59 @@ pub fn runner_context(api_port: u16, coord_mcp: crate::coord_mcp::CoordMcpDelive
         CoordMcpDelivery::Unprovisioned => {}
     }
 
+    // Line 3, when and only when there is something to say: the runner's own
+    // coord-credential posture (plan `2026-09-12-runner-loads-with-an-expired-
+    // coord-credential-and-tells-nobody`, Phase 3b).
+    let credential = coord_credential_briefing_line()
+        .map(|l| format!("{l}\n"))
+        .unwrap_or_default();
+
     format!(
-        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{}{briefing}",
+        "{RUNNER_CONTEXT_SOURCE_MARKER}\n{provenance}\n{credential}{}{briefing}",
         base.text
     )
+}
+
+/// The session briefing's `[coord-credential: <posture> since <ts>]` line, or
+/// `None` when there is nothing to report.
+///
+/// **Why the session is told at all.** In the incident every session the runner
+/// spawned worked normally and had no coord access, and nothing anywhere said
+/// so: `.mcp.json` was valid, the MCP server started, and the first `coord_*`
+/// call came back as a credential error the client latched for the session's
+/// lifetime. A session that reads this line knows, at birth, that the fault is
+/// the RUNNER's credential and not its own transport — so it routes to a
+/// credential-free door instead of re-provisioning something that was never
+/// broken.
+///
+/// Two silences, and they are different:
+///
+/// * **`live` — nothing to say.** The common case, and a line on every healthy
+///   spawn would train every reader to skip it.
+/// * **UNKNOWN (no refresher pass has concluded yet) — nothing KNOWN to say.**
+///   Emitting a posture here would be inventing one; the absent line means
+///   "unknown", exactly as the absent `.coord-mcp-status` breadcrumb does.
+///
+/// `expiring` DOES print, unlike the breadcrumb and the local 401, which fire
+/// on `!can_answer()`. Those two are refusals and must not fire on a credential
+/// that still works; this is one line of information, and "your runner is
+/// mid-rotation" is worth a session knowing when its next call is the one that
+/// lands in the gap.
+///
+/// Zero I/O, per this module's spawn-path contract: one uncontended mutex read.
+fn coord_credential_briefing_line() -> Option<String> {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture;
+    let status = crate::mcp::device_jwt_refresher::coord_credential_posture()?;
+    if status.posture == CoordCredentialPosture::Live {
+        return None;
+    }
+    let since = chrono::DateTime::<chrono::Utc>::from_timestamp(status.since, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| status.since.to_string());
+    Some(format!(
+        "[coord-credential: {} since {since}]",
+        status.posture.as_str()
+    ))
 }
 
 /// The compiled-in FALLBACK briefing body — everything after the marker and
@@ -875,6 +924,20 @@ mod tests {
         BRIEFING_PLAN_CAPTURE_CLAUSE, BRIEFING_RUNNER_SESSION, PLAN_CAPTURE_RECORD,
     };
 
+    /// Hold the coord-credential posture at UNKNOWN for the life of the guard.
+    ///
+    /// [`runner_context`] renders a `[coord-credential: …]` line from a
+    /// PROCESS-GLOBAL cell, and `cargo test` runs this binary's tests on
+    /// parallel threads — so any test that asserts on the render's SHAPE (line
+    /// 2, a byte-identical body, the absence of a clause) is racing every test
+    /// that publishes a posture unless both take this lock. The two
+    /// byte-identical anchors below are the ones that would actually break.
+    fn quiet_credential_posture() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::mcp::device_jwt_refresher::posture_test_lock();
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+        guard
+    }
+
     // =======================================================================
     // Session credential-env scrub (plan
     // 2026-08-07-runner-context-visibility-and-session-env-secret-hygiene)
@@ -1058,6 +1121,10 @@ mod tests {
     /// back to its origin (incident coord #1242).
     #[test]
     fn runner_context_starts_with_attributable_source_marker() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         // Pinned even though the assertion holds at either level: this test
         // renders the same process-global-dependent string as the clause tests,
         // and running it in an undefined level state is the kind of latent race
@@ -1081,6 +1148,10 @@ mod tests {
     /// (plan `2026-08-08-runner-enforced-policy-pull.md` Phase 1.8)
     #[test]
     fn briefing_http_fallback_names_the_agent_door_not_the_operator_door() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
@@ -1112,6 +1183,10 @@ mod tests {
     /// point where the prompt is actually built.
     #[test]
     fn an_edited_body_naming_the_operator_door_is_refused_at_render() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test("off");
         pin.set_briefing(
             BRIEFING_RUNNER_SESSION,
@@ -1160,6 +1235,10 @@ mod tests {
     /// authorization must not appear in a system prompt.
     #[test]
     fn plan_capture_clause_is_absent_at_level_off() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
 
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
@@ -1198,6 +1277,10 @@ mod tests {
     /// statement about every render.
     #[test]
     fn plan_capture_clause_is_present_at_level_record() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
@@ -1306,6 +1389,10 @@ mod tests {
     /// `gate`) or a typo being read as "on-ish, close enough".
     #[test]
     fn an_unrecognised_level_does_not_inject_the_clause() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test("off");
         for level in ["observe", "gate", "recording", "RECORD ", "", "on"] {
             pin.set(level);
@@ -1334,6 +1421,10 @@ mod tests {
     /// arm it can no longer reach. Coord rejects the same shapes at write time.
     #[test]
     fn the_clause_carries_no_tenant_or_agent_identity() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
 
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
@@ -1495,6 +1586,10 @@ mod tests {
     /// the assertive measured arm ships, byte-for-byte.
     #[test]
     fn provisioned_renders_the_measured_assertive_memory_clause() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876, CoordMcpDelivery::Provisioned);
         assert!(
@@ -1515,6 +1610,10 @@ mod tests {
     /// cwd's `.mcp.json` answered 401.
     #[test]
     fn workdir_declared_renders_the_conditional_clause_and_asserts_no_liveness() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876, CoordMcpDelivery::WorkdirDeclared);
         assert!(
@@ -1535,6 +1634,10 @@ mod tests {
     /// the tools exist and keeps the local-file fallback (fail to ABSENT).
     #[test]
     fn unprovisioned_renders_no_memory_clause_at_all() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
         assert!(
@@ -1552,6 +1655,10 @@ mod tests {
     /// `WorkdirDeclared`: say what is true, which is that liveness is unknown.
     #[test]
     fn unknown_renders_the_conditional_clause() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let _pin = pin_plan_capture_level_for_test("off");
         let briefing = runner_context(9876, CoordMcpDelivery::Unknown);
         assert!(
@@ -1566,6 +1673,10 @@ mod tests {
 
     #[test]
     fn memory_clause_appends_cleanly_onto_a_briefing() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         // Composition check: the marker survives, and the clause lands whole.
         let _pin = pin_plan_capture_level_for_test("off");
         let composed = format!(
@@ -1586,6 +1697,10 @@ mod tests {
     /// old named-field scan admitted it could not see.
     #[test]
     fn an_edited_body_carrying_identity_is_refused_at_render() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
         for (label, bad) in [
             ("named key", "your agent_id is attached to every write"),
@@ -1683,6 +1798,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// provenance line that says exactly where the text came from.
     #[test]
     fn builtin_renders_byte_identical_to_todays_briefing() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         // `expected_briefing_body()` and `runner_context()` each read the
         // ambient coord base; the fixture serializes both reads against
         // every `isolated_ambient()` holder, which would otherwise swap the
@@ -1703,6 +1822,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// provenance token on line 2 rather than a line of its own.
     #[test]
     fn builtin_renders_byte_identical_to_todays_briefing_with_the_clause() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         // `expected_briefing_body()` and `runner_context()` each read the
         // ambient coord base; the fixture serializes both reads against
         // every `isolated_ambient()` holder, which would otherwise swap the
@@ -1730,6 +1853,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// spawn-SHA parse depends on.
     #[test]
     fn a_coord_body_renders_with_its_version_on_line_two() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test("off");
         pin.set_briefing(
             BRIEFING_RUNNER_SESSION,
@@ -1760,6 +1887,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// happen.
     #[test]
     fn a_disk_restored_body_is_labelled_stale_not_coord() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test("off");
         pin.set_briefing(
             BRIEFING_RUNNER_SESSION,
@@ -1778,6 +1909,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// the injected text unattributed.
     #[test]
     fn the_clause_carries_its_own_provenance_token() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         let pin = pin_plan_capture_level_for_test(PLAN_CAPTURE_RECORD);
         pin.set_briefing(
             BRIEFING_PLAN_CAPTURE_CLAUSE,
@@ -1801,6 +1936,10 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     /// builds the prompt.
     #[test]
     fn a_body_that_fails_the_render_guard_falls_back_to_the_builtin() {
+        // `runner_context` renders line 3 from the PROCESS-GLOBAL coord
+        // credential posture, which a sibling test may publish at any moment;
+        // this pins it quiet so that line is absent for this render.
+        let _cred_quiet = quiet_credential_posture();
         // `expected_briefing_body()` and `runner_context()` each read the
         // ambient coord base; the fixture serializes both reads against
         // every `isolated_ambient()` holder, which would otherwise swap the
@@ -1986,5 +2125,100 @@ If context runs low, act BEFORE exhaustion: request a handoff (coord_request_han
     #[test]
     fn strip_ansi_removes_a_sequence_with_a_non_ascii_payload() {
         assert_eq!(strip_ansi("a\x1b]0;títle ✓\x1b\\b"), "ab");
+    }
+
+    // =======================================================================
+    // The session briefing's coord-credential line (plan
+    // `2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`,
+    // Phase 3b).
+    //
+    // In the incident every session this runner spawned worked normally and had
+    // no coord access, and the briefing — the one text every session reads at
+    // birth — said nothing at all.
+    // =======================================================================
+
+    /// Publish a posture the way a refresher pass would. Caller holds the lock.
+    fn publish_posture(p: crate::mcp::device_jwt_refresher::CoordCredentialPosture) -> i64 {
+        crate::mcp::device_jwt_refresher::publish_coord_credential_posture(
+            p,
+            Some("11111111-2222-3333-4444-555555555555".to_string()),
+            Some(1_700_000_000),
+            None,
+        );
+        crate::mcp::device_jwt_refresher::coord_credential_posture()
+            .expect("a publish always leaves a status")
+            .since
+    }
+
+    /// Every posture that is not `live` puts its own line into the briefing, as
+    /// line 3 — after the source marker and the provenance label, which are
+    /// parsed positionally by `/whereami` and pinned by the tests above.
+    #[test]
+    fn the_briefing_names_a_non_live_coord_credential_on_its_own_line() {
+        use crate::mcp::device_jwt_refresher::{CoordCredentialPosture as P, DarkCause};
+        let _cred = crate::mcp::device_jwt_refresher::posture_test_lock();
+        let _pin = pin_plan_capture_level_for_test("off");
+
+        for (posture, token) in [
+            (P::Expired, "expired"),
+            (P::Absent, "absent"),
+            (P::Unrefreshable, "unrefreshable"),
+            (P::Dark(DarkCause::UpstreamRejected), "dark"),
+            // `expiring` prints too: the breadcrumb and the local 401 fire on
+            // `!can_answer()` because they are REFUSALS, but this is one line
+            // of information and "your runner is mid-rotation" is worth
+            // knowing when your next call is the one that lands in the gap.
+            (P::Expiring, "expiring"),
+        ] {
+            crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+            let since = publish_posture(posture);
+            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            let line3 = briefing.lines().nth(2).unwrap_or_default();
+            assert!(
+                line3.starts_with("[coord-credential: "),
+                "{posture:?} must get its own line 3, got {line3:?}"
+            );
+            assert!(line3.contains(token), "{posture:?}: {line3}");
+            // The timestamp is the one thing that makes the line actionable —
+            // "since boot" is what told the operator the runner restored an
+            // already-dead credential rather than losing a live one.
+            let rendered = chrono::DateTime::<chrono::Utc>::from_timestamp(since, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            assert!(line3.contains(&format!("since {rendered}")), "{line3}");
+            // Lines 1 and 2 keep their positions: `/whereami` parses line 1 for
+            // the spawn SHA with no shape guard.
+            assert_eq!(briefing.lines().next(), Some(RUNNER_CONTEXT_SOURCE_MARKER));
+            assert!(briefing
+                .lines()
+                .nth(1)
+                .unwrap_or_default()
+                .starts_with("[briefing: "));
+        }
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+    }
+
+    /// The two silences. `live` has nothing to report; UNKNOWN (no refresher
+    /// pass has concluded) has nothing KNOWN to report — and a line invented
+    /// from UNKNOWN would label every session spawned in the seconds after a
+    /// runner start.
+    #[test]
+    fn a_live_or_unknown_credential_adds_no_line_to_the_briefing() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let _cred = crate::mcp::device_jwt_refresher::posture_test_lock();
+        let _pin = pin_plan_capture_level_for_test("off");
+
+        for seed in [None, Some(P::Live)] {
+            crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
+            if let Some(p) = seed {
+                publish_posture(p);
+            }
+            let briefing = runner_context(9876, CoordMcpDelivery::Unprovisioned);
+            assert!(
+                !briefing.contains("[coord-credential:"),
+                "seed {seed:?} must add no credential line: {briefing}"
+            );
+        }
+        crate::mcp::device_jwt_refresher::reset_coord_credential_posture_for_test();
     }
 }
