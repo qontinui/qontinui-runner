@@ -5194,6 +5194,48 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
+    // ---- Phase 3a: the proxy names the RUNNER's fault, not the caller's ----
+    //
+    // DD4 of plan `2026-09-12-runner-loads-with-an-expired-coord-credential-
+    // and-tells-nobody`. THE motivating incident: this proxy accepted every
+    // session's nonce and forwarded with a device JWT that had been dead since
+    // boot, so every session got coord's `token_expired` back — and every
+    // reader of that envelope (the MCP client, `/coord-revive`, and the
+    // incident's own first diagnosis) attributes `token_expired` to the NONCE.
+    // Sessions spent their recovery budget re-provisioning a key that was never
+    // broken. `/health`'s `canAnswer` already says this in words; this is the
+    // forwarder saying it in the actual response.
+    //
+    // PLACED HERE, before bearer selection, for two reasons. It is the earliest
+    // point at which the nonce, the principal and the requested method have all
+    // been vetted — so a bad nonce and a non-allowlisted method still get their
+    // own, more specific answers, which they deserve. And when the credential
+    // is known dead there is nothing for the bearer-selection arm below to
+    // find: it would kick the refresher and spend the bounded re-mint wait per
+    // request before failing anyway.
+    //
+    // Every non-refusal arm is in `runner_credential_local_refusal`, including
+    // the one that matters most: an UNKNOWN posture (no refresher pass has
+    // concluded yet) forwards exactly as before. UNKNOWN is not a fault.
+    if let Some((code, refusal)) = crate::coord_mcp::runner_credential_local_refusal(
+        &principal,
+        crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
+    ) {
+        warn!(
+            code,
+            "coord-mcp proxy: refusing LOCALLY — this runner's own coord credential cannot \
+             answer. The caller's nonce is fine and coord was not dialed."
+        );
+        // The rotation log's `upstream-reject` row for this class, carrying
+        // `cause=runner_credential_<posture>` so the join tells it apart from
+        // an evicted nonce. Detached: a 401 never waits on forensics.
+        crate::coord_mcp::spawn_log_proxy_runner_credential_rejected(
+            nonce.as_deref(),
+            format!("{code} — refused locally; the runner's own coord credential cannot answer, the nonce is live and coord was never dialed"),
+        );
+        return (axum::http::StatusCode::UNAUTHORIZED, Json(refusal)).into_response();
+    }
+
     // C3/M2: the tenant whose DEVICE slot supplied the bearer, hoisted out of
     // the `Device` arm so the upstream verdict below can be filed against the
     // right credential. Stays `None` for an AGENT principal, whose bearer is
@@ -5763,6 +5805,13 @@ async fn coord_mcp_proxy_handler(
             &bytes,
         );
     }
+
+    // Phase 3a, DD4's tail: "the `credential_free_doors` catalogue coord
+    // attaches stays, copied from the last coord answer". Coord authors and
+    // versions that list, so the local refusal above must not invent one — it
+    // copies whatever coord last attached. Recorded on EVERY principal: the
+    // catalogue is a property of coord, not of the credential we presented.
+    crate::coord_mcp::record_credential_free_doors(&bytes);
 
     // A 5xx is the other half of the retryable class (same shared classifier as
     // the write forwarder): coord did not reach a verdict on the content. A
@@ -14394,6 +14443,62 @@ mod coord_claims_proxy_tests {
             "and it must be gated on the DEVICE principal — an agent bearer \
              comes from that agent's own slot and says nothing about this \
              runner's credential"
+        );
+    }
+
+    /// **Phase 3a wiring** (plan `2026-09-12-runner-loads-with-an-expired-
+    /// coord-credential-and-tells-nobody`, DD4).
+    ///
+    /// The decision itself is pure and is tested exhaustively in
+    /// `coord_mcp::runner_credential_tests`; what CANNOT be reached from a unit
+    /// test is this handler, which needs a registered nonce, a live device JWT
+    /// in the encrypted `AuthManager` slot AND a Tauri-backed `ApiState`. So
+    /// this pins the WIRING at the source — the same technique the C3 test
+    /// above uses, and the level at which the defect actually shipped: the
+    /// classifier was never wrong, the forwarder simply never asked it.
+    ///
+    /// The ORDER is the assertion that matters. "Refuse locally" is only true
+    /// if the refusal precedes the forward; a check placed after
+    /// `coord_mcp_url_with_source()` would still dial coord and still hand the
+    /// caller `token_expired`, which is the whole incident.
+    #[test]
+    fn the_coord_mcp_proxy_refuses_locally_on_a_dead_runner_credential() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let start = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("coord_mcp_proxy_handler exists");
+        let end = text[start..]
+            .find("\n/// ")
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        let body = &text[start..end];
+
+        let gate = body.find("runner_credential_local_refusal").expect(
+            "the forwarder must ask whether THIS RUNNER's credential can answer before \
+                 forwarding — otherwise every session on a credential-dark runner is handed \
+                 coord's `token_expired`, which every reader attributes to the NONCE",
+        );
+        let forward = body
+            .find("coord_mcp_url_with_source")
+            .expect("the handler resolves the upstream before forwarding");
+        assert!(
+            gate < forward,
+            "the credential refusal must come BEFORE the upstream is resolved and dialed; \
+             refusing after the forward is not refusing locally"
+        );
+        assert!(
+            body.contains("spawn_log_proxy_runner_credential_rejected"),
+            "the rotation log needs its `upstream-reject` row carrying \
+             `cause=runner_credential_<posture>`, or the log's join cannot tell this case \
+             from an evicted nonce"
+        );
+        // DD4's tail: the catalogue in the local refusal is COPIED from coord,
+        // never authored here — so the handler has to record coord's.
+        assert!(
+            body.contains("record_credential_free_doors"),
+            "the `credential_free_doors` catalogue the local 401 carries is coord's, copied \
+             from the last coord answer"
         );
     }
 
