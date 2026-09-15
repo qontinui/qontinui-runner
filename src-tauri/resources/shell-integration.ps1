@@ -87,7 +87,7 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
         }
         # Classify the caller's own APPEND flags (mirrors the bash wrapper) —
         # the only pair Claude Code refuses together; --system-prompt[-file]
-        # combines with either and is not classified. A caller
+        # starts beside either and never changes which flag we add. A caller
         # --append-system-prompt-file owns the append slot and ours is not
         # added; caller inline flag(s) only get our briefing as ANOTHER inline
         # flag; with none, ours alone, the composed file when it exists. The
@@ -95,20 +95,48 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
         # `--` typed at a function call is consumed by PowerShell's parameter
         # binder and never reaches $args; a quoted '--' or a splatted one does,
         # and is honored here.)
+        # A caller replacement prompt (--system-prompt[-file]) is recorded
+        # separately: whether Claude Code still applies an append file beside
+        # it is unverified, so our file is passed but the delivered-policy
+        # marker is BLANKED and the policy hook serves the full body.
         $callerPrompt = 'none'
+        $replacement = $false
         foreach ($a in $args) {
             if ("$a" -eq '--') { break }
-            if ("$a" -match '^--append-system-prompt-file(=.*)?$') { $callerPrompt = 'file'; break }
-            if ("$a" -match '^--append-system-prompt(=.*)?$') { $callerPrompt = 'inline' }
+            if ("$a" -match '^--append-system-prompt-file(=.*)?$') { $callerPrompt = 'file' }
+            elseif ("$a" -match '^--append-system-prompt(=.*)?$') { if ($callerPrompt -ne 'file') { $callerPrompt = 'inline' } }
+            elseif ("$a" -match '^--system-prompt(-file)?(=.*)?$') { $replacement = $true }
         }
-        if ($callerPrompt -eq 'none' -and -not [string]::IsNullOrEmpty($ctxFile) -and (Test-Path -LiteralPath $ctxFile -PathType Leaf)) {
+        # Touch FIRST, then test (narrows the 7-day prune race for a long-lived
+        # pane). Fail-open and silent: a missing file is caught, not reported,
+        # and takes the inline branch below.
+        $ctxFileLive = $false
+        if ($callerPrompt -eq 'none' -and -not [string]::IsNullOrEmpty($ctxFile)) {
+            try {
+                $item = Get-Item -LiteralPath $ctxFile -ErrorAction Stop
+                $item.LastWriteTime = Get-Date
+            } catch { }
+            $ctxFileLive = Test-Path -LiteralPath $ctxFile -PathType Leaf
+        }
+        if ($ctxFileLive) {
             # The composed spawn file (briefing + policy body); the
             # delivered-policy marker rides along untouched —
-            # QONTINUI_POLICY_DELIVERED_FILE names exactly this file. Touch it
-            # first (fail-open) so a long-lived pane re-arms a file the 7-day
-            # age prune would otherwise reach.
-            try { (Get-Item -LiteralPath $ctxFile).LastWriteTime = Get-Date } catch { }
-            & $exe --append-system-prompt-file $ctxFile @args
+            # QONTINUI_POLICY_DELIVERED_FILE names exactly this file — unless a
+            # caller replacement prompt makes delivery unproven.
+            if (-not $replacement) {
+                & $exe --append-system-prompt-file $ctxFile @args
+                return
+            }
+            $savedSha = $env:QONTINUI_POLICY_DELIVERED_SHA
+            $savedFile = $env:QONTINUI_POLICY_DELIVERED_FILE
+            $env:QONTINUI_POLICY_DELIVERED_SHA = $null
+            $env:QONTINUI_POLICY_DELIVERED_FILE = $null
+            try {
+                & $exe --append-system-prompt-file $ctxFile @args
+            } finally {
+                $env:QONTINUI_POLICY_DELIVERED_SHA = $savedSha
+                $env:QONTINUI_POLICY_DELIVERED_FILE = $savedFile
+            }
             return
         }
         # Inline briefing, caller-owned prompt, or no briefing: no policy body

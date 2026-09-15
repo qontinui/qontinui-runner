@@ -93,8 +93,8 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                 ;;
             *)
                 # Classify the caller's own APPEND flags — the only pair Claude
-                # Code refuses together (`--system-prompt[-file]` combines with
-                # either append flag, so it is not classified at all):
+                # Code refuses together (`--system-prompt[-file]` starts beside
+                # either append flag, so it never changes which flag we add):
                 #   file   — a caller --append-system-prompt-file owns the append
                 #            slot: ours is not added;
                 #   inline — caller inline --append-system-prompt flag(s) only:
@@ -103,26 +103,40 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                 #   none   — ours alone, the composed file when it exists.
                 # The scan stops at `--`: everything after it is the positional
                 # prompt, and a prompt that reads like a flag is not one.
-                local __q_caller_prompt=none __q_arg
+                # A caller REPLACEMENT prompt (`--system-prompt[-file]`) is
+                # recorded separately: whether Claude Code still applies an
+                # append file beside it is unverified, so our file is passed
+                # but the delivered-policy marker is BLANKED and the policy
+                # hook serves the full body.
+                local __q_caller_prompt=none __q_replacement=0 __q_arg
                 for __q_arg in "$@"; do
                     case "$__q_arg" in
                         --)
                             break ;;
                         --append-system-prompt-file|--append-system-prompt-file=*)
-                            __q_caller_prompt=file; break ;;
+                            __q_caller_prompt=file ;;
                         --append-system-prompt|--append-system-prompt=*)
-                            __q_caller_prompt=inline ;;
+                            [ "$__q_caller_prompt" = "file" ] || __q_caller_prompt=inline ;;
+                        --system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*)
+                            __q_replacement=1 ;;
                     esac
                 done
+                # Touch FIRST, then test: the touch re-arms a long-lived pane's
+                # file against the 7-day age prune before the existence check
+                # decides, which narrows the prune race. Fail-open — a file gone
+                # after the touch takes the inline branch below.
                 if [ "$__q_caller_prompt" = "none" ] && [ -n "${QONTINUI_RUNNER_CONTEXT_FILE:-}" ] \
-                    && [ -f "${QONTINUI_RUNNER_CONTEXT_FILE}" ]; then
+                    && { touch -c -- "$QONTINUI_RUNNER_CONTEXT_FILE" 2>/dev/null; [ -f "${QONTINUI_RUNNER_CONTEXT_FILE}" ]; }; then
                     # The composed spawn file: briefing + the tenant's policy
                     # body. The delivered-policy marker rides along untouched —
-                    # QONTINUI_POLICY_DELIVERED_FILE names exactly this file.
-                    # Touch it first (fail-open) so a long-lived pane re-arms a
-                    # file the 7-day age prune would otherwise reach.
-                    touch -c -- "$QONTINUI_RUNNER_CONTEXT_FILE" 2>/dev/null || true
-                    command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
+                    # QONTINUI_POLICY_DELIVERED_FILE names exactly this file —
+                    # unless a caller replacement prompt makes delivery unproven.
+                    if [ "$__q_replacement" = "1" ]; then
+                        QONTINUI_POLICY_DELIVERED_SHA= QONTINUI_POLICY_DELIVERED_FILE= \
+                            command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
+                    else
+                        command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
+                    fi
                 elif [ "$__q_caller_prompt" != "file" ] && [ -n "${QONTINUI_RUNNER_CONTEXT:-}" ]; then
                     # Inline briefing (no file, it was pruned, or the caller
                     # brought inline flags of their own): no policy body reaches

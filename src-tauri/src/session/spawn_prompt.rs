@@ -999,12 +999,27 @@ mod script_tests {
             );
         }
 
-        // A caller `--system-prompt[-file]` combines with the append file flag
-        // (verified on v2.1.272), so it does NOT suppress ours; nor does a
-        // prompt flag spelled AFTER `--`, which is positional prompt text.
+        // A caller `--system-prompt[-file]` STARTS beside the append file flag
+        // (probed on v2.1.272), so ours is still passed — but whether its
+        // content is still applied is unverified, so the marker is BLANKED and
+        // the hook serves the full body.
         for (args, tail) in [
             ("--system-prompt mine", vec!["--system-prompt", "mine"]),
             ("--system-prompt-file=./s.md", vec!["--system-prompt-file=./s.md"]),
+            ("-p hi --system-prompt-file ./s.md", vec!["-p", "hi", "--system-prompt-file", "./s.md"]),
+        ] {
+            let mut expect = vec!["--append-system-prompt-file", file_s.as_str()];
+            expect.extend(tail);
+            assert_eq!(
+                run_wrapper(block, &pane_env, args),
+                record("", "", &expect),
+                "{label}: caller replacement prompt {args:?}"
+            );
+        }
+
+        // A prompt flag spelled AFTER `--` is positional prompt text: ours is
+        // passed and the marker kept.
+        for (args, tail) in [
             (
                 "-p -- --append-system-prompt-file",
                 vec!["-p", "--", "--append-system-prompt-file"],
@@ -1111,7 +1126,7 @@ mod script_tests {
         let run = |ctx_file: &str, args: &str| {
             let script = tmp.path().join("w.ps1");
             std::fs::write(&script, format!("{block}\nclaude {args}\n")).unwrap();
-            let status = Command::new("pwsh")
+            let output = Command::new("pwsh")
                 .args(["-NoProfile", "-NonInteractive", "-File"])
                 .arg(&script)
                 .env("PATH", &path)
@@ -1120,9 +1135,16 @@ mod script_tests {
                 .env("QONTINUI_RUNNER_CONTEXT_FILE", ctx_file)
                 .env("QONTINUI_POLICY_DELIVERED_SHA", SHA)
                 .env("QONTINUI_POLICY_DELIVERED_FILE", ctx_file)
-                .status()
+                .output()
                 .expect("pwsh runs");
-            assert!(status.success());
+            assert!(output.status.success());
+            // Fail-open and SILENT: a missing composed file must not leak a
+            // red non-terminating error into the operator's pane.
+            assert!(
+                output.stderr.is_empty(),
+                "{args}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
             std::fs::read_to_string(&out).unwrap()
         };
         assert_eq!(
@@ -1166,8 +1188,8 @@ mod script_tests {
         assert_eq!(
             run(&file_s, "--system-prompt mine"),
             record(
-                SHA,
-                &file_s,
+                "",
+                "",
                 &["--append-system-prompt-file", &file_s, "--system-prompt", "mine"]
             )
         );

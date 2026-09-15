@@ -6344,8 +6344,8 @@ mod tests {
     ///
     /// Those two guards narrow the race but cannot close it: any OTHER test in
     /// the binary that logs or builds a dispatcher still touches the same
-    /// caches, and a wide parallel run was measured losing a whole capture
-    /// again. So a capture that came back COMPLETELY empty is re-run (up to
+    /// caches, and a whole capture was observed lost once again in a wide
+    /// parallel run. So a capture that came back COMPLETELY empty is re-run (up to
     /// `CAPTURE_ATTEMPTS` times) — a subscriber that received not one byte
     /// is the race's signature, never a meaningful result for a caller that
     /// expects output. A caller asserting ABSENCE is unaffected: an empty
