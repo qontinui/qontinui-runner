@@ -85,21 +85,29 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
             & $exe @args
             return
         }
-        # Classify the caller's own system-prompt flags (mirrors the bash
-        # wrapper). Claude Code refuses the inline and file flags together but
-        # accepts repeated inline flags: a caller --append-system-prompt-file or
-        # --system-prompt[-file] owns the prompt and ours is not added; caller
-        # inline flag(s) only get our briefing as ANOTHER inline flag; with none,
-        # ours alone, the composed file when it exists.
+        # Classify the caller's own APPEND flags (mirrors the bash wrapper) —
+        # the only pair Claude Code refuses together; --system-prompt[-file]
+        # combines with either and is not classified. A caller
+        # --append-system-prompt-file owns the append slot and ours is not
+        # added; caller inline flag(s) only get our briefing as ANOTHER inline
+        # flag; with none, ours alone, the composed file when it exists. The
+        # scan stops at `--`: what follows is the positional prompt. (A BARE
+        # `--` typed at a function call is consumed by PowerShell's parameter
+        # binder and never reaches $args; a quoted '--' or a splatted one does,
+        # and is honored here.)
         $callerPrompt = 'none'
         foreach ($a in $args) {
-            if ("$a" -match '^--(append-system-prompt-file|system-prompt|system-prompt-file)(=.*)?$') { $callerPrompt = 'file'; break }
+            if ("$a" -eq '--') { break }
+            if ("$a" -match '^--append-system-prompt-file(=.*)?$') { $callerPrompt = 'file'; break }
             if ("$a" -match '^--append-system-prompt(=.*)?$') { $callerPrompt = 'inline' }
         }
         if ($callerPrompt -eq 'none' -and -not [string]::IsNullOrEmpty($ctxFile) -and (Test-Path -LiteralPath $ctxFile -PathType Leaf)) {
             # The composed spawn file (briefing + policy body); the
             # delivered-policy marker rides along untouched —
-            # QONTINUI_POLICY_DELIVERED_FILE names exactly this file.
+            # QONTINUI_POLICY_DELIVERED_FILE names exactly this file. Touch it
+            # first (fail-open) so a long-lived pane re-arms a file the 7-day
+            # age prune would otherwise reach.
+            try { (Get-Item -LiteralPath $ctxFile).LastWriteTime = Get-Date } catch { }
             & $exe --append-system-prompt-file $ctxFile @args
             return
         }

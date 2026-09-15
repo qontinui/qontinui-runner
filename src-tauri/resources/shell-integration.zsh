@@ -67,21 +67,23 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                 command claude "$@"
                 ;;
             *)
-                # Classify the caller's own system-prompt flags. Claude Code
-                # refuses the inline and file flags together but accepts
-                # repeated inline flags, so:
-                #   file  — a caller --append-system-prompt-file or
-                #           --system-prompt[-file] owns the prompt: ours is not
-                #           added at all (either of ours could stop the launch
-                #           or override theirs);
+                # Classify the caller's own APPEND flags — the only pair Claude
+                # Code refuses together (`--system-prompt[-file]` combines with
+                # either append flag, so it is not classified at all):
+                #   file   — a caller --append-system-prompt-file owns the append
+                #            slot: ours is not added;
                 #   inline — caller inline --append-system-prompt flag(s) only:
-                #           ours joins as ANOTHER inline flag (the briefing, as
-                #           before this plan), never the file;
-                #   none  — ours alone, the composed file when it exists.
+                #            ours joins as ANOTHER inline flag (the briefing, as
+                #            before this plan), never the file;
+                #   none   — ours alone, the composed file when it exists.
+                # The scan stops at `--`: everything after it is the positional
+                # prompt, and a prompt that reads like a flag is not one.
                 local __q_caller_prompt=none __q_arg
                 for __q_arg in "$@"; do
                     case "$__q_arg" in
-                        --append-system-prompt-file|--append-system-prompt-file=*|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*)
+                        --)
+                            break ;;
+                        --append-system-prompt-file|--append-system-prompt-file=*)
                             __q_caller_prompt=file; break ;;
                         --append-system-prompt|--append-system-prompt=*)
                             __q_caller_prompt=inline ;;
@@ -92,6 +94,9 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                     # The composed spawn file: briefing + the tenant's policy
                     # body. The delivered-policy marker rides along untouched —
                     # QONTINUI_POLICY_DELIVERED_FILE names exactly this file.
+                    # Touch it first (fail-open) so a long-lived pane re-arms a
+                    # file the 7-day age prune would otherwise reach.
+                    touch -c -- "$QONTINUI_RUNNER_CONTEXT_FILE" 2>/dev/null || true
                     command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
                 elif [ "$__q_caller_prompt" != "file" ] && [ -n "${QONTINUI_RUNNER_CONTEXT:-}" ]; then
                     # Inline briefing (no file, it was pruned, or the caller

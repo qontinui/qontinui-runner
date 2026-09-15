@@ -160,8 +160,9 @@ esac
 # system prompt recorded when its conversation began), any other value, or none
 # gets the full body. The
 # script decides nothing: it forwards, the route judges. Constrained to 64 hex
-# characters (a sha256), so it needs no encoding and a garbage value is simply
-# not sent.
+# characters (a sha256), so a garbage value is simply not sent. It rides a
+# request HEADER, not the query string: the runner's HTTP trace log records
+# request URIs.
 dsha="${QONTINUI_POLICY_DELIVERED_SHA:-}"
 case "$dsha" in
   *[!0-9a-fA-F]*) dsha="" ;;
@@ -169,7 +170,7 @@ esac
 [ "${#dsha}" -eq 64 ] || dsha=""
 
 # Every param is shape-constrained above, so none needs encoding: `src` is one
-# of four literals, `csid` is hex-and-hyphens, `dsha` is hex.
+# of four literals, `csid` is hex-and-hyphens.
 url="http://127.0.0.1:${port}/sessions/${sid}/policy-context"
 sep="?"
 if [ -n "$src" ]; then
@@ -178,16 +179,16 @@ if [ -n "$src" ]; then
 fi
 if [ -n "$csid" ]; then
   url="${url}${sep}claude_session_id=${csid}"
-  sep="&"
 fi
+dsha_header=()
 if [ -n "$dsha" ]; then
-  url="${url}${sep}delivered_sha=${dsha}"
+  dsha_header=(-H "X-Qontinui-Policy-Delivered-Sha: ${dsha}")
 fi
 
 # The route fetches from coord, so allow more headroom than the loopback trip
 # itself needs — but stay bounded: a hung coord must not stall a session
 # start. The route's own coord client times out well inside this budget.
-resp="$(curl -fsS --connect-timeout 2 --max-time 15 "$url" 2>/dev/null || true)"
+resp="$(curl -fsS --connect-timeout 2 --max-time 15 ${dsha_header[@]+"${dsha_header[@]}"} "$url" 2>/dev/null || true)"
 [ -z "$resp" ] && exit 0
 
 # Verbatim. The route already rendered the complete hook envelope; adding

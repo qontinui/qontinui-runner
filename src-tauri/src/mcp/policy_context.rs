@@ -65,7 +65,7 @@
 //!
 //! This route still makes the SAME attributed coord read on every start — that
 //! read is the compliance record — and only its render shrinks: a short
-//! confirmation plus the index, and ONLY on a `startup`/`compact`/`clear` whose
+//! confirmation plus the index, and ONLY on a `startup`/`compact` whose
 //! delivered-SHA marker equals the hash of the body just fetched
 //! ([`render_for_session`]). A `resume` (whose conversation re-sends the system
 //! prompt recorded when it began), no marker, a stale spawn-time copy, or a cold
@@ -557,32 +557,35 @@ pub fn render_confirmation(
 /// May a SessionStart with this RAW hook `source` receive the short
 /// confirmation at all?
 ///
-/// Only `startup`, `compact` and `clear`. Claude Code records a conversation's
-/// system prompt on its first request and a `--resume` re-sends THAT record
+/// Only `startup` and `compact`. Claude Code records a conversation's system
+/// prompt on its first request and a `--resume` re-sends THAT record
 /// (`--system-prompt-snapshot`, on by default) until the next compaction, even
 /// when the relaunch passed a different file — so on `resume` a matching marker
 /// names the body this process was launched with, not the body the model is
-/// being sent. A missing or unrecognized source is not evidence of either, so
-/// it is treated like `resume`. Deliberately reads the raw value:
+/// being sent. `clear` is excluded too: whether `/clear` resets that snapshot
+/// is unverified, and doubt yields the full body. A missing or unrecognized
+/// source is not evidence of either, so it is treated like `resume`. Deliberately reads the raw value:
 /// [`normalize_source`] maps "absent" to `startup`, which is right for the
 /// header label and wrong for this decision.
 pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
     matches!(
         raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
-        Some("startup" | "compact" | "clear")
+        Some("startup" | "compact")
     )
 }
 
 /// Choose the render for one session — the honesty decision, pure.
 ///
 /// The short confirmation is sent ONLY when the RAW hook source permits it
+/// (`startup` or `compact`)
 /// ([`source_permits_confirmation`]) AND the session's delivered-SHA marker
 /// equals [`crate::session::spawn_prompt::policy_body_sha`] of the body this
 /// call just fetched. Every other case gets the full render:
 ///
-/// - **`resume`, or no/unknown source** — the resumed conversation re-sends the
-///   system prompt recorded when it began, so a matching marker proves nothing
-///   about what the model holds;
+/// - **`resume`, `clear`, or no/unknown source** — a resumed conversation
+///   re-sends the system prompt recorded when it began, so a matching marker
+///   proves nothing about what the model holds, and a `/clear` snapshot reset
+///   is unverified;
 /// - **no marker** — the session was not given the file carrier (cold cache at
 ///   spawn, a write failure, a wrapper fall-back, a seam that has none), and the
 ///   presence of a cache file NOW says nothing about what it received THEN;
@@ -611,6 +614,21 @@ pub fn render_for_session(
         }
     }
     (render_injection(payload, source, fetched_at), false)
+}
+
+/// The request header the bundled policy hook forwards the delivered-SHA marker
+/// in. A header, not a query parameter: the runner's HTTP `TraceLayer` logs
+/// request URIs, and a per-session body hash has no business in the trace log.
+pub const DELIVERED_SHA_HEADER: &str = "x-qontinui-policy-delivered-sha";
+
+/// Read and [`parse_delivered_sha`] the marker from [`DELIVERED_SHA_HEADER`].
+/// A missing, non-UTF-8 or malformed header is no marker.
+pub fn delivered_sha_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    parse_delivered_sha(
+        headers
+            .get(DELIVERED_SHA_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    )
 }
 
 /// Parse the hook-forwarded delivered-SHA marker. Strict: exactly 64 hex
@@ -1626,12 +1644,13 @@ mod tests {
     }
 
     /// The resume-snapshot rule, per RAW source: a matching marker confirms
-    /// only on `startup`/`compact`/`clear`. `resume` re-sends the system prompt
-    /// recorded when the conversation began, and a missing or unknown source is
-    /// no evidence either way, so both get the full body — even though
-    /// [`normalize_source`] labels an absent source `startup`.
+    /// only on `startup`/`compact`. `resume` re-sends the system prompt recorded
+    /// when the conversation began, a `/clear` snapshot reset is unverified,
+    /// and a missing or unknown source is no evidence either way, so all of
+    /// those get the full body — even though [`normalize_source`] labels an
+    /// absent source `startup`.
     #[test]
-    fn only_startup_compact_and_clear_may_confirm_a_matching_marker() {
+    fn only_startup_and_compact_may_confirm_a_matching_marker() {
         let payload = sample_payload();
         let sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
@@ -1639,8 +1658,9 @@ mod tests {
         for (raw, expect_confirmed, label) in [
             (Some("startup"), true, "startup"),
             (Some("compact"), true, "compact"),
-            (Some("clear"), true, "clear"),
-            (Some(" CLEAR "), true, "clear"),
+            (Some(" COMPACT "), true, "compact"),
+            (Some("clear"), false, "clear"),
+            (Some(" CLEAR "), false, "clear"),
             (Some("resume"), false, "resume"),
             (None, false, "startup"),
             (Some(""), false, "startup"),
@@ -1709,6 +1729,24 @@ mod tests {
             assert_eq!(parse_delivered_sha(Some(bad)), None, "{bad:?}");
         }
         assert_eq!(parse_delivered_sha(None), None);
+    }
+
+    /// The route reads the marker from the request HEADER (case-insensitive
+    /// name), strictly; the query string no longer carries it.
+    #[test]
+    fn delivered_sha_is_read_from_the_header_only() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let sha = "AB".repeat(32);
+        let mut headers = HeaderMap::new();
+        assert_eq!(delivered_sha_from_headers(&headers), None);
+        headers.insert(
+            "X-Qontinui-Policy-Delivered-Sha",
+            HeaderValue::from_str(&sha).unwrap(),
+        );
+        assert_eq!(delivered_sha_from_headers(&headers), Some("ab".repeat(32)));
+        headers.insert(DELIVERED_SHA_HEADER, HeaderValue::from_static("abc"));
+        assert_eq!(delivered_sha_from_headers(&headers), None);
+        assert_eq!(DELIVERED_SHA_HEADER, "x-qontinui-policy-delivered-sha");
     }
 
     #[test]

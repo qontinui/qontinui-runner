@@ -244,7 +244,7 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
     let template = claude_template(cfg);
     let pin = spec.resume_id.as_deref().or(spec.session_id.as_deref());
     let provided = provided_flag_names(&spec.extra_required);
-    let caller_owns_system_prompt = provides_system_prompt_flag(&spec.extra_required);
+    let caller_owns_append_prompt = provides_append_prompt_flag(&spec.extra_required);
 
     let mut template_model: Option<String> = None;
     let mut other_units: Vec<FlagUnit> = Vec::new();
@@ -273,14 +273,27 @@ fn compose_flags(spec: &LaunchSpec, cfg: &LaunchConfig) -> Vec<String> {
                         other_units.push(unit);
                     }
                 }
-                // System-prompt flags are one mutually-exclusive group: when the
-                // caller supplies ANY of them (the runner's spawn-time carrier),
-                // drop EVERY one from the template, whatever its spelling.
-                name if caller_owns_system_prompt && is_system_prompt_flag(name) => {}
+                // The append prompt flags are one mutually-exclusive group: when
+                // the caller supplies either (the runner's spawn-time carrier),
+                // drop both from the template, whatever the spelling. Loudly —
+                // an operator's configured prompt silently vanishing is exactly
+                // what a reader of the launch would never guess.
+                name if caller_owns_append_prompt && is_append_prompt_flag(name) => {
+                    tracing::warn!(
+                        flag = %name,
+                        "launch template flag dropped: the caller's system-prompt carrier owns \
+                         the append slot and Claude Code refuses both append flags together"
+                    );
+                }
                 // Any other operator flag is layered in, unless the caller's
                 // extra_required already provides that flag (spec wins).
                 _ => {
-                    if !provided.contains(&unit.name) {
+                    if provided.contains(&unit.name) {
+                        tracing::warn!(
+                            flag = %unit.name,
+                            "launch template flag dropped: the caller supplies the same flag"
+                        );
+                    } else {
                         other_units.push(unit);
                     }
                 }
@@ -365,35 +378,36 @@ fn is_claude_command(s: &str) -> bool {
     base.eq_ignore_ascii_case("claude")
 }
 
-/// Claude Code's system-prompt flags, which behave as ONE mutually-exclusive
-/// group rather than four independent flags: the CLI refuses
+/// Claude Code's two APPEND system-prompt flags, which behave as ONE
+/// mutually-exclusive group rather than two independent flags: the CLI refuses
 /// `--append-system-prompt` beside `--append-system-prompt-file` (`Error: Cannot
 /// use both …`, verified against v2.1.272), so a template's inline prompt
 /// layered next to a caller's composed-file carrier (plan
 /// `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`) would stop
 /// the spawn outright. Exact-name dedup cannot see that collision.
-const SYSTEM_PROMPT_FLAG_GROUP: [&str; 4] = [
-    "--append-system-prompt",
-    "--append-system-prompt-file",
-    "--system-prompt",
-    "--system-prompt-file",
-];
+///
+/// `--system-prompt` / `--system-prompt-file` are deliberately NOT members:
+/// probed on the same version, either one starts fine beside either append
+/// flag, so an operator's replacement prompt is layered in as before. (The
+/// replacement pair refuses each other, but the runner's carrier is never a
+/// replacement flag, so that pair cannot collide with it.)
+const APPEND_PROMPT_FLAG_GROUP: [&str; 2] = ["--append-system-prompt", "--append-system-prompt-file"];
 
-/// Is `token` one of [`SYSTEM_PROMPT_FLAG_GROUP`], in either the `--flag` or
+/// Is `token` one of [`APPEND_PROMPT_FLAG_GROUP`], in either the `--flag` or
 /// the attached `--flag=value` spelling?
-fn is_system_prompt_flag(token: &str) -> bool {
+fn is_append_prompt_flag(token: &str) -> bool {
     let name = token.split_once('=').map_or(token, |(name, _)| name);
-    SYSTEM_PROMPT_FLAG_GROUP.contains(&name)
+    APPEND_PROMPT_FLAG_GROUP.contains(&name)
 }
 
-/// Does the caller's `extra_required` carry any system-prompt flag ahead of its
+/// Does the caller's `extra_required` carry an append prompt flag ahead of its
 /// `--` terminator? Tokens after the terminator are the positional prompt, and a
-/// prompt that happens to begin with `--system-prompt` is not a flag.
-fn provides_system_prompt_flag(extra: &[String]) -> bool {
+/// prompt that happens to begin with `--append-system-prompt` is not a flag.
+fn provides_append_prompt_flag(extra: &[String]) -> bool {
     extra
         .iter()
         .take_while(|t| t.as_str() != "--")
-        .any(|t| is_system_prompt_flag(t))
+        .any(|t| is_append_prompt_flag(t))
 }
 
 /// Flag names (`--foo`) present in the caller's `extra_required`, used to keep a
@@ -692,12 +706,12 @@ mod tests {
         assert_eq!(argv.iter().filter(|a| *a == "--add-dir").count(), 1);
     }
 
-    /// The system-prompt flags are ONE group: a template's inline prompt (any
-    /// spelling, any member) next to the caller's composed-file carrier would
-    /// make Claude Code refuse to start, so every template member is dropped
+    /// The two APPEND flags are ONE group: a template's append prompt (either
+    /// flag, either spelling) next to the caller's composed-file carrier would
+    /// make Claude Code refuse to start, so both template members are dropped
     /// while the template's unrelated flags still layer in.
     #[test]
-    fn caller_system_prompt_carrier_drops_every_template_prompt_flag() {
+    fn caller_append_carrier_drops_every_template_append_flag() {
         let mut s = spec();
         s.extra_required = vec![
             "--append-system-prompt-file".to_string(),
@@ -708,21 +722,20 @@ mod tests {
         for template in [
             "claude --append-system-prompt \"be terse\" --output-format stream-json",
             "claude --append-system-prompt=terse --output-format stream-json",
-            "claude --system-prompt x --output-format stream-json",
-            "claude --system-prompt-file=/t/sp.md --output-format stream-json",
             "claude --append-system-prompt-file /t/other.md --output-format stream-json",
+            "claude --append-system-prompt-file=/t/other.md --output-format stream-json",
         ] {
             for argv in [
                 render_argv(&s, &tmpl(template), "claude"),
                 shell_tokenize(&render_pty_command(&s, &tmpl(template), false)),
             ] {
-                let prompt_flags: Vec<&String> = argv
+                let append_flags: Vec<&String> = argv
                     .iter()
                     .take_while(|a| a.as_str() != "--")
-                    .filter(|a| is_system_prompt_flag(a))
+                    .filter(|a| is_append_prompt_flag(a))
                     .collect();
                 assert_eq!(
-                    prompt_flags,
+                    append_flags,
                     vec!["--append-system-prompt-file"],
                     "{template}: {argv:?}"
                 );
@@ -731,7 +744,7 @@ mod tests {
                     Some("/rt/spawn-prompts/spawn-1.md"),
                     "{template}"
                 );
-                assert!(!argv.iter().any(|a| a == "be terse" || a == "x"));
+                assert!(!argv.iter().any(|a| a == "be terse" || a == "/t/other.md"));
                 assert_eq!(
                     value_after(&argv, "--output-format"),
                     Some("stream-json"),
@@ -741,10 +754,29 @@ mod tests {
         }
     }
 
-    /// With no caller carrier the template's own system prompt is untouched, and
-    /// a positional prompt that merely LOOKS like the flag does not count.
+    /// A template REPLACEMENT prompt combines with the append carrier (probed
+    /// on v2.1.272), so it is no longer dropped.
     #[test]
-    fn template_system_prompt_kept_without_a_caller_carrier() {
+    fn template_replacement_prompt_survives_a_caller_append_carrier() {
+        let mut s = spec();
+        s.extra_required = vec![
+            "--append-system-prompt-file".to_string(),
+            "/rt/spawn-prompts/spawn-1.md".to_string(),
+        ];
+        let argv = render_argv(&s, &tmpl("claude --system-prompt x"), "claude");
+        assert_eq!(value_after(&argv, "--system-prompt"), Some("x"));
+        let argv = render_argv(&s, &tmpl("claude --system-prompt-file=/t/sp.md"), "claude");
+        assert!(argv.iter().any(|a| a == "--system-prompt-file=/t/sp.md"), "{argv:?}");
+        assert_eq!(
+            value_after(&argv, "--append-system-prompt-file"),
+            Some("/rt/spawn-prompts/spawn-1.md")
+        );
+    }
+
+    /// With no caller carrier the template's own append prompt is untouched,
+    /// and a positional prompt that merely LOOKS like the flag does not count.
+    #[test]
+    fn template_append_prompt_kept_without_a_caller_carrier() {
         let argv = render_argv(
             &spec(),
             &tmpl("claude --append-system-prompt terse"),
@@ -753,7 +785,7 @@ mod tests {
         assert_eq!(value_after(&argv, "--append-system-prompt"), Some("terse"));
 
         let mut s = spec();
-        s.extra_required = vec!["--".to_string(), "--system-prompt".to_string()];
+        s.extra_required = vec!["--".to_string(), "--append-system-prompt-file".to_string()];
         let argv = render_argv(&s, &tmpl("claude --append-system-prompt terse"), "claude");
         assert_eq!(value_after(&argv, "--append-system-prompt"), Some("terse"));
     }

@@ -2424,8 +2424,12 @@ impl TerminalSession {
     /// trust gate's conjunct 3 exists to catch.
     /// Remove the inherited delivered-policy marker pair
     /// ([`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`] and
-    /// [`crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV`]) from a
-    /// DIRECT-EXEC child. Runs BEFORE the caller's `extra_env`, so a caller that
+    /// [`crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV`]) and the
+    /// shell wrapper's composed-file pointer
+    /// ([`crate::session::spawn_prompt::RUNNER_CONTEXT_FILE_ENV`]) from a
+    /// DIRECT-EXEC child — a `claude` run directly has no wrapper to read the
+    /// pointer, and a shell it later opens must not pick up the PARENT pane's
+    /// file. Runs BEFORE the caller's `extra_env`, so a caller that
     /// sets the pair still wins and one that sets neither leaves the child with
     /// none. A shell pane is left alone: its pair is set or removed afterwards
     /// from the pane's own composed file.
@@ -2435,6 +2439,7 @@ impl TerminalSession {
         }
         cmd.env_remove(crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV);
         cmd.env_remove(crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV);
+        cmd.env_remove(crate::session::spawn_prompt::RUNNER_CONTEXT_FILE_ENV);
     }
 
     pub(crate) fn caller_pinned_config_dir(extra_env: Option<&[(String, String)]>) -> Option<&str> {
@@ -4494,11 +4499,14 @@ mod tests {
     /// composed-file logic.
     #[test]
     fn direct_exec_drops_an_inherited_policy_marker_unless_the_caller_sets_it() {
-        use crate::session::spawn_prompt::{POLICY_DELIVERED_FILE_ENV, POLICY_DELIVERED_SHA_ENV};
+        use crate::session::spawn_prompt::{
+            POLICY_DELIVERED_FILE_ENV, POLICY_DELIVERED_SHA_ENV, RUNNER_CONTEXT_FILE_ENV,
+        };
         let seeded = || {
             let mut cmd = TerminalSession::build_command_from(Some(vec!["claude".to_string()]));
             cmd.env(POLICY_DELIVERED_SHA_ENV, "ab".repeat(32));
             cmd.env(POLICY_DELIVERED_FILE_ENV, "/parent/spawn-1.md");
+            cmd.env(RUNNER_CONTEXT_FILE_ENV, "/parent/spawn-1.md");
             cmd
         };
         let get = |cmd: &CommandBuilder, k: &str| {
@@ -4510,6 +4518,7 @@ mod tests {
         TerminalSession::scrub_inherited_policy_marker(&mut cmd, false);
         assert_eq!(get(&cmd, POLICY_DELIVERED_SHA_ENV), None);
         assert_eq!(get(&cmd, POLICY_DELIVERED_FILE_ENV), None);
+        assert_eq!(get(&cmd, RUNNER_CONTEXT_FILE_ENV), None);
 
         // The caller's own pair (applied after, as `extra_env` is) wins.
         let mut cmd = seeded();

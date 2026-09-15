@@ -241,9 +241,10 @@ pub fn read_policy_body_cache(base_dir: &Path, tenant: &uuid::Uuid) -> Option<St
 /// ([`spawn_prompt_file_name`]) — so the name can never point at different
 /// bytes: a later spawn cannot rewrite the prompt an earlier pane is about to
 /// read, and identical spawns (every pane of one briefing and one policy
-/// version) share one file. An existing file of the right size is reused and
-/// its mtime refreshed, so the age prune never removes a file a spawn just
-/// handed out; otherwise it is written by temp + rename, without `fsync`.
+/// version) share one file. An existing file holding exactly these bytes is
+/// reused and its mtime refreshed, so the age prune never removes a file a
+/// spawn just handed out; otherwise it is written by temp + rename, without
+/// `fsync`.
 /// Opportunistically prunes old files ([`maybe_prune`]).
 pub fn compose_spawn_prompt_in(
     base_dir: &Path,
@@ -259,7 +260,7 @@ pub fn compose_spawn_prompt_in(
     }
     content.push_str(body);
     let path = dir.join(spawn_prompt_file_name(&content));
-    if !reuse_spawn_prompt(&path, content.len() as u64) {
+    if !reuse_spawn_prompt(&path, content.as_bytes()) {
         write_atomic_with(&path, content.as_bytes(), false)?;
     }
     Ok(path)
@@ -271,16 +272,22 @@ pub fn spawn_prompt_file_name(content: &str) -> String {
     format!("spawn-{}.md", &digest[..16])
 }
 
-/// Reuse an already-composed file: `true` when `path` is a regular file of
-/// `expected_len` bytes and its mtime was refreshed to now. Anything else — no
-/// file, a torn one, an mtime that cannot be set — is `false`, and the caller
-/// rewrites it. Refreshing the mtime is what keeps the age prune from deleting
-/// a file between this spawn handing out its path and `claude` reading it.
-fn reuse_spawn_prompt(path: &Path, expected_len: u64) -> bool {
+/// Reuse an already-composed file: `true` when `path` is a regular file whose
+/// bytes EQUAL `expected` and its mtime was refreshed to now. Anything else — no
+/// file, a torn or tampered one (same length, different bytes included), an
+/// mtime that cannot be set — is `false`, and the caller rewrites it. The name
+/// is only a hash prefix of what SHOULD be inside; the bytes are what `claude`
+/// reads and what the delivered-SHA marker vouches for. Refreshing the mtime is
+/// what keeps the age prune from deleting a file between this spawn handing out
+/// its path and `claude` reading it.
+fn reuse_spawn_prompt(path: &Path, expected: &[u8]) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() || meta.len() != expected_len {
+    if !meta.is_file() || meta.len() != expected.len() as u64 {
+        return false;
+    }
+    if !std::fs::read(path).is_ok_and(|existing| existing == expected) {
         return false;
     }
     std::fs::OpenOptions::new()
@@ -311,7 +318,9 @@ fn maybe_prune(dir: &Path) {
 }
 
 /// Delete regular files in `dir` whose mtime is older than `max_age` as of
-/// `now`. Returns how many were removed. Every error is swallowed: pruning is
+/// `now` — a file touched within `max_age` is never removed, which is what the
+/// reuse path's mtime refresh and the shell wrappers' pre-exec `touch` rely on
+/// to keep a live pane's file alive. Returns how many were removed. Every error is swallowed: pruning is
 /// housekeeping, and a file it cannot judge is left alone. `now` is a
 /// parameter so the age arithmetic is testable without sleeping.
 pub fn prune_spawn_prompts_in(dir: &Path, max_age: Duration, now: SystemTime) -> usize {
@@ -655,6 +664,11 @@ mod tests {
         std::fs::write(&path, "BO").unwrap();
         compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "BODY");
+
+        // Same length, different bytes: a length check alone would reuse it.
+        std::fs::write(&path, "EVIL").unwrap();
+        compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "BODY");
     }
 
     // ── Pruning ─────────────────────────────────────────────────────────
@@ -920,6 +934,15 @@ mod script_tests {
         ];
 
         // File present: the file flag INSTEAD of the inline one; marker kept.
+        // The file is touched first, so an old live pane re-arms it against
+        // the age prune.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 24 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         assert_eq!(
             run_wrapper(block, &pane_env, "-p hi"),
             record(
@@ -928,6 +951,11 @@ mod script_tests {
                 &["--append-system-prompt-file", &file_s, "-p", "hi"]
             ),
             "{label}: file carrier"
+        );
+        let touched = std::fs::metadata(&file).unwrap().modified().unwrap();
+        assert!(
+            touched > old + std::time::Duration::from_secs(60),
+            "{label}: the wrapper must touch the composed file before exec"
         );
 
         // File pruned/missing: inline fall-back, marker BLANKED.
@@ -971,7 +999,31 @@ mod script_tests {
             );
         }
 
-        // A caller-owned file or replacement prompt suppresses ours entirely.
+        // A caller `--system-prompt[-file]` combines with the append file flag
+        // (verified on v2.1.272), so it does NOT suppress ours; nor does a
+        // prompt flag spelled AFTER `--`, which is positional prompt text.
+        for (args, tail) in [
+            ("--system-prompt mine", vec!["--system-prompt", "mine"]),
+            ("--system-prompt-file=./s.md", vec!["--system-prompt-file=./s.md"]),
+            (
+                "-p -- --append-system-prompt-file",
+                vec!["-p", "--", "--append-system-prompt-file"],
+            ),
+            (
+                "-- --append-system-prompt x",
+                vec!["--", "--append-system-prompt", "x"],
+            ),
+        ] {
+            let mut expect = vec!["--append-system-prompt-file", file_s.as_str()];
+            expect.extend(tail);
+            assert_eq!(
+                run_wrapper(block, &pane_env, args),
+                record(SHA, &file_s, &expect),
+                "{label}: not a caller-owned append prompt {args:?}"
+            );
+        }
+
+        // A caller-owned append FILE suppresses ours entirely.
         for (args, argv) in [
             (
                 "--append-system-prompt-file ./eval.md",
@@ -990,8 +1042,6 @@ mod script_tests {
                     "./eval.md",
                 ],
             ),
-            ("--system-prompt mine", vec!["--system-prompt", "mine"]),
-            ("--system-prompt-file=./s.md", vec!["--system-prompt-file=./s.md"]),
         ] {
             assert_eq!(
                 run_wrapper(block, &pane_env, args),
@@ -1051,6 +1101,13 @@ mod script_tests {
             std::env::var("PATH").unwrap_or_default()
         );
         let file_s = file.to_string_lossy().into_owned();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 24 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         let run = |ctx_file: &str, args: &str| {
             let script = tmp.path().join("w.ps1");
             std::fs::write(&script, format!("{block}\nclaude {args}\n")).unwrap();
@@ -1076,6 +1133,11 @@ mod script_tests {
                 &["--append-system-prompt-file", &file_s, "-p", "hi"]
             )
         );
+        assert!(
+            std::fs::metadata(&file).unwrap().modified().unwrap()
+                > old + std::time::Duration::from_secs(60),
+            "the ps1 wrapper must touch the composed file before exec"
+        );
         assert_eq!(
             run("/nonexistent/spawn-x.md", "-p hi"),
             record("", "", &["--append-system-prompt", "BRIEFING", "-p", "hi"])
@@ -1092,9 +1154,22 @@ mod script_tests {
             run(&file_s, "--append-system-prompt-file ./eval.md"),
             record("", "", &["--append-system-prompt-file", "./eval.md"])
         );
+        // A quoted `--` reaches $args, and the scan stops there.
+        assert_eq!(
+            run(&file_s, "-p '--' --append-system-prompt-file"),
+            record(
+                SHA,
+                &file_s,
+                &["--append-system-prompt-file", &file_s, "-p", "--", "--append-system-prompt-file"]
+            )
+        );
         assert_eq!(
             run(&file_s, "--system-prompt mine"),
-            record("", "", &["--system-prompt", "mine"])
+            record(
+                SHA,
+                &file_s,
+                &["--append-system-prompt-file", &file_s, "--system-prompt", "mine"]
+            )
         );
     }
 
@@ -1163,13 +1238,13 @@ mod script_tests {
         assert!(got.starts_with("SHA=[]\n"), "{got}");
     }
 
-    /// Run the bundled policy hook against a fake `curl` that echoes the URL it
-    /// was asked to fetch, and return that URL.
-    fn hook_url(sha: Option<&str>) -> String {
+    /// Run the bundled policy hook against a fake `curl` that echoes every
+    /// argument it was given, one per line, and return those lines.
+    fn hook_curl_args(sha: Option<&str>) -> Vec<String> {
         let tmp = tempfile::tempdir().unwrap();
         write_exe(
             &tmp.path().join("curl"),
-            "#!/usr/bin/env bash\nfor a in \"$@\"; do last=\"$a\"; done\nprintf '%s' \"$last\"\n",
+            "#!/usr/bin/env bash\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done\n",
         );
         let hook = tmp.path().join("claude_policy_hook.sh");
         write_exe(&hook, POLICY_HOOK);
@@ -1184,26 +1259,32 @@ mod script_tests {
             cmd.env("QONTINUI_POLICY_DELIVERED_SHA", sha);
         }
         let out = cmd.output().expect("the hook runs");
-        String::from_utf8(out.stdout).unwrap()
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
+    /// The marker rides a request HEADER (the runner's trace log records
+    /// request URIs), never the query string, and only when well formed.
     #[test]
-    fn the_policy_hook_forwards_only_a_well_formed_delivered_sha() {
-        assert_eq!(
-            hook_url(Some(SHA)),
-            format!("http://127.0.0.1:9876/sessions/term-1/policy-context?delivered_sha={SHA}")
-        );
-        assert_eq!(
-            hook_url(None),
-            "http://127.0.0.1:9876/sessions/term-1/policy-context"
-        );
+    fn the_policy_hook_forwards_only_a_well_formed_delivered_sha_in_a_header() {
+        const URL: &str = "http://127.0.0.1:9876/sessions/term-1/policy-context";
+        let args = hook_curl_args(Some(SHA));
+        assert_eq!(args.last().map(String::as_str), Some(URL), "{args:?}");
+        assert!(args.iter().all(|a| !a.contains("delivered_sha")), "{args:?}");
+        let h = args.iter().position(|a| a == "-H").expect("a header flag");
+        assert_eq!(args[h + 1], format!("X-Qontinui-Policy-Delivered-Sha: {SHA}"));
+
+        let args = hook_curl_args(None);
+        assert_eq!(args.last().map(String::as_str), Some(URL));
+        assert!(!args.iter().any(|a| a == "-H"), "{args:?}");
         // Empty (the blanked marker), short, or non-hex: not forwarded.
         for bad in ["", "abc", &"z".repeat(64), &format!("{SHA}&x=1")] {
-            assert_eq!(
-                hook_url(Some(bad)),
-                "http://127.0.0.1:9876/sessions/term-1/policy-context",
-                "{bad:?}"
-            );
+            let args = hook_curl_args(Some(bad));
+            assert_eq!(args.last().map(String::as_str), Some(URL), "{bad:?}");
+            assert!(!args.iter().any(|a| a == "-H"), "{bad:?}: {args:?}");
         }
     }
 }
