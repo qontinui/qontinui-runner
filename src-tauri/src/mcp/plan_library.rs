@@ -15,8 +15,17 @@
 //! | `GET /plan-library/artifacts/{id}` | `GET {web}/api/v1/plan-library/{id}[?include_coord]` | no |
 //! | `GET /plan-library/artifacts/{id}/export` | `GET {web}/api/v1/plan-library/{id}/export` (**raw**) | no |
 //! | `GET /plan-library/divergent` | `GET {web}/api/v1/plan-library/divergent` | no |
+//! | `GET /plan-library/scan-roots` | `GET {web}/api/v1/plan-library/scan-roots` | no |
 //!
-//! The last two land plan `2026-09-06-plan-library-door-serves-no-plan-body`.
+//! **This table is the doc-of-record for this door.** One row per forwarded
+//! route, its upstream `{web}` path, and whether it is a write; a forward
+//! shipped without its row is a surface nobody can find, so
+//! `the_forward_table_has_a_row_for_every_registered_route` fails the build
+//! when [`route_entries`] and these rows disagree.
+//!
+//! The export and divergent rows land plan
+//! `2026-09-06-plan-library-door-serves-no-plan-body`; the scan-roots row lands
+//! `2026-09-15-captured-vs-authored-coverage-is-a-set-difference` Phase 5.
 //! The export forward is the one route that does **not** wrap its answer in
 //! [`ApiResponse`] — it passes the upstream's `text/markdown` bytes and its
 //! `X-Content-Sha256` through unmodified, because the corpus-authority
@@ -423,6 +432,28 @@ fn write_capability() -> serde_json::Map<String, Value> {
         scope.map(Value::String).unwrap_or(Value::Null),
     );
     m.insert("writeInstruction".to_string(), Value::String(instruction));
+    // The fifth and sixth switches: this device's plan-library BODY SYNC — the
+    // loop that populates the corpus these reads serve. Published on the same
+    // `writeFlag` / `writeKillSwitchEngaged` precedent (the evaluated value
+    // beside the NAME of the knob that sets it) so a reader who finds it off
+    // can act instead of hunting. `bodySyncEnabled` is a SPAWN-TIME fact and
+    // is not on its own sufficient; `writeContract`'s closing sentence says
+    // both, and is the only reason this key is safe to publish at all.
+    //
+    // `qontinui_runner_lib::`, not `crate::`: `mcp` is a module of the BIN
+    // crate (`main.rs`) and `plan_workunit_adapter` lives in the LIB crate
+    // (`lib.rs`), which is why the same spelling appears at the two other call
+    // sites in this file.
+    m.insert(
+        "bodySyncEnabled".to_string(),
+        Value::Bool(qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled()),
+    );
+    m.insert(
+        "bodySyncFlag".to_string(),
+        Value::String(
+            qontinui_runner_lib::plan_workunit_adapter::trigger::PLAN_LIBRARY_SYNC_ENV.to_string(),
+        ),
+    );
     // The two contract facts a driver would otherwise learn by taking an error
     // (or worse, by NOT taking one). This block exists precisely so it does not
     // have to.
@@ -440,6 +471,17 @@ fn write_capability() -> serde_json::Map<String, Value> {
 /// direction — nothing in the briefing clause or these read routes said it was
 /// part of the identity, so an agent omitting it did not get an error, it got a
 /// SECOND row shadowing the one it meant to update.
+///
+/// The closing sentence is what makes `bodySyncEnabled` safe to publish. Both
+/// halves are quoted from the definitions themselves rather than restated:
+/// [`qontinui_runner_lib::plan_workunit_adapter::trigger::body_sync_enabled`]
+/// is *"Read once at spawn (unlike the write-door kill switch, which is read
+/// per request)"*, and
+/// [`qontinui_runner_lib::plan_workunit_adapter::trigger::PLAN_LIBRARY_SYNC_ENV`]
+/// says *"What bounds the sync is not this flag"* and names the three that do.
+/// A bare `bodySyncEnabled: true` — a confident key a reader has no reason to
+/// doubt — would be a fresh instance of the very defect class this door's
+/// capability block exists to close.
 const WRITE_CONTRACT: &str = "\
 POST /plan-library/artifacts identity is (organization, kind, slug, source_repo) — \
 `source_repo` is part of the key, so omitting it does NOT update an artifact that has \
@@ -450,7 +492,17 @@ cannot tell an omitted field from an empty one, so omitting them would blank the
 stored values — send `\"\"` / `[]` explicitly to mean empty. \
 `work_unit_slug`, `authored_at` and `source_path` are replaced the same way (null clears). \
 `source_path` is read only from the runner's configured plans/prompts/workspace \
-directories; anything else must be sent inline as `body`.";
+directories; anything else must be sent inline as `body`. \
+`bodySyncEnabled` reports this device's plan-library BODY SYNC — the loop that captures \
+plan bodies from disk, a different switch from the write door above — as \
+`bodySyncFlag` was \"read once at spawn (unlike the write-door kill switch, which is \
+read per request)\", so it is a spawn-time fact about THIS process and not the current \
+environment, and it is not sufficient either: \"what bounds the sync is not this flag\" \
+but the backend-resolution guard (`HttpArtifactSink::from_env` answers `None` with no \
+resolvable backend, and a release build refuses a machine-local one), the tenant's \
+`plan_capture` dial consulted every cycle (`CaptureGate`), and the five-cycle failure \
+breaker — so a `true` here means only that nothing on this device's env killed the sync \
+when it started.";
 
 /// Fold [`write_capability`] plus `webBackendReachable: true` into an upstream
 /// payload without disturbing its own keys. A bare array is wrapped rather
@@ -1439,6 +1491,29 @@ pub async fn divergent_handler(Query(params): Query<HashMap<String, String>>) ->
     Ok(Json(ApiResponse::success(with_write_capability(upstream))))
 }
 
+/// `GET /plan-library/scan-roots` — every reporting device's latest
+/// plan-scan-source reading, age-judged, with the per-`source_repo` roll-up.
+///
+/// The forward exists so the coverage block is readable **with no caller
+/// credential** on any box whose runner reaches its web base: upstream the
+/// route is `get_audit_actor_user`-gated like the rest of the library, and the
+/// runner attaches its own device JWT server-side, the same forward-never-emit
+/// shape as the other reads. Without it, the one call that answers "is this
+/// device's scan actually capturing?" needs a device JWT the asking agent has
+/// no way to mint.
+///
+/// **No query parameters.** `list_scan_roots` takes none at all — its whole
+/// answer is the organization's rows — so unlike the other forwards there is
+/// no allowlist to keep: nothing is forwarded, rather than an allowlist that
+/// happens to be empty. **Ungated**, and advertises the write layers (on the
+/// error arm too).
+pub async fn scan_roots_handler() -> ReadResult {
+    let upstream = upstream_get("/api/v1/plan-library/scan-roots", &HashMap::new())
+        .await
+        .map_err(read_failure)?;
+    Ok(Json(ApiResponse::success(with_write_capability(upstream))))
+}
+
 /// The door's route table, as data: `(method, path, requires_a_nonce)`.
 ///
 /// `Router` has no public introspection, so the gating split — writes
@@ -1454,6 +1529,7 @@ pub fn route_entries() -> &'static [(&'static str, &'static str, bool)] {
         ("GET", "/plan-library/artifacts/{id}", false),
         ("GET", "/plan-library/artifacts/{id}/export", false),
         ("GET", "/plan-library/divergent", false),
+        ("GET", "/plan-library/scan-roots", false),
     ]
 }
 
@@ -1469,6 +1545,7 @@ pub fn routes() -> Router<Arc<ApiState>> {
             get(export_artifact_handler),
         )
         .route("/plan-library/divergent", get(divergent_handler))
+        .route("/plan-library/scan-roots", get(scan_roots_handler))
 }
 
 // ===========================================================================
@@ -1585,6 +1662,73 @@ mod tests {
         assert!(msg.contains(CODE_DIAL_OFF), "{msg}");
         assert!(msg.contains("plan_capture"), "{msg}");
         assert!(msg.contains("/admin/coord/plan-library"), "{msg}");
+    }
+
+    /// The fifth and sixth switches ride the same block — the body sync's
+    /// evaluated value and the NAME of the flag that sets it — and the contract
+    /// carries the four things a bare `bodySyncEnabled: true` would not say.
+    ///
+    /// The value is asserted from the flag rather than from a fixed expectation
+    /// so this pins the WIRING, not today's machine: absent is on (the sync
+    /// ships enabled), and only the one exact spelling kills it.
+    #[test]
+    fn reads_advertise_the_body_sync_switch_and_the_bounds_it_does_not_cover() {
+        use qontinui_runner_lib::plan_workunit_adapter::trigger::PLAN_LIBRARY_SYNC_ENV;
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[PLAN_LIBRARY_SYNC_ENV]);
+
+        std::env::remove_var(PLAN_LIBRARY_SYNC_ENV);
+        let on = with_write_capability(serde_json::json!({"items": []}));
+        assert_eq!(
+            on["bodySyncEnabled"],
+            serde_json::json!(true),
+            "absent is ON"
+        );
+        assert_eq!(
+            on["bodySyncFlag"],
+            serde_json::json!(PLAN_LIBRARY_SYNC_ENV),
+            "the flag's NAME travels with its value, as `writeFlag` does — a \
+             reader who finds the sync off can then act instead of hunting"
+        );
+        assert_eq!(on["items"], serde_json::json!([]), "upstream keys survive");
+
+        std::env::set_var(PLAN_LIBRARY_SYNC_ENV, "0");
+        let killed = with_write_capability(serde_json::json!({}));
+        assert_eq!(killed["bodySyncEnabled"], serde_json::json!(false));
+        assert_eq!(
+            killed["bodySyncFlag"],
+            serde_json::json!(PLAN_LIBRARY_SYNC_ENV)
+        );
+
+        // The failed-read arm advertises it too: a driver that could only learn
+        // the sync state from a SUCCESSFUL read would have to be lucky.
+        std::env::remove_var(PLAN_LIBRARY_SYNC_ENV);
+        let (_, body) = read_failure((StatusCode::BAD_GATEWAY, Json(api_error("could not reach"))));
+        let data = body.0.data.expect("the block rides in `data`");
+        assert_eq!(data["bodySyncEnabled"], serde_json::json!(true));
+        assert_eq!(
+            data["bodySyncFlag"],
+            serde_json::json!(PLAN_LIBRARY_SYNC_ENV)
+        );
+
+        // The four things the contract must say, so the key cannot be read as
+        // "the sync is running": it is a SPAWN-time reading, and three other
+        // gates bound the sync that this flag does not cover.
+        let contract = on["writeContract"].as_str().unwrap();
+        for claim in [
+            "read once at spawn",
+            "HttpArtifactSink::from_env",
+            "plan_capture",
+            "CaptureGate",
+            "five-cycle failure breaker",
+        ] {
+            assert!(
+                contract.contains(claim),
+                "the write contract omits `{claim}`, so `bodySyncEnabled` would be a \
+                 confident key a reader has no reason to doubt: {contract}"
+            );
+        }
     }
 
     /// The scope the poller caches beside the level rides on the reads too,
@@ -2384,16 +2528,16 @@ mod tests {
 
     // ---- routes ------------------------------------------------------------
 
-    /// All seven routes are registered, and the split is exactly the
+    /// All eight routes are registered, and the split is exactly the
     /// three-layer model: the two WRITES require a nonce (and sit behind the
-    /// kill switch and the dial), the five READS do not. `gated_flow.rs` makes
+    /// kill switch and the dial), the six READS do not. `gated_flow.rs` makes
     /// the same distinction — "knowing a view exists is inert; opening it is
     /// the privileged act" — and Phase 6's whole value is an agent being able
     /// to ask the candidate question.
     #[test]
     fn the_write_routes_require_a_nonce_and_the_read_routes_do_not() {
         let entries = route_entries();
-        assert_eq!(entries.len(), 7, "keep in lockstep with routes()");
+        assert_eq!(entries.len(), 8, "keep in lockstep with routes()");
         for (method, path, _) in entries {
             assert!(path.starts_with("/plan-library/"), "{path}");
             assert!(matches!(*method, "GET" | "POST"));
@@ -2419,7 +2563,8 @@ mod tests {
                 "/plan-library/candidates",
                 "/plan-library/artifacts/{id}",
                 "/plan-library/artifacts/{id}/export",
-                "/plan-library/divergent"
+                "/plan-library/divergent",
+                "/plan-library/scan-roots"
             ]
         );
         // Every nonce-requiring route is a POST and every open one a GET — a
@@ -2481,6 +2626,69 @@ mod tests {
         }
         // The registration itself type-checks with both handlers attached.
         let _r: Router<Arc<ApiState>> = routes();
+    }
+
+    /// The module-header forward table carries **exactly** the registered
+    /// routes — same paths, same methods, same is-a-write column.
+    ///
+    /// That table is this door's doc-of-record: it is what a reader consults to
+    /// learn the door exists at all, so a forward shipped without its row is a
+    /// surface nobody can find — the same class of defect as a capability key
+    /// that overstates what it knows. The rows are read out of the SOURCE FILE
+    /// rather than re-typed here (the technique
+    /// `the_vocabulary_is_stated_identically_in_all_three_places` already uses):
+    /// a re-typed copy would assert only that the copy matches itself.
+    #[test]
+    fn the_forward_table_has_a_row_for_every_registered_route() {
+        let source = include_str!("plan_library.rs");
+        let rows: Vec<&str> = source
+            .lines()
+            .take_while(|l| l.starts_with("//!"))
+            .filter(|l| l.starts_with("//! | `"))
+            .collect();
+
+        assert_eq!(
+            rows.len(),
+            route_entries().len(),
+            "the forward table has {} rows for {} registered routes — every route \
+             gets one row and no row outlives its route:\n{}",
+            rows.len(),
+            route_entries().len(),
+            rows.join("\n")
+        );
+
+        for (method, path, requires_nonce) in route_entries() {
+            let cell = format!("//! | `{method} {path}` |");
+            let matching: Vec<&&str> = rows.iter().filter(|r| r.starts_with(&cell)).collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the forward table needs exactly one row starting `{cell}`; \
+                 add it beside the other forwards. Rows:\n{}",
+                rows.join("\n")
+            );
+            let row = matching[0];
+
+            // The upstream path column names the `{web}` route being forwarded.
+            assert!(
+                row.contains("{web}/api/v1/plan-library"),
+                "the row for {path} must name its upstream `{{web}}` path: {row}"
+            );
+
+            // The is-a-write column, which is the whole reason the table is
+            // worth reading: `**yes**` for a nonce-authorized write, `no` for
+            // an open read.
+            let expected_gate = if *requires_nonce {
+                "| **yes** |"
+            } else {
+                "| no |"
+            };
+            assert!(
+                row.trim_end().ends_with(expected_gate),
+                "the row for {path} must end `{expected_gate}` (requires_a_nonce = \
+                 {requires_nonce}): {row}"
+            );
+        }
     }
 
     // ---- the export route's two guards ------------------------------------
@@ -2677,6 +2885,9 @@ mod tests {
                 get(export_artifact_handler),
             )
             .route("/plan-library/links", post(create_link_handler))
+            .route("/plan-library/search", get(search_handler))
+            .route("/plan-library/candidates", get(candidates_handler))
+            .route("/plan-library/scan-roots", get(scan_roots_handler))
     }
 
     /// A non-UUID id is refused by the door itself, before the forward — so
@@ -2877,6 +3088,146 @@ mod tests {
                  the door's only defence against a caller steering this call; got {line}"
             );
         }
+    }
+
+    /// The three ungated GET reads, driven end to end against a stub upstream:
+    /// `scan-roots` round-trips, and all three carry the body-sync switch.
+    ///
+    /// Driving the handlers is the point. Calling [`with_write_capability`]
+    /// directly proves only that the FOLD inserts the keys — deleting the fold
+    /// from `search_handler` would leave such a test green — and the exit
+    /// criterion this phase discharges is "six switches readable in **one
+    /// ungated call**", which is a claim about the HTTP answer, not about a
+    /// helper. So this points `web_base()` at a local listener, lets the real
+    /// requests go out over the real client, and reads the JSON that came back.
+    #[tokio::test]
+    async fn the_ungated_reads_round_trip_and_carry_the_body_sync_switch() {
+        use qontinui_runner_lib::plan_workunit_adapter::trigger::PLAN_LIBRARY_SYNC_ENV;
+        use std::sync::{Arc, Mutex};
+
+        let _pin = pin("off");
+        let _guard = crate::test_env::env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(&[
+            PLAN_LIBRARY_WRITE_FLAG,
+            PLAN_LIBRARY_SYNC_ENV,
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            "QONTINUI_CONFIG_DIR",
+            "XDG_CONFIG_HOME",
+        ]);
+        std::env::remove_var(PLAN_LIBRARY_WRITE_FLAG);
+        std::env::remove_var(PLAN_LIBRARY_SYNC_ENV);
+        // `web_base()` reaches a settings WRITER with two roots, only one of
+        // which obeys `QONTINUI_CONFIG_DIR` — see
+        // `the_handler_dials_upstream_with_only_the_allowlisted_param` for why
+        // both are redirected and why the roster half is Linux/macOS-only.
+        let cfg = tempfile::tempdir().expect("temp config dir");
+        std::env::set_var("QONTINUI_CONFIG_DIR", cfg.path());
+        std::env::set_var("XDG_CONFIG_HOME", cfg.path());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        tokio::spawn(async move {
+            // One connection per request: the answer closes it, so a pooled
+            // client cannot pipeline a second request onto a socket this stub
+            // has already finished with.
+            while let Ok((mut sock, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut acc = Vec::new();
+                let mut buf = [0u8; 2048];
+                // Read until the header block is complete. A single `read` is
+                // effectively always enough on loopback, but a short read would
+                // truncate the request line this test asserts on.
+                while !acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let req = String::from_utf8_lossy(&acc).to_string();
+                if let Some(line) = req.lines().next() {
+                    captured.lock().unwrap().push(line.to_string());
+                }
+                let body = r#"{"items":[],"total":0}"#;
+                let _ = sock
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Connection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            }
+        });
+        std::env::set_var(
+            WEB_BACKEND_URL_ENV_FOR_TEST,
+            format!("http://127.0.0.1:{port}"),
+        );
+
+        for (uri, upstream_path) in [
+            ("/plan-library/search", "/api/v1/plan-library"),
+            (
+                "/plan-library/candidates",
+                "/api/v1/plan-library/candidates",
+            ),
+            (
+                "/plan-library/scan-roots",
+                "/api/v1/plan-library/scan-roots",
+            ),
+        ] {
+            let resp = test_app()
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&bytes).unwrap();
+            let data = &json["data"];
+            assert_eq!(
+                data["total"],
+                serde_json::json!(0),
+                "{uri}: upstream survives"
+            );
+            assert_eq!(data["bodySyncEnabled"], serde_json::json!(true), "{uri}");
+            assert_eq!(
+                data["bodySyncFlag"],
+                serde_json::json!(PLAN_LIBRARY_SYNC_ENV),
+                "{uri}"
+            );
+            assert_eq!(
+                data["writeFlag"],
+                serde_json::json!(PLAN_LIBRARY_WRITE_FLAG)
+            );
+            assert_eq!(
+                data["webBackendReachable"],
+                serde_json::json!(true),
+                "{uri}"
+            );
+
+            let lines = seen.lock().unwrap().clone();
+            let line = lines.last().cloned().expect("upstream was dialled");
+            assert!(
+                line.starts_with(&format!("GET {upstream_path} ")),
+                "{uri} must forward to {upstream_path}; got {line}"
+            );
+        }
+
+        // The scan-roots forward carries no query string at all: the upstream
+        // route takes no parameters, so there is nothing to allowlist and
+        // nothing a caller can steer.
+        let scan_line = seen.lock().unwrap().last().cloned().unwrap();
+        assert!(!scan_line.contains('?'), "{scan_line}");
     }
 
     /// A REGISTERED nonce: a fresh agent binding on a throwaway workdir, via
