@@ -18,6 +18,7 @@ pub mod interceptor;
 pub mod manager;
 pub mod output_scan;
 pub mod pane_io;
+pub mod phantom_turn;
 pub mod remote_pane_io;
 mod scan_gate;
 pub mod scan_interval;

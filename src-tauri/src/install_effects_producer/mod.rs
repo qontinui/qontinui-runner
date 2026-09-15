@@ -326,6 +326,7 @@ async fn post_session_open(
                 .unwrap_or_default();
             emit_session_bound_for_open(&state.app_handle, &req, &provider, &recorded_config_dir);
             confirm_coord_harness_session_id(&state, &req);
+            spawn_phantom_turn_watch(&state.app_handle, &store, &req, &provider);
             Ok(Json(ApiResponse::success(())))
         }
         None => {
@@ -339,6 +340,59 @@ async fn post_session_open(
             Ok(Json(ApiResponse::success(())))
         }
     }
+}
+
+/// Start the bounded phantom-turn watch for a confirmed Claude session-open
+/// (plan `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`,
+/// Phase 3). Detection only — see [`crate::terminal::phantom_turn`].
+///
+/// This route is the right trigger because it is the one signal the runner
+/// gets on BOTH startup and `--resume`, from inside the SessionStart hook
+/// batch the incident's phantom turn followed. The session→terminal mapping is
+/// exact, not inferred: the hook posts the `terminal_id` the runner injected
+/// into the PTY child, and that is the terminal whose Phase 2 input slots the
+/// watch reads.
+///
+/// The transcript path needs an account and a project cwd. Both are taken from
+/// the request first and the lifecycle record second — the hook may omit
+/// either, and the record was just written from the best of both. Non-Claude
+/// providers are skipped: the detector reads Claude Code's transcript format.
+fn spawn_phantom_turn_watch(
+    app_handle: &tauri::AppHandle,
+    store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
+    req: &SessionOpenRequest,
+    provider: &str,
+) {
+    use crate::session::session_lifecycle_store::DEFAULT_PROVIDER;
+
+    if provider != DEFAULT_PROVIDER {
+        return;
+    }
+    let record = store.get(&req.session_id);
+    let config_dir = req
+        .config_dir
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .or_else(|| record.as_ref().and_then(|r| r.config_dir.clone()));
+    let mut cwds: Vec<String> = Vec::new();
+    for cwd in [
+        req.cwd.clone(),
+        record.as_ref().and_then(|r| r.working_dir.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !cwd.trim().is_empty() && !cwds.contains(&cwd) {
+            cwds.push(cwd);
+        }
+    }
+    crate::terminal::phantom_turn::spawn_watch(
+        app_handle.clone(),
+        req.session_id.clone(),
+        req.terminal_id.clone(),
+        config_dir,
+        cwds,
+    );
 }
 
 /// Correct this terminal's `coord.sessions` row to the harness session id the
