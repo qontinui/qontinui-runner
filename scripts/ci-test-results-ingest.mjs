@@ -26,8 +26,10 @@
  * pairing that with a GitHub Actions `timeout-minutes` on the SAME step: a
  * `continue-on-error` step that hits its OWN `timeout-minutes` cancels the
  * whole job, not just the step (learned the expensive way in this plan's
- * nextest revert). This script bounds its own network call internally
- * instead, so no step-level timeout is needed here.
+ * nextest revert). This script bounds its own network calls internally
+ * instead — per request (`REQUEST_TIMEOUT_MS`) AND per invocation
+ * (`DEFAULT_BUDGET_MS`, see there for why the second bound exists) — so no
+ * step-level timeout is needed here.
  *
  * USAGE
  *   node scripts/ci-test-results-ingest.mjs --log <path> --repo <owner/repo>
@@ -39,6 +41,14 @@
  *                        coord outage).
  *   COORD_HTTP_URL       coord base URL. Default https://coord.qontinui.io
  *                        (mirrors scripts/export-test-coverage.mjs).
+ *   COORD_INGEST_BUDGET_MS
+ *                        Whole-invocation wall-clock budget across every
+ *                        chunk. Default 180000 (3 min). A chunk that would
+ *                        start with less than a 5 s floor of it left is NOT
+ *                        sent; the skipped chunks are reported together
+ *                        in one `::error::` naming the row count. A set
+ *                        but unusable value falls back to the default with
+ *                        a `::warning::`.
  *
  * EXIT CODES
  *   Always 0, including on a coord/network failure or a missing token —
@@ -81,6 +91,95 @@ const CHUNK_SIZE = 1000;
 /// raised anyway because the failure mode is silent data loss, and the cost of
 /// waiting is a best-effort step nobody is blocked on.
 const REQUEST_TIMEOUT_MS = 120_000;
+
+/// Whole-INVOCATION budget, across every chunk. Override with
+/// `COORD_INGEST_BUDGET_MS`.
+///
+/// "Nobody is blocked on" above turned out to be false. This step runs INSIDE
+/// the gating `test` job, after `cargo test`, and coord's merge predicate
+/// (`ci_outcome_for` in qontinui-coord `merge_scheduler.rs`) waits for every
+/// check run on the head to complete — so the job's wall time is the merge
+/// train's wait, whatever the verdict was. Measured on run 34660689077 (main,
+/// 2026-09-12): the step took 11m39s on ubuntu and 6m13s on windows, because
+/// coord persisted each 1,000-row chunk as a thousand autocommitted INSERTs
+/// (3–120 s per chunk under load; 3 of 12 chunks hit the per-request budget
+/// above). Twelve chunks at the per-request budget is 24 minutes of held job
+/// per leg with NO bound at all.
+///
+/// So: sequential chunks, and a hard stop once this much wall time has been
+/// spent, reported as a loud `::error` naming exactly how many rows were not
+/// sent.
+///
+/// WHAT THIS COSTS, stated rather than assumed. Against the coord that
+/// produced the numbers above — one autocommitted INSERT per row — three
+/// minutes covers only a few chunks: on that same ubuntu leg it would have
+/// recorded ~0 of 11,107 rows (chunk 1 aborted at 120 s, chunk 2 at 60 s, the
+/// other ten skipped) and ~3,000 of 11,111 on windows. That is the trade this
+/// constant makes on purpose: the merge train's wait is bounded FIRST, and
+/// the rows are the price until coord is fast. The speed comes from coord's
+/// batched insert (the qontinui-coord half of this same follow-up — one
+/// `unnest` statement per chunk instead of a thousand round trips), after
+/// which a chunk lands well under a second, the whole suite in seconds, and
+/// this budget never binds. The runner PR carrying this constant MUST carry
+/// `coord:downstream-of` that coord PR, so it lands after it.
+const DEFAULT_BUDGET_MS = 180_000;
+
+/// The smallest per-request timeout worth starting a chunk with. A chunk
+/// whose remaining budget is below this is skipped outright rather than
+/// started and aborted: an abort still costs the round trip, and leaves the
+/// client unable to say whether coord committed the rows before it hung up
+/// (the request may complete server-side after the abort) — so it is worse
+/// than the honest skip, which at least knows what it did not send.
+const MIN_CHUNK_TIMEOUT_MS = 5_000;
+
+/// Resolve the whole-invocation budget from `COORD_INGEST_BUDGET_MS`, falling
+/// back to [`DEFAULT_BUDGET_MS`] for an unset, non-numeric or non-positive
+/// value — a misconfigured knob must degrade to the default bound, never to
+/// "no bound", which is the state this constant exists to end. PURE: returns
+/// `{budgetMs, warning}` so the caller surfaces a SET-but-unusable value the
+/// way every other degraded input here is surfaced, and an unset one silently.
+export function resolveBudgetMs(raw) {
+  const n = Number(raw);
+  // Floor BEFORE the positivity test: "0.5" is > 0 and floors to 0, and 0
+  // is the unbounded-looking value that must never come out of here.
+  if (Number.isFinite(n) && Math.floor(n) > 0) return { budgetMs: Math.floor(n), warning: null };
+  const unset = raw === undefined || raw === null || String(raw).trim() === "";
+  return {
+    budgetMs: DEFAULT_BUDGET_MS,
+    warning: unset
+      ? null
+      : `COORD_INGEST_BUDGET_MS=${JSON.stringify(String(raw))} is not a positive number of ` +
+        `milliseconds; using the default ${DEFAULT_BUDGET_MS}`,
+  };
+}
+
+/// The per-request timeout the NEXT chunk may use given `remainingMs` of the
+/// invocation budget, or `null` when the chunk should not be started at all.
+/// PURE — the loop below feeds it the clock, so the boundary is
+/// table-testable.
+///
+/// Never more than [`REQUEST_TIMEOUT_MS`] (the per-request bound stands on its
+/// own), never less than `floorMs` (see [`MIN_CHUNK_TIMEOUT_MS`]), `null` once
+/// the budget cannot cover even that. The caller clamps `floorMs` to the
+/// invocation budget, so a budget smaller than the floor is not refused
+/// outright: its first chunk is started with the whole budget as its
+/// timeout (which for a budget of a few milliseconds is a guaranteed abort —
+/// the knob's floor is the operator's to respect, not this function's to
+/// second-guess).
+export function chunkTimeoutMs(
+  remainingMs,
+  requestTimeoutMs = REQUEST_TIMEOUT_MS,
+  floorMs = MIN_CHUNK_TIMEOUT_MS,
+) {
+  if (!Number.isFinite(remainingMs)) return null;
+  // Whole milliseconds, rounded UP: the clock is read once at the start and
+  // again per iteration, so the very first remaining value is the budget less
+  // a fraction of a millisecond — and `999.98 < 1000` would skip the first
+  // chunk of a budget that exactly equals the floor.
+  const remaining = Math.ceil(remainingMs);
+  if (remaining <= 0 || remaining < floorMs) return null;
+  return Math.min(requestTimeoutMs, remaining);
+}
 
 /**
  * Build the `POST /coord/test-results/ingest` body from a parsed log. Pure —
@@ -174,10 +273,10 @@ export function chunkResults(results, size) {
   return out;
 }
 
-async function postOneChunk(url, body, token) {
+async function postOneChunk(url, body, token, timeoutMs = REQUEST_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-  const started = Date.now();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const started = performance.now();
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -188,8 +287,13 @@ async function postOneChunk(url, body, token) {
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-    const text = await res.text().catch(() => "");
-    const ms = Date.now() - started;
+    // An abort that fires while the BODY is being read must not be laundered
+    // into an HTTP 200: only a non-abort read failure degrades to "".
+    const text = await res.text().catch((e) => {
+      if (controller.signal.aborted) throw e;
+      return "";
+    });
+    const ms = Math.round(performance.now() - started);
     if (!res.ok) {
       // Include the elapsed time on EVERY outcome. The 60 s abort was only
       // diagnosable because the timestamps happened to bracket it exactly;
@@ -208,12 +312,12 @@ async function postOneChunk(url, body, token) {
     }
     return { ok: true, ms, status: res.status, serverFailed };
   } catch (err) {
-    const ms = Date.now() - started;
+    const ms = Math.round(performance.now() - started);
     const aborted = err?.name === "AbortError" || /abort/i.test(err?.message ?? "");
     error(
       aborted
         ? `request to ${url} ABORTED by the client after ${ms}ms ` +
-            `(REQUEST_TIMEOUT_MS=${REQUEST_TIMEOUT_MS}); these rows were NOT recorded`
+            `(timeout ${timeoutMs}ms); these rows were NOT recorded`
         : `request to ${url} failed after ${ms}ms: ${err.message}`,
     );
     return { ok: false, ms, aborted };
@@ -222,17 +326,36 @@ async function postOneChunk(url, body, token) {
   }
 }
 
-async function postResults(url, body, token) {
+async function postResults(url, body, token, budgetMs = DEFAULT_BUDGET_MS) {
   const chunks = chunkResults(body.results, CHUNK_SIZE);
   let sent = 0;
   let failedChunks = 0;
+  let skippedChunks = 0;
+  let skippedRows = 0;
   let serverFailed = 0;
+  // Monotonic: an NTP step on the runner must not stretch or shrink the
+  // budget. Read ONCE per iteration, so the remaining-budget arithmetic and
+  // the skip decision see the same instant.
+  const startedAt = performance.now();
+  // The floor can never exceed the budget, or a small budget would send
+  // nothing at all instead of its first chunk.
+  const floorMs = Math.min(MIN_CHUNK_TIMEOUT_MS, budgetMs);
 
   for (const [i, results] of chunks.entries()) {
+    const timeoutMs = chunkTimeoutMs(
+      budgetMs - (performance.now() - startedAt),
+      REQUEST_TIMEOUT_MS,
+      floorMs,
+    );
+    if (timeoutMs === null) {
+      skippedChunks += 1;
+      skippedRows += results.length;
+      continue;
+    }
     // Every chunk repeats repo/head_sha/source — coord keys on those and
     // appends, so N posts for one head are a supported shape (its own coverage
     // producer does exactly this per module).
-    const r = await postOneChunk(url, { ...body, results }, token);
+    const r = await postOneChunk(url, { ...body, results }, token, timeoutMs);
     if (r.ok) {
       sent += results.length;
       serverFailed += r.serverFailed ?? 0;
@@ -246,15 +369,29 @@ async function postResults(url, body, token) {
   }
 
   const total = body.results.length;
+  const elapsed = Math.round(performance.now() - startedAt);
   info(
     `POST ${url} (repo=${body.repo} head_sha=${body.head_sha}) — ` +
-      `${sent}/${total} row(s) recorded across ${chunks.length} chunk(s)`,
+      `${sent}/${total} row(s) recorded across ${chunks.length} chunk(s) in ${elapsed}ms`,
   );
+  const where =
+    `${body.repo}@${body.head_sha}` +
+    (body.results[0]?.shard ? ` (shard ${body.results[0].shard})` : "");
+  if (skippedChunks > 0) {
+    // Its own line, distinct from the failed-chunk one below: a chunk that
+    // was never sent is a budget decision this script made, not a coord
+    // failure, and the two want different fixes.
+    error(
+      `invocation budget of ${budgetMs}ms reached after ${elapsed}ms ` +
+        `(remaining budget under the ${floorMs}ms per-request floor) — ` +
+        `${skippedChunks} of ${chunks.length} chunk(s) (${skippedRows} row(s)) were NOT sent ` +
+        `for ${where}; raise COORD_INGEST_BUDGET_MS only if coord is known to be fast again`,
+    );
+  }
   if (failedChunks > 0) {
     error(
-      `${failedChunks} of ${chunks.length} chunk(s) failed — ${total - sent} of ${total} ` +
-        `row(s) were NOT recorded for ${body.repo}@${body.head_sha}` +
-        (body.results[0]?.shard ? ` (shard ${body.results[0].shard})` : ""),
+      `${failedChunks} of ${chunks.length} chunk(s) failed — ${total - sent - skippedRows} of ${total} ` +
+        `row(s) were NOT recorded for ${where}`,
     );
   }
   if (serverFailed > 0) {
@@ -319,7 +456,9 @@ async function main(argv) {
   }
 
   const base = (process.env.COORD_HTTP_URL || DEFAULT_COORD_URL).replace(/\/+$/, "");
-  await postResults(base + INGEST_PATH, body, token);
+  const budget = resolveBudgetMs(process.env.COORD_INGEST_BUDGET_MS);
+  if (budget.warning) warn(budget.warning);
+  await postResults(base + INGEST_PATH, body, token, budget.budgetMs);
   return 0;
 }
 

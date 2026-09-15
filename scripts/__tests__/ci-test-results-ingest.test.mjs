@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Unit tests for the PURE half of ci-test-results-ingest.mjs (Phase 1,
-// redesigned, of plan
-// `2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train`).
+// Tests for ci-test-results-ingest.mjs (Phase 1, redesigned, of plan
+// `2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train`):
+// the PURE half directly, the shape of the ci.yml step that invokes it, and —
+// for the invocation budget — the real CLI as a child process against a local
+// coord stand-in.
 //
 // Uses Node's built-in `node:test` runner, mirroring
 // `scripts/__tests__/ci-flake-analyze.test.mjs`.
@@ -16,7 +18,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { buildIngestBody, chunkResults } from "../ci-test-results-ingest.mjs";
+import { execFile } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+
+import {
+  buildIngestBody,
+  chunkResults,
+  chunkTimeoutMs,
+  resolveBudgetMs,
+} from "../ci-test-results-ingest.mjs";
 
 const TS = "2026-09-02T07:26:07.5955615Z ";
 
@@ -190,6 +202,64 @@ test("a non-positive size degrades to one chunk, never an infinite loop", () => 
 });
 
 // ---------------------------------------------------------------------------
+// The whole-invocation budget. This step runs INSIDE the gating `test` job and
+// coord's merge predicate waits for every check run on the head, so the step's
+// wall time is the merge train's wait: run 34660689077 (2026-09-12) held the
+// job 11m39s on ubuntu / 6m13s on windows AFTER `cargo test` had passed, and
+// twelve chunks at the 120 s per-request cap is 24 min with no bound at all.
+// Every expectation is a LITERAL for the same reason as the chunk tests above.
+// ---------------------------------------------------------------------------
+
+test("chunkTimeoutMs caps the next request at the smaller of the two bounds", () => {
+  // Plenty of budget left: the per-request cap stands on its own.
+  assert.equal(chunkTimeoutMs(1_000_000, 120_000), 120_000);
+  // Less budget than the per-request cap: the budget wins.
+  assert.equal(chunkTimeoutMs(30_000, 120_000), 30_000);
+  // Fractions round UP to whole milliseconds (see the function for why).
+  assert.equal(chunkTimeoutMs(30_000.9, 120_000), 30_001);
+  assert.equal(chunkTimeoutMs(4_999.02, 120_000), 5_000);
+});
+
+test("chunkTimeoutMs refuses to start a chunk it could only abort", () => {
+  // Below the 5 s floor a request would be aborted mid-flight — it still costs
+  // the round trip and records nothing, so the honest answer is "do not start".
+  assert.equal(chunkTimeoutMs(4_999, 120_000), null);
+  assert.equal(chunkTimeoutMs(0, 120_000), null);
+  assert.equal(chunkTimeoutMs(-1, 120_000), null);
+  assert.equal(chunkTimeoutMs(Number.NaN, 120_000), null);
+  // Exactly at the floor is still worth starting.
+  assert.equal(chunkTimeoutMs(5_000, 120_000), 5_000);
+});
+
+test("chunkTimeoutMs honours a caller-lowered floor, so a small budget still sends its first chunk", () => {
+  // `postResults` clamps the floor to the budget: with a 1 s budget the first
+  // chunk gets 1 s rather than the invocation sending nothing at all.
+  assert.equal(chunkTimeoutMs(1_000, 120_000, 1_000), 1_000);
+  assert.equal(chunkTimeoutMs(999, 120_000, 1_000), null);
+  // The first iteration's reading: the budget less a fraction of a millisecond.
+  assert.equal(chunkTimeoutMs(999.98, 120_000, 1_000), 1_000);
+  assert.equal(chunkTimeoutMs(0, 120_000, 0), null);
+});
+
+test("resolveBudgetMs reads the knob and falls back to the 3-minute default, never to unbounded", () => {
+  assert.deepEqual(resolveBudgetMs("60000"), { budgetMs: 60_000, warning: null });
+  assert.deepEqual(resolveBudgetMs(" 60000 "), { budgetMs: 60_000, warning: null });
+  assert.deepEqual(resolveBudgetMs("60000.7"), { budgetMs: 60_000, warning: null });
+  // Unset (or blank) is the ordinary case and is silent.
+  for (const unset of [undefined, "", "  "]) {
+    assert.deepEqual(resolveBudgetMs(unset), { budgetMs: 180_000, warning: null });
+  }
+  // Set but unusable falls back to the default AND says so — the one degraded
+  // input this script would otherwise swallow silently.
+  for (const bad of ["0", "0.5", "-1", "abc", "Infinity", "3m"]) {
+    const r = resolveBudgetMs(bad);
+    assert.equal(r.budgetMs, 180_000, `expected the default for ${JSON.stringify(bad)}`);
+    assert.match(r.warning, /is not a positive number of milliseconds; using the default 180000/);
+    assert.ok(r.warning.includes(JSON.stringify(bad)), r.warning);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Regression: the ingest step must pin its own COORD_HTTP_URL.
 //
 // `Poison ambient state` exports COORD_HTTP_URL=http://poison.invalid to
@@ -324,3 +394,222 @@ test("the coord-report step pins its own COORD_HTTP_URL to empty, defeating the 
     `the ingest step must pin COORD_HTTP_URL to an empty string, got: ${assigned[0].trim()}`,
   );
 });
+
+test("the coord-report step spells its invocation budget, bounded to minutes not tens of minutes", () => {
+  // The step runs inside the gating job and coord waits for it, so the bound
+  // must be visible where the step is — and must stay a bound: 12 chunks at
+  // the 120 s per-request cap is 24 minutes, which is the state this closes.
+  const yml = readFileSync(CI_YML, "utf8");
+  const env = stepEnvLines(yml, "Report test results to coord (best-effort)");
+  const assigned = env.filter((l) => /^\s*COORD_INGEST_BUDGET_MS\s*:/.test(l));
+  assert.equal(assigned.length, 1, "the ingest step must set COORD_INGEST_BUDGET_MS itself");
+  const m = /^\s*COORD_INGEST_BUDGET_MS\s*:\s*["']?(\d+)["']?\s*(#.*)?$/.exec(assigned[0]);
+  assert.ok(m, `COORD_INGEST_BUDGET_MS must be a literal number of milliseconds, got: ${assigned[0].trim()}`);
+  const ms = Number(m[1]);
+  assert.ok(ms >= 60_000 && ms <= 600_000, `budget ${ms}ms is outside the 1–10 minute band this step is sized for`);
+});
+
+// ---------------------------------------------------------------------------
+// The budget, end to end: the REAL CLI (a child process, so this file's own
+// stdout is never touched — `node --test` parses it) against a local coord
+// stand-in that answers each chunk after a fixed delay. CHUNK_SIZE is 1000 and
+// is deliberately not imported, so the log below carries 4,500 tests = 5
+// chunks by the module's own arithmetic.
+// ---------------------------------------------------------------------------
+
+const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "..", "ci-test-results-ingest.mjs");
+
+/** A cargo-test log with `n` passing tests, in the real timestamped shape. */
+function syntheticLog(n) {
+  const lines = [`${TS}running ${n} tests`];
+  for (let i = 0; i < n; i++) lines.push(`${TS}test m::t${i} ... ok`);
+  lines.push(
+    `${TS}test result: ok. ${n} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s`,
+  );
+  return lines.join("\n");
+}
+
+/** Serve `POST /coord/test-results/ingest`, answering after `delayMs`. */
+async function slowCoord(delayMs, { stallBody = false } = {}) {
+  let hits = 0;
+  // Every pending reply timer, so `close` can cancel them: a reply owed to a
+  // client that already aborted would otherwise keep the test process alive
+  // for the rest of `delayMs` after the last test has finished.
+  const timers = new Set();
+  const server = createServer((req, res) => {
+    hits += 1;
+    let bytes = 0;
+    req.on("data", (c) => (bytes += c.length));
+    req.on("end", () => {
+      // `stallBody`: send the 200 and the first byte of the body at once,
+      // and hold the rest for `delayMs` — the client is then inside
+      // `res.text()`, not `fetch()`, when its timeout fires.
+      if (stallBody) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.write("{");
+      }
+      const t = setTimeout(() => {
+        timers.delete(t);
+        if (stallBody) {
+          res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }).slice(1));
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ parsed: 1, persisted: 1, failed: 0, bytes }));
+      }, delayMs);
+      timers.add(t);
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    hits: () => hits,
+    close: () => {
+      for (const t of timers) clearTimeout(t);
+      timers.clear();
+      server.closeAllConnections?.();
+      return new Promise((r) => server.close(r));
+    },
+  };
+}
+
+/** Run the CLI with `env` merged over a minimal base; resolve `{code, out}`. */
+function runCli(logPath, env) {
+  return new Promise((resolve) => {
+    execFile(
+      process.execPath,
+      [SCRIPT, "--log", logPath, "--repo", "o/r", "--head-sha", "h", "--shard", "s"],
+      { env: { PATH: process.env.PATH, ...env }, timeout: 30_000 },
+      (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: `${stdout}${stderr}` }),
+    );
+  });
+}
+
+/**
+ * The wall time the SCRIPT reports for its own POST loop, from its summary
+ * line `… across N chunk(s) in <ms>ms`. This is the number the budget bounds —
+ * the parent's clock around `execFile` also counts process spawn, the
+ * 4,500-line parse and exit, which under CPU contention on a 2-vCPU runner
+ * added up to 2 s on top and failed an honest script.
+ */
+function scriptLoopMs(out) {
+  const m = /across \d+ chunk\(s\) in (\d+)ms/.exec(out);
+  assert.ok(m, `no loop-duration summary line in output:\n${out}`);
+  return Number(m[1]);
+}
+
+/**
+ * One CLI run against a stand-in coord answering after `delayMs`, with a
+ * 4,500-test log (5 chunks) and the given budget; the server and temp dir are
+ * torn down whatever happens. Resolves `{code, out, hits, loopMs}`.
+ */
+async function runBudgetScenario({ delayMs, budgetMs, stallBody = false }) {
+  // File setup BEFORE the server is listening, so a throw here leaves
+  // nothing open (an open server with no per-file timeout under `node --test`
+  // holds the gating step until the job timeout).
+  const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
+  const logPath = join(dir, "cargo-test-output.log");
+  writeFileSync(logPath, syntheticLog(4500));
+  let coord;
+  try {
+    coord = await slowCoord(delayMs, { stallBody });
+    const r = await runCli(logPath, {
+      COORD_INGEST_TOKEN: "tok",
+      COORD_HTTP_URL: coord.url,
+      COORD_INGEST_BUDGET_MS: String(budgetMs),
+    });
+    return { ...r, hits: coord.hits(), loopMs: scriptLoopMs(r.out) };
+  } finally {
+    await coord?.close();
+    // maxRetries: on windows-latest an antivirus handle on the just-written
+    // log turns a one-shot rm into an EBUSY flake.
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  }
+}
+
+test("CLI: a slow coord cannot hold the invocation past COORD_INGEST_BUDGET_MS; later chunks are skipped and named", async () => {
+  // 1 s per chunk against a 7,999 ms budget with the 5 s floor: chunks start
+  // at ~0 / 1 / 2 s with ~7999 / ~6999 / ~5999 ms left and are sent; the
+  // fourth would start at ~3 s with ~4999 ms left, under the floor, so it and
+  // the fifth are skipped. Per-request overhead only ever pushes a start
+  // LATER, which can only turn a send into a skip — so the boundary sits
+  // ~1 s (a whole round trip) past the third start rather than midway, and a
+  // loaded 2-vCPU runner cannot flip the count. (Process start is not on the
+  // clock at all: the budget starts inside `postResults`.)
+  const r = await runBudgetScenario({ delayMs: 1_000, budgetMs: 7_999 });
+
+  assert.equal(r.code, 0, `best-effort: exit 0 even over budget\n${r.out}`);
+  assert.equal(r.hits, 3, `expected exactly 3 requests, got ${r.hits}:\n${r.out}`);
+  // The skips cost nothing: the loop ends when the third chunk does (~3 s),
+  // not at the budget — asserted on the script's OWN clock.
+  assert.ok(r.loopMs < 7_000, `must not wait out its budget, loop took ${r.loopMs}ms\n${r.out}`);
+  assert.match(r.out, /3000\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.match(r.out, /::error title=test-results-ingest::invocation budget of 7999ms reached/);
+  // The two skipped chunks are the fourth (1000 rows) and the short fifth (500).
+  assert.match(r.out, /2 of 5 chunk\(s\) \(1500 row\(s\)\) were NOT sent for o\/r@h \(shard s\)/);
+  // A budget skip is not a coord failure and must not be reported as one.
+  assert.doesNotMatch(r.out, /chunk\(s\) failed/);
+});
+
+test("CLI: the per-request timeout is the remaining budget, so one slow chunk is aborted at the budget and the rest skipped", async () => {
+  // A 1 s budget against a 3 s coord: the FIRST chunk is started (the floor is
+  // clamped to the budget) with the whole budget as its timeout, aborted at
+  // ~1 s, and the remaining four are skipped. This is the wiring test: it
+  // fails if the per-request timeout is not actually handed to the request,
+  // if the floor clamp is dropped (nothing would be sent), or if the
+  // failed-chunk arithmetic double-counts the skipped rows.
+  const r = await runBudgetScenario({ delayMs: 3_000, budgetMs: 1_000 });
+
+  assert.equal(r.code, 0, `best-effort: exit 0 even on abort\n${r.out}`);
+  assert.equal(r.hits, 1, `expected exactly 1 request, got ${r.hits}:\n${r.out}`);
+  assert.ok(r.loopMs < 2_500, `must abort at the budget, not wait for coord, loop took ${r.loopMs}ms\n${r.out}`);
+  assert.match(r.out, /ABORTED by the client after \d+ms \(timeout 1000ms\)/);
+  assert.match(r.out, /0\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.match(r.out, /1 of 5 chunk\(s\) failed — 1000 of 4500 row\(s\) were NOT recorded/);
+  assert.match(r.out, /4 of 5 chunk\(s\) \(3500 row\(s\)\) were NOT sent/);
+});
+
+test("CLI: an abort that fires while the response BODY is being read is a failure, not an HTTP 200", async () => {
+  // The stand-in sends the 200 and one byte immediately and stalls the rest
+  // for 3 s; with a 1 s budget the client's timeout fires inside
+  // `res.text()`, the path a plain `.catch(() => "")` used to launder into a
+  // success with zero rows recorded server-side and "1000/4500" claimed.
+  const r = await runBudgetScenario({ delayMs: 3_000, budgetMs: 1_000, stallBody: true });
+
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.hits, 1, r.out);
+  assert.match(r.out, /ABORTED by the client after \d+ms \(timeout 1000ms\)/);
+  assert.match(r.out, /0\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.doesNotMatch(r.out, /chunk 1\/5 \(1000 rows\) -> HTTP 200/);
+});
+
+test("CLI: within budget every chunk is sent and no budget error is emitted", async () => {
+  const r = await runBudgetScenario({ delayMs: 0, budgetMs: 60_000 });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.hits, 5, r.out);
+  assert.match(r.out, /4500\/4500 row\(s\) recorded across 5 chunk\(s\)/);
+  assert.doesNotMatch(r.out, /::error/);
+});
+
+test("CLI: a set-but-unusable COORD_INGEST_BUDGET_MS is warned about and falls back to the default", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ci-ingest-budget-"));
+  const logPath = join(dir, "cargo-test-output.log");
+  writeFileSync(logPath, syntheticLog(1));
+  const coord = await slowCoord(0);
+  let r;
+  try {
+    r = await runCli(logPath, {
+      COORD_INGEST_TOKEN: "tok",
+      COORD_HTTP_URL: coord.url,
+      COORD_INGEST_BUDGET_MS: "3m",
+    });
+  } finally {
+    await coord.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
+  }
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /::warning title=test-results-ingest::COORD_INGEST_BUDGET_MS="3m" is not a positive number/);
+  assert.match(r.out, /using the default 180000/);
+  assert.match(r.out, /1\/1 row\(s\) recorded/);
+});
+
