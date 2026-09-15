@@ -61,12 +61,21 @@
 //! full body as before. File existence is never evidence: a session launched
 //! before the cache existed has no marker, whatever is on disk now.
 //!
+//! The marker travels with [`POLICY_DELIVERED_FILE_ENV`], the composed file's
+//! path, so the identity shims and shell wrappers can keep it ONLY for a
+//! `claude` whose argv passes exactly that file. A nested `claude` inheriting
+//! both — bare, inline, or with an `--append-system-prompt-file` of its own —
+//! loses both.
+//!
 //! ## Spawn-file lifetime
 //!
-//! Composed files live in [`SPAWN_PROMPTS_DIR`] and are pruned by AGE only
-//! (older than [`SPAWN_PROMPT_MAX_AGE`]), never by a liveness guess. A pruned
-//! file costs an interactive pane nothing worse than the inline fall-back: the
-//! shell wrapper checks existence before choosing the file flag.
+//! Composed files live in [`SPAWN_PROMPTS_DIR`], named by the hash of their
+//! content, so identical spawns share one file and a busy runner writes each
+//! distinct prompt once. They are pruned by AGE only (older than
+//! [`SPAWN_PROMPT_MAX_AGE`]), never by a liveness guess; reusing a file
+//! refreshes its mtime. A pruned file costs an interactive pane nothing worse
+//! than the inline fall-back: the shell wrapper checks existence before
+//! choosing the file flag.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,6 +107,14 @@ pub const RUNNER_CONTEXT_FILE_ENV: &str = "QONTINUI_RUNNER_CONTEXT_FILE";
 /// policy-context route, which trusts it only when it equals the hash of the
 /// body it just fetched.
 pub const POLICY_DELIVERED_SHA_ENV: &str = "QONTINUI_POLICY_DELIVERED_SHA";
+
+/// Env var carrying the absolute path of the composed file whose policy body
+/// [`POLICY_DELIVERED_SHA_ENV`] names. Set and blanked together with the SHA.
+/// The identity shims and shell wrappers keep the pair for a `claude` only when
+/// its `--append-system-prompt-file` argument (`--flag path` or `--flag=path`)
+/// equals this path; any other launch drops both, so a nested `claude` with a
+/// prompt file of its own is never vouched for.
+pub const POLICY_DELIVERED_FILE_ENV: &str = "QONTINUI_POLICY_DELIVERED_FILE";
 
 /// Subdirectory of [`claude_hook::session_restore_dir`] holding the composed
 /// per-spawn files.
@@ -142,13 +159,22 @@ pub fn policy_body_cache_path(base_dir: &Path, tenant: &uuid::Uuid) -> PathBuf {
 }
 
 /// Write `bytes` to `path` by temp-file + rename, so a concurrent reader sees
-/// either the old file or the new one and never a torn one.
+/// either the old file or the new one and never a torn one, and `fsync` the
+/// data before the rename — for a file that is REPLACED in place (the
+/// per-tenant cache), where a crash must not leave a renamed-but-empty file.
 ///
 /// The temp file sits in the SAME directory (a rename across volumes is not
 /// atomic) and carries the pid plus a random suffix, so two runner instances
 /// sharing the machine-global dir never write through the same temp name.
 /// `std::fs::rename` replaces an existing destination on Windows as well.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_atomic_with(path, bytes, true)
+}
+
+/// [`write_atomic`] with the `fsync` optional. Content-addressed, write-once
+/// spawn files skip it: a torn file after a crash is simply re-written by the
+/// next spawn that finds it wrong-sized, and a sync per spawn is pure cost.
+fn write_atomic_with(path: &Path, bytes: &[u8], sync: bool) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent dir")
     })?;
@@ -165,7 +191,10 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()
+        if sync {
+            f.sync_all()?;
+        }
+        Ok(())
     })();
     if let Err(e) = written.and_then(|_| std::fs::rename(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
@@ -208,10 +237,14 @@ pub fn read_policy_body_cache(base_dir: &Path, tenant: &uuid::Uuid) -> Option<St
 /// blank line, then `body` — or `body` alone when there is no briefing (the
 /// account-migration `--resume` respawn passes none).
 ///
-/// Each spawn gets a UNIQUE file, never a shared one: a pane launches `claude`
-/// long after the terminal spawned, and a shared name would let a later spawn
-/// rewrite the prompt an earlier pane is about to read. Opportunistically
-/// prunes old files ([`maybe_prune`]).
+/// The file is CONTENT-ADDRESSED — `spawn-<first 16 hex of sha256(content)>.md`
+/// ([`spawn_prompt_file_name`]) — so the name can never point at different
+/// bytes: a later spawn cannot rewrite the prompt an earlier pane is about to
+/// read, and identical spawns (every pane of one briefing and one policy
+/// version) share one file. An existing file of the right size is reused and
+/// its mtime refreshed, so the age prune never removes a file a spawn just
+/// handed out; otherwise it is written by temp + rename, without `fsync`.
+/// Opportunistically prunes old files ([`maybe_prune`]).
 pub fn compose_spawn_prompt_in(
     base_dir: &Path,
     briefing: Option<&str>,
@@ -225,9 +258,36 @@ pub fn compose_spawn_prompt_in(
         content.push_str("\n\n");
     }
     content.push_str(body);
-    let path = dir.join(format!("spawn-{}.md", uuid::Uuid::new_v4().simple()));
-    write_atomic(&path, content.as_bytes())?;
+    let path = dir.join(spawn_prompt_file_name(&content));
+    if !reuse_spawn_prompt(&path, content.len() as u64) {
+        write_atomic_with(&path, content.as_bytes(), false)?;
+    }
     Ok(path)
+}
+
+/// The content-addressed file name for a composed spawn prompt.
+pub fn spawn_prompt_file_name(content: &str) -> String {
+    let digest = hex::encode(Sha256::digest(content.as_bytes()));
+    format!("spawn-{}.md", &digest[..16])
+}
+
+/// Reuse an already-composed file: `true` when `path` is a regular file of
+/// `expected_len` bytes and its mtime was refreshed to now. Anything else — no
+/// file, a torn one, an mtime that cannot be set — is `false`, and the caller
+/// rewrites it. Refreshing the mtime is what keeps the age prune from deleting
+/// a file between this spawn handing out its path and `claude` reading it.
+fn reuse_spawn_prompt(path: &Path, expected_len: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() != expected_len {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|f| f.set_modified(SystemTime::now()))
+        .is_ok()
 }
 
 /// Prune at most once per [`PRUNE_INTERVAL`] per process.
@@ -315,6 +375,46 @@ impl SystemPromptCarrier {
             SystemPromptCarrier::File { policy_sha, .. } => Some(policy_sha),
         }
     }
+
+    /// The marker pair for the child — `Some` only for the file carrier. The
+    /// one constructor of [`PolicyDelivery`] a spawn seam uses, so the SHA and
+    /// the path always name the same composed file the argv passes.
+    pub fn policy_delivery(&self) -> Option<PolicyDelivery> {
+        match self {
+            SystemPromptCarrier::Inline(_) => None,
+            SystemPromptCarrier::File { path, policy_sha } => Some(PolicyDelivery {
+                sha: policy_sha.clone(),
+                file: path.to_string_lossy().into_owned(),
+            }),
+        }
+    }
+}
+
+/// The delivered-policy marker for one `claude` child: [`POLICY_DELIVERED_SHA_ENV`]
+/// and [`POLICY_DELIVERED_FILE_ENV`], always set (or blanked) together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDelivery {
+    /// [`policy_body_sha`] of the body the composed file carries.
+    pub sha: String,
+    /// The composed file's path, exactly as the argv passes it.
+    pub file: String,
+}
+
+/// The two marker env pairs for a direct-exec child: the delivery's values, or
+/// BOTH blank when there is none — blank, never omitted, so a marker inherited
+/// from the runner's own environment cannot vouch for a delivery this child
+/// never received.
+pub fn policy_delivery_env(delivery: Option<&PolicyDelivery>) -> [(String, String); 2] {
+    [
+        (
+            POLICY_DELIVERED_SHA_ENV.to_string(),
+            delivery.map(|d| d.sha.clone()).unwrap_or_default(),
+        ),
+        (
+            POLICY_DELIVERED_FILE_ENV.to_string(),
+            delivery.map(|d| d.file.clone()).unwrap_or_default(),
+        ),
+    ]
 }
 
 /// Resolve the carrier for a spawn from the live state: the tenant's cached
@@ -371,29 +471,30 @@ pub fn resolve_system_prompt_carrier_in(
 /// set, `(name, None)` to remove.
 ///
 /// The shell wrapper launches `claude` later, so the pane gets the composed
-/// file's PATH plus the SHA; with no file both are REMOVED, so a value
-/// inherited from the runner's own environment can never vouch for a delivery
-/// that did not happen. `QONTINUI_RUNNER_CONTEXT` is set by the caller as
-/// before — it is the wrapper's fall-back and `/whereami`'s source.
-pub fn shell_pane_prompt_env(briefing: &str) -> [(&'static str, Option<String>); 2] {
+/// file's PATH (as [`RUNNER_CONTEXT_FILE_ENV`], the wrapper's input, and as
+/// [`POLICY_DELIVERED_FILE_ENV`], the shims' match target) plus the SHA; with
+/// no file all three are REMOVED, so a value inherited from the runner's own
+/// environment can never vouch for a delivery that did not happen.
+/// `QONTINUI_RUNNER_CONTEXT` is set by the caller as before — it is the
+/// wrapper's fall-back and `/whereami`'s source.
+pub fn shell_pane_prompt_env(briefing: &str) -> [(&'static str, Option<String>); 3] {
     shell_pane_prompt_env_from(resolve_system_prompt_carrier(Some(briefing.to_string())))
 }
 
 /// [`shell_pane_prompt_env`] over an already-resolved carrier (pure).
 fn shell_pane_prompt_env_from(
     carrier: Option<SystemPromptCarrier>,
-) -> [(&'static str, Option<String>); 2] {
-    match carrier {
-        Some(SystemPromptCarrier::File { path, policy_sha }) => [
-            (
-                RUNNER_CONTEXT_FILE_ENV,
-                Some(path.to_string_lossy().into_owned()),
-            ),
-            (POLICY_DELIVERED_SHA_ENV, Some(policy_sha)),
+) -> [(&'static str, Option<String>); 3] {
+    match carrier.as_ref().and_then(SystemPromptCarrier::policy_delivery) {
+        Some(PolicyDelivery { sha, file }) => [
+            (RUNNER_CONTEXT_FILE_ENV, Some(file.clone())),
+            (POLICY_DELIVERED_SHA_ENV, Some(sha)),
+            (POLICY_DELIVERED_FILE_ENV, Some(file)),
         ],
-        _ => [
+        None => [
             (RUNNER_CONTEXT_FILE_ENV, None),
             (POLICY_DELIVERED_SHA_ENV, None),
+            (POLICY_DELIVERED_FILE_ENV, None),
         ],
     }
 }
@@ -492,13 +593,68 @@ mod tests {
     }
 
     #[test]
-    fn compose_without_a_briefing_is_the_body_alone_and_names_are_unique() {
+    fn compose_without_a_briefing_is_the_body_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let a = compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
         let b = compose_spawn_prompt_in(tmp.path(), Some("  "), "BODY").unwrap();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "BODY");
-        assert_eq!(std::fs::read_to_string(&b).unwrap(), "BODY");
-        assert_ne!(a, b, "every spawn gets its own file");
+        assert_eq!(a, b, "a blank briefing composes the same bytes, so the same file");
+    }
+
+    /// Content-addressed: the name is the content hash, identical spawns share
+    /// one file, different content never shares a name, and nothing else (no
+    /// temp file) is left in the directory.
+    #[test]
+    fn composed_files_are_content_addressed_and_written_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = compose_spawn_prompt_in(tmp.path(), Some("BRIEF"), "BODY").unwrap();
+        assert_eq!(
+            a.file_name().unwrap().to_string_lossy(),
+            spawn_prompt_file_name("BRIEF\n\nBODY")
+        );
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("spawn-") && name.ends_with(".md"), "{name}");
+        assert_eq!(name.len(), "spawn-".len() + 16 + ".md".len(), "{name}");
+        assert!(name["spawn-".len()..name.len() - 3]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+
+        let again = compose_spawn_prompt_in(tmp.path(), Some("BRIEF"), "BODY").unwrap();
+        assert_eq!(a, again, "identical content reuses the file");
+        let other = compose_spawn_prompt_in(tmp.path(), Some("BRIEF"), "BODY v7").unwrap();
+        assert_ne!(a, other);
+        assert_eq!(std::fs::read_to_string(&other).unwrap(), "BRIEF\n\nBODY v7");
+
+        let names: Vec<String> = std::fs::read_dir(tmp.path().join(SPAWN_PROMPTS_DIR))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp files, no duplicates: {names:?}");
+    }
+
+    /// Reuse refreshes the mtime (so the age prune cannot delete a file a spawn
+    /// just handed out), and a torn file of the wrong size is rewritten.
+    #[test]
+    fn reusing_a_composed_file_refreshes_its_mtime_and_repairs_a_torn_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(6 * 24 * 60 * 60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
+        let refreshed = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            refreshed > old + Duration::from_secs(60),
+            "mtime was not refreshed on reuse"
+        );
+
+        std::fs::write(&path, "BO").unwrap();
+        compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "BODY");
     }
 
     // ── Pruning ─────────────────────────────────────────────────────────
@@ -606,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_pane_exports_both_vars_only_for_the_file_carrier() {
+    fn a_shell_pane_exports_the_file_and_marker_only_for_the_file_carrier() {
         let file = SystemPromptCarrier::File {
             path: PathBuf::from("/x/spawn-1.md"),
             policy_sha: "ab".repeat(32),
@@ -616,18 +772,47 @@ mod tests {
             [
                 (RUNNER_CONTEXT_FILE_ENV, Some("/x/spawn-1.md".to_string())),
                 (POLICY_DELIVERED_SHA_ENV, Some("ab".repeat(32))),
+                (POLICY_DELIVERED_FILE_ENV, Some("/x/spawn-1.md".to_string())),
             ]
         );
-        // Inline or nothing: both REMOVED, so an inherited marker cannot vouch.
+        // Inline or nothing: all REMOVED, so an inherited marker cannot vouch.
         for carrier in [Some(SystemPromptCarrier::Inline("b".into())), None] {
             assert_eq!(
                 shell_pane_prompt_env_from(carrier),
                 [
                     (RUNNER_CONTEXT_FILE_ENV, None),
-                    (POLICY_DELIVERED_SHA_ENV, None)
+                    (POLICY_DELIVERED_SHA_ENV, None),
+                    (POLICY_DELIVERED_FILE_ENV, None),
                 ]
             );
         }
+    }
+
+    /// A direct-exec child gets the SHA and the exact argv path together, or
+    /// both blank — never omitted.
+    #[test]
+    fn policy_delivery_env_sets_both_or_blanks_both() {
+        let file = SystemPromptCarrier::File {
+            path: PathBuf::from("/x/spawn-2.md"),
+            policy_sha: "cd".repeat(32),
+        };
+        let delivery = file.policy_delivery().unwrap();
+        assert_eq!(delivery.file, file.argv()[1], "the path the argv passes");
+        assert_eq!(
+            policy_delivery_env(Some(&delivery)),
+            [
+                (POLICY_DELIVERED_SHA_ENV.to_string(), "cd".repeat(32)),
+                (POLICY_DELIVERED_FILE_ENV.to_string(), "/x/spawn-2.md".to_string()),
+            ]
+        );
+        assert_eq!(SystemPromptCarrier::Inline("b".into()).policy_delivery(), None);
+        assert_eq!(
+            policy_delivery_env(None),
+            [
+                (POLICY_DELIVERED_SHA_ENV.to_string(), String::new()),
+                (POLICY_DELIVERED_FILE_ENV.to_string(), String::new()),
+            ]
+        );
     }
 
     #[test]
@@ -636,6 +821,7 @@ mod tests {
         // these literally.
         assert_eq!(RUNNER_CONTEXT_FILE_ENV, "QONTINUI_RUNNER_CONTEXT_FILE");
         assert_eq!(POLICY_DELIVERED_SHA_ENV, "QONTINUI_POLICY_DELIVERED_SHA");
+        assert_eq!(POLICY_DELIVERED_FILE_ENV, "QONTINUI_POLICY_DELIVERED_FILE");
     }
 }
 
@@ -653,6 +839,7 @@ mod script_tests {
     const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
     const PS1_INTEGRATION: &str = include_str!("../../resources/shell-integration.ps1");
     const POLICY_HOOK: &str = include_str!("../../resources/session-restore/claude_policy_hook.sh");
+    const IDENTITY_SHIM_BASH: &str = include_str!("../../resources/intercept/identity_shim.bash");
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -673,13 +860,14 @@ mod script_tests {
     }
 
     /// A fake `claude` on PATH that records its argv (one per line) and the
-    /// marker it inherited.
+    /// marker pair it inherited.
     fn fake_claude(dir: &Path) -> std::path::PathBuf {
         let out = dir.join("claude-invocation.txt");
         write_exe(
             &dir.join("claude"),
             &format!(
                 "#!/usr/bin/env bash\n{{ printf 'SHA=[%s]\\n' \"${{QONTINUI_POLICY_DELIVERED_SHA:-}}\"; \
+                 printf 'FILE=[%s]\\n' \"${{QONTINUI_POLICY_DELIVERED_FILE:-}}\"; \
                  for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done; }} > '{}'\n",
                 out.display()
             ),
@@ -710,61 +898,121 @@ mod script_tests {
         std::fs::read_to_string(out).expect("the fake claude ran")
     }
 
+    /// The expected fake-claude record: the marker pair, then each argv entry.
+    fn record(sha: &str, file: &str, args: &[&str]) -> String {
+        let mut out = format!("SHA=[{sha}]\nFILE=[{file}]\n");
+        for a in args {
+            out.push_str(&format!("ARG={a}\n"));
+        }
+        out
+    }
+
     fn assert_wrapper_contract(block: &str, label: &str) {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("spawn-1.md");
         std::fs::write(&file, "BRIEFING\n\nBODY").unwrap();
         let file_s = file.to_string_lossy().into_owned();
+        let pane_env = [
+            ("QONTINUI_RUNNER_CONTEXT", "BRIEFING"),
+            ("QONTINUI_RUNNER_CONTEXT_FILE", file_s.as_str()),
+            ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
+            ("QONTINUI_POLICY_DELIVERED_FILE", file_s.as_str()),
+        ];
 
         // File present: the file flag INSTEAD of the inline one; marker kept.
-        let got = run_wrapper(
-            block,
-            &[
-                ("QONTINUI_RUNNER_CONTEXT", "BRIEFING"),
-                ("QONTINUI_RUNNER_CONTEXT_FILE", &file_s),
-                ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
-            ],
-            "-p hi",
-        );
         assert_eq!(
-            got,
-            format!("SHA=[{SHA}]\nARG=--append-system-prompt-file\nARG={file_s}\nARG=-p\nARG=hi\n"),
+            run_wrapper(block, &pane_env, "-p hi"),
+            record(
+                SHA,
+                &file_s,
+                &["--append-system-prompt-file", &file_s, "-p", "hi"]
+            ),
             "{label}: file carrier"
         );
 
         // File pruned/missing: inline fall-back, marker BLANKED.
-        let got = run_wrapper(
-            block,
-            &[
-                ("QONTINUI_RUNNER_CONTEXT", "BRIEFING"),
-                ("QONTINUI_RUNNER_CONTEXT_FILE", "/nonexistent/spawn-x.md"),
-                ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
-            ],
-            "-p hi",
-        );
         assert_eq!(
-            got, "SHA=[]\nARG=--append-system-prompt\nARG=BRIEFING\nARG=-p\nARG=hi\n",
+            run_wrapper(
+                block,
+                &[
+                    ("QONTINUI_RUNNER_CONTEXT", "BRIEFING"),
+                    ("QONTINUI_RUNNER_CONTEXT_FILE", "/nonexistent/spawn-x.md"),
+                    ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
+                    ("QONTINUI_POLICY_DELIVERED_FILE", "/nonexistent/spawn-x.md"),
+                ],
+                "-p hi",
+            ),
+            record("", "", &["--append-system-prompt", "BRIEFING", "-p", "hi"]),
             "{label}: inline fall-back"
         );
 
-        // The caller brought their own system prompt: untouched, marker blanked.
-        let got = run_wrapper(
-            block,
-            &[
-                ("QONTINUI_RUNNER_CONTEXT", "BRIEFING"),
-                ("QONTINUI_RUNNER_CONTEXT_FILE", &file_s),
-                ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
-            ],
-            "--append-system-prompt mine",
-        );
-        assert_eq!(
-            got, "SHA=[]\nARG=--append-system-prompt\nARG=mine\n",
-            "{label}: caller-owned prompt"
-        );
+        // Caller inline flag(s) only: our briefing JOINS as another inline flag
+        // (never the file — Claude Code refuses that pair); marker blanked.
+        for (args, tail) in [
+            (
+                "--append-system-prompt mine",
+                vec!["--append-system-prompt", "mine"],
+            ),
+            (
+                "--append-system-prompt=mine -p hi",
+                vec!["--append-system-prompt=mine", "-p", "hi"],
+            ),
+            (
+                "--append-system-prompt a --append-system-prompt b",
+                vec!["--append-system-prompt", "a", "--append-system-prompt", "b"],
+            ),
+        ] {
+            let mut expect = vec!["--append-system-prompt", "BRIEFING"];
+            expect.extend(tail);
+            assert_eq!(
+                run_wrapper(block, &pane_env, args),
+                record("", "", &expect),
+                "{label}: caller inline prompt {args:?}"
+            );
+        }
+
+        // A caller-owned file or replacement prompt suppresses ours entirely.
+        for (args, argv) in [
+            (
+                "--append-system-prompt-file ./eval.md",
+                vec!["--append-system-prompt-file", "./eval.md"],
+            ),
+            (
+                "--append-system-prompt-file=./eval.md",
+                vec!["--append-system-prompt-file=./eval.md"],
+            ),
+            (
+                "--append-system-prompt x --append-system-prompt-file ./eval.md",
+                vec![
+                    "--append-system-prompt",
+                    "x",
+                    "--append-system-prompt-file",
+                    "./eval.md",
+                ],
+            ),
+            ("--system-prompt mine", vec!["--system-prompt", "mine"]),
+            ("--system-prompt-file=./s.md", vec!["--system-prompt-file=./s.md"]),
+        ] {
+            assert_eq!(
+                run_wrapper(block, &pane_env, args),
+                record("", "", &argv),
+                "{label}: caller-owned prompt {args:?}"
+            );
+        }
 
         // Nothing at all: bare launch, no marker.
-        let got = run_wrapper(block, &[("QONTINUI_POLICY_DELIVERED_SHA", SHA)], "-p hi");
-        assert_eq!(got, "SHA=[]\nARG=-p\nARG=hi\n", "{label}: no briefing");
+        assert_eq!(
+            run_wrapper(
+                block,
+                &[
+                    ("QONTINUI_POLICY_DELIVERED_SHA", SHA),
+                    ("QONTINUI_POLICY_DELIVERED_FILE", "/x.md")
+                ],
+                "-p hi"
+            ),
+            record("", "", &["-p", "hi"]),
+            "{label}: no briefing"
+        );
     }
 
     #[test]
@@ -802,9 +1050,10 @@ mod script_tests {
             tmp.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let run = |ctx_file: &str| {
+        let file_s = file.to_string_lossy().into_owned();
+        let run = |ctx_file: &str, args: &str| {
             let script = tmp.path().join("w.ps1");
-            std::fs::write(&script, format!("{block}\nclaude -p hi\n")).unwrap();
+            std::fs::write(&script, format!("{block}\nclaude {args}\n")).unwrap();
             let status = Command::new("pwsh")
                 .args(["-NoProfile", "-NonInteractive", "-File"])
                 .arg(&script)
@@ -813,20 +1062,105 @@ mod script_tests {
                 .env("QONTINUI_RUNNER_CONTEXT", "BRIEFING")
                 .env("QONTINUI_RUNNER_CONTEXT_FILE", ctx_file)
                 .env("QONTINUI_POLICY_DELIVERED_SHA", SHA)
+                .env("QONTINUI_POLICY_DELIVERED_FILE", ctx_file)
                 .status()
                 .expect("pwsh runs");
             assert!(status.success());
             std::fs::read_to_string(&out).unwrap()
         };
-        let file_s = file.to_string_lossy().into_owned();
         assert_eq!(
-            run(&file_s),
-            format!("SHA=[{SHA}]\nARG=--append-system-prompt-file\nARG={file_s}\nARG=-p\nARG=hi\n")
+            run(&file_s, "-p hi"),
+            record(
+                SHA,
+                &file_s,
+                &["--append-system-prompt-file", &file_s, "-p", "hi"]
+            )
         );
         assert_eq!(
-            run("/nonexistent/spawn-x.md"),
-            "SHA=[]\nARG=--append-system-prompt\nARG=BRIEFING\nARG=-p\nARG=hi\n"
+            run("/nonexistent/spawn-x.md", "-p hi"),
+            record("", "", &["--append-system-prompt", "BRIEFING", "-p", "hi"])
         );
+        assert_eq!(
+            run(&file_s, "--append-system-prompt mine"),
+            record(
+                "",
+                "",
+                &["--append-system-prompt", "BRIEFING", "--append-system-prompt", "mine"]
+            )
+        );
+        assert_eq!(
+            run(&file_s, "--append-system-prompt-file ./eval.md"),
+            record("", "", &["--append-system-prompt-file", "./eval.md"])
+        );
+        assert_eq!(
+            run(&file_s, "--system-prompt mine"),
+            record("", "", &["--system-prompt", "mine"])
+        );
+    }
+
+    /// Run the rendered bash identity shim as `claude <args>` with the marker
+    /// pair set, against a fake real `claude` further down PATH.
+    fn run_identity_shim(delivered_file: &str, args: &[&str]) -> String {
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_dir = tmp.path().join("shim");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir_all(&shim_dir).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let out = fake_claude(&real_dir);
+        let rendered = IDENTITY_SHIM_BASH
+            .replace("@@TOOL@@", "claude")
+            .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());
+        write_exe(&shim_dir.join("claude"), &rendered);
+        let status = Command::new("bash")
+            .arg(shim_dir.join("claude"))
+            .args(args)
+            .env_clear()
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}:/usr/bin:/bin",
+                    shim_dir.display(),
+                    real_dir.display()
+                ),
+            )
+            .env("QONTINUI_POLICY_DELIVERED_SHA", SHA)
+            .env("QONTINUI_POLICY_DELIVERED_FILE", delivered_file)
+            .status()
+            .expect("the shim runs");
+        assert!(status.success());
+        std::fs::read_to_string(out).expect("the real claude ran")
+    }
+
+    /// The bash identity shim keeps the marker pair ONLY for a launch that
+    /// passes the composed file itself (either spelling). A nested `claude`
+    /// with its own prompt file, a bare one, or an inline one loses both.
+    #[test]
+    fn bash_identity_shim_keeps_the_marker_only_for_the_exact_composed_file() {
+        let composed = "/rt/spawn-prompts/spawn-0123456789abcdef.md";
+        let flag_attached = format!("--append-system-prompt-file={composed}");
+        for args in [
+            vec!["--append-system-prompt-file", composed, "-p", "hi"],
+            vec![flag_attached.as_str(), "-p", "hi"],
+        ] {
+            let got = run_identity_shim(composed, &args);
+            assert!(
+                got.starts_with(&format!("SHA=[{SHA}]\nFILE=[{composed}]\n")),
+                "{args:?}: {got}"
+            );
+        }
+        for args in [
+            vec!["-p", "--append-system-prompt-file", "./eval.md"],
+            vec!["--append-system-prompt-file=./eval.md"],
+            vec!["--append-system-prompt-file", "./eval.md", composed],
+            vec!["--append-system-prompt", "x"],
+            vec!["-p", "hi"],
+        ] {
+            let got = run_identity_shim(composed, &args);
+            assert!(got.starts_with("SHA=[]\nFILE=[]\n"), "{args:?}: {got}");
+        }
+        // No inherited file: nothing to match, the SHA is dropped.
+        let got = run_identity_shim("", &["--append-system-prompt-file", composed]);
+        assert!(got.starts_with("SHA=[]\n"), "{got}");
     }
 
     /// Run the bundled policy hook against a fake `curl` that echoes the URL it

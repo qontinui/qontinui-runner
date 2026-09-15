@@ -155,8 +155,10 @@ esac
 # policy body now normally reaches the session through its system prompt, and
 # the runner exports the sha256 of the exact body it composed on the `claude`
 # process that got it. Forwarded so the route can send a short confirmation
-# INSTEAD of the ~11 KB body — but only when that sha equals the hash of the
-# body it has just fetched; any other value, or none, gets the full body. The
+# INSTEAD of the ~11 KB body — but only on a startup/compact/clear whose sha
+# equals the hash of the body it has just fetched; a resume (which re-sends the
+# system prompt recorded when its conversation began), any other value, or none
+# gets the full body. The
 # script decides nothing: it forwards, the route judges. Constrained to 64 hex
 # characters (a sha256), so it needs no encoding and a garbage value is simply
 # not sent.

@@ -66,6 +66,7 @@ if /I "%TOOL%"=="claude" if defined QONTINUI_MCP_CONFIG (
 rem ---- did the user already choose a session? then don't double-pin --------
 set "USER_CHOSE=0"
 set "KEEP_POLICY_SHA=0"
+set "PREV_APF=0"
 for %%A in (%*) do (
   set "TOK=%%~A"
   if /I "!TOK!"=="--session-id" set "USER_CHOSE=1"
@@ -74,16 +75,24 @@ for %%A in (%*) do (
   if /I "!TOK!"=="resume" set "USER_CHOSE=1"
   if /I "!TOK!"=="--continue" set "USER_CHOSE=1"
   if /I "!TOK!"=="-c" set "USER_CHOSE=1"
-  if /I "!TOK!"=="--append-system-prompt-file" set "KEEP_POLICY_SHA=1"
+  if "!PREV_APF!"=="1" if defined QONTINUI_POLICY_DELIVERED_FILE if /I "!TOK!"=="!QONTINUI_POLICY_DELIVERED_FILE!" set "KEEP_POLICY_SHA=1"
+  set "PREV_APF=0"
+  if /I "!TOK!"=="--append-system-prompt-file" set "PREV_APF=1"
 )
 
 rem ---- spawn-time policy delivery marker -------------------------------------
 rem QONTINUI_POLICY_DELIVERED_SHA says THIS claude received the policy body in
-rem its system prompt. Only a claude whose argv carries
+rem its system prompt, and QONTINUI_POLICY_DELIVERED_FILE names the composed
+rem file it rode in. Only a claude whose argv passes THAT file to
 rem --append-system-prompt-file did; an inherited marker on a nested claude
-rem would make the policy hook skip a body that session never got. (The `for`
-rem above splits `--append-system-prompt-file=x` on `=`, so both forms match.)
-if /I "%TOOL%"=="claude" if not "%KEEP_POLICY_SHA%"=="1" set "QONTINUI_POLICY_DELIVERED_SHA="
+rem (bare, or with its own --append-system-prompt-file) would make the policy
+rem hook skip a body that session never got. (The `for` above splits
+rem `--append-system-prompt-file=x` on `=`, so the file is the token after the
+rem flag in both spellings.)
+if /I "%TOOL%"=="claude" if not "%KEEP_POLICY_SHA%"=="1" (
+  set "QONTINUI_POLICY_DELIVERED_SHA="
+  set "QONTINUI_POLICY_DELIVERED_FILE="
+)
 
 rem ---- best-effort confirmation/liveness POST (never load-bearing) ----------
 if not "%USER_CHOSE%"=="1" if defined PINNED if defined QONTINUI_INSTALL_INTERCEPT_PORT (

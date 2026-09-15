@@ -4712,7 +4712,7 @@ async fn run_continuation_terminal(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
         // Settled below, from the SAME carrier the argv is built from.
-        policy_delivered_sha: None,
+        policy_delivery: None,
     };
 
     // Provision `.mcp.json` so this continuation can reach coord coordination
@@ -4756,10 +4756,9 @@ async fn run_continuation_terminal(
     ));
     // The marker the policy hook's route trusts as proof of delivery — taken
     // from the very carrier the argv uses, never recomputed.
-    capture_hint.policy_delivered_sha = prompt_carrier
+    capture_hint.policy_delivery = prompt_carrier
         .as_ref()
-        .and_then(|c| c.policy_sha())
-        .map(str::to_string);
+        .and_then(|c| c.policy_delivery());
     let command = Some(build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -5372,10 +5371,9 @@ async fn run_condition_check_terminal(
     ));
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
-    let policy_delivered_sha = prompt_carrier
+    let policy_delivery = prompt_carrier
         .as_ref()
-        .and_then(|c| c.policy_sha())
-        .map(str::to_string);
+        .and_then(|c| c.policy_delivery());
     let command = Some(build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -5431,7 +5429,7 @@ async fn run_condition_check_terminal(
             crate::commands::terminal::CoordSessionLineage::for_pinned_session(&pinned_session_id),
         ),
         // From the SAME carrier the argv above was built from.
-        policy_delivered_sha,
+        policy_delivery,
     };
 
     // Same as the gate-continuation terminal: warm the dial so the PTY seam's

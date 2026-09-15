@@ -1895,28 +1895,21 @@ pub(crate) struct SessionCaptureHint {
     /// respawn receiver ([`crate::session::respawn`]) adds the
     /// `parent_session_id` link on top.
     pub coord_lineage: Option<CoordSessionLineage>,
-    /// The [`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`] value for
-    /// this spawn: the sha256 of the policy body its argv delivered through a
-    /// composed `--append-system-prompt-file`, or `None` when its argv carried
-    /// the inline briefing (or no system prompt at all).
+    /// The delivered-policy marker for this spawn
+    /// ([`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`] +
+    /// [`crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV`]): the sha256
+    /// of the policy body its argv delivered through a composed
+    /// `--append-system-prompt-file`, and that file's path, or `None` when its
+    /// argv carried the inline briefing (or no system prompt at all).
     ///
     /// It MUST come from the same carrier the argv was built from
-    /// ([`crate::session::spawn_prompt::SystemPromptCarrier::policy_sha`]),
-    /// because the policy hook's route trusts it as proof of delivery and sends
-    /// the short confirmation instead of the body. `None` is injected as an
-    /// EMPTY value, never omitted, so a marker inherited from the runner's own
-    /// environment cannot vouch for a delivery this child never received.
-    pub policy_delivered_sha: Option<String>,
-}
-
-/// The delivered-SHA env pair for a backend spawn — `(name, sha)` or
-/// `(name, "")`. Pure, so the "never omit, blank instead" rule is assertable.
-pub(crate) fn policy_delivered_sha_env(hint: Option<&SessionCaptureHint>) -> (String, String) {
-    (
-        crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV.to_string(),
-        hint.and_then(|h| h.policy_delivered_sha.clone())
-            .unwrap_or_default(),
-    )
+    /// ([`crate::session::spawn_prompt::SystemPromptCarrier::policy_delivery`]),
+    /// because the policy hook's route trusts the SHA as proof of delivery and
+    /// the identity shims keep it only for a launch passing exactly that path.
+    /// `None` is injected as EMPTY values, never omitted, so a marker inherited
+    /// from the runner's own environment cannot vouch for a delivery this child
+    /// never received.
+    pub policy_delivery: Option<crate::session::spawn_prompt::PolicyDelivery>,
 }
 
 /// Env var carrying the `coord.gates` row id a continuation session must report
@@ -2155,9 +2148,11 @@ pub(crate) fn create_terminal_session_backend(
             gate.consuming_device_id.to_string(),
         ));
     }
-    // The spawn-time policy delivery marker — set, or BLANKED, on every backend
-    // spawn. See `SessionCaptureHint::policy_delivered_sha`.
-    env_pairs.push(policy_delivered_sha_env(capture_hint.as_ref()));
+    // The spawn-time policy delivery marker pair — set, or BLANKED, on every
+    // backend spawn. See `SessionCaptureHint::policy_delivery`.
+    env_pairs.extend(crate::session::spawn_prompt::policy_delivery_env(
+        capture_hint.as_ref().and_then(|h| h.policy_delivery.as_ref()),
+    ));
     let extra_env = if env_pairs.is_empty() {
         None
     } else {
@@ -2304,7 +2299,7 @@ pub(crate) fn create_terminal_session_backend(
                 // Consumed earlier (coord registration above).
                 coord_lineage: _,
                 // Consumed earlier (env injection at spawn); not needed here.
-                policy_delivered_sha: _,
+                policy_delivery: _,
             } = hint;
             // Single source of truth for the recorded page: the hint's page_id
             // (set by the caller to the picked page), defaulting to "default".
@@ -2887,7 +2882,7 @@ mod tests {
             inject_agent_git_identity: false,
             gate_identity: None,
             coord_lineage,
-            policy_delivered_sha: None,
+            policy_delivery: None,
         };
 
         let pinned = hint(Some(CoordSessionLineage::for_pinned_session("pinned-1")));
@@ -2908,38 +2903,6 @@ mod tests {
 
         assert_eq!(registration_lineage_args(Some(&hint(None))), (None, None));
         assert_eq!(registration_lineage_args(None), (None, None));
-    }
-
-    /// The delivered-SHA marker is injected on EVERY backend spawn: the
-    /// carrier's sha when the argv used the composed file, and an explicit
-    /// empty value otherwise — including a hint-less spawn — so a marker
-    /// inherited from the runner's own env can never reach a child that got no
-    /// body. The hook script and the route both treat empty as "no marker".
-    #[test]
-    fn policy_delivered_sha_env_sets_the_sha_or_blanks_never_omits() {
-        let hint = |sha: Option<&str>| SessionCaptureHint {
-            config_dir: None,
-            working_dir: "/w".to_string(),
-            title: "t".to_string(),
-            page_id: None,
-            claude_session_id: None,
-            zone_index: None,
-            inject_agent_git_identity: false,
-            gate_identity: None,
-            coord_lineage: None,
-            policy_delivered_sha: sha.map(str::to_string),
-        };
-        let name = crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV.to_string();
-        let sha = "ab".repeat(32);
-        assert_eq!(
-            policy_delivered_sha_env(Some(&hint(Some(&sha)))),
-            (name.clone(), sha)
-        );
-        assert_eq!(
-            policy_delivered_sha_env(Some(&hint(None))),
-            (name.clone(), String::new())
-        );
-        assert_eq!(policy_delivered_sha_env(None), (name, String::new()));
     }
 
     /// Phase 3 item 1 guardrail: a backend call arriving with
@@ -2965,7 +2928,7 @@ mod tests {
             inject_agent_git_identity: false,
             gate_identity: None,
             coord_lineage: None,
-            policy_delivered_sha: None,
+            policy_delivery: None,
         });
         warn_untracked_backend_spawn(&hint, "Hinted", "/work/dir");
         assert_eq!(

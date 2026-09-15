@@ -67,29 +67,41 @@ if [ "${QONTINUI_RUNNER_TERMINAL}" = "1" ]; then
                 command claude "$@"
                 ;;
             *)
-                # A caller-supplied system-prompt flag wins, untouched: Claude
-                # Code refuses the inline and file flags together, so adding
-                # ours beside theirs could only stop the launch.
-                local __q_own_prompt=0 __q_arg
+                # Classify the caller's own system-prompt flags. Claude Code
+                # refuses the inline and file flags together but accepts
+                # repeated inline flags, so:
+                #   file  — a caller --append-system-prompt-file or
+                #           --system-prompt[-file] owns the prompt: ours is not
+                #           added at all (either of ours could stop the launch
+                #           or override theirs);
+                #   inline — caller inline --append-system-prompt flag(s) only:
+                #           ours joins as ANOTHER inline flag (the briefing, as
+                #           before this plan), never the file;
+                #   none  — ours alone, the composed file when it exists.
+                local __q_caller_prompt=none __q_arg
                 for __q_arg in "$@"; do
                     case "$__q_arg" in
-                        --append-system-prompt|--append-system-prompt=*|--append-system-prompt-file|--append-system-prompt-file=*)
-                            __q_own_prompt=1; break ;;
+                        --append-system-prompt-file|--append-system-prompt-file=*|--system-prompt|--system-prompt=*|--system-prompt-file|--system-prompt-file=*)
+                            __q_caller_prompt=file; break ;;
+                        --append-system-prompt|--append-system-prompt=*)
+                            __q_caller_prompt=inline ;;
                     esac
                 done
-                if [ "$__q_own_prompt" = "0" ] && [ -n "${QONTINUI_RUNNER_CONTEXT_FILE:-}" ] \
+                if [ "$__q_caller_prompt" = "none" ] && [ -n "${QONTINUI_RUNNER_CONTEXT_FILE:-}" ] \
                     && [ -f "${QONTINUI_RUNNER_CONTEXT_FILE}" ]; then
                     # The composed spawn file: briefing + the tenant's policy
-                    # body. QONTINUI_POLICY_DELIVERED_SHA rides along untouched
-                    # — it names exactly that body.
+                    # body. The delivered-policy marker rides along untouched —
+                    # QONTINUI_POLICY_DELIVERED_FILE names exactly this file.
                     command claude --append-system-prompt-file "$QONTINUI_RUNNER_CONTEXT_FILE" "$@"
-                elif [ "$__q_own_prompt" = "0" ] && [ -n "${QONTINUI_RUNNER_CONTEXT:-}" ]; then
-                    # Inline fall-back (no file, or it was pruned): no policy
-                    # body reached this child, so its delivered-SHA marker is
-                    # BLANKED — the policy hook then sends the full body.
-                    QONTINUI_POLICY_DELIVERED_SHA= command claude --append-system-prompt "$QONTINUI_RUNNER_CONTEXT" "$@"
+                elif [ "$__q_caller_prompt" != "file" ] && [ -n "${QONTINUI_RUNNER_CONTEXT:-}" ]; then
+                    # Inline briefing (no file, it was pruned, or the caller
+                    # brought inline flags of their own): no policy body reaches
+                    # this child, so its delivered-policy marker is BLANKED —
+                    # the policy hook then sends the full body.
+                    QONTINUI_POLICY_DELIVERED_SHA= QONTINUI_POLICY_DELIVERED_FILE= \
+                        command claude --append-system-prompt "$QONTINUI_RUNNER_CONTEXT" "$@"
                 else
-                    QONTINUI_POLICY_DELIVERED_SHA= command claude "$@"
+                    QONTINUI_POLICY_DELIVERED_SHA= QONTINUI_POLICY_DELIVERED_FILE= command claude "$@"
                 fi
                 ;;
         esac

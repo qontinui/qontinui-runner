@@ -65,10 +65,12 @@
 //!
 //! This route still makes the SAME attributed coord read on every start — that
 //! read is the compliance record — and only its render shrinks: a short
-//! confirmation plus the index, and ONLY when the session's delivered-SHA marker
-//! equals the hash of the body just fetched ([`render_for_session`]). No marker,
-//! a stale spawn-time copy, or a cold cache all get the full body, exactly as
-//! before. The runner never claims a delivery it cannot prove.
+//! confirmation plus the index, and ONLY on a `startup`/`compact`/`clear` whose
+//! delivered-SHA marker equals the hash of the body just fetched
+//! ([`render_for_session`]). A `resume` (whose conversation re-sends the system
+//! prompt recorded when it began), no marker, a stale spawn-time copy, or a cold
+//! cache all get the full body, exactly as before. The confirmation says what
+//! the runner composed, never that it saw the copy in the model's prompt.
 //!
 //! ## Fires on every `source`
 //!
@@ -513,12 +515,18 @@ pub fn render_injection(payload: &PolicyPayload, source: &str, fetched_at: &str)
     out
 }
 
-/// Render the SHORT `additionalContext`: the body was verifiably delivered at
-/// spawn, so only a confirmation and the index cross the hook boundary.
+/// Render the SHORT `additionalContext`: the runner composed this exact body
+/// into the session's spawn-time system-prompt file, so only a confirmation and
+/// the index cross the hook boundary.
 ///
-/// Names the protocol version and a short prefix of `delivered_sha` so that a
-/// session holding a spawn-time copy for a long time (many `compact` cycles)
-/// can match the copy in its system prompt against what this hook vouched for.
+/// The wording states only what the runner KNOWS — that it composed a
+/// spawn-time system-prompt file whose policy body hashes to `delivered_sha`,
+/// and that the hash equals the body coord serves now. It does not claim the
+/// runner saw that copy inside the model's system prompt: nothing on this side
+/// can observe the request Claude Code actually sends. Names the protocol
+/// version and a short prefix of the hash so a session holding the spawn-time
+/// copy through many `compact` cycles can match the block it has against what
+/// this hook vouched for.
 pub fn render_confirmation(
     payload: &PolicyPayload,
     delivered_sha: &str,
@@ -531,26 +539,50 @@ pub fn render_confirmation(
     out.push_str(&header(source, fetched_at));
     out.push_str("\n\n");
     out.push_str(&format!(
-        "The canonical text of `policy/{PROTOCOL_DOC_NAME}` ({version}, sha256 {short_sha}…) \
-         was delivered into this session's SYSTEM PROMPT at spawn, and the runner verified \
-         that the delivered copy is byte-identical to the body coord serves right now — so \
-         Step 0 of the session protocol is satisfied for this session and the body is not \
-         repeated here. It is the block headed `===== policy/{PROTOCOL_DOC_NAME} ({version}) \
-         =====`. If you cannot find that block, treat Step 0 as NOT satisfied and fetch it \
-         yourself: `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, \
-         or `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}`. You DO still need \
-         to read the category bodies it names.\n\n"
+        "The body of `policy/{PROTOCOL_DOC_NAME}` is not repeated here. At spawn the runner \
+         composed a system-prompt file for this `claude` process (passed via \
+         `--append-system-prompt-file`) containing that body ({version}, sha256 {short_sha}…), \
+         and that hash equals the body coord serves right now. If your system prompt holds the \
+         block headed `===== policy/{PROTOCOL_DOC_NAME} ({version}) =====`, it is the canonical \
+         text and Step 0 of the session protocol is satisfied by it. If you cannot find that \
+         block, treat Step 0 as NOT satisfied and fetch it yourself: \
+         `coord_get_prompt_document(kind=\"{KIND}\", name=\"{PROTOCOL_DOC_NAME}\")`, or \
+         `GET /coord/agent-prompt-documents/{KIND}/{PROTOCOL_DOC_NAME}`. You DO still need to \
+         read the category bodies it names.\n\n"
     ));
     push_index(&mut out, payload);
     out
 }
 
+/// May a SessionStart with this RAW hook `source` receive the short
+/// confirmation at all?
+///
+/// Only `startup`, `compact` and `clear`. Claude Code records a conversation's
+/// system prompt on its first request and a `--resume` re-sends THAT record
+/// (`--system-prompt-snapshot`, on by default) until the next compaction, even
+/// when the relaunch passed a different file — so on `resume` a matching marker
+/// names the body this process was launched with, not the body the model is
+/// being sent. A missing or unrecognized source is not evidence of either, so
+/// it is treated like `resume`. Deliberately reads the raw value:
+/// [`normalize_source`] maps "absent" to `startup`, which is right for the
+/// header label and wrong for this decision.
+pub fn source_permits_confirmation(raw_source: Option<&str>) -> bool {
+    matches!(
+        raw_source.map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+        Some("startup" | "compact" | "clear")
+    )
+}
+
 /// Choose the render for one session — the honesty decision, pure.
 ///
-/// The short confirmation is sent ONLY when the session's delivered-SHA marker
+/// The short confirmation is sent ONLY when the RAW hook source permits it
+/// ([`source_permits_confirmation`]) AND the session's delivered-SHA marker
 /// equals [`crate::session::spawn_prompt::policy_body_sha`] of the body this
 /// call just fetched. Every other case gets the full render:
 ///
+/// - **`resume`, or no/unknown source** — the resumed conversation re-sends the
+///   system prompt recorded when it began, so a matching marker proves nothing
+///   about what the model holds;
 /// - **no marker** — the session was not given the file carrier (cold cache at
 ///   spawn, a write failure, a wrapper fall-back, a seam that has none), and the
 ///   presence of a cache file NOW says nothing about what it received THEN;
@@ -558,20 +590,24 @@ pub fn render_confirmation(
 ///   document since the pane or process started);
 /// - **no body fetched** — nothing to compare, and the partial render says so.
 ///
-/// Returns the text and whether it was the confirmation.
+/// `raw_source` is the hook's value as received; the header label is its
+/// [`normalize_source`]. Returns the text and whether it was the confirmation.
 pub fn render_for_session(
     payload: &PolicyPayload,
     delivered_sha: Option<&str>,
-    source: &str,
+    raw_source: Option<&str>,
     fetched_at: &str,
 ) -> (String, bool) {
-    if let (Some(marker), Some(body)) = (delivered_sha, render_policy_body(payload)) {
-        let current = crate::session::spawn_prompt::policy_body_sha(&body);
-        if marker == current {
-            return (
-                render_confirmation(payload, &current, source, fetched_at),
-                true,
-            );
+    let source = normalize_source(raw_source);
+    if source_permits_confirmation(raw_source) {
+        if let (Some(marker), Some(body)) = (delivered_sha, render_policy_body(payload)) {
+            let current = crate::session::spawn_prompt::policy_body_sha(&body);
+            if marker == current {
+                return (
+                    render_confirmation(payload, &current, source, fetched_at),
+                    true,
+                );
+            }
         }
     }
     (render_injection(payload, source, fetched_at), false)
@@ -1032,7 +1068,8 @@ pub async fn policy_context(
     delivered_sha: Option<&str>,
 ) -> Option<Value> {
     let mode = Mode::from_env();
-    let source = normalize_source(source);
+    let raw_source = source;
+    let source = normalize_source(raw_source);
 
     if mode == Mode::Off {
         debug!(
@@ -1064,7 +1101,7 @@ pub async fn policy_context(
                     persist_policy_body_cache(&jwt, &payload);
                 }
                 let (text, is_confirmation) =
-                    render_for_session(&payload, delivered_sha, source, &fetched_at);
+                    render_for_session(&payload, delivered_sha, raw_source, &fetched_at);
                 confirmed = is_confirmation;
                 text
             }
@@ -1547,13 +1584,17 @@ mod tests {
         let sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
         let (text, confirmed) =
-            render_for_session(&payload, Some(&sha), "resume", "2026-08-19T12:00:00Z");
+            render_for_session(&payload, Some(&sha), Some("compact"), "2026-08-19T12:00:00Z");
         assert!(confirmed);
         // Still attributable, still versioned.
         assert!(text.starts_with("[qontinui-runner]"));
-        assert!(text.contains("source: resume"));
-        assert!(text.contains("SYSTEM PROMPT at spawn"));
+        assert!(text.contains("source: compact"));
         assert!(text.contains(&format!("v6, sha256 {}", &sha[..12])));
+        // It says what the runner KNOWS — it composed the spawn file — and
+        // never that it verified the copy inside the model's system prompt.
+        assert!(text.contains("composed a system-prompt file"));
+        assert!(!text.contains("verified"), "{text}");
+        assert!(!text.contains("was delivered into"), "{text}");
         // The body is NOT repeated — that is the whole point.
         assert!(!text.contains("Step 0 — read the policies, fresh."));
         // The index still rides the hook.
@@ -1573,15 +1614,51 @@ mod tests {
         let real_sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&real).unwrap());
         let (short, confirmed) =
-            render_for_session(&real, Some(&real_sha), "resume", "2026-08-19T12:00:00Z");
+            render_for_session(&real, Some(&real_sha), Some("startup"), "2026-08-19T12:00:00Z");
         assert!(confirmed);
-        let full = render_injection(&real, "resume", "2026-08-19T12:00:00Z");
+        let full = render_injection(&real, "startup", "2026-08-19T12:00:00Z");
         assert!(
             short.len() * 3 < full.len(),
             "confirmation {} bytes vs full {} bytes",
             short.len(),
             full.len()
         );
+    }
+
+    /// The resume-snapshot rule, per RAW source: a matching marker confirms
+    /// only on `startup`/`compact`/`clear`. `resume` re-sends the system prompt
+    /// recorded when the conversation began, and a missing or unknown source is
+    /// no evidence either way, so both get the full body — even though
+    /// [`normalize_source`] labels an absent source `startup`.
+    #[test]
+    fn only_startup_compact_and_clear_may_confirm_a_matching_marker() {
+        let payload = sample_payload();
+        let sha =
+            crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
+        let at = "2026-08-19T12:00:00Z";
+        for (raw, expect_confirmed, label) in [
+            (Some("startup"), true, "startup"),
+            (Some("compact"), true, "compact"),
+            (Some("clear"), true, "clear"),
+            (Some(" CLEAR "), true, "clear"),
+            (Some("resume"), false, "resume"),
+            (None, false, "startup"),
+            (Some(""), false, "startup"),
+            (Some("reload"), false, "startup"),
+        ] {
+            assert_eq!(
+                source_permits_confirmation(raw),
+                expect_confirmed,
+                "{raw:?}"
+            );
+            let (text, confirmed) = render_for_session(&payload, Some(&sha), raw, at);
+            assert_eq!(confirmed, expect_confirmed, "{raw:?}");
+            assert!(text.contains(&format!("source: {label}")), "{raw:?}");
+            if !expect_confirmed {
+                assert_eq!(text, render_injection(&payload, label, at), "{raw:?}");
+                assert!(text.contains("Step 0 — read the policies, fresh."));
+            }
+        }
     }
 
     #[test]
@@ -1591,14 +1668,14 @@ mod tests {
 
         // No marker: the session was not given the file carrier.
         let (text, confirmed) =
-            render_for_session(&payload, None, "startup", "2026-08-19T12:00:00Z");
+            render_for_session(&payload, None, Some("startup"), "2026-08-19T12:00:00Z");
         assert!(!confirmed);
         assert_eq!(text, full);
 
         // A marker for an OLDER body: the spawn-time copy is stale.
         let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
         let (text, confirmed) =
-            render_for_session(&payload, Some(&stale), "startup", "2026-08-19T12:00:00Z");
+            render_for_session(&payload, Some(&stale), Some("startup"), "2026-08-19T12:00:00Z");
         assert!(!confirmed);
         assert_eq!(text, full);
 
@@ -1608,7 +1685,7 @@ mod tests {
             ..sample_payload()
         };
         let (text, confirmed) =
-            render_for_session(&partial, Some(&stale), "startup", "2026-08-19T12:00:00Z");
+            render_for_session(&partial, Some(&stale), Some("startup"), "2026-08-19T12:00:00Z");
         assert!(!confirmed);
         assert!(text.contains("Step 0 is NOT satisfied"));
     }

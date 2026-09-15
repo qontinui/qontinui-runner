@@ -85,30 +85,40 @@ if ($env:QONTINUI_RUNNER_TERMINAL -eq "1") {
             & $exe @args
             return
         }
-        # A caller-supplied system-prompt flag wins, untouched: Claude Code
-        # refuses the inline and file flags together.
-        $ownPrompt = $false
+        # Classify the caller's own system-prompt flags (mirrors the bash
+        # wrapper). Claude Code refuses the inline and file flags together but
+        # accepts repeated inline flags: a caller --append-system-prompt-file or
+        # --system-prompt[-file] owns the prompt and ours is not added; caller
+        # inline flag(s) only get our briefing as ANOTHER inline flag; with none,
+        # ours alone, the composed file when it exists.
+        $callerPrompt = 'none'
         foreach ($a in $args) {
-            if ("$a" -match '^--append-system-prompt(-file)?(=.*)?$') { $ownPrompt = $true; break }
+            if ("$a" -match '^--(append-system-prompt-file|system-prompt|system-prompt-file)(=.*)?$') { $callerPrompt = 'file'; break }
+            if ("$a" -match '^--append-system-prompt(=.*)?$') { $callerPrompt = 'inline' }
         }
-        if (-not $ownPrompt -and -not [string]::IsNullOrEmpty($ctxFile) -and (Test-Path -LiteralPath $ctxFile -PathType Leaf)) {
+        if ($callerPrompt -eq 'none' -and -not [string]::IsNullOrEmpty($ctxFile) -and (Test-Path -LiteralPath $ctxFile -PathType Leaf)) {
             # The composed spawn file (briefing + policy body); the
-            # delivered-SHA marker rides along untouched — it names that body.
+            # delivered-policy marker rides along untouched —
+            # QONTINUI_POLICY_DELIVERED_FILE names exactly this file.
             & $exe --append-system-prompt-file $ctxFile @args
             return
         }
-        # Inline fall-back or no briefing: no policy body reaches this child, so
-        # its delivered-SHA marker is BLANKED for the call and restored after.
+        # Inline briefing, caller-owned prompt, or no briefing: no policy body
+        # reaches this child, so its delivered-policy marker is BLANKED for the
+        # call and restored after.
         $savedSha = $env:QONTINUI_POLICY_DELIVERED_SHA
+        $savedFile = $env:QONTINUI_POLICY_DELIVERED_FILE
         $env:QONTINUI_POLICY_DELIVERED_SHA = $null
+        $env:QONTINUI_POLICY_DELIVERED_FILE = $null
         try {
-            if (-not $ownPrompt -and -not [string]::IsNullOrEmpty($ctx)) {
+            if ($callerPrompt -ne 'file' -and -not [string]::IsNullOrEmpty($ctx)) {
                 & $exe --append-system-prompt $ctx @args
             } else {
                 & $exe @args
             }
         } finally {
             $env:QONTINUI_POLICY_DELIVERED_SHA = $savedSha
+            $env:QONTINUI_POLICY_DELIVERED_FILE = $savedFile
         }
     }
 }

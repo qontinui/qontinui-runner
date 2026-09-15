@@ -530,10 +530,9 @@ pub(crate) fn spawn_resumed_pane(
         gate_identity: spec.gate_identity,
         coord_lineage: spec.coord_lineage,
         // From the SAME carrier the argv above was built from.
-        policy_delivered_sha: prompt_carrier
+        policy_delivery: prompt_carrier
             .as_ref()
-            .and_then(|c| c.policy_sha())
-            .map(str::to_string),
+            .and_then(|c| c.policy_delivery()),
     };
     crate::commands::terminal::create_tracked_terminal_session_backend(
         terminal_manager,

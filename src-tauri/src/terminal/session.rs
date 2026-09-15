@@ -1046,18 +1046,37 @@ pub struct PtyInputObservation {
 /// (`terminal::phantom_turn`) to decide whether a real input event preceded a
 /// suspicious transcript turn.
 ///
-/// Two slots rather than one because the two choke points answer different
-/// questions: `last_submit` is a whole prompt some runner producer injected,
-/// `last_write` is raw bytes (usually keystrokes). A detector wants either;
-/// an investigator reading them wants to know which.
+/// Two input slots rather than one because the two choke points answer
+/// different questions: `last_submit` is a whole prompt some runner producer
+/// injected, `last_write` is raw bytes (usually keystrokes). A detector wants
+/// either; an investigator reading them wants to know which.
+///
+/// A third, `last_control_response`, holds writes that were NOT input: a chunk
+/// made up solely of the terminal emulator's own replies
+/// ([`is_terminal_control_response`] — focus reports, device-attribute / status
+/// / mode reports, cursor-position reports, OSC and DCS replies). Claude Code's
+/// TUI queries the terminal at startup and the frontend's emulator answers
+/// through the same `write` path as keystrokes; counting those answers as input
+/// would mask nearly every phantom turn. They are kept, not dropped, so an
+/// investigator can still see the emulator was talking.
 #[derive(Clone, Debug, Default)]
 pub struct PtyInputSlots {
     pub last_write: Option<PtyInputObservation>,
     pub last_submit: Option<PtyInputObservation>,
+    pub last_control_response: Option<PtyInputObservation>,
+}
+
+/// Which [`PtyInputSlots`] field one observation lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputSlot {
+    Write,
+    Submit,
+    ControlResponse,
 }
 
 impl PtyInputSlots {
-    /// The more recent of the two slots, whichever choke point it came from.
+    /// The more recent of the two INPUT slots, whichever choke point it came
+    /// from. `last_control_response` is never input and never considered.
     pub fn latest(&self) -> Option<&PtyInputObservation> {
         match (&self.last_write, &self.last_submit) {
             (Some(w), Some(s)) => Some(if s.at >= w.at { s } else { w }),
@@ -1066,12 +1085,134 @@ impl PtyInputSlots {
     }
 }
 
-/// The first 8 hex chars of `sha256(body)` — enough to correlate one submit
-/// across the runner log and a transcript without the body entering the log.
+/// Does `data` consist SOLELY of terminal control-response sequences — bytes a
+/// terminal emulator writes back in answer to a query, never text a person
+/// typed?
+///
+/// Recognized, each as a complete sequence, in any concatenation:
+///
+/// - focus reports `ESC [ I` / `ESC [ O`;
+/// - CSI reports by final byte: `c` (primary/secondary/tertiary device
+///   attributes, e.g. `ESC [ ? 1 ; 2 c`, `ESC [ > 0 ; 276 ; 0 c`), `n` (device
+///   status), `R` with two parameters (cursor position, including the `?` DEC
+///   form), `y` behind a `$` intermediate (DECRQM mode report), `t` (window
+///   reports), and `u` behind a `?` (keyboard-protocol flags report);
+/// - OSC replies `ESC ] … BEL` or `ESC ] … ESC \` (colour and clipboard
+///   queries);
+/// - DCS replies `ESC P … ESC \` (DECRQSS, XTGETTCAP).
+///
+/// Everything else is input: arrows, function and editing keys (`A`–`D`, `H`,
+/// `F`, `Z`, `~` finals), bracketed-paste markers, mouse reports, and any
+/// printable or control byte. A chunk mixing a reply with anything else is
+/// input. One known ambiguity is accepted: some terminals encode a MODIFIED F3
+/// as `ESC [ 1 ; <mod> R`, the shape of a cursor-position report; misreading
+/// that one key as a reply costs at worst a phantom-turn warn line, while
+/// counting every real report as input would silence the detector.
+pub fn is_terminal_control_response(data: &[u8]) -> bool {
+    const ESC: u8 = 0x1b;
+    const BEL: u8 = 0x07;
+    if data.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != ESC || i + 1 >= data.len() {
+            return false;
+        }
+        match data[i + 1] {
+            b'[' => {
+                // CSI: parameter bytes 0x30–0x3F, intermediates 0x20–0x2F,
+                // one final 0x40–0x7E.
+                let start = i + 2;
+                let mut j = start;
+                while j < data.len() && (0x30..=0x3f).contains(&data[j]) {
+                    j += 1;
+                }
+                let params = &data[start..j];
+                let inter_start = j;
+                while j < data.len() && (0x20..=0x2f).contains(&data[j]) {
+                    j += 1;
+                }
+                let intermediates = &data[inter_start..j];
+                let Some(&fin) = data.get(j) else {
+                    return false;
+                };
+                if !(0x40..=0x7e).contains(&fin) {
+                    return false;
+                }
+                let is_reply = match fin {
+                    b'I' | b'O' => params.is_empty() && intermediates.is_empty(),
+                    b'c' | b'n' | b't' => intermediates.is_empty(),
+                    b'R' => {
+                        intermediates.is_empty()
+                            && params
+                                .strip_prefix(b"?")
+                                .unwrap_or(params)
+                                .split(|b| *b == b';')
+                                .filter(|p| !p.is_empty())
+                                .count()
+                                >= 2
+                    }
+                    b'y' => intermediates == b"$",
+                    b'u' => intermediates.is_empty() && params.first() == Some(&b'?'),
+                    _ => false,
+                };
+                if !is_reply {
+                    return false;
+                }
+                i = j + 1;
+            }
+            b']' | b'P' => {
+                // OSC (BEL or ST terminated) / DCS (ST terminated).
+                let osc = data[i + 1] == b']';
+                let mut j = i + 2;
+                loop {
+                    match data.get(j) {
+                        None => return false,
+                        Some(&BEL) if osc => {
+                            j += 1;
+                            break;
+                        }
+                        Some(&ESC) if data.get(j + 1) == Some(&b'\\') => {
+                            j += 2;
+                            break;
+                        }
+                        Some(_) => j += 1,
+                    }
+                }
+                i = j;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The first 8 hex chars of `HMAC-SHA256(key, body)` under a per-process random
+/// key ([`submit_log_hash_key`]) — enough to tell two submits of the same body
+/// apart from two different ones within one runner's log, without the body
+/// entering the log.
+///
+/// Keyed, not a plain `sha256` prefix: submit bodies are often SHORT (`yes`,
+/// `continue`, a slash command), and an unkeyed 32-bit prefix of a short body is
+/// recoverable from the log by hashing a dictionary of candidates. A key that
+/// never leaves the process makes that search impossible; the cost is that the
+/// value is comparable only within one runner process, never across restarts or
+/// against a hash computed elsewhere — match a transcript turn by its
+/// `body_bytes` and time instead.
 fn short_body_hash(body: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(body.as_bytes());
-    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+    use hmac::{Hmac, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(submit_log_hash_key())
+        .expect("HMAC accepts a key of any length");
+    mac.update(body.as_bytes());
+    let digest = mac.finalize().into_bytes();
+    hex::encode(&digest[..4])
+}
+
+/// The per-process random HMAC key behind [`short_body_hash`], drawn once.
+fn submit_log_hash_key() -> &'static [u8; 32] {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    KEY.get_or_init(rand::random)
 }
 
 /// Pure line-assembly core of the typed-input observer
@@ -1373,6 +1514,13 @@ impl TerminalSession {
         let caller_config_dir_value: Option<String> =
             Self::caller_pinned_config_dir(extra_env.as_deref()).map(str::to_string);
         let caller_pinned_config_dir = caller_config_dir_value.is_some();
+        // A direct exec's delivered-policy marker is the caller's to set (via
+        // `extra_env`, from the carrier its argv used). Clear any copy inherited
+        // from the RUNNER's own environment first — a runner started inside a
+        // runner session holds its parent's marker — so a caller that sets none
+        // leaves none, rather than leaking a vouch for a body this child never
+        // got. A shell pane's marker is settled below from its composed file.
+        Self::scrub_inherited_policy_marker(&mut cmd, is_shell_pane);
         if let Some(env) = extra_env {
             for (k, v) in env {
                 cmd.env(k, v);
@@ -1458,7 +1606,8 @@ impl TerminalSession {
         // inline flag). No cache or a failed write REMOVES both, so the wrapper
         // stays on the inline briefing and no inherited marker can vouch for a
         // body this pane never got. A direct exec is skipped: its argv carrier
-        // and its marker were settled together by the caller (`extra_env`).
+        // and its marker were settled together by the caller (`extra_env`),
+        // after the inherited pair was scrubbed above.
         if is_shell_pane {
             for (name, value) in
                 crate::session::spawn_prompt::shell_pane_prompt_env(&runner_context)
@@ -2273,6 +2422,21 @@ impl TerminalSession {
     /// derived for that one account rather than minted for every account on the
     /// box. Two readers of the same `(key, value)` list would be the drift the
     /// trust gate's conjunct 3 exists to catch.
+    /// Remove the inherited delivered-policy marker pair
+    /// ([`crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV`] and
+    /// [`crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV`]) from a
+    /// DIRECT-EXEC child. Runs BEFORE the caller's `extra_env`, so a caller that
+    /// sets the pair still wins and one that sets neither leaves the child with
+    /// none. A shell pane is left alone: its pair is set or removed afterwards
+    /// from the pane's own composed file.
+    fn scrub_inherited_policy_marker(cmd: &mut CommandBuilder, is_shell_pane: bool) {
+        if is_shell_pane {
+            return;
+        }
+        cmd.env_remove(crate::session::spawn_prompt::POLICY_DELIVERED_SHA_ENV);
+        cmd.env_remove(crate::session::spawn_prompt::POLICY_DELIVERED_FILE_ENV);
+    }
+
     pub(crate) fn caller_pinned_config_dir(extra_env: Option<&[(String, String)]>) -> Option<&str> {
         extra_env?
             .iter()
@@ -3207,13 +3371,18 @@ impl TerminalSession {
             bytes = data.len(),
             "terminal pty write"
         );
+        let slot = if is_terminal_control_response(data) {
+            InputSlot::ControlResponse
+        } else {
+            InputSlot::Write
+        };
         self.record_input(
             PtyInputObservation {
                 caller,
                 at: Instant::now(),
                 bytes: data.len(),
             },
-            false,
+            slot,
         );
         self.observe_input(data);
         Ok(())
@@ -3227,17 +3396,16 @@ impl TerminalSession {
             .unwrap_or_else(|e| e.into_inner().clone())
     }
 
-    /// Store `obs` in the `last_submit` slot (`submit == true`) or the
-    /// `last_write` slot. A poisoned lock is recovered rather than skipped:
-    /// the slot is diagnostic evidence, and silently losing it on one panic
-    /// elsewhere would make the phantom-turn detector read "no input" — the
-    /// exact false positive it must not produce.
-    fn record_input(&self, obs: PtyInputObservation, submit: bool) {
+    /// Store `obs` in `slot`. A poisoned lock is recovered rather than
+    /// skipped: the slot is diagnostic evidence, and silently losing it on one
+    /// panic elsewhere would make the phantom-turn detector read "no input" —
+    /// the exact false positive it must not produce.
+    fn record_input(&self, obs: PtyInputObservation, slot: InputSlot) {
         let mut slots = self.last_input.lock().unwrap_or_else(|e| e.into_inner());
-        if submit {
-            slots.last_submit = Some(obs);
-        } else {
-            slots.last_write = Some(obs);
+        match slot {
+            InputSlot::Write => slots.last_write = Some(obs),
+            InputSlot::Submit => slots.last_submit = Some(obs),
+            InputSlot::ControlResponse => slots.last_control_response = Some(obs),
         }
     }
 
@@ -3322,7 +3490,7 @@ impl TerminalSession {
     ///
     /// `caller` names the producer. Unlike [`Self::write`], every submit logs
     /// one unconditional `info!` carrying the tag, the body's byte count and a
-    /// short hash of the body — a submit is a whole prompt, rare enough to log
+    /// short keyed hash of the body — a submit is a whole prompt, rare enough to log
     /// every time, and the phantom-turn investigation showed that "which
     /// producer wrote this turn, if any" is otherwise unanswerable.
     pub fn submit_prompt(
@@ -3385,14 +3553,14 @@ impl TerminalSession {
         // so an ordinary submit left no trace of which producer sent it —
         // which is what made ruling the runner out of the phantom `is` turn a
         // multi-hour correlation. Same redaction posture as that warn: the
-        // body is untrusted and never logged; its length and a short digest
-        // of the sanitized body (what actually reaches the wire) are enough to
-        // match it against a transcript turn.
+        // body is untrusted and never logged; its length (matchable against a
+        // transcript turn) and a short KEYED digest of the sanitized body (what
+        // actually reaches the wire; see `short_body_hash`) are logged instead.
         info!(
             terminal_id = %self.id,
             caller = %caller,
             body_bytes = report.body.len(),
-            body_sha256_8 = %short_body_hash(&report.body),
+            body_hmac_8 = %short_body_hash(&report.body),
             "terminal submit_prompt"
         );
 
@@ -3424,7 +3592,7 @@ impl TerminalSession {
                 at: Instant::now(),
                 bytes: block.len(),
             },
-            true,
+            InputSlot::Submit,
         );
 
         // Sleep so Claude Code's readline can fully process the paste
@@ -4320,6 +4488,46 @@ mod tests {
     /// The one pin reader `spawn` and `TerminalManager::create` share: a
     /// `CLAUDE_CONFIG_DIR` entry is the pin, an empty one is no pin, and the
     /// key is exact.
+    /// A direct exec never inherits the RUNNER's delivered-policy marker (a
+    /// runner started inside a runner session holds its parent's), yet a
+    /// caller's `extra_env` pair still lands; a shell pane is left for its own
+    /// composed-file logic.
+    #[test]
+    fn direct_exec_drops_an_inherited_policy_marker_unless_the_caller_sets_it() {
+        use crate::session::spawn_prompt::{POLICY_DELIVERED_FILE_ENV, POLICY_DELIVERED_SHA_ENV};
+        let seeded = || {
+            let mut cmd = TerminalSession::build_command_from(Some(vec!["claude".to_string()]));
+            cmd.env(POLICY_DELIVERED_SHA_ENV, "ab".repeat(32));
+            cmd.env(POLICY_DELIVERED_FILE_ENV, "/parent/spawn-1.md");
+            cmd
+        };
+        let get = |cmd: &CommandBuilder, k: &str| {
+            cmd.get_env(k)
+                .map(|v| v.to_string_lossy().into_owned())
+        };
+
+        let mut cmd = seeded();
+        TerminalSession::scrub_inherited_policy_marker(&mut cmd, false);
+        assert_eq!(get(&cmd, POLICY_DELIVERED_SHA_ENV), None);
+        assert_eq!(get(&cmd, POLICY_DELIVERED_FILE_ENV), None);
+
+        // The caller's own pair (applied after, as `extra_env` is) wins.
+        let mut cmd = seeded();
+        TerminalSession::scrub_inherited_policy_marker(&mut cmd, false);
+        cmd.env(POLICY_DELIVERED_SHA_ENV, "cd".repeat(32));
+        cmd.env(POLICY_DELIVERED_FILE_ENV, "/child/spawn-2.md");
+        assert_eq!(get(&cmd, POLICY_DELIVERED_SHA_ENV), Some("cd".repeat(32)));
+        assert_eq!(
+            get(&cmd, POLICY_DELIVERED_FILE_ENV).as_deref(),
+            Some("/child/spawn-2.md")
+        );
+
+        // A shell pane: untouched here.
+        let mut cmd = seeded();
+        TerminalSession::scrub_inherited_policy_marker(&mut cmd, true);
+        assert_eq!(get(&cmd, POLICY_DELIVERED_SHA_ENV), Some("ab".repeat(32)));
+    }
+
     #[test]
     fn caller_pinned_config_dir_reads_exactly_the_pin() {
         let e = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
@@ -6124,7 +6332,29 @@ mod tests {
     /// whole log (an empty capture) under a parallel run. So the captures
     /// here run one at a time, and each rebuilds the interest cache once its
     /// own subscriber is the thread default, before `f` logs anything.
-    fn capture_logs(level: tracing::Level, f: impl FnOnce()) -> String {
+    ///
+    /// Those two guards narrow the race but cannot close it: any OTHER test in
+    /// the binary that logs or builds a dispatcher still touches the same
+    /// caches, and a wide parallel run was measured losing a whole capture
+    /// again. So a capture that came back COMPLETELY empty is re-run (up to
+    /// `CAPTURE_ATTEMPTS` times) — a subscriber that received not one byte
+    /// is the race's signature, never a meaningful result for a caller that
+    /// expects output. A caller asserting ABSENCE is unaffected: an empty
+    /// capture stays empty on every attempt.
+    fn capture_logs(level: tracing::Level, f: impl Fn()) -> String {
+        const CAPTURE_ATTEMPTS: usize = 5;
+        let mut logs = String::new();
+        for _ in 0..CAPTURE_ATTEMPTS {
+            logs = capture_logs_once(level, &f);
+            if !logs.is_empty() {
+                break;
+            }
+        }
+        logs
+    }
+
+    /// One attempt of [`capture_logs`].
+    fn capture_logs_once(level: tracing::Level, f: &impl Fn()) -> String {
         static CAPTURE_SERIAL: Mutex<()> = Mutex::new(());
         let _serial = CAPTURE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         #[derive(Clone, Default)]
@@ -6220,7 +6450,7 @@ mod tests {
     }
 
     /// The unconditional `info!` inside `submit_prompt`: for EVERY producer,
-    /// the tag, byte count and hash reach the line — for an unaltered body,
+    /// the tag, byte count and keyed hash reach the line — for an unaltered body,
     /// which the older rewrite-only warn never logged at all.
     #[test]
     fn submit_prompt_logs_every_callers_tag_with_length_and_hash() {
@@ -6230,7 +6460,7 @@ mod tests {
             let tag = caller.tag().into_owned();
             let logs = capture_logs(tracing::Level::INFO, || {
                 session
-                    .submit_prompt("hello", caller)
+                    .submit_prompt("hello", caller.clone())
                     .expect("submit_prompt failed");
             });
             let line = logs
@@ -6239,9 +6469,26 @@ mod tests {
                 .unwrap_or_else(|| panic!("no submit_prompt line for {tag}; logs: {logs:?}"));
             assert!(line.contains(&format!("caller={tag}")), "{line:?}");
             assert!(line.contains("body_bytes=5"), "{line:?}");
-            // sha256("hello") = 2cf24dba5fb0a30e...
-            assert!(line.contains("body_sha256_8=2cf24dba"), "{line:?}");
+            assert!(
+                line.contains(&format!("body_hmac_8={}", short_body_hash("hello"))),
+                "{line:?}"
+            );
         }
+    }
+
+    /// The body hash is 8 lower-hex chars, stable for one body within the
+    /// process, distinct across bodies, and KEYED: it is not the plain sha256
+    /// prefix a dictionary over short bodies could reverse.
+    #[test]
+    fn short_body_hash_is_a_keyed_eight_hex_prefix() {
+        let h = short_body_hash("yes");
+        assert_eq!(h.len(), 8);
+        assert!(h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(h, short_body_hash("yes"), "stable within the process");
+        assert_ne!(h, short_body_hash("no"));
+        use sha2::{Digest, Sha256};
+        let unkeyed = hex::encode(&Sha256::digest(b"yes")[..4]);
+        assert_ne!(h, unkeyed, "must not be the unkeyed sha256 prefix");
     }
 
     /// The redaction half: the body itself must never reach the log.
@@ -6280,7 +6527,7 @@ mod tests {
                 "no debug write line for {tag}; logs: {at_debug:?}"
             );
             let at_info = capture_logs(tracing::Level::INFO, || {
-                session.write(b"k", caller).expect("write failed");
+                session.write(b"k", caller.clone()).expect("write failed");
             });
             assert!(
                 !at_info.contains("terminal pty write"),
@@ -6332,6 +6579,91 @@ mod tests {
             slots.latest().map(|o| o.caller.clone()),
             Some(PtyWriteCaller::WorkerSession)
         );
+    }
+
+    /// Emulator replies are classified as NOT input, whole chunks only.
+    #[test]
+    fn terminal_control_responses_are_classified_as_non_input() {
+        for reply in [
+            &b"\x1b[I"[..],
+            b"\x1b[O",
+            b"\x1b[?1;2c",
+            b"\x1b[>0;276;0c",
+            b"\x1b[=0c",
+            b"\x1b[0n",
+            b"\x1b[24;80R",
+            b"\x1b[?24;80;1R",
+            b"\x1b[?2004;1$y",
+            b"\x1b[12;2$y",
+            b"\x1b[8;50;200t",
+            b"\x1b[?1u",
+            b"\x1b]11;rgb:0000/0000/0000\x07",
+            b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1bP1+r544e=787465726d\x1b\\",
+            // A startup burst: several replies in one chunk.
+            b"\x1b[?1;2c\x1b[I\x1b[24;80R\x1b]11;rgb:1/2/3\x07",
+        ] {
+            assert!(
+                is_terminal_control_response(reply),
+                "{:?} should be a reply",
+                String::from_utf8_lossy(reply)
+            );
+        }
+        for input in [
+            &b""[..],
+            b"is",
+            b"\r",
+            b"\x1b",
+            b"\x1b[A",
+            b"\x1b[1;5C",
+            b"\x1b[15~",
+            b"\x1b[H",
+            b"\x1b[Z",
+            b"\x1b[200~is\x1b[201~",
+            b"\x1b[<0;10;5M",
+            b"\x1b[5R",
+            b"\x1b[97;5u",
+            b"\x1b[2004y",
+            b"\x1bOP",
+            b"\x1b[I is",
+            b"\x1b[Iis",
+            b"\x1b[?1;2",
+            b"\x1b]11;rgb:0/0/0",
+        ] {
+            assert!(
+                !is_terminal_control_response(input),
+                "{:?} should be input",
+                String::from_utf8_lossy(input)
+            );
+        }
+    }
+
+    /// A reply chunk lands in `last_control_response` and never in
+    /// `last_write`, so `latest()` — what the phantom-turn detector reads —
+    /// does not see it; a real keystroke still does.
+    #[test]
+    fn emulator_replies_do_not_update_the_input_slots() {
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let session = LiveTestSession::new(buf.clone());
+        session
+            .write(b"\x1b[?1;2c\x1b[I", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        let slots = session.last_input();
+        assert!(slots.last_write.is_none());
+        assert!(slots.latest().is_none(), "a reply is not input");
+        let r = slots
+            .last_control_response
+            .as_ref()
+            .expect("the reply is still recorded");
+        assert_eq!(r.bytes, b"\x1b[?1;2c\x1b[I".len());
+        // The bytes still reached the PTY unchanged.
+        assert_eq!(buf.lock().unwrap().as_slice(), b"\x1b[?1;2c\x1b[I");
+
+        session
+            .write(b"x", PtyWriteCaller::TauriTerminalWrite)
+            .expect("write failed");
+        assert_eq!(session.last_input().latest().map(|o| o.bytes), Some(1));
     }
 
     /// A REFUSED write put nothing on the wire, so it must not read as input —

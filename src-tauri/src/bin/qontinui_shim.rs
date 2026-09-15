@@ -93,6 +93,11 @@ const MCP_CONFIG_ENV: &str = "QONTINUI_MCP_CONFIG";
 /// which this bin cannot import. See [`keeps_policy_delivered_sha`].
 const POLICY_DELIVERED_SHA_ENV: &str = "QONTINUI_POLICY_DELIVERED_SHA";
 
+/// Env var carrying the path of the composed system-prompt file that policy body
+/// rode in. Mirrors `session::spawn_prompt::POLICY_DELIVERED_FILE_ENV`. The
+/// marker survives only a launch that passes exactly this file.
+const POLICY_DELIVERED_FILE_ENV: &str = "QONTINUI_POLICY_DELIVERED_FILE";
+
 /// The runner's session coord-identity mint route (plan
 /// `2026-07-17-universal-coord-device-identity-for-any-session` §1). POST
 /// `{"cwd": "<abs dir>"}`; a 200's BODY IS the `.mcp.json` document.
@@ -276,18 +281,34 @@ pub fn identity_settings_args(tool: IdentityTool, settings_path: Option<&str>) -
 
 /// Does this `claude` launch keep an inherited [`POLICY_DELIVERED_SHA_ENV`]?
 ///
-/// Only when its own argv carries `--append-system-prompt-file` — the carrier
-/// the policy body rides. The marker tells the runner's SessionStart policy
-/// hook that the body is already in this session's system prompt, so the hook
-/// sends a short confirmation instead of the body. It is inherited by every
-/// descendant process, and this shim is exactly what delivers the hook
+/// Only when its own argv passes `delivered_file` (the inherited
+/// [`POLICY_DELIVERED_FILE_ENV`]) to `--append-system-prompt-file`, in either
+/// the `--flag path` or `--flag=path` spelling — that composed file is the
+/// carrier the policy body rode. The marker tells the runner's SessionStart
+/// policy hook that the body is already in this session's system prompt, so the
+/// hook sends a short confirmation instead of the body. It is inherited by
+/// every descendant process, and this shim is exactly what delivers the hook
 /// (`--settings`) to a NESTED `claude` typed inside a session; keeping the
 /// marker there would tell that nested session it holds a body it was never
-/// given. So everything else drops it. Gemini never keeps it (no such flag).
-pub fn keeps_policy_delivered_sha(tool: IdentityTool, args: &[String]) -> bool {
+/// given — including a nested `claude --append-system-prompt-file ./eval.md`,
+/// whose file is not the composed one. So everything else drops it. No
+/// inherited file, or Gemini (no such flag), never keeps it.
+pub fn keeps_policy_delivered_sha(
+    tool: IdentityTool,
+    args: &[String],
+    delivered_file: Option<&str>,
+) -> bool {
+    const FLAG: &str = "--append-system-prompt-file";
+    let Some(file) = delivered_file.filter(|f| !f.is_empty()) else {
+        return false;
+    };
     tool == IdentityTool::Claude
-        && args.iter().any(|a| {
-            a == "--append-system-prompt-file" || a.starts_with("--append-system-prompt-file=")
+        && args.iter().enumerate().any(|(i, a)| {
+            (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
+                || a
+                    .strip_prefix(FLAG)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .is_some_and(|v| v == file)
         })
 }
 
@@ -566,11 +587,13 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
     }
 
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
-    let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args) {
-        &[]
-    } else {
-        &[POLICY_DELIVERED_SHA_ENV]
-    };
+    let delivered_file = std::env::var(POLICY_DELIVERED_FILE_ENV).ok();
+    let env_remove: &[&str] =
+        if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
+            &[]
+        } else {
+            &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
+        };
     let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
@@ -1452,32 +1475,48 @@ mod tests {
         assert!(identity_settings_args(IdentityTool::Claude, None).is_empty());
     }
 
-    /// The policy marker survives ONLY on a claude launch that itself carries
-    /// the file carrier (the interactive wrapper's spelling, both forms). A
-    /// nested `claude` typed inside a session inherits the marker but not the
-    /// body, so it must lose it — or the policy hook would skip a body that
-    /// session never received.
+    /// The policy marker survives ONLY on a claude launch that passes the
+    /// COMPOSED file (the inherited `QONTINUI_POLICY_DELIVERED_FILE`) to the
+    /// file carrier, in either spelling. A nested `claude` typed inside a
+    /// session inherits the marker but not the body — bare, inline, or with a
+    /// file of its own — so it must lose it, or the policy hook would skip a
+    /// body that session never received.
     #[test]
-    fn policy_delivered_sha_is_kept_only_with_the_file_carrier() {
+    fn policy_delivered_sha_is_kept_only_for_the_exact_composed_file() {
+        let composed = Some("/x/spawn-1.md");
         let with_file = strs(&["--append-system-prompt-file", "/x/spawn-1.md", "-p", "hi"]);
         let attached = strs(&["--append-system-prompt-file=/x/spawn-1.md"]);
+        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, composed));
+        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &attached, composed));
+
+        // A nested claude with its OWN file, either spelling: dropped.
+        let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
+        let own_attached = strs(&["--append-system-prompt-file=./eval.md"]);
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &own, composed));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &own_attached, composed));
+        // The composed path as a VALUE of some other flag, or dangling: dropped.
+        let elsewhere = strs(&["--append-system-prompt-file", "./eval.md", "/x/spawn-1.md"]);
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &elsewhere, composed));
+        let dangling = strs(&["--append-system-prompt-file"]);
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &dangling, composed));
+
         let inline = strs(&["--append-system-prompt", "briefing"]);
         let bare = strs(&["-p", "hi"]);
-        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &with_file));
-        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &attached));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &inline));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &bare));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &[]));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &inline, composed));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &bare, composed));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &[], composed));
         // A near-miss token is not the flag.
         assert!(!keeps_policy_delivered_sha(
             IdentityTool::Claude,
-            &strs(&["--append-system-prompt-files", "x"])
+            &strs(&["--append-system-prompt-files=/x/spawn-1.md"]),
+            composed
         ));
-        assert!(!keeps_policy_delivered_sha(
-            IdentityTool::Gemini,
-            &with_file
-        ));
+        // No inherited file (or an empty one): nothing to match, never kept.
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, None));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, Some("")));
+        assert!(!keeps_policy_delivered_sha(IdentityTool::Gemini, &with_file, composed));
         assert_eq!(POLICY_DELIVERED_SHA_ENV, "QONTINUI_POLICY_DELIVERED_SHA");
+        assert_eq!(POLICY_DELIVERED_FILE_ENV, "QONTINUI_POLICY_DELIVERED_FILE");
     }
 
     #[test]

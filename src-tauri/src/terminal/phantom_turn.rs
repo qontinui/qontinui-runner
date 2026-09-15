@@ -34,7 +34,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::session::{PtyInputObservation, PtyInputSlots};
 
@@ -67,6 +67,63 @@ pub const PHANTOM_TURN_MAX_CHARS: usize = 3;
 /// notifications and similar) and `suggestion_accepted`; only `typed` is the
 /// incident's shape.
 const PROMPT_SOURCE_TYPED: &str = "typed";
+
+/// How far before session-open a turn's own `timestamp` may be and still be
+/// judged. Covers clock granularity and the few ms between Claude Code writing a
+/// turn and the runner stamping session-open; anything older is prior
+/// conversation — notably the history `--fork-session` copies into a brand-new
+/// transcript file, which the append baseline cannot exclude because the file
+/// did not exist when the watch started.
+pub const PHANTOM_TURN_TIMESTAMP_SLACK: Duration = Duration::from_secs(2);
+
+/// Process-global registry of ACTIVE watches, keyed by session id, valued by
+/// when each started. One fresh session posts `/control/session-open` twice
+/// (the identity shim and the SessionStart hook both do), and two watches over
+/// one transcript would emit the same detection twice.
+static ACTIVE_WATCHES: std::sync::Mutex<Option<std::collections::HashMap<String, Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// An active watch's claim on its session id. Dropping it — when the watch
+/// task finishes, or unwinds — releases the id.
+pub struct WatchClaim {
+    session_id: String,
+    started: Instant,
+}
+
+impl WatchClaim {
+    /// Claim `session_id` for one watch, or `None` while another watch for it
+    /// is still active. A claim older than the watch window plus a minute is
+    /// treated as abandoned and replaced, so a registry entry can never
+    /// suppress watches for a session forever.
+    pub fn try_claim(session_id: &str) -> Option<Self> {
+        let mut guard = ACTIVE_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
+        let map = guard.get_or_insert_with(Default::default);
+        let now = Instant::now();
+        if let Some(started) = map.get(session_id) {
+            if now.duration_since(*started) < PHANTOM_TURN_WATCH_WINDOW + Duration::from_secs(60) {
+                return None;
+            }
+        }
+        map.insert(session_id.to_string(), now);
+        Some(Self {
+            session_id: session_id.to_string(),
+            started: now,
+        })
+    }
+}
+
+impl Drop for WatchClaim {
+    fn drop(&mut self) {
+        let mut guard = ACTIVE_WATCHES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(map) = guard.as_mut() {
+            // Only this claim's own entry: an abandoned claim that was replaced
+            // must not release its successor.
+            if map.get(&self.session_id) == Some(&self.started) {
+                map.remove(&self.session_id);
+            }
+        }
+    }
+}
 
 /// One user turn read out of a transcript line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +189,9 @@ fn parse_user_turn(line: &str) -> Option<UserTurn> {
 pub struct InputEvidence<'a> {
     /// When `POST /control/session-open` arrived.
     pub session_open_at: Instant,
+    /// The same moment on the wall clock, compared against each turn's own
+    /// transcript `timestamp` ([`PHANTOM_TURN_TIMESTAMP_SLACK`]).
+    pub session_open_wall: chrono::DateTime<chrono::Utc>,
     /// The terminal's latest PTY input event, if any — `None` also when the
     /// terminal could not be resolved (see [`SessionOpenWatch`]).
     pub latest: Option<&'a PtyInputObservation>,
@@ -176,11 +236,17 @@ pub enum Verdict {
 }
 
 /// The pure detector. Walks `lines` in order and returns on the first `typed`
-/// user text turn: [`Verdict::Phantom`] when it is at most
-/// [`PHANTOM_TURN_MAX_CHARS`] trimmed chars AND `input` shows no real input
-/// since session-open, else [`Verdict::ClearTypedTurn`]. Non-`typed` turns
-/// (`system`, `suggestion_accepted`, absent) are skipped however short: those
-/// sources are not the incident's shape.
+/// user text turn written after session-open: [`Verdict::Phantom`] when it is
+/// at most [`PHANTOM_TURN_MAX_CHARS`] trimmed chars AND `input` shows no real
+/// input since session-open, else [`Verdict::ClearTypedTurn`]. Non-`typed`
+/// turns (`system`, `suggestion_accepted`, absent) are skipped however short:
+/// those sources are not the incident's shape.
+///
+/// A turn is judged only when its own `timestamp` parses and is no earlier
+/// than session-open minus [`PHANTOM_TURN_TIMESTAMP_SLACK`]. An older turn is
+/// prior conversation (a `--fork-session` copies the whole history into a new
+/// file); an unstamped one cannot be placed in time, and a detector whose
+/// precision rests on timing does not guess.
 pub fn detect_phantom_turn<'l>(
     lines: impl IntoIterator<Item = &'l str>,
     input: InputEvidence<'_>,
@@ -190,6 +256,14 @@ pub fn detect_phantom_turn<'l>(
             continue;
         };
         if turn.prompt_source.as_deref() != Some(PROMPT_SOURCE_TYPED) {
+            continue;
+        }
+        let slack = chrono::Duration::from_std(PHANTOM_TURN_TIMESTAMP_SLACK)
+            .unwrap_or_else(|_| chrono::Duration::seconds(2));
+        if !turn
+            .timestamp
+            .is_some_and(|ts| ts >= input.session_open_wall - slack)
+        {
             continue;
         }
         if turn.text_chars <= PHANTOM_TURN_MAX_CHARS && !input.real_input_since_open() {
@@ -337,6 +411,7 @@ impl SessionOpenWatch {
                 let slots = input_slots();
                 let evidence = InputEvidence {
                     session_open_at: self.session_open_at,
+                    session_open_wall: self.session_open_wall.into(),
                     latest: slots.as_ref().and_then(|s| s.latest()),
                 };
                 match detect_phantom_turn(lines.iter().map(String::as_str), evidence) {
@@ -424,6 +499,17 @@ pub fn spawn_watch(
         );
         return;
     }
+    // One watch per session: the shim and the SessionStart hook both post
+    // session-open for a fresh session. The claim rides into the task and is
+    // released when the watch ends.
+    let Some(claim) = WatchClaim::try_claim(&session_id) else {
+        debug!(
+            session_id = %session_id,
+            terminal_id = %terminal_id,
+            "phantom-turn watch skipped: a watch for this session is already active"
+        );
+        return;
+    };
     let tid = terminal_id.clone();
     let input_slots = move || {
         use tauri::Manager;
@@ -457,7 +543,11 @@ pub fn spawn_watch(
         // phantom turn can land and be swallowed into it.
         Some(dir) => {
             let watch = build(vec![PathBuf::from(dir)]);
-            tokio::spawn(watch.run(input_slots));
+            tokio::spawn(async move {
+                let verdict = watch.run(input_slots).await;
+                drop(claim);
+                verdict
+            });
         }
         // Account unknown: discovery walks every account home on the box, which
         // does not belong on the route. The baseline is then taken a few ms
@@ -469,7 +559,9 @@ pub fn spawn_watch(
         None => {
             tokio::spawn(async move {
                 let watch = build(super::transcript::find_claude_config_dirs());
-                watch.run(input_slots).await
+                let verdict = watch.run(input_slots).await;
+                drop(claim);
+                verdict
             });
         }
     }
@@ -492,11 +584,88 @@ mod tests {
 
     const HOOK_LINE: &str = r#"{"type":"attachment","attachment":{"type":"hook_success","hookName":"SessionStart:resume"}}"#;
 
+    /// Session-open on the wall clock, 20 ms before the fixture turns'
+    /// `timestamp` (`10:00:00.120Z`).
+    fn open_wall() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-15T10:00:00.100Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
     fn no_input(open: Instant) -> InputEvidence<'static> {
         InputEvidence {
             session_open_at: open,
+            session_open_wall: open_wall(),
             latest: None,
         }
+    }
+
+    fn user_line_at(text: &str, source: &str, timestamp: Option<&str>) -> String {
+        let mut v = serde_json::json!({
+            "type": "user",
+            "promptSource": source,
+            "message": {"role": "user", "content": text},
+        });
+        if let Some(ts) = timestamp {
+            v["timestamp"] = serde_json::Value::String(ts.to_string());
+        }
+        v.to_string()
+    }
+
+    /// `--fork-session` copies the whole prior conversation into a NEW
+    /// transcript file, so the append baseline (0 for a new file) cannot
+    /// exclude it. Turns stamped before session-open (minus the slack) are
+    /// history and never judged; unstamped turns are skipped; a turn inside the
+    /// slack, or after open, still is.
+    #[test]
+    fn turns_older_than_session_open_or_unstamped_are_never_judged() {
+        let open = Instant::now();
+        let forked_history = [
+            user_line_at("is", "typed", Some("2026-09-14T08:00:00Z")),
+            user_line_at("please run the tests", "typed", Some("2026-09-14T08:01:00Z")),
+            user_line_at("ok", "typed", Some("2026-09-15T10:00:00.099Z")),
+            user_line_at("is", "typed", None),
+            user_line_at("is", "typed", Some("not a time")),
+        ];
+        // 10:00:00.099 is 1 ms before open — inside the 2 s slack, so judged.
+        assert!(matches!(
+            detect_phantom_turn(forked_history.iter().map(String::as_str), no_input(open)),
+            Verdict::Phantom(PhantomTurn {
+                content_chars: 2,
+                ..
+            })
+        ));
+        // Without that one, everything is history or unstamped: undecided.
+        let history_only = [
+            &forked_history[0],
+            &forked_history[1],
+            &forked_history[3],
+            &forked_history[4],
+        ];
+        assert_eq!(
+            detect_phantom_turn(history_only.iter().map(|s| s.as_str()), no_input(open)),
+            Verdict::Undecided
+        );
+        // Just past the slack (open − 2.001 s): history.
+        let stale = [user_line_at("is", "typed", Some("2026-09-15T09:59:58.099Z"))];
+        assert_eq!(
+            detect_phantom_turn(stale.iter().map(String::as_str), no_input(open)),
+            Verdict::Undecided
+        );
+    }
+
+    /// One watch per session id while it is active; the claim is released on
+    /// drop, and only by its own holder.
+    #[test]
+    fn a_session_gets_one_active_watch_at_a_time() {
+        let sid = format!("test-dedupe-{}", uuid::Uuid::new_v4());
+        let first = WatchClaim::try_claim(&sid).expect("first claim");
+        assert!(WatchClaim::try_claim(&sid).is_none(), "second watch skipped");
+        let other = WatchClaim::try_claim(&format!("{sid}-other"));
+        assert!(other.is_some(), "a different session is independent");
+        drop(first);
+        let again = WatchClaim::try_claim(&sid);
+        assert!(again.is_some(), "released when the watch finishes");
     }
 
     /// The incident's shape: hook output, then a 2-char `typed` `is` with no
@@ -541,6 +710,7 @@ mod tests {
         };
         let evidence = InputEvidence {
             session_open_at: open,
+            session_open_wall: open_wall(),
             latest: Some(&obs),
         };
         let lines = [user_line("ok", "typed")];
@@ -562,6 +732,7 @@ mod tests {
         let open = obs.at + Duration::from_millis(900);
         let evidence = InputEvidence {
             session_open_at: open,
+            session_open_wall: open_wall(),
             latest: Some(&obs),
         };
         let lines = [user_line("is", "typed")];
@@ -599,7 +770,7 @@ mod tests {
             Verdict::Undecided
         );
         // Array-form text content, at the threshold (3) and one past it (4).
-        let three = r#"{"type":"user","promptSource":"typed","message":{"content":[{"type":"text","text":" yes "}]}}"#;
+        let three = r#"{"type":"user","promptSource":"typed","timestamp":"2026-09-15T10:00:00.120Z","message":{"content":[{"type":"text","text":" yes "}]}}"#;
         assert!(matches!(
             detect_phantom_turn([three], no_input(open)),
             Verdict::Phantom(PhantomTurn {
@@ -646,7 +817,9 @@ mod tests {
                 .open(&writer_path)
                 .unwrap();
             // Written in two halves so the partial-line rule is exercised.
-            let line = user_line("is", "typed");
+            // Stamped NOW, i.e. after session-open, as a live turn is.
+            let now = chrono::Utc::now().to_rfc3339();
+            let line = user_line_at("is", "typed", Some(&now));
             let (a, b) = line.split_at(line.len() / 2);
             f.write_all(format!("{HOOK_LINE}\n{a}").as_bytes()).unwrap();
             f.flush().unwrap();

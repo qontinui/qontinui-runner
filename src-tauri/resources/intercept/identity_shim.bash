@@ -127,20 +127,35 @@ done
 # 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel).
 # QONTINUI_POLICY_DELIVERED_SHA tells the runner's policy hook that THIS
 # `claude` received the policy body in its system prompt, so the hook may skip
-# re-sending it. It is inherited by every descendant, but only a `claude` whose
-# argv carries --append-system-prompt-file actually received a body. This shim
-# is what delivers the hook (--settings) to a nested `claude` typed inside a
-# session, so it is where an inherited marker must be dropped — otherwise that
-# nested session would be told it has a body it was never given.
+# re-sending it; QONTINUI_POLICY_DELIVERED_FILE names the composed file that
+# body rode in. Both are inherited by every descendant, but only a `claude`
+# whose argv passes THAT file to --append-system-prompt-file (either spelling)
+# actually received the body — a nested `claude --append-system-prompt-file
+# ./eval.md` did not. This shim is what delivers the hook (--settings) to a
+# nested `claude` typed inside a session, so it is where an inherited marker
+# must be dropped — otherwise that nested session would be told it has a body
+# it was never given.
 if [ "$TOOL" = "claude" ]; then
   keep_policy_sha=0
-  for a in "$@"; do
-    case "$a" in
-      --append-system-prompt-file|--append-system-prompt-file=*)
-        keep_policy_sha=1; break ;;
-    esac
-  done
-  [ "$keep_policy_sha" = "1" ] || unset QONTINUI_POLICY_DELIVERED_SHA
+  delivered_file="${QONTINUI_POLICY_DELIVERED_FILE:-}"
+  if [ -n "$delivered_file" ]; then
+    prev_arg=""
+    for a in "$@"; do
+      if [ "$prev_arg" = "--append-system-prompt-file" ] && [ "$a" = "$delivered_file" ]; then
+        keep_policy_sha=1; break
+      fi
+      case "$a" in
+        --append-system-prompt-file=*)
+          if [ "${a#--append-system-prompt-file=}" = "$delivered_file" ]; then
+            keep_policy_sha=1; break
+          fi ;;
+      esac
+      prev_arg="$a"
+    done
+  fi
+  if [ "$keep_policy_sha" != "1" ]; then
+    unset QONTINUI_POLICY_DELIVERED_SHA QONTINUI_POLICY_DELIVERED_FILE
+  fi
 fi
 
 # Best-effort confirmation/liveness POST to the runner loopback (the existing
