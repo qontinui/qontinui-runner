@@ -1106,8 +1106,7 @@ const CREDENTIAL_FREE_DOORS_SCAN_BYTES: usize = 8192;
 /// gone), and an unparseable body is ignored entirely.
 pub(crate) fn record_credential_free_doors(body: &[u8]) {
     let scan = &body[..body.len().min(CREDENTIAL_FREE_DOORS_SCAN_BYTES)];
-    let Ok(serde_json::Value::Object(map)) =
-        serde_json::from_slice::<serde_json::Value>(scan.as_ref())
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(scan)
     else {
         return;
     };
@@ -18529,7 +18528,7 @@ mod runner_credential_tests {
         let remedy = body["remedy"].as_str().expect("remedy is a string");
         assert!(!remedy.trim().is_empty(), "remedy must say something");
         assert!(
-            !remedy.lines().nth(1).is_some_and(|l| !l.trim().is_empty()),
+            remedy.lines().nth(1).is_none_or(|l| l.trim().is_empty()),
             "remedy is ONE line: {remedy}"
         );
         // The incident in one assertion: the answer must tell the caller its
@@ -18845,8 +18844,7 @@ mod runner_credential_tests {
             .lines()
             .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
             .find(|v| {
-                v["key_prefix"] == serde_json::Value::from(rotation_key_prefix(&nonce))
-                    && v["event"] == "upstream-reject"
+                v["key_prefix"] == rotation_key_prefix(&nonce) && v["event"] == "upstream-reject"
             })
             .expect("an upstream-reject row for this key");
         assert_eq!(row["layer"], "runner-credential");
