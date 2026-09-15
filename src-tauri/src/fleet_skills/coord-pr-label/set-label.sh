@@ -1,59 +1,90 @@
 #!/usr/bin/env bash
-# coord-pr-label — set a coord:* label on a PR via gh + record in coord.pr_labels.
+# coord-pr-label — declare or retract coord:* labels on a PR through coord's ONE
+# label door (`POST|DELETE /coord/pr-labels`).
 #
-# Phase 2 D2.6 of the PR Merge Orchestrator
-# (qontinui-dev-notes/plans/2026-05-21-pr-merge-orchestrator-design.md).
+# THIS SCRIPT IS THE SHELL / CI FALLBACK. From a Claude Code session that has
+# coord-mcp, call the MCP tools `coord_pr_label_set` / `coord_pr_label_unset`
+# directly — that is the sanctioned path, and it needs no credential handling.
 #
-# Validates the label against the `coord:*` namespace, adds the label over
-# the REST issues-labels route (`gh api -X POST repos/<o>/<r>/issues/<n>/labels`
-# -- NOT `gh pr edit --add-label`, whose GraphQL prefetch still selects the
-# retired `repository.pullRequest.projectCards` field and exits 1 before
-# touching the label on gh 2.46.0, measured 2026-09-03), then POSTs the same label to
-# coord's `POST /pr-merge/labels` so the row in `coord.pr_labels`
-# carries `source='coord_skill'` + tenant resolved from the caller's
-# agent_id (= the agent_worktrees row's tenant_id).
+# What the door guarantees (plan 2026-08-27-coord-pr-label-write-path-single-door,
+# dossier coord-pr-label-half-write): coord validates each label, canonicalizes
+# a bare `<repo>#<n>` against your tenant's repos, writes GITHUB FIRST, then
+# records the coord.pr_labels row as source='github', then syncs the dependency
+# edges before it answers. A GitHub failure yields a `rejected[]` entry and NO
+# row; a dependency edge that would close a cycle is undone on GitHub. There is
+# no `gh` step and no separate coord step in this script any more, so there is
+# no half-write it can leave behind — the seven-occurrence failure class the old
+# two-step script produced ("label on GitHub, no edge in coord") is structurally
+# gone, and so is the client-side validator mirror that drifted from coord five
+# times: `--dry-run` asks the door to validate instead.
+#
+# Transport cascade — the first rung that ANSWERS wins; a 401/403 falls through:
+#   1. The local runner's coord-mcp write forwarder:
+#      <proxy-url>/pr-labels with the nonce from a runner-written .mcp.json
+#      ($PWD, its parent, sibling repos, $QONTINUI_ROOT). The runner injects a
+#      fresh device JWT upstream, so this rung needs no credential in your hands.
+#   2. coord directly — ${COORD_HTTP_URL:-${COORD_URL:-https://coord.qontinui.io}}/coord/pr-labels
+#      with a bearer from $COORD_AGENT_JWT, else $COORD_DEVICE_JWT, else the
+#      file ~/.qontinui/coord-device-jwt.
+#   Neither answered: exit 4, and the message says that NOTHING was written on
+#   either side — which is true, because there is nothing this script writes
+#   itself.
+#
+# Exit codes:
+#   0  every requested label was declared / retracted
+#   1  the door answered and REFUSED some or all labels (`rejected:` lines say why);
+#      nothing partial was left behind for a refused label
+#   2  usage error, or no JSON tool (python3/python/jq) on PATH
+#   4  no transport answered — NOTHING was written, on either side. This is the
+#      only code that promises that, which is why 5 exists.
+#   5  a door ANSWERED and the call failed anyway (a 5xx, an unexpected 4xx, or a
+#      body that is not JSON). NOT the same as 4: coord writes GitHub FIRST, so a
+#      500 from the row INSERT lands after the label is already on the PR. Re-run
+#      with --dry-run, or look at the PR, before assuming nothing happened.
 
 set -euo pipefail
 
 REPO=""
 PR=""
-LABEL=""
+LABELS=()
+UNSET=""
+MODE="merge"
 DRY_RUN=0
+RAW_JSON=0
 
 usage() {
   cat <<'EOF'
-Usage: set-label.sh --repo <owner/name> --pr <n> --label "coord:<key>[=<value>]"
-                    [--dry-run]
+Usage: set-label.sh --repo <owner/name> --pr <n> --label "coord:<key>[=<value>]" [--label ...]
+                    [--replace] [--dry-run] [--json]
+       set-label.sh --repo <owner/name> --pr <n> --unset "coord:<key>[=<value>]" [--json]
 
 Options:
-  --dry-run          Validate the label (namespace grammar + GitHub's 50-char
-                     label-name ceiling) and exit. Nothing is sent to GitHub or
-                     coord, and QONTINUI_AGENT_ID is not required. It therefore
-                     cannot check whether the label EXISTS -- that needs a send
-                     -- and the report says so rather than leaving "is valid" to
-                     imply it.
+  --label <l>   A coord:* label to declare. Repeatable. With --replace, the
+                posted set becomes the PR's COMPLETE author-settable coord:*
+                declaration — every other author-settable label is retracted
+                from GitHub and coord. --replace with no --label is a total
+                retraction.
+  --unset <l>   Retract one label from both stores (GitHub, then coord), then
+                re-sync the dependency edges.
+  --replace     Set semantics (see --label). Default is additive (`merge`).
+  --dry-run     Ask coord to validate + canonicalize + check the repo is yours,
+                writing nothing. Replaces the old local validator.
+  --json        Print the door's raw JSON response after the summary lines.
 
-Required env:
-  QONTINUI_AGENT_ID  — the spawning agent's UUID. Set by the agent-spawn
-                       flow; if absent the skill exits with an error.
+Env (only for the direct rung; the runner forwarder rung needs none of it):
+  COORD_HTTP_URL / COORD_URL   coord base. Default https://coord.qontinui.io.
+  COORD_AGENT_JWT, COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt   a bearer.
 
-Optional env:
-  COORD_URL          — coord base URL. Default http://localhost:9870.
-
-Examples:
-  set-label.sh --repo qontinui/qontinui-coord --pr 75 \
-      --label "coord:upstream-of=qontinui/qontinui-schemas#42"
-  set-label.sh --repo qontinui/qontinui-coord --pr 75 --label coord:merge-strategy=squash
-
-No label holds a PR. To hold one, convert it to draft:
-  gh pr ready --undo 75 --repo qontinui/qontinui-coord
+Grammar (validated by coord, not here): coord:upstream-of=[<owner>/]<repo>#<n>,
+coord:downstream-of=[<owner>/]<repo>#<n>, coord:stacked-on=#<n>|[<owner>/]<repo>#<n>,
+coord:requires-tag=<pattern>, coord:merge-strategy=squash|rebase|merge, and the
+flags coord:credibility-override, coord:migrate-repair. coord:priority,
+coord:blocked, coord:experimental and coord-set labels are refused --
+coord:blocked / coord:experimental are retired holds (they never held a PR), so
+declare one and the door says so. --unset still retracts one already on a PR.
 EOF
 }
 
-# ----- arg parse --------------------------------------------------------------
-
-# `shift 2` on a valueless flag fails under `set -e` and exits 1 with NO
-# message at all, so check arity explicitly and say which flag is bare.
 need_value() {
   if [[ $# -lt 2 ]]; then
     echo "error: $1 needs a value" >&2
@@ -64,535 +95,305 @@ need_value() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)  need_value "$@"; REPO="$2";  shift 2 ;;
-    --pr)    need_value "$@"; PR="$2";    shift 2 ;;
-    --label) need_value "$@"; LABEL="$2"; shift 2 ;;
+    --repo)    need_value "$@"; REPO="$2";      shift 2 ;;
+    --pr)      need_value "$@"; PR="$2";        shift 2 ;;
+    --label)   need_value "$@"; LABELS+=("$2"); shift 2 ;;
+    --unset)   need_value "$@"; UNSET="$2";     shift 2 ;;
+    --replace) MODE="replace"; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --json)    RAW_JSON=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
-if [[ -z "$REPO" || -z "$PR" || -z "$LABEL" ]]; then
-  echo "error: --repo, --pr, --label are all required" >&2
+if [[ -z "$REPO" || -z "$PR" ]]; then
+  echo "error: --repo and --pr are required" >&2
   usage >&2
   exit 2
 fi
+if [[ -n "$UNSET" && ${#LABELS[@]} -gt 0 ]]; then
+  echo "error: --unset and --label are exclusive (one retraction per call)" >&2
+  exit 2
+fi
+# The door has no dry_run on its retract verb, so accepting the flag here would
+# silently perform the retraction the caller asked to rehearse. A destructive
+# verb never ignores a flag: refuse instead.
+if [[ -n "$UNSET" && "$DRY_RUN" -eq 1 ]]; then
+  echo "error: --dry-run does not apply to --unset — the retract verb has no dry run," >&2
+  echo "       and ignoring the flag would retract the label you asked to rehearse." >&2
+  exit 2
+fi
+if [[ -z "$UNSET" && ${#LABELS[@]} -eq 0 && "$MODE" != "replace" ]]; then
+  echo "error: nothing to do — pass --label (repeatable), --unset, or --replace with no labels" >&2
+  usage >&2
+  exit 2
+fi
+if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+  echo "error: --pr must be a positive integer, got \"$PR\"" >&2
+  exit 2
+fi
 
-# Coord is the hosted service; a localhost default silently posted every
-# label ingest at a port nothing listens on and reported it as "coord
-# unreachable" (measured 2026-09-02). Same precedence every other coord
-# caller uses: COORD_URL, then COORD_HTTP_URL, then the hosted base.
-COORD_URL="${COORD_URL:-${COORD_HTTP_URL:-https://coord.qontinui.io}}"
+# ----- JSON tool -------------------------------------------------------------
+# python3, else python (checked by OUTPUT — Windows ships App Execution Alias
+# stubs that resolve and exit non-zero), else jq. The body and the response are
+# both JSON, so one of them is required; say so rather than guessing.
+JSON_PY=""
+for c in python3 python; do
+  if command -v "$c" >/dev/null 2>&1 \
+     && [[ "$("$c" -c 'import json;print(1)' </dev/null 2>/dev/null | tr -d '\r\n')" == "1" ]]; then
+    JSON_PY="$c"; break
+  fi
+done
+HAVE_JQ=0
+command -v jq >/dev/null 2>&1 && HAVE_JQ=1
+if [[ -z "$JSON_PY" && "$HAVE_JQ" -eq 0 ]]; then
+  echo "error: need python3, python, or jq on PATH to build and read JSON" >&2
+  exit 2
+fi
 
-# ----- validate against the coord:* namespace --------------------------------
-# Mirrors qontinui-coord/src/pr_merge/labels_routes.rs::validate_label.
-# Keeping the two in sync is a Phase 2 D2.6 requirement; the doc at
-# qontinui-dev-notes/docs/coord/pr-merge-labels.md is the spec.
-#
-# Last reconciled against coord `origin/main` @ da36d08d (2026-08-22), which
-# closed four drifts this mirror had accumulated. Cite the REF, not a local
-# checkout, when you re-sync: the arms below are ordered as coord orders them,
-# because order is load-bearing (a bespoke arm must precede the generic
-# `parameterised labels need "=value"` fallthrough, or it never fires).
-
-# Mirrors `labels_routes.rs::repo_segments_well_formed` -- a `<owner>/<repo>`
-# value must have BOTH segments non-empty. Without this the skill green-lit
-# `coord:upstream-of=/repo#1` and `coord:upstream-of=qontinui/#1`, which coord
-# then refused at the write surface: a pre-flight that says "valid" for a label
-# the server rejects is worse than no pre-flight.
-repo_segments_well_formed() {
-  local repo="$1"
-  case "$repo" in
-    */*) [[ -n "${repo%%/*}" && -n "${repo#*/}" ]]; return $? ;;
-    *)   return 0 ;;
-  esac
-}
-
-# Mirrors Rust `n.parse::<i32>()` in the dep-label / stacked-on arms.
-# `^[0-9]+$` was NOT equivalent and diverged BOTH ways: it accepted
-# `#2147483648` and `#99999999999999999999` (which coord rejects as i32
-# overflow -- the same green-light-then-server-refuses failure that
-# `repo_segments_well_formed` exists to prevent), and it rejected `#-1`,
-# `#+1` and `#-2147483648` (which coord accepts).
-#
-# Whether a NEGATIVE pr_number ought to be legal is a separate question,
-# and the answer is not this file's to give: change `labels_routes.rs`
-# first and re-mirror. A mirror that "improves on" its source is drift.
-#
-# Leading zeros are the trap: bare `(( 007 ))` octal-parses, and `(( 008 ))`
-# is a hard error. Three mechanisms interact below, and their relationship
-# is NOT symmetric -- an earlier draft of this comment called the first two
-# "redundant with each other", which is false in one direction:
-#
-#   * `10#` is DEFENCE-IN-DEPTH, fully covered by the strip loop. After
-#     stripping there is never a leading zero left to octal-parse, so
-#     removing `10#` alone drifts from `parse::<i32>()` on ZERO inputs.
-#
-#   * The strip loop is LOAD-BEARING TWICE. Beyond octal, it normalises
-#     length BEFORE the `<= 10` guard runs -- and that ordering is the
-#     whole point. Without it, `+00000000000` (11 zero chars) is rejected
-#     by the length guard while Rust parses it as 0. Removing the strip
-#     loop alone drifts on every zero-padded value over 10 characters.
-#
-#   * The `<= 10` length guard stops a REAL wrap, not a hypothetical one.
-#     Values just above a multiple of 2^64 wrap into range: 2^64+5 =
-#     18446744073709551621 evaluates to 5 in bash's 64-bit arithmetic, so
-#     without the guard it would be ACCEPTED while coord rejects it --
-#     the green-light-then-server-refuses class again.
-#
-# All three are pinned by the corpus (`#008`/`#09` for octal,
-# `#00000000008` at 11 chars for the strip-before-guard ordering, and
-# `#18446744073709551621` for the wrap). Do not delete one on the strength
-# of a green suite without re-running the differential.
-parses_as_i32() {
-  local n="$1" digits sign=""
-  [[ "$n" =~ ^[+-]?[0-9]+$ ]] || return 1
-  digits="$n"
-  case "$n" in
-    -*) sign="-"; digits="${n#-}" ;;
-    +*) digits="${n#+}" ;;
-  esac
-  while [[ "${digits:0:1}" == "0" && ${#digits} -gt 1 ]]; do
-    digits="${digits:1}"
-  done
-  (( ${#digits} <= 10 )) || return 1
-  if [[ "$sign" == "-" ]]; then
-    (( 10#$digits <= 2147483648 ))
+# ----- request body ------------------------------------------------------------
+if [[ -n "$UNSET" ]]; then
+  METHOD="DELETE"
+  if [[ -n "$JSON_PY" ]]; then
+    BODY=$("$JSON_PY" -c 'import json,sys; print(json.dumps({"repo":sys.argv[1],"pr_number":int(sys.argv[2]),"label":sys.argv[3]}))' "$REPO" "$PR" "$UNSET")
   else
-    (( 10#$digits <= 2147483647 ))
+    BODY=$(jq -cn --arg r "$REPO" --argjson n "$PR" --arg l "$UNSET" '{repo:$r,pr_number:$n,label:$l}')
   fi
-}
+else
+  METHOD="POST"
+  if [[ -n "$JSON_PY" ]]; then
+    BODY=$("$JSON_PY" -c 'import json,sys; print(json.dumps({"repo":sys.argv[1],"pr_number":int(sys.argv[2]),"mode":sys.argv[3],"dry_run":sys.argv[4]=="1","labels":sys.argv[5:]}))' "$REPO" "$PR" "$MODE" "$DRY_RUN" "${LABELS[@]+"${LABELS[@]}"}")
+  else
+    BODY=$(jq -cn --arg r "$REPO" --argjson n "$PR" --arg m "$MODE" --argjson d "$([[ $DRY_RUN == 1 ]] && echo true || echo false)" \
+      '{repo:$r,pr_number:$n,mode:$m,dry_run:$d,labels:$ARGS.positional}' --args "${LABELS[@]+"${LABELS[@]}"}")
+  fi
+fi
 
-validate_label() {
-  local label="$1"
-  if [[ "${label:0:6}" != "coord:" ]]; then
-    echo "error: label must start with \"coord:\"" >&2
+# ----- one request; returns "<code>\n<body>" via globals ------------------------
+HTTP_CODE=""
+RESPONSE=""
+# $1 url, $2 header name, $3 header value. Returns 0 when curl completed (any
+# HTTP code), 1 when the transport itself failed (connection refused, timeout).
+send() {
+  local raw
+  if ! raw=$(curl -sS -m 30 -w $'\n%{http_code}' -X "$METHOD" "$1" \
+      -H "$2: $3" -H 'Content-Type: application/json' -d "$BODY" 2>/dev/null); then
     return 1
   fi
-  local rest="${label:6}"
-
-  # Reject coord-set labels
-  case "$rest" in
-    state=*|blocked-by=*|specialist-decision=*)
-      echo "error: coord-set label \"$label\" cannot be authored via skill" >&2
-      return 1
-      ;;
-  esac
-
-  # Retired hold-labels — rejected with guidance (mirrors coord's
-  # RETIRED_HOLD_LABEL_ERR; retired 2026-06-20, nothing consumes the rows).
-  case "$rest" in
-    operator-review|version-bump|version-bump=*)
-      echo "error: $label: retired label — labels no longer hold PRs; convert the PR to draft, or register a coord gate with a MergePr continuation" >&2
-      return 1
-      ;;
-  esac
-
-  # `blocked` / `experimental` are the same retirement. coord matches them in
-  # `data/repo_branches.rs` `inert_hold_labels` and posts
-  # `render_inert_hold_label_comment` telling the author they do NOT hold the
-  # PR; their only live effect is downgrading dequeue routing (Contending, no
-  # fast-land). An author reaching for them wants a hold, so refuse and name
-  # the one that works. (Accepting them here was the 2026-07-10 incident's
-  # shape: a PR "held" by `coord:blocked` auto-merged once green.)
-  case "$rest" in
-    blocked|experimental)
-      echo "error: $label: retired hold label — coord treats it as inert and the PR still auto-merges once green. To hold a PR, convert it to draft: gh pr ready --undo <n> --repo <owner/repo>" >&2
-      return 1
-      ;;
-  esac
-
-  # The merge-train priority lane. Rejected here with the working
-  # alternative named — mirrors coord's `PRIORITY_LABEL_ERR`. This arm ALSO
-  # catches the parameterised form (`coord:priority=1`), which must never be
-  # accepted: the lever is ONE BIT, and an author writing `=1` is reaching for
-  # numeric levels that do not exist. Before this arm existed the bare flag
-  # fell through to the generic `parameterised labels need "=value"` while
-  # `priority=1` reported `unknown coord:* label key` — two different
-  # unhelpful errors for one cause, and neither naming the fix.
-  case "$rest" in
-    priority|priority=*)
-      echo "error: coord:priority must be set on the PR itself (\`gh pr edit --add-label coord:priority\`) — a skill-set row is invisible on GitHub and inert in the merge scheduler, which only honours source='github'" >&2
-      return 1
-      ;;
-  esac
-
-  # Flag labels (no =). Accepted because live consumers read the rows
-  # (the Tier-7 credibility gate; the migrate self-blocking check).
-  #
-  # `credibility-override` is BOUNDED — it relaxes a credibility threshold
-  # inside a gate that still runs. `migrate-repair` is the ODD ONE
-  # OUT, and the asymmetry is deliberate: it is the only flag here that
-  # RELEASES a hold, i.e. can make a land happen that otherwise would not.
-  # coord bounds it at the CONSUMING end rather than here — the validator
-  # only decides whether the label may be SET, and
-  # `merge_scheduler::migrate_self_blocking` independently refuses to honour
-  # it unless the land is genuinely self-blocking. Setting it is cheap and
-  # auditable; acting on it is not, and coord keeps those two decisions
-  # separate. (Value mirrored from `MIGRATE_REPAIR_LABEL_SUFFIX`.)
-  if [[ "$rest" == "credibility-override" || "$rest" == "migrate-repair" ]]; then
-    return 0
-  fi
-
-  # Parameterised labels — must have key=value
-  if [[ "$rest" != *=* ]]; then
-    echo "error: parameterised labels need \"=value\"" >&2
-    return 1
-  fi
-  local key="${rest%%=*}"
-  local value="${rest#*=}"
-  if [[ -z "$value" ]]; then
-    echo "error: value after \"=\" cannot be empty" >&2
-    return 1
-  fi
-
-  case "$key" in
-    upstream-of|downstream-of)
-      if [[ "$value" != *#* ]]; then
-        echo "error: $key: missing \"#<pr_number>\"" >&2
-        return 1
-      fi
-      local repo_part="${value%%#*}"
-      local n_part="${value#*#}"
-      if [[ -z "$repo_part" ]]; then
-        echo "error: $key: missing repo" >&2
-        return 1
-      fi
-      if ! repo_segments_well_formed "$repo_part"; then
-        echo "error: $key: empty owner or repo segment around \"/\"" >&2
-        return 1
-      fi
-      if ! parses_as_i32 "$n_part"; then
-        echo "error: $key: pr_number must be int" >&2
-        return 1
-      fi
-      ;;
-    stacked-on)
-      # `#<n>` (same repo, back-compat) OR `[<owner>/]<repo>#<n>` —
-      # an empty repo part is the same-repo form.
-      if [[ "$value" != *#* ]]; then
-        echo "error: stacked-on: missing \"#<pr_number>\"" >&2
-        return 1
-      fi
-      local repo_part="${value%%#*}"
-      # An EMPTY repo part is the legitimate same-repo form (`=#<n>`); only a
-      # non-empty one has segments to check.
-      if [[ -n "$repo_part" ]] && ! repo_segments_well_formed "$repo_part"; then
-        echo "error: stacked-on: empty owner or repo segment around \"/\"" >&2
-        return 1
-      fi
-      local n_part="${value#*#}"
-      if ! parses_as_i32 "$n_part"; then
-        echo "error: stacked-on: pr_number must be int" >&2
-        return 1
-      fi
-      ;;
-    requires-tag)
-      : # any non-empty value
-      ;;
-    merge-strategy)
-      case "$value" in
-        squash|rebase|merge) : ;;
-        *) echo "error: merge-strategy: must be one of squash|rebase|merge" >&2; return 1 ;;
-      esac
-      ;;
-    *)
-      echo "error: unknown coord:* label key \"$key\"" >&2
-      return 1
-      ;;
-  esac
+  HTTP_CODE=${raw##*$'\n'}
+  RESPONSE=${raw%$'\n'*}
   return 0
 }
 
-if ! validate_label "$LABEL"; then
-  exit 2
+# ----- rung 1: the runner's coord-mcp write forwarder -------------------------
+# Candidate .mcp.json files: own cwd, its parent, sibling repos, $QONTINUI_ROOT.
+# A runner-written coord-mcp entry is proxy-shaped: a loopback `url` ending in
+# /coord-mcp plus the nonce under `Authorization: Bearer <nonce>` (configs
+# written after the Phase 2 header move) or the legacy `X-Coord-Mcp-Proxy-Key`.
+# `Authorization` wins when both are present, mirroring the runner's own
+# request-side resolver.
+declare -a CANDIDATES=("$PWD/.mcp.json" "$PWD/../.mcp.json")
+for f in "$PWD"/../*/.mcp.json; do CANDIDATES+=("$f"); done
+if [[ -n "${QONTINUI_ROOT:-}" ]]; then
+  CANDIDATES+=("$QONTINUI_ROOT/.mcp.json")
+  for f in "$QONTINUI_ROOT"/*/.mcp.json; do CANDIDATES+=("$f"); done
 fi
 
-# ----- GitHub's label-name ceiling (deliberately NOT part of the mirror) -----
-# GitHub caps a label NAME at 50 characters. coord has no such rule and should
-# not grow one: `coord.pr_labels` stores a text column and the cap belongs to
-# the GitHub API, not to the namespace. So this check lives OUTSIDE
-# validate_label above, which mirrors labels_routes.rs::validate_label -- do
-# not fold it in, or the next sync against coord will delete it as "not in
-# coord".
-#
-# Without this pre-flight the caller gets GitHub's own mis-signposted pair:
-#   gh label create        -> HTTP 422 ... name is too long (maximum is 50 characters)
-#   gh pr edit --add-label -> '<label>' not found
-# and the second one reads as a MISSING-label problem, sending the caller off
-# to create a label that cannot exist.
-#
-# With the 8-character owner `qontinui` and a 4-digit PR number, the FULL
-# `owner/repo#n` form overflows once the repo name reaches 17 characters
-# (`downstream-of`), 19 (`upstream-of`) or 20 (`stacked-on`). The owner-dropped
-# SHORT form always fits: it is 25 + name characters, and the longest repo name
-# in the org is 23. Stated as a rule because a list of overflowing repo names
-# goes stale on every rename -- #297's list already missed two. See SKILL.md,
-# "GitHub caps a label name at 50 characters".
-
-GH_LABEL_MAX=50
-
-# Owner-dropped short form of a dep label: `<owner>/<repo>#<n>` -> `<repo>#<n>`,
-# which coord canonicalizes back via `coord.tenant_repos` -- the grammar's own
-# owner-optional arm, not a workaround.
-#
-# Prints NOTHING unless the short form is (a) a label this script would itself
-# accept and (b) still the same repo. A suggestion the validator rejects, or one
-# that silently retargets the edge at a different owner's repo, is worse than no
-# suggestion at all -- the caller is being told to trust it. So the owner must
-# match the owner of --repo (coord canonicalizes a bare name to the TENANT's
-# owner, which is a round trip only for our own owner), and the candidate is run
-# through the real validate_label rather than eyeballed.
-#
-# The owner proxy is deliberately CONSERVATIVE: it can only ever withhold a
-# suggestion, never emit a retargeting one. It also withholds in three benign
-# cases -- a --repo with no owner, an owner differing only in case (GitHub is
-# case-insensitive here, this comparison is not), and a tenant owning repos
-# under a second org. That is degradation, not a wrong answer; do not "fix" it
-# by loosening the match.
-#
-# The validate_label round-trip is a BACKSTOP, not a reachable branch: given the
-# guards above, `short` is valid by construction. It is kept so that editing
-# those guards cannot silently start emitting a label the validator rejects.
-# The self-test therefore does not assert it independently, and cannot.
-#
-# $1 = the label, $2 = the owner to expect (from --repo).
-short_form() {
-  local label="$1" expect_owner="$2"
-  local rest="${label#coord:}"
-  case "$rest" in
-    upstream-of=*|downstream-of=*|stacked-on=*) : ;;
-    *) return 0 ;;
-  esac
-  local key="${rest%%=*}"
-  local value="${rest#*=}"
-  [[ "$value" == *#* ]] || return 0
-  local repo_part="${value%%#*}"
-  local n_part="${value#*#}"
-  [[ -n "$expect_owner" && "$repo_part" == "$expect_owner"/* ]] || return 0
-  local bare="${repo_part#*/}"
-  # a plain repo name: non-empty, and not itself a path
-  [[ -n "$bare" && "$bare" != */* ]] || return 0
-  local short="coord:$key=$bare#$n_part"
-  validate_label "$short" >/dev/null 2>&1 || return 0
-  printf '%s' "$short"
-}
-
-if (( ${#LABEL} > GH_LABEL_MAX )); then
-  echo "error: label is ${#LABEL} characters; GitHub caps a label name at $GH_LABEL_MAX" >&2
-  echo "       \"$LABEL\"" >&2
-  SHORT="$(short_form "$LABEL" "${REPO%%/*}")"
-  if [[ -n "$SHORT" && ${#SHORT} -le $GH_LABEL_MAX ]]; then
-    echo "       drop the owner -- coord restores it via coord.tenant_repos:" >&2
-    echo "         --label \"$SHORT\"   (${#SHORT} chars)" >&2
-  else
-    echo "       shorten the value; see SKILL.md, \"GitHub caps a label name at 50 characters\"" >&2
-  fi
-  echo "       NOTE: gh reports this as \"'<label>' not found\", which is NOT a" >&2
-  echo "       missing-label problem -- gh label create cannot succeed either." >&2
-  exit 2
-fi
-
-# ----- what a dry run CANNOT check -------------------------------------------
-# `'<label>' not found` has TWO causes (SKILL.md, "Failure modes"). The ceiling
-# check above closes cause 2 -- over 50 characters, therefore uncreatable -- and
-# the diagnosis after `gh pr edit` below closes cause 1. A dry run reaches
-# NEITHER end of that pair: it sends nothing, so it cannot ask GitHub whether the
-# label exists, and an unqualified "is valid" is exactly the reassurance that
-# invites the caller to assume it did. The real run then contradicts it, which
-# leaves a `--dry-run` user in the same place #318 found them -- one entry point
-# over.
-#
-# It says NOT CHECKED and never "does not exist": a dry run has no evidence in
-# either direction, and reporting a label somebody already created as absent
-# would be a fresh mis-signpost rather than a fix.
-#
-# The `gh label create` line is printed only for an OPEN-VALUED KEY, and the arm
-# is KEYED rather than inferred from the presence of `=`. That distinction is the
-# whole correctness of the split:
-#
-#   * OPEN-valued -- `upstream-of` / `downstream-of` / `stacked-on` carry a PR
-#     number and are unique to the pair they wire; `requires-tag` carries a
-#     caller-chosen pattern. Nothing pre-creates those, so `not found` is the
-#     expected first answer for a new one and the create command is the fix.
-#   * CLOSED or valueless -- the flag labels, and `merge-strategy`, whose value
-#     is one of exactly three strings (`squash|rebase|merge`). Those are
-#     repo-wide labels somebody creates once, so pointing at a repo-wide mutation
-#     for one signposts work nobody needs -- the same over-broad-advice failure
-#     the post-gh arm below narrows its match to avoid.
-#
-# A `*=*` test looks equivalent and is not: it sweeps `merge-strategy` in with
-# the dep labels and then justifies the advice with "unique to the PR pair",
-# which is a claim about a key that label is not. Same `case` shape as
-# `short_form` above, for the same reason -- the set of keys is the fact, not the
-# punctuation.
-dry_run_existence_note() {
-  echo "note: NOT checked -- whether \"$LABEL\" exists as a label in $REPO."
-  echo "      A dry run sends nothing, so it cannot ask. This is the one cause of"
-  echo "      \"'<label>' not found\" the ceiling check above does not cover."
-  case "${LABEL#coord:}" in
-    upstream-of=*|downstream-of=*|stacked-on=*|requires-tag=*)
-      echo "      This key is open-valued, so its labels are not created on demand --"
-      echo "      a dep label's value is unique to the PR pair it wires. If nobody has"
-      echo "      created this one, a real send fails until you run:"
-      echo "        gh label create \"$LABEL\" --repo $REPO"
-      ;;
-  esac
-}
-
-if [[ "$DRY_RUN" == "1" ]]; then
-  echo "ok: label \"$LABEL\" is valid (${#LABEL}/$GH_LABEL_MAX chars) -- dry run, nothing sent"
-  dry_run_existence_note
-  exit 0
-fi
-
-if [[ -z "${QONTINUI_AGENT_ID:-}" ]]; then
-  echo "error: QONTINUI_AGENT_ID env var unset — coord-side ingest needs it" >&2
-  exit 2
-fi
-
-# ----- step 1: gh-side label add ---------------------------------------------
-
-if ! command -v gh >/dev/null 2>&1; then
-  echo "error: gh CLI not on PATH — install + auth before running this skill" >&2
-  exit 3
-fi
-
-# The REST issues/labels route, NOT `gh pr edit --add-label`. `gh pr edit`
-# opens with a GraphQL query that still selects `projectCards`, and GitHub now
-# answers that with `GraphQL: Projects (classic) is being deprecated ...
-# (repository.pullRequest.projectCards)` -- non-zero exit, nothing applied,
-# even for a label that exists (measured 2026-09-02, qontinui/qontinui-coord#1857,
-# where the skill reported "gh pr edit failed" and the PR sat in coord's train
-# with no dependency edge). The REST call carries no such query, and — unlike
-# `gh pr edit` — does NOT create a missing dynamic-value label as a side
-# effect; that is done explicitly below, on the 404 this route reports for one.
-echo "step 1/2: gh api POST repos/$REPO/issues/$PR/labels \"$LABEL\""
-
-# gh's stderr is CAPTURED rather than let straight through, so that a
-# `'<label>' not found` can be answered here instead of left for the caller to
-# mis-read. It is re-emitted verbatim first: gh's own wording is the evidence
-# for anything added below it, and swallowing it would trade one bad diagnostic
-# for another.
-#
-# `2>&1 1>&3` is order-sensitive. Inside `$( )` stdout is the capture pipe, so
-# stderr is pointed at that pipe FIRST and stdout is then restored to the real
-# one through the saved fd -- which is why gh's success output (the PR URL)
-# still reaches the terminal. Writing `1>&3 2>&1` captures stdout and leaks
-# stderr, i.e. exactly backwards.
-#
-# The fd is allocated by bash (`{gh_out}`) rather than hardcoded as 3: a literal
-# `exec 3>&1` clobbers whatever the caller had on fd 3, and `exec 3>&-` then
-# CLOSES it rather than restoring it. Nothing invokes this script that way
-# today, but the automatic form costs nothing and cannot.
-GH_RC=0
-exec {gh_out}>&1
-GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
-exec {gh_out}>&-
-
-# Re-emitted on BOTH paths, before anything is decided about it. Capturing gh's
-# stderr in order to answer ONE failure must not silently eat what it says the
-# rest of the time: gh writes to stderr on SUCCESS too -- the
-# `A new release of gh is available` notice, deprecation and auth-scope warnings
-# -- and swallowing those would be this change committing the same offence it
-# exists to fix, one path over.
-if [[ -n "$GH_STDERR" ]]; then
-  printf '%s\n' "$GH_STDERR" >&2
-fi
-
-if (( GH_RC != 0 )); then
-  echo "error: label add failed (exit $GH_RC)" >&2
-
-  # The REST route names this cause exactly: `Label does not exist` (HTTP 404).
-  # By this line the label has already cleared the ceiling check above, so the
-  # over-50-characters cause is RULED OUT and what is left is a dynamic-value
-  # label nobody has created yet. Create it and retry ONCE. This overturns the
-  # earlier "print the command, never create on demand" stance: a label is a
-  # reversible, mechanical mutation (`gh label delete` undoes it), the
-  # `coord:stacked-on=#<n>` namespace already carries one label per stacked PR
-  # by design, and stopping an autonomous session on it was costing a
-  # dependency edge every time [policy: do-reversible-mechanical-work].
-  if [[ "$GH_STDERR" == *"Label does not exist"* ]]; then
-    echo "       \"$LABEL\" does not exist in $REPO yet -- creating it (${#LABEL}/$GH_LABEL_MAX chars)" >&2
-    if ! gh label create "$LABEL" --repo "$REPO" --color 0E8A16 \
-         --description "coord merge-train label (set by coord-pr-label)"; then
-      echo "error: gh label create failed for \"$LABEL\"" >&2
-      exit 3
-    fi
-    GH_RC=0
-    exec {gh_out}>&1
-    GH_STDERR="$(gh api --silent -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" 2>&1 1>&"$gh_out")" || GH_RC=$?
-    exec {gh_out}>&-
-    if [[ -n "$GH_STDERR" ]]; then
-      printf '%s\n' "$GH_STDERR" >&2
-    fi
-    if (( GH_RC != 0 )); then
-      echo "error: label add failed after create (exit $GH_RC)" >&2
-      exit 3
-    fi
-  else
-    exit 3
-  fi
-fi
-echo "ok: gh added label \"$LABEL\" to $REPO#$PR"
-
-# ----- step 2: coord-side ingest hook ----------------------------------------
-
-PAYLOAD=$(python3 -c "
+read_mcp_entry() {
+  # Prints "<url>\t<header>\t<value>" or nothing.
+  local cfg="$1"
+  if [[ -n "$JSON_PY" ]]; then
+    "$JSON_PY" - "$cfg" <<'PY' 2>/dev/null
 import json, sys
-print(json.dumps({
-    'agent_id': sys.argv[1],
-    'repo': sys.argv[2],
-    'pr_number': int(sys.argv[3]),
-    'labels': [sys.argv[4]],
-}))
-" "$QONTINUI_AGENT_ID" "$REPO" "$PR" "$LABEL")
-
-echo "step 2/2: POST $COORD_URL/pr-merge/labels"
-# -w appends the HTTP code on its own line; plain -sS exits 0 on HTTP 4xx/5xx,
-# which is how a 422 tenant_resolution_failed once printed as "ok, written=0".
-RAW=$(curl -sS -w '\n%{http_code}' -X POST "$COORD_URL/pr-merge/labels" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD") || {
-    echo "error: POST $COORD_URL/pr-merge/labels failed (coord unreachable?)" >&2
-    echo "       gh-side label add succeeded; reconciler will eventually pick it up." >&2
-    exit 4
-}
-HTTP_CODE=${RAW##*$'\n'}
-RESPONSE=${RAW%$'\n'*}
-
-if [[ "$HTTP_CODE" != 2* ]]; then
-  echo "error: coord ingest returned HTTP $HTTP_CODE — body: $RESPONSE" >&2
-  if [[ "$RESPONSE" == *tenant_resolution_failed* ]]; then
-    echo "       QONTINUI_AGENT_ID must be an agent id coord knows (an agent_worktrees" >&2
-    echo "       row, e.g. an ~/.qontinui/agent-runs/<uuid> id) — a session id or gate" >&2
-    echo "       registered_by id does NOT resolve to a tenant." >&2
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+c = ((d.get("mcpServers") or {}).get("coord-mcp") or {})
+url = (c.get("url") or "").rstrip("/")
+h = c.get("headers") or {}
+if not url.endswith("/coord-mcp"):
+    sys.exit(0)
+if str(h.get("Authorization") or ""):
+    print(f"{url}\tAuthorization\t{h['Authorization']}")
+elif str(h.get("X-Coord-Mcp-Proxy-Key") or ""):
+    print(f"{url}\tX-Coord-Mcp-Proxy-Key\t{h['X-Coord-Mcp-Proxy-Key']}")
+PY
+  else
+    jq -r '(.mcpServers["coord-mcp"] // {}) as $c
+      | ($c.url // "" | rtrimstr("/")) as $u
+      | ($c.headers // {}) as $h
+      | if ($u | endswith("/coord-mcp")) | not then empty
+        elif (($h.Authorization // "") | tostring) != "" then "\($u)\tAuthorization\t\($h.Authorization)"
+        elif (($h["X-Coord-Mcp-Proxy-Key"] // "") | tostring) != "" then "\($u)\tX-Coord-Mcp-Proxy-Key\t\($h["X-Coord-Mcp-Proxy-Key"])"
+        else empty end' < "$cfg" 2>/dev/null
   fi
-  echo "       gh-side label add succeeded (canonical); coord.pr_labels is out of sync" >&2
-  echo "       until the reconciler ingests the GitHub label event." >&2
+}
+
+ANSWERED=""
+TRIED=()
+SEEN_CFG=""
+for cfg in "${CANDIDATES[@]}"; do
+  [[ -f "$cfg" ]] || continue
+  # `$PWD/../*/.mcp.json` re-lists $PWD's own file; probe each file once.
+  real=$(cd "$(dirname "$cfg")" 2>/dev/null && pwd -P)/$(basename "$cfg")
+  case "$SEEN_CFG" in *"|$real|"*) continue ;; esac
+  SEEN_CFG="$SEEN_CFG|$real|"
+  entry=$(read_mcp_entry "$cfg") || true
+  [[ -n "$entry" ]] || continue
+  IFS=$'\t' read -r PURL PHDR PKEY <<<"$entry"
+  TRIED+=("forwarder:$PURL/pr-labels")
+  if send "$PURL/pr-labels" "$PHDR" "$PKEY"; then
+    case "$HTTP_CODE" in
+      401|403) continue ;;                       # dead or foreign nonce — next candidate
+      404)
+        # A runner built before the pr-labels forwarder route 404s here; coord's
+        # own 404 for a repo outside the tenant carries a typed body. Only the
+        # latter is an answer.
+        if [[ "$RESPONSE" == *repo_not_found_in_tenant_scope* ]]; then ANSWERED="forwarder $PURL"; break; fi
+        continue ;;
+      5*)
+        # A 5xx carrying a RUNNER-originated code is the runner failing, not
+        # coord answering — `COORD_MCP_PROXY_TENANT_UNRESOLVABLE` is a 503 from a
+        # missing or malformed ~/.qontinui/machine.json, and
+        # `COORD_WRITE_PROXY_UPSTREAM_UNREACHABLE` is a 502 because the runner
+        # could not reach coord at all. Rung 2 exists for exactly that runner, so
+        # fall through instead of stopping on it. A 5xx that coord itself
+        # produced carries neither code and IS an answer.
+        case "$RESPONSE" in
+          *COORD_MCP_PROXY_*|*COORD_WRITE_PROXY_*) continue ;;
+          *) ANSWERED="forwarder $PURL"; break ;;
+        esac ;;
+      *) ANSWERED="forwarder $PURL"; break ;;
+    esac
+  fi
+done
+
+# ----- rung 2: coord directly, with a bearer this shell holds -----------------
+if [[ -z "$ANSWERED" ]]; then
+  COORD_BASE="${COORD_HTTP_URL:-${COORD_URL:-https://coord.qontinui.io}}"
+  COORD_BASE="${COORD_BASE%/}"
+  # jwt-cascade-selection: every bearer below is PROBED against coord and a 401/403
+  # falls through to the next candidate, so a stale static $COORD_AGENT_JWT or
+  # $COORD_DEVICE_JWT cannot SHADOW the file token or the runner mint behind it
+  # (#366); no local `exp` decode is needed on this path. Declared for
+  # scripts/lint-jwt-cascade-parity.py check E.
+  TOKENS=()
+  [[ -n "${COORD_AGENT_JWT:-}" ]] && TOKENS+=("$COORD_AGENT_JWT")
+  [[ -n "${COORD_DEVICE_JWT:-}" ]] && TOKENS+=("$COORD_DEVICE_JWT")
+  if [[ -r "$HOME/.qontinui/coord-device-jwt" ]]; then
+    t=$(tr -d '\r\n' < "$HOME/.qontinui/coord-device-jwt")
+    [[ -n "$t" ]] && TOKENS+=("$t")
+  fi
+  for tok in "${TOKENS[@]+"${TOKENS[@]}"}"; do
+    TRIED+=("bearer:$COORD_BASE/coord/pr-labels")
+    if send "$COORD_BASE/coord/pr-labels" "Authorization" "Bearer $tok"; then
+      case "$HTTP_CODE" in
+        401|403) continue ;;
+        *) ANSWERED="direct $COORD_BASE"; break ;;
+      esac
+    fi
+  done
+fi
+
+if [[ -z "$ANSWERED" ]]; then
+  {
+    echo "error: no coord door answered — NOTHING was written, on GitHub or in coord."
+    if [[ ${#TRIED[@]} -eq 0 ]]; then
+      echo "       No runner-written .mcp.json with a coord-mcp entry was found near \$PWD, and"
+      echo "       no bearer is set (\$COORD_AGENT_JWT / \$COORD_DEVICE_JWT / ~/.qontinui/coord-device-jwt)."
+    else
+      echo "       tried (each unreachable or 401/403):"
+      printf '         %s\n' "${TRIED[@]}"
+    fi
+    echo "       From a Claude Code session, call the MCP tool coord_pr_label_set / coord_pr_label_unset"
+    echo "       instead; from a shell, run /coord-revive to find a live door or export a bearer."
+  } >&2
   exit 4
 fi
 
-# Parse the response — `written` should be 1, `rejected` should be empty.
-if command -v python3 >/dev/null 2>&1; then
-  TENANT_ID=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(d.get('tenant_id', '?'))" 2>/dev/null || echo "?")
-  WRITTEN=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(d.get('written', 0))" 2>/dev/null || echo "0")
-  REJECTED=$(echo "$RESPONSE" | python3 -c "import json, sys; d = json.load(sys.stdin); print(len(d.get('rejected', [])))" 2>/dev/null || echo "0")
-else
-  TENANT_ID="?"
-  WRITTEN="?"
-  REJECTED="?"
-fi
+# ----- render the door's answer -------------------------------------------------
+RENDER_PY=$(cat <<'PY'
+import json, os, sys
+method, code, door = sys.argv[1], sys.argv[2], sys.argv[3]
+raw = os.environ.get("RESP_JSON", "")
+try:
+    d = json.loads(raw)
+except Exception:
+    print(f"error: HTTP {code} from {door} with a non-JSON body: {raw[:400]}", file=sys.stderr)
+    # 5, not 4: a door answered. Whether it wrote anything is UNKNOWN.
+    sys.exit(5)
+# The typed 404: coord considered the request and refused it outright because
+# the repo is not in the acting tenant's scope. It is an ANSWER and a REFUSAL,
+# so it exits 1 -- never into the success renderer, whose body it does not have.
+# `acting_tenant_id` is echoed because it is the fact that separates "I typed
+# the repo wrong" from "my credential is for another tenant".
+if code == "404":
+    print(f"rejected: {d.get('repo')} — {d.get('detail') or d.get('error')}", file=sys.stderr)
+    if d.get("acting_tenant_id"):
+        print(f"       acting tenant: {d['acting_tenant_id']} — check THAT before the repo name.",
+              file=sys.stderr)
+    sys.exit(1)
+# ONLY a 2xx is success from here, plus 422 -- the code the door uses to say
+# "everything you posted was refused", whose body IS the normal response shape
+# and renders below as `rejected:` lines. Everything else -- 400 from
+# `tenant_from_auth` when the bearer carries no tenant claim, 409, 413, 429,
+# every 5xx -- is a FAILURE. The test was `startswith(("2","4"))`, which let
+# 400/409/429 fall into the success renderer: a POST printed nothing and exited
+# 0, and a DELETE printed `ok: retracted "None" from None#None`.
+if not (code.startswith("2") or code == "422"):
+    print(f"error: HTTP {code} from {door}: {json.dumps(d)[:600]}", file=sys.stderr)
+    if method == "POST":
+        print("       The door writes GitHub FIRST, so this does NOT mean nothing happened -- "
+              "check the PR, or re-run with --dry-run.", file=sys.stderr)
+    sys.exit(5)
+if method == "DELETE":
+    print(f"ok: retracted \"{d.get('label')}\" from {d.get('repo')}#{d.get('pr_number')} "
+          f"(GitHub + coord; coord row existed: {str(d.get('deleted')).lower()}) via {door}")
+    sys.exit(0)
+repo, pr = d.get("repo"), d.get("pr_number")
+if d.get("dry_run"):
+    print(f"ok: dry run — coord accepts {len(d.get('valid') or [])} label(s) for {repo}#{pr}: "
+          + ", ".join(d.get("valid") or []) + " (nothing sent to GitHub or written)")
+for l in (d.get("github") or {}).get("added") or []:
+    print(f"ok: declared \"{l}\" on {repo}#{pr} — on GitHub and in coord (source=github), edges synced")
+for l in (d.get("github") or {}).get("removed") or []:
+    print(f"ok: retracted \"{l}\" from {repo}#{pr} (mode=replace or cycle undo)")
+rej = d.get("rejected") or []
+for r in rej:
+    cyc = r.get("cycle") or []
+    extra = " — cycle: " + " -> ".join(f"{c['repo']}#{c['pr_number']}" for c in cyc) if cyc else ""
+    print(f"rejected: \"{r.get('label')}\" — {r.get('reason')}{extra}", file=sys.stderr)
+if rej:
+    print(f"note: {len(rej)} label(s) refused by coord; nothing partial was left behind for them.", file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+PY
+)
 
-if [[ "$REJECTED" != "0" ]]; then
-  echo "error: coord rejected the label — body: $RESPONSE" >&2
-  exit 4
-fi
+render() {
+  if [[ -n "$JSON_PY" ]]; then
+    RESP_JSON="$RESPONSE" "$JSON_PY" -c "$RENDER_PY" "$METHOD" "$HTTP_CODE" "$ANSWERED"
+  else
+    # jq-only render: coarse but honest.
+    echo "$RESPONSE" | jq -r --arg m "$METHOD" --arg door "$ANSWERED" '
+      if $m == "DELETE" then "ok: retracted \(.label) from \(.repo)#\(.pr_number) via \($door)"
+      else (
+        (if .dry_run then ["ok: dry run — valid: \(.valid | join(", "))"] else [] end)
+        + ((.github.added // []) | map("ok: declared \(.) — on GitHub and in coord"))
+        + ((.github.removed // []) | map("ok: retracted \(.)"))
+        + ((.rejected // []) | map("rejected: \(.label) — \(.reason)"))
+      ) | .[] end'
+    if [[ "$METHOD" == "POST" ]] && echo "$RESPONSE" | jq -e '(.rejected // []) | length > 0' >/dev/null; then
+      return 1
+    fi
+  fi
+}
 
-if [[ "$WRITTEN" == "0" ]]; then
-  echo "error: coord wrote no pr_labels row (written=0, nothing rejected?) — body: $RESPONSE" >&2
-  exit 4
+RC=0
+render || RC=$?
+if [[ "$RAW_JSON" -eq 1 ]]; then
+  echo "$RESPONSE"
 fi
-
-echo "ok: coord recorded label \"$LABEL\" in pr_labels (tenant_id=$TENANT_ID, written=$WRITTEN)"
+exit "$RC"
