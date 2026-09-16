@@ -1093,6 +1093,9 @@ impl PgDb {
         // (see `database/pg/completion_reports.rs`); `produced_by` is the
         // elaborating parent task_id (null for DESIGN-origin rows) and is the
         // idempotent splice key used by progressive elaboration (Phase 4).
+        // `runs.status_reason` is why a run left `running` (fatal error, stall
+        // pattern, DESIGN failure, stop request) — written by the conductor's
+        // every terminal exit so the row never lies `running` for a dead run.
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS orchestration; \
              CREATE TABLE IF NOT EXISTS orchestration.runs ( \
@@ -1101,9 +1104,11 @@ impl PgDb {
                  recipe     TEXT, \
                  phases     TEXT[] NOT NULL DEFAULT '{}', \
                  status     TEXT NOT NULL, \
+                 status_reason TEXT, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
              ); \
+             ALTER TABLE orchestration.runs ADD COLUMN IF NOT EXISTS status_reason TEXT; \
              CREATE TABLE IF NOT EXISTS orchestration.subtasks ( \
                  task_id         TEXT NOT NULL, \
                  run_id          UUID NOT NULL REFERENCES orchestration.runs(run_id) ON DELETE CASCADE, \

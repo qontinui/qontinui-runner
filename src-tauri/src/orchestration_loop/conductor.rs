@@ -26,12 +26,19 @@
 //!    but has no artifact after a per-subtask timeout is re-prompted ONCE (the
 //!    only place a live session is re-prompted); still no artifact after a
 //!    second timeout → `Failed`.
-//! 6. **harvest hook** — [`harvest_elaboration`] is the Phase-4 extension
-//!    point; in Phase 3 it is a no-op (documented below).
+//! 6. **harvest** — [`harvest_elaboration`] is LIVE: a Completed elaborator's
+//!    `next_subtasks` are spliced into the ledger as `produced_by` children
+//!    (idempotently) BEFORE the elaborator flips to `Completed`, and again as a
+//!    resume safety net for one that completed in a prior process.
 //! 7. **stall / exit** — exit when all subtasks are terminal AND no
 //!    `emits_subtasks` row is un-harvested; stall via [`StallDetector`] over a
 //!    fingerprint that EXCLUDES legitimately-blocked/elaborating rows
-//!    (contract §3.5).
+//!    (contract §3.5) but INCLUDES a row the runner cannot ask coord about
+//!    (`gate_status = coord_unreachable`). **Every exit is written to
+//!    `orchestration.runs`** — `complete`, `failed` (fatal / DAG cycle) or
+//!    `stalled`, with `status_reason` — via [`finish_run`], so the durable row
+//!    never reads `running` for a run whose reconciler has returned. The
+//!    in-memory [`LoopPhase`] mirrors it for the live status strip only.
 //!
 //! ## Testability
 //!
@@ -57,7 +64,7 @@ use uuid::Uuid;
 use super::ai_session_executor::{self, can_complete, WorkerSignal};
 use super::coord_gate::{
     classify_drift_verify, classify_gate, CoordGateClient, DriftClass, GatePredicateSpec,
-    GateStatus, DEFAULT_DRIFT_SUBSPACE,
+    GateStatus, DEFAULT_DRIFT_SUBSPACE, GATE_STATUS_COORD_UNREACHABLE,
 };
 use super::ledger::{Subtask, SubtaskState};
 use super::loop_engine::SharedLoopState;
@@ -196,6 +203,20 @@ pub fn needs_gate_registration(subtask: &Subtask) -> bool {
     subtask.state == SubtaskState::Submitted
         && subtask.gate_id.is_none()
         && classify_gate(&subtask.expected_output, subtask.repo.as_deref()).is_some()
+}
+
+/// `true` when a `Submitted` subtask is **blocked on coord reachability**: the
+/// last attempt to register or poll its gate failed typed
+/// [`CoordGateError::Unreachable`](super::coord_gate::CoordGateError::Unreachable)
+/// and `apply_tick` recorded [`GATE_STATUS_COORD_UNREACHABLE`] in `gate_status`.
+/// Such a row is still re-tried every tick (it stays in `to_register_gate` /
+/// `to_poll_gate`), but unlike a gate coord is genuinely holding open it is
+/// NOT "legitimately waiting": it is INCLUDED in the stall fingerprint and its
+/// retry does NOT count as progress, so a run wedged on an unpaired runner
+/// surfaces as `stalled` instead of ticking forever.
+pub fn blocked_on_coord(subtask: &Subtask) -> bool {
+    subtask.state == SubtaskState::Submitted
+        && subtask.gate_status.as_deref() == Some(GATE_STATUS_COORD_UNREACHABLE)
 }
 
 /// `true` when a subtask is a DriftVerdict **verify** subtask (its
@@ -350,17 +371,13 @@ pub fn in_flight(subtasks: &[Subtask]) -> Vec<&Subtask> {
 }
 
 /// Elaborator rows (`emits_subtasks == true`) that are `Completed` but whose
-/// children have NOT yet been spliced in. **Phase-3 definition** of
-/// "un-harvested" (documented for Phase 4 to wire cleanly): a Completed
-/// elaborator E is un-harvested iff NO subtask in the run carries
-/// `produced_by == Some(E.task_id)`. Phase 4's [`harvest_elaboration`] splices
-/// children and so flips this predicate to false; until then a Completed
-/// elaborator with children declared in its artifact would read as
-/// un-harvested. In Phase 3 the harvest hook is a no-op, so to avoid wedging
-/// the exit on a design-only DAG we additionally treat an elaborator as
-/// "harvested" once it is terminal AND the hook has run for it (see
-/// [`compute_tick`] / [`ExitState`]). The pure predicate here is the raw
-/// "children present?" check Phase 4 owns.
+/// children have NOT yet been spliced in: a Completed elaborator E is
+/// un-harvested iff NO subtask in the run carries
+/// `produced_by == Some(E.task_id)`. [`harvest_elaboration`] (live — it runs
+/// before the elaborator flips to Completed, and again from `apply_tick`'s
+/// `to_harvest` safety net) splices the children and so flips this predicate
+/// to false. The run is not `done` while any elaborator reads un-harvested
+/// (see [`compute_tick`]'s exit guard).
 pub fn unharvested_elaborators(subtasks: &[Subtask]) -> Vec<&Subtask> {
     let has_children: HashSet<&str> = subtasks
         .iter()
@@ -512,6 +529,13 @@ pub struct TickPlan {
     /// remediation subtask + store the verdict (the verify stays not-Completed
     /// until remediation + re-verify resolve).
     pub to_verify_drift: Vec<String>,
+    /// `task_id`s whose gate could not be registered or polled because the
+    /// runner cannot reach coord ([`blocked_on_coord`]). They ALSO appear in
+    /// `to_register_gate` / `to_poll_gate` (the call is retried every tick),
+    /// but that retry is not progress — see [`TickPlan::progressed`] — and the
+    /// rows are part of `stall_fingerprint`, so a run wedged on an unpaired
+    /// runner stalls visibly rather than ticking forever.
+    pub blocked_on_coord: Vec<String>,
     /// `true` when the run is finished (all terminal + nothing un-harvested).
     pub done: bool,
     /// Set when a hard error (e.g. DAG cycle) should terminate the run.
@@ -519,6 +543,26 @@ pub struct TickPlan {
     /// The fingerprint of "stuck-relevant" state for stall detection (excludes
     /// legitimately-blocked/elaborating rows; contract §3.5).
     pub stall_fingerprint: String,
+}
+
+impl TickPlan {
+    /// `true` when applying this tick does real work, which resets stall
+    /// accounting: a completion, dispatch, failure, or a gate registration /
+    /// poll for a subtask coord can actually be asked about. A retry for a
+    /// [`blocked_on_coord`] row is NOT progress — the runner is about to make
+    /// the same call that just failed for lack of a credential or transport —
+    /// and neither is a DriftVerdict read: a read that succeeds changes the
+    /// rows (the verify completes or remediation is spliced) and so changes the
+    /// next fingerprint by itself, while a read that keeps failing must be
+    /// allowed to register as a stall.
+    pub fn progressed(&self) -> bool {
+        let coord_ok = |t: &String| !self.blocked_on_coord.contains(t);
+        !self.to_complete.is_empty()
+            || !self.to_dispatch.is_empty()
+            || !self.to_fail.is_empty()
+            || self.to_register_gate.iter().any(coord_ok)
+            || self.to_poll_gate.iter().any(coord_ok)
+    }
 }
 
 /// Per-`task_run_id` timing the live loop tracks across ticks for the §5
@@ -666,6 +710,16 @@ pub fn compute_tick<S: SignalSource>(
     for st in gate_blocked_subtasks(subtasks, &order) {
         plan.to_poll_gate.push(st.task_id.clone());
     }
+    // Rows whose last gate call failed for want of coord itself. They are in
+    // one of the two lists above (retried), but tagged so the retry is not
+    // counted as progress and the row is fingerprinted (see `progressed`).
+    let by_id: HashMap<&str, &Subtask> = subtasks.iter().map(|s| (s.task_id.as_str(), s)).collect();
+    for &i in &order {
+        let st = &subtasks[i];
+        if blocked_on_coord(st) && deps_satisfied(st, &by_id) {
+            plan.blocked_on_coord.push(st.task_id.clone());
+        }
+    }
 
     // Dispatch (step 3) — ready subtasks in topo order, capped by remaining
     // concurrency. `still_inflight` already reflects completions/failures
@@ -724,9 +778,11 @@ pub fn compute_tick<S: SignalSource>(
 }
 
 /// Build the stall fingerprint: a stable string over the ACTIONABLE state
-/// only. Legitimately-blocked subtasks (Submitted with unmet deps) and
-/// terminal subtasks are excluded so a run that is correctly waiting never
-/// trips the stall detector (contract §3.5).
+/// only. Legitimately-blocked subtasks (Submitted with unmet deps, or held by
+/// a gate coord is genuinely keeping open) and terminal subtasks are excluded
+/// so a run that is correctly waiting never trips the stall detector (contract
+/// §3.5). A row blocked because the runner cannot REACH coord is not waiting
+/// on anything coord said, so it is INCLUDED (`C:<task_id>`).
 fn stall_fingerprint(subtasks: &[Subtask], order: &[usize]) -> String {
     let by_id: HashMap<&str, &Subtask> = subtasks.iter().map(|s| (s.task_id.as_str(), s)).collect();
     let mut parts: Vec<String> = Vec::new();
@@ -743,6 +799,13 @@ fn stall_fingerprint(subtasks: &[Subtask], order: &[usize]) -> String {
                     s.task_id,
                     s.task_run_id.map(|i| i.to_string()).unwrap_or_default()
                 ));
+            }
+            // Blocked on coord REACHABILITY (not on a gate verdict): the runner
+            // could not register or poll the gate at all. Included, so a run
+            // wedged on an unpaired runner accumulates a stall instead of
+            // reading as legitimate waiting forever.
+            SubtaskState::Submitted if deps_satisfied(s, &by_id) && blocked_on_coord(s) => {
+                parts.push(format!("C:{}", s.task_id));
             }
             // Ready-to-dispatch: actionable. Phase 6: a subtask blocked on an
             // OPEN gate, or one awaiting gate registration, is NOT actionable —
@@ -768,10 +831,12 @@ fn stall_fingerprint(subtasks: &[Subtask], order: &[usize]) -> String {
 }
 
 // ============================================================================
-// Harvest hook — Phase 4 extension point (Phase 3: no-op)
+// Harvest — splice a completed elaborator's emitted children (LIVE)
 // ============================================================================
 
-/// **Phase-4 — harvest a completed elaborator's emitted child org-chart.**
+/// **Harvest a completed elaborator's emitted child org-chart.** Called from
+/// `apply_tick` on every elaborator completion (before the state flip) and
+/// again for any Completed-but-unharvested elaborator (resume safety net).
 ///
 /// Given a Completed elaborator subtask (`emits_subtasks == true`) and the full
 /// current row set, this:
@@ -956,9 +1021,12 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     // ---- Phase 6: coord gate registration (best-effort) -----------------
     // Register a gate for each classified subtask and persist gate_id +
     // status=open. The subtask STAYS `Submitted` (no new state variant) — the
-    // gate_id column annotates it blocked. On a register failure we leave the
-    // row ungated so the NEXT tick retries registration (never wedges; coord may
-    // be transiently unreachable).
+    // gate_id column annotates it blocked. On a register failure the row stays
+    // ungated so the NEXT tick retries registration. A failure typed
+    // `Unreachable` (no device JWT / transport down) is additionally RECORDED
+    // on the row as `gate_status = coord_unreachable`, so the block is visible
+    // per-subtask and counts toward a stall; any other failure leaves the row
+    // as it was.
     for tid in &plan.to_register_gate {
         let Some(st) = by_id.get(tid.as_str()) else {
             continue;
@@ -980,6 +1048,13 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     );
                 }
             }
+            Err(e) if e.is_unreachable() => {
+                warn!(
+                    "apply_tick: register {} gate for {tid}: {e}; recording coord_unreachable, will retry next tick",
+                    predicate.kind_label()
+                );
+                record_coord_unreachable(pg, run_id, st).await;
+            }
             Err(e) => warn!(
                 "apply_tick: register {} gate for {tid} failed ({e}); will retry next tick",
                 predicate.kind_label()
@@ -990,8 +1065,11 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     // ---- Phase 6: poll open gates (re-attach + clearance) ----------------
     // Poll each blocked-on-gate subtask and persist the new status. `cleared`
     // unblocks dispatch on the NEXT tick (the column is the durable record);
-    // `failed` fails the subtask on the next tick (`gate_failed`). A poll that
-    // can't reach coord returns `Unknown` → persisted as `open` → keep waiting.
+    // `failed` fails the subtask on the next tick (`gate_failed`). A poll coord
+    // answers but cannot resolve returns `Unknown` → persisted as `open` → keep
+    // waiting. A poll the runner cannot even MAKE (`Unreachable`) is recorded
+    // as `gate_status = coord_unreachable` (gate_id kept, so recovery resumes
+    // polling the same gate) and counts toward a stall.
     for tid in &plan.to_poll_gate {
         let Some(st) = by_id.get(tid.as_str()) else {
             continue;
@@ -1015,6 +1093,12 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                         warn!("conductor: gate {gate_id} FAILED — {tid} will be failed (run {run_id})");
                     }
                 }
+            }
+            Err(e) if e.is_unreachable() => {
+                warn!(
+                    "apply_tick: poll gate {gate_id} for {tid}: {e}; recording coord_unreachable"
+                );
+                record_coord_unreachable(pg, run_id, st).await;
             }
             Err(e) => warn!("apply_tick: poll gate {gate_id} for {tid}: {e} (keeping open)"),
         }
@@ -1073,6 +1157,181 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
 
     let _ = config;
     Ok(plan.done)
+}
+
+/// Persist the typed coord-reachability block on a subtask: `gate_status =`
+/// [`GATE_STATUS_COORD_UNREACHABLE`], keeping whatever `gate_id` the row has (a
+/// registered gate resumes polling once coord is back; an unregistered one is
+/// re-registered — `needs_gate_registration` still holds). Idempotent: a row
+/// already carrying the token is not rewritten.
+async fn record_coord_unreachable(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask) {
+    if subtask.gate_status.as_deref() == Some(GATE_STATUS_COORD_UNREACHABLE) {
+        return;
+    }
+    if let Err(e) = pg
+        .set_subtask_gate(
+            run_id,
+            &subtask.task_id,
+            subtask.gate_id.as_deref(),
+            Some(GATE_STATUS_COORD_UNREACHABLE),
+        )
+        .await
+    {
+        warn!(
+            "apply_tick: persist coord_unreachable for {}: {e}",
+            subtask.task_id
+        );
+    }
+}
+
+// ============================================================================
+// Run exit — the terminal outcome written to `orchestration.runs`
+// ============================================================================
+
+/// The terminal outcome of a conductor run, and the ONLY thing that may end
+/// the run loop. Every variant is written to `orchestration.runs.status` (+
+/// `status_reason`) through [`finish_run`] before the loop returns, so the
+/// durable row and the in-memory [`LoopPhase`] can never disagree about
+/// whether a run is still running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunExit {
+    /// All subtasks terminal and nothing un-harvested.
+    Complete,
+    /// A hard error: a DAG cycle, or the DESIGN bootstrap failing before a
+    /// single subtask existed. `reason` is the error text.
+    Failed { reason: String },
+    /// The stall detector fired over an unchanged actionable fingerprint.
+    /// `reason` names the pattern and any subtasks blocked on coord.
+    Stalled { reason: String },
+}
+
+impl RunExit {
+    /// `orchestration.runs.status` token for a completed run.
+    pub const STATUS_COMPLETE: &'static str = "complete";
+    /// `orchestration.runs.status` token for a failed run.
+    pub const STATUS_FAILED: &'static str = "failed";
+    /// `orchestration.runs.status` token for a stalled run.
+    pub const STATUS_STALLED: &'static str = "stalled";
+
+    /// A fatal tick error (today: the DAG cycle `topo_order` surfaces).
+    pub fn failed(reason: impl Into<String>) -> Self {
+        RunExit::Failed {
+            reason: reason.into(),
+        }
+    }
+
+    /// The DESIGN bootstrap failed, so the run has no subtasks to drive. The
+    /// run is `failed` with the design error — never "complete on zero
+    /// subtasks", which is what ticking an empty run to done would say.
+    pub fn design_failed(error: impl std::fmt::Display) -> Self {
+        RunExit::Failed {
+            reason: format!("DESIGN bootstrap failed: {error}"),
+        }
+    }
+
+    /// The stall detector fired. `blocked_on_coord` (from the tick's plan) is
+    /// folded into the reason so the row says WHY nothing moved.
+    pub fn stalled(pattern: impl std::fmt::Display, blocked_on_coord: &[String]) -> Self {
+        let mut reason = format!("Stall detected: {pattern}");
+        if !blocked_on_coord.is_empty() {
+            reason.push_str(&format!(
+                "; blocked on coord ({GATE_STATUS_COORD_UNREACHABLE}): {}",
+                blocked_on_coord.join(", ")
+            ));
+        }
+        RunExit::Stalled { reason }
+    }
+
+    /// The `orchestration.runs.status` token this exit writes.
+    pub fn status(&self) -> &'static str {
+        match self {
+            RunExit::Complete => Self::STATUS_COMPLETE,
+            RunExit::Failed { .. } => Self::STATUS_FAILED,
+            RunExit::Stalled { .. } => Self::STATUS_STALLED,
+        }
+    }
+
+    /// The `orchestration.runs.status_reason` this exit writes (`None` for a
+    /// completed run).
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            RunExit::Complete => None,
+            RunExit::Failed { reason } | RunExit::Stalled { reason } => Some(reason),
+        }
+    }
+
+    /// The live [`LoopPhase`] mirroring this exit for the status strip. There
+    /// is no `Stalled` phase in the shared enum; a stall is an `Error` whose
+    /// reason is carried in `LoopState::error` (and durably in `status_reason`).
+    pub fn loop_phase(&self) -> LoopPhase {
+        match self {
+            RunExit::Complete => LoopPhase::Complete,
+            RunExit::Failed { .. } | RunExit::Stalled { .. } => LoopPhase::Error,
+        }
+    }
+}
+
+/// Decide whether this tick ENDS the run, before any side effect. Pure over the
+/// plan plus the detector's own history, so tests drive it tick by tick:
+///
+/// - a fatal plan (a DAG cycle) → [`RunExit::Failed`] with the error;
+/// - an actionable fingerprint recorded without progress until the detector
+///   fires → [`RunExit::Stalled`] with the pattern (and the coord-blocked rows).
+///
+/// A tick whose only "no progress" is legitimate waiting has an EMPTY
+/// fingerprint and records nothing, so pure waiting can never accumulate a
+/// stall; a [`blocked_on_coord`] row is fingerprinted and its retry is not
+/// progress, so an unpaired runner DOES stall (contract §3.5, extended).
+/// Completion is decided AFTER `apply_tick` (it reads committed rows) and is
+/// not here.
+pub fn tick_exit(
+    plan: &TickPlan,
+    stall_detector: &mut StallDetector,
+    tick: u32,
+) -> Option<RunExit> {
+    if let Some(fatal) = &plan.fatal {
+        return Some(RunExit::failed(fatal.clone()));
+    }
+    if plan.stall_fingerprint.is_empty() {
+        return None;
+    }
+    stall_detector.record_action(
+        plan.stall_fingerprint.clone(),
+        "conductor".to_string(),
+        tick,
+        None,
+    );
+    if plan.progressed() {
+        return None;
+    }
+    let pattern = stall_detector.check()?;
+    Some(RunExit::stalled(pattern, &plan.blocked_on_coord))
+}
+
+/// Write a run's terminal outcome — the durable row FIRST (`status` +
+/// `status_reason` through [`PgDb::set_run_status`]), then the in-memory loop
+/// state the status strip reads while the process lives. This is the single
+/// exit path of [`run_orchestration`]; a `return` from the loop that bypasses
+/// it leaves the row lying `running`, which is the defect this exists to close.
+async fn finish_run(pg: &Arc<PgDb>, loop_state: &SharedLoopState, run_id: Uuid, exit: RunExit) {
+    match &exit {
+        RunExit::Complete => info!("conductor: run {run_id} complete — all subtasks terminal"),
+        RunExit::Failed { reason } => error!("conductor: run {run_id} failed: {reason}"),
+        RunExit::Stalled { reason } => warn!("conductor: run {run_id} stalled: {reason}"),
+    }
+    if let Err(e) = pg
+        .set_run_status(run_id, exit.status(), exit.reason())
+        .await
+    {
+        error!(
+            "conductor: run {run_id} could not persist status={} (row still reads running): {e}",
+            exit.status()
+        );
+    }
+    let mut st = loop_state.lock().await;
+    st.error = exit.reason().map(str::to_string);
+    st.phase = exit.loop_phase();
+    st.running = false;
 }
 
 /// The twin sub-space a verify subtask reads. Parsed from a `subspace=<id>` /
@@ -1197,8 +1456,12 @@ async fn splice_drift_remediation(
 /// The live conductor background task. Stateless over the ledger: each tick
 /// reloads ALL rows and re-derives everything (statelessness / resume).
 ///
-/// Drives the run to terminal state, updating the [`SharedLoopState`] phase for
-/// the status surface and respecting the stop signal.
+/// Drives the run to terminal state. Every exit but an operator stop goes
+/// through [`finish_run`], which writes `orchestration.runs.status` +
+/// `status_reason` (`complete` / `failed` / `stalled`) before updating the
+/// [`SharedLoopState`] phase for the status surface. (A stop is written as
+/// `stopped` by `loop_engine::stop_orchestration_run`, the one that sends the
+/// signal.)
 ///
 /// ## Phase 6 restart re-attach (gate durability)
 ///
@@ -1284,46 +1547,13 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         let now = Utc::now().timestamp();
         let plan = compute_tick(&subtasks, &signals, &mut timers, &config, now);
 
-        if let Some(fatal) = &plan.fatal {
-            error!("conductor: run {run_id} fatal: {fatal}");
-            let mut st = loop_state.lock().await;
-            st.error = Some(fatal.clone());
-            st.phase = LoopPhase::Error;
-            st.running = false;
+        // Fatal (DAG cycle) or stall (§3.5, over the ACTIONABLE-only
+        // fingerprint; see `tick_exit`) ends the run — and is WRITTEN to the
+        // run row before the loop returns, so the ledger says `failed` /
+        // `stalled` with the reason rather than lying `running` forever.
+        if let Some(exit) = tick_exit(&plan, &mut stall_detector, tick) {
+            finish_run(&pg, &loop_state, run_id, exit).await;
             return;
-        }
-
-        // Stall check over the ACTIONABLE-only fingerprint (§3.5). A tick whose
-        // only "no progress" is waiting on blocked/elaborating rows produces an
-        // EMPTY/unchanged actionable fingerprint AND no dispatch/complete — but
-        // we only record an action when there IS actionable state, so pure
-        // waiting cannot accumulate a stall.
-        // Phase 6: gate registration / polling / verify reads are PROGRESS — a
-        // tick that registers a gate, observes a gate transition, or reads a
-        // verdict is doing real work, so it must NOT count toward a stall.
-        let progressed = !plan.to_complete.is_empty()
-            || !plan.to_dispatch.is_empty()
-            || !plan.to_fail.is_empty()
-            || !plan.to_register_gate.is_empty()
-            || !plan.to_poll_gate.is_empty()
-            || !plan.to_verify_drift.is_empty();
-        if !plan.stall_fingerprint.is_empty() {
-            stall_detector.record_action(
-                plan.stall_fingerprint.clone(),
-                "conductor".to_string(),
-                tick,
-                None,
-            );
-            if !progressed {
-                if let Some(pattern) = stall_detector.check() {
-                    warn!("conductor: run {run_id} stall detected: {pattern}");
-                    let mut st = loop_state.lock().await;
-                    st.error = Some(format!("Stall detected: {pattern}"));
-                    st.phase = LoopPhase::Error;
-                    st.running = false;
-                    return;
-                }
-            }
         }
 
         // Surface dispatching phase when we are about to spawn workers.
@@ -1356,14 +1586,7 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         };
 
         if done {
-            info!("conductor: run {run_id} complete — all subtasks terminal");
-            let _ = pg
-                .set_run_status(run_id, "complete")
-                .await
-                .map_err(|e| warn!("conductor: set_run_status complete: {e}"));
-            let mut st = loop_state.lock().await;
-            st.phase = LoopPhase::Complete;
-            st.running = false;
+            finish_run(&pg, &loop_state, run_id, RunExit::Complete).await;
             return;
         }
 
@@ -2127,7 +2350,9 @@ mod tests {
     // Phase 6 — coord gates + DriftVerdict verify
     // ======================================================================
 
-    use super::super::coord_gate::{CoordGateClient, DriftClass, GatePredicateSpec, GateStatus};
+    use super::super::coord_gate::{
+        CoordGateClient, CoordGateError, DriftClass, GatePredicateSpec, GateStatus,
+    };
     use std::sync::Mutex as GateMutex;
 
     /// A subtask with an `expected_output` that drives the gate classifier, and
@@ -2158,6 +2383,8 @@ mod tests {
         next_gate_id: String,
         poll_status: GateMutex<Option<GateStatus>>,
         drift: GateMutex<Option<DriftClass>>,
+        /// When set, every call fails typed `Unreachable` (an unpaired runner).
+        unreachable: GateMutex<bool>,
     }
 
     impl FakeCoordGateClient {
@@ -2173,6 +2400,14 @@ mod tests {
         fn set_drift(&self, d: DriftClass) {
             *self.drift.lock().unwrap() = Some(d);
         }
+        fn set_unreachable(&self, on: bool) {
+            *self.unreachable.lock().unwrap() = on;
+        }
+        fn gate_err(&self) -> Option<CoordGateError> {
+            (*self.unreachable.lock().unwrap()).then(|| {
+                CoordGateError::Unreachable("runner has no device JWT (unpaired)".to_string())
+            })
+        }
     }
 
     #[async_trait]
@@ -2182,15 +2417,21 @@ mod tests {
             _run_id: Uuid,
             task_id: &str,
             _predicate: &GatePredicateSpec,
-        ) -> Result<String, String> {
+        ) -> Result<String, CoordGateError> {
             self.registered.lock().unwrap().push(task_id.to_string());
+            if let Some(e) = self.gate_err() {
+                return Err(e);
+            }
             Ok(self.next_gate_id.clone())
         }
-        async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, String> {
+        async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, CoordGateError> {
             self.polled.lock().unwrap().push(gate_id.to_string());
+            if let Some(e) = self.gate_err() {
+                return Err(e);
+            }
             Ok(self.poll_status.lock().unwrap().unwrap_or(GateStatus::Open))
         }
-        async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, String> {
+        async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, CoordGateError> {
             self.verdict_subspaces
                 .lock()
                 .unwrap()
@@ -2719,5 +2960,444 @@ mod tests {
                 .execute("DELETE FROM orchestration.runs WHERE run_id = $1", &[&r])
                 .await;
         }
+    }
+
+    // ======================================================================
+    // Phase 2 (2026-09-12 consolidate onto conductor) — run-exit honesty
+    // ======================================================================
+
+    fn stall_detector(max_repeated_actions: u32) -> StallDetector {
+        StallDetector::new(StallDetectorConfig {
+            max_repeated_actions,
+            // Wide enough that only `RepeatedIdenticalAction` can fire here.
+            max_total_steps: 1_000,
+            stall_timeout_secs: 3_600,
+            oscillation_window: 100,
+        })
+    }
+
+    /// A DAG cycle is a fatal tick: the run exits `failed`, and the reason the
+    /// row gets is the cycle error itself — not an empty `failed`.
+    #[test]
+    fn fatal_cycle_exit_is_written_failed_with_reason() {
+        let rows = vec![
+            mk("A", 0, &["C"], SubtaskState::Submitted),
+            mk("B", 1, &["A"], SubtaskState::Submitted),
+            mk("C", 2, &["B"], SubtaskState::Submitted),
+        ];
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
+        let mut det = stall_detector(5);
+
+        let exit = tick_exit(&plan, &mut det, 1).expect("a cycle ends the run on tick 1");
+        assert_eq!(exit.status(), "failed");
+        assert_eq!(exit.status(), RunExit::STATUS_FAILED);
+        assert_eq!(
+            exit.reason(),
+            Some("Circular dependency detected in subtask DAG"),
+            "the written reason is the fatal error text"
+        );
+        assert_eq!(exit.loop_phase(), LoopPhase::Error);
+        assert_eq!(
+            det.action_count(),
+            0,
+            "a fatal exit records nothing on the stall detector"
+        );
+    }
+
+    /// An unchanged actionable fingerprint with no progress, repeated past
+    /// the detector's window, exits the run `stalled` with the pattern as
+    /// the reason. Below the window there is no exit at all.
+    #[test]
+    fn stall_exit_is_written_stalled_with_reason() {
+        // One in-flight worker that stays `Working` forever: the fingerprint is
+        // `W:A:<trid>` every tick and nothing completes/dispatches/fails.
+        let trid = Uuid::new_v4();
+        let mut a = mk("A", 0, &[], SubtaskState::Working);
+        a.task_run_id = Some(trid);
+        let rows = vec![a];
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::Working);
+        let signals = FakeSignals(sigs);
+        let mut timers = ReadyIdleTimers::default();
+        let mut det = stall_detector(3);
+
+        for tick in 1..3 {
+            let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), tick as i64);
+            assert!(!plan.progressed(), "a Working-only tick is not progress");
+            assert_eq!(
+                tick_exit(&plan, &mut det, tick),
+                None,
+                "no exit before the detector's window (tick {tick})"
+            );
+        }
+        let plan = compute_tick(&rows, &signals, &mut timers, &cfg(), 3);
+        let exit = tick_exit(&plan, &mut det, 3).expect("the third identical tick stalls");
+        assert_eq!(exit.status(), "stalled");
+        assert_eq!(exit.status(), RunExit::STATUS_STALLED);
+        let reason = exit.reason().expect("a stall carries its reason");
+        assert!(
+            reason.starts_with("Stall detected: ") && reason.contains("repeated 3 times"),
+            "reason names the pattern: {reason:?}"
+        );
+        assert!(
+            !reason.contains(GATE_STATUS_COORD_UNREACHABLE),
+            "no coord-blocked rows → no coord clause in the reason: {reason:?}"
+        );
+        assert_eq!(exit.loop_phase(), LoopPhase::Error);
+    }
+
+    /// A DESIGN failure is a `failed` run carrying the design error — never a
+    /// `complete` on zero subtasks.
+    #[test]
+    fn design_failure_exit_is_failed_with_the_error() {
+        let exit = RunExit::design_failed("design AI call failed: claude --print exited 1");
+        assert_eq!(exit.status(), "failed");
+        assert_eq!(
+            exit.reason(),
+            Some("DESIGN bootstrap failed: design AI call failed: claude --print exited 1")
+        );
+        assert_eq!(exit.loop_phase(), LoopPhase::Error);
+        // And the one exit that carries no reason is completion.
+        assert_eq!(RunExit::Complete.status(), "complete");
+        assert_eq!(RunExit::Complete.reason(), None);
+        assert_eq!(RunExit::Complete.loop_phase(), LoopPhase::Complete);
+    }
+
+    /// A subtask whose gate call failed for want of coord itself
+    /// (`gate_status = coord_unreachable`) is a TYPED block: it is still retried
+    /// (stays in the register/poll list), but the retry is not progress, the
+    /// row IS in the stall fingerprint, and the run stalls with the row named —
+    /// unlike a gate coord is genuinely holding open, which is excluded.
+    #[test]
+    fn coord_unreachable_row_is_typed_blocked_and_counts_toward_stall() {
+        struct Case {
+            name: &'static str,
+            gate_id: Option<&'static str>,
+            want_in_register: bool,
+            want_in_poll: bool,
+        }
+        let cases = [
+            Case {
+                name: "registration failed unreachable → re-registered, fingerprinted",
+                gate_id: None,
+                want_in_register: true,
+                want_in_poll: false,
+            },
+            Case {
+                name: "poll failed unreachable → re-polled (same gate), fingerprinted",
+                gate_id: Some("gate-1"),
+                want_in_register: false,
+                want_in_poll: true,
+            },
+        ];
+        for c in &cases {
+            let rows = vec![mk_gated(
+                "test",
+                0,
+                &[],
+                "CI green",
+                c.gate_id,
+                Some(GATE_STATUS_COORD_UNREACHABLE),
+            )];
+            assert!(blocked_on_coord(&rows[0]), "{}", c.name);
+            let order = topo_order(&rows).unwrap();
+            assert_eq!(
+                stall_fingerprint(&rows, &order),
+                "C:test",
+                "{}: the coord-blocked row is IN the fingerprint",
+                c.name
+            );
+
+            let mut timers = ReadyIdleTimers::default();
+            let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
+            assert_eq!(
+                plan.blocked_on_coord,
+                vec!["test".to_string()],
+                "{}",
+                c.name
+            );
+            assert_eq!(
+                plan.to_register_gate.contains(&"test".to_string()),
+                c.want_in_register,
+                "{}: retry-by-registration",
+                c.name
+            );
+            assert_eq!(
+                plan.to_poll_gate.contains(&"test".to_string()),
+                c.want_in_poll,
+                "{}: retry-by-poll",
+                c.name
+            );
+            assert!(plan.to_dispatch.is_empty(), "{}: never dispatched", c.name);
+            assert!(
+                !plan.progressed(),
+                "{}: retrying a coord-blocked row is not progress",
+                c.name
+            );
+
+            // Driven through the exit decision, the run stalls and the reason
+            // names the token and the row.
+            let mut det = stall_detector(3);
+            let mut exit = None;
+            for tick in 1..=3 {
+                exit = tick_exit(&plan, &mut det, tick);
+            }
+            let exit = exit.unwrap_or_else(|| panic!("{}: stalls within the window", c.name));
+            assert_eq!(exit.status(), "stalled", "{}", c.name);
+            let reason = exit.reason().unwrap();
+            assert!(
+                reason.contains(GATE_STATUS_COORD_UNREACHABLE) && reason.contains("test"),
+                "{}: reason names the coord block and the row: {reason:?}",
+                c.name
+            );
+        }
+
+        // Contrast: the same row with an OPEN gate (coord answered) is excluded
+        // from the fingerprint and its poll IS progress — unchanged §3.5.
+        let open = vec![mk_gated(
+            "test",
+            0,
+            &[],
+            "CI green",
+            Some("gate-1"),
+            Some("open"),
+        )];
+        let order = topo_order(&open).unwrap();
+        assert!(stall_fingerprint(&open, &order).is_empty());
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&open, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
+        assert!(plan.blocked_on_coord.is_empty());
+        assert!(
+            plan.progressed(),
+            "polling a gate coord holds open is progress"
+        );
+    }
+
+    /// A gate poll / registration for a subtask coord can be asked about is
+    /// progress; only the coord-blocked retry and the verify read are not.
+    #[test]
+    fn progressed_counts_reachable_gate_work_only() {
+        let mut plan = TickPlan::default();
+        assert!(!plan.progressed(), "an empty plan is not progress");
+        plan.to_verify_drift.push("v".to_string());
+        assert!(
+            !plan.progressed(),
+            "a DriftVerdict read is not progress by itself (a successful one changes the rows)"
+        );
+        plan.to_poll_gate.push("blocked".to_string());
+        plan.blocked_on_coord.push("blocked".to_string());
+        assert!(!plan.progressed(), "a coord-blocked retry is not progress");
+        plan.to_poll_gate.push("open".to_string());
+        assert!(plan.progressed(), "a reachable gate poll is progress");
+    }
+
+    /// `finish_run` writes the exit to the run ROW (status + reason) before it
+    /// touches the in-memory loop state; `orchestration_run_status`'s
+    /// reader then finds the reason after the reconciler is gone.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture
+    /// (DATABASE_URL); the `orchestration` schema (incl. `runs.status_reason`)
+    /// self-heals at `PgDb::new`. Run with:
+    /// `cargo test -p qontinui-runner orchestration_loop::conductor::tests::finish_run_writes_status_and_reason_to_the_run_row -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn finish_run_writes_status_and_reason_to_the_run_row() {
+        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let cases: [(RunExit, &str, Option<&str>, LoopPhase); 3] = [
+            (
+                RunExit::failed("Circular dependency detected in subtask DAG"),
+                "failed",
+                Some("Circular dependency detected in subtask DAG"),
+                LoopPhase::Error,
+            ),
+            (
+                RunExit::stalled("Action 'C:test' repeated 5 times", &["test".to_string()]),
+                "stalled",
+                Some("Stall detected: Action 'C:test' repeated 5 times; blocked on coord (coord_unreachable): test"),
+                LoopPhase::Error,
+            ),
+            (RunExit::Complete, "complete", None, LoopPhase::Complete),
+        ];
+        for (exit, want_status, want_reason, want_phase) in cases {
+            let run_id = Uuid::new_v4();
+            pg.create_run(run_id, "exit run", None, &["test".to_string()], "running")
+                .await
+                .expect("create_run");
+            let loop_state: SharedLoopState = Arc::new(tokio::sync::Mutex::new(
+                super::super::loop_engine::LoopState::new(),
+            ));
+            {
+                let mut st = loop_state.lock().await;
+                st.running = true;
+                st.phase = LoopPhase::Reconciling;
+            }
+
+            finish_run(&pg, &loop_state, run_id, exit).await;
+
+            let row = pg.get_run(run_id).await.expect("get_run").expect("row");
+            assert_eq!(row.status, want_status, "durable status for {want_status}");
+            assert_eq!(
+                row.status_reason.as_deref(),
+                want_reason,
+                "durable reason for {want_status}"
+            );
+            let st = loop_state.lock().await;
+            assert!(!st.running);
+            assert_eq!(st.phase, want_phase);
+            assert_eq!(st.error.as_deref(), want_reason);
+            drop(st);
+
+            let conn = pg.pool().get().await.expect("conn");
+            let _ = conn
+                .execute(
+                    "DELETE FROM orchestration.runs WHERE run_id = $1",
+                    &[&run_id],
+                )
+                .await;
+        }
+    }
+
+    /// `apply_tick` records a typed `Unreachable` register/poll failure on the
+    /// subtask as `gate_status = coord_unreachable` — keeping `gate_id` so a
+    /// registered gate resumes polling once coord is back — and clears it on
+    /// recovery. Other failures leave the row untouched.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention (needs DATABASE_URL).
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn coord_unreachable_is_recorded_on_the_subtask_and_clears_on_recovery() {
+        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let run_id = Uuid::new_v4();
+        pg.create_run(
+            run_id,
+            "unpaired run",
+            None,
+            &["test".to_string()],
+            "running",
+        )
+        .await
+        .expect("create_run");
+        let mut st = mk_gated("test", 0, &[], "CI green", None, None);
+        st.run_id = run_id;
+        pg.upsert_subtask(&st).await.expect("upsert");
+
+        let dispatcher = FakeDispatcher::default();
+        let gate = FakeCoordGateClient::with_gate_id("gate-abc");
+        let mut timers = ReadyIdleTimers::default();
+        let c = cfg();
+        let row = |rows: &[Subtask]| rows.iter().find(|s| s.task_id == "test").cloned().unwrap();
+
+        // Tick 1: registration fails Unreachable → typed block recorded, no gate_id.
+        gate.set_unreachable(true);
+        let rows = pg.list_subtasks(run_id).await.unwrap();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(plan.to_register_gate, vec!["test".to_string()]);
+        apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .unwrap();
+        let r = row(&pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(r.gate_id, None, "no gate was registered");
+        assert_eq!(
+            r.gate_status.as_deref(),
+            Some(GATE_STATUS_COORD_UNREACHABLE),
+            "the typed block is on the row"
+        );
+        assert_eq!(r.state, SubtaskState::Submitted);
+
+        // Tick 2: still blocked → retried, fingerprinted, not progress.
+        let rows = pg.list_subtasks(run_id).await.unwrap();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 1);
+        assert_eq!(plan.blocked_on_coord, vec!["test".to_string()]);
+        assert_eq!(plan.stall_fingerprint, "C:test");
+        assert!(!plan.progressed());
+
+        // Tick 3: coord back → registration lands, status open, block cleared.
+        gate.set_unreachable(false);
+        apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .unwrap();
+        let r = row(&pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(r.gate_id.as_deref(), Some("gate-abc"));
+        assert_eq!(r.gate_status.as_deref(), Some("open"));
+
+        // Tick 4: poll fails Unreachable → typed block, gate_id KEPT.
+        gate.set_unreachable(true);
+        let rows = pg.list_subtasks(run_id).await.unwrap();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 2);
+        assert_eq!(plan.to_poll_gate, vec!["test".to_string()]);
+        assert!(plan.progressed(), "polling a reachable-so-far gate counts");
+        apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .unwrap();
+        let r = row(&pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(
+            r.gate_id.as_deref(),
+            Some("gate-abc"),
+            "gate association survives"
+        );
+        assert_eq!(
+            r.gate_status.as_deref(),
+            Some(GATE_STATUS_COORD_UNREACHABLE)
+        );
+
+        // Tick 5: coord back, gate cleared → status cleared, then dispatchable.
+        gate.set_unreachable(false);
+        gate.set_poll(GateStatus::Cleared);
+        let rows = pg.list_subtasks(run_id).await.unwrap();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 3);
+        assert_eq!(plan.to_poll_gate, vec!["test".to_string()]);
+        apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .unwrap();
+        let r = row(&pg.list_subtasks(run_id).await.unwrap());
+        assert_eq!(r.gate_status.as_deref(), Some("cleared"));
+        let rows = pg.list_subtasks(run_id).await.unwrap();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 4);
+        assert_eq!(plan.to_dispatch, vec!["test".to_string()]);
+
+        let conn = pg.pool().get().await.unwrap();
+        let _ = conn
+            .execute(
+                "DELETE FROM orchestration.runs WHERE run_id = $1",
+                &[&run_id],
+            )
+            .await;
     }
 }

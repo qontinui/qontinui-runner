@@ -173,6 +173,52 @@ impl GateStatus {
     }
 }
 
+/// The durable `orchestration.subtasks.gate_status` token for a subtask the
+/// runner could not register or poll a gate for because it cannot reach coord
+/// at all — no device credential (unpaired runner) or the transport failed
+/// before coord answered. It is NOT a coord verdict (coord never says it), so
+/// it is a separate constant rather than a [`GateStatus`] variant: the column
+/// records the runner-side block, the reconciler retries the call every tick,
+/// and the row counts toward the run's stall fingerprint (contract §3.5's
+/// exclusion covers a gate coord is genuinely holding open, not one the runner
+/// cannot even ask about). A UI reads it per-subtask as "blocked: coord
+/// unreachable".
+pub const GATE_STATUS_COORD_UNREACHABLE: &str = "coord_unreachable";
+
+/// Typed failure of a coord gate call. The reconciler branches on the variant:
+/// [`Unreachable`](CoordGateError::Unreachable) is persisted on the subtask as
+/// [`GATE_STATUS_COORD_UNREACHABLE`] (a visible, stall-counted block);
+/// [`Failed`](CoordGateError::Failed) is logged and retried next tick with no
+/// row change, as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoordGateError {
+    /// The runner cannot talk to coord: it holds no device JWT (unpaired), or
+    /// the HTTP transport failed before coord answered (connect / timeout).
+    /// Nothing about the gate itself is known.
+    Unreachable(String),
+    /// Coord answered and the call still failed (non-2xx, JSON-RPC error,
+    /// malformed payload, unmapped sub-space). Coord is reachable; the call is
+    /// retried next tick.
+    Failed(String),
+}
+
+impl CoordGateError {
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self, CoordGateError::Unreachable(_))
+    }
+}
+
+impl std::fmt::Display for CoordGateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoordGateError::Unreachable(detail) => write!(f, "coord unreachable: {detail}"),
+            CoordGateError::Failed(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for CoordGateError {}
+
 /// The Digital-Twin `DriftVerdict.drift_class` token, normalized to the only
 /// distinction the verify phase needs: drift vs no-drift. (`none` ⇒ no drift.)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,9 +400,11 @@ fn parse_pr_number(text: &str) -> Option<i64> {
 /// The conductor's coord interface, factored behind a trait so tests inject a
 /// fake that returns scripted gate statuses / drift verdicts WITHOUT a live coord.
 ///
-/// All three methods are best-effort: the live impl swallows transport errors and
-/// returns `Err` only for a genuinely actionable failure (the reconciler treats
-/// ANY error as "keep waiting" / "no verdict yet", never as a hard stop).
+/// All three methods are best-effort and never a hard stop for the run, but the
+/// error is TYPED: [`CoordGateError::Unreachable`] (no credential / transport
+/// failed) is persisted on the subtask as [`GATE_STATUS_COORD_UNREACHABLE`] so
+/// the block is visible and stall-counted; [`CoordGateError::Failed`] (coord
+/// answered, call failed) is logged and retried next tick with no row change.
 #[async_trait]
 pub trait CoordGateClient: Send + Sync {
     /// Register a gate for `(run_id, task_id)` with the given predicate. Returns
@@ -367,14 +415,14 @@ pub trait CoordGateClient: Send + Sync {
         run_id: uuid::Uuid,
         task_id: &str,
         predicate: &GatePredicateSpec,
-    ) -> Result<String, String>;
+    ) -> Result<String, CoordGateError>;
 
     /// Poll a registered gate's current status by `gate_id`.
-    async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, String>;
+    async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, CoordGateError>;
 
     /// Read the Digital-Twin `DriftVerdict` for `subspace` (e.g. `health`,
     /// `schema`, `release`) and return its normalized [`DriftClass`].
-    async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, String>;
+    async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, CoordGateError>;
 }
 
 /// The twin sub-space a DriftVerdict verify reads when the `expected_output`
@@ -426,7 +474,8 @@ impl LiveCoordGateClient {
     /// Read the runner's live device JWT from the encrypted `AuthManager` slot —
     /// the SAME credential `coord_mcp::provision_coord_mcp_for_session` writes
     /// into spawned sessions' `.mcp.json`. `None` when the runner is unpaired (no
-    /// token) — the caller degrades to a no-op (coord calls skipped).
+    /// token) — every call then fails typed as [`CoordGateError::Unreachable`],
+    /// which the reconciler records on the subtask rather than swallowing.
     fn device_jwt() -> Option<String> {
         match crate::auth::AuthManager::new().get_access_token() {
             Ok(t) if !t.trim().is_empty() => Some(t),
@@ -434,11 +483,17 @@ impl LiveCoordGateClient {
         }
     }
 
-    fn http_client(&self) -> Result<reqwest::Client, String> {
+    fn http_client(&self) -> Result<reqwest::Client, CoordGateError> {
         reqwest::Client::builder()
             .timeout(self.timeout)
             .build()
-            .map_err(|e| format!("coord_gate: http client build: {e:#}"))
+            .map_err(|e| CoordGateError::Failed(format!("coord_gate: http client build: {e:#}")))
+    }
+
+    /// The typed error for a missing device credential — the unpaired-runner
+    /// case every coord call shares.
+    fn unpaired() -> CoordGateError {
+        CoordGateError::Unreachable("runner has no device JWT (unpaired)".to_string())
     }
 
     /// Issue a coord `/mcp` JSON-RPC `tools/call` with the device JWT and return
@@ -447,9 +502,8 @@ impl LiveCoordGateClient {
         &self,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        let jwt = Self::device_jwt()
-            .ok_or_else(|| "coord_gate: runner has no device JWT (unpaired)".to_string())?;
+    ) -> Result<serde_json::Value, CoordGateError> {
+        let jwt = Self::device_jwt().ok_or_else(Self::unpaired)?;
         let (url, _coord_base_source) = crate::coord_mcp::coord_mcp_url_with_source();
         let client = self.http_client()?;
         let body = json!({
@@ -467,21 +521,26 @@ impl LiveCoordGateClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("coord_gate: tools/call {tool_name} POST: {e:#}"))?;
+            .map_err(|e| {
+                // The request never got an answer — coord is unreachable from
+                // here (connect refused / DNS / timeout), not a failed call.
+                CoordGateError::Unreachable(format!("tools/call {tool_name} POST: {e:#}"))
+            })?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(format!(
+            return Err(CoordGateError::Failed(format!(
                 "coord_gate: tools/call {tool_name} → {status}: {}",
                 first_line(&text)
-            ));
+            )));
         }
-        let env: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| format!("coord_gate: tools/call {tool_name} parse: {e}"))?;
+        let env: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            CoordGateError::Failed(format!("coord_gate: tools/call {tool_name} parse: {e}"))
+        })?;
         if let Some(err) = env.get("error") {
-            return Err(format!(
+            return Err(CoordGateError::Failed(format!(
                 "coord_gate: tools/call {tool_name} JSON-RPC error: {err}"
-            ));
+            )));
         }
         // The MCP envelope wraps the tool result under `result`. A coord tool's
         // structured payload arrives either directly as `result` or under
@@ -530,7 +589,7 @@ impl CoordGateClient for LiveCoordGateClient {
         run_id: uuid::Uuid,
         task_id: &str,
         predicate: &GatePredicateSpec,
-    ) -> Result<String, String> {
+    ) -> Result<String, CoordGateError> {
         let args = json!({
             "predicate": predicate.predicate_json(),
             // Claim anchor (coord requires exactly one anchor): a synthetic,
@@ -547,7 +606,11 @@ impl CoordGateClient for LiveCoordGateClient {
             .get("gate_id")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| format!("coord_gate: register returned no gate_id: {payload}"))?;
+            .ok_or_else(|| {
+                CoordGateError::Failed(format!(
+                    "coord_gate: register returned no gate_id: {payload}"
+                ))
+            })?;
         info!(
             "coord_gate: registered {} gate {gate_id} for {run_id}/{task_id}",
             predicate.kind_label()
@@ -555,12 +618,11 @@ impl CoordGateClient for LiveCoordGateClient {
         Ok(gate_id)
     }
 
-    async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, String> {
+    async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, CoordGateError> {
         // Reuse the coord base resolver; poll the list route filtered nothing and
         // match gate_id client-side (coord has no per-gate-id MCP read tool; the
         // REST GET resolves the tenant from the device-bearer context).
-        let jwt = Self::device_jwt()
-            .ok_or_else(|| "coord_gate: runner has no device JWT (unpaired)".to_string())?;
+        let jwt = Self::device_jwt().ok_or_else(Self::unpaired)?;
         let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
         let url = format!("{base}/coord/gates?limit=500");
         let client = self.http_client()?;
@@ -569,7 +631,7 @@ impl CoordGateClient for LiveCoordGateClient {
             .bearer_auth(&jwt)
             .send()
             .await
-            .map_err(|e| format!("coord_gate: poll GET: {e:#}"))?;
+            .map_err(|e| CoordGateError::Unreachable(format!("poll GET: {e:#}")))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -580,8 +642,8 @@ impl CoordGateClient for LiveCoordGateClient {
             );
             return Ok(GateStatus::Unknown);
         }
-        let gates: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| format!("coord_gate: poll parse: {e}"))?;
+        let gates: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| CoordGateError::Failed(format!("coord_gate: poll parse: {e}")))?;
         let arr = gates.as_array().cloned().unwrap_or_default();
         for g in &arr {
             if g.get("gate_id").and_then(|v| v.as_str()) == Some(gate_id) {
@@ -594,16 +656,22 @@ impl CoordGateClient for LiveCoordGateClient {
         Ok(GateStatus::Unknown)
     }
 
-    async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, String> {
+    async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, CoordGateError> {
         let tool = drift_subspace_tool(subspace).ok_or_else(|| {
-            format!("coord_gate: no snapshot twin tool for drift sub-space {subspace:?}")
+            CoordGateError::Failed(format!(
+                "coord_gate: no snapshot twin tool for drift sub-space {subspace:?}"
+            ))
         })?;
         let payload = self.mcp_tools_call(tool, json!({})).await?;
         // The DriftVerdict envelope's top-level `drift_class` is the wire token.
         let token = payload
             .get("drift_class")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("coord_gate: drift verdict has no drift_class: {payload}"))?;
+            .ok_or_else(|| {
+                CoordGateError::Failed(format!(
+                    "coord_gate: drift verdict has no drift_class: {payload}"
+                ))
+            })?;
         Ok(DriftClass::from_drift_class_token(token))
     }
 }

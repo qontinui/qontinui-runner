@@ -92,7 +92,17 @@ pub struct Run {
     /// (`plan` is the phase that runs the DESIGN step which emits the org-chart;
     /// `design` is the step name, not a phase name — contract §3.)
     pub phases: Vec<String>,
+    /// Lifecycle status of the run as the conductor last wrote it:
+    /// `running` | `complete` | `failed` | `stalled` | `stopped`. Every
+    /// terminal exit of the reconciler writes this column — a run whose
+    /// reconciler is gone reads its true outcome from here, not from the
+    /// in-memory loop phase (which dies with the process).
     pub status: String,
+    /// Why the run left `running`: the fatal error (a DAG cycle, a DESIGN
+    /// failure), the stall pattern, or the stop request. `None` while the run
+    /// is `running` and for a `complete` run. Surfaced as `error` on the run
+    /// status payload when the reconciler is no longer registered.
+    pub status_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -131,9 +141,16 @@ pub struct Subtask {
     /// reconciler treats it as not-dispatchable. This column is the DURABLE record
     /// a restart re-attaches to (it resumes polling, never re-registers).
     pub gate_id: Option<String>,
-    /// Phase 6: the last-polled coord gate verdict (`open` | `cleared` | `failed`).
-    /// `None` until the gate is first polled. `cleared` ⇒ unblock + dispatch;
-    /// `failed` ⇒ the subtask is failed.
+    /// Phase 6: the last-polled coord gate verdict (`open` | `cleared` | `failed`),
+    /// or the runner-side typed block token
+    /// [`coord_gate::GATE_STATUS_COORD_UNREACHABLE`](super::coord_gate::GATE_STATUS_COORD_UNREACHABLE)
+    /// (`coord_unreachable`) when the runner could not reach coord at all to
+    /// register or poll the gate — no device credential (unpaired), or the
+    /// transport failed. `None` until the gate is first polled. `cleared` ⇒
+    /// unblock + dispatch; `failed` ⇒ the subtask is failed;
+    /// `coord_unreachable` ⇒ the subtask is blocked on coord reachability, the
+    /// call is retried every tick, and the row COUNTS toward the run's stall
+    /// fingerprint (it is not legitimately waiting on anything coord said).
     pub gate_status: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
