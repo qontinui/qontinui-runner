@@ -139,7 +139,7 @@ export function resetCoordModeCache(): void {
 
 // ---------------------------------------------------------------------------
 // Derivation — pure, so it is testable under the runner's `environment:
-// "node"` vitest config (no jsdom; see FleetHealthPanel.test.tsx for the same
+// "node"` vitest config (no jsdom; see FileActivityPanel.test.tsx for the same
 // constraint).
 // ---------------------------------------------------------------------------
 
