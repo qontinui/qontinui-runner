@@ -658,6 +658,15 @@ export function classifyRestoreAction(
   return "terminal-only";
 }
 
+/**
+ * Is this durable record a Conductor worker's? The marker is `taskRunId`
+ * (set only by `dispatch_subtask`), NOT `terminalId === claudeSessionId` —
+ * a coincidence a hand-pinned `--session-id` shell could also produce. Pure.
+ */
+export function isWorkerRecord(rec: Pick<TerminalSessionRecord, "taskRunId">): boolean {
+  return typeof rec.taskRunId === "string" && rec.taskRunId.length > 0;
+}
+
 /** Validate config dir paths — reject shell metacharacters. */
 const SAFE_PATH_RE = /^[a-zA-Z0-9_\-./\\: ]+$/;
 function sanitizeConfigDir(dir: string | undefined): string | undefined {
@@ -679,6 +688,14 @@ interface UseTerminalInitializationParams {
   reconnectToExistingSessions: () => Promise<string[] | null>;
   createTerminal: (title?: string, workingDir?: string) => Promise<string | null>;
   createPlanTab: (filePath: string) => string | null;
+  /**
+   * Add the grid tab for a Conductor worker's durable record (`taskRunId`
+   * set). Such a record names NO terminal process — its `terminalId` is the
+   * task run id — so the cold-restore path must adopt it as a
+   * `sessionBacked` tab rather than `terminal_create` a shell that would
+   * sit empty beside the real worker. See `useTerminalManager.adoptWorkerTab`.
+   */
+  adoptWorkerTab: (rec: TerminalSessionRecord) => string | null;
   setInitialized: (v: boolean) => void;
   updateTab: (
     id: string,
@@ -747,6 +764,7 @@ export function useTerminalInitialization({
   reconnectToExistingSessions,
   createTerminal,
   createPlanTab,
+  adoptWorkerTab,
   setInitialized,
   updateTab,
   zoneLayout,
@@ -959,6 +977,16 @@ export function useTerminalInitialization({
         //    `useZoneLayout` can never steal a zone a record owns (it only fills
         //    zones still empty after this loop runs).
         for (const rec of openRecords) {
+          // A Conductor worker (Phase 2b): no PTY exists or should exist for
+          // it. Adopt the record as a `sessionBacked` tab and let
+          // `reconcileAssignments` place it — every worker record is written
+          // with `zone_index: 0`, so binding its recorded zone would stack
+          // all of them onto one zone. Its state, transcript and steering
+          // come from the SessionManager through `WorkerSessionCell`.
+          if (isWorkerRecord(rec)) {
+            adoptWorkerTab(rec);
+            continue;
+          }
           const safeConfigDir = sanitizeConfigDir(rec.configDir);
           const restoreAction = classifyRestoreAction(rec);
 
@@ -1315,6 +1343,7 @@ export function useTerminalInitialization({
     pageId,
     reconnectToExistingSessions,
     createTerminal,
+    adoptWorkerTab,
     createPlanTab,
     setInitialized,
     sessionPersistence,

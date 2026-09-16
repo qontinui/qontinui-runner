@@ -337,7 +337,8 @@ async function fetchAndSendSpecPrompt(params: {
   isRegenSpec: boolean;
   projectPath: string;
   analysis: { framework: string; project_path: string };
-  sendMessage: (msg: string) => Promise<void>;
+  /** `useAiSession().sendMessage`; its outcome is not consulted here. */
+  sendMessage: (msg: string) => Promise<unknown>;
 }): Promise<void> {
   const { signal, isRegenSpec, projectPath, analysis, sendMessage } = params;
   let specPrompt: string;
