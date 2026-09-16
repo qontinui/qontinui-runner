@@ -39,6 +39,17 @@
 //!    catch-up, so a request published while the runner was disconnected
 //!    is never lost. This is the robustness backstop — steady-state
 //!    delivery is the push.
+//! 3. **Periodic catch-up tick.** The same catch-up GETs also run every
+//!    [`CATCHUP_TICK`] while the socket is up, so the window is bounded even
+//!    when the socket is healthy but DELIVERS nothing. That is exactly the
+//!    shape against a coord predating the closed subscription set: such a
+//!    coord ignores `?subscribe=` and PSUBSCRIBEs its default `events.*`,
+//!    which never matches `qontinui.sessions.*` — so with the socket held
+//!    open, no `handoff_request` frame ever arrives on it. Against that coord
+//!    this lane degrades to POLL cadence (one tick), not to silence. The
+//!    other three lanes are harmless against the old coord because their
+//!    subjects sit under `events.*`; this one is not, which is why the tick
+//!    exists.
 //!
 //! ## Receiver flow (one handoff)
 //!
@@ -117,6 +128,10 @@ use super::{SessionKind, SessionRegistry};
 const RECONNECT_BACKOFF_FLOOR: Duration = Duration::from_secs(2);
 /// Reconnect backoff ceiling.
 const RECONNECT_BACKOFF_CEIL: Duration = Duration::from_secs(60);
+/// How often the catch-up GETs re-run on a LIVE socket (module doc, point 3).
+/// Same interval class as `agent_runtime`'s poll backstop. Against a coord
+/// predating `?subscribe=` this is the lane's whole delivery cadence.
+const CATCHUP_TICK: Duration = Duration::from_secs(60);
 
 /// Purpose suffix a HANDOFF stamps on the child intent. Parameterised (rather
 /// than inlined) because the respawn receiver reuses
@@ -354,10 +369,75 @@ async fn connect_and_pump(
     tracing::info!(device = %device_id, "session handoff: push WS connected");
 
     // On-connect catch-up: replay anything that landed while we were
-    // offline. The durable `handoff_request` event row in coord is the
-    // source of truth; this GET drains it. Best-effort — a failure here
-    // doesn't abort the pump (the push path still works, and the next
-    // reconnect retries the catch-up).
+    // offline. Best-effort — a failure here doesn't abort the pump (the push
+    // path still works, and the next tick or reconnect retries it).
+    run_all_catchups(registry, lifecycle_store, http, coord_url, device_id).await;
+
+    // Periodic catch-up (module doc, point 3): bounds the delivery window on a
+    // socket that is up but delivers nothing — the pre-`subscribe=` coord.
+    let mut catchup_tick = tokio::time::interval(CATCHUP_TICK);
+    catchup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick fires immediately; the on-connect catch-up just ran.
+    catchup_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = catchup_tick.tick() => {
+                run_all_catchups(registry, lifecycle_store, http, coord_url, device_id).await;
+            }
+            maybe_msg = ws.next() => {
+                let Some(msg) = maybe_msg else {
+                    // Stream ended (peer hung up without a Close frame).
+                    return Ok(());
+                };
+                let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
+                match msg {
+                    tokio_tungstenite::tungstenite::Message::Text(t) => {
+                        handle_push_frame(
+                            registry,
+                            lifecycle_store,
+                            http,
+                            coord_url,
+                            device_id,
+                            t.as_str(),
+                        )
+                        .await;
+                    }
+                    tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                        let s = String::from_utf8_lossy(&b);
+                        handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, &s)
+                            .await;
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(p) => {
+                        // Keep the socket alive — coord's `/ws` answers our pings,
+                        // but reply to server pings too.
+                        let _ = ws
+                            .send(tokio_tungstenite::tungstenite::Message::Pong(p))
+                            .await;
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => {
+                        tracing::debug!("session handoff: push WS closed by peer");
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+/// Every catch-up GET this receiver owns, in order. Run on every (re)connect
+/// and on every [`CATCHUP_TICK`] while the socket is up. Each one is
+/// best-effort and self-logging; none aborts the pump.
+async fn run_all_catchups(
+    registry: &Arc<SessionRegistry>,
+    lifecycle_store: &Arc<SessionLifecycleStore>,
+    http: &reqwest::Client,
+    coord_url: &str,
+    device_id: Uuid,
+) {
+    // The HANDOFF catch-up: the durable `handoff_request` event row in coord
+    // is the source of truth; this GET drains it.
     run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
     // …and the RESPAWN catch-up, on its own coord route. Separate on purpose:
     // the handoff read filters `s.state <> 'closed'` (fatal for a respawn,
@@ -376,44 +456,10 @@ async fn connect_and_pump(
     // minted while it was down, and a `terminal_create` arriving under one of
     // them is refused — which is correct, but avoidable.
     super::create::run_catchup(http, coord_url, device_id, super::create::CATCHUP_TIMEOUT).await;
-
-    while let Some(msg) = ws.next().await {
-        let msg = msg.map_err(|e| HandoffError::Http(format!("coord /ws recv: {e}")))?;
-        match msg {
-            tokio_tungstenite::tungstenite::Message::Text(t) => {
-                handle_push_frame(
-                    registry,
-                    lifecycle_store,
-                    http,
-                    coord_url,
-                    device_id,
-                    t.as_str(),
-                )
-                .await;
-            }
-            tokio_tungstenite::tungstenite::Message::Binary(b) => {
-                let s = String::from_utf8_lossy(&b);
-                handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, &s).await;
-            }
-            tokio_tungstenite::tungstenite::Message::Ping(p) => {
-                // Keep the socket alive — coord's `/ws` answers our pings,
-                // but reply to server pings too.
-                let _ = ws
-                    .send(tokio_tungstenite::tungstenite::Message::Pong(p))
-                    .await;
-            }
-            tokio_tungstenite::tungstenite::Message::Close(_) => {
-                tracing::debug!("session handoff: push WS closed by peer");
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
-/// Run the one-shot catch-up: GET the durable pending list and materialize
-/// each. Used on every (re)connect.
+/// Run the one-shot handoff catch-up: GET the durable pending list and
+/// materialize each. Used on every (re)connect and on every [`CATCHUP_TICK`].
 async fn run_catchup(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
@@ -426,7 +472,7 @@ async fn run_catchup(
             if !pending.is_empty() {
                 tracing::info!(
                     count = pending.len(),
-                    "session handoff: on-connect catch-up replaying pending handoffs"
+                    "session handoff: catch-up replaying pending handoffs"
                 );
             }
             for handoff in pending {
