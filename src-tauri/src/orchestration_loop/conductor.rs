@@ -139,6 +139,28 @@ pub struct OrchestrationRunConfig {
     /// the run dead first. (It used to be five identical ticks: 25 s against
     /// a 90 s report timeout, i.e. the two mechanisms contradicting each other.)
     pub stall_after_secs: i64,
+    /// Seconds a row whose ONLY stuck reason is a coord block (`C:` — the
+    /// runner has no coord ANSWER about it) must stay continuously stuck before
+    /// it alone may write the run `stalled`.
+    ///
+    /// It is deliberately much longer than [`Self::stall_after_secs`], because
+    /// the two measure different things. `stall_after_secs` is sized against a
+    /// WORKER's report deadline — it times a row this runner owns end to end.
+    /// Coord reachability is not a property of the row at all: it is a
+    /// runner-wide condition (a coord deploy, an LB returning 5xx, a device-JWT
+    /// expiry inside the re-mint gap) that every blocked row observes at once
+    /// and that no row can influence. Timing it on a row-sized clock meant an
+    /// ordinary few minutes of coord unreachability ended a run whose workers
+    /// were all healthy.
+    ///
+    /// The number matches [`Self::working_silence_secs`], which is already this
+    /// config's declared budget for "a thing we depend on has stopped
+    /// answering"; a coord outage longer than a worker is allowed to be silent
+    /// is an outage, not a blip. See also the in-flight guard in [`tick_exit`],
+    /// which is the other half of the fix: this window bounds a coord block that
+    /// is the ONLY thing left in the run, and the guard stops one ending a run
+    /// with live workers in it before the window is even reached.
+    pub coord_block_stall_after_secs: i64,
     /// The agent registry's declared `parallel_fanout` bound, refreshed from
     /// coord once per tick by the live loop (see
     /// [`crate::agent_authorization::current_fanout_bound`]).
@@ -174,6 +196,11 @@ impl Default for OrchestrationRunConfig {
             // pre-empt the §5 recovery path or the stall detector; it exists
             // only to put an upper bound on a worker that will never report.
             working_silence_secs: 1800,
+            // 30 minutes of coord being unable to answer about a row. Same
+            // budget as `working_silence_secs` and for the same reason: below
+            // it, an outage is indistinguishable from a blip this fleet sees
+            // routinely.
+            coord_block_stall_after_secs: 1800,
             fanout_bound: None,
         }
     }
@@ -484,10 +511,19 @@ pub trait SignalSource {
     /// ([`OrchestrationRunConfig::working_silence_secs`]). It is deliberately
     /// SEPARATE from [`Self::signal`]: the FSM sits at `Processing` for a whole
     /// turn, so the signal alone cannot distinguish a worker that is busy from
-    /// one that is wedged — only the output stamp can. `None` makes the
-    /// deadline measure from the first tick the row was observed `Working`,
-    /// which is the conservative reading (it can only ever fire LATER than the
-    /// real last-activity would).
+    /// one that is wedged — only the output stamp can. `None` makes the deadline
+    /// measure from the first tick the row was observed `Working`.
+    ///
+    /// **`None` is only conservative when it is TRUE.** For a source that
+    /// genuinely has no activity channel the fallback base (first-seen-`Working`)
+    /// is at or after the worker's real last activity, so the deadline can only
+    /// fire LATER than the truth. For a source that HAS activity and simply does
+    /// not report it, the same base is EARLIER than the real last activity, so
+    /// the deadline fires EARLY and kills a live worker. No such source exists
+    /// today — `dispatch_subtask` only ever spawns a `ClaudeSession`, and
+    /// [`ManagerSignalSource`] reads its output tracker — which is exactly why
+    /// implementing this as `|_| None` is a silent regression rather than a
+    /// visible one, and why it must never be one.
     fn last_activity(&self, task_run_id: Uuid) -> Option<i64>;
 }
 
@@ -521,13 +557,32 @@ impl SignalSource for ManagerSignalSource {
 // Dispatcher (injected — real = spawn a worker, test = record-only)
 // ============================================================================
 
-/// Dispatches a ready subtask to a worker. The live impl
-/// ([`AiSessionDispatcher`]) calls Phase-2
-/// [`ai_session_executor::dispatch_subtask`] (spawns the AI-session, persists
-/// `task_run_id` + flips to `Working`). Tests inject a fake that records the
-/// dispatch and persists the transition itself, so readiness/cap/resume logic
-/// is exercised WITHOUT a live spawn.
-/// Why a dispatch did not produce a live worker.
+/// Why a dispatch did not produce a live worker — the distinction stall
+/// accounting turns on.
+///
+/// A [`Failed`](Self::Failed) dispatch is one nothing but a change in this run
+/// can fix: the worktree could not be acquired, the CLI would not spawn, the
+/// `Working` upsert was refused. Re-deciding it produces the same failure
+/// forever, so the row is fingerprinted and the run eventually stalls with the
+/// reason.
+///
+/// The other two variants are TRANSIENT — they resolve without anything in this
+/// run changing, so [`transient`](Self::transient) reads `true` and `tick_exit`
+/// DROPS the row's fingerprint key instead of accruing stall time against it:
+///
+/// * [`DeferredByDrain`](Self::DeferredByDrain) — coord has drained this device
+///   (or its drain state is unknown). Expected for as long as the drain holds,
+///   so `apply_tick` logs it at `debug!` rather than warning once per queued
+///   subtask every tick.
+/// * [`Transient`](Self::Transient) — today, exactly the fleet-wide
+///   `parallel_fanout` bound being fully occupied. The served clause the
+///   admission implements says a bound breach "must never become a task failure
+///   while sequential progress is still possible", and the conductor already
+///   treats ready work beyond THIS RUN's own cap as legitimate waiting. Before
+///   this type existed the two were one `String` and the fleet-wide arm was
+///   counted as stuck — the same condition as the run-wide one, with the
+///   opposite verdict, and a busy fan-out gate wrote a healthy run `stalled`
+///   after `stall_after_secs`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DispatchError {
     /// Coord's device drain deferred it (plan
@@ -535,14 +590,33 @@ pub enum DispatchError {
     /// for as long as the drain holds: the subtask stays `Submitted` and a later
     /// tick retries, so it is logged quietly rather than as a failure.
     DeferredByDrain(String),
-    /// Anything else. The subtask also stays `Submitted` and is retried.
+    /// A failure that resolves on its own — the row is queued, not stuck. The
+    /// subtask stays `Submitted` and a later tick retries once the bound frees.
+    Transient(String),
+    /// Anything else. The subtask also stays `Submitted` and is retried, but a
+    /// retry re-decides it identically, so the row keeps its fingerprint and the
+    /// run eventually stalls on it.
     Failed(String),
+}
+
+impl DispatchError {
+    /// `true` for the two variants that resolve without anything in this run
+    /// changing ([`Self::DeferredByDrain`] and [`Self::Transient`]). Such a row
+    /// is waiting, not stuck, so `tick_exit` removes its fingerprint key.
+    pub fn transient(&self) -> bool {
+        matches!(
+            self,
+            DispatchError::DeferredByDrain(_) | DispatchError::Transient(_)
+        )
+    }
 }
 
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DispatchError::DeferredByDrain(m) | DispatchError::Failed(m) => f.write_str(m),
+            DispatchError::DeferredByDrain(m)
+            | DispatchError::Transient(m)
+            | DispatchError::Failed(m) => f.write_str(m),
         }
     }
 }
@@ -553,6 +627,12 @@ impl From<String> for DispatchError {
     }
 }
 
+/// Dispatches a ready subtask to a worker. The live impl
+/// ([`AiSessionDispatcher`]) calls Phase-2
+/// [`ai_session_executor::dispatch_subtask`] (spawns the AI-session, persists
+/// `task_run_id` + flips to `Working`). Tests inject a fake that records the
+/// dispatch and persists the transition itself, so readiness/cap/resume logic
+/// is exercised WITHOUT a live spawn.
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
     async fn dispatch(&self, run_id: Uuid, subtask: &Subtask) -> Result<Uuid, DispatchError>;
@@ -646,6 +726,18 @@ pub struct TickPlan {
     /// [`Self::to_fail`], carried separately so the log and the tests can name
     /// the reason (the other `to_fail` arms are `Errored` / `Gone` / no-report).
     pub silent_workers: Vec<String>,
+    /// `task_id`s with a LIVE worker this tick is not ending: `Working` with a
+    /// bound `task_run_id`, not decided `to_complete`/`to_fail`, and not itself
+    /// blocked on coord. This is the run's "something is genuinely happening"
+    /// term, and [`tick_exit`] uses it for one job only — refusing to end a run
+    /// on a coord block alone while healthy work is in flight (a stall exit
+    /// RETURNS from the reconciler and orphans those workers; `finish_run`
+    /// touches no session).
+    ///
+    /// Rows blocked on coord are excluded deliberately: a `Working` verify
+    /// subtask whose verdict read keeps failing is BOTH in flight and the stuck
+    /// row, and counting it would let a coord block guard itself forever.
+    pub in_flight_workers: Vec<String>,
     /// `true` when the run is finished (all terminal + nothing un-harvested).
     pub done: bool,
     /// Set when a hard error (e.g. DAG cycle) should terminate the run.
@@ -676,13 +768,43 @@ pub struct TickOutcome {
     /// `task_id`s durably written `Failed`.
     pub failed: Vec<String>,
     /// `<op>:<task_id>` for every side effect that was ATTEMPTED and did not
-    /// land: `dispatch`, `complete`, `fail`, `harvest`. Each becomes an `E:`
-    /// entry in the stall fingerprint, because such a row is stuck in exactly
-    /// the sense §3.5 means — nothing is waiting on it, the reconciler simply
-    /// cannot move it — and it is the one stuck shape that CANNOT be recorded
-    /// on the row itself: when the durable write is the thing failing, a typed
-    /// marker written the same way fails too.
+    /// land: `dispatch`, `complete`, `fail`, `harvest`, `reprompt`,
+    /// `gate_persist`, `drift_store`. Each becomes an `E:` entry in the stall
+    /// fingerprint, because such a row is stuck in exactly the sense §3.5 means
+    /// — nothing is waiting on it, the reconciler simply cannot move it — and it
+    /// is the one stuck shape that CANNOT be recorded on the row itself: when
+    /// the durable write is the thing failing, a typed marker written the same
+    /// way fails too.
+    ///
+    /// The list is exhaustive over `apply_tick`'s side effects on purpose. The
+    /// three that were missing each had the same shape: a failure that left the
+    /// row exactly where it was, in a lifecycle state nothing else
+    /// fingerprints, so the identical decision was re-made every tick forever
+    /// with the run reading `running`. A `reprompt` that never lands never arms
+    /// the §5 deadline that would fail the row, and pins a concurrency slot; a
+    /// `gate_persist` that never lands re-registers a NEW coord gate every tick
+    /// (one leaked gate row per tick) or keeps polling a gate coord already
+    /// cleared; a `drift_store` that never lands re-reads the same verdict
+    /// forever on a row the §5 timers are diverted around.
     pub apply_failures: Vec<String>,
+    /// `task_id`s whose side effect failed TRANSIENTLY — attempted, did not
+    /// land, and will land on its own once a condition outside this run clears.
+    /// Today that is exactly the two dispatch outcomes
+    /// [`DispatchError::transient`] reads `true` for: the fleet's declared
+    /// `parallel_fanout` bound being fully occupied
+    /// ([`DispatchError::Transient`]), and coord having drained this device
+    /// ([`DispatchError::DeferredByDrain`]).
+    ///
+    /// [`tick_exit`] drops the row's stall-fingerprint KEY entirely — not just
+    /// the `E:` entry, because the row also carries an `R:` from the dispatch
+    /// this tick decided. A row waiting for a slot is waiting, not stuck: the
+    /// served clause the admission implements says "a bound breach must never
+    /// become a task failure while sequential progress is still possible", and
+    /// the conductor already treats ready work beyond THIS RUN's cap as
+    /// legitimate waiting. Calling the same condition stuck because the bound
+    /// is fleet-wide rather than run-wide was the same condition with the
+    /// opposite verdict.
+    pub transient_failures: Vec<String>,
     /// `true` when the run is finished (mirrors [`TickPlan::done`], which reads
     /// committed rows).
     pub done: bool,
@@ -697,6 +819,7 @@ impl TickOutcome {
             ("completed", &self.completed),
             ("failed", &self.failed),
             ("did-not-land", &self.apply_failures),
+            ("waiting-for-a-slot", &self.transient_failures),
         ] {
             if !v.is_empty() {
                 parts.push(format!("{label}={}", v.join(",")));
@@ -746,7 +869,9 @@ impl ReadyIdleTimers {
     /// because that is the truth about when it last did anything; a worker that
     /// emits resets its own stretch with no bookkeeping at all. Only a source
     /// that cannot observe activity falls back to "since we first saw it
-    /// `Working`", which can only ever fire LATER than the real silence would.
+    /// `Working`" — conservative for a source that really has no activity
+    /// channel, and EARLY (see [`SignalSource::last_activity`]) for one that has
+    /// activity it does not report.
     fn observe_working_silence(
         &mut self,
         task_run_id: Uuid,
@@ -905,7 +1030,8 @@ pub fn compute_tick<S: SignalSource>(
     }
     // Rows whose last gate call failed for want of coord itself. They are in
     // one of the two lists above (retried), but tagged so the retry is not
-    // counted as progress and the row is fingerprinted (see `progressed`).
+    // counted as life and the row is fingerprinted (`C:`, see
+    // `stall_fingerprint`; the retry lands in no `TickOutcome` either).
     let by_id: HashMap<&str, &Subtask> = subtasks.iter().map(|s| (s.task_id.as_str(), s)).collect();
     for &i in &order {
         let st = &subtasks[i];
@@ -916,6 +1042,22 @@ pub fn compute_tick<S: SignalSource>(
             plan.blocked_on_coord.push(st.task_id.clone());
         }
     }
+
+    // The run's live work, for `tick_exit`'s in-flight guard ONLY (see
+    // `TickPlan::in_flight_workers`). Rows this tick decided to end are not
+    // live, and a row blocked on coord is the stuck row itself — counting
+    // either would let a run guard itself open with nothing actually working.
+    let ending: HashSet<&str> = plan
+        .to_complete
+        .iter()
+        .chain(plan.to_fail.iter())
+        .map(|s| s.as_str())
+        .collect();
+    plan.in_flight_workers = inflight
+        .iter()
+        .map(|s| s.task_id.clone())
+        .filter(|t| !ending.contains(t.as_str()) && !plan.blocked_on_coord.contains(t))
+        .collect();
 
     // Dispatch (step 3) — ready subtasks in topo order, capped by remaining
     // concurrency. `still_inflight` already reflects completions/failures
@@ -1025,11 +1167,16 @@ pub fn compute_tick<S: SignalSource>(
 /// either way; only the sentence differs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StallFingerprint {
-    /// Sorted, deduped keys (a `task_id`, or [`NOTHING_ACTIONABLE_KEY`]) — the
-    /// WATCHED identity of the stuck set.
-    keys: Vec<String>,
-    /// Sorted reason entries, one per key (`C:`/`R:`/`B:`/`W!:`/`E:`/`Z:`).
-    entries: Vec<String>,
+    /// Sorted, deduped `(key, entry)` pairs: the key is a `task_id` (or
+    /// [`NOTHING_ACTIONABLE_KEY`]) and the entry is that row's reason sentence
+    /// (`C:`/`R:`/`B:`/`W!:`/`E:`/`Z:`). One row may carry several entries.
+    ///
+    /// They are stored PAIRED rather than as two independent lists because a
+    /// key can leave the set for a reason its entries must follow
+    /// ([`Self::remove_key`]), and because the reasons decide how a key is
+    /// TIMED ([`Self::coord_only_keys`]). Two parallel lists can answer
+    /// neither question.
+    rows: Vec<(String, String)>,
 }
 
 /// The [`StallFingerprint`] key for the "nothing is actionable and nothing is in
@@ -1040,27 +1187,66 @@ impl StallFingerprint {
     /// Record one stuck row: `key` is what continuity is measured on, `entry`
     /// is the sentence the stall reason carries.
     pub fn push(&mut self, key: String, entry: String) {
-        self.keys.push(key);
-        self.entries.push(entry);
-        self.keys.sort();
-        self.keys.dedup();
-        self.entries.sort();
-        self.entries.dedup();
+        self.rows.push((key, entry));
+        self.rows.sort();
+        self.rows.dedup();
+    }
+
+    /// Drop a row from the stuck set entirely — its key AND every reason it
+    /// carries. This is what "not stuck after all" means: leaving the key while
+    /// dropping one entry would keep [`StallWatch`]'s window running on a row
+    /// nothing can name a reason for, and leaving an entry while dropping the
+    /// key would put a sentence in the operator's stall reason about a row the
+    /// watch is not watching. See [`TickOutcome::transient_failures`].
+    pub fn remove_key(&mut self, key: &str) {
+        self.rows.retain(|(k, _)| k != key);
     }
 
     /// `true` when nothing is stuck.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.rows.is_empty()
     }
 
-    /// The stuck rows, sorted — what [`StallWatch`] tracks over time.
-    pub fn keys(&self) -> &[String] {
-        &self.keys
+    /// The stuck rows, sorted and deduped — what [`StallWatch`] tracks over
+    /// time.
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.rows.iter().map(|(k, _)| k.clone()).collect();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// The stuck rows whose EVERY reason is a coord block (`C:` — the runner
+    /// has no coord ANSWER about the row). Those are timed on
+    /// [`OrchestrationRunConfig::coord_block_stall_after_secs`] instead of the
+    /// row-sized window, because coord reachability is a runner-wide condition
+    /// no row can influence.
+    ///
+    /// "EVERY reason" is the load-bearing part. A row that is coord-blocked AND
+    /// carries an `E:` for a durable write that will not land is stuck for a
+    /// reason of its own, and gets the short window — the long one is for rows
+    /// whose ONLY problem is that coord is not answering.
+    pub fn coord_only_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for key in self.keys() {
+            if self
+                .rows
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .all(|(_, e)| e.starts_with("C:"))
+            {
+                keys.push(key);
+            }
+        }
+        keys
     }
 
     /// The human-readable reasons, `|`-joined — what the stall reason carries.
     pub fn evidence(&self) -> String {
-        self.entries.join("|")
+        let mut entries: Vec<&str> = self.rows.iter().map(|(_, e)| e.as_str()).collect();
+        entries.sort();
+        entries.dedup();
+        entries.join("|")
     }
 }
 
@@ -1328,7 +1514,20 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                 info!("conductor: re-prompted {tid} ({trid}) for missing report");
                 timers.reprompted_at.insert(*trid, Utc::now().timestamp());
             }
-            Err(e) => warn!("apply_tick: reprompt {tid}: {e}"),
+            Err(e) => {
+                // A re-prompt that did not land is the §5 recovery path failing
+                // OPEN, and it is unbounded on its own: `reprompted_at` is only
+                // inserted on success, so the SECOND deadline — the one that
+                // FAILS the row — is never armed, and the next tick re-decides
+                // the identical re-prompt forever. Nothing else reaches the row
+                // either: it is `Working` with a `task_run_id` (so the
+                // fingerprint excludes it) and the worker is `ReadyIdle` (so
+                // the silence deadline was cleared). It holds its concurrency
+                // slot for the life of the run, which then excludes every other
+                // ready row as "waiting on a slot".
+                warn!("apply_tick: reprompt {tid}: {e}");
+                outcome.apply_failures.push(format!("reprompt:{tid}"));
+            }
         }
     }
 
@@ -1341,17 +1540,44 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     outcome.dispatched.push(tid.clone());
                 }
                 // Expected for as long as coord's device drain holds; every
-                // tick would otherwise WARN once per queued subtask.
+                // tick would otherwise WARN once per queued subtask. Recorded
+                // as a transient failure all the same: the row is waiting on a
+                // drain that will lift, not stuck, so `tick_exit` drops its
+                // fingerprint KEY and a held drain can never write a healthy
+                // run `stalled`.
                 Err(DispatchError::DeferredByDrain(reason)) => {
                     debug!("apply_tick: dispatch {tid} deferred by the device drain: {reason}");
+                    outcome.transient_failures.push(tid.clone());
+                }
+                Err(e) if e.transient() => {
+                    // The fleet's declared fan-out bound was full. The subtask
+                    // stays `Submitted` and a later tick dispatches it once a
+                    // slot frees — waiting, not stuck, exactly as ready work
+                    // beyond THIS RUN's own cap is. `tick_exit` drops the row's
+                    // fingerprint KEY (the `R:` this tick put there), so a busy
+                    // gate can never write a healthy run `stalled`.
+                    info!("conductor: {tid} queued — {e}");
+                    outcome.transient_failures.push(tid.clone());
                 }
                 Err(e) => {
-                    // Dispatch failed before the worker was live; the subtask
-                    // stays Submitted (dispatch_subtask only flips on success)
-                    // so a later tick retries — and re-decides it identically,
-                    // forever, if the cause is permanent. The row is already
-                    // `R:`-fingerprinted (this tick decided to dispatch it) and
-                    // the non-outcome is what stops that retry reading as life.
+                    // The subtask stays `Submitted` (`dispatch_subtask` flips it
+                    // only on success) so a later tick retries — and re-decides
+                    // it identically, forever, if the cause is permanent. The
+                    // row is already `R:`-fingerprinted (this tick decided to
+                    // dispatch it) and the non-outcome is what stops that retry
+                    // reading as life.
+                    //
+                    // NOT "before the worker was live", which this comment used
+                    // to claim: `dispatch_subtask` spawns the CLI, acquires the
+                    // worktree, registers the session and binds coord identity
+                    // BEFORE it upserts `task_run_id` + `Working`, so a PG
+                    // refusal at that last step fails with a fully live worker.
+                    // It is `dispatch_subtask`'s own teardown — not this retry —
+                    // that makes re-dispatch safe: it closes and unregisters the
+                    // session it could not bind before returning `Err`. Without
+                    // that, a 5s tick against a 300s stall window spawned ~60
+                    // orphaned CLI sessions and took ~60 worktree acquisitions
+                    // before the run stalled.
                     warn!("apply_tick: dispatch {tid}: {e}");
                     outcome.apply_failures.push(format!("dispatch:{tid}"));
                 }
@@ -1404,7 +1630,15 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     .set_subtask_gate(run_id, tid, Some(&gate_id), Some("open"))
                     .await
                 {
+                    // coord registered a gate this row will never be told
+                    // about: it stays ungated, so `needs_gate_registration`
+                    // still holds and the NEXT tick registers ANOTHER one. One
+                    // leaked coord gate row per tick, with the run reading
+                    // `running` and nothing on the subtask to show for it —
+                    // precisely the shape `E:` exists for, since the failing
+                    // write IS the durable marker.
                     warn!("apply_tick: persist gate for {tid}: {e}");
+                    outcome.apply_failures.push(format!("gate_persist:{tid}"));
                 } else {
                     info!(
                         "conductor: {tid} blocked on {} gate {gate_id} (run {run_id})",
@@ -1418,7 +1652,7 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     "apply_tick: register {} gate for {tid}: {e}; recording {token}, will retry next tick",
                     predicate.kind_label()
                 );
-                record_coord_block(pg, run_id, st, token).await;
+                record_coord_block(pg, run_id, st, token, &mut outcome).await;
             }
         }
     }
@@ -1450,7 +1684,13 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                         .set_subtask_gate(run_id, tid, Some(gate_id), Some(col))
                         .await
                     {
+                        // coord gave a verdict the row will never carry. A
+                        // `cleared` that does not persist leaves `gate_blocked`
+                        // true, so the row is excluded from the fingerprint as
+                        // legitimate waiting — forever, on a gate coord has
+                        // already opened.
                         warn!("apply_tick: persist gate status for {tid}: {e}");
+                        outcome.apply_failures.push(format!("gate_persist:{tid}"));
                     } else if matches!(status, GateStatus::Cleared) {
                         info!("conductor: gate {gate_id} CLEARED — {tid} now dispatchable (run {run_id})");
                     } else if matches!(status, GateStatus::Failed) {
@@ -1461,7 +1701,7 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
             Err(e) => {
                 let token = coord_block_token(&e);
                 warn!("apply_tick: poll gate {gate_id} for {tid}: {e}; recording {token}");
-                record_coord_block(pg, run_id, st, token).await;
+                record_coord_block(pg, run_id, st, token, &mut outcome).await;
             }
         }
     }
@@ -1483,9 +1723,15 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
         let subspace = drift_subspace_for(st);
         match gate_client.drift_verdict(&subspace).await {
             Ok(DriftClass::NoDrift) => {
-                clear_coord_block(pg, run_id, st).await;
+                clear_coord_block(pg, run_id, st, &mut outcome).await;
                 if let Err(e) = store_drift_verdict(pg, run_id, st, &subspace, "none").await {
+                    // The verdict is read and thrown away: the row stays
+                    // ReadyIdle-with-artifact and no `drift_verdict` key, so the
+                    // next tick reads the SAME verdict and drops it again. A
+                    // verify row is diverted before the §5 timers, so nothing
+                    // else bounds it.
                     warn!("apply_tick: store no-drift verdict for {tid}: {e}");
+                    outcome.apply_failures.push(format!("drift_store:{tid}"));
                     continue;
                 }
                 if let Err(e) = pg
@@ -1493,14 +1739,18 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     .await
                 {
                     warn!("apply_tick: complete verify {tid}: {e}");
+                    outcome.apply_failures.push(format!("complete:{tid}"));
                 } else {
                     info!("conductor: verify {tid} — DriftVerdict[{subspace}] shows NO DRIFT → Completed (run {run_id})");
                 }
             }
             Ok(DriftClass::Drift(class)) => {
-                clear_coord_block(pg, run_id, st).await;
+                clear_coord_block(pg, run_id, st, &mut outcome).await;
                 if let Err(e) = store_drift_verdict(pg, run_id, st, &subspace, &class).await {
+                    // Same shape as the no-drift arm: a verdict read forever,
+                    // recorded never, on a row no deadline reaches.
                     warn!("apply_tick: store drift verdict for {tid}: {e}");
+                    outcome.apply_failures.push(format!("drift_store:{tid}"));
                     continue;
                 }
                 match splice_drift_remediation(pg, run_id, st, &subspace, &class).await {
@@ -1522,7 +1772,7 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                 // read was the thing failing.
                 let token = coord_block_token(&e);
                 warn!("apply_tick: drift verdict[{subspace}] for {tid}: {e}; recording {token}");
-                record_coord_block(pg, run_id, st, token).await;
+                record_coord_block(pg, run_id, st, token, &mut outcome).await;
             }
         }
     }
@@ -1549,7 +1799,21 @@ fn coord_block_token(err: &CoordGateError) -> &'static str {
 /// Idempotent: a row already carrying THIS token is not rewritten, while a row
 /// carrying the OTHER one is corrected, so the operator never reads "pair this
 /// runner" about a coord that is answering.
-async fn record_coord_block(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask, token: &str) {
+///
+/// A write that FAILS here is the `E:` mechanism's own justifying case — the
+/// durable marker for "no coord answer" cannot be written because the durable
+/// store is what is failing — so it is recorded in the [`TickOutcome`] instead.
+/// Without it the row keeps whatever `gate_status` it had (usually none), so an
+/// unregistered row registers a NEW coord gate every tick and a polled one is
+/// read as legitimately waiting, with nothing anywhere saying the run cannot
+/// move.
+async fn record_coord_block(
+    pg: &Arc<PgDb>,
+    run_id: Uuid,
+    subtask: &Subtask,
+    token: &str,
+    outcome: &mut TickOutcome,
+) {
     if subtask.gate_status.as_deref() == Some(token) {
         return;
     }
@@ -1563,6 +1827,9 @@ async fn record_coord_block(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask, tok
         .await
     {
         warn!("apply_tick: persist {token} for {}: {e}", subtask.task_id);
+        outcome
+            .apply_failures
+            .push(format!("gate_persist:{}", subtask.task_id));
     }
 }
 
@@ -1574,7 +1841,12 @@ async fn record_coord_block(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask, tok
 /// Without this a row tagged while the runner was unpaired kept the token
 /// forever once it was paired: the row stayed in the stall fingerprint, and the
 /// eventual stall reason pointed the operator at pairing while coord was up.
-async fn clear_coord_block(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask) {
+async fn clear_coord_block(
+    pg: &Arc<PgDb>,
+    run_id: Uuid,
+    subtask: &Subtask,
+    outcome: &mut TickOutcome,
+) {
     let Some(stale) = coord_block(subtask) else {
         return;
     };
@@ -1582,7 +1854,13 @@ async fn clear_coord_block(pg: &Arc<PgDb>, run_id: Uuid, subtask: &Subtask) {
         .set_subtask_gate(run_id, &subtask.task_id, subtask.gate_id.as_deref(), None)
         .await
     {
+        // The row keeps a coord block coord has just DISPROVED, which is worse
+        // than an unrecorded one: the stall reason would point the operator at
+        // coord while coord is answering.
         warn!("apply_tick: clear {stale} for {}: {e}", subtask.task_id);
+        outcome
+            .apply_failures
+            .push(format!("gate_persist:{}", subtask.task_id));
     }
 }
 
@@ -1739,21 +2017,34 @@ pub struct StallWatch {
 
 impl StallWatch {
     /// Observe one tick. Returns evidence once ANY single key has been stuck for
-    /// `window_secs` without interruption.
+    /// its own window without interruption: `coord_window_secs` for a key whose
+    /// ONLY reasons are coord blocks ([`StallFingerprint::coord_only_keys`]),
+    /// `window_secs` for every other key.
+    ///
+    /// Both windows run off the SAME continuity memory, so a row that is coord
+    /// blocked for a while and then stuck for a reason of its own does not get
+    /// a fresh window — only its deadline shortens.
     pub fn observe(
         &mut self,
         fingerprint: &StallFingerprint,
         now: i64,
         window_secs: i64,
+        coord_window_secs: i64,
     ) -> Option<StallEvidence> {
         let keys = fingerprint.keys();
+        let coord_only = fingerprint.coord_only_keys();
         // Drop anything no longer stuck — that row moved, so its window is over.
         self.seen_since.retain(|k, _| keys.contains(k));
         let mut fired: Vec<(String, i64)> = Vec::new();
-        for key in keys {
+        for key in &keys {
             let since = *self.seen_since.entry(key.clone()).or_insert(now);
             let stuck_for = now - since;
-            if stuck_for >= window_secs {
+            let window = if coord_only.contains(key) {
+                coord_window_secs
+            } else {
+                window_secs
+            };
+            if stuck_for >= window {
                 fired.push((key.clone(), stuck_for));
             }
         }
@@ -1793,11 +2084,24 @@ impl StallWatch {
 /// per-row marker cannot record (when the row write is what is failing, so is
 /// the marker), so it is carried in memory instead, and because the same failure
 /// recurs every tick the entry is stable and accumulates exactly like any other.
+/// It also REMOVES rows: a side effect that failed transiently
+/// ([`TickOutcome::transient_failures`]) takes the whole row out of the stuck
+/// set, `R:` entry included.
 ///
 /// A tick whose only "no progress" is legitimate waiting — a working worker, an
 /// open gate, a dependency that can still be satisfied, a saturated concurrency
-/// cap — contributes NO fingerprint entry at all, so a healthy run can never be
-/// written `stalled`.
+/// cap, a fleet fan-out bound that is momentarily full — contributes NO
+/// fingerprint entry at all, so a healthy run can never be written `stalled`.
+///
+/// One further refusal, the in-flight guard: a run is NOT ended on coord blocks
+/// ALONE while it still has live workers. A stall exit is terminal and the
+/// reconciler RETURNS, so it orphans every session the run spawned
+/// (`finish_run` touches no session); doing that to three healthy workers
+/// because a fourth row's gate poll cannot reach coord trades the whole run for
+/// a diagnosis. The guard cannot wedge: every `Working` row is bounded by
+/// [`OrchestrationRunConfig::working_silence_secs`], so the in-flight set drains
+/// on its own, and because the window keeps accumulating underneath the guard,
+/// the stall fires the moment it does.
 pub fn tick_exit(
     plan: &TickPlan,
     outcome: &TickOutcome,
@@ -1816,7 +2120,33 @@ pub fn tick_exit(
         let task_id = failure.split_once(':').map(|(_, t)| t).unwrap_or(failure);
         fingerprint.push(task_id.to_string(), format!("E:{failure}"));
     }
-    let evidence = watch.observe(&fingerprint, now, config.stall_after_secs)?;
+    // ...and a row whose only failure was transient is not stuck at all. The
+    // KEY goes, not just the `E:` entry: the row is `R:`-fingerprinted too (this
+    // tick decided to dispatch it), and leaving that behind would stall the run
+    // on exactly the condition the removal exists to forgive.
+    for tid in &outcome.transient_failures {
+        fingerprint.remove_key(tid);
+    }
+    let evidence = watch.observe(
+        &fingerprint,
+        now,
+        config.stall_after_secs,
+        config.coord_block_stall_after_secs,
+    )?;
+    if !plan.in_flight_workers.is_empty() {
+        let coord_only = fingerprint.coord_only_keys();
+        if evidence.stuck_keys.iter().all(|k| coord_only.contains(k)) {
+            warn!(
+                "conductor: holding the run OPEN despite {} — every stuck row is blocked on \
+                 coord and {} worker(s) are still live ({}). A coord block alone does not end a \
+                 run with work in flight; the window keeps running underneath.",
+                evidence,
+                plan.in_flight_workers.len(),
+                plan.in_flight_workers.join(",")
+            );
+            return None;
+        }
+    }
     Some(RunExit::stalled(evidence, &plan.blocked_on_coord))
 }
 
@@ -2227,12 +2557,35 @@ mod tests {
         }
     }
 
-    /// Records dispatch/reprompt calls; never spawns.
+    /// Records dispatch/reprompt calls; never spawns. Either side effect can be
+    /// scripted to FAIL, which is what drives `apply_tick` down the arms that
+    /// produce `apply_failures` / `transient_failures` — the arms every
+    /// hand-built `TickOutcome` in this module skips over.
     #[derive(Default)]
     struct FakeDispatcher {
         dispatched: StdMutex<Vec<String>>,
         reprompted: StdMutex<Vec<Uuid>>,
         next_trid: StdMutex<Vec<Uuid>>,
+        dispatch_err: StdMutex<Option<DispatchError>>,
+        reprompt_err: StdMutex<Option<String>>,
+    }
+    impl FakeDispatcher {
+        /// Every dispatch is ATTEMPTED and fails with `err`.
+        fn dispatch_failing(err: DispatchError) -> Self {
+            FakeDispatcher {
+                dispatch_err: StdMutex::new(Some(err)),
+                ..Default::default()
+            }
+        }
+        /// Every re-prompt is ATTEMPTED and fails — the live shape is a CLI
+        /// whose stdin write fails, which leaves the FSM at `Ready` because
+        /// `send_user_message` only transitions AFTER the write.
+        fn reprompt_failing(msg: &str) -> Self {
+            FakeDispatcher {
+                reprompt_err: StdMutex::new(Some(msg.to_string())),
+                ..Default::default()
+            }
+        }
     }
     #[async_trait]
     impl Dispatcher for FakeDispatcher {
@@ -2241,6 +2594,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(subtask.task_id.clone());
+            if let Some(e) = self.dispatch_err.lock().unwrap().clone() {
+                return Err(e);
+            }
             let trid = self
                 .next_trid
                 .lock()
@@ -2251,6 +2607,9 @@ mod tests {
         }
         async fn reprompt(&self, task_run_id: Uuid, _message: &str) -> Result<(), String> {
             self.reprompted.lock().unwrap().push(task_run_id);
+            if let Some(e) = self.reprompt_err.lock().unwrap().clone() {
+                return Err(e);
+            }
             Ok(())
         }
     }
@@ -2880,9 +3239,14 @@ mod tests {
     #[test]
     fn a_working_worker_and_a_dep_blocked_row_are_both_excluded() {
         // A Working, B Submitted-blocked-on-A: NOTHING is stuck. A live worker
-        // is legitimate waiting bounded by the §5 recovery deadlines, and B is
-        // waiting on A. An empty fingerprint is what stops the run being
-        // written `stalled` while a healthy worker works.
+        // is legitimate waiting, and B is waiting on A. An empty fingerprint is
+        // what stops the run being written `stalled` while a healthy worker
+        // works.
+        //
+        // What BOUNDS the live worker is the per-worker silence deadline
+        // (`working_silence_secs`), NOT the §5 recovery deadlines: those fire
+        // from `ReadyIdle`/`Gone` only, and a wedged CLI sits at `Processing`
+        // (→ `WorkerSignal::Working`) forever, which no §5 timer reaches.
         let trid = Uuid::new_v4();
         let mut a = mk("A", 0, &[], SubtaskState::Working);
         a.task_run_id = Some(trid);
@@ -3818,6 +4182,10 @@ mod tests {
     /// working, and a row the runner has no coord answer about — still exits
     /// `stalled`, with the reason naming the elapsed window, the fingerprint
     /// (including WHICH coord failure) and the blocked row.
+    ///
+    /// The row's only reason is a coord block, so it is timed on
+    /// `coord_block_stall_after_secs` rather than the row-sized window — the
+    /// run still stalls, it just is not ended by an ordinary coord blip.
     #[test]
     fn a_genuinely_stuck_run_is_written_stalled_with_reason() {
         let rows = vec![mk_gated(
@@ -3835,7 +4203,7 @@ mod tests {
 
         let mut exit = None;
         let mut fired_at = None;
-        for tick in 1..=200u32 {
+        for tick in 1..=500u32 {
             let now = tick as i64 * c.tick_interval_secs as i64;
             let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
             assert_eq!(
@@ -3853,9 +4221,9 @@ mod tests {
         let exit = exit.expect("a stuck run must eventually stall");
         let fired_at = fired_at.unwrap();
         assert!(
-            fired_at >= c.stall_after_secs,
-            "never before the window: fired at {fired_at}s, window {}s",
-            c.stall_after_secs
+            fired_at >= c.coord_block_stall_after_secs,
+            "never before the coord window: fired at {fired_at}s, window {}s",
+            c.coord_block_stall_after_secs
         );
         assert!(
             fired_at > c.report_timeout_secs.max(c.gone_grace_secs),
@@ -3893,7 +4261,7 @@ mod tests {
         let c = cfg();
 
         let mut fired_at = None;
-        for tick in 1..=200u32 {
+        for tick in 1..=500u32 {
             let now = tick as i64 * c.tick_interval_secs as i64;
             let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
             // The shape the old test built and then only half-checked.
@@ -3915,7 +4283,7 @@ mod tests {
             }
         }
         assert!(
-            fired_at.is_some_and(|f| f >= c.stall_after_secs),
+            fired_at.is_some_and(|f| f >= c.coord_block_stall_after_secs),
             "X must stall on its own clock however healthy Y is: {fired_at:?}"
         );
     }
@@ -4060,22 +4428,33 @@ mod tests {
     #[test]
     fn stall_watch_measures_each_row_continuously() {
         let window = 300;
+        // Both windows are set to the same value here on purpose: this test is
+        // about CONTINUITY, not about which class of reason gets which window
+        // (that is `a_coord_block_is_timed_on_the_coord_window`).
+        let coord = window;
         let mut w = StallWatch::default();
-        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 0, window), None, "first");
+        assert_eq!(
+            w.observe(&fp(&[("x", "C:x")]), 0, window, coord),
+            None,
+            "first"
+        );
         assert_eq!(w.watching(), vec!["x".to_string()]);
         assert_eq!(
-            w.observe(&fp(&[("x", "C:x")]), 299, window),
+            w.observe(&fp(&[("x", "C:x")]), 299, window, coord),
             None,
             "1 s short"
         );
         // x leaves the stuck set — it moved, so its window is over.
-        assert_eq!(w.observe(&StallFingerprint::default(), 300, window), None);
+        assert_eq!(
+            w.observe(&StallFingerprint::default(), 300, window, coord),
+            None
+        );
         assert!(w.watching().is_empty());
         // ...and re-entering starts a fresh window rather than inheriting one.
-        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 301, window), None);
-        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 599, window), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 301, window, coord), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 599, window, coord), None);
         let ev = w
-            .observe(&fp(&[("x", "C:x")]), 601, window)
+            .observe(&fp(&[("x", "C:x")]), 601, window, coord)
             .expect("300 s continuous");
         assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
         assert_eq!(ev.unchanged_for_secs, 300);
@@ -4091,6 +4470,9 @@ mod tests {
     #[test]
     fn an_oscillating_reason_does_not_defeat_the_window() {
         let window = 300;
+        // One window for both classes — the claim under test is that the KEY,
+        // not the reason string, is what continuity is measured on.
+        let coord = window;
         let mut w = StallWatch::default();
         let mut fired = None;
         for tick in 1..=200i64 {
@@ -4101,7 +4483,7 @@ mod tests {
             } else {
                 "C:coord_error:x"
             };
-            if let Some(ev) = w.observe(&fp(&[("x", token)]), now, window) {
+            if let Some(ev) = w.observe(&fp(&[("x", token)]), now, window, coord) {
                 assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
                 assert_eq!(ev.fingerprint, token, "the evidence carries WHICH failure");
                 fired = Some(now);
@@ -4120,6 +4502,7 @@ mod tests {
     #[test]
     fn one_rows_churn_does_not_reset_another_rows_window() {
         let window = 300;
+        let coord = window;
         let mut w = StallWatch::default();
         let mut fired = None;
         for tick in 1..=200i64 {
@@ -4133,6 +4516,7 @@ mod tests {
                 &fp(&[("stuck", "C:x:stuck"), (&churn, &entry)]),
                 now,
                 window,
+                coord,
             ) {
                 assert_eq!(ev.stuck_keys, vec!["stuck".to_string()]);
                 fired = Some(now);
@@ -4312,11 +4696,13 @@ mod tests {
             completed: vec!["b".to_string()],
             failed: vec![],
             apply_failures: vec!["dispatch:c".to_string()],
+            transient_failures: vec!["d".to_string()],
             done: false,
         };
         assert_eq!(
             o.summary(),
-            "dispatched=a completed=b did-not-land=dispatch:c"
+            "dispatched=a completed=b did-not-land=dispatch:c waiting-for-a-slot=d",
+            "a transient failure is REPORTED but is not a did-not-land"
         );
 
         // The failure becomes a stall-counted fingerprint entry KEYED ON THE
@@ -4326,7 +4712,11 @@ mod tests {
         let plan = TickPlan::default();
         let c = cfg();
         assert_eq!(tick_exit(&plan, &o, &mut watch, 0, &c), None);
-        assert_eq!(watch.watching(), vec!["c".to_string()]);
+        assert_eq!(
+            watch.watching(),
+            vec!["c".to_string()],
+            "only the did-not-land row is watched — `d` is waiting for a slot"
+        );
         let other = TickOutcome {
             apply_failures: vec!["complete:c".to_string()],
             ..Default::default()
@@ -4821,5 +5211,572 @@ mod tests {
                 &[&run_id],
             )
             .await;
+    }
+
+    // --- apply_tick's OWN outcome, driven by a failing dispatcher ----------
+    //
+    // Everything above that asserts on `apply_failures` hand-builds a
+    // `TickOutcome`, so deleting the `outcome.apply_failures.push(...)` lines
+    // in `apply_tick` left the suite green. These drive `apply_tick` itself.
+
+    /// Set up a one-row run in PG and return `(pg, run_id, rows)`.
+    async fn one_row_run(row: Subtask) -> (Arc<PgDb>, Uuid, Vec<Subtask>) {
+        let pg = PgDb::new_for_test().await;
+        let run_id = Uuid::new_v4();
+        pg.create_run(
+            run_id,
+            "apply-tick outcome",
+            None,
+            &["implement".to_string()],
+            "running",
+        )
+        .await
+        .expect("create_run");
+        let mut row = row;
+        row.run_id = run_id;
+        pg.upsert_subtask(&row).await.expect("upsert subtask");
+        let rows = pg.list_subtasks(run_id).await.expect("list");
+        (pg, run_id, rows)
+    }
+
+    async fn drop_run(pg: &Arc<PgDb>, run_id: Uuid) {
+        let conn = pg.pool().get().await.expect("conn");
+        let _ = conn
+            .execute(
+                "DELETE FROM orchestration.runs WHERE run_id = $1",
+                &[&run_id],
+            )
+            .await;
+    }
+
+    /// A dispatch that THROWS produces `apply_failures = ["dispatch:A"]` and an
+    /// empty `dispatched` — the claim the whole `TickOutcome` split rests on,
+    /// asserted against a real `apply_tick` rather than a hand-built outcome.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn apply_tick_records_a_thrown_dispatch_and_lands_nothing() {
+        let (pg, run_id, rows) = one_row_run(mk("A", 0, &[], SubtaskState::Submitted)).await;
+        let c = cfg();
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(plan.to_dispatch, vec!["A".to_string()], "A is ready");
+
+        let dispatcher =
+            FakeDispatcher::dispatch_failing(DispatchError::Failed(
+                "worktree acquisition failed".to_string(),
+            ));
+        let gate = FakeCoordGateClient::with_gate_id("g-1");
+        let outcome = apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .expect("apply_tick");
+
+        assert_eq!(
+            outcome.apply_failures,
+            vec!["dispatch:A".to_string()],
+            "a dispatch that threw is an ATTEMPTED side effect that did not land"
+        );
+        assert!(
+            outcome.dispatched.is_empty(),
+            "nothing landed: {:?}",
+            outcome.dispatched
+        );
+        assert!(outcome.transient_failures.is_empty(), "not transient");
+        assert_eq!(
+            *dispatcher.dispatched.lock().unwrap(),
+            vec!["A".to_string()],
+            "and it really was attempted"
+        );
+        let after = pg.list_subtasks(run_id).await.expect("list");
+        assert_eq!(
+            after[0].state,
+            SubtaskState::Submitted,
+            "the row did not move, so the next tick re-decides the same dispatch"
+        );
+
+        // The E: entry is what carries that into the stall reason.
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &outcome, &mut watch, 0, &c).is_none());
+        match tick_exit(&plan, &outcome, &mut watch, c.stall_after_secs, &c) {
+            Some(RunExit::Stalled { reason }) => assert!(
+                reason.contains("E:dispatch:A"),
+                "the stall reason names the failed side effect: {reason}"
+            ),
+            other => panic!("expected a stall, got {other:?}"),
+        }
+        drop_run(&pg, run_id).await;
+    }
+
+    /// A dispatch refused because the FLEET's fan-out bound is full is
+    /// TRANSIENT: no `apply_failures`, and `tick_exit` drops the row's KEY — the
+    /// `R:` this tick put there included — so the run never stalls on it however
+    /// long the gate stays busy. The opposite verdict is what
+    /// `ready_work_beyond_a_partially_admitting_cap_is_not_stuck` already gives
+    /// the run-wide cap; this pins that the fleet-wide bound reads the same.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn a_full_fanout_bound_is_transient_and_never_stalls_the_run() {
+        let (pg, run_id, rows) = one_row_run(mk("A", 0, &[], SubtaskState::Submitted)).await;
+        let c = cfg();
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(
+            plan.stall_fingerprint.keys(),
+            ["A".to_string()],
+            "the plan alone fingerprints the decided dispatch as R:A"
+        );
+
+        let dispatcher = FakeDispatcher::dispatch_failing(DispatchError::Transient(
+            "the parallel fan-out bound (15) was fully occupied".to_string(),
+        ));
+        let gate = FakeCoordGateClient::with_gate_id("g-1");
+        let outcome = apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .expect("apply_tick");
+
+        assert!(
+            outcome.apply_failures.is_empty(),
+            "a full bound is not a did-not-land: {:?}",
+            outcome.apply_failures
+        );
+        assert_eq!(outcome.transient_failures, vec!["A".to_string()]);
+        assert!(outcome.dispatched.is_empty());
+
+        let mut watch = StallWatch::default();
+        for tick in 0..200i64 {
+            assert!(
+                tick_exit(&plan, &outcome, &mut watch, tick * 5, &c).is_none(),
+                "tick {tick}: a row waiting for a fleet slot is waiting, not stuck"
+            );
+        }
+        assert!(
+            watch.watching().is_empty(),
+            "and the watch is not even tracking it: {:?}",
+            watch.watching()
+        );
+        drop_run(&pg, run_id).await;
+    }
+
+    /// A re-prompt that will not land is recorded. It is the one side effect
+    /// nothing else bounds: `reprompted_at` is inserted only on success, so the
+    /// §5 deadline that FAILS the row is never armed, the row is `Working` with a
+    /// `task_run_id` (excluded from the fingerprint) and `ReadyIdle` (so the
+    /// silence deadline was cleared). The plan alone can never end this run.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn a_reprompt_that_never_lands_is_recorded_and_bounded() {
+        let trid = Uuid::new_v4();
+        let mut row = mk("A", 0, &[], SubtaskState::Working);
+        row.task_run_id = Some(trid);
+        row.artifact = None;
+        let (pg, run_id, rows) = one_row_run(row).await;
+
+        let c = OrchestrationRunConfig {
+            // The worker has been Ready-without-artifact since the first tick.
+            report_timeout_secs: 0,
+            ..cfg()
+        };
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::ReadyIdle);
+        let signals = FakeSignals(sigs);
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &c, 0);
+        assert_eq!(plan.to_reprompt.len(), 1, "the §5 first deadline fired");
+        assert!(
+            plan.stall_fingerprint.is_empty(),
+            "and the PLAN says nothing is stuck — the row is Working with a task_run_id"
+        );
+
+        let dispatcher = FakeDispatcher::reprompt_failing("stdin write failed: broken pipe");
+        let gate = FakeCoordGateClient::with_gate_id("g-1");
+        let outcome = apply_tick(
+            &plan,
+            &rows,
+            run_id,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .expect("apply_tick");
+
+        assert_eq!(outcome.apply_failures, vec!["reprompt:A".to_string()]);
+        assert!(
+            timers.reprompted_at.is_empty(),
+            "the second §5 deadline is NOT armed, which is why this needs its own bound"
+        );
+        // ...and the reconciler really does re-decide it forever.
+        let plan2 = compute_tick(
+            &rows,
+            &signals,
+            &mut timers,
+            &c,
+            c.report_timeout_secs + 10_000,
+        );
+        assert_eq!(plan2.to_reprompt.len(), 1, "re-decided, identically");
+        assert!(plan2.to_fail.is_empty(), "and never failed on its own");
+
+        // Only the OUTCOME can end this run.
+        let mut plan_only = StallWatch::default();
+        assert!(
+            tick_exit(
+                &plan,
+                &TickOutcome::default(),
+                &mut plan_only,
+                c.stall_after_secs * 100,
+                &c
+            )
+            .is_none(),
+            "the plan alone never stalls a Working row"
+        );
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &outcome, &mut watch, 0, &c).is_none());
+        match tick_exit(&plan, &outcome, &mut watch, c.stall_after_secs, &c) {
+            Some(RunExit::Stalled { reason }) => assert!(
+                reason.contains("E:reprompt:A"),
+                "the stall reason names the re-prompt: {reason}"
+            ),
+            other => panic!("expected a stall, got {other:?}"),
+        }
+        drop_run(&pg, run_id).await;
+    }
+
+    /// A gate verdict that coord GAVE and PG would not store is recorded. The
+    /// register variant is the expensive one: the row stays ungated, so the next
+    /// tick registers a NEW coord gate — one leaked gate row per tick, with the
+    /// run reading `running` and nothing on the subtask to show for it.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn a_gate_verdict_that_will_not_persist_is_recorded() {
+        let (pg, run_id, rows) = one_row_run(mk_gated(
+            "test",
+            0,
+            &[],
+            "CI green on this repo",
+            None,
+            None,
+        ))
+        .await;
+        let c = cfg();
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(plan.to_register_gate, vec!["test".to_string()]);
+
+        // `set_subtask_gate` writes by (run_id, task_id); a run_id nothing was
+        // written under is the cheapest honest "the durable write will not
+        // land" — the same class as a PG refusal, and the reason the failure
+        // cannot be recorded on the row itself.
+        let missing_run = Uuid::new_v4();
+        let dispatcher = FakeDispatcher::default();
+        let gate = FakeCoordGateClient::with_gate_id("gate-abc");
+        let outcome = apply_tick(
+            &plan,
+            &rows,
+            missing_run,
+            &pg,
+            &dispatcher,
+            &gate,
+            &c,
+            &mut timers,
+        )
+        .await
+        .expect("apply_tick");
+
+        assert_eq!(
+            outcome.apply_failures,
+            vec!["gate_persist:test".to_string()],
+            "coord registered a gate the row will never carry"
+        );
+        assert_eq!(
+            *gate.registered.lock().unwrap(),
+            vec!["test".to_string()],
+            "and the gate really was registered at coord — this is the leak"
+        );
+        let after = pg.list_subtasks(run_id).await.expect("list");
+        assert!(
+            after[0].gate_id.is_none(),
+            "the row is still ungated, so the next tick registers ANOTHER gate"
+        );
+        drop_run(&pg, run_id).await;
+    }
+
+    // --- the coord-block window + the in-flight guard ----------------------
+
+    /// A row whose ONLY stuck reason is a coord block is timed on
+    /// `coord_block_stall_after_secs`, not the row-sized `stall_after_secs`.
+    /// Coord reachability is a runner-wide condition no row can influence, and
+    /// a few minutes of it is an ordinary event on this fleet.
+    #[test]
+    fn a_coord_block_is_timed_on_the_coord_window() {
+        let c = cfg();
+        let rows = vec![mk_gated(
+            "X",
+            0,
+            &[],
+            "CI green on this repo",
+            Some("gate-1"),
+            Some(GATE_STATUS_COORD_UNREACHABLE),
+        )];
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(plan.stall_fingerprint.keys(), ["X".to_string()]);
+        assert_eq!(
+            plan.stall_fingerprint.coord_only_keys(),
+            ["X".to_string()],
+            "its only reason is C:"
+        );
+        assert!(
+            plan.in_flight_workers.is_empty(),
+            "nothing is live, so the in-flight guard does not apply"
+        );
+
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &TickOutcome::default(), &mut watch, 0, &c).is_none());
+        assert!(
+            tick_exit(
+                &plan,
+                &TickOutcome::default(),
+                &mut watch,
+                c.stall_after_secs,
+                &c
+            )
+            .is_none(),
+            "the row-sized window must NOT end a run on a coord blip"
+        );
+        assert!(
+            tick_exit(
+                &plan,
+                &TickOutcome::default(),
+                &mut watch,
+                c.coord_block_stall_after_secs,
+                &c
+            )
+            .is_some(),
+            "but a coord outage still surfaces, on its own window"
+        );
+    }
+
+    /// ...unless the SAME row is also stuck for a reason of its own, in which
+    /// case the short window applies: the long one is for rows whose only
+    /// problem is that coord is not answering.
+    #[test]
+    fn a_coord_blocked_row_that_also_fails_a_write_gets_the_short_window() {
+        let c = cfg();
+        let rows = vec![mk_gated(
+            "X",
+            0,
+            &[],
+            "CI green on this repo",
+            Some("gate-1"),
+            Some(GATE_STATUS_COORD_ERROR),
+        )];
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        let outcome = TickOutcome {
+            apply_failures: vec!["gate_persist:X".to_string()],
+            ..Default::default()
+        };
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &outcome, &mut watch, 0, &c).is_none());
+        assert!(
+            tick_exit(&plan, &outcome, &mut watch, c.stall_after_secs, &c).is_some(),
+            "a row that also cannot be written is stuck on its own account"
+        );
+    }
+
+    /// A coord block does NOT end a run that still has live workers, however
+    /// long coord stays unreachable — a stall exit RETURNS from the reconciler
+    /// and orphans every session the run spawned. The window keeps accumulating
+    /// underneath the guard, so the stall fires the moment the last worker is
+    /// gone.
+    #[test]
+    fn a_coord_block_alone_does_not_end_a_run_with_live_workers() {
+        let c = cfg();
+        let trid = Uuid::new_v4();
+        let mut worker = mk("A", 0, &[], SubtaskState::Working);
+        worker.task_run_id = Some(trid);
+        let blocked = mk_gated(
+            "X",
+            1,
+            &[],
+            "CI green on this repo",
+            Some("gate-1"),
+            Some(GATE_STATUS_COORD_UNREACHABLE),
+        );
+        let rows = vec![worker.clone(), blocked.clone()];
+        // A busy mid-turn worker: `Working` with a moving output stamp, so the
+        // silence deadline never reaches it either.
+        let signals = FakeActivity::working(0);
+
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &c, 0);
+        assert_eq!(
+            plan.in_flight_workers,
+            vec!["A".to_string()],
+            "A is live and is not the blocked row"
+        );
+        assert_eq!(plan.stall_fingerprint.keys(), ["X".to_string()]);
+
+        let mut watch = StallWatch::default();
+        for now in [
+            0,
+            c.stall_after_secs,
+            c.coord_block_stall_after_secs,
+            c.coord_block_stall_after_secs * 4,
+        ] {
+            signals.emit(now);
+            assert!(
+                tick_exit(&plan, &TickOutcome::default(), &mut watch, now, &c).is_none(),
+                "now={now}: a coord block must not kill a run with a healthy worker in it"
+            );
+        }
+
+        // The worker finishes. Nothing is in flight, and the window that has
+        // been running underneath the guard fires immediately — no extra wait.
+        let rows_idle = vec![
+            {
+                let mut a = worker;
+                a.state = SubtaskState::Completed;
+                a.task_run_id = None;
+                a
+            },
+            blocked,
+        ];
+        let plan_idle = compute_tick(
+            &rows_idle,
+            &signals,
+            &mut timers,
+            &c,
+            c.coord_block_stall_after_secs * 4,
+        );
+        assert!(plan_idle.in_flight_workers.is_empty());
+        assert!(
+            tick_exit(
+                &plan_idle,
+                &TickOutcome::default(),
+                &mut watch,
+                c.coord_block_stall_after_secs * 4,
+                &c
+            )
+            .is_some(),
+            "and the moment the run has nothing live, the accumulated window fires"
+        );
+    }
+
+    /// A `Working` row that is ITSELF blocked on coord is not counted as live
+    /// work — otherwise a coord block would guard itself open forever. The live
+    /// shape is a DriftVerdict verify whose verdict read keeps failing.
+    #[test]
+    fn a_coord_blocked_working_row_does_not_count_as_live_work() {
+        let c = cfg();
+        let trid = Uuid::new_v4();
+        let mut verify = mk("V", 0, &[], SubtaskState::Working);
+        verify.task_run_id = Some(trid);
+        verify.gate_status = Some(GATE_STATUS_COORD_UNREACHABLE.to_string());
+        let rows = vec![verify];
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::Working);
+        let signals = FakeSignals(sigs);
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &signals, &mut timers, &c, 0);
+        assert!(
+            plan.in_flight_workers.is_empty(),
+            "the blocked row is the stuck row; it cannot vouch for itself"
+        );
+        let mut watch = StallWatch::default();
+        assert!(tick_exit(&plan, &TickOutcome::default(), &mut watch, 0, &c).is_none());
+        assert!(
+            tick_exit(
+                &plan,
+                &TickOutcome::default(),
+                &mut watch,
+                c.coord_block_stall_after_secs,
+                &c
+            )
+            .is_some(),
+            "so it still stalls on the coord window"
+        );
+    }
+
+    /// `run_orchestration` must call `tick_exit` AFTER `apply_tick` and feed it
+    /// the OUTCOME. The scenario separates the two orders: the row is `Working`
+    /// with a `task_run_id`, so the PLAN's fingerprint is EMPTY and a `tick_exit`
+    /// that ran first (or ignored the outcome) would loop at `running` forever.
+    /// Only the applied re-prompt failure can end this run.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn run_orchestration_decides_the_exit_from_the_applied_outcome() {
+        let trid = Uuid::new_v4();
+        let mut row = mk("A", 0, &[], SubtaskState::Working);
+        row.task_run_id = Some(trid);
+        row.artifact = None;
+        let (pg, run_id, _rows) = one_row_run(row).await;
+
+        let c = OrchestrationRunConfig {
+            tick_interval_secs: 1,
+            report_timeout_secs: 0,
+            stall_after_secs: 0,
+            ..cfg()
+        };
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::ReadyIdle);
+        let loop_state: SharedLoopState = Arc::new(tokio::sync::Mutex::new(
+            super::super::loop_engine::LoopState::new(),
+        ));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            run_orchestration(
+                loop_state.clone(),
+                run_id,
+                pg.clone(),
+                FakeDispatcher::reprompt_failing("stdin write failed: broken pipe"),
+                FakeSignals(sigs),
+                FakeCoordGateClient::with_gate_id("g-1"),
+                c,
+                stop_rx,
+            ),
+        )
+        .await
+        .expect("the run must END — a tick_exit that ignored the outcome would loop forever");
+
+        let run = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(run.status, "stalled");
+        let reason = run.status_reason.unwrap_or_default();
+        assert!(
+            reason.contains("E:reprompt:A"),
+            "the durable reason names the side effect that did not land: {reason}"
+        );
+        drop_run(&pg, run_id).await;
     }
 }

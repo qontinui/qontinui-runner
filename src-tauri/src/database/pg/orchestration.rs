@@ -111,10 +111,19 @@ impl PgDb {
     /// Update a run's `status` (e.g. `running` → `complete` / `failed` /
     /// `stalled` / `stopped`) together with the reason it left `running`
     /// (`status_reason`; `None` clears it — a `complete` run carries no reason).
-    /// This is the ONE writer of a run's terminal outcome: the conductor's
-    /// fatal, stall, DESIGN-failure and completion exits all land here, so the
-    /// row never says `running` for a run whose reconciler has exited.
     /// Returns `Err` if no row matched `run_id`.
+    ///
+    /// **UNCONDITIONAL — it overwrites whatever the row says, including a
+    /// terminal status another writer just wrote.** That is why the conductor
+    /// does NOT use it: its exits go through
+    /// [`Self::set_run_status_if_running`], which loses to whoever left
+    /// `running` first, because the reconciler and `stop_orchestration_run`
+    /// race one tick wide and an operator's `stopped` must not be clobbered by
+    /// a `stalled` decided before the Stop was pressed.
+    ///
+    /// Use this one only where the caller is the run's sole writer at that
+    /// moment — creating the row, or a path that has already established the
+    /// run is not being reconciled.
     pub async fn set_run_status(
         &self,
         run_id: Uuid,

@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 use crate::claude_session::manager::SessionManager;
 use crate::claude_session::state::SessionState;
+use crate::orchestration_loop::conductor::DispatchError;
 use crate::orchestration_loop::ledger::{Subtask, SubtaskState};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -204,15 +205,29 @@ fn report_endpoint_url(app_handle: &tauri::AppHandle) -> String {
 /// 6. Persist the `task_id ↔ task_run_id` binding and flip the subtask to
 ///    `Working`.
 ///
-/// On any hard failure before the session is live, the subtask is left in its
-/// prior state (caller may retry) and an `Err` is returned describing the
-/// failure point.
+/// On any hard failure the subtask is left in its prior state and an
+/// [`DispatchError`] is returned describing the failure point, so the caller
+/// may retry. **A failure AFTER the session is live tears that session down
+/// first** — closes the CLI, unregisters it from the `SessionManager`, closes
+/// its lifecycle record and its coord session — because steps 3 through 5
+/// spawn, register and bind a worker BEFORE step 6 binds it to the row. Without
+/// the teardown a step-6 failure returned `Err` with a fully live worker the
+/// ledger has no record of, and the conductor's 5 s retry against its 300 s
+/// stall window spawned roughly 60 orphaned CLI sessions (and took as many
+/// worktree acquisitions) before the run stalled. Re-dispatch is safe BECAUSE
+/// of the teardown, not despite it.
+///
+/// The error is TYPED, and the conductor reads the type rather than the text:
+/// [`DispatchError::Transient`] for a fan-out bound that is momentarily full and
+/// [`DispatchError::DeferredByDrain`] for a device coord has drained — in both
+/// the row is queued, not stuck, so the conductor must not count it toward a
+/// stall — and [`DispatchError::Failed`] for everything else.
 pub async fn dispatch_subtask(
     app_handle: &tauri::AppHandle,
     pg: &Arc<crate::database::pg::PgDb>,
     run_id: Uuid,
     subtask: &Subtask,
-) -> Result<Uuid, super::conductor::DispatchError> {
+) -> Result<Uuid, DispatchError> {
     let task_run_id = Uuid::new_v4();
     info!(
         "dispatch_subtask: run={} task_id={} -> task_run_id={} (repo={:?})",
@@ -319,21 +334,21 @@ pub async fn dispatch_subtask(
             // must never become a task failure while sequential progress is
             // still possible, so the subtask stays `Submitted` and a later tick
             // retries once a slot frees.
-            return Err(format!(
+            return Err(DispatchError::Transient(format!(
                 "dispatch_subtask: {} not dispatched — the parallel fan-out bound ({bound}) \
                  was fully occupied ({}ms). Transient: the subtask stays queued and a later \
                  tick retries.",
                 subtask.task_id,
                 waited.as_millis()
-            )
-            .into());
+            )));
         }
         crate::agent_authorization::FanoutAdmission::DeferredByDrain { reason } => {
             // TRANSIENT, like the bound above: coord has drained this device (or
             // its drain state is unknown). The subtask stays `Submitted` — the
             // work is deferred, never failed — and a later tick dispatches it
-            // once the drain lifts. Typed so the conductor logs it quietly.
-            return Err(super::conductor::DispatchError::DeferredByDrain(format!(
+            // once the drain lifts. Typed so the conductor logs it quietly and
+            // `tick_exit` drops the row's fingerprint key.
+            return Err(DispatchError::DeferredByDrain(format!(
                 "dispatch_subtask: {} not dispatched — {reason}. Transient: the subtask stays \
                  queued and a later tick retries.",
                 subtask.task_id
@@ -370,7 +385,9 @@ pub async fn dispatch_subtask(
     // we spawn a CLI we can't track.
     let session_mgr = app_handle
         .try_state::<Arc<SessionManager>>()
-        .ok_or_else(|| "dispatch_subtask: SessionManager state not available".to_string())?
+        .ok_or_else(|| {
+            DispatchError::Failed("dispatch_subtask: SessionManager state not available".to_string())
+        })?
         .inner()
         .clone();
     let registrar = app_handle
@@ -433,21 +450,31 @@ pub async fn dispatch_subtask(
             session.set_isolated_edit_ctx(ctx);
         }
 
-        session_mgr
-            .register(&trid, session.clone())
-            .map_err(|e| format!("dispatch_subtask: register session: {e}"))?;
+        // From here the CLI is LIVE. Every failure below tears it down before
+        // returning: a `?` here used to leave a running Claude process the
+        // ledger has no row for, which the conductor's retry then duplicated.
+        if let Err(e) = session_mgr.register(&trid, session.clone()) {
+            let _ = session.close();
+            return Err(format!(
+                "dispatch_subtask: register session: {e} (the spawned CLI was closed)"
+            ));
+        }
 
         // 5. Submit the brief + report contract as the worker's first message.
-        session
-            .send_user_message(&first_message)
-            .map_err(|e| format!("dispatch_subtask: send brief: {e}"))?;
+        if let Err(e) = session.send_user_message(&first_message) {
+            session_mgr.remove(&trid);
+            let _ = session.close();
+            return Err(format!(
+                "dispatch_subtask: send brief: {e} (the spawned CLI was closed and unregistered)"
+            ));
+        }
 
         Ok(())
     })
     .await
-    .map_err(|e| format!("dispatch_subtask: spawn join error: {e}"))?;
+    .map_err(|e| DispatchError::Failed(format!("dispatch_subtask: spawn join error: {e}")))?;
 
-    spawn_result?;
+    spawn_result.map_err(DispatchError::Failed)?;
 
     // 3b (Phase 5 carry-forward — VISIBLE GRID). Durably record the worker as
     // a terminal-session lifecycle row tagged with `page_id = run_id`, keyed by
@@ -541,9 +568,20 @@ pub async fn dispatch_subtask(
     let mut updated = subtask.clone();
     updated.task_run_id = Some(task_run_id);
     updated.state = SubtaskState::Working;
-    pg.upsert_subtask(&updated)
-        .await
-        .map_err(|e| format!("dispatch_subtask: persist task_run_id/Working: {e}"))?;
+    if let Err(e) = pg.upsert_subtask(&updated).await {
+        // The one step that makes a live worker RECONCILABLE, and the one that
+        // can fail with the worker already live. Leaving it up is not a
+        // recoverable state: the row stays `Submitted` with no `task_run_id`,
+        // so no later tick can ever find this session — it is not `in_flight`,
+        // no §5 deadline reaches it, and `worker_terminal_state` is never asked
+        // about it. It would hold a worktree claim and a CLI process until the
+        // runner exits, while the next tick spawns its replacement.
+        let torn = teardown_unbound_worker(app_handle, task_run_id);
+        return Err(DispatchError::Failed(format!(
+            "dispatch_subtask: persist task_run_id/Working: {e} — the live worker was torn \
+             down ({torn}), so a retry re-dispatches rather than duplicating it"
+        )));
+    }
 
     info!(
         "dispatch_subtask: worker live — run={} task_id={} task_run_id={}",
@@ -555,6 +593,51 @@ pub async fn dispatch_subtask(
     // returns above, or a panic) releases it the same way, via `Drop`.
     drop(fanout_slot);
     Ok(task_run_id)
+}
+
+/// Tear down a worker that is LIVE but never got bound to its subtask row —
+/// the only state in which a session exists that nothing will ever reconcile.
+///
+/// Closes it on every plane it was registered on, in the order that leaves no
+/// observer holding a stale "open": the `SessionManager` entry (so
+/// `worker_terminal_state` stops resolving it), the CLI itself (which also
+/// drops the isolated-edit context and releases its worktree claim), the
+/// durable lifecycle record the run's grid page reads, and the coord session
+/// binding. Every plane is best-effort and reported rather than propagated:
+/// this runs on a path that is ALREADY failing, and the caller's error is the
+/// one the operator needs to read.
+///
+/// Returns a short description of what it actually closed, for that error.
+fn teardown_unbound_worker(app_handle: &tauri::AppHandle, task_run_id: Uuid) -> String {
+    let trid = task_run_id.to_string();
+    let mut closed: Vec<&str> = Vec::new();
+
+    if let Some(mgr) = app_handle.try_state::<Arc<SessionManager>>() {
+        if let Some(session) = mgr.remove(&trid) {
+            closed.push("session");
+            if let Err(e) = session.close() {
+                warn!("teardown_unbound_worker: close {trid}: {e}");
+            }
+        }
+    }
+    if let Some(store) = app_handle
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    {
+        store.record_close(&trid, "orchestration dispatch could not bind the worker");
+        closed.push("lifecycle record");
+    }
+    if let Some(registrar) =
+        app_handle.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+    {
+        registrar.close_session(&trid);
+        closed.push("coord session");
+    }
+
+    if closed.is_empty() {
+        "nothing was registered yet".to_string()
+    } else {
+        format!("closed: {}", closed.join(", "))
+    }
 }
 
 #[cfg(test)]
