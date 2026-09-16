@@ -4,7 +4,7 @@
  * The runner's vitest config uses `environment: "node"` (no jsdom) and
  * doesn't bundle React Testing Library (see
  * `WebIntegrationAuthBanner.test.ts` and
- * `CompletionReportSections.test.tsx` precedents). Rather than render
+ * `FileActivityPanel.test.tsx` precedents). Rather than render
  * the hook through a `renderHook` harness, these tests:
  *
  *   1. Mock `@tauri-apps/api/event` and `@tauri-apps/api/core` so we
