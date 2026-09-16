@@ -96,8 +96,14 @@ pub enum AcquireOutcome {
 pub enum HeartbeatOutcome {
     /// Still ours; TTL extended.
     Ok,
-    /// The key vanished (TTL expired) or was taken — we do NOT hold this slot.
+    /// Another owner holds this slot now — coord returned a current holder.
     Stolen,
+    /// Nothing holds this slot: the grant EXPIRED, or was never taken. Coord
+    /// answers this separately from `Stolen` so a lapse is not read as a theft
+    /// (plan `2026-09-15-coord-claims-heartbeat-answers-an-expired-claim-as-stolen-with-no-holder`).
+    /// Like `Stolen` it means we do NOT hold the slot — unlike `Stolen` it
+    /// asserts no rival.
+    NotHeld,
     /// Transport error. Says nothing about ownership.
     Unavailable(String),
 }
@@ -171,7 +177,9 @@ pub fn spawn_permitted(outcome: &AcquireOutcome) -> bool {
 /// Fold a heartbeat outcome into "do we still believe we hold this lease?".
 ///
 /// The asymmetry is deliberate:
-/// * `Stolen` is COORD'S AUTHORITATIVE ANSWER that we do not hold it → drop it.
+/// * `Stolen` and `NotHeld` are both COORD'S AUTHORITATIVE ANSWER that we do
+///   not hold it → drop it. They differ only in whether a rival exists, which
+///   matters for the operator-facing message, never for this predicate.
 /// * `Unavailable` is OUR failure to ask → keep believing we hold it. Dropping
 ///   on a transport blip would make every runner release its slot during a coord
 ///   hiccup and then all race to re-acquire — self-inflicted churn. If coord is
@@ -181,6 +189,7 @@ pub fn still_held_after_heartbeat(outcome: &HeartbeatOutcome) -> bool {
     match outcome {
         HeartbeatOutcome::Ok => true,
         HeartbeatOutcome::Stolen => false,
+        HeartbeatOutcome::NotHeld => false,
         HeartbeatOutcome::Unavailable(_) => true,
     }
 }
@@ -202,6 +211,12 @@ pub fn parse_heartbeat_result(result: &str) -> HeartbeatOutcome {
     match result {
         "ok" => HeartbeatOutcome::Ok,
         "stolen" => HeartbeatOutcome::Stolen,
+        // An expired or absent claim. coord spelled this `stolen` with a null
+        // holder until the plan above; an unmapped word here would fall to
+        // `Unavailable`, which `still_held_after_heartbeat` reads as STILL
+        // HELD — so a lapse would leave this supervisor running on a slot a
+        // peer can take. That is the regression this arm exists to prevent.
+        "not_held" => HeartbeatOutcome::NotHeld,
         other => HeartbeatOutcome::Unavailable(format!("unexpected heartbeat result `{other}`")),
     }
 }
@@ -336,6 +351,28 @@ mod tests {
         assert!(
             still_held_after_heartbeat(&HeartbeatOutcome::Unavailable("timeout".into())),
             "a transport blip must not make every runner drop and re-race its slot"
+        );
+    }
+
+    /// An EXPIRED claim drops the lease exactly as a stolen one does, and is
+    /// parsed as its own verdict rather than falling through to `Unavailable`.
+    ///
+    /// The second assertion is the load-bearing one: `Unavailable` reads as
+    /// STILL HELD, so an unmapped `not_held` would leave this supervisor
+    /// believing it owns a slot coord has just said nobody owns — and a peer
+    /// acquiring the same slot then runs a second agent on it. A mutation
+    /// deleting the `"not_held"` arm turns this red.
+    #[test]
+    fn heartbeat_not_held_drops_the_lease_and_is_not_an_unavailable() {
+        assert_eq!(parse_heartbeat_result("not_held"), HeartbeatOutcome::NotHeld);
+        assert!(
+            !still_held_after_heartbeat(&parse_heartbeat_result("not_held")),
+            "an expired claim is not held, however politely coord says so"
+        );
+        assert_ne!(
+            parse_heartbeat_result("not_held"),
+            HeartbeatOutcome::Stolen,
+            "an expiry must stay distinguishable from a theft on the wire"
         );
     }
 
