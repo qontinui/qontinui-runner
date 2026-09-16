@@ -1011,7 +1011,15 @@ mod script_tests {
             .env("QONTINUI_RUNNER_TERMINAL", "1")
             .envs(envs.iter().copied());
         let out_res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("bash runs inside its budget");
-        assert!(out_res.status.success());
+        // `output_with_timeout` PIPES stderr, where `.status()` inherited it — so
+        // the script's own diagnosis reaches the failing assertion only if we
+        // carry it here. Without this a broken wrapper reports `assertion failed`
+        // and nothing else.
+        assert!(
+            out_res.status.success(),
+            "wrapper script failed: {}",
+            String::from_utf8_lossy(&out_res.stderr)
+        );
         std::fs::read_to_string(out).expect("the fake claude ran")
     }
 
@@ -1349,7 +1357,13 @@ mod script_tests {
             .env("QONTINUI_POLICY_DELIVERED_FILE", delivered_file);
         let shim_out =
             output_with_timeout(cmd, SCRIPT_BUDGET).expect("the shim runs inside its budget");
-        assert!(shim_out.status.success());
+        // Same reason as `run_wrapper`: stderr is piped now, so surface it in the
+        // assertion rather than discarding the shim's own error text.
+        assert!(
+            shim_out.status.success(),
+            "identity shim failed: {}",
+            String::from_utf8_lossy(&shim_out.stderr)
+        );
         std::fs::read_to_string(out).expect("the real claude ran")
     }
 
