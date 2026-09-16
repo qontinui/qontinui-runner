@@ -22,7 +22,7 @@
 //! - **NO dedup / cooldown** beyond the mark-delivered round-trip — a
 //!   double-inject window exists before the ack lands.
 //! - It bypassed the in-process injection primitive
-//!   (`coordinator::act::send_message_to_worker`), which prefers the SDK queue
+//!   (`claude_session::worker_message::send_message_to_worker`), which prefers the SDK queue
 //!   (safe by construction when `state == Processing`).
 //!
 //! To avoid TWO executors racing the same mailbox (double injection), the old
@@ -1053,7 +1053,12 @@ async fn deliver_once(
         // 3. Inject via the in-process primitive (reuses the SDK queue / PTY
         // submit dispatch — no second injection primitive).
         let framed = frame_message(msg);
-        crate::coordinator::act::send_message_to_worker(api_state, &task_run_id, &framed).await;
+        crate::claude_session::worker_message::send_message_to_worker(
+            api_state,
+            &task_run_id,
+            &framed,
+        )
+        .await;
 
         // 4. Mark delivered. Record locally FIRST (cooldown + delivered-set)
         // so even if the ack POST fails we won't re-inject within the TTL.

@@ -527,7 +527,7 @@ fn auto_register_file(
             // session editing the same path later sees both rows.
             let _ = app_state
                 .touch_events_tx
-                .send(crate::coordinator::deconflicter::TouchEvent {
+                .send(crate::deconflict::TouchEvent {
                     task_run_id: task_run_id.clone(),
                     file_path: file_path.clone(),
                 });

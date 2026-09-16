@@ -96,6 +96,7 @@ mod crash_observability;
 mod credential_helper;
 mod database;
 mod debug_lifecycle;
+mod deconflict;
 mod demo_workflows;
 mod dev_services;
 mod dirty_poller;
@@ -2036,7 +2037,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // because the deconflicter is a soft advisor (missed touches degrade
     // gracefully: the next touch on the same path re-triggers).
     let (touch_events_tx, touch_events_rx) =
-        tokio::sync::broadcast::channel::<crate::coordinator::deconflicter::TouchEvent>(256);
+        tokio::sync::broadcast::channel::<crate::deconflict::TouchEvent>(256);
 
     // Create run recording handler for automatic workflow execution recording
     let run_recording_handler = Arc::new(RunRecordingHandler::new());
@@ -2904,7 +2905,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::get_fleet_health,
             prompt_library::list_prompt_templates,
             commands::productivity::get_coord_http_base,
-            commands::productivity::get_coord_mode,
+            commands::coord_mode::get_coord_mode,
             commands::productivity::spawn_from_plan,
             commands::productivity::get_plan_recommendations,
             commands::productivity::get_plan_tasks,
@@ -2920,9 +2921,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::productivity::list_workers,
             commands::productivity::preview_assignment_brief,
             commands::productivity::reject_recommendation,
-            commands::productivity::resolve_escalation,
+            commands::deconflict::resolve_escalation,
             commands::productivity::rewind_session,
-            commands::productivity::search_knowledge,
+            commands::knowledge::search_knowledge,
             commands::productivity::spawn_worker_session,
             commands::productivity::stop_coordinator_session,
             commands::productivity::submit_task_completion_report,
@@ -5608,7 +5609,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             info!("Starting Rust deconflicter loop");
             let deconflicter_pg = app.state::<Arc<AppState>>().inner().pg_db.clone();
             let deconflicter_app_handle = app.handle().clone();
-            crate::coordinator::deconflicter::DeconflicterLoop::start(
+            crate::deconflict::DeconflicterLoop::start(
                 deconflicter_pg,
                 deconflicter_app_handle,
                 touch_events_rx,

@@ -92,7 +92,7 @@ import { CommandPalette } from "./components/unified-search/CommandPalette";
 import {
   KnowledgeBrowser,
   useKnowledgeBrowserHotkey,
-} from "./components/productivity/KnowledgeBrowser";
+} from "./components/knowledge/KnowledgeBrowser";
 import { PromptExecutionProvider } from "./components/prompt-home/PromptExecutionContext";
 import { PromptAutomationOverlay } from "./components/prompt-home/PromptAutomationOverlay";
 import { BackgroundTaskPill } from "./components/prompt-home/BackgroundTaskPill";

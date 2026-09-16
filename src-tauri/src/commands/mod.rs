@@ -174,12 +174,14 @@ pub mod compartments; // Workstream C: scoped wrappers around Arc<AppState> for 
 pub mod config;
 pub mod container_settings;
 pub mod context;
+pub mod coord_mode; // get_coord_mode — the connected/isolated coord mode the frontend CoordModeContext reads
 pub mod cost_budget_settings; // get/save settings.cost_budget (per-run AI cost cap)
 pub mod cost_dashboard; // Cost dashboard with cache efficiency and phase breakdowns
 pub mod dag_workflows; // DAG workflow import, export, and validation
 pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
+pub mod deconflict; // resolve_escalation — the deconflict advisory banner's dismiss path
 pub mod dev_findings; // Dev-only: seed synthetic findings into the frontend tracker
 pub mod devenv_enroll; // Phase 2 — in-app devenv enrollment (no terminal); wraps env_agent::enroll
 pub mod discoveries;
@@ -199,6 +201,7 @@ pub mod hooks;
 pub mod instances; // Runner instance management (dev feature)
 pub mod interaction;
 pub mod issues;
+pub mod knowledge; // search_knowledge — the Ctrl+Shift+E knowledge browser
 pub mod known_issues; // Known issues registry CRUD
 pub mod learning; // Learning insights dashboard commands
 pub mod library_sync; // Sync library items (checks, macros, etc.) to web backend
@@ -349,7 +352,7 @@ pub struct AppState {
     /// receiver is fine — the deconflicter is a soft advisor and missed
     /// touches degrade gracefully (the next touch on the same path
     /// re-triggers).
-    pub touch_events_tx: broadcast::Sender<crate::coordinator::deconflicter::TouchEvent>,
+    pub touch_events_tx: broadcast::Sender<crate::deconflict::TouchEvent>,
     /// Tracks consecutive UI Bridge failures per URL.
     /// After 3+ consecutive failures to the same URL, triggers an AI diagnostic.
     pub ui_bridge_failure_tracker: UiBridgeFailureTracker,
@@ -647,4 +650,17 @@ pub struct CommandResponse {
     pub success: bool,
     pub message: Option<String>,
     pub data: Option<serde_json::Value>,
+}
+
+/// Resolve the managed `AppState`, or a stable error string when a command
+/// fires before `setup` has installed it.
+pub(crate) fn require_app_state(app_handle: &tauri::AppHandle) -> Result<Arc<AppState>, String> {
+    use tauri::Manager as _;
+    match app_handle.try_state::<Arc<AppState>>() {
+        Some(s) => Ok(s.inner().clone()),
+        None => {
+            tracing::warn!("command: AppState not yet available");
+            Err("Application state is not yet initialised".to_string())
+        }
+    }
 }

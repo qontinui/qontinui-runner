@@ -17,7 +17,7 @@ import { useEffect, useState } from "react";
 import { ClipboardList, Bot, BookOpen } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { PlanTaskBoard } from "./PlanTaskBoard";
-import { KnowledgeBrowser } from "./KnowledgeBrowser";
+import { KnowledgeBrowser } from "@/components/knowledge/KnowledgeBrowser";
 import { CoordinatorDashboard } from "./CoordinatorDashboard";
 import type { ProductivityView } from "./types";
 
