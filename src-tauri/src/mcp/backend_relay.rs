@@ -3861,21 +3861,6 @@ fn register_remote_created_session(
     }
 }
 
-/// The spawn tenant a relayed `terminal_create` frame is spawned for: always
-/// `None`, whatever the frame carries.
-///
-/// This frame comes over the relay from another machine, and every spawn
-/// parameter it may carry is either answered by a device-owned grant or resolved
-/// through a device-owned allowlist (see `resolve_relay_create`). Neither names
-/// a tenant, so reading one off the frame would let the remote party choose
-/// which of this device's tenant credentials a session is issued — a capability
-/// no grant confers (plan
-/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`). The
-/// session keeps the machine default until a grant can carry a tenant.
-fn relay_spawn_tenant(_frame: &Value) -> Option<uuid::Uuid> {
-    None
-}
-
 async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     // D2 — the TARGET chooses. A frame with no `remote` block is the
     // operator-web / mobile path and keeps its caller-chosen `working_dir`;
@@ -4097,7 +4082,16 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 title.as_deref().unwrap_or("Terminal edit session"),
                 working_dir,
                 agent_session_id,
-                relay_spawn_tenant(data),
+                // No spawn tenant, whatever the frame carries. It came over the
+                // relay from another machine, and every spawn parameter it may
+                // carry is answered by a device-owned grant or resolved through a
+                // device-owned allowlist (`resolve_relay_create`, whose
+                // `RelayCreate` has no tenant field to carry one). Neither names a
+                // tenant, so reading one off the frame would let the remote party
+                // choose which of this device's tenant credentials a session is
+                // issued — a capability no grant confers (plan
+                // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential).
+                None,
             )
             .await;
 
@@ -4133,7 +4127,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // The account is chosen after this point (a shell the relay
             // types into), so the every-account mint applies.
             crate::terminal::TrustArm::AccountChosenLater,
-            relay_spawn_tenant(data),
+            // No spawn tenant — see the allocate above.
+            None,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {
@@ -4718,19 +4713,6 @@ mod tests {
     //! shape so a tungstenite bump can't silently break it.
 
     use super::*;
-
-    /// N4 (review of plan 2026-09-10). A relayed `terminal_create` frame that
-    /// carries a tenant still spawns for none: no grant names a tenant, so the
-    /// remote party cannot pick which of this device's credentials a session gets.
-    #[test]
-    fn a_relayed_terminal_create_frame_never_chooses_the_spawn_tenant() {
-        let frame = serde_json::json!({
-            "title": "t",
-            "tenantId": "b2b20000-0000-4000-8000-0000000000b2",
-            "tenant_id": "b2b20000-0000-4000-8000-0000000000b2",
-        });
-        assert_eq!(relay_spawn_tenant(&frame), None);
-    }
     use crate::test_env::{env_lock, EnvVarRestore};
     use tokio_tungstenite::tungstenite::{
         http::{self, Response, StatusCode},

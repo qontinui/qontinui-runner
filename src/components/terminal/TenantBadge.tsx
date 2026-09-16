@@ -91,8 +91,8 @@ export function tenantBadgeLabel(
       `TENANT MISMATCH — this session does not act as one tenant.`,
       `Spawned for: ${
         stamped ??
-        (tenancy.row.deviceDefaultTenantId
-          ? `no choice (device default ${tenancy.row.deviceDefaultTenantId})`
+        (tenancy.row.spawnDeviceDefaultTenantId
+          ? `no choice (device default at spawn: ${tenancy.row.spawnDeviceDefaultTenantId})`
           : "not recorded")
       }`,
       `Runner writes: ${tenancy.dataPlane.tenantId ?? tenancy.dataPlane.status}`,

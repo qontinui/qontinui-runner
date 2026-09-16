@@ -35,6 +35,8 @@ import {
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
   normalizeTenancy,
+  LOADING_STATE,
+  sessionInfoSnapshot,
   sessionInfoSubscriptionCount,
   subscribeSessionInfo,
   prGithubUrl,
@@ -967,6 +969,35 @@ describe("shared session-info poll", () => {
       expect(sessionInfoSubscriptionCount()).toBe(0);
       await vi.advanceTimersByTimeAsync(120_000);
       expect(invokeMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("shared session-info poll — a zone switched to another session", () => {
+  it("reads LOADING for the new session and releases the old session's poll", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockClear();
+      invokeMock.mockResolvedValueOnce({ available: false, reason: "session_not_found" });
+      const releaseA = subscribeSessionInfo("sid-A", 60_000, () => {});
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sessionInfoSnapshot("sid-A").status).toBe("unavailable");
+
+      // The zone now shows session B: the hook subscribes B, then releases A.
+      const releaseB = subscribeSessionInfo("sid-B", 60_000, () => {});
+      expect(sessionInfoSnapshot("sid-B")).toBe(LOADING_STATE);
+      releaseA();
+      expect(sessionInfoSubscriptionCount()).toBe(1);
+      expect(sessionInfoSnapshot("sid-A")).toBe(LOADING_STATE);
+
+      invokeMock.mockClear();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(invokeMock).toHaveBeenCalledTimes(1);
+      expect(invokeMock).toHaveBeenCalledWith("session_info_get", { claudeSessionId: "sid-B" });
+      releaseB();
+      expect(sessionInfoSubscriptionCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }

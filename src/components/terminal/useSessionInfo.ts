@@ -160,10 +160,13 @@ export interface SessionTenancy {
    * default) — NOT "no tenant". */
   row: {
     tenantId: string | null;
-    /** The machine's current default tenant for new sessions — the expected
-     * tenant of a spawn that chose none, compared only when nothing else names
-     * one. */
-    deviceDefaultTenantId: string | null;
+    /** The machine's default tenant as read when this session was SPAWNED —
+     * the expected tenant of a spawn that chose none, compared only when nothing
+     * else names one. `null` when the runner did not record the spawn. */
+    spawnDeviceDefaultTenantId: string | null;
+    /** The machine's CURRENT default tenant — context only, never compared (a
+     * switch re-points future sessions only). */
+    currentDeviceDefaultTenantId: string | null;
   };
   dataPlane: {
     /** `"owned"` | `"device"` | `"unresolved"` | `"unknown"`. */
@@ -823,7 +826,11 @@ function normalizePrs(raw: unknown): SessionPrs {
 export function normalizeTenancy(raw: unknown): SessionTenancy | null {
   if (!raw || typeof raw !== "object") return null;
   const v = raw as {
-    row?: { tenantId?: unknown; deviceDefaultTenantId?: unknown };
+    row?: {
+      tenantId?: unknown;
+      spawnDeviceDefaultTenantId?: unknown;
+      currentDeviceDefaultTenantId?: unknown;
+    };
     dataPlane?: { status?: unknown; tenantId?: unknown; reason?: unknown };
     credential?: {
       status?: unknown;
@@ -843,7 +850,8 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
   return {
     row: {
       tenantId: str(v.row.tenantId),
-      deviceDefaultTenantId: str(v.row.deviceDefaultTenantId),
+      spawnDeviceDefaultTenantId: str(v.row.spawnDeviceDefaultTenantId),
+      currentDeviceDefaultTenantId: str(v.row.currentDeviceDefaultTenantId),
     },
     dataPlane: {
       status: dataPlaneStatus,
@@ -956,6 +964,11 @@ async function fetchSessionInfo(sid: string): Promise<void> {
   entry.listeners.forEach((notify) => notify());
 }
 
+/**
+ * Join (or start) the shared poll for `sid`. The poll interval is fixed by the
+ * FIRST subscriber: later subscribers with a different `pollMs` share the
+ * running timer rather than restarting it.
+ */
 function subscribeSessionInfo(sid: string, pollMs: number, notify: () => void): () => void {
   const entry = sessionInfoEntry(sid);
   entry.listeners.add(notify);
@@ -967,9 +980,21 @@ function subscribeSessionInfo(sid: string, pollMs: number, notify: () => void): 
     entry.listeners.delete(notify);
     if (entry.listeners.size === 0) {
       if (entry.timer !== null) clearInterval(entry.timer);
-      sessionInfoEntries.delete(sid);
+      entry.timer = null;
+      // Only remove the map slot if it is still THIS entry — a fresh
+      // subscriber may already have replaced it.
+      if (sessionInfoEntries.get(sid) === entry) sessionInfoEntries.delete(sid);
     }
   };
+}
+
+/**
+ * The state a consumer of `sid` renders: the shared entry's, or LOADING when
+ * there is no session id or no entry yet — so a zone switched to another
+ * session never shows the previous session's identity. Pure over the store.
+ */
+export function sessionInfoSnapshot(sid: string | undefined): SessionInfoState {
+  return sid ? (sessionInfoEntries.get(sid)?.state ?? LOADING_STATE) : LOADING_STATE;
 }
 
 /** Test seam: how many live shared entries exist (one per polled session). */
@@ -999,13 +1024,7 @@ export function useSessionInfo(
       claudeSessionId ? subscribeSessionInfo(claudeSessionId, pollMs, notify) : () => {},
     [claudeSessionId, pollMs],
   );
-  const getSnapshot = useCallback(
-    () =>
-      claudeSessionId
-        ? (sessionInfoEntries.get(claudeSessionId)?.state ?? LOADING_STATE)
-        : LOADING_STATE,
-    [claudeSessionId],
-  );
+  const getSnapshot = useCallback(() => sessionInfoSnapshot(claudeSessionId), [claudeSessionId]);
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
   const refresh = useCallback(() => {
     if (claudeSessionId) void fetchSessionInfo(claudeSessionId);

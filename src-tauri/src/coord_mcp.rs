@@ -6199,18 +6199,8 @@ fn reusable_in_cwd_device_nonce(
     bound_port: u16,
     session_tenant: Option<Uuid>,
 ) -> Option<ReusableInCwdNonce> {
-    if read_proxy_port(workdir)? != bound_port {
-        return None;
-    }
+    let (nonce, binding) = live_cwd_device_binding(workdir, bound_port)?;
     let path = Path::new(workdir).join(".mcp.json");
-    let nonce = read_proxy_nonce(&path)?;
-    let binding = live_binding(&nonce)?;
-    if binding.principal != ProxyPrincipal::Device || binding.lifetime.is_ephemeral() {
-        return None;
-    }
-    if binding.workdir != normalize_binding_workdir(workdir) {
-        return None;
-    }
     {
         use crate::session::tenant_pin::TenantPin;
         let admissible = match (session_tenant, binding.session_pin) {
@@ -6229,6 +6219,48 @@ fn reusable_in_cwd_device_nonce(
         terminal_id: binding.terminal_id,
         needs_header_upgrade: !read_static_authorization_presence(&path),
     })
+}
+
+/// The key in `<workdir>/.mcp.json`, IF it is one a session in that cwd can
+/// actually present right now: our proxy shape on `bound_port`, a LIVE binding
+/// ([`live_binding`] — deliberately not [`proxy_nonce_is_valid`], which also
+/// accepts a GRACED key that dies at the end of its window), of the PERSISTENT
+/// DEVICE class, bound to THIS workdir.
+///
+/// The one definition of "a usable cwd key", shared by the in-cwd reuse
+/// ([`reusable_in_cwd_device_nonce`]), the seam's cwd-declared admission
+/// ([`declared_workdir_key`]) and the resident-key guard in
+/// [`provision_coord_mcp_with_jwt`], so the three can never disagree about which
+/// key a cwd holds.
+fn live_cwd_device_binding(workdir: &str, bound_port: u16) -> Option<(String, NonceBinding)> {
+    if read_proxy_port(workdir)? != bound_port {
+        return None;
+    }
+    let nonce = read_proxy_nonce(&Path::new(workdir).join(".mcp.json"))?;
+    let binding = live_binding(&nonce)?;
+    if binding.principal != ProxyPrincipal::Device || binding.lifetime.is_ephemeral() {
+        return None;
+    }
+    if binding.workdir != normalize_binding_workdir(workdir) {
+        return None;
+    }
+    Some((nonce, binding))
+}
+
+/// The tenant a usable cwd key is pinned to, when that tenant is NOT the one
+/// this machine would mint for a spawn that chose none — i.e. the cwd belongs
+/// to another tenant's session (a tenant-B worktree on an A machine).
+fn cwd_key_pinned_away_from_machine(workdir: &str, bound_port: u16) -> Option<Uuid> {
+    use crate::session::tenant_pin::TenantPin;
+    let (_, binding) = live_cwd_device_binding(workdir, bound_port)?;
+    match binding.session_pin {
+        TenantPin::Pinned(t)
+            if crate::session::tenant_pin::resolve_tenant_pin() != TenantPin::Pinned(t) =>
+        {
+            Some(t)
+        }
+        _ => None,
+    }
 }
 
 /// Write the DEVICE-path `.mcp.json`: an `http`-transport server pointing at
@@ -7912,7 +7944,27 @@ fn provision_coord_mcp_with_jwt(
                     ],
                 );
             }
-            None => write_coord_mcp_proxy_config(workdir, port, session_tenant),
+            None => {
+                // A spawn that chose NO tenant must not clobber a cwd whose live
+                // key belongs to ANOTHER tenant's session (plan 2026-09-10 review
+                // C1). Minting here would evict that key into grace and rewrite
+                // the file with a machine-pinned one: the resident session loses
+                // coord-mcp, and every later spawn or restore for that tenant into
+                // its own worktree is refused. Write nothing — the identity seam
+                // admits this session on the resident key (and warns), and the
+                // session-info report names the divergence.
+                if session_tenant.is_none() {
+                    if let Some(resident) = cwd_key_pinned_away_from_machine(workdir, port) {
+                        warn!(
+                            "coord_mcp: {workdir}/.mcp.json holds a live key pinned to tenant \
+                             {resident}, not this machine's tenant — a tenant-less provision \
+                             leaves it in place (no mint, no eviction)"
+                        );
+                        return CoordMcpDelivery::WorkdirDeclared;
+                    }
+                }
+                write_coord_mcp_proxy_config(workdir, port, session_tenant)
+            }
         }
         // Phase 3b — the config is FINE and the runner's own credential may not
         // be. Written SYNCHRONOUSLY, before the probe below, so the artifact
@@ -8847,16 +8899,43 @@ fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
 /// `.mcp.json` — reading the cwd file for a terminal the seam provisioned would
 /// describe a key that session never presents. One small entry per spawned
 /// terminal for the life of the process.
-fn terminal_coord_mcp_deliveries() -> &'static Mutex<HashMap<String, CoordMcpDelivery>> {
-    static DELIVERIES: OnceLock<Mutex<HashMap<String, CoordMcpDelivery>>> = OnceLock::new();
+fn terminal_coord_mcp_deliveries() -> &'static Mutex<HashMap<String, TerminalDeliveryRecord>> {
+    static DELIVERIES: OnceLock<Mutex<HashMap<String, TerminalDeliveryRecord>>> = OnceLock::new();
     DELIVERIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// What the seam recorded for one terminal at spawn.
+#[derive(Debug, Clone, Copy)]
+struct TerminalDeliveryRecord {
+    delivery: CoordMcpDelivery,
+    /// The machine's default tenant for new sessions AS READ AT SPAWN — the
+    /// tenant a spawn that chose none was spawned under, frozen the same way its
+    /// minted key's pin is. Switching the active tenant later re-points future
+    /// sessions only, so this, not the live default, is what such a session is
+    /// compared against.
+    spawn_default_tenant: Option<Uuid>,
+}
+
 fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDelivery) {
+    let record = TerminalDeliveryRecord {
+        delivery,
+        spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().pinned(),
+    };
     terminal_coord_mcp_deliveries()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(terminal_id.to_string(), delivery);
+        .insert(terminal_id.to_string(), record);
+}
+
+/// The default tenant the seam read when it spawned `terminal_id`: `None` when
+/// this process never recorded the terminal, `Some(None)` when the machine
+/// named no default then.
+pub(crate) fn terminal_spawn_default_tenant(terminal_id: &str) -> Option<Option<Uuid>> {
+    terminal_coord_mcp_deliveries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(terminal_id)
+        .map(|r| r.spawn_default_tenant)
 }
 
 /// What the coord-mcp credential of the session in `terminal_id` resolves to.
@@ -8888,7 +8967,7 @@ pub(crate) fn session_credential_tenant(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(terminal_id)
-        .copied();
+        .map(|r| r.delivery);
     match (delivery, workdir) {
         (Some(CoordMcpDelivery::WorkdirDeclared), Some(wd)) => credential_tenant_for_nonce(
             read_proxy_nonce(&Path::new(wd).join(".mcp.json")).as_deref(),
@@ -8904,7 +8983,8 @@ pub(crate) fn session_credential_tenant(
 pub(crate) enum DeclaredWorkdirKey {
     /// No runner proxy nonce in the file.
     NoNonce,
-    /// A nonce the proxy no longer accepts.
+    /// A key a session cannot rely on: not live (graced, reaped, unregistered),
+    /// not a persistent device key, bound to another workdir, or on another port.
     NotLive,
     /// A live nonce pinned to this tenant.
     Pinned(Uuid),
@@ -8913,15 +8993,19 @@ pub(crate) enum DeclaredWorkdirKey {
     NotPinned,
 }
 
-/// Classify the key in `<workdir>/.mcp.json`.
-pub(crate) fn declared_workdir_key(workdir: &str) -> DeclaredWorkdirKey {
-    let Some(nonce) = read_proxy_nonce(&Path::new(workdir).join(".mcp.json")) else {
+/// Classify the key in `<workdir>/.mcp.json` by the same definition of a usable
+/// cwd key the in-cwd reuse applies ([`live_cwd_device_binding`]): a graced,
+/// ephemeral, agent, foreign-workdir or wrong-port key is `NotLive`. With no
+/// resolvable bound port nothing can be established, so that is `NotLive` too.
+pub(crate) fn declared_workdir_key(workdir: &str, bound_port: Option<u16>) -> DeclaredWorkdirKey {
+    if read_proxy_nonce(&Path::new(workdir).join(".mcp.json")).is_none() {
         return DeclaredWorkdirKey::NoNonce;
-    };
-    if !proxy_nonce_is_valid(&nonce) {
-        return DeclaredWorkdirKey::NotLive;
     }
-    match proxy_session_pin_for_nonce(&nonce) {
+    let Some((_, binding)) = bound_port.and_then(|port| live_cwd_device_binding(workdir, port))
+    else {
+        return DeclaredWorkdirKey::NotLive;
+    };
+    match binding.session_pin {
         crate::session::tenant_pin::TenantPin::Pinned(t) => DeclaredWorkdirKey::Pinned(t),
         _ => DeclaredWorkdirKey::NotPinned,
     }
@@ -9072,8 +9156,9 @@ fn spawn_tenant_admission(
 
 /// The cwd-declared arm of P1: a spawn that chose `tenant` into a cwd whose
 /// `.mcp.json` already declares coord-mcp is admitted only when that file's key
-/// is LIVE and PINNED to `tenant` — the same rule
-/// [`reusable_in_cwd_device_nonce`] applies before handing a key to a session.
+/// is a usable cwd key ([`live_cwd_device_binding`] — live, persistent device
+/// class, this workdir, the bound port, the definition the in-cwd reuse shares)
+/// PINNED to `tenant`.
 ///
 /// The identity seam delivers no per-terminal credential to such a cwd (two
 /// `coord-mcp` entries would race, and the project file's precedence over an
@@ -9084,8 +9169,9 @@ fn spawn_tenant_admission(
 pub(crate) fn check_workdir_declared_tenant(
     workdir: &str,
     tenant: Uuid,
+    bound_port: Option<u16>,
 ) -> Result<(), SpawnTenantRefusal> {
-    match declared_workdir_key(workdir) {
+    match declared_workdir_key(workdir, bound_port) {
         DeclaredWorkdirKey::Pinned(t) if t == tenant => Ok(()),
         declared => Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
             tenant,
@@ -9323,7 +9409,7 @@ fn deliver_terminal_coord_mcp_unrecorded(
     let credential_tenant = credential_spawn_tenant(spawn_tenant);
     if workdir_declares_coord_mcp(cwd) {
         match credential_tenant {
-            Some(tenant) => check_workdir_declared_tenant(cwd, tenant)?,
+            Some(tenant) => check_workdir_declared_tenant(cwd, tenant, bound_port)?,
             // A spawn that chose NO tenant takes the machine's. If the cwd's key
             // is pinned to a different tenant, the session will present that
             // tenant's credential — admitted (refusing every tenant-less spawn
@@ -9331,7 +9417,7 @@ fn deliver_terminal_coord_mcp_unrecorded(
             // silently: it is logged here, and the session-info tenancy report
             // names it as a divergence against the device default.
             None => {
-                if let DeclaredWorkdirKey::Pinned(pinned) = declared_workdir_key(cwd) {
+                if let DeclaredWorkdirKey::Pinned(pinned) = declared_workdir_key(cwd, bound_port) {
                     let machine = crate::session::tenant_pin::resolve_tenant_pin();
                     if machine != crate::session::tenant_pin::TenantPin::Pinned(pinned) {
                         warn!(
@@ -20414,6 +20500,7 @@ mod spawn_tenant_credential_tests {
             crate::auth::BindingTenantRead::Unknown,
             None,
             None,
+            None,
         );
         assert_eq!(report.row.tenant_id, Some(tenant_b().to_string()));
         assert_eq!(report.credential.status, TENANCY_RESOLVED);
@@ -20438,6 +20525,7 @@ mod spawn_tenant_credential_tests {
             None,
             &refused,
             crate::auth::BindingTenantRead::Unknown,
+            None,
             None,
             None,
         );
@@ -20501,12 +20589,130 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Bound(tenant_a()),
-            Some(tenant_a()),
+            terminal_spawn_default_tenant(&term).flatten(),
+            crate::session::tenant_pin::resolve_tenant_pin().pinned(),
             None,
         );
+        assert_eq!(terminal_spawn_default_tenant(&term), Some(Some(tenant_a())));
         assert!(
             report.diverged,
             "a B credential on an A-default session must diverge"
+        );
+    }
+
+    /// C1 (re-review). A TENANT-LESS provision of a cwd whose live key is pinned
+    /// to another tenant (B's worktree, on an A machine) writes nothing: the
+    /// file's bytes are unchanged and B's key is still live — before, the
+    /// rejected reuse fell through to a mint that evicted it into grace.
+    #[test]
+    fn a_tenantless_provision_never_evicts_another_tenants_cwd_key() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "resident-b");
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let before = std::fs::read(&mcp).unwrap();
+        let resident = read_proxy_nonce(&mcp).unwrap();
+        let device_jwt = format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#)
+        );
+
+        let outcome = provision_coord_mcp_with_jwt(&wd, &device_jwt, Some(PORT), None);
+
+        assert_eq!(outcome, CoordMcpDelivery::WorkdirDeclared);
+        assert_eq!(std::fs::read(&mcp).unwrap(), before, ".mcp.json rewritten");
+        assert!(live_binding(&resident).is_some(), "resident B key evicted");
+        assert_eq!(
+            proxy_session_pin_for_nonce(&resident),
+            TenantPin::Pinned(tenant_b())
+        );
+        // An ordinary machine-pinned cwd key is still reused, as before.
+        let wd_a = workdir(&amb, "resident-a");
+        write_coord_mcp_proxy_config(&wd_a, PORT, None);
+        let before_a = std::fs::read(Path::new(&wd_a).join(".mcp.json")).unwrap();
+        assert_eq!(
+            provision_coord_mcp_with_jwt(&wd_a, &device_jwt, Some(PORT), None),
+            CoordMcpDelivery::Provisioned
+        );
+        assert_eq!(
+            std::fs::read(Path::new(&wd_a).join(".mcp.json")).unwrap(),
+            before_a
+        );
+    }
+
+    /// W1 (re-review). Declared-cwd admission uses the same "usable cwd key"
+    /// definition as the in-cwd reuse: a GRACED key pinned to B (still accepted
+    /// by the proxy for its window, but dying) and a key on another port are
+    /// refused, not admitted.
+    #[test]
+    fn a_declared_cwd_refuses_a_graced_or_wrong_port_key_even_when_pinned() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_b());
+        let wd = workdir(&amb, "graced");
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let first_bytes = std::fs::read(&mcp).unwrap();
+        let first = read_proxy_nonce(&mcp).unwrap();
+        // Supersede it (the key rides grace), then put the graced key's file back.
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        std::fs::write(&mcp, &first_bytes).unwrap();
+        assert!(live_binding(&first).is_none() && proxy_nonce_is_valid(&first));
+
+        match deliver_terminal_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)) {
+            Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
+                assert_eq!(declared, DeclaredWorkdirKey::NotLive)
+            }
+            other => panic!("a graced key must refuse: {other:?}"),
+        }
+
+        let wd_port = workdir(&amb, "port");
+        write_coord_mcp_proxy_config(&wd_port, PORT, Some(tenant_b()));
+        assert!(matches!(
+            deliver_terminal_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT + 1)),
+            Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+                declared: DeclaredWorkdirKey::NotLive,
+                ..
+            })
+        ));
+        assert!(
+            deliver_terminal_coord_mcp(&wd_port, &terminal(), Some(tenant_b()), Some(PORT)).is_ok()
+        );
+    }
+
+    /// W2 (re-review). After the operator switches the default A→B, a
+    /// tenant-less session spawned under A and still presenting A is NOT
+    /// reported diverged: it is compared against the default it was spawned
+    /// under, and the live default is reported as context only.
+    #[test]
+    fn a_default_switch_does_not_make_running_tenantless_sessions_read_diverged() {
+        use crate::commands::session_info::project_tenancy;
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "switch"), terminal());
+        deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+
+        amb.write_active_tenant_id(tenant_b());
+        let credential = session_credential_tenant(&term, Some(&wd));
+        assert_eq!(credential, CredentialTenantRead::Resolved(Some(tenant_a())));
+        let report = project_tenancy(
+            None,
+            None,
+            &credential,
+            crate::auth::BindingTenantRead::Bound(tenant_a()),
+            terminal_spawn_default_tenant(&term).flatten(),
+            crate::session::tenant_pin::resolve_tenant_pin().pinned(),
+            None,
+        );
+        assert!(!report.diverged, "an operator switch is not a divergence");
+        assert_eq!(
+            report.row.spawn_device_default_tenant_id,
+            Some(tenant_a().to_string())
+        );
+        assert_eq!(
+            report.row.current_device_default_tenant_id,
+            Some(tenant_b().to_string())
         );
     }
 
