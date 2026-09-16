@@ -13,7 +13,7 @@
 //!
 //! The deconflicter never assigns or merges — its allow-list is hard-
 //! capped at `advise-with-text` by `must_advise_only` (which gates on the
-//! `deconflicter-` session-id prefix; see `act.rs:68-73`). The HTTP layer
+//! `deconflicter-` session-id prefix; see `coordinator::act::must_advise_only`). The HTTP layer
 //! 403s any deconflicter session that tries a richer action.
 //!
 //! ## Rate limiting (plan §4.1)
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn deconflicter_session_id_prefix_reserved() {
         // The `must_advise_only` gate keys on the `deconflicter-` prefix
-        // (see act.rs). Defend the prefix here so a future rename of
+        // (see `coordinator::act`). Defend the prefix here so a future rename of
         // `DECONFLICTER_SESSION_ID` doesn't silently break the gate.
         assert!(DECONFLICTER_SESSION_ID.starts_with("deconflicter-"));
     }

@@ -356,7 +356,7 @@ pub(crate) async fn add_dependency_inner(
     let upstream_brief: String = upstream.description.chars().take(60).collect();
     let pause_msg = format!("Pause and wait — added dependency on {}", upstream_brief);
     if let Some(sid) = task.assigned_session_id.as_deref() {
-        crate::coordinator::act::send_message_to_worker(state, sid, &pause_msg).await;
+        crate::claude_session::worker_message::send_message_to_worker(state, sid, &pause_msg).await;
     }
 
     // (e) Wake the Coordinator scheduler.

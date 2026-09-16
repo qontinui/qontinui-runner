@@ -69,7 +69,7 @@ const MIN_RETENTION_DAYS: u32 = crate::projects::snapshot::SESSION_WINDOW_DAYS a
 ///
 /// | Reader | Horizon |
 /// |---|---|
-/// | `coordinator::deconflicter` (`RECENT_TOUCH_WINDOW_MINUTES`) | 15 minutes |
+/// | `deconflict` (`RECENT_TOUCH_WINDOW_MINUTES`) | 15 minutes |
 /// | `commands::ai_session::recent_session_touched_files` (the heatmap panel) | caller-supplied `window_secs`; the UI default is 30 s and its widest fixed option is 24 h |
 /// | [`PgDb::hot_files`] / [`PgDb::hot_sessions`] via `GET /file-activity/heatmap` | caller-supplied, **clamped to 86 400 s** (24 h) by the handler |
 /// | `coordinator::observe` | 3600 s for `hot_sessions`; unbounded for [`PgDb::get_files_touched`], but scoped to sessions that are live right now |

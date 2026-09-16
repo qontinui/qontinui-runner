@@ -4,7 +4,7 @@
  * every such handler must use to test for them.
  *
  * Why this exists: `useKeyboardShortcuts` (terminal) and
- * `useKnowledgeBrowserHotkey` (productivity) both attach their own
+ * `useKnowledgeBrowserHotkey` (knowledge) both attach their own
  * `keydown` listener to `window`, and both claimed `Ctrl+Shift+K`. Two
  * listeners on the SAME target both run — `stopPropagation()` does not
  * suppress a sibling listener on that target — so the chord opened the
@@ -87,7 +87,7 @@ export interface GlobalChord {
 export const GLOBAL_CHORDS = {
   /** Terminal command palette (`useKeyboardShortcuts` → `TOGGLE_COMMAND_PALETTE`). */
   commandPalette: { key: "k", shift: true, meta: false },
-  /** Productivity knowledge browser (`useKnowledgeBrowserHotkey`). */
+  /** Knowledge browser (`components/knowledge`, `useKnowledgeBrowserHotkey`). */
   knowledgeBrowser: { key: "e", shift: true, meta: false },
   /** Unified search modal (`unified-search/CommandPalette`) — Cmd/Ctrl+K, NO Shift. */
   unifiedSearch: { key: "k", shift: false, meta: true },

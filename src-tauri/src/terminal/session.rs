@@ -3506,7 +3506,7 @@ impl TerminalSession {
         // Same LIVENESS GATE as `write`. `submit_prompt` takes the writer lock
         // directly rather than routing through `write`, so it does NOT inherit
         // that gate — without this, `POST /terminals/{id}/submit-prompt` and
-        // `coordinator/act.rs::send_message_to_worker` still answered green for
+        // `claude_session/worker_message.rs::send_message_to_worker` still answered green for
         // a bracketed paste plus Enter that reached no process, which is the
         // very defect the gate exists to close, on a sibling path.
         if !self.is_alive() {
@@ -3605,7 +3605,7 @@ impl TerminalSession {
         // bracketed-paste handler consumes the trailing CR as paste-tail
         // and never submits — see [`POST_PASTE_DELAY`] doc for the §6 E2E
         // reproduction. Sync sleep is acceptable here; callers
-        // (`coordinator/act.rs::send_message_to_worker`) tolerate ~150ms
+        // (`claude_session/worker_message.rs::send_message_to_worker`) tolerate ~150ms
         // blocking on the multi-threaded tokio runtime. Move to
         // `tokio::task::spawn_blocking` if this ever goes hot-path.
         std::thread::sleep(POST_PASTE_DELAY);
