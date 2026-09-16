@@ -5867,6 +5867,14 @@ const CREDENTIAL_FETCH_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(10),
 ];
 
+/// The TERMINAL `spawn-failed` reason for an operator stop that lands during
+/// the credential back-off. Same family as the running-child stop path's
+/// `stopped by operator (events.agent.stop_requested)`; deliberately NOT
+/// `deferred_load:`-prefixed, because coord re-offers those and a stopped
+/// agent must not be minted and launched on the next reconnect.
+const STOPPED_DURING_CREDENTIAL_BACKOFF_REASON: &str =
+    "stopped by operator (events.agent.stop_requested) during the credential fetch back-off";
+
 /// Whether a door answer is TRANSIENT — the door may well answer differently
 /// in a moment — rather than settled. Exactly two shapes: a 503 (coord's
 /// `schema_migration_pending`, or any upstream unavailability) and no HTTP
@@ -6325,15 +6333,31 @@ async fn run_agent_subprocess(
             );
             // Race the back-off against an operator stop: up to 17 s of sleep
             // plus door timeouts is long enough for a `stop_requested` to
-            // arrive, and nothing exists yet to kill or report — so on stop
-            // the launch simply ends here, before any fetch spends the mint.
+            // arrive. Nothing exists yet to KILL — but the stop still has to
+            // be REPORTED: coord's `post_stop` only publishes `stop_requested`
+            // and never transitions the agent row, so this runner's report is
+            // what settles it. A silent return would leave the row `spawning`
+            // forever and coord would re-dispatch it on every reconnect — the
+            // stopped agent minted and launched next time (the same trap the
+            // registry-refusal arm names). Reported as a plain TERMINAL reason,
+            // never `deferred_load:` — a stop must not be re-offered.
             tokio::select! {
                 biased;
                 _ = stop.cancelled() => {
                     info!(
                         "agent_runtime: stop requested for agent_id={agent_id} during the \
-                         credential fetch back-off; abandoning the launch (nothing was spawned)"
+                         credential fetch back-off; abandoning the launch (nothing was \
+                         spawned) and reporting it terminal"
                     );
+                    report_spawn_failed_in_phase(
+                        agent_id,
+                        STOPPED_DURING_CREDENTIAL_BACKOFF_REASON,
+                        None,
+                        0,
+                        primary_push_ref.as_deref(),
+                        SpawnPhase::Blocked,
+                    )
+                    .await;
                     return Ok(());
                 }
                 _ = tokio::time::sleep(delay) => {}
@@ -9679,6 +9703,21 @@ mod tests {
             assert!(reason.contains("own configuration"), "{reason}");
             assert!(!reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
         }
+    }
+
+    /// An operator stop during the credential back-off is reported TERMINAL:
+    /// the reason must never carry the `deferred_load:` prefix (coord would
+    /// re-offer it, and the stopped agent would be minted and launched on the
+    /// next reconnect), and it names the stop in the same family as the
+    /// running-child stop path. The POST itself needs a coord and is covered
+    /// by inspection (`run_agent_subprocess`, credential back-off `select!`).
+    #[test]
+    fn credential_backoff_stop_reason_is_terminal_not_deferred() {
+        assert!(!STOPPED_DURING_CREDENTIAL_BACKOFF_REASON.starts_with(DEFERRED_LOAD_REASON_PREFIX));
+        assert!(!STOPPED_DURING_CREDENTIAL_BACKOFF_REASON.contains(DEFERRED_LOAD_REASON_PREFIX));
+        assert!(STOPPED_DURING_CREDENTIAL_BACKOFF_REASON.starts_with("stopped by operator"));
+        assert!(STOPPED_DURING_CREDENTIAL_BACKOFF_REASON.contains("events.agent.stop_requested"));
+        assert!(STOPPED_DURING_CREDENTIAL_BACKOFF_REASON.contains("credential fetch back-off"));
     }
 
     /// The 503 body's `error` string is server-controlled: the deferral
