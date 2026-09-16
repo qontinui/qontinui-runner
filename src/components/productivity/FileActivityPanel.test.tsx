@@ -295,15 +295,15 @@ describe("lockYieldCooldownRemainingSecs", () => {
   });
 });
 
-// ── buildYieldRequestBody — synthetic File Activity panel identity ─────────
+// ── buildYieldRequestBody — synthetic File activity panel identity ─────────
 
 describe("buildYieldRequestBody — §Open Q5 synthetic requester identity", () => {
-  it("uses 'productivity-file-activity' / 'File Activity panel' as requester", () => {
+  it("uses 'productivity-file-activity' / 'File activity panel' as requester", () => {
     const body = buildYieldRequestBody("src/foo.rs", "tab-B");
     expect(body).toEqual({
       file_path: "src/foo.rs",
       requester_task_run_id: "productivity-file-activity",
-      requester_name: "File Activity panel",
+      requester_name: "File activity panel",
       holder_task_run_id: "tab-B",
     });
   });
@@ -363,7 +363,7 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
     vi.restoreAllMocks();
   });
 
-  it("posts to /file-locks/yield-request with the File Activity panel body", async () => {
+  it("posts to /file-locks/yield-request with the File activity panel body", async () => {
     const fetchSpy = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ requested: true }), {
         status: 200,
@@ -390,7 +390,7 @@ describe("yield-request POST dispatch — Phase 4 wire contract", () => {
     expect(JSON.parse(init!.body as string)).toEqual({
       file_path: "src/foo.rs",
       requester_task_run_id: "productivity-file-activity",
-      requester_name: "File Activity panel",
+      requester_name: "File activity panel",
       holder_task_run_id: "tab-B",
     });
   });
