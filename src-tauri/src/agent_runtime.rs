@@ -6308,9 +6308,18 @@ pub(crate) enum CredentialDoorAnswer {
     /// bearer — and a coord that predates the door answers a bare 404 for the
     /// whole route.
     Refused { status: u16, body: String },
-    /// No HTTP answer at all: no coord base, no HTTP client, a transport
-    /// error, or a 2xx whose body did not parse.
+    /// No HTTP answer at all: a transport error (refused, reset, timed out).
+    /// The ONE transient shape besides 503 — the door may answer in a moment.
     Unreachable(String),
+    /// A 2xx whose body did not parse as a mint. SETTLED, not transient: the
+    /// door is single-shot per agent and has already spent its mint on this
+    /// fetch, so a retry can only 409 — and would then be reported under the
+    /// misleading "minted before a restart" hint. `why` is the parse error.
+    MalformedMint { status: u16, why: String },
+    /// The runner could not ASK: no coord HTTP client, or no connected coord
+    /// base. SETTLED — a property of this runner's own configuration, not of
+    /// the door's availability, so waiting does not change it.
+    Unconfigured(String),
 }
 
 /// Where a launch's credential came from.
@@ -6390,29 +6399,58 @@ impl CredentialDoorAnswer {
                     .unwrap_or("<none>")
             ),
             CredentialDoorAnswer::Unreachable(why) => format!("unreachable: {why}"),
+            CredentialDoorAnswer::MalformedMint { status, why } => {
+                format!("status={status} unparseable body: {why}")
+            }
+            CredentialDoorAnswer::Unconfigured(why) => format!("unconfigured: {why}"),
         }
     }
+}
+
+/// Longest `<detail>` a `deferred_load:credential_door:` reason carries.
+const DEFERRAL_DETAIL_MAX_CHARS: usize = 64;
+
+/// Bound a server-controlled string before it goes on the wire as a reason
+/// detail: at most [`DEFERRAL_DETAIL_MAX_CHARS`] chars, and only
+/// `[A-Za-z0-9_.-]` — anything else becomes `_`. The 503 body's `error`
+/// field is coord's (or any upstream proxy's) to write, so its length and
+/// alphabet are not this runner's to trust.
+fn sanitize_reason_detail(raw: &str) -> String {
+    raw.chars()
+        .take(DEFERRAL_DETAIL_MAX_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// The `deferred_load:` reason for a transient credential-door outcome, in
 /// the same `deferred_load:<class>:<detail>` no-whitespace shape as
 /// [`launch_deferral_reason`]: `deferred_load:credential_door:503_<code>` or
 /// `deferred_load:credential_door:unreachable`. The transport detail of an
-/// unreachable door is logged beside it, never put on the wire.
+/// unreachable door is logged beside it, never put on the wire; the 503
+/// body's `error` code is server-controlled, so it passes through
+/// [`sanitize_reason_detail`] (bounded length, bounded alphabet) first.
+/// Only the two transient shapes reach here; every settled answer is a
+/// [`CredentialDecision::Refuse`] and never asks for a deferral reason.
 fn credential_deferral_reason(answer: &CredentialDoorAnswer) -> String {
     let detail = match answer {
         CredentialDoorAnswer::Refused { status, body } => {
             let code = qontinui_runner_lib::coord_ws::refusal_error_code(body)
                 .unwrap_or_else(|| "unavailable".to_string());
-            let code: String = code
-                .chars()
-                .map(|c| if c.is_whitespace() { '_' } else { c })
-                .collect();
-            format!("{status}_{code}")
+            format!("{status}_{}", sanitize_reason_detail(&code))
         }
-        CredentialDoorAnswer::Unreachable(_) | CredentialDoorAnswer::Minted { .. } => {
-            "unreachable".to_string()
-        }
+        CredentialDoorAnswer::Unreachable(_) => "unreachable".to_string(),
+        // Settled shapes never defer (`credential_answer_is_transient` is
+        // false for them); named rather than wildcarded so a new variant is a
+        // compile error here, not a silent "unreachable".
+        CredentialDoorAnswer::Minted { .. }
+        | CredentialDoorAnswer::MalformedMint { .. }
+        | CredentialDoorAnswer::Unconfigured(_) => "unreachable".to_string(),
     };
     format!("{DEFERRED_LOAD_REASON_PREFIX}credential_door:{detail}")
 }
@@ -6424,7 +6462,7 @@ fn credential_deferral_reason(answer: &CredentialDoorAnswer) -> String {
 async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialDoorAnswer {
     let url = format!("{base}/agents/{agent_id}/credential");
     let Some(client) = crate::coord_http::coord_client() else {
-        return CredentialDoorAnswer::Unreachable("no coord HTTP client".to_string());
+        return CredentialDoorAnswer::Unconfigured("no coord HTTP client".to_string());
     };
     // coord-tenant-scope(session-noop): agent_id is a path parameter; coord resolves the agent's device from coord.agent_worktrees and compares it to the bearer's own device_id claim, persisting no tenant. Nothing to thread. Credential: the DEFAULT binding's device JWT via attach_device_auth — the same bearer every lifecycle post presents, and the one the door's device_mismatch check is keyed on.
     let resp = match crate::auth::attach_device_auth(client.post(&url))
@@ -6449,10 +6487,10 @@ async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialD
             exp: c.exp,
             jti: c.jti,
         },
-        Err(e) => CredentialDoorAnswer::Unreachable(format!(
-            "credential door answered {} with an unparseable body: {e}",
-            status.as_u16()
-        )),
+        Err(e) => CredentialDoorAnswer::MalformedMint {
+            status: status.as_u16(),
+            why: e.to_string(),
+        },
     }
 }
 
@@ -6470,11 +6508,16 @@ async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialD
 ///   Phase 3 "Rollout"). A 404 whose body names `agent_not_found` is a NEW
 ///   coord's typed answer — the door exists and the agent does not — so it
 ///   never takes this arm.
-/// - 503, or no HTTP answer at all (transport failure, no client, no base, an
-///   unparseable 2xx body) → DEFER: the caller has already spent the
-///   [`CREDENTIAL_FETCH_RETRY_DELAYS`] budget on it, so the launch is handed
-///   back to coord with a `deferred_load:` reason and re-offered later rather
-///   than latched failed for the length of a deploy window.
+/// - 503, or no HTTP answer at all (transport failure) → DEFER: the caller
+///   has already spent the [`CREDENTIAL_FETCH_RETRY_DELAYS`] budget on it, so
+///   the launch is handed back to coord with a `deferred_load:` reason and
+///   re-offered later rather than latched failed for the length of a deploy
+///   window.
+/// - A 2xx whose body did not parse → refuse, terminally: the single-shot
+///   mint is SPENT, so neither a retry nor a deferral can recover a token —
+///   the reason names "unparseable body" so it is not read as a restart.
+/// - No coord HTTP client / no connected coord base → refuse, terminally:
+///   the runner's own configuration, which waiting does not change.
 /// - Everything else (401/403/409, a typed 404, a 404 with an empty frame
 ///   `jwt`, a 2xx with an empty token) → refuse, terminally. A
 ///   credential-less agent is never launched; the reason names the status and
@@ -6558,6 +6601,19 @@ pub(crate) fn decide_agent_credential(
                 ),
             }
         }
+        CredentialDoorAnswer::MalformedMint { status, why } => CredentialDecision::Refuse {
+            reason: format!(
+                "credential door answered {status} (2xx) with an unparseable body ({why}) — the \
+                 single-shot mint is spent and no token was received; not launching a \
+                 credential-less agent"
+            ),
+        },
+        CredentialDoorAnswer::Unconfigured(why) => CredentialDecision::Refuse {
+            reason: format!(
+                "credential door could not be asked ({why}) — this runner's own configuration, \
+                 not a door outage; not launching a credential-less agent"
+            ),
+        },
     }
 }
 
@@ -6748,7 +6804,7 @@ async fn run_agent_subprocess(
         let answer = loop {
             let answer = match connected_coord_base() {
                 Some(base) => fetch_agent_credential(&base, agent_id).await,
-                None => CredentialDoorAnswer::Unreachable("no connected coord base".to_string()),
+                None => CredentialDoorAnswer::Unconfigured("no connected coord base".to_string()),
             };
             let Some(delay) = credential_retry_delay(&answer, attempt) else {
                 break answer;
@@ -6761,7 +6817,21 @@ async fn run_agent_subprocess(
                 CREDENTIAL_FETCH_RETRY_DELAYS.len(),
                 delay.as_secs()
             );
-            tokio::time::sleep(delay).await;
+            // Race the back-off against an operator stop: up to 17 s of sleep
+            // plus door timeouts is long enough for a `stop_requested` to
+            // arrive, and nothing exists yet to kill or report — so on stop
+            // the launch simply ends here, before any fetch spends the mint.
+            tokio::select! {
+                biased;
+                _ = stop.cancelled() => {
+                    info!(
+                        "agent_runtime: stop requested for agent_id={agent_id} during the \
+                         credential fetch back-off; abandoning the launch (nothing was spawned)"
+                    );
+                    return Ok(());
+                }
+                _ = tokio::time::sleep(delay) => {}
+            }
             attempt += 1;
         };
         let answer_summary = answer.summary();
@@ -10051,6 +10121,11 @@ mod tests {
             refused(404, r#"{"error":"agent_not_found"}"#),
             minted("t.o.k"),
             minted(""),
+            CredentialDoorAnswer::MalformedMint {
+                status: 200,
+                why: "expected value at line 1 column 1".to_string(),
+            },
+            CredentialDoorAnswer::Unconfigured("no coord HTTP client".to_string()),
         ] {
             assert!(!credential_answer_is_transient(&settled), "{settled:?}");
             assert_eq!(credential_retry_delay(&settled, 0), None, "{settled:?}");
@@ -10059,6 +10134,80 @@ mod tests {
             decide_agent_credential(refused(403, r#"{"error":"device_mismatch"}"#), "x", 1),
             CredentialDecision::Refuse { .. }
         ));
+    }
+
+    /// A 2xx with an unparseable body is SETTLED: the single-shot mint is
+    /// spent, so it is never retried (a retry could only 409 into the
+    /// restart hint) and never deferred; it refuses, naming the shape, and a
+    /// frame jwt does not rescue it (the door exists and answered).
+    #[test]
+    fn credential_door_malformed_2xx_is_settled_and_refuses_naming_the_body() {
+        let malformed = CredentialDoorAnswer::MalformedMint {
+            status: 200,
+            why: "missing field `token`".to_string(),
+        };
+        assert!(!credential_answer_is_transient(&malformed));
+        assert_eq!(credential_retry_delay(&malformed, 0), None);
+        let reason = refuse_reason(decide_agent_credential(
+            malformed,
+            "frame.tok.en",
+            1_700_000_000,
+        ));
+        assert!(reason.contains("200 (2xx)"), "{reason}");
+        assert!(reason.contains("unparseable body"), "{reason}");
+        assert!(reason.contains("missing field `token`"), "{reason}");
+        assert!(reason.contains("mint is spent"), "{reason}");
+        assert!(!reason.contains("restart"), "{reason}");
+    }
+
+    /// No coord HTTP client / no connected coord base is the runner's own
+    /// configuration: SETTLED, never retried, never deferred, refuses.
+    #[test]
+    fn credential_door_unconfigured_runner_is_settled_and_refuses() {
+        for why in ["no coord HTTP client", "no connected coord base"] {
+            let answer = CredentialDoorAnswer::Unconfigured(why.to_string());
+            assert!(!credential_answer_is_transient(&answer));
+            assert_eq!(credential_retry_delay(&answer, 0), None);
+            let reason = refuse_reason(decide_agent_credential(answer, "frame.tok.en", 1));
+            assert!(reason.contains(why), "{reason}");
+            assert!(reason.contains("own configuration"), "{reason}");
+            assert!(!reason.starts_with(DEFERRED_LOAD_REASON_PREFIX), "{reason}");
+        }
+    }
+
+    /// The 503 body's `error` string is server-controlled: the deferral
+    /// detail that carries it on the wire is bounded to 64 chars and to
+    /// `[A-Za-z0-9_.-]`, everything else becoming `_`.
+    #[test]
+    fn credential_deferral_detail_is_bounded_and_sanitized() {
+        // The sanitizer itself.
+        assert_eq!(sanitize_reason_detail("schema_migration_pending"), "schema_migration_pending");
+        assert_eq!(sanitize_reason_detail("a b/c\"d\\e:f\ng.h-i"), "a_b_c_d_e_f_g.h-i");
+        assert_eq!(sanitize_reason_detail("é€x"), "__x");
+        assert_eq!(sanitize_reason_detail(""), "");
+        let long = "x".repeat(200);
+        assert_eq!(sanitize_reason_detail(&long).chars().count(), 64);
+
+        // Through the deferral reason: an oversized, hostile `error`.
+        let hostile = format!(
+            "{} deferred_load:evil <script>{}",
+            "A".repeat(50),
+            "B".repeat(100)
+        );
+        let body = serde_json::json!({ "error": hostile }).to_string();
+        let reason = defer_reason(decide_agent_credential(refused(503, &body), "", 0));
+        let prefix = "deferred_load:credential_door:503_";
+        assert!(reason.starts_with(prefix), "{reason}");
+        let detail = &reason[prefix.len()..];
+        assert!(detail.chars().count() <= 64, "{detail}");
+        assert!(
+            detail
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+            "{detail}"
+        );
+        assert!(!detail.contains('<'), "{detail}");
+        assert!(!reason.contains(char::is_whitespace), "{reason}");
     }
 
     /// The follow-up coord stops publishing `jwt`/`jwt_exp`; a frame without

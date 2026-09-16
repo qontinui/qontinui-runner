@@ -49,7 +49,10 @@
 //!    this lane degrades to POLL cadence (one tick), not to silence. The
 //!    other three lanes are harmless against the old coord because their
 //!    subjects sit under `events.*`; this one is not, which is why the tick
-//!    exists.
+//!    exists. The tick re-sights every handoff whose `close_source` failed,
+//!    so [`MaterializedSources`] turns a repeat sighting into a close-only
+//!    retry — a second child is never started for a source this process
+//!    already materialized.
 //!
 //! ## Receiver flow (one handoff)
 //!
@@ -105,7 +108,8 @@
 //! materialized child on this device, so a push + catch-up double-delivery
 //! never materializes twice.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -132,6 +136,66 @@ const RECONNECT_BACKOFF_CEIL: Duration = Duration::from_secs(60);
 /// Same interval class as `agent_runtime`'s poll backstop. Against a coord
 /// predating `?subscribe=` this is the lane's whole delivery cadence.
 const CATCHUP_TICK: Duration = Duration::from_secs(60);
+
+/// The periodic catch-up ticker (module doc, point 3): fires immediately
+/// once (the caller consumes that tick, since the on-connect catch-up just
+/// ran), then every [`CATCHUP_TICK`]; a tick missed while a catch-up was
+/// still running is delayed, not bunched. Factored out so the schedule is
+/// unit-testable on a paused clock without a socket.
+fn catchup_interval() -> tokio::time::Interval {
+    let mut tick = tokio::time::interval(CATCHUP_TICK);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick
+}
+
+/// What a sighting of a pending handoff for a given source should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Sighting {
+    /// First sighting this run: start the child, then close the source.
+    Materialize,
+    /// A child for this source was already started by THIS process: do not
+    /// start another; only retry the `close_source` that must have failed.
+    CloseOnly,
+}
+
+/// Source sessions this process has already started a child for.
+///
+/// The only "ack" of a handoff is `close_source`, which runs AFTER the child
+/// is started (`materialize`). A close that keeps failing — 403 in a
+/// credential gap, coord 5xx — leaves the handoff in coord's pending list, and
+/// with the [`CATCHUP_TICK`] every tick would otherwise start ANOTHER child
+/// terminal for the same source: an unbounded duplicate-spawn loop, one per
+/// minute. This set turns a repeat sighting into a close-only retry.
+///
+/// Per-process on purpose: it is the process that started the child, so it is
+/// the process that knows. A restart forgets it, and the next sighting after
+/// a restart materializes again — one duplicate per restart, bounded, versus
+/// one per tick. Marked at the moment the child is STARTED, not when the
+/// close succeeds, because the child is what must not be duplicated.
+#[derive(Default)]
+pub(super) struct MaterializedSources(Mutex<HashSet<Uuid>>);
+
+impl MaterializedSources {
+    /// The pure decision for one sighting of `source`.
+    pub(super) fn sighting(&self, source: Uuid) -> Sighting {
+        sighting_for(&self.0.lock().unwrap_or_else(|p| p.into_inner()), source)
+    }
+
+    /// Record that a child for `source` has been started. Returns `true` when
+    /// this is the first record (the set changed).
+    pub(super) fn mark(&self, source: Uuid) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(source)
+    }
+}
+
+/// [`Sighting`] for `source` against the set of sources already materialized.
+pub(super) fn sighting_for(seen: &HashSet<Uuid>, source: Uuid) -> Sighting {
+    if seen.contains(&source) {
+        Sighting::CloseOnly
+    } else {
+        Sighting::Materialize
+    }
+}
 
 /// Purpose suffix a HANDOFF stamps on the child intent. Parameterised (rather
 /// than inlined) because the respawn receiver reuses
@@ -321,6 +385,10 @@ async fn run_receiver_loop(
         "session handoff: push receiver starting"
     );
 
+    // Lives for the whole receiver (every reconnect): the duplicate-spawn
+    // guard has to outlive the socket, or a reconnect would forget it.
+    let sources = MaterializedSources::default();
+
     let mut backoff = RECONNECT_BACKOFF_FLOOR;
     loop {
         match connect_and_pump(
@@ -330,6 +398,7 @@ async fn run_receiver_loop(
             &coord_url,
             &ws_url,
             device_id,
+            &sources,
         )
         .await
         {
@@ -361,6 +430,7 @@ async fn connect_and_pump(
     coord_url: &str,
     ws_url: &str,
     device_id: Uuid,
+    sources: &MaterializedSources,
 ) -> Result<(), HandoffError> {
     let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "session handoff")
         .await
@@ -371,19 +441,18 @@ async fn connect_and_pump(
     // On-connect catch-up: replay anything that landed while we were
     // offline. Best-effort — a failure here doesn't abort the pump (the push
     // path still works, and the next tick or reconnect retries it).
-    run_all_catchups(registry, lifecycle_store, http, coord_url, device_id).await;
+    run_all_catchups(registry, lifecycle_store, http, coord_url, device_id, sources).await;
 
     // Periodic catch-up (module doc, point 3): bounds the delivery window on a
     // socket that is up but delivers nothing — the pre-`subscribe=` coord.
-    let mut catchup_tick = tokio::time::interval(CATCHUP_TICK);
-    catchup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut catchup_tick = catchup_interval();
     // The first tick fires immediately; the on-connect catch-up just ran.
     catchup_tick.tick().await;
 
     loop {
         tokio::select! {
             _ = catchup_tick.tick() => {
-                run_all_catchups(registry, lifecycle_store, http, coord_url, device_id).await;
+                run_all_catchups(registry, lifecycle_store, http, coord_url, device_id, sources).await;
             }
             maybe_msg = ws.next() => {
                 let Some(msg) = maybe_msg else {
@@ -399,14 +468,23 @@ async fn connect_and_pump(
                             http,
                             coord_url,
                             device_id,
+                            sources,
                             t.as_str(),
                         )
                         .await;
                     }
                     tokio_tungstenite::tungstenite::Message::Binary(b) => {
                         let s = String::from_utf8_lossy(&b);
-                        handle_push_frame(registry, lifecycle_store, http, coord_url, device_id, &s)
-                            .await;
+                        handle_push_frame(
+                            registry,
+                            lifecycle_store,
+                            http,
+                            coord_url,
+                            device_id,
+                            sources,
+                            &s,
+                        )
+                        .await;
                     }
                     tokio_tungstenite::tungstenite::Message::Ping(p) => {
                         // Keep the socket alive — coord's `/ws` answers our pings,
@@ -435,10 +513,11 @@ async fn run_all_catchups(
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
+    sources: &MaterializedSources,
 ) {
     // The HANDOFF catch-up: the durable `handoff_request` event row in coord
     // is the source of truth; this GET drains it.
-    run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
+    run_catchup(registry, lifecycle_store, http, coord_url, device_id, sources).await;
     // …and the RESPAWN catch-up, on its own coord route. Separate on purpose:
     // the handoff read filters `s.state <> 'closed'` (fatal for a respawn,
     // whose source is closed by construction) and `PendingHandoff` carries
@@ -466,6 +545,7 @@ async fn run_catchup(
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
+    sources: &MaterializedSources,
 ) {
     match fetch_pending(http, coord_url, device_id).await {
         Ok(pending) => {
@@ -476,7 +556,7 @@ async fn run_catchup(
                 );
             }
             for handoff in pending {
-                materialize_logged(registry, lifecycle_store, http, coord_url, &handoff).await;
+                materialize_logged(registry, lifecycle_store, http, coord_url, sources, &handoff).await;
             }
         }
         Err(HandoffError::Status(401 | 403, _)) => {
@@ -506,6 +586,7 @@ async fn handle_push_frame(
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
+    sources: &MaterializedSources,
     text: &str,
 ) {
     // The RESPAWN arm shares this one socket (coord publishes respawns on the
@@ -533,7 +614,7 @@ async fn handle_push_frame(
         source = %handoff.source_session_id,
         "session handoff: push received; materializing"
     );
-    materialize_logged(registry, lifecycle_store, http, coord_url, &handoff).await;
+    materialize_logged(registry, lifecycle_store, http, coord_url, sources, &handoff).await;
 }
 
 /// Pure parse+filter of a coord `/ws` envelope into a [`PendingHandoff`]
@@ -601,19 +682,48 @@ pub(super) fn parse_handoff_push(text: &str, device_id: Uuid) -> Option<PendingH
 
 /// Materialize a handoff and log (but swallow) any error. The source is
 /// left intact on failure so the next push/catch-up retries.
+///
+/// A source this process has ALREADY started a child for (`sources`) is not
+/// materialized again: the repeat sighting means the earlier `close_source`
+/// failed and the handoff is still pending, so only the close is retried —
+/// never a second child (module doc, point 3).
 async fn materialize_logged(
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
+    sources: &MaterializedSources,
     handoff: &PendingHandoff,
 ) {
-    if let Err(e) = materialize(registry, lifecycle_store, http, coord_url, handoff).await {
-        tracing::warn!(
-            source = %handoff.source_session_id,
-            error = %e,
-            "session handoff: materialize failed; source left intact, will retry on next push/catch-up"
-        );
+    match sources.sighting(handoff.source_session_id) {
+        Sighting::Materialize => {
+            if let Err(e) =
+                materialize(registry, lifecycle_store, http, coord_url, sources, handoff).await
+            {
+                tracing::warn!(
+                    source = %handoff.source_session_id,
+                    error = %e,
+                    "session handoff: materialize failed; source left intact, will retry on next push/catch-up"
+                );
+            }
+        }
+        Sighting::CloseOnly => {
+            tracing::info!(
+                source = %handoff.source_session_id,
+                "session handoff: source already materialized by this process; retrying close only (no second child)"
+            );
+            match close_source(http, coord_url, handoff.source_session_id).await {
+                Ok(()) => tracing::info!(
+                    source = %handoff.source_session_id,
+                    "session handoff: deferred close of the source succeeded"
+                ),
+                Err(e) => tracing::warn!(
+                    source = %handoff.source_session_id,
+                    error = %e,
+                    "session handoff: deferred close of the source failed again; will retry on next tick"
+                ),
+            }
+        }
     }
 }
 
@@ -685,6 +795,7 @@ async fn materialize(
     lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
     coord_url: &str,
+    sources: &MaterializedSources,
     handoff: &PendingHandoff,
 ) -> Result<(), HandoffError> {
     let state = fetch_state(http, coord_url, handoff.source_session_id).await?;
@@ -700,6 +811,9 @@ async fn materialize(
         .start_with_parent(intent, handoff.source_session_id)
         .map_err(|e| HandoffError::Session(e.to_string()))?;
     let child_id = child.id();
+    // Marked the moment the child EXISTS — before the close below, whose
+    // failure is exactly what makes this source get sighted again.
+    sources.mark(handoff.source_session_id);
 
     tracing::info!(
         source = %handoff.source_session_id,
@@ -1190,6 +1304,68 @@ async fn close_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // Catch-up dedupe (module doc, point 3): a source already materialized by
+    // this process is sighted again only because its close failed, so the
+    // second sighting is close-only — never a second child.
+    // =======================================================================
+
+    #[test]
+    fn handoff_dedupe_first_sighting_materializes_second_is_close_only() {
+        let sources = MaterializedSources::default();
+        let src = Uuid::new_v4();
+        let other = Uuid::new_v4();
+
+        assert_eq!(sources.sighting(src), Sighting::Materialize);
+        // The child is started: mark. First record changes the set.
+        assert!(sources.mark(src));
+        // Every later sighting of the SAME source (the next tick, the next
+        // reconnect's catch-up, a replayed push frame) is close-only.
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
+        // Re-marking is idempotent and does not flip the decision.
+        assert!(!sources.mark(src));
+        assert_eq!(sources.sighting(src), Sighting::CloseOnly);
+        // A different source is unaffected.
+        assert_eq!(sources.sighting(other), Sighting::Materialize);
+    }
+
+    #[test]
+    fn handoff_dedupe_pure_decision_is_membership() {
+        let src = Uuid::new_v4();
+        let mut seen = HashSet::new();
+        assert_eq!(sighting_for(&seen, src), Sighting::Materialize);
+        seen.insert(src);
+        assert_eq!(sighting_for(&seen, src), Sighting::CloseOnly);
+        assert_eq!(sighting_for(&seen, Uuid::new_v4()), Sighting::Materialize);
+    }
+
+    /// The tick arm's schedule, on a paused clock: the first tick is
+    /// immediate (the caller consumes it because the on-connect catch-up
+    /// just ran), the next does not fire before `CATCHUP_TICK`, and does
+    /// fire at it.
+    #[tokio::test(start_paused = true)]
+    async fn catchup_tick_fires_immediately_once_then_every_catchup_tick() {
+        let mut tick = catchup_interval();
+        let start = tokio::time::Instant::now();
+
+        // First tick: immediate.
+        tick.tick().await;
+        assert_eq!(tokio::time::Instant::now() - start, Duration::ZERO);
+
+        // Not before the period.
+        let early = tokio::time::timeout(CATCHUP_TICK - Duration::from_secs(1), tick.tick()).await;
+        assert!(early.is_err(), "tick fired before CATCHUP_TICK");
+
+        // At the period.
+        tick.tick().await;
+        assert_eq!(tokio::time::Instant::now() - start, CATCHUP_TICK);
+
+        // And again one period later.
+        tick.tick().await;
+        assert_eq!(tokio::time::Instant::now() - start, CATCHUP_TICK * 2);
+    }
 
     fn make_state(kind: &str) -> HandoffState {
         HandoffState {
