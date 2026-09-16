@@ -45,7 +45,7 @@
 //!    [`OrchestrationRunConfig::working_silence_secs`] — which every emitted
 //!    line RESETS, so it bounds a worker that goes QUIET rather than every
 //!    `Working` worker, and a wedged-but-chatty CLI has no bound at all short
-//!    of [`stop_orchestration_run`] (see [`tick_exit`]). **Every exit
+//!    of `stop_orchestration_run` (see [`tick_exit`]). **Every exit
 //!    the reconciler TAKES is written to `orchestration.runs`** — `complete`,
 //!    `failed` (fatal / DAG cycle) or `stalled`, with `status_reason` — via
 //!    [`finish_run`], so the durable row never reads `running` for a run whose
@@ -116,7 +116,9 @@ pub struct OrchestrationRunConfig {
     /// Seconds a worker may stay `Working` with NO observed activity — no FSM
     /// edge and no new CLI output line — before the reconciler fails it.
     ///
-    /// This is the ONLY bound on a worker wedged mid-turn. Every §5 recovery
+    /// This is the only bound on a worker wedged mid-turn **that goes quiet**,
+    /// and there is no bound at all on one that wedges while still emitting —
+    /// see the closing paragraph. Every §5 recovery
     /// deadline above fires from `ReadyIdle` or `Gone`; a CLI that hangs inside
     /// a turn stays `Processing` forever, which
     /// [`ai_session_executor::signal_from_state`] maps to [`WorkerSignal::Working`],
@@ -131,6 +133,18 @@ pub struct OrchestrationRunConfig {
     /// stall window (that was the regression the `Working` exclusion closed).
     /// It is a per-worker deadline on SILENCE instead, reset by any observed
     /// output, so a busy long turn never trips it.
+    ///
+    /// **That reset is a limit as well as a margin, and it is the gap this
+    /// field does not close.** Because any line resets the clock, a CLI that is
+    /// wedged but still TALKING — a retry loop, a progress spinner, a provider
+    /// streaming an error over and over — resets its own deadline forever and is
+    /// bounded by nothing: not this field, not the §5 deadlines, not the stall
+    /// detector (a `Working` row is excluded from the fingerprint), and not
+    /// `claude_session`. The only way out is `stop_orchestration_run`. Holding
+    /// the run open is the deliberate choice — a stall exit is terminal and
+    /// orphans every session the run spawned — but it is a choice, not a bound,
+    /// and `a_worker_that_keeps_working_is_never_written_stalled` pins the
+    /// behaviour: 5000 s of emitting ticks past this deadline, no stall.
     pub working_silence_secs: i64,
     /// Seconds a SINGLE stuck row must stay continuously stuck before the run is
     /// written `stalled` ([`StallWatch`]).
@@ -197,7 +211,9 @@ impl Default for OrchestrationRunConfig {
             // cross-session build lock, is the worst case). It is 20x
             // `report_timeout_secs` and 6x `stall_after_secs`, so it can never
             // pre-empt the §5 recovery path or the stall detector; it exists
-            // only to put an upper bound on a worker that will never report.
+            // only to put an upper bound on a worker that goes silent and will
+            // never report. One that wedges while still emitting resets this
+            // clock on every line and is bounded by nothing — see the field doc.
             working_silence_secs: 1800,
             // 30 minutes of coord being unable to answer about a row. Same
             // budget as `working_silence_secs` and for the same reason: below
@@ -976,13 +992,16 @@ pub fn compute_tick<S: SignalSource>(
                 // Active mid-turn — clear any stale ready/gone timers.
                 timers.first_ready_no_artifact_at.remove(&trid);
                 timers.first_gone_at.remove(&trid);
-                // ...and hold the ONE bound a mid-turn worker has. `Working`
-                // covers `Processing`/`Initializing`/`Interrupting`/`Promoting`/
+                // ...and hold the only bound a mid-turn worker has, which
+                // reaches it only once it goes QUIET: every emitted line resets
+                // this clock, so a wedged-but-chatty CLI is bounded by nothing
+                // here (see `working_silence_secs`). `Working` covers
+                // `Processing`/`Initializing`/`Interrupting`/`Promoting`/
                 // `Created`, none of which any other timer reaches: the §5
                 // deadlines fire from `ReadyIdle` or `Gone` only, and nothing in
                 // `claude_session` moves a session out of `Processing` on a
                 // clock. A wedged CLI would otherwise hold its concurrency slot
-                // for the life of the run.
+                // for the life of the run — and a chatty one still does.
                 let silent_for =
                     timers.observe_working_silence(trid, signals.last_activity(trid), now);
                 if silent_for >= config.working_silence_secs {
@@ -4063,7 +4082,10 @@ mod tests {
 
     /// **BLOCKER 2 of round 2.** A worker whose CLI wedges mid-turn sits at
     /// `SessionState::Processing`, which `signal_from_state` maps to
-    /// `WorkerSignal::Working`. Nothing else in the system bounds that: the §5
+    /// `WorkerSignal::Working`. Nothing else in the system bounds that — and
+    /// this deadline bounds it only while it stays QUIET, since any emitted line
+    /// resets the clock (`a_worker_that_keeps_working_is_never_written_stalled`
+    /// is the other side of that, and is green). The §5
     /// deadlines fire from `ReadyIdle`/`Gone`, `compute_tick`'s `Working` arm
     /// CLEARS both of their timers, and no timeout in `claude_session` moves a
     /// session out of `Processing`. With the `W:` fingerprint entry removed such
