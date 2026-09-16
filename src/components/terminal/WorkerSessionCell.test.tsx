@@ -20,6 +20,7 @@ import {
   describeWorkerState,
   deliveryLabel,
   settleQueuedOnTransition,
+  shouldFetchChanges,
   type SteeringEntry,
 } from "./WorkerSessionCell";
 import type { FileChangesRead, SessionFileChangesResponse } from "./workerFileChanges";
@@ -44,9 +45,49 @@ describe("settleQueuedOnTransition", () => {
   const queued: SteeringEntry = { id: "q", text: "do x", atMs: 1, delivery: "queued" };
   const sent: SteeringEntry = { id: "s", text: "do y", atMs: 2, delivery: "sent" };
 
-  it("flips queued entries to delivered on the ready → processing edge only", () => {
+  it("flips the OLDEST queued entry to delivered on the ready → processing edge", () => {
     const after = settleQueuedOnTransition([queued, sent], "ready", "processing");
     expect(after.map((e) => e.delivery)).toEqual(["delivered", "sent"]);
+  });
+
+  it("settles ONE queued message per edge, FIFO — never the whole queue", () => {
+    // `send_next_pending_message` (claude_session/dispatcher.rs) does a single
+    // `pop_front` per turn end, and MAX_PENDING_MESSAGES > 1. Flipping both A
+    // and B on one edge told the operator B had landed while it was still
+    // queued — or lost, if the worker finished first.
+    const a: SteeringEntry = { id: "a", text: "first", atMs: 1, delivery: "queued" };
+    const b: SteeringEntry = { id: "b", text: "second", atMs: 2, delivery: "queued" };
+
+    const afterFirstTurn = settleQueuedOnTransition([a, b], "ready", "processing");
+    expect(afterFirstTurn.map((e) => [e.id, e.delivery])).toEqual([
+      ["a", "delivered"],
+      ["b", "queued"],
+    ]);
+
+    const afterSecondTurn = settleQueuedOnTransition(afterFirstTurn, "ready", "processing");
+    expect(afterSecondTurn.map((e) => [e.id, e.delivery])).toEqual([
+      ["a", "delivered"],
+      ["b", "delivered"],
+    ]);
+
+    // A third edge with nothing queued invents no delivery.
+    expect(
+      settleQueuedOnTransition(afterSecondTurn, "ready", "processing").map((e) => e.delivery),
+    ).toEqual(["delivered", "delivered"]);
+  });
+
+  it("picks the oldest queued entry even with later rows around it", () => {
+    // Order in the ledger IS send order, so the first `queued` row is the head
+    // of the backend's own FIFO regardless of what sits around it.
+    const entries: SteeringEntry[] = [
+      { id: "old-sent", text: "0", atMs: 0, delivery: "sent" },
+      { id: "q1", text: "1", atMs: 1, delivery: "queued" },
+      { id: "failed", text: "2", atMs: 2, delivery: "failed", error: "nope" },
+      { id: "q2", text: "3", atMs: 3, delivery: "queued" },
+    ];
+    expect(settleQueuedOnTransition(entries, "ready", "processing").map((e) => e.delivery)).toEqual(
+      ["sent", "delivered", "failed", "queued"],
+    );
   });
 
   it("leaves every entry alone on any other edge", () => {
@@ -114,10 +155,38 @@ describe("SteeringLedger", () => {
   });
 });
 
-const okResponse = (files: SessionFileChangesResponse["files"]): SessionFileChangesResponse => ({
+const okResponse = (
+  files: SessionFileChangesResponse["files"],
+  extra: Partial<SessionFileChangesResponse> = {},
+): SessionFileChangesResponse => ({
   sessionId: "w1",
   files,
+  filesTruncated: false,
+  omittedFiles: 0,
   readAtMs: 0,
+  ...extra,
+});
+
+describe("shouldFetchChanges", () => {
+  const base = { taskRunId: "w1", fetchedFor: null as string | null, stale: false };
+
+  it("reads nothing while the cell is not visible", () => {
+    expect(shouldFetchChanges({ ...base, visible: false })).toBe(false);
+    expect(shouldFetchChanges({ ...base, visible: false, stale: true })).toBe(false);
+    expect(shouldFetchChanges({ ...base, visible: false, fetchedFor: "w1", stale: true })).toBe(
+      false,
+    );
+  });
+
+  it("reads on FIRST becoming visible, and not again while nothing is owed", () => {
+    expect(shouldFetchChanges({ ...base, visible: true })).toBe(true);
+    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1" })).toBe(false);
+  });
+
+  it("reads again when a refresh fell due while hidden, or the worker changed", () => {
+    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "w1", stale: true })).toBe(true);
+    expect(shouldFetchChanges({ ...base, visible: true, fetchedFor: "other" })).toBe(true);
+  });
 });
 
 describe("FileChangesPanel", () => {
@@ -153,6 +222,34 @@ describe("FileChangesPanel", () => {
     expect(html).toContain("may be stale");
     expect(html).toContain("a.ts");
     expect(html).toContain("UNKNOWN");
+  });
+
+  it("says when the backend cut the list, rather than presenting it as whole", () => {
+    const read: FileChangesRead = {
+      status: "ok",
+      response: okResponse(
+        [
+          {
+            filePath: "/repo/a.ts",
+            status: "modified",
+            before: "a\n",
+            after: "b\n",
+            beforeBytes: 2,
+            afterBytes: 2,
+            beforeSha256: "x",
+            afterSha256: "y",
+            truncated: false,
+            takenAt: null,
+            detail: null,
+          },
+        ],
+        { filesTruncated: true, omittedFiles: 12 },
+      ),
+    };
+    const html = renderToStaticMarkup(<FileChangesPanel read={read} onRefresh={noop} />);
+    expect(html).toContain('data-file-changes-cut="true"');
+    expect(html).toContain("12 more path");
+    expect(html).toContain("NOT shown");
   });
 
   it("says a successful empty read is genuinely empty", () => {
@@ -263,5 +360,23 @@ describe("ZoneGrid wiring", () => {
 
   it("never gives a worker tab the hidden TerminalInstance mount", () => {
     expect(source).toContain("!t.sessionBacked");
+  });
+
+  it("passes the zone's visibility through to every WorkerSessionCell mount", () => {
+    // The cell's file-changes read is gated on `visible`; a mount that hard-
+    // coded `visible` would defeat that silently.
+    expect(source.match(/<WorkerSessionCell[^>]*visible=\{/g)?.length).toBe(2);
+  });
+});
+
+describe("WorkerSessionCell wiring", () => {
+  const source = readFileSync(resolve(__dirname, "./WorkerSessionCell.tsx"), "utf8");
+
+  it("hands the cell's visibility to the file-changes hook", () => {
+    // Pins the fix: `visible` must reach `useWorkerFileChanges`, not just the
+    // `data-visible` attribute it used to be spent on.
+    expect(source).toMatch(
+      /useWorkerFileChanges\(\s*taskRunId,\s*session\.sessionState,\s*visible,\s*\)/,
+    );
   });
 });

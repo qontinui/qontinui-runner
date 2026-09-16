@@ -33,6 +33,15 @@ export interface SessionFileChange {
 export interface SessionFileChangesResponse {
   sessionId: string;
   files: SessionFileChange[];
+  /**
+   * The backend caps how many paths one report examines
+   * (`FILE_CHANGE_MAX_FILES` in `mcp/snapshots.rs`). True means `files` is a
+   * PREFIX of what the worker touched — the UI says so rather than presenting
+   * a cut list as the whole truth.
+   */
+  filesTruncated: boolean;
+  /** How many paths that cap dropped (`0` when none were). */
+  omittedFiles: number;
   readAtMs: number;
 }
 
@@ -60,9 +69,14 @@ export async function fetchSessionFileChanges(
   if (!json || !Array.isArray(json.files)) {
     throw new Error("malformed file-changes payload (no `files` array)");
   }
+  const omittedFiles = typeof json.omittedFiles === "number" ? json.omittedFiles : 0;
   return {
     sessionId: json.sessionId ?? taskRunId,
     files: json.files,
+    // A backend that predates the cap sends neither field; `false` / `0` is
+    // then the truth for it — it never cut anything.
+    filesTruncated: json.filesTruncated === true || omittedFiles > 0,
+    omittedFiles,
     readAtMs: typeof json.readAtMs === "number" ? json.readAtMs : Date.now(),
   };
 }
@@ -185,4 +199,52 @@ export function orderChanges(files: readonly SessionFileChange[]): SessionFileCh
 /** Count of rows a reader would call "changes" (everything but `unchanged`). */
 export function countChanged(files: readonly SessionFileChange[]): number {
   return files.filter((c) => c.status !== "unchanged").length;
+}
+
+export interface ChangedCountLabel {
+  /** What the Changes tab shows in its parentheses. */
+  text: string;
+  /** True when `text` describes a read that is not the current one. */
+  stale: boolean;
+  /** Tooltip naming WHY, never `undefined` when `stale`. */
+  title?: string;
+}
+
+/**
+ * The Changes tab's count, agreeing with what `FileChangesPanel` renders
+ * underneath it.
+ *
+ * The panel keeps the last successful list up (labelled "may be stale") when a
+ * refresh fails, so a bare `?` on the tab contradicted the rows right below
+ * it. A count the reader can still see is reported as that count, marked
+ * stale; `?` is reserved for the one case where it is the truth — nothing has
+ * ever been read for this worker.
+ */
+export function changedCountLabel(read: FileChangesRead): ChangedCountLabel {
+  if (read.status === "ok") {
+    return { text: String(countChanged(read.response.files)), stale: false };
+  }
+  const previous = read.previous;
+  if (previous) {
+    return {
+      text: `${countChanged(previous.files)} stale`,
+      stale: true,
+      title:
+        read.status === "error"
+          ? `the last read failed (${read.error}); showing the count from the read at ${new Date(
+              previous.readAtMs,
+            ).toLocaleTimeString()}`
+          : `re-reading; showing the count from the read at ${new Date(
+              previous.readAtMs,
+            ).toLocaleTimeString()}`,
+    };
+  }
+  return {
+    text: "?",
+    stale: true,
+    title:
+      read.status === "error"
+        ? `UNKNOWN — nothing has been read successfully for this worker yet: ${read.error}`
+        : "UNKNOWN — the change list has not been read yet",
+  };
 }

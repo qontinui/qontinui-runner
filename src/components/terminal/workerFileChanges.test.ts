@@ -6,13 +6,16 @@
 
 import { describe, it, expect } from "vitest";
 import {
+  changedCountLabel,
   countChanged,
   diffHunks,
   diffStat,
   noDiffReason,
   orderChanges,
   shortPath,
+  type FileChangesRead,
   type SessionFileChange,
+  type SessionFileChangesResponse,
 } from "./workerFileChanges";
 
 function change(partial: Partial<SessionFileChange>): SessionFileChange {
@@ -103,5 +106,59 @@ describe("ordering and counting", () => {
     expect(shortPath("/home/x/repo/src/lib/a.ts")).toBe("lib/a.ts");
     expect(shortPath("C:\\repo\\src\\a.ts")).toBe("src/a.ts");
     expect(shortPath("a.ts")).toBe("a.ts");
+  });
+});
+
+describe("changedCountLabel", () => {
+  const response = (files: SessionFileChange[]): SessionFileChangesResponse => ({
+    sessionId: "w1",
+    files,
+    filesTruncated: false,
+    omittedFiles: 0,
+    readAtMs: 0,
+  });
+  const two = response([
+    change({ filePath: "/a.ts", status: "modified" }),
+    change({ filePath: "/b.ts", status: "created" }),
+    change({ filePath: "/c.ts", status: "unchanged" }),
+  ]);
+
+  it("reports the live count for a settled read", () => {
+    expect(changedCountLabel({ status: "ok", response: two })).toEqual({ text: "2", stale: false });
+  });
+
+  it("keeps the count the panel is still showing when the fresh read FAILED", () => {
+    // The panel renders `previous` under a "may be stale" banner, so a bare
+    // "?" on the tab contradicted the rows immediately below it.
+    const read: FileChangesRead = {
+      status: "error",
+      error: "HTTP 500",
+      atMs: 0,
+      previous: two,
+    };
+    const label = changedCountLabel(read);
+    expect(label.text).toBe("2 stale");
+    expect(label.stale).toBe(true);
+    expect(label.title).toContain("HTTP 500");
+  });
+
+  it("keeps the previous count visible during an in-flight refresh", () => {
+    const label = changedCountLabel({ status: "loading", previous: two });
+    expect(label.text).toBe("2 stale");
+    expect(label.stale).toBe(true);
+  });
+
+  it("is ? ONLY when nothing has ever been read — and says why", () => {
+    const never = changedCountLabel({ status: "loading", previous: null });
+    expect(never).toMatchObject({ text: "?", stale: true });
+    expect(never.title).toContain("UNKNOWN");
+    const failedFirst = changedCountLabel({
+      status: "error",
+      error: "boom",
+      atMs: 0,
+      previous: null,
+    });
+    expect(failedFirst.text).toBe("?");
+    expect(failedFirst.title).toContain("boom");
   });
 });

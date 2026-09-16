@@ -28,7 +28,10 @@ import {
   workerTabFromRecord,
   findWorkerRecord,
   workerAdoptProbeDelayMs,
+  pruneWorkerProbes,
   WORKER_ADOPT_PROBE_MAX_MS,
+  WORKER_PROBE_ENTRY_TTL_MS,
+  type WorkerProbeEntry,
   type TerminalTab,
   type SessionIdsByTerminal,
 } from "./useTerminalManager";
@@ -484,6 +487,31 @@ describe("Conductor worker tabs", () => {
     expect(workerAdoptProbeDelayMs(2)).toBe(27_000);
     expect(workerAdoptProbeDelayMs(3)).toBe(WORKER_ADOPT_PROBE_MAX_MS);
     expect(workerAdoptProbeDelayMs(50)).toBe(WORKER_ADOPT_PROBE_MAX_MS);
+  });
+
+  it("pruneWorkerProbes evicts entries older than the TTL and keeps live ones", () => {
+    // Every page's manager hears every AI session's events on the box, and an
+    // entry is otherwise only deleted on a successful adoption that never
+    // comes for a foreign session \u2014 so the ledger grew without bound.
+    const now = 10 * WORKER_PROBE_ENTRY_TTL_MS;
+    const probes = new Map<string, WorkerProbeEntry>([
+      ["live", { at: now - 1_000, misses: 3 }],
+      ["just-inside", { at: now - WORKER_PROBE_ENTRY_TTL_MS, misses: 3 }],
+      ["ancient", { at: now - WORKER_PROBE_ENTRY_TTL_MS - 1, misses: 9 }],
+      ["never-probed", { at: 0, misses: 0 }],
+    ]);
+    pruneWorkerProbes(probes, now);
+    expect([...probes.keys()].sort()).toEqual(["just-inside", "live"]);
+    // The surviving entries keep their backoff.
+    expect(probes.get("live")).toEqual({ at: now - 1_000, misses: 3 });
+  });
+
+  it("pruneWorkerProbes leaves an empty ledger alone and is TTL-parameterised", () => {
+    const empty = new Map<string, WorkerProbeEntry>();
+    expect(pruneWorkerProbes(empty, 1).size).toBe(0);
+    const probes = new Map<string, WorkerProbeEntry>([["a", { at: 0, misses: 0 }]]);
+    expect(pruneWorkerProbes(probes, 5, 10).size).toBe(1);
+    expect(pruneWorkerProbes(probes, 50, 10).size).toBe(0);
   });
 
   it("reconcileTabsWithBackend keeps a sessionBacked tab the backend cannot list", () => {
