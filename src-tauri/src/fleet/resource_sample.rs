@@ -37,10 +37,11 @@
 //! retried. The next tick re-observes the machine, and a sample is only
 //! interesting while it is fresh.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
+use qontinui_runner_lib::wedge_diagnostics::{spawn_blocking_tracked, tracked_blocking_by_thread};
 use serde::Serialize;
 use tracing::{debug, warn};
 
@@ -295,6 +296,39 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
+    /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
+    /// keyed by the thread that spawned each body. Bounded to
+    /// `wedge_diagnostics::MAX_BLOCKING_LANES` (15) distinct names plus one
+    /// `<other-threads>` overflow bucket, so it needs no additional capping
+    /// here.
+    ///
+    /// **Host lane only** — same placement argument as [`Self::thread_count`]
+    /// and [`Self::active_terminal_sessions`] immediately above: this is a
+    /// property of the runner PROCESS, not of a machine-level pool the `wsl`
+    /// lane could plausibly own. Every other lane keeps
+    /// [`ResourceSample::empty`]'s `None`.
+    ///
+    /// Until this field, the per-lane breakdown reached only an on-incident
+    /// local capture ([`crate::wedge_diagnostics`]'s escalation record) — coord
+    /// could see a device's aggregate thread count trending up but not which
+    /// runtime/lane was leaking. This publishes the same breakdown on the
+    /// routine ~30s sample loop so the fleet's dev-ops twin can name the lane
+    /// without waiting for an incident.
+    ///
+    /// `u32`, not `usize`: the wire type coord's ingest DTO deserializes, and
+    /// [`tracked_blocking_by_thread`]'s per-lane counts are saturated into it
+    /// the same way [`Self::thread_count`] saturates into `i32` — a
+    /// pathological in-flight count must not panic the publish loop.
+    ///
+    /// `None` only when the lane never attempts the read at all (every
+    /// non-host lane); the host lane always publishes `Some`, even
+    /// `Some(<empty map>)` when nothing is currently in flight — an empty map
+    /// is itself the correct reading (`by_thread()`'s own doc: "a zero carries
+    /// no information", so an idle lane is omitted rather than zeroed), not a
+    /// missing one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) blocking_lanes: Option<BTreeMap<String, u32>>,
     /// The kernel task ceiling for this lane — `/proc/sys/kernel/threads-max`
     /// on Linux. `i64`, not `u64`, because coord reads the column as
     /// `Option<i64>` and a number it cannot deserialize is a silently dropped
@@ -529,6 +563,7 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            blocking_lanes: None,
             threads_max: None,
             threads_used: None,
             pids_max: None,
@@ -815,6 +850,12 @@ fn collect_host_lane() -> ResourceSample {
     s.thread_count =
         crate::health_monitor::thread_count_reading().map(|n| n.min(i32::MAX as usize) as i32);
     s.active_terminal_sessions = live_terminal_session_count();
+    s.blocking_lanes = Some(
+        tracked_blocking_by_thread()
+            .into_iter()
+            .map(|(k, v)| (k, v.min(u32::MAX as usize) as u32))
+            .collect(),
+    );
 
     // The saturation axis — the third one, and the one the 2026-08-27 incident
     // sat at 99.3% of while every field above it read healthy.
@@ -2313,6 +2354,82 @@ MemAvailable:   15335424 kB
             None,
             "no Tauri runtime is UNKNOWN, not zero sessions"
         );
+    }
+
+    /// The host lane's `blocking_lanes` breakdown must actually reflect
+    /// [`tracked_blocking_by_thread`] — an always-`None` or always-empty field
+    /// would pass a shape check while publishing nothing useful during an
+    /// incident, exactly the failure mode
+    /// `only_the_host_lane_carries_the_spawn_pressure_pair` above guards
+    /// against for `thread_count`.
+    ///
+    /// Puts one tracked body in flight on a thread this fixture names, so the
+    /// expected lane key is a constant rather than whatever the test harness
+    /// happened to call the running thread — same technique
+    /// `wedge_diagnostics`'s own
+    /// `assert_a_body_is_charged_to_its_spawner` fixture uses. `spawn_blocking_tracked`
+    /// charges the GLOBAL lane table (there is no way to hand it a private
+    /// one from outside `wedge_diagnostics`), so this asserts presence and the
+    /// fixture's own count rather than an exact whole-map equality against a
+    /// second, separately-timed read — the same "asserted on presence, not
+    /// equality" call the spawn-pressure test above makes, and for the same
+    /// reason: the global table is shared with whatever else this test binary
+    /// is doing concurrently.
+    #[test]
+    fn the_host_lane_carries_the_blocking_lane_breakdown() {
+        const SPAWNER: &str = "resource-sample-blocking-fixture";
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let fixture = std::thread::Builder::new()
+            .name(SPAWNER.to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("runtime");
+                let _guard = rt.enter();
+                let jh = spawn_blocking_tracked(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                });
+                rt.block_on(jh).expect("join the tracked body");
+            })
+            .expect("spawn the named fixture thread");
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the tracked body must start running");
+
+        // A non-host lane must never see this — same placement argument as
+        // `only_the_host_lane_carries_the_spawn_pressure_pair`.
+        let wsl = parse_meminfo("MemTotal: 1024 kB\n", "Ubuntu-24.04".to_string()).expect("parses");
+        assert_eq!(wsl.blocking_lanes, None);
+
+        let host = collect_host_lane();
+        let published = host
+            .blocking_lanes
+            .as_ref()
+            .expect("the host lane must publish a blocking_lanes map");
+        assert_eq!(
+            published.get(SPAWNER).copied(),
+            Some(1),
+            "the fixture's own in-flight body did not appear in the published \
+             breakdown: {published:?}"
+        );
+        // Cross-checks the live accessor directly, not just the wire struct —
+        // the same key this fixture's body is charged to on the source of
+        // truth `collect_host_lane` reads from.
+        assert!(
+            tracked_blocking_by_thread()
+                .get(SPAWNER)
+                .copied()
+                .is_some_and(|n| n >= 1),
+            "the fixture's body must still be tracked while it is in flight"
+        );
+
+        let _ = release_tx.send(());
+        fixture.join().expect("fixture thread");
     }
 
     /// The socket census's wire names, pinned for the same reason the
