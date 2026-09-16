@@ -15,13 +15,15 @@
  *   (`capture_pre_edit_snapshot`, taken the first time it touched the path,
  *   whatever tool made the edit) against the file as it is now, refreshed on
  *   the `commit-state-changed` event the edit hook already emits and again
- *   when a turn ends.
+ *   when a turn ends. The read costs a whole-file sweep on the runner, so it
+ *   is gated on `visible`: a cell the grid has hidden reads nothing and
+ *   remembers that a read is owed (`shouldFetchChanges`).
  * - **Steering**: an input that sends through `send_user_message`, the same
  *   command the Process Manager uses. `ClaudeSession::send_user_message` sends
  *   immediately when the worker is `Ready` and queues otherwise; the ledger
- *   under the input says which happened, and flips a queued entry to
- *   "delivered" only when the `ready → processing` transition that drains the
- *   queue is actually observed.
+ *   under the input says which happened, and flips ONE queued entry —
+ *   the oldest — to "delivered" per observed `ready → processing` transition,
+ *   matching the single `pop_front` the backend does per turn end.
  *
  * Honesty (served `ux-priorities`): a read that fails renders UNKNOWN with
  * the failure named — never an empty transcript, never an empty change list,
@@ -39,6 +41,7 @@ import { useAiSession, type SessionReadStatus } from "@/hooks/useAiSession";
 import { StreamingMessageView } from "../shared/StreamingMessageView";
 import type { TerminalTab } from "./useTerminalManager";
 import {
+  changedCountLabel,
   countChanged,
   diffHunks,
   diffStat,
@@ -111,6 +114,15 @@ export interface SteeringEntry {
  * straight back to `Processing`. That `ready → processing` edge is the only
  * evidence the frontend has of delivery, so a queued entry flips to
  * `delivered` on that edge and on nothing else. Pure.
+ *
+ * **Exactly ONE entry per edge, oldest first.** `send_next_pending_message`
+ * (`claude_session/dispatcher.rs`) does a single `pop_front` per turn end, and
+ * `MAX_PENDING_MESSAGES` is greater than 1 (`claude_session/session.rs`), so
+ * two queued messages drain over two turns. Flipping the whole queue on one
+ * edge told the operator a message had landed while it was still queued — or,
+ * if the worker finished first, while it was lost. The ledger is the only
+ * account of steering this cell offers; it says what happened or it says
+ * nothing.
  */
 export function settleQueuedOnTransition(
   entries: readonly SteeringEntry[],
@@ -118,8 +130,11 @@ export function settleQueuedOnTransition(
   next: AiSessionState,
 ): SteeringEntry[] {
   if (!(prev === "ready" && next === "processing")) return [...entries];
-  if (!entries.some((e) => e.delivery === "queued")) return [...entries];
-  return entries.map((e) => (e.delivery === "queued" ? { ...e, delivery: "delivered" } : e));
+  // Entries are appended in send order, so the first `queued` one is the head
+  // of the backend's own FIFO — the message its `pop_front` just took.
+  const oldest = entries.findIndex((e) => e.delivery === "queued");
+  if (oldest === -1) return [...entries];
+  return entries.map((e, i) => (i === oldest ? { ...e, delivery: "delivered" } : e));
 }
 
 export const STEERING_LEDGER_ROWS = 3;
@@ -305,11 +320,22 @@ function ChangeList({ response }: { response: SessionFileChangesResponse }) {
     );
   }
   return (
-    <ul className="m-0 list-none p-0">
-      {orderChanges(response.files).map((change) => (
-        <FileChangeRow key={change.filePath} change={change} />
-      ))}
-    </ul>
+    <>
+      <ul className="m-0 list-none p-0">
+        {orderChanges(response.files).map((change) => (
+          <FileChangeRow key={change.filePath} change={change} />
+        ))}
+      </ul>
+      {response.filesTruncated && (
+        <div
+          className="border-t border-[#2a2d3d] px-2 py-1.5 text-[10px] text-fuchsia-300"
+          data-file-changes-cut="true"
+        >
+          list cut at {response.files.length} files — {response.omittedFiles} more path
+          {response.omittedFiles === 1 ? "" : "s"} this worker touched are NOT shown
+        </div>
+      )}
+    </>
   );
 }
 
@@ -470,15 +496,55 @@ export function ConversationView({
 /** Debounce for `commit-state-changed` bursts (one per Edit/Write hook). */
 const CHANGES_REFRESH_DEBOUNCE_MS = 750;
 
-function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState) {
+/**
+ * Whether the changes hook should issue a read right now. Pure, exported for
+ * the test.
+ *
+ * A cell whose body the grid has hidden (behind a compact card, or an
+ * off-screen zone — `ZoneGrid` passes `visible={!showCompactCard}`) reads
+ * NOTHING: the route reads every file the worker touched off disk, and with N
+ * workers on a page an unconditional read meant N whole-file sweeps per edit
+ * burst for the page's lifetime, for a list no one could see. The read is
+ * deferred to the moment the cell first becomes visible, and a refresh
+ * triggered while hidden is remembered as `stale` rather than performed.
+ */
+export function shouldFetchChanges(args: {
+  visible: boolean;
+  /** `taskRunId` the last read was issued for, or `null` if none ever was. */
+  fetchedFor: string | null;
+  taskRunId: string;
+  /** A refresh was wanted while hidden. */
+  stale: boolean;
+}): boolean {
+  if (!args.visible) return false;
+  if (args.fetchedFor !== args.taskRunId) return true;
+  return args.stale;
+}
+
+function useWorkerFileChanges(
+  taskRunId: string,
+  sessionState: AiSessionState,
+  visible: boolean,
+) {
   const [read, setRead] = useState<FileChangesRead>({ status: "loading", previous: null });
   const latestRef = useRef<SessionFileChangesResponse | null>(null);
   const inFlightRef = useRef<AbortController | null>(null);
+  /** The id the last read was issued for — `null` until one has been. */
+  const fetchedForRef = useRef<string | null>(null);
+  /** A refresh was wanted while the cell was hidden; owed on next visible. */
+  const staleRef = useRef(false);
+  /** `visible` readable from the event listener without re-subscribing it. */
+  const visibleRef = useRef(visible);
+  useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
 
   const refresh = useCallback(() => {
     inFlightRef.current?.abort();
     const ctrl = new AbortController();
     inFlightRef.current = ctrl;
+    fetchedForRef.current = taskRunId;
+    staleRef.current = false;
     setRead({ status: "loading", previous: latestRef.current });
     fetchSessionFileChanges(taskRunId, ctrl.signal)
       .then((response) => {
@@ -497,11 +563,32 @@ function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState) {
       });
   }, [taskRunId]);
 
-  // First read on mount / id change.
-  useEffect(() => {
+  /** Refresh, or remember that one is owed, depending on visibility. */
+  const refreshIfVisible = useCallback(() => {
+    if (!visibleRef.current) {
+      staleRef.current = true;
+      return;
+    }
     refresh();
-    return () => inFlightRef.current?.abort();
   }, [refresh]);
+
+  // First read once the cell is actually visible, and again on id change or
+  // when a refresh fell due while it was hidden.
+  useEffect(() => {
+    if (
+      shouldFetchChanges({
+        visible,
+        fetchedFor: fetchedForRef.current,
+        taskRunId,
+        stale: staleRef.current,
+      })
+    ) {
+      refresh();
+    }
+  }, [visible, taskRunId, refresh]);
+
+  // Abort whatever is in flight when the cell goes away.
+  useEffect(() => () => inFlightRef.current?.abort(), []);
 
   // Edit-time refresh: the dispatcher emits `commit-state-changed` for the
   // session after every Edit/Write hook (`dispatcher.rs`), debounced here so
@@ -512,8 +599,14 @@ function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState) {
     let disposed = false;
     listen<{ task_run_id?: string }>("commit-state-changed", (event) => {
       if (event.payload?.task_run_id !== taskRunId) return;
+      // Hidden: mark the list stale and do no work. The read happens when the
+      // operator can see it.
+      if (!visibleRef.current) {
+        staleRef.current = true;
+        return;
+      }
       if (timer) clearTimeout(timer);
-      timer = setTimeout(refresh, CHANGES_REFRESH_DEBOUNCE_MS);
+      timer = setTimeout(refreshIfVisible, CHANGES_REFRESH_DEBOUNCE_MS);
     }).then((fn) => {
       if (disposed) fn();
       else unlisten = fn;
@@ -523,7 +616,7 @@ function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState) {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [taskRunId, refresh]);
+  }, [taskRunId, refreshIfVisible]);
 
   // Turn-end refresh: catches edits made by a tool the hook did not see.
   const prevStateRef = useRef<AiSessionState>(sessionState);
@@ -531,9 +624,9 @@ function useWorkerFileChanges(taskRunId: string, sessionState: AiSessionState) {
     const prev = prevStateRef.current;
     prevStateRef.current = sessionState;
     if (prev === "processing" && (sessionState === "ready" || sessionState === "closed")) {
-      refresh();
+      refreshIfVisible();
     }
-  }, [sessionState, refresh]);
+  }, [sessionState, refreshIfVisible]);
 
   return { read, refresh };
 }
@@ -554,6 +647,7 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   const { read: changesRead, refresh: refreshChanges } = useWorkerFileChanges(
     taskRunId,
     session.sessionState,
+    visible,
   );
   const [pane, setPane] = useState<CellPane>("conversation");
   const [draft, setDraft] = useState("");
@@ -597,12 +691,9 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
     inputRef.current?.focus();
   }, [draft, sending, session]);
 
-  const changedCount =
-    changesRead.status === "ok"
-      ? String(countChanged(changesRead.response.files))
-      : changesRead.status === "loading" && changesRead.previous
-        ? String(countChanged(changesRead.previous.files))
-        : "?";
+  // The tab's count must agree with the rows the panel renders underneath it
+  // — including the stale list it keeps up after a failed read.
+  const changedCount = changedCountLabel(changesRead);
 
   return (
     <div
@@ -637,8 +728,10 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
                   : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
               )}
               data-pane={p}
+              title={p === "changes" ? changedCount.title : undefined}
+              data-changes-stale={p === "changes" ? String(changedCount.stale) : undefined}
             >
-              {p === "conversation" ? "Conversation" : `Changes (${changedCount})`}
+              {p === "conversation" ? "Conversation" : `Changes (${changedCount.text})`}
             </button>
           ))}
         </div>

@@ -396,36 +396,43 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
       // Check if session has a live CLI process. A failed read is recorded as
       // such (`readStatus: "failed"`) rather than rendered as "closed": a
       // session whose state could not be read is UNKNOWN, not stopped.
+      //
+      // Every write below is guarded on `taskRunIdRef`, not just the status
+      // pair at the end: an `attachTo` change from A to B starts switch(B)
+      // while switch(A) is still awaiting its IPC, and an unguarded
+      // `setSessionState` / `setMessages` from A's tail landed AFTER B's,
+      // leaving the cell showing B's identity with A's state and transcript.
       let readError: string | null = null;
+      let resolvedState: AiSessionState = "closed";
       try {
         const stateResponse = await invoke<CommandResponse>("get_ai_session_state", {
           taskRunId: newTaskRunId,
         });
         const state = stateResponse.data?.state as string | undefined;
         if (state && state !== "not_found" && state !== "closed") {
-          setSessionState(state as AiSessionState);
+          resolvedState = state as AiSessionState;
         } else if (state) {
           // Read succeeded: no live process — show as stopped/historical
-          setSessionState("closed");
+          resolvedState = "closed";
         } else {
           readError = stateResponse.message
             ? `state read failed: ${stateResponse.message}`
             : "state read returned no state";
-          setSessionState("closed");
         }
       } catch (e) {
         readError = `state read failed: ${e instanceof Error ? e.message : String(e)}`;
-        setSessionState("closed");
       }
+      if (taskRunIdRef.current !== newTaskRunId) return;
+      setSessionState(resolvedState);
 
       // Load messages from DB
+      let parsedMessages: AiMessage[] | null = null;
       try {
         const outputResponse = await invoke<CommandResponse>("get_ai_output", {
           taskRunId: newTaskRunId,
         });
         if (outputResponse.success && outputResponse.data?.output_log) {
-          const parsed = parseOutputLog(outputResponse.data.output_log as string);
-          setMessages(parsed);
+          parsedMessages = parseOutputLog(outputResponse.data.output_log as string);
         } else if (!outputResponse.success) {
           readError ??= `history read failed: ${outputResponse.message ?? "unknown error"}`;
         }
@@ -435,8 +442,9 @@ export function useAiSession(options: UseAiSessionOptions = {}) {
       }
 
       // Only the session still being observed may settle the read; a
-      // switch that raced past this one owns the status now.
+      // switch that raced past this one owns the transcript and status now.
       if (taskRunIdRef.current !== newTaskRunId) return;
+      if (parsedMessages) setMessages(parsedMessages);
       setLastReadError(readError);
       setReadStatus(readError ? "failed" : "ok");
     },
