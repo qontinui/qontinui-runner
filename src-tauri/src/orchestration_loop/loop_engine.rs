@@ -743,10 +743,22 @@ pub async fn stop_orchestration_run(
             let _ = tx.send(true);
         }
     }
-    // Best-effort run-row status (the reconciler also flips its own phase).
-    let _ = pg
-        .set_run_status(run_id, "stopped", Some("stop requested"))
-        .await;
+    // Best-effort run-row status (the reconciler also flips its own phase) —
+    // CONDITIONAL on the run still being `running`. A run that already exited
+    // `stalled` or `failed` keeps that verdict and its reason: the operator can
+    // still press Stop on a listed terminal run, and an unconditional write
+    // would destroy exactly the diagnosis the conductor persists.
+    match pg
+        .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+        .await
+    {
+        Ok(true) => info!("stop_orchestration_run: run {run_id} marked stopped"),
+        Ok(false) => info!(
+            "stop_orchestration_run: run {run_id} was already terminal — \
+             keeping its status and reason (stop signalled anyway)"
+        ),
+        Err(e) => warn!("stop_orchestration_run: run {run_id} status write failed: {e}"),
+    }
     Ok(())
 }
 
@@ -754,9 +766,10 @@ pub async fn stop_orchestration_run(
 /// phase (if the reconciler is still registered). Reads the durable ledger so
 /// it works even after the background task has exited: the terminal phase is
 /// derived from `run.status` and `error` carries `run.status_reason` (the
-/// fatal error, the stall pattern, the DESIGN failure). Per-subtask blocks are
-/// on the rows themselves — `gate_status = coord_unreachable` is the typed
-/// "blocked: coord unreachable" a UI renders.
+/// fatal error, the stall evidence, the DESIGN failure). Per-subtask blocks are
+/// on the rows themselves — `gate_status = coord_unreachable` ("blocked: coord
+/// unreachable") and `coord_error` ("blocked: coord call failing") are the two
+/// typed blocks a UI renders.
 pub async fn orchestration_run_status(
     states: SharedLoopStates,
     pg: &Arc<PgDb>,
