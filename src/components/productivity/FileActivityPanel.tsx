@@ -80,11 +80,18 @@ export function lockYieldCooldownRemainingSecs(cooldownUntilMs: number, nowMs: n
 }
 
 /** Build the POST body for the Phase 1 `/file-locks/yield-request` endpoint
- *  using the synthetic Coordinator Dashboard requester identity per
- *  §Open Q5 of the lock-yield plan. The holder banner will display
- *  "Coordinator Dashboard has asked you to yield" — intentional signal
- *  that the request came from the global dashboard view, not a peer
- *  session. */
+ *  using a synthetic requester identity per §Open Q5 of the lock-yield plan —
+ *  the ask comes from an operator looking at a panel, not from a peer session.
+ *
+ *  `requester_name` is NOT a comment: `request_yield`
+ *  (`src-tauri/src/mcp/file_registry.rs`) copies it verbatim into the
+ *  `file-lock-yield-requested` payload, and the holder's banner renders it as
+ *  "<name> has asked you to yield". It therefore has to name a surface the
+ *  operator can actually go and find. It used to say "Coordinator Dashboard",
+ *  which Phase 4 of
+ *  `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted; this
+ *  panel outlived it on the interim Productivity page, so the identity now
+ *  names the panel's real home. */
 export function buildYieldRequestBody(
   filePath: string,
   holderTaskRunId: string,
@@ -96,8 +103,8 @@ export function buildYieldRequestBody(
 } {
   return {
     file_path: filePath,
-    requester_task_run_id: "coordinator-dashboard",
-    requester_name: "Coordinator Dashboard",
+    requester_task_run_id: "productivity-file-activity",
+    requester_name: "File Activity panel",
     holder_task_run_id: holderTaskRunId,
   };
 }
