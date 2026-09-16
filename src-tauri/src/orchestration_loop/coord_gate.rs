@@ -450,10 +450,17 @@ fn parse_pr_number(text: &str) -> Option<i64> {
 /// fake that returns scripted gate statuses / drift verdicts WITHOUT a live coord.
 ///
 /// All three methods are best-effort and never a hard stop for the run, but the
-/// error is TYPED: [`CoordGateError::Unreachable`] (no credential / transport
-/// failed) is persisted on the subtask as [`GATE_STATUS_COORD_UNREACHABLE`] so
-/// the block is visible and stall-counted; [`CoordGateError::Failed`] (coord
-/// answered, call failed) is logged and retried next tick with no row change.
+/// error is TYPED, and BOTH variants are persisted on the subtask so the block
+/// is visible and stall-counted: [`CoordGateError::Unreachable`] (no credential
+/// / transport failed) as [`GATE_STATUS_COORD_UNREACHABLE`],
+/// [`CoordGateError::Failed`] (coord answered and refused the call) as
+/// [`GATE_STATUS_COORD_ERROR`]. The type decides which sentence the operator
+/// reads, not whether the failure is recorded.
+///
+/// `Failed` used to be logged and retried with NO row change, which is the hole
+/// the typed block closed: the retry read as progress, so a run whose every
+/// remaining row was refused by coord polled forever with nothing surfaced
+/// anywhere. Both are now written through `record_coord_block`.
 #[async_trait]
 pub trait CoordGateClient: Send + Sync {
     /// Register a gate for `(run_id, task_id)` with the given predicate. Returns
