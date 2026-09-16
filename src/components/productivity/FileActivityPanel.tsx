@@ -104,7 +104,7 @@ export function buildYieldRequestBody(
   return {
     file_path: filePath,
     requester_task_run_id: "productivity-file-activity",
-    requester_name: "File Activity panel",
+    requester_name: "File activity panel",
     holder_task_run_id: holderTaskRunId,
   };
 }

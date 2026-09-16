@@ -33,7 +33,9 @@ would be the same mistake in the other direction.
 > This file is the CANONICAL copy for a spawned session: `fleet_commands.rs`
 > ships these `.md` bodies, and `provision_fleet_commands_into` writes this one
 > into a session's working directory unless the destination already exists AND
-> is git-tracked there — false in every allocated agent worktree. The rule above
+> is git-tracked there — false in an allocated worktree of any repo EXCEPT
+> qontinui-claude-config, which tracks its own copy at `.claude/commands/`, so
+> there the tracked file is left in place and is what the session reads. The rule above
 > is deliberately worded to match `.claude/commands/summarize-session.md` in
 > qontinui-claude-config, which corrected the same clause; the two must not
 > drift. The Rust default that used to contradict both
