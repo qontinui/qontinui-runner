@@ -4,7 +4,7 @@
  * The runner's vitest config uses `environment: "node"` — no jsdom and
  * no `@testing-library/react` (verified via `vitest.config.ts` and
  * `package.json`). Following the precedent set by
- * `CompletionReportSections.test.tsx` and `WebIntegrationAuthBanner.test.ts`,
+ * `FileActivityPanel.test.tsx` and `WebIntegrationAuthBanner.test.ts`,
  * we exercise the load-bearing logic by exporting pure helpers from the
  * component and asserting on those, plus the wire shape of the probe
  * request via a mocked `fetch`.

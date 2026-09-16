@@ -1098,7 +1098,7 @@ function AppWithTutorials() {
           FileActivityPanel, TerminalTabBar tooltip ticks) so we don't
           burn three+ private intervals on the same cadence. Mounted
           here because every consumer of useNow1Hz lives under
-          AppContent — TerminalPage, CoordinatorDashboard, etc.
+          AppContent — TerminalPage, FileActivityPanel, etc.
         */}
         <Now1HzProvider>
           <AppContent />

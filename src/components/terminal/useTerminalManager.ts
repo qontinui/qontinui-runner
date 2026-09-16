@@ -705,9 +705,8 @@ export function useTerminalManager(
    * Worker marks (`terminalId → taskRunId`) received from the Rust side
    * before their tab record exists in React state. The Tauri command path
    * emits `terminal-created` then `worker-registered` in order, but their
-   * arrival order at the webview is not strictly guaranteed; on reconnect
-   * we also call `list_workers` while `terminal_list` is mid-flight, so a
-   * buffer is the simplest race-safe shape.
+   * arrival order at the webview is not strictly guaranteed, so a buffer is
+   * the simplest race-safe shape.
    */
   const pendingWorkerMarks = useRef<Map<string, string>>(new Map());
   /**
@@ -1229,30 +1228,12 @@ export function useTerminalManager(
       // Select the last tab (most recently created)
       setActiveId(reconnectedTabs[reconnectedTabs.length - 1].id);
 
-      // Backfill the Phase 2 worker marker for reconnected tabs. The Rust
-      // `SessionManager` keeps `WorkerSession` registrations across reloads
-      // of the React tree, so a `worker-registered` event won't re-fire for
-      // these tabs — we have to ask. Fire-and-forget; if it fails the
-      // worker tabs simply lose the gate on the frontend (backend gate
-      // still holds).
-      invoke<Array<{ terminal_id: string; task_run_id: string }>>("list_workers")
-        .then((workers) => {
-          for (const w of workers) {
-            if (w.terminal_id && w.task_run_id) {
-              markAsWorker(w.terminal_id, w.task_run_id);
-            }
-          }
-        })
-        .catch((err) => {
-          logger.warn(`list_workers backfill failed: ${err}`);
-        });
-
       return reconnectedTabs.map((t) => t.id);
     } catch (err) {
       console.error("[TerminalManager] Failed to reconnect:", err);
       return null;
     }
-  }, [pageId, markAsWorker]);
+  }, [pageId]);
 
   /** Mark a tab as having completed reconnection (buffer replayed). */
   const markReconnected = useCallback((id: string) => {
