@@ -21819,6 +21819,66 @@ mod spawn_tenant_credential_tests {
         );
     }
 
+    /// Every nonce the registry holds bound to `wd`, whatever its class.
+    fn nonces_bound_to(wd: &str) -> usize {
+        proxy_nonces()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.workdir == wd || b.workdir == normalize_binding_workdir(wd))
+            .count()
+    }
+
+    fn nonce_of(doc: &serde_json::Value) -> String {
+        crate::coord_mcp_config::proxy_nonce_from_config_doc(doc)
+            .expect("the provision document carries the nonce")
+    }
+
+    /// P2 acceptance 1. `{cwd, tenant: B}` on a machine pinned to A mints an
+    /// ephemeral binding frozen to `Pinned(B)`, and the proxy resolves B for it
+    /// — the mint route's tenant reaches the credential, not only the label.
+    /// (The route's own admission of B is pinned in `mcp_api`; this is the
+    /// mint, which is where the pin is either frozen or lost.)
+    #[test]
+    fn a_provision_session_tenant_pins_the_minted_session_nonce() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "p2-pin");
+
+        let doc = provision_session_proxy_config_at(&wd, PORT, Some(tenant_b()));
+        let nonce = nonce_of(&doc);
+
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+        assert!(
+            live_binding(&nonce).is_some_and(|b| b.lifetime.is_ephemeral()),
+            "the mint route's class is unchanged by the tenant: ephemeral"
+        );
+    }
+
+    /// P2 acceptance 3. `{cwd}` alone is the mint as it was before the route
+    /// took a tenant: the http document shape verbatim, one ephemeral device
+    /// binding, and the MACHINE's pin.
+    #[test]
+    fn a_tenantless_provision_session_is_unchanged() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "p2-none");
+
+        let doc = provision_session_proxy_config_at(&wd, PORT, None);
+        let nonce = nonce_of(&doc);
+        assert_eq!(doc, http_proxy_config_json(PORT, &nonce, false));
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_a())
+        );
+        assert_eq!(nonces_bound_to(&wd), 1);
+    }
+
     #[test]
     fn the_kill_switch_is_off_only_for_exactly_zero() {
         assert!(spawn_tenant_credential_enabled_from(None));
