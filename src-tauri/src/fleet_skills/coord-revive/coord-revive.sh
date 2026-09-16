@@ -2158,7 +2158,7 @@ fi
 # the runner's own `qontinui-pr` CLI POINTS at it in its no-credential error
 # without opening it; none of them writes it.
 #
-# It is read here because six of its thirteen reasons say THAT provisioning pass
+# It is read here because six of its fourteen reasons say THAT provisioning pass
 # wrote no `.mcp.json` (no device JWT in the runner's access_token slot; a
 # bearer whose `sub_type` is neither device nor agent; a workdir the
 # non-clobber guard refused (a foreign `.mcp.json`, an unparseable one, or no
@@ -2168,14 +2168,20 @@ fi
 # consequence of a fault the runner already diagnosed. Without this line the
 # cascade reports the SYMPTOM while the CAUSE sits one directory read away.
 #
-# The other seven are the PROBE's typed verdicts — TIMEOUT (the 12s budget
+# The other eight are the PROBE's typed verdicts — TIMEOUT (the 12s budget
 # expired; NOT known dead, the runner may merely be saturated),
 # CONNECT_REFUSED, UNAUTHORIZED (401), CREDENTIAL_REFRESHING (503), some other
-# HTTP status, HTTP_200_NOT_MCP, and an unclassified TRANSPORT error — and they
-# mean the opposite: a `.mcp.json` WAS written and did not answer at spawn.
-# They reuse the same vocabulary this script's own per-door table uses, on
-# purpose. Thirteen reasons across FOURTEEN call sites (the writer's own two
-# files): one reason is written from two of them. A breadcrumb whose
+# HTTP status, HTTP_200_NOT_MCP, an unclassified TRANSPORT error, and the
+# runner-credential verdict (the .mcp.json and its nonce are FINE; the RUNNER's
+# own coord credential is the half at fault, so a new session will not
+# help) — and they
+# mean the opposite: a `.mcp.json` WAS written. The first seven say the probe
+# got no usable answer at spawn; the eighth says the RUNNER's own credential is
+# dark, and its provision-time writer runs before any probe at all.
+# The first seven reuse the same vocabulary this script's own per-door table
+# uses, on purpose. The runner-credential verdict is NOT in that table: this
+# script has no arm for a runner_credential_* 401 yet. Fourteen reasons across SIXTEEN call sites (the writer's own two
+# files): two reasons are each written from two of them. A breadcrumb whose
 # parenthetical still GUESSES a three-way cause — a dead port, or a stale nonce
 # 401, or coord being down — came from a runner build predating those verdicts.
 # It established none of them; read it as "no 2xx within 3s" and nothing more.

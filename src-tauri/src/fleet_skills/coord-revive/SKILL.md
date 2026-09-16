@@ -570,7 +570,7 @@ That file is the **runner's** record that it could not give this workdir a
 working coord-mcp (`coord_mcp.rs`, `write_degraded_breadcrumb`;
 `/gate` and `/policy` tell an agent to read it and `qontinui-pr` points at it in
 its no-credential error — none of them writes it, and none of them opens it the
-way this script does). It matters here because **six of its thirteen reasons
+way this script does). It matters here because **six of its fourteen reasons
 say that provisioning pass wrote no `.mcp.json`**: no device JWT in the runner's
 access_token slot, a bearer whose `sub_type` is neither `device` nor `agent`, a
 workdir the non-clobber guard refused, an unresolvable
@@ -586,35 +586,50 @@ the file is read. Look at what is on disk rather than assuming the first.)
 landed in runner `38c337ba5` on 2026-08-19 and were missing from every document
 in this repo until 2026-08-28 — including this one, which said "four of its
 five". The seven typed probe verdicts below took it to thirteen when the runner
-started writing them.
+started writing them in #1441 (landed 2026-09-11); `270a9b65f` (landed
+2026-09-16) added the eighth, the runner-credential verdict, taking it to
+fourteen.
 `scripts/breadcrumb-reason-drift.py` re-derives the set in one command, and
 since 2026-09-06 it runs in CI (`.github/workflows/doc-transcription-parity.yml`)
 against runner `main`, so this count now reddens a PR instead of rotting.
 
 **That is "this pass wrote none", not "there is no config".**
 `coord_mcp_safe_to_write` passes a workdir whose file is absent *or* holds only
-our own `coord-mcp` config. Ten of the fourteen call sites return BEFORE that
-guard is consulted at all -- seven in `apply_probe_verdict`, one in
-`provision_coord_mcp_for_session`, one early-returning at
-`provision_coord_mcp_with_jwt`'s bearer check, and one in
-`agent_runtime.rs` -- and the remaining four are reached after it; either way none
+our own `coord-mcp` config. The sixteen call sites split FOUR ways against that
+guard, and which way is PATH-DEPENDENT rather than flat. Three write without it
+being consulted at all: `provision_coord_mcp_for_session`, the early return at
+`provision_coord_mcp_with_jwt`'s bearer check, and `agent_runtime.rs`'s. One is
+written only when the guard returned FALSE -- the non-clobber row, inside the
+refusal block itself. Four are reached only after it returned true: three later
+arms of `provision_coord_mcp_with_jwt`, plus
+`breadcrumb_runner_credential_if_dark`, which writes on the SUCCESS path right
+after a valid `.mcp.json` rather than refusing anything. The eight in `apply_probe_verdict` are either, according to
+the caller -- after the guard from the provisioning arms, with no guard from the
+recovery seams or from `agent_runtime.rs`; either way none
 deletes anything — so a
 re-provision leaves an earlier, stale `.mcp.json` sitting there. L1 probing it
 into a `CONNECT_REFUSED` or a `COORD_MCP_PROXY_UNAUTHORIZED` while the
 breadcrumb says "NOT written" is a consistent pair, not a contradiction.
 
-The remaining **seven** reasons are the probe's typed verdicts, and they mean the
-opposite: a `.mcp.json` WAS written and did not answer at spawn. They are
+The remaining **eight** reasons are the probe-family verdicts, and they mean the
+opposite: a `.mcp.json` WAS written. Seven say the probe got no usable answer at
+spawn; the eighth says the RUNNER's own credential is dark, and its
+provision-time writer runs before any probe at all. They are
 `TIMEOUT` (the 12 s budget expired — *NOT known dead*; the runner may merely be
 saturated), `CONNECT_REFUSED`, `UNAUTHORIZED (401)`,
 `CREDENTIAL_REFRESHING (503)`, some other `HTTP <status>`, `HTTP_200_NOT_MCP`,
-and an unclassified `TRANSPORT` error. Those are the words on **line 1**; line
+an unclassified `TRANSPORT` error, and the runner-credential verdict — the one
+that is not about this session at all: the `.mcp.json` and its nonce are FINE,
+the RUNNER's own coord credential is what cannot answer, and a new session will
+not help. Those are the words on **line 1**; line
 2's JSON `verdict` field carries the machine token, which differs for two of
 them: `UNAUTHORIZED (401)` is `PROXY_UNAUTHORIZED` there, and `HTTP <status>`
-is `HTTP_<code>` (for example `HTTP_502`). The other five read the same on both
-lines — the same vocabulary this script's own
-per-door table uses, reused on purpose rather than invented twice. Thirteen
-reasons in all, across **fourteen** call sites in the writer's two files.
+is `HTTP_<code>` (for example `HTTP_502`). The other six read the same on both
+lines. The seven PROBE verdicts reuse the same vocabulary this script's own
+per-door table uses, rather than being invented twice; the runner-credential
+verdict (`BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_*`) is not in that table yet.
+Fourteen
+reasons in all, across **sixteen** call sites in the writer's two files.
 
 **A breadcrumb whose parenthetical instead GUESSES a three-way cause — a dead
 port, or a stale-nonce 401, or coord being down — came from a runner build
