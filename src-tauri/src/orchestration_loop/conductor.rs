@@ -42,7 +42,10 @@
 //!    separately, so one healthy row cannot hide a stuck one. The `Working`
 //!    worker is bounded NOT by the §5 recovery deadlines (they fire from
 //!    `ReadyIdle`/`Gone` only) but by its own silence deadline,
-//!    [`OrchestrationRunConfig::working_silence_secs`]. **Every exit
+//!    [`OrchestrationRunConfig::working_silence_secs`] — which every emitted
+//!    line RESETS, so it bounds a worker that goes QUIET rather than every
+//!    `Working` worker, and a wedged-but-chatty CLI has no bound at all short
+//!    of [`stop_orchestration_run`] (see [`tick_exit`]). **Every exit
 //!    the reconciler TAKES is written to `orchestration.runs`** — `complete`,
 //!    `failed` (fatal / DAG cycle) or `stalled`, with `status_reason` — via
 //!    [`finish_run`], so the durable row never reads `running` for a run whose
@@ -3269,6 +3272,14 @@ mod tests {
         // (`working_silence_secs`), NOT the §5 recovery deadlines: those fire
         // from `ReadyIdle`/`Gone` only, and a wedged CLI sits at `Processing`
         // (→ `WorkerSignal::Working`) forever, which no §5 timer reaches.
+        //
+        // And that silence deadline bounds a worker that goes QUIET, not every
+        // `Working` worker: every emitted line resets it. A wedged CLI that
+        // keeps TALKING is bounded by nothing here — see
+        // `a_worker_that_keeps_working_is_never_written_stalled`, which drives
+        // 5000 s of emitting ticks past `working_silence_secs` and asserts no
+        // stall. That is deliberate (a stall exit orphans the sessions) and
+        // `stop_orchestration_run` remains the way out.
         let trid = Uuid::new_v4();
         let mut a = mk("A", 0, &[], SubtaskState::Working);
         a.task_run_id = Some(trid);
