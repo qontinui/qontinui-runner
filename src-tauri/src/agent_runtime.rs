@@ -11884,10 +11884,9 @@ mod tests {
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         for _ in 0..2 {
             // Bound for the same reason as the AtCap half above.
-            let (verdict, held) =
-                evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
-                    thread_verdict(Some(540))
-                });
+            let (verdict, held) = evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
+                thread_verdict(Some(540))
+            });
             assert!(
                 matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
                 "a loaded machine must defer on every evaluation, got {verdict:?}"
