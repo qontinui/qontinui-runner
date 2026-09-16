@@ -221,10 +221,12 @@ function ZoneGridInner({
    * de-dupes against its last-reported value, so this fires at most once
    * per real title change despite the 200ms idle repaint cadence.
    *
-   * Worker tabs (presence of `taskRunId`) are pinned at `Worker N` per the
-   * Phase 1 backend gate (`set_title_unless_worker`); skip the local rename
-   * *and* the backend invoke for those so OSC 0 emissions from the embedded
-   * Claude CLI don't clobber the operator-facing identifier.
+   * Worker tabs (presence of `taskRunId`) stay pinned at `Worker N`: skip
+   * the local rename *and* the backend invoke for those so OSC 0 emissions
+   * from the embedded Claude CLI don't clobber the operator-facing
+   * identifier. This skip is the only thing enforcing the pin — the backend
+   * title gate that used to mirror it was deleted with the Productivity
+   * scheduler.
    */
   // tabsRef keeps the worker-marker lookup current without re-creating
   // onTitleChange on every tab mutation (TerminalInstance refs onto the
