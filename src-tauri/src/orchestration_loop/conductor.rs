@@ -2098,10 +2098,24 @@ impl StallWatch {
 /// reconciler RETURNS, so it orphans every session the run spawned
 /// (`finish_run` touches no session); doing that to three healthy workers
 /// because a fourth row's gate poll cannot reach coord trades the whole run for
-/// a diagnosis. The guard cannot wedge: every `Working` row is bounded by
-/// [`OrchestrationRunConfig::working_silence_secs`], so the in-flight set drains
-/// on its own, and because the window keeps accumulating underneath the guard,
-/// the stall fires the moment it does.
+/// a diagnosis.
+///
+/// The guard does not wedge in any case the reconciler can observe, but the
+/// bound is weaker than "every `Working` row times out". A `Working` row is
+/// bounded by [`OrchestrationRunConfig::working_silence_secs`] OR by the §5
+/// recovery deadlines, whichever reaches it first — and neither is guaranteed
+/// to: the silence deadline measures from `SignalSource::last_activity`, which
+/// every emitted CLI line resets, and the §5 deadlines fire only from
+/// `ReadyIdle`/`Gone`. So a worker that is wedged but still CHATTY resets its
+/// own deadline forever, and with coord unreachable at the same time the run
+/// holds open instead of stalling at `coord_block_stall_after_secs`.
+///
+/// That is deliberately the safer of the two failure modes — a stall exit is
+/// terminal and orphans the sessions, while holding open leaves them reachable
+/// — it warns every tick, and `stop_orchestration_run` still ends the run. In
+/// every case where a `Working` row DOES reach a deadline, the in-flight set
+/// drains on its own, and because the window keeps accumulating underneath the
+/// guard, the stall fires the moment it does.
 pub fn tick_exit(
     plan: &TickPlan,
     outcome: &TickOutcome,
