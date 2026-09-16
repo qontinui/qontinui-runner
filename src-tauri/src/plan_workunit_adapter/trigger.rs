@@ -2837,7 +2837,12 @@ async fn run_loop<S: WorkUnitSink + ?Sized>(
 /// not this flag: the backend-resolution guard (`HttpArtifactSink::from_env`
 /// answers `None` with no resolvable backend, and a release build refuses a
 /// machine-local one — see `main.rs`), the tenant's `plan_capture` dial
-/// consulted every cycle ([`CaptureGate`]), and the five-cycle failure breaker.
+/// consulted every cycle ([`CaptureGate`]), the five-cycle failure breaker,
+/// and — stricter than all three — the adapter loop ITSELF:
+/// [`spawn_if_configured`] returns as soon as no coord base resolves
+/// (`COORD_HTTP_URL` / `profiles.<active>.coord_url`), which is BEFORE the
+/// body-sync sink is built, so a runner with none never syncs at all however
+/// this flag reads.
 /// The name is kept so an operator's existing `=1` keeps meaning "on".
 pub const PLAN_LIBRARY_SYNC_ENV: &str = "QONTINUI_PLAN_LIBRARY_SYNC";
 
