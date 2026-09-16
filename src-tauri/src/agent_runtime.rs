@@ -1064,8 +1064,28 @@ const HEALTHY_PUMP_THRESHOLD_SECS: u64 = 30;
 /// pure function so the decision is unit-testable without a live socket.
 ///
 /// Returns `true` when `elapsed >= HEALTHY_PUMP_THRESHOLD_SECS`.
+///
+/// `elapsed` must be measured from the moment the socket was ESTABLISHED, not
+/// from the start of the connect attempt — see [`pump_uptime`]. Since the
+/// coord `/ws` connect became bounded
+/// (`qontinui_runner_lib::coord_ws::CONNECT_TIMEOUT`), a connect that black-holes
+/// for the whole budget returns `Err` after a wall time comparable to this
+/// threshold. Measured across the connect, a timer serviced late on a loaded
+/// box would make that FAILURE read as healthy uptime, reset the back-off to
+/// [`BACKOFF_BASE_MS`], and produce a permanent ~2 s connect-storm against a
+/// coord that is already unreachable — logged, wrongly, as a healthy
+/// connection dying. Measuring from the socket removes the coupling entirely
+/// rather than relying on the two constants keeping a safe margin.
 fn reset_backoff_after_pump(elapsed: Duration) -> bool {
     elapsed.as_secs() >= HEALTHY_PUMP_THRESHOLD_SECS
+}
+
+/// How long the PUMP ran, given the instant the socket was established.
+///
+/// `None` means the socket was never established (the connect itself failed or
+/// timed out), which is never healthy uptime however long the attempt took.
+fn pump_uptime(connected_at: Option<std::time::Instant>) -> Duration {
+    connected_at.map_or(Duration::ZERO, |at| at.elapsed())
 }
 
 /// Subscribe loop: connects to coord WS, filters for this device's
@@ -1099,9 +1119,12 @@ async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()
     };
     let mut backoff_ms: u64 = BACKOFF_BASE_MS;
     loop {
-        let started = std::time::Instant::now();
-        let pump_result = connect_and_pump(&ws_url, device_id).await;
-        let elapsed = started.elapsed();
+        // Set by `connect_and_pump` the moment the socket is established, so
+        // the health classifier below measures PUMP time and not the bounded
+        // connect wait ahead of it. `None` ⇒ the connect never succeeded.
+        let mut connected_at: Option<std::time::Instant> = None;
+        let pump_result = connect_and_pump(&ws_url, device_id, &mut connected_at).await;
+        let elapsed = pump_uptime(connected_at);
         match pump_result {
             Ok(()) => {
                 debug!("agent_runtime: WS pump returned cleanly; reconnecting");
@@ -1171,13 +1194,18 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 20;
 /// path, the poll is the catch-up. Dedup against the process-wide
 /// [`dispatched_gate_ids`] set keeps a frame delivered by BOTH paths from
 /// double-spawning.
-async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
+async fn connect_and_pump(
+    ws_url: &str,
+    device_id: uuid::Uuid,
+    connected_at: &mut Option<std::time::Instant>,
+) -> anyhow::Result<()> {
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio::time::MissedTickBehavior;
     use tokio_tungstenite::tungstenite::Message;
 
     let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "agent_runtime").await?;
+    *connected_at = Some(std::time::Instant::now());
     info!("agent_runtime: WS connected for device_id={device_id}");
 
     // Fix (c2): on every fresh connect, replay any gate-continuation dispatches
@@ -11334,6 +11362,29 @@ mod tests {
     // Fix (a): back-off reset decision
     // =========================================================================
 
+    /// A connect that never established a socket is NEVER healthy uptime,
+    /// however long the ATTEMPT took.
+    ///
+    /// This is the property that decouples [`HEALTHY_PUMP_THRESHOLD_SECS`]
+    /// (30 s) from `coord_ws::CONNECT_TIMEOUT` (20 s). Measured across the
+    /// connect, a black-holed socket whose timer is serviced ~10 s late on a
+    /// loaded box would report ≥30 s and be classified as a healthy connection
+    /// dying — resetting the back-off to its 2 s floor and reconnect-storming a
+    /// coord that is already unreachable, forever. `pump_uptime` answers ZERO
+    /// for a connect that never completed, so no amount of timer lateness can
+    /// reach the threshold.
+    #[test]
+    fn a_connect_that_never_established_is_never_healthy_uptime() {
+        // The connect failed: nothing set `connected_at`.
+        assert_eq!(pump_uptime(None), Duration::ZERO);
+        assert!(!reset_backoff_after_pump(pump_uptime(None)));
+
+        // And a socket that WAS established measures from the socket, so a
+        // just-connected pump is likewise not yet healthy.
+        let just_connected = Some(std::time::Instant::now());
+        assert!(!reset_backoff_after_pump(pump_uptime(just_connected)));
+    }
+
     /// A pump that ran longer than [`HEALTHY_PUMP_THRESHOLD_SECS`] was a healthy
     /// connection that died — it MUST reset the back-off (regardless of Ok/Err).
     /// A pump that died almost immediately is a connect failure — it must NOT
@@ -12381,12 +12432,11 @@ mod tests {
             ContinuationGuard::Proceed
         );
         // The registry no longer holds the dead session.
-        assert!(continuation_sessions()
+        assert!(!continuation_sessions()
             .lock()
             .unwrap()
             .live
-            .get("term-tid-1")
-            .is_none());
+            .contains_key("term-tid-1"));
 
         std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
         clear_continuation_registry();

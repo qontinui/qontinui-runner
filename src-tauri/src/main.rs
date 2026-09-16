@@ -1248,6 +1248,22 @@ fn main() {
     // Initialize lifecycle debugging BEFORE anything else
     debug_lifecycle::init_lifecycle_debug();
 
+    // Wire the coord `/ws` lanes' 401 recovery to the device-JWT refresher.
+    // Installed HERE, before any lane can open a socket, because the hook is
+    // first-installation-wins and an uninstalled one degrades silently to the
+    // refresher's own ~5 min poll.
+    //
+    // The indirection is a crate-boundary fact, not a preference: the four
+    // lanes connect through `qontinui_runner_lib::coord_ws` (lib, because
+    // `env_agent` lives there) and the refresher is `mcp::device_jwt_refresher`
+    // (bin), so lib cannot name it. `kick_device_jwt_refresher` is async and
+    // no-ops when no refresher is running, hence the detached spawn.
+    qontinui_runner_lib::coord_ws::set_unauthorized_hook(|| {
+        tokio::spawn(async {
+            mcp::device_jwt_refresher::commands::kick_device_jwt_refresher().await;
+        });
+    });
+
     // Per-monitor DPI awareness must be set before any screen capture
     // (Windows: PROCESS_PER_MONITOR_DPI_AWARE_V2). No-op on macOS/Linux.
     screen::ensure_dpi_awareness();

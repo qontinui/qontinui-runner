@@ -145,9 +145,13 @@ pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
             tokio::time::sleep(Duration::from_secs(CI_NO_COORD_URL_RETRY_SECS)).await;
             continue;
         };
-        let started = std::time::Instant::now();
-        let pump_result = connect_and_pump_ci(&ws_url, device_id).await;
-        let elapsed = started.elapsed();
+        // Measured from the ESTABLISHED socket, not from the start of the
+        // bounded connect ahead of it — same reasoning as
+        // `agent_runtime::pump_uptime`: a connect that burns its whole
+        // `coord_ws::CONNECT_TIMEOUT` budget must never read as healthy uptime.
+        let mut connected_at: Option<std::time::Instant> = None;
+        let pump_result = connect_and_pump_ci(&ws_url, device_id, &mut connected_at).await;
+        let elapsed = connected_at.map_or(Duration::ZERO, |at| at.elapsed());
         match pump_result {
             Ok(()) => {
                 debug!("ci_node: WS pump returned cleanly; reconnecting");
@@ -176,13 +180,18 @@ pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
 
 /// One connect-and-pump iteration — same keepalive/recv discipline as
 /// `agent_runtime::connect_and_pump`.
-async fn connect_and_pump_ci(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
+async fn connect_and_pump_ci(
+    ws_url: &str,
+    device_id: uuid::Uuid,
+    connected_at: &mut Option<std::time::Instant>,
+) -> anyhow::Result<()> {
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use tokio::time::MissedTickBehavior;
     use tokio_tungstenite::tungstenite::Message;
 
     let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "ci_node").await?;
+    *connected_at = Some(std::time::Instant::now());
     info!("ci_node: WS connected for device_id={device_id}");
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(CI_KEEPALIVE_INTERVAL_SECS));
