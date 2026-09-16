@@ -2217,7 +2217,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn harvest_splices_then_is_idempotent() {
-        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
         pg.create_run(
             run_id,
@@ -2682,7 +2682,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn gate_register_persists_and_clears_then_dispatches() {
-        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
         pg.create_run(run_id, "gate run", None, &["test".to_string()], "running")
             .await
@@ -2818,7 +2818,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn drift_verify_no_drift_completes_drift_splices_remediation() {
-        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let pg = PgDb::new_for_test().await;
         let dispatcher = FakeDispatcher::default();
         let mut timers = ReadyIdleTimers::default();
         let c = cfg();
@@ -3203,7 +3203,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn finish_run_writes_status_and_reason_to_the_run_row() {
-        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let pg = PgDb::new_for_test().await;
         let cases: [(RunExit, &str, Option<&str>, LoopPhase); 3] = [
             (
                 RunExit::failed("Circular dependency detected in subtask DAG"),
@@ -3267,7 +3267,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn coord_unreachable_is_recorded_on_the_subtask_and_clears_on_recovery() {
-        let pg = Arc::new(PgDb::new_blocking_for_test());
+        let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
         pg.create_run(
             run_id,

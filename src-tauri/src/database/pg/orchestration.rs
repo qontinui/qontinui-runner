@@ -576,7 +576,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn run_and_subtask_dag_round_trip() {
-        let pg = PgDb::new_blocking_for_test();
+        let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
 
         // 1. Create the run.
