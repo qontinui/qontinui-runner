@@ -1452,6 +1452,12 @@ impl TerminalSession {
     /// that only runs in the frontend is not a guard for the paths that spawn
     /// unattended. See [`crate::resource_guard`] for the verdict ladder and for
     /// why it fails open.
+    ///
+    /// `spawn_tenant` is the tenant the caller chose for this session (the spawn
+    /// picker, `--tenant`), or `None`. It is carried into the session's coord-mcp
+    /// credential by the identity seam, which REFUSES the spawn — before the
+    /// child exists — when that tenant cannot be presented (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         id: TerminalId,
@@ -1465,6 +1471,7 @@ impl TerminalSession {
         command: Option<Vec<String>>,
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
+        spawn_tenant: Option<uuid::Uuid>,
     ) -> Result<Self, String> {
         // Spawn-time resource gate — BEFORE the PTY is opened, so a refusal
         // leaves no half-built session behind and nothing already running is
@@ -1555,7 +1562,10 @@ impl TerminalSession {
         // prepends their dir to PATH, and records the session AUTHORITATIVELY at
         // spawn (zero transcript race — the §3b determinism mechanism). Runs
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
-        // any failure injects nothing and the terminal still spawns. The pinned
+        // any failure injects nothing and the terminal still spawns — with ONE
+        // exception, the spawn tenant: a tenant its coord-mcp credential cannot
+        // carry refuses the spawn here, before the child exists, rather than
+        // start a session labelled one tenant that writes to another. The pinned
         // id it hands back is kept on the session so the coord registration
         // that follows the spawn can key the row by it.
         let seam = {
@@ -1573,8 +1583,9 @@ impl TerminalSession {
                 &title,
                 &page_id,
                 effective_claude_config_dir.clone(),
+                spawn_tenant,
             )
-        };
+        }?;
         let pinned_session_id = seam.pinned_session_id;
 
         // ---- The canonical runner-context briefing --------------------------
@@ -3037,6 +3048,11 @@ impl TerminalSession {
     /// the coord registration — plus what this session's coord-mcp provisioning
     /// actually did, which only this seam knows and which the caller needs in
     /// order to render an honest briefing.
+    ///
+    /// `Err` is the one refusal this seam makes, and it is made before anything
+    /// is recorded: `spawn_tenant` names a tenant the session's coord-mcp
+    /// credential cannot be issued for — see
+    /// [`crate::coord_mcp::SpawnTenantRefusal`].
     #[allow(clippy::too_many_arguments)]
     fn apply_identity_seam(
         cmd: &mut CommandBuilder,
@@ -3050,7 +3066,9 @@ impl TerminalSession {
         // authoritative record so an autonomous boot-resume runs under the
         // CORRECT account. `None` = default account (no CLAUDE_CONFIG_DIR).
         config_dir: Option<String>,
-    ) -> IdentitySeamOutcome {
+        // The caller's chosen tenant, BEFORE the kill switch — resolved below.
+        spawn_tenant: Option<uuid::Uuid>,
+    ) -> Result<IdentitySeamOutcome, String> {
         use crate::install_effects_producer::intercept::shim_materializer;
         use tauri::Manager;
 
@@ -3137,69 +3155,41 @@ impl TerminalSession {
         // the caller so the briefing it renders next can gate the memory clause
         // on THIS session's outcome rather than on a runner-level property (plan
         // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-        // Seeded `Unprovisioned` so a branch added below that forgets to record
-        // an outcome fails to SILENCE — a session never told the tools exist —
-        // rather than to a claim the runner cannot support.
-        let mut coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
-        {
+        let coord_mcp = {
             // Phase 0 instrumentation: `.mcp.json` read+parse and, on the
             // provisioning branch, a nonce registration that re-encrypts the
             // WHOLE secure-storage token store (B2).
             let _span =
                 tracing::debug_span!("terminal_spawn.coord_mcp_provision", terminal_id = %terminal_id)
                     .entered();
-            if crate::coord_mcp::workdir_declares_coord_mcp(cwd) {
+            // The whole decision — skip for a cwd that declares coord-mcp, else
+            // provision a per-terminal config, and refuse a spawn tenant either
+            // arm cannot carry — lives in `coord_mcp::deliver_terminal_coord_mcp`
+            // so it is testable without a PTY. A refusal returns BEFORE the
+            // child exists and before the session is recorded.
+            let delivered = crate::coord_mcp::deliver_terminal_coord_mcp(
+                cwd,
+                terminal_id,
+                spawn_tenant,
+                crate::coord_mcp::resolve_bound_api_port(),
+            )
+            .map_err(|refusal| {
+                warn!(terminal_id = %terminal_id, cwd = %cwd, "{refusal}");
+                refusal.to_string()
+            })?;
+            if let Some(cfg_path) = &delivered.config_path {
+                cmd.env(
+                    crate::coord_mcp::MCP_CONFIG_ENV,
+                    cfg_path.to_string_lossy().as_ref(),
+                );
                 info!(
                     terminal_id = %terminal_id,
-                    "coord-mcp: cwd already declares coord-mcp — skipping --mcp-config injection"
+                    path = %cfg_path.display(),
+                    "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
                 );
-                // UNPROBED, not unreachable: the runner neither wrote that file
-                // nor asked it anything, so its bearer may be stale, foreign, or
-                // bound to a port nothing serves. This is the arm the 2026-08-21
-                // measurement landed on.
-                coord_mcp = crate::coord_mcp::CoordMcpDelivery::WorkdirDeclared;
-            } else {
-                match crate::coord_mcp::provision_coord_mcp_config_file(cwd, Some(terminal_id)) {
-                    Some(cfg_path) => {
-                        cmd.env(
-                            crate::coord_mcp::MCP_CONFIG_ENV,
-                            cfg_path.to_string_lossy().as_ref(),
-                        );
-                        info!(
-                            terminal_id = %terminal_id,
-                            path = %cfg_path.display(),
-                            "coord-mcp: QONTINUI_MCP_CONFIG injected for universal --mcp-config delivery"
-                        );
-                        // This cwd HAS coord-mcp now — retire any breadcrumb a
-                        // previous un-provisioned spawn left behind.
-                        crate::coord_mcp::clear_degraded_breadcrumb(cwd);
-                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Provisioned;
-                    }
-                    None => {
-                        // Provisioning was ATTEMPTED and produced nothing. The
-                        // one way that happens is the fail-closed port resolve
-                        // in `mint_device_proxy_config` (no live Tauri runtime /
-                        // managed AppState), plus an app-data write failure —
-                        // both of which `provision_coord_mcp_config_file` has
-                        // already warned about with the specific error. Name the
-                        // OUTCOME here so the session's own cwd carries it.
-                        warn!(
-                            terminal_id = %terminal_id,
-                            cwd = %cwd,
-                            "coord-mcp: no --mcp-config provisioned for this terminal — \
-                             the session starts with NO coord-mcp"
-                        );
-                        crate::coord_mcp::write_unprovisioned_breadcrumb(
-                            cwd,
-                            "the runner could not materialize a --mcp-config for this \
-                             terminal (bound API port unresolvable, or the app-data \
-                             write failed) — see the runner log for the specific error",
-                        );
-                        coord_mcp = crate::coord_mcp::CoordMcpDelivery::Unprovisioned;
-                    }
-                }
             }
-        }
+            delivered.delivery
+        };
 
         // 3. Materialize the always-on identity shims + prepend their dir.
         // Phase 6 (B2): the dir is CONTENT-ADDRESSED per runner build and
@@ -3263,10 +3253,10 @@ impl TerminalSession {
             );
         }
 
-        IdentitySeamOutcome {
+        Ok(IdentitySeamOutcome {
             pinned_session_id: pinned,
             coord_mcp,
-        }
+        })
     }
 
     /// Steps 1 + 2 of [`Self::apply_identity_seam`]: settle the session id

@@ -146,6 +146,44 @@ export interface SessionPrs {
   scannedRepos: string[];
 }
 
+/**
+ * Which tenant each half of the session acts as (plan
+ * `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P0).
+ * Mirrors the Rust `SessionTenancy`; keep the two spellings in step.
+ *
+ * Three values because three mechanisms decide them — the coord row stamped at
+ * spawn, the runner's data-plane writes, and the coord-mcp credential — and a
+ * session labelled one tenant has written to another through the third.
+ */
+export interface SessionTenancy {
+  /** `tenantId: null` ⇒ the spawn chose none (coord's row holds the device
+   * default) — NOT "no tenant". */
+  row: { tenantId: string | null };
+  dataPlane: {
+    /** `"owned"` | `"device"` | `"unresolved"` | `"unknown"`. */
+    status: string;
+    tenantId: string | null;
+    reason: string | null;
+  };
+  credential: {
+    /** `"resolved"` | `"unknown"` — an unknown is never rendered as a default. */
+    status: string;
+    tenantId: string | null;
+    /** `"tenant"` | `"default"`; `null` while unknown. */
+    slot: string | null;
+    reason: string | null;
+    posture: {
+      /** `"observed"` | `"unknown"`. */
+      status: string;
+      value: string | null;
+      canAnswer: boolean | null;
+      reason: string | null;
+    };
+  };
+  /** The tenants that ARE known name more than one tenant. */
+  diverged: boolean;
+}
+
 export interface SessionInfoBody {
   identity: SessionIdentity;
   name: SessionName;
@@ -153,6 +191,9 @@ export interface SessionInfoBody {
   placement: SessionPlacement;
   lifecycle: SessionLifecycleInfo;
   prs: SessionPrs;
+  /** `null` when the envelope carried no well-formed tenancy block — UNKNOWN,
+   * not "agrees". */
+  tenancy: SessionTenancy | null;
 }
 
 /** `"loading"` is a distinct third state: the first read has not returned, so
@@ -477,8 +518,7 @@ export function prRowChip(
   // thing. (The strong claim used to read "closed, not landed", and it was
   // printed on every coord rebase-fast-forward land: those rewrite the shas,
   // so the ancestry probe backing it could never have passed.)
-  if (pr.prState === "closed")
-    return { text: "closed — land unverified", tone: "unknown" };
+  if (pr.prState === "closed") return { text: "closed — land unverified", tone: "unknown" };
   return { text: pr.prState ?? "open", tone: "open" };
 }
 
@@ -772,6 +812,50 @@ function normalizePrs(raw: unknown): SessionPrs {
   };
 }
 
+/** Tenancy block → typed, or `null` when it is absent or malformed. Pure. */
+export function normalizeTenancy(raw: unknown): SessionTenancy | null {
+  if (!raw || typeof raw !== "object") return null;
+  const v = raw as {
+    row?: { tenantId?: unknown };
+    dataPlane?: { status?: unknown; tenantId?: unknown; reason?: unknown };
+    credential?: {
+      status?: unknown;
+      tenantId?: unknown;
+      slot?: unknown;
+      reason?: unknown;
+      posture?: { status?: unknown; value?: unknown; canAnswer?: unknown; reason?: unknown };
+    };
+    diverged?: unknown;
+  };
+  const credentialStatus = str(v.credential?.status);
+  const dataPlaneStatus = str(v.dataPlane?.status);
+  if (!v.row || !credentialStatus || !dataPlaneStatus || typeof v.diverged !== "boolean") {
+    return null;
+  }
+  const posture = v.credential?.posture;
+  return {
+    row: { tenantId: str(v.row.tenantId) },
+    dataPlane: {
+      status: dataPlaneStatus,
+      tenantId: str(v.dataPlane?.tenantId),
+      reason: str(v.dataPlane?.reason),
+    },
+    credential: {
+      status: credentialStatus,
+      tenantId: str(v.credential?.tenantId),
+      slot: str(v.credential?.slot),
+      reason: str(v.credential?.reason),
+      posture: {
+        status: str(posture?.status) ?? UNKNOWN_TEXT,
+        value: str(posture?.value),
+        canAnswer: typeof posture?.canAnswer === "boolean" ? posture.canAnswer : null,
+        reason: str(posture?.reason),
+      },
+    },
+    diverged: v.diverged,
+  };
+}
+
 /**
  * Envelope → state. A malformed or non-`available` payload becomes an
  * `unavailable` state WITH a reason — there is no branch that produces a
@@ -790,6 +874,7 @@ export function normalizeSessionInfo(raw: unknown): SessionInfoState {
     placement?: SessionPlacement;
     lifecycle?: SessionLifecycleInfo;
     prs?: unknown;
+    tenancy?: unknown;
   };
   if (v.available !== true) {
     return { status: "unavailable", reason: str(v.reason) ?? "unspecified", body: null };
@@ -807,6 +892,7 @@ export function normalizeSessionInfo(raw: unknown): SessionInfoState {
       placement: v.placement,
       lifecycle: v.lifecycle,
       prs: normalizePrs(v.prs),
+      tenancy: normalizeTenancy(v.tenancy),
     },
   };
 }

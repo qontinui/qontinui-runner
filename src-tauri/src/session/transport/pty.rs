@@ -89,6 +89,8 @@ impl Transport for PtyTransport {
                 // A plain shell transport; the account is chosen after this
                 // point, if ever.
                 crate::terminal::TrustArm::AccountChosenLater,
+                // No tenant choice on this transport.
+                None,
             )
             .map_err(TransportError::Runtime)?;
 

@@ -353,6 +353,244 @@ pub struct SessionPrs {
     pub scanned_repos: Vec<String>,
 }
 
+/// `tenancy.credential.status` / `tenancy.credential.posture.status`: the value
+/// was established.
+pub const TENANCY_RESOLVED: &str = "resolved";
+/// `tenancy.credential.posture.status`: a posture was published and it
+/// describes this session's own credential slot.
+pub const TENANCY_OBSERVED: &str = "observed";
+/// Any tenancy value that could not be established — always with a `reason`.
+pub const TENANCY_UNKNOWN: &str = "unknown";
+
+/// The coord row tenant: what the session was stamped with at spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyRow {
+    /// The tenant the spawn chose, as durably stamped on the lifecycle record —
+    /// the same value `Intent.tenant_id` carried to coord. `None` ⇒ the spawn
+    /// chose none, so coord's row carries whatever default the registry
+    /// stamped; it does NOT mean the session has no tenant.
+    pub tenant_id: Option<String>,
+}
+
+/// The runner data-plane tenant: what the runner's own work-scoped coord writes
+/// for this session present ([`crate::session::session_tenant_scope`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyDataPlane {
+    /// `"owned"` (a tenant is stamped on the registry session) | `"device"` |
+    /// `"unresolved"` | `"unknown"` (no registry session to ask — `reason`).
+    pub status: String,
+    pub tenant_id: Option<String>,
+    /// Set when `status` is `"unknown"`.
+    pub reason: Option<String>,
+}
+
+/// The coord-credential posture of the slot the session's credential selects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyPosture {
+    /// [`TENANCY_OBSERVED`] | [`TENANCY_UNKNOWN`].
+    pub status: String,
+    /// `live` | `expiring` | `expired` | `absent` | `unrefreshable` | `dark`.
+    pub value: Option<String>,
+    pub can_answer: Option<bool>,
+    /// Set when `status` is `"unknown"`: `credential_tenant_unknown`,
+    /// `no_posture_published`, or `posture_describes_another_slot` (the runner
+    /// publishes ONE posture — the worst slot's — so another slot's reading is
+    /// not a statement about this one).
+    pub reason: Option<String>,
+}
+
+/// The coord-mcp credential tenant: what this session's coord-mcp writes (memory,
+/// prompt documents, gates) are actually attributed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenancyCredential {
+    /// [`TENANCY_RESOLVED`] | [`TENANCY_UNKNOWN`]. Never a default in place of
+    /// an unknown — served policy `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`.
+    pub status: String,
+    /// The tenant whose slot the proxy selects. With `slot: "default"` this is
+    /// the device's default binding when that is known, else `None`.
+    pub tenant_id: Option<String>,
+    /// `"tenant"` (a per-tenant slot) | `"default"` (the legacy default slot);
+    /// `None` while unknown.
+    pub slot: Option<String>,
+    /// Set when `status` is `"unknown"`: `no_session_nonce`, or
+    /// `tenant_unresolvable: <the proxy's refusal>`.
+    pub reason: Option<String>,
+    pub posture: TenancyPosture,
+}
+
+/// Which tenant each half of this session acts as, and whether they disagree
+/// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
+/// P0).
+///
+/// Three values, not one, because three mechanisms decide them: the coord row
+/// is stamped at spawn, the runner's data-plane writes follow the registry, and
+/// the coord-mcp proxy resolves its own nonce. A session spawned for tenant B
+/// used to be labelled B and have its runner writes go to B while its coord-mcp
+/// writes went to the machine's tenant — so all three are reported, and the
+/// disagreement is stated rather than resolved by picking one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTenancy {
+    pub row: TenancyRow,
+    pub data_plane: TenancyDataPlane,
+    pub credential: TenancyCredential,
+    /// True iff the tenants that ARE known name more than one tenant. An
+    /// unknown value never manufactures a divergence, and never hides one.
+    pub diverged: bool,
+}
+
+/// Project the three tenancy reads into [`SessionTenancy`]. Pure.
+///
+/// - `row_tenant` — the lifecycle record's stamped tenant.
+/// - `data_plane` — the registry session's scope, `None` when the terminal has
+///   no registry session to ask.
+/// - `credential` — what the session's coord-mcp nonce resolves to.
+/// - `default_binding` — the device's default binding, which is the tenant
+///   behind the legacy default slot.
+/// - `posture` — the runner's published credential posture.
+pub(crate) fn project_tenancy(
+    row_tenant: Option<&str>,
+    data_plane: Option<crate::auth::TenantScope>,
+    credential: &crate::coord_mcp::CredentialTenantRead,
+    default_binding: Option<uuid::Uuid>,
+    posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
+) -> SessionTenancy {
+    use crate::auth::TenantScope;
+    use crate::coord_mcp::CredentialTenantRead;
+
+    let row_tenant = row_tenant.map(str::trim).filter(|t| !t.is_empty());
+    let data_plane = match data_plane {
+        Some(TenantScope::Owned(t)) => TenancyDataPlane {
+            status: "owned".to_string(),
+            tenant_id: Some(t.to_string()),
+            reason: None,
+        },
+        Some(TenantScope::Device) => TenancyDataPlane {
+            status: "device".to_string(),
+            tenant_id: None,
+            reason: None,
+        },
+        Some(TenantScope::Unresolved) => TenancyDataPlane {
+            status: "unresolved".to_string(),
+            tenant_id: None,
+            reason: None,
+        },
+        None => TenancyDataPlane {
+            status: TENANCY_UNKNOWN.to_string(),
+            tenant_id: None,
+            reason: Some("no_coord_session".to_string()),
+        },
+    };
+
+    // (the tenant the credential selects, the session tenant the posture gate
+    // compares against) — the second is `None` for the default slot, which is
+    // how `posture_describes_session_slot` spells it.
+    let credential_slot: Result<(Option<uuid::Uuid>, Option<uuid::Uuid>), String> = match credential
+    {
+        CredentialTenantRead::Resolved(Some(t)) => Ok((Some(*t), Some(*t))),
+        CredentialTenantRead::Resolved(None) => Ok((default_binding, None)),
+        CredentialTenantRead::NoNonce => Err("no_session_nonce".to_string()),
+        CredentialTenantRead::Refused(body) => Err(format!("tenant_unresolvable: {body}")),
+    };
+    let credential = match &credential_slot {
+        Ok((tenant, session_tenant)) => {
+            let posture = match posture {
+                None => unknown_posture("no_posture_published"),
+                Some(status)
+                    if crate::coord_mcp::posture_describes_session_slot(
+                        status,
+                        *session_tenant,
+                    ) =>
+                {
+                    TenancyPosture {
+                        status: TENANCY_OBSERVED.to_string(),
+                        value: Some(status.posture.as_str().to_string()),
+                        can_answer: Some(status.posture.can_answer()),
+                        reason: None,
+                    }
+                }
+                Some(_) => unknown_posture("posture_describes_another_slot"),
+            };
+            TenancyCredential {
+                status: TENANCY_RESOLVED.to_string(),
+                tenant_id: tenant.map(|t| t.to_string()),
+                slot: Some(
+                    if session_tenant.is_some() {
+                        "tenant"
+                    } else {
+                        "default"
+                    }
+                    .to_string(),
+                ),
+                reason: None,
+                posture,
+            }
+        }
+        Err(reason) => TenancyCredential {
+            status: TENANCY_UNKNOWN.to_string(),
+            tenant_id: None,
+            slot: None,
+            reason: Some(reason.clone()),
+            posture: unknown_posture("credential_tenant_unknown"),
+        },
+    };
+
+    let mut known: Vec<String> = Vec::with_capacity(3);
+    known.extend(row_tenant.map(str::to_ascii_lowercase));
+    known.extend(data_plane.tenant_id.as_deref().map(str::to_ascii_lowercase));
+    known.extend(credential.tenant_id.as_deref().map(str::to_ascii_lowercase));
+    known.sort();
+    known.dedup();
+
+    SessionTenancy {
+        row: TenancyRow {
+            tenant_id: row_tenant.map(String::from),
+        },
+        data_plane,
+        credential,
+        diverged: known.len() > 1,
+    }
+}
+
+fn unknown_posture(reason: &str) -> TenancyPosture {
+    TenancyPosture {
+        status: TENANCY_UNKNOWN.to_string(),
+        value: None,
+        can_answer: None,
+        reason: Some(reason.to_string()),
+    }
+}
+
+/// Read the three tenancy values for `rec` from the live runner and project
+/// them. The registry session is reached through the terminal that hosts the
+/// session; the credential through that terminal's nonce, or its cwd's.
+pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenancy {
+    use tauri::Manager;
+    let data_plane = crate::tauri_app_handle::current()
+        .and_then(|app| {
+            app.try_state::<Arc<crate::terminal::TerminalManager>>()
+                .and_then(|tm| tm.get(&rec.terminal_id))
+        })
+        .and_then(|terminal| terminal.coord_session_id())
+        .map(|id| crate::session::session_tenant_scope(Some(id)));
+    let credential = crate::coord_mcp::session_credential_tenant(
+        &rec.terminal_id,
+        non_empty(rec.working_dir.as_ref()).as_deref(),
+    );
+    project_tenancy(
+        rec.tenant_id.as_deref(),
+        data_plane,
+        &credential,
+        crate::auth::default_binding_tenant(),
+        crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
+    )
+}
+
 /// The projected body — every field group of D1. Flattened into
 /// [`SessionInfoEnvelope`] so the wire shape is exactly D1's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -364,6 +602,8 @@ pub struct SessionInfoBody {
     pub placement: SessionPlacement,
     pub lifecycle: SessionLifecycleInfo,
     pub prs: SessionPrs,
+    /// Which tenant each half of the session acts as — see [`SessionTenancy`].
+    pub tenancy: SessionTenancy,
 }
 
 /// The one-shot session-info envelope.
@@ -544,6 +784,7 @@ pub fn project_session_info(
     live: Option<&LiveClaudeSession>,
     transcript_exists: bool,
     prs: SessionPrs,
+    tenancy: SessionTenancy,
 ) -> SessionInfoEnvelope {
     let confirmed = rec.confirmed_at.is_some();
     let live_name = live
@@ -626,6 +867,7 @@ pub fn project_session_info(
                 bypass_permissions: rec.bypass_permissions,
             },
             prs,
+            tenancy,
         }),
     }
 }
@@ -681,7 +923,8 @@ pub async fn build_session_info(
     let transcript_exists =
         probe.transcript_exists(&rec.claude_session_id, rec.working_dir.as_deref());
     let prs = load_prs(&rec.claude_session_id).await;
-    project_session_info(rec, live.as_ref(), transcript_exists, prs)
+    let tenancy = read_session_tenancy(rec);
+    project_session_info(rec, live.as_ref(), transcript_exists, prs, tenancy)
 }
 
 /// `session_info_get` — the ONE read the session-info dropdown makes.
@@ -828,10 +1071,124 @@ mod tests {
         }
     }
 
+    /// A tenancy block that establishes nothing — for tests about other fields.
+    fn unknown_tenancy() -> SessionTenancy {
+        project_tenancy(
+            None,
+            None,
+            &crate::coord_mcp::CredentialTenantRead::NoNonce,
+            None,
+            None,
+        )
+    }
+
+    fn tenant(n: u8) -> uuid::Uuid {
+        uuid::Uuid::from_bytes([n; 16])
+    }
+
+    fn posture_on(
+        posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+        slot: Option<uuid::Uuid>,
+    ) -> crate::mcp::device_jwt_refresher::CoordCredentialStatus {
+        crate::mcp::device_jwt_refresher::CoordCredentialStatus {
+            posture,
+            tenant_id: slot.map(|t| t.to_string()),
+            exp: None,
+            last_ok_at: None,
+            last_401_at: None,
+            last_refresh_outcome: None,
+            since: 0,
+            observed_at_unix: 0,
+            attributable: true,
+        }
+    }
+
+    /// P0 (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential):
+    /// all three halves agreeing is NOT a divergence, and the posture of the
+    /// credential's own slot is reported beside it.
+    #[test]
+    fn tenancy_agreeing_on_one_tenant_is_not_diverged_and_reports_that_slots_posture() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let b = tenant(0xB2);
+        let status = posture_on(P::Live, Some(b));
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            Some(crate::auth::TenantScope::Owned(b)),
+            &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
+            None,
+            Some(&status),
+        );
+        assert!(!t.diverged);
+        assert_eq!(t.credential.status, TENANCY_RESOLVED);
+        assert_eq!(t.credential.slot.as_deref(), Some("tenant"));
+        assert_eq!(t.credential.posture.status, TENANCY_OBSERVED);
+        assert_eq!(t.credential.posture.value.as_deref(), Some("live"));
+    }
+
+    /// The published posture is the WORST slot's. A reading about tenant A's
+    /// slot says nothing about B's, so it must report UNKNOWN for a B credential
+    /// rather than lend B the A reading.
+    #[test]
+    fn tenancy_never_reports_another_slots_posture_as_the_credentials_own() {
+        use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let status = posture_on(P::Expired, Some(a));
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            None,
+            &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
+            None,
+            Some(&status),
+        );
+        assert_eq!(t.credential.posture.status, TENANCY_UNKNOWN);
+        assert_eq!(
+            t.credential.posture.reason.as_deref(),
+            Some("posture_describes_another_slot")
+        );
+        assert_eq!(t.data_plane.status, TENANCY_UNKNOWN);
+        assert_eq!(t.data_plane.reason.as_deref(), Some("no_coord_session"));
+    }
+
+    /// The default slot IS the default binding's credential, so a row stamped B
+    /// on a device whose default binding is A diverges even though the proxy
+    /// names no tenant.
+    #[test]
+    fn tenancy_compares_a_default_slot_credential_as_the_default_binding() {
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            None,
+            &crate::coord_mcp::CredentialTenantRead::Resolved(None),
+            Some(a),
+            None,
+        );
+        assert_eq!(t.credential.slot.as_deref(), Some("default"));
+        assert_eq!(t.credential.tenant_id, Some(a.to_string()));
+        assert!(t.diverged);
+    }
+
+    /// An unknown credential never manufactures a divergence, and never renders
+    /// as a tenant.
+    #[test]
+    fn tenancy_unknown_credential_is_spelled_unknown_not_defaulted() {
+        let b = tenant(0xB2);
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            None,
+            &crate::coord_mcp::CredentialTenantRead::NoNonce,
+            Some(tenant(0xA1)),
+            None,
+        );
+        assert_eq!(t.credential.status, TENANCY_UNKNOWN);
+        assert_eq!(t.credential.tenant_id, None);
+        assert_eq!(t.credential.reason.as_deref(), Some("no_session_nonce"));
+        assert!(!t.diverged);
+    }
+
     #[test]
     fn session_info_projects_all_four_identifiers_and_the_durable_identity() {
         let rec = record("11111111-1111-4111-8111-111111111111");
-        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let env = project_session_info(&rec, None, true, project_prs(&[]), unknown_tenancy());
         let body = env
             .body
             .as_ref()
@@ -862,7 +1219,7 @@ mod tests {
     #[test]
     fn transcriptless_confirmed_session_is_not_restorable() {
         let rec = record("22222222-2222-4222-8222-222222222222");
-        let env = project_session_info(&rec, None, false, project_prs(&[]));
+        let env = project_session_info(&rec, None, false, project_prs(&[]), unknown_tenancy());
         let body = env.body.unwrap();
         assert!(body.lifecycle.confirmed);
         assert!(!body.lifecycle.transcript_exists);
@@ -876,7 +1233,7 @@ mod tests {
     fn name_source_absent_is_unknown_not_operator() {
         let mut rec = record("33333333-3333-4333-8333-333333333333");
         rec.name_source = None;
-        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let env = project_session_info(&rec, None, true, project_prs(&[]), unknown_tenancy());
         let body = env.body.unwrap();
         assert_eq!(body.name.value.as_deref(), Some("stored-name"));
         // R2: never back-fill a provenance nobody reported.
@@ -888,7 +1245,7 @@ mod tests {
         let mut rec = record("44444444-4444-4444-8444-444444444444");
         rec.session_name = None;
         rec.name_source = Some(NAME_SOURCE_OPERATOR.to_string());
-        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let env = project_session_info(&rec, None, true, project_prs(&[]), unknown_tenancy());
         let body = env.body.unwrap();
         assert_eq!(body.name.value, None);
         assert_eq!(body.name.source, NAME_SOURCE_UNKNOWN);
@@ -897,7 +1254,7 @@ mod tests {
     #[test]
     fn derived_name_source_is_carried_through_verbatim() {
         let rec = record("55555555-5555-4555-8555-555555555555");
-        let env = project_session_info(&rec, None, true, project_prs(&[]));
+        let env = project_session_info(&rec, None, true, project_prs(&[]), unknown_tenancy());
         assert_eq!(env.body.unwrap().name.source, NAME_SOURCE_DERIVED);
     }
 
@@ -906,11 +1263,17 @@ mod tests {
     #[test]
     fn pr_ledger_unavailable_is_distinct_from_a_genuine_zero() {
         let rec = record("66666666-6666-4666-8666-666666666666");
-        let degraded = project_session_info(&rec, None, true, prs_unavailable("db_unavailable"))
-            .body
-            .unwrap()
-            .prs;
-        let empty = project_session_info(&rec, None, true, project_prs(&[]))
+        let degraded = project_session_info(
+            &rec,
+            None,
+            true,
+            prs_unavailable("db_unavailable"),
+            unknown_tenancy(),
+        )
+        .body
+        .unwrap()
+        .prs;
+        let empty = project_session_info(&rec, None, true, project_prs(&[]), unknown_tenancy())
             .body
             .unwrap()
             .prs;
@@ -1029,8 +1392,13 @@ mod tests {
     #[test]
     fn envelope_serializes_in_the_d1_camel_case_shape() {
         let rec = record("77777777-7777-4777-8777-777777777777");
-        let env =
-            project_session_info(&rec, None, true, project_prs(&[pr_row(1, true, "ff-land")]));
+        let env = project_session_info(
+            &rec,
+            None,
+            true,
+            project_prs(&[pr_row(1, true, "ff-land")]),
+            unknown_tenancy(),
+        );
         let v = serde_json::to_value(&env).unwrap();
         assert_eq!(v["available"], serde_json::json!(true));
         // Flattened groups sit at the top level, exactly as D1 spells them.
@@ -1065,6 +1433,7 @@ mod tests {
             None,
             true,
             project_prs(&[pr_row(1, true, "ff-land")]),
+            unknown_tenancy(),
         ))
         .unwrap();
         assert_eq!(mv["lifecycle"]["restoreTier"], serde_json::json!("failed"));
@@ -1083,7 +1452,13 @@ mod tests {
         assert_eq!(v["prs"]["scanned"], serde_json::json!(false));
         assert_eq!(v["prs"]["scannedRepos"], serde_json::json!([]));
         // A degraded ledger spells its reason on the wire.
-        let degraded = project_session_info(&rec, None, true, prs_unavailable("db_error"));
+        let degraded = project_session_info(
+            &rec,
+            None,
+            true,
+            prs_unavailable("db_error"),
+            unknown_tenancy(),
+        );
         let dv = serde_json::to_value(&degraded).unwrap();
         assert_eq!(dv["prs"]["status"], serde_json::json!("unavailable"));
         assert_eq!(dv["prs"]["reason"], serde_json::json!("db_error"));

@@ -1653,6 +1653,12 @@ struct GracedNonce {
     workdir: String,
     /// The terminal it was provisioned for, when there was one.
     terminal_id: Option<String>,
+    /// The tenant the evicted binding was PINNED to, when it was. An MCP client
+    /// never re-reads its config, so a graced key is a live session's
+    /// credential for the whole window — and must keep resolving to the tenant
+    /// it was issued for rather than to whatever the machine reads now (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
+    session_tenant: Option<Uuid>,
 }
 
 /// Transient grace registry: an evicted DEVICE nonce → its expiry and the
@@ -1704,6 +1710,7 @@ fn grace_evicted_device_nonces(evicted: &[(String, NonceBinding)]) {
                 grace_until,
                 workdir: b.workdir.clone(),
                 terminal_id: b.terminal_id.clone(),
+                session_tenant: b.session_pin.pinned(),
             },
         );
     }
@@ -1749,6 +1756,7 @@ fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGrace
                     workdir: g.workdir.clone(),
                     terminal_id: g.terminal_id.clone(),
                     grace_until_unix: minted_at_to_unix(g.grace_until),
+                    session_tenant: g.session_tenant,
                 },
             )
         })
@@ -1788,6 +1796,7 @@ fn restore_graced_nonces(
                     grace_until,
                     workdir: g.workdir.clone(),
                     terminal_id: g.terminal_id.clone(),
+                    session_tenant: g.session_tenant,
                 },
             );
             restored.push((nonce, g.workdir, g.terminal_id, grace_until));
@@ -2992,6 +3001,13 @@ fn device_nonce_snapshot(
                     // `Some(0)`, which reads back as the same sentinel — unknown
                     // stays unknown-and-oldest, never laundered into "just now".
                     minted_at_unix: Some(minted_at_to_unix(b.minted_at)),
+                    // The mint-time pin, so a restart restores the session to
+                    // the tenant it was issued for instead of re-pinning it to
+                    // whatever the machine reads at restore (plan
+                    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential
+                    // P1). Unpinned / Unresolvable mints persist nothing and
+                    // restore as before.
+                    session_tenant: b.session_pin.pinned(),
                 },
             )
         })
@@ -4296,13 +4312,23 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                 // say what was actually observed instead of what happened to
                 // select the right slot.
                 //
-                // What was observed is the MACHINE's pin at restore time. It is
-                // not a claim about the session — the persisted store carries
-                // only (nonce, workdir, terminal), never a tenant, and the
-                // original session's tenant died with the previous runner
-                // process. It records the one tenant fact that was true when
-                // the binding came back.
-                session_pin: restore_time_pin,
+                // A binding that was PINNED at mint restores that pin VERBATIM
+                // (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-
+                // credential P1). Row 1 of `resolve_session_tenant` honours a
+                // `Pinned` binding over the machine, so stamping the restore-time
+                // pin here re-pinned a session spawned for tenant B to the
+                // machine's tenant A at every restart — its coord row still said
+                // B while its writes moved to A.
+                //
+                // Only a binding persisted WITHOUT a tenant — minted unpinned, or
+                // written by a store that predates the field — falls back to what
+                // was observed: the MACHINE's pin at restore time. That is not a
+                // claim about the session; it records the one tenant fact that
+                // was true when the binding came back.
+                session_pin: binding
+                    .session_tenant
+                    .map(crate::session::tenant_pin::TenantPin::Pinned)
+                    .unwrap_or(restore_time_pin),
                 // The terminal IS carried, since plan 2026-08-20 Phase 4
                 // widened the store to hold it. It is not an identity claim —
                 // the PTY it names died with the previous runner process, so
@@ -4383,12 +4409,22 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
 /// This is the RUNNER-SPAWN path (the identity seam, the terminal chokepoint,
 /// the boot self-heal). Its semantics are otherwise deliberately unchanged by
 /// plan 2026-07-17 — see [`register_session_proxy_nonce`] for the mint-route path.
-fn register_proxy_nonce(workdir: &str, terminal_id: Option<&str>) -> String {
+///
+/// `session_tenant` is the tenant the SPAWN chose, when it chose one (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1) —
+/// see [`mint_and_register_nonce`] for what it freezes. The caller has already
+/// validated it ([`validate_spawn_tenant`]); `None` keeps the machine pin.
+fn register_proxy_nonce(
+    workdir: &str,
+    terminal_id: Option<&str>,
+    session_tenant: Option<Uuid>,
+) -> String {
     let (nonce, snapshot) = mint_and_register_nonce(
         workdir,
         ProxyPrincipal::Device,
         NonceLifetime::Persistent,
         terminal_id,
+        session_tenant,
     );
     persist_proxy_nonces(&snapshot);
     nonce
@@ -4439,6 +4475,7 @@ fn register_session_proxy_nonce(workdir: &str) -> String {
         ProxyPrincipal::Device,
         NonceLifetime::ephemeral(),
         None,
+        None,
     );
     nonce
 }
@@ -4461,6 +4498,7 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
         workdir,
         ProxyPrincipal::Agent { agent_id },
         NonceLifetime::Persistent,
+        None,
         None,
     );
     // Mirror to the store as a no-op for the agent entry (device entries in the
@@ -4516,11 +4554,22 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
 /// that terminal's MCP client. Two live nonces for one workdir is a sanctioned
 /// state, and both map to the same workdir, so [`workdir_for_nonce`] stays
 /// correct either way.
+///
+/// **`session_tenant`** (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1): the
+/// tenant the spawn picker / `--tenant` flag chose for THIS session. `Some(t)`
+/// freezes `Pinned(t)` as the binding's pin instead of sampling the machine,
+/// and Row 1 of [`resolve_session_tenant`] already makes a `Pinned` binding
+/// outrank the live machine pin — so the session's coord-mcp writes land in the
+/// tenant its coord row names instead of the machine's. `None` is every caller
+/// that did not choose, and keeps the machine pin exactly as before. Validation
+/// is the caller's ([`validate_spawn_tenant`]): this is the mint, not the gate.
 fn mint_and_register_nonce(
     workdir: &str,
     principal: ProxyPrincipal,
     lifetime: NonceLifetime,
     terminal_id: Option<&str>,
+    session_tenant: Option<Uuid>,
 ) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
@@ -4540,7 +4589,14 @@ fn mint_and_register_nonce(
     // own pin, so the Pinned / Unpinned / Unresolvable distinction is captured
     // while it still exists. Every other construction site of `NonceBinding`
     // has no machine pin to read and says `Unpinned` explicitly.
-    let session_pin = crate::session::tenant_pin::resolve_tenant_pin();
+    //
+    // A spawn that CHOSE its tenant is the exception, and the machine is not
+    // sampled at all: the chosen tenant is the session's own, which is exactly
+    // what the machine-global pin cannot express for two co-resident sessions.
+    let session_pin = match session_tenant {
+        Some(t) => crate::session::tenant_pin::TenantPin::Pinned(t),
+        None => crate::session::tenant_pin::resolve_tenant_pin(),
+    };
     // Forensics cause resolved BEFORE `principal` is moved into the map.
     let mint_cause = match (&principal, ephemeral) {
         (ProxyPrincipal::Device, false) => "persistent device mint (runner-spawn/re-provision)",
@@ -4888,16 +4944,28 @@ pub(crate) fn proxy_principal_for_nonce(nonce: &str) -> Option<ProxyPrincipal> {
 
 /// The typed pin a DEVICE proxy nonce was provisioned under.
 ///
-/// A nonce with no live binding (graced, or already reaped) reads
-/// [`TenantPin::Unpinned`], never `Unresolvable`: a graced session is a
-/// legitimate one whose binding simply aged out, and the nonce/scope gate in
-/// [`proxy_request_gate`] is what decides whether it may proceed at all. Only a
-/// binding minted on a machine that could not state its tenant reads
-/// `Unresolvable`.
+/// A GRACED nonce whose evicted binding was pinned keeps that pin — its client
+/// still presents it, and a pinned session's tenant does not change because
+/// its key was superseded. Any other nonce with no live binding (an unpinned
+/// graced one, or one already reaped) reads [`TenantPin::Unpinned`], never
+/// `Unresolvable`: a graced session is a legitimate one whose binding simply
+/// aged out, and the nonce/scope gate in [`proxy_request_gate`] is what decides
+/// whether it may proceed at all. Only a binding minted on a machine that could
+/// not state its tenant reads `Unresolvable`.
 pub(crate) fn proxy_session_pin_for_nonce(nonce: &str) -> crate::session::tenant_pin::TenantPin {
-    live_binding(nonce)
-        .map(|b| b.session_pin)
-        .unwrap_or(crate::session::tenant_pin::TenantPin::Unpinned)
+    use crate::session::tenant_pin::TenantPin;
+    if let Some(binding) = live_binding(nonce) {
+        return binding.session_pin;
+    }
+    let now = std::time::Instant::now();
+    graced_nonces()
+        .lock()
+        .expect("graced nonce map poisoned")
+        .get(nonce)
+        .filter(|g| g.expires_at > now)
+        .and_then(|g| g.session_tenant)
+        .map(TenantPin::Pinned)
+        .unwrap_or(TenantPin::Unpinned)
 }
 
 /// Typed refusal for a session whose tenant cannot be resolved by ANY route.
@@ -6051,7 +6119,19 @@ struct ReusableInCwdNonce {
 /// ([`adopt_on_disk_nonce`]). It never re-registers, never touches the grace
 /// map, and never changes what any nonce validates as. The accept set after a
 /// reuse is byte-identical to the accept set before it.
-fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<ReusableInCwdNonce> {
+///
+/// **A spawn that chose its tenant reuses only that tenant's key.** With
+/// `session_tenant: Some(t)` the binding must be `Pinned(t)`: handing a
+/// tenant-B session the file's machine-pinned key is exactly the
+/// labelled-B-writes-A defect plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` closes.
+/// `None` keeps the rule above unchanged — a caller that chose nothing never
+/// forces a re-mint, which in a shared cwd would evict a live sibling's key.
+fn reusable_in_cwd_device_nonce(
+    workdir: &str,
+    bound_port: u16,
+    session_tenant: Option<Uuid>,
+) -> Option<ReusableInCwdNonce> {
     if read_proxy_port(workdir)? != bound_port {
         return None;
     }
@@ -6063,6 +6143,11 @@ fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<Reusab
     }
     if binding.workdir != normalize_binding_workdir(workdir) {
         return None;
+    }
+    if let Some(t) = session_tenant {
+        if binding.session_pin != crate::session::tenant_pin::TenantPin::Pinned(t) {
+            return None;
+        }
     }
     Some(ReusableInCwdNonce {
         nonce,
@@ -6094,8 +6179,18 @@ fn reusable_in_cwd_device_nonce(workdir: &str, bound_port: u16) -> Option<Reusab
 /// self-heal's `Rewrite` arm still calls it directly, on the same "port moved
 /// or nothing to reuse" grounds. Do not call it to "refresh" a healthy config —
 /// that is the sibling kill this plan removed.
-pub(crate) fn write_coord_mcp_proxy_config(primary_wt: &str, bound_port: u16) {
-    let nonce = register_proxy_nonce(primary_wt, None);
+///
+/// `session_tenant` pins the minted nonce to a spawn-chosen tenant. Only a
+/// workdir that belongs to ONE session may carry one — an isolated worktree
+/// allocated for that spawn ([`crate::agent_worktree::isolated_edit::acquire_for_terminal`]
+/// is the only caller that passes `Some`) — because this file is read by every
+/// session launched in its cwd. Every shared-cwd caller passes `None`.
+pub(crate) fn write_coord_mcp_proxy_config(
+    primary_wt: &str,
+    bound_port: u16,
+    session_tenant: Option<Uuid>,
+) {
+    let nonce = register_proxy_nonce(primary_wt, None, session_tenant);
     write_mcp_json(
         primary_wt,
         &coord_mcp_proxy_config_json(
@@ -7540,6 +7635,15 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
 /// arm that declines because the workdir already declares one answers
 /// `WorkdirDeclared` (unprobed — the runner did not write that file and did not
 /// ask it anything); a completed write answers `Provisioned`.
+///
+/// # `session_tenant`
+///
+/// `Some(t)` pins a freshly minted in-cwd nonce to the spawn-chosen tenant and
+/// refuses to reuse a key pinned to anything else (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b). It
+/// is only ever `Some` for a workdir that belongs to one session — see
+/// [`write_coord_mcp_proxy_config`]. Every other caller passes `None`, which is
+/// today's behaviour byte-for-byte.
 // `pub(crate)` so the operator-opened-tab entry point
 // (`commands::terminal::terminal_create`) reuses this exact helper — closing the
 // last dark runner-spawned session kind (plan
@@ -7548,6 +7652,7 @@ fn write_mcp_json(primary_wt: &str, mcp_config: &serde_json::Value) -> bool {
 pub(crate) fn provision_coord_mcp_for_session(
     workdir: &str,
     bound_port: Option<u16>,
+    session_tenant: Option<Uuid>,
 ) -> CoordMcpDelivery {
     let jwt = match crate::auth::AuthManager::new().get_access_token() {
         Ok(t) if !t.trim().is_empty() => t,
@@ -7569,7 +7674,7 @@ pub(crate) fn provision_coord_mcp_for_session(
         }
     };
 
-    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port)
+    provision_coord_mcp_with_jwt(workdir, &jwt, bound_port, session_tenant)
 }
 
 /// Apply an already-resolved bearer to `workdir`'s `.mcp.json`, enforcing the two
@@ -7596,6 +7701,7 @@ fn provision_coord_mcp_with_jwt(
     workdir: &str,
     jwt: &str,
     bound_port: Option<u16>,
+    session_tenant: Option<Uuid>,
 ) -> CoordMcpDelivery {
     let sub_type = jwt_unverified_claim(jwt, "sub_type");
     match sub_type.as_deref() {
@@ -7708,7 +7814,7 @@ fn provision_coord_mcp_with_jwt(
         // cwd, on this port), or the session would be handed a dying key. A
         // mint is now the exception — no config, or a dead one — not the
         // default.
-        match reusable_in_cwd_device_nonce(workdir, port) {
+        match reusable_in_cwd_device_nonce(workdir, port, session_tenant) {
             Some(reuse) => {
                 let rewritten = if reuse.needs_header_upgrade {
                     rewrite_config_preserving_nonce(workdir, port, &reuse.nonce)
@@ -7731,7 +7837,7 @@ fn provision_coord_mcp_with_jwt(
                     ],
                 );
             }
-            None => write_coord_mcp_proxy_config(workdir, port),
+            None => write_coord_mcp_proxy_config(workdir, port, session_tenant),
         }
         // Phase 3b — the config is FINE and the runner's own credential may not
         // be. Written SYNCHRONOUSLY, before the probe below, so the artifact
@@ -8581,6 +8687,276 @@ fn mcp_config_file_name(workdir: &str, terminal_id: Option<&str>) -> String {
     format!("coord-mcp-{:016x}.json", h.finish())
 }
 
+/// Runner-process kill switch for carrying a spawn's chosen tenant into its
+/// coord-mcp credential (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
+///
+/// Exactly `0` restores machine-pin minting: no spawn-tenant validation, no
+/// tenant pin on the nonce, and no refusal for a cwd that declares another
+/// tenant's coord-mcp. Absent, empty or any other value leaves it on. Read per
+/// spawn, so it applies without a runner restart. The session-info tenancy
+/// report keeps naming the divergence while it is set — that is how an operator
+/// sees what flipping it cost.
+pub(crate) const SPAWN_TENANT_CREDENTIAL_ENV: &str = "QONTINUI_SPAWN_TENANT_CREDENTIAL";
+
+/// Is [`SPAWN_TENANT_CREDENTIAL_ENV`] leaving the spawn-tenant credential on?
+pub(crate) fn spawn_tenant_credential_enabled() -> bool {
+    spawn_tenant_credential_enabled_from(std::env::var(SPAWN_TENANT_CREDENTIAL_ENV).ok().as_deref())
+}
+
+/// Pure half of [`spawn_tenant_credential_enabled`].
+fn spawn_tenant_credential_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) != Some("0")
+}
+
+/// The tenant a spawn's coord-mcp credential is minted for: the spawn's chosen
+/// tenant, or `None` when it chose none or the kill switch is thrown.
+///
+/// Every spawn-side use of the chosen tenant for CREDENTIAL purposes goes
+/// through here, so the kill switch cannot be honoured on one arm (the
+/// per-terminal mint) and forgotten on another (the in-worktree `.mcp.json`,
+/// the cwd-declared refusal, the early precheck).
+pub(crate) fn credential_spawn_tenant(spawn_tenant: Option<Uuid>) -> Option<Uuid> {
+    let tenant = spawn_tenant?;
+    if spawn_tenant_credential_enabled() {
+        Some(tenant)
+    } else {
+        info!(
+            "coord_mcp: {SPAWN_TENANT_CREDENTIAL_ENV}=0 — minting this spawn's coord-mcp \
+             credential from the machine pin, NOT the chosen tenant {tenant}"
+        );
+        None
+    }
+}
+
+/// What a session's coord-mcp credential resolves to, read the way the proxy
+/// resolves it per request ([`session_tenant_or_refuse`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialTenantRead {
+    /// No runner proxy nonce could be found for the session — none minted for
+    /// its terminal, and no proxy-shaped `.mcp.json` in its cwd. UNKNOWN: the
+    /// session may hold a credential the runner did not issue.
+    NoNonce,
+    /// The proxy would select this tenant's slot; `None` is the default
+    /// (`access_token`) slot.
+    Resolved(Option<Uuid>),
+    /// [`session_tenant_or_refuse`] refused — the proxy would refuse every
+    /// request. The string is its typed refusal body.
+    Refused(String),
+}
+
+/// Resolve `nonce` the way the coord-mcp proxy does.
+fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
+    match nonce {
+        None => CredentialTenantRead::NoNonce,
+        Some(n) => match session_tenant_or_refuse(Some(n)) {
+            Ok(tenant) => CredentialTenantRead::Resolved(tenant),
+            Err((_, body)) => CredentialTenantRead::Refused(body),
+        },
+    }
+}
+
+/// What the proxy nonce in `<workdir>/.mcp.json` resolves to.
+pub(crate) fn workdir_credential_tenant(workdir: &str) -> CredentialTenantRead {
+    credential_tenant_for_nonce(read_proxy_nonce(&Path::new(workdir).join(".mcp.json")).as_deref())
+}
+
+/// What the coord-mcp credential of the session in `terminal_id` resolves to.
+///
+/// The session's credential is the one the identity seam gave it: the
+/// per-terminal nonce minted for THIS terminal when the seam provisioned one,
+/// else — when the seam skipped because the cwd declares coord-mcp — the nonce
+/// in that cwd's `.mcp.json`. A terminal re-provisioned into a second cwd holds
+/// one live binding per cwd; the newest mint is the one its `--mcp-config` file
+/// carries.
+pub(crate) fn session_credential_tenant(
+    terminal_id: &str,
+    workdir: Option<&str>,
+) -> CredentialTenantRead {
+    let terminal_nonce = {
+        let map = proxy_nonces().lock().expect("proxy nonce map poisoned");
+        map.iter()
+            .filter(|(_, b)| {
+                b.terminal_id.as_deref() == Some(terminal_id)
+                    && b.principal == ProxyPrincipal::Device
+            })
+            .max_by(|(na, a), (nb, b)| a.minted_at.cmp(&b.minted_at).then_with(|| na.cmp(nb)))
+            .map(|(n, _)| n.clone())
+    };
+    match (terminal_nonce, workdir) {
+        (Some(nonce), _) => credential_tenant_for_nonce(Some(&nonce)),
+        (None, Some(wd)) => workdir_credential_tenant(wd),
+        (None, None) => CredentialTenantRead::NoNonce,
+    }
+}
+
+/// How to give a runner a credential for a tenant it holds none for. Named in
+/// every refusal so the operator is handed the heal, not only the fault.
+pub(crate) const SPAWN_TENANT_PAIRING_HINT: &str =
+    "pair this device for that tenant (`qontinui_profile device pair --tenant-id <uuid>`), \
+     or spawn without a tenant";
+
+/// A spawn refused because the tenant it chose could not be carried into its
+/// coord-mcp credential (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
+///
+/// Refusing is the point. The alternative is minting the machine pin's
+/// credential for a session whose coord row says another tenant — a session
+/// that authors a prompt document into the wrong tenant and gets a `201`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnTenantRefusal {
+    /// This runner holds no device-JWT slot for the tenant and it is not the
+    /// default binding.
+    NotPaired { tenant: Uuid },
+    /// The credential store could not be read, so whether the tenant is paired
+    /// is UNKNOWN — refused rather than guessed.
+    CredentialStoreUnreadable { tenant: Uuid, error: String },
+    /// The cwd's own `.mcp.json` declares a coord-mcp server — so the seam
+    /// delivers no credential of its own — and that file's key does not resolve
+    /// to the chosen tenant.
+    WorkdirDeclaresOtherTenant {
+        tenant: Uuid,
+        declared_file: std::path::PathBuf,
+        declared: CredentialTenantRead,
+    },
+}
+
+impl SpawnTenantRefusal {
+    /// The stable machine-readable prefix, in the `terminal:tenant_invalid:`
+    /// family `commands::terminal::terminal_create` already answers with.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            SpawnTenantRefusal::NotPaired { .. } => "terminal:tenant_not_paired",
+            SpawnTenantRefusal::CredentialStoreUnreadable { .. } => {
+                "terminal:tenant_credential_store_unreadable"
+            }
+            SpawnTenantRefusal::WorkdirDeclaresOtherTenant { .. } => {
+                "terminal:tenant_workdir_declares_other_tenant"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SpawnTenantRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = self.code();
+        match self {
+            SpawnTenantRefusal::NotPaired { tenant } => write!(
+                f,
+                "{code}: this runner holds no coord credential for tenant {tenant}, so a session \
+                 spawned for it would write to another tenant — refusing the spawn. To fix: \
+                 {SPAWN_TENANT_PAIRING_HINT}"
+            ),
+            SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error } => write!(
+                f,
+                "{code}: could not read this runner's credential store ({error}), so whether it \
+                 holds a coord credential for tenant {tenant} is unknown — refusing the spawn \
+                 rather than guessing. If the store is healthy and the tenant unpaired: \
+                 {SPAWN_TENANT_PAIRING_HINT}"
+            ),
+            SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+                tenant,
+                declared_file,
+                declared,
+            } => {
+                let resolves = match declared {
+                    CredentialTenantRead::NoNonce => {
+                        "carries no runner proxy key, so its tenant cannot be established"
+                            .to_string()
+                    }
+                    CredentialTenantRead::Resolved(Some(t)) => format!("resolves to tenant {t}"),
+                    CredentialTenantRead::Resolved(None) => {
+                        "resolves to the default credential slot, not a named tenant".to_string()
+                    }
+                    CredentialTenantRead::Refused(body) => {
+                        format!("resolves to no tenant at all ({body})")
+                    }
+                };
+                write!(
+                    f,
+                    "{code}: {} declares a coord-mcp server, which this session would use \
+                     instead of a credential for tenant {tenant}, and its key {resolves} — \
+                     refusing the spawn. Spawn it in a directory whose .mcp.json declares no \
+                     coord-mcp (an isolated worktree via intent_repo does this), or without a tenant",
+                    declared_file.display()
+                )
+            }
+        }
+    }
+}
+
+/// Refuse a spawn tenant this runner cannot present a credential for.
+///
+/// The admitted set is the tenants holding a device-JWT slot
+/// ([`crate::auth::AuthManager::try_list_tenant_device_jwt_tenants`]) plus the
+/// device's default binding, whose JWT may live only in the legacy
+/// `access_token` slot — the same two routes
+/// [`crate::auth::select_device_bearer`] can serve a tenant from. Membership,
+/// not liveness: a dead slot for a paired tenant is the refresher's to heal, and
+/// the proxy's per-request gate ([`runner_credential_local_refusal`]) already
+/// answers it on that tenant's own slot. Coord re-validates server-side.
+pub(crate) fn validate_spawn_tenant(tenant: Uuid) -> Result<(), SpawnTenantRefusal> {
+    spawn_tenant_admission(
+        tenant,
+        crate::auth::AuthManager::new()
+            .try_list_tenant_device_jwt_tenants()
+            .map_err(|e| format!("{e:#}")),
+        crate::auth::default_binding_tenant(),
+    )
+}
+
+/// Pure core of [`validate_spawn_tenant`].
+fn spawn_tenant_admission(
+    tenant: Uuid,
+    held: Result<Vec<Uuid>, String>,
+    default_binding: Option<Uuid>,
+) -> Result<(), SpawnTenantRefusal> {
+    if default_binding == Some(tenant) {
+        return Ok(());
+    }
+    match held {
+        Ok(slots) if slots.contains(&tenant) => Ok(()),
+        Ok(_) => Err(SpawnTenantRefusal::NotPaired { tenant }),
+        Err(error) => Err(SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error }),
+    }
+}
+
+/// The cwd-declared arm of P1: a spawn that chose `tenant` into a cwd whose
+/// `.mcp.json` already declares coord-mcp is admitted only when that file's key
+/// resolves to `tenant`.
+///
+/// The identity seam delivers no per-terminal credential to such a cwd (two
+/// `coord-mcp` entries would race, and the project file's precedence over an
+/// injected one is unmeasured), so the file's key IS the session's credential.
+pub(crate) fn check_workdir_declared_tenant(
+    workdir: &str,
+    tenant: Uuid,
+) -> Result<(), SpawnTenantRefusal> {
+    match workdir_credential_tenant(workdir) {
+        CredentialTenantRead::Resolved(Some(t)) if t == tenant => Ok(()),
+        declared => Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+            tenant,
+            declared_file: Path::new(workdir).join(".mcp.json"),
+            declared,
+        }),
+    }
+}
+
+/// The early-out for a spawn entry point, run BEFORE its worktree allocation.
+///
+/// [`TerminalSession::spawn`]'s identity seam is the authority — it is where the
+/// credential is minted, and where the cwd-declared arm can be judged against
+/// the FINAL cwd. But by then `acquire_for_terminal` has already allocated a
+/// worktree and taken a claim, and a refusal there would leak both. Membership
+/// does not depend on the cwd, so it is checked here first, the way
+/// `resource_guard::precheck_spawn` fronts the seam's resource gate.
+pub(crate) fn precheck_spawn_tenant(spawn_tenant: Option<Uuid>) -> Result<(), String> {
+    match credential_spawn_tenant(spawn_tenant) {
+        Some(t) => validate_spawn_tenant(t).map_err(|refusal| refusal.to_string()),
+        None => Ok(()),
+    }
+}
+
 /// Materialize a DEVICE-scope coord-mcp `--mcp-config` file into the runner's OWN
 /// app-data dir (`~/.qontinui/runner/session-restore/coord-mcp/`, NEVER the cwd)
 /// and return its absolute path, so the identity shim can append
@@ -8612,13 +8988,36 @@ fn mcp_config_file_name(workdir: &str, terminal_id: Option<&str>) -> String {
 /// the app-data filename ([`mcp_config_file_name`]), so two terminals in one cwd
 /// get two files and two live nonces rather than racing one. `None` degrades to
 /// the previous per-workdir behavior in full.
-pub(crate) fn provision_coord_mcp_config_file(
+///
+/// `spawn_tenant` is the tenant the spawn chose, already passed through the kill
+/// switch ([`credential_spawn_tenant`]). `Some(t)` is validated before anything
+/// is minted and the nonce is pinned to `t`; a tenant this runner holds no
+/// credential for is `Err` — a typed refusal of the spawn — and registers
+/// nothing. `Ok(None)` keeps its old meaning: provisioning produced no file.
+///
+/// `bound_port` is injected (production passes [`resolve_bound_api_port`]) so the
+/// whole chain is drivable by a test without a live Tauri runtime.
+///
+/// The spawn tenant is judged FIRST, before the port: whether a tenant can be
+/// carried is a fact about this runner's credentials, not about its listener,
+/// so the refusal must not depend on which of the two a test (or a boot window)
+/// happens to have. A refusal registers nothing.
+fn provision_coord_mcp_config_file(
     workdir: &str,
     terminal_id: Option<&str>,
-) -> Option<std::path::PathBuf> {
-    // The shared mint core (§2): fail-closed port resolve + a DEVICE, cwd-bound
-    // nonce. `Persistent` = the runner-spawn class — today's semantics exactly.
-    let mcp_config = mint_device_proxy_config(workdir, NonceLifetime::Persistent, terminal_id)?;
+    spawn_tenant: Option<Uuid>,
+    bound_port: Option<u16>,
+) -> Result<Option<std::path::PathBuf>, SpawnTenantRefusal> {
+    if let Some(t) = spawn_tenant {
+        validate_spawn_tenant(t)?;
+    }
+    // Fail-closed port resolve: no bound port, no config and no nonce.
+    let Some(bound_port) = bound_port else {
+        return Ok(None);
+    };
+    // The shared mint core (§2): a DEVICE, cwd-bound, persistent nonce — the
+    // runner-spawn class — pinned to the spawn tenant when there is one.
+    let mcp_config = mint_device_proxy_config(workdir, terminal_id, spawn_tenant, bound_port);
     let dir = crate::session::claude_hook::session_restore_dir().join("coord-mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -8626,7 +9025,7 @@ pub(crate) fn provision_coord_mcp_config_file(
              --mcp-config delivery off for {workdir} (session simply has no coord-mcp)",
             dir.display()
         );
-        return None;
+        return Ok(None);
     }
     // Restrict the directory BEFORE writing, so the credential is never even
     // briefly world-readable inside a permissive parent. Best-effort: losing
@@ -8664,7 +9063,7 @@ pub(crate) fn provision_coord_mcp_config_file(
                 &key,
                 "app-data --mcp-config file materialized (proxy shape)",
             );
-            Some(file)
+            Ok(Some(file))
         }
         Err(e) => {
             warn!(
@@ -8672,50 +9071,139 @@ pub(crate) fn provision_coord_mcp_config_file(
                  --mcp-config delivery off for {workdir}",
                 file.display()
             );
-            None
+            Ok(None)
         }
     }
 }
 
-/// **The ONE mint path** (plan 2026-07-17 §2): resolve the bound port
-/// fail-closed, mint a DEVICE-principal nonce bound to `workdir`, and return the
-/// proxy config document. Both consumers go through here —
-/// [`provision_coord_mcp_config_file`] (the identity seam, which then
-/// materializes the doc as an app-data file) and
-/// [`provision_session_proxy_config`] (the `/coord-mcp/provision-session` mint
-/// route, which returns the doc over loopback). One mint path ⇒ ONE security
-/// invariant to review, rather than a route that could drift from the seam.
+/// The identity seam's mint: a PERSISTENT DEVICE-principal nonce bound to
+/// `workdir` (and pinned to the spawn tenant, which the caller has validated),
+/// and the proxy config document for the bound port.
 ///
 /// The invariant, stated once: **the port is fail-closed and the nonce is DEVICE
-/// + cwd-bound.** `resolve_bound_api_port()` returns `None` outside a live Tauri
-/// runtime (no managed `AppState`), and this returns `None` with it rather than
-/// falling back to the bootstrap-default `:9876` — which is right only by luck
-/// on a single-runner box and dead on any temp runner (the F1 root cause, and
-/// exactly the stale-:9879 config this plan's Phase-0 probe found in the wild).
-/// The route cannot bypass this: it has no port argument to pass.
+/// and cwd-bound.** The port is resolved by the caller
+/// ([`provision_coord_mcp_config_file`]), which returns before reaching here
+/// when `resolve_bound_api_port()` is `None` rather than falling back to the
+/// bootstrap-default `:9876` — right only by luck on a single-runner box and dead
+/// on any temp runner (the F1 root cause).
 ///
-/// `lifetime` and `terminal_id` are the ONLY axes the two callers differed on —
-/// see [`NonceLifetime`] for why the mint route's nonces are bounded and the
-/// seam's are not, and [`NonceBinding::terminal_id`] for why only the seam can
-/// name a terminal. Since the stdio arm the mint route no longer comes through
-/// here ([`provision_session_proxy_config`] is pinned to the http shape); the
-/// ephemeral arm is kept for the route's nonce lifetime.
+/// **Validation precedes the mint** ([`provision_coord_mcp_config_file`]).
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
+/// P1: a spawn tenant this runner holds no credential for is refused rather
+/// than minted as the machine pin — a silent fallback is exactly the
+/// labelled-B-writes-A defect that plan closes.
+///
+/// There used to be an ephemeral arm here for the `/coord-mcp/provision-session`
+/// mint route. That route stopped coming through here when it was pinned to the
+/// http shape ([`provision_session_proxy_config`]), leaving the arm with no
+/// caller — and an arm that would have silently dropped a spawn tenant — so it
+/// is gone.
 fn mint_device_proxy_config(
     workdir: &str,
-    lifetime: NonceLifetime,
     terminal_id: Option<&str>,
-) -> Option<serde_json::Value> {
-    let bound_port = resolve_bound_api_port()?;
-    let nonce = if lifetime.is_ephemeral() {
-        register_session_proxy_nonce(workdir)
-    } else {
-        register_proxy_nonce(workdir, terminal_id)
-    };
-    Some(coord_mcp_proxy_config_json(
+    spawn_tenant: Option<Uuid>,
+    bound_port: u16,
+) -> serde_json::Value {
+    let nonce = register_proxy_nonce(workdir, terminal_id, spawn_tenant);
+    coord_mcp_proxy_config_json(
         bound_port,
         &nonce,
         ProxyConfigIdentity::device(workdir, terminal_id),
-    ))
+    )
+}
+
+/// What the identity seam gave a terminal's session for coord-mcp.
+#[derive(Debug)]
+pub(crate) struct TerminalCoordMcp {
+    /// The per-session outcome the briefing is gated on.
+    pub(crate) delivery: CoordMcpDelivery,
+    /// The app-data `--mcp-config` file to export as [`MCP_CONFIG_ENV`], when
+    /// one was provisioned.
+    pub(crate) config_path: Option<std::path::PathBuf>,
+}
+
+/// The identity seam's coord-mcp delivery for one terminal
+/// ([`crate::terminal::session::TerminalSession`]'s spawn), extracted so every
+/// arm — including the refusals — is testable without a PTY.
+///
+/// Give EVERY device-scope session coord-mcp with zero setup by materializing a
+/// runner-owned DEVICE `--mcp-config` file (app-data, never the cwd) — EXCEPT
+/// when the cwd already declares a coord-mcp server in its own `.mcp.json` (the
+/// operator's repo-root config, or a gate-continuation terminal whose device
+/// `.mcp.json` was written before this spawn). Re-injecting there would give the
+/// session two coord-mcp entries racing the per-workdir nonce, and the loser
+/// 401s / shows FAILED — so the existing file owns it.
+///
+/// `spawn_tenant` is the caller's choice BEFORE the kill switch
+/// ([`credential_spawn_tenant`] is applied here). With a tenant:
+/// - a declared cwd is admitted only when its key resolves to that tenant
+///   ([`check_workdir_declared_tenant`]) — its key IS the session's credential;
+/// - otherwise the per-terminal nonce is pinned to it, after
+///   [`validate_spawn_tenant`].
+///
+/// `Err` means refuse the spawn, and nothing has been minted or written.
+///
+/// A provisioning attempt that produces no file (unresolvable bound port, an
+/// app-data write failure) leaves a NOT PROVISIONED breadcrumb naming the
+/// reason (plan 2026-08-24-headless-box-has-no-working-coord-credential-door
+/// Phase 4); one that does provision clears any stale breadcrumb, so the marker
+/// never outlives the condition it describes.
+pub(crate) fn deliver_terminal_coord_mcp(
+    cwd: &str,
+    terminal_id: &str,
+    spawn_tenant: Option<Uuid>,
+    bound_port: Option<u16>,
+) -> Result<TerminalCoordMcp, SpawnTenantRefusal> {
+    let credential_tenant = credential_spawn_tenant(spawn_tenant);
+    if workdir_declares_coord_mcp(cwd) {
+        if let Some(tenant) = credential_tenant {
+            check_workdir_declared_tenant(cwd, tenant)?;
+        }
+        info!(
+            "coord-mcp: terminal {terminal_id}: cwd already declares coord-mcp — skipping \
+             --mcp-config injection"
+        );
+        // UNPROBED, not unreachable: the runner neither wrote that file nor
+        // asked it anything, so its bearer may be stale, foreign, or bound to a
+        // port nothing serves. This is the arm the 2026-08-21 measurement landed
+        // on.
+        return Ok(TerminalCoordMcp {
+            delivery: CoordMcpDelivery::WorkdirDeclared,
+            config_path: None,
+        });
+    }
+    match provision_coord_mcp_config_file(cwd, Some(terminal_id), credential_tenant, bound_port)? {
+        Some(config_path) => {
+            // This cwd HAS coord-mcp now — retire any breadcrumb a previous
+            // un-provisioned spawn left behind.
+            clear_degraded_breadcrumb(cwd);
+            Ok(TerminalCoordMcp {
+                delivery: CoordMcpDelivery::Provisioned,
+                config_path: Some(config_path),
+            })
+        }
+        None => {
+            // Provisioning was ATTEMPTED and produced nothing: the fail-closed
+            // port resolve (no live Tauri runtime / managed AppState), or an
+            // app-data write failure `provision_coord_mcp_config_file` has
+            // already warned about with the specific error. Name the OUTCOME so
+            // the session's own cwd carries it.
+            warn!(
+                "coord-mcp: terminal {terminal_id}: no --mcp-config provisioned for cwd {cwd} — \
+                 the session starts with NO coord-mcp"
+            );
+            write_unprovisioned_breadcrumb(
+                cwd,
+                "the runner could not materialize a --mcp-config for this terminal (bound API \
+                 port unresolvable, or the app-data write failed) — see the runner log for the \
+                 specific error",
+            );
+            Ok(TerminalCoordMcp {
+                delivery: CoordMcpDelivery::Unprovisioned,
+                config_path: None,
+            })
+        }
+    }
 }
 
 /// Mint coord identity for a session the runner did NOT spawn: the
@@ -9527,7 +10015,7 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             if !coord_mcp_safe_to_write(&root, IntendedWrite::Device) {
                 return RootReconcileAction::Leave;
             }
-            write_coord_mcp_proxy_config(&root, bound_port);
+            write_coord_mcp_proxy_config(&root, bound_port, None);
             info!(
                 "coord_mcp: boot self-heal rewrote root {root}/.mcp.json to bound \
                  port :{bound_port} (fresh nonce — port moved or no on-disk nonce)"
@@ -9850,7 +10338,7 @@ where
                     // touch.)
                     continue;
                 }
-                write_coord_mcp_proxy_config(&workdir, bound_port);
+                write_coord_mcp_proxy_config(&workdir, bound_port, None);
                 counts.rewritten += 1;
                 info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
             }
@@ -10386,7 +10874,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         // A live PTY terminal's nonce for this cwd (runner-spawn class).
-        let pty_nonce = register_proxy_nonce(&wd, None);
+        let pty_nonce = register_proxy_nonce(&wd, None, None);
         // A bare session mints for the SAME cwd (mint-route class).
         let bare_nonce = register_session_proxy_nonce(&wd);
         assert_ne!(pty_nonce, bare_nonce);
@@ -10506,7 +10994,7 @@ mod tests {
         }
 
         // Any mint triggers the opportunistic sweep.
-        let persistent = register_proxy_nonce(&wd, None);
+        let persistent = register_proxy_nonce(&wd, None, None);
 
         let map = proxy_nonces().lock().unwrap();
         assert!(
@@ -10560,7 +11048,7 @@ mod tests {
         // the property nonce persistence + the restart grace window depend on
         // (the MCP client never re-reads its config), and the reason the TTL is
         // scoped to the mint route instead of applied globally.
-        let persistent = register_proxy_nonce(&wd, None);
+        let persistent = register_proxy_nonce(&wd, None, None);
         assert!(proxy_nonce_is_valid(&persistent));
     }
 
@@ -10579,7 +11067,7 @@ mod tests {
         let wd = format!("D:/selfid-terminal-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-{}", uuid::Uuid::now_v7());
 
-        let nonce = register_proxy_nonce(&wd, Some(term.as_str()));
+        let nonce = register_proxy_nonce(&wd, Some(term.as_str()), None);
 
         assert_eq!(
             terminal_id_for_nonce(&nonce).as_deref(),
@@ -10611,8 +11099,8 @@ mod tests {
         let t1 = format!("terminal-a-{}", uuid::Uuid::now_v7());
         let t2 = format!("terminal-b-{}", uuid::Uuid::now_v7());
 
-        let n1 = register_proxy_nonce(&wd, Some(t1.as_str()));
-        let n2 = register_proxy_nonce(&wd, Some(t2.as_str()));
+        let n1 = register_proxy_nonce(&wd, Some(t1.as_str()), None);
+        let n2 = register_proxy_nonce(&wd, Some(t2.as_str()), None);
         assert_ne!(n1, n2, "each terminal gets its own nonce");
 
         assert!(
@@ -10632,7 +11120,7 @@ mod tests {
 
         // Re-provisioning the SAME terminal (a re-spawn into the same cwd) still
         // evicts its own predecessor — narrowed, not removed.
-        let n1b = register_proxy_nonce(&wd, Some(t1.as_str()));
+        let n1b = register_proxy_nonce(&wd, Some(t1.as_str()), None);
         assert_ne!(n1b, n1);
         assert!(
             !proxy_nonces().lock().unwrap().contains_key(&n1),
@@ -10658,8 +11146,8 @@ mod tests {
         let wd = format!("D:/selfid-terminalless-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-live-{}", uuid::Uuid::now_v7());
 
-        let owned = register_proxy_nonce(&wd, Some(term.as_str()));
-        let a = register_proxy_nonce(&wd, None);
+        let owned = register_proxy_nonce(&wd, Some(term.as_str()), None);
+        let a = register_proxy_nonce(&wd, None, None);
         assert_eq!(
             terminal_id_for_nonce(&a),
             None,
@@ -10668,7 +11156,7 @@ mod tests {
         );
         assert_eq!(workdir_for_nonce(&a).as_deref(), Some(wd.as_str()));
 
-        let b = register_proxy_nonce(&wd, None);
+        let b = register_proxy_nonce(&wd, None, None);
         assert!(
             !proxy_nonces().lock().unwrap().contains_key(&a),
             "a terminal-less re-provision into the same cwd still evicts its \
@@ -10696,7 +11184,7 @@ mod tests {
         let (dir, store) = temp_store("ephemeral-never-persisted");
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
-        let persistent = register_proxy_nonce(&wd, None);
+        let persistent = register_proxy_nonce(&wd, None, None);
         let ephemeral = register_session_proxy_nonce(&wd);
 
         let snapshot = proxy_nonces().lock().unwrap().clone();
@@ -10773,7 +11261,10 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         assert!(
-            provision_coord_mcp_config_file(&wd, None).is_none(),
+            matches!(
+                provision_coord_mcp_config_file(&wd, None, None, None),
+                Ok(None)
+            ),
             "no bound port ⇒ no --mcp-config file (fail-closed)"
         );
         // And no cwd pollution — the degraded breadcrumb belongs to the workdir
@@ -10894,6 +11385,7 @@ mod tests {
             workdir: workdir.to_string(),
             terminal_id: terminal_id.map(str::to_string),
             minted_at_unix,
+            session_tenant: None,
         }
     }
 
@@ -10907,7 +11399,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let primary_wt = tmp.to_string_lossy().to_string();
 
-        write_coord_mcp_proxy_config(&primary_wt, 23456);
+        write_coord_mcp_proxy_config(&primary_wt, 23456, None);
 
         let written = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -10949,7 +11441,7 @@ mod tests {
         // client that cached it rides through until it reconnects — rather than
         // hard-401ing the instant `.mcp.json` is rewritten. Both nonces resolve
         // to the same Device principal, so there is no scope-elevation surface.
-        write_coord_mcp_proxy_config(&primary_wt, 23456);
+        write_coord_mcp_proxy_config(&primary_wt, 23456, None);
         let reprovisioned = std::fs::read_to_string(tmp.join(".mcp.json")).unwrap();
         let v2: serde_json::Value = serde_json::from_str(&reprovisioned).unwrap();
         let new_nonce = v2["mcpServers"]["coord-mcp"]["headers"]["X-Coord-Mcp-Proxy-Key"]
@@ -10982,7 +11474,7 @@ mod tests {
             format!("h.{payload}.s")
         };
         let dir = std::env::temp_dir().join(format!("coord-mcp-gate-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None, None);
         let device = mk("device");
         let dev_p = ProxyPrincipal::Device;
 
@@ -11092,7 +11584,7 @@ mod tests {
         // And a device principal must reject an agent bearer.
         let dev_dir =
             std::env::temp_dir().join(format!("coord-mcp-dgate-{}", uuid::Uuid::new_v4()));
-        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy(), None);
+        let dev_nonce = register_proxy_nonce(&dev_dir.to_string_lossy(), None, None);
         assert_eq!(
             proxy_request_gate(Some(&dev_nonce), Some(&mk("agent")), &device_p)
                 .unwrap_err()
@@ -11143,7 +11635,7 @@ mod tests {
         // bearer is still a hard 401 backstop (the proxy handler only reaches
         // the gate AFTER the bounded re-mint produced a usable bearer).
         let dir = std::env::temp_dir().join(format!("coord-mcp-p3-{}", uuid::Uuid::new_v4()));
-        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None, None);
         let dev_p = ProxyPrincipal::Device;
         assert_eq!(
             proxy_request_gate(Some(&nonce), None, &dev_p)
@@ -11400,7 +11892,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
 
-        write_coord_mcp_proxy_config(&wd, 23457);
+        write_coord_mcp_proxy_config(&wd, 23457, None);
 
         let mcp_path = tmp.join(".mcp.json");
         let written = std::fs::read_to_string(&mcp_path).unwrap();
@@ -11456,13 +11948,13 @@ mod tests {
         assert_eq!(classify_mcp_json_doc(&v), McpJsonShape::OursProxy);
         assert!(workdir_declares_coord_mcp(&wd));
         assert!(
-            reusable_in_cwd_device_nonce(&wd, 23457).is_some(),
+            reusable_in_cwd_device_nonce(&wd, 23457, None).is_some(),
             "the F4 no-mint reuse must still see the stdio config's nonce"
         );
 
         // A re-provision (the one-slot eviction) rewrites the SAME credential
         // file with the fresh nonce; the document is unchanged in shape.
-        write_coord_mcp_proxy_config(&wd, 23457);
+        write_coord_mcp_proxy_config(&wd, 23457, None);
         let v2 = read_json(&mcp_path);
         assert_eq!(
             v2["mcpServers"]["coord-mcp"]["args"][2],
@@ -11544,7 +12036,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("coord-mcp-kill-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
-        write_coord_mcp_proxy_config(&wd, 23458);
+        write_coord_mcp_proxy_config(&wd, 23458, None);
         let v = read_json(&tmp.join(".mcp.json"));
         assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http");
         assert_eq!(
@@ -11575,7 +12067,7 @@ mod tests {
         let wd = tmp.to_string_lossy().to_string();
 
         let assert_http_and_no_breadcrumb = |label: &str| {
-            write_coord_mcp_proxy_config(&wd, 23459);
+            write_coord_mcp_proxy_config(&wd, 23459, None);
             let v = read_json(&tmp.join(".mcp.json"));
             assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "http", "{label}");
             assert!(
@@ -11690,7 +12182,7 @@ mod tests {
                 },
                 "the first interpreter that passes wins, after the one that could not spawn"
             );
-            write_coord_mcp_proxy_config(&wd, 23459);
+            write_coord_mcp_proxy_config(&wd, 23459, None);
             let v = read_json(&tmp.join(".mcp.json"));
             assert_eq!(v["mcpServers"]["coord-mcp"]["type"], "stdio");
             assert_eq!(
@@ -11714,7 +12206,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
 
-        write_coord_mcp_proxy_config(&wd, 23460);
+        write_coord_mcp_proxy_config(&wd, 23460, None);
 
         let v = read_json(&tmp.join(".mcp.json"));
         let server = &v["mcpServers"]["coord-mcp"];
@@ -11738,7 +12230,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("coord-mcp-rw-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let wd = tmp.to_string_lossy().to_string();
-        let nonce = register_proxy_nonce(&wd, None);
+        let nonce = register_proxy_nonce(&wd, None, None);
 
         assert!(rewrite_config_preserving_nonce(&wd, 23461, &nonce));
 
@@ -12356,7 +12848,7 @@ mod tests {
         // The UNMARKED device proxy shape is untouched by this change — nothing
         // already on disk changes class, which is why the device shape omits the
         // header rather than spelling `device`.
-        write_coord_mcp_proxy_config(&wd, 9876);
+        write_coord_mcp_proxy_config(&wd, 9876, None);
         assert!(
             coord_mcp_safe_to_write(&wd, IntendedWrite::Device),
             "an unmarked device proxy config stays refreshable"
@@ -12404,7 +12896,7 @@ mod tests {
         // A) device bearer + clean dir → provisions the loopback PROXY shape on
         //    the passed bound port: nonce header, NO static bearer.
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876), None);
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("device bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -12436,7 +12928,7 @@ mod tests {
         let d = new_dir();
         let agent_id = uuid::Uuid::new_v4();
         let agent_jwt = mk_agent(agent_id);
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, Some(19876));
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &agent_jwt, Some(19876), None);
         let written =
             std::fs::read_to_string(mcp_of(&d)).expect("agent bearer must provision .mcp.json");
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -12470,7 +12962,7 @@ mod tests {
         // C) non-coord bearer (e.g. a Cognito access token, sub_type=access) →
         //    sub_type gate skips; no file is written (would 401 coord's verifier).
         let d = new_dir();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"), Some(19876));
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &mk("access"), Some(19876), None);
         assert!(
             !mcp_of(&d).exists(),
             "a non-device/agent bearer must NOT be written"
@@ -12485,7 +12977,7 @@ mod tests {
             mk("agent")
         );
         std::fs::write(mcp_of(&d), &agent_cfg).unwrap();
-        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&d.to_string_lossy(), &dev, Some(19876), None);
         assert_eq!(
             std::fs::read_to_string(mcp_of(&d)).unwrap(),
             agent_cfg,
@@ -12510,7 +13002,7 @@ mod tests {
         let wd = d.to_string_lossy().to_string();
 
         // None bound port → fail-closed.
-        provision_coord_mcp_with_jwt(&wd, &dev, None);
+        provision_coord_mcp_with_jwt(&wd, &dev, None, None);
 
         assert!(
             !d.join(".mcp.json").exists(),
@@ -12551,7 +13043,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let wd = d.to_string_lossy().to_string();
 
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(34567));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(34567), None);
 
         assert!(
             d.join(".mcp.json").exists(),
@@ -12579,7 +13071,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let wd = d.to_string_lossy().to_string();
 
-        provision_coord_mcp_with_jwt(&wd, &svc, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &svc, Some(19876), None);
 
         assert!(
             !d.join(".mcp.json").exists(),
@@ -12617,7 +13109,7 @@ mod tests {
         let foreign = r#"{"mcpServers":{"some-other":{"type":"http","url":"https://x/mcp"}}}"#;
         std::fs::write(d.join(".mcp.json"), foreign).unwrap();
 
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
 
         assert_eq!(
             std::fs::read_to_string(d.join(".mcp.json")).unwrap(),
@@ -12656,7 +13148,7 @@ mod tests {
         );
         std::fs::write(d.join(".mcp.json"), &agent_cfg).unwrap();
 
-        provision_coord_mcp_with_jwt(&wd, &mk("device"), Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &mk("device"), Some(19876), None);
 
         assert_eq!(
             std::fs::read_to_string(d.join(".mcp.json")).unwrap(),
@@ -12694,13 +13186,13 @@ mod tests {
         let wd = d.to_string_lossy().to_string();
 
         // Session 1 spawns into the shared cwd: no config yet → mint.
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let first = std::fs::read_to_string(d.join(".mcp.json")).unwrap();
         let n1 = read_proxy_nonce(&d.join(".mcp.json")).expect("first provision mints a nonce");
         assert!(live_binding(&n1).is_some());
 
         // Session 2 spawns into the SAME cwd while session 1 is live → reuse.
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let second = std::fs::read_to_string(d.join(".mcp.json")).unwrap();
         assert_eq!(
             second, first,
@@ -13116,14 +13608,14 @@ mod tests {
         //     `proxy_nonce_is_valid` still says yes for it; reuse must not.
         let d = new_dir();
         let wd = d.to_string_lossy().to_string();
-        let old = register_proxy_nonce(&wd, None);
-        let _newer = register_proxy_nonce(&wd, None); // evicts + graces `old`
+        let old = register_proxy_nonce(&wd, None, None);
+        let _newer = register_proxy_nonce(&wd, None, None); // evicts + graces `old`
         assert!(proxy_nonce_is_valid(&old) && live_binding(&old).is_none());
         write_mcp_json(
             &wd,
             &coord_mcp_proxy_config_json(19876, &old, ProxyConfigIdentity::device(&wd, None)),
         );
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(
             minted, old,
@@ -13135,9 +13627,9 @@ mod tests {
         // (b) port moved: the live nonce is fine but the URL is dead.
         let d = new_dir();
         let wd = d.to_string_lossy().to_string();
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let on_old_port = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19877));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19877), None);
         let on_new_port = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(
             on_new_port, on_old_port,
@@ -13159,7 +13651,7 @@ mod tests {
             &wd,
             &coord_mcp_proxy_config_json(19876, &stranger, ProxyConfigIdentity::device(&wd, None)),
         );
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(minted, stranger);
         assert!(
@@ -13174,12 +13666,12 @@ mod tests {
         //     other checkout's live nonce exactly as it was.
         let other = new_dir();
         let other_wd = other.to_string_lossy().to_string();
-        provision_coord_mcp_with_jwt(&other_wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&other_wd, &dev, Some(19876), None);
         let foreign = read_proxy_nonce(&other.join(".mcp.json")).unwrap();
         let d = new_dir();
         let wd = d.to_string_lossy().to_string();
         std::fs::copy(other.join(".mcp.json"), d.join(".mcp.json")).unwrap();
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
         let minted = read_proxy_nonce(&d.join(".mcp.json")).unwrap();
         assert_ne!(
             minted, foreign,
@@ -13209,7 +13701,7 @@ mod tests {
         let d = std::env::temp_dir().join(format!("coord-mcp-f4-legacy-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         let wd = d.to_string_lossy().to_string();
-        let live = register_proxy_nonce(&wd, None);
+        let live = register_proxy_nonce(&wd, None, None);
         std::fs::write(
             d.join(".mcp.json"),
             format!(
@@ -13219,7 +13711,7 @@ mod tests {
         .unwrap();
         assert!(!read_static_authorization_presence(&d.join(".mcp.json")));
 
-        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876));
+        provision_coord_mcp_with_jwt(&wd, &dev, Some(19876), None);
 
         let path = d.join(".mcp.json");
         assert_eq!(
@@ -13328,9 +13820,9 @@ mod tests {
         let wd = format!("D:/rot-f4-terminal-{}", uuid::Uuid::now_v7());
         let term = format!("terminal-f4-{}", uuid::Uuid::now_v7());
 
-        let first = register_proxy_nonce(&wd, Some(term.as_str()));
-        let _second = register_proxy_nonce(&wd, Some(term.as_str())); // same slot → evicts `first`
-        let _bare = register_proxy_nonce(&wd, None); // terminal-less slot → evicts nothing
+        let first = register_proxy_nonce(&wd, Some(term.as_str()), None);
+        let _second = register_proxy_nonce(&wd, Some(term.as_str()), None); // same slot → evicts `first`
+        let _bare = register_proxy_nonce(&wd, None, None); // terminal-less slot → evicts nothing
 
         let raw = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap();
         let mine: Vec<serde_json::Value> = raw
@@ -13544,6 +14036,7 @@ mod tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             None,
+            None,
         );
         persist_proxy_nonces_with_store(&store, &snapshot);
         assert!(proxy_nonce_is_valid(&nonce));
@@ -13592,6 +14085,7 @@ mod tests {
             ProxyPrincipal::Agent { agent_id },
             NonceLifetime::Persistent,
             None,
+            None,
         );
         persist_proxy_nonces_with_store(&store, &snapshot);
 
@@ -13601,6 +14095,7 @@ mod tests {
             &dev_wd,
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
+            None,
             None,
         );
         persist_proxy_nonces_with_store(&store, &snapshot);
@@ -13656,12 +14151,14 @@ mod tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term_a),
+            None,
         );
         let (b, snapshot) = mint_and_register_nonce(
             &wd,
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term_b),
+            None,
         );
         // THROUGH THE REAL PRODUCER — `persist_proxy_nonces_with_store` calls
         // `device_nonce_snapshot`, so an inert phase fails right here.
@@ -13703,8 +14200,13 @@ mod tests {
         // None`, so `None == None` matched all of them and one mint took the
         // lot — 33 of them in five seconds against `D:\qontinui-root` on
         // 2026-08-19.
-        let (terminalless, _) =
-            mint_and_register_nonce(&wd, ProxyPrincipal::Device, NonceLifetime::Persistent, None);
+        let (terminalless, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+            None,
+        );
         assert!(
             live_binding(&a).is_some() && live_binding(&b).is_some(),
             "a terminal-less re-mint must not collapse the restored per-terminal \
@@ -13719,6 +14221,7 @@ mod tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term_a),
+            None,
         );
         assert!(
             live_binding(&a).is_none(),
@@ -13809,6 +14312,7 @@ mod tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term),
+            None,
         );
         let (agent, _) = mint_and_register_nonce(
             &wd,
@@ -13817,11 +14321,13 @@ mod tests {
             },
             NonceLifetime::Persistent,
             None,
+            None,
         );
         let (ephemeral, map) = mint_and_register_nonce(
             &wd,
             ProxyPrincipal::Device,
             NonceLifetime::ephemeral(),
+            None,
             None,
         );
 
@@ -14135,6 +14641,7 @@ mod tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             None,
+            None,
         );
         assert!(
             proxy_nonce_is_valid(&nonce),
@@ -14198,7 +14705,7 @@ mod tests {
         let wd = store_dir.join("already-live").to_string_lossy().to_string();
 
         // The 2026-08-24 shape: one persisted entry, already in the live map.
-        let live_nonce = register_proxy_nonce(&wd, None);
+        let live_nonce = register_proxy_nonce(&wd, None, None);
         let mut persisted = HashMap::new();
         persisted.insert(
             live_nonce.clone(),
@@ -15487,7 +15994,7 @@ mod tests {
         let path = root.join(".mcp.json");
 
         // A LIVE, registered nonce written in the pre-Phase-2 shape.
-        let live = register_proxy_nonce(&root.to_string_lossy(), None);
+        let live = register_proxy_nonce(&root.to_string_lossy(), None, None);
         std::fs::write(
             &path,
             format!(
@@ -15628,9 +16135,9 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         // Device: mint A, then re-mint B for the SAME workdir → A graced, B live.
         let wd = format!("D:/grace-wt-{}", uuid::Uuid::now_v7());
-        let a = register_proxy_nonce(&wd, None);
+        let a = register_proxy_nonce(&wd, None, None);
         assert!(proxy_nonce_is_valid(&a));
-        let b = register_proxy_nonce(&wd, None);
+        let b = register_proxy_nonce(&wd, None, None);
         assert_ne!(a, b);
         assert!(proxy_nonce_is_valid(&b), "the fresh device nonce is live");
         assert!(
@@ -15678,6 +16185,7 @@ mod tests {
                 grace_until: std::time::SystemTime::now(),
                 workdir: "D:/grace-expired-wt".to_string(),
                 terminal_id: None,
+                session_tenant: None,
             },
         );
         assert!(
@@ -15701,8 +16209,8 @@ mod tests {
         );
         let wd = format!("D:/grace-ttl-wt-{}", uuid::Uuid::now_v7());
         let before = std::time::Instant::now();
-        let a = register_proxy_nonce(&wd, None);
-        let _b = register_proxy_nonce(&wd, None); // evicts + graces `a`
+        let a = register_proxy_nonce(&wd, None, None);
+        let _b = register_proxy_nonce(&wd, None, None); // evicts + graces `a`
         let expires_at = graced_nonces()
             .lock()
             .unwrap()
@@ -15761,8 +16269,8 @@ mod tests {
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-forensics-wt-{}", uuid::Uuid::now_v7());
-        let a = register_proxy_nonce(&wd, None); // mint
-        let b = register_proxy_nonce(&wd, None); // mint + evict(a) + grace(a)
+        let a = register_proxy_nonce(&wd, None, None); // mint
+        let b = register_proxy_nonce(&wd, None, None); // mint + evict(a) + grace(a)
         evict_proxy_nonces_for_workdir(&wd); // evict(b) + grace(b)
         let adopted = format!(
             "{}{}",
@@ -15836,7 +16344,7 @@ mod tests {
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-reject-wt-{}", uuid::Uuid::now_v7());
-        let live = register_proxy_nonce(&wd, None);
+        let live = register_proxy_nonce(&wd, None, None);
         // A key this runner never minted — the shape a client presents after
         // its own was evicted and the registry moved on.
         let stranger = format!(
@@ -15897,7 +16405,7 @@ mod tests {
         // Arm 1 — a live DEVICE nonce minted for a named terminal.
         let wd = format!("D:/rot-attr-wt-{}", uuid::Uuid::now_v7());
         let term = format!("term-{}", uuid::Uuid::now_v7());
-        let live = register_proxy_nonce(&wd, Some(&term));
+        let live = register_proxy_nonce(&wd, Some(&term), None);
 
         // Arm 2 — a live AGENT nonce (no terminal by construction).
         let awd = format!("D:/rot-attr-agent-wt-{}", uuid::Uuid::now_v7());
@@ -16109,7 +16617,7 @@ mod tests {
         let dir = rotation_log_test_dir();
 
         let wd = format!("D:/rot-revoke-wt-{}", uuid::Uuid::now_v7());
-        let nonce = register_proxy_nonce(&wd, None);
+        let nonce = register_proxy_nonce(&wd, None, None);
         revoke_proxy_nonce(&nonce);
 
         let awd = format!("D:/rot-revoke-agent-wt-{}", uuid::Uuid::now_v7());
@@ -16165,8 +16673,8 @@ mod tests {
         // Both classes bound to one workdir: the shared `.mcp.json` credential
         // (terminal-less) and a per-PTY one. Session close drops both, so both
         // must be accounted for.
-        let shared = register_proxy_nonce(&wd, None);
-        let per_terminal = register_proxy_nonce(&wd, Some("terminal-rot-close"));
+        let shared = register_proxy_nonce(&wd, None, None);
+        let per_terminal = register_proxy_nonce(&wd, Some("terminal-rot-close"), None);
 
         release_workdir_on_session_close(&wd);
 
@@ -16291,7 +16799,7 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         // Live revoke.
         let wd = format!("D:/revoke-wt-{}", uuid::Uuid::now_v7());
-        let nonce = register_proxy_nonce(&wd, None);
+        let nonce = register_proxy_nonce(&wd, None, None);
         assert!(proxy_nonce_is_valid(&nonce));
         revoke_proxy_nonce(&nonce);
         assert!(
@@ -16304,8 +16812,8 @@ mod tests {
         // Graced revoke: re-mint moves the first nonce onto grace, where it
         // still validates — an explicit revoke must kill that too.
         let wd2 = format!("D:/revoke-grace-wt-{}", uuid::Uuid::now_v7());
-        let old = register_proxy_nonce(&wd2, None);
-        let _new = register_proxy_nonce(&wd2, None);
+        let old = register_proxy_nonce(&wd2, None, None);
+        let _new = register_proxy_nonce(&wd2, None, None);
         assert!(
             proxy_nonce_is_valid(&old),
             "precondition: the superseded nonce rides the grace TTL"
@@ -16338,8 +16846,8 @@ mod tests {
         };
 
         let wd = format!("D:/close-wt-{}", uuid::Uuid::now_v7());
-        let current = register_proxy_nonce(&wd, None);
-        let per_terminal = register_proxy_nonce(&wd, Some("terminal-close-1"));
+        let current = register_proxy_nonce(&wd, None, None);
+        let per_terminal = register_proxy_nonce(&wd, Some("terminal-close-1"), None);
         assert!(proxy_nonce_is_valid(&current));
         assert!(proxy_nonce_is_valid(&per_terminal));
 
@@ -16391,7 +16899,7 @@ mod tests {
 
         // (a) Our port, REGISTERED nonce → keep.
         let wd = format!("D:/reap-live-wt-{}", uuid::Uuid::now_v7());
-        let live_nonce = register_proxy_nonce(&wd, None);
+        let live_nonce = register_proxy_nonce(&wd, None, None);
         let keep_ours = dir.join("keep-ours.json");
         std::fs::write(&keep_ours, cfg_body(bound_port, &live_nonce)).unwrap();
 
@@ -16447,9 +16955,9 @@ mod tests {
         let wd = format!("D:/revreap-wt-{}", uuid::Uuid::now_v7());
         // Two terminals in ONE workdir (the case that motivated per-terminal
         // nonces) plus the terminal-less/workdir-derived form.
-        let n_t1 = register_proxy_nonce(&wd, Some("terminal-alpha"));
-        let n_t2 = register_proxy_nonce(&wd, Some("terminal-beta"));
-        let n_none = register_proxy_nonce(&wd, None);
+        let n_t1 = register_proxy_nonce(&wd, Some("terminal-alpha"), None);
+        let n_t2 = register_proxy_nonce(&wd, Some("terminal-beta"), None);
+        let n_none = register_proxy_nonce(&wd, None, None);
         assert_ne!(n_t1, n_t2, "distinct terminals must hold distinct nonces");
 
         // Named exactly as production names them — terminal-derived for the two
@@ -16464,7 +16972,7 @@ mod tests {
         // A bystander config for a DIFFERENT workdir's nonce — never revoked
         // here, so it must survive.
         let other_wd = format!("D:/revreap-other-{}", uuid::Uuid::now_v7());
-        let n_other = register_proxy_nonce(&other_wd, Some("terminal-gamma"));
+        let n_other = register_proxy_nonce(&other_wd, Some("terminal-gamma"), None);
         let f_other = dir.join(mcp_config_file_name(&other_wd, Some("terminal-gamma")));
         std::fs::write(&f_other, cfg_body(&n_other)).unwrap();
 
@@ -16528,6 +17036,7 @@ mod phase2_proxy_header_shape_tests {
         let nonce = register_proxy_nonce(
             &format!("D:/phase2-emit-{}", uuid::Uuid::now_v7()),
             Some("terminal-emit"),
+            None,
         );
         let doc = coord_mcp_proxy_config_json(
             9876,
@@ -16566,7 +17075,7 @@ mod phase2_proxy_header_shape_tests {
         let dir = std::env::temp_dir().join(format!("phase2-read-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".mcp.json");
-        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None);
+        let nonce = register_proxy_nonce(&dir.to_string_lossy(), None, None);
 
         // (a) The real emitter's output, round-tripped through the real writer.
         write_mcp_json(
@@ -16626,7 +17135,7 @@ mod phase2_proxy_header_shape_tests {
         let path = dir.join(".mcp.json");
         let bound = 9876u16;
 
-        let live = register_proxy_nonce(&dir.to_string_lossy(), Some("terminal-reconcile"));
+        let live = register_proxy_nonce(&dir.to_string_lossy(), Some("terminal-reconcile"), None);
         std::fs::write(&path, new_shape_config(bound, &live)).unwrap();
         let (action, seen) = resolve_root_reconcile(&dir, bound);
         assert_eq!(seen.as_deref(), Some(live.as_str()));
@@ -16700,7 +17209,7 @@ mod phase2_proxy_header_shape_tests {
         std::fs::create_dir_all(&wt).unwrap();
         let wt_str = wt.to_string_lossy().to_string();
 
-        let nonce = register_proxy_nonce(&wt_str, Some("terminal-write-line"));
+        let nonce = register_proxy_nonce(&wt_str, Some("terminal-write-line"), None);
         write_mcp_json(
             &wt_str,
             &coord_mcp_proxy_config_json(9876, &nonce, ProxyConfigIdentity::device(&wt_str, None)),
@@ -16738,7 +17247,7 @@ mod phase2_proxy_header_shape_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let wd = dir.to_string_lossy().to_string();
         let mcp = dir.join(".mcp.json");
-        let nonce = register_proxy_nonce(&wd, Some("terminal-safe"));
+        let nonce = register_proxy_nonce(&wd, Some("terminal-safe"), None);
 
         // The real emitter's output — Authorization present, value a nonce.
         std::fs::write(
@@ -17039,7 +17548,7 @@ mod agent_binding_census_tests {
         // A REGISTERED nonce, so the row resolves this test's own workdir and
         // every assertion below can filter on it without racing peers.
         let wd = format!("D:/rot-unreachable-wt-{}", uuid::Uuid::now_v7());
-        let nonce = register_proxy_nonce(&wd, None);
+        let nonce = register_proxy_nonce(&wd, None, None);
 
         // Twice, same nonce: the second must be SUPPRESSED by the throttle, so
         // a client retrying against a dead coord cannot grow the log without
@@ -17061,7 +17570,7 @@ mod agent_binding_census_tests {
         // A SECOND nonce/workdir for the read-failed class: a different
         // transport class is a different row, not a re-labelled one.
         let wd2 = format!("D:/rot-readfailed-wt-{}", uuid::Uuid::now_v7());
-        let nonce2 = register_proxy_nonce(&wd2, None);
+        let nonce2 = register_proxy_nonce(&wd2, None, None);
         log_proxy_upstream_unreachable(
             Some(&nonce2),
             UpstreamTransportClass::ReadFailed,
@@ -17751,8 +18260,13 @@ mod reject_row_workdir_sentinel_tests {
     #[test]
     fn a_binding_minted_without_a_workdir_attributes_as_unknown() {
         let _amb = crate::test_env::isolated_ambient();
-        let (nonce, _) =
-            mint_and_register_nonce("", ProxyPrincipal::Device, NonceLifetime::Persistent, None);
+        let (nonce, _) = mint_and_register_nonce(
+            "",
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            None,
+            None,
+        );
         let attr = reject_attribution_for_nonce(&nonce);
         assert_eq!(
             attr.workdir, ROTATION_UNKNOWN,
@@ -17786,14 +18300,14 @@ mod reject_row_workdir_sentinel_tests {
         // bound: a live key rejected by a later gate still names itself.
         let wd = format!("D:/attr-wt-{}", uuid::Uuid::now_v7());
         let term = format!("term-{}", uuid::Uuid::now_v7());
-        let first = register_proxy_nonce(&wd, Some(&term));
+        let first = register_proxy_nonce(&wd, Some(&term), None);
         let live = reject_attribution_for_nonce(&first);
         assert_eq!(live.attribution, RejectAttribution::BOUND);
         assert_eq!(live.workdir, wd);
 
         // superseded: a same-slot re-mint tombstones the old key WITH its
         // workdir, terminal and grace deadline.
-        let second = register_proxy_nonce(&wd, Some(&term));
+        let second = register_proxy_nonce(&wd, Some(&term), None);
         let sup = reject_attribution_for_nonce(&first);
         assert_eq!(sup.attribution, RejectAttribution::SUPERSEDED);
         assert_eq!(sup.workdir, wd);
@@ -17859,8 +18373,8 @@ mod reject_row_workdir_sentinel_tests {
     #[test]
     fn attributed_error_names_the_arm_the_refusal_point_and_both_callers() {
         let wd = format!("D:/attr-msg-wt-{}", uuid::Uuid::now_v7());
-        let first = register_proxy_nonce(&wd, Some("term-msg"));
-        let _second = register_proxy_nonce(&wd, Some("term-msg"));
+        let first = register_proxy_nonce(&wd, Some("term-msg"), None);
+        let _second = register_proxy_nonce(&wd, Some("term-msg"), None);
         let sup = reject_attribution_for_nonce(&first);
         let msg = attributed_proxy_key_error(&sup);
         assert!(msg.starts_with("superseded coord-mcp proxy key"), "{msg}");
@@ -17916,12 +18430,14 @@ mod reject_row_workdir_sentinel_tests {
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term),
+            None,
         );
         let (_new, snapshot) = mint_and_register_nonce(
             &wd,
             ProxyPrincipal::Device,
             NonceLifetime::Persistent,
             Some(&term),
+            None,
         );
         assert!(
             proxy_nonce_is_valid(&old),
@@ -17989,6 +18505,7 @@ mod reject_row_workdir_sentinel_tests {
                         workdir: wd.clone(),
                         terminal_id: None,
                         grace_until_unix: now.saturating_sub(60),
+                        session_tenant: None,
                     },
                 )]),
             )
@@ -18921,7 +19438,7 @@ mod runner_credential_tests {
         };
 
         publish(P::Expired);
-        let outcome = provision_coord_mcp_with_jwt(&wd, &dev, Some(port));
+        let outcome = provision_coord_mcp_with_jwt(&wd, &dev, Some(port), None);
         assert_eq!(
             outcome,
             CoordMcpDelivery::Provisioned,
@@ -19352,5 +19869,369 @@ mod runner_credential_tests {
             "the cause must open with the typed code: {}",
             row["cause"]
         );
+    }
+}
+
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
+/// P0 + P1: the tenant a spawn CHOSE reaches the session's coord-mcp credential,
+/// is refused when it cannot, survives a restart and a supersede, and is
+/// reported beside the session's other two tenants.
+///
+/// Every test writes its own `machine.json` pin (tenant A) inside an isolated
+/// ambient, so "the machine pin" is a fact the test chose rather than whatever
+/// this box is paired to, and every tenant slot is seeded into that ambient's
+/// own credential store.
+#[cfg(test)]
+mod spawn_tenant_credential_tests {
+    use super::*;
+    use crate::session::tenant_pin::TenantPin;
+
+    const PORT: u16 = 23_901;
+
+    fn tenant_a() -> Uuid {
+        Uuid::from_u128(0xA1A1_0000_0000_4000_8000_0000_0000_00A1)
+    }
+
+    fn tenant_b() -> Uuid {
+        Uuid::from_u128(0xB2B2_0000_0000_4000_8000_0000_0000_00B2)
+    }
+
+    /// Give this ambient a credential slot for `tenant` — what pairing the
+    /// device for it would leave behind.
+    fn pair(tenant: Uuid) {
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant, "header.payload.signature")
+            .expect("seed a tenant slot in the isolated store");
+    }
+
+    /// A fresh workdir inside the ambient, so no other test's nonces share it.
+    fn workdir(amb: &crate::test_env::IsolatedAmbient, tag: &str) -> String {
+        let wd = amb
+            .dir()
+            .join(format!("wd-{tag}-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&wd).unwrap();
+        wd.to_string_lossy().to_string()
+    }
+
+    fn terminal() -> String {
+        format!("term-{}", Uuid::new_v4())
+    }
+
+    /// P1 acceptance 1. With spawn tenant B and machine pin A, the minted
+    /// binding is `Pinned(B)` and the proxy resolves B — the credential follows
+    /// the tenant the coord row names, not the machine.
+    #[test]
+    fn a_spawn_tenant_pins_the_minted_credential_over_the_machine_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let (wd, term) = (workdir(&amb, "pin"), terminal());
+
+        let path = provision_coord_mcp_config_file(&wd, Some(&term), Some(tenant_b()), Some(PORT))
+            .expect("a paired spawn tenant is admitted")
+            .expect("a bound port provisions a config file");
+        let nonce = read_proxy_nonce(&path).expect("the config carries the proxy nonce");
+
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+        // The machine pin is untouched for a spawn that chose nothing.
+        let unchosen = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
+            .unwrap()
+            .unwrap();
+        let unchosen = read_proxy_nonce(&unchosen).unwrap();
+        assert_eq!(
+            session_tenant_or_refuse(Some(&unchosen)),
+            Ok(Some(tenant_a()))
+        );
+    }
+
+    /// P1 acceptance 2. A spawn tenant this runner holds no credential for is
+    /// a typed refusal naming the pairing flow, the seam refuses the spawn, and
+    /// NOTHING is minted — no nonce for the terminal, no config file.
+    #[test]
+    fn an_unpaired_spawn_tenant_is_refused_and_registers_no_nonce() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_a());
+        let (wd, term) = (workdir(&amb, "unpaired"), terminal());
+
+        let refusal = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
+            .expect_err("an unpaired tenant must refuse the spawn");
+        assert_eq!(
+            refusal,
+            SpawnTenantRefusal::NotPaired { tenant: tenant_b() }
+        );
+        let text = refusal.to_string();
+        assert!(text.starts_with("terminal:tenant_not_paired:"), "{text}");
+        assert!(
+            text.contains("qontinui_profile device pair --tenant-id"),
+            "{text}"
+        );
+
+        assert_eq!(
+            session_credential_tenant(&term, None),
+            CredentialTenantRead::NoNonce,
+            "a refusal must register no nonce for the terminal"
+        );
+        let file = crate::session::claude_hook::session_restore_dir()
+            .join("coord-mcp")
+            .join(mcp_config_file_name(&wd, Some(&term)));
+        assert!(!file.exists(), "a refusal must write no --mcp-config file");
+
+        // The entry-point early-out refuses identically, before any allocation.
+        let early = precheck_spawn_tenant(Some(tenant_b())).expect_err("precheck refuses too");
+        assert!(early.starts_with("terminal:tenant_not_paired:"), "{early}");
+        // The device's default binding is admitted even with no tenant slot.
+        assert_eq!(
+            spawn_tenant_admission(tenant_b(), Ok(vec![]), Some(tenant_b())),
+            Ok(())
+        );
+        // An unreadable store is UNKNOWN, refused rather than guessed.
+        assert!(matches!(
+            spawn_tenant_admission(tenant_b(), Err("io".into()), None),
+            Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
+        ));
+    }
+
+    /// P1 acceptance 3. Persist → restore keeps `Pinned(B)` even though the
+    /// machine reads A at restore; before, the restore stamped the restore-time
+    /// pin and row 1 then honoured `Pinned(A)`. A graced (superseded) key keeps
+    /// it too.
+    #[test]
+    fn a_spawn_tenant_pin_survives_a_restart_and_a_supersede() {
+        let amb = crate::test_env::isolated_ambient();
+        let _serial = tests::restore_forensics_lock();
+        amb.write_active_tenant_id(tenant_a());
+        let (_store_dir, store) = tests::temp_store("spawn-tenant-restore");
+        let (wd, term) = (workdir(&amb, "restore"), terminal());
+
+        let (nonce, snapshot) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term),
+            Some(tenant_b()),
+        );
+        persist_proxy_nonces_with_store(&store, &snapshot);
+        assert_eq!(
+            store
+                .load_coord_mcp_nonces()
+                .get(&nonce)
+                .and_then(|b| b.session_tenant),
+            Some(tenant_b()),
+            "the mint-time pin must reach the store"
+        );
+
+        proxy_nonces().lock().unwrap().remove(&nonce);
+        restore_proxy_nonces_from(&store);
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+
+        // Supersede it: the same (workdir, terminal) re-mints, the old key rides
+        // grace — and a client still presenting it keeps writing to B.
+        let _ = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some(&term),
+            Some(tenant_b()),
+        );
+        assert!(live_binding(&nonce).is_none() && graced_nonce_is_valid(&nonce));
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+    }
+
+    /// P1 acceptance 4. Slot A expired, slot B live: the per-request credential
+    /// gate refuses a machine-pinned (A) session and forwards a P1-minted
+    /// `Pinned(B)` one — the gate moves onto B's slot with the pin.
+    #[test]
+    fn the_local_credential_gate_follows_a_p1_minted_pin_onto_its_own_slot() {
+        use crate::mcp::device_jwt_refresher::{CoordCredentialPosture, CoordCredentialStatus};
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "gate");
+
+        // The runner publishes the WORST slot, which is A.
+        let expired_a = CoordCredentialStatus {
+            posture: CoordCredentialPosture::Expired,
+            tenant_id: Some(tenant_a().to_string()),
+            exp: Some(1),
+            last_ok_at: None,
+            last_401_at: None,
+            last_refresh_outcome: None,
+            since: 0,
+            observed_at_unix: 0,
+            attributable: true,
+        };
+
+        let b_path =
+            provision_coord_mcp_config_file(&wd, Some(&terminal()), Some(tenant_b()), Some(PORT))
+                .unwrap()
+                .unwrap();
+        let b_tenant = session_tenant_or_refuse(Some(&read_proxy_nonce(&b_path).unwrap())).unwrap();
+        assert_eq!(b_tenant, Some(tenant_b()));
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, b_tenant, Some(&expired_a))
+                .is_none(),
+            "a Pinned(B) session must forward past A's dead slot"
+        );
+
+        let a_path = provision_coord_mcp_config_file(&wd, Some(&terminal()), None, Some(PORT))
+            .unwrap()
+            .unwrap();
+        let a_tenant = session_tenant_or_refuse(Some(&read_proxy_nonce(&a_path).unwrap())).unwrap();
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, a_tenant, Some(&expired_a))
+                .is_some(),
+            "the machine-pinned session presents A's slot and is still refused"
+        );
+    }
+
+    /// P1 acceptance 5. The cwd declares coord-mcp with a key that resolves to
+    /// A, and the spawn chose B: the seam refuses the spawn and mints nothing.
+    /// A cwd whose key resolves to B is admitted, and so is the refusal's arm
+    /// under the kill switch.
+    #[test]
+    fn a_cwd_declaring_another_tenants_coord_mcp_refuses_the_spawn() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let (wd, term) = (workdir(&amb, "declared"), terminal());
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        assert!(workdir_declares_coord_mcp(&wd));
+
+        let refusal = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT))
+            .expect_err("a cwd key for A must refuse a spawn for B");
+        match &refusal {
+            SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+                tenant,
+                declared_file,
+                declared,
+            } => {
+                assert_eq!(*tenant, tenant_b());
+                assert_eq!(declared_file, &Path::new(&wd).join(".mcp.json"));
+                assert_eq!(declared, &CredentialTenantRead::Resolved(Some(tenant_a())));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert!(refusal.to_string().contains(".mcp.json"), "{refusal}");
+        assert_eq!(
+            session_credential_tenant(&term, None),
+            CredentialTenantRead::NoNonce
+        );
+
+        // Unchosen spawns keep today's skip.
+        assert!(matches!(
+            deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)),
+            Ok(TerminalCoordMcp {
+                delivery: CoordMcpDelivery::WorkdirDeclared,
+                config_path: None
+            })
+        ));
+
+        // The kill switch restores the machine-pin behaviour, refusal included.
+        std::env::set_var(SPAWN_TENANT_CREDENTIAL_ENV, "0");
+        let switched = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT));
+        std::env::remove_var(SPAWN_TENANT_CREDENTIAL_ENV);
+        assert!(matches!(
+            switched,
+            Ok(TerminalCoordMcp {
+                delivery: CoordMcpDelivery::WorkdirDeclared,
+                ..
+            })
+        ));
+
+        // A cwd whose key IS B's (an isolated worktree provisioned for this
+        // tenant) is admitted.
+        let (wd_b, term_b) = (workdir(&amb, "declared-b"), terminal());
+        write_coord_mcp_proxy_config(&wd_b, PORT, Some(tenant_b()));
+        assert!(matches!(
+            deliver_terminal_coord_mcp(&wd_b, &term_b, Some(tenant_b()), Some(PORT)),
+            Ok(TerminalCoordMcp {
+                delivery: CoordMcpDelivery::WorkdirDeclared,
+                ..
+            })
+        ));
+    }
+
+    /// P5b's in-cwd half: a tenant-B spawn never REUSES a machine-pinned key
+    /// already in its (session-owned) cwd — it mints a B key instead — while an
+    /// unchosen spawn keeps reusing, so a shared cwd's live sibling is never
+    /// evicted by it.
+    #[test]
+    fn in_cwd_reuse_requires_the_spawn_tenants_own_key() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "reuse");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+
+        assert!(reusable_in_cwd_device_nonce(&wd, PORT, None).is_some());
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, PORT, Some(tenant_b())).is_none(),
+            "a machine-pinned key must never be handed to a tenant-B session"
+        );
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+        assert!(reusable_in_cwd_device_nonce(&wd, PORT, Some(tenant_b())).is_some());
+    }
+
+    /// P0 acceptance. A proxy nonce minted for terminal T while the machine pin
+    /// reads A, on a session whose record is stamped B, reports
+    /// `{row: B, credential: A, diverged: true}`; a nonce the proxy refuses
+    /// reports the credential UNKNOWN rather than a default.
+    #[test]
+    fn the_tenancy_report_names_a_row_credential_divergence_and_an_unknown() {
+        use crate::commands::session_info::{project_tenancy, TENANCY_RESOLVED, TENANCY_UNKNOWN};
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "report"), terminal());
+        let _ = provision_coord_mcp_config_file(&wd, Some(&term), None, Some(PORT))
+            .unwrap()
+            .unwrap();
+
+        let credential = session_credential_tenant(&term, Some(&wd));
+        assert_eq!(credential, CredentialTenantRead::Resolved(Some(tenant_a())));
+        let report = project_tenancy(Some(&tenant_b().to_string()), None, &credential, None, None);
+        assert_eq!(report.row.tenant_id, Some(tenant_b().to_string()));
+        assert_eq!(report.credential.status, TENANCY_RESOLVED);
+        assert_eq!(report.credential.tenant_id, Some(tenant_a().to_string()));
+        assert!(report.diverged);
+
+        // A session minted on a machine that cannot state its tenant, with no
+        // JWT claim to fall back on: the proxy refuses, so the report says
+        // UNKNOWN — never the default slot.
+        amb.write_machine_json(r#"{"active_tenant_id":"not-a-uuid"}"#);
+        let unresolvable = terminal();
+        let _ = provision_coord_mcp_config_file(&wd, Some(&unresolvable), None, Some(PORT))
+            .unwrap()
+            .unwrap();
+        let refused = session_credential_tenant(&unresolvable, Some(&wd));
+        assert!(
+            matches!(refused, CredentialTenantRead::Refused(_)),
+            "{refused:?}"
+        );
+        let report = project_tenancy(Some(&tenant_b().to_string()), None, &refused, None, None);
+        assert_eq!(report.credential.status, TENANCY_UNKNOWN);
+        assert_eq!(report.credential.tenant_id, None);
+        assert!(report
+            .credential
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("tenant_unresolvable:")));
+    }
+
+    #[test]
+    fn the_kill_switch_is_off_only_for_exactly_zero() {
+        assert!(spawn_tenant_credential_enabled_from(None));
+        assert!(spawn_tenant_credential_enabled_from(Some("1")));
+        assert!(spawn_tenant_credential_enabled_from(Some("")));
+        assert!(!spawn_tenant_credential_enabled_from(Some("0")));
+        assert!(!spawn_tenant_credential_enabled_from(Some(" 0 ")));
     }
 }

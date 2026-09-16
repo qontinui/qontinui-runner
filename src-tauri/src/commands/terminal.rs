@@ -33,6 +33,23 @@ fn intent_sharing_from_settings() -> (bool, Option<bool>) {
     (perf.share_terminal_output, perf.redact_terminal_secrets)
 }
 
+/// Parse a spawn surface's optional tenant argument.
+///
+/// Blank or absent is "no choice" (`None`, the machine default). A malformed
+/// uuid is rejected rather than silently dropped, so a typo'd `/spawn-ai
+/// --tenant` can never bind the session to the wrong tenant. Shared by
+/// [`terminal_create`] and the HTTP-proxy and backend-relay entry points kept in
+/// lockstep with it, so all three answer a bad tenant with the same
+/// `terminal:tenant_invalid:` refusal.
+pub(crate) fn parse_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => uuid::Uuid::parse_str(raw)
+            .map(Some)
+            .map_err(|e| format!("terminal:tenant_invalid: {raw} is not a tenant uuid: {e}")),
+    }
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -104,13 +121,12 @@ pub async fn terminal_create(
     // once, at the seam.
     crate::resource_guard::precheck_spawn("terminal session", resource_override.unwrap_or(false))?;
 
-    let spawn_tenant_id: Option<uuid::Uuid> = match tenant_id.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(raw) => Some(
-            uuid::Uuid::parse_str(raw)
-                .map_err(|e| format!("terminal:tenant_invalid: {raw} is not a tenant uuid: {e}"))?,
-        ),
-    };
+    let spawn_tenant_id = parse_spawn_tenant(tenant_id.as_deref())?;
+    // Refuse a tenant this runner cannot issue a coord credential for BEFORE
+    // `acquire_for_terminal` allocates a worktree and takes a claim a refusal
+    // would leak. The PTY seam re-checks as the authority (plan
+    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P1).
+    crate::coord_mcp::precheck_spawn_tenant(spawn_tenant_id)?;
 
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore
@@ -161,18 +177,18 @@ pub async fn terminal_create(
     // interactive/UI-created terminal with no agent session to attribute.
     // The coord session id is only minted later (registration below), and
     // it identifies the coord row, not the spawning agent. None is correct.
+    // The spawn tenant rides along because this allocate runs before the
+    // session exists, so no registry tenant can answer for it (P5b).
     let (working_dir, isolated_ctx) = crate::agent_worktree::isolated_edit::acquire_for_terminal(
         effective_intent_repo.as_deref(),
         title.as_deref().unwrap_or("Terminal edit session"),
         working_dir,
         None,
+        spawn_tenant_id,
     )
     .await;
 
     let repo_detect_handle = app_handle.clone();
-    // D1: the durable tenant stamp runs after the spawn returns, so it needs a
-    // handle of its own (`app_handle` is moved into the blocking spawn below).
-    let tenant_stamp_handle = app_handle.clone();
     let repo_detect_dir = working_dir.clone();
     let cred_helper_dir = working_dir.clone();
     // The shared session-env contribution (`QONTINUI_SESSION_WORKTREES` +
@@ -208,6 +224,7 @@ pub async fn terminal_create(
             // Operator-opened terminal (the Tauri `terminal_create` command):
             // the account is chosen after this point.
             crate::terminal::TrustArm::AccountChosenLater,
+            spawn_tenant_id,
         )
     })
     .await
@@ -221,27 +238,9 @@ pub async fn terminal_create(
         }
     }
 
-    // D1 tenant stamp. The tenant the operator picked for THIS spawn is known
-    // only here — `Intent.tenant_id` below carries it to coord, and the
-    // frontend `TerminalTab` carries it for the session's lifetime, but nothing
-    // wrote it durably, so a restart lost it. The spawn-time identity seam has
-    // already recorded the session by now (synchronously, inside `create`), so
-    // the record exists and is addressable by terminal id.
-    //
-    // Only stamped when the caller actually chose a tenant: `None` means "let
-    // the registry stamp the device default", and copying a default the runner
-    // did not resolve here would be an invented value.
-    if let Some(tenant) = spawn_tenant_id {
-        if let Some(store) = tenant_stamp_handle.try_state::<Arc<SessionLifecycleStore>>() {
-            store.update_identity_by_terminal(
-                &info.id,
-                &crate::session::session_lifecycle_store::SessionIdentityUpdate {
-                    tenant_id: Some(tenant.to_string()),
-                    ..Default::default()
-                },
-            );
-        }
-    }
+    // The D1 durable tenant stamp is written inside `create` (the chokepoint
+    // every tenant-offering door shares); `Intent.tenant_id` below carries the
+    // same tenant to coord.
 
     // Unconditional coord registration — every terminal session is
     // mirrored into the coordinator's session plane so the dashboard
@@ -2179,6 +2178,8 @@ pub(crate) fn create_terminal_session_backend(
         // `claude` — so trust is DERIVED for that account, never minted for every
         // account on the box.
         crate::terminal::TrustArm::Pinned(capture_hint.as_ref().and_then(|h| h.config_dir.clone())),
+        // A gate continuation is coord-spawned: no picker chose a tenant.
+        None,
     )?;
 
     // Park the pre-acquired isolated edit context on the session so its

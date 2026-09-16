@@ -1046,6 +1046,7 @@ pub async fn launch_coordinator_session(
             // `try_acquire_coordinator_lease` inside the spawned CLI
             // process, not in this scope. None is correct here.
             None,
+            None,
         )
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
@@ -1080,6 +1081,8 @@ pub async fn launch_coordinator_session(
         resource_override.unwrap_or(false),
         // Operator-launched shell: the account is chosen after this point.
         crate::terminal::TrustArm::AccountChosenLater,
+        // No tenant choice on this surface — the machine default.
+        None,
     )?;
 
     if let Some(ctx) = isolated_ctx {
@@ -1168,6 +1171,7 @@ pub async fn spawn_worker_session(
             "Worker session",
             Some(primary_repo_path.clone()),
             uuid::Uuid::parse_str(&task_run_id).ok(),
+            None,
         )
         .await;
     let repo_path = effective_repo_path.unwrap_or(primary_repo_path);
@@ -1248,6 +1252,8 @@ pub async fn spawn_worker_session(
         resource_override.unwrap_or(false),
         // Operator-launched shell: the account is chosen after this point.
         crate::terminal::TrustArm::AccountChosenLater,
+        // No tenant choice on this surface — the machine default.
+        None,
     )?;
 
     // Phase 2 — park the isolated edit context on the TerminalSession

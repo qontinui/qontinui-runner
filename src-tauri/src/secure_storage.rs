@@ -113,9 +113,9 @@ const STORAGE_FILE: &str = "auth_tokens.enc";
 /// ever persisted — OQ3 — so a stored class would be a redundant field that
 /// could disagree with the filter), the lifetime (only Persistent bindings are
 /// persisted, and a stored expiry is exactly what would let an ephemeral nonce
-/// restore as an unbounded one), and `session_tenant` (widening the store makes
-/// it possible, but tenant restoration has its own cross-tenant blast radius
-/// and is a separate decision).
+/// restore as an unbounded one). The session's tenant IS carried, since plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1 made
+/// that separate decision — see [`Self::session_tenant`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct StoredNonceBinding {
     /// The session workdir the nonce was provisioned into.
@@ -165,6 +165,30 @@ pub struct StoredNonceBinding {
     /// rewrites instead of being laundered into "minted just now".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minted_at_unix: Option<u64>,
+    /// The tenant the binding was PINNED to at mint time, when it was pinned —
+    /// the spawn-chosen tenant, or the machine's active tenant for a spawn that
+    /// chose none.
+    ///
+    /// ## Why it is here
+    ///
+    /// Without it the restore could only stamp the machine's pin AT RESTORE, and
+    /// row 1 of `coord_mcp::resolve_session_tenant` honours a `Pinned` binding
+    /// over everything else. So every runner restart actively re-pinned a
+    /// session spawned for tenant B to the machine's tenant A, and its coord-mcp
+    /// writes silently moved tenants while its coord row still said B. A
+    /// session's tenant is fixed at spawn; this is what keeps it fixed across a
+    /// restart. The blast radius the earlier exclusion worried about is the
+    /// opposite direction: restoring verbatim can only return a binding to the
+    /// tenant it was issued for, never move it to one it was not.
+    ///
+    /// ## Absent
+    ///
+    /// `#[serde(default)]` ⇒ `None` for every entry written before the field
+    /// existed and for a binding minted unpinned; the restore then stamps the
+    /// restore-time pin exactly as it did before, so no `.enc` migration is
+    /// needed and an old store restores byte-for-byte as it used to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tenant: Option<uuid::Uuid>,
 }
 
 /// What loading the persisted proxy-nonce set actually found. See
@@ -209,6 +233,13 @@ pub struct StoredGracedNonce {
     pub terminal_id: Option<String>,
     /// End of the grace window, whole seconds since the Unix epoch.
     pub grace_until_unix: u64,
+    /// The tenant the evicted binding was pinned to — see
+    /// [`StoredNonceBinding::session_tenant`]. A graced key is still a live
+    /// client's credential for its whole window, so it must keep resolving to
+    /// the tenant it was issued for. `None` for an unpinned binding and for
+    /// every entry written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tenant: Option<uuid::Uuid>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -238,6 +269,8 @@ impl From<StoredNonceEntry> for StoredNonceBinding {
                 // existed: the age is unrecoverable, and the restore leg reads
                 // `None` as "older than anything dated".
                 minted_at_unix: None,
+                // Pre-Phase-4 entries predate the tenant too: restore-time pin.
+                session_tenant: None,
             },
             StoredNonceEntry::Modern(b) => b,
         }
@@ -2155,6 +2188,7 @@ mod tests {
             workdir: "D:\\wd-t".into(),
             terminal_id: None,
             minted_at_unix: Some(1_755_000_000),
+            session_tenant: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2171,6 +2205,7 @@ mod tests {
             workdir: "D:\\wd-z".into(),
             terminal_id: None,
             minted_at_unix: Some(0),
+            session_tenant: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2203,6 +2238,7 @@ mod tests {
             workdir: "D:\\wd-c".into(),
             terminal_id: None,
             minted_at_unix: None,
+            session_tenant: None,
         }))
         .unwrap();
         assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
@@ -2226,6 +2262,7 @@ mod tests {
                 workdir: "D:\\wd".into(),
                 terminal_id: Some("term-1".into()),
                 minted_at_unix: Some(1_700_000_000),
+                session_tenant: None,
             },
         )]);
         let graced = std::collections::HashMap::from([(
@@ -2234,6 +2271,7 @@ mod tests {
                 workdir: "D:\\wd".into(),
                 terminal_id: Some("term-1".into()),
                 grace_until_unix: 1_700_021_600,
+                session_tenant: None,
             },
         )]);
         storage
@@ -2259,6 +2297,7 @@ mod tests {
                 workdir: "D:\\wd".into(),
                 terminal_id: Some("term-1".into()),
                 minted_at_unix: Some(1_700_000_123),
+                session_tenant: None,
             },
         );
         map.insert(
@@ -2267,6 +2306,7 @@ mod tests {
                 workdir: "D:\\wd".into(),
                 terminal_id: None,
                 minted_at_unix: None,
+                session_tenant: None,
             },
         );
         storage.store_coord_mcp_nonces(&map).unwrap();

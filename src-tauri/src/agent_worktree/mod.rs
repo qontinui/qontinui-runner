@@ -1329,6 +1329,29 @@ fn allocate_request_body(
     body
 }
 
+/// The tenant an allocate is made under: the owning session's registry tenant,
+/// else the tenant the spawn chose.
+///
+/// The interactive spawn surfaces allocate BEFORE their session is registered
+/// (`commands::terminal::terminal_create` and its lockstep siblings), so
+/// `session_tenant_scope` answers `Unresolved` for them — which declares no
+/// `tenant_id` and, on a multi-bound device, presents no bearer — even though
+/// the operator's chosen tenant was parsed a few lines earlier. Plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b.
+///
+/// The registry wins whenever it answers: a registered session's stamped tenant
+/// is the authority, and a spawn tenant that disagreed with it would be a
+/// runner-side drift this must not paper over.
+fn allocate_tenant_scope(
+    registry: crate::auth::TenantScope,
+    spawn_tenant: Option<uuid::Uuid>,
+) -> crate::auth::TenantScope {
+    match (registry, spawn_tenant) {
+        (crate::auth::TenantScope::Unresolved, Some(t)) => crate::auth::TenantScope::Owned(t),
+        (scope, _) => scope,
+    }
+}
+
 /// Call coord's `/agents/allocate` and then `git worktree add` for each
 /// returned row.
 ///
@@ -1348,6 +1371,10 @@ fn allocate_request_body(
 /// `plan_id` / `phase`, when both present, select `ClaimKind::Phase` with
 /// `resource_key = "plan:<plan>:phase:<phase>"`; when only
 /// `declared_overlap_paths` is present the claim kind is `FileGlob`.
+///
+/// `spawn_tenant` is the tenant the spawning caller chose, used only when
+/// `agent_session_id` resolves no registry tenant — see
+/// [`allocate_tenant_scope`].
 ///
 /// Claim acquisition (Phase 1, plan
 /// 2026-06-06-session-scoped-multi-repo-workspace-coordination). BEFORE
@@ -1381,6 +1408,7 @@ pub async fn allocate_and_materialize_with_claim(
     repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
     plan_id: Option<&str>,
     phase: Option<&str>,
+    spawn_tenant: Option<uuid::Uuid>,
 ) -> Result<MaterializeOutcome, AllocateError> {
     if !worktree_mode_enabled() {
         return Err(AllocateError::Other(format!(
@@ -1448,7 +1476,10 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
-    let scope = crate::session::session_tenant_scope(agent_session_id);
+    let scope = allocate_tenant_scope(
+        crate::session::session_tenant_scope(agent_session_id),
+        spawn_tenant,
+    );
     let body = allocate_request_body(
         machine_id,
         agent_session_id,
@@ -2537,6 +2568,74 @@ mod tests {
         // The pre-existing wire contract is untouched by the added field.
         assert_eq!(alloc["agent_session_id"], session.to_string());
         assert_eq!(claim["machine_id"], machine.to_string());
+    }
+
+    /// P5b (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential).
+    /// `terminal_create` allocates BEFORE its session exists, so the registry
+    /// answers `Unresolved` — and on origin/main the allocate declared no tenant
+    /// and, on a multi-bound device, presented NO bearer. The tenant the spawn
+    /// chose now fills that gap: the body declares B and B's slot is presented.
+    /// A registry tenant, when there is one, still wins.
+    #[test]
+    fn an_interactive_spawn_allocates_under_the_tenant_it_chose() {
+        use crate::auth::{AuthManager, TenantScope};
+        use base64::Engine as _;
+
+        let machine = uuid::Uuid::parse_str("99999999-9999-4999-8999-999999999999").unwrap();
+        let a = uuid::Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
+        let b = uuid::Uuid::parse_str("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb").unwrap();
+        let repos = vec![RepoRequest {
+            repo: "qontinui-coord".to_string(),
+            parent_sha: None,
+        }];
+
+        // The pre-session interactive spawn: no registry tenant, spawn chose B.
+        let scope = allocate_tenant_scope(TenantScope::Unresolved, Some(b));
+        assert_eq!(scope, TenantScope::Owned(b));
+        let body = allocate_request_body(&machine, None, &repos, None, None, scope);
+        assert_eq!(body["tenant_id"], b.to_string());
+
+        // ...and the bearer attached to that allocate is B's slot, on a device
+        // bound to A (the default) and B.
+        let jwt = |tag: &str| {
+            let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+            let exp = chrono::Utc::now().timestamp() + 3 * 60 * 60;
+            format!(
+                "{}.{}.{}",
+                enc(br#"{"alg":"none","typ":"JWT"}"#),
+                enc(format!(r#"{{"exp":{exp},"tag":"{tag}"}}"#).as_bytes()),
+                enc(b"sig")
+            )
+        };
+        let store_path = std::env::temp_dir()
+            .join("qontinui_test_p5b_allocate_scope")
+            .join(format!("{}.enc", uuid::Uuid::new_v4()));
+        let mgr = AuthManager::with_storage(
+            crate::secure_storage::SecureStorage::with_path(store_path).unwrap(),
+        );
+        let (jwt_a, jwt_b) = (jwt("a"), jwt("b"));
+        mgr.store_tenant_device_jwt(&a, &jwt_a).unwrap();
+        mgr.store_tenant_device_jwt(&b, &jwt_b).unwrap();
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&mgr, scope, Some(a), 2).as_deref(),
+            Some(jwt_b.as_str()),
+            "the allocate must present B's slot"
+        );
+        assert_eq!(
+            crate::auth::select_scoped_bearer(&mgr, TenantScope::Unresolved, Some(a), 2),
+            None,
+            "the pre-P5b scope presented nothing on a multi-bound device"
+        );
+
+        // No choice keeps the old answer; a registry tenant outranks the choice.
+        assert_eq!(
+            allocate_tenant_scope(TenantScope::Unresolved, None),
+            TenantScope::Unresolved
+        );
+        assert_eq!(
+            allocate_tenant_scope(TenantScope::Owned(a), Some(b)),
+            TenantScope::Owned(a)
+        );
     }
 
     #[test]

@@ -340,6 +340,7 @@ pub async fn dispatch_subtask(
             &purpose,
             Some(default_cwd.clone()),
             Some(task_run_id),
+            None,
         )
         .await;
     let working_dir = working_dir_opt.unwrap_or(default_cwd);

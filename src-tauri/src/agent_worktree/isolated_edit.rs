@@ -78,6 +78,12 @@ pub struct IsolatedEditContext {
     // credential install this context owns; `Drop` must tear down these too.
     // Never contains `agent_id` itself (deduped on push).
     extra_cred_agent_ids: Vec<String>,
+
+    // The tenant the SPAWN chose for this session, when it chose one (plan
+    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P5b).
+    // Kept so a grow call ([`IsolatedEditContext::acquire_additional`])
+    // allocates under the same tenant the first allocate did.
+    spawn_tenant: Option<uuid::Uuid>,
 }
 
 impl Drop for IsolatedEditContext {
@@ -240,6 +246,7 @@ impl IsolatedEditContext {
             None,
             None,
             session_id,
+            self.spawn_tenant,
         )
         .await?;
 
@@ -359,6 +366,11 @@ pub struct AcquireRequest<'a> {
     pub phase: Option<&'a str>,
     /// coord-assigned per-agent session id, folded into the claim owner token.
     pub agent_session_id: Option<uuid::Uuid>,
+    /// The tenant the spawn chose, when it chose one. Declared on the allocate
+    /// when `agent_session_id` resolves no registry tenant — the interactive
+    /// spawn allocates before its session exists (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b).
+    pub spawn_tenant: Option<uuid::Uuid>,
 }
 
 /// Allocate isolated worktrees for the given repos.
@@ -395,6 +407,7 @@ pub async fn acquire(
         req.plan_id,
         req.phase,
         req.agent_session_id,
+        req.spawn_tenant,
     )
     .await?;
 
@@ -442,6 +455,7 @@ pub async fn acquire(
         edit_loop_correlation_id,
         edit_loop_declared_paths,
         extra_cred_agent_ids: Vec::new(),
+        spawn_tenant: req.spawn_tenant,
     }))
 }
 
@@ -470,6 +484,7 @@ async fn materialize_repos(
     plan_id: Option<&str>,
     phase: Option<&str>,
     agent_session_id: Option<uuid::Uuid>,
+    spawn_tenant: Option<uuid::Uuid>,
 ) -> Result<super::AllocateResult, AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
@@ -500,6 +515,7 @@ async fn materialize_repos(
         &canonical_paths,
         plan_id,
         phase,
+        spawn_tenant,
     )
     .await
     {
@@ -541,6 +557,7 @@ async fn materialize_repos(
                 &canonical_paths,
                 plan_id,
                 phase,
+                spawn_tenant,
             )
             .await?
         }
@@ -695,11 +712,19 @@ impl IsolatedEditContext {
 ///   the spawn flow falls back to the primary checkout (this matches
 ///   the in-place Phase 2 wireup of `terminal_create` and
 ///   `spawn_worker_session`).
+///
+/// `spawn_tenant` is the tenant the caller chose for this session (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b).
+/// These spawns allocate before their session exists, so `agent_session_id`
+/// resolves no registry tenant and the allocate would otherwise declare none;
+/// the chosen tenant fills that gap. It also decides the in-cwd coord-mcp
+/// credential below — see the provisioning block.
 pub async fn acquire_for_terminal(
     intent_repo: Option<&str>,
     purpose: &str,
     working_dir: Option<String>,
     agent_session_id: Option<uuid::Uuid>,
+    spawn_tenant: Option<uuid::Uuid>,
 ) -> (Option<String>, Option<IsolatedEditContext>) {
     // ── REUSE BEFORE ALLOCATE (session restore) ────────────────────────────
     //
@@ -782,6 +807,7 @@ pub async fn acquire_for_terminal(
                 plan_id: None,
                 phase: None,
                 agent_session_id,
+                spawn_tenant,
             })
             .await
             {
@@ -819,10 +845,37 @@ pub async fn acquire_for_terminal(
     // breadcrumb) rather than silently substituting the bootstrap default — the
     // F1 root cause. We pass it through unchanged.
     if let Some(wd) = &out.0 {
-        crate::coord_mcp::provision_coord_mcp_for_session(
-            wd,
-            crate::coord_mcp::resolve_bound_api_port(),
-        );
+        // A spawn that chose a tenant (plan
+        // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential)
+        // must not get the machine pin's key in its cwd `.mcp.json`: that file
+        // IS the session's credential whenever it declares coord-mcp (the PTY
+        // seam then delivers none of its own). But the file is also read by
+        // every OTHER session launched in that cwd, so it may carry the chosen
+        // tenant's key only when the cwd belongs to this session alone — an
+        // agent worktree allocation, fresh or reused. In a shared cwd the file
+        // is left to whoever else provisions it, and the seam either issues a
+        // per-terminal credential for the tenant or refuses the spawn.
+        let credential_tenant = crate::coord_mcp::credential_spawn_tenant(spawn_tenant);
+        let session_owns_workdir =
+            super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
+                .is_some_and(|root| {
+                    super::canonical_paths::paths_equal(&root, std::path::Path::new(wd))
+                });
+        match (credential_tenant, session_owns_workdir) {
+            (Some(tenant), false) => info!(
+                workdir = %wd,
+                tenant = %tenant,
+                "acquire_for_terminal: shared cwd — not writing a tenant-pinned .mcp.json \
+                 other sessions would read; the PTY seam issues this session's credential"
+            ),
+            (tenant, _) => {
+                crate::coord_mcp::provision_coord_mcp_for_session(
+                    wd,
+                    crate::coord_mcp::resolve_bound_api_port(),
+                    tenant,
+                );
+            }
+        }
         // The fleet COMMANDS and SKILLS belong at this same chokepoint, for the
         // same reason coord-mcp does: they are per-session cwd artifacts, and
         // PROJECT-scoped skills and commands resolve only from the cwd `claude`
@@ -1008,6 +1061,7 @@ impl IsolatedEditContext {
             edit_loop_correlation_id: uuid::Uuid::nil(),
             edit_loop_declared_paths: Vec::new(),
             extra_cred_agent_ids: Vec::new(),
+            spawn_tenant: None,
         }
     }
 
@@ -1360,6 +1414,7 @@ mod tests {
                 plan_id: None,
                 phase: None,
                 agent_session_id: None,
+                spawn_tenant: None,
             })
             .await
             .expect("flag-off should return Ok(None), not Err");

@@ -1012,7 +1012,7 @@ async fn spawn_looping_agent_terminal(
     // actually given (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
     // Provisioning runs before the render here, so the honest value is available.
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port);
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(&workdir, bound_port, None);
     crate::fleet_commands::provision_fleet_commands_for_session(&workdir);
     crate::fleet_skills::provision_fleet_skills_for_session(&workdir);
 

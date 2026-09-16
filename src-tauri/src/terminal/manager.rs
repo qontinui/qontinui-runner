@@ -205,6 +205,11 @@ impl TerminalManager {
     /// ([`TrustArm::Pinned`] — trust is derived for that account and a refusal
     /// refuses the spawn) or whether the account is chosen later
     /// ([`TrustArm::AccountChosenLater`] — the every-account best-effort mint).
+    ///
+    /// `spawn_tenant` is the tenant the caller chose for this session, forwarded
+    /// to [`TerminalSession::spawn`], whose identity seam issues the session's
+    /// coord-mcp credential for it or refuses the spawn. `None` — every surface
+    /// that does not offer a tenant choice — keeps the machine pin.
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         &self,
@@ -218,6 +223,7 @@ impl TerminalManager {
         extra_env: Option<Vec<(String, String)>>,
         resource_override: bool,
         trust: TrustArm,
+        spawn_tenant: Option<uuid::Uuid>,
     ) -> Result<TerminalInfo, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| format!("Terminal {}", self.count() + 1));
@@ -294,6 +300,7 @@ impl TerminalManager {
             command,
             extra_env,
             resource_override,
+            spawn_tenant,
         )?;
 
         let info = session.info();
@@ -325,6 +332,13 @@ impl TerminalManager {
         // The record already exists: `TerminalSession::spawn` records the
         // pre-pinned session synchronously through the identity seam before it
         // returns.
+        //
+        // The spawn tenant is made durable in the same write (D1), and HERE —
+        // the one chokepoint every tenant-offering surface reaches — rather than
+        // in one caller, so the session-info tenancy report reads the tenant the
+        // session was spawned for whichever door spawned it. Only stamped when
+        // the caller chose one: `None` means "the device default", and copying a
+        // default nobody resolved here would be an invented value.
         {
             use tauri::Manager;
             if let Some(store) = emitter
@@ -334,6 +348,7 @@ impl TerminalManager {
                     &info.id,
                     &crate::session::session_lifecycle_store::SessionIdentityUpdate {
                         bypass_permissions: Some(bypass_permissions),
+                        tenant_id: spawn_tenant.map(|t| t.to_string()),
                         ..Default::default()
                     },
                 );

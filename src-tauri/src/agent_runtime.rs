@@ -5212,7 +5212,7 @@ async fn run_continuation_terminal(
     let bound_port = app
         .try_state::<Arc<crate::commands::AppState>>()
         .map(|s| crate::mcp::types::runner_api_port(s.inner()));
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
 
     // The argv, built HERE rather than beside `launch_cfg` above: the briefing
     // it carries gates its memory clause on `coord_mcp`, which the call
@@ -6032,6 +6032,9 @@ async fn acquire_continuation_workdir(
             // Phase 1b: session-keyed worktree claims for the continuation —
             // see `continuation_session_id` for how this stable id is derived.
             agent_session_id,
+            // A gate continuation is coord-spawned: no spawn picker chose a
+            // tenant, and its session id resolves its own.
+            spawn_tenant: None,
         })
         .await
         {
@@ -6190,7 +6193,7 @@ async fn run_continuation_headless(
     // memory clause is gated on, and provisioning runs before the spawn here so
     // the honest value is available (plan
     // `2026-08-21-memory-clause-liveness-gate-is-coarser-than-the-session`).
-    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port);
+    let coord_mcp = crate::coord_mcp::provision_coord_mcp_for_session(workdir, bound_port, None);
     // No per-spawn pin here: a gate continuation carries no account field —
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {

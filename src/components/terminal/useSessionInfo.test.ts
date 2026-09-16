@@ -29,6 +29,7 @@ import {
   isProvisionalIdentity,
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
+  normalizeTenancy,
   prGithubUrl,
   prKey,
   prLabel,
@@ -114,6 +115,7 @@ function body(overrides: Partial<SessionInfoBody> = {}): SessionInfoBody {
       bypassPermissions: false,
     },
     prs: prs(),
+    tenancy: null,
     ...overrides,
   };
 }
@@ -905,5 +907,38 @@ describe("sessionInfoTriggerLabel (D5)", () => {
     const trigger = deriveTrigger(states[1]);
     expect(trigger.summary).toBe("Session info unavailable — session_not_found");
     expect(trigger.summary.match(/Session info/g)).toHaveLength(1);
+  });
+});
+
+describe("normalizeTenancy (plan 2026-09-10 P0)", () => {
+  it("keeps a well-formed block, divergence included", () => {
+    const raw = {
+      row: { tenantId: "b" },
+      dataPlane: { status: "owned", tenantId: "b", reason: null },
+      credential: {
+        status: "resolved",
+        tenantId: "a",
+        slot: "tenant",
+        reason: null,
+        posture: { status: "observed", value: "live", canAnswer: true, reason: null },
+      },
+      diverged: true,
+    };
+    const t = normalizeTenancy(raw);
+    expect(t?.diverged).toBe(true);
+    expect(t?.credential.tenantId).toBe("a");
+    expect(t?.credential.posture.value).toBe("live");
+  });
+
+  it("reads an absent or malformed block as null (unknown), never as agreeing", () => {
+    expect(normalizeTenancy(undefined)).toBeNull();
+    expect(normalizeTenancy({ row: { tenantId: "b" } })).toBeNull();
+    expect(
+      normalizeTenancy({
+        row: {},
+        dataPlane: { status: "owned" },
+        credential: { status: "resolved" },
+      }),
+    ).toBeNull();
   });
 });

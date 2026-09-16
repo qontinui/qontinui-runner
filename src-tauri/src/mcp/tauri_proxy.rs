@@ -206,11 +206,27 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 /// a path that did not exist.
                 #[serde(default)]
                 resource_override: bool,
+                /// The tenant to spawn this session for — the `tenant_id`
+                /// argument of the `terminal_create` Tauri command this route
+                /// proxies, with the same contract: absent/blank keeps the
+                /// machine default, a malformed uuid is refused, and a tenant
+                /// this runner holds no coord credential for refuses the spawn
+                /// (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+                #[serde(default)]
+                tenant_id: Option<String>,
             }
             let a = match serde_json::from_value::<Args>(req.args) {
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
+            let spawn_tenant =
+                match crate::commands::terminal::parse_spawn_tenant(a.tenant_id.as_deref())
+                    .and_then(|tenant| {
+                        crate::coord_mcp::precheck_spawn_tenant(tenant).map(|()| tenant)
+                    }) {
+                    Ok(tenant) => tenant,
+                    Err(e) => return TauriInvokeResponse::err(e),
+                };
             let tm: Arc<TerminalManager> = state
                 .app_handle
                 .state::<Arc<TerminalManager>>()
@@ -242,6 +258,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                     a.title.as_deref().unwrap_or("Terminal edit session"),
                     a.working_dir,
                     a.agent_session_id,
+                    spawn_tenant,
                 )
                 .await;
 
@@ -273,6 +290,7 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 // The account is chosen after this point, so the every-account
                 // mint applies.
                 crate::terminal::TrustArm::AccountChosenLater,
+                spawn_tenant,
             ) {
                 Ok(info) => {
                     if let Some(ctx) = isolated_ctx {

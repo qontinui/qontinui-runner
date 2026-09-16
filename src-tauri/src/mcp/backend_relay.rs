@@ -3315,7 +3315,7 @@ async fn handle_chat_create(api_state: &Arc<ApiState>, data: &Value) -> Option<V
                 // helper logs, writes a degraded breadcrumb, and the session
                 // still answers (just without twin tools).
                 let bound_port = Some(crate::mcp::types::runner_api_port(&bg_state.app_state));
-                crate::coord_mcp::provision_coord_mcp_for_session(&dir, bound_port);
+                crate::coord_mcp::provision_coord_mcp_for_session(&dir, bound_port, None);
                 dir
             }
             // Legacy fallback (no home dir / create failed): the runner's own
@@ -4082,6 +4082,15 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                 title.as_deref().unwrap_or("Terminal edit session"),
                 working_dir,
                 agent_session_id,
+                // No spawn tenant, deliberately. This frame comes over the relay
+                // from another machine, and every spawn parameter it may carry
+                // is either answered by a device-owned grant or resolved through
+                // a device-owned allowlist (see `resolve_relay_create`). Neither
+                // names a tenant, so reading one off the frame would let the
+                // remote party choose which of this device's tenant credentials
+                // a session is issued — a capability no grant confers. The
+                // session keeps the machine default until a grant can carry one.
+                None,
             )
             .await;
 
@@ -4117,6 +4126,8 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // The account is chosen after this point (a shell the relay
             // types into), so the every-account mint applies.
             crate::terminal::TrustArm::AccountChosenLater,
+            // No spawn tenant — see the allocate above.
+            None,
         ) {
             Ok(info) => {
                 if let Some(ctx) = isolated_ctx {

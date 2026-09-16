@@ -79,6 +79,13 @@ pub struct CreateTerminalRequest {
     /// PTY env untouched (existing behaviour).
     #[serde(default)]
     pub account: Option<String>,
+    /// Optional tenant to spawn this session for — the same contract as the
+    /// `terminal_create` Tauri command's `tenant_id`: absent/blank keeps the
+    /// machine default, a malformed uuid is a 400, and a tenant this runner
+    /// holds no coord credential for is refused (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+    #[serde(default, alias = "tenant_id")]
+    pub tenant_id: Option<String>,
 }
 
 /// Request body for writing data to a terminal.
@@ -242,6 +249,16 @@ pub async fn create_terminal_handler(
         }
     }
 
+    // The spawn tenant is judged BEFORE the worktree allocation below, which a
+    // refusal would otherwise leak. A malformed or unpaired tenant is the
+    // caller's to fix, so both are a 400 naming the heal.
+    let spawn_tenant = crate::commands::terminal::parse_spawn_tenant(request.tenant_id.as_deref())
+        .and_then(|tenant| crate::coord_mcp::precheck_spawn_tenant(tenant).map(|()| tenant))
+        .map_err(|e| {
+            warn!("HTTP: rejecting terminal create — {e}");
+            (StatusCode::BAD_REQUEST, Json(api_error(e)))
+        })?;
+
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
     // terminal_manager.create call sites. `intent_repo == None` is a
@@ -254,6 +271,7 @@ pub async fn create_terminal_handler(
             .unwrap_or("HTTP terminal edit session"),
         request.working_dir,
         request.agent_session_id,
+        spawn_tenant,
     )
     .await;
 
@@ -316,6 +334,7 @@ pub async fn create_terminal_handler(
         // trust is derived for that one account; without it the account is chosen
         // by whatever the caller types into the shell.
         trust_arm,
+        spawn_tenant,
     ) {
         Ok(info) => {
             if let Some(ctx) = isolated_ctx {

@@ -163,7 +163,7 @@ export function ZoneLabel({
 
       {/* F1 — which tenant this session is acting as. Self-hides on
           single-tenant devices and on tabs with no recorded tenant. */}
-      <TenantBadge tenantId={tab.tenantId} />
+      <TenantBadge tenantId={tab.tenantId} claudeSessionId={tab.claudeSessionId} />
 
       {/* Remote tab (Phase 4/5): device badge, earlier-output and reattach.
           Renders nothing for a local tab. */}

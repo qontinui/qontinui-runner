@@ -593,6 +593,8 @@ pub async fn steward_start_handler(
         // Interactive shell; the skill command is typed in afterwards and the
         // account is chosen then, so the every-account mint applies.
         crate::terminal::TrustArm::AccountChosenLater,
+        // A steward session runs under the machine default tenant.
+        None,
     ) {
         Ok(info) => {
             info!("HTTP: Created {} terminal: {}", spec.skill, info.id);

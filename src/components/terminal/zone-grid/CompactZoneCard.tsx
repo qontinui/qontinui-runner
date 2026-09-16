@@ -332,7 +332,11 @@ function CompactZoneCardInner({
         )}
         {/* F1 — tenant parity with the full-zone header (`ZoneLabel`), so the
             compact multi-zone overview isn't the one place tenancy is invisible. */}
-        <TenantBadge tenantId={tab.tenantId} className="rounded-full py-0.5" />
+        <TenantBadge
+          tenantId={tab.tenantId}
+          claudeSessionId={tab.claudeSessionId}
+          className="rounded-full py-0.5"
+        />
         <RemoteTabControls tab={tab} compact />
         {/* Session identity + PR ledger, at parity with the full-zone header
             (`ZoneLabel`) and the single-view header. A compact zone is still a

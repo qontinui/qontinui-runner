@@ -111,6 +111,8 @@ impl Transport for ClaudeCliTransport {
                         // The operator (or the frontend pre-fill) types `claude`
                         // afterwards; the account is chosen then.
                         crate::terminal::TrustArm::AccountChosenLater,
+                        // No tenant choice on this transport.
+                        None,
                     )
                     .map_err(TransportError::Runtime)?;
 
