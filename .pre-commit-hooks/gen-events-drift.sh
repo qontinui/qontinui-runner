@@ -347,6 +347,31 @@ esac
 
 cd "$RUNNER_DIR"
 
+# `generate_types.sh` runs `cargo build --bin export_schemas --release`, and it
+# resolves its output dir from an INHERITED `CARGO_TARGET_DIR` only
+# (`generate_types.sh:71`) — deliberately, because CI and hand runs have no
+# `cargo-guard.sh` to ask. So the caller is what has to answer, and from a
+# linked worktree with nothing inherited that build lands cold in the
+# worktree's own `target/`: finding 33d6f2d8 (b) measured 5.2 GB for ONE push
+# across this hook and `cargo-prepush.sh` together.
+#
+# qontinui-runner#1556 fixed only the `cargo-prepush.sh` half, and could not
+# fix this one: it exported the variable inside its own process, and the
+# pre-push shim runs each hook as a separate `bash`. Hence the shared library.
+#
+# Every miss keeps today's behaviour and says so on one line; nothing here can
+# fail the push, which is the same non-blocking contract as the resolution in
+# `cargo-prepush.sh`.
+SHARED_TARGET_LIB="$SCRIPT_DIR/lib/shared-target.sh"
+if [ -f "$SHARED_TARGET_LIB" ]; then
+    # shellcheck source=lib/shared-target.sh
+    . "$SHARED_TARGET_LIB"
+    resolve_shared_target "$RUNNER_DIR" "[gen-events-drift]"
+else
+    log "NOTE — missing $SHARED_TARGET_LIB, so the shared target cannot be"
+    log "       resolved. Building into this checkout's own target/."
+fi
+
 log "regenerating Rust JSON Schemas + per-type TS bindings into a scratch dir..."
 log "  scratch  : $SCRATCH_DIR"
 log "  baseline : $BASELINE_DIR (read-only)"
@@ -374,9 +399,16 @@ log "  baseline : $BASELINE_DIR (read-only)"
 # output directory would show up as spurious drift in the comparison below.
 GEN_LOG="$SCRATCH_ROOT/.generate_types.log"
 set +e
+# QONTINUI_SCHEMAS_JSON keeps the exported schema out of the cargo target dir.
+# That dir is SHARED now (see the resolution above), so the default location
+# would be the same file for every worktree borrowing it — and cargo's lock
+# covers the build, not this redirect. Two concurrent pushes would then diff
+# their bindings against each other's schema. Scratch is per-run and already
+# cleaned up on exit.
 QONTINUI_TS_OUT_DIR="$SCRATCH_DIR" \
 QONTINUI_PY_OUT_DIR="$SCRATCH_PY_DIR" \
 QONTINUI_SCHEMAS_DIR="$SCHEMAS_DIR" \
+QONTINUI_SCHEMAS_JSON="$SCRATCH_ROOT/schemas.json" \
 QONTINUI_TS_COMPILE_SCRIPT="$TS_CODEGEN_DEPS_SCRIPT" \
     bash src-tauri/scripts/generate_types.sh --ts-only >"$GEN_LOG" 2>&1
 GEN_RC=$?

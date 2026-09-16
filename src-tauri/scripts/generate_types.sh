@@ -73,7 +73,21 @@ case "$CARGO_OUT_DIR" in
     /*|[A-Za-z]:[/\\]*) ;;                       # already absolute
     *) CARGO_OUT_DIR="$PROJECT_ROOT/$CARGO_OUT_DIR" ;;
 esac
-SCHEMAS_JSON="$CARGO_OUT_DIR/schemas.json"
+# QONTINUI_SCHEMAS_JSON overrides where the exported schema lands, for the same
+# reason QONTINUI_TS_OUT_DIR and QONTINUI_PY_OUT_DIR exist: a caller that must
+# not write into shared space needs somewhere private to put it.
+#
+# ⚠️ IT BECAME LOAD-BEARING WHEN THE TARGET DIR STOPPED BEING PRIVATE. The
+# default puts this file INSIDE the cargo target dir, which used to be
+# per-checkout — so two concurrent runs could not collide. `gen-events-drift.sh`
+# now borrows the SHARED target (lib/shared-target.sh) so a worktree push does
+# not cold-build 5 GB, and with that, every borrower resolves the same
+# `<shared>/schemas.json`. cargo's own file lock serialises the BUILD, not this
+# redirect, so two pre-push hooks on different branches would overwrite each
+# other's export and then diff their bindings against the OTHER branch's
+# schema — a spurious drift failure that blocks a push. The drift hook
+# therefore points this at its own scratch dir.
+SCHEMAS_JSON="${QONTINUI_SCHEMAS_JSON:-$CARGO_OUT_DIR/schemas.json}"
 
 SCHEMAS_DIR="${QONTINUI_SCHEMAS_DIR:-$PROJECT_ROOT/../../qontinui-schemas}"
 

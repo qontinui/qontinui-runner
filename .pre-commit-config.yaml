@@ -134,7 +134,44 @@ repos:
         # A passing run should still say which arms it exercised (it reports
         # skips, which a bare "Passed" would hide).
         verbose: true
-        files: '^\.pre-commit-hooks/(lib/push-range\.sh|push-range-test\.sh|cargo-prepush\.sh)$'
+        files: '^\.pre-commit-hooks/(lib/(push-range|crate-inputs|shared-target)\.sh|push-range-test\.sh|cargo-prepush\.sh)$'
+        pass_filenames: false
+
+      # `lib/crate-inputs.sh` derives "which files outside src-tauri/ does the
+      # cargo gate compile?", which is what `cargo-prepush.sh` scopes on. Its own
+      # test file, per the one-test-file-per-lib-file convention those two state.
+      #
+      # The manifests and `build.rs` are on the trigger list because the suite
+      # asserts against the REAL repo: adding a path dependency or a build-script
+      # input is exactly when the derivation needs re-checking.
+      #
+      # The arm worth knowing about is the last one: it runs the derivation over
+      # THIS repository and requires zero unreadable invocations. A single macro
+      # spelling the reader cannot follow makes the gate fail open on every push
+      # — safe, but silently back to charging every markdown-only push a full
+      # Rust build, which is invisible because a gate that runs looks exactly
+      # like a gate that was needed.
+      - id: crate-inputs-test
+        name: crate-input derivation — tests
+        entry: bash .pre-commit-hooks/crate-inputs-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^(\.pre-commit-hooks/(lib/crate-inputs\.sh|crate-inputs-test\.sh)|src-tauri/build\.rs|src-tauri/Cargo\.toml|Cargo\.toml)$'
+        pass_filenames: false
+
+      # `lib/shared-target.sh` is what makes BOTH pre-push hooks build into the
+      # shared cargo target instead of a cold per-worktree one. It also covers
+      # `generate_types.sh`'s QONTINUI_SCHEMAS_JSON override, which is what keeps
+      # the now-shared target from becoming a collision point between two
+      # concurrent pushes — so that script is on the trigger list too.
+      - id: shared-target-test
+        name: shared cargo target resolution — tests
+        entry: bash .pre-commit-hooks/shared-target-test.sh
+        language: system
+        stages: [pre-commit]
+        verbose: true
+        files: '^(\.pre-commit-hooks/(lib/shared-target\.sh|shared-target-test\.sh|gen-events-drift\.sh)|src-tauri/scripts/generate_types\.sh)$'
         pass_filenames: false
 
       # And one file over again: `lib/ts-codegen-deps.sh` is what lets
