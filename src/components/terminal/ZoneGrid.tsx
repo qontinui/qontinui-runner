@@ -221,26 +221,20 @@ function ZoneGridInner({
    * de-dupes against its last-reported value, so this fires at most once
    * per real title change despite the 200ms idle repaint cadence.
    *
-   * Worker tabs (presence of `taskRunId`) stay pinned at `Worker N`: skip
-   * the local rename *and* the backend invoke for those so OSC 0 emissions
-   * from the embedded Claude CLI don't clobber the operator-facing
-   * identifier. This skip is the only thing enforcing the pin — the backend
-   * title gate that used to mirror it was deleted with the Productivity
-   * scheduler.
+   * There is no worker-tab case to skip here. A Conductor worker's tab is
+   * `sessionBacked` and both mount sites below render it through
+   * `WorkerSessionCell`, never `TerminalInstance` — and `onTitleChange` is
+   * passed to `TerminalInstance` alone. A worker emits no OSC 0/2 at all
+   * (it is an in-process stream-json session, not a pty), so the `Worker N`
+   * pin is enforced by the mount split, not by a test in this callback. The
+   * `taskRunId` test that used to stand here was kept after its subject was
+   * deleted; it could no longer fire, and the only tab it could have fired
+   * for would have been a PTY tab that is not a worker.
    */
-  // tabsRef keeps the worker-marker lookup current without re-creating
-  // onTitleChange on every tab mutation (TerminalInstance refs onto the
-  // latest callback, so this ref pattern also avoids re-render thrash).
-  const tabsRef = useRef(tabs);
-  useEffect(() => {
-    tabsRef.current = tabs;
-  }, [tabs]);
   const onTitleChange = useCallback(
     (tabId: string, title: string) => {
       const trimmed = title.trim();
       if (!trimmed) return;
-      const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (tab?.taskRunId) return;
       renameTab(tabId, trimmed);
       // Phase 2: bi-directional title sync. The local React rename above
       // updates UI immediately; fire-and-forget the backend write so other
