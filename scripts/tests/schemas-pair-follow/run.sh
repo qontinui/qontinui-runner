@@ -242,6 +242,42 @@ got="$(SPF_FIXTURES="$FX" SPF_KILL_SWITCH=off bash "$SUT" scan 2>/dev/null | tr 
 gh_fx "repos/$R/pulls?state=open&per_page=100&page=1" "__ERR__"
 if SPF_FIXTURES="$FX" bash "$SUT" scan >/dev/null 2>&1; then bad "scan: unreadable PR list must fail (UNKNOWN)"; else ok "scan: unreadable PR list fails red"; fi
 
+# A page of open PRs BIGGER THAN MAX_ARG_STRLEN (128 KiB). The accumulator used
+# `jq --argjson c "$chunk"`, which hands the page to execve as ONE argument —
+# and Linux caps a single argument at 128 KiB no matter how much ARG_MAX room is
+# left. The real listing was 636 KB for 30 open PRs, so the scheduled lane died
+# with `jq: Argument list too long` (exit 126) on every run from
+# 2026-09-14T17:19Z. The fixtures were all a few hundred bytes, which is exactly
+# why 85 passing tests said nothing about it.
+#
+# The padding is a field jq never reads, so the ONLY thing this case can fail on
+# is the size. It must stay well over 128 KiB, and the page must stay UNDER 100
+# entries so the loop does not ask for a page 2 this fixture root has no answer
+# for: 99 PRs x ~1.6 KB ~= 160 KB.
+new_fx bigscan
+{
+  printf '['
+  for i in $(seq 1 99); do
+    [ "$i" -gt 1 ] && printf ','
+    printf '{"number":%d,"created_at":"2026-09-01T00:00:00Z","labels":[],"_pad":"%s"}' \
+      "$((1000 + i))" "$(printf 'x%.0s' $(seq 1 1600))"
+  done
+  printf ']'
+} >"$FX/gh/$(fxname "repos/$R/pulls?state=open&per_page=100&page=1")"
+bytes="$(wc -c <"$FX/gh/$(fxname "repos/$R/pulls?state=open&per_page=100&page=1")")"
+[ "$bytes" -gt 131072 ] || bad "bigscan fixture is only $bytes bytes — under MAX_ARG_STRLEN, so it cannot reproduce the defect"
+for i in $(seq 1001 1099); do
+  gh_fx "repos/$R/issues/$i/events?per_page=100" '[]'
+done
+gh_fx "repos/$SC/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1" '[{"number":50,"updated_at":"2026-09-10T00:00:00Z","labels":[{"name":"coord:upstream-of=qontinui-runner#1001"}]}]'
+if got="$(SPF_FIXTURES="$FX" bash "$SUT" scan 2>"$FX/stderr")"; then
+  [ "$got" = "1001 50" ] \
+    && ok "scan: a ${bytes}-byte page (> MAX_ARG_STRLEN) still accumulates" \
+    || bad "scan: big page produced the wrong candidates" "got '$got'"
+else
+  bad "scan: a ${bytes}-byte page must not blow the argv limit" "stderr: $(tr '\n' ' ' <"$FX/stderr")"
+fi
+
 echo "# compute + push (local git)"
 
 # git_setup NAME VARIANT
