@@ -23,7 +23,9 @@
  *   immediately when the worker is `Ready` and queues otherwise; the ledger
  *   under the input says which happened, and flips ONE queued entry —
  *   the oldest — to "delivered" per observed `ready → processing` transition,
- *   matching the single `pop_front` the backend does per turn end.
+ *   matching the single `pop_front` the backend does per turn end. A worker
+ *   that ENDS pops nothing ever again, so on that edge everything still queued
+ *   settles to "not delivered" rather than going on promising a delivery.
  *
  * Honesty (served `ux-priorities`): a read that fails renders UNKNOWN with
  * the failure named — never an empty transcript, never an empty change list,
@@ -37,7 +39,11 @@ import remarkGfm from "remark-gfm";
 import { RefreshCw, Send, Square } from "lucide-react";
 import type { AiMessage, AiSessionState } from "@qontinui/shared-types";
 import { cn } from "@/lib/utils";
-import { useAiSession, type SessionReadStatus } from "@/hooks/useAiSession";
+import {
+  useAiSession,
+  type SendMessageOutcome,
+  type SessionReadStatus,
+} from "@/hooks/useAiSession";
 import { StreamingMessageView } from "../shared/StreamingMessageView";
 import type { TerminalTab } from "./useTerminalManager";
 import {
@@ -98,7 +104,13 @@ export function describeWorkerState(
   }
 }
 
-export type SteeringDelivery = "sending" | "sent" | "queued" | "delivered" | "failed";
+export type SteeringDelivery =
+  | "sending"
+  | "sent"
+  | "queued"
+  | "delivered"
+  | "undelivered"
+  | "failed";
 
 export interface SteeringEntry {
   id: string;
@@ -106,6 +118,15 @@ export interface SteeringEntry {
   atMs: number;
   delivery: SteeringDelivery;
   error?: string;
+}
+
+/**
+ * A worker state from which no queued message can ever be drained. The backend
+ * pops the queue at a turn END; a worker that finishes or dies has no next turn
+ * end, so anything still queued is lost.
+ */
+export function isWorkerEndState(state: AiSessionState): boolean {
+  return state === "closed" || state === "error" || state === "not_found";
 }
 
 /**
@@ -123,18 +144,114 @@ export interface SteeringEntry {
  * if the worker finished first, while it was lost. The ledger is the only
  * account of steering this cell offers; it says what happened or it says
  * nothing.
+ *
+ * **The other terminal edge is the worker ENDING.** `processing → closed` (or
+ * `error`, or `not_found`) is the turn that never ends: whatever is still
+ * queued when the worker stops will never be popped. Leaving those entries at
+ * `queued` left the ledger asserting "delivered when the current turn ends"
+ * about a message that is gone, which is the one thing this ledger must not do.
+ * They settle to `undelivered` instead.
+ *
+ * `causedByDirectSend` suppresses the `ready → processing` settle for the edge
+ * an immediate send CAUSED: a message sent at the `Ready` instant goes straight
+ * out (`queued: false`) and drives the session back to `Processing` without the
+ * backend popping anything, so settling on it would credit a still-queued
+ * predecessor with a delivery that did not happen.
  */
 export function settleQueuedOnTransition(
   entries: readonly SteeringEntry[],
   prev: AiSessionState,
   next: AiSessionState,
-): SteeringEntry[] {
-  if (!(prev === "ready" && next === "processing")) return [...entries];
+  causedByDirectSend = false,
+): readonly SteeringEntry[] {
+  const firstQueued = entries.findIndex((e) => e.delivery === "queued");
+  if (firstQueued === -1) return entries;
+  if (isWorkerEndState(next) && !isWorkerEndState(prev)) {
+    // No further turn end, so no further pop: everything still queued is lost.
+    return entries.map((e) => (e.delivery === "queued" ? { ...e, delivery: "undelivered" } : e));
+  }
+  if (!(prev === "ready" && next === "processing")) return entries;
+  if (causedByDirectSend) return entries;
   // Entries are appended in send order, so the first `queued` one is the head
   // of the backend's own FIFO — the message its `pop_front` just took.
-  const oldest = entries.findIndex((e) => e.delivery === "queued");
-  if (oldest === -1) return [...entries];
-  return entries.map((e, i) => (i === oldest ? { ...e, delivery: "delivered" } : e));
+  return entries.map((e, i) => (i === firstQueued ? { ...e, delivery: "delivered" } : e));
+}
+
+/**
+ * How a send's outcome settles its own ledger row.
+ *
+ * `workerStateNow` is the worker's state at the moment the outcome arrives, not
+ * at the moment the send was issued. A row is `sending` for the whole duration
+ * of the `send_user_message` invoke, and `settleQueuedOnTransition` only moves
+ * rows that are already `queued` — so a worker that ENDS while a send is in
+ * flight goes past the end edge with nothing to settle, and writing `queued`
+ * afterwards would strand a permanent "delivered when the current turn ends" on
+ * a dead worker. That window is exactly when a steering message is most likely
+ * to be lost (queued into a worker's last turn), so it records `undelivered`.
+ */
+export function deliveryForSendOutcome(
+  outcome: SendMessageOutcome,
+  workerStateNow: AiSessionState,
+): { delivery: SteeringDelivery; error?: string } {
+  if (!outcome.ok) return { delivery: "failed", error: outcome.error };
+  if (!outcome.queued) return { delivery: "sent" };
+  return { delivery: isWorkerEndState(workerStateNow) ? "undelivered" : "queued" };
+}
+
+/**
+ * The one-shot suppression that keeps an immediate send from being mistaken for
+ * the backend draining its queue.
+ *
+ * `pending` means a send was issued while the worker looked idle, so the next
+ * `ready → processing` edge is expected to be that send's own and not a
+ * `pop_front`. `spent` means the suppression was actually applied — which
+ * matters because the client's "idle" is a guess: only the send's OUTCOME says
+ * whether it went out immediately, and it arrives after the edge may already
+ * have gone past.
+ */
+export interface DirectSendArm {
+  pending: boolean;
+  spent: boolean;
+}
+
+export const IDLE_DIRECT_SEND_ARM: DirectSendArm = { pending: false, spent: false };
+
+/** Arm iff the worker looked idle when the send was issued. */
+export function armDirectSend(stateAtIssue: AiSessionState): DirectSendArm {
+  return { pending: stateAtIssue === "ready", spent: false };
+}
+
+/**
+ * Apply the arm to an observed transition.
+ *
+ * ANY observed transition consumes it, not only the expected edge: an arm that
+ * is never consumed goes on to suppress a genuine `pop_front` an arbitrary
+ * number of turns later, which would report a delivered message as lost.
+ */
+export function consumeDirectSendArm(
+  arm: DirectSendArm,
+  prev: AiSessionState,
+  next: AiSessionState,
+): { arm: DirectSendArm; causedByDirectSend: boolean } {
+  if (!arm.pending) return { arm, causedByDirectSend: false };
+  const causedByDirectSend = prev === "ready" && next === "processing";
+  return { arm: { pending: false, spent: causedByDirectSend }, causedByDirectSend };
+}
+
+/**
+ * Reconcile the arm with the outcome that finally arrived.
+ *
+ * `resettle` is the repair: the client thought the worker was idle, suppressed
+ * an edge on that basis, and the outcome then said `queued` — so that edge WAS
+ * a real turn end and the settle it swallowed has to be put back, or an older
+ * queued message is reported lost when it was delivered.
+ */
+export function reconcileDirectSendArm(
+  arm: DirectSendArm,
+  wentOutImmediately: boolean,
+): { arm: DirectSendArm; resettle: boolean } {
+  if (wentOutImmediately) return { arm: { pending: false, spent: false }, resettle: false };
+  return { arm: IDLE_DIRECT_SEND_ARM, resettle: arm.spent };
 }
 
 export const STEERING_LEDGER_ROWS = 3;
@@ -149,6 +266,8 @@ export function deliveryLabel(entry: SteeringEntry): string {
       return "queued — delivered when the current turn ends";
     case "delivered":
       return "delivered";
+    case "undelivered":
+      return "not delivered — the worker ended before the queue drained";
     case "failed":
       return `failed: ${entry.error ?? "unknown error"}`;
     default:
@@ -211,7 +330,10 @@ export function SteeringLedger({ entries }: { entries: readonly SteeringEntry[] 
           <span
             className={cn(
               "shrink-0",
-              e.delivery === "failed" && "text-red-400",
+              // A message that was LOST reads as a failure, because it is one.
+              // Falling through to the neutral default would have coloured it
+              // the same as a send still in flight.
+              (e.delivery === "failed" || e.delivery === "undelivered") && "text-red-400",
               e.delivery === "queued" && "text-amber-400",
               (e.delivery === "sent" || e.delivery === "delivered") && "text-emerald-400",
             )}
@@ -554,6 +676,13 @@ function useWorkerFileChanges(
       })
       .catch((err: unknown) => {
         if (ctrl.signal.aborted) return;
+        // A read is still OWED. `fetchedForRef` and `staleRef` were both
+        // settled at issue time, so without this a first FAILED read left
+        // `shouldFetchChanges` answering false forever — visible, same id, not
+        // stale — and the only ways back were a `commit-state-changed`, a turn
+        // end, or a manual refresh. For a worker that failed and went quiet
+        // that is never, so the pane sat on its error until the page reloaded.
+        staleRef.current = true;
         setRead({
           status: "error",
           error: err instanceof Error ? err.message : String(err),
@@ -652,19 +781,53 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   const [pane, setPane] = useState<CellPane>("conversation");
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
-  const [ledger, setLedger] = useState<SteeringEntry[]>([]);
+  const [ledger, setLedger] = useState<readonly SteeringEntry[]>([]);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Delivery of a QUEUED steering message is inferred from the one edge the
-  // backend exposes for it (see `settleQueuedOnTransition`).
+  /**
+   * A send issued while the worker was `Ready` is expected to cause the next
+   * `ready → processing` edge itself, so that edge is NOT a queue drain (see
+   * `settleQueuedOnTransition`).
+   *
+   * The transitions are `armDirectSend` / `consumeDirectSendArm` /
+   * `reconcileDirectSendArm` — pure, and tested there.
+   */
+  const directSendEdgeRef = useRef<DirectSendArm>(IDLE_DIRECT_SEND_ARM);
+
+  /**
+   * The worker's state as of the last committed render, readable from `send`'s
+   * post-await code. `session.sessionState` inside that closure is the value
+   * from the render the send was issued in, which by then may be two
+   * transitions old.
+   */
+  const sessionStateRef = useRef<AiSessionState>(session.sessionState);
+
+  // Delivery of a QUEUED steering message is inferred from the two edges the
+  // backend exposes for it (see `settleQueuedOnTransition`): a turn end that
+  // pops one, and the worker ending, which pops nothing ever again.
+  //
+  // FOLLOW-UP (backend): both are inferences from a state stream, and a narrow
+  // gap survives every mitigation here — the `Ready` between a `pop_front` and
+  // the re-send can be microseconds, so if two `claude-session-state` events
+  // land in the same React batch the intermediate `ready` is never observed and
+  // the entry sticks at `queued` until the worker ends. A
+  // `delivered`-with-message-id signal from `send_next_pending_message` would
+  // remove the whole class; inferring it from a state stream cannot.
   const prevStateRef = useRef<AiSessionState>(session.sessionState);
   useEffect(() => {
     const prev = prevStateRef.current;
     const next = session.sessionState;
+    sessionStateRef.current = next;
+    if (prev === next) return;
     prevStateRef.current = next;
-    if (prev === "ready" && next === "processing") {
-      setLedger((entries) => settleQueuedOnTransition(entries, prev, next));
-    }
+    const consumed = consumeDirectSendArm(directSendEdgeRef.current, prev, next);
+    directSendEdgeRef.current = consumed.arm;
+    // Which edges mean what is decided in ONE place — the pure function, which
+    // returns the SAME array when a transition changes nothing, so React bails
+    // out of the re-render without a second copy of that decision here.
+    setLedger((entries) =>
+      settleQueuedOnTransition(entries, prev, next, consumed.causedByDirectSend),
+    );
   }, [session.sessionState]);
 
   const isProcessing =
@@ -677,15 +840,30 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
     setSending(true);
     setDraft("");
     setLedger((entries) => [...entries, { id, text, atMs: Date.now(), delivery: "sending" }]);
+    // Issued while the worker is idle: this send goes out immediately and is
+    // itself what drives `ready → processing`, so that edge must not be read as
+    // the backend popping an older queued message. Armed BEFORE the await,
+    // because the state event can arrive before the command resolves.
+    directSendEdgeRef.current = armDirectSend(sessionStateRef.current);
     const outcome = await session.sendMessage(text);
+    const reconciled = reconcileDirectSendArm(
+      directSendEdgeRef.current,
+      outcome.ok && !outcome.queued,
+    );
+    directSendEdgeRef.current = reconciled.arm;
+    if (reconciled.resettle) {
+      // A suppression was applied to an edge that the outcome proved was a real
+      // turn end. Put the settle back BEFORE this entry is marked, so it lands
+      // on the older queued message rather than on this one — which is still
+      // `sending`, and therefore invisible to `settleQueuedOnTransition`.
+      setLedger((entries) => settleQueuedOnTransition(entries, "ready", "processing"));
+    }
+    // `sessionStateRef` and not the render-time state: the worker may have
+    // ENDED while this send was in flight, and the effect cannot fix that row
+    // afterwards because it was still `sending` when the end edge went past.
+    const settled = deliveryForSendOutcome(outcome, sessionStateRef.current);
     setLedger((entries) =>
-      entries.map((e) =>
-        e.id !== id
-          ? e
-          : outcome.ok
-            ? { ...e, delivery: outcome.queued ? "queued" : "sent" }
-            : { ...e, delivery: "failed", error: outcome.error },
-      ),
+      entries.map((e) => (e.id !== id ? e : { ...e, ...settled })),
     );
     setSending(false);
     inputRef.current?.focus();
