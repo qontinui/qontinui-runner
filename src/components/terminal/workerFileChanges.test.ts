@@ -82,6 +82,29 @@ describe("noDiffReason", () => {
     ).toBe("too large to diff (300 KB → 2 KB)");
   });
 
+  it("prefers the route's own reason over 'too large' for a budget-truncated row", () => {
+    // Two different bounds produce `truncated` and they say different things
+    // about the file. A 2 KB row cut because the report's aggregate text budget
+    // (FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES, mcp/snapshots.rs) was already spent
+    // is not "too large to diff" — saying so would be a lie about its size.
+    expect(
+      noDiffReason(
+        change({
+          truncated: true,
+          beforeBytes: 2048,
+          afterBytes: 2048,
+          detail: "the report's text budget was spent on earlier files — size and digest only",
+        }),
+      ),
+    ).toBe(
+      "the report's text budget was spent on earlier files — size and digest only (2 KB → 2 KB)",
+    );
+    // With no detail it is a genuinely over-cap side, and still says so.
+    expect(noDiffReason(change({ truncated: true, beforeBytes: 300 * 1024 }))).toContain(
+      "too large to diff",
+    );
+  });
+
   it("returns null when a diff can be shown", () => {
     expect(noDiffReason(change({ before: "a", after: "b" }))).toBeNull();
     expect(noDiffReason(change({ status: "created", after: "a" }))).toBeNull();

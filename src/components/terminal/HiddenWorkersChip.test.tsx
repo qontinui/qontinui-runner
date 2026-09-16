@@ -47,6 +47,60 @@ describe("hiddenWorkersChipLabel", () => {
     expect(label?.title).toContain("could not be re-opened");
     expect(hiddenWorkersChipLabel([hidden()])?.title).not.toContain("could not be re-opened");
   });
+
+  it("counts only the NOT-missed workers as still running", () => {
+    // Nit 7. The lead clause used to claim all N were "still running" and then
+    // append that M of them could not be re-opened — a sentence contradicting
+    // its own tail, and false for exactly those M. A missed worker is unknown,
+    // not running.
+    const label = hiddenWorkersChipLabel([
+      hidden({ tabId: "t1", title: "alpha", restoreMissedAtMs: 5 }),
+      hidden({ tabId: "t2", title: "beta" }),
+      hidden({ tabId: "t3", title: "gamma" }),
+    ]);
+    expect(label?.text).toBe("3 hidden workers"); // the chip still counts all of them
+    expect(label?.title).toContain("2 worker cells were closed");
+    expect(label?.title).not.toContain("3 worker cells were closed");
+    // The still-running clause names only the two that are.
+    const stillRunningClause = label!.title.split("could not be re-opened")[0];
+    expect(stillRunningClause).toContain("beta");
+    expect(stillRunningClause).toContain("gamma");
+    expect(stillRunningClause).not.toContain("alpha");
+    // …and the miss clause names the one that is not.
+    expect(label?.title).toContain("1 could not be re-opened");
+    expect(label?.title).toContain("alpha");
+  });
+
+  it("claims nobody is still running when EVERY hidden worker was missed", () => {
+    const label = hiddenWorkersChipLabel([
+      hidden({ tabId: "t1", title: "alpha", restoreMissedAtMs: 5 }),
+      hidden({ tabId: "t2", title: "beta", restoreMissedAtMs: 6 }),
+    ]);
+    expect(label?.title).not.toContain("still running");
+    expect(label?.title).toContain("2 could not be re-opened");
+    // Clicking still retries, so the affordance still says what it does.
+    expect(label?.title).toContain("Click to show");
+  });
+
+  it("pluralises the article with the noun in the miss clause", () => {
+    // "no longer listed as an open sessions" — the article was not pluralised
+    // with the noun, and the count assertions above do not reach it.
+    const two = hiddenWorkersChipLabel([
+      hidden({ tabId: "t1", restoreMissedAtMs: 5 }),
+      hidden({ tabId: "t2", restoreMissedAtMs: 6 }),
+    ]);
+    expect(two?.title).toContain("no longer listed as open sessions");
+    expect(two?.title).not.toContain("an open sessions");
+    const one = hiddenWorkersChipLabel([hidden({ restoreMissedAtMs: 5 })]);
+    expect(one?.title).toContain("no longer listed as an open session;");
+  });
+
+  it("uses the singular consistently for one still-running worker", () => {
+    const label = hiddenWorkersChipLabel([hidden()]);
+    expect(label?.title).toContain("1 worker cell was closed");
+    expect(label?.title).toContain("is still running");
+    expect(label?.title).toContain("Click to show it again.");
+  });
 });
 
 describe("HiddenWorkersChip", () => {
@@ -64,8 +118,11 @@ describe("TerminalPage wiring", () => {
   const source = readFileSync(resolve(__dirname, "./TerminalPage.tsx"), "utf8");
 
   it("mounts the chip on the page, fed by the manager's hidden-worker state", () => {
+    // Markup only. The REVERSAL's behaviour is covered by
+    // `hiddenWorkerReducer.test.ts`, which exercises the actual state
+    // transitions rather than the hook's source text.
     expect(source).toContain("<HiddenWorkersChip");
-    expect(source).toContain("hidden={hiddenWorkers}");
-    expect(source).toContain("restoreHiddenWorkers()");
+    expect(source).toMatch(/hidden=\{hiddenWorkers\}/);
+    expect(source).toMatch(/restoreHiddenWorkers\(\s*\)/);
   });
 });

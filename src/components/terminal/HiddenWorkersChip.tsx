@@ -3,8 +3,9 @@
  * cell.
  *
  * Closing a worker's cell is a VIEW operation: `useTerminalManager.closeTerminal`
- * drops the tab and records the id in `dismissedWorkerIdsRef` so the live
- * adoption probe does not re-add it on the worker's next `ai-output` line.
+ * drops the tab and records the id in the dismissal set (`hideWorker` in
+ * `hiddenWorkerReducer.ts`) so the live adoption probe does not re-add it on
+ * the worker's next `ai-output` line.
  * That dismissal used to be permanent for the page's lifetime, so an operator
  * who closed a cell to declutter could not get it back without restarting the
  * app — while the worker kept running invisibly, which is the opposite of the
@@ -31,26 +32,40 @@ import type { HiddenWorker } from "./useTerminalManager";
  * Returns `null` when nothing is hidden (the chip must not render), otherwise
  * the short label plus a `title` that names the workers — and, honestly, any
  * that a previous "show" could NOT bring back.
+ *
+ * The two groups get SEPARATE clauses. The lead used to claim all `hidden` were
+ * "still running" and then append that some could not be re-opened, which is
+ * precisely a claim that those ones are NOT known to be running — the sentence
+ * contradicted its own tail. A worker with `restoreMissedAtMs` is unknown, not
+ * running, so it is never counted in the "still running" clause.
  */
 export function hiddenWorkersChipLabel(
   hidden: readonly HiddenWorker[],
 ): { text: string; title: string } | null {
   if (hidden.length === 0) return null;
-  const names = hidden.map((w) => w.title).join(", ");
   const missed = hidden.filter((w) => w.restoreMissedAtMs !== undefined);
-  const missedNote =
-    missed.length > 0
-      ? ` ${missed.length} of them could not be re-opened — no longer listed as an open session${
-          missed.length === 1 ? "" : "s"
-        }; it may have finished.`
-      : "";
+  const running = hidden.filter((w) => w.restoreMissedAtMs === undefined);
+  const clauses: string[] = [];
+  if (running.length > 0) {
+    clauses.push(
+      `${running.length} worker cell${running.length === 1 ? " was" : "s were"} closed on this page and ${
+        running.length === 1 ? "is" : "are"
+      } still running: ${running.map((w) => w.title).join(", ")}.`,
+    );
+  }
+  if (missed.length > 0) {
+    clauses.push(
+      `${missed.length} could not be re-opened — ${
+        missed.length === 1 ? "no longer listed as an open session" : "no longer listed as open sessions"
+      }; ${missed.length === 1 ? "it" : "they"} may have finished: ${missed
+        .map((w) => w.title)
+        .join(", ")}.`,
+    );
+  }
+  clauses.push(`Click to show ${hidden.length === 1 ? "it" : "them"} again.`);
   return {
     text: `${hidden.length} hidden worker${hidden.length === 1 ? "" : "s"}`,
-    title: `${hidden.length} worker cell${
-      hidden.length === 1 ? " was" : "s were"
-    } closed on this page and ${
-      hidden.length === 1 ? "is" : "are"
-    } still running: ${names}. Click to show ${hidden.length === 1 ? "it" : "them"} again.${missedNote}`,
+    title: clauses.join(" "),
   };
 }
 

@@ -11,6 +11,14 @@ import {
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
+import {
+  EMPTY_HIDDEN_WORKER_STATE,
+  beginRestore,
+  forgetAdoptedWorker,
+  hideWorker,
+  recordRestoreMisses,
+  type HiddenWorkerState,
+} from "./hiddenWorkerReducer";
 
 const logger = createLogger("TerminalManager");
 
@@ -699,14 +707,21 @@ export function useTerminalManager(
    * whole reversal — an automatic expiry (on the worker's next state
    * transition, say) would restore exactly the three-second hide this set
    * exists to prevent, so the way back is an EXPLICIT operator action.
+   *
+   * The dismissal set and the chip's rows are ONE value
+   * (`HiddenWorkerState`), transitioned by the pure functions in
+   * `hiddenWorkerReducer.ts` — a dismissal without a row is a worker the
+   * operator can never get back, and a row without a dismissal is a chip entry
+   * for a cell about to reappear on its own, so the two never move apart.
    */
-  const dismissedWorkerIdsRef = useRef<Set<string>>(new Set());
-  /** The same dismissals, as renderable state for the "show worker" chip. */
-  const [hiddenWorkers, setHiddenWorkers] = useState<HiddenWorker[]>([]);
-  const hiddenWorkersRef = useRef<HiddenWorker[]>(hiddenWorkers);
-  useEffect(() => {
-    hiddenWorkersRef.current = hiddenWorkers;
-  }, [hiddenWorkers]);
+  const hiddenWorkerStateRef = useRef<HiddenWorkerState>(EMPTY_HIDDEN_WORKER_STATE);
+  /** The rows, mirrored into React state for the "show worker" chip. */
+  const [hiddenWorkers, setHiddenWorkers] = useState<readonly HiddenWorker[]>([]);
+  const applyHiddenWorkerState = useCallback((next: HiddenWorkerState) => {
+    if (next === hiddenWorkerStateRef.current) return;
+    hiddenWorkerStateRef.current = next;
+    setHiddenWorkers(next.hidden);
+  }, []);
 
   /**
    * Live-adopt a Conductor worker the moment it starts talking. The restore
@@ -720,7 +735,7 @@ export function useTerminalManager(
    */
   const maybeAdoptWorker = useCallback(
     async (taskRunId: string): Promise<boolean> => {
-      if (dismissedWorkerIdsRef.current.has(taskRunId)) return false;
+      if (hiddenWorkerStateRef.current.dismissed.has(taskRunId)) return false;
       if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return false;
       const now = Date.now();
       // Bound the probe ledger: this manager hears EVERY AI session's events,
@@ -751,15 +766,13 @@ export function useTerminalManager(
         logger.info(`Adopted Conductor worker ${taskRunId} onto page ${pageId}`);
         // The worker is on screen again, so it is no longer hidden — drop any
         // "could not be re-opened" entry left over from a failed restore.
-        setHiddenWorkers((prev) =>
-          prev.some((w) => w.tabId === tabId || w.taskRunId === taskRunId)
-            ? prev.filter((w) => w.tabId !== tabId && w.taskRunId !== taskRunId)
-            : prev,
+        applyHiddenWorkerState(
+          forgetAdoptedWorker(hiddenWorkerStateRef.current, tabId, taskRunId),
         );
       }
       return tabId !== null;
     },
-    [pageId, adoptWorkerTab],
+    [pageId, adoptWorkerTab, applyHiddenWorkerState],
   );
 
   /**
@@ -773,35 +786,27 @@ export function useTerminalManager(
    */
   const restoreHiddenWorkers = useCallback(
     async (tabIds?: readonly string[]) => {
-      const entries = hiddenWorkersRef.current.filter((w) => !tabIds || tabIds.includes(w.tabId));
-      if (entries.length === 0) return;
-      for (const w of entries) {
-        dismissedWorkerIdsRef.current.delete(w.tabId);
-        if (w.taskRunId) dismissedWorkerIdsRef.current.delete(w.taskRunId);
-        workerProbeRef.current.delete(w.taskRunId ?? w.tabId);
-      }
-      const restoring = new Set(entries.map((w) => w.tabId));
-      setHiddenWorkers((prev) => prev.filter((w) => !restoring.has(w.tabId)));
+      const begun = beginRestore(hiddenWorkerStateRef.current, tabIds);
+      if (begun.restoring.length === 0) return;
+      for (const key of begun.probeKeys) workerProbeRef.current.delete(key);
+      applyHiddenWorkerState(begun.state);
       const outcomes = await Promise.all(
-        entries.map(async (w) => ({
+        begun.restoring.map(async (w) => ({
           worker: w,
           adopted: await maybeAdoptWorker(w.taskRunId ?? w.tabId),
         })),
       );
-      const missed = outcomes
-        .filter((o) => !o.adopted)
-        .map((o) => ({ ...o.worker, restoreMissedAtMs: Date.now() }));
+      const missed = outcomes.filter((o) => !o.adopted).map((o) => o.worker);
       if (missed.length === 0) return;
-      // Note: the DISMISSAL stays cleared. If the miss was transient (a failed
-      // `terminal_session_list_open`, or a record not yet written), the live
-      // adoption probe brings the worker in on its next event and clears the
-      // entry above.
-      setHiddenWorkers((prev) => [
-        ...prev,
-        ...missed.filter((m) => !prev.some((p) => p.tabId === m.tabId)),
-      ]);
+      // Note: the DISMISSAL stays cleared (see `beginRestore`). If the miss was
+      // transient (a failed `terminal_session_list_open`, or a record not yet
+      // written), the live adoption probe brings the worker in on its next
+      // event and `forgetAdoptedWorker` clears the entry re-listed here.
+      applyHiddenWorkerState(
+        recordRestoreMisses(hiddenWorkerStateRef.current, missed, Date.now()),
+      );
     },
-    [maybeAdoptWorker],
+    [maybeAdoptWorker, applyHiddenWorkerState],
   );
 
   useEffect(() => {
@@ -1393,18 +1398,16 @@ export function useTerminalManager(
     const closingTab = tabsRef.current.find((t) => t.id === id);
     const sessionBacked = closingTab?.sessionBacked === true;
     if (sessionBacked) {
-      dismissedWorkerIdsRef.current.add(id);
-      if (closingTab?.taskRunId) dismissedWorkerIdsRef.current.add(closingTab.taskRunId);
-      // Record it so the close is reversible (`restoreHiddenWorkers`) — see
-      // `HiddenWorker`. The worker keeps running either way.
-      const hidden: HiddenWorker = {
-        tabId: id,
-        taskRunId: closingTab?.taskRunId ?? null,
-        title: closingTab?.title ?? id,
-        hiddenAtMs: Date.now(),
-      };
-      setHiddenWorkers((prev) =>
-        prev.some((w) => w.tabId === id) ? prev : [...prev, hidden],
+      // Record the dismissal AND the chip row together, so the close is
+      // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
+      // keeps running either way.
+      applyHiddenWorkerState(
+        hideWorker(hiddenWorkerStateRef.current, {
+          tabId: id,
+          taskRunId: closingTab?.taskRunId ?? null,
+          title: closingTab?.title ?? id,
+          hiddenAtMs: Date.now(),
+        }),
       );
     }
     // Update React state immediately so the UI is responsive.
@@ -1447,7 +1450,7 @@ export function useTerminalManager(
           void resyncTabs();
         });
     }
-  }, [resyncTabs]);
+  }, [resyncTabs, applyHiddenWorkerState]);
 
   const renameTab = useCallback((id: string, title: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)));
