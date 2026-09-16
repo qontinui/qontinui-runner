@@ -3,7 +3,7 @@
  *
  * The runner's vitest config uses `environment: "node"` (no jsdom), so we
  * follow the repo precedent (`WebIntegrationAuthBanner.test.ts`,
- * `CompletionReportSections.test.tsx`) and exercise the exported pure
+ * `FileActivityPanel.test.tsx`) and exercise the exported pure
  * helpers + the click-handler logic via module-level mocks of the Tauri
  * IPC surface. The JSX shell itself is verified by manual + UI Bridge
  * tests once the spec is updated.

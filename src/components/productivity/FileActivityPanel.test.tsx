@@ -2,7 +2,7 @@
  * Pure-helper tests for FileActivityPanel and fileActivityApi.
  *
  * The runner's vitest config is `environment: "node"` (no jsdom — see
- * CompletionReportSections.test.tsx for the same pattern). That means we
+ * CoordConnectionRequired.test.ts for the same pattern). That means we
  * can't render the panel and assert on its DOM. The plan's three Phase 2
  * test cases ("renders empty state", "click on hot session row calls
  * setActiveId", "window selector change triggers a re-fetch") map to:

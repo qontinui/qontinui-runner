@@ -98,7 +98,7 @@ const SETTINGS_PATH_HINT =
  * like: nothing is configured.
  *
  * Pure, so it is testable under the runner's `environment: "node"` vitest
- * config (no jsdom — see FleetHealthPanel.test.tsx for the same constraint).
+ * config (no jsdom — see FileActivityPanel.test.tsx for the same constraint).
  */
 export function coordDisabledCopy(
   source: string | null,
@@ -148,7 +148,7 @@ export function coordDisabledCopy(
  * Fire the notice's in-app action.
  *
  * `onDismiss` runs FIRST and unconditionally. The action navigates the
- * runner to another tab, and a host that is an overlay — `SpawnFromPlanModal`
+ * runner to another tab, and a host that is an overlay — a `fixed inset-0` modal
  * is `fixed inset-0` with `aria-modal="true"` — would otherwise keep covering
  * the tab it just switched to, so the operator sees nothing happen. That is
  * precisely the failure this component exists to remove, so the dismiss is
