@@ -500,9 +500,12 @@ read per request)\", so it is a spawn-time fact about THIS process and not the c
 environment, and it is not sufficient either: \"what bounds the sync is not this flag\" \
 but the backend-resolution guard (`HttpArtifactSink::from_env` answers `None` with no \
 resolvable backend, and a release build refuses a machine-local one), the tenant's \
-`plan_capture` dial consulted every cycle (`CaptureGate`), and the five-cycle failure \
-breaker — so a `true` here means only that nothing on this device's env killed the sync \
-when it started.";
+`plan_capture` dial consulted every cycle (`CaptureGate`), the five-cycle failure \
+breaker, and — stricter than all three — the adapter loop ITSELF, which does not start \
+at all without a coord base (`COORD_HTTP_URL` / `profiles.<active>.coord_url`): \
+`spawn_if_configured` returns before the body-sync sink is even built, so a runner with \
+none never syncs and no other bound is ever reached. A `true` here means only that \
+nothing on this device's env killed the sync when it started.";
 
 /// Fold [`write_capability`] plus `webBackendReachable: true` into an upstream
 /// payload without disturbing its own keys. A bare array is wrapped rather
@@ -1712,9 +1715,12 @@ mod tests {
             serde_json::json!(PLAN_LIBRARY_SYNC_ENV)
         );
 
-        // The four things the contract must say, so the key cannot be read as
-        // "the sync is running": it is a SPAWN-time reading, and three other
-        // gates bound the sync that this flag does not cover.
+        // The things the contract must say, so the key cannot be read as "the
+        // sync is running": it is a SPAWN-time reading, and four other gates
+        // bound the sync that this flag does not cover. `COORD_HTTP_URL` pins
+        // the strictest of them — without a coord base `spawn_if_configured`
+        // returns before the body-sync sink is built, so the loop never runs
+        // and the other three bounds are never reached.
         let contract = on["writeContract"].as_str().unwrap();
         for claim in [
             "read once at spawn",
@@ -1722,6 +1728,7 @@ mod tests {
             "plan_capture",
             "CaptureGate",
             "five-cycle failure breaker",
+            "COORD_HTTP_URL",
         ] {
             assert!(
                 contract.contains(claim),
@@ -2691,6 +2698,48 @@ mod tests {
         }
     }
 
+    /// `route_entries()` is what every gating test above reads, so a route
+    /// registered in `routes()` alone would be classified by nothing here —
+    /// and the forward-table test above would still pass, because it anchors
+    /// to `route_entries()` too. Counted off the `routes()` FUNCTION BODY
+    /// rather than trusted, the technique
+    /// `terminals::tests::route_entries_covers_every_route_registration_in_this_file`
+    /// already uses.
+    ///
+    /// Scoped to the function body deliberately: counting the whole file would
+    /// be defeated by prose in a doc comment (including this one), which is a
+    /// test that fails for a reason unrelated to what it claims.
+    #[test]
+    fn route_entries_covers_every_route_registration_in_this_file() {
+        // Both built at runtime so this test's own source cannot match itself.
+        let needle = format!(".{}(", "route");
+        let fn_header = format!("pub fn {}() -> Router<Arc<ApiState>> {{", "routes");
+        let src = include_str!("plan_library.rs");
+
+        let start = src
+            .find(fn_header.as_str())
+            .expect("routes() signature — update this test if it changes");
+        let body = &src[start..];
+        // The function's own closing brace is the first one at column 0.
+        let end = body
+            .find("\n}")
+            .expect("routes() must be closed by a brace at column 0");
+        let registered = body[..end].matches(needle.as_str()).count();
+
+        let mut paths: Vec<&str> = route_entries().iter().map(|(_, p, _)| *p).collect();
+        paths.sort_unstable();
+        paths.dedup();
+
+        assert_eq!(
+            paths.len(),
+            registered,
+            "route_entries() lists {} distinct paths but routes() registers {} — a new \
+             route must be added to route_entries() so the nonce-gating tests classify it",
+            paths.len(),
+            registered
+        );
+    }
+
     // ---- the export route's two guards ------------------------------------
 
     /// The export allowlist forwards `version_number` and drops everything
@@ -3173,8 +3222,12 @@ mod tests {
                 "/plan-library/candidates",
                 "/api/v1/plan-library/candidates",
             ),
+            // Driven WITH a query string on purpose: the assertion below says
+            // the forward carries none, and with an empty inbound query there
+            // would be nothing for a `Query`-taking handler to forward, so the
+            // assertion could not fail against the mutation it names.
             (
-                "/plan-library/scan-roots",
+                "/plan-library/scan-roots?limit=5&offset=3&q=x",
                 "/api/v1/plan-library/scan-roots",
             ),
         ] {
@@ -3223,9 +3276,11 @@ mod tests {
             );
         }
 
-        // The scan-roots forward carries no query string at all: the upstream
-        // route takes no parameters, so there is nothing to allowlist and
-        // nothing a caller can steer.
+        // The scan-roots forward carries no query string at all, even though
+        // the caller just sent one: the upstream route takes no parameters, so
+        // there is nothing to allowlist and nothing a caller can steer. A
+        // handler that grew a `Query` extractor and forwarded it would fail
+        // here.
         let scan_line = seen.lock().unwrap().last().cloned().unwrap();
         assert!(!scan_line.contains('?'), "{scan_line}");
     }
