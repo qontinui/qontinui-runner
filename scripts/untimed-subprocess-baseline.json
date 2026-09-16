@@ -89,14 +89,14 @@
       "reason": "Standalone CLI binary (`qontinui_cli`), not the runner: one `git` plumbing read. It has no tokio runtime and therefore no blocking pool to exhaust; the process is one command and exits."
     },
     {
-      "site": "src-tauri/src/bin/qontinui_shim.rs::exec_real_child",
+      "site": "src-tauri/src/bin/qontinui_shim.rs::exec_real_child_env",
       "waits": [
         "dyn:p"
       ],
       "reason_covers_waits": [
         "dyn:p"
       ],
-      "reason": "The PATH shim's whole job is to become the real tool: it must inherit stdio and wait for exactly as long as the real `git`/`cargo` takes. A timeout here would truncate the very command the caller asked for. Separate binary, no tokio runtime."
+      "reason": "The PATH shim's whole job is to become the real tool: it must inherit stdio and wait for exactly as long as the real `git`/`cargo`/`claude` takes. A timeout here would truncate the very command the caller asked for. Separate binary (`qontinui_shim`), no tokio runtime and therefore no blocking pool to exhaust; the process runs exactly one child and exits. This is the SAME terminal exec-and-wait that used to be spelled `exec_real_child` — that function is now a thin delegator with no wait of its own, and the `env_remove` parameter this one gained only strips inherited variables (the identity straddle's policy-marker rule) before the same one-shot `status()`."
     },
     {
       "site": "src-tauri/src/check_executor/mod.rs::execute_check",

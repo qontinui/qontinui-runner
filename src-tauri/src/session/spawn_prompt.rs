@@ -938,9 +938,20 @@ mod tests {
 /// wrapper is exercised only when `pwsh` is on PATH.
 #[cfg(all(test, unix))]
 mod script_tests {
+    use crate::process_helpers::output_with_timeout;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::process::Command;
+    use std::time::Duration;
+
+    /// Every shell these tests run is a handful of lines that redirects into a
+    /// tempdir and exits. A bound this loose can only be hit by a script that
+    /// has genuinely hung — and a hung shell must FAIL the test rather than
+    /// park the test thread (and CI) forever, which is exactly what a bare
+    /// `.status()` / `.output()` does. Routed through
+    /// [`crate::process_helpers::output_with_timeout`], so expiry kills the
+    /// whole process tree and returns an error.
+    const SCRIPT_BUDGET: Duration = Duration::from_secs(30);
 
     const BASH_INTEGRATION: &str = include_str!("../../resources/shell-integration.bash");
     const ZSH_INTEGRATION: &str = include_str!("../../resources/shell-integration.zsh");
@@ -993,15 +1004,14 @@ mod script_tests {
             tmp.path().display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let status = Command::new("bash")
-            .arg(&script)
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script)
             .env_clear()
             .env("PATH", path)
             .env("QONTINUI_RUNNER_TERMINAL", "1")
-            .envs(envs.iter().copied())
-            .status()
-            .expect("bash runs");
-        assert!(status.success());
+            .envs(envs.iter().copied());
+        let out_res = output_with_timeout(cmd, SCRIPT_BUDGET).expect("bash runs inside its budget");
+        assert!(out_res.status.success());
         std::fs::read_to_string(out).expect("the fake claude ran")
     }
 
@@ -1323,8 +1333,8 @@ mod script_tests {
             .replace("@@TOOL@@", "claude")
             .replace("@@SHIM_DIR@@", &shim_dir.to_string_lossy());
         write_exe(&shim_dir.join("claude"), &rendered);
-        let status = Command::new("bash")
-            .arg(shim_dir.join("claude"))
+        let mut cmd = Command::new("bash");
+        cmd.arg(shim_dir.join("claude"))
             .args(args)
             .env_clear()
             .env(
@@ -1336,10 +1346,10 @@ mod script_tests {
                 ),
             )
             .env("QONTINUI_POLICY_DELIVERED_SHA", SHA)
-            .env("QONTINUI_POLICY_DELIVERED_FILE", delivered_file)
-            .status()
-            .expect("the shim runs");
-        assert!(status.success());
+            .env("QONTINUI_POLICY_DELIVERED_FILE", delivered_file);
+        let shim_out =
+            output_with_timeout(cmd, SCRIPT_BUDGET).expect("the shim runs inside its budget");
+        assert!(shim_out.status.success());
         std::fs::read_to_string(out).expect("the real claude ran")
     }
 
@@ -1410,7 +1420,7 @@ mod script_tests {
         if let Some(sha) = sha {
             cmd.env("QONTINUI_POLICY_DELIVERED_SHA", sha);
         }
-        let out = cmd.output().expect("the hook runs");
+        let out = output_with_timeout(cmd, SCRIPT_BUDGET).expect("the hook runs inside its budget");
         String::from_utf8(out.stdout)
             .unwrap()
             .lines()
