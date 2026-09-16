@@ -2166,17 +2166,39 @@ struct ContinuationSession {
     gate_id: Option<uuid::Uuid>,
 }
 
+/// The value behind [`continuation_sessions`]: the LIVE continuation sessions
+/// plus the anchors RESERVED by dispatches that passed the guard and have not
+/// yet registered (or given up).
+///
+/// Both halves sit under ONE mutex on purpose. P3's "is this anchor taken?"
+/// scan and its "then it is mine" reservation must be a single critical
+/// section, or two dispatches for one anchor can both scan an empty registry,
+/// both drop the lock, and both spawn — the burst window
+/// [`DEFAULT_CONTINUATION_SESSION_CAP`]'s doc describes. A second mutex for the
+/// reservations would reintroduce exactly that gap between the two reads.
+#[derive(Debug, Default)]
+struct ContinuationRegistry {
+    /// Registered, running continuation sessions keyed by `terminal_id`.
+    live: std::collections::HashMap<String, ContinuationSession>,
+    /// Anchors held by an in-flight dispatch: inserted by
+    /// [`evaluate_continuation_guard`] inside the P3 critical section, removed
+    /// by [`register_continuation_session`] (swapped for the live entry) or by
+    /// [`AnchorReservation`]'s drop on every non-spawn exit. Never counted
+    /// toward P4 — the cap bounds RUNNING sessions, and a reservation is not
+    /// one.
+    pending_anchors: std::collections::HashSet<String>,
+}
+
 /// Process-wide registry of continuation-spawned terminal sessions, keyed by
 /// `terminal_id`. Distinct from [`dispatched_gate_ids`] (which dedupes a single
 /// `gate_id` delivered twice): this tracks LIVE sessions so a re-cleared gate
 /// (new `gate_id`, same `anchor_key`) is deduped (P3) and the live count is
-/// capped (P4).
-fn continuation_sessions(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, ContinuationSession>> {
-    static SESSIONS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, ContinuationSession>>,
-    > = std::sync::OnceLock::new();
-    SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+/// capped (P4) — and, beside them, the anchors reserved by dispatches still
+/// between the guard and the spawn (see [`ContinuationRegistry`]).
+fn continuation_sessions() -> &'static std::sync::Mutex<ContinuationRegistry> {
+    static SESSIONS: std::sync::OnceLock<std::sync::Mutex<ContinuationRegistry>> =
+        std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| std::sync::Mutex::new(ContinuationRegistry::default()))
 }
 
 /// The configured continuation-session cap (env override, else the default).
@@ -2252,6 +2274,7 @@ fn continuation_addressed_to_self(
 /// an entry removed concurrently makes the removal a no-op.
 fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     let ids: Vec<String> = lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
         .keys()
         .cloned()
         .collect();
@@ -2260,9 +2283,13 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     if dead.is_empty() {
         return;
     }
+    // Only `live` is reaped: a pending anchor has no terminal to test and is
+    // released by the dispatch that holds it (`AnchorReservation`).
     let reaped: Vec<ContinuationSession> = {
-        let mut map = lock_recover(continuation_sessions(), "continuation_sessions");
-        dead.iter().filter_map(|tid| map.remove(tid)).collect()
+        let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+        dead.iter()
+            .filter_map(|tid| registry.live.remove(tid))
+            .collect()
     };
 
     // The reaper is the SECOND producer path, and the only one that covers the
@@ -2289,15 +2316,31 @@ fn prune_dead_continuations(is_live: &dyn Fn(&str) -> bool) {
     }
 }
 
+/// Who owns an anchor the guard found taken (the payload of
+/// [`ContinuationGuard::DuplicateAnchor`]).
+#[derive(Debug, PartialEq, Eq)]
+enum AnchorHolder {
+    /// A registered, running continuation session — its `terminal_id`, so the
+    /// operator can be pointed at the tab that is doing the work.
+    Live(String),
+    /// A dispatch that passed this guard and has not yet spawned (or given
+    /// up): the reservation [`evaluate_continuation_guard`] takes inside its
+    /// P3 critical section. No terminal exists yet, so there is nothing to
+    /// focus; the row is deferred exactly as for a live holder and re-delivery
+    /// finds either the registered session or a released anchor.
+    Reserved,
+}
+
 /// Outcome of the pre-spawn continuation guard (P3 + thread pressure + P4).
 #[derive(Debug, PartialEq, Eq)]
 enum ContinuationGuard {
     /// Clear to spawn — no live duplicate, machine not under thread pressure,
     /// under cap.
     Proceed,
-    /// A live continuation already exists for this `anchor_key` (P3): skip the
-    /// spawn (re-cleared gate / duplicate). Carries the existing terminal_id.
-    DuplicateAnchor(String),
+    /// This `anchor_key` is already taken (P3): skip the spawn (re-cleared gate
+    /// / duplicate). Carries WHO holds it — a live session, or a dispatch still
+    /// between the guard and its spawn.
+    DuplicateAnchor(AnchorHolder),
     /// The machine is out of THREADS, not out of slots: the spawn gate's thread
     /// lane ([`crate::resource_guard::thread_pressure`]) returned something
     /// other than `Proceed`. Defer the spawn.
@@ -2387,18 +2430,34 @@ fn evaluate_continuation_guard(
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
     let live_count = {
-        let map = lock_recover(continuation_sessions(), "continuation_sessions");
+        let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
-        // P3: a LIVE session already exists for this anchor_key → dedup.
         if let Some(anchor) = anchor_key {
-            if let Some(existing) = map
+            // P3: a LIVE session already exists for this anchor_key → dedup.
+            if let Some(existing) = registry
+                .live
                 .values()
                 .find(|s| s.anchor_key.as_deref() == Some(anchor))
             {
-                return ContinuationGuard::DuplicateAnchor(existing.terminal_id.clone());
+                return ContinuationGuard::DuplicateAnchor(AnchorHolder::Live(
+                    existing.terminal_id.clone(),
+                ));
+            }
+            // P3, same critical section: a dispatch that passed this guard
+            // earlier and has not yet registered holds the anchor too.
+            // Otherwise it is ours from here on — the reservation is taken
+            // BEFORE the lock drops, so a second evaluation racing this one
+            // cannot also read the anchor as free. This is the "real permit
+            // held from the guard through the spawn" that
+            // `DEFAULT_CONTINUATION_SESSION_CAP`'s doc names as the fix for the
+            // burst window; `AnchorReservation` carries it from here.
+            if !registry.pending_anchors.insert(anchor.to_string()) {
+                return ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved);
             }
         }
-        map.len()
+        // `live` only: the reservation just taken (and any other) is not a
+        // running session and does not count toward the cap.
+        registry.live.len()
     };
     // The registry lock is RELEASED before the thread reading is taken. The
     // reading is a synchronous OS-table read (and, in the live wrapper, a
@@ -2406,7 +2465,9 @@ fn evaluate_continuation_guard(
     // `register_continuation_session` and every other guard behind one syscall.
     // The count is read out above instead: it is a snapshot either way — see
     // `DEFAULT_CONTINUATION_SESSION_CAP` on why this check is not a semaphore
-    // and holding the lock longer would not make it one.
+    // and holding the lock longer would not make it one. The ANCHOR is no
+    // longer a snapshot, though: it is reserved above, so the load verdicts
+    // below must give it back when they refuse.
     //
     // Admitted coord LAUNCHES count toward the same cap: both populations are
     // unattended coord-dispatched sessions spending the same machine, and a cap
@@ -2416,7 +2477,7 @@ fn evaluate_continuation_guard(
     // Thread pressure next, then the count cap — shared with the launch path
     // through `evaluate_load_guard`. Evaluated HERE, after the dedup arm has had
     // its chance to return, so a deduped row never pays for a thread snapshot.
-    match evaluate_load_guard(live_count, thread_pressure) {
+    let verdict = match evaluate_load_guard(live_count, thread_pressure) {
         LoadGuard::Proceed => ContinuationGuard::Proceed,
         LoadGuard::ThreadPressure {
             severity,
@@ -2426,7 +2487,14 @@ fn evaluate_continuation_guard(
             observation,
         },
         LoadGuard::AtCap { cap, .. } => ContinuationGuard::AtCap(cap),
+    };
+    // A load deferral leaves the row pending for re-delivery; the re-delivery
+    // must find the anchor free, not reserved by this refused evaluation. Only
+    // a `Proceed` leaves the reservation behind, for the caller to carry.
+    if verdict != ContinuationGuard::Proceed {
+        release_anchor_reservation(anchor_key);
     }
+    verdict
 }
 
 /// Outcome of the machine-load half of the pre-spawn guard: thread pressure,
@@ -2605,7 +2673,11 @@ fn admit_launch(
         !launches.contains_key(&agent_id),
         "register_launch_stop admits one live launch per agent_id"
     );
-    let continuations = lock_recover(continuation_sessions(), "continuation_sessions").len();
+    // `live` only: a pending anchor reservation is not a running session and
+    // never counts toward the cap (see `ContinuationRegistry`).
+    let continuations = lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .len();
     let verdict = evaluate_load_guard(continuations + launches.len(), &|| reading.clone());
     if let Some(reason) = launch_deferral_reason(&verdict) {
         return Err(reason);
@@ -2645,12 +2717,20 @@ fn evaluate_continuation_guard_live(
 /// Register a freshly-spawned continuation session in the live registry (after
 /// `create_terminal_session_backend` succeeds). The entry is reaped lazily by
 /// [`prune_dead_continuations`] the next time the guard runs.
+///
+/// The anchor's pending reservation (taken by [`evaluate_continuation_guard`])
+/// is swapped for the live entry under the SAME lock acquisition, so there is
+/// no instant at which a same-anchor dispatch sees neither.
 fn register_continuation_session(
     terminal_id: String,
     anchor_key: Option<String>,
     gate_id: Option<uuid::Uuid>,
 ) {
-    lock_recover(continuation_sessions(), "continuation_sessions").insert(
+    let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
+    if let Some(anchor) = anchor_key.as_deref() {
+        registry.pending_anchors.remove(anchor);
+    }
+    registry.live.insert(
         terminal_id.clone(),
         ContinuationSession {
             terminal_id,
@@ -2658,6 +2738,65 @@ fn register_continuation_session(
             gate_id,
         },
     );
+}
+
+/// Drop the pending reservation for `anchor_key`, if one is held. Idempotent;
+/// `None` (an anchor-less continuation) reserves nothing and releases nothing.
+fn release_anchor_reservation(anchor_key: Option<&str>) {
+    if let Some(anchor) = anchor_key {
+        lock_recover(continuation_sessions(), "continuation_sessions")
+            .pending_anchors
+            .remove(anchor);
+    }
+}
+
+/// The same-anchor reservation a `Proceed` from [`evaluate_continuation_guard`]
+/// leaves in [`ContinuationRegistry::pending_anchors`], carried by
+/// [`run_gate_continuation_inner`] from the guard through the spawn.
+///
+/// RAII rather than a release call on each exit: the path from the guard to a
+/// registered session crosses an authorization check, the coord consume claim
+/// (three skip arms), a worktree acquire and two presentation fns with their
+/// own early returns, and every one of them must release or the anchor is
+/// dead until the runner restarts. Dropping releases, so an exit added later
+/// is covered without knowing this type exists — and so is a task aborted at
+/// runtime shutdown. The two exits that must NOT release on drop say so
+/// explicitly: [`Self::handed_to_registry`] (the terminal arm registered the
+/// live entry, which already took the reservation with it) and
+/// [`Self::release`] (the headless arm spawned; that path never registers, so
+/// the anchor is released the moment the child exists — headless sessions are
+/// outside P3/P4).
+#[must_use = "dropping the reservation releases the anchor immediately"]
+struct AnchorReservation {
+    anchor_key: Option<String>,
+}
+
+impl AnchorReservation {
+    /// Take custody of the reservation the guard just inserted for
+    /// `anchor_key`. `None` holds nothing and drops as a no-op.
+    fn held(anchor_key: Option<String>) -> Self {
+        Self { anchor_key }
+    }
+
+    /// Release now: the headless child is running and nothing will register
+    /// this anchor, so the guard must stop reporting it as taken.
+    fn release(self) {
+        drop(self);
+    }
+
+    /// The registry now carries this anchor as a LIVE entry, and
+    /// [`register_continuation_session`] already removed the reservation under
+    /// the same lock. Disarm so the drop cannot remove a reservation a LATER
+    /// same-anchor dispatch takes after this session exits and is pruned.
+    fn handed_to_registry(mut self) {
+        self.anchor_key = None;
+    }
+}
+
+impl Drop for AnchorReservation {
+    fn drop(&mut self) {
+        release_anchor_reservation(self.anchor_key.as_deref());
+    }
 }
 
 // =============================================================================
@@ -2852,7 +2991,9 @@ fn deregister_exited_continuation(terminal_id: &str) -> Option<ContinuationSessi
     // work-outcome fallback for every later continuation. The other two writers
     // ([`register_continuation_session`], [`prune_dead_continuations`]) already
     // recover; this one was the odd one out.
-    lock_recover(continuation_sessions(), "continuation_sessions").remove(terminal_id)
+    lock_recover(continuation_sessions(), "continuation_sessions")
+        .live
+        .remove(terminal_id)
 }
 
 /// A continuation registration lifted off one terminal so it can be re-pinned
@@ -3806,8 +3947,15 @@ struct ContinuationDeferredBody {
 /// one mirrored a string that had already been inlined into a `warn!`, and so
 /// pinned the wording of a log line while advertising itself as a wire
 /// contract). Each arm below calls one of these; the test calls the same ones.
-fn duplicate_anchor_stamp_reason(existing_terminal_id: &str) -> String {
-    format!("duplicate_anchor:{existing_terminal_id}")
+fn duplicate_anchor_stamp_reason(holder: &AnchorHolder) -> String {
+    match holder {
+        AnchorHolder::Live(existing_terminal_id) => {
+            format!("duplicate_anchor:{existing_terminal_id}")
+        }
+        // A reservation has no terminal id; the detail names the holder's
+        // kind instead so the class parser still finds a non-empty detail.
+        AnchorHolder::Reserved => "duplicate_anchor:reserved".to_string(),
+    }
 }
 
 /// The `reason` a thread-pressure deferral stamps: the severity word and the
@@ -3853,7 +4001,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 ///
 /// | reason | stamped by | constructor |
 /// |---|---|---|
-/// | `duplicate_anchor:<terminal_id>` | a live session already owns the anchor | [`duplicate_anchor_stamp_reason`] |
+/// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| an in-flight dispatch has reserved it | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `at_cap:<cap>` | the continuation concurrency cap | [`at_cap_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
@@ -4118,31 +4266,52 @@ async fn run_gate_continuation_inner(
     // headless-only context). The thread lane needs no registry at all — it
     // reads the process — so it is the one guard here that still has an opinion
     // in a headless context.
-    match evaluate_continuation_guard_live(
+    //
+    // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
+    // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
+    // `reservation` carries it from here, and dropping it on ANY exit below —
+    // the authorization refusal, all three consume-claim skips, a worktree
+    // failure, a presentation fn's early return — gives the anchor back. The
+    // two spawn successes disarm it explicitly inside the presentation fns.
+    let reservation = match evaluate_continuation_guard_live(
         payload.anchor_key.as_deref(),
         &live_terminal_predicate(),
     ) {
-        ContinuationGuard::Proceed => {}
-        ContinuationGuard::DuplicateAnchor(existing_terminal_id) => {
-            info!(
-                "agent_runtime: gate-continuation deduped by anchor_key={:?} — a live \
-                 continuation session (terminal_id={existing_terminal_id}) already exists; \
-                 skipping double-spawn",
-                payload.anchor_key
-            );
-            // Best-effort: bring the existing docked tab to focus so the
-            // operator sees the live continuation rather than nothing happening.
-            focus_existing_continuation(&existing_terminal_id);
-            // The ALREADY-LIVE continuation (the one that won the anchor) owns
-            // its own claim+outcome; the deduped gate stays pending on coord
-            // (its work IS the live session) until cancelled or it expires.
-            // Once the anchor's live session exits, a re-delivery of this same
-            // gate_id must be able to dispatch — which is what the release
-            // inside `defer_continuation_unclaimed` buys.
+        ContinuationGuard::Proceed => AnchorReservation::held(payload.anchor_key.clone()),
+        ContinuationGuard::DuplicateAnchor(holder) => {
+            match &holder {
+                AnchorHolder::Live(existing_terminal_id) => {
+                    info!(
+                        "agent_runtime: gate-continuation deduped by anchor_key={:?} — a live \
+                         continuation session (terminal_id={existing_terminal_id}) already \
+                         exists; skipping double-spawn",
+                        payload.anchor_key
+                    );
+                    // Best-effort: bring the existing docked tab to focus so the
+                    // operator sees the live continuation rather than nothing
+                    // happening.
+                    focus_existing_continuation(existing_terminal_id);
+                }
+                AnchorHolder::Reserved => {
+                    info!(
+                        "agent_runtime: gate-continuation deduped by anchor_key={:?} — another \
+                         dispatch for this anchor passed the guard and has not spawned yet; \
+                         skipping double-spawn",
+                        payload.anchor_key
+                    );
+                }
+            }
+            // The holder of the anchor (the live session, or the dispatch about
+            // to spawn one) owns its own claim+outcome; the deduped gate stays
+            // pending on coord (its work IS that session) until cancelled or it
+            // expires. Once the anchor's session exits — or the reservation is
+            // released without a spawn — a re-delivery of this same gate_id must
+            // be able to dispatch, which is what the release inside
+            // `defer_continuation_unclaimed` buys.
             defer_continuation_unclaimed(
                 consume_target,
                 device_id,
-                duplicate_anchor_stamp_reason(&existing_terminal_id),
+                duplicate_anchor_stamp_reason(&holder),
             )
             .await;
             return Ok(());
@@ -4196,7 +4365,7 @@ async fn run_gate_continuation_inner(
             defer_continuation_unclaimed(consume_target, device_id, at_cap_stamp_reason(cap)).await;
             return Ok(());
         }
-    }
+    };
 
     // Step 1b: agent-registry spawn authorization (plan
     // `2026-07-28-migrate-claude-md-into-qontinui.md` Phase 4c, served clause
@@ -4338,7 +4507,8 @@ async fn run_gate_continuation_inner(
     let result = match payload.presentation {
         Presentation::Terminal => {
             info!("agent_runtime: gate-continuation presentation=terminal agent_id={agent_id}");
-            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx).await
+            run_continuation_terminal(agent_id, &workdir, &payload, device_id, ctx, reservation)
+                .await
         }
         Presentation::Headless => {
             info!("agent_runtime: gate-continuation presentation=headless agent_id={agent_id}");
@@ -4355,7 +4525,8 @@ async fn run_gate_continuation_inner(
                 &payload.initial_prompt,
                 payload.brief.as_ref(),
             );
-            let res = run_continuation_headless(agent_id, &workdir, &headless_prompt).await;
+            let res =
+                run_continuation_headless(agent_id, &workdir, &headless_prompt, reservation).await;
             drop(ctx);
             res
         }
@@ -4565,6 +4736,10 @@ async fn run_continuation_terminal(
     // `QONTINUI_GATE_DEVICE_ID` and reused by the exit fallback.
     device_id: uuid::Uuid,
     ctx: Option<crate::agent_worktree::isolated_edit::IsolatedEditContext>,
+    // The anchor reservation the guard left behind. Every early `Err` below
+    // drops it, which releases the anchor; the `Ok` arm hands it to the
+    // registry once the live entry exists.
+    reservation: AnchorReservation,
 ) -> anyhow::Result<()> {
     use std::sync::Arc;
 
@@ -4871,6 +5046,10 @@ async fn run_continuation_terminal(
                 payload.anchor_key.clone(),
                 reportable_gate,
             );
+            // The live entry now holds the anchor and registration swapped the
+            // reservation out under its own lock; disarm so this fn's drop
+            // never touches a reservation a later same-anchor dispatch takes.
+            reservation.handed_to_registry();
             // The session is intentionally left on `main` (docked, visible) — no
             // pop-out window was opened, so there is nothing to reassign it to.
             info!(
@@ -5728,6 +5907,10 @@ async fn run_continuation_headless(
     agent_id: uuid::Uuid,
     workdir: &str,
     initial_prompt: &str,
+    // The anchor reservation the guard left behind. This path never registers
+    // in the continuation registry (headless sessions are outside P3/P4), so
+    // it is released the moment the child exists; a spawn `Err` drops it.
+    reservation: AnchorReservation,
 ) -> anyhow::Result<()> {
     let log_path = agent_log_path(agent_id);
     // Select the most-available account once before spawning (pins the resolved
@@ -5755,6 +5938,11 @@ async fn run_continuation_headless(
     // the `pick_best_account` call above is the whole selection.
     match spawn_claude_child(workdir, initial_prompt, None, coord_mcp).await {
         Ok((mut child, preconditions)) => {
+            // The child exists and nothing will register it: give the anchor
+            // back now rather than when the subprocess exits, or every later
+            // same-anchor dispatch would read `DuplicateAnchor` for its whole
+            // lifetime (headless sessions are not P3/P4 population).
+            reservation.release();
             let pid = child.id().map(|p| p as i64);
             // Exempt this headless child from the session-tracking health
             // check for its lifetime — it legitimately has no lifecycle
@@ -9985,6 +10173,7 @@ mod tests {
             &payload,
             uuid::Uuid::now_v7(),
             None,
+            AnchorReservation::held(None),
         )
         .await;
         assert!(
@@ -10084,8 +10273,13 @@ mod tests {
         let prev_tier = std::env::var("QONTINUI_TRUST_GATE_TIER").ok();
         std::env::set_var("QONTINUI_TRUST_GATE_TIER", "proceed");
         let agent_id = uuid::Uuid::now_v7();
-        let res =
-            run_continuation_headless(agent_id, &workdir, "echo gate-continuation-proof").await;
+        let res = run_continuation_headless(
+            agent_id,
+            &workdir,
+            "echo gate-continuation-proof",
+            AnchorReservation::held(None),
+        )
+        .await;
         match prev_tier {
             Some(v) => std::env::set_var("QONTINUI_TRUST_GATE_TIER", v),
             None => std::env::remove_var("QONTINUI_TRUST_GATE_TIER"),
@@ -10607,10 +10801,11 @@ mod tests {
         // Poison-recovering to match `CONT_GUARD_LOCK` / the shared `env_lock`:
         // a prior test that panicked while holding this registry mutex must not
         // cascade-poison the continuation-guard tests that reset it here.
-        continuation_sessions()
+        // Both halves: a reservation left by a `Proceed` in one test must not
+        // read as `DuplicateAnchor` in the next.
+        *continuation_sessions()
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clear();
+            .unwrap_or_else(|p| p.into_inner()) = ContinuationRegistry::default();
         // Admitted launches share the cap, so they are part of the same reset.
         admitted_launches()
             .lock()
@@ -11029,7 +11224,7 @@ mod tests {
         // Same anchor, still live → DuplicateAnchor (carries the existing tid).
         assert_eq!(
             evaluate_continuation_guard(Some("plan:foo:phase:1"), &live_all, &calm),
-            ContinuationGuard::DuplicateAnchor("term-tid-1".to_string())
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-tid-1".to_string()))
         );
         // A different anchor is unaffected.
         assert_eq!(
@@ -11048,10 +11243,215 @@ mod tests {
         assert!(continuation_sessions()
             .lock()
             .unwrap()
+            .live
             .get("term-tid-1")
             .is_none());
 
         std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
+        clear_continuation_registry();
+    }
+
+    /// Whether the registry currently holds a pending reservation for `anchor`.
+    fn anchor_is_reserved(anchor: &str) -> bool {
+        continuation_sessions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_anchors
+            .contains(anchor)
+    }
+
+    /// Phase 4 of plan
+    /// `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`:
+    /// P3 reserves the anchor INSIDE its critical section, so two evaluations
+    /// for one anchor with no registration between them — the burst window,
+    /// where every task of one poll iteration used to see the pre-burst
+    /// registry — cannot both `Proceed`. The second reads the reservation, and
+    /// carries `Reserved` (no terminal exists yet to focus). Deleting the
+    /// `pending_anchors.insert` in the guard fails this test.
+    #[test]
+    fn same_anchor_reservation_dedups_a_second_evaluation_before_registration() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+
+        assert_eq!(
+            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm),
+            ContinuationGuard::Proceed
+        );
+        assert!(
+            anchor_is_reserved("unit:u1:phase-2"),
+            "a Proceed must leave the anchor reserved for the dispatch it admitted"
+        );
+        // The twin, evaluated before the first has registered anything.
+        assert_eq!(
+            evaluate_continuation_guard(Some("unit:u1:phase-2"), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved),
+            "the second evaluation for a reserved anchor must dedup, not proceed"
+        );
+        // A different anchor is unaffected by the reservation.
+        assert_eq!(
+            evaluate_continuation_guard(Some("unit:u1:phase-3"), &live_all, &calm),
+            ContinuationGuard::Proceed
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// The reservation is a permit, not a tombstone: dropping the
+    /// [`AnchorReservation`] (every non-spawn exit of the dispatcher) frees the
+    /// anchor, and the next evaluation proceeds. Registration swaps the
+    /// reservation for the live entry, and a reservation handed to the
+    /// registry no longer releases on drop — so it cannot remove a LATER
+    /// dispatch's reservation for the same anchor.
+    #[test]
+    fn released_reservation_frees_the_anchor_and_registration_takes_it_over() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        let live_all = |_id: &str| true;
+
+        // 1. Proceed reserves; the twin is deduped; the dispatch gives up
+        //    (worktree failure, claim refused, …) → its reservation drops.
+        assert_eq!(
+            evaluate_continuation_guard(Some("claim:pr:qontinui/x#1"), &live_all, &calm),
+            ContinuationGuard::Proceed
+        );
+        let reservation = AnchorReservation::held(Some("claim:pr:qontinui/x#1".into()));
+        assert_eq!(
+            evaluate_continuation_guard(Some("claim:pr:qontinui/x#1"), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Reserved)
+        );
+        drop(reservation);
+        assert!(
+            !anchor_is_reserved("claim:pr:qontinui/x#1"),
+            "dropping the reservation must release the anchor"
+        );
+        // 2. The third evaluation — a re-delivery — proceeds again.
+        assert_eq!(
+            evaluate_continuation_guard(Some("claim:pr:qontinui/x#1"), &live_all, &calm),
+            ContinuationGuard::Proceed,
+            "a released reservation must let the next evaluation proceed"
+        );
+
+        // 3. This time the dispatch spawns: registration takes the reservation
+        //    with it under one lock, and the handed-over guard is inert.
+        let reservation = AnchorReservation::held(Some("claim:pr:qontinui/x#1".into()));
+        register_continuation_session(
+            "term-x1".to_string(),
+            Some("claim:pr:qontinui/x#1".into()),
+            None,
+        );
+        assert!(
+            !anchor_is_reserved("claim:pr:qontinui/x#1"),
+            "registration must remove the reservation it replaces"
+        );
+        reservation.handed_to_registry();
+        assert_eq!(
+            evaluate_continuation_guard(Some("claim:pr:qontinui/x#1"), &live_all, &calm),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("term-x1".to_string())),
+            "after registration the holder is the live session, not a reservation"
+        );
+
+        // 4. The session exits and a later dispatch reserves the same anchor;
+        //    the handed-over guard from step 3 has already been consumed, and
+        //    the peer's reservation stands.
+        let x1_dead = |id: &str| id != "term-x1";
+        assert_eq!(
+            evaluate_continuation_guard(Some("claim:pr:qontinui/x#1"), &x1_dead, &calm),
+            ContinuationGuard::Proceed
+        );
+        assert!(
+            anchor_is_reserved("claim:pr:qontinui/x#1"),
+            "the later dispatch's reservation must survive the earlier hand-over"
+        );
+
+        clear_continuation_registry();
+    }
+
+    /// A load verdict (`ThreadPressure` / `AtCap`) leaves NO reservation
+    /// behind: the row is deferred for re-delivery, and the re-delivery must
+    /// read the load verdict again — not `DuplicateAnchor` against a refused
+    /// evaluation's own leftover.
+    #[test]
+    fn load_verdicts_leave_no_reservation_behind() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        let live_all = |_id: &str| true;
+
+        // AtCap: cap 1, one live session, a new anchor twice.
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
+        register_continuation_session("t-busy".into(), Some("a-busy".into()), None);
+        assert_eq!(
+            evaluate_continuation_guard(Some("a-capped"), &live_all, &calm),
+            ContinuationGuard::AtCap(1)
+        );
+        assert!(
+            !anchor_is_reserved("a-capped"),
+            "an AtCap verdict must remove the reservation it took under the lock"
+        );
+        assert_eq!(
+            evaluate_continuation_guard(Some("a-capped"), &live_all, &calm),
+            ContinuationGuard::AtCap(1),
+            "the re-delivery must see the cap again, not its own leftover reservation"
+        );
+
+        // ThreadPressure: cap out of the way, a loaded reading twice.
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
+        for _ in 0..2 {
+            let verdict = evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
+                thread_verdict(Some(540))
+            });
+            assert!(
+                matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
+                "a loaded machine must defer on every evaluation, got {verdict:?}"
+            );
+            assert!(
+                !anchor_is_reserved("a-loaded"),
+                "a ThreadPressure verdict must remove the reservation it took under the lock"
+            );
+        }
+
+        clear_continuation_registry();
+    }
+
+    /// The reservation is not a running session and must not count toward P4
+    /// — for the continuation guard's `live_count` and for the launch guard
+    /// that shares the cap. With cap 2, one live session and one reservation,
+    /// a second anchor and a coord launch both still proceed.
+    #[test]
+    fn anchor_reservation_does_not_count_toward_the_cap() {
+        let _env_lock = env_lock();
+        let _restore = crate::test_env::EnvVarRestore::capture(CAP_ENV_KEYS);
+        let _g = CONT_GUARD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_continuation_registry();
+        std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "2");
+        let live_all = |_id: &str| true;
+
+        register_continuation_session("t-live".into(), Some("a-live".into()), None);
+        assert_eq!(
+            evaluate_continuation_guard(Some("a-reserved"), &live_all, &calm),
+            ContinuationGuard::Proceed
+        );
+        assert!(anchor_is_reserved("a-reserved"));
+        // 1 live + 1 reserved, cap 2: if the reservation counted this would be
+        // AtCap(2).
+        assert_eq!(
+            evaluate_continuation_guard(Some("a-next"), &live_all, &calm),
+            ContinuationGuard::Proceed,
+            "a reservation must not consume a cap slot"
+        );
+        assert!(
+            admit_launch(uuid::Uuid::now_v7(), &live_all, &calm).is_ok(),
+            "the launch guard shares the cap and must not count reservations either"
+        );
+
         clear_continuation_registry();
     }
 
@@ -11128,7 +11528,7 @@ mod tests {
         // At cap (1) AND the anchor matches a live session → dedup wins.
         assert_eq!(
             evaluate_continuation_guard(Some("anchor-dup"), &live_all, &calm),
-            ContinuationGuard::DuplicateAnchor("t1".to_string())
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t1".to_string()))
         );
 
         std::env::remove_var("QONTINUI_CONTINUATION_SESSION_CAP");
@@ -11215,10 +11615,13 @@ mod tests {
             "cap-1 live sessions is under the cap"
         );
 
-        // At the cap → the next one is refused, naming the default.
+        // At the cap → the next one is refused, naming the default. A FRESH
+        // anchor: the `Proceed` above reserved `a-new` for the dispatch it
+        // admitted (Phase 4's same-anchor reservation), so re-evaluating that
+        // anchor would report the dedup, not the cap this test is about.
         register_continuation_session(format!("t{}", cap - 1), Some("a-last".into()), None);
         assert_eq!(
-            evaluate_continuation_guard(Some("a-new"), &live_all, &calm),
+            evaluate_continuation_guard(Some("a-new-2"), &live_all, &calm),
             ContinuationGuard::AtCap(cap),
             "at {cap} live sessions the {n}th continuation is refused on count alone",
             n = cap + 1
@@ -11246,6 +11649,10 @@ mod tests {
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
+        // One anchor per evaluation: a `Proceed` reserves its anchor for the
+        // dispatch it admitted (Phase 4), so re-evaluating `a1` after the first
+        // verdict would report that dedup instead of the thread lane under test.
+        //
         // A live idle runner (151 threads) is BELOW the 256 warn ceiling →
         // nothing to say, spawn.
         assert_eq!(
@@ -11257,13 +11664,13 @@ mod tests {
         // Exactly ON the warn ceiling is AT it, not over it (the lane's
         // boundaries are strictly-above).
         assert_eq!(
-            evaluate_continuation_guard(Some("a1"), &live_all, &|| thread_verdict(Some(256))),
+            evaluate_continuation_guard(Some("a2"), &live_all, &|| thread_verdict(Some(256))),
             ContinuationGuard::Proceed,
             "256 is the ceiling, not a crossing of it"
         );
 
         // WARN band (257..=400): defer, naming the warn ceiling.
-        match evaluate_continuation_guard(Some("a1"), &live_all, &|| thread_verdict(Some(300))) {
+        match evaluate_continuation_guard(Some("a3"), &live_all, &|| thread_verdict(Some(300))) {
             ContinuationGuard::ThreadPressure {
                 severity,
                 observation,
@@ -11281,7 +11688,7 @@ mod tests {
         // CRITICAL band (>400): still a deferral, now naming the critical
         // ceiling. The guard does not escalate past deferral — there is nothing
         // heavier for a queued row than leaving it queued.
-        match evaluate_continuation_guard(Some("a1"), &live_all, &|| thread_verdict(Some(540))) {
+        match evaluate_continuation_guard(Some("a4"), &live_all, &|| thread_verdict(Some(540))) {
             ContinuationGuard::ThreadPressure {
                 severity,
                 observation,
@@ -11366,7 +11773,7 @@ mod tests {
             evaluate_continuation_guard(Some("anchor-dup"), &live_all, &|| thread_verdict(Some(
                 540
             ))),
-            ContinuationGuard::DuplicateAnchor("t-live".to_string()),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t-live".to_string())),
             "a live duplicate is a dedup, not a load deferral"
         );
 
@@ -11412,7 +11819,7 @@ mod tests {
         register_continuation_session("t-live".into(), Some("anchor-dup".into()), None);
         assert_eq!(
             evaluate_continuation_guard(Some("anchor-dup"), &live_all, &counted),
-            ContinuationGuard::DuplicateAnchor("t-live".to_string()),
+            ContinuationGuard::DuplicateAnchor(AnchorHolder::Live("t-live".to_string())),
         );
         assert_eq!(
             readings.load(std::sync::atomic::Ordering::SeqCst),
@@ -11934,6 +12341,7 @@ mod tests {
             continuation_sessions()
                 .lock()
                 .unwrap()
+                .live
                 .contains_key("term-cont-1"),
             "precondition: the continuation session is registered live"
         );
@@ -11957,6 +12365,7 @@ mod tests {
             !continuation_sessions()
                 .lock()
                 .unwrap()
+                .live
                 .contains_key("term-cont-1"),
             "the exited continuation must be removed from the live registry"
         );
@@ -12030,6 +12439,7 @@ mod tests {
             continuation_sessions()
                 .lock()
                 .unwrap()
+                .live
                 .contains_key("term-cont-1"),
             "an operator-tab exit must not disturb a live continuation's registration"
         );
@@ -12054,6 +12464,7 @@ mod tests {
             !continuation_sessions()
                 .lock()
                 .unwrap()
+                .live
                 .contains_key("term-cont-2"),
             "the exited continuation is deregistered even when no poll could be spawned"
         );
@@ -12127,10 +12538,15 @@ mod tests {
     /// breaking coord.
     #[test]
     fn the_deferred_stamp_reasons_follow_the_class_detail_grammar() {
-        // 1. Dedup: the class, then the terminal id that won the anchor.
+        // 1. Dedup: the class, then the terminal id that won the anchor — or
+        //    `reserved` when the winner is a dispatch that has not spawned yet.
         assert_eq!(
-            duplicate_anchor_stamp_reason("term-tid-1"),
+            duplicate_anchor_stamp_reason(&AnchorHolder::Live("term-tid-1".to_string())),
             "duplicate_anchor:term-tid-1"
+        );
+        assert_eq!(
+            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
+            "duplicate_anchor:reserved"
         );
 
         // 2. Thread pressure: class, severity, and the REAL numbers. Built from
@@ -12186,10 +12602,11 @@ mod tests {
              the `_` form and every stamp already written uses it"
         );
 
-        // The first three share the grammar: exactly one leading class, split on
-        // the first colon, and a non-empty detail after it.
+        // The `<class>:<detail>` reasons share the grammar: exactly one leading
+        // class, split on the first colon, and a non-empty detail after it.
         for reason in [
-            duplicate_anchor_stamp_reason("t1"),
+            duplicate_anchor_stamp_reason(&AnchorHolder::Live("t1".to_string())),
+            duplicate_anchor_stamp_reason(&AnchorHolder::Reserved),
             thread_pressure_stamp_reason(severity, observation),
             at_cap_stamp_reason(64),
         ] {
