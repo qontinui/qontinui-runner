@@ -147,6 +147,45 @@ impl PgDb {
         Ok(())
     }
 
+    /// Move a run out of `running` ONLY IF it is still `running`, returning
+    /// whether the row moved. The guard is in the SQL (`AND status = 'running'`)
+    /// so it is atomic against the reconciler's own terminal write.
+    ///
+    /// This is what a stop must use. An unconditional `stopped` write overwrote
+    /// the terminal diagnosis a run had already reached: a run that exited
+    /// `stalled` (or `failed` on a DAG cycle) is still listed, the operator
+    /// presses Stop, and the row becomes `stopped` / "stop requested" — erasing
+    /// the reason the run ended, which is the whole point of persisting it.
+    /// `false` means the run was already terminal and keeps the status it has.
+    pub async fn set_run_status_if_running(
+        &self,
+        run_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let n = conn
+            .execute(
+                r#"
+                UPDATE orchestration.runs
+                SET status = $2,
+                    status_reason = $3,
+                    updated_at = now()
+                WHERE run_id = $1 AND status = 'running'
+                "#,
+                &[&run_id, &status, &reason],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("set_run_status_if_running", &e))?;
+
+        Ok(n > 0)
+    }
+
     /// Insert-or-update a subtask keyed on `(run_id, task_id)`. Used by the
     /// conductor when it (re)declares a DAG node. On conflict every mutable
     /// column is overwritten and `updated_at` is bumped; `created_at` is
@@ -609,12 +648,40 @@ mod tests {
         let stalled = pg.get_run(run_id).await.expect("get_run").expect("row");
         assert_eq!(stalled.status, "stalled");
         assert_eq!(stalled.status_reason.as_deref(), Some("Stall detected: x"));
+        // A STOP must not erase a terminal diagnosis: the conditional write
+        // refuses to move a run that already left `running`.
+        let moved = pg
+            .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+            .await
+            .expect("conditional write");
+        assert!(!moved, "a stalled run is not moved by a stop");
+        let still = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(still.status, "stalled", "the terminal status survives Stop");
+        assert_eq!(
+            still.status_reason.as_deref(),
+            Some("Stall detected: x"),
+            "and so does the reason the run ended"
+        );
+
         pg.set_run_status(run_id, "running", None)
             .await
             .expect("set_run_status running");
         let back = pg.get_run(run_id).await.expect("get_run").expect("row");
         assert_eq!(back.status, "running");
         assert_eq!(back.status_reason, None, "None clears the reason");
+
+        // The same call on a run that IS running does move it.
+        let moved = pg
+            .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+            .await
+            .expect("conditional write");
+        assert!(moved, "a running run is stopped");
+        let stopped = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(stopped.status_reason.as_deref(), Some("stop requested"));
+        pg.set_run_status(run_id, "running", None)
+            .await
+            .expect("back to running for the rest of the test");
 
         // 2. Upsert a small DAG: A (root), B depends on A, C depends on A+B.
         let a = mk_subtask(run_id, "A", 0, vec![], true);
