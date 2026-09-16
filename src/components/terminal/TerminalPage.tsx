@@ -1726,8 +1726,9 @@ function TerminalPageInner({
                 advisory banner that surfaces `project.coordinator_decisions`
                 rows fired by the Rust deconflicter loop. Gated on
                 `claudeSessionId` per `proj_holding_banner_pty_gate` — the
-                emergent-task wiring (commands/productivity.rs:1082 +
-                ai_session register sites) ensures every AI tab has one.
+                emergent-task wiring (the `create_emergent_task` calls in
+                `commands/ai_session.rs` and `mcp/ai_session.rs`) ensures
+                every AI tab has one.
                 Lives below the lock-yield banners by document order so
                 they stack instead of overlapping. */}
             {activeTab?.claudeSessionId && (
