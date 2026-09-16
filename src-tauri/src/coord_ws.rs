@@ -195,12 +195,18 @@ pub fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .unwrap_or_default();
             let hint = match status {
-                400 => " — coord refused the request shape; a `?pattern=` query is no longer \
-                        accepted (this build sends `?subscribe=`, so check for a proxy rewrite)",
-                401 => " — coord requires a device JWT on the upgrade and none was accepted \
-                        (unpaired runner, expired credential, or revoked device)",
-                403 => " — the credential was accepted but this subscription is not admitted \
-                        for its principal",
+                400 => {
+                    " — coord refused the request shape; a `?pattern=` query is no longer \
+                        accepted (this build sends `?subscribe=`, so check for a proxy rewrite)"
+                }
+                401 => {
+                    " — coord requires a device JWT on the upgrade and none was accepted \
+                        (unpaired runner, expired credential, or revoked device)"
+                }
+                403 => {
+                    " — the credential was accepted but this subscription is not admitted \
+                        for its principal"
+                }
                 _ => "",
             };
             warn!(
@@ -295,7 +301,10 @@ mod tests {
         ] {
             let url = build_ws_url("https://coord.qontinui.io", sub);
             assert!(!url.contains("pattern="), "{url}");
-            assert!(url.ends_with(&format!("?subscribe={}", sub.name())), "{url}");
+            assert!(
+                url.ends_with(&format!("?subscribe={}", sub.name())),
+                "{url}"
+            );
         }
     }
 
@@ -313,15 +322,18 @@ mod tests {
             ws_url_with_token("wss://c/ws?subscribe=device", "a.b.c"),
             "wss://c/ws?subscribe=device&token=a.b.c"
         );
-        assert_eq!(ws_url_with_token("wss://c/ws", "a.b.c"), "wss://c/ws?token=a.b.c");
+        assert_eq!(
+            ws_url_with_token("wss://c/ws", "a.b.c"),
+            "wss://c/ws?token=a.b.c"
+        );
     }
 
     /// Both carriages: the token rides the query string (what a browser
     /// could send) AND the `Authorization` header (what coord reads first).
     #[test]
     fn upgrade_request_carries_the_token_as_query_and_bearer_header() {
-        let req = upgrade_request_with("wss://coord.example/ws?subscribe=device", Some("t.o.k"))
-            .unwrap();
+        let req =
+            upgrade_request_with("wss://coord.example/ws?subscribe=device", Some("t.o.k")).unwrap();
         assert_eq!(req.uri().query(), Some("subscribe=device&token=t.o.k"));
         assert_eq!(
             req.headers()
