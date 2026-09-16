@@ -67,6 +67,9 @@ pub mod instance_env;
 // that needs the encrypted token store outside the Tauri runtime). Both
 // modules are Tauri-free.
 pub mod auth;
+/// The one coord `/ws` upgrade (URL shape + per-connect device JWT) every
+/// subscriber lane goes through.
+pub mod coord_ws;
 pub mod fs_perms;
 pub mod machine_identity;
 pub mod secure_storage;

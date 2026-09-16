@@ -82,7 +82,20 @@ pub struct LaunchPayload {
     pub agent_session_id: Option<uuid::Uuid>,
     pub target_device_id: uuid::Uuid,
     pub worktrees: Vec<AllocatedWorktree>,
+    /// Agent credential carried IN THE FRAME — legacy, **scheduled for
+    /// deletion**. Plan
+    /// `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
+    /// Phase 3: the runner now mints the agent token itself against coord's
+    /// `POST /agents/:agent_id/credential` door ([`fetch_agent_credential`])
+    /// and reads this field ONLY on the rollout-fallback arm of
+    /// [`decide_agent_credential`], taken when coord predates that door (a
+    /// bare 404). `#[serde(default)]` so a frame WITHOUT the field — the
+    /// follow-up coord PR that stops publishing it — still parses. That
+    /// follow-up deletes both fields, the fallback arm and this comment.
+    #[serde(default)]
     pub jwt: String,
+    /// See [`LaunchPayload::jwt`] — same lifecycle, deleted together.
+    #[serde(default)]
     pub jwt_exp: i64,
     pub initial_prompt: String,
     pub claim_token: String,
@@ -839,40 +852,17 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
 /// in `/ws`: producing `…/ws/ws` would 401 at the ALB and the subscribe loop
 /// would never connect in prod. The coord `/ws` endpoint is a Redis pub/sub
 /// bridge at the `/ws` path (not the root); connecting to the root also 401s.
-fn coord_ws_url(device_id: uuid::Uuid) -> Option<String> {
-    let coord_base = connected_coord_base()?;
-    Some(build_coord_ws_url(&coord_base, device_id))
-}
-
-/// Pure builder for the coord agent-spawn WS subscription URL. Extracted from
-/// [`coord_ws_url`] so it can be unit-tested without global profile state.
 ///
-/// Normalization rule:
-/// 1. Trim whitespace and any trailing `/`.
-/// 2. Swap the scheme: `https://`→`wss://`, `http://`→`ws://`; leave an
-///    already-`ws(s)://` base (or any other scheme) untouched.
-/// 3. Append `/ws` ONLY if the base does not already end in `/ws` (the trailing
-///    `/` was stripped in step 1, so a `…/ws/` input is handled too). This makes
-///    the construction idempotent for the shipped profiles whose `coord_url`
-///    already ends in `/ws`, while still appending it for a bare host URL.
-/// 4. Append the device-scoped `events.agent.spawn_requested.<device>` pattern.
-fn build_coord_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
-    let base = coord_url.trim().trim_end_matches('/');
-    let ws_base = base
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .or_else(|| {
-            base.strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-        })
-        .unwrap_or_else(|| base.to_string());
-    // Idempotent: don't double-append `/ws` when the base already ends in it.
-    let ws_base = if ws_base.ends_with("/ws") {
-        ws_base
-    } else {
-        format!("{ws_base}/ws")
-    };
-    format!("{ws_base}?pattern=events.agent.spawn_requested.{device_id}")
+/// The URL carries the closed-set subscription name `?subscribe=device`, which
+/// coord resolves server-side to this device's spawn and stop channels from
+/// the credential presented at upgrade (`qontinui_runner_lib::coord_ws`) —
+/// never a caller-supplied uuid, so this resolver takes none.
+fn coord_ws_url() -> Option<String> {
+    let coord_base = connected_coord_base()?;
+    Some(qontinui_runner_lib::coord_ws::build_ws_url(
+        &coord_base,
+        qontinui_runner_lib::coord_ws::Subscription::Device,
+    ))
 }
 
 /// Read `~/.qontinui/machine.json` → device_id. Falls back to None.
@@ -1096,7 +1086,7 @@ fn reset_backoff_after_pump(elapsed: Duration) -> bool {
 ///    first place; this reset is the belt-and-suspenders recovery if a drop still
 ///    occurs for any other reason.
 async fn subscribe_to_spawn_requests(device_id: uuid::Uuid) -> anyhow::Result<()> {
-    let ws_url = match coord_ws_url(device_id) {
+    let ws_url = match coord_ws_url() {
         Some(u) => u,
         None => {
             warn!(
@@ -1155,10 +1145,13 @@ const KEEPALIVE_INTERVAL_SECS: u64 = 20;
 /// Single connect-and-pump iteration: opens the WS, listens for events,
 /// dispatches spawn-requests. Returns on disconnect.
 ///
-/// Coord's `/ws` endpoint is a Redis pub/sub bridge; the pattern filter
-/// is set via the `?pattern=` query param at upgrade time (client-sent
-/// Text frames are silently ignored). The URL already carries the
-/// device-scoped pattern from [`coord_ws_url`].
+/// Coord's `/ws` endpoint is a Redis pub/sub bridge; the subscription is
+/// chosen at upgrade time (client-sent Text frames are silently ignored) by
+/// the closed-set name the URL from [`coord_ws_url`] carries (`?subscribe=device`),
+/// and the device JWT is attached to the upgrade PER CONNECT by
+/// `qontinui_runner_lib::coord_ws::connect` — so a reconnect after the ~4 h
+/// device-token rollover presents the fresh token, never one captured at
+/// startup.
 ///
 /// ## Keepalive (Fix (b))
 ///
@@ -1183,7 +1176,7 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
     use tokio::time::MissedTickBehavior;
     use tokio_tungstenite::tungstenite::Message;
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
+    let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "agent_runtime").await?;
     info!("agent_runtime: WS connected for device_id={device_id}");
 
     // Fix (c2): on every fresh connect, replay any gate-continuation dispatches
@@ -1255,9 +1248,11 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
     // where `payload` is the raw Redis message — the LaunchPayload serialized
     // as a STRING. Older/test fixtures used {"channel","body":<object>}; we
     // accept both (see `parse_envelope_payload`). On a miss we log + return Ok:
-    // a malformed or foreign frame must never kill the subscribe loop, and
-    // because coord's default `events.*` subscription delivers every event,
-    // most frames legitimately are not ours.
+    // a malformed or foreign frame must never kill the subscribe loop, and a
+    // coord predating the closed subscription set delivers its default
+    // `events.*` universe on this socket, so there most frames legitimately
+    // are not ours. The channel-name filter below is what keeps the new
+    // `?subscribe=device` URL harmless against that older coord.
     if let Some(channel) = value.get("channel").and_then(|c| c.as_str()) {
         let spawn_ch = format!("events.agent.spawn_requested.{device_id}");
         let stop_ch = format!("events.agent.stop_requested.{device_id}");
@@ -1329,8 +1324,8 @@ async fn handle_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> 
                 }
             }
         }
-        // Any other events.* frame (coord's default subscription delivers all)
-        // is not ours — ignore.
+        // Any other events.* frame (an older coord's default subscription
+        // delivers all of them) is not ours — ignore.
         return Ok(());
     }
 
@@ -6263,11 +6258,226 @@ async fn run_continuation_headless(
 // Subprocess lifecycle
 // =============================================================================
 
+// =============================================================================
+// Agent credential — minted on fetch, never carried on the bus
+// =============================================================================
+//
+// Plan `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
+// Phase 3. A spawn frame is a NOTIFICATION; the agent's token is minted by
+// coord's `POST /agents/:agent_id/credential` door when THIS device asks for
+// it, authenticated by the device JWT, single-shot per agent. The token never
+// exists until the device it belongs to fetches it, is never at rest in
+// Postgres or Redis, and its `exp` clock starts at fetch rather than publish.
+
+/// The credential a coord-dispatched agent runs under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentCredential {
+    pub(crate) token: String,
+    /// Unix seconds; the bookkeeping `exp` the token slot's refresh loop reads.
+    pub(crate) exp: i64,
+    /// coord's `jti` for the mint when the door supplied one; `nil` on the
+    /// frame-fallback arm, which has none. Bookkeeping only — the proxy sends
+    /// the bearer, not the jti.
+    pub(crate) jti: uuid::Uuid,
+}
+
+/// Wire shape of a 2xx from the credential door — coord's `RefreshResponse`
+/// (`tokens.rs`): `{token, agent_id, jti, exp}`. `agent_id` is not read.
+#[derive(Debug, Clone, Deserialize)]
+struct CredentialResponse {
+    token: String,
+    exp: i64,
+    #[serde(default)]
+    jti: Option<uuid::Uuid>,
+}
+
+/// What the credential door answered, as the transport saw it — the input
+/// [`decide_agent_credential`] classifies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialDoorAnswer {
+    /// 2xx with a parseable body.
+    Minted {
+        token: String,
+        exp: i64,
+        jti: Option<uuid::Uuid>,
+    },
+    /// Any non-2xx, with the body so the `error` code can be named: coord's
+    /// typed refusals are 409 `already_credentialed`, 403 `device_mismatch`,
+    /// 404 `agent_not_found`, 503 `schema_migration_pending`, 401 on a bad
+    /// bearer — and a coord that predates the door answers a bare 404 for the
+    /// whole route.
+    Refused { status: u16, body: String },
+    /// No HTTP answer at all: no coord base, no HTTP client, a transport
+    /// error, or a 2xx whose body did not parse.
+    Unreachable(String),
+}
+
+/// Where a launch's credential came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CredentialSource {
+    /// Minted by the credential door for this fetch.
+    Door,
+    /// The frame's own `jwt` — the rollout-compatibility arm, see
+    /// [`decide_agent_credential`].
+    FrameFallback,
+}
+
+/// The launch decision [`decide_agent_credential`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialDecision {
+    Launch {
+        credential: AgentCredential,
+        source: CredentialSource,
+    },
+    /// Do NOT launch a credential-less agent; `reason` is what the
+    /// `spawn-failed` report carries.
+    Refuse { reason: String },
+}
+
+/// `POST {base}/agents/{agent_id}/credential`, authenticated with the device
+/// JWT. Pure transport — every outcome is a [`CredentialDoorAnswer`] for
+/// [`decide_agent_credential`] to classify, so the launch policy is testable
+/// without a socket.
+async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialDoorAnswer {
+    let url = format!("{base}/agents/{agent_id}/credential");
+    let Some(client) = crate::coord_http::coord_client() else {
+        return CredentialDoorAnswer::Unreachable("no coord HTTP client".to_string());
+    };
+    // coord-tenant-scope(session-noop): agent_id is a path parameter; coord resolves the agent's device from coord.agent_worktrees and compares it to the bearer's own device_id claim, persisting no tenant. Nothing to thread. Credential: the DEFAULT binding's device JWT via attach_device_auth — the same bearer every lifecycle post presents, and the one the door's device_mismatch check is keyed on.
+    let resp = match crate::auth::attach_device_auth(client.post(&url))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => return CredentialDoorAnswer::Unreachable(format!("transport: {e}")),
+    };
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return CredentialDoorAnswer::Refused {
+            status: status.as_u16(),
+            body,
+        };
+    }
+    match serde_json::from_str::<CredentialResponse>(&body) {
+        Ok(c) => CredentialDoorAnswer::Minted {
+            token: c.token,
+            exp: c.exp,
+            jti: c.jti,
+        },
+        Err(e) => CredentialDoorAnswer::Unreachable(format!(
+            "credential door answered {} with an unparseable body: {e}",
+            status.as_u16()
+        )),
+    }
+}
+
+/// Pure launch policy: door answer × frame credential → launch or refuse.
+///
+/// - 2xx with a non-empty token → launch on the DOOR's credential.
+/// - **404 without `agent_not_found`, and the frame carries a `jwt`** → launch
+///   on the FRAME's credential. ROLLOUT COMPATIBILITY, DELIBERATE: a coord that
+///   predates the credential door answers a bare 404 for the whole route while
+///   still publishing the token in the frame. **This arm is deleted by the
+///   follow-up that drops `jwt`/`jwt_exp` from `LaunchPayload`** (the coord PR
+///   that stops publishing the field, gated on the door's per-device fetch
+///   count matching the spawn count — plan
+///   `2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose`
+///   Phase 3 "Rollout"). A 404 whose body names `agent_not_found` is a NEW
+///   coord's typed answer — the door exists and the agent does not — so it
+///   never takes this arm.
+/// - Everything else (401/403/409/503, a typed 404, a 404 with an empty frame
+///   `jwt`, a 2xx with an empty token, transport failure) → refuse. A
+///   credential-less agent is never launched; the reason names the status and
+///   coord's `error` code so the `spawn-failed` row is diagnosable.
+pub(crate) fn decide_agent_credential(
+    answer: CredentialDoorAnswer,
+    frame_jwt: &str,
+    frame_jwt_exp: i64,
+) -> CredentialDecision {
+    use qontinui_runner_lib::coord_ws::refusal_error_code;
+    match answer {
+        CredentialDoorAnswer::Minted { token, .. } if token.is_empty() => {
+            CredentialDecision::Refuse {
+                reason: "credential door answered 2xx with an empty token — not launching a \
+                         credential-less agent"
+                    .to_string(),
+            }
+        }
+        CredentialDoorAnswer::Minted { token, exp, jti } => CredentialDecision::Launch {
+            credential: AgentCredential {
+                token,
+                exp,
+                jti: jti.unwrap_or_default(),
+            },
+            source: CredentialSource::Door,
+        },
+        CredentialDoorAnswer::Refused { status: 404, body } => {
+            let code = refusal_error_code(&body);
+            if code.as_deref() == Some("agent_not_found") {
+                CredentialDecision::Refuse {
+                    reason: "credential door answered 404 agent_not_found — coord does not know \
+                             this agent; not launching"
+                        .to_string(),
+                }
+            } else if !frame_jwt.is_empty() {
+                // ROLLOUT FALLBACK — deleted with `LaunchPayload::jwt` (see doc).
+                CredentialDecision::Launch {
+                    credential: AgentCredential {
+                        token: frame_jwt.to_string(),
+                        exp: frame_jwt_exp,
+                        jti: uuid::Uuid::nil(),
+                    },
+                    source: CredentialSource::FrameFallback,
+                }
+            } else {
+                CredentialDecision::Refuse {
+                    reason: format!(
+                        "credential door answered 404 (error={}) and the frame carried no \
+                         credential — coord predates the door yet publishes no token, or the \
+                         route is misrouted; not launching a credential-less agent",
+                        code.as_deref().unwrap_or("<none>")
+                    ),
+                }
+            }
+        }
+        CredentialDoorAnswer::Refused { status, body } => {
+            let code = refusal_error_code(&body);
+            let hint = match status {
+                409 => " (another holder fetched this agent's credential first, or this is a \
+                        duplicate delivery)",
+                403 => " (the agent belongs to a different device than this runner's \
+                        credential)",
+                503 => " (coord's credential schema migration has not landed yet)",
+                401 => " (this runner's device JWT was not accepted)",
+                _ => "",
+            };
+            CredentialDecision::Refuse {
+                reason: format!(
+                    "credential door refused status={status} error={}{hint} — not launching a \
+                     credential-less agent",
+                    code.as_deref().unwrap_or("<none>")
+                ),
+            }
+        }
+        CredentialDoorAnswer::Unreachable(why) => CredentialDecision::Refuse {
+            reason: format!(
+                "credential door unreachable ({why}) — not launching a credential-less agent"
+            ),
+        },
+    }
+}
+
 /// Map a coord-delivered LaunchPayload onto the AllocateResult shape the
 /// per-agent daemons (agent_pusher / dirty_poller) consume. The daemons'
 /// stable contract is AllocateResult (also produced by the isolated_edit
-/// path); this keeps spawn_for_agent's signature untouched.
-fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree::AllocateResult {
+/// path); this keeps spawn_for_agent's signature untouched. The token is the
+/// fetched [`AgentCredential`], never the frame's.
+fn payload_to_allocate_result(
+    payload: &LaunchPayload,
+    credential: &AgentCredential,
+) -> crate::agent_worktree::AllocateResult {
     use crate::agent_worktree::{AllocateResult, MaterializedWorktree};
     AllocateResult {
         agent_id: payload.agent_id.to_string(),
@@ -6285,9 +6495,9 @@ fn payload_to_allocate_result(payload: &LaunchPayload) -> crate::agent_worktree:
                     .unwrap_or_else(|| crate::agent_worktree::remote_agent_ref(&w.branch)),
             })
             .collect(),
-        token: payload.jwt.clone(),
-        token_jti: uuid::Uuid::nil(), // bookkeeping only; maybe_refresh sends the bearer, not the jti
-        token_exp: payload.jwt_exp,
+        token: credential.token.clone(),
+        token_jti: credential.jti, // bookkeeping only; maybe_refresh sends the bearer, not the jti
+        token_exp: credential.exp,
         active_claims: Vec::new(), // unread by either daemon
     }
 }
@@ -6431,6 +6641,48 @@ async fn run_agent_subprocess(
     }
     let pinned_config_dir = pinned_account.as_ref().map(|a| a.config_dir.clone());
 
+    // Step 0b: mint this agent's credential against coord's credential door —
+    // BEFORE materializing anything, so a refused credential costs no
+    // worktrees, and before the token slot below is registered, so nothing
+    // ever runs on an empty or frame-supplied token. A refusal is reported as
+    // a `spawn-failed` in the `blocked` phase (no child ever existed) and the
+    // launch is skipped; a credential-less agent is never launched.
+    let credential = {
+        let answer = match connected_coord_base() {
+            Some(base) => fetch_agent_credential(&base, agent_id).await,
+            None => CredentialDoorAnswer::Unreachable("no connected coord base".to_string()),
+        };
+        match decide_agent_credential(answer, &payload.jwt, payload.jwt_exp) {
+            CredentialDecision::Launch {
+                credential,
+                source: CredentialSource::Door,
+            } => credential,
+            CredentialDecision::Launch {
+                credential,
+                source: CredentialSource::FrameFallback,
+            } => {
+                warn!(
+                    "agent_runtime: agent_id={agent_id}: coord predates the credential door; \
+                     using the frame credential"
+                );
+                credential
+            }
+            CredentialDecision::Refuse { reason } => {
+                warn!("agent_runtime: agent_id={agent_id} NOT launched — {reason}");
+                report_spawn_failed_in_phase(
+                    agent_id,
+                    &reason,
+                    None,
+                    0,
+                    primary_push_ref.as_deref(),
+                    SpawnPhase::Blocked,
+                )
+                .await;
+                return Err(anyhow::anyhow!(reason));
+            }
+        }
+    };
+
     // Step 1: materialize worktrees.
     if let Err(e) = materialize_worktrees(&payload).await {
         report_spawn_failed(
@@ -6452,7 +6704,7 @@ async fn run_agent_subprocess(
         .clone();
 
     // Write .mcp.json so the spawned claude process auto-discovers the coord MCP
-    // server. Agent-spawns carry a coord-minted agent JWT with a ~4h TTL, and
+    // server. The agent runs under a coord-minted agent JWT with a ~4h TTL, and
     // Claude Code's MCP client reads `.mcp.json` exactly once at connect — a
     // STATIC baked bearer silently dies at expiry (the bug this fixes). Instead
     // we register the agent's JWT in a process-global live-token slot and write
@@ -6468,13 +6720,13 @@ async fn run_agent_subprocess(
     let coord_mcp;
     {
         let slot = std::sync::Arc::new(tokio::sync::RwLock::new(crate::agent_token::TokenSlot {
-            token: payload.jwt.clone(),
-            jti: uuid::Uuid::nil(),
+            token: credential.token.clone(),
+            jti: credential.jti,
             // The REAL JWT is untouched (still ~4h valid); only the bookkeeping
             // `exp` is clamped here. In debug / `test-fixtures` builds a test can
             // compress it via QONTINUI_AGENT_JWT_EXP_COMPRESS_SECS so the refresh
-            // boundary fires in seconds. In release this is always `payload.jwt_exp`.
-            exp: compressed_jwt_exp(payload.jwt_exp),
+            // boundary fires in seconds. In release this is always `credential.exp`.
+            exp: compressed_jwt_exp(credential.exp),
             ..Default::default()
         }));
         crate::coord_mcp::register_agent_token(payload.agent_id, slot.clone());
@@ -6515,19 +6767,18 @@ async fn run_agent_subprocess(
         // Wire the per-agent durability (agent_pusher) + observability (dirty_poller)
         // daemons onto the SAME refreshing token slot registered in AGENT_TOKENS, so
         // the proxy, heartbeat, pusher, and poller all read one slot (single-slot
-        // invariant — agent_token/mod.rs:1). Best-effort: skipped without a JWT or a
-        // configured coord base (dev/no-coord), and each daemon self-skips when it has
-        // no work (no push targets / no worktrees).
-        if !payload.jwt.is_empty() {
-            if let Some(base) = connected_coord_base() {
-                let allocate = payload_to_allocate_result(&payload);
-                crate::agent_daemons::spawn_for_agent_with_token(
-                    &allocate,
-                    base,
-                    payload.target_device_id,
-                    slot.clone(),
-                );
-            }
+        // invariant — agent_token/mod.rs:1). A credential is guaranteed here —
+        // Step 0b refused the launch otherwise — so the daemons spawn iff a coord
+        // base is configured (dev/no-coord skips), and each daemon self-skips
+        // when it has no work (no push targets / no worktrees).
+        if let Some(base) = connected_coord_base() {
+            let allocate = payload_to_allocate_result(&payload, &credential);
+            crate::agent_daemons::spawn_for_agent_with_token(
+                &allocate,
+                base,
+                payload.target_device_id,
+                slot.clone(),
+            );
         }
     }
 
@@ -9290,57 +9541,6 @@ mod tests {
         focus_existing_continuation("term-headless-noop");
     }
 
-    #[test]
-    fn build_coord_ws_url_appends_ws_to_bare_host() {
-        // A bare host URL (no `/ws`) gets `/ws` appended, scheme swapped.
-        let device = uuid::Uuid::nil();
-        assert_eq!(
-            build_coord_ws_url("http://localhost:9870", device),
-            format!("ws://localhost:9870/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-        assert_eq!(
-            build_coord_ws_url("https://coord.qontinui.io", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-    }
-
-    #[test]
-    fn build_coord_ws_url_does_not_double_append_ws() {
-        // The shipped `dev`/`production` profiles' coord_url ALREADY ends in
-        // `/ws` (see bin/qontinui_profile.rs). Must produce a single `/ws`,
-        // not `/ws/ws` (which 401s at the ALB and blocks the subscribe loop).
-        let device = uuid::Uuid::nil();
-        assert_eq!(
-            build_coord_ws_url("wss://coord.qontinui.io/ws", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-        assert_eq!(
-            build_coord_ws_url("ws://localhost:9870/ws", device),
-            format!("ws://localhost:9870/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-        // https→wss conversion preserved on an already-`/ws` https base.
-        assert_eq!(
-            build_coord_ws_url("https://coord.qontinui.io/ws", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-    }
-
-    #[test]
-    fn build_coord_ws_url_normalizes_trailing_slash_after_ws() {
-        // A `…/ws/` input (trailing slash) is normalized to a single `/ws`,
-        // not `/ws/ws` and not `/ws/`.
-        let device = uuid::Uuid::nil();
-        assert_eq!(
-            build_coord_ws_url("wss://coord.qontinui.io/ws/", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-        // A bare host with a trailing slash still gets exactly one `/ws`.
-        assert_eq!(
-            build_coord_ws_url("https://coord.qontinui.io/", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}")
-        );
-    }
-
     /// REGRESSION (P2a review #2): the spawn gate and the WS resolver must
     /// read the SAME fact.
     ///
@@ -9362,7 +9562,6 @@ mod tests {
         let amb = crate::test_env::isolated_ambient();
         amb.write_settings_json(r#"{"tier":"qontinui_account"}"#);
 
-        let device = uuid::Uuid::nil();
         // Which arm the base resolves through, read BEFORE the asserted read;
         // each failure message adds a second read taken at failure. See
         // `crate::test_env::coord_base_diagnostic`.
@@ -9376,10 +9575,8 @@ mod tests {
         );
         // …so the resolver behind it must agree, and produce exactly one `/ws`.
         assert_eq!(
-            coord_ws_url(device),
-            Some(format!(
-                "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
-            )),
+            coord_ws_url(),
+            Some("wss://coord.qontinui.io/ws?subscribe=device".to_string()),
             "gate and WS resolver disagreed — the respawn-loop regression\n  before: {before}\n  \
              at failure: {}",
             crate::test_env::coord_base_diagnostic()
@@ -9411,7 +9608,7 @@ mod tests {
                 crate::test_env::coord_base_diagnostic()
             );
             assert_eq!(
-                coord_ws_url(uuid::Uuid::nil()),
+                coord_ws_url(),
                 None,
                 "settings {settings:?} must not open a prod WS subscription\n  before: {before}\n  \
                  at failure: {}",
@@ -9425,7 +9622,7 @@ mod tests {
     /// `2026-09-03-runner-tests-read-ambient-machine-state`).
     ///
     /// `coord_ws_url` is `connected_coord_base()` followed by
-    /// `build_coord_ws_url`, and `connected_coord_base_from` is that gate with
+    /// `coord_ws::build_ws_url`, and `connected_coord_base_from` is that gate with
     /// the `(resolved base, configured source, tier)` reading injected —
     /// `apply_tier_policy` then `classify_connected`. So every tier arm,
     /// including the unreadable-settings one that must NOT dial production
@@ -9433,17 +9630,15 @@ mod tests {
     /// asserted here with no `set_var` and no file at all.
     #[test]
     fn coord_ws_url_agrees_with_the_gate_over_every_tier() {
+        use qontinui_runner_lib::coord_ws::{build_ws_url, Subscription};
         use qontinui_runner_lib::profiles::{
             connected_coord_base_from, CoordBase, CoordBaseSource, TierRead, PROD_COORD_BASE,
             QONTINUI_ACCOUNT_TIER,
         };
-        let device = uuid::Uuid::nil();
         let cases: [(TierRead, Option<String>); 5] = [
             (
                 TierRead::Known(QONTINUI_ACCOUNT_TIER.into()),
-                Some(format!(
-                    "wss://coord.qontinui.io/ws?pattern=events.agent.spawn_requested.{device}"
-                )),
+                Some("wss://coord.qontinui.io/ws?subscribe=device".to_string()),
             ),
             // Non-hosted: isolated — no dev-localhost guess leaks through.
             (TierRead::Known("local".into()), None),
@@ -9454,7 +9649,9 @@ mod tests {
         ];
         for (tier, expected) in cases {
             let gate = connected_coord_base_from(CoordBase::Unset, None, &tier);
-            let ws = gate.as_deref().map(|base| build_coord_ws_url(base, device));
+            let ws = gate
+                .as_deref()
+                .map(|base| build_ws_url(base, Subscription::Device));
             assert_eq!(
                 gate.is_some(),
                 ws.is_some(),
@@ -9484,23 +9681,178 @@ mod tests {
                 "tier {tier:?}"
             );
             assert_eq!(
-                gate.as_deref().map(|b| build_coord_ws_url(b, device)),
-                Some(format!(
-                    "wss://coord.example/ws?pattern=events.agent.spawn_requested.{device}"
-                ))
+                gate.as_deref().map(|b| build_ws_url(b, Subscription::Device)),
+                Some("wss://coord.example/ws?subscribe=device".to_string())
             );
         }
     }
 
+    // ---- credential-on-fetch (plan 2026-09-13 …ws-firehose Phase 3) ------
+
+    fn minted(token: &str) -> CredentialDoorAnswer {
+        CredentialDoorAnswer::Minted {
+            token: token.to_string(),
+            exp: 1_800_000_000,
+            jti: Some(uuid::Uuid::from_u128(7)),
+        }
+    }
+
+    fn refused(status: u16, body: &str) -> CredentialDoorAnswer {
+        CredentialDoorAnswer::Refused {
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    fn refuse_reason(d: CredentialDecision) -> String {
+        match d {
+            CredentialDecision::Refuse { reason } => reason,
+            other => panic!("expected Refuse, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn build_coord_ws_url_preserves_already_ws_scheme() {
-        // An already-`ws://`/`wss://` base keeps its scheme (no http prefix to
-        // swap) and is not double-appended.
-        let device = uuid::Uuid::nil();
+    fn credential_door_200_launches_on_the_door_token_and_ignores_the_frame() {
+        // The frame still carries a legacy jwt; the DOOR's wins.
+        let d = decide_agent_credential(minted("door.tok.en"), "frame.tok.en", 1);
         assert_eq!(
-            build_coord_ws_url("ws://h:9870/ws", device),
-            format!("ws://h:9870/ws?pattern=events.agent.spawn_requested.{device}")
+            d,
+            CredentialDecision::Launch {
+                credential: AgentCredential {
+                    token: "door.tok.en".to_string(),
+                    exp: 1_800_000_000,
+                    jti: uuid::Uuid::from_u128(7),
+                },
+                source: CredentialSource::Door,
+            }
         );
+    }
+
+    #[test]
+    fn credential_door_200_with_missing_jti_is_nil_bookkeeping() {
+        let d = decide_agent_credential(
+            CredentialDoorAnswer::Minted {
+                token: "t.o.k".to_string(),
+                exp: 5,
+                jti: None,
+            },
+            "",
+            0,
+        );
+        match d {
+            CredentialDecision::Launch { credential, .. } => {
+                assert_eq!(credential.jti, uuid::Uuid::nil());
+                assert_eq!(credential.exp, 5);
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn credential_door_200_with_empty_token_refuses() {
+        let reason = refuse_reason(decide_agent_credential(minted(""), "frame.tok.en", 1));
+        assert!(reason.contains("empty token"), "{reason}");
+    }
+
+    /// ROLLOUT FALLBACK: a bare 404 (old coord, no such route) with a frame
+    /// jwt launches on the FRAME credential. Deleted with `LaunchPayload::jwt`.
+    #[test]
+    fn credential_door_bare_404_with_frame_jwt_falls_back_to_the_frame() {
+        let d = decide_agent_credential(refused(404, ""), "frame.tok.en", 1_700_000_000);
+        assert_eq!(
+            d,
+            CredentialDecision::Launch {
+                credential: AgentCredential {
+                    token: "frame.tok.en".to_string(),
+                    exp: 1_700_000_000,
+                    jti: uuid::Uuid::nil(),
+                },
+                source: CredentialSource::FrameFallback,
+            }
+        );
+        // An axum-style 404 with a non-JSON body is the same old-coord shape.
+        let d = decide_agent_credential(refused(404, "Not Found"), "frame.tok.en", 1);
+        assert!(matches!(
+            d,
+            CredentialDecision::Launch {
+                source: CredentialSource::FrameFallback,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn credential_door_bare_404_with_empty_frame_jwt_refuses() {
+        let reason = refuse_reason(decide_agent_credential(refused(404, ""), "", 0));
+        assert!(reason.contains("404"), "{reason}");
+        assert!(reason.contains("no credential"), "{reason}");
+    }
+
+    /// A NEW coord's typed 404 means the door exists and the agent does not:
+    /// never the fallback, even with a frame jwt present.
+    #[test]
+    fn credential_door_typed_404_agent_not_found_never_falls_back() {
+        let reason = refuse_reason(decide_agent_credential(
+            refused(404, r#"{"error":"agent_not_found"}"#),
+            "frame.tok.en",
+            1,
+        ));
+        assert!(reason.contains("agent_not_found"), "{reason}");
+    }
+
+    #[test]
+    fn credential_door_403_409_503_401_refuse_naming_status_and_code() {
+        for (status, code) in [
+            (403, "device_mismatch"),
+            (409, "already_credentialed"),
+            (503, "schema_migration_pending"),
+            (401, "unauthorized"),
+        ] {
+            let body = format!(r#"{{"error":"{code}"}}"#);
+            // A frame jwt present must NOT rescue any of these.
+            let reason = refuse_reason(decide_agent_credential(
+                refused(status, &body),
+                "frame.tok.en",
+                1,
+            ));
+            assert!(reason.contains(&format!("status={status}")), "{reason}");
+            assert!(reason.contains(&format!("error={code}")), "{reason}");
+        }
+    }
+
+    #[test]
+    fn credential_door_refusal_without_json_body_names_none() {
+        let reason = refuse_reason(decide_agent_credential(refused(502, "<html>"), "x", 1));
+        assert!(reason.contains("status=502"), "{reason}");
+        assert!(reason.contains("error=<none>"), "{reason}");
+    }
+
+    #[test]
+    fn credential_door_unreachable_refuses_even_with_a_frame_jwt() {
+        let reason = refuse_reason(decide_agent_credential(
+            CredentialDoorAnswer::Unreachable("transport: connection reset".to_string()),
+            "frame.tok.en",
+            1,
+        ));
+        assert!(reason.contains("unreachable"), "{reason}");
+        assert!(reason.contains("connection reset"), "{reason}");
+    }
+
+    /// The follow-up coord stops publishing `jwt`/`jwt_exp`; a frame without
+    /// them must still parse (they default to empty / 0, which the decision
+    /// function treats as "no frame credential").
+    #[test]
+    fn launch_payload_without_jwt_fields_parses_with_empty_defaults() {
+        let body = serde_json::json!({
+            "agent_id": uuid::Uuid::nil(),
+            "target_device_id": uuid::Uuid::nil(),
+            "worktrees": [],
+            "initial_prompt": "go",
+            "claim_token": "agent:00000000-0000-0000-0000-000000000000",
+        });
+        let payload: LaunchPayload = serde_json::from_value(body).unwrap();
+        assert_eq!(payload.jwt, "");
+        assert_eq!(payload.jwt_exp, 0);
     }
 
     #[test]

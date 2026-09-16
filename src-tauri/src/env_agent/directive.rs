@@ -6,9 +6,12 @@
 //! so the drift view populates without waiting for the periodic tick.
 //!
 //! This is a SECOND, independent coord `/ws` subscription — coord's bridge is
-//! one-pattern-per-connection (`coord/src/ws.rs` does a single `PSUBSCRIBE`), so
-//! the enroll directive rides its own connection, fully isolated from the
-//! critical agent-spawn subscriber in `agent_runtime.rs`. Enroll is a
+//! one-subscription-per-connection (`coord/src/ws.rs`), so the enroll
+//! directive rides its own connection, fully isolated from the critical
+//! agent-spawn subscriber in `agent_runtime.rs`. The subscription is the
+//! closed-set name `device_devenv` (`crate::coord_ws::Subscription::DeviceDevenv`),
+//! which coord resolves server-side to `events.devenv.*.<device_id>` for the
+//! device of the credential presented at upgrade. Enroll is a
 //! deterministic HTTP call — it needs no agent runtime, so a full
 //! `/agents/spawn` coding agent would be overkill (see the plan's OQ#1).
 //!
@@ -228,51 +231,37 @@ pub async fn handle_enroll_directive(directive: EnrollDirective) {
     }
 }
 
-/// The Redis glob this subscriber PSUBSCRIBEs with: every devenv directive
-/// addressed to THIS device.
+/// The Redis glob coord resolves the `device_devenv` subscription to: every
+/// devenv directive addressed to THIS device. Coord derives it from the
+/// upgrade credential's device_id; this mirror exists so the test below can
+/// pin that BOTH directive channels sit under the one glob.
 ///
-/// coord's `/ws` bridge is one-pattern-per-connection (`coord/src/ws.rs` does a
-/// single `PSUBSCRIBE`), so a second directive kind needs either a second socket
-/// or a wider pattern. The wider pattern is correct here rather than merely
-/// cheaper: both directives are device-scoped, both are consumed by THIS module,
-/// and a second connection would double the reconnect/backoff machinery for no
-/// isolation benefit — the isolation that matters is from the agent-spawn
-/// subscriber, which still has its own connection.
+/// coord's `/ws` bridge is one-subscription-per-connection, so a second
+/// directive kind needs either a second socket or a wider glob. The wider glob
+/// is correct here rather than merely cheaper: both directives are
+/// device-scoped, both are consumed by THIS module, and a second connection
+/// would double the reconnect/backoff machinery for no isolation benefit — the
+/// isolation that matters is from the agent-spawn subscriber, which still has
+/// its own connection.
 ///
 /// Widening is safe because **every parser matches the channel EXACTLY**
-/// (`parse_enroll_envelope`, `parse_repos_apply_envelope`). A frame this glob
+/// (`parse_enroll_envelope`, `parse_repos_apply_envelope`). A frame the glob
 /// admits but no parser claims is ignored, exactly as a foreign frame already
 /// was — so a wider net can add ignored frames, never misrouted ones.
+#[cfg(test)]
 fn devenv_directive_pattern(device_id: uuid::Uuid) -> String {
     format!("events.devenv.*.{device_id}")
 }
 
-/// Build the coord `/ws` subscription URL for this device's devenv directive
-/// channels. Mirrors `agent_runtime::build_coord_ws_url` (scheme swap +
-/// idempotent `/ws` append). Pure — unit-tested without profile state.
-fn build_enroll_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
-    let base = coord_url.trim().trim_end_matches('/');
-    let ws_base = base
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .or_else(|| {
-            base.strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-        })
-        .unwrap_or_else(|| base.to_string());
-    let ws_base = if ws_base.ends_with("/ws") {
-        ws_base
-    } else {
-        format!("{ws_base}/ws")
-    };
-    format!("{ws_base}?pattern={}", devenv_directive_pattern(device_id))
-}
-
 /// Resolve the coord WS URL from the active profile's `coord_url`. `None` when
-/// there's no profile or no `coord_url`.
-fn enroll_ws_url(device_id: uuid::Uuid) -> Option<String> {
+/// there's no profile or no `coord_url`. The device is not part of the URL:
+/// coord resolves the `device_devenv` subscription from the upgrade credential.
+fn enroll_ws_url() -> Option<String> {
     let coord_url = crate::profiles::load_strict().ok()?.coord_url?;
-    Some(build_enroll_ws_url(&coord_url, device_id))
+    Some(crate::coord_ws::build_ws_url(
+        &coord_url,
+        crate::coord_ws::Subscription::DeviceDevenv,
+    ))
 }
 
 /// This machine's coord device_id (uuid) from `~/.qontinui/machine.json`, reusing
@@ -295,7 +284,7 @@ pub fn spawn_enroll_directive_subscriber() {
             return;
         }
     };
-    let ws_url = match enroll_ws_url(device_id) {
+    let ws_url = match enroll_ws_url() {
         Some(u) => u,
         None => {
             info!(
@@ -330,7 +319,7 @@ async fn connect_and_pump(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Result
     use tokio::time::MissedTickBehavior;
     use tokio_tungstenite::tungstenite::Message;
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
+    let mut ws = crate::coord_ws::connect(ws_url, "env_agent::directive").await?;
     info!("env_agent::directive: WS connected for device_id={device_id}");
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
@@ -383,20 +372,22 @@ mod tests {
         uuid::Uuid::parse_str("c79a07d5-7e40-49b4-87fa-554c749f9644").unwrap()
     }
 
+    /// The lane subscribes under the closed-set name coord maps to the devenv
+    /// glob — never a caller-supplied `?pattern=`.
     #[test]
-    fn build_ws_url_swaps_scheme_and_appends_pattern() {
-        let url = build_enroll_ws_url("https://coord.qontinui.io", dev());
-        assert_eq!(
-            url,
-            "wss://coord.qontinui.io/ws?pattern=events.devenv.*.c79a07d5-7e40-49b4-87fa-554c749f9644"
+    fn enroll_lane_subscribes_as_device_devenv() {
+        let url = crate::coord_ws::build_ws_url(
+            "https://coord.qontinui.io",
+            crate::coord_ws::Subscription::DeviceDevenv,
         );
-        assert!(build_enroll_ws_url("http://localhost:8080", dev())
-            .starts_with("ws://localhost:8080/ws?pattern="));
+        assert_eq!(url, "wss://coord.qontinui.io/ws?subscribe=device_devenv");
+        assert!(!url.contains("pattern="));
     }
 
-    /// The one PSUBSCRIBE must admit BOTH directive channels for this device —
-    /// coord's bridge is one-pattern-per-connection, so a pattern that only
-    /// covered enroll would make every repos-apply directive vanish silently.
+    /// The one glob coord resolves `device_devenv` to must admit BOTH directive
+    /// channels for this device — coord's bridge is one-subscription-per-
+    /// connection, so a glob that only covered enroll would make every
+    /// repos-apply directive vanish silently.
     #[test]
     fn the_subscription_pattern_admits_both_directive_channels() {
         let pat = devenv_directive_pattern(dev());
@@ -411,14 +402,6 @@ mod tests {
                 "{ch} must be admitted by {pat}"
             );
         }
-    }
-
-    #[test]
-    fn build_ws_url_is_idempotent_on_trailing_ws() {
-        // Shipped profiles' coord_url already ends in /ws — don't double-append.
-        let url = build_enroll_ws_url("wss://coord.qontinui.io/ws", dev());
-        assert!(url.starts_with("wss://coord.qontinui.io/ws?pattern="));
-        assert!(!url.contains("/ws/ws"));
     }
 
     #[test]

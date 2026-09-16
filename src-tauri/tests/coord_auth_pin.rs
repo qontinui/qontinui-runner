@@ -803,7 +803,7 @@ const TENANT_SCOPE_KINDS: &[(&str, &str)] = &[
 /// gone from this table.
 const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
     ("agent_runtime.rs", "device", 5),
-    ("agent_runtime.rs", "session-noop", 5),
+    ("agent_runtime.rs", "session-noop", 6),
     ("agent_worktree/edit_effect_loop.rs", "session-noop", 1),
     ("agent_worktree/fs_backstop.rs", "work-owed", 1),
     ("claude_session/spawn_preconditions.rs", "device", 1),
@@ -886,7 +886,7 @@ const EXPECTED_TENANT_SCOPES: &[(&str, &str, usize)] = &[
 /// tenant, this site moves with it. So `work-owed` 16 -> 17.
 const EXPECTED_TENANT_SCOPE_TOTALS: &[(&str, usize)] = &[
     ("device", 21),
-    ("session-noop", 9),
+    ("session-noop", 10),
     ("session-owed", 0),
     ("work-owed", 17),
     ("escalated", 2),
@@ -1043,8 +1043,8 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
         "every scanned defaulting call site should have been classified"
     );
     assert_eq!(
-        sites, 49,
-        "expected 49 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
+        sites, 50,
+        "expected 50 defaulting call sites — the Phase-2 census's 52 at ebbd3c70 minus the 12 \
          session-scoped ones Phase 5 moved onto the tenant-STATING seam (52 - 12 = 40), plus 1 \
          new work-owed defaulting call site (mcp/plan_library.rs's upstream_get_raw, the \
          body-export forward, which shares upstream_get's qontinui-web base and its \
@@ -1065,7 +1065,11 @@ fn every_defaulting_call_site_declares_its_tenant_scope() {
          same debt as current_status beside it); 47 to 48. Plan \
          2026-09-11-the-plan-corpus-scan-root-does-not-report-its-own-drift then added \
          plan_workunit_adapter/body_push.rs::report_scan_root (work-owed, the same web base and \
-         the same debt as the artifact upsert beside it); 48 to 49. Found {sites}. A change here \
+         the same debt as the artifact upsert beside it); 48 to 49. Plan \
+         2026-09-13-coord-publishes-agent-jwts-on-a-redis-channel-fronted-by-an-unauthenticated-ws-firehose \
+         Phase 3 then added agent_runtime's credential-door fetch (fetch_agent_credential, \
+         session-noop: the path agent_id is the whole key and coord compares the bearer's \
+         device_id to the agent row); 49 to 50. Found {sites}. A change here \
          is fine — it just has \
          to be deliberate. It goes DOWN when a site adopts \
          `attach_device_auth_for(.., TenantScope)`, and UP only when someone adds a new \
