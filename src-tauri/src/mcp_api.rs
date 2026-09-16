@@ -7817,6 +7817,16 @@ struct ProvisionSessionBody {
     /// `coord_declare_intent`'s peer-overlap derivation is only meaningful if
     /// that workdir is the session's REAL cwd.
     cwd: String,
+    /// The tenant the session is FOR (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2).
+    /// Optional: absent, `null` or blank mints exactly as before the field
+    /// existed — the machine's pin. Present, it must be a tenant uuid this runner
+    /// holds a coord credential for, and the minted nonce is frozen to it, so
+    /// the session's coord-mcp writes land in THAT tenant instead of whichever
+    /// one the machine-global pin names. A tenant the runner cannot present is
+    /// refused, never silently swapped for the machine's.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 /// `POST /coord-mcp/provision-session` — mint coord device identity for a
@@ -7886,7 +7896,21 @@ struct ProvisionSessionBody {
 ///
 /// # Contract
 ///
-/// Request: `{"cwd": "<absolute path to an existing directory>"}`.
+/// Request: `{"cwd": "<absolute path to an existing directory>", "tenant_id": "<uuid>"}`,
+/// where `tenant_id` is optional (P2 of plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`). With it,
+/// the nonce is PINNED to that tenant exactly as the identity seam pins a
+/// spawn-picker tenant; without it, the machine's pin, as before.
+///
+/// **Security (named for review: content triggers 3 and 5).** `tenant_id` widens
+/// which credential slot a loopback caller that has ALREADY passed both gates can
+/// select — from "the machine's" to "any tenant this runner holds a credential
+/// for". It never widens past that set: the tenant is validated against the
+/// runner's own tenant slots plus the default binding
+/// ([`crate::coord_mcp::validate_spawn_tenant`]), the gate still runs FIRST, and
+/// coord re-validates the binding server-side on every forwarded request. The
+/// same operator could already obtain the same slot by spawning through the
+/// runner's picker, so no new principal gains a capability.
 ///
 /// `200` — body IS the `.mcp.json` document, verbatim and ready to write to a
 /// temp file and pass as `--mcp-config <path>`:
@@ -7917,6 +7941,9 @@ struct ProvisionSessionBody {
 /// |---|---|---|
 /// | 400 | `COORD_MCP_PROVISION_INVALID_BODY` | body is not `{cwd:String}` |
 /// | 400 | `COORD_MCP_PROVISION_INVALID_CWD` | `cwd` empty or not an existing dir |
+/// | 400 | `COORD_MCP_PROVISION_INVALID_TENANT` | `tenant_id` present but not a uuid |
+/// | 422 | `COORD_MCP_PROVISION_TENANT_NOT_PAIRED` | this runner holds no coord credential for `tenant_id` — nothing minted |
+/// | 503 | `COORD_MCP_PROVISION_TENANT_UNKNOWN` | the credential store could not be read, so whether `tenant_id` is paired is UNKNOWN — nothing minted |
 /// | 403 | `COORD_MCP_PROVISION_NO_HANDSHAKE` | no (or empty) `X-Qontinui-Loopback-Key` header |
 /// | 403 | `COORD_MCP_PROVISION_HANDSHAKE_MISMATCH` | handshake presented, not this runner start's key |
 /// | 403 | `COORD_MCP_PROVISION_NOT_OPTED_IN` | no opt-in marker on this machine |
@@ -7965,13 +7992,39 @@ async fn coord_provision_session_handler(
         );
     }
 
-    let req: ProvisionSessionBody = match serde_json::from_slice(&body) {
+    provision_session_after_gate(&body, crate::coord_mcp::resolve_bound_api_port())
+}
+
+/// Everything [`coord_provision_session_handler`] does once the caller has passed
+/// [`crate::coord_mcp::session_identity_gate`]: parse, validate, mint, answer.
+///
+/// Split out so the typed answers are testable without a runner start's
+/// loopback key; `bound_port` is injected for the same reason. **Never call it
+/// from anywhere that has not run the gate** — it is the mint.
+fn provision_session_after_gate(body: &[u8], bound_port: Option<u16>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let err = |status: axum::http::StatusCode, code: &str, msg: String| {
+        (
+            status,
+            Json(serde_json::json!({
+                "success": false,
+                "error": msg,
+                "code": code,
+            })),
+        )
+            .into_response()
+    };
+
+    let req: ProvisionSessionBody = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
             return err(
                 axum::http::StatusCode::BAD_REQUEST,
                 "COORD_MCP_PROVISION_INVALID_BODY",
-                format!("expected a JSON body of the shape {{\"cwd\": \"<path>\"}}: {e}"),
+                format!(
+                    "expected a JSON body of the shape {{\"cwd\": \"<path>\", \"tenant_id\": \"<uuid>\" (optional)}}: {e}"
+                ),
             );
         }
     };
@@ -7990,16 +8043,35 @@ async fn coord_provision_session_handler(
         );
     }
 
-    // The shared mint core (§2) — fail-closed on an unresolvable bound port.
-    match crate::coord_mcp::provision_session_proxy_config(cwd) {
-        Some(config) => {
+    // P2: a malformed tenant is refused, never dropped — dropping it would mint
+    // the machine's credential for a caller that asked for another tenant's.
+    let requested_tenant = match req.tenant_id.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => match uuid::Uuid::parse_str(raw) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                return err(
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "COORD_MCP_PROVISION_INVALID_TENANT",
+                    format!("tenant_id {raw:?} is not a tenant uuid: {e}"),
+                );
+            }
+        },
+    };
+    // The P1 kill switch covers this door too: one switch reverses the whole
+    // "a chosen tenant reaches the credential" behaviour.
+    let session_tenant = crate::coord_mcp::credential_spawn_tenant(requested_tenant);
+
+    match crate::coord_mcp::provision_session_proxy_config(cwd, session_tenant, bound_port) {
+        Ok(Some(config)) => {
             info!(
                 cwd = %cwd,
+                tenant = ?session_tenant,
                 "coord-mcp provision-session: minted an ephemeral device session config"
             );
             (axum::http::StatusCode::OK, Json(config)).into_response()
         }
-        None => {
+        Ok(None) => {
             warn!(
                 cwd = %cwd,
                 "coord-mcp provision-session: bound API port unresolvable — refusing to \
@@ -8014,6 +8086,39 @@ async fn coord_provision_session_handler(
                  runtime is up"
                     .to_string(),
             )
+        }
+        Err(refusal) => {
+            warn!(cwd = %cwd, "coord-mcp provision-session: refused — {refusal}");
+            use crate::coord_mcp::SpawnTenantRefusal;
+            match refusal {
+                SpawnTenantRefusal::NotPaired { tenant } => err(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "COORD_MCP_PROVISION_TENANT_NOT_PAIRED",
+                    format!(
+                        "this runner holds no coord credential for tenant {tenant}, so a session \
+                         provisioned for it would write to another tenant — nothing was minted. \
+                         To fix: {}, or omit tenant_id to take this machine's tenant",
+                        crate::coord_mcp::PAIR_DEVICE_FOR_TENANT_HINT
+                    ),
+                ),
+                SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error } => err(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "COORD_MCP_PROVISION_TENANT_UNKNOWN",
+                    format!(
+                        "could not read this runner's credential store ({error}), so whether it \
+                         holds a coord credential for tenant {tenant} is unknown — nothing was \
+                         minted rather than guessing"
+                    ),
+                ),
+                // The mint route never consults a cwd `.mcp.json` (it RETURNS a
+                // document rather than relying on one), so this arm is not
+                // produced here today; it is answered rather than panicked on.
+                SpawnTenantRefusal::WorkdirDeclaresOtherTenant { tenant, .. } => err(
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    "COORD_MCP_PROVISION_TENANT_REFUSED",
+                    format!("refused to mint a session credential for tenant {tenant}: {refusal}"),
+                ),
+            }
         }
     }
 }
@@ -15197,6 +15302,65 @@ mod coord_provision_session_gate_tests {
             "COORD_MCP_PROVISION_DISABLED",
             "the flag-off denial is deleted, not merely unused"
         );
+    }
+
+    /// P2 of plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`:
+    /// the typed answers of the post-gate half, which a caller that PASSED the
+    /// gate sees. (The pin itself is asserted in `coord_mcp`'s
+    /// `spawn_tenant_credential_tests`, where the registry is reachable.)
+    #[tokio::test]
+    async fn provision_session_tenant_answers_are_typed() {
+        let amb = crate::test_env::isolated_ambient();
+        let tenant_a = uuid::Uuid::from_u128(0xA1);
+        let tenant_b = uuid::Uuid::from_u128(0xB2);
+        amb.write_active_tenant_id(tenant_a);
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&tenant_b, "header.payload.signature")
+            .unwrap();
+        let cwd = amb.dir().join("p2-route");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.to_string_lossy().to_string();
+        let post = |body: serde_json::Value, port: Option<u16>| {
+            super::provision_session_after_gate(body.to_string().as_bytes(), port)
+        };
+
+        // A malformed tenant is a 400, never dropped into a machine-pin mint.
+        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": "not-a-uuid"}), Some(23_950));
+        assert_eq!(resp.status(), 400);
+        assert_eq!(body_json(resp).await["code"], "COORD_MCP_PROVISION_INVALID_TENANT");
+
+        // An unpaired tenant is a typed 422 naming the pairing heal.
+        let unpaired = uuid::Uuid::from_u128(0xC3);
+        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": unpaired}), Some(23_950));
+        assert_eq!(resp.status(), 422);
+        let v = body_json(resp).await;
+        assert_eq!(v["code"], "COORD_MCP_PROVISION_TENANT_NOT_PAIRED");
+        assert!(
+            v["error"].as_str().unwrap_or_default().contains("device pair --tenant-id"),
+            "{v}"
+        );
+
+        // A paired tenant mints the http document.
+        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": tenant_b}), Some(23_950));
+        assert_eq!(resp.status(), 200);
+        let doc = body_json(resp).await;
+        assert_eq!(
+            doc["mcpServers"]["coord-mcp"]["url"],
+            "http://127.0.0.1:23950/coord-mcp"
+        );
+
+        // `{cwd}` alone, `null` and blank are all "no tenant" — today's mint.
+        for body in [
+            serde_json::json!({"cwd": cwd}),
+            serde_json::json!({"cwd": cwd, "tenant_id": null}),
+            serde_json::json!({"cwd": cwd, "tenant_id": "  "}),
+        ] {
+            assert_eq!(post(body, Some(23_950)).status(), 200);
+        }
+        // ...and the unresolvable port keeps its 503 for a tenant-less body.
+        let resp = post(serde_json::json!({"cwd": cwd}), None);
+        assert_eq!(resp.status(), 503);
+        assert_eq!(body_json(resp).await["code"], "COORD_MCP_PROVISION_PORT_UNRESOLVABLE");
     }
 
     /// The two CSP rules a substring search gets wrong. Both were live defects
