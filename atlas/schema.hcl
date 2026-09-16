@@ -679,7 +679,10 @@ table "subtasks" {
   }
   // Phase 6 coord-gate association. `gate_id` is the coord gate that gates
   // this subtask's dispatch (CI-green / PR-merged / deploy-healthy); `gate_status`
-  // mirrors the last-polled coord verdict (open|cleared|failed). Both nullable —
+  // mirrors the last-polled coord verdict (open|cleared|failed) OR the
+  // runner-side typed block when the call produced no verdict at all
+  // (coord_unreachable = could not ask; coord_error = coord answered and
+  // refused the call). Both nullable —
   // a subtask without an observable external pre-condition carries neither. The
   // gate row is the DURABLE record a restart re-attaches to (no re-registration).
   column "gate_id" {

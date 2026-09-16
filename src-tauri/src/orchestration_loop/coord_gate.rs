@@ -30,8 +30,11 @@
 //!   we NEVER pass a tenant.
 //! - poll → `GET <coord>/coord/gates` (filtered, device-bearer attached), matched
 //!   client-side on `gate_id`. Coord's `resolve_operator_optional` resolves the
-//!   tenant from the bearer context. Any failure → [`GateStatus::Unknown`] so the
-//!   subtask simply stays blocked (best-effort, never wedges the run).
+//!   tenant from the bearer context. A gate coord has not listed yet →
+//!   [`GateStatus::Unknown`] (keep waiting); a transport failure or a non-2xx →
+//!   a TYPED [`CoordGateError`] the reconciler records on the subtask, so a
+//!   failing poll is visible per-subtask instead of being written back as a
+//!   coord verdict of `open`.
 //! - drift verdict → `POST <coord>/mcp` JSON-RPC `tools/call <twin tool>`, the
 //!   same tool the Digital-Twin Explorer's `GET /coord/twin/:subspace/verdict`
 //!   dispatches; we read the raw [`crate::twin_verdict`]-shaped `DriftVerdict`
@@ -134,9 +137,13 @@ pub const GATE_CLAIM_KIND: &str = "file_glob";
 // Gate status (coord verdict, normalized) + drift class
 // ============================================================================
 
-/// A coord gate's verdict as the reconciler treats it. `Unknown` collapses every
-/// best-effort failure mode (coord unreachable, parse failure, gate not yet
-/// found) into "keep waiting" so a coord outage NEVER fails a run.
+/// A coord gate's verdict as the reconciler treats it. `Unknown` is the one
+/// best-effort shape left: coord ANSWERED and the gate is not in the listing
+/// yet (eventual consistency / pagination), so "keep waiting" is true. Every
+/// way of NOT getting an answer — no credential, a dead transport, a non-2xx —
+/// is a typed [`CoordGateError`] instead, because collapsing those into
+/// `Unknown` wrote `gate_status = "open"` onto a row nobody had asked coord
+/// about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
     /// Gate is registered and its condition has not yet been met → stay blocked.
@@ -185,11 +192,34 @@ impl GateStatus {
 /// unreachable".
 pub const GATE_STATUS_COORD_UNREACHABLE: &str = "coord_unreachable";
 
-/// Typed failure of a coord gate call. The reconciler branches on the variant:
-/// [`Unreachable`](CoordGateError::Unreachable) is persisted on the subtask as
-/// [`GATE_STATUS_COORD_UNREACHABLE`] (a visible, stall-counted block);
-/// [`Failed`](CoordGateError::Failed) is logged and retried next tick with no
-/// row change, as before.
+/// The durable `orchestration.subtasks.gate_status` token for a subtask whose
+/// gate call REACHED coord and still failed — a credential coord chose to
+/// reject, a JSON-RPC error, a malformed payload, an unmapped drift sub-space.
+/// Coord is reachable, so [`GATE_STATUS_COORD_UNREACHABLE`] would be a lie (it
+/// points an operator at pairing); but the runner has no answer about this row
+/// either, so it is NOT the legitimate "coord is holding this gate open" wait.
+/// The two tokens are therefore treated identically by the reconciler — retried
+/// every tick, not counted as progress, and INCLUDED in the stall fingerprint —
+/// and differ only in what they tell the operator. A UI reads it per-subtask as
+/// "blocked: coord call failing".
+///
+/// Without it a permanently-failing register/poll was invisible: the retry
+/// counted as progress, the row was excluded from the fingerprint, and the run
+/// polled forever while `runs.status` read `running`.
+pub const GATE_STATUS_COORD_ERROR: &str = "coord_error";
+
+/// Every `gate_status` token meaning "the runner has no coord answer for this
+/// row". Not coord verdicts — `open`/`cleared`/`failed` are those.
+pub const GATE_STATUS_COORD_BLOCKS: [&str; 2] =
+    [GATE_STATUS_COORD_UNREACHABLE, GATE_STATUS_COORD_ERROR];
+
+/// Typed failure of a coord gate call. The reconciler branches on the variant,
+/// and BOTH are persisted on the subtask as a visible, stall-counted block:
+/// [`Unreachable`](CoordGateError::Unreachable) as
+/// [`GATE_STATUS_COORD_UNREACHABLE`], [`Failed`](CoordGateError::Failed) as
+/// [`GATE_STATUS_COORD_ERROR`]. The variant decides which sentence the operator
+/// reads ("pair this runner" vs "coord refused the call"), never whether the
+/// block is surfaced at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoordGateError {
     /// The runner cannot talk to coord: it holds no device JWT (unpaired), or
@@ -529,10 +559,11 @@ impl LiveCoordGateClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(CoordGateError::Failed(format!(
-                "coord_gate: tools/call {tool_name} → {status}: {}",
-                first_line(&text)
-            )));
+            return Err(classify_http_failure(
+                &format!("tools/call {tool_name}"),
+                status,
+                &text,
+            ));
         }
         let env: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             CoordGateError::Failed(format!("coord_gate: tools/call {tool_name} parse: {e}"))
@@ -570,6 +601,26 @@ fn extract_tool_payload(result: serde_json::Value) -> serde_json::Value {
         }
     }
     result
+}
+
+/// Classify a non-2xx coord HTTP response into the typed error the reconciler
+/// branches on.
+///
+/// `401`/`403` are [`CoordGateError::Unreachable`], not `Failed`: a device JWT
+/// lives about four hours, so an expired one mid-run is the LIKELY failure, and
+/// what it means operationally is exactly what an unpaired runner means — the
+/// runner cannot ask coord about this gate. `408`/`429` and every `5xx` are the
+/// same shape: coord returned no verdict the reconciler may act on. Everything
+/// else (a `404`, a `422`) is a genuine [`CoordGateError::Failed`] — coord
+/// understood the call and refused it.
+fn classify_http_failure(what: &str, status: reqwest::StatusCode, body: &str) -> CoordGateError {
+    let detail = format!("coord_gate: {what}: {status}: {}", first_line(body));
+    let code = status.as_u16();
+    if code == 401 || code == 403 || code == 408 || code == 429 || status.is_server_error() {
+        CoordGateError::Unreachable(detail)
+    } else {
+        CoordGateError::Failed(detail)
+    }
 }
 
 fn first_line(s: &str) -> String {
@@ -635,12 +686,13 @@ impl CoordGateClient for LiveCoordGateClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            // Best-effort: a poll that can't read coord → Unknown (keep waiting).
-            warn!(
-                "coord_gate: poll {gate_id} → {status}: {}",
-                first_line(&text)
-            );
-            return Ok(GateStatus::Unknown);
+            // NOT `Ok(Unknown)`: that persists as `gate_status = "open"`, a
+            // verdict coord never gave, and it CLEARS any typed block already on
+            // the row. A non-2xx is a typed failure the reconciler records per
+            // subtask (see `classify_http_failure`).
+            let err = classify_http_failure(&format!("poll {gate_id}"), status, &text);
+            warn!("coord_gate: {err}");
+            return Err(err);
         }
         let gates: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| CoordGateError::Failed(format!("coord_gate: poll parse: {e}")))?;
@@ -816,6 +868,45 @@ mod tests {
     }
 
     // --- status / drift parsing --------------------------------------------
+
+    /// A non-2xx coord answer is classified, not collapsed: the credential and
+    /// coord-side arms are `Unreachable` (the runner has no verdict it may act
+    /// on, exactly as with a dead transport), a refusal coord understood is
+    /// `Failed`. The 401 row is the one that matters — a device JWT lives about
+    /// four hours, so mid-run expiry is the likely failure, and it used to
+    /// persist `gate_status = "open"`.
+    #[test]
+    fn non_2xx_poll_is_typed_not_collapsed_into_open() {
+        use reqwest::StatusCode;
+        let cases = [
+            (StatusCode::UNAUTHORIZED, true),
+            (StatusCode::FORBIDDEN, true),
+            (StatusCode::REQUEST_TIMEOUT, true),
+            (StatusCode::TOO_MANY_REQUESTS, true),
+            (StatusCode::INTERNAL_SERVER_ERROR, true),
+            (StatusCode::BAD_GATEWAY, true),
+            (StatusCode::SERVICE_UNAVAILABLE, true),
+            (StatusCode::NOT_FOUND, false),
+            (StatusCode::UNPROCESSABLE_ENTITY, false),
+            (StatusCode::BAD_REQUEST, false),
+        ];
+        for (status, want_unreachable) in cases {
+            let e = classify_http_failure("poll gate-1", status, "{\"detail\":\"nope\"}\nrest");
+            assert_eq!(
+                e.is_unreachable(),
+                want_unreachable,
+                "{status} classified wrong: {e}"
+            );
+            assert!(
+                e.to_string().contains("gate-1") && e.to_string().contains(status.as_str()),
+                "the error names the call and the status: {e}"
+            );
+            assert!(
+                !e.to_string().contains("rest"),
+                "only the first body line is carried: {e}"
+            );
+        }
+    }
 
     #[test]
     fn gate_status_from_verdict() {
