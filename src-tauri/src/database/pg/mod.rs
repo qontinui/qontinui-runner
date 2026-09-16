@@ -312,15 +312,23 @@ pub const REHOMED_MACHINE_LOCAL_TABLES: [&str; 9] = [
 ///   `idx_tasks_plan` went with it (D2: stop creating, never `DROP` — an
 ///   existing database keeps its orphaned `plans`, `coordinator_leader` and
 ///   `coordinator_shadow_decisions` tables untouched).
-///   Two more indexes went the same way, for the same reason and under the
-///   same rule: `idx_tasks_plan_identity_hash` and, on `reviews`,
-///   `idx_reviews_pending_recommendations` — whose predicate WAS
-///   `list_pending_recommendations` verbatim. `create_emergent_task` is now
-///   the only writer of `project.tasks` and writes neither `identity_hash`
-///   nor `assignment_brief_extras`, and nothing writes `reviews.user_decision`
-///   any more, so both indexes could only ever be empty. The COLUMNS stay:
-///   they are the table's shape, and a fresh cluster whose `CREATE TABLE`
-///   omitted them would diverge structurally from every installed base.
+///   Two more indexes went the same way and under the same rule, but for
+///   DIFFERENT reasons — they are not one argument:
+///   - `idx_tasks_plan_identity_hash` is UNREACHABLE. It is partial on
+///     `WHERE identity_hash IS NOT NULL`, and `create_emergent_task` is now
+///     the only writer of `project.tasks` and writes neither `identity_hash`
+///     nor `assignment_brief_extras` — so nothing can ever satisfy the
+///     predicate and the index could only ever be empty.
+///   - `idx_reviews_pending_recommendations` is UNUSED, which is a different
+///     claim. Its predicate WAS `list_pending_recommendations` verbatim, and
+///     that query — its only reader — went with the board (a line above).
+///     Emptiness is NOT the reason and would be the wrong one: the predicate
+///     ends `AND user_decision IS NULL`, so a column nothing writes leaves
+///     every row matching, not none. An index with no reader is dead weight
+///     on every INSERT whether it is empty or full, which is why it goes.
+///   The COLUMNS stay: they are the table's shape, and a fresh cluster whose
+///   `CREATE TABLE` omitted them would diverge structurally from every
+///   installed base.
 /// - the other eight — the live shapes in `schema.pg.sql.generated`, checked
 ///   column by column against everything the owning `database/pg/*.rs`
 ///   module SELECTs, INSERTs or binds.

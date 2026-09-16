@@ -3,9 +3,14 @@
 //!
 //! Three endpoints, mounted at `mcp::reviews::routes()`:
 //!
-//! - `POST /reviews` — inserts a row and emits a `review-completed` Tauri
-//!   event. Written by the `/auto-review` reviewer agent. Rejects
-//!   self-review (reviewer == reviewed) with HTTP 409.
+//! - `POST /reviews` — inserts a row. Written by the `/auto-review` reviewer
+//!   agent. Rejects self-review (reviewer == reviewed) with HTTP 409. It used
+//!   to also emit a `review-completed` Tauri event; both subscribers
+//!   (`ReviewBadge`, `/coordinate` Rule D) went with the board in Phase 4 of
+//!   `2026-09-12-consolidate-local-orchestration-onto-conductor`, and an emit
+//!   kept for a subscriber that does not exist is speculative generality —
+//!   the row is already readable through the two GETs below, so a future
+//!   subscriber loses nothing by the emit going too.
 //! - `GET /reviews/recent?withinSeconds=N&limit=N` — recent reviews.
 //! - `GET /sessions/<id>/latest-review` — a session's most recent verdict.
 //!
@@ -27,8 +32,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::Emitter;
-use tracing::warn;
 
 use crate::database::pg::reviews::{InsertReviewError, InsertReviewInput, ReviewRow};
 use crate::mcp::types::ApiState;
@@ -112,24 +115,6 @@ async fn post_review(
             return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
         }
     };
-
-    // Emit the `review-completed` event. Both in-product subscribers
-    // (`ReviewBadge`, `/coordinate` Rule D) went in Phase 4 of
-    // `2026-09-12-consolidate-local-orchestration-onto-conductor`; the emit
-    // stays because the Tauri event bus is an open surface and the payload is
-    // the row a future subscriber would want.
-    let payload = serde_json::json!({
-        "id": row.id,
-        "taskId": row.task_id,
-        "reviewerSessionId": row.reviewer_session_id,
-        "reviewedSessionId": row.reviewed_session_id,
-        "verdict": row.verdict,
-        "confidence": row.confidence,
-        "createdAt": row.created_at,
-    });
-    if let Err(e) = state.app_handle.emit("review-completed", &payload) {
-        warn!("Failed to emit review-completed event: {}", e);
-    }
 
     Ok((
         StatusCode::CREATED,

@@ -119,8 +119,11 @@ Confidence-gated downstream behaviour (handled by the Coordinator):
 }
 ```
 
-The endpoint inserts the row and emits a `review-completed` Tauri event so the
-dashboard updates and the Coordinator's observe loop sees it.
+The endpoint inserts the row. It is a plain write — the `review-completed`
+Tauri event it used to emit went with its only two subscribers (the board's
+`ReviewBadge` and the Coordinator observe loop) in Phase 4 of
+`2026-09-12-consolidate-local-orchestration-onto-conductor`. Read the row back
+with `GET /reviews/recent` or `GET /sessions/<id>/latest-review`.
 
 ### 7. Report
 
