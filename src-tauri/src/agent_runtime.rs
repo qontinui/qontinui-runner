@@ -6593,11 +6593,15 @@ pub(crate) fn decide_agent_credential(
                 // restart: it fetched, died before `spawn-complete`, and coord
                 // re-dispatched the still-`spawning` row on reconnect — the mint
                 // is single-shot, so the second fetch is refused.
-                409 => " (this agent's single-shot credential was already minted — typically \
+                409 => {
+                    " (this agent's single-shot credential was already minted — typically \
                         by this runner before a restart, since coord re-dispatches \
-                        `spawning` rows on reconnect)",
-                403 => " (the agent belongs to a different device than this runner's \
-                        credential)",
+                        `spawning` rows on reconnect)"
+                }
+                403 => {
+                    " (the agent belongs to a different device than this runner's \
+                        credential)"
+                }
                 401 => " (this runner's device JWT was not accepted)",
                 _ => "",
             };
@@ -9898,7 +9902,8 @@ mod tests {
                 "tier {tier:?}"
             );
             assert_eq!(
-                gate.as_deref().map(|b| build_ws_url(b, Subscription::Device)),
+                gate.as_deref()
+                    .map(|b| build_ws_url(b, Subscription::Device)),
                 Some("wss://coord.example/ws?subscribe=device".to_string())
             );
         }
@@ -10220,8 +10225,14 @@ mod tests {
     #[test]
     fn credential_deferral_detail_is_bounded_and_sanitized() {
         // The sanitizer itself.
-        assert_eq!(sanitize_reason_detail("schema_migration_pending"), "schema_migration_pending");
-        assert_eq!(sanitize_reason_detail("a b/c\"d\\e:f\ng.h-i"), "a_b_c_d_e_f_g.h-i");
+        assert_eq!(
+            sanitize_reason_detail("schema_migration_pending"),
+            "schema_migration_pending"
+        );
+        assert_eq!(
+            sanitize_reason_detail("a b/c\"d\\e:f\ng.h-i"),
+            "a_b_c_d_e_f_g.h-i"
+        );
         assert_eq!(sanitize_reason_detail("é€x"), "__x");
         assert_eq!(sanitize_reason_detail(""), "");
         let long = "x".repeat(200);

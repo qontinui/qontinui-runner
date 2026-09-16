@@ -184,7 +184,10 @@ impl MaterializedSources {
     /// Record that a child for `source` has been started. Returns `true` when
     /// this is the first record (the set changed).
     pub(super) fn mark(&self, source: Uuid) -> bool {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).insert(source)
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(source)
     }
 }
 
@@ -441,7 +444,15 @@ async fn connect_and_pump(
     // On-connect catch-up: replay anything that landed while we were
     // offline. Best-effort — a failure here doesn't abort the pump (the push
     // path still works, and the next tick or reconnect retries it).
-    run_all_catchups(registry, lifecycle_store, http, coord_url, device_id, sources).await;
+    run_all_catchups(
+        registry,
+        lifecycle_store,
+        http,
+        coord_url,
+        device_id,
+        sources,
+    )
+    .await;
 
     // Periodic catch-up (module doc, point 3): bounds the delivery window on a
     // socket that is up but delivers nothing — the pre-`subscribe=` coord.
@@ -517,7 +528,15 @@ async fn run_all_catchups(
 ) {
     // The HANDOFF catch-up: the durable `handoff_request` event row in coord
     // is the source of truth; this GET drains it.
-    run_catchup(registry, lifecycle_store, http, coord_url, device_id, sources).await;
+    run_catchup(
+        registry,
+        lifecycle_store,
+        http,
+        coord_url,
+        device_id,
+        sources,
+    )
+    .await;
     // …and the RESPAWN catch-up, on its own coord route. Separate on purpose:
     // the handoff read filters `s.state <> 'closed'` (fatal for a respawn,
     // whose source is closed by construction) and `PendingHandoff` carries
@@ -556,7 +575,15 @@ async fn run_catchup(
                 );
             }
             for handoff in pending {
-                materialize_logged(registry, lifecycle_store, http, coord_url, sources, &handoff).await;
+                materialize_logged(
+                    registry,
+                    lifecycle_store,
+                    http,
+                    coord_url,
+                    sources,
+                    &handoff,
+                )
+                .await;
             }
         }
         Err(HandoffError::Status(401 | 403, _)) => {
@@ -614,7 +641,15 @@ async fn handle_push_frame(
         source = %handoff.source_session_id,
         "session handoff: push received; materializing"
     );
-    materialize_logged(registry, lifecycle_store, http, coord_url, sources, &handoff).await;
+    materialize_logged(
+        registry,
+        lifecycle_store,
+        http,
+        coord_url,
+        sources,
+        &handoff,
+    )
+    .await;
 }
 
 /// Pure parse+filter of a coord `/ws` envelope into a [`PendingHandoff`]
