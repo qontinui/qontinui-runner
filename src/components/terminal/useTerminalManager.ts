@@ -373,6 +373,63 @@ export function workerAdoptProbeDelayMs(misses: number): number {
   return Math.min(WORKER_ADOPT_PROBE_MAX_MS, WORKER_ADOPT_PROBE_BASE_MS * 3 ** Math.max(0, misses));
 }
 
+export interface WorkerProbeEntry {
+  at: number;
+  misses: number;
+}
+
+/**
+ * How long a probe entry outlives its last probe before being evicted. An
+ * entry is only ever DELETED on successful adoption, and every page's manager
+ * hears every AI session's events on the box — so without this a long-lived
+ * run page accumulated one entry per FOREIGN session it would never adopt,
+ * forever. Ten times the backoff ceiling: long enough that a live session's
+ * entry (refreshed every probe) is never evicted, short enough that a session
+ * which stopped talking stops costing memory.
+ */
+export const WORKER_PROBE_ENTRY_TTL_MS = WORKER_ADOPT_PROBE_MAX_MS * 10;
+
+/**
+ * Drop probe entries whose last probe is older than `ttlMs`. Mutates and
+ * returns the map (it is ref-held state). Pure enough to test.
+ *
+ * Evicting resets that id's backoff, which is harmless: the eviction can only
+ * fire for an id that has produced no event for `ttlMs`, and an id producing
+ * events keeps its `at` fresh.
+ */
+export function pruneWorkerProbes(
+  probes: Map<string, WorkerProbeEntry>,
+  now: number,
+  ttlMs: number = WORKER_PROBE_ENTRY_TTL_MS,
+): Map<string, WorkerProbeEntry> {
+  for (const [id, entry] of probes) {
+    if (now - entry.at > ttlMs) probes.delete(id);
+  }
+  return probes;
+}
+
+/**
+ * A worker view the operator closed on this page, kept so the close is
+ * REVERSIBLE. Closing a worker cell hides a view of a still-running worker;
+ * without a way back the operator had to restart the app to see it again,
+ * which is the opposite of the supervision this cell exists to provide.
+ */
+export interface HiddenWorker {
+  /** The tab id the view had (the worker's terminal id). */
+  tabId: string;
+  /** The worker's task run id, when the tab carried one. */
+  taskRunId: string | null;
+  /** The title the tab had, so the affordance can name it. */
+  title: string;
+  hiddenAtMs: number;
+  /**
+   * Set when an explicit "show" could not bring the worker back — its record
+   * is no longer listed open. The affordance says so rather than silently
+   * doing nothing.
+   */
+  restoreMissedAtMs?: number;
+}
+
 /**
  * Pure: reconcile the local tab list against the BACKEND's authoritative
  * terminal list for this page.
@@ -629,16 +686,27 @@ export function useTerminalManager(
   useEffect(() => {
     tabsRef.current = tabs;
   }, [tabs]);
-  const workerProbeRef = useRef<Map<string, { at: number; misses: number }>>(new Map());
+  const workerProbeRef = useRef<Map<string, WorkerProbeEntry>>(new Map());
   /**
    * Worker views the operator CLOSED on this page since it mounted. A closed
    * worker keeps streaming (`closeTerminal` never touches the worker itself),
    * so without this set the live-adoption probe below would re-add the tab
    * on its very next `ai-output` line and "close" would be a three-second
-   * hide. Held for the page's lifetime only: the next cold restore reads the
-   * still-open durable record and brings the view back, by design.
+   * hide.
+   *
+   * It is no longer write-only: every id in here is mirrored by a
+   * `hiddenWorkers` entry, and `restoreHiddenWorkers` clears it. That is the
+   * whole reversal — an automatic expiry (on the worker's next state
+   * transition, say) would restore exactly the three-second hide this set
+   * exists to prevent, so the way back is an EXPLICIT operator action.
    */
   const dismissedWorkerIdsRef = useRef<Set<string>>(new Set());
+  /** The same dismissals, as renderable state for the "show worker" chip. */
+  const [hiddenWorkers, setHiddenWorkers] = useState<HiddenWorker[]>([]);
+  const hiddenWorkersRef = useRef<HiddenWorker[]>(hiddenWorkers);
+  useEffect(() => {
+    hiddenWorkersRef.current = hiddenWorkers;
+  }, [hiddenWorkers]);
 
   /**
    * Live-adopt a Conductor worker the moment it starts talking. The restore
@@ -651,12 +719,16 @@ export function useTerminalManager(
    * treated as "no such worker".
    */
   const maybeAdoptWorker = useCallback(
-    async (taskRunId: string) => {
-      if (dismissedWorkerIdsRef.current.has(taskRunId)) return;
-      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return;
+    async (taskRunId: string): Promise<boolean> => {
+      if (dismissedWorkerIdsRef.current.has(taskRunId)) return false;
+      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return false;
       const now = Date.now();
+      // Bound the probe ledger: this manager hears EVERY AI session's events,
+      // not just its own workers', and an entry is otherwise only removed on
+      // a successful adoption that will never come for a foreign session.
+      pruneWorkerProbes(workerProbeRef.current, now);
       const probe = workerProbeRef.current.get(taskRunId) ?? { at: 0, misses: 0 };
-      if (now - probe.at < workerAdoptProbeDelayMs(probe.misses)) return;
+      if (now - probe.at < workerAdoptProbeDelayMs(probe.misses)) return false;
       workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses });
       let sessions: TerminalSessionRecord[] | undefined;
       try {
@@ -665,20 +737,71 @@ export function useTerminalManager(
       } catch (err) {
         // A failed read is not "no such worker": retry on the base cadence.
         logger.warn(`worker adoption probe for ${taskRunId} failed (will retry): ${err}`);
-        return;
+        return false;
       }
-      if (!Array.isArray(sessions)) return;
+      if (!Array.isArray(sessions)) return false;
       const rec = findWorkerRecord(sessions, taskRunId, pageId);
       if (!rec) {
         workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses + 1 });
-        return;
+        return false;
       }
       workerProbeRef.current.delete(taskRunId);
-      if (adoptWorkerTab(rec)) {
+      const tabId = adoptWorkerTab(rec);
+      if (tabId) {
         logger.info(`Adopted Conductor worker ${taskRunId} onto page ${pageId}`);
+        // The worker is on screen again, so it is no longer hidden — drop any
+        // "could not be re-opened" entry left over from a failed restore.
+        setHiddenWorkers((prev) =>
+          prev.some((w) => w.tabId === tabId || w.taskRunId === taskRunId)
+            ? prev.filter((w) => w.tabId !== tabId && w.taskRunId !== taskRunId)
+            : prev,
+        );
       }
+      return tabId !== null;
     },
     [pageId, adoptWorkerTab],
+  );
+
+  /**
+   * Bring closed worker views back. With no argument, all of them.
+   *
+   * Clears the dismissal, drops the probe throttle so the adoption read
+   * happens NOW rather than on the worker's next event (a quiet worker would
+   * otherwise stay invisible after an explicit "show"), and re-lists anything
+   * that could not be adopted with `restoreMissedAtMs` set — a click that
+   * silently does nothing is the failure this whole finding is about.
+   */
+  const restoreHiddenWorkers = useCallback(
+    async (tabIds?: readonly string[]) => {
+      const entries = hiddenWorkersRef.current.filter((w) => !tabIds || tabIds.includes(w.tabId));
+      if (entries.length === 0) return;
+      for (const w of entries) {
+        dismissedWorkerIdsRef.current.delete(w.tabId);
+        if (w.taskRunId) dismissedWorkerIdsRef.current.delete(w.taskRunId);
+        workerProbeRef.current.delete(w.taskRunId ?? w.tabId);
+      }
+      const restoring = new Set(entries.map((w) => w.tabId));
+      setHiddenWorkers((prev) => prev.filter((w) => !restoring.has(w.tabId)));
+      const outcomes = await Promise.all(
+        entries.map(async (w) => ({
+          worker: w,
+          adopted: await maybeAdoptWorker(w.taskRunId ?? w.tabId),
+        })),
+      );
+      const missed = outcomes
+        .filter((o) => !o.adopted)
+        .map((o) => ({ ...o.worker, restoreMissedAtMs: Date.now() }));
+      if (missed.length === 0) return;
+      // Note: the DISMISSAL stays cleared. If the miss was transient (a failed
+      // `terminal_session_list_open`, or a record not yet written), the live
+      // adoption probe brings the worker in on its next event and clears the
+      // entry above.
+      setHiddenWorkers((prev) => [
+        ...prev,
+        ...missed.filter((m) => !prev.some((p) => p.tabId === m.tabId)),
+      ]);
+    },
+    [maybeAdoptWorker],
   );
 
   useEffect(() => {
@@ -1272,6 +1395,17 @@ export function useTerminalManager(
     if (sessionBacked) {
       dismissedWorkerIdsRef.current.add(id);
       if (closingTab?.taskRunId) dismissedWorkerIdsRef.current.add(closingTab.taskRunId);
+      // Record it so the close is reversible (`restoreHiddenWorkers`) — see
+      // `HiddenWorker`. The worker keeps running either way.
+      const hidden: HiddenWorker = {
+        tabId: id,
+        taskRunId: closingTab?.taskRunId ?? null,
+        title: closingTab?.title ?? id,
+        hiddenAtMs: Date.now(),
+      };
+      setHiddenWorkers((prev) =>
+        prev.some((w) => w.tabId === id) ? prev : [...prev, hidden],
+      );
     }
     // Update React state immediately so the UI is responsive.
     // The Rust-side close (process kill + thread join) runs in the background.
@@ -1364,5 +1498,12 @@ export function useTerminalManager(
     markAsBypass,
     markAsRemote,
     adoptWorkerTab,
+    /**
+     * Worker views the operator closed on this page — the input to the
+     * "N hidden worker(s)" chip. Empty when none are hidden.
+     */
+    hiddenWorkers,
+    /** Bring hidden worker views back (all of them, or the named tab ids). */
+    restoreHiddenWorkers,
   };
 }
