@@ -2525,6 +2525,24 @@ pub struct CoordCredentialStatus {
     /// "expired since 03:54".
     pub since: i64,
     pub observed_at_unix: i64,
+    /// Does [`Self::tenant_id`] actually NAME the slot this posture is about?
+    ///
+    /// **`tenant_id: None` means two different things and a reader could not
+    /// tell them apart.** A slot candidate for the LEGACY default
+    /// (`access_token`) slot carries `None` because that slot has no tenant —
+    /// and it precisely describes the credential an UNPINNED session presents.
+    /// The unattributable orphan arm in [`derive_and_publish_posture`] also
+    /// carries `None`, but for the opposite reason: it deliberately withholds
+    /// the field because nothing in the pass describes which slot coord is
+    /// refusing (its own doc comment says so).
+    ///
+    /// Advisory readers never had to care — a banner says the same words
+    /// either way. The coord-mcp forwarder's per-request gate does: on the
+    /// first shape `None` is a MATCH against an unpinned session and refusing
+    /// is correct, on the second it is UNKNOWN and refusing would take out a
+    /// session whose own credential works. `true` on every slot-derived
+    /// publish, `false` only on the orphan arm.
+    pub attributable: bool,
 }
 
 impl CoordCredentialStatus {
@@ -2549,6 +2567,9 @@ impl CoordCredentialStatus {
             "lastRefreshOutcome": self.last_refresh_outcome,
             "since": self.since,
             "observedAtUnix": self.observed_at_unix,
+            // `false` = "we could not say WHICH slot", not "no tenant". A
+            // reader joining `tenantId` to a slot must check this first.
+            "attributable": self.attributable,
         })
     }
 }
@@ -2677,7 +2698,17 @@ pub(crate) fn publish_coord_credential_posture(
     // The signal for THIS slot, not a process-wide aggregate: `lastOkAt` /
     // `last401At` must describe the credential the posture is about.
     let signal = upstream_signal_for(tenant_id.as_deref());
-    publish_coord_credential_posture_with(posture, tenant_id, exp, last_refresh_outcome, signal)
+    // ATTRIBUTABLE: this entry point publishes a posture derived from a named
+    // slot. The one arm that cannot name a slot goes through
+    // `publish_coord_credential_posture_with` directly with `false`.
+    publish_coord_credential_posture_with(
+        posture,
+        tenant_id,
+        exp,
+        last_refresh_outcome,
+        signal,
+        true,
+    )
 }
 
 /// [`publish_coord_credential_posture`] with the slot's signal supplied by the
@@ -2692,6 +2723,7 @@ fn publish_coord_credential_posture_with(
     exp: Option<i64>,
     last_refresh_outcome: Option<String>,
     signal: UpstreamSignal,
+    attributable: bool,
 ) -> Option<PostureTransition> {
     let now = chrono::Utc::now().timestamp();
     // L1: a poisoned mutex must not turn `/health` — the endpoint whose job is
@@ -2714,6 +2746,7 @@ fn publish_coord_credential_posture_with(
         last_refresh_outcome,
         since,
         observed_at_unix: now,
+        attributable,
     });
     let transition = (previous != Some(posture)).then_some(PostureTransition {
         from: previous,
@@ -2882,6 +2915,15 @@ pub(crate) fn derive_and_publish_posture(
                     None,
                     None,
                     orphan_signal,
+                    // UNATTRIBUTABLE — and the field exists so a reader can
+                    // tell this `None` from the legacy default slot's `None`.
+                    // The coord-mcp forwarder's per-request gate refuses a
+                    // session only when the posture describes the slot THAT
+                    // session presents; without this flag it would read the
+                    // withheld `tenant_id` as "the legacy slot" and refuse
+                    // every unpinned session on a box where some OTHER,
+                    // unreadable slot is the one coord is refusing.
+                    false,
                 );
             }
             UnclaimedVerdict::StaleEvidence(orphan_key) => {
@@ -2912,6 +2954,11 @@ pub(crate) fn derive_and_publish_posture(
         worst.exp,
         worst.outcome.map(tenant_slot_outcome_token),
         worst.signal,
+        // ATTRIBUTABLE: `worst` is a real slot candidate (or the unserved
+        // pin), so `tenant_id` names the slot this posture is about —
+        // including when it is `None`, which is the LEGACY default slot and
+        // is exactly the credential an unpinned session presents.
+        true,
     )
 }
 
@@ -6292,6 +6339,7 @@ mod tenant_slot_refresh_tests {
             last_refresh_outcome: Some("kept-existing".into()),
             since: 7,
             observed_at_unix: 9,
+            attributable: true,
         };
         let v = status.to_json();
         assert_eq!(v["state"], "dark");
@@ -8332,6 +8380,7 @@ mod tenant_slot_refresh_tests {
                 last_refresh_outcome: None,
                 since: 1_700_000_000,
                 observed_at_unix: 1_700_000_050,
+                attributable: true,
             };
             let bag = coord_credential_bag(&fallback, Some(&status));
             assert_eq!(

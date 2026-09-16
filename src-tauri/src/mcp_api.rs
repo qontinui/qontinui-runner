@@ -5194,48 +5194,6 @@ async fn coord_mcp_proxy_handler(
             .into_response();
     }
 
-    // ---- Phase 3a: the proxy names the RUNNER's fault, not the caller's ----
-    //
-    // DD4 of plan `2026-09-12-runner-loads-with-an-expired-coord-credential-
-    // and-tells-nobody`. THE motivating incident: this proxy accepted every
-    // session's nonce and forwarded with a device JWT that had been dead since
-    // boot, so every session got coord's `token_expired` back — and every
-    // reader of that envelope (the MCP client, `/coord-revive`, and the
-    // incident's own first diagnosis) attributes `token_expired` to the NONCE.
-    // Sessions spent their recovery budget re-provisioning a key that was never
-    // broken. `/health`'s `canAnswer` already says this in words; this is the
-    // forwarder saying it in the actual response.
-    //
-    // PLACED HERE, before bearer selection, for two reasons. It is the earliest
-    // point at which the nonce, the principal and the requested method have all
-    // been vetted — so a bad nonce and a non-allowlisted method still get their
-    // own, more specific answers, which they deserve. And when the credential
-    // is known dead there is nothing for the bearer-selection arm below to
-    // find: it would kick the refresher and spend the bounded re-mint wait per
-    // request before failing anyway.
-    //
-    // Every non-refusal arm is in `runner_credential_local_refusal`, including
-    // the one that matters most: an UNKNOWN posture (no refresher pass has
-    // concluded yet) forwards exactly as before. UNKNOWN is not a fault.
-    if let Some((code, refusal)) = crate::coord_mcp::runner_credential_local_refusal(
-        &principal,
-        crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
-    ) {
-        warn!(
-            code,
-            "coord-mcp proxy: refusing LOCALLY — this runner's own coord credential cannot \
-             answer. The caller's nonce is fine and coord was not dialed."
-        );
-        // The rotation log's `upstream-reject` row for this class, carrying
-        // `cause=runner_credential_<posture>` so the join tells it apart from
-        // an evicted nonce. Detached: a 401 never waits on forensics.
-        crate::coord_mcp::spawn_log_proxy_runner_credential_rejected(
-            nonce.as_deref(),
-            format!("{code} — refused locally; the runner's own coord credential cannot answer, the nonce is live and coord was never dialed"),
-        );
-        return (axum::http::StatusCode::UNAUTHORIZED, Json(refusal)).into_response();
-    }
-
     // C3/M2: the tenant whose DEVICE slot supplied the bearer, hoisted out of
     // the `Device` arm so the upstream verdict below can be filed against the
     // right credential. Stays `None` for an AGENT principal, whose bearer is
@@ -5247,7 +5205,10 @@ async fn coord_mcp_proxy_handler(
     //  - Agent  → THAT agent's own refreshed JWT from its AGENT_TOKENS slot; a
     //    belt-and-suspenders `maybe_refresh` keeps it live on the request path
     //    too. An absent slot (torn-down / restarted agent) is a hard 401.
-    let bearer = match &principal {
+    // `mut` because the Phase 3a credential gate below may replace this with a
+    // credential it just proved usable, when the store contradicts a stale
+    // posture. The forward must then present the PROVED one, not the stale one.
+    let mut bearer = match &principal {
         crate::coord_mcp::ProxyPrincipal::Device => {
             // B3: select the bearer for the SESSION's tenant (frozen on the
             // nonce at provision time), NOT the legacy `access_token` slot.
@@ -5360,6 +5321,96 @@ async fn coord_mcp_proxy_handler(
             }
         }
     };
+
+    // ---- Phase 3a: the proxy names the RUNNER's fault, not the caller's ----
+    //
+    // DD4 of plan `2026-09-12-runner-loads-with-an-expired-coord-credential-
+    // and-tells-nobody`. THE motivating incident: this proxy accepted every
+    // session's nonce and forwarded with a device JWT that had been dead since
+    // boot, so every session got coord's `token_expired` back — and every
+    // reader of that envelope (the MCP client, `/coord-revive`, and the
+    // incident's own first diagnosis) attributes `token_expired` to the NONCE.
+    // Sessions spent their recovery budget re-provisioning a key that was never
+    // broken. `/health`'s `canAnswer` already says this in words; this is the
+    // forwarder saying it in the actual response.
+    //
+    // PLACED HERE — AFTER bearer selection, not before it — and both halves of
+    // that are load-bearing. `coord_credential_posture()` is an ADVISORY,
+    // AGGREGATED, INTENTIONALLY-STICKY report, and this phase turns it into a
+    // per-request authorization predicate; each of those three properties is a
+    // way for a HEALTHY credential to read dead, so each is answered here:
+    //
+    //  * AGGREGATED — the published posture is the WORST of every slot, with
+    //    that slot's tenant. The refusal needs `device_tenant`, which exists
+    //    only after `session_bearer_and_tenant_or_refuse` above has resolved
+    //    the session's pin. Refusing before it meant one dead tenant slot 401'd
+    //    every OTHER tenant's sessions, whose own bearers coord answers 200.
+    //  * STICKY / STALE — up to one 300 s refresher interval, and its
+    //    `StaleEvidence` arm republishes nothing at all, so the gate must ask
+    //    the credential store what it holds NOW rather than trust the cell.
+    //    That is `heal` below.
+    //  * ADVISORY — it never had to be right per request; now it does, so the
+    //    only refusals left are the ones a live read could not contradict.
+    //
+    // Sitting after the bearer arm also KEEPS the pre-existing graceful
+    // degrade: an empty slot still reaches `await_device_jwt_remint_for` and
+    // still answers the RETRYABLE `503 COORD_MCP_PROXY_CREDENTIAL_REFRESHING`,
+    // which is a strictly better answer than a non-retryable 401. The earlier
+    // placement returned before it and removed that heal outright.
+    //
+    // A bad nonce and a non-allowlisted method are still refused ABOVE this and
+    // keep their own, more specific answers.
+    if let Some((code, refusal, heal)) = crate::coord_mcp::runner_credential_local_refusal(
+        &principal,
+        device_tenant,
+        crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
+    ) {
+        // THE INVARIANT: a session whose own credential would have worked is
+        // never refused. The posture says this slot cannot answer; ask the
+        // store directly before acting on a reading up to five minutes old.
+        let healed = match heal {
+            crate::coord_mcp::RunnerCredentialHeal::Remint => {
+                crate::coord_mcp::await_device_jwt_remint_for(device_tenant).await
+            }
+            crate::coord_mcp::RunnerCredentialHeal::LocalReadOnly => {
+                crate::coord_mcp::read_usable_device_jwt_for(device_tenant).await
+            }
+            crate::coord_mcp::RunnerCredentialHeal::None => None,
+        };
+        match healed {
+            // The store CONTRADICTS the cell — an operator re-paired, or the
+            // refresher landed a credential since the last pass. Forward with
+            // the credential we just proved usable, not the one selected
+            // before the heal ran.
+            Some(fresh) if !fresh.trim().is_empty() => {
+                info!(
+                    code,
+                    ?heal,
+                    "coord-mcp proxy: the posture says this slot cannot answer, but the store \
+                     now holds a usable credential for it — forwarding rather than refusing"
+                );
+                bearer = Some(fresh);
+            }
+            _ => {
+                warn!(
+                    code,
+                    ?heal,
+                    "coord-mcp proxy: refusing LOCALLY — this runner's own coord credential \
+                     for THIS session's slot cannot answer. The caller's nonce is fine and \
+                     coord was not dialed."
+                );
+                // The rotation log's `upstream-reject` row for this class,
+                // carrying `cause=runner_credential_<posture>` so the join
+                // tells it apart from an evicted nonce. Detached: a 401 never
+                // waits on forensics.
+                crate::coord_mcp::spawn_log_proxy_runner_credential_rejected(
+                    nonce.as_deref(),
+                    format!("{code} — refused locally; the runner's own coord credential cannot answer, the nonce is live and coord was never dialed"),
+                );
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(refusal)).into_response();
+            }
+        }
+    }
 
     if let Err((status, msg)) =
         crate::coord_mcp::proxy_request_gate(nonce.as_deref(), bearer.as_deref(), &principal)
@@ -5809,9 +5860,20 @@ async fn coord_mcp_proxy_handler(
     // Phase 3a, DD4's tail: "the `credential_free_doors` catalogue coord
     // attaches stays, copied from the last coord answer". Coord authors and
     // versions that list, so the local refusal above must not invent one — it
-    // copies whatever coord last attached. Recorded on EVERY principal: the
-    // catalogue is a property of coord, not of the credential we presented.
-    crate::coord_mcp::record_credential_free_doors(&bytes);
+    // copies whatever coord last attached.
+    //
+    // TWO BOUNDS, both narrowing what the first cut recorded. Coord attaches
+    // the catalogue to REFUSALS, so a 2xx cannot carry one and parsing every
+    // successful proxied response — the overwhelming majority, and the hot
+    // path — was work that could only ever find nothing. And the catalogue is
+    // served back inside a DEVICE-principal refusal, so recording one out of
+    // an AGENT principal's answer would hand a device-scope caller a list
+    // coord composed for a different principal.
+    if !(200..300).contains(&status)
+        && matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device)
+    {
+        crate::coord_mcp::record_credential_free_doors(&bytes);
+    }
 
     // A 5xx is the other half of the retryable class (same shared classifier as
     // the write forwarder): coord did not reach a verdict on the content. A

@@ -1004,13 +1004,24 @@ pub(crate) fn runner_credential_refusal_code(
     posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
 ) -> Option<&'static str> {
     use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
-    match posture {
+    let code = match posture {
         P::Live | P::Expiring => None,
         P::Expired => Some("runner_credential_expired"),
         P::Absent => Some("runner_credential_absent"),
         P::Unrefreshable => Some("runner_credential_unrefreshable"),
         P::Dark(_) => Some("runner_credential_dark"),
-    }
+    };
+    // This match re-derives "which postures can answer" in parallel with
+    // `CoordCredentialPosture::can_answer`, the authority `/health` reports.
+    // Being exhaustive it cannot drift SILENTLY — but it can drift loudly
+    // wrong, which is a runner refusing a credential `/health` calls live.
+    // Free to pin, so pinned.
+    debug_assert_eq!(
+        code.is_none(),
+        posture.can_answer(),
+        "a posture that can answer must have no refusal code, and vice versa"
+    );
+    code
 }
 
 /// The UPPERCASE twin of [`runner_credential_refusal_code`]: the token stamped
@@ -1095,25 +1106,46 @@ pub(crate) fn runner_credential_remedy(
 static LAST_CREDENTIAL_FREE_DOORS: std::sync::Mutex<Option<serde_json::Value>> =
     std::sync::Mutex::new(None);
 
-/// How much of a coord body is scanned for the catalogue. Same budget and same
-/// reasoning as `device_jwt_refresher`'s upstream scan: `serde_json` sorts
-/// keys, so the catalogue sits near the front of a refusal body.
-const CREDENTIAL_FREE_DOORS_SCAN_BYTES: usize = 8192;
+/// Largest coord body this will parse looking for the catalogue.
+///
+/// **A CEILING ON WHETHER WE PARSE, NEVER A TRUNCATION.** The first cut cut
+/// the body at 8 KiB and then required the truncated PREFIX to parse as whole
+/// JSON — which truncation guarantees it will not, so it recorded a catalogue
+/// only when coord's entire body fitted, and the catalogue is the field most
+/// likely to blow that budget. `upstream_refusal_code` can afford a truncating
+/// scan because it has a text-scan second rung for exactly that case; this has
+/// none, so it parses the whole body or nothing. The bound is generous because
+/// the only bodies that reach here are coord REFUSALS (see the call site's
+/// non-2xx gate), and one that exceeds it is not coord's refusal shape.
+const CREDENTIAL_FREE_DOORS_MAX_BODY_BYTES: usize = 256 * 1024;
 
-/// Remember the `credential_free_doors` catalogue out of a coord answer, if it
-/// carried one. Best-effort and cheap: a body without the key leaves the
-/// previous catalogue standing (absence is not a statement that the doors are
-/// gone), and an unparseable body is ignored entirely.
+/// Remember the `credential_free_doors` catalogue out of a coord REFUSAL, if
+/// it carried one.
+///
+/// Best-effort: a body without the key leaves the previous catalogue standing
+/// (absence is not a statement that the doors are gone), an unparseable or
+/// oversized body is ignored entirely, and an EMPTY catalogue is ignored too —
+/// storing `[]` or `{}` would later be served as "here are the doors: none",
+/// which is the omission-vs-empty inversion this store exists to avoid and
+/// which its own reader doc promises it does not commit.
 pub(crate) fn record_credential_free_doors(body: &[u8]) {
-    let scan = &body[..body.len().min(CREDENTIAL_FREE_DOORS_SCAN_BYTES)];
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(scan)
+    if body.len() > CREDENTIAL_FREE_DOORS_MAX_BODY_BYTES {
+        return;
+    }
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(body)
     else {
         return;
     };
     let Some(doors) = map.get("credential_free_doors") else {
         return;
     };
-    if doors.is_null() {
+    let empty = match doors {
+        serde_json::Value::Null => true,
+        serde_json::Value::Array(a) => a.is_empty(),
+        serde_json::Value::Object(o) => o.is_empty(),
+        _ => false,
+    };
+    if empty {
         return;
     }
     *LAST_CREDENTIAL_FREE_DOORS
@@ -1137,12 +1169,62 @@ pub(crate) fn reset_credential_free_doors_for_test() {
         .unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-/// DD4's decision, as a pure function: should this coord-mcp request be
-/// REFUSED LOCALLY because the runner's own credential cannot answer?
+/// What recovery, if any, the handler must try before it may refuse.
 ///
-/// `Some((code, body))` ⇒ answer `401` with `body` and do not dial coord.
-/// `None` ⇒ forward exactly as before. Three of the four `None` arms are
-/// load-bearing:
+/// The published posture is up to [`REFRESH_CHECK_INTERVAL`] (300 s) stale and
+/// its `StaleEvidence` arm publishes NOTHING so the previous value STICKS —
+/// both correct for the advisory banner it was built for, both wrong for a
+/// per-request authorization gate. So the gate never refuses on the cell
+/// alone: it first asks the credential store what it holds RIGHT NOW.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunnerCredentialHeal {
+    /// `expired` / `absent` — the states the shipped automatic rung heals.
+    /// Kick the refresher and wait the bounded re-mint window
+    /// ([`await_device_jwt_remint_for`]); forward if a usable credential
+    /// appears. This is the heal the pre-Phase-3 handler already performed for
+    /// an EMPTY slot, and keeping it is why a caller still gets the retryable
+    /// `503 COORD_MCP_PROXY_CREDENTIAL_REFRESHING` rather than a dead-end 401.
+    Remint,
+    /// `unrefreshable` — the automatic rung already RAN and refused, so
+    /// kicking it again is noise. But an operator re-pair lands a live JWT in
+    /// the slot immediately while the posture stays stale for up to one
+    /// refresher interval, so take the cheap local read: a usable credential
+    /// CONTRADICTS the stale posture and the session must be forwarded.
+    LocalReadOnly,
+    /// `dark` — a credential that is locally usable and that coord refuses.
+    /// A local usability read is definitionally unable to contradict this
+    /// (looking alive is what `dark` MEANS), so there is nothing to ask and
+    /// the refusal is immediate. It is still bounded: an operator re-pair
+    /// makes the refresher persist a new credential, which spends the
+    /// rejection streak ([`reset_upstream_rejections_for`]) and the next pass
+    /// publishes an answering posture.
+    None,
+}
+
+/// DD4's decision, as a pure function over the session's OWN slot: should this
+/// coord-mcp request be refused locally, and may the handler heal first?
+///
+/// `None` ⇒ forward exactly as before. `Some((code, body, heal))` ⇒ attempt
+/// `heal`, and refuse with `body` only if it does not produce a usable
+/// credential.
+///
+/// # The predicate is PER SLOT, not per runner
+///
+/// `derive_and_publish_posture` folds every observed slot with
+/// `max_by_key(severity)` and publishes the single WORST, carrying that slot's
+/// `tenant_id`. That is right for one banner on one screen and catastrophic as
+/// an authorization predicate: with slots for A (expired) and B (live), the
+/// fold publishes `expired`/`A`, and a session pinned to B — whose own bearer
+/// `device_bearer_for(Some(B))` resolves and which coord answers `200` — would
+/// be refused `401 runner_credential_expired`. `device_bearer_for`'s own
+/// invariant ("never presents another tenant's credential") already
+/// establishes the per-tenant model; this gate honours it.
+///
+/// So the refusal fires only when the posture DESCRIBES THE SLOT THIS SESSION
+/// PRESENTS — see [`posture_describes_session_slot`] for the three-way `None`
+/// rule, which is the subtle half.
+///
+/// # The forward-anyway arms, each load-bearing
 ///
 /// * **UNKNOWN is not a fault.** `posture: None` means no refresher pass has
 ///   concluded in this process yet. Manufacturing a 401 from that would be the
@@ -1156,16 +1238,77 @@ pub(crate) fn reset_credential_free_doors_for_test() {
 ///   token slot; this runner's device posture is not a statement about it, and
 ///   refusing it here would fabricate a fault out of an unrelated credential.
 ///   Same bound as the retry arm and `note_coord_upstream_verdict`'s.
+/// * **A posture about ANOTHER slot forwards.**
+/// * **An UNATTRIBUTABLE posture forwards** (it names no slot at all).
 pub(crate) fn runner_credential_local_refusal(
     principal: &ProxyPrincipal,
+    session_tenant: Option<Uuid>,
     posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
-) -> Option<(&'static str, serde_json::Value)> {
+) -> Option<(&'static str, serde_json::Value, RunnerCredentialHeal)> {
     if !matches!(principal, ProxyPrincipal::Device) {
         return None;
     }
     let status = posture?;
     let code = runner_credential_refusal_code(status.posture)?;
-    Some((code, runner_credential_refusal_body(code, status)))
+    if !posture_describes_session_slot(status, session_tenant) {
+        return None;
+    }
+    Some((
+        code,
+        runner_credential_refusal_body(code, status),
+        runner_credential_heal(status.posture),
+    ))
+}
+
+/// Does the published posture describe the credential slot THIS session
+/// presents?
+///
+/// `tenant_id` is `Option<String>` on one side and `Option<Uuid>` on the
+/// other, and on BOTH sides `None` is meaningful rather than missing — which
+/// is what makes this three cases instead of an equality check:
+///
+/// 1. **Not attributable** ⇒ `false`, always. The orphan arm of
+///    `derive_and_publish_posture` withholds `tenant_id` because nothing in
+///    the pass describes which slot coord is refusing; the shapes reaching it
+///    include a slot the pass could not READ. Treating that withheld `None` as
+///    "the legacy slot" would refuse every unpinned session on a box where a
+///    different, unreadable slot is the faulty one — the same outage one step
+///    over. UNKNOWN forwards.
+/// 2. **Both `None`** ⇒ `true`. An attributable `None` is the LEGACY default
+///    (`access_token`) slot, which has no tenant, and an unpinned session
+///    resolves exactly that slot (`device_bearer_for(None)`). This is the
+///    single-tenant shape — the common one on this fleet — and excluding it
+///    would leave the phase inert where it matters most.
+/// 3. **Otherwise** ⇒ string equality on the tenant. A posture about A never
+///    refuses a session pinned to B, in either direction.
+pub(crate) fn posture_describes_session_slot(
+    status: &crate::mcp::device_jwt_refresher::CoordCredentialStatus,
+    session_tenant: Option<Uuid>,
+) -> bool {
+    if !status.attributable {
+        return false;
+    }
+    match (status.tenant_id.as_deref(), session_tenant) {
+        (None, None) => true,
+        (Some(posture_tenant), Some(session)) => posture_tenant == session.to_string(),
+        _ => false,
+    }
+}
+
+/// Which recovery the handler owes a refusable posture before it may refuse.
+/// Exhaustive so a new posture must decide rather than default into `None`.
+pub(crate) fn runner_credential_heal(
+    posture: crate::mcp::device_jwt_refresher::CoordCredentialPosture,
+) -> RunnerCredentialHeal {
+    use crate::mcp::device_jwt_refresher::CoordCredentialPosture as P;
+    match posture {
+        // Unreachable through the refusal path (both can answer); a local read
+        // is the conservative answer rather than a panic.
+        P::Live | P::Expiring => RunnerCredentialHeal::LocalReadOnly,
+        P::Expired | P::Absent => RunnerCredentialHeal::Remint,
+        P::Unrefreshable => RunnerCredentialHeal::LocalReadOnly,
+        P::Dark(_) => RunnerCredentialHeal::None,
+    }
 }
 
 /// The body of the local 401. The three keys DD4 names —
@@ -18356,12 +18499,21 @@ mod runner_credential_tests {
     fn publish(posture: P) -> djr::CoordCredentialStatus {
         djr::publish_coord_credential_posture(
             posture,
-            Some("11111111-2222-3333-4444-555555555555".to_string()),
+            Some(FIXTURE_TENANT.to_string()),
             Some(1_700_000_000),
             Some("cleared".to_string()),
         );
         djr::coord_credential_posture().expect("a publish always leaves a status")
     }
+
+    /// The tenant the fixture's published posture is ABOUT. A gate decision
+    /// is now per slot, so every "this must refuse" assertion has to speak for
+    /// a session pinned to the same tenant — the whole point of R1.
+    fn posture_tenant() -> uuid::Uuid {
+        uuid::Uuid::parse_str(FIXTURE_TENANT).expect("fixture tenant parses")
+    }
+
+    const FIXTURE_TENANT: &str = "11111111-2222-3333-4444-555555555555";
 
     /// The four NON-ANSWERING postures, in the order the ladder ranks them.
     fn dark_postures() -> [P; 4] {
@@ -18445,9 +18597,12 @@ mod runner_credential_tests {
 
         for p in dark_postures() {
             let status = publish(p);
-            let (code, body) =
-                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status))
-                    .unwrap_or_else(|| panic!("{p:?} must be refused locally"));
+            let (code, body, _heal) = runner_credential_local_refusal(
+                &ProxyPrincipal::Device,
+                Some(posture_tenant()),
+                Some(&status),
+            )
+            .unwrap_or_else(|| panic!("{p:?} must be refused locally"));
             assert_eq!(code, runner_credential_refusal_code(p).unwrap());
             assert_eq!(body["code"], code);
             // The layer is the whole point: NOT `runner-nonce` (which blames
@@ -18462,7 +18617,12 @@ mod runner_credential_tests {
         for p in [P::Live, P::Expiring] {
             let status = publish(p);
             assert!(
-                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).is_none(),
+                runner_credential_local_refusal(
+                    &ProxyPrincipal::Device,
+                    Some(posture_tenant()),
+                    Some(&status),
+                )
+                .is_none(),
                 "{p:?} can answer — refusing it would turn a routine rotation into an outage"
             );
             djr::reset_coord_credential_posture_for_test();
@@ -18482,7 +18642,7 @@ mod runner_credential_tests {
             "the cell starts UNKNOWN"
         );
         assert!(
-            runner_credential_local_refusal(&ProxyPrincipal::Device, None).is_none(),
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, None).is_none(),
             "UNKNOWN must forward, exactly as before this phase"
         );
     }
@@ -18499,12 +18659,18 @@ mod runner_credential_tests {
             agent_id: uuid::Uuid::from_bytes([7; 16]),
         };
         assert!(
-            runner_credential_local_refusal(&agent, Some(&status)).is_none(),
+            runner_credential_local_refusal(&agent, Some(posture_tenant()), Some(&status))
+                .is_none(),
             "an agent session must not be refused on a credential it never presents"
         );
         // ...and the same status DOES refuse a device principal, so the
         // assertion above is about the principal and not about the posture.
-        assert!(runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).is_some());
+        assert!(runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        )
+        .is_some());
         djr::reset_coord_credential_posture_for_test();
     }
 
@@ -18515,8 +18681,12 @@ mod runner_credential_tests {
         let _serialised = djr::posture_test_lock();
         djr::reset_coord_credential_posture_for_test();
         let status = publish(P::Expired);
-        let (_code, body) =
-            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        let (_code, body, _heal) = runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        )
+        .unwrap();
 
         assert_eq!(body["code"], "runner_credential_expired");
         let since = body["since"].as_str().expect("since is a string");
@@ -18557,8 +18727,12 @@ mod runner_credential_tests {
         reset_credential_free_doors_for_test();
 
         let status = publish(P::Dark(DarkCause::UpstreamRejected));
-        let (_c, before) =
-            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        let (_c, before, _h) = runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        )
+        .unwrap();
         assert!(
             before.get("credential_free_doors").is_none(),
             "never invent a catalogue this process has not seen"
@@ -18568,8 +18742,12 @@ mod runner_credential_tests {
         record_credential_free_doors(
             br#"{"error":"nope","code":"token_expired","credential_free_doors":{"guard_free":["/coord/agent-prompt-documents"]}}"#,
         );
-        let (_c, after) =
-            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        let (_c, after, _h) = runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        )
+        .unwrap();
         assert_eq!(
             after["credential_free_doors"]["guard_free"][0],
             "/coord/agent-prompt-documents"
@@ -18578,8 +18756,12 @@ mod runner_credential_tests {
         // A later coord answer WITHOUT the key leaves the catalogue standing:
         // absence is not a statement that the doors are gone.
         record_credential_free_doors(br#"{"error":"nope","code":"token_expired"}"#);
-        let (_c, still) =
-            runner_credential_local_refusal(&ProxyPrincipal::Device, Some(&status)).unwrap();
+        let (_c, still, _h) = runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status),
+        )
+        .unwrap();
         assert!(still.get("credential_free_doors").is_some());
 
         reset_credential_free_doors_for_test();
@@ -18825,6 +19007,319 @@ mod runner_credential_tests {
         let door = ProxyFailureLayer::RunnerCredential.next_door();
         assert!(door.contains("will NOT help"), "{door}");
         assert!(door.contains("nonce is FINE"), "{door}");
+    }
+
+    // =======================================================================
+    // Review round 2 — "a healthy credential reads dead". Every test below
+    // fails against 763d0ddcb, where the gate branched on the aggregate
+    // posture alone.
+    // =======================================================================
+
+    /// Publish a posture ABOUT a specific slot, the way one refresher pass
+    /// would after folding every slot and keeping the worst.
+    fn publish_for(posture: P, tenant: Option<&str>) -> djr::CoordCredentialStatus {
+        djr::publish_coord_credential_posture(
+            posture,
+            tenant.map(str::to_string),
+            Some(1_700_000_000),
+            None,
+        );
+        djr::coord_credential_posture().expect("a publish always leaves a status")
+    }
+
+    /// **R1 — the blocking one.** `derive_and_publish_posture` folds every
+    /// observed slot with `max_by_key(severity)` and publishes the single
+    /// WORST, carrying THAT slot's `tenant_id`. Branching on the posture alone
+    /// turned one dead tenant's slot into a 401 for every healthy tenant's
+    /// sessions — whose own bearer `device_bearer_for(Some(B))` resolves and
+    /// which coord answers 200. That worked before this phase.
+    #[test]
+    fn a_dead_slot_for_tenant_a_never_refuses_a_session_pinned_to_tenant_b() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let a = "aaaaaaaa-0000-0000-0000-00000000000a";
+        let b = uuid::Uuid::parse_str("bbbbbbbb-0000-0000-0000-00000000000b").unwrap();
+
+        for p in dark_postures() {
+            let status = publish_for(p, Some(a));
+            assert!(
+                runner_credential_local_refusal(&ProxyPrincipal::Device, Some(b), Some(&status))
+                    .is_none(),
+                "{p:?} on slot A must not refuse a session pinned to B"
+            );
+            // ...and the SAME status still refuses A's own sessions, so the
+            // assertion above is about the slot and not about the posture.
+            assert!(
+                runner_credential_local_refusal(
+                    &ProxyPrincipal::Device,
+                    Some(uuid::Uuid::parse_str(a).unwrap()),
+                    Some(&status),
+                )
+                .is_some(),
+                "{p:?} must still refuse the slot it is ABOUT"
+            );
+            djr::reset_coord_credential_posture_for_test();
+        }
+    }
+
+    /// The tenant-slot posture must not refuse an UNPINNED session either: an
+    /// unpinned session presents the legacy `access_token` slot, which is a
+    /// different credential from any tenant-keyed one — `device_bearer_for`'s
+    /// own invariant.
+    #[test]
+    fn a_tenant_slot_posture_never_refuses_an_unpinned_session() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+        let status = publish_for(P::Unrefreshable, Some(FIXTURE_TENANT));
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_none()
+        );
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// The other half of the `None` rule, and the reason it cannot simply
+    /// "fall through": an ATTRIBUTABLE `None` is the LEGACY default slot, and
+    /// it is exactly the credential an unpinned session presents. This is the
+    /// single-tenant shape — the common one on this fleet — so excluding it
+    /// would leave the phase inert precisely where the incident happened.
+    #[test]
+    fn an_attributable_none_is_the_legacy_slot_and_does_refuse_an_unpinned_session() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let status = publish_for(P::Expired, None);
+        assert!(status.attributable, "a slot candidate is attributable");
+        assert!(
+            posture_describes_session_slot(&status, None),
+            "legacy slot ↔ unpinned session is a real match"
+        );
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_some()
+        );
+        // And it is still NOT about a pinned session's slot.
+        assert!(runner_credential_local_refusal(
+            &ProxyPrincipal::Device,
+            Some(posture_tenant()),
+            Some(&status)
+        )
+        .is_none());
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// The UNATTRIBUTABLE arm. `derive_and_publish_posture`'s orphan branch
+    /// publishes `Dark` with `tenant_id: None` **because it cannot say which
+    /// slot** — the shapes reaching it include a slot the pass could not READ.
+    /// Reading that withheld `None` as "the legacy slot" would refuse every
+    /// unpinned session on a box whose faulty slot is a different one: the
+    /// same outage one step over. It must refuse NOBODY.
+    #[test]
+    fn an_unattributable_posture_refuses_nobody() {
+        let _serialised = djr::posture_test_lock();
+        djr::reset_coord_credential_posture_for_test();
+
+        let mut status = publish_for(P::Dark(DarkCause::UpstreamRejected), None);
+        status.attributable = false;
+        assert!(!posture_describes_session_slot(&status, None));
+        assert!(!posture_describes_session_slot(
+            &status,
+            Some(posture_tenant())
+        ));
+        assert!(
+            runner_credential_local_refusal(&ProxyPrincipal::Device, None, Some(&status)).is_none(),
+            "UNKNOWN-which-slot must forward, not refuse everyone"
+        );
+        djr::reset_coord_credential_posture_for_test();
+    }
+
+    /// **R2 — the heal the gate owes before it may refuse.** The cell has ONE
+    /// production writer at a 300 s interval and a `StaleEvidence` arm that
+    /// republishes nothing, so a refusal taken on the cell alone can be up to
+    /// five minutes behind an operator re-pair. Each refusable posture
+    /// therefore names the recovery the handler must attempt first.
+    #[test]
+    fn every_refusable_posture_names_the_recovery_owed_before_refusing() {
+        // The two the shipped automatic rung heals: kick the refresher and
+        // wait the bounded re-mint window, which is also what preserves the
+        // retryable 503 the pre-Phase-3 handler answered here.
+        assert_eq!(
+            runner_credential_heal(P::Expired),
+            RunnerCredentialHeal::Remint
+        );
+        assert_eq!(
+            runner_credential_heal(P::Absent),
+            RunnerCredentialHeal::Remint
+        );
+        // The automatic rung already RAN and refused, so kicking it again is
+        // noise — but an operator re-pair lands a usable JWT immediately while
+        // the posture stays stale, and a local read contradicts it for free.
+        assert_eq!(
+            runner_credential_heal(P::Unrefreshable),
+            RunnerCredentialHeal::LocalReadOnly
+        );
+        // `dark` MEANS locally-usable-and-refused-by-coord, so a local
+        // usability read is definitionally unable to contradict it. Nothing to
+        // ask; refuse now.
+        assert_eq!(
+            runner_credential_heal(P::Dark(DarkCause::UpstreamRejected)),
+            RunnerCredentialHeal::None
+        );
+    }
+
+    /// The handler must ATTEMPT that recovery and must forward when it
+    /// succeeds — the invariant in one assertion: a session whose own
+    /// credential would have worked is never refused. Pinned at the source,
+    /// because the heal reads the encrypted `AuthManager` slot and the handler
+    /// needs a Tauri-backed `ApiState`; neither is constructible in a unit
+    /// test.
+    #[test]
+    fn the_handler_heals_before_it_refuses_and_keeps_the_retryable_degrade() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let start = text
+            .find("async fn coord_mcp_proxy_handler(")
+            .expect("coord_mcp_proxy_handler exists");
+        let end = text[start..]
+            .find("\n/// ")
+            .map(|i| start + i)
+            .unwrap_or(text.len());
+        let body = &text[start..end];
+
+        let bearer_arm = body
+            .find("await_device_jwt_remint_for(session_tenant)")
+            .expect("the pre-existing empty-slot heal still exists");
+        let degrade = body
+            .find("COORD_MCP_PROXY_CREDENTIAL_REFRESHING")
+            .expect("the retryable 503 still exists");
+        let gate = body
+            .find("runner_credential_local_refusal")
+            .expect("the credential gate exists");
+        assert!(
+            bearer_arm < gate && degrade < gate,
+            "the gate must sit AFTER the bounded re-mint and the retryable 503, or it \
+             returns a NON-retryable 401 in place of the degrade built for this state"
+        );
+        // And it must resolve the session's own tenant before deciding.
+        let tenant = body
+            .find("session_bearer_and_tenant_or_refuse")
+            .expect("the session tenant is resolved");
+        assert!(
+            tenant < gate,
+            "the refusal is per SLOT, so the session's tenant must be resolved first"
+        );
+        // The heal itself, and the forward-on-heal.
+        assert!(
+            body.contains("RunnerCredentialHeal::Remint")
+                && body.contains("RunnerCredentialHeal::LocalReadOnly"),
+            "both recoveries must be attempted by the handler"
+        );
+        assert!(
+            body.contains("bearer = Some(fresh)"),
+            "a heal must forward with the credential it just proved usable, not the stale one"
+        );
+    }
+
+    /// **R3 + R5 — the catalogue store.** The first cut truncated at 8 KiB and
+    /// then required the truncated PREFIX to parse as whole JSON, so it
+    /// recorded only when coord's entire body fitted — and the catalogue is
+    /// the field most likely to exceed it. It also stored an EMPTY catalogue,
+    /// which reads back as "there are no doors": the omission-vs-empty
+    /// inversion its own reader doc promises it avoids.
+    #[test]
+    fn the_catalogue_store_survives_a_big_body_and_never_stores_an_empty_one() {
+        let _serialised = djr::posture_test_lock();
+        reset_credential_free_doors_for_test();
+
+        // A refusal well past the old 8 KiB cut, with the catalogue at the
+        // END — the shape truncation-then-parse could never record.
+        let filler = "x".repeat(32 * 1024);
+        let big = format!(
+            r#"{{"error":"{filler}","code":"token_expired","credential_free_doors":{{"guard_free":["/coord/agent-prompt-documents"]}}}}"#
+        );
+        assert!(big.len() > 8192, "the fixture must exceed the old budget");
+        record_credential_free_doors(big.as_bytes());
+        assert_eq!(
+            last_credential_free_doors().expect("a >8KiB body must still record")["guard_free"][0],
+            "/coord/agent-prompt-documents"
+        );
+
+        // An EMPTY catalogue is not a catalogue: it must not replace what we
+        // hold, and must never be served as "the doors are: none".
+        for empty in [
+            r#"{"credential_free_doors":[]}"#,
+            r#"{"credential_free_doors":{}}"#,
+            r#"{"credential_free_doors":null}"#,
+        ] {
+            record_credential_free_doors(empty.as_bytes());
+            assert_eq!(
+                last_credential_free_doors().expect("the previous catalogue stands")["guard_free"]
+                    [0],
+                "/coord/agent-prompt-documents",
+                "an empty catalogue must not overwrite a real one: {empty}"
+            );
+        }
+
+        // A body beyond the parse ceiling records nothing rather than
+        // half-parsing something.
+        reset_credential_free_doors_for_test();
+        let huge = format!(
+            r#"{{"error":"{}","credential_free_doors":{{"guard_free":["/x"]}}}}"#,
+            "y".repeat(300 * 1024)
+        );
+        record_credential_free_doors(huge.as_bytes());
+        assert!(last_credential_free_doors().is_none());
+        reset_credential_free_doors_for_test();
+    }
+
+    /// **R4** — the catalogue is coord's answer to a REFUSAL, and it is served
+    /// back inside a DEVICE-principal refusal. Recording it off every 2xx was
+    /// a full parse on the hot path for a key that cannot be there; recording
+    /// it off an AGENT principal's answer would serve a device-scope caller a
+    /// list coord composed for a different principal.
+    #[test]
+    fn the_catalogue_is_recorded_only_from_a_device_principal_refusal() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs");
+        let text = std::fs::read_to_string(&src).expect("read mcp_api.rs");
+        let at = text
+            .find("record_credential_free_doors(&bytes)")
+            .expect("the recorder is called");
+        let window = &text[at.saturating_sub(400)..at];
+        assert!(
+            window.contains("!(200..300).contains(&status)"),
+            "gate the recorder on a non-2xx: a 2xx cannot carry a catalogue"
+        );
+        assert!(
+            window.contains("ProxyPrincipal::Device"),
+            "and on the DEVICE principal, whose refusal is where it is served back"
+        );
+    }
+
+    /// **R7** — the `credential:` throttle namespace, pinned rather than
+    /// merely intended. A `reject`/`upstream-reject` pair for the SAME nonce
+    /// inside one window must both be emitted; a shared key would let them
+    /// suppress each other and re-create, inside the throttle, exactly the
+    /// conflation of layers this phase removes from the response.
+    #[test]
+    fn a_credential_row_and_an_upstream_row_for_one_nonce_both_emit() {
+        let dir = rotation_log_test_dir();
+        let nonce = format!("ns-split-{}", uuid::Uuid::now_v7());
+        log_proxy_runner_credential_rejected(Some(&nonce), "runner_credential_dark — local");
+        log_proxy_upstream_rejected(Some(&nonce), 401, "coord rejected the injected bearer");
+
+        let log = std::fs::read_to_string(dir.join(ROTATION_LOG_FILE)).unwrap_or_default();
+        let layers: Vec<String> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| {
+                v["key_prefix"] == rotation_key_prefix(&nonce) && v["event"] == "upstream-reject"
+            })
+            .filter_map(|v| v["layer"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            layers.iter().any(|l| l == "runner-credential")
+                && layers.iter().any(|l| l == "coord-upstream"),
+            "both layers must survive one throttle window for one nonce, got {layers:?}"
+        );
     }
 
     /// The rotation row: same `upstream-reject` EVENT (the reader's question is
