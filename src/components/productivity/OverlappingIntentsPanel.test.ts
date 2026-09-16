@@ -94,6 +94,10 @@ describe("deriveOverlapView — coord mode gating", () => {
 
 describe("OverlappingIntentsPanel error handling", () => {
   it("no catch site hand-rolls error stringification — it goes through describeThrown", () => {
+    // LINT-SHAPED GUARD, not a behavioural test: it regex-matches the panel's
+    // own source text, so it is coupled to source FORMATTING and a failure here
+    // may be a reformat rather than a regression — read the match before
+    // treating it as one.
     // `invoke()` rejects with a plain STRING; an `instanceof Error ?` ternary
     // would discard the cause on every real failure and render a bare
     // constant. Same guard the deleted CoordinatorDashboard carried.
