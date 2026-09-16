@@ -417,8 +417,8 @@ fn now_epoch_ms() -> u64 {
 ///
 /// Returns an empty array when no AI sessions are registered, or when
 /// `SessionManager` is not available in Tauri state (which would only
-/// happen during early startup). PTY workers and inline-PID
-/// registrations are intentionally excluded — see
+/// happen during early startup). Inline-PID registrations are
+/// intentionally excluded — see
 /// `SessionManager::snapshot` for the rationale.
 pub async fn idle_status(State(state): State<Arc<ApiState>>) -> Json<Vec<SessionIdleEntry>> {
     use crate::claude_session::manager::SessionManager;

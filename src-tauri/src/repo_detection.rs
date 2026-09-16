@@ -26,7 +26,7 @@ const CACHE_TTL: Duration = Duration::from_secs(60);
 
 pub fn detect_repo_slug(working_dir: &str) -> Option<String> {
     // Bounded. This is not periodic, but it IS burst-prone: it fires once per
-    // `terminal_create` / `spawn_worker_session`, and ~130 concurrent session
+    // `terminal_create`, and ~130 concurrent session
     // spawns were observed during the 2026-08-30 wedge. 130 unbounded
     // `.output()` calls behind one wedged git is 130 blocking-pool threads.
     let mut cmd = crate::process_helpers::no_window("git");

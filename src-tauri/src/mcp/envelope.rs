@@ -502,7 +502,7 @@ pub async fn envelope_rewrite_middleware(req: Request, next: Next) -> Response {
 /// This function has TWO callers — the `text/plain` rewrite and the JSON
 /// stamping pass — so naming these statuses also changes what the plaintext
 /// path emits. A handler returning the `(StatusCode, String)` idiom on a 404
-/// (`completion_sources.rs`, `task_runs.rs`, `skills.rs`, `checks.rs`,
+/// (`task_runs.rs`, `skills.rs`, `checks.rs`,
 /// `shell_commands.rs`, …) previously produced `code: "BAD_REQUEST"` and now
 /// produces `"NOT_FOUND"`. That is the same misclassification being corrected
 /// on the other path, not collateral damage — one status must yield one code

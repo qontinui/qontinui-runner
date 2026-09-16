@@ -59,6 +59,7 @@ project.conflict_logs
 project.contradiction_resolutions
 project.contradiction_resolutions_id_seq
 project.convergence_snapshots
+project.coordinator_shadow_decisions
 project.coverage_snapshots
 project.cross_run_patterns
 project.curated_examples

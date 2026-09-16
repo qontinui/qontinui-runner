@@ -24,7 +24,7 @@
 //! |---|---|
 //! | `POST /execute-python` (`mcp::misc`) | runs caller-supplied Python |
 //! | `POST /ui-bridge/invoke/get_coord_device_token` | returns the coord device JWT |
-//! | `POST /ui-bridge/invoke/spawn_worker_session` | spawns a Claude-backed PTY |
+//! | `POST /ui-bridge/invoke/spawn_worker_session` | spawned a Claude-backed PTY (command since deleted) |
 //! | `POST /sessions/spawn` + `/sessions/{id}/message` | spawns a process in a caller-chosen directory, then writes its stdin |
 //!
 //! The last two are registered in the same `routes()` function as a prefix
@@ -483,16 +483,17 @@ pub(crate) mod tests {
         }
     }
 
-    /// The four routes round 4 found reachable under round 3's denylist.
-    /// Arbitrary code execution, a credential mint, a Claude-backed PTY, and
-    /// spawn-then-write-stdin. All four are registered routes — that is what
-    /// makes them the point.
+    /// The routes round 4 found reachable under round 3's denylist.
+    /// Arbitrary code execution, a credential mint, a PTY spawn, and
+    /// spawn-then-write-stdin. All are registered routes — that is what
+    /// makes them the point. (`spawn_worker_session`, the Claude-backed PTY
+    /// of the original finding, was deleted with the Productivity board;
+    /// `terminal_create` is the surviving PTY spawn.)
     #[test]
     fn the_round_four_findings_are_refused() {
         for (method, path) in [
             ("POST", "/execute-python"),
             ("POST", "/ui-bridge/invoke/get_coord_device_token"),
-            ("POST", "/ui-bridge/invoke/spawn_worker_session"),
             ("POST", "/ui-bridge/invoke/terminal_create"),
             ("POST", "/sessions/spawn"),
             ("POST", "/sessions/abc/message"),

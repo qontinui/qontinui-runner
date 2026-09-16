@@ -50,7 +50,7 @@
 //! [`crate::agent_worktree::isolated_edit`] (the terminal-spawn /
 //! slash-command path). This module also retains the shared
 //! coord-base resolver that several call sites depend on
-//! (`file_registry`, `terminal::coord_warn`, `commands::productivity`,
+//! (`file_registry`, `terminal::coord_warn`, `commands::deconflict`,
 //! `commands::claims`, `fleet`, …).
 //!
 //! Historical note: a `POST /agents/allocate-local` HTTP endpoint used
