@@ -28,13 +28,21 @@
 //!   the coord `/mcp` relay presents). The device-authed `coord_register_gate`
 //!   tool resolves the tenant + `registered_by` server-side from the JWT claims —
 //!   we NEVER pass a tenant.
-//! - poll → `GET <coord>/coord/gates` (filtered, device-bearer attached), matched
-//!   client-side on `gate_id`. Coord's `resolve_operator_optional` resolves the
-//!   tenant from the bearer context. A gate coord has not listed yet →
-//!   [`GateStatus::Unknown`] (keep waiting); a transport failure or a non-2xx →
-//!   a TYPED [`CoordGateError`] the reconciler records on the subtask, so a
-//!   failing poll is visible per-subtask instead of being written back as a
-//!   coord verdict of `open`.
+//! - poll → `POST <coord>/mcp` JSON-RPC `tools/call coord_gate_inspect` with the
+//!   gate's own id — the SAME door, credential and tenant resolution as the
+//!   register above. Anything but a verdict coord sent and this build
+//!   understands is a TYPED [`CoordGateError`] the reconciler records on the
+//!   subtask, so a failing poll is visible per-subtask instead of being written
+//!   back as a coord verdict of `open`.
+//!
+//!   It used to scan `GET <coord>/coord/gates?limit=500` and match `gate_id`
+//!   client-side. Three things were wrong with that at once, and the by-id read
+//!   closes all three: the route rides coord's `TenantId` extractor, which
+//!   resolves only an operator Cognito context and answers a DEVICE JWT `403
+//!   tenant_not_resolved` (`api/gate_routes.rs`, which is why
+//!   `GET /coord/agent-gates` exists); its body is a `{gates, …}` ENVELOPE, not
+//!   the bare array the scan indexed, so a 200 matched nothing; and a gate past
+//!   the 500-row cap read as "not listed yet" either way.
 //! - drift verdict → `POST <coord>/mcp` JSON-RPC `tools/call <twin tool>`, the
 //!   same tool the Digital-Twin Explorer's `GET /coord/twin/:subspace/verdict`
 //!   dispatches; we read the raw [`crate::twin_verdict`]-shaped `DriftVerdict`
@@ -137,43 +145,54 @@ pub const GATE_CLAIM_KIND: &str = "file_glob";
 // Gate status (coord verdict, normalized) + drift class
 // ============================================================================
 
-/// A coord gate's verdict as the reconciler treats it. `Unknown` is the one
-/// best-effort shape left: coord ANSWERED and the gate is not in the listing
-/// yet (eventual consistency / pagination), so "keep waiting" is true. Every
-/// way of NOT getting an answer — no credential, a dead transport, a non-2xx —
-/// is a typed [`CoordGateError`] instead, because collapsing those into
-/// `Unknown` wrote `gate_status = "open"` onto a row nobody had asked coord
-/// about.
+/// A coord gate's verdict as the reconciler treats it. There is no `Unknown`
+/// variant: EVERY way of not getting a verdict the runner understands — no
+/// credential, a dead transport, a non-2xx, a missing `verdict` field, a token
+/// coord added that this build does not know — is a typed [`CoordGateError`]
+/// instead, so it is recorded on the row, retried, and counted toward the stall
+/// fingerprint.
+///
+/// The variant was deleted rather than narrowed because `Unknown` persisted as
+/// `gate_status = "open"` — a coord verdict coord never gave — and an `open`
+/// row is EXCLUDED from the fingerprint as legitimate waiting, so every path
+/// that reached `Unknown` produced a subtask that waited forever with nothing
+/// surfaced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateStatus {
     /// Gate is registered and its condition has not yet been met → stay blocked.
     Open,
     /// Gate's condition is met → unblock + dispatch.
     Cleared,
-    /// Gate's condition failed terminally (e.g. CI red, PR closed-unmerged) →
-    /// fail the subtask.
+    /// The gate will never clear — its condition failed terminally (CI red, PR
+    /// closed-unmerged), or the gate itself was `withdrawn` / found
+    /// `misconfigured` → fail the subtask. All three are the same fact for the
+    /// reconciler: this subtask's external pre-condition can no longer be
+    /// established, so waiting on it is waiting forever.
     Failed,
-    /// Could not determine the status (best-effort failure) → treat as `Open`.
-    Unknown,
 }
 
 impl GateStatus {
-    /// Parse coord's `verdict` token (`open`/`cleared`/`failed`).
-    pub fn from_verdict(s: &str) -> GateStatus {
+    /// Parse coord's `verdict` token. Coord's own vocabulary is
+    /// `open | cleared | failed | misconfigured | withdrawn` (the validated set
+    /// in `list_gates_core`'s verdict filter); anything else is a token this
+    /// build does not understand, which is NOT a verdict and must not be
+    /// guessed at.
+    pub fn from_verdict(s: &str) -> Result<GateStatus, CoordGateError> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "open" => GateStatus::Open,
-            "cleared" => GateStatus::Cleared,
-            "failed" => GateStatus::Failed,
-            _ => GateStatus::Unknown,
+            "open" => Ok(GateStatus::Open),
+            "cleared" => Ok(GateStatus::Cleared),
+            "failed" | "withdrawn" | "misconfigured" => Ok(GateStatus::Failed),
+            other => Err(CoordGateError::Failed(format!(
+                "coord_gate: unrecognised gate verdict {other:?} — refusing to guess \
+                 (an unknown verdict is not `open`)"
+            ))),
         }
     }
 
-    /// The durable `gate_status` column token to persist. `Unknown` persists as
-    /// `open` (the conservative "keep waiting" shape) so a restart re-attaches
-    /// and resumes polling rather than seeing an unrecognized value.
+    /// The durable `gate_status` column token to persist.
     pub fn as_column(self) -> &'static str {
         match self {
-            GateStatus::Open | GateStatus::Unknown => "open",
+            GateStatus::Open => "open",
             GateStatus::Cleared => "cleared",
             GateStatus::Failed => "failed",
         }
@@ -623,6 +642,47 @@ fn classify_http_failure(what: &str, status: reqwest::StatusCode, body: &str) ->
     }
 }
 
+/// Read a `coord_gate_inspect` payload's `verdict` into a [`GateStatus`].
+///
+/// The whole function is the "no fabricated verdict" rule, and every arm of it
+/// was a live bug in the listing-scan this replaced:
+///
+/// - **an ABSENT `verdict`** was `unwrap_or("open")` — the runner inventing a
+///   coord verdict from a field coord did not send;
+/// - **an unrecognised token** (`withdrawn`, `misconfigured`, anything coord
+///   adds later) became `GateStatus::Unknown`, which `as_column` persisted as
+///   `"open"` — the same invention by a different route;
+/// - **a body that was not a JSON array** silently became an EMPTY gate list
+///   (`as_array().cloned().unwrap_or_default()`) and therefore "not listed yet"
+///   → `Unknown` → `"open"`. That was not hypothetical: `GET /coord/gates`
+///   returns an `{gates, count, total, …}` ENVELOPE, so the scan matched
+///   nothing on every successful poll.
+///
+/// In each case the row was then `gate_blocked`, excluded from the stall
+/// fingerprint as legitimate waiting, and waited forever. Now the only `Ok` is a
+/// token coord actually sent and this build understands.
+fn interpret_inspect_payload(
+    gate_id: &str,
+    payload: &serde_json::Value,
+) -> Result<GateStatus, CoordGateError> {
+    let verdict = payload
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            CoordGateError::Failed(format!(
+                "coord_gate: inspect {gate_id} returned no verdict: {payload}"
+            ))
+        })?;
+    let status = GateStatus::from_verdict(verdict)?;
+    if matches!(status, GateStatus::Failed) && !verdict.trim().eq_ignore_ascii_case("failed") {
+        warn!(
+            "coord_gate: gate {gate_id} verdict `{verdict}` — the gate will never clear; \
+             failing the subtask that waits on it"
+        );
+    }
+    Ok(status)
+}
+
 fn first_line(s: &str) -> String {
     s.lines()
         .next()
@@ -670,42 +730,14 @@ impl CoordGateClient for LiveCoordGateClient {
     }
 
     async fn poll_gate(&self, gate_id: &str) -> Result<GateStatus, CoordGateError> {
-        // Reuse the coord base resolver; poll the list route filtered nothing and
-        // match gate_id client-side (coord has no per-gate-id MCP read tool; the
-        // REST GET resolves the tenant from the device-bearer context).
-        let jwt = Self::device_jwt().ok_or_else(Self::unpaired)?;
-        let (base, _coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
-        let url = format!("{base}/coord/gates?limit=500");
-        let client = self.http_client()?;
-        let resp = client
-            .get(&url)
-            .bearer_auth(&jwt)
-            .send()
-            .await
-            .map_err(|e| CoordGateError::Unreachable(format!("poll GET: {e:#}")))?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            // NOT `Ok(Unknown)`: that persists as `gate_status = "open"`, a
-            // verdict coord never gave, and it CLEARS any typed block already on
-            // the row. A non-2xx is a typed failure the reconciler records per
-            // subtask (see `classify_http_failure`).
-            let err = classify_http_failure(&format!("poll {gate_id}"), status, &text);
-            warn!("coord_gate: {err}");
-            return Err(err);
-        }
-        let gates: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| CoordGateError::Failed(format!("coord_gate: poll parse: {e}")))?;
-        let arr = gates.as_array().cloned().unwrap_or_default();
-        for g in &arr {
-            if g.get("gate_id").and_then(|v| v.as_str()) == Some(gate_id) {
-                let verdict = g.get("verdict").and_then(|v| v.as_str()).unwrap_or("open");
-                return Ok(GateStatus::from_verdict(verdict));
-            }
-        }
-        // Gate not present in the listing yet (eventual consistency / pagination)
-        // → Unknown, keep waiting.
-        Ok(GateStatus::Unknown)
+        // Read THIS gate by id, over the same device-JWT `/mcp` door
+        // `register_gate` uses. See `interpret_inspect_payload` for what the
+        // answer may and may not mean.
+        let payload = self
+            .mcp_tools_call("coord_gate_inspect", json!({ "gate_id": gate_id }))
+            .await?;
+        let status = interpret_inspect_payload(gate_id, &payload)?;
+        Ok(status)
     }
 
     async fn drift_verdict(&self, subspace: &str) -> Result<DriftClass, CoordGateError> {
@@ -875,6 +907,12 @@ mod tests {
     /// `Failed`. The 401 row is the one that matters — a device JWT lives about
     /// four hours, so mid-run expiry is the likely failure, and it used to
     /// persist `gate_status = "open"`.
+    ///
+    /// This is the poll's own HTTP arm: since the poll became a
+    /// `tools/call coord_gate_inspect`, register, poll and drift-verdict all
+    /// share `mcp_tools_call`, whose non-2xx branch is exactly this function.
+    /// The poll's payload arm is pinned separately by
+    /// `a_poll_never_invents_a_verdict`.
     #[test]
     fn non_2xx_poll_is_typed_not_collapsed_into_open() {
         use reqwest::StatusCode;
@@ -910,14 +948,64 @@ mod tests {
 
     #[test]
     fn gate_status_from_verdict() {
-        assert_eq!(GateStatus::from_verdict("open"), GateStatus::Open);
-        assert_eq!(GateStatus::from_verdict("CLEARED"), GateStatus::Cleared);
-        assert_eq!(GateStatus::from_verdict(" failed "), GateStatus::Failed);
-        assert_eq!(GateStatus::from_verdict("weird"), GateStatus::Unknown);
-        // Unknown persists as the conservative "open" so a restart keeps waiting.
-        assert_eq!(GateStatus::Unknown.as_column(), "open");
+        assert_eq!(GateStatus::from_verdict("open").unwrap(), GateStatus::Open);
+        assert_eq!(
+            GateStatus::from_verdict("CLEARED").unwrap(),
+            GateStatus::Cleared
+        );
+        assert_eq!(
+            GateStatus::from_verdict(" failed ").unwrap(),
+            GateStatus::Failed
+        );
+        // A gate that will never clear is `Failed`, not a wait: the subtask's
+        // pre-condition can no longer be established either way.
+        for never_clears in ["withdrawn", "MISCONFIGURED"] {
+            assert_eq!(
+                GateStatus::from_verdict(never_clears).unwrap(),
+                GateStatus::Failed,
+                "{never_clears}"
+            );
+        }
+        // A token this build does not know is NOT a verdict. It used to become
+        // `Unknown` and persist as `open`, so the subtask waited forever on a
+        // verdict coord never gave.
+        let err = GateStatus::from_verdict("weird").expect_err("unknown token is an error");
+        assert!(!err.is_unreachable(), "coord answered — it is not a reach");
+        assert!(err.to_string().contains("weird"), "names the token: {err}");
+        assert_eq!(GateStatus::Open.as_column(), "open");
         assert_eq!(GateStatus::Cleared.as_column(), "cleared");
         assert_eq!(GateStatus::Failed.as_column(), "failed");
+    }
+
+    /// The poll's INTERPRETATION step, which is where the "never persist a
+    /// verdict coord did not give" rule lives now that the poll reads one gate
+    /// by id. Reverting any arm of `interpret_inspect_payload` to the old
+    /// listing-scan behaviour (`unwrap_or("open")`, or an unrecognised token
+    /// collapsing to a wait) fails this test.
+    #[test]
+    fn a_poll_never_invents_a_verdict() {
+        assert_eq!(
+            interpret_inspect_payload("g1", &json!({"verdict": "open"})).unwrap(),
+            GateStatus::Open
+        );
+        assert_eq!(
+            interpret_inspect_payload("g1", &json!({"verdict": "cleared"})).unwrap(),
+            GateStatus::Cleared
+        );
+        // Absent verdict → an error, never `open`.
+        let err = interpret_inspect_payload("g1", &json!({"gate_id": "g1"}))
+            .expect_err("an absent verdict is not `open`");
+        assert!(err.to_string().contains("no verdict"), "{err}");
+        // A shape that is not an object at all (the envelope-vs-array class of
+        // surprise) is likewise an error rather than a silent wait.
+        for wrong_shape in [json!([]), json!("open"), json!(null)] {
+            assert!(
+                interpret_inspect_payload("g1", &wrong_shape).is_err(),
+                "{wrong_shape} must not read as a verdict"
+            );
+        }
+        // An unknown token → an error the reconciler records as `coord_error`.
+        assert!(interpret_inspect_payload("g1", &json!({"verdict": "quantum"})).is_err());
     }
 
     #[test]

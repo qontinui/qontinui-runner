@@ -32,11 +32,17 @@
 //!    resume safety net for one that completed in a prior process.
 //! 7. **stall / exit** — exit when all subtasks are terminal AND no
 //!    `emits_subtasks` row is un-harvested; stall via [`StallWatch`] over a
-//!    fingerprint that EXCLUDES everything legitimately waiting — an unmet
-//!    dependency, an elaboration, a gate coord holds open, a concurrency slot,
-//!    and a `Working` worker (contract §3.5; the §5 recovery deadlines are what
-//!    bound that last one) — but INCLUDES a row the runner has no coord ANSWER
-//!    about (`gate_status = coord_unreachable` / `coord_error`). **Every exit
+//!    fingerprint that EXCLUDES everything legitimately waiting — a dependency
+//!    that can still be satisfied, an elaboration, a gate coord holds open, a
+//!    concurrency slot, and a `Working` worker (contract §3.5) — but INCLUDES a
+//!    row the runner has no coord ANSWER about (`gate_status =
+//!    coord_unreachable` / `coord_error`), a row whose dependency can never be
+//!    satisfied, a dispatch this tick decided and did not land, and any side
+//!    effect that was attempted and failed. The watch measures each stuck ROW
+//!    separately, so one healthy row cannot hide a stuck one. The `Working`
+//!    worker is bounded NOT by the §5 recovery deadlines (they fire from
+//!    `ReadyIdle`/`Gone` only) but by its own silence deadline,
+//!    [`OrchestrationRunConfig::working_silence_secs`]. **Every exit
 //!    the reconciler TAKES is written to `orchestration.runs`** — `complete`,
 //!    `failed` (fatal / DAG cycle) or `stalled`, with `status_reason` — via
 //!    [`finish_run`], so the durable row never reads `running` for a run whose
@@ -104,8 +110,27 @@ pub struct OrchestrationRunConfig {
     /// Seconds a `Gone` worker (vanished from the SessionManager) is tolerated
     /// before being failed — covers a transient restart window.
     pub gone_grace_secs: i64,
-    /// Seconds an UNCHANGED, un-progressed actionable stall fingerprint must
-    /// persist before the run is written `stalled` ([`StallWatch`]).
+    /// Seconds a worker may stay `Working` with NO observed activity — no FSM
+    /// edge and no new CLI output line — before the reconciler fails it.
+    ///
+    /// This is the ONLY bound on a worker wedged mid-turn. Every §5 recovery
+    /// deadline above fires from `ReadyIdle` or `Gone`; a CLI that hangs inside
+    /// a turn stays `Processing` forever, which
+    /// [`ai_session_executor::signal_from_state`] maps to [`WorkerSignal::Working`],
+    /// and nothing in `claude_session` times a `Processing` session out. Such a
+    /// worker holds a concurrency slot for the life of the run, and once the cap
+    /// is saturated every other ready row is excluded from the stall fingerprint
+    /// as "waiting on a slot" — so the whole run goes invisible and ticks at
+    /// `running` indefinitely.
+    ///
+    /// It is deliberately NOT a stall-fingerprint entry: a fingerprinted
+    /// `Working` row false-positives on a normal long turn inside the 300 s
+    /// stall window (that was the regression the `Working` exclusion closed).
+    /// It is a per-worker deadline on SILENCE instead, reset by any observed
+    /// output, so a busy long turn never trips it.
+    pub working_silence_secs: i64,
+    /// Seconds a SINGLE stuck row must stay continuously stuck before the run is
+    /// written `stalled` ([`StallWatch`]).
     ///
     /// This is wall clock, not a tick count, and it is deliberately LONGER than
     /// every §5 recovery deadline above: those deadlines are the mechanism that
@@ -140,6 +165,15 @@ impl Default for OrchestrationRunConfig {
             // > report_timeout_secs + report_reprompt_grace_secs (180), so the
             // §5 recovery path always gets to run to its own conclusion first.
             stall_after_secs: 300,
+            // 30 minutes of TOTAL silence — no FSM edge, no CLI output line.
+            // Sized against the longest legitimately quiet thing a worker here
+            // does: a single tool call that emits nothing until it returns (a
+            // full `cargo test` on this repo, serialized behind `cargo-guard`'s
+            // cross-session build lock, is the worst case). It is 20x
+            // `report_timeout_secs` and 6x `stall_after_secs`, so it can never
+            // pre-empt the §5 recovery path or the stall detector; it exists
+            // only to put an upper bound on a worker that will never report.
+            working_silence_secs: 1800,
             fanout_bound: None,
         }
     }
@@ -285,8 +319,11 @@ pub fn drift_verdict_recorded(subtask: &Subtask) -> bool {
 ///
 /// Unknown `depends_on` ids (a dep that names no row in this run) are ignored
 /// for ordering — they are treated as "not satisfiable" by [`deps_satisfied`]
-/// so a subtask naming a missing dep simply never becomes ready (surfaced as a
-/// stall rather than a crash).
+/// so a subtask naming a missing dep simply never becomes ready. It is surfaced
+/// as a stall rather than a crash by [`stall_fingerprint`]'s `B:` entry, which
+/// is what makes that sentence true: the row is excluded from `ready_subtasks`
+/// AND from every other fingerprint arm, so without `B:` it was invisible and
+/// the run looped at `running` forever with no diagnosis.
 pub fn topo_order(subtasks: &[Subtask]) -> Result<Vec<usize>, String> {
     let n = subtasks.len();
     let id_to_index: HashMap<&str, usize> = subtasks
@@ -437,6 +474,21 @@ pub fn unharvested_elaborators(subtasks: &[Subtask]) -> Vec<&Subtask> {
 /// [`ai_session_executor::worker_terminal_state`]; tests inject a scripted map.
 pub trait SignalSource {
     fn signal(&self, task_run_id: Uuid) -> WorkerSignal;
+
+    /// Epoch seconds of the most recent OUTPUT observed from this worker, or
+    /// `None` when the source cannot observe activity for it (no such session,
+    /// or a session kind that runs no Claude CLI and therefore has no activity
+    /// channel).
+    ///
+    /// This is the `Working`-silence deadline's reset signal
+    /// ([`OrchestrationRunConfig::working_silence_secs`]). It is deliberately
+    /// SEPARATE from [`Self::signal`]: the FSM sits at `Processing` for a whole
+    /// turn, so the signal alone cannot distinguish a worker that is busy from
+    /// one that is wedged — only the output stamp can. `None` makes the
+    /// deadline measure from the first tick the row was observed `Working`,
+    /// which is the conservative reading (it can only ever fire LATER than the
+    /// real last-activity would).
+    fn last_activity(&self, task_run_id: Uuid) -> Option<i64>;
 }
 
 /// Live signal source backed by the in-process `SessionManager`.
@@ -447,6 +499,21 @@ pub struct ManagerSignalSource {
 impl SignalSource for ManagerSignalSource {
     fn signal(&self, task_run_id: Uuid) -> WorkerSignal {
         ai_session_executor::worker_terminal_state(&self.session_mgr, task_run_id)
+    }
+
+    fn last_activity(&self, task_run_id: Uuid) -> Option<i64> {
+        // `ClaudeSession::last_activity_tracker` is the shared `AtomicU64` the
+        // session's stdout pump stores `now` into on EVERY line it reads
+        // (`claude_session/session.rs`), so it moves whenever the CLI emits
+        // anything — tool calls, assistant text, progress — and stands still
+        // while the process is wedged. A worker dispatched by
+        // `ai_session_executor::dispatch_subtask` is always a `ClaudeSession`,
+        // so this resolves for every worker the conductor spawns; a pty
+        // `WorkerSession` (no Claude CLI, no tracker) reads `None`.
+        self.session_mgr.get(&task_run_id.to_string()).map(|s| {
+            s.last_activity_tracker()
+                .load(std::sync::atomic::Ordering::Relaxed) as i64
+        })
     }
 }
 
@@ -568,37 +635,74 @@ pub struct TickPlan {
     /// the last register / poll / drift-verdict call either could not be made
     /// (`coord_unreachable`) or was refused by a coord that answered
     /// (`coord_error`). They ALSO appear in `to_register_gate` / `to_poll_gate`
-    /// / `to_verify_drift` (the call is retried every tick), but that retry is
-    /// not progress — see [`TickPlan::progressed`] — and the rows are part of
-    /// `stall_fingerprint`, so a run wedged on coord stalls visibly rather than
-    /// ticking forever.
+    /// / `to_verify_drift` (the call is retried every tick), and the rows are
+    /// part of `stall_fingerprint`, so a run wedged on coord stalls visibly
+    /// rather than ticking forever. The retry itself moves nothing, so it
+    /// produces no [`TickOutcome`] entry either.
     pub blocked_on_coord: Vec<String>,
+    /// `task_id`s the reconciler failed because the worker went SILENT while
+    /// `Working` — no FSM edge and no CLI output for
+    /// [`OrchestrationRunConfig::working_silence_secs`]. A subset of
+    /// [`Self::to_fail`], carried separately so the log and the tests can name
+    /// the reason (the other `to_fail` arms are `Errored` / `Gone` / no-report).
+    pub silent_workers: Vec<String>,
     /// `true` when the run is finished (all terminal + nothing un-harvested).
     pub done: bool,
     /// Set when a hard error (e.g. DAG cycle) should terminate the run.
     pub fatal: Option<String>,
     /// The fingerprint of "stuck-relevant" state for stall detection (excludes
     /// legitimately-blocked/elaborating rows; contract §3.5).
-    pub stall_fingerprint: String,
+    pub stall_fingerprint: StallFingerprint,
 }
 
-impl TickPlan {
-    /// `true` when applying this tick does real work, which resets stall
-    /// accounting: a completion, dispatch, failure, or a gate registration /
-    /// poll for a subtask coord can actually be asked about. A retry for a
-    /// [`blocked_on_coord`] row is NOT progress — the runner is about to make
-    /// the same call that just failed — and neither is a DriftVerdict read: a
-    /// read that succeeds changes the rows (the verify completes or remediation
-    /// is spliced) and so changes the next fingerprint by itself, while a read
-    /// that keeps failing tags its row with a typed coord block, which puts it
-    /// IN the fingerprint and lets it register as a stall.
-    pub fn progressed(&self) -> bool {
-        let coord_ok = |t: &String| !self.blocked_on_coord.contains(t);
-        !self.to_complete.is_empty()
-            || !self.to_dispatch.is_empty()
-            || !self.to_fail.is_empty()
-            || self.to_register_gate.iter().any(coord_ok)
-            || self.to_poll_gate.iter().any(coord_ok)
+/// What one [`apply_tick`] actually LANDED — the durable outcome, not the
+/// [`TickPlan`]'s intent.
+///
+/// The distinction is the whole point. A plan says what the reconciler decided
+/// to do; an outcome says what the ledger now holds. Stall accounting reads the
+/// OUTCOME, because every "we tried and it did not work" — a dispatch that
+/// threw, a `set_subtask_state` that errored, a harvest that would not parse —
+/// leaves the row exactly where it was and is re-decided identically on the
+/// next tick. Reading the plan's intent as evidence of life is what let a run
+/// re-decide the same failing action forever while `runs.status` read
+/// `running`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// `task_id`s whose worker actually spawned (`task_run_id` bound, row
+    /// `Working`).
+    pub dispatched: Vec<String>,
+    /// `task_id`s durably written `Completed`.
+    pub completed: Vec<String>,
+    /// `task_id`s durably written `Failed`.
+    pub failed: Vec<String>,
+    /// `<op>:<task_id>` for every side effect that was ATTEMPTED and did not
+    /// land: `dispatch`, `complete`, `fail`, `harvest`. Each becomes an `E:`
+    /// entry in the stall fingerprint, because such a row is stuck in exactly
+    /// the sense §3.5 means — nothing is waiting on it, the reconciler simply
+    /// cannot move it — and it is the one stuck shape that CANNOT be recorded
+    /// on the row itself: when the durable write is the thing failing, a typed
+    /// marker written the same way fails too.
+    pub apply_failures: Vec<String>,
+    /// `true` when the run is finished (mirrors [`TickPlan::done`], which reads
+    /// committed rows).
+    pub done: bool,
+}
+
+impl TickOutcome {
+    /// A one-line summary for the tick log. Empty string when nothing landed.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (label, v) in [
+            ("dispatched", &self.dispatched),
+            ("completed", &self.completed),
+            ("failed", &self.failed),
+            ("did-not-land", &self.apply_failures),
+        ] {
+            if !v.is_empty() {
+                parts.push(format!("{label}={}", v.join(",")));
+            }
+        }
+        parts.join(" ")
     }
 }
 
@@ -617,6 +721,10 @@ pub struct ReadyIdleTimers {
     reprompted_at: HashMap<Uuid, i64>,
     /// First tick we observed this worker `Gone` (epoch s).
     first_gone_at: HashMap<Uuid, i64>,
+    /// First tick we observed this worker `Working` (epoch s) — the FALLBACK
+    /// base for the silence deadline, used only when the signal source reports
+    /// no output stamp for it.
+    first_working_at: HashMap<Uuid, i64>,
 }
 
 impl ReadyIdleTimers {
@@ -626,6 +734,34 @@ impl ReadyIdleTimers {
             .retain(|k, _| in_flight_ids.contains(k));
         self.reprompted_at.retain(|k, _| in_flight_ids.contains(k));
         self.first_gone_at.retain(|k, _| in_flight_ids.contains(k));
+        self.first_working_at
+            .retain(|k, _| in_flight_ids.contains(k));
+    }
+
+    /// Observe a worker seen `Working` this tick and return how long it has been
+    /// SILENT — no FSM edge (any other signal clears the entry via
+    /// [`Self::clear_working_silence`]) and no output.
+    ///
+    /// Measured from the worker's own last-output stamp when the source has one,
+    /// because that is the truth about when it last did anything; a worker that
+    /// emits resets its own stretch with no bookkeeping at all. Only a source
+    /// that cannot observe activity falls back to "since we first saw it
+    /// `Working`", which can only ever fire LATER than the real silence would.
+    fn observe_working_silence(
+        &mut self,
+        task_run_id: Uuid,
+        last_activity: Option<i64>,
+        now: i64,
+    ) -> i64 {
+        let first_working = *self.first_working_at.entry(task_run_id).or_insert(now);
+        let base = last_activity.unwrap_or(first_working);
+        (now - base).max(0)
+    }
+
+    /// Forget a worker's silence stretch — called on every non-`Working` signal,
+    /// which IS the observed FSM edge.
+    fn clear_working_silence(&mut self, task_run_id: Uuid) {
+        self.first_working_at.remove(&task_run_id);
     }
 }
 
@@ -677,9 +813,11 @@ pub fn compute_tick<S: SignalSource>(
             // recorded (no `drift_verdict` artifact key).
             if is_drift_verify(st) && !drift_verdict_recorded(st) {
                 plan.to_verify_drift.push(st.task_id.clone());
+                timers.clear_working_silence(trid);
                 // Still in-flight for slot accounting until the verify resolves.
                 continue;
             }
+            timers.clear_working_silence(trid);
             plan.to_complete.push(st.task_id.clone());
             still_inflight -= 1;
             continue;
@@ -690,6 +828,7 @@ pub fn compute_tick<S: SignalSource>(
                 // Ready but NO artifact (can_complete was false ⇒ artifact
                 // absent). Step-5 recovery: re-prompt once after the first
                 // timeout, fail after the second.
+                timers.clear_working_silence(trid);
                 let first = *timers.first_ready_no_artifact_at.entry(trid).or_insert(now);
                 match timers.reprompted_at.get(&trid).copied() {
                     None => {
@@ -709,13 +848,30 @@ pub fn compute_tick<S: SignalSource>(
                 // Active mid-turn — clear any stale ready/gone timers.
                 timers.first_ready_no_artifact_at.remove(&trid);
                 timers.first_gone_at.remove(&trid);
+                // ...and hold the ONE bound a mid-turn worker has. `Working`
+                // covers `Processing`/`Initializing`/`Interrupting`/`Promoting`/
+                // `Created`, none of which any other timer reaches: the §5
+                // deadlines fire from `ReadyIdle` or `Gone` only, and nothing in
+                // `claude_session` moves a session out of `Processing` on a
+                // clock. A wedged CLI would otherwise hold its concurrency slot
+                // for the life of the run.
+                let silent_for =
+                    timers.observe_working_silence(trid, signals.last_activity(trid), now);
+                if silent_for >= config.working_silence_secs {
+                    plan.to_fail.push(st.task_id.clone());
+                    plan.silent_workers.push(st.task_id.clone());
+                    timers.clear_working_silence(trid);
+                    still_inflight -= 1;
+                }
             }
             WorkerSignal::Errored => {
+                timers.clear_working_silence(trid);
                 plan.to_fail.push(st.task_id.clone());
                 still_inflight -= 1;
             }
             WorkerSignal::Gone => {
                 // Tolerate a transient restart window, then fail.
+                timers.clear_working_silence(trid);
                 let first = *timers.first_gone_at.entry(trid).or_insert(now);
                 if now - first >= config.gone_grace_secs {
                     plan.to_fail.push(st.task_id.clone());
@@ -774,9 +930,9 @@ pub fn compute_tick<S: SignalSource>(
         .effective_concurrency_cap()
         .saturating_sub(still_inflight);
     // Ready work the cap cannot admit this tick is waiting on a SLOT, which is
-    // legitimate waiting in exactly the sense §3.5 means — see
+    // legitimate waiting in exactly the sense §3.5 means. That is why only the
+    // rows this tick actually DECIDES to dispatch are fingerprinted — see
     // `stall_fingerprint`.
-    let dispatch_capped = slots == 0;
     if slots > 0 {
         for st in ready_subtasks(subtasks, &order).into_iter().take(slots) {
             plan.to_dispatch.push(st.task_id.clone());
@@ -812,39 +968,150 @@ pub fn compute_tick<S: SignalSource>(
     plan.done = all_terminal(subtasks) && unharvested.is_empty();
 
     // Stall fingerprint (step 3.5) — the state that is STUCK, not the state
-    // that is busy. Everything legitimately waiting (an unmet dependency, an
-    // elaboration, a gate coord holds open, a concurrency slot, a worker that
-    // is working) is excluded; a row the runner has no coord ANSWER about is
-    // included. See `stall_fingerprint`.
-    plan.stall_fingerprint = stall_fingerprint(subtasks, &order, dispatch_capped);
+    // that is busy. Everything legitimately waiting (a dependency that can still
+    // be satisfied, an elaboration, a gate coord holds open, a concurrency slot,
+    // a worker that is working) is excluded; a row the runner has no coord
+    // ANSWER about, a row whose dependency can NEVER be satisfied, and a row
+    // this tick decided to dispatch are included. See `stall_fingerprint`.
+    plan.stall_fingerprint = stall_fingerprint(subtasks, &order, &plan.to_dispatch);
+
+    // Catch-all (contract §3.5, the residual arm): a tick that decided NOTHING,
+    // has NOTHING in flight, and is not done cannot be waiting on anything the
+    // reconciler will ever observe — whatever the reason, nothing will move
+    // again. This is the term that covers the shapes the per-row arms above do
+    // not enumerate (an `InputRequired` row, which no arm dispatches, completes
+    // or fails, is today's example). It fires ONLY when the fingerprint is
+    // otherwise empty, so it never masks a specific diagnosis.
+    let decided_nothing = plan.to_dispatch.is_empty()
+        && plan.to_complete.is_empty()
+        && plan.to_fail.is_empty()
+        && plan.to_reprompt.is_empty()
+        && plan.to_harvest.is_empty()
+        && plan.to_register_gate.is_empty()
+        && plan.to_poll_gate.is_empty()
+        && plan.to_verify_drift.is_empty();
+    if decided_nothing
+        && inflight.is_empty()
+        && !plan.done
+        && plan.stall_fingerprint.is_empty()
+        && !subtasks.is_empty()
+    {
+        plan.stall_fingerprint.push(
+            NOTHING_ACTIONABLE_KEY.to_string(),
+            format!(
+                "Z:nothing-actionable:{}",
+                subtasks
+                    .iter()
+                    .filter(|s| !is_terminal(s.state))
+                    .map(|s| s.task_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        );
+    }
 
     plan
 }
 
-/// Build the stall fingerprint: a stable string over the state that is STUCK in
-/// a way the reconciler itself cannot move. Everything that is legitimately
-/// waiting — on a dependency, on a gate coord is genuinely holding open, on a
-/// concurrency slot, or on a worker that is actively working — is excluded, so
-/// a healthy run produces an empty or changing fingerprint and can never
+/// The set of rows that are STUCK this tick, each with a human-readable reason.
+///
+/// Two halves on purpose. [`keys`](Self::keys) — the stuck ROWS — is what
+/// [`StallWatch`] measures continuity over; [`evidence`](Self::evidence) is what
+/// the operator reads. Keying on the row rather than on the reason string is
+/// load-bearing: a coord behind a load balancer whose instances answer 503 (→
+/// `coord_unreachable`) and 422 (→ `coord_error`) alternately produced a reason
+/// string that changed every tick, which restarted the window every 5 s and let
+/// a 100%-blocked run tick forever without ever stalling. The row is stuck
+/// either way; only the sentence differs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StallFingerprint {
+    /// Sorted, deduped keys (a `task_id`, or [`NOTHING_ACTIONABLE_KEY`]) — the
+    /// WATCHED identity of the stuck set.
+    keys: Vec<String>,
+    /// Sorted reason entries, one per key (`C:`/`R:`/`B:`/`W!:`/`E:`/`Z:`).
+    entries: Vec<String>,
+}
+
+/// The [`StallFingerprint`] key for the "nothing is actionable and nothing is in
+/// flight" catch-all, which names no single row.
+pub const NOTHING_ACTIONABLE_KEY: &str = "*";
+
+impl StallFingerprint {
+    /// Record one stuck row: `key` is what continuity is measured on, `entry`
+    /// is the sentence the stall reason carries.
+    pub fn push(&mut self, key: String, entry: String) {
+        self.keys.push(key);
+        self.entries.push(entry);
+        self.keys.sort();
+        self.keys.dedup();
+        self.entries.sort();
+        self.entries.dedup();
+    }
+
+    /// `true` when nothing is stuck.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// The stuck rows, sorted — what [`StallWatch`] tracks over time.
+    pub fn keys(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// The human-readable reasons, `|`-joined — what the stall reason carries.
+    pub fn evidence(&self) -> String {
+        self.entries.join("|")
+    }
+}
+
+/// Build the stall fingerprint: the rows that are STUCK in a way the reconciler
+/// itself cannot move. Everything that is legitimately waiting — on a
+/// dependency that can still be satisfied, on a gate coord is genuinely holding
+/// open, on a concurrency slot, or on a worker that is actively working — is
+/// excluded, so a healthy run produces an empty fingerprint and can never
 /// accumulate a stall (contract §3.5).
 ///
-/// **A `Working` worker is NOT fingerprinted.** It is exactly the shape §3.5
-/// calls legitimate waiting: a live session mid-turn, already bounded by the §5
-/// recovery deadlines (`report_timeout_secs` / `report_reprompt_grace_secs` /
-/// `gone_grace_secs`), which fail it on their own clock if it goes quiet.
-/// Including it meant a perfectly healthy worker emitted the same
-/// `W:<task_id>:<task_run_id>` every tick with nothing completing, and the
-/// detector declared the run `stalled` — a durable, operator-visible verdict on
-/// a live worker, roughly 25 s after dispatch and 3.6x sooner than the recovery
-/// timers it contradicted.
+/// **A `Working` worker is NOT fingerprinted.** Including it meant a perfectly
+/// healthy worker emitted the same `W:<task_id>:<task_run_id>` every tick with
+/// nothing completing, and the detector declared the run `stalled` — a durable,
+/// operator-visible verdict on a live worker, roughly 25 s after dispatch and
+/// 3.6x sooner than the recovery timers it contradicted. What bounds a `Working`
+/// worker is NOT a fingerprint entry and NOT the §5 deadlines (those fire from
+/// `ReadyIdle`/`Gone` only): it is the per-worker silence deadline
+/// [`OrchestrationRunConfig::working_silence_secs`], which is reset by observed
+/// output and so never false-positives on a long turn.
 ///
-/// A row the runner has no coord ANSWER about ([`coord_block`]) is included in
-/// any lifecycle state, as `C:<token>:<task_id>` — it is not waiting on
-/// anything coord said, it is retried forever with no bound of its own, and the
-/// token travels into the stall reason so the row says which failure it was.
-fn stall_fingerprint(subtasks: &[Subtask], order: &[usize], dispatch_capped: bool) -> String {
+/// The entries, and why each one is stuck rather than waiting:
+///
+/// - `C:<token>:<task_id>` — the runner has no coord ANSWER about this row
+///   ([`coord_block`]), in ANY lifecycle state (a `Working` DriftVerdict verify
+///   whose verdict read keeps failing is the non-`Submitted` case). It is
+///   retried forever with no bound of its own. The token is in the sentence but
+///   NOT in the key — see [`StallFingerprint`].
+/// - `R:<task_id>` — a row this tick DECIDED to dispatch. If it is still
+///   `Submitted` on the next tick the dispatch did not land, and the reconciler
+///   will re-decide it identically forever. Only the decided rows qualify:
+///   ready work beyond the cap is waiting on a slot a live worker holds.
+/// - `B:<task_id>` — a row whose dependency can NEVER be satisfied: the dep
+///   names no row in this run, or it names one that is terminal and not
+///   `Completed`. [`deps_satisfied`] will read `false` forever, so the row is
+///   excluded from `ready_subtasks` and `all_terminal` never holds — the run
+///   loops at `running` with no diagnosis. A dep that is merely not `Completed`
+///   YET (`Submitted`/`Working`) is ordinary waiting and is excluded.
+/// - `W!:<task_id>` — a `Working` row with no `task_run_id`. Defensive only:
+///   `dispatch_subtask` writes the id and the state in ONE upsert and nothing
+///   else writes `Working`, so no live path produces it. It stays because the
+///   row would be unreconcilable if anything ever did.
+/// - `E:<op>:<task_id>` — a side effect that was attempted and did not land
+///   (added by [`tick_exit`] from the [`TickOutcome`], not here).
+/// - `Z:nothing-actionable:<rows>` — the catch-all, added by [`compute_tick`].
+fn stall_fingerprint(
+    subtasks: &[Subtask],
+    order: &[usize],
+    to_dispatch: &[String],
+) -> StallFingerprint {
     let by_id: HashMap<&str, &Subtask> = subtasks.iter().map(|s| (s.task_id.as_str(), s)).collect();
-    let mut parts: Vec<String> = Vec::new();
+    let mut fp = StallFingerprint::default();
     for &i in order {
         let s = &subtasks[i];
         // Blocked on coord (unreachable, or coord answered and refused) — in
@@ -852,45 +1119,47 @@ fn stall_fingerprint(subtasks: &[Subtask], order: &[usize], dispatch_capped: boo
         // read keeps failing. Nothing else bounds these rows.
         if !is_terminal(s.state) && deps_satisfied(s, &by_id) {
             if let Some(token) = coord_block(s) {
-                parts.push(format!("C:{token}:{}", s.task_id));
+                fp.push(s.task_id.clone(), format!("C:{token}:{}", s.task_id));
+                continue;
+            }
+        }
+        if !is_terminal(s.state) {
+            if let Some(dep) = unsatisfiable_dep(s, &by_id) {
+                fp.push(s.task_id.clone(), format!("B:{}:{dep}", s.task_id));
                 continue;
             }
         }
         match s.state {
-            // A `Working` row with NO task_run_id cannot be reconciled at all:
-            // the tick skips it, so no §5 deadline reaches it and nothing will
-            // ever move it. `dispatch_subtask` writes the id and the state in
-            // one upsert, so this is not reachable through dispatch — but it is
-            // the one working-row shape that is genuinely stuck rather than
-            // waiting, so it stays fingerprinted.
             SubtaskState::Working if s.task_run_id.is_none() => {
-                parts.push(format!("W!:{}", s.task_id));
+                fp.push(s.task_id.clone(), format!("W!:{}", s.task_id));
             }
-            // Ready-to-dispatch AND admissible: actionable. Excluded when the
-            // dispatch cap is saturated — such a row is waiting on a slot a
-            // live worker holds, which is the same legitimate waiting as an
-            // unmet dependency, and fingerprinting it re-created the very
-            // false-stall the `Working` exclusion above closes.
-            //
-            // Phase 6: a subtask blocked on an OPEN gate, or one awaiting gate
-            // registration, is likewise not actionable — it is waiting on an
-            // external condition (contract §3.5, extended to gates).
-            SubtaskState::Submitted
-                if !dispatch_capped
-                    && deps_satisfied(s, &by_id)
-                    && !gate_blocked(s)
-                    && !gate_failed(s)
-                    && !needs_gate_registration(s) =>
-            {
-                parts.push(format!("R:{}", s.task_id));
+            SubtaskState::Submitted if to_dispatch.contains(&s.task_id) => {
+                fp.push(s.task_id.clone(), format!("R:{}", s.task_id));
             }
             // Working, Submitted-but-blocked (deps, gate or slot), terminal, or
             // reserved: excluded.
             _ => {}
         }
     }
-    parts.sort();
-    parts.join("|")
+    fp
+}
+
+/// The first dependency of `subtask` that can NEVER be satisfied — one naming no
+/// row in this run, or one naming a row that is terminal and not `Completed`
+/// (`Failed` / `Canceled`). [`deps_satisfied`] will read `false` for this
+/// subtask forever, so it is stuck rather than waiting.
+fn unsatisfiable_dep<'a>(subtask: &'a Subtask, by_id: &HashMap<&str, &Subtask>) -> Option<&'a str> {
+    subtask.depends_on.iter().find_map(|dep| {
+        match by_id.get(dep.as_str()) {
+            // Names no row in this run.
+            None => Some(dep.as_str()),
+            // Terminal and not Completed — it will never become Completed.
+            Some(d) if is_terminal(d.state) && d.state != SubtaskState::Completed => {
+                Some(dep.as_str())
+            }
+            Some(_) => None,
+        }
+    })
 }
 
 // ============================================================================
@@ -955,7 +1224,8 @@ pub async fn harvest_elaboration(
 // ============================================================================
 
 /// Apply a computed [`TickPlan`] against the DB + dispatcher (side effects).
-/// Returns `Ok(true)` when the run is done.
+/// Returns what actually LANDED — see [`TickOutcome`], which is what stall
+/// accounting reads.
 #[allow(clippy::too_many_arguments)]
 async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     plan: &TickPlan,
@@ -966,8 +1236,12 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     gate_client: &G,
     config: &OrchestrationRunConfig,
     timers: &mut ReadyIdleTimers,
-) -> Result<bool, String> {
+) -> Result<TickOutcome, String> {
     let by_id: HashMap<&str, &Subtask> = subtasks.iter().map(|s| (s.task_id.as_str(), s)).collect();
+    let mut outcome = TickOutcome {
+        done: plan.done,
+        ..Default::default()
+    };
 
     // Completions (§5 guard already held in compute_tick).
     //
@@ -997,10 +1271,14 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                 }
                 Err(e) => {
                     // Leave it Working — retry next tick. NEVER complete with
-                    // un-spliced seeds.
+                    // un-spliced seeds. A harvest that keeps failing (a PRESENT
+                    // but malformed `next_subtasks`) would otherwise retry
+                    // forever on a `Working` row nothing fingerprints, so the
+                    // failure is carried into the stall fingerprint instead.
                     warn!(
                         "apply_tick: harvest {tid} failed ({e}); leaving Working, will retry next tick"
                     );
+                    outcome.apply_failures.push(format!("harvest:{tid}"));
                     continue;
                 }
             }
@@ -1011,8 +1289,10 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
             .await
         {
             warn!("apply_tick: complete {tid}: {e}");
+            outcome.apply_failures.push(format!("complete:{tid}"));
         } else {
             info!("conductor: {tid} Working → Completed (run {run_id})");
+            outcome.completed.push(tid.clone());
         }
     }
 
@@ -1023,8 +1303,18 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
             .await
         {
             warn!("apply_tick: fail {tid}: {e}");
+            outcome.apply_failures.push(format!("fail:{tid}"));
+        } else if plan.silent_workers.contains(tid) {
+            warn!(
+                "conductor: {tid} Working → Failed (run {run_id}) — no FSM edge and no worker \
+                 output for {}s (working_silence_secs); the session is left alone, only the \
+                 subtask and its concurrency slot are released",
+                config.working_silence_secs
+            );
+            outcome.failed.push(tid.clone());
         } else {
             warn!("conductor: {tid} Working → Failed (run {run_id})");
+            outcome.failed.push(tid.clone());
         }
     }
 
@@ -1046,7 +1336,10 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     for tid in &plan.to_dispatch {
         if let Some(st) = by_id.get(tid.as_str()) {
             match dispatcher.dispatch(run_id, st).await {
-                Ok(trid) => info!("conductor: dispatched {tid} → worker {trid} (run {run_id})"),
+                Ok(trid) => {
+                    info!("conductor: dispatched {tid} → worker {trid} (run {run_id})");
+                    outcome.dispatched.push(tid.clone());
+                }
                 // Expected for as long as coord's device drain holds; every
                 // tick would otherwise WARN once per queued subtask.
                 Err(DispatchError::DeferredByDrain(reason)) => {
@@ -1055,8 +1348,12 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                 Err(e) => {
                     // Dispatch failed before the worker was live; the subtask
                     // stays Submitted (dispatch_subtask only flips on success)
-                    // so a later tick retries. Log loudly.
+                    // so a later tick retries — and re-decides it identically,
+                    // forever, if the cause is permanent. The row is already
+                    // `R:`-fingerprinted (this tick decided to dispatch it) and
+                    // the non-outcome is what stops that retry reading as life.
                     warn!("apply_tick: dispatch {tid}: {e}");
+                    outcome.apply_failures.push(format!("dispatch:{tid}"));
                 }
             }
         }
@@ -1076,7 +1373,10 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
                     info!("conductor: late-harvested {n} seed(s) from completed elaborator {tid} (run {run_id})")
                 }
                 Ok(_) => {}
-                Err(e) => warn!("apply_tick: harvest {tid}: {e}"),
+                Err(e) => {
+                    warn!("apply_tick: harvest {tid}: {e}");
+                    outcome.apply_failures.push(format!("harvest:{tid}"));
+                }
             }
         }
     }
@@ -1126,10 +1426,11 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
     // ---- Phase 6: poll open gates (re-attach + clearance) ----------------
     // Poll each blocked-on-gate subtask and persist the new status. `cleared`
     // unblocks dispatch on the NEXT tick (the column is the durable record);
-    // `failed` fails the subtask on the next tick (`gate_failed`). A poll coord
-    // ANSWERS but has not listed the gate for yet returns `Unknown` → persisted
-    // as `open` → keep waiting (and that write is what clears a typed block on
-    // recovery). A poll that produced no answer at all is recorded as the typed
+    // `failed` fails the subtask on the next tick (`gate_failed`). Every poll
+    // that returns `Ok` carries a verdict coord actually gave, and persisting it
+    // is what clears a typed block on recovery. A poll that produced no answer
+    // — including one whose verdict token the runner does not understand, which
+    // is no more an answer than a 500 — is recorded as the typed
     // block `coord_unreachable` / `coord_error` (gate_id kept, so recovery
     // resumes polling the same gate) and counts toward a stall — it is NEVER
     // written back as `open`, which would be a coord verdict coord never gave.
@@ -1226,8 +1527,7 @@ async fn apply_tick<D: Dispatcher, G: CoordGateClient>(
         }
     }
 
-    let _ = config;
-    Ok(plan.done)
+    Ok(outcome)
 }
 
 /// The durable `gate_status` token a [`CoordGateError`] is recorded as:
@@ -1375,15 +1675,18 @@ impl RunExit {
     }
 }
 
-/// What a fired [`StallWatch`] saw: the unchanged fingerprint and how long it
-/// has held. This is the whole stall verdict — a run is stalled when the state
-/// the reconciler cannot move has not changed for `stall_after_secs` of wall
-/// clock, and nothing else.
+/// What a fired [`StallWatch`] saw: the stuck rows, the reasons, and how long
+/// the longest-stuck row has been continuously stuck. This is the whole stall
+/// verdict — a run is stalled when a row the reconciler cannot move has been
+/// stuck for `stall_after_secs` of wall clock, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StallEvidence {
-    /// The unchanged actionable fingerprint (see [`stall_fingerprint`]).
+    /// The reason entries of the stuck set (see [`stall_fingerprint`]).
     pub fingerprint: String,
-    /// Wall-clock seconds it has read exactly that, with no progressing tick.
+    /// The keys that have been stuck for the full window — the rows that fired.
+    pub stuck_keys: Vec<String>,
+    /// Wall-clock seconds the longest-stuck of those has been continuously
+    /// stuck.
     pub unchanged_for_secs: i64,
 }
 
@@ -1391,8 +1694,10 @@ impl std::fmt::Display for StallEvidence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "stuck state unchanged for {}s: {}",
-            self.unchanged_for_secs, self.fingerprint
+            "{} stuck for {}s: {}",
+            self.stuck_keys.join(","),
+            self.unchanged_for_secs,
+            self.fingerprint
         )
     }
 }
@@ -1413,69 +1718,89 @@ impl std::fmt::Display for StallEvidence {
 ///
 /// One piece of cross-tick memory, rebuilt from empty on restart (the worst case
 /// is that the window restarts, which errs toward NOT declaring a stall).
+///
+/// **It tracks each stuck row SEPARATELY, and there is no run-wide progress
+/// veto.** Both properties exist because a single run-wide window is maskable:
+/// with one window over the whole set, a run where row X is permanently stuck
+/// and row Y keeps moving resets the window every time Y moves, so X never
+/// accumulates a second — which is the defect this phase exists to remove,
+/// re-created one level up. Per-row continuity needs no progress term at all:
+/// [`stall_fingerprint`] already excludes everything that is legitimately
+/// waiting, so a row that stays in it for the whole window is stuck whatever
+/// the rest of the run is doing, and a row that gets unstuck simply leaves the
+/// set.
 #[derive(Debug, Default)]
 pub struct StallWatch {
-    /// The fingerprint being watched and the epoch second it first read that.
-    watching: Option<(String, i64)>,
+    /// Per stuck key, the epoch second it has been CONTINUOUSLY stuck since.
+    /// A key absent from a tick's fingerprint is dropped, so re-appearing
+    /// restarts its window.
+    seen_since: HashMap<String, i64>,
 }
 
 impl StallWatch {
-    /// Observe one tick. Returns evidence once an unchanged, un-progressed
-    /// fingerprint has held for `window_secs`.
-    ///
-    /// Any of these RESETS the window, because each is evidence the run is
-    /// alive: an empty fingerprint (nothing is stuck), a progressing tick, or a
-    /// fingerprint that differs from the one being watched (the stuck set
-    /// itself moved).
+    /// Observe one tick. Returns evidence once ANY single key has been stuck for
+    /// `window_secs` without interruption.
     pub fn observe(
         &mut self,
-        fingerprint: &str,
-        progressed: bool,
+        fingerprint: &StallFingerprint,
         now: i64,
         window_secs: i64,
     ) -> Option<StallEvidence> {
-        if fingerprint.is_empty() || progressed {
-            self.watching = None;
+        let keys = fingerprint.keys();
+        // Drop anything no longer stuck — that row moved, so its window is over.
+        self.seen_since.retain(|k, _| keys.contains(k));
+        let mut fired: Vec<(String, i64)> = Vec::new();
+        for key in keys {
+            let since = *self.seen_since.entry(key.clone()).or_insert(now);
+            let stuck_for = now - since;
+            if stuck_for >= window_secs {
+                fired.push((key.clone(), stuck_for));
+            }
+        }
+        if fired.is_empty() {
             return None;
         }
-        match &self.watching {
-            Some((seen, since)) if seen == fingerprint => {
-                let unchanged_for_secs = now - since;
-                (unchanged_for_secs >= window_secs).then(|| StallEvidence {
-                    fingerprint: fingerprint.to_string(),
-                    unchanged_for_secs,
-                })
-            }
-            _ => {
-                self.watching = Some((fingerprint.to_string(), now));
-                None
-            }
-        }
+        let unchanged_for_secs = fired.iter().map(|(_, s)| *s).max().unwrap_or(0);
+        let mut stuck_keys: Vec<String> = fired.into_iter().map(|(k, _)| k).collect();
+        stuck_keys.sort();
+        Some(StallEvidence {
+            fingerprint: fingerprint.evidence(),
+            stuck_keys,
+            unchanged_for_secs,
+        })
     }
 
-    /// The fingerprint currently under watch, if any (diagnostics + tests).
-    pub fn watching(&self) -> Option<&str> {
-        self.watching.as_ref().map(|(f, _)| f.as_str())
+    /// The keys currently under watch, sorted (diagnostics + tests).
+    pub fn watching(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.seen_since.keys().cloned().collect();
+        keys.sort();
+        keys
     }
 }
 
-/// Decide whether this tick ENDS the run, before any side effect. Pure over the
-/// plan plus the watch's one piece of memory, so tests drive it tick by tick:
+/// Decide whether this tick ENDS the run. Pure over the plan, the tick's APPLIED
+/// [`TickOutcome`] and the watch's one piece of memory, so tests drive it tick by
+/// tick:
 ///
 /// - a fatal plan (a DAG cycle) → [`RunExit::Failed`] with the error;
-/// - a non-empty fingerprint that has not changed, with no progressing tick,
-///   for `config.stall_after_secs` → [`RunExit::Stalled`] with the evidence
-///   (and the coord-blocked rows).
+/// - any single stuck row held for `config.stall_after_secs` → [`RunExit::Stalled`]
+///   with the evidence (and the coord-blocked rows).
+///
+/// It runs AFTER `apply_tick`, not before, because the outcome is what decides
+/// whether the tick moved anything — see [`TickOutcome`]. The outcome also
+/// CONTRIBUTES fingerprint entries: an `E:<op>:<task_id>` for every side effect
+/// that was attempted and did not land. That is the one stuck shape a durable
+/// per-row marker cannot record (when the row write is what is failing, so is
+/// the marker), so it is carried in memory instead, and because the same failure
+/// recurs every tick the entry is stable and accumulates exactly like any other.
 ///
 /// A tick whose only "no progress" is legitimate waiting — a working worker, an
-/// open gate, an unmet dependency, a saturated concurrency cap — has an EMPTY
-/// fingerprint and resets the watch, so a healthy run can never be written
-/// `stalled`; a [`blocked_on_coord`] row IS fingerprinted and its retry is not
-/// progress, so a run wedged on coord does stall (contract §3.5, extended).
-/// Completion is decided AFTER `apply_tick` (it reads committed rows) and is
-/// not here.
+/// open gate, a dependency that can still be satisfied, a saturated concurrency
+/// cap — contributes NO fingerprint entry at all, so a healthy run can never be
+/// written `stalled`.
 pub fn tick_exit(
     plan: &TickPlan,
+    outcome: &TickOutcome,
     watch: &mut StallWatch,
     now: i64,
     config: &OrchestrationRunConfig,
@@ -1483,38 +1808,55 @@ pub fn tick_exit(
     if let Some(fatal) = &plan.fatal {
         return Some(RunExit::failed(fatal.clone()));
     }
-    let evidence = watch.observe(
-        &plan.stall_fingerprint,
-        plan.progressed(),
-        now,
-        config.stall_after_secs,
-    )?;
+    let mut fingerprint = plan.stall_fingerprint.clone();
+    for failure in &outcome.apply_failures {
+        // `<op>:<task_id>` — the key is the row, so a row that fails a dispatch
+        // one tick and a state write the next is continuously stuck, not two
+        // half-windows.
+        let task_id = failure.split_once(':').map(|(_, t)| t).unwrap_or(failure);
+        fingerprint.push(task_id.to_string(), format!("E:{failure}"));
+    }
+    let evidence = watch.observe(&fingerprint, now, config.stall_after_secs)?;
     Some(RunExit::stalled(evidence, &plan.blocked_on_coord))
 }
 
 /// Write a run's terminal outcome — the durable row FIRST (`status` +
-/// `status_reason` through [`PgDb::set_run_status`]), then the in-memory loop
-/// state the status strip reads while the process lives. This is the single
-/// exit path of [`run_orchestration`]; a `return` from the loop that bypasses
-/// it leaves the row lying `running`, which is the defect this exists to close.
+/// `status_reason` through [`PgDb::set_run_status_if_running`]), then the
+/// in-memory loop state the status strip reads while the process lives. This is
+/// the single exit path of [`run_orchestration`]; a `return` from the loop that
+/// bypasses it leaves the row lying `running`, which is the defect this exists
+/// to close.
 ///
 /// It can only close it for an exit the reconciler REACHES: a killed or crashed
 /// runner never runs this, and no boot-time sweep reconciles the row it left
 /// behind (module docs, step 7).
+///
+/// The write is CONDITIONAL on the row still reading `running`, the same guard
+/// `stop_orchestration_run` uses and for the mirror-image reason. The two
+/// writers race one tick wide: the operator presses Stop, the row moves
+/// `running → stopped`, and the reconciler — already mid-tick with its exit
+/// decided — would overwrite that with `stalled`/`complete`. Whoever leaves
+/// `running` first wins, and the loser says so instead of clobbering.
 async fn finish_run(pg: &Arc<PgDb>, loop_state: &SharedLoopState, run_id: Uuid, exit: RunExit) {
     match &exit {
         RunExit::Complete => info!("conductor: run {run_id} complete — all subtasks terminal"),
         RunExit::Failed { reason } => error!("conductor: run {run_id} failed: {reason}"),
         RunExit::Stalled { reason } => warn!("conductor: run {run_id} stalled: {reason}"),
     }
-    if let Err(e) = pg
-        .set_run_status(run_id, exit.status(), exit.reason())
+    match pg
+        .set_run_status_if_running(run_id, exit.status(), exit.reason())
         .await
     {
-        error!(
+        Ok(true) => {}
+        Ok(false) => warn!(
+            "conductor: run {run_id} was stopped out from under the reconciler; keeping \
+             `stopped` rather than writing status={}",
+            exit.status()
+        ),
+        Err(e) => error!(
             "conductor: run {run_id} could not persist status={} (row still reads running): {e}",
             exit.status()
-        );
+        ),
     }
     let mut st = loop_state.lock().await;
     st.error = exit.reason().map(str::to_string);
@@ -1736,15 +2078,6 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         let now = Utc::now().timestamp();
         let plan = compute_tick(&subtasks, &signals, &mut timers, &config, now);
 
-        // Fatal (DAG cycle) or stall (§3.5, over the ACTIONABLE-only
-        // fingerprint; see `tick_exit`) ends the run — and is WRITTEN to the
-        // run row before the loop returns, so the ledger says `failed` /
-        // `stalled` with the reason rather than lying `running` forever.
-        if let Some(exit) = tick_exit(&plan, &mut stall_watch, now, &config) {
-            finish_run(&pg, &loop_state, run_id, exit).await;
-            return;
-        }
-
         // Surface dispatching phase when we are about to spawn workers.
         if !plan.to_dispatch.is_empty() {
             let mut st = loop_state.lock().await;
@@ -1755,7 +2088,11 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
             st.phase = LoopPhase::Elaborating;
         }
 
-        let done = match apply_tick(
+        // Apply FIRST, then decide the exit from what actually landed. The
+        // order is load-bearing: stall accounting reads the APPLIED outcome
+        // (see `TickOutcome`), and a tick's intent — "we decided to dispatch
+        // it", "we decided to poll that gate" — is not evidence anything moved.
+        let outcome = match apply_tick(
             &plan,
             &subtasks,
             run_id,
@@ -1767,15 +2104,28 @@ pub async fn run_orchestration<D: Dispatcher, S: SignalSource, G: CoordGateClien
         )
         .await
         {
-            Ok(d) => d,
+            Ok(o) => o,
             Err(e) => {
                 error!("conductor: run {run_id} apply_tick failed: {e}");
-                false
+                TickOutcome::default()
             }
         };
+        let summary = outcome.summary();
+        if !summary.is_empty() {
+            info!("conductor: run {run_id} tick {tick} applied: {summary}");
+        }
 
-        if done {
+        if outcome.done {
             finish_run(&pg, &loop_state, run_id, RunExit::Complete).await;
+            return;
+        }
+
+        // Fatal (DAG cycle) or stall (§3.5, over the stuck-rows-only
+        // fingerprint; see `tick_exit`) ends the run — and is WRITTEN to the
+        // run row before the loop returns, so the ledger says `failed` /
+        // `stalled` with the reason rather than lying `running` forever.
+        if let Some(exit) = tick_exit(&plan, &outcome, &mut stall_watch, now, &config) {
+            finish_run(&pg, &loop_state, run_id, exit).await;
             return;
         }
 
@@ -1832,7 +2182,10 @@ mod tests {
         }
     }
 
-    /// Scripted signal source keyed by task_run_id.
+    /// Scripted signal source keyed by task_run_id. Reports NO activity stamp —
+    /// the conservative arm, where the `Working`-silence deadline measures from
+    /// the first tick a row was seen `Working`. Use [`FakeActivity`] to script
+    /// the output stamps that reset it.
     struct FakeSignals(Map<Uuid, WorkerSignal>);
     impl SignalSource for FakeSignals {
         fn signal(&self, task_run_id: Uuid) -> WorkerSignal {
@@ -1840,6 +2193,37 @@ mod tests {
                 .get(&task_run_id)
                 .copied()
                 .unwrap_or(WorkerSignal::Gone)
+        }
+        fn last_activity(&self, _task_run_id: Uuid) -> Option<i64> {
+            None
+        }
+    }
+
+    /// A signal source that also scripts the worker's OUTPUT stamp — the thing
+    /// that distinguishes a busy mid-turn worker from a wedged one, since both
+    /// sit at `WorkerSignal::Working` forever.
+    struct FakeActivity {
+        signal: WorkerSignal,
+        activity: StdMutex<i64>,
+    }
+    impl FakeActivity {
+        fn working(at: i64) -> Self {
+            FakeActivity {
+                signal: WorkerSignal::Working,
+                activity: StdMutex::new(at),
+            }
+        }
+        /// The worker emitted a line at `at`.
+        fn emit(&self, at: i64) {
+            *self.activity.lock().unwrap() = at;
+        }
+    }
+    impl SignalSource for FakeActivity {
+        fn signal(&self, _task_run_id: Uuid) -> WorkerSignal {
+            self.signal
+        }
+        fn last_activity(&self, _task_run_id: Uuid) -> Option<i64> {
+            Some(*self.activity.lock().unwrap())
         }
     }
 
@@ -2504,35 +2888,70 @@ mod tests {
         a.task_run_id = Some(trid);
         let rows = vec![a, mk("B", 1, &["A"], SubtaskState::Submitted)];
         let order = topo_order(&rows).unwrap();
-        let fp = stall_fingerprint(&rows, &order, false);
+        let fp = stall_fingerprint(&rows, &order, &[]);
         assert!(
             fp.is_empty(),
-            "a working worker + a dep-blocked row is not stuck state: {fp:?}"
+            "a working worker + a dep-blocked row is not stuck state: {:?}",
+            fp.evidence()
         );
     }
 
     #[test]
-    fn ready_rows_are_fingerprinted_only_when_the_cap_can_admit_them() {
-        // A ready row the cap CAN admit is actionable (and is dispatched the
-        // same tick, which is progress). The same row when the cap is saturated
-        // is waiting on a slot a live worker holds — the same legitimate
-        // waiting as an unmet dependency, so it is excluded. Fingerprinting it
-        // re-created the very false stall the Working exclusion closes.
+    fn only_the_rows_a_tick_decided_to_dispatch_are_fingerprinted() {
+        // A ready row is `R:`-fingerprinted iff THIS tick decided to dispatch
+        // it: if it is still Submitted next tick the dispatch did not land, and
+        // the reconciler will re-decide it identically forever. Ready work the
+        // cap could not admit is waiting on a slot a live worker holds — the
+        // same legitimate waiting as an unmet dependency. (The predicate used to
+        // be the run-wide `dispatch_capped` flag, which mis-classified the
+        // surplus rows of a partially-admitted ready set as stuck.)
         let rows = vec![mk("X", 0, &[], SubtaskState::Submitted)];
         let order = topo_order(&rows).unwrap();
-        assert_eq!(stall_fingerprint(&rows, &order, false), "R:X");
+        assert_eq!(
+            stall_fingerprint(&rows, &order, &["X".to_string()]).evidence(),
+            "R:X"
+        );
         assert!(
-            stall_fingerprint(&rows, &order, true).is_empty(),
-            "ready work waiting on a concurrency slot is not stuck state"
+            stall_fingerprint(&rows, &order, &[]).is_empty(),
+            "ready work this tick did not decide to dispatch is not stuck state"
+        );
+    }
+
+    /// A dependency that can still be satisfied is waiting; one that can NEVER
+    /// be satisfied is stuck, and used to be invisible in both directions — the
+    /// row is excluded from `ready_subtasks` AND (before `B:`) from the
+    /// fingerprint, while `all_terminal` stayed false, so the run looped at
+    /// `running` forever with no diagnosis.
+    #[test]
+    fn a_dependency_that_can_never_be_satisfied_is_stuck_not_waiting() {
+        // A dep naming no row at all.
+        let missing = vec![mk("X", 0, &["nope"], SubtaskState::Submitted)];
+        let order = topo_order(&missing).unwrap();
+        assert_eq!(
+            stall_fingerprint(&missing, &order, &[]).evidence(),
+            "B:X:nope",
+            "a dep naming no row is surfaced as a stall, as topo_order's doc promises"
         );
 
-        // A truly pure-waiting set: one Submitted row whose dep is missing.
-        let blocked = vec![mk("X", 0, &["missing"], SubtaskState::Submitted)];
-        let order2 = topo_order(&blocked).unwrap();
-        assert!(
-            stall_fingerprint(&blocked, &order2, false).is_empty(),
-            "a dep-blocked-only set has an empty fingerprint"
+        // A dep that FAILED: its dependent can never become ready, and the run
+        // can never be done (the dependent is non-terminal forever).
+        let stranded = vec![
+            mk("A", 0, &[], SubtaskState::Failed),
+            mk("B", 1, &["A"], SubtaskState::Submitted),
+        ];
+        let order = topo_order(&stranded).unwrap();
+        assert_eq!(
+            stall_fingerprint(&stranded, &order, &[]).evidence(),
+            "B:B:A"
         );
+        assert!(!all_terminal(&stranded), "the run cannot finish either");
+
+        // Contrast: a dep that is merely not Completed YET is ordinary waiting.
+        let mut live = mk("A", 0, &[], SubtaskState::Working);
+        live.task_run_id = Some(Uuid::new_v4());
+        let waiting = vec![live, mk("B", 1, &["A"], SubtaskState::Submitted)];
+        let order = topo_order(&waiting).unwrap();
+        assert!(stall_fingerprint(&waiting, &order, &[]).is_empty());
     }
 
     // ======================================================================
@@ -2804,16 +3223,17 @@ mod tests {
             Some("open"),
         )];
         let order = topo_order(&rows).unwrap();
-        let fp = stall_fingerprint(&rows, &order, false);
+        let fp = stall_fingerprint(&rows, &order, &[]);
         assert!(
             fp.is_empty(),
-            "a gate-blocked-only set has empty actionable fingerprint (no stall): {fp:?}"
+            "a gate-blocked-only set has empty actionable fingerprint (no stall): {:?}",
+            fp.evidence()
         );
         // And a needs-registration row is likewise excluded.
         let rows2 = vec![mk_gated("test", 0, &[], "CI green", None, None)];
         let order2 = topo_order(&rows2).unwrap();
         assert!(
-            stall_fingerprint(&rows2, &order2, false).is_empty(),
+            stall_fingerprint(&rows2, &order2, &[]).is_empty(),
             "a needs-gate-registration row is excluded from the stall fingerprint"
         );
     }
@@ -3179,7 +3599,8 @@ mod tests {
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
         let mut watch = StallWatch::default();
 
-        let exit = tick_exit(&plan, &mut watch, 0, &cfg()).expect("a cycle ends the run on tick 1");
+        let exit = tick_exit(&plan, &TickOutcome::default(), &mut watch, 0, &cfg())
+            .expect("a cycle ends the run on tick 1");
         assert_eq!(exit.status(), "failed");
         assert_eq!(exit.status(), RunExit::STATUS_FAILED);
         assert_eq!(
@@ -3188,9 +3609,8 @@ mod tests {
             "the written reason is the fatal error text"
         );
         assert_eq!(exit.loop_phase(), LoopPhase::Error);
-        assert_eq!(
-            watch.watching(),
-            None,
+        assert!(
+            watch.watching().is_empty(),
             "a fatal exit is decided before the stall watch sees anything"
         );
     }
@@ -3200,43 +3620,115 @@ mod tests {
     ///
     /// Before the fix the fingerprint carried `W:<task_id>:<task_run_id>` for
     /// every in-flight row. A dispatched worker signalling `Working` produced
-    /// that same string every tick with nothing completing, so `progressed()`
-    /// was false, the detector counted five identical records, and the run was
+    /// that same string every tick with nothing completing, so the tick read as
+    /// no-progress, the detector counted five identical records, and the run was
     /// written `stalled` with a `status_reason` — durably, operator-visibly —
     /// about 25 s after dispatch, abandoning a live worker. It also
     /// contradicted the §5 recovery deadlines in the same file, which give that
     /// worker 90 s of quiet before even a re-prompt.
     ///
-    /// The bound on a worker that goes quiet is those deadlines, not this —
-    /// see `ready_without_artifact_does_not_complete_and_eventually_reprompts_then_fails`.
+    /// A worker that keeps EMITTING is never touched, however long it runs. What
+    /// bounds one that goes silent is `working_silence_secs` —
+    /// `a_worker_wedged_mid_turn_is_failed_on_its_silence_deadline` — not this
+    /// and not the §5 deadlines, which fire from `ReadyIdle`/`Gone` only.
     #[test]
     fn a_worker_that_keeps_working_is_never_written_stalled() {
         let trid = Uuid::new_v4();
         let mut a = mk("A", 0, &[], SubtaskState::Working);
         a.task_run_id = Some(trid);
         let rows = vec![a];
-        let mut sigs = Map::new();
-        sigs.insert(trid, WorkerSignal::Working);
-        let signals = FakeSignals(sigs);
+        let signals = FakeActivity::working(0);
         let mut timers = ReadyIdleTimers::default();
         let mut watch = StallWatch::default();
         let c = cfg();
 
-        // 200 ticks = 1000 s at the 5 s tick interval: far past the old
-        // 5-identical-action window AND past `stall_after_secs`.
-        for tick in 1..=200u32 {
+        // 1000 ticks = 5000 s at the 5 s tick interval: far past the old
+        // 5-identical-action window, past `stall_after_secs`, and past
+        // `working_silence_secs` — which this worker keeps resetting by
+        // emitting, as a live CLI does.
+        for tick in 1..=1000u32 {
             let now = tick as i64 * c.tick_interval_secs as i64;
+            signals.emit(now);
             let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
             assert!(
                 plan.stall_fingerprint.is_empty(),
                 "tick {tick}: a working worker is not stuck state: {:?}",
-                plan.stall_fingerprint
+                plan.stall_fingerprint.evidence()
             );
             assert!(plan.to_fail.is_empty(), "tick {tick}: nor is it failed");
             assert_eq!(
-                tick_exit(&plan, &mut watch, now, &c),
+                tick_exit(&plan, &TickOutcome::default(), &mut watch, now, &c),
                 None,
                 "tick {tick} ({now}s in): a healthy worker must never end the run"
+            );
+        }
+    }
+
+    /// **BLOCKER 2 of round 2.** A worker whose CLI wedges mid-turn sits at
+    /// `SessionState::Processing`, which `signal_from_state` maps to
+    /// `WorkerSignal::Working`. Nothing else in the system bounds that: the §5
+    /// deadlines fire from `ReadyIdle`/`Gone`, `compute_tick`'s `Working` arm
+    /// CLEARS both of their timers, and no timeout in `claude_session` moves a
+    /// session out of `Processing`. With the `W:` fingerprint entry removed such
+    /// a worker held its concurrency slot forever, and once the cap saturated
+    /// every other ready row was excluded as "waiting on a slot" — so the whole
+    /// run went invisible and ticked at `running` indefinitely.
+    #[test]
+    fn a_worker_wedged_mid_turn_is_failed_on_its_silence_deadline() {
+        let trid = Uuid::new_v4();
+        let mut a = mk("A", 0, &[], SubtaskState::Working);
+        a.task_run_id = Some(trid);
+        let rows = vec![a];
+        // Last output at t=0 and never again: the CLI is alive (the FSM still
+        // says Processing) but it has stopped producing anything.
+        let signals = FakeActivity::working(0);
+        let mut timers = ReadyIdleTimers::default();
+        let c = cfg();
+
+        let mut failed_at = None;
+        for tick in 1..=1000u32 {
+            let now = tick as i64 * c.tick_interval_secs as i64;
+            let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
+            if !plan.to_fail.is_empty() {
+                assert_eq!(plan.to_fail, vec!["A".to_string()]);
+                assert_eq!(
+                    plan.silent_workers,
+                    vec!["A".to_string()],
+                    "and the reason travels with it"
+                );
+                failed_at = Some(now);
+                break;
+            }
+            assert!(
+                now < c.working_silence_secs,
+                "tick {tick}: not failed at {now}s, past the {}s deadline",
+                c.working_silence_secs
+            );
+        }
+        let failed_at = failed_at.expect("a permanently silent worker must be bounded");
+        assert!(
+            failed_at >= c.working_silence_secs,
+            "never before the deadline: {failed_at}s vs {}s",
+            c.working_silence_secs
+        );
+        assert!(
+            failed_at >= c.report_timeout_secs + c.report_reprompt_grace_secs,
+            "and never before the §5 recovery path could have run to its own conclusion"
+        );
+
+        // One emitted line resets the whole stretch — a long tool call that
+        // finally prints is not a wedge.
+        let mut timers = ReadyIdleTimers::default();
+        let signals = FakeActivity::working(0);
+        for tick in 1..=1000u32 {
+            let now = tick as i64 * c.tick_interval_secs as i64;
+            if now % 600 == 0 {
+                signals.emit(now);
+            }
+            let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
+            assert!(
+                plan.to_fail.is_empty(),
+                "tick {tick} ({now}s): a worker emitting every 600s is not wedged"
             );
         }
     }
@@ -3248,7 +3740,7 @@ mod tests {
     fn a_working_row_with_no_worker_id_is_still_fingerprinted() {
         let rows = vec![mk("A", 0, &[], SubtaskState::Working)];
         let order = topo_order(&rows).unwrap();
-        assert_eq!(stall_fingerprint(&rows, &order, false), "W!:A");
+        assert_eq!(stall_fingerprint(&rows, &order, &[]).evidence(), "W!:A");
     }
 
     /// Ready work the concurrency cap cannot admit is waiting on a SLOT, which
@@ -3283,10 +3775,43 @@ mod tests {
             assert!(
                 plan.stall_fingerprint.is_empty(),
                 "tick {tick}: queued-behind-the-cap is not stuck state: {:?}",
-                plan.stall_fingerprint
+                plan.stall_fingerprint.evidence()
             );
-            assert_eq!(tick_exit(&plan, &mut watch, now, &c), None, "tick {tick}");
+            assert_eq!(
+                tick_exit(&plan, &TickOutcome::default(), &mut watch, now, &c),
+                None,
+                "tick {tick}"
+            );
         }
+    }
+
+    /// The same exclusion one step further in: a ready set the cap admits only
+    /// PARTIALLY. The surplus rows are waiting on a slot exactly as above, and
+    /// the run is plainly healthy — it dispatches one row per tick. Under the
+    /// old run-wide `dispatch_capped` flag those surplus rows WERE fingerprinted
+    /// (slots > 0), and only the run-wide progress veto kept the run alive;
+    /// with progress no longer a veto, mis-classifying them would stall a
+    /// perfectly busy run.
+    #[test]
+    fn ready_work_beyond_a_partially_admitting_cap_is_not_stuck() {
+        let rows = vec![
+            mk("a", 0, &[], SubtaskState::Submitted),
+            mk("b", 1, &[], SubtaskState::Submitted),
+            mk("c", 2, &[], SubtaskState::Submitted),
+        ];
+        let c = OrchestrationRunConfig {
+            concurrency_cap: 1,
+            ..cfg()
+        };
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
+        assert_eq!(plan.to_dispatch.len(), 1, "one slot, one dispatch decided");
+        let decided = plan.to_dispatch[0].clone();
+        assert_eq!(
+            plan.stall_fingerprint.keys(),
+            std::slice::from_ref(&decided),
+            "only the decided row is fingerprinted; the other two wait on a slot"
+        );
     }
 
     /// A genuinely stuck run — nothing dispatched, nothing completing, nothing
@@ -3313,12 +3838,13 @@ mod tests {
         for tick in 1..=200u32 {
             let now = tick as i64 * c.tick_interval_secs as i64;
             let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
-            assert_eq!(plan.stall_fingerprint, "C:coord_unreachable:test");
-            assert!(
-                !plan.progressed(),
-                "retrying a coord-blocked row is not work"
+            assert_eq!(
+                plan.stall_fingerprint.evidence(),
+                "C:coord_unreachable:test"
             );
-            if let Some(e) = tick_exit(&plan, &mut watch, now, &c) {
+            // Retrying a coord-blocked row moves nothing, so the tick lands no
+            // outcome — which is what lets the window accumulate.
+            if let Some(e) = tick_exit(&plan, &TickOutcome::default(), &mut watch, now, &c) {
                 exit = Some(e);
                 fired_at = Some(now);
                 break;
@@ -3338,51 +3864,282 @@ mod tests {
         assert_eq!(exit.status(), RunExit::STATUS_STALLED);
         let reason = exit.reason().expect("a stall carries its reason");
         assert!(
-            reason.starts_with("Stall detected: stuck state unchanged for ")
+            reason.starts_with("Stall detected: test stuck for ")
                 && reason.contains("C:coord_unreachable:test")
                 && reason.ends_with("; blocked on coord: test"),
-            "reason names the window, the stuck state and the row: {reason:?}"
+            "reason names the row, the window, the stuck state and the block: {reason:?}"
         );
         assert_eq!(exit.loop_phase(), LoopPhase::Error);
     }
 
-    /// The watch measures UNCHANGED state, not ticks: progress, an empty
-    /// fingerprint, or a fingerprint that moved all restart the window.
+    /// **BLOCKER 1 of round 2.** One healthy row must not hide a stuck one.
+    ///
+    /// Subtask `X`'s gate registration is refused by coord (422 →
+    /// `coord_error`); subtask `Y` waits on a gate coord legitimately holds
+    /// open. Every tick `to_poll_gate = [Y]` and `blocked_on_coord = [X]`, so
+    /// the old run-wide `progressed()` read TRUE because of Y, the window reset,
+    /// and X's entry never accumulated a second — the run polled forever at
+    /// `runs.status = 'running'`, which is the exact defect this phase exists to
+    /// remove, re-created whenever the run had one other answering gate.
     #[test]
-    fn stall_watch_resets_on_progress_empty_and_change() {
+    fn a_row_coord_answers_about_does_not_mask_one_it_does_not() {
+        let rows = vec![
+            mk_gated("X", 0, &[], "CI green", None, Some(GATE_STATUS_COORD_ERROR)),
+            mk_gated("Y", 1, &[], "CI green", Some("gate-y"), Some("open")),
+        ];
+        let signals = FakeSignals(Map::new());
+        let mut timers = ReadyIdleTimers::default();
+        let mut watch = StallWatch::default();
+        let c = cfg();
+
+        let mut fired_at = None;
+        for tick in 1..=200u32 {
+            let now = tick as i64 * c.tick_interval_secs as i64;
+            let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
+            // The shape the old test built and then only half-checked.
+            assert_eq!(plan.to_poll_gate, vec!["Y".to_string()]);
+            assert_eq!(plan.blocked_on_coord, vec!["X".to_string()]);
+            assert_eq!(plan.stall_fingerprint.evidence(), "C:coord_error:X");
+            assert_eq!(
+                plan.stall_fingerprint.keys(),
+                ["X".to_string()],
+                "Y is legitimately waiting; X is stuck"
+            );
+            // Y's poll lands (coord answers about it) — under the old rule THIS
+            // is what reset the window. It changes nothing on Y's row, so it is
+            // not even an outcome.
+            if let Some(e) = tick_exit(&plan, &TickOutcome::default(), &mut watch, now, &c) {
+                assert!(e.reason().unwrap().contains("C:coord_error:X"));
+                fired_at = Some(now);
+                break;
+            }
+        }
+        assert!(
+            fired_at.is_some_and(|f| f >= c.stall_after_secs),
+            "X must stall on its own clock however healthy Y is: {fired_at:?}"
+        );
+    }
+
+    /// The other half of BLOCKER 1: `to_dispatch` is a DECISION, not an
+    /// outcome. A dispatch that keeps failing leaves the row `Submitted`, so the
+    /// next tick re-decides it identically — forever, under a rule that read the
+    /// decision as life. Now the row is `R:`-fingerprinted and the failed
+    /// dispatch lands no outcome, so the two agree and the run stalls.
+    #[test]
+    fn a_dispatch_that_never_lands_is_not_mistaken_for_progress() {
+        let rows = vec![mk("A", 0, &[], SubtaskState::Submitted)];
+        let signals = FakeSignals(Map::new());
+        let mut timers = ReadyIdleTimers::default();
+        let mut watch = StallWatch::default();
+        let c = cfg();
+        // What `apply_tick` returns when `dispatcher.dispatch` errored.
+        let failed_dispatch = TickOutcome {
+            apply_failures: vec!["dispatch:A".to_string()],
+            ..Default::default()
+        };
+
+        let mut fired_at = None;
+        for tick in 1..=200u32 {
+            let now = tick as i64 * c.tick_interval_secs as i64;
+            let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
+            assert_eq!(plan.to_dispatch, vec!["A".to_string()], "re-decided");
+            assert_eq!(plan.stall_fingerprint.evidence(), "R:A");
+            if let Some(e) = tick_exit(&plan, &failed_dispatch, &mut watch, now, &c) {
+                let reason = e.reason().unwrap();
+                assert!(
+                    reason.contains("R:A") && reason.contains("E:dispatch:A"),
+                    "{reason}"
+                );
+                fired_at = Some(now);
+                break;
+            }
+        }
+        assert!(
+            fired_at.is_some_and(|f| f >= c.stall_after_secs),
+            "{fired_at:?}"
+        );
+
+        // A dispatch that LANDS leaves the row Working next tick, so nothing is
+        // fingerprinted and nothing accumulates.
+        let mut working = mk("A", 0, &[], SubtaskState::Working);
+        working.task_run_id = Some(Uuid::new_v4());
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&[working], &FakeActivity::working(0), &mut timers, &c, 0);
+        assert!(plan.stall_fingerprint.is_empty());
+    }
+
+    /// A state write that keeps failing is the one stuck shape that cannot be
+    /// recorded on the row — when the row write is what is failing, so is any
+    /// marker written the same way. It is carried in the tick OUTCOME instead
+    /// and folded into the fingerprint by `tick_exit`.
+    #[test]
+    fn a_durable_write_that_keeps_failing_is_stall_counted() {
+        let trid = Uuid::new_v4();
+        let mut a = mk("A", 0, &[], SubtaskState::Working);
+        a.task_run_id = Some(trid);
+        a.artifact = Some(report());
+        let rows = vec![a];
+        let mut sigs = Map::new();
+        sigs.insert(trid, WorkerSignal::ReadyIdle);
+        let signals = FakeSignals(sigs);
+        let mut timers = ReadyIdleTimers::default();
+        let mut watch = StallWatch::default();
+        let c = cfg();
+        let write_failed = TickOutcome {
+            apply_failures: vec!["complete:A".to_string()],
+            ..Default::default()
+        };
+
+        let mut fired_at = None;
+        for tick in 1..=200u32 {
+            let now = tick as i64 * c.tick_interval_secs as i64;
+            let plan = compute_tick(&rows, &signals, &mut timers, &c, now);
+            assert_eq!(plan.to_complete, vec!["A".to_string()], "re-decided");
+            assert!(
+                plan.stall_fingerprint.is_empty(),
+                "a Working row is not fingerprinted by itself — the outcome is what says it is stuck"
+            );
+            if let Some(e) = tick_exit(&plan, &write_failed, &mut watch, now, &c) {
+                assert!(e.reason().unwrap().contains("E:complete:A"));
+                fired_at = Some(now);
+                break;
+            }
+        }
+        assert!(
+            fired_at.is_some_and(|f| f >= c.stall_after_secs),
+            "{fired_at:?}"
+        );
+    }
+
+    /// The residual arm: a tick that decides nothing, has nothing in flight and
+    /// is not done. `InputRequired` is today's instance — no arm dispatches,
+    /// completes or fails such a row, and `all_terminal` is false forever.
+    #[test]
+    fn a_run_with_nothing_actionable_and_nothing_in_flight_is_stuck() {
+        let rows = vec![mk("A", 0, &[], SubtaskState::InputRequired)];
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
+        assert!(!plan.done, "an InputRequired row is not terminal");
+        assert_eq!(
+            plan.stall_fingerprint.keys(),
+            [NOTHING_ACTIONABLE_KEY.to_string()]
+        );
+        assert_eq!(
+            plan.stall_fingerprint.evidence(),
+            "Z:nothing-actionable:A",
+            "and it names the rows that will never move"
+        );
+
+        // It never fires while something specific IS diagnosed, so it can only
+        // ever ADD a verdict, never replace one.
+        let diagnosed = vec![mk_gated(
+            "A",
+            0,
+            &[],
+            "CI green",
+            None,
+            Some(GATE_STATUS_COORD_ERROR),
+        )];
+        let mut timers = ReadyIdleTimers::default();
+        let plan = compute_tick(&diagnosed, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
+        assert_eq!(plan.stall_fingerprint.evidence(), "C:coord_error:A");
+    }
+
+    /// A [`StallFingerprint`] with one entry per key, for driving the watch.
+    fn fp(entries: &[(&str, &str)]) -> StallFingerprint {
+        let mut f = StallFingerprint::default();
+        for (key, entry) in entries {
+            f.push(key.to_string(), entry.to_string());
+        }
+        f
+    }
+
+    /// The watch measures how long each ROW has been continuously stuck. A row
+    /// that leaves the stuck set restarts its own window on re-entry; a row that
+    /// stays fires on its own clock.
+    #[test]
+    fn stall_watch_measures_each_row_continuously() {
         let window = 300;
         let mut w = StallWatch::default();
-        assert_eq!(w.observe("C:x", false, 0, window), None, "first sighting");
-        assert_eq!(w.watching(), Some("C:x"));
-        assert_eq!(w.observe("C:x", false, 299, window), None, "1 s short");
-        // Progress resets it, so the next 299 s do not fire either.
-        assert_eq!(w.observe("C:x", true, 300, window), None, "progress resets");
-        assert_eq!(w.watching(), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 0, window), None, "first");
+        assert_eq!(w.watching(), vec!["x".to_string()]);
         assert_eq!(
-            w.observe("C:x", false, 301, window),
+            w.observe(&fp(&[("x", "C:x")]), 299, window),
             None,
-            "window restarted"
+            "1 s short"
         );
-        assert_eq!(w.observe("C:x", false, 599, window), None);
-        // An empty fingerprint likewise resets.
-        assert_eq!(w.observe("", false, 600, window), None, "nothing is stuck");
-        assert_eq!(w.watching(), None);
-        // A changed stuck set restarts the window rather than inheriting it.
-        assert_eq!(w.observe("C:x", false, 601, window), None);
+        // x leaves the stuck set — it moved, so its window is over.
+        assert_eq!(w.observe(&StallFingerprint::default(), 300, window), None);
+        assert!(w.watching().is_empty());
+        // ...and re-entering starts a fresh window rather than inheriting one.
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 301, window), None);
+        assert_eq!(w.observe(&fp(&[("x", "C:x")]), 599, window), None);
+        let ev = w
+            .observe(&fp(&[("x", "C:x")]), 601, window)
+            .expect("300 s continuous");
+        assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
+        assert_eq!(ev.unchanged_for_secs, 300);
+        assert_eq!(ev.fingerprint, "C:x");
+    }
+
+    /// **SHOULD-FIX 4 of round 2.** An OSCILLATING reason must not defeat the
+    /// window. A coord behind a load balancer whose instances answer 503 (→
+    /// `coord_unreachable`) and 422 (→ `coord_error`) alternately made the
+    /// fingerprint STRING change every tick; when the watch keyed on that
+    /// string it restarted every 5 s and a 100%-blocked run never stalled. The
+    /// key is the row; the token rides along in the evidence only.
+    #[test]
+    fn an_oscillating_reason_does_not_defeat_the_window() {
+        let window = 300;
+        let mut w = StallWatch::default();
+        let mut fired = None;
+        for tick in 1..=200i64 {
+            let now = tick * 5;
+            // Alternate the token exactly as the two coord instances would.
+            let token = if tick % 2 == 0 {
+                "C:coord_unreachable:x"
+            } else {
+                "C:coord_error:x"
+            };
+            if let Some(ev) = w.observe(&fp(&[("x", token)]), now, window) {
+                assert_eq!(ev.stuck_keys, vec!["x".to_string()]);
+                assert_eq!(ev.fingerprint, token, "the evidence carries WHICH failure");
+                fired = Some(now);
+                break;
+            }
+        }
         assert_eq!(
-            w.observe("C:y", false, 900, window),
-            None,
-            "changed → restart"
+            fired,
+            Some(305),
+            "the row is stuck throughout — first seen at t=5, fires 300 s later"
         );
-        assert_eq!(w.watching(), Some("C:y"));
-        // Held unchanged for the full window: fires, and says how long.
-        assert_eq!(
-            w.observe("C:y", false, 1200, window),
-            Some(StallEvidence {
-                fingerprint: "C:y".to_string(),
-                unchanged_for_secs: 300,
-            })
-        );
+    }
+
+    /// And a busy neighbour cannot hold the window open for a stuck row — the
+    /// per-row rule stated directly, without the conductor around it.
+    #[test]
+    fn one_rows_churn_does_not_reset_another_rows_window() {
+        let window = 300;
+        let mut w = StallWatch::default();
+        let mut fired = None;
+        for tick in 1..=200i64 {
+            let now = tick * 5;
+            // `stuck` is present every tick; `churn-<n>` is a different row each
+            // time, which under a set-equality rule changed the watched value
+            // every tick and reset everything.
+            let churn = format!("churn-{tick}");
+            let entry = format!("R:{churn}");
+            if let Some(ev) = w.observe(
+                &fp(&[("stuck", "C:x:stuck"), (&churn, &entry)]),
+                now,
+                window,
+            ) {
+                assert_eq!(ev.stuck_keys, vec!["stuck".to_string()]);
+                fired = Some(now);
+                break;
+            }
+        }
+        assert_eq!(fired, Some(305), "first seen at t=5");
     }
 
     /// A DESIGN failure is a `failed` run carrying the design error — never a
@@ -3459,7 +4216,7 @@ mod tests {
             assert_eq!(coord_block(&rows[0]), Some(c.token), "{}", c.name);
             let order = topo_order(&rows).unwrap();
             assert_eq!(
-                stall_fingerprint(&rows, &order, false),
+                stall_fingerprint(&rows, &order, &[]).evidence(),
                 format!("C:{}:test", c.token),
                 "{}: the coord-blocked row is IN the fingerprint, with its token",
                 c.name
@@ -3486,15 +4243,12 @@ mod tests {
                 c.name
             );
             assert!(plan.to_dispatch.is_empty(), "{}: never dispatched", c.name);
-            assert!(
-                !plan.progressed(),
-                "{}: retrying a coord-blocked row is not progress",
-                c.name
-            );
         }
 
         // Contrast: the same row with an OPEN gate (coord answered) is excluded
-        // from the fingerprint and its poll IS progress — unchanged §3.5.
+        // from the fingerprint — unchanged §3.5. It is NOT excluded because the
+        // poll "counts as progress"; it is excluded because coord told us to
+        // wait, which is the only reason that ever justified it.
         let open = vec![mk_gated(
             "test",
             0,
@@ -3504,14 +4258,11 @@ mod tests {
             Some("open"),
         )];
         let order = topo_order(&open).unwrap();
-        assert!(stall_fingerprint(&open, &order, false).is_empty());
+        assert!(stall_fingerprint(&open, &order, &[]).is_empty());
         let mut timers = ReadyIdleTimers::default();
         let plan = compute_tick(&open, &FakeSignals(Map::new()), &mut timers, &cfg(), 0);
         assert!(plan.blocked_on_coord.is_empty());
-        assert!(
-            plan.progressed(),
-            "polling a gate coord holds open is progress"
-        );
+        assert_eq!(plan.to_poll_gate, vec!["test".to_string()]);
     }
 
     /// A DriftVerdict verify whose verdict read keeps failing is `Working`, so
@@ -3533,11 +4284,11 @@ mod tests {
 
         let order = topo_order(&[v.clone()]).unwrap();
         assert_eq!(
-            stall_fingerprint(&[v.clone()], &order, false),
+            stall_fingerprint(&[v.clone()], &order, &[]).evidence(),
             "C:coord_error:verify"
         );
         // Without the token the same row is a healthy in-flight worker: excluded.
-        assert!(stall_fingerprint(&[healthy], &order, false).is_empty());
+        assert!(stall_fingerprint(&[healthy], &order, &[]).is_empty());
 
         let mut sigs = Map::new();
         sigs.insert(trid, WorkerSignal::ReadyIdle);
@@ -3545,25 +4296,44 @@ mod tests {
         let plan = compute_tick(&[v], &FakeSignals(sigs), &mut timers, &cfg(), 0);
         assert_eq!(plan.to_verify_drift, vec!["verify".to_string()]);
         assert_eq!(plan.blocked_on_coord, vec!["verify".to_string()]);
-        assert!(!plan.progressed(), "a failing verdict read is not progress");
     }
 
-    /// A gate poll / registration for a subtask coord can be asked about is
-    /// progress; only the coord-blocked retry and the verify read are not.
+    /// What an outcome says, and what it deliberately does not. Only things that
+    /// LANDED are listed; a side effect that was attempted and failed is an
+    /// `apply_failures` entry, which `tick_exit` turns into a fingerprint entry
+    /// rather than into evidence of life.
     #[test]
-    fn progressed_counts_reachable_gate_work_only() {
-        let mut plan = TickPlan::default();
-        assert!(!plan.progressed(), "an empty plan is not progress");
-        plan.to_verify_drift.push("v".to_string());
-        assert!(
-            !plan.progressed(),
-            "a DriftVerdict read is not progress by itself (a successful one changes the rows)"
+    fn an_outcome_lists_what_landed_and_names_what_did_not() {
+        let empty = TickOutcome::default();
+        assert_eq!(empty.summary(), "", "a tick that did nothing says nothing");
+
+        let o = TickOutcome {
+            dispatched: vec!["a".to_string()],
+            completed: vec!["b".to_string()],
+            failed: vec![],
+            apply_failures: vec!["dispatch:c".to_string()],
+            done: false,
+        };
+        assert_eq!(
+            o.summary(),
+            "dispatched=a completed=b did-not-land=dispatch:c"
         );
-        plan.to_poll_gate.push("blocked".to_string());
-        plan.blocked_on_coord.push("blocked".to_string());
-        assert!(!plan.progressed(), "a coord-blocked retry is not progress");
-        plan.to_poll_gate.push("open".to_string());
-        assert!(plan.progressed(), "a reachable gate poll is progress");
+
+        // The failure becomes a stall-counted fingerprint entry KEYED ON THE
+        // ROW, so a row that fails a dispatch one tick and a state write the
+        // next is continuously stuck rather than two half-windows.
+        let mut watch = StallWatch::default();
+        let plan = TickPlan::default();
+        let c = cfg();
+        assert_eq!(tick_exit(&plan, &o, &mut watch, 0, &c), None);
+        assert_eq!(watch.watching(), vec!["c".to_string()]);
+        let other = TickOutcome {
+            apply_failures: vec!["complete:c".to_string()],
+            ..Default::default()
+        };
+        let exit = tick_exit(&plan, &other, &mut watch, c.stall_after_secs, &c)
+            .expect("the row was stuck across both attempts");
+        assert!(exit.reason().unwrap().contains("E:complete:c"));
     }
 
     /// `finish_run` writes the exit to the run ROW (status + reason) before it
@@ -3589,13 +4359,14 @@ mod tests {
                 RunExit::stalled(
                     StallEvidence {
                         fingerprint: "C:coord_unreachable:test".to_string(),
+                        stuck_keys: vec!["test".to_string()],
                         unchanged_for_secs: 300,
                     },
                     &["test".to_string()],
                 ),
                 "stalled",
                 Some(
-                    "Stall detected: stuck state unchanged for 300s: \
+                    "Stall detected: test stuck for 300s: \
                      C:coord_unreachable:test; blocked on coord: test",
                 ),
                 LoopPhase::Error,
@@ -3629,6 +4400,68 @@ mod tests {
             assert!(!st.running);
             assert_eq!(st.phase, want_phase);
             assert_eq!(st.error.as_deref(), want_reason);
+            drop(st);
+
+            let conn = pg.pool().get().await.expect("conn");
+            let _ = conn
+                .execute(
+                    "DELETE FROM orchestration.runs WHERE run_id = $1",
+                    &[&run_id],
+                )
+                .await;
+        }
+    }
+
+    /// The mirror image of the Stop-overwrites-a-stall fix: the RECONCILER must
+    /// not overwrite a `stopped` either. The operator presses Stop, the row
+    /// moves `running → stopped`, and the conductor is mid-tick with its exit
+    /// already decided — one tick wide, and `finish_run`'s write used to be
+    /// unconditional, so `stopped` became `stalled`/`complete`.
+    ///
+    /// `#[ignore]` per the `database/pg/*` convention — needs a live PG fixture.
+    #[tokio::test]
+    #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
+    async fn finish_run_does_not_overwrite_a_run_stopped_out_from_under_it() {
+        let pg = PgDb::new_for_test().await;
+        for exit in [
+            RunExit::stalled(
+                StallEvidence {
+                    fingerprint: "C:coord_error:test".to_string(),
+                    stuck_keys: vec!["test".to_string()],
+                    unchanged_for_secs: 300,
+                },
+                &[],
+            ),
+            RunExit::Complete,
+        ] {
+            let run_id = Uuid::new_v4();
+            pg.create_run(
+                run_id,
+                "stopped run",
+                None,
+                &["test".to_string()],
+                "running",
+            )
+            .await
+            .expect("create_run");
+            // The operator's Stop lands first (this is exactly what
+            // `stop_orchestration_run` writes).
+            assert!(pg
+                .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+                .await
+                .expect("stop write"));
+
+            let loop_state: SharedLoopState = Arc::new(tokio::sync::Mutex::new(
+                super::super::loop_engine::LoopState::new(),
+            ));
+            finish_run(&pg, &loop_state, run_id, exit).await;
+
+            let row = pg.get_run(run_id).await.expect("get_run").expect("row");
+            assert_eq!(row.status, "stopped", "the operator's verdict survives");
+            assert_eq!(row.status_reason.as_deref(), Some("stop requested"));
+            // The in-memory state still settles — the reconciler HAS returned.
+            let st = loop_state.lock().await;
+            assert!(!st.running);
             drop(st);
 
             let conn = pg.pool().get().await.expect("conn");
@@ -3701,8 +4534,7 @@ mod tests {
         // Which makes the stuck verify visible to the stall watch.
         let rows = pg.list_subtasks(run_id).await.unwrap();
         let plan = compute_tick(&rows, &signals, &mut timers, &c, 1);
-        assert_eq!(plan.stall_fingerprint, "C:coord_error:verify");
-        assert!(!plan.progressed());
+        assert_eq!(plan.stall_fingerprint.evidence(), "C:coord_error:verify");
 
         // The twin answers → block cleared and the verdict lands.
         gate.set_failed(false);
@@ -3795,12 +4627,15 @@ mod tests {
         );
         assert_eq!(r.state, SubtaskState::Submitted);
 
-        // Tick 2: still blocked → retried, fingerprinted, not progress.
+        // Tick 2: still blocked → retried and fingerprinted. The retry lands
+        // nothing, so the outcome stays empty and the window accumulates.
         let rows = pg.list_subtasks(run_id).await.unwrap();
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 1);
         assert_eq!(plan.blocked_on_coord, vec!["test".to_string()]);
-        assert_eq!(plan.stall_fingerprint, "C:coord_unreachable:test");
-        assert!(!plan.progressed());
+        assert_eq!(
+            plan.stall_fingerprint.evidence(),
+            "C:coord_unreachable:test"
+        );
 
         // Tick 3: coord back → registration lands, status open, block cleared.
         gate.set_unreachable(false);
@@ -3825,7 +4660,6 @@ mod tests {
         let rows = pg.list_subtasks(run_id).await.unwrap();
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 2);
         assert_eq!(plan.to_poll_gate, vec!["test".to_string()]);
-        assert!(plan.progressed(), "polling a reachable-so-far gate counts");
         apply_tick(
             &plan,
             &rows,
@@ -3913,7 +4747,10 @@ mod tests {
         assert_eq!(r.gate_id.as_deref(), Some("gate-zzz"), "gate kept");
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 6);
         assert_eq!(plan.blocked_on_coord, vec!["failing".to_string()]);
-        assert!(plan.stall_fingerprint.contains("C:coord_error:failing"));
+        assert!(plan
+            .stall_fingerprint
+            .evidence()
+            .contains("C:coord_error:failing"));
 
         // A pairing-era `coord_unreachable` is CORRECTED, not left to point the
         // operator at pairing while coord is answering (finding 3).
@@ -3970,10 +4807,11 @@ mod tests {
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 9);
         assert!(plan.blocked_on_coord.is_empty());
         assert!(
-            !plan.stall_fingerprint.contains("C:"),
-            "no coord block left in the fingerprint (the other row is R:, ready \
-             to dispatch, which is actionable rather than stuck): {:?}",
-            plan.stall_fingerprint
+            !plan.stall_fingerprint.evidence().contains("C:"),
+            "no coord block left in the fingerprint (the other row is R:, the \
+             dispatch this tick decided, which is checked against its OUTCOME \
+             rather than being stuck): {:?}",
+            plan.stall_fingerprint.evidence()
         );
 
         let conn = pg.pool().get().await.unwrap();

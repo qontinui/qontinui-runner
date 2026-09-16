@@ -21,7 +21,6 @@ use uuid::Uuid;
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::orchestration_loop::commands::StartOrchestrationRunArgs;
-use crate::orchestration_loop::conductor::OrchestrationRunConfig;
 use crate::orchestration_loop::ledger::Run;
 use crate::orchestration_loop::loop_engine::{self, OrchestrationRunStatus};
 
@@ -31,13 +30,9 @@ async fn start_run(
     Json(args): Json<StartOrchestrationRunArgs>,
 ) -> Result<Json<ApiResponse<Run>>, (StatusCode, Json<ApiResponse<()>>)> {
     let run_id = args.run_id.unwrap_or_else(Uuid::new_v4);
-    let mut cfg = OrchestrationRunConfig::default();
-    if let Some(c) = args.concurrency_cap {
-        cfg.concurrency_cap = c.max(1);
-    }
-    if let Some(t) = args.tick_interval_secs {
-        cfg.tick_interval_secs = t.max(1);
-    }
+    // The SAME args→config mapping the Tauri door uses, so a default or clamp
+    // added there reaches this door too (it used to be re-implemented inline).
+    let cfg = crate::orchestration_loop::commands::run_config_from_args(&args);
 
     let run = loop_engine::start_orchestration_run(
         state.app_state.orchestration_loops.clone(),
