@@ -79,8 +79,9 @@ export interface TerminalTab {
    * Coordinator `task_run_id` for tabs backed by a registered `WorkerSession`.
    * Presence is the worker marker — `ZoneGrid::onTitleChange` skips the local
    * `renameTab` + backend `terminal_set_title` invoke so worker tabs stay
-   * pinned at `Worker N` in the tab strip. Mirrors the Phase 1 backend gate
-   * (`set_title_unless_worker`) on the frontend side.
+   * pinned at `Worker N` in the tab strip. The title pin is now a
+   * frontend-only rule: the backend gate that used to enforce it alongside
+   * this one was deleted with the Productivity scheduler.
    */
   taskRunId?: string;
   /**
