@@ -1,9 +1,23 @@
 //! HTTP surface for the D4+D6 Blind-Spot Recommender (Phase 2).
 //!
 //! Mirror of `git_supervision_api.rs`: callers that can't subscribe to a
-//! Tauri channel (curl smoke tests, headless UI Bridge probes, the
-//! `/manual-test` slash command) poll `GET /blind-spots` and get the
-//! recommender's full output.
+//! Tauri channel (curl smoke tests, headless UI Bridge probes, an operator
+//! reading the recommender from outside the app) poll `GET /blind-spots` and
+//! get the recommender's full output.
+//!
+//! It has no in-repo consumer. `BlindSpotsPanel`, the one webview reader, went
+//! with the board in Phase 4 of
+//! `2026-09-12-consolidate-local-orchestration-onto-conductor`, and the route
+//! is deliberately kept: it is the only door onto a recommender
+//! (`blind_spots::compute_scored_blind_spots`) this phase does NOT delete, and
+//! a live subsystem with no way to read it is worse than an unused route.
+//! Retiring it is a separate decision about the HTTP surface.
+//!
+//! This header used to cite the `/manual-test` slash command as a poller. That
+//! could not be confirmed — no `fleet_commands/*.md` mentions `/blind-spots` —
+//! so the claim is dropped rather than repeated. (`git_supervision_api.rs`
+//! carries the same unverified citation for its own route; that file is
+//! untouched here.)
 //!
 //! The endpoint is a pure read: it snapshots the supervision demand ring,
 //! reads the observer registry (a read-through facade — no watchers

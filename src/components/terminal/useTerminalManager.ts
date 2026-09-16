@@ -76,12 +76,18 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
-   * Coordinator `task_run_id` for tabs backed by a registered `WorkerSession`.
-   * Presence is the worker marker — `ZoneGrid::onTitleChange` skips the local
-   * `renameTab` + backend `terminal_set_title` invoke so worker tabs stay
-   * pinned at `Worker N` in the tab strip. The title pin is now a
-   * frontend-only rule: the backend gate that used to enforce it alongside
-   * this one was deleted with the Productivity scheduler.
+   * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
+   * Conductor worker (`dispatch_subtask` in
+   * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
+   * its only writer and always sets {@link sessionBacked} beside it, so a tab
+   * carrying this is a worker view and never a pty tab.
+   *
+   * It is an identity, not a behaviour switch: `WorkerSessionCell` keys the
+   * conversation and steering channels on it, and `closeTerminal` records it
+   * so a hidden worker can be found again. The `Worker N` title pin is NOT
+   * enforced from here — see `ZoneGrid::onTitleChange`, which no longer tests
+   * this field because a worker never mounts the `TerminalInstance` that
+   * reports OSC titles.
    */
   taskRunId?: string;
   /**
@@ -200,10 +206,17 @@ export function shouldIngestCreatedTerminal(
 /**
  * Pure helper: fold a `terminal-created` payload into the existing tab list.
  * Returns the next tabs array — the SAME identity when the terminal already
- * exists (dedup), otherwise a new array with the tab appended. `pendingTaskRunId`
- * is the worker mark drained from the race buffer by the caller (or `undefined`);
- * `pendingBypass` is the bypass-permissions mark drained the same way (a
- * `terminal-bypass-permissions` event that arrived before this `terminal-created`).
+ * exists (dedup), otherwise a new array with the tab appended. `pendingBypass`
+ * is the bypass-permissions mark drained from the race buffer by the caller (a
+ * `terminal-bypass-permissions` event that arrived before this
+ * `terminal-created`); `pendingRemote` is the remote identity drained the same
+ * way.
+ *
+ * This path never stamps a `taskRunId`. Every tab it builds is a PTY tab, and
+ * the only worker mark it ever carried came from the event-based marking drain
+ * that went with the Productivity scheduler — a Conductor worker's tab is
+ * built by `workerTabFromRecord` instead, off a durable
+ * `TerminalSessionRecord`.
  *
  * Exported so `useTerminalManager.test.ts` can drive the ingest + dedup contract
  * without booting React.
@@ -211,7 +224,6 @@ export function shouldIngestCreatedTerminal(
 export function reduceCreatedTerminal(
   tabs: TerminalTab[],
   info: TerminalInfo,
-  pendingTaskRunId: string | undefined,
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
@@ -226,7 +238,6 @@ export function reduceCreatedTerminal(
       exitCode: info.exitCode ?? null,
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
-      taskRunId: pendingTaskRunId,
       bypassPermissions: pendingBypass || undefined,
       remote: pendingRemote,
     },
@@ -950,7 +961,7 @@ export function useTerminalManager(
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
       setTabs((prev) =>
-        reduceCreatedTerminal(prev, info, undefined, pendingBypass, pendingRemote),
+        reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
       );
       if (selectId !== null) {
         ingestedIds.current.add(info.id);
@@ -1028,7 +1039,7 @@ export function useTerminalManager(
             const pendingRemote = pendingRemoteMarks.current.get(id);
             if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
             setTabs((prev) =>
-              reduceCreatedTerminal(prev, info, undefined, pendingBypass, pendingRemote),
+              reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
             );
             ingestedIds.current.add(id);
             setActiveId(id);

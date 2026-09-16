@@ -86,14 +86,14 @@ describe("shouldIngestCreatedTerminal (page routing)", () => {
 
 describe("reduceCreatedTerminal (ingest + dedup)", () => {
   it("captures a terminal-created payload into the page slice", () => {
-    const next = reduceCreatedTerminal([], createdEvent("t1", "page-a"), undefined);
+    const next = reduceCreatedTerminal([], createdEvent("t1", "page-a"));
     expect(next).toHaveLength(1);
     expect(next[0]).toMatchObject({ id: "t1", title: "t1", isAlive: true, workingDir: "/repo" });
   });
 
   it("appends without clearing the existing page state", () => {
     const existing = [tab("t1")];
-    const next = reduceCreatedTerminal(existing, createdEvent("t2", "page-a"), undefined);
+    const next = reduceCreatedTerminal(existing, createdEvent("t2", "page-a"));
     expect(next).toHaveLength(2);
     expect(next.map((t) => t.id)).toEqual(["t1", "t2"]);
     // Original array is not mutated (the t1 tab object survives untouched).
@@ -102,22 +102,17 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
 
   it("dedups by id: a re-delivered event returns the same array identity", () => {
     const existing = [tab("t1")];
-    const next = reduceCreatedTerminal(existing, createdEvent("t1", "page-a"), undefined);
+    const next = reduceCreatedTerminal(existing, createdEvent("t1", "page-a"));
     expect(next).toBe(existing);
   });
 
-  it("stamps the drained worker mark onto the new tab", () => {
-    const next = reduceCreatedTerminal([], createdEvent("w1", "page-a"), "task-42");
-    expect(next[0].taskRunId).toBe("task-42");
-  });
-
   it("stamps the drained bypass mark onto the new tab", () => {
-    const next = reduceCreatedTerminal([], createdEvent("b1", "page-a"), undefined, true);
+    const next = reduceCreatedTerminal([], createdEvent("b1", "page-a"), true);
     expect(next[0].bypassPermissions).toBe(true);
   });
 
   it("leaves bypassPermissions undefined when no bypass mark was drained", () => {
-    const next = reduceCreatedTerminal([], createdEvent("p1", "page-a"), undefined);
+    const next = reduceCreatedTerminal([], createdEvent("p1", "page-a"));
     expect(next[0].bypassPermissions).toBeUndefined();
   });
 
@@ -129,11 +124,11 @@ describe("reduceCreatedTerminal (ingest + dedup)", () => {
     const deliver = (info: TerminalInfo) => {
       // page A's listener
       if (shouldIngestCreatedTerminal(info.pageId, "page-a")) {
-        pageA = reduceCreatedTerminal(pageA, info, undefined);
+        pageA = reduceCreatedTerminal(pageA, info);
       }
       // page B's listener
       if (shouldIngestCreatedTerminal(info.pageId, "page-b")) {
-        pageB = reduceCreatedTerminal(pageB, info, undefined);
+        pageB = reduceCreatedTerminal(pageB, info);
       }
     };
 
@@ -165,7 +160,7 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
     const prev: TerminalTab[] = [];
     const info = createdEvent("cont-2", "default");
     const isNew = !prev.some((t) => t.id === info.id);
-    const next = reduceCreatedTerminal(prev, info, undefined);
+    const next = reduceCreatedTerminal(prev, info);
     expect(next).not.toBe(prev); // appended
     expect(nextActiveIdAfterIngest(info, isNew)).toBe("cont-2"); // selected
   });
@@ -174,7 +169,7 @@ describe("nextActiveIdAfterIngest (auto-select on ingest)", () => {
     const prev: TerminalTab[] = [tab("cont-2")];
     const info = createdEvent("cont-2", "default");
     const isNew = !prev.some((t) => t.id === info.id);
-    const next = reduceCreatedTerminal(prev, info, undefined);
+    const next = reduceCreatedTerminal(prev, info);
     expect(next).toBe(prev); // dedup'd — same identity
     expect(nextActiveIdAfterIngest(info, isNew)).toBeNull(); // no focus steal
   });

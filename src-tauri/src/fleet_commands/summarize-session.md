@@ -21,10 +21,25 @@ discovery.
 `GET /sessions/<task_run_id>/transcript`. If the session is still running,
 abort: "session is not yet complete; summarise after `done` state".
 
-Also fetch the session's verdict (the `reviews.verdict` for the most recent
-review of any task assigned to this session, if one exists). This drives the
-Outcome tag in step 5. If no review exists yet, treat the verdict as
-`approved` — i.e. emit a normal summary, not a failure summary.
+Also fetch the session's verdict: `GET /sessions/<task_run_id>/latest-review`
+→ `review.verdict` (`review` is `null` when no review exists). This drives the
+Outcome tag in step 5. A `null` review is **UNKNOWN — never `approved`**: no
+review having run is not a review that passed, and resolving that absence to
+the permissive value is how an unreviewed failure gets summarised as a normal
+session. Carry the verdict as `unknown`, emit no Outcome tag, and SAY in the
+summary that no review existed — do not emit a failure summary either, which
+would be the same mistake in the other direction.
+
+> This file is the CANONICAL copy for a spawned session: `fleet_commands.rs`
+> ships these `.md` bodies, and `provision_fleet_commands_into` writes this one
+> into a session's working directory unless the destination already exists AND
+> is git-tracked there — false in every allocated agent worktree. The rule above
+> is deliberately worded to match `.claude/commands/summarize-session.md` in
+> qontinui-claude-config, which corrected the same clause; the two must not
+> drift. The Rust default that used to contradict both
+> (`productivity/summarize.rs`, `Ok(None) => "approved"`) is deleted by Phase 4
+> of `2026-09-12-consolidate-local-orchestration-onto-conductor`, so there is no
+> third copy.
 
 ### 2. Identify learnings
 
@@ -79,7 +94,10 @@ line is parsed by the knowledge browser to surface failure-mode warnings
 distinctly.
 
 For `verdict=approved` sessions, omit the Outcome tag — the body is a
-positive learning and standing in for it would be misleading.
+positive learning and standing in for it would be misleading. For
+`verdict=unknown` (no review existed — step 1) omit it too, but for the
+opposite reason: there is no verdict to tag either way. Say so in the body —
+"no review had run on this session" — so the row is not read as an approval.
 
 ### 5. Persist
 
