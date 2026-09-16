@@ -16010,7 +16010,16 @@ mod tests {
     #[test]
     fn shared_root_write_guard_refuses_only_the_root_dir_and_only_for_secondaries() {
         let root = Path::new("D:/qontinui-root");
-        let sibling = "D:/qontinui-root/qontinui-runner";
+        // A sibling that CANNOT exist. It used to read
+        // `D:/qontinui-root/qontinui-runner`, which is not a hypothetical path
+        // on this fleet — it is the PRIMARY runner checkout, present on every
+        // machine laid out the standard way. The canonical arm then measured a
+        // real clone root and answered `RefusedCanonicalRepo` where the
+        // assertion below demands `None`, so this test failed locally for
+        // everyone while passing in CI, whose checkout lives elsewhere. The
+        // literal must name a directory the assertion's own comment is true
+        // of; the suffix keeps it that way.
+        let sibling = "D:/qontinui-root/qontinui-runner-absent-9f3a1c";
         let worktree = "D:/qontinui-root/wt-something";
 
         // PRIMARY (owns shared root state) — unchanged everywhere, root included.

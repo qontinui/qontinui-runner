@@ -17,9 +17,14 @@
 //!
 //! - [`build_ws_url`] — scheme swap, idempotent `/ws`, `?subscribe=<name>`;
 //! - [`connect`] — resolve the device JWT PER CONNECT and present it as
-//!   `?token=` AND `Authorization: Bearer`, then name any refusal
-//!   (status + coord's `error` code) so a 401/403 reconnect flap is
-//!   diagnosable from the log.
+//!   `?token=` AND `Authorization: Bearer`, BOUND the attempt by
+//!   [`CONNECT_TIMEOUT`], then name any refusal (status + coord's `error`
+//!   code) so a 401/403 reconnect flap is diagnosable from the log, and hand
+//!   a 401 to the device-JWT refresher through [`set_unauthorized_hook`].
+//!
+//! The last two are what makes a shared connect worth having over four
+//! copies: a hang bound and a credential-recovery kick are each one edit
+//! here rather than four, and neither can drift between lanes.
 //!
 //! It lives in the lib crate because `env_agent` does, and the bin crate's
 //! lanes reach it as `qontinui_runner_lib::coord_ws`. The bearer accessor it
@@ -27,8 +32,46 @@
 //! `auth::attach_device_auth`, reading the on-disk credential slot per call,
 //! so a reconnect after the ~4 h device-JWT rollover presents the fresh token.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
 use tokio_tungstenite::tungstenite;
 use tracing::warn;
+
+/// Hard ceiling on ONE coord `/ws` connect attempt (TCP + TLS + HTTP
+/// upgrade).
+///
+/// `connect_async` has **no** built-in timeout and is not interruptible
+/// while parked, so a half-open or black-holed socket parks the calling
+/// lane's reconnect loop forever: no error, no backoff, no log line, and —
+/// because every lane here is a single task around a single socket — no
+/// agent spawns, no CI dispatch, no devenv directives and no session
+/// handoffs for the life of the process. The runner's other WS client
+/// records that exact failure being observed in production
+/// (`mcp::backend_relay::CONNECT_TIMEOUT`: *"would block the relay task
+/// indefinitely with no recovery"*); these four lanes had the same exposure
+/// and no bound. Same 20 s budget as that client, deliberately: it is one
+/// property with one value, and a lane that timed out differently from the
+/// relay would be a second thing to reason about.
+///
+/// Exceeding it surfaces as an ordinary `Error::Io(TimedOut)`, which every
+/// lane's existing `Err` arm already handles as a transport failure — so the
+/// recovery is the reconnect backoff that was always there, not new
+/// machinery. [`upgrade_refusal_is_unauthorized`] answers `false` for it, so
+/// a slow network never kicks the credential refresher.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Shortest interval between two [`unauthorized_hook`] firings, process-wide.
+///
+/// Four lanes reconnect independently with a 2 s backoff floor, so one stale
+/// device JWT produces a 401 on each of them several times a minute. The
+/// hook's job is to tell the refresher to look NOW, and telling it once is
+/// the whole of that job — an unfloored kick would turn one expired
+/// credential into a mint storm against coord. The same bounding instinct as
+/// `backend_relay`'s consecutive-rejection kick ceiling, expressed as a rate
+/// rather than a count because these lanes never stop retrying.
+const UNAUTHORIZED_KICK_FLOOR: Duration = Duration::from_secs(60);
 
 /// The closed set of subscriptions coord's `/ws` admits, by wire name.
 ///
@@ -103,7 +146,12 @@ pub fn build_ws_url(coord_url: &str, subscription: Subscription) -> String {
 /// carries a query (it always does: [`build_ws_url`] emits `?subscribe=`),
 /// `?` otherwise. A JWT is base64url segments joined by `.`, all URL-safe,
 /// so no percent-encoding is needed.
-pub fn ws_url_with_token(ws_url: &str, token: &str) -> String {
+///
+/// `pub(crate)`, not `pub`: the carriage is [`connect`]'s business and no
+/// lane assembles a credentialed URL itself — one that did would be holding a
+/// token it must then keep out of its own logs, which is the hazard this
+/// module exists to centralise.
+pub(crate) fn ws_url_with_token(ws_url: &str, token: &str) -> String {
     let sep = if ws_url.contains('?') { '&' } else { '?' };
     format!("{ws_url}{sep}token={token}")
 }
@@ -131,13 +179,159 @@ pub type CoordWs =
 /// `lane` is the log prefix of the calling subscriber.
 pub async fn connect(ws_url: &str, lane: &str) -> anyhow::Result<CoordWs> {
     let request = build_upgrade_request(ws_url, lane)?;
-    match tokio_tungstenite::connect_async(request).await {
+    let attempt = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    {
+        Ok(inner) => inner,
+        // Render the expired budget as the transport error it is, so the
+        // caller's existing `Err` arm backs off and retries exactly as it
+        // would for a refused connection. See [`CONNECT_TIMEOUT`].
+        Err(_elapsed) => Err(tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "coord /ws connect exceeded {}s with no handshake response",
+                CONNECT_TIMEOUT.as_secs()
+            ),
+        ))),
+    };
+    match attempt {
         Ok((ws, _resp)) => Ok(ws),
         Err(e) => {
             log_upgrade_failure(lane, &e);
+            if upgrade_refusal_is_unauthorized(&e) {
+                kick_unauthorized_hook(lane);
+            }
             Err(anyhow::anyhow!("WS upgrade: {e}"))
         }
     }
+}
+
+/// Install the process-wide callback [`connect`] fires when coord refuses a
+/// `/ws` upgrade **401**. Idempotent: the first installation wins and later
+/// calls are ignored, so a double-install cannot produce a double kick.
+///
+/// Why a hook rather than a direct call: the recovery is the device-JWT
+/// refresher (`mcp::device_jwt_refresher`), which lives in the BIN crate,
+/// while this module lives in the lib crate that `env_agent` needs — so the
+/// dependency can only run bin→lib. `main.rs` installs the kick once at
+/// startup and all four lanes inherit it; leaving the hook uninstalled (every
+/// test binary, and `env_agent` used standalone) degrades to today's
+/// behaviour, which is the reconnect flap plus the refresher's own ~5 min
+/// poll.
+///
+/// Why it exists at all: before Phase 2 these upgrades carried no credential,
+/// so a 401 was not reachable and there was nothing to refresh. Making them
+/// credential-bearing created the stale-JWT failure mode in these four lanes
+/// for the first time, and the runner already knows what to do about it —
+/// `backend_relay` kicks the refresher on its own 401 rather than waiting out
+/// the poll (`mcp::backend_relay::is_unauthorized`). This wires the same
+/// recovery to the lanes that just acquired the same failure mode.
+pub fn set_unauthorized_hook(hook: fn()) {
+    let _ = unauthorized_hook().set(hook);
+}
+
+fn unauthorized_hook() -> &'static OnceLock<fn()> {
+    static HOOK: OnceLock<fn()> = OnceLock::new();
+    &HOOK
+}
+
+/// Millis since [`process_epoch`] at which the NEXT hook firing becomes due.
+///
+/// A DEADLINE rather than a "last fired" timestamp, and that is the whole
+/// reason it is correct. A "last fired" counter would need `0` to mean "never
+/// fired", and `now_ms == 0` is not a rare first-millisecond edge case here —
+/// because [`process_epoch`] is initialised lazily by the very same call, it
+/// is the value of the FIRST kick, every time, in every process. So the
+/// sentinel would collide on the first kick always: that kick would never
+/// advance the floor, and every refusal after it would kick again, defeating
+/// the rate limit entirely. A deadline starting at `0` needs no sentinel —
+/// every `now_ms` is `>= 0`, so the first refusal is due whenever it lands.
+fn next_unauthorized_kick_due() -> &'static AtomicU64 {
+    static NEXT_DUE: AtomicU64 = AtomicU64::new(0);
+    &NEXT_DUE
+}
+
+/// The monotonic origin [`UNAUTHORIZED_KICK_FLOOR`] is measured against.
+///
+/// NOT process start: `OnceLock::get_or_init` runs on the FIRST call, and the
+/// only caller is [`kick_unauthorized_hook`] past its hook guard — so this is
+/// the instant of the first 401 seen with a hook installed, which may be hours
+/// into the process. That is fine, and it is what makes the deadline model in
+/// [`next_unauthorized_kick_due`] load-bearing rather than defensive. What
+/// matters here is only that it is an [`Instant`]: monotonic, so a
+/// system-clock step cannot move the floor.
+fn process_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Fire the installed hook unless one fired within
+/// [`UNAUTHORIZED_KICK_FLOOR`]. No hook installed → nothing happens, and the
+/// floor is not consumed (hence the guard order: hook lookup FIRST).
+///
+/// One case that guard does not cover, stated rather than hidden: `main.rs`
+/// installs the hook in the first lines of `main()`, while the refresher it
+/// kicks is registered later in setup and `kick_device_jwt_refresher` no-ops
+/// until then. A 401 landing in that window claims the floor for a kick that
+/// did nothing, swallowing 401s for one [`UNAUTHORIZED_KICK_FLOOR`]. Bounded
+/// at 60 s, still far better than the ~5 min poll this replaces, and not worth
+/// a readiness handshake between the two crates to close.
+fn kick_unauthorized_hook(lane: &str) {
+    let Some(hook) = unauthorized_hook().get() else {
+        return;
+    };
+    let now_ms = process_epoch().elapsed().as_millis() as u64;
+    if !claim_unauthorized_kick(
+        next_unauthorized_kick_due(),
+        now_ms,
+        UNAUTHORIZED_KICK_FLOOR,
+    ) {
+        return;
+    }
+    warn!(
+        "{lane}: coord /ws upgrade refused 401 — asking the device-JWT refresher to \
+         re-mint now rather than waiting out its poll"
+    );
+    hook();
+}
+
+/// Pure rate floor: `true` — and `next_due` is pushed out by `floor` — iff
+/// `now_ms` has reached the stored deadline. Split out so the bound is
+/// unit-testable without a clock or a hook.
+fn claim_unauthorized_kick(next_due: &AtomicU64, now_ms: u64, floor: Duration) -> bool {
+    let mut prev = next_due.load(Ordering::Relaxed);
+    loop {
+        if now_ms < prev {
+            return false;
+        }
+        let pushed = now_ms.saturating_add(floor.as_millis() as u64);
+        // CAS rather than a plain store: four lanes can refuse concurrently,
+        // and exactly one of them should carry the kick through.
+        match next_due.compare_exchange_weak(prev, pushed, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(observed) => prev = observed,
+        }
+    }
+}
+
+/// Whether `e` is coord refusing the upgrade with **401**, the one shape a
+/// fresher device JWT can fix.
+///
+/// Mirrors `mcp::backend_relay::is_unauthorized` deliberately, including what
+/// it excludes: a 403 is a policy verdict about this principal's
+/// subscriptions, a 400 is a request-shape complaint, a 5xx is coord's
+/// problem, and a transport error (including [`CONNECT_TIMEOUT`] expiring)
+/// carries no verdict at all. A new credential fixes none of them, so none of
+/// them kicks the refresher.
+///
+/// `pub(crate)` for the same reason as [`log_upgrade_failure`] beside it:
+/// [`connect`] is the only caller, and the only way a lane obtains one of
+/// these errors at all.
+pub(crate) fn upgrade_refusal_is_unauthorized(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Http(resp) if resp.status().as_u16() == 401)
 }
 
 /// Build the upgrade request [`connect`] sends. Split out so the credential
@@ -185,7 +379,11 @@ fn upgrade_request_with(
 /// HTTP status plus the `error` field of coord's JSON refusal body (coord's
 /// refusals are `{"error": "<code>", …}`). Only the code is logged, never the
 /// request — the URL carries the token.
-pub fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
+///
+/// `pub(crate)`, not `pub`: [`connect`] is the only caller and the only way a
+/// lane obtains one of these errors, so a `pub` spelling advertised an entry
+/// point into this module that does not exist.
+pub(crate) fn log_upgrade_failure(lane: &str, e: &tungstenite::Error) {
     match e {
         tungstenite::Error::Http(resp) => {
             let status = resp.status().as_u16();
@@ -350,6 +548,117 @@ mod tests {
         let req = upgrade_request_with("wss://coord.example/ws?subscribe=device", None).unwrap();
         assert_eq!(req.uri().query(), Some("subscribe=device"));
         assert!(req.headers().get("authorization").is_none());
+    }
+
+    /// Only a 401 kicks the refresher. Everything else — a policy 403, a
+    /// shape 400, coord's own 5xx, and every transport error including the
+    /// [`CONNECT_TIMEOUT`] expiry — carries no verdict a fresh credential
+    /// changes.
+    #[test]
+    fn only_a_401_upgrade_refusal_is_unauthorized() {
+        let http = |status: u16| {
+            let resp = tungstenite::http::Response::builder()
+                .status(status)
+                .body(None)
+                .unwrap();
+            tungstenite::Error::Http(Box::new(resp))
+        };
+        assert!(upgrade_refusal_is_unauthorized(&http(401)));
+        for status in [400, 403, 404, 429, 500, 502, 503] {
+            assert!(
+                !upgrade_refusal_is_unauthorized(&http(status)),
+                "status {status} must not kick the refresher"
+            );
+        }
+        assert!(!upgrade_refusal_is_unauthorized(&tungstenite::Error::Io(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "connect budget")
+        )));
+        assert!(!upgrade_refusal_is_unauthorized(
+            &tungstenite::Error::ConnectionClosed
+        ));
+    }
+
+    /// The very first refusal kicks even when it lands in the process's
+    /// first MILLISECOND (`now_ms == 0`) — and having kicked, it advances the
+    /// floor. A "last fired" counter with `0` meaning "never" gets this
+    /// wrong in both halves: it kicks, stores 0, still reads as never-fired,
+    /// and then kicks on every refusal that follows.
+    #[test]
+    fn the_first_refusal_kicks_at_t0_and_still_advances_the_floor() {
+        let next_due = AtomicU64::new(0);
+        assert!(claim_unauthorized_kick(
+            &next_due,
+            0,
+            UNAUTHORIZED_KICK_FLOOR
+        ));
+        assert!(!claim_unauthorized_kick(
+            &next_due,
+            1,
+            UNAUTHORIZED_KICK_FLOOR
+        ));
+        assert!(!claim_unauthorized_kick(
+            &next_due,
+            UNAUTHORIZED_KICK_FLOOR.as_millis() as u64 - 1,
+            UNAUTHORIZED_KICK_FLOOR
+        ));
+        assert!(claim_unauthorized_kick(
+            &next_due,
+            UNAUTHORIZED_KICK_FLOOR.as_millis() as u64,
+            UNAUTHORIZED_KICK_FLOOR
+        ));
+    }
+
+    /// Four lanes flapping at the 2 s backoff floor must produce ONE kick per
+    /// [`UNAUTHORIZED_KICK_FLOOR`], not one per refusal.
+    #[test]
+    fn concurrent_lane_refusals_collapse_to_one_kick_per_floor() {
+        let next_due = AtomicU64::new(0);
+        let floor = Duration::from_secs(60);
+        let mut kicks = 0;
+        // 150 s of four lanes each refusing every 2 s: 300 refusals.
+        for t_ms in (0..150_000).step_by(2_000) {
+            for _lane in 0..4 {
+                if claim_unauthorized_kick(&next_due, t_ms, floor) {
+                    kicks += 1;
+                }
+            }
+        }
+        // t=0, t=60s, t=120s — and nothing in between.
+        assert_eq!(kicks, 3, "expected one kick per 60s floor over 150s");
+    }
+
+    /// The floor is a rate, not a one-shot: a credential that goes stale
+    /// again hours later still gets a kick.
+    #[test]
+    fn a_later_refusal_past_the_floor_kicks_again() {
+        let next_due = AtomicU64::new(0);
+        let floor = Duration::from_secs(60);
+        assert!(claim_unauthorized_kick(&next_due, 1_000, floor));
+        assert!(!claim_unauthorized_kick(&next_due, 60_999, floor));
+        assert!(claim_unauthorized_kick(&next_due, 61_000, floor));
+    }
+
+    /// With no hook installed the floor must stay unconsumed, or the first
+    /// refusals of a process would silently spend the budget the hook is
+    /// installed to use.
+    #[test]
+    fn no_hook_installed_does_not_consume_the_floor() {
+        // `unauthorized_hook()` is process-global and this test must not
+        // install one; it asserts the guard ORDER in `kick_unauthorized_hook`
+        // (hook lookup first, floor second) by calling it and observing the
+        // deadline is untouched.
+        let before = next_unauthorized_kick_due().load(Ordering::Relaxed);
+        if unauthorized_hook().get().is_none() {
+            kick_unauthorized_hook("test");
+            assert_eq!(next_unauthorized_kick_due().load(Ordering::Relaxed), before);
+        }
+    }
+
+    /// The bound is the same one the runner's other WS client applies, and it
+    /// is a value this module OWNS rather than re-derives per lane.
+    #[test]
+    fn connect_timeout_is_bounded_and_matches_the_relay_budget() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(20));
     }
 
     #[test]

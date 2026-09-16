@@ -39,7 +39,7 @@
 //!    catch-up, so a request published while the runner was disconnected
 //!    is never lost. This is the robustness backstop — steady-state
 //!    delivery is the push.
-//! 3. **Periodic catch-up tick.** The same catch-up GETs also run every
+//! 3. **Periodic catch-up tick.** The HANDOFF catch-up GET also runs every
 //!    [`CATCHUP_TICK`] while the socket is up, so the window is bounded even
 //!    when the socket is healthy but DELIVERS nothing. That is exactly the
 //!    shape against a coord predating the closed subscription set: such a
@@ -53,6 +53,13 @@
 //!    so [`MaterializedSources`] turns a repeat sighting into a close-only
 //!    retry — a second child is never started for a source this process
 //!    already materialized.
+//!
+//!    The tick drives only the arms with no OTHER periodic owner — handoff
+//!    and respawn. The remote-attach and remote-create arms that share this
+//!    socket's on-connect replay each already have their own 60 s poll task
+//!    in `main.rs`, on the same period, so putting them on this tick as well
+//!    would double their GETs and deliver nothing sooner.
+//!    [`catchups_for`] is where that split lives.
 //!
 //! ## Receiver flow (one handoff)
 //!
@@ -445,6 +452,7 @@ async fn connect_and_pump(
     // offline. Best-effort — a failure here doesn't abort the pump (the push
     // path still works, and the next tick or reconnect retries it).
     run_all_catchups(
+        CatchupPass::OnConnect,
         registry,
         lifecycle_store,
         http,
@@ -463,7 +471,7 @@ async fn connect_and_pump(
     loop {
         tokio::select! {
             _ = catchup_tick.tick() => {
-                run_all_catchups(registry, lifecycle_store, http, coord_url, device_id, sources).await;
+                run_all_catchups(CatchupPass::Tick, registry, lifecycle_store, http, coord_url, device_id, sources).await;
             }
             maybe_msg = ws.next() => {
                 let Some(msg) = maybe_msg else {
@@ -515,10 +523,68 @@ async fn connect_and_pump(
     }
 }
 
-/// Every catch-up GET this receiver owns, in order. Run on every (re)connect
-/// and on every [`CATCHUP_TICK`] while the socket is up. Each one is
-/// best-effort and self-logging; none aborts the pump.
+/// Which pass is asking for a catch-up — the input to [`catchups_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatchupPass {
+    /// A (re)connect of this receiver's socket. Everything that landed while
+    /// the socket was down has to be replayed, so this runs EVERY arm.
+    OnConnect,
+    /// A [`CATCHUP_TICK`] on a live socket.
+    Tick,
+}
+
+/// The catch-up arms this one socket's (re)connect drives, each on its own
+/// coord route. They ride together because they share a socket, not because
+/// they share a schedule — see [`catchups_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CatchupKind {
+    /// The durable pending `handoff_request` list.
+    Handoff,
+    /// The pending respawn requests (`session::respawn`).
+    Respawn,
+    /// The remote-ATTACH grants (`session::attach`).
+    Attach,
+    /// The remote-CREATE grants (`session::create`).
+    Create,
+}
+
+/// Which arms a pass drives, and the whole of why the two passes differ.
+///
+/// `OnConnect` runs all four: a socket that was down missed every push, so
+/// every arm needs its replay.
+///
+/// `Tick` runs only the two arms that have **no other periodic owner**:
+///
+/// - `Handoff` and `Respawn` are driven by nothing else in the process. The
+///   on-connect replay was their only backstop, which is the gap
+///   [`CATCHUP_TICK`] exists to close.
+/// - `Attach` and `Create` each already have a process-lifetime 60 s poll
+///   task — `session::attach::start_poll_task` and
+///   `session::create::start_poll_task`, both spawned in `main.rs`, both on a
+///   `POLL_INTERVAL` equal to [`CATCHUP_TICK`]. Driving them from here as
+///   well issues two GETs a minute to each of those routes and delivers
+///   nothing the existing poll would not have delivered within the same
+///   minute.
+///
+/// Expressed as a function over the pass rather than as "which helper the
+/// select arm happens to call", because the asymmetry IS the decision and at
+/// the call site it is invisible.
+pub(super) fn catchups_for(pass: CatchupPass) -> &'static [CatchupKind] {
+    match pass {
+        CatchupPass::OnConnect => &[
+            CatchupKind::Handoff,
+            CatchupKind::Respawn,
+            CatchupKind::Attach,
+            CatchupKind::Create,
+        ],
+        CatchupPass::Tick => &[CatchupKind::Handoff, CatchupKind::Respawn],
+    }
+}
+
+/// Run the catch-up GETs [`catchups_for`] selects for `pass`, in order. Each
+/// one is best-effort and self-logging; none aborts the pump.
 async fn run_all_catchups(
+    pass: CatchupPass,
     registry: &Arc<SessionRegistry>,
     lifecycle_store: &Arc<SessionLifecycleStore>,
     http: &reqwest::Client,
@@ -526,34 +592,58 @@ async fn run_all_catchups(
     device_id: Uuid,
     sources: &MaterializedSources,
 ) {
-    // The HANDOFF catch-up: the durable `handoff_request` event row in coord
-    // is the source of truth; this GET drains it.
-    run_catchup(
-        registry,
-        lifecycle_store,
-        http,
-        coord_url,
-        device_id,
-        sources,
-    )
-    .await;
-    // …and the RESPAWN catch-up, on its own coord route. Separate on purpose:
-    // the handoff read filters `s.state <> 'closed'` (fatal for a respawn,
-    // whose source is closed by construction) and `PendingHandoff` carries
-    // neither the account pin nor the Claude session id. Plan
-    // `2026-08-26-sessions-console-consolidation` §6 Phase 5.
-    super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id).await;
-    // …and the REMOTE-ATTACH catch-up (plan
-    // `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c): the
-    // grants coord minted for this device while the socket was down, into the
-    // table the backend relay's terminal handlers enforce against.
-    super::attach::run_catchup(http, coord_url, device_id).await;
-    // …and the REMOTE-CREATE one beside it (plan
-    // `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase 3b).
-    // Without this the target has no source for the create grants coord
-    // minted while it was down, and a `terminal_create` arriving under one of
-    // them is refused — which is correct, but avoidable.
-    super::create::run_catchup(http, coord_url, device_id, super::create::CATCHUP_TIMEOUT).await;
+    for kind in catchups_for(pass) {
+        match kind {
+            // The durable `handoff_request` event row in coord is the source
+            // of truth; this GET drains it.
+            CatchupKind::Handoff => {
+                run_catchup(
+                    registry,
+                    lifecycle_store,
+                    http,
+                    coord_url,
+                    device_id,
+                    sources,
+                )
+                .await
+            }
+            // The RESPAWN catch-up, on its own coord route. Separate on
+            // purpose: the handoff read filters `s.state <> 'closed'` (fatal
+            // for a respawn, whose source is closed by construction) and
+            // `PendingHandoff` carries neither the account pin nor the Claude
+            // session id. Plan `2026-08-26-sessions-console-consolidation` §6
+            // Phase 5. Safe to repeat on the tick without a
+            // [`MaterializedSources`]-style guard: its dedup is coord's
+            // server-side materialized-child filter (keyed on the
+            // `parent_session_id` the resume stamps), and the per-session
+            // `MIGRATION_CAP` bounds any residue at 3 per 24 h rather than
+            // one per tick.
+            CatchupKind::Respawn => {
+                super::respawn::run_catchup(registry, lifecycle_store, http, coord_url, device_id)
+                    .await
+            }
+            // The remote-ATTACH grants coord minted for this device while the
+            // socket was down (plan
+            // `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c),
+            // into the table the backend relay's terminal handlers enforce
+            // against.
+            CatchupKind::Attach => super::attach::run_catchup(http, coord_url, device_id).await,
+            // The remote-CREATE grants beside them (plan
+            // `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase
+            // 3b). Without this the target has no source for the grants coord
+            // minted while it was down, and a `terminal_create` arriving under
+            // one of them is refused — correct, but avoidable.
+            CatchupKind::Create => {
+                super::create::run_catchup(
+                    http,
+                    coord_url,
+                    device_id,
+                    super::create::CATCHUP_TIMEOUT,
+                )
+                .await
+            }
+        }
+    }
 }
 
 /// Run the one-shot handoff catch-up: GET the durable pending list and
@@ -1374,6 +1464,55 @@ mod tests {
         seen.insert(src);
         assert_eq!(sighting_for(&seen, src), Sighting::CloseOnly);
         assert_eq!(sighting_for(&seen, Uuid::new_v4()), Sighting::Materialize);
+    }
+
+    /// A (re)connect missed every push, so it replays EVERY arm.
+    #[test]
+    fn on_connect_replays_every_catchup_arm() {
+        assert_eq!(
+            catchups_for(CatchupPass::OnConnect),
+            &[
+                CatchupKind::Handoff,
+                CatchupKind::Respawn,
+                CatchupKind::Attach,
+                CatchupKind::Create,
+            ]
+        );
+    }
+
+    /// The tick drives ONLY the arms nothing else drives. `attach` and
+    /// `create` each have their own 60 s poll task in `main.rs`, so adding
+    /// them here is a doubled GET, not a second backstop. This test fails the
+    /// moment someone "restores symmetry" between the two passes.
+    #[test]
+    fn the_tick_drives_only_the_arms_with_no_other_periodic_owner() {
+        let ticked = catchups_for(CatchupPass::Tick);
+        assert_eq!(ticked, &[CatchupKind::Handoff, CatchupKind::Respawn]);
+        for owned_elsewhere in [CatchupKind::Attach, CatchupKind::Create] {
+            assert!(
+                !ticked.contains(&owned_elsewhere),
+                "{owned_elsewhere:?} already has a 60s poll task; the tick must not double it"
+            );
+        }
+    }
+
+    /// The doubling this split removes is only a doubling because the two
+    /// schedules coincide. Pinned so a change to either period is a decision
+    /// taken here rather than a silent re-divergence.
+    #[test]
+    fn the_polled_arms_share_the_ticks_period() {
+        assert_eq!(crate::session::attach::POLL_INTERVAL, CATCHUP_TICK);
+        assert_eq!(crate::session::create::POLL_INTERVAL, CATCHUP_TICK);
+    }
+
+    /// Every arm the tick drives must be one `OnConnect` drives too —
+    /// otherwise a reconnect would SKIP a replay the tick was covering.
+    #[test]
+    fn the_tick_arms_are_a_subset_of_the_on_connect_arms() {
+        let on_connect = catchups_for(CatchupPass::OnConnect);
+        for arm in catchups_for(CatchupPass::Tick) {
+            assert!(on_connect.contains(arm), "{arm:?} missing from OnConnect");
+        }
     }
 
     /// The tick arm's schedule, on a paused clock: the first tick is
