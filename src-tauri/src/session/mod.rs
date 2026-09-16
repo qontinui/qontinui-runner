@@ -1230,9 +1230,9 @@ impl SessionRegistry {
     }
 
     /// Attach an output pipe to an existing externally-owned session so
-    /// its PTY output streams to coord. Used by `terminal_create` and
-    /// `spawn_worker_session` after they register an external session and
-    /// have a broadcast receiver from the real PTY.
+    /// its PTY output streams to coord. Used by `terminal_create` after it
+    /// registers an external session and has a broadcast receiver from the
+    /// real PTY.
     ///
     /// The spawned pipe task is stored on the session record so it lives
     /// for the session's lifetime and is aborted on close (same lifecycle

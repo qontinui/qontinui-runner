@@ -196,11 +196,6 @@ const CODE_ANALYZE: &str = include_str!("fleet_commands/code-analyze.md");
 /// there, then re-vendor.
 const CODE_FIX: &str = include_str!("fleet_commands/code-fix.md");
 
-/// `/coordinate` procedure, bundled into the binary. Vendored from
-/// qontinui-claude-config `.claude/commands/coordinate.md` (canonical) — edit it
-/// there, then re-vendor.
-const COORDINATE: &str = include_str!("fleet_commands/coordinate.md");
-
 /// `/create-plan` procedure, bundled into the binary. Vendored from
 /// qontinui-claude-config `.claude/commands/create-plan.md` (canonical) — edit it
 /// there, then re-vendor.
@@ -481,7 +476,6 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("clean", CLEAN),
     ("code-analyze", CODE_ANALYZE),
     ("code-fix", CODE_FIX),
-    ("coordinate", COORDINATE),
     ("create-plan", CREATE_PLAN),
     ("create-tutorial", CREATE_TUTORIAL),
     ("debug-loop", DEBUG_LOOP),
