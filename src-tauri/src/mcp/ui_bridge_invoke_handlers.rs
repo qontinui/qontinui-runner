@@ -253,7 +253,7 @@ in_process_dispatch_table! {
     (state, args) {
         "redeem_pair_code" => in_process_redeem_pair_code(args),
         "dismiss_recent_crash" => in_process_dismiss_recent_crash(state),
-        "get_coord_device_token" => in_process_get_coord_device_token(),
+        "get_coord_device_token" => in_process_get_coord_device_token(args),
         "get_access_token_for_websocket" => in_process_get_access_token_for_websocket(args),
     }
 }
@@ -269,7 +269,9 @@ in_process_dispatch_table! {
 /// structured error text — never an empty 200 a caller could read as a token.
 ///
 /// Wire shape: success is `{ "success": true, "data": "<token>" }`; the token
-/// is the operator's Cognito ACCESS token (not a coord device JWT). Takes no
+/// is the legacy `access_token` slot — the DEFAULT binding's coord device JWT
+/// (see `get_access_token_for_websocket_impl`'s doc for the Step 0 read that
+/// corrected "Cognito access token" here). Takes no
 /// arguments; a non-empty `args` object is a 400 rather than silently ignored.
 async fn in_process_get_access_token_for_websocket(
     args: &Value,
@@ -406,25 +408,72 @@ async fn in_process_dismiss_recent_crash(
 /// `crate::ui_bridge_invoke::UI_BRIDGE_COMMANDS` for why this command and not
 /// `get_access_token_for_websocket`, and why the entry exists at all.
 ///
-/// A plain `fn() -> Result<Option<String>, String>` that reads the credential
-/// store, so it needs neither `ApiState` nor `args` -- and, crucially, nothing
-/// from the webview. That is what lets it answer on a headless runner and on a
-/// CSP-enforcing build, the two shapes `page/evaluate` cannot serve.
+/// A plain fn that reads the credential store, so it needs no `ApiState` --
+/// and, crucially, nothing from the webview. That is what lets it answer on a
+/// headless runner and on a CSP-enforcing build, the two shapes `page/evaluate`
+/// cannot serve.
+///
+/// # Args (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
+///
+/// `{"tenantId": "<uuid>"}` names the tenant whose token the caller wants --
+/// the same key the Tauri command's `tenant_id` parameter takes over IPC.
+/// `tenant_id` is accepted as an alias (shell callers spell it that way); both
+/// present and disagreeing is a 400, as is a non-string value or any other key.
+/// `{}` / `null` names no tenant, which on a runner holding several tenant slots
+/// is REFUSED -- see `commands::auth::get_coord_device_token`. An older runner
+/// ignores the args entirely, so a caller may always send them.
 ///
 /// Mapping, deliberately three-valued so a caller can tell them apart:
 /// - `Ok(Some(jwt))` -> the JWT as a JSON string;
-/// - `Ok(None)`      -> JSON `null`: definitively unpaired. NOT an error.
-/// - `Err(e)`        -> 500: the credential store was unreadable, so the
-///   pairing state is UNKNOWN. Never collapsed into `null` -- that would render
-///   an unreadable store as "this runner is unpaired", the exact NO-DOWNGRADE
-///   flattening the command's own doc comment records having removed.
-async fn in_process_get_coord_device_token() -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
+/// - `Ok(None)`      -> JSON `null`: definitively no token (for that tenant). NOT an error.
+/// - `Err(e)`        -> 500: the credential store was unreadable, so the answer
+///   is UNKNOWN -- never collapsed into `null`;
+/// - refused         -> 409 `get_coord_device_token:tenant_required` (name a
+///   tenant) or 400 `get_coord_device_token:tenant_invalid`, typed text verbatim.
+async fn in_process_get_coord_device_token(
+    args: &Value,
+) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     const COMMAND: &str = "get_coord_device_token";
 
-    match crate::commands::auth::get_coord_device_token() {
+    let tenant = coord_device_token_tenant_arg(args).map_err(|d| in_process_bad_args(COMMAND, &d))?;
+    match crate::commands::auth::get_coord_device_token(tenant) {
         Ok(Some(token)) => Ok(Value::String(token)),
         Ok(None) => Ok(Value::Null),
+        Err(e) if e.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_INVALID) => {
+            Err(in_process_bad_args(COMMAND, &e))
+        }
+        // A refusal is the caller's to fix (name a tenant), so it is a 409 --
+        // distinct from the 500 an unreadable store answers, which is not.
+        Err(e) if e.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) => Err((
+            StatusCode::CONFLICT,
+            Json(api_error(format!(
+                "invoke proxy: in-process invoke of '{}' refused: {}",
+                COMMAND, e
+            ))),
+        )),
         Err(e) => Err(in_process_command_failed(COMMAND, e)),
+    }
+}
+
+/// Parse `get_coord_device_token`'s args: `tenantId` (canonical) or its
+/// `tenant_id` alias, nothing else.
+fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String> {
+    let obj = match args {
+        Value::Null => return Ok(None),
+        Value::Object(o) => o,
+        _ => return Err("args must be an object `{\"tenantId\": \"<uuid>\"}` or `{}`".to_string()),
+    };
+    if let Some(other) = obj.keys().find(|k| *k != "tenantId" && *k != "tenant_id") {
+        return Err(format!("unknown arg `{other}` -- the only arg is `tenantId`"));
+    }
+    let canonical = optional_string_arg(args, "tenantId")?;
+    let alias = optional_string_arg(args, "tenant_id")?;
+    match (canonical, alias) {
+        (Some(a), Some(b)) if a.trim() != b.trim() => {
+            Err("`tenantId` and `tenant_id` name different tenants -- send one".to_string())
+        }
+        (Some(a), _) => Ok(Some(a)),
+        (None, b) => Ok(b),
     }
 }
 
@@ -1069,5 +1118,29 @@ mod in_process_dispatch_tests {
         let (status, Json(body)) = in_process_command_failed("x", "y".to_string());
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.error.unwrap().contains("in-process invoke of 'x'"));
+    }
+}
+
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3:
+/// the invoke door carries the tenant argument, and never silently drops a bad one.
+#[cfg(test)]
+mod coord_device_token_arg_tests {
+    use super::coord_device_token_tenant_arg as parse;
+    use serde_json::json;
+
+    #[test]
+    fn the_tenant_arg_is_read_under_either_spelling_and_nothing_else() {
+        assert_eq!(parse(&json!(null)), Ok(None));
+        assert_eq!(parse(&json!({})), Ok(None));
+        assert_eq!(parse(&json!({"tenantId": "t1"})), Ok(Some("t1".into())));
+        assert_eq!(parse(&json!({"tenant_id": "t1"})), Ok(Some("t1".into())));
+        assert_eq!(
+            parse(&json!({"tenantId": "t1", "tenant_id": "t1"})),
+            Ok(Some("t1".into()))
+        );
+        assert!(parse(&json!({"tenantId": "t1", "tenant_id": "t2"})).is_err());
+        assert!(parse(&json!({"tenantId": 7})).is_err());
+        assert!(parse(&json!({"tenant": "t1"})).is_err());
+        assert!(parse(&json!("t1")).is_err());
     }
 }
