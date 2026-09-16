@@ -83,9 +83,9 @@ pub mod session_transcript_tailer; // Interactive-pane Claude Code transcript ->
 pub mod shutdown_marker;
 pub mod snapshot_history;
 pub mod spawn_prompt; // The spawn-time system-prompt carrier: ONE composed file (briefing + policy body) via --append-system-prompt-file (plan 2026-09-15-runner-policy-injection-off-sessionstart-hook-channel, Phase 1)
-// Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
-// can read the same pin the proxy does — see the lib declaration for why.
-// Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
+                      // Moved to the lib crate (`qontinui_runner_lib::tenant_pin`) so `coord_doctor`
+                      // can read the same pin the proxy does — see the lib declaration for why.
+                      // Re-exported here so every `crate::session::tenant_pin::…` path is unchanged.
 pub use qontinui_runner_lib::tenant_pin;
 pub mod tracking_health;
 pub mod transcript_emitter;

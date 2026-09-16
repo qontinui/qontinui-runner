@@ -4756,9 +4756,7 @@ async fn run_continuation_terminal(
     ));
     // The marker the policy hook's route trusts as proof of delivery — taken
     // from the very carrier the argv uses, never recomputed.
-    let policy_delivery = prompt_carrier
-        .as_ref()
-        .and_then(|c| c.policy_delivery());
+    let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -5376,9 +5374,7 @@ async fn run_condition_check_terminal(
     ));
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
-    let policy_delivery = prompt_carrier
-        .as_ref()
-        .and_then(|c| c.policy_delivery());
+    let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     let argv = build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,
@@ -8482,8 +8478,14 @@ mod tests {
         };
         let with = build(Some("claude --system-prompt operator-prompt"));
         assert!(with.iter().any(|a| a == "--system-prompt"), "{with:?}");
-        assert!(with.iter().any(|a| a == "--append-system-prompt-file"), "{with:?}");
-        assert_eq!(delivery_unless_replacement(carrier.policy_delivery(), &with), None);
+        assert!(
+            with.iter().any(|a| a == "--append-system-prompt-file"),
+            "{with:?}"
+        );
+        assert_eq!(
+            delivery_unless_replacement(carrier.policy_delivery(), &with),
+            None
+        );
 
         let without = build(None);
         assert_eq!(

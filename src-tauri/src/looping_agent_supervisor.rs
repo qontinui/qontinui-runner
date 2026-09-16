@@ -1046,9 +1046,7 @@ async fn spawn_looping_agent_terminal(
     ));
     // Carried to the child env by the capture hint below; from the SAME
     // carrier the argv uses.
-    let policy_delivery = prompt_carrier
-        .as_ref()
-        .and_then(|c| c.policy_delivery());
+    let policy_delivery = prompt_carrier.as_ref().and_then(|c| c.policy_delivery());
     let argv = crate::agent_runtime::build_continuation_claude_command(
         claude_bin,
         &pinned_session_id,

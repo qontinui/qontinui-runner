@@ -1601,8 +1601,12 @@ mod tests {
         let payload = sample_payload();
         let sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&payload).unwrap());
-        let (text, confirmed) =
-            render_for_session(&payload, Some(&sha), Some("compact"), "2026-08-19T12:00:00Z");
+        let (text, confirmed) = render_for_session(
+            &payload,
+            Some(&sha),
+            Some("compact"),
+            "2026-08-19T12:00:00Z",
+        );
         assert!(confirmed);
         // Still attributable, still versioned.
         assert!(text.starts_with("[qontinui-runner]"));
@@ -1631,8 +1635,12 @@ mod tests {
         };
         let real_sha =
             crate::session::spawn_prompt::policy_body_sha(&render_policy_body(&real).unwrap());
-        let (short, confirmed) =
-            render_for_session(&real, Some(&real_sha), Some("startup"), "2026-08-19T12:00:00Z");
+        let (short, confirmed) = render_for_session(
+            &real,
+            Some(&real_sha),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
         assert!(confirmed);
         let full = render_injection(&real, "startup", "2026-08-19T12:00:00Z");
         assert!(
@@ -1694,8 +1702,12 @@ mod tests {
 
         // A marker for an OLDER body: the spawn-time copy is stale.
         let stale = crate::session::spawn_prompt::policy_body_sha("an older session-protocol");
-        let (text, confirmed) =
-            render_for_session(&payload, Some(&stale), Some("startup"), "2026-08-19T12:00:00Z");
+        let (text, confirmed) = render_for_session(
+            &payload,
+            Some(&stale),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
         assert!(!confirmed);
         assert_eq!(text, full);
 
@@ -1704,8 +1716,12 @@ mod tests {
             protocol_body: None,
             ..sample_payload()
         };
-        let (text, confirmed) =
-            render_for_session(&partial, Some(&stale), Some("startup"), "2026-08-19T12:00:00Z");
+        let (text, confirmed) = render_for_session(
+            &partial,
+            Some(&stale),
+            Some("startup"),
+            "2026-08-19T12:00:00Z",
+        );
         assert!(!confirmed);
         assert!(text.contains("Step 0 is NOT satisfied"));
     }

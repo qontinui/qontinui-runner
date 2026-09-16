@@ -391,7 +391,8 @@ fn is_claude_command(s: &str) -> bool {
 /// flag, so an operator's replacement prompt is layered in as before. (The
 /// replacement pair refuses each other, but the runner's carrier is never a
 /// replacement flag, so that pair cannot collide with it.)
-const APPEND_PROMPT_FLAG_GROUP: [&str; 2] = ["--append-system-prompt", "--append-system-prompt-file"];
+const APPEND_PROMPT_FLAG_GROUP: [&str; 2] =
+    ["--append-system-prompt", "--append-system-prompt-file"];
 
 /// Is `token` one of [`APPEND_PROMPT_FLAG_GROUP`], in either the `--flag` or
 /// the attached `--flag=value` spelling?
@@ -767,7 +768,10 @@ mod tests {
         let argv = render_argv(&s, &tmpl("claude --system-prompt x"), "claude");
         assert_eq!(value_after(&argv, "--system-prompt"), Some("x"));
         let argv = render_argv(&s, &tmpl("claude --system-prompt-file=/t/sp.md"), "claude");
-        assert!(argv.iter().any(|a| a == "--system-prompt-file=/t/sp.md"), "{argv:?}");
+        assert!(
+            argv.iter().any(|a| a == "--system-prompt-file=/t/sp.md"),
+            "{argv:?}"
+        );
         assert_eq!(
             value_after(&argv, "--append-system-prompt-file"),
             Some("/rt/spawn-prompts/spawn-1.md")

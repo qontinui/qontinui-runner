@@ -318,8 +318,7 @@ pub fn keeps_policy_delivered_sha(
         && !replacement
         && args.iter().enumerate().any(|(i, a)| {
             (a == FLAG && args.get(i + 1).is_some_and(|v| v == file))
-                || a
-                    .strip_prefix(FLAG)
+                || a.strip_prefix(FLAG)
                     .and_then(|rest| rest.strip_prefix('='))
                     .is_some_and(|v| v == file)
         })
@@ -601,12 +600,11 @@ fn run_identity(tool: IdentityTool, args: &[String]) -> Option<i32> {
 
     let final_args = identity_argv(args, &settings, &mcp_config, pinned.as_deref(), user_chose);
     let delivered_file = std::env::var(POLICY_DELIVERED_FILE_ENV).ok();
-    let env_remove: &[&str] =
-        if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
-            &[]
-        } else {
-            &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
-        };
+    let env_remove: &[&str] = if keeps_policy_delivered_sha(tool, args, delivered_file.as_deref()) {
+        &[]
+    } else {
+        &[POLICY_DELIVERED_SHA_ENV, POLICY_DELIVERED_FILE_ENV]
+    };
     let code = exec_real_child_env(&real, tool.program(), &final_args, env_remove);
     // Explicit, not incidental: the minted config holds a live device credential
     // and is deleted HERE — after the child that read it has exited. Dropping it
@@ -1499,25 +1497,61 @@ mod tests {
         let composed = Some("/x/spawn-1.md");
         let with_file = strs(&["--append-system-prompt-file", "/x/spawn-1.md", "-p", "hi"]);
         let attached = strs(&["--append-system-prompt-file=/x/spawn-1.md"]);
-        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, composed));
-        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &attached, composed));
+        assert!(keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &with_file,
+            composed
+        ));
+        assert!(keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &attached,
+            composed
+        ));
 
         // A nested claude with its OWN file, either spelling: dropped.
         let own = strs(&["-p", "--append-system-prompt-file", "./eval.md"]);
         let own_attached = strs(&["--append-system-prompt-file=./eval.md"]);
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &own, composed));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &own_attached, composed));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &own,
+            composed
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &own_attached,
+            composed
+        ));
         // The composed path as a VALUE of some other flag, or dangling: dropped.
         let elsewhere = strs(&["--append-system-prompt-file", "./eval.md", "/x/spawn-1.md"]);
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &elsewhere, composed));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &elsewhere,
+            composed
+        ));
         let dangling = strs(&["--append-system-prompt-file"]);
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &dangling, composed));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &dangling,
+            composed
+        ));
 
         let inline = strs(&["--append-system-prompt", "briefing"]);
         let bare = strs(&["-p", "hi"]);
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &inline, composed));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &bare, composed));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &[], composed));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &inline,
+            composed
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &bare,
+            composed
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &[],
+            composed
+        ));
         // A near-miss token is not the flag.
         assert!(!keeps_policy_delivered_sha(
             IdentityTool::Claude,
@@ -1527,21 +1561,49 @@ mod tests {
         // A replacement prompt beside the composed file: withheld (either
         // spelling); the same token after `--` is prompt text.
         for replacement in [
-            strs(&["--append-system-prompt-file", "/x/spawn-1.md", "--system-prompt", "x"]),
-            strs(&["--system-prompt-file=/t.md", "--append-system-prompt-file=/x/spawn-1.md"]),
+            strs(&[
+                "--append-system-prompt-file",
+                "/x/spawn-1.md",
+                "--system-prompt",
+                "x",
+            ]),
+            strs(&[
+                "--system-prompt-file=/t.md",
+                "--append-system-prompt-file=/x/spawn-1.md",
+            ]),
         ] {
             assert!(
                 !keeps_policy_delivered_sha(IdentityTool::Claude, &replacement, composed),
                 "{replacement:?}"
             );
         }
-        let after_terminator =
-            strs(&["--append-system-prompt-file", "/x/spawn-1.md", "--", "--system-prompt"]);
-        assert!(keeps_policy_delivered_sha(IdentityTool::Claude, &after_terminator, composed));
+        let after_terminator = strs(&[
+            "--append-system-prompt-file",
+            "/x/spawn-1.md",
+            "--",
+            "--system-prompt",
+        ]);
+        assert!(keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &after_terminator,
+            composed
+        ));
         // No inherited file (or an empty one): nothing to match, never kept.
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, None));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Claude, &with_file, Some("")));
-        assert!(!keeps_policy_delivered_sha(IdentityTool::Gemini, &with_file, composed));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &with_file,
+            None
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Claude,
+            &with_file,
+            Some("")
+        ));
+        assert!(!keeps_policy_delivered_sha(
+            IdentityTool::Gemini,
+            &with_file,
+            composed
+        ));
         assert_eq!(POLICY_DELIVERED_SHA_ENV, "QONTINUI_POLICY_DELIVERED_SHA");
         assert_eq!(POLICY_DELIVERED_FILE_ENV, "QONTINUI_POLICY_DELIVERED_FILE");
     }

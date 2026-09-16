@@ -2151,7 +2151,9 @@ pub(crate) fn create_terminal_session_backend(
     // The spawn-time policy delivery marker pair — set, or BLANKED, on every
     // backend spawn. See `SessionCaptureHint::policy_delivery`.
     env_pairs.extend(crate::session::spawn_prompt::policy_delivery_env(
-        capture_hint.as_ref().and_then(|h| h.policy_delivery.as_ref()),
+        capture_hint
+            .as_ref()
+            .and_then(|h| h.policy_delivery.as_ref()),
     ));
     let extra_env = if env_pairs.is_empty() {
         None

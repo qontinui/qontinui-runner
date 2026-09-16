@@ -222,7 +222,11 @@ impl WatchClaim {
         if let Some(active) = map.get(session_id) {
             let mut state = lock_state(&active.shared);
             let first = state.timing.evidence.at;
-            let (lo, hi) = if open.at < first { (open.at, first) } else { (first, open.at) };
+            let (lo, hi) = if open.at < first {
+                (open.at, first)
+            } else {
+                (first, open.at)
+            };
             let pairs = active.terminal_id == terminal_id
                 && !state.ending
                 && !state.superseded
@@ -692,7 +696,12 @@ impl SessionOpenWatch {
         }
     }
 
-    fn emit_detection(&self, turn: &PhantomTurn, slots: Option<&PtyInputSlots>, anchor: OpenAnchor) {
+    fn emit_detection(
+        &self,
+        turn: &PhantomTurn,
+        slots: Option<&PtyInputSlots>,
+        anchor: OpenAnchor,
+    ) {
         let latest = slots.and_then(|s| s.latest());
         let last_write_caller = latest
             .map(|o| o.caller.tag().into_owned())
@@ -875,7 +884,10 @@ pub fn spawn_watch(
         None => {
             tokio::spawn(async move {
                 let Ok(watch) = tokio::task::spawn_blocking(move || {
-                    build(super::transcript::find_claude_config_dirs(), TailStart::RecentTail)
+                    build(
+                        super::transcript::find_claude_config_dirs(),
+                        TailStart::RecentTail,
+                    )
                 })
                 .await
                 else {
@@ -945,7 +957,11 @@ mod tests {
         let open = Instant::now();
         let forked_history = [
             user_line_at("is", "typed", Some("2026-09-14T08:00:00Z")),
-            user_line_at("please run the tests", "typed", Some("2026-09-14T08:01:00Z")),
+            user_line_at(
+                "please run the tests",
+                "typed",
+                Some("2026-09-14T08:01:00Z"),
+            ),
             user_line_at("ok", "typed", Some("2026-09-15T10:00:00.099Z")),
             user_line_at("is", "typed", None),
             user_line_at("is", "typed", Some("not a time")),
@@ -970,7 +986,11 @@ mod tests {
             Verdict::Undecided
         );
         // Just past the slack (open − 2.001 s): history.
-        let stale = [user_line_at("is", "typed", Some("2026-09-15T09:59:58.099Z"))];
+        let stale = [user_line_at(
+            "is",
+            "typed",
+            Some("2026-09-15T09:59:58.099Z"),
+        )];
         assert_eq!(
             detect_phantom_turn(stale.iter().map(String::as_str), no_input(open)),
             Verdict::Undecided
@@ -1006,7 +1026,10 @@ mod tests {
             panic!("first claim");
         };
         let later = open_after(first_open, Duration::from_secs(5));
-        assert!(matches!(claim(&sid, "t1", later, None), ClaimOutcome::Extended));
+        assert!(matches!(
+            claim(&sid, "t1", later, None),
+            ClaimOutcome::Extended
+        ));
         assert_eq!(
             read_timing(&first.timing()),
             WatchTiming {
@@ -1042,11 +1065,17 @@ mod tests {
         assert!(!lock_state(&new.timing()).superseded);
         drop(old);
         assert!(
-            matches!(claim(&sid, "t2", anchor_now(), None), ClaimOutcome::Extended),
+            matches!(
+                claim(&sid, "t2", anchor_now(), None),
+                ClaimOutcome::Extended
+            ),
             "the replacement survives the old claim's drop"
         );
         drop(new);
-        assert!(matches!(claim(&sid, "t2", anchor_now(), None), ClaimOutcome::New(_)));
+        assert!(matches!(
+            claim(&sid, "t2", anchor_now(), None),
+            ClaimOutcome::New(_)
+        ));
     }
 
     /// A quit and `claude --resume` in the same pane is its OWN launch: a later
@@ -1060,7 +1089,10 @@ mod tests {
         let ClaimOutcome::New(first) = claim(&sid, "t1", first_open, None) else {
             panic!("first claim");
         };
-        let late = open_after(first_open, PHANTOM_TURN_PAIRING_INTERVAL + Duration::from_secs(1));
+        let late = open_after(
+            first_open,
+            PHANTOM_TURN_PAIRING_INTERVAL + Duration::from_secs(1),
+        );
         let ClaimOutcome::New(second) = claim(&sid, "t1", late, None) else {
             panic!("a launch past the pairing interval is a new watch");
         };
@@ -1087,9 +1119,17 @@ mod tests {
         let ClaimOutcome::New(_held) = claim(&sid, "t1", first_open, None) else {
             panic!("first claim");
         };
-        let prior = first_open.at.checked_sub(Duration::from_millis(1)).unwrap_or(first_open.at);
+        let prior = first_open
+            .at
+            .checked_sub(Duration::from_millis(1))
+            .unwrap_or(first_open.at);
         assert!(matches!(
-            claim(&sid, "t1", open_after(first_open, Duration::from_secs(1)), Some(prior)),
+            claim(
+                &sid,
+                "t1",
+                open_after(first_open, Duration::from_secs(1)),
+                Some(prior)
+            ),
             ClaimOutcome::Extended
         ));
     }
@@ -1103,7 +1143,10 @@ mod tests {
             panic!("first claim");
         };
         lock_state(&first.timing()).ending = true;
-        assert!(matches!(claim(&sid, "t1", anchor_now(), None), ClaimOutcome::New(_)));
+        assert!(matches!(
+            claim(&sid, "t1", anchor_now(), None),
+            ClaimOutcome::New(_)
+        ));
 
         let sid = format!("test-expired-{}", uuid::Uuid::new_v4());
         let ClaimOutcome::New(_short) =
@@ -1112,7 +1155,10 @@ mod tests {
             panic!("first claim");
         };
         std::thread::sleep(Duration::from_millis(5));
-        assert!(matches!(claim(&sid, "t1", anchor_now(), None), ClaimOutcome::New(_)));
+        assert!(matches!(
+            claim(&sid, "t1", anchor_now(), None),
+            ClaimOutcome::New(_)
+        ));
     }
 
     /// The deadline is the latest open plus the window, capped at the evidence
@@ -1134,7 +1180,10 @@ mod tests {
             superseded: false,
         };
         assert_eq!(state(Duration::ZERO).deadline(), t + w);
-        assert_eq!(state(Duration::from_secs(10)).deadline(), t + Duration::from_secs(35));
+        assert_eq!(
+            state(Duration::from_secs(10)).deadline(),
+            t + Duration::from_secs(35)
+        );
         assert_eq!(state(Duration::from_secs(40)).deadline(), t + 2 * w);
     }
 
@@ -1162,7 +1211,11 @@ mod tests {
             panic!("replacement");
         };
         let now = chrono::Utc::now().to_rfc3339();
-        std::fs::write(&path, format!("{}\n", user_line_at("is", "typed", Some(&now)))).unwrap();
+        std::fs::write(
+            &path,
+            format!("{}\n", user_line_at("is", "typed", Some(&now))),
+        )
+        .unwrap();
         let started = Instant::now();
         let verdict = watch.run(|| Some(PtyInputSlots::default())).await;
         assert_eq!(verdict, Verdict::Superseded);
@@ -1210,7 +1263,13 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(verdict, Verdict::Phantom(PhantomTurn { content_chars: 2, .. })),
+            matches!(
+                verdict,
+                Verdict::Phantom(PhantomTurn {
+                    content_chars: 2,
+                    ..
+                })
+            ),
             "{verdict:?}"
         );
     }
@@ -1316,7 +1375,13 @@ mod tests {
         .run(|| Some(PtyInputSlots::default()))
         .await;
         assert!(
-            matches!(verdict, Verdict::Phantom(PhantomTurn { content_chars: 2, .. })),
+            matches!(
+                verdict,
+                Verdict::Phantom(PhantomTurn {
+                    content_chars: 2,
+                    ..
+                })
+            ),
             "{verdict:?}"
         );
     }
@@ -1367,9 +1432,15 @@ mod tests {
         let mut tail = AppendTail::from_recent(path);
         assert_eq!(tail.offset, len - PHANTOM_TURN_TAIL_LOOKBACK_BYTES);
         let lines = tail.read_new_lines();
-        assert!(!lines.is_empty() && lines.len() < total, "{} lines", lines.len());
         assert!(
-            lines.iter().all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
+            !lines.is_empty() && lines.len() < total,
+            "{} lines",
+            lines.len()
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()),
             "a torn record was yielded"
         );
         assert!(lines.last().unwrap().contains("\"is\""));

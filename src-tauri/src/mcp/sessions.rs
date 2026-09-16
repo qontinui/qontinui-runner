@@ -980,8 +980,7 @@ async fn policy_context(
     // forwarded by the hook script in a HEADER so it never reaches the trace
     // log's request URI. Parsed strictly; anything but a 64-hex SHA-256 is no
     // marker and gets the full render.
-    let delivered_sha =
-        crate::mcp::policy_context::delivered_sha_from_headers(&headers);
+    let delivered_sha = crate::mcp::policy_context::delivered_sha_from_headers(&headers);
     match crate::mcp::policy_context::policy_context(
         &key,
         q.source.as_deref(),

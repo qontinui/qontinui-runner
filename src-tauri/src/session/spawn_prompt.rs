@@ -526,7 +526,10 @@ pub fn shell_pane_prompt_env(briefing: &str) -> [(&'static str, Option<String>);
 fn shell_pane_prompt_env_from(
     carrier: Option<SystemPromptCarrier>,
 ) -> [(&'static str, Option<String>); 3] {
-    match carrier.as_ref().and_then(SystemPromptCarrier::policy_delivery) {
+    match carrier
+        .as_ref()
+        .and_then(SystemPromptCarrier::policy_delivery)
+    {
         Some(PolicyDelivery { sha, file }) => [
             (RUNNER_CONTEXT_FILE_ENV, Some(file.clone())),
             (POLICY_DELIVERED_SHA_ENV, Some(sha)),
@@ -639,7 +642,10 @@ mod tests {
         let a = compose_spawn_prompt_in(tmp.path(), None, "BODY").unwrap();
         let b = compose_spawn_prompt_in(tmp.path(), Some("  "), "BODY").unwrap();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "BODY");
-        assert_eq!(a, b, "a blank briefing composes the same bytes, so the same file");
+        assert_eq!(
+            a, b,
+            "a blank briefing composes the same bytes, so the same file"
+        );
     }
 
     /// Content-addressed: the name is the content hash, identical spawns share
@@ -654,7 +660,10 @@ mod tests {
             spawn_prompt_file_name("BRIEF\n\nBODY")
         );
         let name = a.file_name().unwrap().to_string_lossy().into_owned();
-        assert!(name.starts_with("spawn-") && name.ends_with(".md"), "{name}");
+        assert!(
+            name.starts_with("spawn-") && name.ends_with(".md"),
+            "{name}"
+        );
         assert_eq!(name.len(), "spawn-".len() + 16 + ".md".len(), "{name}");
         assert!(name["spawn-".len()..name.len() - 3]
             .bytes()
@@ -844,16 +853,31 @@ mod tests {
         };
         let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         for with in [
-            argv(&["claude", "--system-prompt", "x", "--append-system-prompt-file", "/x/spawn-1.md"]),
+            argv(&[
+                "claude",
+                "--system-prompt",
+                "x",
+                "--append-system-prompt-file",
+                "/x/spawn-1.md",
+            ]),
             argv(&["claude", "--system-prompt=x"]),
             argv(&["claude", "--system-prompt-file", "/t.md"]),
             argv(&["claude", "--system-prompt-file=/t.md", "--", "p"]),
         ] {
             assert!(argv_carries_replacement_prompt(&with), "{with:?}");
-            assert_eq!(delivery_unless_replacement(Some(delivery.clone()), &with), None);
+            assert_eq!(
+                delivery_unless_replacement(Some(delivery.clone()), &with),
+                None
+            );
         }
         for without in [
-            argv(&["claude", "--append-system-prompt-file", "/x/spawn-1.md", "--", "--system-prompt"]),
+            argv(&[
+                "claude",
+                "--append-system-prompt-file",
+                "/x/spawn-1.md",
+                "--",
+                "--system-prompt",
+            ]),
             argv(&["claude", "--system-prompts", "x"]),
             argv(&["claude"]),
         ] {
@@ -879,10 +903,16 @@ mod tests {
             policy_delivery_env(Some(&delivery)),
             [
                 (POLICY_DELIVERED_SHA_ENV.to_string(), "cd".repeat(32)),
-                (POLICY_DELIVERED_FILE_ENV.to_string(), "/x/spawn-2.md".to_string()),
+                (
+                    POLICY_DELIVERED_FILE_ENV.to_string(),
+                    "/x/spawn-2.md".to_string()
+                ),
             ]
         );
-        assert_eq!(SystemPromptCarrier::Inline("b".into()).policy_delivery(), None);
+        assert_eq!(
+            SystemPromptCarrier::Inline("b".into()).policy_delivery(),
+            None
+        );
         assert_eq!(
             policy_delivery_env(None),
             [
@@ -1068,8 +1098,14 @@ mod script_tests {
         // the hook serves the full body.
         for (args, tail) in [
             ("--system-prompt mine", vec!["--system-prompt", "mine"]),
-            ("--system-prompt-file=./s.md", vec!["--system-prompt-file=./s.md"]),
-            ("-p hi --system-prompt-file ./s.md", vec!["-p", "hi", "--system-prompt-file", "./s.md"]),
+            (
+                "--system-prompt-file=./s.md",
+                vec!["--system-prompt-file=./s.md"],
+            ),
+            (
+                "-p hi --system-prompt-file ./s.md",
+                vec!["-p", "hi", "--system-prompt-file", "./s.md"],
+            ),
         ] {
             let mut expect = vec!["--append-system-prompt-file", file_s.as_str()];
             expect.extend(tail);
@@ -1232,7 +1268,12 @@ mod script_tests {
             record(
                 "",
                 "",
-                &["--append-system-prompt", "BRIEFING", "--append-system-prompt", "mine"]
+                &[
+                    "--append-system-prompt",
+                    "BRIEFING",
+                    "--append-system-prompt",
+                    "mine"
+                ]
             )
         );
         assert_eq!(
@@ -1245,7 +1286,13 @@ mod script_tests {
             record(
                 SHA,
                 &file_s,
-                &["--append-system-prompt-file", &file_s, "-p", "--", "--append-system-prompt-file"]
+                &[
+                    "--append-system-prompt-file",
+                    &file_s,
+                    "-p",
+                    "--",
+                    "--append-system-prompt-file"
+                ]
             )
         );
         assert_eq!(
@@ -1253,7 +1300,12 @@ mod script_tests {
             record(
                 "",
                 "",
-                &["--append-system-prompt-file", &file_s, "--system-prompt", "mine"]
+                &[
+                    "--append-system-prompt-file",
+                    &file_s,
+                    "--system-prompt",
+                    "mine"
+                ]
             )
         );
     }
@@ -1302,7 +1354,12 @@ mod script_tests {
             vec!["--append-system-prompt-file", composed, "-p", "hi"],
             vec![flag_attached.as_str(), "-p", "hi"],
             // A replacement flag spelled after `--` is prompt text.
-            vec!["--append-system-prompt-file", composed, "--", "--system-prompt"],
+            vec![
+                "--append-system-prompt-file",
+                composed,
+                "--",
+                "--system-prompt",
+            ],
         ] {
             let got = run_identity_shim(composed, &args);
             assert!(
@@ -1317,7 +1374,12 @@ mod script_tests {
             vec!["--append-system-prompt", "x"],
             vec!["-p", "hi"],
             // The composed file beside a REPLACEMENT prompt: withheld.
-            vec!["--append-system-prompt-file", composed, "--system-prompt", "x"],
+            vec![
+                "--append-system-prompt-file",
+                composed,
+                "--system-prompt",
+                "x",
+            ],
             vec!["--system-prompt-file=./s.md", flag_attached.as_str()],
         ] {
             let got = run_identity_shim(composed, &args);
@@ -1363,9 +1425,15 @@ mod script_tests {
         const URL: &str = "http://127.0.0.1:9876/sessions/term-1/policy-context";
         let args = hook_curl_args(Some(SHA));
         assert_eq!(args.last().map(String::as_str), Some(URL), "{args:?}");
-        assert!(args.iter().all(|a| !a.contains("delivered_sha")), "{args:?}");
+        assert!(
+            args.iter().all(|a| !a.contains("delivered_sha")),
+            "{args:?}"
+        );
         let h = args.iter().position(|a| a == "-H").expect("a header flag");
-        assert_eq!(args[h + 1], format!("X-Qontinui-Policy-Delivered-Sha: {SHA}"));
+        assert_eq!(
+            args[h + 1],
+            format!("X-Qontinui-Policy-Delivered-Sha: {SHA}")
+        );
 
         let args = hook_curl_args(None);
         assert_eq!(args.last().map(String::as_str), Some(URL));

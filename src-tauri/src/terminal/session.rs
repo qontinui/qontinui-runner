@@ -4510,8 +4510,7 @@ mod tests {
             cmd
         };
         let get = |cmd: &CommandBuilder, k: &str| {
-            cmd.get_env(k)
-                .map(|v| v.to_string_lossy().into_owned())
+            cmd.get_env(k).map(|v| v.to_string_lossy().into_owned())
         };
 
         let mut cmd = seeded();
@@ -6492,7 +6491,9 @@ mod tests {
     fn short_body_hash_is_a_keyed_eight_hex_prefix() {
         let h = short_body_hash("yes");
         assert_eq!(h.len(), 8);
-        assert!(h.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert!(h
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
         assert_eq!(h, short_body_hash("yes"), "stable within the process");
         assert_ne!(h, short_body_hash("no"));
         use sha2::{Digest, Sha256};
