@@ -218,16 +218,12 @@ pub async fn list_terminals_handler(
     }))))
 }
 
-/// `POST /terminals`' spawn-tenant admission: the shared
-/// [`crate::commands::terminal::admit_spawn_tenant`], answered as a 400 naming
-/// the refusal (a malformed or unpaired tenant is the caller's to fix).
-fn spawn_tenant_or_bad_request(
-    raw: Option<&str>,
-) -> Result<Option<uuid::Uuid>, (StatusCode, Json<ApiResponse<()>>)> {
-    crate::commands::terminal::admit_spawn_tenant(raw).map_err(|e| {
-        warn!("HTTP: rejecting terminal create — {e}");
-        (StatusCode::BAD_REQUEST, Json(api_error(e)))
-    })
+/// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
+/// refusal, since a malformed or unpaired tenant is the caller's to fix. The
+/// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
+fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
+    warn!("HTTP: rejecting terminal create — {refusal}");
+    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
 }
 
 /// Create a new terminal session.
@@ -264,7 +260,8 @@ pub async fn create_terminal_handler(
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
     // caller's to fix, so both are a 400 naming the heal.
-    let spawn_tenant = spawn_tenant_or_bad_request(request.tenant_id.as_deref())?;
+    let spawn_tenant = crate::commands::terminal::admit_spawn_tenant(request.tenant_id.as_deref())
+        .map_err(spawn_tenant_bad_request)?;
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -1059,8 +1056,10 @@ mod tests {
             .store_tenant_device_jwt(&a, "header.payload.signature")
             .unwrap();
 
-        let (status, Json(body)) =
-            spawn_tenant_or_bad_request(Some(&b.to_string())).expect_err("unpaired → refused");
+        let admit = |raw: Option<&str>| {
+            crate::commands::terminal::admit_spawn_tenant(raw).map_err(spawn_tenant_bad_request)
+        };
+        let (status, Json(body)) = admit(Some(&b.to_string())).expect_err("unpaired → refused");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
@@ -1069,13 +1068,10 @@ mod tests {
             "{text}"
         );
 
-        let (status, _) = spawn_tenant_or_bad_request(Some("not-a-uuid")).unwrap_err();
+        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            spawn_tenant_or_bad_request(Some(&a.to_string())).unwrap(),
-            Some(a)
-        );
-        assert_eq!(spawn_tenant_or_bad_request(None).unwrap(), None);
+        assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
+        assert_eq!(admit(None).ok(), Some(None));
     }
 
     #[test]
