@@ -186,7 +186,11 @@ pub struct DiskFiles;
 
 impl FileProbe for DiskFiles {
     fn read_capped(&self, path: &str, cap: usize) -> std::io::Result<Vec<u8>> {
-        let limit = cap as u64 + 1;
+        // Saturating, not `+ 1`: `FileProbe` is public and the tests already
+        // hand it `usize::MAX`. A wrapping `cap + 1` there is a debug panic,
+        // and in release a `take(0)` — which reports the file as EMPTY TEXT,
+        // the one answer that is both wrong and confident.
+        let limit = (cap as u64).saturating_add(1);
         let mut buf = Vec::new();
         std::fs::File::open(path)?
             .take(limit)
@@ -208,6 +212,14 @@ enum Side {
     Oversize {
         bytes: usize,
         sha256: String,
+        /// The cap this side's read was ACTUALLY handed — recorded at the read
+        /// that refused it, so the attribution below cannot be moved by a
+        /// concurrent writer. `bytes` comes from the second (digest) pass and
+        /// is therefore a different observation of the same file: a file that
+        /// SHRINKS between the two passes lands under the per-side cap and
+        /// would otherwise be attributed to the report's budget when the
+        /// budget was never touched.
+        handed_cap: usize,
     },
 }
 
@@ -249,6 +261,7 @@ fn read_side(files: &dyn FileProbe, path: &str, cap: usize) -> Side {
         Ok((sha256, len)) => Side::Oversize {
             bytes: usize::try_from(len).unwrap_or(usize::MAX),
             sha256,
+            handed_cap: cap,
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Side::Missing,
         Err(e) => Side::Unreadable(e.to_string()),
@@ -263,17 +276,30 @@ fn read_side(files: &dyn FileProbe, path: &str, cap: usize) -> Side {
 /// is enforced at the same place and in the same way as the per-side cap,
 /// rather than by trimming an already-allocated list afterwards.
 struct TextBudget {
+    total: usize,
     remaining: usize,
 }
 
 impl TextBudget {
     fn new(total: usize) -> Self {
-        Self { remaining: total }
+        Self {
+            total,
+            remaining: total,
+        }
     }
     /// The cap for the next side: the per-side cap, or what is left of the
     /// aggregate budget, whichever is smaller.
     fn cap(&self) -> usize {
         FILE_CHANGE_TEXT_CAP_BYTES.min(self.remaining)
+    }
+    /// The cap an UNSPENT budget hands out. A side handed less than this was
+    /// refused because EARLIER reads had spent the budget down — which is the
+    /// exact claim the truncation `detail` makes, and the only reading under
+    /// which it is true for a total budget smaller than the per-side cap (a
+    /// configuration the route never uses, but `assemble_file_changes` allows
+    /// and the tests exercise).
+    fn unspent_cap(&self) -> usize {
+        FILE_CHANGE_TEXT_CAP_BYTES.min(self.total)
     }
     fn spend(&mut self, n: usize) {
         self.remaining = self.remaining.saturating_sub(n);
@@ -292,6 +318,9 @@ struct SideFacts {
     sha256: String,
     /// `None` for an over-cap side — present but not diffable.
     text: Option<Vec<u8>>,
+    /// `Some(cap)` iff the read refused to buffer this side, carrying the cap
+    /// it was handed. `None` for a side that fits. See [`Side::Oversize`].
+    handed_cap: Option<usize>,
 }
 
 enum SideOutcome {
@@ -308,11 +337,17 @@ fn classify(side: Side) -> SideOutcome {
             bytes: bytes.len(),
             sha256: sha256_hex(&bytes),
             text: Some(bytes),
+            handed_cap: None,
         }),
-        Side::Oversize { bytes, sha256 } => SideOutcome::Present(SideFacts {
+        Side::Oversize {
+            bytes,
+            sha256,
+            handed_cap,
+        } => SideOutcome::Present(SideFacts {
             bytes,
             sha256,
             text: None,
+            handed_cap: Some(handed_cap),
         }),
     }
 }
@@ -395,6 +430,11 @@ pub fn assemble_file_changes(
             }
         };
         let spent = before.buffered_len() + after.buffered_len();
+        // Sampled from the budget's STARTING total, not its remainder, so it is
+        // the same value for every entry — the per-side `handed_cap` recorded
+        // at each read is what varies, and comparing the two is what decides
+        // which bound refused a side.
+        let unspent_cap = budget.unspent_cap();
         let change = match snapshot {
             Some(snap) => pair_sides(
                 path,
@@ -403,8 +443,9 @@ pub fn assemble_file_changes(
                 before,
                 after,
                 true,
+                unspent_cap,
             ),
-            None => pair_sides(path, None, None, before, after, false),
+            None => pair_sides(path, None, None, before, after, false, unspent_cap),
         };
         // Bytes read but not kept (a binary side, or one discarded because its
         // partner was oversize) were resident for this iteration only — they
@@ -429,6 +470,7 @@ fn pair_sides(
     before: Side,
     after: Side,
     had_snapshot: bool,
+    unspent_cap: usize,
 ) -> SessionFileChange {
     let mut change = SessionFileChange {
         file_path: file_path.to_string(),
@@ -512,33 +554,33 @@ fn pair_sides(
         change.status = "binary".to_string();
         return change;
     }
-    // A present side with no bytes is one `read_side` refused to buffer: it is
-    // over the cap, so there is a size and a digest but nothing to diff.
     // A present side with no bytes is one `read_side` refused to buffer. WHICH
-    // bound refused it is decided here, from the side's own true length, and
-    // not from any flag sampled before the reads: the aggregate budget shrinks
-    // between the two sides of one entry, so a flag taken at the top of the
-    // iteration is wrong for the second side exactly at the boundary — the
-    // entry most likely to be truncated in the first place.
-    let truncated_side_bytes: Vec<usize> = [before.as_ref(), after.as_ref()]
+    // bound refused it is decided PER SIDE from the cap that side's read was
+    // actually handed, recorded at the read itself — not from any flag sampled
+    // before the reads (the aggregate budget shrinks between the two sides of
+    // one entry, so such a flag is wrong for the second side exactly at the
+    // boundary), and not from the side's reported length either. That length
+    // comes from the digest pass, a SECOND observation of the same file: a file
+    // that shrinks between the two passes reports a length under the per-side
+    // cap and would be blamed on a budget that was never touched. The handed
+    // cap is immune in both directions because it is not a property of the file
+    // at all.
+    let budget_limited_sides: Vec<bool> = [before.as_ref(), after.as_ref()]
         .into_iter()
         .flatten()
         .filter(|f| f.text.is_none())
-        .map(|f| f.bytes)
+        .map(|f| f.handed_cap.is_some_and(|cap| cap < unspent_cap))
         .collect();
-    if !truncated_side_bytes.is_empty() {
+    if !budget_limited_sides.is_empty() {
         change.truncated = true;
-        // At or below the per-side cap, a side can only have been refused by
-        // the aggregate budget — `read_side` returns `Text` for anything within
-        // the cap it was handed. Honesty: a 2 KiB file whose neighbours ate the
-        // report's budget is not "too large to diff", which is what the UI says
-        // for a plain over-cap entry, so name the bound that actually applied.
-        // If EITHER side is genuinely over the per-side cap, "too large" is the
-        // true statement about this entry and the UI's default says it.
-        if truncated_side_bytes
-            .iter()
-            .all(|bytes| *bytes <= FILE_CHANGE_TEXT_CAP_BYTES)
-        {
+        // A side handed less than an unspent budget's cap can only have been
+        // refused by what earlier reads had already spent. Honesty: a 2 KiB
+        // file whose neighbours ate the report's budget is not "too large to
+        // diff", which is what the UI says for a plain over-cap entry, so name
+        // the bound that actually applied. If EITHER side was handed the full
+        // cap and still refused, "too large" is the true statement about this
+        // entry and the UI's default says it.
+        if budget_limited_sides.iter().all(|by_budget| *by_budget) {
             change.detail = Some(
                 "the report's text budget was spent on earlier files — size and digest only"
                     .to_string(),
@@ -1260,6 +1302,172 @@ mod file_changes_tests {
             out[0].detail, None,
             "blamed the budget for an over-cap side"
         );
+    }
+
+    /// A probe whose file is OVER the cap at the bounded read and SMALLER at
+    /// the digest pass — the concurrent-writer case in the shrinking
+    /// direction. It also records every cap it was handed.
+    struct ShrinkingFile {
+        handed_caps: std::cell::RefCell<Vec<usize>>,
+        shrunk_to: Vec<u8>,
+    }
+
+    impl FileProbe for ShrinkingFile {
+        fn read_capped(&self, _path: &str, cap: usize) -> std::io::Result<Vec<u8>> {
+            self.handed_caps.borrow_mut().push(cap);
+            // Always over whatever cap it was handed: the read is what decides.
+            Ok(vec![b'w'; cap.saturating_add(1)])
+        }
+        fn digest(&self, _path: &str) -> std::io::Result<(String, u64)> {
+            Ok((sha256_hex(&self.shrunk_to), self.shrunk_to.len() as u64))
+        }
+    }
+
+    /// Attribution reads the cap handed to the READ, not the length reported by
+    /// the digest pass.
+    ///
+    /// The two passes are separate observations of the same file. A file that
+    /// shrinks between them comes back under the per-side cap, so a rule keyed
+    /// on that length blames the report's aggregate budget — here on the FIRST
+    /// candidate, with the budget wide open and nothing yet spent. The `detail`
+    /// exists to stop false statements; that would be one.
+    #[test]
+    fn a_side_that_shrinks_between_the_two_passes_does_not_blame_an_untouched_budget() {
+        let probe = ShrinkingFile {
+            handed_caps: std::cell::RefCell::new(Vec::new()),
+            shrunk_to: vec![b'w'; 2048],
+        };
+
+        let out = assemble_file_changes(
+            &[],
+            &["/src/shrinks".to_string()],
+            &probe,
+            NO_FILE_CAP,
+            NO_TEXT_BUDGET,
+        )
+        .files;
+
+        // The read really was handed the full per-side cap: nothing had been
+        // spent, so the budget cannot be what refused it.
+        assert_eq!(
+            probe.handed_caps.borrow().as_slice(),
+            &[FILE_CHANGE_TEXT_CAP_BYTES]
+        );
+        assert!(out[0].truncated);
+        assert_eq!(out[0].after_bytes, Some(2048));
+        assert_eq!(
+            out[0].detail, None,
+            "blamed an untouched budget for a file that shrank between the bounded read and the digest pass"
+        );
+    }
+
+    /// Every other test in this module drives [`FakeFs`], whose `read_capped`
+    /// honours the cap BY CONSTRUCTION — so they pin what
+    /// `assemble_file_changes` asks for, not what the production probe does.
+    /// Dropping `.take(..)` from [`DiskFiles::read_capped`] compiles, satisfies
+    /// the trait and fails none of them. These three exercise the real
+    /// filesystem, which is where the bound actually has to hold.
+    #[test]
+    fn disk_files_read_capped_stops_at_the_cap_on_a_real_filesystem() {
+        const CAP: usize = 64;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, len: usize| -> String {
+            let path = dir.path().join(name);
+            std::fs::write(&path, vec![b'q'; len]).expect("write");
+            path.to_string_lossy().into_owned()
+        };
+
+        // Under the cap and exactly AT it are whole files: the returned length
+        // is the file's own, and `read_side` classifies them as text.
+        assert_eq!(
+            DiskFiles
+                .read_capped(&write("under", CAP - 1), CAP)
+                .unwrap()
+                .len(),
+            CAP - 1
+        );
+        assert_eq!(
+            DiskFiles
+                .read_capped(&write("exact", CAP), CAP)
+                .unwrap()
+                .len(),
+            CAP
+        );
+        // `cap + 1` is the VERDICT, and it is the ONLY over-cap signal — which
+        // is why the assertion is on the returned LENGTH. A file one byte over
+        // and a file forty times the cap must be indistinguishable here, or the
+        // bound is not a property of the read.
+        assert_eq!(
+            DiskFiles
+                .read_capped(&write("over", CAP + 1), CAP)
+                .unwrap()
+                .len(),
+            CAP + 1
+        );
+        assert_eq!(
+            DiskFiles
+                .read_capped(&write("huge", CAP * 40), CAP)
+                .unwrap()
+                .len(),
+            CAP + 1
+        );
+        // A zero cap (aggregate budget spent) still probes exactly one byte, so
+        // a non-empty file is oversize and an empty one is text.
+        assert_eq!(DiskFiles.read_capped(&write("z", 10), 0).unwrap().len(), 1);
+        assert_eq!(
+            DiskFiles.read_capped(&write("empty", 0), 0).unwrap().len(),
+            0
+        );
+        // The error kind `read_side` branches on to report `Missing`.
+        let missing = dir.path().join("nope").to_string_lossy().into_owned();
+        assert_eq!(
+            DiskFiles.read_capped(&missing, CAP).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn disk_files_digest_reports_the_files_own_length_and_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = vec![b'd'; 5000];
+        let path = dir.path().join("body");
+        std::fs::write(&path, &body).expect("write");
+        let path = path.to_string_lossy().into_owned();
+
+        // The two halves must agree with each other AND with the bytes on
+        // disk: `Side::Oversize` reports a file it never buffered, so this pair
+        // is the only description the operator gets of it.
+        let (sha, len) = DiskFiles.digest(&path).expect("digest");
+        assert_eq!(len, body.len() as u64);
+        assert_eq!(sha, sha256_hex(&body));
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").expect("write");
+        let (sha, len) = DiskFiles.digest(&empty.to_string_lossy()).expect("digest");
+        assert_eq!(len, 0);
+        assert_eq!(sha, sha256_hex(b""));
+
+        let missing = dir.path().join("nope").to_string_lossy().into_owned();
+        assert_eq!(
+            DiskFiles.digest(&missing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// `FileProbe` is public and `usize::MAX` is a cap a caller can hand it —
+    /// the tests above pass it as a budget. A wrapping `cap as u64 + 1` is a
+    /// debug panic, and in release a `take(0)`: the file comes back empty and
+    /// `bytes.len() <= cap` classifies it as EMPTY TEXT. Confidently wrong is
+    /// the one answer this route must not give.
+    #[test]
+    fn disk_files_read_capped_survives_a_usize_max_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("whole");
+        std::fs::write(&path, b"whole file\n").expect("write");
+        let got = DiskFiles
+            .read_capped(&path.to_string_lossy(), usize::MAX)
+            .expect("read");
+        assert_eq!(got, b"whole file\n");
     }
 
     /// Bytes read but NOT kept are refunded: a binary file's bytes are dropped
