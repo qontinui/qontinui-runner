@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tauri-events";
-import type { CommandResponse } from "./types";
+import type { CommandResponse, TerminalSessionRecord } from "./types";
 import {
   buildSessionCloseArgs,
   type FrontendSessionCloseReason,
@@ -75,6 +75,19 @@ export interface TerminalTab {
    * (`set_title_unless_worker`) on the frontend side.
    */
   taskRunId?: string;
+  /**
+   * True when this tab is backed by an in-process stream-json
+   * `ClaudeSession` registered in the Rust `SessionManager` — a Conductor
+   * worker (`dispatch_subtask`) — and NOT by a PTY. `id === taskRunId`, `pid`
+   * is null, and there is no terminal process to attach to: `terminal_list`
+   * never lists it, `terminal_close` cannot kill it, and `terminal-output`
+   * never carries its text. The grid renders it through `WorkerSessionCell`
+   * (conversation via `ai-output` / `claude-session-state`, steering via
+   * `send_user_message`) instead of `TerminalInstance`; `reconcileTabsWithBackend`
+   * keeps it across `terminal_list` re-syncs; `closeTerminal` drops the tab
+   * without touching the worker, whose lifetime the Conductor owns.
+   */
+  sessionBacked?: boolean;
   /**
    * True when the PTY child runs Claude with tool permissions bypassed
    * (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions`).
@@ -294,6 +307,73 @@ export const RESYNC_CREATE_GRACE_MS = 5_000;
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
 
 /**
+ * Build the grid tab for a Conductor worker's lifecycle record. Pure.
+ *
+ * Returns `null` for a record that is not a worker (no `taskRunId`) — the
+ * caller then takes the ordinary PTY restore path. A worker tab is keyed by
+ * the record's `terminalId` (which `dispatch_subtask` sets equal to the task
+ * run id), carries `sessionBacked: true` so every PTY-only code path skips it,
+ * and is `isAlive` because the record is an OPEN one — the cell reads the
+ * session's real state from the SessionManager once mounted.
+ */
+export function workerTabFromRecord(
+  rec: Pick<
+    TerminalSessionRecord,
+    "claudeSessionId" | "terminalId" | "taskRunId" | "title" | "workingDir" | "openedAt"
+  >,
+  now: number = Date.now(),
+): TerminalTab | null {
+  if (!rec.taskRunId) return null;
+  return {
+    id: rec.terminalId || rec.taskRunId,
+    title: rec.title?.trim() || `worker:${rec.taskRunId.slice(0, 8)}`,
+    pid: null,
+    isAlive: true,
+    exitCode: null,
+    workingDir: rec.workingDir || undefined,
+    createdAt: rec.openedAt || now,
+    claudeSessionId: rec.claudeSessionId,
+    taskRunId: rec.taskRunId,
+    sessionBacked: true,
+  };
+}
+
+/**
+ * Pick the worker record for `taskRunId` on `pageId` out of a
+ * `terminal_session_list_open` payload. Pure. A record on another page is
+ * NOT this page's to adopt; a non-worker record with a coincidentally equal
+ * id is never matched because `taskRunId` (not `claudeSessionId`) is the
+ * worker marker.
+ */
+export function findWorkerRecord(
+  sessions: readonly TerminalSessionRecord[],
+  taskRunId: string,
+  pageId: string,
+): TerminalSessionRecord | undefined {
+  return sessions.find(
+    (rec) => rec.taskRunId === taskRunId && (rec.pageId || "default") === pageId,
+  );
+}
+
+/**
+ * Spacing between `terminal_session_list_open` probes for the SAME
+ * not-yet-adopted task run id, by how many probes have already missed. The
+ * trigger events (`ai-output`, `claude-session-state`) fire per streamed
+ * line, and a worker's record is written AFTER its first state events
+ * (`dispatch_subtask` records the worker once the spawn joins), so the first
+ * probe can legitimately miss and a later one must be allowed — but not one
+ * per line, and not forever: an AI session that is NOT a worker on this page
+ * (a Process Manager "Fix with AI" chat) streams the same events, and every
+ * page's manager hears them. Backs off 3 s → 9 s → 27 s → 60 s (capped).
+ */
+export const WORKER_ADOPT_PROBE_BASE_MS = 3_000;
+export const WORKER_ADOPT_PROBE_MAX_MS = 60_000;
+
+export function workerAdoptProbeDelayMs(misses: number): number {
+  return Math.min(WORKER_ADOPT_PROBE_MAX_MS, WORKER_ADOPT_PROBE_BASE_MS * 3 ** Math.max(0, misses));
+}
+
+/**
  * Pure: reconcile the local tab list against the BACKEND's authoritative
  * terminal list for this page.
  *
@@ -349,6 +429,9 @@ export function reconcileTabsWithBackend(
     // Tabs the backend structurally cannot list.
     if (t.type === "plan" || t.id.startsWith("plan-")) return true;
     if (t.__synthetic) return true;
+    // A Conductor worker has no PTY; `terminal_list` is the wrong census for
+    // it (its liveness is the SessionManager's, read by `WorkerSessionCell`).
+    if (t.sessionBacked) return true;
     // The runner has already announced this terminal's exit, so its absence
     // from the list is a real teardown, not a create the snapshot predates.
     if (settledIds.has(t.id)) return false;
@@ -523,6 +606,101 @@ export function useTerminalManager(
       return result.tabs;
     });
   }, []);
+
+  /**
+   * Add the grid tab for a Conductor worker's lifecycle record. Idempotent:
+   * a tab with the same id (or the same `taskRunId`) is left untouched.
+   * Never steals `activeId` — a run page fills as workers dispatch, and the
+   * operator's focus should not jump each time one lands. Returns the tab id,
+   * or `null` when the record is not a worker's.
+   */
+  const adoptWorkerTab = useCallback((rec: TerminalSessionRecord): string | null => {
+    const tab = workerTabFromRecord(rec);
+    if (!tab) return null;
+    setTabs((prev) => {
+      if (prev.some((t) => t.id === tab.id || t.taskRunId === tab.taskRunId)) return prev;
+      return [...prev, tab];
+    });
+    return tab.id;
+  }, []);
+
+  // Tabs snapshot for the adoption probe below (reads outside setState).
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+  const workerProbeRef = useRef<Map<string, { at: number; misses: number }>>(new Map());
+  /**
+   * Worker views the operator CLOSED on this page since it mounted. A closed
+   * worker keeps streaming (`closeTerminal` never touches the worker itself),
+   * so without this set the live-adoption probe below would re-add the tab
+   * on its very next `ai-output` line and "close" would be a three-second
+   * hide. Held for the page's lifetime only: the next cold restore reads the
+   * still-open durable record and brings the view back, by design.
+   */
+  const dismissedWorkerIdsRef = useRef<Set<string>>(new Set());
+
+  /**
+   * Live-adopt a Conductor worker the moment it starts talking. The restore
+   * path (`useTerminalInitialization`) runs ONCE per page, so a worker
+   * dispatched after the run page initialised would otherwise have no tab
+   * until the next boot. Any `ai-output` / `claude-session-state` event for a
+   * task run this page has no tab for triggers ONE throttled read of the
+   * durable records; a record on this page with that `taskRunId` becomes a
+   * tab. A failed read is logged and retried on the next event — never
+   * treated as "no such worker".
+   */
+  const maybeAdoptWorker = useCallback(
+    async (taskRunId: string) => {
+      if (dismissedWorkerIdsRef.current.has(taskRunId)) return;
+      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return;
+      const now = Date.now();
+      const probe = workerProbeRef.current.get(taskRunId) ?? { at: 0, misses: 0 };
+      if (now - probe.at < workerAdoptProbeDelayMs(probe.misses)) return;
+      workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses });
+      let sessions: TerminalSessionRecord[] | undefined;
+      try {
+        const resp = await invoke<CommandResponse>("terminal_session_list_open");
+        sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
+      } catch (err) {
+        // A failed read is not "no such worker": retry on the base cadence.
+        logger.warn(`worker adoption probe for ${taskRunId} failed (will retry): ${err}`);
+        return;
+      }
+      if (!Array.isArray(sessions)) return;
+      const rec = findWorkerRecord(sessions, taskRunId, pageId);
+      if (!rec) {
+        workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses + 1 });
+        return;
+      }
+      workerProbeRef.current.delete(taskRunId);
+      if (adoptWorkerTab(rec)) {
+        logger.info(`Adopted Conductor worker ${taskRunId} onto page ${pageId}`);
+      }
+    },
+    [pageId, adoptWorkerTab],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const attach = (fn: () => void) => {
+      if (disposed) fn();
+      else unlisteners.push(fn);
+    };
+    listen<{ taskRunId?: string | null }>("ai-output", (event) => {
+      const id = event.payload?.taskRunId;
+      if (id) void maybeAdoptWorker(id);
+    }).then(attach);
+    listen<{ taskRunId?: string | null }>("claude-session-state", (event) => {
+      const id = event.payload?.taskRunId;
+      if (id) void maybeAdoptWorker(id);
+    }).then(attach);
+    return () => {
+      disposed = true;
+      for (const fn of unlisteners) fn();
+    };
+  }, [maybeAdoptWorker]);
 
   const markAsBypass = useCallback((terminalId: string) => {
     setTabs((prev) => {
@@ -1083,10 +1261,22 @@ export function useTerminalManager(
     // updater's `prev` without mutating inside the updater (StrictMode double-
     // invokes updaters in dev).
     let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
+    // A Conductor worker's tab is a VIEW: closing it hides the cell and
+    // nothing more. The Conductor owns the worker's lifetime, and its durable
+    // record must stay open so the next restore brings the cell back while
+    // the worker is still live. No close record, no `terminal_close` (there
+    // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
+    // inside the updater, which React may run later than this handler.
+    const closingTab = tabsRef.current.find((t) => t.id === id);
+    const sessionBacked = closingTab?.sessionBacked === true;
+    if (sessionBacked) {
+      dismissedWorkerIdsRef.current.add(id);
+      if (closingTab?.taskRunId) dismissedWorkerIdsRef.current.add(closingTab.taskRunId);
+    }
     // Update React state immediately so the UI is responsive.
     // The Rust-side close (process kill + thread join) runs in the background.
     setTabs((prev) => {
-      closeRecord = buildSessionCloseRecord(prev, id);
+      closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
       const next = prev.filter((t) => t.id !== id);
       setActiveId((currentActive) => {
         if (currentActive !== id) return currentActive;
@@ -1104,8 +1294,9 @@ export function useTerminalManager(
       });
     }
 
-    // Only invoke Rust close for terminal tabs (plan tabs have no PTY)
-    if (!id.startsWith("plan-")) {
+    // Only invoke Rust close for terminal tabs (plan tabs and worker views
+    // have no PTY)
+    if (!id.startsWith("plan-") && !sessionBacked) {
       invoke<CommandResponse>("terminal_close", { terminalId: id })
         .catch(() => {
           // Terminal may already be gone (e.g. removed out-of-band by
@@ -1172,5 +1363,6 @@ export function useTerminalManager(
     markAsWorker,
     markAsBypass,
     markAsRemote,
+    adoptWorkerTab,
   };
 }
