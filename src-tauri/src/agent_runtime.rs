@@ -2127,6 +2127,13 @@ enum ClaimOutcome {
 /// the [`ClaimOutcome`] **and** the resulting claim state for all four
 /// [`SpawnDecision`] variants.
 ///
+/// The residual, stated rather than overstated: the gap is NARROWED to one
+/// statement, not removed. Deleting the whole wiring line in
+/// [`run_gate_continuation_inner`] still fails no test, because that fn has no
+/// unit-test caller — but it is one statement carrying log, settle and
+/// decision together, so there is no longer a partial deletion that leaves a
+/// plausible-looking arm behind.
+///
 /// The asymmetry between the two skips is not restated here — it is
 /// [`skip_leaves_row_pending`], which [`settle_skipped_claim`] gates on, and
 /// both arms call it unconditionally so the policy stays in one place instead
@@ -2232,12 +2239,12 @@ fn settle_claim_decision(
 ///
 /// ## It is a steady-state bound, NOT a semaphore
 ///
-/// [`evaluate_continuation_guard`] reads `map.len()`, but
+/// [`evaluate_continuation_guard`] reads `registry.live.len()`, but
 /// [`register_continuation_session`] only runs after the coord consume-claim,
 /// the worktree acquire and `create_terminal_session_backend` have all
 /// completed — so every task dispatched in one `poll_pending_continuations`
 /// iteration observes the PRE-BURST registry. In the 130-concurrent shape this
-/// number was chosen against, all 130 see `map.len() == 0` and this cap binds on
+/// number was chosen against, all 130 see `live.len() == 0` and this cap binds on
 /// none of them. It holds the line across successive polls, once the earlier
 /// dispatches have registered; it cannot hold it *within* one.
 ///
@@ -2249,6 +2256,13 @@ fn settle_claim_decision(
 /// is exactly the kind of misreading that sent the 2026-08-29 investigation to
 /// the wrong constant. Closing the window would mean a real permit held from the
 /// guard through the spawn — a design change, and not this cap's job.
+///
+/// **The ANCHOR half of that permit has since shipped** as
+/// [`AnchorReservation`], taken inside this guard's own critical section, so a
+/// same-anchor twin can no longer pass within one burst. It deliberately does
+/// NOT count toward this cap: the COUNT stays the steady-state bound described
+/// above, while the ANCHOR is now held check-to-register. The paragraph above
+/// still describes the count.
 ///
 /// `QONTINUI_CONTINUATION_SESSION_CAP` remains the operator override, unchanged
 /// and in both directions (a bigger number is as settable as a smaller one).
@@ -11937,10 +11951,9 @@ mod tests {
             "cap-1 live sessions is under the cap"
         );
 
-        // At the cap → the next one is refused, naming the default. A FRESH
-        // anchor: the `Proceed` above reserved `a-new` for the dispatch it
-        // admitted (Phase 4's same-anchor reservation), so re-evaluating that
-        // anchor would report the dedup, not the cap this test is about.
+        // At the cap → the next one is refused, naming the default. One anchor
+        // per evaluation, so this test does not depend on `guard_verdict`
+        // dropping the permit it never binds (see its doc).
         register_continuation_session(format!("t{}", cap - 1), Some("a-last".into()), None);
         assert_eq!(
             guard_verdict(Some("a-new-2"), &live_all, &calm),
@@ -11971,9 +11984,9 @@ mod tests {
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         let live_all = |_id: &str| true;
 
-        // One anchor per evaluation: a `Proceed` reserves its anchor for the
-        // dispatch it admitted (Phase 4), so re-evaluating `a1` after the first
-        // verdict would report that dedup instead of the thread lane under test.
+        // One anchor per evaluation, so this test does not depend on
+        // `guard_verdict` dropping the permit it never binds (see its doc)
+        // rather than on the thread lane under test.
         //
         // A live idle runner (151 threads) is BELOW the 256 warn ceiling →
         // nothing to say, spawn.
