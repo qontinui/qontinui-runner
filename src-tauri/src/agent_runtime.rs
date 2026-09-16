@@ -847,7 +847,8 @@ fn agent_log_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
 /// [`connected_coord_base`] hands back the coord HTTP base with any `/ws`
 /// suffix already stripped by `profiles::coord_ws_to_http` (so the shipped
 /// `wss://coord.qontinui.io/ws` arrives here as `https://coord.qontinui.io`);
-/// [`build_coord_ws_url`] then flips the scheme and appends `/ws`. That append
+/// `qontinui_runner_lib::coord_ws::build_ws_url` then flips the scheme and
+/// appends `/ws`. That append
 /// stays idempotent because the builder also accepts a base that already ends
 /// in `/ws`: producing `…/ws/ws` would 401 at the ALB and the subscribe loop
 /// would never connect in prod. The coord `/ws` endpoint is a Redis pub/sub
@@ -6329,9 +6330,91 @@ pub(crate) enum CredentialDecision {
         credential: AgentCredential,
         source: CredentialSource,
     },
-    /// Do NOT launch a credential-less agent; `reason` is what the
-    /// `spawn-failed` report carries.
+    /// Do NOT launch a credential-less agent; `reason` is what the TERMINAL
+    /// `spawn-failed` report carries. Coord latches the agent failed.
     Refuse { reason: String },
+    /// Do NOT launch now, but the cause was TRANSIENT (the door answered 503
+    /// or not at all, past the retry budget): `reason` carries the
+    /// `deferred_load:` prefix, which coord's spawn-failed handler treats as
+    /// RE-OFFERABLE — it abandons the allocation and retires the dispatch
+    /// dedup marker so the launch is offered again on a later pass instead
+    /// of latching failed for the length of a deploy window or a proxy blip.
+    Defer { reason: String },
+}
+
+/// Back-off before each RETRY of a transient credential fetch: the first
+/// fetch plus up to this many retries, so a coord deploy window
+/// (503 `schema_migration_pending`) or a transport blip of a few seconds is
+/// ridden out in-process before the launch is deferred back to coord.
+const CREDENTIAL_FETCH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+
+/// Whether a door answer is TRANSIENT — the door may well answer differently
+/// in a moment — rather than settled. Exactly two shapes: a 503 (coord's
+/// `schema_migration_pending`, or any upstream unavailability) and no HTTP
+/// answer at all. Every other refusal is a verdict about THIS agent or THIS
+/// credential and does not change by waiting.
+pub(crate) fn credential_answer_is_transient(answer: &CredentialDoorAnswer) -> bool {
+    matches!(
+        answer,
+        CredentialDoorAnswer::Refused { status: 503, .. } | CredentialDoorAnswer::Unreachable(_)
+    )
+}
+
+/// Pure retry policy: the delay before retry `attempt + 1` (0-based `attempt`
+/// that just produced `answer`), or `None` when the answer is settled or the
+/// retry budget is spent — in which case the caller hands the last answer to
+/// [`decide_agent_credential`], which defers a transient one.
+pub(crate) fn credential_retry_delay(
+    answer: &CredentialDoorAnswer,
+    attempt: usize,
+) -> Option<Duration> {
+    if !credential_answer_is_transient(answer) {
+        return None;
+    }
+    CREDENTIAL_FETCH_RETRY_DELAYS.get(attempt).copied()
+}
+
+impl CredentialDoorAnswer {
+    /// One-line, token-free summary for the log.
+    fn summary(&self) -> String {
+        match self {
+            CredentialDoorAnswer::Minted { .. } => "2xx".to_string(),
+            CredentialDoorAnswer::Refused { status, body } => format!(
+                "status={status} error={}",
+                qontinui_runner_lib::coord_ws::refusal_error_code(body)
+                    .as_deref()
+                    .unwrap_or("<none>")
+            ),
+            CredentialDoorAnswer::Unreachable(why) => format!("unreachable: {why}"),
+        }
+    }
+}
+
+/// The `deferred_load:` reason for a transient credential-door outcome, in
+/// the same `deferred_load:<class>:<detail>` no-whitespace shape as
+/// [`launch_deferral_reason`]: `deferred_load:credential_door:503_<code>` or
+/// `deferred_load:credential_door:unreachable`. The transport detail of an
+/// unreachable door is logged beside it, never put on the wire.
+fn credential_deferral_reason(answer: &CredentialDoorAnswer) -> String {
+    let detail = match answer {
+        CredentialDoorAnswer::Refused { status, body } => {
+            let code = qontinui_runner_lib::coord_ws::refusal_error_code(body)
+                .unwrap_or_else(|| "unavailable".to_string());
+            let code: String = code
+                .chars()
+                .map(|c| if c.is_whitespace() { '_' } else { c })
+                .collect();
+            format!("{status}_{code}")
+        }
+        CredentialDoorAnswer::Unreachable(_) | CredentialDoorAnswer::Minted { .. } => {
+            "unreachable".to_string()
+        }
+    };
+    format!("{DEFERRED_LOAD_REASON_PREFIX}credential_door:{detail}")
 }
 
 /// `POST {base}/agents/{agent_id}/credential`, authenticated with the device
@@ -6387,8 +6470,13 @@ async fn fetch_agent_credential(base: &str, agent_id: uuid::Uuid) -> CredentialD
 ///   Phase 3 "Rollout"). A 404 whose body names `agent_not_found` is a NEW
 ///   coord's typed answer — the door exists and the agent does not — so it
 ///   never takes this arm.
-/// - Everything else (401/403/409/503, a typed 404, a 404 with an empty frame
-///   `jwt`, a 2xx with an empty token, transport failure) → refuse. A
+/// - 503, or no HTTP answer at all (transport failure, no client, no base, an
+///   unparseable 2xx body) → DEFER: the caller has already spent the
+///   [`CREDENTIAL_FETCH_RETRY_DELAYS`] budget on it, so the launch is handed
+///   back to coord with a `deferred_load:` reason and re-offered later rather
+///   than latched failed for the length of a deploy window.
+/// - Everything else (401/403/409, a typed 404, a 404 with an empty frame
+///   `jwt`, a 2xx with an empty token) → refuse, terminally. A
 ///   credential-less agent is never launched; the reason names the status and
 ///   coord's `error` code so the `spawn-failed` row is diagnosable.
 pub(crate) fn decide_agent_credential(
@@ -6442,14 +6530,23 @@ pub(crate) fn decide_agent_credential(
                 }
             }
         }
+        answer @ (CredentialDoorAnswer::Refused { status: 503, .. }
+        | CredentialDoorAnswer::Unreachable(_)) => CredentialDecision::Defer {
+            reason: credential_deferral_reason(&answer),
+        },
         CredentialDoorAnswer::Refused { status, body } => {
             let code = refusal_error_code(&body);
             let hint = match status {
-                409 => " (another holder fetched this agent's credential first, or this is a \
-                        duplicate delivery)",
+                // In-process duplicates never reach here (`register_launch_stop`
+                // bars them), so the realistic 409 is this runner ITSELF before a
+                // restart: it fetched, died before `spawn-complete`, and coord
+                // re-dispatched the still-`spawning` row on reconnect — the mint
+                // is single-shot, so the second fetch is refused.
+                409 => " (this agent's single-shot credential was already minted — typically \
+                        by this runner before a restart, since coord re-dispatches \
+                        `spawning` rows on reconnect)",
                 403 => " (the agent belongs to a different device than this runner's \
                         credential)",
-                503 => " (coord's credential schema migration has not landed yet)",
                 401 => " (this runner's device JWT was not accepted)",
                 _ => "",
             };
@@ -6461,11 +6558,6 @@ pub(crate) fn decide_agent_credential(
                 ),
             }
         }
-        CredentialDoorAnswer::Unreachable(why) => CredentialDecision::Refuse {
-            reason: format!(
-                "credential door unreachable ({why}) — not launching a credential-less agent"
-            ),
-        },
     }
 }
 
@@ -6644,14 +6736,35 @@ async fn run_agent_subprocess(
     // Step 0b: mint this agent's credential against coord's credential door —
     // BEFORE materializing anything, so a refused credential costs no
     // worktrees, and before the token slot below is registered, so nothing
-    // ever runs on an empty or frame-supplied token. A refusal is reported as
-    // a `spawn-failed` in the `blocked` phase (no child ever existed) and the
-    // launch is skipped; a credential-less agent is never launched.
+    // ever runs on an empty or frame-supplied token. A transient answer (503,
+    // no answer) is retried on the bounded `CREDENTIAL_FETCH_RETRY_DELAYS`
+    // schedule and, if it persists, DEFERRED back to coord with a
+    // `deferred_load:` reason so the launch is re-offered; a settled refusal
+    // is reported as a terminal `spawn-failed` in the `blocked` phase (no
+    // child ever existed). Either way the launch is skipped here; a
+    // credential-less agent is never launched.
     let credential = {
-        let answer = match connected_coord_base() {
-            Some(base) => fetch_agent_credential(&base, agent_id).await,
-            None => CredentialDoorAnswer::Unreachable("no connected coord base".to_string()),
+        let mut attempt = 0usize;
+        let answer = loop {
+            let answer = match connected_coord_base() {
+                Some(base) => fetch_agent_credential(&base, agent_id).await,
+                None => CredentialDoorAnswer::Unreachable("no connected coord base".to_string()),
+            };
+            let Some(delay) = credential_retry_delay(&answer, attempt) else {
+                break answer;
+            };
+            warn!(
+                "agent_runtime: agent_id={agent_id}: credential door answered transiently ({}); \
+                 retry {} of {} in {}s",
+                answer.summary(),
+                attempt + 1,
+                CREDENTIAL_FETCH_RETRY_DELAYS.len(),
+                delay.as_secs()
+            );
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         };
+        let answer_summary = answer.summary();
         match decide_agent_credential(answer, &payload.jwt, payload.jwt_exp) {
             CredentialDecision::Launch {
                 credential,
@@ -6678,6 +6791,16 @@ async fn run_agent_subprocess(
                     SpawnPhase::Blocked,
                 )
                 .await;
+                return Err(anyhow::anyhow!(reason));
+            }
+            CredentialDecision::Defer { reason } => {
+                warn!(
+                    "agent_runtime: agent_id={agent_id} deferred, NOT launched — credential door \
+                     still transient after {} retries ({answer_summary}); reporting {reason} so \
+                     coord re-offers the launch",
+                    CREDENTIAL_FETCH_RETRY_DELAYS.len()
+                );
+                report_launch_deferral(agent_id, &reason).await;
                 return Err(anyhow::anyhow!(reason));
             }
         }
@@ -9781,6 +9904,29 @@ mod tests {
         ));
     }
 
+    /// A 404 whose JSON body carries a code OTHER than `agent_not_found`
+    /// (a proxy's or an older router's `not_found`) is still the old-coord
+    /// shape as far as this policy can tell, so the frame fallback applies.
+    #[test]
+    fn credential_door_404_with_a_different_json_code_and_frame_jwt_falls_back() {
+        let d = decide_agent_credential(
+            refused(404, r#"{"error":"not_found"}"#),
+            "frame.tok.en",
+            1_700_000_000,
+        );
+        assert_eq!(
+            d,
+            CredentialDecision::Launch {
+                credential: AgentCredential {
+                    token: "frame.tok.en".to_string(),
+                    exp: 1_700_000_000,
+                    jti: uuid::Uuid::nil(),
+                },
+                source: CredentialSource::FrameFallback,
+            }
+        );
+    }
+
     #[test]
     fn credential_door_bare_404_with_empty_frame_jwt_refuses() {
         let reason = refuse_reason(decide_agent_credential(refused(404, ""), "", 0));
@@ -9801,11 +9947,10 @@ mod tests {
     }
 
     #[test]
-    fn credential_door_403_409_503_401_refuse_naming_status_and_code() {
+    fn credential_door_403_409_401_refuse_terminally_naming_status_and_code() {
         for (status, code) in [
             (403, "device_mismatch"),
             (409, "already_credentialed"),
-            (503, "schema_migration_pending"),
             (401, "unauthorized"),
         ] {
             let body = format!(r#"{{"error":"{code}"}}"#);
@@ -9827,15 +9972,93 @@ mod tests {
         assert!(reason.contains("error=<none>"), "{reason}");
     }
 
+    fn defer_reason(d: CredentialDecision) -> String {
+        match d {
+            CredentialDecision::Defer { reason } => reason,
+            other => panic!("expected Defer, got {other:?}"),
+        }
+    }
+
+    /// 503 is transient: past the retry budget it DEFERS (coord re-offers)
+    /// rather than latching the agent failed for a deploy window. A frame jwt
+    /// does not rescue it — the door exists, so the frame token is not used.
     #[test]
-    fn credential_door_unreachable_refuses_even_with_a_frame_jwt() {
-        let reason = refuse_reason(decide_agent_credential(
+    fn credential_door_503_defers_with_a_deferred_load_reason() {
+        let reason = defer_reason(decide_agent_credential(
+            refused(503, r#"{"error":"schema_migration_pending"}"#),
+            "frame.tok.en",
+            1,
+        ));
+        assert_eq!(
+            reason,
+            "deferred_load:credential_door:503_schema_migration_pending"
+        );
+        assert!(reason.starts_with(DEFERRED_LOAD_REASON_PREFIX));
+        assert!(!reason.contains(char::is_whitespace), "{reason}");
+        // A 503 with no JSON body still defers with a well-formed reason.
+        let reason = defer_reason(decide_agent_credential(refused(503, "<html>"), "", 0));
+        assert_eq!(reason, "deferred_load:credential_door:503_unavailable");
+    }
+
+    /// No HTTP answer at all is transient too: defer, even with a frame jwt,
+    /// and keep the transport detail off the wire (it goes to the log).
+    #[test]
+    fn credential_door_unreachable_defers_even_with_a_frame_jwt() {
+        let reason = defer_reason(decide_agent_credential(
             CredentialDoorAnswer::Unreachable("transport: connection reset".to_string()),
             "frame.tok.en",
             1,
         ));
-        assert!(reason.contains("unreachable"), "{reason}");
-        assert!(reason.contains("connection reset"), "{reason}");
+        assert_eq!(reason, "deferred_load:credential_door:unreachable");
+        assert!(!reason.contains(char::is_whitespace), "{reason}");
+    }
+
+    /// The retry policy: transient answers are retried on the fixed schedule
+    /// (three retries after the first fetch), then handed to the decision;
+    /// settled answers are never retried.
+    #[test]
+    fn credential_retry_policy_retries_transient_answers_then_stops() {
+        let s503 = refused(503, r#"{"error":"schema_migration_pending"}"#);
+        let unreachable = CredentialDoorAnswer::Unreachable("timeout".to_string());
+        for transient in [&s503, &unreachable] {
+            assert!(credential_answer_is_transient(transient));
+            assert_eq!(
+                credential_retry_delay(transient, 0),
+                Some(Duration::from_secs(2))
+            );
+            assert_eq!(
+                credential_retry_delay(transient, 1),
+                Some(Duration::from_secs(5))
+            );
+            assert_eq!(
+                credential_retry_delay(transient, 2),
+                Some(Duration::from_secs(10))
+            );
+            // Budget spent: the caller hands the answer to the decision, which
+            // defers it.
+            assert_eq!(credential_retry_delay(transient, 3), None);
+            assert!(matches!(
+                decide_agent_credential(transient.clone(), "", 0),
+                CredentialDecision::Defer { .. }
+            ));
+        }
+        // Settled answers: never retried, and 403 is terminal.
+        for settled in [
+            refused(403, r#"{"error":"device_mismatch"}"#),
+            refused(409, r#"{"error":"already_credentialed"}"#),
+            refused(401, ""),
+            refused(404, ""),
+            refused(404, r#"{"error":"agent_not_found"}"#),
+            minted("t.o.k"),
+            minted(""),
+        ] {
+            assert!(!credential_answer_is_transient(&settled), "{settled:?}");
+            assert_eq!(credential_retry_delay(&settled, 0), None, "{settled:?}");
+        }
+        assert!(matches!(
+            decide_agent_credential(refused(403, r#"{"error":"device_mismatch"}"#), "x", 1),
+            CredentialDecision::Refuse { .. }
+        ));
     }
 
     /// The follow-up coord stops publishing `jwt`/`jwt_exp`; a frame without
