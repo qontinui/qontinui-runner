@@ -70,8 +70,68 @@ if [[ -f "$PUSH_RANGE_LIB" ]]; then
   . "$PUSH_RANGE_LIB"
   if base_ref="$(push_base_ref "$ROOT")"; then
     if base=$(git -C "$ROOT" merge-base "$base_ref" HEAD 2>/dev/null); then
-      if ! git -C "$ROOT" diff --name-only "$base"..HEAD -- src-tauri/ | grep -q .; then
-        echo "[pre-push] no src-tauri/ changes since $base_ref — skipping cargo gate"
+      # A MODIFIED markdown body cannot change either half's verdict: `cargo
+      # fmt` formats Rust sources and `cargo clippy` lints Rust code, and no
+      # build.rs step reads these files. They reach the binary only through
+      # `include_str!` / `include_dir!` (the bundled fleet commands, skills and
+      # agents), so the gate cannot judge a content edit — with ONE exception:
+      # `include_str!` refuses a file that is not valid UTF-8, so an edit that
+      # re-encodes a body (an editor saving UTF-16 or Windows-1252) breaks the
+      # build. ADDING, DELETING, RENAMING, COPYING or retyping one also breaks
+      # it: `include_str!` of a missing path is a compile error. So a `.md` is
+      # excused only on status `M` AND only when its pushed blob is valid UTF-8
+      # (an absent `iconv` counts as "not proven valid" and runs the gate).
+      # Every other path counts on any status, exactly as before.
+      #
+      # `-z --name-status` output is NUL-separated `<status> <path>` fields
+      # (renames and copies carry `R<score> <old> <new>`). `-z` because without
+      # it git quotes non-ASCII paths, and a quoted `"...md"` never matches.
+      # A diff that FAILS runs the gate — the same
+      # fail-open direction as the base-ref fallback below. (The `--name-only
+      # | grep -q .` form this replaced skipped on a failed diff, because
+      # pipefail made the pipeline non-zero and the `if !` read that as "no
+      # changes".)
+      gated_paths=()
+      md_only_paths=()
+      diff_ok=1
+      # A missing temp file, or a record cut off before its closing NUL, is
+      # "could not tell" — and that runs the gate, never skips it.
+      diff_file="$(mktemp 2>/dev/null)" || diff_file=""
+      if [[ -n "$diff_file" ]] \
+         && git -C "$ROOT" diff -z --name-status "$base"..HEAD -- src-tauri/ >"$diff_file" 2>/dev/null; then
+        while IFS= read -r -d '' status; do
+          IFS= read -r -d '' path || { diff_ok=0; break; }
+          if [[ "$status" == R* || "$status" == C* ]]; then
+            IFS= read -r -d '' path || { diff_ok=0; break; }
+          fi
+          if [[ "$status" == "M" && "$path" == *.md ]] \
+             && git -C "$ROOT" cat-file blob "HEAD:$path" 2>/dev/null \
+                | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1; then
+            md_only_paths+=("$path")
+          else
+            gated_paths+=("$path")
+          fi
+        done <"$diff_file"
+        # At EOF `read` leaves a partial field in `status`; a clean end leaves it empty.
+        [[ -z "${status:-}" ]] || diff_ok=0
+        rm -f "$diff_file"
+        if [[ "$diff_ok" -eq 0 ]]; then
+          echo "[pre-push] the diff of $base_ref..HEAD was truncated — running the full gate"
+        fi
+      else
+        [[ -z "$diff_file" ]] || rm -f "$diff_file"
+        diff_ok=0
+        echo "[pre-push] could not diff $base_ref..HEAD — running the full gate"
+      fi
+      if [[ "$diff_ok" -eq 1 && "${#gated_paths[@]}" -eq 0 ]]; then
+        if [[ "${#md_only_paths[@]}" -eq 0 ]]; then
+          echo "[pre-push] no src-tauri/ changes since $base_ref — skipping cargo gate"
+        else
+          echo "[pre-push] only content edits to src-tauri/ markdown since $base_ref — skipping cargo gate"
+          echo "[pre-push]   (fmt and clippy cannot judge an include_str! body; an added,"
+          echo "[pre-push]   deleted or renamed .md would still run the gate):"
+          printf '[pre-push]     %s\n' "${md_only_paths[@]}"
+        fi
         exit 0
       fi
     fi
@@ -205,6 +265,80 @@ if [[ "$metadata_rc" -ne 0 ]]; then
 fi
 rm -f "$METADATA_LOG"
 trap - EXIT
+
+# ── Linked worktree: build into the SHARED target, not a cold private one ────
+#
+# With no CARGO_TARGET_DIR, cargo builds into `<checkout>/target`. In the
+# primary checkout that is the warm target every build uses. In a linked
+# worktree (every coord-allocated agent worktree) it is a brand-new directory:
+# a cold build of the whole dependency tree, measured at 4.9-5.2 GB per push
+# (findings 33d6f2d8, f896b13f), and slow enough that sessions read the silent
+# hook as a credential hang and skip it.
+#
+# The shared target is whatever `cargo-guard.sh` resolves — it owns that
+# decision for every other runner build (`target-agent/` from a worktree, and
+# the Linux live-runner routing), so this asks it rather than re-deriving it.
+# `CARGO_GUARD_RESOLVE_ONLY=1` prints `TARGET_DIR=` and exits before any lock,
+# build or write.
+#
+# ⚠️ BORROW THE TARGET DIR; DO NOT RUN CARGO THROUGH THE GUARD. The guard
+# injects `--all-targets` into a `clippy` that names no target, which compiles
+# #[cfg(test)] code — exactly what the T1 comment further down rejects for this
+# gate. Concurrency is still safe: cargo takes its own file lock on the target
+# directory and prints "Blocking waiting for file lock" while it waits, which
+# is also visible output rather than silence.
+#
+# `cargo-guard.sh` lives in qontinui-claude-config, not in this repo, so an
+# open-source checkout or CI has none. Every miss keeps today's behaviour and
+# says so on one line; nothing here can fail the push. A caller-set
+# CARGO_TARGET_DIR always wins, and the primary checkout is never touched.
+resolve_shared_target() {
+  local git_dir common_dir primary guard candidate out
+  if ! git_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-dir 2>/dev/null)" \
+     || ! common_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+     || [[ -z "$git_dir" || -z "$common_dir" ]]; then
+    echo "[pre-push] could not tell whether this is a linked worktree (git >= 2.31 needed) — building into this checkout's own target/"
+    return 0
+  fi
+  # The primary checkout already builds into its own warm target: nothing to say.
+  [[ "$git_dir" != "$common_dir" ]] || return 0
+
+  if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+    echo "[pre-push] linked worktree — using the caller's CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+    return 0
+  fi
+
+  primary="$(dirname "$common_dir")"
+  guard=""
+  for candidate in \
+    "${QONTINUI_PREPUSH_CARGO_GUARD:-}" \
+    "${QONTINUI_ROOT:+$QONTINUI_ROOT/qontinui-claude-config/scripts/cargo-guard.sh}" \
+    "$(dirname "$primary")/qontinui-claude-config/scripts/cargo-guard.sh"
+  do
+    if [[ -n "$candidate" && -f "$candidate" && -r "$candidate" ]]; then
+      guard="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$guard" ]]; then
+    echo "[pre-push] linked worktree, but no cargo-guard.sh to resolve the shared target — building into this worktree's own target/"
+    return 0
+  fi
+
+  if ! out="$(cd "$ROOT" && CARGO_GUARD_RESOLVE_ONLY=1 bash "$guard" check 2>/dev/null)"; then
+    echo "[pre-push] linked worktree, but $guard could not resolve a target — building into this worktree's own target/"
+    return 0
+  fi
+  local target
+  target="$(printf '%s\n' "$out" | sed -n 's/^TARGET_DIR=//p' | head -n 1)" || target=""
+  if [[ -z "$target" ]]; then
+    echo "[pre-push] linked worktree, but $guard printed no TARGET_DIR — building into this worktree's own target/"
+    return 0
+  fi
+  export CARGO_TARGET_DIR="$target"
+  echo "[pre-push] linked worktree — reusing the shared target CARGO_TARGET_DIR=$target"
+}
+resolve_shared_target
 
 cd "$ROOT/src-tauri"
 
