@@ -2097,6 +2097,89 @@ fn settle_skipped_claim(decision: &SpawnDecision, consume_target: ConsumeTarget)
     }
 }
 
+/// What step 2 of [`run_gate_continuation_inner`] does next with coord's answer
+/// to the consume claim.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimOutcome {
+    /// coord accepted the claim — or could not answer it, which proceeds
+    /// anyway (availability over consistency). Go on to the worktree acquire
+    /// and the spawn.
+    Spawn,
+    /// coord refused. The log is written and the local claim settled; the
+    /// caller returns without spawning.
+    Skip,
+}
+
+/// Log coord's claim answer, settle the in-process dispatch claim, and say
+/// whether the caller spawns — **the whole of step 2's decision handling**, so
+/// [`run_gate_continuation_inner`] wires it in with ONE statement and a unit
+/// test drives this fn rather than a re-implementation of a match arm.
+///
+/// That shape closes a real gap rather than tidying one. While the release sat
+/// in the `SkipSuperseded` match arm, deleting **the call** — not the body of
+/// [`settle_skipped_claim`], which a test did cover — left every test green
+/// and stranded the superseded loser's gate id in
+/// [`release_gate_dispatch`]'s claim set for the process lifetime, so coord's
+/// re-listed row could never be re-claimed. The call site was the untested
+/// half. Here there is no such statement to delete: the log, the settle and
+/// the skip/spawn decision are one unit, and
+/// `superseded_skip_releases_local_dispatch_claim_so_relist_reclaims` asserts
+/// the [`ClaimOutcome`] **and** the resulting claim state for all four
+/// [`SpawnDecision`] variants.
+///
+/// The asymmetry between the two skips is not restated here — it is
+/// [`skip_leaves_row_pending`], which [`settle_skipped_claim`] gates on, and
+/// both arms call it unconditionally so the policy stays in one place instead
+/// of being an absence in one arm.
+///
+/// The two decisions that are not skips proceed and must NOT release: the
+/// claim they hold is the in-process dedupe covering the spawn they are about
+/// to make.
+fn settle_claim_decision(
+    decision: &SpawnDecision,
+    consume_target: ConsumeTarget,
+    gate_id: uuid::Uuid,
+) -> ClaimOutcome {
+    match decision {
+        SpawnDecision::Spawn => ClaimOutcome::Spawn,
+        SpawnDecision::SpawnDespiteClaimError { cause } => {
+            warn!(
+                "agent_runtime: continuation claim error (proceeding, in-process dedupe \
+                 guards): {cause} (gate_id={gate_id})"
+            );
+            ClaimOutcome::Spawn
+        }
+        SpawnDecision::SkipCancelled { reason } => {
+            info!(
+                "agent_runtime: continuation cancelled upstream: {} — skipping spawn \
+                 (gate_id={gate_id})",
+                reason.as_deref().unwrap_or("(no reason given)")
+            );
+            // Keeps the claim: `skip_leaves_row_pending` is false here because
+            // coord's row is terminal. The settle is called anyway — one
+            // settle point for both skips.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+        SpawnDecision::SkipSuperseded { winner_gate_id } => {
+            info!(
+                "agent_runtime: continuation superseded by a sibling follow-up for the \
+                 same landed PR — skipping spawn (gate_id={gate_id} winner_gate_id={})",
+                winner_gate_id
+                    .as_ref()
+                    .map(|w| w.to_string())
+                    .unwrap_or_else(|| "(not named)".to_string())
+            );
+            // RELEASES, unlike the cancelled arm, because coord left the row
+            // pending and re-listed — the asymmetry lives in
+            // `skip_leaves_row_pending`. No deferred stamp is posted from
+            // here: coord wrote it in the refusing transaction.
+            settle_skipped_claim(decision, consume_target);
+            ClaimOutcome::Skip
+        }
+    }
+}
+
 // =============================================================================
 // Continuation-session registry (P3 anchor_key dedup + P4 concurrency cap)
 // =============================================================================
@@ -2256,6 +2339,28 @@ impl ContinuationRegistry {
                 gate_id,
             },
         );
+    }
+
+    /// Drop the [`Self::pending_anchors`] entry `anchor` names — but ONLY if
+    /// this registry still holds that exact `token`, i.e. only if the caller is
+    /// its owner.
+    ///
+    /// **The one and only place a `pending_anchors` entry is ever removed.**
+    /// Both release paths route through it: [`release_anchor_reservation`],
+    /// which every [`AnchorReservation`] drop calls, and
+    /// [`AnchorReservation::handed_to_registry`], which settles the entry under
+    /// the same lock that inserts the live row. They used to carry a copy each,
+    /// and the second copy was reachable by no test at all — making it
+    /// unconditional failed nothing, while re-opening exactly the
+    /// steal-a-foreign-reservation class the token exists to close (see
+    /// [`Self::pending_anchors`] for the account-migration window that makes it
+    /// a live instance rather than a hypothetical). One comparison means
+    /// `stale_reservation_drop_cannot_steal_a_foreign_reservation` covers both
+    /// paths, and making it unconditional fails that test.
+    fn release_owned(&mut self, anchor: &str, token: AnchorReservationToken) {
+        if self.pending_anchors.get(anchor) == Some(&token) {
+            self.pending_anchors.remove(anchor);
+        }
     }
 }
 
@@ -2514,15 +2619,29 @@ fn evaluate_continuation_guard(
     // Prune runs `is_live` OUTSIDE the registry lock (see its doc); the P3/P4
     // scan below then runs under a freshly-acquired lock.
     prune_dead_continuations(is_live);
-    // The permit this evaluation takes, if it takes one. Minted INSIDE the
-    // critical section below and handed back to the caller only with a
-    // `Proceed`; every other exit drops it, and dropping is what gives the
-    // anchor back.
-    let mut reservation = AnchorReservation::none();
-    let live_count = {
+    // The permit this evaluation takes, if it takes one, RETURNED OUT of the
+    // critical section that mints it — never assigned over a placeholder
+    // declared above the lock.
+    //
+    // That distinction is the whole shape of this block. An assignment over a
+    // live `AnchorReservation` runs the OLD value's `Drop` at the point of
+    // assignment, which here is inside the critical section, and that `Drop`
+    // releases through the very mutex being held. It is harmless today only
+    // because `release_anchor_reservation` early-returns on a `None` permit
+    // before it reaches `lock_recover` — a coincidence of the placeholder
+    // being empty, not a property anyone stated. `std::sync::Mutex` is not
+    // reentrant, so the first release path that locks unconditionally
+    // self-deadlocks the one mutex the entire continuation path shares: on the
+    // SUCCESS path, under load, and in no test. Binding the permit as this
+    // block's value removes the placeholder, so there is nothing to drop in
+    // here and no such change can reintroduce the hazard.
+    //
+    // Handed back to the caller only with a `Proceed`; every other exit drops
+    // it — outside the lock — and dropping is what gives the anchor back.
+    let (live_count, reservation) = {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
 
-        if let Some(anchor) = anchor_key {
+        let reservation = if let Some(anchor) = anchor_key {
             // P3: a LIVE session already exists for this anchor_key → dedup.
             if let Some(existing) = registry
                 .live
@@ -2558,13 +2677,19 @@ fn evaluate_continuation_guard(
                     // value. Nothing else can mint one for this anchor, and
                     // nothing else can remove the entry it names (see
                     // `ContinuationRegistry::pending_anchors`).
-                    reservation = AnchorReservation::owning(anchor.to_string(), token);
+                    AnchorReservation::owning(anchor.to_string(), token)
                 }
             }
-        }
+        } else {
+            // An anchor-less continuation reserves nothing and releases
+            // nothing — a permit over no anchor, whose drop is a no-op
+            // wherever it happens.
+            AnchorReservation::none()
+        };
         // `live` only: the reservation just taken (and any other) is not a
-        // running session and does not count toward the cap.
-        registry.live.len()
+        // running session and does not count toward the cap. Moved out with
+        // the count, so the guard below drops on an empty local.
+        (registry.live.len(), reservation)
     };
     // The registry lock is RELEASED before the thread reading is taken. The
     // reading is a synchronous OS-table read (and, in the live wrapper, a
@@ -2857,15 +2982,16 @@ fn register_continuation_session(
 ///
 /// The token comparison is the whole safety property: without it this removes
 /// whatever reservation currently sits under the key, which is not necessarily
-/// the one the caller took (see [`ContinuationRegistry::pending_anchors`]).
+/// the one the caller took (see [`ContinuationRegistry::pending_anchors`]). It
+/// is not written here — it is [`ContinuationRegistry::release_owned`], the
+/// single comparison this path shares with the hand-over.
 fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
     let Some((anchor, token)) = held else {
         return;
     };
-    let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
-    if registry.pending_anchors.get(anchor) == Some(&token) {
-        registry.pending_anchors.remove(anchor);
-    }
+    // The owner comparison itself lives on the registry — one copy, shared
+    // with `AnchorReservation::handed_to_registry`.
+    lock_recover(continuation_sessions(), "continuation_sessions").release_owned(anchor, token);
 }
 
 /// The same-anchor reservation a `Proceed` from [`evaluate_continuation_guard`]
@@ -2874,7 +3000,8 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
 ///
 /// RAII rather than a release call on each exit: the path from the guard to a
 /// registered session crosses an authorization check, the coord consume claim
-/// (three skip arms), a worktree acquire and two presentation fns with their
+/// (two skip arms, and a `SpawnDespiteClaimError` that proceeds), a worktree
+/// acquire and two presentation fns with their
 /// own early returns, and every one of them must release or the anchor is
 /// dead until the runner restarts. Dropping releases, so an exit added later
 /// is covered without knowing this type exists — and so is a task aborted at
@@ -2934,10 +3061,10 @@ impl AnchorReservation {
         let mut registry = lock_recover(continuation_sessions(), "continuation_sessions");
         registry.insert_live(terminal_id, anchor_key, gate_id);
         if let Some((anchor, token)) = held {
-            // Owner-checked like every other removal, for the same reason.
-            if registry.pending_anchors.get(&anchor) == Some(&token) {
-                registry.pending_anchors.remove(&anchor);
-            }
+            // Owner-checked like every other removal, through the SAME
+            // comparison — `release_owned` is the only remover there is, so
+            // this path cannot drift away from the drop path.
+            registry.release_owned(&anchor, token);
         }
     }
 }
@@ -4423,8 +4550,10 @@ async fn run_gate_continuation_inner(
     // A `Proceed` leaves the anchor RESERVED in the registry (Phase 4 of plan
     // `2026-09-13-one-landed-pr-dispatches-its-follow-up-to-two-sessions-through-two-gate-anchors`):
     // `reservation` carries it from here, and dropping it on ANY exit below —
-    // the authorization refusal, all three consume-claim skips, a worktree
-    // failure, a presentation fn's early return — gives the anchor back. The
+    // the authorization refusal, the two consume-claim skips (and a
+    // `SpawnDespiteClaimError` that proceeds, so it does NOT release), a
+    // worktree failure, a presentation fn's early return — gives the anchor
+    // back. The
     // two spawn successes disarm it explicitly inside the presentation fns.
     let (guard_verdict, reservation) =
         evaluate_continuation_guard_live(payload.anchor_key.as_deref(), &live_terminal_predicate());
@@ -4557,48 +4686,15 @@ async fn run_gate_continuation_inner(
     // spawn. This closes the poll→cancel→spawn race: if a cancel landed between
     // the poll and now, coord returns 409 cancelled and we skip the spawn.
     if let ConsumeTarget::Gate(gate_id) = consume_target {
-        // Matched by REFERENCE so the decision outlives the arm that logged
-        // it: both skips hand the SAME value to `settle_skipped_claim`, which
-        // is the only place either of them can release the local claim.
+        // ONE wiring statement. Every per-decision behaviour — which skip
+        // releases the local claim, which decision proceeds, and what each
+        // logs — lives in `settle_claim_decision`, which the unit test drives
+        // for all four variants. The old shape spread it across match arms
+        // here, where deleting the superseded arm's release call broke no test
+        // and stranded the loser's gate id for the process lifetime.
         let decision = post_continuation_claim(gate_id, device_id).await;
-        match &decision {
-            SpawnDecision::Spawn => {}
-            SpawnDecision::SkipCancelled { reason } => {
-                info!(
-                    "agent_runtime: continuation cancelled upstream: {} — skipping spawn \
-                     (gate_id={gate_id})",
-                    reason.as_deref().unwrap_or("(no reason given)")
-                );
-                // Keeps the claim: `skip_leaves_row_pending` is false here
-                // because coord's row is terminal. The call is deliberately
-                // made anyway — one settle point for both arms, so the policy
-                // is readable in one place instead of being an absence.
-                settle_skipped_claim(&decision, consume_target);
-                return Ok(());
-            }
-            SpawnDecision::SkipSuperseded { winner_gate_id } => {
-                info!(
-                    "agent_runtime: continuation superseded by a sibling follow-up for the \
-                     same landed PR — skipping spawn (gate_id={gate_id} winner_gate_id={})",
-                    winner_gate_id
-                        .as_ref()
-                        .map(|w| w.to_string())
-                        .unwrap_or_else(|| "(not named)".to_string())
-                );
-                // RELEASES, unlike the cancelled arm, because coord left the
-                // row pending and re-listed — the asymmetry itself lives in
-                // `skip_leaves_row_pending`, which both arms are gated on. No
-                // deferred stamp is posted from here: coord wrote it in the
-                // refusing transaction.
-                settle_skipped_claim(&decision, consume_target);
-                return Ok(());
-            }
-            SpawnDecision::SpawnDespiteClaimError { cause } => {
-                warn!(
-                    "agent_runtime: continuation claim error (proceeding, in-process dedupe \
-                     guards): {cause} (gate_id={gate_id})"
-                );
-            }
+        if settle_claim_decision(&decision, consume_target, gate_id) == ClaimOutcome::Skip {
+            return Ok(());
         }
     }
 
@@ -10742,6 +10838,63 @@ mod tests {
             "after a superseded skip, the re-listed gate id claims again"
         );
         release_gate_dispatch(relisted);
+
+        // …and the WIRING: `settle_claim_decision` is the whole of step 2's
+        // decision handling, so this drives the fn `run_gate_continuation_inner`
+        // actually calls rather than a copy of a match arm. Outcome AND claim
+        // state, for all four variants — the superseded release is no longer a
+        // deletable statement at an untested call site.
+        let gate = uuid::Uuid::now_v7();
+
+        let funnel_relisted = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel_relisted));
+        assert_eq!(
+            settle_claim_decision(&superseded, ConsumeTarget::Gate(funnel_relisted), gate),
+            ClaimOutcome::Skip,
+            "a superseded claim refusal must not spawn"
+        );
+        assert!(
+            claim_gate_dispatch(funnel_relisted),
+            "the superseded loser's id must be claimable again after the funnel settles it, \
+             or coord's re-listed row is stranded for the process lifetime"
+        );
+        release_gate_dispatch(funnel_relisted);
+
+        let funnel_kept = uuid::Uuid::now_v7();
+        assert!(claim_gate_dispatch(funnel_kept));
+        assert_eq!(
+            settle_claim_decision(&cancelled, ConsumeTarget::Gate(funnel_kept), gate),
+            ClaimOutcome::Skip,
+            "a cancelled claim refusal must not spawn"
+        );
+        assert!(
+            !claim_gate_dispatch(funnel_kept),
+            "a cancelled skip KEEPS the claim through the funnel too — coord's row is terminal"
+        );
+        release_gate_dispatch(funnel_kept);
+
+        // The two decisions that are not skips: both reach the spawn, and
+        // neither releases — the claim they hold is the dedupe for the spawn
+        // they are about to make.
+        for proceeding in [
+            SpawnDecision::Spawn,
+            SpawnDecision::SpawnDespiteClaimError {
+                cause: "network".into(),
+            },
+        ] {
+            let claimed = uuid::Uuid::now_v7();
+            assert!(claim_gate_dispatch(claimed));
+            assert_eq!(
+                settle_claim_decision(&proceeding, ConsumeTarget::Gate(claimed), gate),
+                ClaimOutcome::Spawn,
+                "{proceeding:?} must reach the spawn"
+            );
+            assert!(
+                !claim_gate_dispatch(claimed),
+                "{proceeding:?} proceeds to spawn and must KEEP its in-process dedupe claim"
+            );
+            release_gate_dispatch(claimed);
+        }
     }
 
     /// End-to-end sequencing of the incident fix at the unit level: a gate id
@@ -11703,24 +11856,38 @@ mod tests {
         // AtCap: cap 1, one live session, a new anchor twice.
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "1");
         register_continuation_session("t-busy".into(), Some("a-busy".into()), None);
-        assert_eq!(
-            guard_verdict(Some("a-capped"), &live_all, &calm),
-            ContinuationGuard::AtCap(1)
-        );
+        // The permit is BOUND, never taken through `guard_verdict`. That
+        // wrapper is `evaluate_continuation_guard(..).0`, so the tuple
+        // temporary's `.1` is dropped at the end of the wrapper's own tail
+        // expression — the WRAPPER releases the anchor before this test can
+        // look at it, and the assertion below would then pass even with the
+        // production release deleted. Bound here, the registry is read with the
+        // permit still alive, which is exactly the state
+        // `run_gate_continuation_inner`'s AtCap arm is in while it awaits
+        // `defer_continuation_unclaimed`'s network POST.
+        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
+        assert_eq!(verdict, ContinuationGuard::AtCap(1));
         assert!(
             !anchor_is_reserved("a-capped"),
             "an AtCap verdict must remove the reservation it took under the lock"
         );
+        drop(held);
+        let (verdict, held) = evaluate_continuation_guard(Some("a-capped"), &live_all, &calm);
         assert_eq!(
-            guard_verdict(Some("a-capped"), &live_all, &calm),
+            verdict,
             ContinuationGuard::AtCap(1),
             "the re-delivery must see the cap again, not its own leftover reservation"
         );
+        drop(held);
 
         // ThreadPressure: cap out of the way, a loaded reading twice.
         std::env::set_var("QONTINUI_CONTINUATION_SESSION_CAP", "100");
         for _ in 0..2 {
-            let verdict = guard_verdict(Some("a-loaded"), &live_all, &|| thread_verdict(Some(540)));
+            // Bound for the same reason as the AtCap half above.
+            let (verdict, held) =
+                evaluate_continuation_guard(Some("a-loaded"), &live_all, &|| {
+                    thread_verdict(Some(540))
+                });
             assert!(
                 matches!(verdict, ContinuationGuard::ThreadPressure { .. }),
                 "a loaded machine must defer on every evaluation, got {verdict:?}"
@@ -11729,6 +11896,7 @@ mod tests {
                 !anchor_is_reserved("a-loaded"),
                 "a ThreadPressure verdict must remove the reservation it took under the lock"
             );
+            drop(held);
         }
 
         clear_continuation_registry();
