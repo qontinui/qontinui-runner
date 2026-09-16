@@ -103,10 +103,13 @@ try {
     # Atlas-managed, so they must never appear in the --exclude list. The
     # historical hardcoded carve-out (regression_% + coordinator_shadow_decisions)
     # emitted spec_proposals and proposal_events here.
-    $leaked = @($seeded | Where-Object { $_ -match 'spec_proposals|proposal_events|^orchestration\.|regression_|coordinator_shadow_decisions' })
+    $leaked = @($seeded | Where-Object { $_ -match 'spec_proposals|proposal_events|^orchestration\.|regression_' })
     Assert-Equal "no pilot table leaks into exclude.txt" 0 $leaked.Count
     # ...and non-pilot objects must still be excluded, or the list is useless.
-    foreach ($expected in @("project.alembic_version", "project.workflows", "coord.agents", "project.workflow_status")) {
+    # `project.coordinator_shadow_decisions` is the orphan a pre-Phase-4
+    # runner self-healed: no longer declared, so it must be EXCLUDED, never
+    # offered as a DROP.
+    foreach ($expected in @("project.alembic_version", "project.workflows", "coord.agents", "project.workflow_status", "project.coordinator_shadow_decisions")) {
         Assert-Equal "non-pilot '$expected' excluded" $true ($seeded -contains $expected)
     }
 

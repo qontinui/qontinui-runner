@@ -38,12 +38,11 @@
 //!   QUEUES the message when the session is `Processing`
 //!   (`claude_session/session.rs`), so it is safe by construction and never
 //!   clobbers a turn.
-//! - **PTY / `WorkerSession`** — `submit_prompt` writes raw bracketed-paste +
-//!   CR with NO state check, so injecting mid-turn corrupts the running turn.
-//!   We FIRST check the idle gate (`TerminalSession::looks_idle_quiescent`,
-//!   over `looping_agent::idle::snapshot_looks_idle`); only inject when
-//!   the terminal is quiescent and showing its input prompt. If not idle we
-//!   SKIP this tick (leave the message unacked; retry next poll).
+//! - The pty-backed `WorkerSession` plane, with its grid-reading idle gate,
+//!   was deleted by Phase 4 of
+//!   `2026-09-12-consolidate-local-orchestration-onto-conductor`: nothing
+//!   registered a worker once the Productivity board went, so the PTY arm
+//!   could never resolve. Only SDK sessions are addressable here now.
 //!
 //! ## Safety rails
 //!
@@ -89,12 +88,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// spam a single session with back-to-back prompts. Messages held off by the
 /// cooldown stay UNACKED and are retried on a later tick.
 const PER_SESSION_COOLDOWN: Duration = Duration::from_secs(30);
-
-/// Idle-gate quiescence debounce. The PTY idle gate reads the grid, waits this
-/// long, then reads again; idle requires the input prompt visible AND the
-/// rendered text UNCHANGED across both reads (no streaming). Short enough to
-/// keep a poll tick snappy, long enough to catch a mid-output frame.
-const IDLE_QUIESCENCE_DEBOUNCE: Duration = Duration::from_millis(600);
 
 /// How long a `message_id` lingers in the delivered-set after a successful
 /// ack. Long enough to cover coord's mark-delivered eventual consistency (so a
@@ -191,8 +184,7 @@ impl DeliveryGuard {
 //
 // A `priority="blocking"` message that cannot be delivered used to fail
 // SILENTLY forever: an unresolvable `to_session` just logged-and-waited (until
-// the 14d TTL), and a PTY that never passes the idle gate deferred injection
-// on every tick with no aging signal. Both are exactly the invisible-stall
+// the 14d TTL) with no aging signal. That is exactly the invisible-stall
 // class the stall-watchdog plan exists to kill, so once a blocking message has
 // been blocked past `RUNNER_BLOCKING_MSG_SURFACE_SECS` we POST a typed
 // delivery-failure to coord (`.../delivery-blocked`) as EVIDENCE for coord's
@@ -251,8 +243,6 @@ fn surface_threshold() -> Duration {
 enum BlockReason {
     /// Fix 2: `to_session` does not resolve to a live local session.
     TargetNotLive,
-    /// Fix 3: the target PTY keeps failing the idle gate, deferring injection.
-    PtyNeverIdle,
 }
 
 impl BlockReason {
@@ -260,7 +250,6 @@ impl BlockReason {
     fn as_str(self) -> &'static str {
         match self {
             BlockReason::TargetNotLive => "target_not_live",
-            BlockReason::PtyNeverIdle => "pty_never_idle",
         }
     }
 }
@@ -431,98 +420,36 @@ async fn surface_blocked_delivery(
 // Session resolution
 // ===========================================================================
 
-/// Where a `to_session` resolved to, and how to inject into it.
-enum ResolvedTarget {
-    /// SDK `ClaudeSession` — inject immediately; it queues if Processing.
-    /// Carries the runner `task_run_id` to pass to `send_message_to_worker`.
-    Sdk { task_run_id: String },
-    /// PTY/Worker — gate on idle first. Carries the worker's `task_run_id`
-    /// (for `send_message_to_worker`) and `terminal_id` (for the grid read).
-    Pty {
-        task_run_id: String,
-        terminal_id: String,
-    },
-}
-
-/// Resolve coord's `to_session` to a live local session, or `None` if this
-/// device is not currently hosting it (leave the message pending — not ours /
-/// not live).
+/// Resolve coord's `to_session` to the runner `task_run_id` of a live local
+/// SDK `ClaudeSession`, or `None` if this device is not currently hosting it
+/// (leave the message pending — not ours / not live). The SDK queue is
+/// clobber-safe, so the resolved id can be injected into immediately.
 ///
 /// `to_session` is the runner-side session identity coord stores. We resolve it
 /// against, in order:
 ///
-/// 1. The durable lifecycle store (`claude_session_id -> terminal_id`, the
-///    proven `session_bus` path) — the terminal_id then finds a live
-///    WorkerSession (PTY) via `SessionManager::find_worker_by_terminal_id`.
-/// 2. A direct SDK `SessionManager::get(to_session)` — covers a session whose
-///    runner `task_run_id` IS what coord addressed (SDK sessions).
-/// 3. The `AiCoordRegistrar` forward index (coord UUIDv7 → the registered
+/// 1. A direct SDK `SessionManager::get(to_session)` — covers a session whose
+///    runner `task_run_id` IS what coord addressed.
+/// 2. The `AiCoordRegistrar` forward index (coord UUIDv7 → the registered
 ///    `claude_session_id`, which is the runner `task_run_id` for the pinned
-///    plane), if `to_session` parses as a coord session UUID — covers agentic
-///    SDK sessions, PTY workers, and (fabric Phase 3) sniffed interactive
-///    sessions, whose index value resolves through the lifecycle store like
-///    arm (1).
-///
-/// SDK matches win over PTY (the SDK queue is clobber-safe), so we probe (2)/(3)
-/// before falling back to the PTY terminal from (1).
+///    plane), if `to_session` parses as a coord session UUID.
 fn resolve_target(
     session_manager: &crate::claude_session::SessionManager,
     registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
-    lifecycle_store: &crate::session::session_lifecycle_store::SessionLifecycleStore,
     to_session: &str,
-) -> Option<ResolvedTarget> {
-    // (2) Direct SDK session keyed by the runner task_run_id == to_session.
+) -> Option<String> {
+    // (1) Direct SDK session keyed by the runner task_run_id == to_session.
     if session_manager.get(to_session).is_some() {
-        return Some(ResolvedTarget::Sdk {
-            task_run_id: to_session.to_string(),
-        });
+        return Some(to_session.to_string());
     }
 
-    // (3) Coord UUIDv7 → runner task_run_id via the registrar.
+    // (2) Coord UUIDv7 → runner task_run_id via the registrar.
     if let Some(reg) = registrar {
         if let Ok(uuid) = to_session.parse::<uuid::Uuid>() {
             if let Some(task_run_id) = reg.task_run_id_for(&uuid) {
                 if session_manager.get(&task_run_id).is_some() {
-                    return Some(ResolvedTarget::Sdk { task_run_id });
+                    return Some(task_run_id);
                 }
-                // Resolved to a worker task_run_id?
-                if let Some(worker) = session_manager.get_worker(&task_run_id) {
-                    return Some(ResolvedTarget::Pty {
-                        task_run_id,
-                        terminal_id: worker.terminal_id().to_string(),
-                    });
-                }
-                // Sniffed interactive session (fabric Phase 3, review N2):
-                // the registrar index value IS the claude_session_id (no
-                // SessionManager entry exists for a typed `--resume`
-                // session), so resolve it through the lifecycle store
-                // exactly like arm (1) — coord-id addressing then reaches
-                // the same PTY that csid addressing already could.
-                if let Some(rec) = lifecycle_store.get(&task_run_id) {
-                    if rec.state == "open" {
-                        if let Some(worker) =
-                            session_manager.find_worker_by_terminal_id(&rec.terminal_id)
-                        {
-                            return Some(ResolvedTarget::Pty {
-                                task_run_id: worker.task_run_id().to_string(),
-                                terminal_id: rec.terminal_id.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // (1) Lifecycle store: claude_session_id == to_session → terminal_id →
-    // live WorkerSession (PTY). This is the proven `session_bus` resolution.
-    if let Some(rec) = lifecycle_store.get(to_session) {
-        if rec.state == "open" {
-            if let Some(worker) = session_manager.find_worker_by_terminal_id(&rec.terminal_id) {
-                return Some(ResolvedTarget::Pty {
-                    task_run_id: worker.task_run_id().to_string(),
-                    terminal_id: rec.terminal_id.clone(),
-                });
             }
         }
     }
@@ -838,13 +765,6 @@ async fn deliver_once(
         .app_handle
         .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
         .map(|r| r.inner().clone());
-    let terminal_manager = api_state
-        .app_handle
-        .try_state::<Arc<crate::terminal::TerminalManager>>()
-        .map(|t| t.inner().clone());
-    let lifecycle_store = crate::session::session_lifecycle_store::SessionLifecycleStore::open(
-        crate::session::session_lifecycle_store::store_path(),
-    )?;
 
     let now = Instant::now();
     let mut delivered = 0usize;
@@ -868,12 +788,8 @@ async fn deliver_once(
             continue;
         }
 
-        let Some(target) = resolve_target(
-            &session_manager,
-            registrar.as_deref(),
-            &lifecycle_store,
-            to_session,
-        ) else {
+        let Some(task_run_id) = resolve_target(&session_manager, registrar.as_deref(), to_session)
+        else {
             // Not live on this device. Leave pending — delivered on its next
             // open (its spawn preamble pulls coord_inbox), or by another
             // device hosting it.
@@ -904,53 +820,8 @@ async fn deliver_once(
             continue;
         };
 
-        // Turn arbitration: SDK queues safely; PTY must be idle.
-        let task_run_id = match &target {
-            ResolvedTarget::Sdk { task_run_id } => task_run_id.clone(),
-            ResolvedTarget::Pty {
-                task_run_id,
-                terminal_id,
-            } => {
-                let Some(tm) = terminal_manager.as_ref() else {
-                    debug!("session_message_poller: TerminalManager unavailable — skip PTY inject");
-                    continue;
-                };
-                let Some(term) = tm.get(terminal_id) else {
-                    debug!(
-                        "session_message_poller: terminal {terminal_id} gone — skip msg {}",
-                        msg.message_id
-                    );
-                    continue;
-                };
-                if !term.looks_idle_quiescent(IDLE_QUIESCENCE_DEBOUNCE).await {
-                    debug!(
-                        "session_message_poller: terminal {terminal_id} not idle — deferring msg {}",
-                        msg.message_id
-                    );
-                    // Fix 3: a blocking message whose PTY never quiesces past
-                    // the threshold is surfaced to coord as evidence for the
-                    // stuck-not-dead classifier (once per window, fail-open).
-                    // Injection behavior is unchanged — we still just defer.
-                    if msg.priority == "blocking" {
-                        surface_blocked_delivery(
-                            &client,
-                            &base,
-                            &token,
-                            tracker,
-                            &msg.message_id,
-                            BlockReason::PtyNeverIdle,
-                            now,
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-                task_run_id.clone()
-            }
-        };
-
-        // 3. Inject via the in-process primitive (reuses the SDK queue / PTY
-        // submit dispatch — no second injection primitive).
+        // 3. Inject via the in-process primitive (the SDK queue — no second
+        // injection primitive).
         let framed = frame_message(msg);
         crate::claude_session::worker_message::send_message_to_worker(
             api_state,
@@ -1040,10 +911,6 @@ pub mod commands {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn lines(rows: &[&str]) -> Vec<String> {
-        rows.iter().map(|s| s.to_string()).collect()
-    }
 
     // ---- delivery guard: dedup + cooldown -------------------------------
 
@@ -1395,28 +1262,10 @@ mod tests {
     }
 
     #[test]
-    fn tracker_reasons_are_tracked_independently() {
-        let mut t = SurfacingTracker::default();
-        let t0 = Instant::now();
-        let t1 = t0 + THRESH + Duration::from_secs(1);
-        // target_not_live aged past the threshold...
-        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
-        assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
-            .is_some());
-        // ...but a FRESH pty_never_idle sighting of the same message starts
-        // its own clock and does not fire yet.
-        assert!(t
-            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, true)
-            .is_none());
-    }
-
-    #[test]
     fn successful_delivery_clears_tracking() {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
         t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, true);
         t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, true);
         t.clear_message("m1");
         // m1's clocks restart from scratch; m2 is untouched.
@@ -1438,7 +1287,7 @@ mod tests {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
         t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, true);
+        t.note_blocked("kept", BlockReason::TargetNotLive, t0, THRESH, true);
         let pending: std::collections::HashSet<&str> = ["kept"].into_iter().collect();
         t.retain_pending(&pending);
         assert!(!t
@@ -1446,7 +1295,7 @@ mod tests {
             .contains_key(&("gone".to_string(), BlockReason::TargetNotLive)));
         assert!(t
             .entries
-            .contains_key(&("kept".to_string(), BlockReason::PtyNeverIdle)));
+            .contains_key(&("kept".to_string(), BlockReason::TargetNotLive)));
     }
 
     #[test]
@@ -1475,6 +1324,5 @@ mod tests {
     fn block_reason_wire_values() {
         // Pins the coord route contract (`POST .../delivery-blocked` body).
         assert_eq!(BlockReason::TargetNotLive.as_str(), "target_not_live");
-        assert_eq!(BlockReason::PtyNeverIdle.as_str(), "pty_never_idle");
     }
 }
