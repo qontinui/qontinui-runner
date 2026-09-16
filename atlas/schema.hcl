@@ -594,6 +594,14 @@ table "runs" {
     null = false
     type = text
   }
+  // Why the run left `running`: the fatal error (DAG cycle, DESIGN failure),
+  // the stall pattern, or the stop request. Null while `running` and for a
+  // `complete` run. Written together with `status` by every terminal exit of
+  // the conductor (`PgDb::set_run_status`).
+  column "status_reason" {
+    null = true
+    type = text
+  }
   column "created_at" {
     null    = false
     type    = timestamptz

@@ -52,7 +52,7 @@ impl PgDb {
                 INSERT INTO orchestration.runs
                     (run_id, goal, recipe, phases, status)
                 VALUES ($1, $2, $3, $4, $5)
-                RETURNING run_id, goal, recipe, phases, status, created_at, updated_at
+                RETURNING run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 "#,
                 &[&run_id, &goal, &recipe, &phases_owned, &status],
             )
@@ -73,7 +73,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 FROM orchestration.runs
                 WHERE run_id = $1
                 "#,
@@ -96,7 +96,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 FROM orchestration.runs
                 ORDER BY created_at DESC
                 "#,
@@ -108,9 +108,19 @@ impl PgDb {
         Ok(rows.iter().map(Self::run_from_row).collect())
     }
 
-    /// Update a run's `status` (e.g. `running` → `complete`/`failed`/`stopped`).
+    /// Update a run's `status` (e.g. `running` → `complete` / `failed` /
+    /// `stalled` / `stopped`) together with the reason it left `running`
+    /// (`status_reason`; `None` clears it — a `complete` run carries no reason).
+    /// This is the ONE writer of a run's terminal outcome: the conductor's
+    /// fatal, stall, DESIGN-failure and completion exits all land here, so the
+    /// row never says `running` for a run whose reconciler has exited.
     /// Returns `Err` if no row matched `run_id`.
-    pub async fn set_run_status(&self, run_id: Uuid, status: &str) -> Result<(), String> {
+    pub async fn set_run_status(
+        &self,
+        run_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self
             .pool
             .get()
@@ -122,10 +132,11 @@ impl PgDb {
                 r#"
                 UPDATE orchestration.runs
                 SET status = $2,
+                    status_reason = $3,
                     updated_at = now()
                 WHERE run_id = $1
                 "#,
-                &[&run_id, &status],
+                &[&run_id, &status, &reason],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("set_run_status", &e))?;
@@ -434,8 +445,9 @@ impl PgDb {
             recipe: row.get(2),
             phases: row.get(3),
             status: row.get(4),
-            created_at: row.get::<_, DateTime<Utc>>(5),
-            updated_at: row.get::<_, DateTime<Utc>>(6),
+            status_reason: row.get(5),
+            created_at: row.get::<_, DateTime<Utc>>(6),
+            updated_at: row.get::<_, DateTime<Utc>>(7),
         }
     }
 
@@ -588,6 +600,21 @@ mod tests {
         assert_eq!(run.recipe.as_deref(), Some("approach-d"));
         assert_eq!(run.phases, phases);
         assert_eq!(run.status, "running");
+        assert_eq!(run.status_reason, None, "a fresh run carries no reason");
+
+        // set_run_status writes status AND reason; get_run reads both back.
+        pg.set_run_status(run_id, "stalled", Some("Stall detected: x"))
+            .await
+            .expect("set_run_status stalled");
+        let stalled = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(stalled.status, "stalled");
+        assert_eq!(stalled.status_reason.as_deref(), Some("Stall detected: x"));
+        pg.set_run_status(run_id, "running", None)
+            .await
+            .expect("set_run_status running");
+        let back = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(back.status, "running");
+        assert_eq!(back.status_reason, None, "None clears the reason");
 
         // 2. Upsert a small DAG: A (root), B depends on A, C depends on A+B.
         let a = mk_subtask(run_id, "A", 0, vec![], true);
