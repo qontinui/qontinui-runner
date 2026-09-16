@@ -18,7 +18,13 @@ import {
   SteeringLedger,
   WorkerStateBadge,
   describeWorkerState,
+  armDirectSend,
+  consumeDirectSendArm,
+  deliveryForSendOutcome,
   deliveryLabel,
+  IDLE_DIRECT_SEND_ARM,
+  isWorkerEndState,
+  reconcileDirectSendArm,
   settleQueuedOnTransition,
   shouldFetchChanges,
   type SteeringEntry,
@@ -95,14 +101,81 @@ describe("settleQueuedOnTransition", () => {
       ["processing", "ready"],
       ["processing", "processing"],
       ["ready", "ready"],
-      ["ready", "closed"],
       ["connecting", "processing"],
+      ["connecting", "ready"],
     ] as const) {
       expect(settleQueuedOnTransition([queued, sent], prev, next).map((e) => e.delivery)).toEqual([
         "queued",
         "sent",
       ]);
     }
+  });
+
+  it("settles every queued entry to UNDELIVERED when the worker ENDS", () => {
+    // The fix. The backend pops the queue at a TURN END; a worker that
+    // finishes or dies mid-turn goes `processing -> closed` and has no next
+    // turn end, so anything still queued is lost. Leaving those rows at
+    // `queued` kept the ledger promising "delivered when the current turn
+    // ends" about a message that will never be delivered.
+    const a: SteeringEntry = { id: "a", text: "first", atMs: 1, delivery: "queued" };
+    const b: SteeringEntry = { id: "b", text: "second", atMs: 2, delivery: "queued" };
+    const after = settleQueuedOnTransition([sent, a, b], "processing", "closed");
+    expect(after.map((e) => [e.id, e.delivery])).toEqual([
+      ["s", "sent"],
+      ["a", "undelivered"],
+      ["b", "undelivered"],
+    ]);
+  });
+
+  it("treats error and not_found as ends too, and settles from any live state", () => {
+    for (const end of ["closed", "error", "not_found"] as const) {
+      for (const from of ["processing", "ready", "interrupting"] as const) {
+        expect(
+          settleQueuedOnTransition([queued], from, end).map((e) => e.delivery),
+        ).toEqual(["undelivered"]);
+      }
+    }
+  });
+
+  it("does not re-settle when the worker was already ended", () => {
+    // `closed -> not_found` is not a fresh end; nothing about it is new
+    // evidence, and a `sent` row must never be rewritten by it.
+    const settled: SteeringEntry = { id: "u", text: "x", atMs: 1, delivery: "undelivered" };
+    expect(
+      settleQueuedOnTransition([settled, sent], "closed", "not_found").map((e) => e.delivery),
+    ).toEqual(["undelivered", "sent"]);
+  });
+
+  it("never invents a delivery for an end edge — only queued rows move", () => {
+    const sending: SteeringEntry = { id: "x", text: "z", atMs: 3, delivery: "sending" };
+    const failed: SteeringEntry = { id: "f", text: "w", atMs: 4, delivery: "failed", error: "no" };
+    expect(
+      settleQueuedOnTransition([sending, failed], "processing", "closed").map((e) => e.delivery),
+    ).toEqual(["sending", "failed"]);
+  });
+
+  it("does NOT settle a queued entry on the edge an immediate send caused", () => {
+    // Nit 4. M1 is queued while the worker is Processing; the worker reaches
+    // Ready; the operator sends M2 at that instant so it goes straight out
+    // (`queued: false`) and drives `ready -> processing` itself. The backend
+    // popped nothing, so crediting M1 with a delivery would be a lie — M1 is
+    // still sitting in the `VecDeque`.
+    const m1: SteeringEntry = { id: "m1", text: "first", atMs: 1, delivery: "queued" };
+    const m2: SteeringEntry = { id: "m2", text: "second", atMs: 2, delivery: "sent" };
+    expect(
+      settleQueuedOnTransition([m1, m2], "ready", "processing", true).map((e) => e.delivery),
+    ).toEqual(["queued", "sent"]);
+    // The very next real turn end still settles it.
+    expect(
+      settleQueuedOnTransition([m1, m2], "ready", "processing", false).map((e) => e.delivery),
+    ).toEqual(["delivered", "sent"]);
+  });
+
+  it("suppression applies ONLY to the ready → processing edge", () => {
+    // A direct send cannot make a worker's END mean anything else.
+    expect(
+      settleQueuedOnTransition([queued], "processing", "closed", true).map((e) => e.delivery),
+    ).toEqual(["undelivered"]);
   });
 
   it("labels each delivery state distinctly, naming the failure", () => {
@@ -112,6 +185,165 @@ describe("settleQueuedOnTransition", () => {
     expect(deliveryLabel({ ...sent, delivery: "failed", error: "queue full" })).toBe(
       "failed: queue full",
     );
+    // The honesty that matters: the undelivered label must not read as a
+    // delivery, and must say why.
+    const undelivered = deliveryLabel({ ...queued, delivery: "undelivered" });
+    expect(undelivered).toContain("not delivered");
+    expect(undelivered).toContain("worker ended");
+  });
+
+  it("returns the SAME array when a transition changes nothing", () => {
+    // The effect hands EVERY transition to this function rather than keeping a
+    // second copy of the edge rules; identity is what lets React bail out of
+    // the re-render, so it is part of the contract, not an optimisation.
+    const entries: SteeringEntry[] = [queued, sent];
+    expect(settleQueuedOnTransition(entries, "processing", "ready")).toBe(entries);
+    expect(settleQueuedOnTransition(entries, "ready", "processing", true)).toBe(entries);
+    const nothingQueued: SteeringEntry[] = [sent];
+    expect(settleQueuedOnTransition(nothingQueued, "processing", "closed")).toBe(nothingQueued);
+    expect(settleQueuedOnTransition(nothingQueued, "ready", "processing")).toBe(nothingQueued);
+  });
+
+  it("isWorkerEndState names exactly the states from which no queue can drain", () => {
+    for (const s of ["closed", "error", "not_found"] as const) {
+      expect(isWorkerEndState(s)).toBe(true);
+    }
+    for (const s of [
+      "connecting",
+      "initializing",
+      "ready",
+      "processing",
+      "interrupting",
+      "restoring",
+      "disconnected",
+    ] as const) {
+      expect(isWorkerEndState(s)).toBe(false);
+    }
+  });
+});
+
+describe("deliveryForSendOutcome", () => {
+  it("records a message queued into a worker that ALREADY ENDED as undelivered", () => {
+    // The end-edge settle only moves rows that are already `queued`, and a row
+    // is `sending` for the whole `send_user_message` invoke. So a worker that
+    // dies while a send is in flight goes past the end edge with nothing to
+    // settle, and writing `queued` afterwards strands a permanent "delivered
+    // when the current turn ends" on a dead worker — in exactly the window
+    // where a steering message is most likely to be lost.
+    for (const end of ["closed", "error", "not_found"] as const) {
+      expect(deliveryForSendOutcome({ ok: true, queued: true, state: null }, end)).toEqual({
+        delivery: "undelivered",
+      });
+    }
+  });
+
+  it("records an ordinary queue as queued while the worker is alive", () => {
+    for (const live of ["processing", "ready", "interrupting", "restoring"] as const) {
+      expect(deliveryForSendOutcome({ ok: true, queued: true, state: null }, live)).toEqual({
+        delivery: "queued",
+      });
+    }
+  });
+
+  it("an immediate send is `sent` even if the worker ended straight after", () => {
+    // It really did go out; the worker ending afterwards does not unsend it.
+    expect(deliveryForSendOutcome({ ok: true, queued: false, state: null }, "closed")).toEqual({
+      delivery: "sent",
+    });
+  });
+
+  it("carries a failure through with its reason", () => {
+    expect(deliveryForSendOutcome({ ok: false, error: "queue full" }, "ready")).toEqual({
+      delivery: "failed",
+      error: "queue full",
+    });
+  });
+});
+
+describe("the direct-send arm", () => {
+  it("arms only when the worker looked idle at issue time", () => {
+    expect(armDirectSend("ready")).toEqual({ pending: true, spent: false });
+    for (const s of ["processing", "closed", "interrupting", "connecting"] as const) {
+      expect(armDirectSend(s)).toEqual({ pending: false, spent: false });
+    }
+  });
+
+  it("suppresses the edge the direct send caused, and records that it did", () => {
+    const { arm, causedByDirectSend } = consumeDirectSendArm(
+      armDirectSend("ready"),
+      "ready",
+      "processing",
+    );
+    expect(causedByDirectSend).toBe(true);
+    expect(arm).toEqual({ pending: false, spent: true });
+  });
+
+  it("is retired by ANY other observed transition, without suppressing it", () => {
+    // A stale arm is the dangerous state: left pending, it would suppress a
+    // genuine `pop_front` an arbitrary number of turns later and report a
+    // delivered message as lost.
+    for (const [prev, next] of [
+      ["ready", "closed"],
+      ["processing", "ready"],
+      ["ready", "error"],
+    ] as const) {
+      const { arm, causedByDirectSend } = consumeDirectSendArm(armDirectSend("ready"), prev, next);
+      expect(causedByDirectSend).toBe(false);
+      expect(arm.pending).toBe(false);
+      expect(arm.spent).toBe(false);
+    }
+  });
+
+  it("leaves an unarmed arm alone, and never suppresses on one", () => {
+    const { arm, causedByDirectSend } = consumeDirectSendArm(
+      IDLE_DIRECT_SEND_ARM,
+      "ready",
+      "processing",
+    );
+    expect(causedByDirectSend).toBe(false);
+    expect(arm).toBe(IDLE_DIRECT_SEND_ARM);
+  });
+
+  it("puts the settle BACK when the outcome proves the edge was a real pop", () => {
+    // The interleaving: M1 is queued; the worker reaches a turn end; the
+    // operator sends M2 at that instant so the client arms; the backend pops M1
+    // and re-sends it, driving `ready -> processing` while the M2 invoke is
+    // still outstanding, so the arm suppresses M1's settle; M2's outcome then
+    // comes back `queued: true` — the client's `ready` was wrong and the edge
+    // it swallowed was M1's delivery.
+    const consumed = consumeDirectSendArm(armDirectSend("ready"), "ready", "processing");
+    expect(consumed.causedByDirectSend).toBe(true);
+    const reconciled = reconcileDirectSendArm(consumed.arm, /* wentOutImmediately */ false);
+    expect(reconciled.resettle).toBe(true);
+    expect(reconciled.arm).toEqual({ pending: false, spent: false });
+  });
+
+  it("does NOT re-settle when the send really did go out immediately", () => {
+    const consumed = consumeDirectSendArm(armDirectSend("ready"), "ready", "processing");
+    expect(reconcileDirectSendArm(consumed.arm, true)).toEqual({
+      arm: { pending: false, spent: false },
+      resettle: false,
+    });
+  });
+
+  it("does NOT re-settle a suppression that was never applied", () => {
+    // Queued outcome, but no edge was suppressed — nothing to put back.
+    expect(reconcileDirectSendArm(armDirectSend("ready"), false).resettle).toBe(false);
+    expect(reconcileDirectSendArm(IDLE_DIRECT_SEND_ARM, false).resettle).toBe(false);
+  });
+
+  it("the re-settle lands on the OLDER queued row, not on the in-flight one", () => {
+    // The row for the send being reconciled is still `sending`, so
+    // `settleQueuedOnTransition` cannot see it — which is why the repair is
+    // issued before that row is marked.
+    const m1: SteeringEntry = { id: "m1", text: "first", atMs: 1, delivery: "queued" };
+    const m2: SteeringEntry = { id: "m2", text: "second", atMs: 2, delivery: "sending" };
+    expect(
+      settleQueuedOnTransition([m1, m2], "ready", "processing").map((e) => [e.id, e.delivery]),
+    ).toEqual([
+      ["m1", "delivered"],
+      ["m2", "sending"],
+    ]);
   });
 });
 
