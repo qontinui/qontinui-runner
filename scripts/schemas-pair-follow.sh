@@ -366,7 +366,22 @@ cmd_scan() {
   local page=1 open="[]" chunk
   while :; do
     chunk="$(gh_get "repos/$RUNNER/pulls?state=open&per_page=100&page=$page")" || { err "list open runner PRs failed"; exit 3; }
-    open="$(jq -c --argjson c "$chunk" '. + $c' <<<"$open")"
+    # ACCUMULATE ON STDIN, NEVER ON argv. `--argjson c "$chunk"` passed a whole
+    # page of open-PR JSON as ONE execve argument, and Linux caps a single
+    # argument at MAX_ARG_STRLEN (128 KiB) independently of ARG_MAX (2 MiB) —
+    # so the ARG_MAX headroom this looked to have was never the binding limit.
+    # That is what killed this lane: `jq: Argument list too long`, exit 126, on
+    # EVERY scheduled run from 2026-09-14T17:19Z onward (64 consecutive reds;
+    # the one "success" in that window was a pull_request run whose scan job
+    # was skipped). Measured 2026-09-16: 30 open runner PRs serialise to
+    # 636 KB, ~5x the cap, so the lane breaks at roughly 7 open PRs and had no
+    # chance of recovering on its own.
+    #
+    # `printf` is a bash BUILTIN, so neither string reaches execve here; jq
+    # reads both arrays from the pipe and `add` concatenates them. `jq length`
+    # and the reads below use here-strings, which bash backs with a file
+    # descriptor rather than argv, so they were never at risk.
+    open="$(printf '%s\n%s\n' "$open" "$chunk" | jq -c -s 'add')"
     if [ "$(jq length <<<"$chunk")" -lt 100 ]; then break; fi
     page=$((page + 1))
   done
