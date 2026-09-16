@@ -4,7 +4,7 @@ import { createContext, useCallback, useContext, useMemo, useState } from "react
  * Optional feature sets the runner keeps out of the default UI.
  *
  * The runner's default surface is Terminal-first: a session-driven user gets
- * the Terminal, the Productivity board, their run/session history and the
+ * the Terminal, the Productivity page, their run/session history and the
  * memory/knowledge surfaces — and nothing else. Two older, larger paradigms
  * still ship in the app and are revealed one toggle at a time from
  * Settings → General:
