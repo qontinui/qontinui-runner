@@ -15,4 +15,8 @@
 /// against. Bin-only: every coord egress site lives in the bin crate.
 pub mod egress_context;
 pub mod error_chain;
+/// The OS resolver on a dedicated bounded thread lane, and THE reqwest client
+/// factory (`client_builder`, `ResettableClient`). Compiled in the LIB crate and
+/// re-exported here so the bin and lib share one process-wide DNS lane.
+pub use qontinui_runner_lib::util::{dns, http};
 pub mod path_extraction;

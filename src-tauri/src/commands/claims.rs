@@ -105,7 +105,10 @@ fn http_client() -> Result<&'static reqwest::Client, String> {
     static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            reqwest::Client::builder()
+            // Shared OS-DNS lane: a process-lifetime client must not freeze its
+            // resolver state (plan 2026-09-16-runner-long-lived-http-clients-
+            // freeze-dns-state-across-network-changes).
+            crate::util::http::client_builder()
                 .timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(90))
                 .build()

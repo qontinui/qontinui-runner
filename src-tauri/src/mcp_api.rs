@@ -5499,14 +5499,24 @@ async fn coord_mcp_proxy_handler(
 
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
-    static COORD_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = COORD_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .expect("coord-mcp proxy reqwest client")
+    //
+    // Resolves through the shared OS-DNS lane and heals itself after repeated
+    // transport failures (plan
+    // 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes):
+    // this process-lifetime client stayed wedged for 90+ minutes after a WLAN
+    // blip while freshly-built clients recovered.
+    static COORD_PROXY_CLIENT: std::sync::OnceLock<crate::util::http::ResettableClient> =
+        std::sync::OnceLock::new();
+    let resettable = COORD_PROXY_CLIENT.get_or_init(|| {
+        crate::util::http::ResettableClient::new("coord-mcp-proxy", || {
+            crate::util::http::client_builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(300))
+                .build()
+        })
+        .expect("coord-mcp proxy reqwest client")
     });
+    let client = resettable.client();
 
     // Semantic recall (Phase 2): put a locally-computed query vector into
     // `coord_memory_search`'s existing field. `None` — every other request, and
@@ -5577,19 +5587,20 @@ async fn coord_mcp_proxy_handler(
         req
     };
 
-    let unreachable_response = |e: reqwest::Error| {
+    // `egress` is `egress_context::failure_snapshot` — computed by the caller
+    // because it awaits the DNS-vs-TCP discriminator (`dns_probe`), which this
+    // synchronous closure cannot.
+    let unreachable_response = |e: reqwest::Error, egress: serde_json::Value| {
         // The FULL source chain, not `{e}`. `Display` on a `reqwest::Error`
         // collapses to "error sending request for url (…)" — identical for a
         // refused connect, a DNS failure, a TLS verdict and `os error 10053`.
         // That is why 5,967 failures on 2026-08-02 were one indistinguishable
         // line. The `code` is untouched (compat); only the human text grows.
         let chain = crate::util::error_chain::error_chain(&e);
-        let egress = crate::util::egress_context::snapshot(
-            crate::util::egress_context::EgressClient::CoordMcpProxy,
-        );
         // The SAME snapshot the envelope carries, rendered as compact JSON:
         // one handle census per failure, and a log line joinable to the body a
-        // caller received.
+        // caller received. It carries `dns_probe` (class `tcp` / `dns`) and the
+        // client's rebuild count, so the next episode names its class.
         warn!(
             "coord-mcp proxy: forward to {url} failed \
              (coord_base_source={coord_base_source}): {chain} egress={egress}"
@@ -5629,6 +5640,9 @@ async fn coord_mcp_proxy_handler(
         );
         build_forward(&bearer).send().await
     };
+    // Feeds the self-healing backstop: a success resets the streak, a run of
+    // connect/timeout failures rebuilds the client.
+    resettable.record_outcome(&first_forward);
     let mut upstream = match first_forward {
         Ok(resp) => resp,
         Err(e) => {
@@ -5681,7 +5695,16 @@ async fn coord_mcp_proxy_handler(
             ) {
                 return resp;
             }
-            return unreachable_response(e);
+            // Bounded (`egress_context::DNS_PROBE_CAP`); see there for why the
+            // discriminator runs inline rather than detached.
+            let egress = crate::util::egress_context::failure_snapshot(
+                crate::util::egress_context::EgressClient::CoordMcpProxy,
+                &e,
+                &url,
+                Some(resettable),
+            )
+            .await;
+            return unreachable_response(e, egress);
         }
     };
 
@@ -5726,7 +5749,9 @@ async fn coord_mcp_proxy_handler(
         // replacing it with a second, less informative error.
         match crate::coord_mcp::session_bearer_and_tenant_or_refuse(nonce.clone()).await {
             Ok((_tenant, Some(fresh))) if !fresh.trim().is_empty() && fresh != bearer => {
-                match build_forward(&fresh).send().await {
+                let retried = build_forward(&fresh).send().await;
+                resettable.record_outcome(&retried);
+                match retried {
                     Ok(resp) => {
                         upstream_retry = Some(if resp.status().is_success() {
                             "retried-recovered"
@@ -5805,6 +5830,9 @@ async fn coord_mcp_proxy_handler(
         Err(e) => {
             let chain = crate::util::error_chain::error_chain(&e);
             let tail = crate::util::error_chain::error_chain_tail(&e);
+            // A body stalled past the client timeout counts toward a rebuild
+            // (a half-dead pooled connection presents exactly this way).
+            resettable.record_failure(&e);
             let egress = crate::util::egress_context::snapshot(
                 crate::util::egress_context::EgressClient::CoordMcpProxy,
             );
@@ -6581,20 +6609,29 @@ async fn forward_coord_get(
     // Shared client: connect fast-fail like the `/coord-mcp` proxy client, but
     // a much shorter overall timeout — these are bounded REST reads (a hook
     // helper sits on the response), not long-running MCP tool calls.
-    static COORD_CLAIMS_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+    // OS-DNS lane + self-healing, like `COORD_PROXY_CLIENT`.
+    static COORD_CLAIMS_PROXY_CLIENT: std::sync::OnceLock<crate::util::http::ResettableClient> =
         std::sync::OnceLock::new();
-    let client = COORD_CLAIMS_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("coord claims proxy reqwest client")
+    let resettable = COORD_CLAIMS_PROXY_CLIENT.get_or_init(|| {
+        crate::util::http::ResettableClient::new("coord-read-proxy", || {
+            crate::util::http::client_builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+        })
+        .expect("coord claims proxy reqwest client")
     });
 
     let upstream = {
         let _in_flight = egress::in_flight(EG);
-        client.get(url).bearer_auth(bearer).send().await
+        resettable
+            .client()
+            .get(url)
+            .bearer_auth(bearer)
+            .send()
+            .await
     };
+    resettable.record_outcome(&upstream);
     let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
@@ -6602,7 +6639,7 @@ async fn forward_coord_get(
             // `operation timed out` must reach the caller. `code` unchanged.
             let chain = crate::util::error_chain::error_chain(&e);
             egress::record_failure(EG);
-            let ctx = egress::snapshot(EG);
+            let ctx = egress::failure_snapshot(EG, &e, url, Some(resettable)).await;
             warn!(
                 "{door}: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {chain} egress={ctx}"
@@ -7572,15 +7609,19 @@ async fn forward_coord_write_post(
     // Shared client: connect fast-fail like the claims proxy client, with a
     // short overall timeout — these are bounded REST writes (a caller sits on
     // the response), not long-running MCP tool calls.
-    static COORD_WRITE_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> =
+    // OS-DNS lane + self-healing, like `COORD_PROXY_CLIENT`.
+    static COORD_WRITE_PROXY_CLIENT: std::sync::OnceLock<crate::util::http::ResettableClient> =
         std::sync::OnceLock::new();
-    let client = COORD_WRITE_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("coord write proxy reqwest client")
+    let resettable = COORD_WRITE_PROXY_CLIENT.get_or_init(|| {
+        crate::util::http::ResettableClient::new("coord-write-proxy", || {
+            crate::util::http::client_builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+        })
+        .expect("coord write proxy reqwest client")
     });
+    let client = resettable.client();
 
     let upstream = {
         let _in_flight = egress::in_flight(EG);
@@ -7594,13 +7635,14 @@ async fn forward_coord_write_post(
             .send()
             .await
     };
+    resettable.record_outcome(&upstream);
     let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
             // Full `source()` chain, not `{e}`. `code` unchanged (compat).
             let chain = crate::util::error_chain::error_chain(&e);
             egress::record_failure(EG);
-            let ctx = egress::snapshot(EG);
+            let ctx = egress::failure_snapshot(EG, &e, url, Some(resettable)).await;
             warn!(
                 "coord-mcp write proxy: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {chain} egress={ctx}"
@@ -8331,14 +8373,19 @@ async fn forward_vcs_pr_post(
     const EG: crate::util::egress_context::EgressClient =
         crate::util::egress_context::EgressClient::VcsPr;
 
-    static VCS_PR_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = VCS_PR_PROXY_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .expect("vcs pr proxy reqwest client")
+    // OS-DNS lane + self-healing, like `COORD_PROXY_CLIENT`.
+    static VCS_PR_PROXY_CLIENT: std::sync::OnceLock<crate::util::http::ResettableClient> =
+        std::sync::OnceLock::new();
+    let resettable = VCS_PR_PROXY_CLIENT.get_or_init(|| {
+        crate::util::http::ResettableClient::new("vcs-pr-proxy", || {
+            crate::util::http::client_builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+        })
+        .expect("vcs pr proxy reqwest client")
     });
+    let client = resettable.client();
 
     let upstream = {
         let _in_flight = egress::in_flight(EG);
@@ -8346,12 +8393,13 @@ async fn forward_vcs_pr_post(
         // `forward_coord_write_post`; the caller owns the bearer.
         client.post(url).bearer_auth(bearer).json(body).send().await
     };
+    resettable.record_outcome(&upstream);
     let upstream = match upstream {
         Ok(resp) => resp,
         Err(e) => {
             let chain = crate::util::error_chain::error_chain(&e);
             egress::record_failure(EG);
-            let ctx = egress::snapshot(EG);
+            let ctx = egress::failure_snapshot(EG, &e, url, Some(resettable)).await;
             warn!(
                 "vcs pr proxy: forward to {url} failed \
                  (coord_base_source={coord_base_source}): {chain} egress={ctx}"

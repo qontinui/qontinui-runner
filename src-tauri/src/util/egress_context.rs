@@ -363,9 +363,13 @@ pub(crate) fn handle_census() -> HandleCensus {
 ///   "socket_handles": 88,                    // or {"unavailable": "…"}
 ///   "in_flight": 3,
 ///   "failures_total": 17,
-///   "pool_introspection": "unavailable: …"
+///   "pool_introspection": "unavailable: …",
+///   "dns_lane": { "lane": "dns", "queued": 0, … } // or {"unavailable": "…"}
 /// }
 /// ```
+///
+/// [`failure_snapshot`] adds `dns_probe` (the DNS-vs-TCP discriminator) and,
+/// for a self-healing client, `client_health`.
 pub(crate) fn snapshot(client: EgressClient) -> Value {
     let census = handle_census();
     json!({
@@ -376,7 +380,93 @@ pub(crate) fn snapshot(client: EgressClient) -> Value {
         "in_flight": IN_FLIGHT[client.index()].load(Ordering::Relaxed),
         "failures_total": FAILURES[client.index()].load(Ordering::Relaxed),
         "pool_introspection": POOL_INTROSPECTION,
+        "dns_lane": dns_lane_json(),
     })
+}
+
+/// The shared OS-DNS lane's counters, or a typed `unavailable` when nothing has
+/// resolved through it yet (never a row of zeros that would read as "idle").
+fn dns_lane_json() -> Value {
+    match crate::util::dns::shared_snapshot() {
+        Some(s) => serde_json::to_value(s)
+            .unwrap_or_else(|e| json!({ "unavailable": format!("serialize: {e}") })),
+        None => json!({ "unavailable": "the shared dns lane has not been used yet" }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The DNS-vs-TCP discriminator (plan
+// 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes,
+// Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Upper bound on the discriminator's OS lookup.
+///
+/// The probe runs INLINE on the failure path, before the error envelope is
+/// returned, because the envelope is where the caller (an agent session with no
+/// log access) reads the class — a detached probe could only ever reach the
+/// log. It cannot meaningfully delay a response: it runs only after a transport
+/// failure that already cost up to the client's `connect_timeout`, it is capped
+/// here at 2s (below the lane's own 4s deadline), and a saturated lane refuses
+/// instantly rather than queueing, so a burst of failures during an outage adds
+/// no queueing delay either.
+pub(crate) const DNS_PROBE_CAP: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The host a failed request was dialling: reqwest's own record of the URL,
+/// else `fallback_url`.
+fn failing_host(err: &reqwest::Error, fallback_url: &str) -> Option<String> {
+    if let Some(h) = err.url().and_then(|u| u.host_str()) {
+        return Some(h.to_string());
+    }
+    reqwest::Url::parse(fallback_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+}
+
+/// Time an OS lookup of the failing host through the shared DNS lane, so the
+/// failure names its class: `tcp` (the OS resolved it quickly — the fault is
+/// after DNS) versus `dns` (the OS resolver failed or was slow).
+///
+/// Only a connect / timeout failure is probed; anything else is reported as
+/// `skipped` with the reason, never silently absent.
+pub(crate) async fn dns_probe(err: &reqwest::Error, fallback_url: &str) -> Value {
+    if !crate::util::http::is_transport_failure(err) {
+        return json!({ "skipped": "not a connect/timeout failure" });
+    }
+    let Some(host) = failing_host(err, fallback_url) else {
+        return json!({ "skipped": "no host in the failing url" });
+    };
+    // `host_str` keeps IPv6 brackets; an IP literal involves no DNS at all.
+    if host
+        .trim_matches(|c| c == '[' || c == ']')
+        .parse::<std::net::IpAddr>()
+        .is_ok()
+    {
+        return json!({ "skipped": "ip literal: no dns involved", "host": host });
+    }
+    let probe = crate::util::dns::shared().probe(&host, DNS_PROBE_CAP).await;
+    serde_json::to_value(probe)
+        .unwrap_or_else(|e| json!({ "unavailable": format!("serialize: {e}") }))
+}
+
+/// [`snapshot`] plus the discriminator for one transport failure: the
+/// `dns_probe` block and, for a self-healing client, its failure streak and
+/// rebuild count (`client_health`).
+pub(crate) async fn failure_snapshot(
+    client: EgressClient,
+    err: &reqwest::Error,
+    url: &str,
+    resettable: Option<&crate::util::http::ResettableClient>,
+) -> Value {
+    let mut v = snapshot(client);
+    let probe = dns_probe(err, url).await;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("dns_probe".to_string(), probe);
+        if let Some(rc) = resettable {
+            obj.insert("client_health".to_string(), rc.health_json());
+        }
+    }
+    v
 }
 
 /// A one-line rendering of [`snapshot`] for a WARN that is already a string.
@@ -426,13 +516,14 @@ pub(crate) fn log_baseline() {
         Measured::Unavailable(why) => format!("unavailable({why})"),
     };
     info!(
-        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} in_flight/failures {}",
+        "egress_baseline: uptime_ms={} open_handles={} socket_handles={} in_flight/failures {} dns_lane={}",
         process_uptime_ms()
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string()),
         m(&census.open),
         m(&census.sockets),
         per_client.join(" "),
+        dns_lane_json(),
     );
 }
 
@@ -504,6 +595,7 @@ mod tests {
             "in_flight",
             "failures_total",
             "pool_introspection",
+            "dns_lane",
         ] {
             assert!(v.get(k).is_some(), "missing {k} in {v}");
         }
@@ -558,6 +650,67 @@ mod tests {
         if let Some(s) = census.sockets.counted() {
             assert!(s <= open, "sockets {s} > open {open}");
         }
+    }
+
+    /// A real connect failure to a named host carries a `dns_probe` with a
+    /// class, and a resettable client's health: the Phase 1 discriminator.
+    #[tokio::test]
+    async fn failure_snapshot_carries_dns_probe_and_client_health() {
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let rc = crate::util::http::ResettableClient::new("t-egress", || {
+            crate::util::http::client_builder()
+                .connect_timeout(std::time::Duration::from_millis(300))
+                .no_proxy()
+                .build()
+        })
+        .unwrap();
+        let url = format!("http://localhost:{}/", dead.port());
+        let err = rc
+            .client()
+            .get(&url)
+            .send()
+            .await
+            .expect_err("nothing listens there");
+        rc.record_failure(&err);
+        let v = failure_snapshot(EgressClient::CoordMcpProxy, &err, &url, Some(&rc)).await;
+        let probe = &v["dns_probe"];
+        assert_eq!(probe["host"], "localhost", "{v}");
+        assert_eq!(probe["class"], "tcp", "localhost resolves fast: {v}");
+        assert!(probe["os_resolve_ms"].is_number(), "{v}");
+        assert!(probe["addrs_n"].as_u64().unwrap_or(0) >= 1, "{v}");
+        assert_eq!(probe["lane"]["lane"], "dns", "{v}");
+        assert_eq!(
+            v["client_health"]["consecutive_transport_failures"], 1,
+            "{v}"
+        );
+        assert_eq!(v["client_health"]["rebuilds"], 0, "{v}");
+        assert!(v["dns_lane"].is_object(), "{v}");
+    }
+
+    #[tokio::test]
+    async fn ip_literal_failures_skip_the_probe() {
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let client = crate::util::http::client_builder()
+            .connect_timeout(std::time::Duration::from_millis(300))
+            .no_proxy()
+            .build()
+            .unwrap();
+        let url = format!("http://{dead}/");
+        let err = client.get(&url).send().await.expect_err("refused");
+        let probe = dns_probe(&err, &url).await;
+        assert!(
+            probe["skipped"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("ip literal"),
+            "{probe}"
+        );
     }
 
     /// Uptime is `null`, not `0`, until something anchors the clock.

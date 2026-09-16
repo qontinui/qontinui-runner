@@ -54,8 +54,12 @@ const POOL_MAX_IDLE_PER_HOST: usize = 64;
 /// How long an idle pooled connection survives before being dropped.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Built through `util::http::client_builder` so this process-lifetime pool
+/// resolves through the shared OS-DNS lane instead of a per-client resolver
+/// frozen at first lookup (plan
+/// 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes).
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
@@ -70,7 +74,11 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
                 "agent_http: pooled client build failed ({e}); \
                  falling back to an unpooled default client"
             );
-            reqwest::Client::new()
+            // Same failure-panics posture `reqwest::Client::new()` had, but
+            // still on the OS-DNS lane.
+            crate::util::http::client_builder()
+                .build()
+                .expect("agent_http: fallback client")
         })
 });
 

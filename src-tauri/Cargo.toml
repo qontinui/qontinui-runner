@@ -92,7 +92,16 @@ adb_client = { version = "3", features = ["usb", "mdns"] }
 # as `operation timed out`). `coord_http::coord_client` fixes the coord paths by
 # sharing one pooled client; this feature protects the ~160 call sites that
 # still construct clients per request.
-reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
+#
+# BUT each hickory client snapshots the DNS servers once and never rebuilds, so
+# a process-lifetime client stays broken after a network change (2026-09-16).
+# Clients built via `util::http::client_builder()` override it with the shared
+# OS resolver on a dedicated bounded lane (`util::dns`). The feature stays on
+# only for the not-yet-converted per-call sites (see
+# scripts/reqwest-client-construction-baseline.json) and is removed once that
+# baseline is empty. Plan
+# 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes.
+reqwest ={ version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to

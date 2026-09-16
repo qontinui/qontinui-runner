@@ -30,7 +30,10 @@
 //! 5s timeout while still queued, and coord — answering this box in under half
 //! a second — was blamed for `operation timed out`.
 //!
-//! The client carries NO global timeout on purpose. Coord call sites want
+//! It is built through [`crate::util::http::client_builder`], so it resolves
+//! through the shared OS-DNS lane and carries a connect-phase ceiling.
+//!
+//! The client carries NO global (whole-request) timeout on purpose. Coord call sites want
 //! different deadlines (3s for log lines, 5s for polls and heartbeats, 10s for
 //! claim acquisition), so each sets its own via
 //! [`reqwest::RequestBuilder::timeout`]. A global timeout here would silently
@@ -73,7 +76,21 @@ pub fn coord_client() -> Option<&'static reqwest::Client> {
             // churn is how the runner accumulated hundreds of half-live
             // connections. `pool_idle_timeout` keeps a warm connection across
             // the 30s heartbeat tick so the steady state is zero handshakes.
-            match reqwest::Client::builder()
+            //
+            // `util::http::client_builder` resolves through the shared OS-DNS
+            // lane and adds a 10s `connect_timeout` (this client had none, so a
+            // black-holed connect was bounded only by each caller's whole-request
+            // timeout). Plan
+            // 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes:
+            // under reqwest's per-client hickory resolver THIS client stayed
+            // wedged after a network change for as long as the process lived.
+            //
+            // Not a `ResettableClient`: `coord_client()` hands out a `&'static`
+            // to 28 callers with no shared send helper to report outcomes
+            // through, so a rebuild could never be triggered from here. OS-DNS
+            // removes the frozen-resolver cause; the rebuild backstop covers the
+            // proxy forwarders and `CoordSync`, whose send sites are few.
+            match crate::util::http::client_builder()
                 .pool_max_idle_per_host(32)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .tcp_keepalive(Duration::from_secs(60))

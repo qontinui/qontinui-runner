@@ -129,7 +129,13 @@ pub struct CoordSync {
 struct CoordSyncInner {
     outbox: Arc<OutboxWriter>,
     coord_url: String,
-    http: reqwest::Client,
+    /// Process-lifetime coord client on the shared OS-DNS lane, rebuilt after
+    /// consecutive transport failures (plan
+    /// 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes:
+    /// this client kept failing `POST /sessions` for 90+ minutes after a WLAN
+    /// blip). Take `http.client()` per request; `push_record` and
+    /// `probe_resume` report outcomes.
+    http: crate::util::http::ResettableClient,
     heartbeat: Duration,
     stale: Duration,
     /// Set the first time we successfully reach coord. Used to decide
@@ -186,16 +192,21 @@ impl CoordSync {
         ));
         let stale = Duration::from_secs(env_u64("QONTINUI_SESSION_STALE_SECS", DEFAULT_STALE_SECS));
 
-        let http = reqwest::Client::builder()
-            // Per-request timeout — slow enough to ride out a hiccup,
-            // fast enough that the drain loop doesn't stall on a hung
-            // coord. 30s matches the `agent_claims` heartbeat client.
-            .timeout(Duration::from_secs(30))
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "coord_sync: reqwest client build failed; using default");
-                reqwest::Client::new()
-            });
+        let http = crate::util::http::ResettableClient::new("coord-sync", || {
+            crate::util::http::client_builder()
+                // Per-request timeout — slow enough to ride out a hiccup,
+                // fast enough that the drain loop doesn't stall on a hung
+                // coord. 30s matches the `agent_claims` heartbeat client.
+                .timeout(Duration::from_secs(30))
+                .build()
+        })
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "coord_sync: reqwest client build failed; using default");
+            crate::util::http::ResettableClient::new("coord-sync", || {
+                crate::util::http::client_builder().build()
+            })
+            .expect("coord_sync: default reqwest client")
+        });
 
         Self {
             inner: Arc::new(CoordSyncInner {
@@ -227,10 +238,12 @@ impl CoordSync {
             inner: Arc::new(CoordSyncInner {
                 outbox,
                 coord_url,
-                http: reqwest::Client::builder()
-                    .timeout(Duration::from_secs(5))
-                    .build()
-                    .unwrap(),
+                http: crate::util::http::ResettableClient::new("coord-sync-test", || {
+                    crate::util::http::client_builder()
+                        .timeout(Duration::from_secs(5))
+                        .build()
+                })
+                .unwrap(),
                 heartbeat,
                 stale,
                 has_been_online: AtomicBool::new(false),
@@ -258,7 +271,7 @@ impl CoordSync {
     /// Phase 7 handoff trigger + receiver reuse it rather than minting a
     /// fresh client per call.
     pub fn http_client(&self) -> reqwest::Client {
-        self.inner.http.clone()
+        self.inner.http.client()
     }
 
     /// The tenant scope that owns `session_id`, for per-session credential
@@ -398,13 +411,14 @@ impl CoordSync {
         // that asymmetry — `probe_resume` was added later, for a different
         // reason, and the auth was attached per-function rather than by a
         // predicate over all of them.
-        match crate::auth::attach_device_auth_for(
-            self.inner.http.patch(&url).json(&body),
+        let sent = crate::auth::attach_device_auth_for(
+            self.inner.http.client().patch(&url).json(&body),
             TenantScope::for_session(tenant),
         )
         .send()
-        .await
-        {
+        .await;
+        self.inner.http.record_outcome(&sent);
+        match sent {
             Ok(resp) => {
                 let status = resp.status();
                 if status.is_success() {
@@ -875,14 +889,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // session start; we just forward it.
             let body = rebuild_create_body(rec);
             let url = format!("{base}/sessions");
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
         "heartbeat" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = json!({ "heartbeat": true });
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -891,20 +905,20 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // The payload carries whatever fields the runner changed —
             // forward the subset coord understands.
             let body = state_change_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().patch(&url).json(&body), scope)
                 .send()
                 .await
         }
         "closed" => {
             let url = format!("{base}/sessions/{}", rec.session_id);
-            crate::auth::attach_device_auth_for(inner.http.delete(&url), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().delete(&url), scope)
                 .send()
                 .await
         }
         "claim_stolen" => {
             let url = format!("{base}/sessions/{}/steal", rec.session_id);
             let body = steal_body(rec);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -917,7 +931,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // stamps last_progress_at=now() when the body omits it.
             let url = format!("{base}/sessions/{}", rec.session_id);
             let body = progress_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -937,7 +951,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             let body = json!({
                 "progress": { "session_status": "finished" },
             });
-            crate::auth::attach_device_auth_for(inner.http.patch(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().patch(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -956,9 +970,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // `helper_task_queue_unavailable` 503 drop, bounded retry for
             // everything else).
             let url = format!("{base}/coord/helper-tasks");
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
-                .send()
-                .await
+            crate::auth::attach_device_auth_for(
+                inner.http.client().post(&url).json(&rec.payload),
+                scope,
+            )
+            .send()
+            .await
         }
         "gate_registration" => {
             // Closeout gate registration (plan
@@ -982,7 +999,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             };
             let url = format!("{base}/coord/work-units/{slug}/register-gate");
             let body = gate_registration_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -995,9 +1012,12 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // generic arm below turns into an Ack-drop (a retry could never
             // fix a body the queue cannot edit).
             let url = format!("{base}/coord/agent-findings");
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&rec.payload), scope)
-                .send()
-                .await
+            crate::auth::attach_device_auth_for(
+                inner.http.client().post(&url).json(&rec.payload),
+                scope,
+            )
+            .send()
+            .await
         }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
@@ -1009,7 +1029,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // machine.json default only backfills tenant-less legacy rows.
             let url = format!("{base}/coord/commits/report");
             let mut rb = crate::auth::attach_device_auth_for(
-                inner.http.post(&url).json(&rec.payload),
+                inner.http.client().post(&url).json(&rec.payload),
                 scope,
             );
             if let Some(tid) = scope
@@ -1030,7 +1050,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             // (session_id, stream, chunk_offset), so a replay is a no-op.
             let url = format!("{base}/sessions/{}/output", rec.session_id);
             let body = output_chunk_body(&rec.payload);
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -1049,7 +1069,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 "event_kind": rec.event_kind,
                 "payload": rec.payload,
             });
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -1077,7 +1097,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 "event_kind": rec.event_kind,
                 "payload": rec.payload,
             });
-            crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+            crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
                 .send()
                 .await
         }
@@ -1091,6 +1111,9 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
             return PushOutcome::Acked;
         }
     };
+    // The drain is this client's dominant traffic, so it is what drives the
+    // rebuild backstop.
+    inner.http.record_outcome(&result);
 
     match result {
         Ok(resp) => {
@@ -1550,9 +1573,12 @@ async fn bootstrap_then_register(
 
     let base = inner.coord_url.trim_end_matches('/');
     let upsert_url = format!("{base}/coord/work-units/upsert");
-    match crate::auth::attach_device_auth_for(inner.http.post(&upsert_url).json(&upsert), scope)
-        .send()
-        .await
+    match crate::auth::attach_device_auth_for(
+        inner.http.client().post(&upsert_url).json(&upsert),
+        scope,
+    )
+    .send()
+    .await
     {
         Ok(resp) => {
             let status = resp.status();
@@ -1578,7 +1604,7 @@ async fn bootstrap_then_register(
     // values, so the retry costs nothing beyond one extra request.
     let url = format!("{base}/coord/work-units/{slug}/register-gate");
     let body = gate_registration_body(&rec.payload);
-    match crate::auth::attach_device_auth_for(inner.http.post(&url).json(&body), scope)
+    match crate::auth::attach_device_auth_for(inner.http.client().post(&url).json(&body), scope)
         .send()
         .await
     {
@@ -1976,7 +2002,7 @@ async fn fetch_session_coordination_flag(
 ) -> Result<bool, String> {
     let base = inner.coord_url.trim_end_matches('/');
     let url = format!("{base}/tenant-policy?tenant_id={tenant_id}");
-    let resp = crate::coord_http::coord_get(&inner.http, &url)
+    let resp = crate::coord_http::coord_get(&inner.http.client(), &url)
         .send()
         .await
         .map_err(|e| format!("transport: {e}"))?;

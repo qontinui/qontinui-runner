@@ -122,7 +122,14 @@ pub mod env_agent;
 // `crate::executor::file_registry`, which exists in the BIN alone, so
 // declaring the whole `util` directory here would not compile.
 pub mod util {
+    // The OS-DNS lane and THE reqwest client factory (plan
+    // 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes).
+    // Declared HERE, not compiled a second time in the bin: the bin's
+    // `util/mod.rs` re-exports these, so the process has ONE shared DNS lane
+    // rather than one per crate.
+    pub mod dns;
     pub mod error_chain;
+    pub mod http;
 }
 
 // Device-pairing flow (headless + browser-mediated). Lifted out of
