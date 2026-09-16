@@ -4,7 +4,7 @@
  * `plans/2026-05-13-coord-as-deconflicter-plan.md`).
  *
  * Rendered above the terminal cell grid when the Rust deconflicter loop
- * (`src-tauri/src/coordinator/deconflicter.rs`) decides that this
+ * (`src-tauri/src/deconflict/mod.rs`) decides that this
  * session's recent file edit overlaps with another live session's recent
  * touches. The deconflicter writes one `project.coordinator_decisions` row
  * per fire (rule=`deconflict`, action=`advise-with-text`,
@@ -46,7 +46,7 @@ const logger = createLogger("DeconflictAdvisoryBanner");
 /**
  * One advisory the banner is tracking. Matches the JSON shape emitted by
  * `DeconflicterLoop::emit_decision` in
- * `src-tauri/src/coordinator/deconflicter.rs::emit_decision`.
+ * `src-tauri/src/deconflict/mod.rs::emit_decision`.
  */
 export interface DeconflictAdvisory {
   /** Coordinator decision row id (UUID as text). */
