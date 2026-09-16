@@ -25,7 +25,13 @@
  *   the oldest — to "delivered" per observed `ready → processing` transition,
  *   matching the single `pop_front` the backend does per turn end. A worker
  *   that ENDS pops nothing ever again, so on that edge everything still queued
- *   settles to "not delivered" rather than going on promising a delivery.
+ *   settles to UNKNOWN — "the worker ended — delivery unconfirmed" — rather
+ *   than going on promising a delivery. It is UNKNOWN and not "not delivered"
+ *   because a `Ready` between the backend's `pop_front` and its re-send can be
+ *   coalesced into one React batch: the pop is then never observed, the entry
+ *   is still `queued` at the end edge, and a confident "not delivered" about a
+ *   message that WAS delivered invites the operator to re-send and duplicate
+ *   the steering. The cell genuinely cannot separate the two.
  *
  * Honesty (served `ux-priorities`): a read that fails renders UNKNOWN with
  * the failure named — never an empty transcript, never an empty change list,
@@ -267,9 +273,18 @@ export function consumeDirectSendArm(
  * — `claude_session/dispatcher.rs` — so a direct send that wins that race
  * leaves the older message queued.)
  *
- * Nothing stale survives: `consumeDirectSendArm` retires the arm on the NEXT
- * observed transition whatever it is. Only a `spent` arm — one whose
- * suppression was already applied — is retired here, because its edge is gone.
+ * A pending arm is retired by `consumeDirectSendArm` on the next OBSERVED
+ * transition, whatever it is. Only a `spent` arm — one whose suppression was
+ * already applied — is retired here, because its edge is gone.
+ *
+ * That bound is on observed transitions, not on elapsed turns, and the gap is
+ * real: in the same coalescing window this doc names above, a `processing`
+ * that React never renders is never observed, so the effect sees
+ * `prev === next` and returns without consuming. A pending arm can therefore
+ * outlive its own send and suppress a LATER genuine `pop_front` edge. The
+ * consequence is a delivered entry left `queued`, which the end edge then
+ * reports as `unconfirmed` — an UNKNOWN, never a false delivery — and the next
+ * send re-arms. The asymmetry is accepted in that direction on purpose.
  */
 export function reconcileDirectSendArm(
   arm: DirectSendArm,
