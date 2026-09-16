@@ -150,7 +150,12 @@ export function isWorkerEndState(state: AiSessionState): boolean {
  * queued when the worker stops will never be popped. Leaving those entries at
  * `queued` left the ledger asserting "delivered when the current turn ends"
  * about a message that is gone, which is the one thing this ledger must not do.
- * They settle to `undelivered` instead.
+ * They settle to `undelivered` instead — a state whose LABEL says "delivery
+ * unconfirmed", because the same unobserved-`Ready` window (see the FOLLOW-UP
+ * on the effect below) means an entry can still be `queued` here after the
+ * backend already popped and re-sent it. `undelivered` is this ledger's UNKNOWN
+ * for a message whose fate the state stream cannot settle, not an assertion of
+ * loss.
  *
  * `causedByDirectSend` suppresses the `ready → processing` settle for the edge
  * an immediate send CAUSED: a message sent at the `Ready` instant goes straight
@@ -245,12 +250,34 @@ export function consumeDirectSendArm(
  * an edge on that basis, and the outcome then said `queued` — so that edge WAS
  * a real turn end and the settle it swallowed has to be put back, or an older
  * queued message is reported lost when it was delivered.
+ *
+ * **A still-PENDING arm survives `wentOutImmediately`, and that is the whole
+ * point of the arm.** This runs on the awaited continuation — a microtask —
+ * while `consumeDirectSendArm` runs from an effect, after a commit. The edge's
+ * only route to the UI is the same round-trip that resolves this promise
+ * (`send_user_message` returns the new `state`, which `useAiSession.sendMessage`
+ * writes), so on the ordinary immediate-send path the reconcile lands FIRST and
+ * the edge has NOT been observed yet. Disarming here would hand that unobserved
+ * `ready → processing` to `settleQueuedOnTransition` with
+ * `causedByDirectSend === false`, crediting a still-queued predecessor with a
+ * delivery — the exact false claim the arm exists to prevent. (It is reachable:
+ * the backend sends directly whenever `state == Ready` without consulting
+ * `pending_messages` — `claude_session/session.rs` `send_user_message` — while
+ * `send_next_pending_message` bails once the state is no longer `Ready`
+ * — `claude_session/dispatcher.rs` — so a direct send that wins that race
+ * leaves the older message queued.)
+ *
+ * Nothing stale survives: `consumeDirectSendArm` retires the arm on the NEXT
+ * observed transition whatever it is. Only a `spent` arm — one whose
+ * suppression was already applied — is retired here, because its edge is gone.
  */
 export function reconcileDirectSendArm(
   arm: DirectSendArm,
   wentOutImmediately: boolean,
 ): { arm: DirectSendArm; resettle: boolean } {
-  if (wentOutImmediately) return { arm: { pending: false, spent: false }, resettle: false };
+  if (wentOutImmediately) {
+    return { arm: arm.spent ? IDLE_DIRECT_SEND_ARM : arm, resettle: false };
+  }
   return { arm: IDLE_DIRECT_SEND_ARM, resettle: arm.spent };
 }
 
@@ -267,7 +294,13 @@ export function deliveryLabel(entry: SteeringEntry): string {
     case "delivered":
       return "delivered";
     case "undelivered":
-      return "not delivered — the worker ended before the queue drained";
+      // UNKNOWN, deliberately, and not "not delivered": the cell cannot tell
+      // "never popped" from "popped during a turn end it never observed" (the
+      // coalesced-`Ready` window named in the FOLLOW-UP below). A confident
+      // "not delivered" about a message the worker did receive invites the
+      // operator to re-send and duplicate the steering, so the label states the
+      // uncertainty and the row stays red.
+      return "the worker ended — delivery unconfirmed";
     case "failed":
       return `failed: ${entry.error ?? "unknown error"}`;
     default:
@@ -810,9 +843,13 @@ export function WorkerSessionCell({ tab, taskRunId, visible }: WorkerSessionCell
   // gap survives every mitigation here — the `Ready` between a `pop_front` and
   // the re-send can be microseconds, so if two `claude-session-state` events
   // land in the same React batch the intermediate `ready` is never observed and
-  // the entry sticks at `queued` until the worker ends. A
-  // `delivered`-with-message-id signal from `send_next_pending_message` would
-  // remove the whole class; inferring it from a state stream cannot.
+  // the entry sticks at `queued` until the worker ends. That cuts BOTH ways:
+  // the end-edge settle then moves an entry the backend really did deliver, so
+  // `undelivered` is falsely ASSERTABLE, not merely late. The cell cannot tell
+  // the two apart from this stream, which is why `undelivered` is labelled as
+  // unconfirmed rather than as a loss. A `delivered`-with-message-id signal
+  // from `send_next_pending_message` would remove the whole class; inferring it
+  // from a state stream cannot.
   const prevStateRef = useRef<AiSessionState>(session.sessionState);
   useEffect(() => {
     const prev = prevStateRef.current;

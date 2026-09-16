@@ -185,11 +185,16 @@ describe("settleQueuedOnTransition", () => {
     expect(deliveryLabel({ ...sent, delivery: "failed", error: "queue full" })).toBe(
       "failed: queue full",
     );
-    // The honesty that matters: the undelivered label must not read as a
-    // delivery, and must say why.
+    // The honesty that matters, in BOTH directions. The label must not read as
+    // a delivery — and it must not read as a confident NON-delivery either:
+    // the coalesced-`Ready` window means an entry can still be `queued` at the
+    // end edge after the backend popped and re-sent it, so "not delivered"
+    // would be a false claim that costs the operator a duplicated steering
+    // message. It states the uncertainty and names the cause.
     const undelivered = deliveryLabel({ ...queued, delivery: "undelivered" });
-    expect(undelivered).toContain("not delivered");
+    expect(undelivered).toContain("unconfirmed");
     expect(undelivered).toContain("worker ended");
+    expect(undelivered).not.toContain("not delivered");
   });
 
   it("returns the SAME array when a transition changes nothing", () => {
@@ -324,6 +329,34 @@ describe("the direct-send arm", () => {
       arm: { pending: false, spent: false },
       resettle: false,
     });
+  });
+
+  it("KEEPS a pending, unconsumed arm when the send went out immediately", () => {
+    // The ordinary immediate-send path, and the one the arm exists for. This
+    // reconcile runs on the awaited continuation (a microtask); the effect that
+    // calls `consumeDirectSendArm` runs after a commit. The edge's only route
+    // to the UI is the same round-trip that resolves the send, so the reconcile
+    // lands FIRST and the `ready -> processing` edge has not been observed yet.
+    // Disarming here would hand that edge to `settleQueuedOnTransition` with
+    // `causedByDirectSend === false` and credit a still-queued predecessor with
+    // a delivery that never happened.
+    const armed = armDirectSend("ready");
+    const reconciled = reconcileDirectSendArm(armed, true);
+    expect(reconciled.resettle).toBe(false);
+    expect(reconciled.arm).toEqual({ pending: true, spent: false });
+
+    // Still-armed, so the edge it was waiting for IS suppressed when it finally
+    // arrives — and is retired by that same observation, so nothing goes stale.
+    const consumed = consumeDirectSendArm(reconciled.arm, "ready", "processing");
+    expect(consumed.causedByDirectSend).toBe(true);
+    expect(consumed.arm.pending).toBe(false);
+  });
+
+  it("an unarmed arm survives the reconcile as an unarmed arm", () => {
+    // A send issued while the worker was busy never armed, so an immediate
+    // outcome must not conjure a suppression for the next edge.
+    const reconciled = reconcileDirectSendArm(armDirectSend("processing"), true);
+    expect(reconciled).toEqual({ arm: { pending: false, spent: false }, resettle: false });
   });
 
   it("does NOT re-settle a suppression that was never applied", () => {
