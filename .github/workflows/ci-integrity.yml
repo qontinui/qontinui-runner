@@ -171,6 +171,11 @@ on:
       # job body carries the same path as a `case` arm — a `paths:` entry alone
       # would trigger the run and then be silently dropped by that filter.
       - 'scripts/check_untimed_subprocess.py'
+      # The second gate forbid-untimed-subprocess.yml delegates to a script:
+      # reqwest clients built outside util/http.rs (plan
+      # 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes).
+      # Same argument, same `case` arm below.
+      - 'scripts/check_reqwest_client_construction.py'
 
 permissions:
   contents: read
@@ -265,6 +270,7 @@ jobs:
               # whole verdict lives in it. Kept in step with the `paths:`
               # trigger above — either half alone guards nothing.
               scripts/check_untimed_subprocess.py) ;;
+              scripts/check_reqwest_client_construction.py) ;;
               *) continue ;;
             esac
             if grep -qxF "${f}" <<< "${NON_GATING}"; then continue; fi

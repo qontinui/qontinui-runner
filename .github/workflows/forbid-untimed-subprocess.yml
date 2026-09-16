@@ -563,6 +563,7 @@ jobs:
           python-version: "3.12"
 
       - name: Scan the runner's Rust crates for unbounded blocking subprocess waits
+        id: untimed-scan
         shell: bash
         run: |
           set -euo pipefail
@@ -585,3 +586,41 @@ jobs:
           # locally before pushing (on the Windows dev box: `python
           # scripts\check_untimed_subprocess.py`).
           python3 scripts/check_untimed_subprocess.py --ci
+
+      # ----------------------------------------------------------------------
+      # SECOND GATE, SAME TREE: reqwest clients built outside util/http.rs.
+      # ----------------------------------------------------------------------
+      #
+      # Lives in this job rather than its own workflow because it needs exactly
+      # what the steps above already paid for — the PR's merge state re-derived
+      # against the LIVE base — and the frozen-merge-commit defect documented
+      # above applies to every tree-reading gate equally.
+      #
+      # WHAT IT FORBIDS: a NEW `reqwest::Client::new()` / `::builder()` (and the
+      # blocking / `ClientBuilder` / imported-bare spellings) outside
+      # `src-tauri/src/util/http.rs`. A reqwest client owns its DNS resolver:
+      # with the `hickory-dns` feature it snapshots the DNS servers once and
+      # never recovers from a network change (2026-09-16: a 90+ minute coord
+      # outage on a process-lifetime client), and without it `GaiResolver` spends
+      # a tokio blocking-pool thread per lookup (runner #918's flood). The
+      # factory resolves through the shared OS-DNS lane, which has neither.
+      # Existing sites are recorded per file in
+      # `scripts/reqwest-client-construction-baseline.json`, a ratchet that Wave B
+      # of the plan empties.
+      #
+      # Runs whenever the tree was actually scanned by the step above — pass OR
+      # fail — so one gate's red never hides the other's verdict, but never when
+      # the merge-state re-derivation failed (that leaves the step above
+      # `skipped`, and there is no trustworthy tree to judge).
+      #
+      # Plan: 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes
+      - name: Forbid reqwest clients constructed outside util/http.rs
+        if: ${{ !cancelled() && (steps.untimed-scan.outcome == 'success' || steps.untimed-scan.outcome == 'failure') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check_reqwest_client_construction.py --list-roots
+          # The checker's own fixtures first: a lexer or import-resolver
+          # regression must fail loudly rather than silently match nothing.
+          python3 scripts/check_reqwest_client_construction.py --self-test
+          python3 scripts/check_reqwest_client_construction.py --ci
