@@ -798,9 +798,18 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
 /// so the HTTP door and the Tauri command run the SAME function — plan
 /// `2026-09-02-steering-layers-unreadable-without-a-credential`, Phase 1f.
 ///
-/// What it returns is the signed-in OPERATOR's **Cognito access token**, not a
-/// coord device JWT: the fleet's `COORD_DEVICE_JWT` name for what the doors
-/// mint here is a misnomer that `coord-revive`'s SKILL.md already records.
+/// What it returns is the legacy `access_token` slot — the DEFAULT binding's
+/// **coord device JWT**, not a Cognito token. (Corrected by plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3 Step 0,
+/// a read of every writer of that slot: `pair::persist_pairing`,
+/// `pair::reconcile`, and the device-JWT refresher's Cognito pair, device
+/// self-refresh and device-machine-key exchange all store a coord-minted device
+/// token there; the operator's Cognito tokens live in the separate OAuth slots
+/// written by `cognito::store_cognito_tokens`. This doc, and `coord-revive`'s
+/// SKILL.md, used to say "Cognito access token".) The one exception is a
+/// pre-migration install whose store file is absent, where the keychain backup
+/// answers with whatever it last held. Unlike [`get_coord_device_token`] it takes
+/// no tenant — its tenant is whatever the default binding is.
 ///
 /// `require_tier_2()` stays the FIRST statement: a Tier-0/1 runner answers the
 /// structured "Tier 0/1 …" error before any keychain read, so a headless
@@ -1559,15 +1568,36 @@ pub fn device_jwt_present() -> Result<bool, String> {
     }
 }
 
-/// Returns the runner's coord **device-JWT** (the token stored in
-/// `AuthManager`'s `access_token` slot), or `None` when the device is unpaired
-/// — i.e. the slot is empty or does not hold a JWT-shaped value.
+/// Returns a coord **device JWT** this runner holds, or `None` when it holds
+/// none for what was asked.
 ///
-/// The CI-runner settings panel attaches this as `Authorization: Bearer <jwt>`
-/// on its loopback calls to the supervisor (`:9875` enable/disable), which now
-/// require + forward the credential so coord can enforce `FleetPrincipal` on
-/// the registration-token mint. A `None` return is the FE's cue to surface a
-/// "pair this runner first" CTA rather than calling the supervisor anonymously.
+/// # What it returns (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
+///
+/// - **`tenant_id: Some(t)`** — tenant `t`'s credential, through
+///   [`crate::auth::select_device_bearer`] (the [`crate::auth::device_bearer_for`]
+///   core): `t`'s own `device_jwt:<t>` slot, or the legacy `access_token` slot
+///   ONLY when `t` is the device's default binding. The no-substitution rule is
+///   intact — a tenant this runner holds no usable credential for is `Ok(None)`,
+///   never another tenant's token. That path also applies the selector's
+///   validity gate: an expired or opaque slot reads as `None`.
+/// - **`tenant_id: None` on a runner holding at most one tenant slot** — the
+///   legacy `access_token` slot, exactly as before P3. That slot holds the
+///   DEFAULT binding's coord device JWT: every non-test writer of it
+///   (`pair::persist_pairing`, `pair::reconcile`, and the refresher's Cognito
+///   pair, device self-refresh and device-machine-key exchange paths) stores a
+///   coord-minted device token, and Cognito's own tokens live in the separate
+///   OAuth slots. This arm stays a PROBE: it does not check `exp`.
+/// - **`tenant_id: None` on a runner holding more than one tenant slot** —
+///   REFUSED with [`DEVICE_TOKEN_TENANT_REQUIRED`]. Which tenant the default slot
+///   belongs to is not something a caller of this door can see, and a skill that
+///   silently gets the default tenant's token writes to the wrong tenant with a
+///   `201`. Kill switch: [`DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV`]`=1` restores the
+///   default-slot answer. Design fork recorded as coord finding
+///   `1416461a-9f9a-46bc-ac68-7b10eb386879` (deciding priority: robustness).
+///
+/// The CI-runner settings panel attaches the result as `Authorization: Bearer
+/// <jwt>` on its loopback calls to the supervisor; a `None` return is its cue to
+/// surface a "pair this runner first" CTA rather than calling anonymously.
 ///
 /// Unlike [`get_access_token_for_websocket`], this neither requires tier-2 nor
 /// errors when unpaired: it is a credential *probe*, so a missing token is a
@@ -1578,19 +1608,108 @@ pub fn device_jwt_present() -> Result<bool, String> {
 /// renders as "pair this runner first" — wrong remediation, and it disabled
 /// the CI-runner controls on a paired runner. A read error is now `Err`, so
 /// `Ok(None)` keeps its single meaning: definitively no device JWT.
+///
+/// Security: glob `**/auth*` + content trigger 5 (which credential a caller is
+/// handed).
 #[tauri::command]
-pub fn get_coord_device_token() -> Result<Option<String>, String> {
+pub fn get_coord_device_token(tenant_id: Option<String>) -> Result<Option<String>, String> {
+    let tenant = parse_device_token_tenant(tenant_id.as_deref())?;
+    let am = AuthManager::new();
+    coord_device_token_for(
+        &am,
+        tenant,
+        crate::auth::default_binding_tenant(),
+        device_token_door_default_slot_enabled(),
+    )
+    .map_err(|e| {
+        error!("get_coord_device_token: {e}");
+        e
+    })
+}
+
+/// Runner kill switch for P3's refusal: exactly `1` makes a tenant-less
+/// [`get_coord_device_token`] answer the default slot again on a runner holding
+/// several tenant slots. Read per call, so it applies without a restart.
+pub(crate) const DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV: &str = "QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT";
+
+/// Stable prefix of the refusal a tenant-less call gets on a multi-slot runner.
+pub(crate) const DEVICE_TOKEN_TENANT_REQUIRED: &str = "get_coord_device_token:tenant_required";
+
+/// Stable prefix of the refusal a malformed `tenant_id` gets.
+pub(crate) const DEVICE_TOKEN_TENANT_INVALID: &str = "get_coord_device_token:tenant_invalid";
+
+fn device_token_door_default_slot_enabled() -> bool {
+    device_token_door_default_slot_enabled_from(
+        std::env::var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV).ok().as_deref(),
+    )
+}
+
+fn device_token_door_default_slot_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// Blank or absent is "no tenant named"; anything else must be a uuid — a typo
+/// is refused rather than silently read as "no tenant", which would hand back
+/// the default slot's token.
+pub(crate) fn parse_device_token_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    match raw.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => uuid::Uuid::parse_str(raw).map(Some).map_err(|e| {
+            format!("{DEVICE_TOKEN_TENANT_INVALID}: tenant_id {raw:?} is not a tenant uuid: {e}")
+        }),
+    }
+}
+
+/// Pure-over-injected-parts core of [`get_coord_device_token`].
+pub(crate) fn coord_device_token_for(
+    am: &AuthManager,
+    tenant: Option<uuid::Uuid>,
+    default_tenant: Option<uuid::Uuid>,
+    default_slot_switch: bool,
+) -> Result<Option<String>, String> {
     use crate::secure_storage::StoredTokenRead;
-    match AuthManager::new().probe_access_token() {
+
+    if let Some(t) = tenant {
+        if let Some(jwt) = crate::auth::select_device_bearer(am, Some(&t), default_tenant) {
+            return Ok(Some(jwt));
+        }
+        // A miss is "no credential for t" only if the slot store was READ. An
+        // unreadable store is UNKNOWN — the same no-downgrade rule as below.
+        return match am.try_list_tenant_device_jwt_tenants() {
+            Ok(_) => Ok(None),
+            Err(e) => Err(format!(
+                "Could not read the credential store, so whether this runner holds a device \
+                 token for tenant {t} is unknown (it has NOT been unpaired): {e:#}"
+            )),
+        };
+    }
+
+    if !default_slot_switch {
+        let slots = am.try_list_tenant_device_jwt_tenants().map_err(|e| {
+            format!(
+                "Could not read the credential store, so whether a tenant-less answer is \
+                 unambiguous is unknown (it has NOT been unpaired): {e:#}"
+            )
+        })?;
+        if slots.len() > 1 {
+            return Err(format!(
+                "{DEVICE_TOKEN_TENANT_REQUIRED}: this runner holds coord credentials for {} \
+                 tenants, so a token requested without a tenant could belong to the wrong one \
+                 — pass `tenant_id` (UI Bridge invoke args: {{\"tenantId\": \"<uuid>\"}}) naming \
+                 the tenant the caller acts for. Operator override: set \
+                 {DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV}=1 on the runner to answer the default slot",
+                slots.len()
+            ));
+        }
+    }
+
+    match am.probe_access_token() {
         StoredTokenRead::Present(token) if crate::auth::looks_like_jwt(&token) => Ok(Some(token)),
         StoredTokenRead::Present(_) | StoredTokenRead::Absent => Ok(None),
-        StoredTokenRead::Unreadable(e) => {
-            error!("get_coord_device_token: credential store unreadable — pairing state is UNKNOWN, not unpaired: {e}");
-            Err(format!(
-                "Could not read the credential store, so this runner's device token is \
-                 unknown (it has NOT been unpaired): {e}"
-            ))
-        }
+        StoredTokenRead::Unreadable(e) => Err(format!(
+            "Could not read the credential store, so this runner's device token is \
+             unknown (it has NOT been unpaired): {e}"
+        )),
     }
 }
 
@@ -1875,5 +1994,124 @@ mod tests {
                 "{rendered} lost its remediation"
             );
         }
+    }
+}
+
+/// Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3:
+/// the device-token door names its tenant, and refuses to guess one.
+#[cfg(test)]
+mod device_token_door_tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+    fn tenant(n: u128) -> uuid::Uuid {
+        uuid::Uuid::from_u128(n)
+    }
+
+    /// A structurally valid, unexpired device JWT carrying `tenant`'s claim —
+    /// distinct per tenant, so an assertion can tell whose token came back.
+    fn jwt_for(tenant: uuid::Uuid) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({"sub_type": "device", "tenant_id": tenant, "exp": exp}).to_string(),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    /// A runner paired for A (the default binding, in the legacy slot and — by
+    /// the mirror — its own slot) and for B.
+    fn two_slot_runner() -> (AuthManager, uuid::Uuid, uuid::Uuid) {
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = AuthManager::new();
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
+        assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap().len(), 2);
+        (am, a, b)
+    }
+
+    /// P3 acceptance 1. Two tenant slots and no argument: refused, typed, and
+    /// naming the argument — never the default slot's token.
+    #[test]
+    fn a_tenantless_call_on_a_two_slot_runner_refuses() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        let refusal = coord_device_token_for(&am, None, Some(a), false)
+            .expect_err("two slots and no tenant must refuse");
+        assert!(refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED), "{refusal}");
+        assert!(refusal.contains("tenant_id"), "{refusal}");
+        assert!(!refusal.contains(&jwt_for(a)), "a refusal never carries a token");
+    }
+
+    /// P3 acceptance 2. Argument B returns B's slot, not the default's.
+    #[test]
+    fn a_named_tenant_gets_that_tenants_slot() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, b) = two_slot_runner();
+        let token = coord_device_token_for(&am, Some(b), Some(a), false).unwrap();
+        assert_eq!(token.as_deref().and_then(crate::auth::jwt_tenant_claim), Some(b));
+        let token = coord_device_token_for(&am, Some(a), Some(a), false).unwrap();
+        assert_eq!(token.as_deref().and_then(crate::auth::jwt_tenant_claim), Some(a));
+    }
+
+    /// P3 acceptance 3. A tenant this runner is not paired for gets `None` —
+    /// never A's token, not even with the kill switch thrown.
+    #[test]
+    fn an_unpaired_tenant_never_gets_another_tenants_token() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        let c = tenant(0xC3);
+        for switch in [false, true] {
+            assert_eq!(coord_device_token_for(&am, Some(c), Some(a), switch), Ok(None));
+        }
+    }
+
+    /// P3 kill switch. `QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT=1` restores the
+    /// default slot for a tenant-less call on a multi-slot runner, and only `1`
+    /// throws it.
+    #[test]
+    fn the_kill_switch_restores_the_default_slot() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (am, a, _) = two_slot_runner();
+        assert_eq!(
+            coord_device_token_for(&am, None, Some(a), true),
+            Ok(Some(jwt_for(a)))
+        );
+        std::env::set_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV, "1");
+        assert!(device_token_door_default_slot_enabled());
+        std::env::remove_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV);
+        assert!(!device_token_door_default_slot_enabled_from(None));
+        assert!(!device_token_door_default_slot_enabled_from(Some("0")));
+        assert!(!device_token_door_default_slot_enabled_from(Some("true")));
+        assert!(device_token_door_default_slot_enabled_from(Some(" 1 ")));
+    }
+
+    /// A single-slot runner keeps today's answer for a tenant-less call, and an
+    /// unpaired one keeps its `None`.
+    #[test]
+    fn a_single_slot_runner_is_unchanged() {
+        let _amb = crate::test_env::isolated_ambient();
+        let am = AuthManager::new();
+        assert_eq!(coord_device_token_for(&am, None, None, false), Ok(None));
+        let a = tenant(0xA1);
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, None, Some(a), false),
+            Ok(Some(jwt_for(a)))
+        );
+    }
+
+    #[test]
+    fn a_malformed_tenant_is_refused_not_read_as_absent() {
+        assert_eq!(parse_device_token_tenant(None), Ok(None));
+        assert_eq!(parse_device_token_tenant(Some("  ")), Ok(None));
+        let e = parse_device_token_tenant(Some("nope")).unwrap_err();
+        assert!(e.starts_with(DEVICE_TOKEN_TENANT_INVALID), "{e}");
+        let t = tenant(0xB2);
+        assert_eq!(parse_device_token_tenant(Some(&t.to_string())), Ok(Some(t)));
     }
 }

@@ -12,6 +12,7 @@ import { Play, Square, Info, X, Check, CircleDot } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { getAccentColors, type AccentColor } from "@/design-system";
 import type { LogFunction } from "./types";
+import { useTenant } from "@/contexts/TenantContext";
 
 // --- Types ---
 
@@ -108,9 +109,16 @@ class UnpairedError extends Error {}
  * {@link UnpairedError} when the device is unpaired (command returns null).
  * Returns the `Authorization: Bearer <jwt>` value to attach to supervisor calls
  * that perform the FleetPrincipal-gated registration-token mint.
+ *
+ * `tenantId` is the device's default tenant — the tenant device-level surfaces
+ * act as. It is passed because the command REFUSES a tenant-less call on a
+ * runner paired for more than one tenant (plan
+ * 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P3): which
+ * tenant the CI runner registers under must be named, not guessed. `null` (still
+ * loading, or no default) sends no tenant, and a refusal then surfaces verbatim.
  */
-async function deviceBearerHeader(): Promise<string> {
-  const token = await invoke<string | null>("get_coord_device_token");
+async function deviceBearerHeader(tenantId: string | null): Promise<string> {
+  const token = await invoke<string | null>("get_coord_device_token", { tenantId });
   if (!token) {
     throw new UnpairedError(UNPAIRED_ERROR);
   }
@@ -213,6 +221,7 @@ function StatusBadge({ status }: { status: CiRunnerDisplayState }) {
 }
 
 export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
+  const { defaultTenantIdForNewSessions } = useTenant();
   const [status, setStatus] = useState<CiRunnerStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionLoading, setActionLoading] = useState(false);
@@ -275,7 +284,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     setError(null);
     setActionSuccess(null);
     try {
-      const authHeader = await deviceBearerHeader();
+      const authHeader = await deviceBearerHeader(defaultTenantIdForNewSessions);
       const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/enable`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: authHeader },
@@ -304,14 +313,14 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog]);
+  }, [fetchStatus, onLog, defaultTenantIdForNewSessions]);
 
   const handleDisable = useCallback(async () => {
     setActionLoading(true);
     setError(null);
     setActionSuccess(null);
     try {
-      const authHeader = await deviceBearerHeader();
+      const authHeader = await deviceBearerHeader(defaultTenantIdForNewSessions);
       const resp = await fetch(`${SUPERVISOR_BASE}/ci-runner/disable`, {
         method: "POST",
         headers: { Authorization: authHeader },
@@ -336,7 +345,7 @@ export function CiRunnerSettings({ onLog }: CiRunnerSettingsProps) {
     } finally {
       setActionLoading(false);
     }
-  }, [fetchStatus, onLog]);
+  }, [fetchStatus, onLog, defaultTenantIdForNewSessions]);
 
   const handleStart = useCallback(async () => {
     setActionLoading(true);
