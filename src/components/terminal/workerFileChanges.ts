@@ -164,7 +164,14 @@ export function noDiffReason(change: SessionFileChange): string | null {
       .filter((n): n is number => typeof n === "number")
       .map(formatBytes)
       .join(" → ");
-    return `too large to diff${sizes ? ` (${sizes})` : ""}`;
+    // Two different bounds produce `truncated`, and they are not the same
+    // statement about the file. A side over the per-side cap really is too
+    // large to diff; an ordinary file whose neighbours spent the report's
+    // aggregate text budget is not, and saying so would be a lie about its
+    // size. The route names the bound it hit in `detail` when it is the
+    // budget (`FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES`, `mcp/snapshots.rs`).
+    const why = change.detail ?? "too large to diff";
+    return `${why}${sizes ? ` (${sizes})` : ""}`;
   }
   return null;
 }

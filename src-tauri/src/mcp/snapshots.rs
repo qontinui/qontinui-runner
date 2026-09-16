@@ -11,11 +11,15 @@
 //! (the Terminal grid's `WorkerSessionCell`) can render a true
 //! snapshot-vs-now diff whatever tool made the edit. The diff itself is
 //! computed client-side; this route only reads and reports, and it reports a
-//! read failure per file rather than dropping the file. It is BOUNDED on both
-//! axes — [`FILE_CHANGE_TEXT_CAP_BYTES`] per side (applied from `metadata()`,
-//! before any body read) and [`FILE_CHANGE_MAX_FILES`] paths per report — so
-//! an unauthenticated loopback caller cannot make the runner allocate a
-//! worker's whole touched set.
+//! read failure per file rather than dropping the file. It is BOUNDED on three
+//! axes — [`FILE_CHANGE_TEXT_CAP_BYTES`] per side (structurally, through a
+//! `take`-bounded read rather than a stat that is stale by the time it is
+//! used), [`FILE_CHANGE_MAX_FILES`] paths per report, and
+//! [`FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES`] across the whole response — so an
+//! unauthenticated loopback caller cannot make the runner allocate a worker's
+//! whole touched set. The first two bound each file and the file count; the
+//! third bounds their PRODUCT, which is the number that actually reaches the
+//! allocator.
 //!
 //! `POST /sessions/<id>/rewind` performs the actual restore: for each
 //! pre-edit snapshot, verify the on-disk blob's sha256 matches the
@@ -41,13 +45,36 @@ use crate::mcp::types::ApiState;
 /// A side above the cap is reported by size only (`truncated: true`, text
 /// `None`) — a diff of a truncated file would be a lie, so none is offered.
 ///
-/// The cap is applied from `metadata()` BEFORE any body read, so an over-cap
-/// side is never held in memory: the runner is a tier-0 process whose loss
-/// destroys every live session on the box, and this route is reachable by
-/// anything on loopback (the `:9876` router has permissive CORS and no auth
-/// layer), so a worker that touched a multi-GB generated artifact must not be
-/// able to make it allocate one.
+/// The cap is STRUCTURAL, not advisory: [`FileProbe`] offers no unbounded read
+/// at all, so a side is read through `File::take(cap + 1)` and a result of
+/// `cap + 1` bytes IS the over-cap verdict. A stat-then-read would have decided
+/// on a length that is stale the moment it is returned — a worker actively
+/// appending to a generated artifact or a log between the two syscalls gets the
+/// whole thing read in — and the runner is a tier-0 process whose loss destroys
+/// every live session on the box, over a route reachable by anything on
+/// loopback (the `:9876` router has permissive CORS and no auth layer). So a
+/// worker that touched a multi-GB generated artifact must not be able to make
+/// it allocate one, whatever that file is doing while we look at it.
 pub const FILE_CHANGE_TEXT_CAP_BYTES: usize = 256 * 1024;
+
+/// Aggregate byte budget for ALL the text one `GET /sessions/<id>/file-changes`
+/// response holds.
+///
+/// [`FILE_CHANGE_TEXT_CAP_BYTES`] bounds one side and [`FILE_CHANGE_MAX_FILES`]
+/// bounds the count, but until this budget existed nothing bounded their
+/// PRODUCT: 400 files × 2 sides × 256 KiB is ~200 MiB resident, which `Json(…)`
+/// then serialises into a second buffer of comparable size — ~400 MiB peak for
+/// one request, with no concurrency limit in front of it. The realistic case is
+/// worse than the adversarial one is rare: a worker that touched 400 files
+/// averaging 50 KiB is ~80 MiB per request, and the page issues one per visible
+/// cell per `commit-state-changed` burst.
+///
+/// Once the budget is spent, the remaining candidates are still REPORTED — with
+/// sizes, digests, status and `truncated: true` — so the cut is visible rather
+/// than silent. A `detail` naming the budget distinguishes it from a
+/// genuinely over-cap file, which the UI renders instead of "too large to
+/// diff" (`noDiffReason` in `workerFileChanges.ts`).
+pub const FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum number of candidate paths one `GET /sessions/<id>/file-changes`
 /// examines. A session that touched more has the remainder reported as
@@ -111,48 +138,62 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// sha256 of a reader's remaining bytes, computed through a fixed-size buffer
-/// so the contents are never held in memory.
-fn sha256_stream(mut reader: impl Read) -> std::io::Result<String> {
+/// sha256 AND byte length of a reader's remaining bytes, computed through a
+/// fixed-size buffer so the contents are never held in memory.
+///
+/// The length comes from the same pass as the digest rather than from a
+/// separate `metadata()` call, so the two describe the same bytes even if the
+/// file is being written while we read it.
+fn sha256_stream(mut reader: impl Read) -> std::io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; SHA_STREAM_CHUNK_BYTES];
+    let mut len: u64 = 0;
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        len += n as u64;
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok((format!("{:x}", hasher.finalize()), len))
 }
 
 /// Filesystem access for [`assemble_file_changes`], narrow enough that a test
 /// can supply an in-memory tree.
 ///
-/// Deliberately three calls rather than one `read`: [`FileProbe::size`] is a
-/// `metadata` stat, so a path over [`FILE_CHANGE_TEXT_CAP_BYTES`] is never read
-/// into memory at all, and [`FileProbe::sha256`] streams it. `read` is called
-/// ONLY for a path already stat'd at or below the cap.
+/// **There is deliberately no unbounded read here.** The trait offers exactly
+/// two operations, and neither can pull an arbitrary file into memory:
+/// [`FileProbe::read_capped`] stops after `cap + 1` bytes, and
+/// [`FileProbe::digest`] streams through a fixed buffer. An earlier shape had a
+/// `size` stat plus an unbounded `read`, which made the cap a decision taken on
+/// a length that the very next syscall could invalidate (TOCTOU); the bound is
+/// now a property of the read itself.
 pub trait FileProbe {
-    /// Byte length of `path` without reading its contents.
-    fn size(&self, path: &str) -> std::io::Result<u64>;
-    /// Whole contents — only ever called for a path at or below the cap.
-    fn read(&self, path: &str) -> std::io::Result<Vec<u8>>;
-    /// sha256 of `path` computed without holding its contents.
-    fn sha256(&self, path: &str) -> std::io::Result<String>;
+    /// Read at most `cap + 1` bytes of `path`.
+    ///
+    /// The extra byte is the verdict: a result of exactly `cap + 1` bytes means
+    /// the file is OVER the cap and must not be diffed. Anything shorter is the
+    /// whole file.
+    fn read_capped(&self, path: &str, cap: usize) -> std::io::Result<Vec<u8>>;
+    /// sha256 AND byte length of `path`, computed in ONE streaming pass so the
+    /// contents are never held and the two agree with each other.
+    fn digest(&self, path: &str) -> std::io::Result<(String, u64)>;
 }
 
 /// The real filesystem.
 pub struct DiskFiles;
 
 impl FileProbe for DiskFiles {
-    fn size(&self, path: &str) -> std::io::Result<u64> {
-        Ok(std::fs::metadata(path)?.len())
+    fn read_capped(&self, path: &str, cap: usize) -> std::io::Result<Vec<u8>> {
+        let limit = cap as u64 + 1;
+        let mut buf = Vec::new();
+        std::fs::File::open(path)?
+            .take(limit)
+            .read_to_end(&mut buf)?;
+        Ok(buf)
     }
-    fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-        std::fs::read(path)
-    }
-    fn sha256(&self, path: &str) -> std::io::Result<String> {
+    fn digest(&self, path: &str) -> std::io::Result<(String, u64)> {
         sha256_stream(std::fs::File::open(path)?)
     }
 }
@@ -170,28 +211,78 @@ enum Side {
     },
 }
 
-fn read_side(files: &dyn FileProbe, path: &str) -> Side {
-    let size = match files.size(path) {
-        Ok(n) => n,
+impl Side {
+    /// Bytes this side is holding resident. `0` for every variant that is not
+    /// buffered text — which is the point of the other variants.
+    fn buffered_len(&self) -> usize {
+        match self {
+            Side::Text(bytes) => bytes.len(),
+            _ => 0,
+        }
+    }
+}
+
+/// Read one side, bounded at `cap` bytes.
+///
+/// The read itself carries the bound (`take(cap + 1)`), so nothing decided here
+/// can be invalidated by a concurrent writer: a file that grows past `cap`
+/// between two syscalls simply comes back as `cap + 1` bytes and is classified
+/// [`Side::Oversize`]. That is the whole TOCTOU fix — there is no stat to race.
+///
+/// `cap` is the smaller of [`FILE_CHANGE_TEXT_CAP_BYTES`] and whatever is left
+/// of the report's aggregate budget, so a `0` cap (budget spent) makes every
+/// non-empty file oversize, which is exactly the "sizes and digests only"
+/// behaviour that budget wants.
+fn read_side(files: &dyn FileProbe, path: &str, cap: usize) -> Side {
+    let bytes = match files.read_capped(path, cap) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Side::Missing,
         Err(e) => return Side::Unreadable(e.to_string()),
     };
-    if size > FILE_CHANGE_TEXT_CAP_BYTES as u64 {
-        // Over the cap: hash by streaming and report the size. The body is
-        // NOT read — the old code read it whole and then threw the text away.
-        return match files.sha256(path) {
-            Ok(sha256) => Side::Oversize {
-                bytes: usize::try_from(size).unwrap_or(usize::MAX),
-                sha256,
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Side::Missing,
-            Err(e) => Side::Unreadable(e.to_string()),
-        };
+    if bytes.len() <= cap {
+        return Side::Text(bytes);
     }
-    match files.read(path) {
-        Ok(bytes) => Side::Text(bytes),
+    // Over the cap. Drop the probe bytes before the streaming pass so the two
+    // are never resident together, then describe the file by size and digest.
+    drop(bytes);
+    match files.digest(path) {
+        Ok((sha256, len)) => Side::Oversize {
+            bytes: usize::try_from(len).unwrap_or(usize::MAX),
+            sha256,
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Side::Missing,
         Err(e) => Side::Unreadable(e.to_string()),
+    }
+}
+
+/// Running aggregate cap on the text one report holds
+/// ([`FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES`]).
+///
+/// It works by SHRINKING the per-side cap handed to [`read_side`], so an
+/// over-budget side is never read into memory in the first place — the budget
+/// is enforced at the same place and in the same way as the per-side cap,
+/// rather than by trimming an already-allocated list afterwards.
+struct TextBudget {
+    remaining: usize,
+}
+
+impl TextBudget {
+    fn new(total: usize) -> Self {
+        Self { remaining: total }
+    }
+    /// The cap for the next side: the per-side cap, or what is left of the
+    /// aggregate budget, whichever is smaller.
+    fn cap(&self) -> usize {
+        FILE_CHANGE_TEXT_CAP_BYTES.min(self.remaining)
+    }
+    fn spend(&mut self, n: usize) {
+        self.remaining = self.remaining.saturating_sub(n);
+    }
+    /// Give back bytes that were read but NOT kept in the response (a side
+    /// dropped as binary, or discarded because its partner was oversize). They
+    /// were resident for one iteration, but they are not in `out`.
+    fn refund(&mut self, n: usize) {
+        self.remaining = self.remaining.saturating_add(n);
     }
 }
 
@@ -247,14 +338,21 @@ pub struct AssembledFileChanges {
 ///   paths in touch order.
 /// - At most `max_files` CANDIDATE paths are examined, in that order. The
 ///   bound is on candidates rather than emitted rows so it also bounds the
-///   number of stat/read syscalls; a candidate that turns out not to be a
-///   change still consumes its slot. Whatever is left over is counted into
+///   number of read syscalls; a candidate that turns out not to be a change
+///   still consumes its slot. Whatever is left over is counted into
 ///   [`AssembledFileChanges::omitted_files`] and never silently dropped.
+/// - At most `total_text_budget` bytes of TEXT are held across the whole
+///   report. Once it is spent every remaining candidate is still emitted —
+///   status, sizes, digests, `truncated: true` and a `detail` naming the
+///   budget — so the operator sees which files changed and only loses the
+///   ability to diff them inline. Files are not dropped to stay in budget;
+///   their bodies are.
 pub fn assemble_file_changes(
     snapshots: &[SnapshotRow],
     touched: &[String],
     files: &dyn FileProbe,
     max_files: usize,
+    total_text_budget: usize,
 ) -> AssembledFileChanges {
     // Resolve the candidate set FIRST, so the bound is applied before any
     // filesystem work rather than after it.
@@ -274,25 +372,47 @@ pub fn assemble_file_changes(
     candidates.truncate(max_files);
 
     let mut out: Vec<SessionFileChange> = Vec::with_capacity(candidates.len());
+    let mut budget = TextBudget::new(total_text_budget);
     for (path, snapshot) in candidates {
-        match snapshot {
+        let (before, after) = match snapshot {
             Some(snap) => {
-                let before = read_side(files, &snap.snapshot_blob_path);
-                let after = read_side(files, path);
-                out.push(pair_sides(
-                    path,
-                    Some(snap.taken_at.clone()),
-                    Some(snap.blob_sha256.as_str()),
-                    before,
-                    after,
-                    true,
-                ));
+                // Sequential caps, not one cap used twice: the second side's
+                // bound already accounts for what the first side took, so a
+                // single pair can never hold 2× the remaining budget.
+                let before = read_side(files, &snap.snapshot_blob_path, budget.cap());
+                budget.spend(before.buffered_len());
+                let after = read_side(files, path, budget.cap());
+                budget.spend(after.buffered_len());
+                (before, after)
             }
-            None => match read_side(files, path) {
-                Side::Missing => continue,
-                after => out.push(pair_sides(path, None, None, Side::Missing, after, false)),
-            },
-        }
+            None => {
+                let after = read_side(files, path, budget.cap());
+                if matches!(after, Side::Missing) {
+                    continue;
+                }
+                budget.spend(after.buffered_len());
+                (Side::Missing, after)
+            }
+        };
+        let spent = before.buffered_len() + after.buffered_len();
+        let change = match snapshot {
+            Some(snap) => pair_sides(
+                path,
+                Some(snap.taken_at.clone()),
+                Some(snap.blob_sha256.as_str()),
+                before,
+                after,
+                true,
+            ),
+            None => pair_sides(path, None, None, before, after, false),
+        };
+        // Bytes read but not kept (a binary side, or one discarded because its
+        // partner was oversize) were resident for this iteration only — they
+        // are not in `out`, so they do not count against the report's budget.
+        let kept = change.before.as_ref().map_or(0, |s| s.len())
+            + change.after.as_ref().map_or(0, |s| s.len());
+        budget.refund(spent.saturating_sub(kept));
+        out.push(change);
     }
 
     AssembledFileChanges {
@@ -301,6 +421,7 @@ pub fn assemble_file_changes(
     }
 }
 
+/// Pair the two sides into one reported entry.
 fn pair_sides(
     file_path: &str,
     taken_at: Option<String>,
@@ -393,10 +514,36 @@ fn pair_sides(
     }
     // A present side with no bytes is one `read_side` refused to buffer: it is
     // over the cap, so there is a size and a digest but nothing to diff.
-    let over_cap = before.as_ref().is_some_and(|f| f.text.is_none())
-        || after.as_ref().is_some_and(|f| f.text.is_none());
-    if over_cap {
+    // A present side with no bytes is one `read_side` refused to buffer. WHICH
+    // bound refused it is decided here, from the side's own true length, and
+    // not from any flag sampled before the reads: the aggregate budget shrinks
+    // between the two sides of one entry, so a flag taken at the top of the
+    // iteration is wrong for the second side exactly at the boundary — the
+    // entry most likely to be truncated in the first place.
+    let truncated_side_bytes: Vec<usize> = [before.as_ref(), after.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|f| f.text.is_none())
+        .map(|f| f.bytes)
+        .collect();
+    if !truncated_side_bytes.is_empty() {
         change.truncated = true;
+        // At or below the per-side cap, a side can only have been refused by
+        // the aggregate budget — `read_side` returns `Text` for anything within
+        // the cap it was handed. Honesty: a 2 KiB file whose neighbours ate the
+        // report's budget is not "too large to diff", which is what the UI says
+        // for a plain over-cap entry, so name the bound that actually applied.
+        // If EITHER side is genuinely over the per-side cap, "too large" is the
+        // true statement about this entry and the UI's default says it.
+        if truncated_side_bytes
+            .iter()
+            .all(|bytes| *bytes <= FILE_CHANGE_TEXT_CAP_BYTES)
+        {
+            change.detail = Some(
+                "the report's text budget was spent on earlier files — size and digest only"
+                    .to_string(),
+            );
+        }
         return change;
     }
     change.before = before_text.and_then(|r| r.ok()).map(str::to_string);
@@ -420,7 +567,13 @@ async fn file_changes_handler(
 
     // Disk reads are blocking; keep them off the async executor.
     let assembled = tokio::task::spawn_blocking(move || {
-        assemble_file_changes(&snapshots, &touched, &DiskFiles, FILE_CHANGE_MAX_FILES)
+        assemble_file_changes(
+            &snapshots,
+            &touched,
+            &DiskFiles,
+            FILE_CHANGE_MAX_FILES,
+            FILE_CHANGE_TOTAL_TEXT_BUDGET_BYTES,
+        )
     })
     .await
     .map_err(|e| {
@@ -499,7 +652,11 @@ pub struct RewindSessionResponse {
 /// Returns `None` if the file cannot be read. Streamed, so a large snapshot
 /// blob costs a fixed buffer rather than its own size.
 fn sha256_of_file(path: &Path) -> Option<String> {
-    sha256_stream(std::fs::File::open(path).ok()?).ok()
+    // `sha256_stream` also reports the length it hashed; the rewind path only
+    // verifies the digest, so the length is dropped here.
+    sha256_stream(std::fs::File::open(path).ok()?)
+        .ok()
+        .map(|(sha, _len)| sha)
 }
 
 async fn rewind_session_handler(
@@ -648,11 +805,13 @@ mod file_changes_tests {
         }
     }
 
-    /// In-memory tree that RECORDS which paths had their body read, so a test
-    /// can assert the oversize path was never buffered.
+    /// In-memory tree that RECORDS every bounded read — the path, the cap it
+    /// was asked for, and how many bytes it handed back — so a test can assert
+    /// what the production code actually pulled into memory rather than trust
+    /// it. `read_capped` honours the cap exactly as `DiskFiles` does.
     struct FakeFs {
         files: HashMap<String, Vec<u8>>,
-        body_reads: std::cell::RefCell<Vec<String>>,
+        reads: std::cell::RefCell<Vec<(String, usize, usize)>>,
     }
 
     impl FakeFs {
@@ -662,7 +821,7 @@ mod file_changes_tests {
                     .iter()
                     .map(|(p, b)| (p.to_string(), b.to_vec()))
                     .collect(),
-                body_reads: std::cell::RefCell::new(Vec::new()),
+                reads: std::cell::RefCell::new(Vec::new()),
             }
         }
         fn get(&self, path: &str) -> std::io::Result<&Vec<u8>> {
@@ -672,21 +831,49 @@ mod file_changes_tests {
                 None => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
             }
         }
-        fn read_bodies(&self) -> Vec<String> {
-            self.body_reads.borrow().clone()
+        /// Paths whose read came back WITHIN its cap — the only case the
+        /// production code buffers as text.
+        ///
+        /// Deliberately not "n == the file's length": a file of exactly
+        /// `cap + 1` bytes returns its whole length and is still over the cap,
+        /// so length equality would call the very file the bound exists to stop
+        /// "fully read".
+        fn fully_buffered(&self) -> Vec<String> {
+            self.reads
+                .borrow()
+                .iter()
+                .filter(|(_, cap, n)| n <= cap)
+                .map(|(p, _, _)| p.clone())
+                .collect()
+        }
+        /// The largest number of bytes any single read handed back. The whole
+        /// point of the `take`-bounded read is that this stays tiny however
+        /// large the tree is.
+        fn largest_read(&self) -> usize {
+            self.reads
+                .borrow()
+                .iter()
+                .map(|(_, _, n)| *n)
+                .max()
+                .unwrap_or(0)
+        }
+        /// Every read honoured its cap: no call returned more than `cap + 1`.
+        fn every_read_respected_its_cap(&self) -> bool {
+            self.reads.borrow().iter().all(|(_, cap, n)| *n <= cap + 1)
         }
     }
 
     impl FileProbe for FakeFs {
-        fn size(&self, path: &str) -> std::io::Result<u64> {
-            Ok(self.get(path)?.len() as u64)
-        }
-        fn read(&self, path: &str) -> std::io::Result<Vec<u8>> {
-            let bytes = self.get(path)?.clone();
-            self.body_reads.borrow_mut().push(path.to_string());
+        fn read_capped(&self, path: &str, cap: usize) -> std::io::Result<Vec<u8>> {
+            let body = self.get(path)?;
+            let take = body.len().min(cap.saturating_add(1));
+            let bytes = body[..take].to_vec();
+            self.reads
+                .borrow_mut()
+                .push((path.to_string(), cap, bytes.len()));
             Ok(bytes)
         }
-        fn sha256(&self, path: &str) -> std::io::Result<String> {
+        fn digest(&self, path: &str) -> std::io::Result<(String, u64)> {
             sha256_stream(self.get(path)?.as_slice())
         }
     }
@@ -695,22 +882,26 @@ mod file_changes_tests {
         FakeFs::new(entries)
     }
 
-    /// The bound is exercised explicitly by its own test; everywhere else it
-    /// must not interfere.
+    /// The bounds are exercised by their own tests; everywhere else they must
+    /// not interfere.
     const NO_FILE_CAP: usize = usize::MAX;
+    const NO_TEXT_BUDGET: usize = usize::MAX;
+
+    /// `assemble_file_changes` with both bounds wide open.
+    fn assemble(
+        snapshots: &[SnapshotRow],
+        touched: &[String],
+        files: &dyn FileProbe,
+    ) -> AssembledFileChanges {
+        assemble_file_changes(snapshots, touched, files, NO_FILE_CAP, NO_TEXT_BUDGET)
+    }
 
     #[test]
     fn modified_file_carries_both_sides_and_shas() {
         let before = b"a\nb\n";
         let sha = sha256_hex(before);
         let read = fs(&[("/blob/1", before), ("/src/x.rs", b"a\nc\n")]);
-        let out = assemble_file_changes(
-            &[snap("/src/x.rs", "/blob/1", &sha, true)],
-            &[],
-            &read,
-            NO_FILE_CAP,
-        )
-        .files;
+        let out = assemble(&[snap("/src/x.rs", "/blob/1", &sha, true)], &[], &read).files;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].status, "modified");
         assert_eq!(out[0].before.as_deref(), Some("a\nb\n"));
@@ -739,7 +930,7 @@ mod file_changes_tests {
             "/src/new.rs".to_string(),
             "/src/never-landed.rs".to_string(),
         ];
-        let out = assemble_file_changes(&snaps, &touched, &read, NO_FILE_CAP).files;
+        let out = assemble(&snaps, &touched, &read).files;
         let by_path: HashMap<_, _> = out.iter().map(|c| (c.file_path.as_str(), c)).collect();
         assert_eq!(by_path["/src/same.rs"].status, "unchanged");
         assert_eq!(by_path["/src/gone.rs"].status, "deleted");
@@ -767,7 +958,7 @@ mod file_changes_tests {
             // recorded sha disagrees with the blob's bytes
             snap("/src/c.rs", "/blob/x", "deadbeef", true),
         ];
-        let out = assemble_file_changes(&snaps, &[], &read, NO_FILE_CAP).files;
+        let out = assemble(&snaps, &[], &read).files;
         assert_eq!(out.len(), 3);
         for c in &out {
             assert_eq!(c.status, "unreadable", "{c:?}");
@@ -796,7 +987,7 @@ mod file_changes_tests {
             snap("/src/bin", "/blob/bin", &sha_bin, true),
             snap("/src/big", "/blob/big", &sha_big, true),
         ];
-        let out = assemble_file_changes(&snaps, &[], &read, NO_FILE_CAP).files;
+        let out = assemble(&snaps, &[], &read).files;
         assert_eq!(out[0].status, "binary");
         assert_eq!(out[0].before, None);
         assert_eq!(out[1].status, "modified");
@@ -805,27 +996,23 @@ mod file_changes_tests {
         assert_eq!(out[1].before_bytes, Some(FILE_CHANGE_TEXT_CAP_BYTES + 1));
     }
 
-    /// The availability fix: an over-cap side is stat'd and STREAM-hashed, and
-    /// its body is never pulled into memory. Before this, every side was read
-    /// whole and the cap only suppressed the text afterwards — so one
-    /// multi-GB generated artifact in a worker's touched set could OOM the
-    /// runner, a tier-0 process, through an unauthenticated loopback route.
+    /// The availability fix: an over-cap side is never pulled into memory.
+    /// Before this, every side was read whole and the cap only suppressed the
+    /// text afterwards — so one multi-GB generated artifact in a worker's
+    /// touched set could OOM the runner, a tier-0 process, through an
+    /// unauthenticated loopback route.
     #[test]
     fn an_over_cap_side_is_never_read_into_memory() {
         let big = vec![b'a'; FILE_CHANGE_TEXT_CAP_BYTES + 1];
         let sha_big = sha256_hex(&big);
         let small = b"small now";
         let read = fs(&[("/blob/big", &big), ("/src/big", small)]);
-        let out = assemble_file_changes(
-            &[snap("/src/big", "/blob/big", &sha_big, true)],
-            &[],
-            &read,
-            NO_FILE_CAP,
-        )
-        .files;
+        let out = assemble(&[snap("/src/big", "/blob/big", &sha_big, true)], &[], &read).files;
 
-        // The oversize blob's BODY was never requested; the small side's was.
-        assert_eq!(read.read_bodies(), vec!["/src/big".to_string()]);
+        // Only the small side came back WHOLE; the oversize blob was probed to
+        // `cap + 1` bytes and no further.
+        assert_eq!(read.fully_buffered(), vec!["/src/big".to_string()]);
+        assert!(read.largest_read() <= FILE_CHANGE_TEXT_CAP_BYTES + 1);
         // It is still fully described: size, digest, and an honest `truncated`.
         assert_eq!(out[0].before_bytes, Some(FILE_CHANGE_TEXT_CAP_BYTES + 1));
         assert_eq!(out[0].before_sha256.as_deref(), Some(sha_big.as_str()));
@@ -834,6 +1021,48 @@ mod file_changes_tests {
         assert_eq!(out[0].before, None);
         assert_eq!(out[0].after, None);
         assert_eq!(out[0].status, "modified");
+        // Cut by its own size, so no budget claim.
+        assert_eq!(out[0].detail, None);
+    }
+
+    /// The TOCTOU fix: the cap is enforced by the READ, not by a stat taken
+    /// before it.
+    ///
+    /// The old `read_side` stat'd, decided the file was under the cap, then
+    /// called `std::fs::read` — the whole file, at whatever size it had by
+    /// then. A worker appending to a generated artifact or a log between those
+    /// two syscalls got that file read whole into a tier-0 process. Here the
+    /// tree holds a body 16× the cap: whatever any stat might have said, the
+    /// bound is what `read_capped` hands back, so the entry is `truncated`
+    /// with a streamed digest and NOTHING near the body's size is ever
+    /// resident.
+    ///
+    /// Note the bound is now structural as well as tested: [`FileProbe`] has no
+    /// unbounded read to call, so restoring the old stat-then-read shape does
+    /// not fail this assertion — it fails to compile.
+    #[test]
+    fn a_side_far_over_the_cap_is_bounded_by_the_read_itself() {
+        let huge = vec![b'a'; FILE_CHANGE_TEXT_CAP_BYTES * 16];
+        let sha_huge = sha256_hex(&huge);
+        let read = fs(&[("/blob/huge", &huge), ("/src/huge", b"now\n")]);
+        let out = assemble(
+            &[snap("/src/huge", "/blob/huge", &sha_huge, true)],
+            &[],
+            &read,
+        )
+        .files;
+
+        assert!(read.every_read_respected_its_cap());
+        assert!(
+            read.largest_read() <= FILE_CHANGE_TEXT_CAP_BYTES + 1,
+            "largest read was {} bytes for a {}-byte file",
+            read.largest_read(),
+            huge.len()
+        );
+        assert!(out[0].truncated);
+        assert_eq!(out[0].before, None);
+        assert_eq!(out[0].before_bytes, Some(huge.len()));
+        assert_eq!(out[0].before_sha256.as_deref(), Some(sha_huge.as_str()));
     }
 
     /// The streamed digest of an over-cap side is still checked against the
@@ -842,18 +1071,18 @@ mod file_changes_tests {
     fn an_over_cap_snapshot_blob_still_fails_its_sha_check() {
         let big = vec![b'a'; FILE_CHANGE_TEXT_CAP_BYTES + 1];
         let read = fs(&[("/blob/big", &big), ("/src/big", b"now")]);
-        let out = assemble_file_changes(
+        let out = assemble(
             &[snap("/src/big", "/blob/big", "deadbeef", true)],
             &[],
             &read,
-            NO_FILE_CAP,
         )
         .files;
         assert_eq!(out[0].status, "unreadable");
         assert!(out[0].detail.as_deref().unwrap().contains("mismatch"));
         // The digest that failed the check was STREAMED: the huge blob's body
-        // was never pulled in. (The under-cap current file is read normally.)
-        assert!(!read.read_bodies().contains(&"/blob/big".to_string()));
+        // was never pulled in whole. (The under-cap current file is.)
+        assert!(!read.fully_buffered().contains(&"/blob/big".to_string()));
+        assert!(read.largest_read() <= FILE_CHANGE_TEXT_CAP_BYTES + 1);
     }
 
     /// The file-count bound: the report stops at `max_files` candidates, says
@@ -870,19 +1099,189 @@ mod file_changes_tests {
         let read = fs(&borrowed);
         let touched: Vec<String> = entries.iter().map(|(p, _)| p.clone()).collect();
 
-        let assembled = assemble_file_changes(&[], &touched, &read, 3);
+        let assembled = assemble_file_changes(&[], &touched, &read, 3, NO_TEXT_BUDGET);
         assert_eq!(assembled.files.len(), 3);
         assert_eq!(assembled.omitted_files, 7);
         // Order is preserved: the cut is a suffix, not an arbitrary subset.
         assert_eq!(assembled.files[0].file_path, "/src/f0");
         assert_eq!(assembled.files[2].file_path, "/src/f2");
         // Nothing beyond the bound was even opened.
-        assert_eq!(read.read_bodies().len(), 3);
+        assert_eq!(read.fully_buffered().len(), 3);
 
         // Under the bound, nothing is reported as omitted.
-        let all = assemble_file_changes(&[], &touched, &fs(&borrowed), 10);
+        let all = assemble_file_changes(&[], &touched, &fs(&borrowed), 10, NO_TEXT_BUDGET);
         assert_eq!(all.files.len(), 10);
         assert_eq!(all.omitted_files, 0);
+    }
+
+    /// The aggregate-bytes fix. The per-side cap and the file-count cap each
+    /// bound one axis; nothing bounded their PRODUCT, so 400 files just under
+    /// the per-side cap was ~200 MiB resident plus a comparable serialisation
+    /// buffer — for one unauthenticated loopback request, with no concurrency
+    /// limit. The realistic shape is the one tested here: many ordinary files,
+    /// each individually fine.
+    ///
+    /// The budget does not DROP files. Every candidate is still reported, with
+    /// status, sizes and digests; only the bodies stop.
+    #[test]
+    fn the_total_text_budget_bounds_the_whole_report() {
+        // 20 files of 1 KiB each = 20 KiB of text, against a 4 KiB budget.
+        let bodies: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|i| (format!("/src/f{i:02}"), vec![b'x'; 1024]))
+            .collect();
+        let borrowed: Vec<(&str, &[u8])> = bodies
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        let read = fs(&borrowed);
+        let touched: Vec<String> = bodies.iter().map(|(p, _)| p.clone()).collect();
+
+        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 4 * 1024);
+
+        // Nothing was dropped: the file-count bound is a different bound.
+        assert_eq!(assembled.files.len(), 20);
+        assert_eq!(assembled.omitted_files, 0);
+
+        // The text the response holds is inside the budget.
+        let held: usize = assembled
+            .files
+            .iter()
+            .map(|c| {
+                c.before.as_ref().map_or(0, |s| s.len()) + c.after.as_ref().map_or(0, |s| s.len())
+            })
+            .sum();
+        assert!(
+            held <= 4 * 1024,
+            "held {held} bytes against a 4096-byte budget"
+        );
+
+        // The first few carry text; the rest are truncated but fully described.
+        assert!(assembled.files[0].after.is_some());
+        assert!(!assembled.files[0].truncated);
+        let tail = &assembled.files[19];
+        assert!(tail.truncated);
+        assert_eq!(tail.after, None);
+        assert_eq!(tail.after_bytes, Some(1024));
+        assert!(tail.after_sha256.is_some());
+        assert_eq!(tail.status, "created");
+        // Honesty: a 1 KiB file is not "too large to diff". The entry names the
+        // bound that actually applied, and the UI renders that `detail`.
+        assert!(
+            tail.detail.as_deref().unwrap().contains("budget"),
+            "{:?}",
+            tail.detail
+        );
+        // And it is the BUDGET, not the per-side cap, so the per-file detail
+        // must not appear on an entry read while the budget was still wide.
+        assert_eq!(assembled.files[0].detail, None);
+    }
+
+    /// The budget shrinks the cap handed to the read, so an over-budget side is
+    /// never buffered in the first place — the bound is not a post-hoc trim of
+    /// an already-allocated list.
+    #[test]
+    fn an_over_budget_side_is_not_read_into_memory_and_then_discarded() {
+        let bodies: Vec<(String, Vec<u8>)> = (0..6)
+            .map(|i| (format!("/src/g{i}"), vec![b'y'; 1024]))
+            .collect();
+        let borrowed: Vec<(&str, &[u8])> = bodies
+            .iter()
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        let read = fs(&borrowed);
+        let touched: Vec<String> = bodies.iter().map(|(p, _)| p.clone()).collect();
+
+        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 2048);
+
+        // Two files fit; the remaining four were probed to their (zero) cap and
+        // no further, so only two whole bodies were ever resident.
+        assert_eq!(read.fully_buffered().len(), 2);
+        assert!(read.every_read_respected_its_cap());
+        assert_eq!(assembled.files.iter().filter(|c| c.truncated).count(), 4);
+    }
+
+    /// The truncation REASON is decided per side from that side's own length,
+    /// not from a flag sampled before the entry's reads.
+    ///
+    /// The budget shrinks between the two sides of one entry, so a per-entry
+    /// flag is wrong exactly at the boundary — which is the entry most likely
+    /// to be truncated. Here the `before` side (256 KiB, within its own cap)
+    /// leaves too little budget for a 60 KiB `after`: the UI must be told the
+    /// BUDGET cut it, or `noDiffReason` renders "too large to diff" about a
+    /// 60 KiB file against a 256 KiB cap.
+    #[test]
+    fn a_side_cut_at_the_budget_boundary_names_the_budget_not_its_size() {
+        let before = vec![b'b'; FILE_CHANGE_TEXT_CAP_BYTES];
+        let after = vec![b'a'; 60 * 1024];
+        let sha_before = sha256_hex(&before);
+        let read = fs(&[("/blob/x", &before), ("/src/x", &after)]);
+
+        let out = assemble_file_changes(
+            &[snap("/src/x", "/blob/x", &sha_before, true)],
+            &[],
+            &read,
+            NO_FILE_CAP,
+            300 * 1024, // wide open at the top of the loop, spent by the before side
+        )
+        .files;
+
+        assert!(out[0].truncated);
+        assert_eq!(out[0].after_bytes, Some(60 * 1024));
+        assert!(
+            out[0].detail.as_deref().unwrap_or("").contains("budget"),
+            "a 60 KiB side cut by the budget claimed the per-side cap: {:?}",
+            out[0].detail
+        );
+    }
+
+    /// The converse: a genuinely over-cap side says nothing about the budget,
+    /// even when the budget happens to be low. "Too large to diff" is the true
+    /// statement about that entry and the UI supplies it.
+    #[test]
+    fn a_genuinely_over_cap_side_never_blames_the_budget() {
+        let huge = vec![b'h'; FILE_CHANGE_TEXT_CAP_BYTES * 4];
+        let sha_huge = sha256_hex(&huge);
+        let read = fs(&[("/blob/h", &huge), ("/src/h", b"now\n")]);
+
+        // Budget deliberately smaller than the per-side cap, which is the case
+        // an entry-level flag got wrong on the very FIRST candidate.
+        let out = assemble_file_changes(
+            &[snap("/src/h", "/blob/h", &sha_huge, true)],
+            &[],
+            &read,
+            NO_FILE_CAP,
+            4 * 1024,
+        )
+        .files;
+
+        assert!(out[0].truncated);
+        assert_eq!(out[0].before_bytes, Some(FILE_CHANGE_TEXT_CAP_BYTES * 4));
+        assert_eq!(
+            out[0].detail, None,
+            "blamed the budget for an over-cap side"
+        );
+    }
+
+    /// Bytes read but NOT kept are refunded: a binary file's bytes are dropped
+    /// by `pair_sides`, so they must not eat the budget the text files need.
+    #[test]
+    fn bytes_that_never_reach_the_response_do_not_spend_the_budget() {
+        let bin = vec![0xff_u8; 1024];
+        let text = vec![b'z'; 1024];
+        let read = fs(&[("/src/a.bin", &bin), ("/src/b.txt", &text)]);
+        let touched = ["/src/a.bin".to_string(), "/src/b.txt".to_string()];
+
+        // 1200 bytes: enough for ONE 1 KiB body. The binary one is read first
+        // and discarded, so the text one must still fit.
+        let assembled = assemble_file_changes(&[], &touched, &read, NO_FILE_CAP, 1200);
+        assert_eq!(assembled.files[0].status, "binary");
+        assert_eq!(assembled.files[0].after, None);
+        assert_eq!(assembled.files[1].status, "created");
+        assert!(
+            assembled.files[1].after.is_some(),
+            "the binary file's discarded bytes spent the budget: {:?}",
+            assembled.files[1]
+        );
     }
 
     #[test]
@@ -899,7 +1298,7 @@ mod file_changes_tests {
             snap("/src/x", "/blob/second", &sha256_hex(second), true),
             snap("/src/x", "/blob/second", &sha256_hex(second), false),
         ];
-        let out = assemble_file_changes(&snaps, &["/src/x".to_string()], &read, NO_FILE_CAP).files;
+        let out = assemble(&snaps, &["/src/x".to_string()], &read).files;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].before.as_deref(), Some("first\n"));
     }
