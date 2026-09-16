@@ -1267,6 +1267,14 @@ impl StallFingerprint {
 /// [`OrchestrationRunConfig::working_silence_secs`], which is reset by observed
 /// output and so never false-positives on a long turn.
 ///
+/// That reset is the same property read from the other side, and it is a real
+/// limit rather than only a safety margin: a worker that is WEDGED but still
+/// emitting resets its own deadline on every line, so `working_silence_secs`
+/// bounds a worker that goes QUIET, not every `Working` worker. Nothing else
+/// bounds the chatty-wedged case — see the `tick_exit` doc for what that costs
+/// when coord is unreachable at the same time, and why holding the run open is
+/// the deliberate choice there.
+///
 /// The entries, and why each one is stuck rather than waiting:
 ///
 /// - `C:<token>:<task_id>` — the runner has no coord ANSWER about this row
