@@ -1456,7 +1456,8 @@ impl TerminalSession {
     /// `spawn_tenant` is the tenant the caller chose for this session (the spawn
     /// picker, `--tenant`), or `None`. It is carried into the session's coord-mcp
     /// credential by the identity seam, which REFUSES the spawn — before the
-    /// child exists — when that tenant cannot be presented (plan
+    /// child process is spawned; the PTY pair already opened is dropped with the
+    /// error — when that tenant cannot be presented (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -1564,7 +1565,7 @@ impl TerminalSession {
         // AFTER caller `extra_env` so the identity dir wins on PATH. Fail-open:
         // any failure injects nothing and the terminal still spawns — with ONE
         // exception, the spawn tenant: a tenant its coord-mcp credential cannot
-        // carry refuses the spawn here, before the child exists, rather than
+        // carry refuses the spawn here, before the child process, rather than
         // start a session labelled one tenant that writes to another. The pinned
         // id it hands back is kept on the session so the coord registration
         // that follows the spawn can key the row by it.
@@ -3165,8 +3166,9 @@ impl TerminalSession {
             // The whole decision — skip for a cwd that declares coord-mcp, else
             // provision a per-terminal config, and refuse a spawn tenant either
             // arm cannot carry — lives in `coord_mcp::deliver_terminal_coord_mcp`
-            // so it is testable without a PTY. A refusal returns BEFORE the
-            // child exists and before the session is recorded.
+            // so it is testable without a PTY. A refusal returns before the
+            // child PROCESS is spawned (the PTY pair opened above is simply
+            // dropped) and before the session is recorded.
             let delivered = crate::coord_mcp::deliver_terminal_coord_mcp(
                 cwd,
                 terminal_id,

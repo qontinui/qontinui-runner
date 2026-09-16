@@ -50,6 +50,16 @@ pub(crate) fn parse_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>
     }
 }
 
+/// [`parse_spawn_tenant`] then [`crate::coord_mcp::precheck_spawn_tenant`]:
+/// the one admission every tenant-offering spawn door runs BEFORE it allocates a
+/// worktree (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+/// Returns the tenant to spawn for, or the typed refusal text.
+pub(crate) fn admit_spawn_tenant(raw: Option<&str>) -> Result<Option<uuid::Uuid>, String> {
+    let tenant = parse_spawn_tenant(raw)?;
+    crate::coord_mcp::precheck_spawn_tenant(tenant)?;
+    Ok(tenant)
+}
+
 /// Create a new terminal session.
 ///
 /// Phase 2 of `plans/2026-05-28-isolate-session-edit-work-in-worktrees.md`:
@@ -121,12 +131,11 @@ pub async fn terminal_create(
     // once, at the seam.
     crate::resource_guard::precheck_spawn("terminal session", resource_override.unwrap_or(false))?;
 
-    let spawn_tenant_id = parse_spawn_tenant(tenant_id.as_deref())?;
     // Refuse a tenant this runner cannot issue a coord credential for BEFORE
     // `acquire_for_terminal` allocates a worktree and takes a claim a refusal
-    // would leak. The PTY seam re-checks as the authority (plan
+    // would leak. The identity seam re-checks as the authority (plan
     // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P1).
-    crate::coord_mcp::precheck_spawn_tenant(spawn_tenant_id)?;
+    let spawn_tenant_id = admit_spawn_tenant(tenant_id.as_deref())?;
 
     // R2 (session-lifecycle-cleanup) — derive the STABLE pane identity from
     // the create-time triple the frontend round-trips on restore

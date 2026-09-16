@@ -848,27 +848,28 @@ pub async fn acquire_for_terminal(
         // A spawn that chose a tenant (plan
         // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential)
         // must not get the machine pin's key in its cwd `.mcp.json`: that file
-        // IS the session's credential whenever it declares coord-mcp (the PTY
-        // seam then delivers none of its own). But the file is also read by
-        // every OTHER session launched in that cwd, so it may carry the chosen
-        // tenant's key only when the cwd belongs to this session alone — an
-        // agent worktree allocation, fresh or reused. In a shared cwd the file
-        // is left to whoever else provisions it, and the seam either issues a
-        // per-terminal credential for the tenant or refuses the spawn.
-        let credential_tenant = crate::coord_mcp::credential_spawn_tenant(spawn_tenant);
-        let session_owns_workdir =
-            super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
+        // IS the session's credential whenever it declares coord-mcp (the
+        // identity seam then delivers none of its own). But the file is also
+        // read by every OTHER session launched in that cwd, so it may carry the
+        // chosen tenant's key only when THIS call allocated the worktree — see
+        // [`in_cwd_credential_plan`].
+        let freshly_allocated = out.1.is_some()
+            && super::canonical_paths::allocated_worktree_for_path(std::path::Path::new(wd))
                 .is_some_and(|root| {
                     super::canonical_paths::paths_equal(&root, std::path::Path::new(wd))
                 });
-        match (credential_tenant, session_owns_workdir) {
-            (Some(tenant), false) => info!(
+        match in_cwd_credential_plan(
+            crate::coord_mcp::credential_spawn_tenant(spawn_tenant),
+            freshly_allocated,
+        ) {
+            InCwdCredentialPlan::LeaveShared(tenant) => info!(
                 workdir = %wd,
                 tenant = %tenant,
-                "acquire_for_terminal: shared cwd — not writing a tenant-pinned .mcp.json \
-                 other sessions would read; the PTY seam issues this session's credential"
+                "acquire_for_terminal: cwd not allocated by this spawn — not writing a \
+                 tenant-pinned .mcp.json other sessions read; the identity seam issues this \
+                 session's credential or refuses"
             ),
-            (tenant, _) => {
+            InCwdCredentialPlan::Provision(tenant) => {
                 crate::coord_mcp::provision_coord_mcp_for_session(
                     wd,
                     crate::coord_mcp::resolve_bound_api_port(),
@@ -927,6 +928,35 @@ pub async fn acquire_for_terminal(
         }
     }
     out
+}
+
+/// What [`acquire_for_terminal`] does with the cwd `.mcp.json` for one spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InCwdCredentialPlan {
+    /// Provision (or reuse) the cwd key, pinned to this tenant when `Some`.
+    Provision(Option<uuid::Uuid>),
+    /// Write nothing: a tenant was chosen and the cwd is not this spawn's own.
+    LeaveShared(uuid::Uuid),
+}
+
+/// Decide the cwd `.mcp.json` for a spawn. Pure.
+///
+/// A tenant-pinned key goes into the cwd ONLY when this very call allocated the
+/// worktree (`freshly_allocated`). Every other cwd — the reuse arm, a
+/// caller-supplied `working_dir`, a shared-branch canonical checkout — is
+/// treated as SHARED even when it is path-shaped like a worktree: the path
+/// cannot say whose allocation it is, and writing a tenant-B key there would
+/// evict the resident session's nonce into grace, rewrite its `.mcp.json`, and
+/// hand B's credential to the next tenant-less spawn in that directory. A
+/// spawn that chose no tenant keeps today's provisioning everywhere.
+fn in_cwd_credential_plan(
+    credential_tenant: Option<uuid::Uuid>,
+    freshly_allocated: bool,
+) -> InCwdCredentialPlan {
+    match (credential_tenant, freshly_allocated) {
+        (Some(tenant), false) => InCwdCredentialPlan::LeaveShared(tenant),
+        (tenant, _) => InCwdCredentialPlan::Provision(tenant),
+    }
 }
 
 /// Budget for the `.claude` tracked-file probe.
@@ -1076,6 +1106,33 @@ impl IsolatedEditContext {
 
 #[cfg(test)]
 mod tests {
+    /// B1 (review of plan 2026-09-10 P5b). A path-shaped worktree the spawn
+    /// did NOT allocate — another session's, reached through `working_dir` or
+    /// the reuse arm — is shared: a tenant-B spawn there must write nothing, so
+    /// the resident's key is neither evicted nor rewritten. Only a worktree this
+    /// call allocated gets the chosen tenant's key.
+    #[test]
+    fn a_tenant_pinned_cwd_key_is_written_only_into_a_worktree_this_spawn_allocated() {
+        let b = uuid::Uuid::from_u128(0xB2);
+        assert_eq!(
+            in_cwd_credential_plan(Some(b), false),
+            InCwdCredentialPlan::LeaveShared(b)
+        );
+        assert_eq!(
+            in_cwd_credential_plan(Some(b), true),
+            InCwdCredentialPlan::Provision(Some(b))
+        );
+        // No tenant chosen: today's provisioning, wherever the cwd is.
+        assert_eq!(
+            in_cwd_credential_plan(None, false),
+            InCwdCredentialPlan::Provision(None)
+        );
+        assert_eq!(
+            in_cwd_credential_plan(None, true),
+            InCwdCredentialPlan::Provision(None)
+        );
+    }
+
     use super::*;
 
     fn git(dir: &Path, args: &[&str]) {

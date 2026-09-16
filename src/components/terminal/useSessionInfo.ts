@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useSyncExternalStore } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 /**
@@ -158,7 +158,13 @@ export interface SessionPrs {
 export interface SessionTenancy {
   /** `tenantId: null` ⇒ the spawn chose none (coord's row holds the device
    * default) — NOT "no tenant". */
-  row: { tenantId: string | null };
+  row: {
+    tenantId: string | null;
+    /** The machine's current default tenant for new sessions — the expected
+     * tenant of a spawn that chose none, compared only when nothing else names
+     * one. */
+    deviceDefaultTenantId: string | null;
+  };
   dataPlane: {
     /** `"owned"` | `"device"` | `"unresolved"` | `"unknown"`. */
     status: string;
@@ -518,7 +524,8 @@ export function prRowChip(
   // thing. (The strong claim used to read "closed, not landed", and it was
   // printed on every coord rebase-fast-forward land: those rewrite the shas,
   // so the ancestry probe backing it could never have passed.)
-  if (pr.prState === "closed") return { text: "closed — land unverified", tone: "unknown" };
+  if (pr.prState === "closed")
+    return { text: "closed — land unverified", tone: "unknown" };
   return { text: pr.prState ?? "open", tone: "open" };
 }
 
@@ -816,7 +823,7 @@ function normalizePrs(raw: unknown): SessionPrs {
 export function normalizeTenancy(raw: unknown): SessionTenancy | null {
   if (!raw || typeof raw !== "object") return null;
   const v = raw as {
-    row?: { tenantId?: unknown };
+    row?: { tenantId?: unknown; deviceDefaultTenantId?: unknown };
     dataPlane?: { status?: unknown; tenantId?: unknown; reason?: unknown };
     credential?: {
       status?: unknown;
@@ -834,7 +841,10 @@ export function normalizeTenancy(raw: unknown): SessionTenancy | null {
   }
   const posture = v.credential?.posture;
   return {
-    row: { tenantId: str(v.row.tenantId) },
+    row: {
+      tenantId: str(v.row.tenantId),
+      deviceDefaultTenantId: str(v.row.deviceDefaultTenantId),
+    },
     dataPlane: {
       status: dataPlaneStatus,
       tenantId: str(v.dataPlane?.tenantId),
@@ -898,49 +908,107 @@ export function normalizeSessionInfo(raw: unknown): SessionInfoState {
 }
 
 /**
+ * One shared poll per session id.
+ *
+ * Several components of one terminal tab read the same projection — the
+ * session-info dropdown and the tenant badge today. Each used to run its own
+ * 60 s `session_info_get` poll, so every zone paid two IPC round-trips (and
+ * the runner two tenancy resolutions) per minute for one answer. Subscribers
+ * with the same session id now share one entry: one poll, one cached state,
+ * released when the last subscriber unmounts.
+ */
+interface SessionInfoEntry {
+  state: SessionInfoState;
+  listeners: Set<() => void>;
+  timer: ReturnType<typeof setInterval> | null;
+  inFlight: boolean;
+}
+
+const sessionInfoEntries = new Map<string, SessionInfoEntry>();
+
+function sessionInfoEntry(sid: string): SessionInfoEntry {
+  let entry = sessionInfoEntries.get(sid);
+  if (!entry) {
+    entry = { state: LOADING_STATE, listeners: new Set(), timer: null, inFlight: false };
+    sessionInfoEntries.set(sid, entry);
+  }
+  return entry;
+}
+
+async function fetchSessionInfo(sid: string): Promise<void> {
+  const entry = sessionInfoEntries.get(sid);
+  if (!entry || entry.inFlight) return;
+  entry.inFlight = true;
+  let next: SessionInfoState;
+  try {
+    const raw = await invoke<unknown>("session_info_get", { claudeSessionId: sid });
+    next = normalizeSessionInfo(raw);
+  } catch (err) {
+    // A hard Err is an IPC/caller fault, not a data condition. Surface it as
+    // an explicit unavailable state rather than keeping a stale projection
+    // or silently rendering nothing.
+    console.error("session_info_get failed:", err);
+    next = { status: "unavailable", reason: "ipc_error", body: null };
+  } finally {
+    entry.inFlight = false;
+  }
+  entry.state = next;
+  entry.listeners.forEach((notify) => notify());
+}
+
+function subscribeSessionInfo(sid: string, pollMs: number, notify: () => void): () => void {
+  const entry = sessionInfoEntry(sid);
+  entry.listeners.add(notify);
+  if (entry.timer === null) {
+    void fetchSessionInfo(sid);
+    entry.timer = setInterval(() => void fetchSessionInfo(sid), pollMs);
+  }
+  return () => {
+    entry.listeners.delete(notify);
+    if (entry.listeners.size === 0) {
+      if (entry.timer !== null) clearInterval(entry.timer);
+      sessionInfoEntries.delete(sid);
+    }
+  };
+}
+
+/** Test seam: how many live shared entries exist (one per polled session). */
+export function sessionInfoSubscriptionCount(): number {
+  return sessionInfoEntries.size;
+}
+
+/** Exported for the unit test — subscribe without React. */
+export { subscribeSessionInfo };
+
+/**
  * Poll `session_info_get` while mounted. `claudeSessionId` is undefined for
  * plain PTY tabs and not-yet-reconciled spawns — no fetch, and the caller
  * renders no trigger at all (a tab with no Claude session has no session
  * info, which is a different statement from "its session info is unknown").
+ *
+ * Every mounted consumer of the same session id shares ONE poll — see
+ * `SessionInfoEntry`. A zone reassigned to another session reads LOADING until
+ * that session's first fetch lands, never the previous session's identity.
  */
 export function useSessionInfo(
   claudeSessionId: string | undefined,
   pollMs = 60_000,
 ): SessionInfoState & { refresh: () => void } {
-  // Cache keyed by session id: when the zone is reassigned to another
-  // session, render falls back to LOADING until that session's fetch lands —
-  // no setState-in-effect reset, no flash of the previous session's identity.
-  const [cached, setCached] = useState<{ sid: string; data: SessionInfoState } | null>(null);
-  const inFlight = useRef(false);
-
-  const fetchInfo = useCallback(async () => {
-    if (!claudeSessionId || inFlight.current) return;
-    inFlight.current = true;
-    try {
-      const raw = await invoke<unknown>("session_info_get", { claudeSessionId });
-      setCached({ sid: claudeSessionId, data: normalizeSessionInfo(raw) });
-    } catch (err) {
-      // A hard Err is an IPC/caller fault, not a data condition. Surface it as
-      // an explicit unavailable state rather than keeping a stale projection
-      // or silently rendering nothing.
-      console.error("session_info_get failed:", err);
-      setCached({
-        sid: claudeSessionId,
-        data: { status: "unavailable", reason: "ipc_error", body: null },
-      });
-    } finally {
-      inFlight.current = false;
-    }
+  const subscribe = useCallback(
+    (notify: () => void) =>
+      claudeSessionId ? subscribeSessionInfo(claudeSessionId, pollMs, notify) : () => {},
+    [claudeSessionId, pollMs],
+  );
+  const getSnapshot = useCallback(
+    () =>
+      claudeSessionId
+        ? (sessionInfoEntries.get(claudeSessionId)?.state ?? LOADING_STATE)
+        : LOADING_STATE,
+    [claudeSessionId],
+  );
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const refresh = useCallback(() => {
+    if (claudeSessionId) void fetchSessionInfo(claudeSessionId);
   }, [claudeSessionId]);
-
-  useEffect(() => {
-    if (!claudeSessionId) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- fetchInfo is async; setCached fires after the IPC await, never synchronously in the effect body
-    void fetchInfo();
-    const timer = setInterval(() => void fetchInfo(), pollMs);
-    return () => clearInterval(timer);
-  }, [claudeSessionId, fetchInfo, pollMs]);
-
-  const state = claudeSessionId && cached?.sid === claudeSessionId ? cached.data : LOADING_STATE;
-  return { ...state, refresh: () => void fetchInfo() };
+  return { ...state, refresh };
 }

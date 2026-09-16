@@ -64,6 +64,15 @@ pub struct TauriInvokeResponse {
     pub error: Option<String>,
 }
 
+/// The `terminal_create` proxy's spawn-tenant admission: the shared
+/// [`crate::commands::terminal::admit_spawn_tenant`], answered as the invoke
+/// error a refused `terminal_create` command would return.
+fn spawn_tenant_or_invoke_error(
+    raw: Option<&str>,
+) -> Result<Option<uuid::Uuid>, TauriInvokeResponse> {
+    crate::commands::terminal::admit_spawn_tenant(raw).map_err(TauriInvokeResponse::err)
+}
+
 impl TauriInvokeResponse {
     fn ok(data: Value) -> Self {
         Self {
@@ -219,14 +228,10 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 Ok(v) => v,
                 Err(e) => return TauriInvokeResponse::err(format!("bad args: {}", e)),
             };
-            let spawn_tenant =
-                match crate::commands::terminal::parse_spawn_tenant(a.tenant_id.as_deref())
-                    .and_then(|tenant| {
-                        crate::coord_mcp::precheck_spawn_tenant(tenant).map(|()| tenant)
-                    }) {
-                    Ok(tenant) => tenant,
-                    Err(e) => return TauriInvokeResponse::err(e),
-                };
+            let spawn_tenant = match spawn_tenant_or_invoke_error(a.tenant_id.as_deref()) {
+                Ok(tenant) => tenant,
+                Err(refusal) => return refusal,
+            };
             let tm: Arc<TerminalManager> = state
                 .app_handle
                 .state::<Arc<TerminalManager>>()
@@ -413,4 +418,32 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
 pub fn routes() -> axum::Router<Arc<ApiState>> {
     use axum::routing::post;
     axum::Router::new().route("/ui-bridge/tauri/invoke", post(tauri_invoke_handler))
+}
+
+#[cfg(test)]
+mod spawn_tenant_tests {
+    use super::*;
+
+    /// N4 (review of plan 2026-09-10). The `terminal_create` proxy answers a
+    /// tenant this runner holds no credential for with the same typed invoke
+    /// error the Tauri command returns, and admits a paired one.
+    #[test]
+    fn the_terminal_create_proxy_refuses_an_unpaired_spawn_tenant() {
+        let amb = crate::test_env::isolated_ambient();
+        let (a, b) = (uuid::Uuid::from_u128(0xA1), uuid::Uuid::from_u128(0xB2));
+        amb.write_active_tenant_id(a);
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&a, "header.payload.signature")
+            .unwrap();
+
+        let refusal =
+            spawn_tenant_or_invoke_error(Some(&b.to_string())).expect_err("unpaired → refused");
+        assert!(!refusal.success);
+        let error = refusal.error.unwrap_or_default();
+        assert!(error.starts_with("terminal:tenant_not_paired:"), "{error}");
+        assert_eq!(
+            spawn_tenant_or_invoke_error(Some(&a.to_string())).ok(),
+            Some(Some(a))
+        );
+    }
 }

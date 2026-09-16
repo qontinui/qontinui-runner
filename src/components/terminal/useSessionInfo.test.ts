@@ -21,7 +21,12 @@
  * used to be a `return null` (G5).
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+const invokeMock = vi.hoisted(() =>
+  vi.fn(async () => ({ available: false, reason: "session_not_found" })),
+);
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 import {
   deriveTrigger,
   formatEpochMs,
@@ -30,6 +35,8 @@ import {
   PROVISIONAL_SUFFIX,
   normalizeSessionInfo,
   normalizeTenancy,
+  sessionInfoSubscriptionCount,
+  subscribeSessionInfo,
   prGithubUrl,
   prKey,
   prLabel,
@@ -940,5 +947,28 @@ describe("normalizeTenancy (plan 2026-09-10 P0)", () => {
         credential: { status: "resolved" },
       }),
     ).toBeNull();
+  });
+});
+
+describe("shared session-info poll", () => {
+  it("runs ONE poll for every subscriber of the same session, released with the last", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockClear();
+      const badge = subscribeSessionInfo("sid-shared", 60_000, () => {});
+      const dropdown = subscribeSessionInfo("sid-shared", 60_000, () => {});
+      expect(sessionInfoSubscriptionCount()).toBe(1);
+      expect(invokeMock).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(invokeMock).toHaveBeenCalledTimes(2);
+      badge();
+      expect(sessionInfoSubscriptionCount()).toBe(1);
+      dropdown();
+      expect(sessionInfoSubscriptionCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(invokeMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

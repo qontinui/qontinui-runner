@@ -54,7 +54,7 @@ function tenancy(overrides: {
   diverged: boolean;
 }): SessionTenancy {
   return {
-    row: { tenantId: overrides.row ?? null },
+    row: { tenantId: overrides.row ?? null, deviceDefaultTenantId: null },
     dataPlane: {
       status: overrides.dataPlane ? "owned" : "unknown",
       tenantId: overrides.dataPlane ?? null,

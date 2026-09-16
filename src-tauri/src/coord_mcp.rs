@@ -4593,6 +4593,12 @@ fn mint_and_register_nonce(
     // A spawn that CHOSE its tenant is the exception, and the machine is not
     // sampled at all: the chosen tenant is the session's own, which is exactly
     // what the machine-global pin cannot express for two co-resident sessions.
+    //
+    // A spawn that chose NOTHING still freezes the machine's pin as read NOW,
+    // and that freeze is persisted and restored verbatim — deliberately. It is
+    // the same rule `commands::tenant` states for switching the active tenant:
+    // a switch re-points FUTURE sessions only, so a running (or restored)
+    // session keeps the tenant it was spawned under.
     let session_pin = match session_tenant {
         Some(t) => crate::session::tenant_pin::TenantPin::Pinned(t),
         None => crate::session::tenant_pin::resolve_tenant_pin(),
@@ -5065,21 +5071,79 @@ pub(crate) fn resolve_session_tenant(
     live_pin: crate::session::tenant_pin::TenantPin,
     jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
 ) -> Result<Option<Uuid>, (u16, String)> {
+    let decision = decide_session_tenant(binding_pin, live_pin, jwt_claim_tenant);
+    match &decision {
+        SessionTenantDecision::BindingPin {
+            tenant,
+            live_differs: true,
+        } => tracing::debug!(
+            "coord_mcp: session pinned to tenant {tenant} at mint time while this machine \
+             now reads {live_pin:?} — honoring the session's own tenant (provenance \
+             telemetry, not a credential-slot choice)"
+        ),
+        SessionTenantDecision::JwtClaim(t) => warn!(
+            "coord_mcp: machine pin unresolvable; falling back to the \
+             device JWT's tenant claim ({t}) — repair ~/.qontinui/machine.json"
+        ),
+        SessionTenantDecision::Unresolvable => warn!(
+            "coord_mcp: REFUSING proxy request — tenant unresolvable by \
+             any route (no usable machine.json pin and no tenant_id claim \
+             on the device JWT)"
+        ),
+        _ => {}
+    }
+    decision.into_result()
+}
+
+/// Which row of [`resolve_session_tenant`]'s authority table decided — kept
+/// apart from the logging so a READ-ONLY reporter (the session-info tenancy
+/// block, polled per zone) can ask the same question without emitting the
+/// proxy's per-request refusal warning on every poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionTenantDecision {
+    /// Row 1: the binding's own `Pinned` tenant.
+    BindingPin { tenant: Uuid, live_differs: bool },
+    /// Row 2: the machine's pin, read now.
+    LivePin(Uuid),
+    /// Row 3: the default slot.
+    DefaultSlot,
+    /// Row 4, second route: the device JWT's tenant claim.
+    JwtClaim(Uuid),
+    /// Row 4, no route at all: refuse.
+    Unresolvable,
+}
+
+impl SessionTenantDecision {
+    /// The proxy's answer: the tenant to select (`None` = the default slot), or
+    /// the typed refusal.
+    pub(crate) fn into_result(self) -> Result<Option<Uuid>, (u16, String)> {
+        match self {
+            SessionTenantDecision::BindingPin { tenant, .. }
+            | SessionTenantDecision::LivePin(tenant)
+            | SessionTenantDecision::JwtClaim(tenant) => Ok(Some(tenant)),
+            SessionTenantDecision::DefaultSlot => Ok(None),
+            SessionTenantDecision::Unresolvable => Err(tenant_unresolvable_error()),
+        }
+    }
+}
+
+/// The authority order itself, pure and silent. See [`resolve_session_tenant`].
+pub(crate) fn decide_session_tenant(
+    binding_pin: crate::session::tenant_pin::TenantPin,
+    live_pin: crate::session::tenant_pin::TenantPin,
+    jwt_claim_tenant: impl FnOnce() -> Option<Uuid>,
+) -> SessionTenantDecision {
     use crate::session::tenant_pin::TenantPin;
 
     // Row 1. The ONE authority the binding keeps: an explicitly pinned session
     // tenant. `machine.json` names a single active tenant, so on a
     // multi-tenant device it is the only thing that can tell two co-resident
     // sessions apart. It NAMES a tenant; it no longer selects a slot family.
-    if let TenantPin::Pinned(t) = binding_pin {
-        if live_pin != binding_pin {
-            tracing::debug!(
-                "coord_mcp: session pinned to tenant {t} at mint time while this machine \
-                 now reads {live_pin:?} — honoring the session's own tenant (provenance \
-                 telemetry, not a credential-slot choice)"
-            );
-        }
-        return Ok(Some(t));
+    if let TenantPin::Pinned(tenant) = binding_pin {
+        return SessionTenantDecision::BindingPin {
+            tenant,
+            live_differs: live_pin != binding_pin,
+        };
     }
 
     // Rows 2-4. The binding carries no tenant — it is a restored nonce, an
@@ -5087,34 +5151,31 @@ pub(crate) fn resolve_session_tenant(
     // that could not state its tenant. Whatever it was THEN is not evidence
     // about now, so resolve now.
     match live_pin {
-        TenantPin::Pinned(t) => Ok(Some(t)),
-        TenantPin::Unpinned => Ok(None),
-        TenantPin::Unresolvable => {
-            // FAIL-CLOSED, and it stays that way. Second and last route to a
-            // tenant: the device JWT's own claim, which coord issued and which
-            // is authoritative. NEVER fall through to `Ok(None)` here — that
-            // would silently route an unresolvable device onto whichever slot
-            // happens to exist, which is the Phase-1 defect wearing a
-            // different hat.
-            match jwt_claim_tenant() {
-                Some(t) => {
-                    warn!(
-                        "coord_mcp: machine pin unresolvable; falling back to the \
-                         device JWT's tenant claim ({t}) — repair ~/.qontinui/machine.json"
-                    );
-                    Ok(Some(t))
-                }
-                None => {
-                    warn!(
-                        "coord_mcp: REFUSING proxy request — tenant unresolvable by \
-                         any route (no usable machine.json pin and no tenant_id claim \
-                         on the device JWT)"
-                    );
-                    Err(tenant_unresolvable_error())
-                }
-            }
-        }
+        TenantPin::Pinned(t) => SessionTenantDecision::LivePin(t),
+        TenantPin::Unpinned => SessionTenantDecision::DefaultSlot,
+        // FAIL-CLOSED, and it stays that way. Second and last route to a
+        // tenant: the device JWT's own claim, which coord issued and which is
+        // authoritative. NEVER fall through to the default slot here — that
+        // would silently route an unresolvable device onto whichever slot
+        // happens to exist, which is the Phase-1 defect wearing a different hat.
+        TenantPin::Unresolvable => match jwt_claim_tenant() {
+            Some(t) => SessionTenantDecision::JwtClaim(t),
+            None => SessionTenantDecision::Unresolvable,
+        },
     }
+}
+
+/// [`session_tenant_or_refuse`] without its logging — for read-only reporters.
+pub(crate) fn session_tenant_decision(nonce: Option<&str>) -> SessionTenantDecision {
+    use crate::session::tenant_pin::TenantPin;
+    let binding_pin = nonce
+        .map(proxy_session_pin_for_nonce)
+        .unwrap_or(TenantPin::Unpinned);
+    decide_session_tenant(
+        binding_pin,
+        crate::session::tenant_pin::resolve_tenant_pin(),
+        device_jwt_claim_tenant,
+    )
 }
 
 /// Async wrapper: resolve the session tenant AND read its bearer, or refuse.
@@ -6125,8 +6186,14 @@ struct ReusableInCwdNonce {
 /// tenant-B session the file's machine-pinned key is exactly the
 /// labelled-B-writes-A defect plan
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` closes.
-/// `None` keeps the rule above unchanged — a caller that chose nothing never
-/// forces a re-mint, which in a shared cwd would evict a live sibling's key.
+///
+/// **A spawn that chose nothing reuses only a key its machine would mint.** With
+/// `session_tenant: None` a key PINNED to a tenant is reused only when that
+/// tenant is the machine's current pin — otherwise a tenant-less session would
+/// silently present another tenant's credential (a tenant-B worktree key, say).
+/// An unpinned key is reused as before, and so is a key pinned to the machine's
+/// own tenant, so an ordinary shared cwd still never forces a re-mint that
+/// would evict a live sibling.
 fn reusable_in_cwd_device_nonce(
     workdir: &str,
     bound_port: u16,
@@ -6144,8 +6211,16 @@ fn reusable_in_cwd_device_nonce(
     if binding.workdir != normalize_binding_workdir(workdir) {
         return None;
     }
-    if let Some(t) = session_tenant {
-        if binding.session_pin != crate::session::tenant_pin::TenantPin::Pinned(t) {
+    {
+        use crate::session::tenant_pin::TenantPin;
+        let admissible = match (session_tenant, binding.session_pin) {
+            (Some(t), pin) => pin == TenantPin::Pinned(t),
+            (None, TenantPin::Pinned(t)) => {
+                crate::session::tenant_pin::resolve_tenant_pin() == TenantPin::Pinned(t)
+            }
+            (None, _) => true,
+        };
+        if !admissible {
             return None;
         }
     }
@@ -8730,45 +8805,68 @@ pub(crate) fn credential_spawn_tenant(spawn_tenant: Option<Uuid>) -> Option<Uuid
 }
 
 /// What a session's coord-mcp credential resolves to, read the way the proxy
-/// resolves it per request ([`session_tenant_or_refuse`]).
+/// resolves it per request ([`decide_session_tenant`]) — but silently, because
+/// its reader is the session-info tenancy report, polled per zone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CredentialTenantRead {
     /// No runner proxy nonce could be found for the session — none minted for
-    /// its terminal, and no proxy-shaped `.mcp.json` in its cwd. UNKNOWN: the
-    /// session may hold a credential the runner did not issue.
+    /// its terminal, and the seam did not hand it the cwd's `.mcp.json`. UNKNOWN:
+    /// the session may hold a credential the runner did not issue.
     NoNonce,
+    /// This process never recorded what the identity seam delivered to the
+    /// terminal, so which key the session presents cannot be said. UNKNOWN.
+    DeliveryUnrecorded,
+    /// A nonce was found but the proxy no longer accepts it (unregistered,
+    /// reaped, expired). Resolving it would only describe the machine's pin, not
+    /// anything the session can present. UNKNOWN.
+    NotLive,
     /// The proxy would select this tenant's slot; `None` is the default
     /// (`access_token`) slot.
     Resolved(Option<Uuid>),
-    /// [`session_tenant_or_refuse`] refused — the proxy would refuse every
-    /// request. The string is its typed refusal body.
+    /// The proxy would refuse every request. The string is its typed refusal body.
     Refused(String),
 }
 
-/// Resolve `nonce` the way the coord-mcp proxy does.
+/// Resolve `nonce` the way the coord-mcp proxy does, without its logging.
 fn credential_tenant_for_nonce(nonce: Option<&str>) -> CredentialTenantRead {
-    match nonce {
-        None => CredentialTenantRead::NoNonce,
-        Some(n) => match session_tenant_or_refuse(Some(n)) {
-            Ok(tenant) => CredentialTenantRead::Resolved(tenant),
-            Err((_, body)) => CredentialTenantRead::Refused(body),
-        },
+    let Some(nonce) = nonce else {
+        return CredentialTenantRead::NoNonce;
+    };
+    if !proxy_nonce_is_valid(nonce) {
+        return CredentialTenantRead::NotLive;
+    }
+    match session_tenant_decision(Some(nonce)).into_result() {
+        Ok(tenant) => CredentialTenantRead::Resolved(tenant),
+        Err((_, body)) => CredentialTenantRead::Refused(body),
     }
 }
 
-/// What the proxy nonce in `<workdir>/.mcp.json` resolves to.
-pub(crate) fn workdir_credential_tenant(workdir: &str) -> CredentialTenantRead {
-    credential_tenant_for_nonce(read_proxy_nonce(&Path::new(workdir).join(".mcp.json")).as_deref())
+/// What the identity seam delivered to each terminal in this process, recorded
+/// by [`deliver_terminal_coord_mcp`]. It is what lets the tenancy report say
+/// whether a session's credential is its own per-terminal key or its cwd's
+/// `.mcp.json` — reading the cwd file for a terminal the seam provisioned would
+/// describe a key that session never presents. One small entry per spawned
+/// terminal for the life of the process.
+fn terminal_coord_mcp_deliveries() -> &'static Mutex<HashMap<String, CoordMcpDelivery>> {
+    static DELIVERIES: OnceLock<Mutex<HashMap<String, CoordMcpDelivery>>> = OnceLock::new();
+    DELIVERIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDelivery) {
+    terminal_coord_mcp_deliveries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(terminal_id.to_string(), delivery);
 }
 
 /// What the coord-mcp credential of the session in `terminal_id` resolves to.
 ///
 /// The session's credential is the one the identity seam gave it: the
-/// per-terminal nonce minted for THIS terminal when the seam provisioned one,
-/// else — when the seam skipped because the cwd declares coord-mcp — the nonce
-/// in that cwd's `.mcp.json`. A terminal re-provisioned into a second cwd holds
-/// one live binding per cwd; the newest mint is the one its `--mcp-config` file
-/// carries.
+/// per-terminal nonce minted for THIS terminal when the seam provisioned one
+/// (a terminal re-provisioned into a second cwd holds one live binding per cwd;
+/// the newest mint is the one its `--mcp-config` file carries), else — ONLY
+/// when the seam recorded that it skipped because the cwd declares coord-mcp —
+/// the nonce in that cwd's `.mcp.json`.
 pub(crate) fn session_credential_tenant(
     terminal_id: &str,
     workdir: Option<&str>,
@@ -8783,10 +8881,49 @@ pub(crate) fn session_credential_tenant(
             .max_by(|(na, a), (nb, b)| a.minted_at.cmp(&b.minted_at).then_with(|| na.cmp(nb)))
             .map(|(n, _)| n.clone())
     };
-    match (terminal_nonce, workdir) {
-        (Some(nonce), _) => credential_tenant_for_nonce(Some(&nonce)),
-        (None, Some(wd)) => workdir_credential_tenant(wd),
-        (None, None) => CredentialTenantRead::NoNonce,
+    if let Some(nonce) = terminal_nonce {
+        return credential_tenant_for_nonce(Some(&nonce));
+    }
+    let delivery = terminal_coord_mcp_deliveries()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(terminal_id)
+        .copied();
+    match (delivery, workdir) {
+        (Some(CoordMcpDelivery::WorkdirDeclared), Some(wd)) => credential_tenant_for_nonce(
+            read_proxy_nonce(&Path::new(wd).join(".mcp.json")).as_deref(),
+        ),
+        (Some(_), _) => CredentialTenantRead::NoNonce,
+        (None, _) => CredentialTenantRead::DeliveryUnrecorded,
+    }
+}
+
+/// What the key in a cwd's `.mcp.json` is, for the seam's cwd-declared
+/// admission ([`check_workdir_declared_tenant`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclaredWorkdirKey {
+    /// No runner proxy nonce in the file.
+    NoNonce,
+    /// A nonce the proxy no longer accepts.
+    NotLive,
+    /// A live nonce pinned to this tenant.
+    Pinned(Uuid),
+    /// A live nonce with no tenant pin — it follows whatever the machine reads
+    /// per request, so it is not a statement about any chosen tenant.
+    NotPinned,
+}
+
+/// Classify the key in `<workdir>/.mcp.json`.
+pub(crate) fn declared_workdir_key(workdir: &str) -> DeclaredWorkdirKey {
+    let Some(nonce) = read_proxy_nonce(&Path::new(workdir).join(".mcp.json")) else {
+        return DeclaredWorkdirKey::NoNonce;
+    };
+    if !proxy_nonce_is_valid(&nonce) {
+        return DeclaredWorkdirKey::NotLive;
+    }
+    match proxy_session_pin_for_nonce(&nonce) {
+        crate::session::tenant_pin::TenantPin::Pinned(t) => DeclaredWorkdirKey::Pinned(t),
+        _ => DeclaredWorkdirKey::NotPinned,
     }
 }
 
@@ -8817,7 +8954,7 @@ pub(crate) enum SpawnTenantRefusal {
     WorkdirDeclaresOtherTenant {
         tenant: Uuid,
         declared_file: std::path::PathBuf,
-        declared: CredentialTenantRead,
+        declared: DeclaredWorkdirKey,
     },
 }
 
@@ -8860,16 +8997,17 @@ impl std::fmt::Display for SpawnTenantRefusal {
                 declared,
             } => {
                 let resolves = match declared {
-                    CredentialTenantRead::NoNonce => {
+                    DeclaredWorkdirKey::NoNonce => {
                         "carries no runner proxy key, so its tenant cannot be established"
                             .to_string()
                     }
-                    CredentialTenantRead::Resolved(Some(t)) => format!("resolves to tenant {t}"),
-                    CredentialTenantRead::Resolved(None) => {
-                        "resolves to the default credential slot, not a named tenant".to_string()
+                    DeclaredWorkdirKey::NotLive => {
+                        "is a key this runner no longer accepts".to_string()
                     }
-                    CredentialTenantRead::Refused(body) => {
-                        format!("resolves to no tenant at all ({body})")
+                    DeclaredWorkdirKey::Pinned(t) => format!("is pinned to tenant {t}"),
+                    DeclaredWorkdirKey::NotPinned => {
+                        "is pinned to no tenant (it follows the machine's tenant per request)"
+                            .to_string()
                     }
                 };
                 write!(
@@ -8901,39 +9039,54 @@ pub(crate) fn validate_spawn_tenant(tenant: Uuid) -> Result<(), SpawnTenantRefus
         crate::auth::AuthManager::new()
             .try_list_tenant_device_jwt_tenants()
             .map_err(|e| format!("{e:#}")),
-        crate::auth::default_binding_tenant(),
+        crate::auth::default_binding_tenant_probe(),
     )
 }
 
 /// Pure core of [`validate_spawn_tenant`].
+///
+/// "Not paired" is a claim that BOTH routes were read and neither holds the
+/// tenant. An unreadable slot store or an unreadable default-binding file
+/// establishes nothing, so either one refuses as
+/// [`SpawnTenantRefusal::CredentialStoreUnreadable`] — the heal differs, and an
+/// operator sent to pair a tenant that is already paired would be sent wrong.
 fn spawn_tenant_admission(
     tenant: Uuid,
     held: Result<Vec<Uuid>, String>,
-    default_binding: Option<Uuid>,
+    default_binding: crate::auth::BindingTenantRead,
 ) -> Result<(), SpawnTenantRefusal> {
-    if default_binding == Some(tenant) {
+    use crate::auth::BindingTenantRead;
+    if default_binding == BindingTenantRead::Bound(tenant) {
         return Ok(());
     }
-    match held {
-        Ok(slots) if slots.contains(&tenant) => Ok(()),
-        Ok(_) => Err(SpawnTenantRefusal::NotPaired { tenant }),
-        Err(error) => Err(SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error }),
+    match (held, default_binding) {
+        (Ok(slots), _) if slots.contains(&tenant) => Ok(()),
+        (Err(error), _) => Err(SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error }),
+        (Ok(_), BindingTenantRead::Unknown) => Err(SpawnTenantRefusal::CredentialStoreUnreadable {
+            tenant,
+            error: "the default-binding record (paired_user.json) could not be read".to_string(),
+        }),
+        (Ok(_), _) => Err(SpawnTenantRefusal::NotPaired { tenant }),
     }
 }
 
 /// The cwd-declared arm of P1: a spawn that chose `tenant` into a cwd whose
 /// `.mcp.json` already declares coord-mcp is admitted only when that file's key
-/// resolves to `tenant`.
+/// is LIVE and PINNED to `tenant` — the same rule
+/// [`reusable_in_cwd_device_nonce`] applies before handing a key to a session.
 ///
 /// The identity seam delivers no per-terminal credential to such a cwd (two
 /// `coord-mcp` entries would race, and the project file's precedence over an
 /// injected one is unmeasured), so the file's key IS the session's credential.
+/// "Resolves to `tenant`" is not enough: a stale or unpinned key resolves to
+/// whatever the machine reads at request time, which happening to be `tenant`
+/// today is not a credential for it.
 pub(crate) fn check_workdir_declared_tenant(
     workdir: &str,
     tenant: Uuid,
 ) -> Result<(), SpawnTenantRefusal> {
-    match workdir_credential_tenant(workdir) {
-        CredentialTenantRead::Resolved(Some(t)) if t == tenant => Ok(()),
+    match declared_workdir_key(workdir) {
+        DeclaredWorkdirKey::Pinned(t) if t == tenant => Ok(()),
         declared => Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
             tenant,
             declared_file: Path::new(workdir).join(".mcp.json"),
@@ -9154,10 +9307,41 @@ pub(crate) fn deliver_terminal_coord_mcp(
     spawn_tenant: Option<Uuid>,
     bound_port: Option<u16>,
 ) -> Result<TerminalCoordMcp, SpawnTenantRefusal> {
+    let delivered =
+        deliver_terminal_coord_mcp_unrecorded(cwd, terminal_id, spawn_tenant, bound_port)?;
+    record_terminal_coord_mcp_delivery(terminal_id, delivered.delivery);
+    Ok(delivered)
+}
+
+/// [`deliver_terminal_coord_mcp`] before the delivery is recorded.
+fn deliver_terminal_coord_mcp_unrecorded(
+    cwd: &str,
+    terminal_id: &str,
+    spawn_tenant: Option<Uuid>,
+    bound_port: Option<u16>,
+) -> Result<TerminalCoordMcp, SpawnTenantRefusal> {
     let credential_tenant = credential_spawn_tenant(spawn_tenant);
     if workdir_declares_coord_mcp(cwd) {
-        if let Some(tenant) = credential_tenant {
-            check_workdir_declared_tenant(cwd, tenant)?;
+        match credential_tenant {
+            Some(tenant) => check_workdir_declared_tenant(cwd, tenant)?,
+            // A spawn that chose NO tenant takes the machine's. If the cwd's key
+            // is pinned to a different tenant, the session will present that
+            // tenant's credential — admitted (refusing every tenant-less spawn
+            // into a tenant's worktree would be a new outage), but never
+            // silently: it is logged here, and the session-info tenancy report
+            // names it as a divergence against the device default.
+            None => {
+                if let DeclaredWorkdirKey::Pinned(pinned) = declared_workdir_key(cwd) {
+                    let machine = crate::session::tenant_pin::resolve_tenant_pin();
+                    if machine != crate::session::tenant_pin::TenantPin::Pinned(pinned) {
+                        warn!(
+                            "coord-mcp: terminal {terminal_id}: tenant-less spawn into {cwd}, whose \
+                             .mcp.json key is pinned to tenant {pinned} while this machine reads \
+                             {machine:?} — the session's coord-mcp writes go to {pinned}"
+                        );
+                    }
+                }
+            }
         }
         info!(
             "coord-mcp: terminal {terminal_id}: cwd already declares coord-mcp — skipping \
@@ -19917,6 +20101,15 @@ mod spawn_tenant_credential_tests {
         format!("term-{}", Uuid::new_v4())
     }
 
+    /// Does the registry hold ANY nonce minted for `terminal_id`?
+    fn terminal_has_nonce(terminal_id: &str) -> bool {
+        proxy_nonces()
+            .lock()
+            .unwrap()
+            .values()
+            .any(|b| b.terminal_id.as_deref() == Some(terminal_id))
+    }
+
     /// P1 acceptance 1. With spawn tenant B and machine pin A, the minted
     /// binding is `Pinned(B)` and the proxy resolves B — the credential follows
     /// the tenant the coord row names, not the machine.
@@ -19971,9 +20164,8 @@ mod spawn_tenant_credential_tests {
             "{text}"
         );
 
-        assert_eq!(
-            session_credential_tenant(&term, None),
-            CredentialTenantRead::NoNonce,
+        assert!(
+            !terminal_has_nonce(&term),
             "a refusal must register no nonce for the terminal"
         );
         let file = crate::session::claude_hook::session_restore_dir()
@@ -19985,15 +20177,27 @@ mod spawn_tenant_credential_tests {
         let early = precheck_spawn_tenant(Some(tenant_b())).expect_err("precheck refuses too");
         assert!(early.starts_with("terminal:tenant_not_paired:"), "{early}");
         // The device's default binding is admitted even with no tenant slot.
+        use crate::auth::BindingTenantRead;
         assert_eq!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![]), Some(tenant_b())),
+            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Bound(tenant_b())),
             Ok(())
         );
         // An unreadable store is UNKNOWN, refused rather than guessed.
         assert!(matches!(
-            spawn_tenant_admission(tenant_b(), Err("io".into()), None),
+            spawn_tenant_admission(tenant_b(), Err("io".into()), BindingTenantRead::Unbound),
             Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
         ));
+        // S4 (review): so is an unreadable DEFAULT-BINDING record — "not paired"
+        // would send the operator to pair a tenant that may already be paired.
+        assert!(matches!(
+            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Unknown),
+            Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
+        ));
+        // ...while a slot for the tenant admits it whatever the binding file says.
+        assert_eq!(
+            spawn_tenant_admission(tenant_b(), Ok(vec![tenant_b()]), BindingTenantRead::Unknown),
+            Ok(())
+        );
     }
 
     /// P1 acceptance 3. Persist → restore keeps `Pinned(B)` even though the
@@ -20117,15 +20321,12 @@ mod spawn_tenant_credential_tests {
             } => {
                 assert_eq!(*tenant, tenant_b());
                 assert_eq!(declared_file, &Path::new(&wd).join(".mcp.json"));
-                assert_eq!(declared, &CredentialTenantRead::Resolved(Some(tenant_a())));
+                assert_eq!(declared, &DeclaredWorkdirKey::Pinned(tenant_a()));
             }
             other => panic!("wrong refusal: {other:?}"),
         }
         assert!(refusal.to_string().contains(".mcp.json"), "{refusal}");
-        assert_eq!(
-            session_credential_tenant(&term, None),
-            CredentialTenantRead::NoNonce
-        );
+        assert!(!terminal_has_nonce(&term), "a refusal must mint nothing");
 
         // Unchosen spawns keep today's skip.
         assert!(matches!(
@@ -20137,6 +20338,9 @@ mod spawn_tenant_credential_tests {
         ));
 
         // The kill switch restores the machine-pin behaviour, refusal included.
+        // Safe to write: `isolated_ambient` holds the process env lock for the
+        // whole test, and the key is in `ambient::AMBIENT_ENV_KEYS`, so the
+        // fixture restores it on drop even if an assertion below panics.
         std::env::set_var(SPAWN_TENANT_CREDENTIAL_ENV, "0");
         let switched = deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT));
         std::env::remove_var(SPAWN_TENANT_CREDENTIAL_ENV);
@@ -20179,6 +20383,12 @@ mod spawn_tenant_credential_tests {
         );
         write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
         assert!(reusable_in_cwd_device_nonce(&wd, PORT, Some(tenant_b())).is_some());
+        // B1 (review): and a tenant-less spawn, whose tenant is the machine's
+        // (A), is never silently handed the B key either.
+        assert!(
+            reusable_in_cwd_device_nonce(&wd, PORT, None).is_none(),
+            "a tenant-B key must never be reused for a tenant-less session on an A machine"
+        );
     }
 
     /// P0 acceptance. A proxy nonce minted for terminal T while the machine pin
@@ -20197,7 +20407,14 @@ mod spawn_tenant_credential_tests {
 
         let credential = session_credential_tenant(&term, Some(&wd));
         assert_eq!(credential, CredentialTenantRead::Resolved(Some(tenant_a())));
-        let report = project_tenancy(Some(&tenant_b().to_string()), None, &credential, None, None);
+        let report = project_tenancy(
+            Some(&tenant_b().to_string()),
+            None,
+            &credential,
+            crate::auth::BindingTenantRead::Unknown,
+            None,
+            None,
+        );
         assert_eq!(report.row.tenant_id, Some(tenant_b().to_string()));
         assert_eq!(report.credential.status, TENANCY_RESOLVED);
         assert_eq!(report.credential.tenant_id, Some(tenant_a().to_string()));
@@ -20216,7 +20433,14 @@ mod spawn_tenant_credential_tests {
             matches!(refused, CredentialTenantRead::Refused(_)),
             "{refused:?}"
         );
-        let report = project_tenancy(Some(&tenant_b().to_string()), None, &refused, None, None);
+        let report = project_tenancy(
+            Some(&tenant_b().to_string()),
+            None,
+            &refused,
+            crate::auth::BindingTenantRead::Unknown,
+            None,
+            None,
+        );
         assert_eq!(report.credential.status, TENANCY_UNKNOWN);
         assert_eq!(report.credential.tenant_id, None);
         assert!(report
@@ -20224,6 +20448,131 @@ mod spawn_tenant_credential_tests {
             .reason
             .as_deref()
             .is_some_and(|r| r.starts_with("tenant_unresolvable:")));
+    }
+
+    /// B1 (review). A second spawn for ANOTHER tenant into an existing
+    /// worktree — whose `.mcp.json` carries the resident session's A key — is
+    /// refused, and neither rewrites that file nor evicts the resident's key.
+    #[test]
+    fn a_different_tenant_spawn_into_an_existing_worktree_neither_rewrites_nor_evicts() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "resident");
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_a()));
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let before = std::fs::read_to_string(&mcp).unwrap();
+        let resident = read_proxy_nonce(&mcp).unwrap();
+
+        assert!(matches!(
+            deliver_terminal_coord_mcp(&wd, &terminal(), Some(tenant_b()), Some(PORT)),
+            Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&mcp).unwrap(),
+            before,
+            "file rewritten"
+        );
+        assert!(live_binding(&resident).is_some(), "resident key evicted");
+        assert_eq!(
+            proxy_session_pin_for_nonce(&resident),
+            TenantPin::Pinned(tenant_a())
+        );
+    }
+
+    /// B1 (review). A tenant-less spawn into a cwd whose key is pinned to B, on
+    /// a machine reading A, is admitted — but the tenancy report names what it
+    /// presents: credential B against the device default A, diverged.
+    #[test]
+    fn a_tenantless_spawn_into_a_tenant_pinned_cwd_is_reported_not_silent() {
+        use crate::commands::session_info::project_tenancy;
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let (wd, term) = (workdir(&amb, "pinned-b"), terminal());
+        write_coord_mcp_proxy_config(&wd, PORT, Some(tenant_b()));
+
+        let delivered = deliver_terminal_coord_mcp(&wd, &term, None, Some(PORT)).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::WorkdirDeclared);
+        let credential = session_credential_tenant(&term, Some(&wd));
+        assert_eq!(credential, CredentialTenantRead::Resolved(Some(tenant_b())));
+        let report = project_tenancy(
+            None,
+            None,
+            &credential,
+            crate::auth::BindingTenantRead::Bound(tenant_a()),
+            Some(tenant_a()),
+            None,
+        );
+        assert!(
+            report.diverged,
+            "a B credential on an A-default session must diverge"
+        );
+    }
+
+    /// S1 (review). Admission into a declared cwd requires a LIVE key PINNED to
+    /// the chosen tenant. An unpinned key that happens to resolve to B through
+    /// the machine pin, and a key the proxy no longer accepts, both refuse.
+    #[test]
+    fn a_declared_cwd_admits_only_a_live_key_pinned_to_the_chosen_tenant() {
+        let amb = crate::test_env::isolated_ambient();
+        pair(tenant_b());
+
+        // Minted unpinned (MSI machine.json), then the machine moves to B: the
+        // key now RESOLVES to B, but it is not B's credential.
+        amb.write_machine_json(r#"{"device_id":"d"}"#);
+        let (wd, term) = (workdir(&amb, "unpinned"), terminal());
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        amb.write_active_tenant_id(tenant_b());
+        let nonce = read_proxy_nonce(&Path::new(&wd).join(".mcp.json")).unwrap();
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+        match deliver_terminal_coord_mcp(&wd, &term, Some(tenant_b()), Some(PORT)) {
+            Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
+                assert_eq!(declared, DeclaredWorkdirKey::NotPinned)
+            }
+            other => panic!("an unpinned key must refuse: {other:?}"),
+        }
+
+        // A stale key: pinned to B once, then gone from the registry.
+        let wd_stale = workdir(&amb, "stale");
+        write_coord_mcp_proxy_config(&wd_stale, PORT, Some(tenant_b()));
+        let stale = read_proxy_nonce(&Path::new(&wd_stale).join(".mcp.json")).unwrap();
+        proxy_nonces().lock().unwrap().remove(&stale);
+        match deliver_terminal_coord_mcp(&wd_stale, &terminal(), Some(tenant_b()), Some(PORT)) {
+            Err(SpawnTenantRefusal::WorkdirDeclaresOtherTenant { declared, .. }) => {
+                assert_eq!(declared, DeclaredWorkdirKey::NotLive)
+            }
+            other => panic!("a stale key must refuse: {other:?}"),
+        }
+        assert_eq!(
+            credential_tenant_for_nonce(Some(&stale)),
+            CredentialTenantRead::NotLive
+        );
+    }
+
+    /// N1 (review). The cwd `.mcp.json` is read as a session's credential only
+    /// when the seam recorded that it handed the session that file; otherwise
+    /// the answer is NoNonce, or UNKNOWN for a terminal this process never saw.
+    #[test]
+    fn the_cwd_key_is_the_sessions_credential_only_when_the_seam_recorded_it() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "n1");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+
+        assert_eq!(
+            session_credential_tenant(&terminal(), Some(&wd)),
+            CredentialTenantRead::DeliveryUnrecorded
+        );
+        let unprovisioned = terminal();
+        let plain = workdir(&amb, "n1-plain");
+        let delivered = deliver_terminal_coord_mcp(&plain, &unprovisioned, None, None).unwrap();
+        assert_eq!(delivered.delivery, CoordMcpDelivery::Unprovisioned);
+        assert_eq!(
+            session_credential_tenant(&unprovisioned, Some(&wd)),
+            CredentialTenantRead::NoNonce,
+            "a terminal the seam did not hand the cwd file must not report that file's key"
+        );
     }
 
     #[test]

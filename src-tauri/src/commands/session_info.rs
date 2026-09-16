@@ -371,6 +371,12 @@ pub struct TenancyRow {
     /// chose none, so coord's row carries whatever default the registry
     /// stamped; it does NOT mean the session has no tenant.
     pub tenant_id: Option<String>,
+    /// The machine's CURRENT default tenant for new sessions
+    /// (`machine.json::active_tenant_id`). Compared for divergence only when
+    /// neither `tenantId` nor the data plane names a tenant — a tenant-less
+    /// spawn's expected tenant — so a session presenting another tenant's key
+    /// (a tenant-pinned cwd `.mcp.json`) is never silently reported as agreeing.
+    pub device_default_tenant_id: Option<String>,
 }
 
 /// The runner data-plane tenant: what the runner's own work-scoped coord writes
@@ -378,11 +384,14 @@ pub struct TenancyRow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenancyDataPlane {
-    /// `"owned"` (a tenant is stamped on the registry session) | `"device"` |
-    /// `"unresolved"` | `"unknown"` (no registry session to ask — `reason`).
+    /// `"owned"` (a tenant is stamped on the registry session) | `"device"`
+    /// (the default binding's credential; `tenantId` is that binding) |
+    /// `"unresolved"` | `"unknown"` (`reason`: `no_coord_session`,
+    /// `default_binding_unknown`).
     pub status: String,
     pub tenant_id: Option<String>,
-    /// Set when `status` is `"unknown"`.
+    /// Why `tenantId` is absent: set for `"unknown"`, and for `"device"` on a
+    /// device with no default binding (`default_binding_unbound`).
     pub reason: Option<String>,
 }
 
@@ -417,7 +426,9 @@ pub struct TenancyCredential {
     /// `"tenant"` (a per-tenant slot) | `"default"` (the legacy default slot);
     /// `None` while unknown.
     pub slot: Option<String>,
-    /// Set when `status` is `"unknown"`: `no_session_nonce`, or
+    /// Set when `status` is `"unknown"`: `no_session_nonce`,
+    /// `coord_mcp_delivery_unrecorded`, `nonce_not_live`,
+    /// `default_slot_binding_unbound`, `default_slot_binding_unknown`, or
     /// `tenant_unresolvable: <the proxy's refusal>`.
     pub reason: Option<String>,
     pub posture: TenancyPosture,
@@ -451,16 +462,19 @@ pub struct SessionTenancy {
 ///   no registry session to ask.
 /// - `credential` — what the session's coord-mcp nonce resolves to.
 /// - `default_binding` — the device's default binding, which is the tenant
-///   behind the legacy default slot.
+///   behind the legacy default slot. An `Unknown` or `Unbound` read makes every
+///   default-slot answer UNKNOWN rather than a tenant-less "resolved".
+/// - `device_default` — the machine's current default tenant for new sessions.
 /// - `posture` — the runner's published credential posture.
 pub(crate) fn project_tenancy(
     row_tenant: Option<&str>,
     data_plane: Option<crate::auth::TenantScope>,
     credential: &crate::coord_mcp::CredentialTenantRead,
-    default_binding: Option<uuid::Uuid>,
+    default_binding: crate::auth::BindingTenantRead,
+    device_default: Option<uuid::Uuid>,
     posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
 ) -> SessionTenancy {
-    use crate::auth::TenantScope;
+    use crate::auth::{BindingTenantRead, TenantScope};
     use crate::coord_mcp::CredentialTenantRead;
 
     let row_tenant = row_tenant.map(str::trim).filter(|t| !t.is_empty());
@@ -470,10 +484,24 @@ pub(crate) fn project_tenancy(
             tenant_id: Some(t.to_string()),
             reason: None,
         },
-        Some(TenantScope::Device) => TenancyDataPlane {
-            status: "device".to_string(),
-            tenant_id: None,
-            reason: None,
+        // `Device` presents the default binding's credential, so it acts as
+        // that binding's tenant — and takes part in `diverged` like any other.
+        Some(TenantScope::Device) => match default_binding {
+            BindingTenantRead::Bound(t) => TenancyDataPlane {
+                status: "device".to_string(),
+                tenant_id: Some(t.to_string()),
+                reason: None,
+            },
+            BindingTenantRead::Unbound => TenancyDataPlane {
+                status: "device".to_string(),
+                tenant_id: None,
+                reason: Some("default_binding_unbound".to_string()),
+            },
+            BindingTenantRead::Unknown => TenancyDataPlane {
+                status: TENANCY_UNKNOWN.to_string(),
+                tenant_id: None,
+                reason: Some("default_binding_unknown".to_string()),
+            },
         },
         Some(TenantScope::Unresolved) => TenancyDataPlane {
             status: "unresolved".to_string(),
@@ -490,11 +518,18 @@ pub(crate) fn project_tenancy(
     // (the tenant the credential selects, the session tenant the posture gate
     // compares against) — the second is `None` for the default slot, which is
     // how `posture_describes_session_slot` spells it.
-    let credential_slot: Result<(Option<uuid::Uuid>, Option<uuid::Uuid>), String> = match credential
-    {
-        CredentialTenantRead::Resolved(Some(t)) => Ok((Some(*t), Some(*t))),
-        CredentialTenantRead::Resolved(None) => Ok((default_binding, None)),
+    let credential_slot: Result<(uuid::Uuid, Option<uuid::Uuid>), String> = match credential {
+        CredentialTenantRead::Resolved(Some(t)) => Ok((*t, Some(*t))),
+        CredentialTenantRead::Resolved(None) => match default_binding {
+            BindingTenantRead::Bound(t) => Ok((t, None)),
+            BindingTenantRead::Unbound => Err("default_slot_binding_unbound".to_string()),
+            BindingTenantRead::Unknown => Err("default_slot_binding_unknown".to_string()),
+        },
         CredentialTenantRead::NoNonce => Err("no_session_nonce".to_string()),
+        CredentialTenantRead::DeliveryUnrecorded => {
+            Err("coord_mcp_delivery_unrecorded".to_string())
+        }
+        CredentialTenantRead::NotLive => Err("nonce_not_live".to_string()),
         CredentialTenantRead::Refused(body) => Err(format!("tenant_unresolvable: {body}")),
     };
     let credential = match &credential_slot {
@@ -518,7 +553,7 @@ pub(crate) fn project_tenancy(
             };
             TenancyCredential {
                 status: TENANCY_RESOLVED.to_string(),
-                tenant_id: tenant.map(|t| t.to_string()),
+                tenant_id: Some(tenant.to_string()),
                 slot: Some(
                     if session_tenant.is_some() {
                         "tenant"
@@ -540,7 +575,15 @@ pub(crate) fn project_tenancy(
         },
     };
 
-    let mut known: Vec<String> = Vec::with_capacity(3);
+    // The expected tenant of a spawn that chose none is the device default —
+    // compared only when nothing better (the stamp, the registry) names one.
+    let device_default = device_default.map(|t| t.to_string());
+    let expected = row_tenant
+        .map(String::from)
+        .or_else(|| data_plane.tenant_id.clone())
+        .or_else(|| device_default.clone());
+    let mut known: Vec<String> = Vec::with_capacity(4);
+    known.extend(expected.as_deref().map(str::to_ascii_lowercase));
     known.extend(row_tenant.map(str::to_ascii_lowercase));
     known.extend(data_plane.tenant_id.as_deref().map(str::to_ascii_lowercase));
     known.extend(credential.tenant_id.as_deref().map(str::to_ascii_lowercase));
@@ -550,6 +593,7 @@ pub(crate) fn project_tenancy(
     SessionTenancy {
         row: TenancyRow {
             tenant_id: row_tenant.map(String::from),
+            device_default_tenant_id: device_default,
         },
         data_plane,
         credential,
@@ -586,7 +630,8 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         rec.tenant_id.as_deref(),
         data_plane,
         &credential,
-        crate::auth::default_binding_tenant(),
+        crate::auth::default_binding_tenant_probe(),
+        crate::session::tenant_pin::resolve_tenant_pin().pinned(),
         crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
     )
 }
@@ -1077,6 +1122,7 @@ mod tests {
             None,
             None,
             &crate::coord_mcp::CredentialTenantRead::NoNonce,
+            crate::auth::BindingTenantRead::Unknown,
             None,
             None,
         )
@@ -1115,6 +1161,7 @@ mod tests {
             Some(&b.to_string()),
             Some(crate::auth::TenantScope::Owned(b)),
             &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
+            crate::auth::BindingTenantRead::Unknown,
             None,
             Some(&status),
         );
@@ -1137,6 +1184,7 @@ mod tests {
             Some(&b.to_string()),
             None,
             &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
+            crate::auth::BindingTenantRead::Unknown,
             None,
             Some(&status),
         );
@@ -1159,7 +1207,8 @@ mod tests {
             Some(&b.to_string()),
             None,
             &crate::coord_mcp::CredentialTenantRead::Resolved(None),
-            Some(a),
+            crate::auth::BindingTenantRead::Bound(a),
+            None,
             None,
         );
         assert_eq!(t.credential.slot.as_deref(), Some("default"));
@@ -1176,13 +1225,118 @@ mod tests {
             Some(&b.to_string()),
             None,
             &crate::coord_mcp::CredentialTenantRead::NoNonce,
-            Some(tenant(0xA1)),
+            crate::auth::BindingTenantRead::Bound(tenant(0xA1)),
+            None,
             None,
         );
         assert_eq!(t.credential.status, TENANCY_UNKNOWN);
         assert_eq!(t.credential.tenant_id, None);
         assert_eq!(t.credential.reason.as_deref(), Some("no_session_nonce"));
         assert!(!t.diverged);
+    }
+
+    /// S2 (review). A default-slot credential on a device whose default binding
+    /// is unbound or unreadable names no tenant, so it is UNKNOWN — never
+    /// `resolved` with a null tenant that a badge reads as "acting as B". A
+    /// nonce the proxy no longer accepts is UNKNOWN too.
+    #[test]
+    fn tenancy_never_resolves_a_default_slot_whose_binding_is_not_known() {
+        use crate::auth::BindingTenantRead;
+        use crate::coord_mcp::CredentialTenantRead;
+        let b = tenant(0xB2);
+        for (binding, reason) in [
+            (BindingTenantRead::Unbound, "default_slot_binding_unbound"),
+            (BindingTenantRead::Unknown, "default_slot_binding_unknown"),
+        ] {
+            let t = project_tenancy(
+                Some(&b.to_string()),
+                None,
+                &CredentialTenantRead::Resolved(None),
+                binding,
+                None,
+                None,
+            );
+            assert_eq!(t.credential.status, TENANCY_UNKNOWN, "{binding:?}");
+            assert_eq!(t.credential.slot, None);
+            assert_eq!(t.credential.reason.as_deref(), Some(reason));
+        }
+        let stale = project_tenancy(
+            Some(&b.to_string()),
+            None,
+            &CredentialTenantRead::NotLive,
+            BindingTenantRead::Bound(b),
+            None,
+            None,
+        );
+        assert_eq!(stale.credential.status, TENANCY_UNKNOWN);
+        assert_eq!(stale.credential.reason.as_deref(), Some("nonce_not_live"));
+    }
+
+    /// S3 (review). A `Device` data plane presents the default binding's
+    /// credential, so it acts as that tenant and takes part in `diverged`; an
+    /// unreadable binding makes it unknown rather than tenant-less.
+    #[test]
+    fn tenancy_maps_a_device_data_plane_through_the_default_binding() {
+        use crate::auth::{BindingTenantRead, TenantScope};
+        use crate::coord_mcp::CredentialTenantRead;
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let t = project_tenancy(
+            None,
+            Some(TenantScope::Device),
+            &CredentialTenantRead::Resolved(Some(b)),
+            BindingTenantRead::Bound(a),
+            None,
+            None,
+        );
+        assert_eq!(t.data_plane.status, "device");
+        assert_eq!(t.data_plane.tenant_id, Some(a.to_string()));
+        assert!(
+            t.diverged,
+            "a Device data plane on A and a credential on B diverge"
+        );
+
+        let unknown = project_tenancy(
+            None,
+            Some(TenantScope::Device),
+            &CredentialTenantRead::Resolved(Some(b)),
+            BindingTenantRead::Unknown,
+            None,
+            None,
+        );
+        assert_eq!(unknown.data_plane.status, TENANCY_UNKNOWN);
+        assert_eq!(
+            unknown.data_plane.reason.as_deref(),
+            Some("default_binding_unknown")
+        );
+    }
+
+    /// B1 (review). A tenant-less spawn whose credential is another tenant's
+    /// (a tenant-pinned cwd key) diverges from the device default even when
+    /// nothing else names a tenant — it is never reported as agreeing.
+    #[test]
+    fn tenancy_compares_a_tenantless_session_against_the_device_default() {
+        use crate::auth::BindingTenantRead;
+        use crate::coord_mcp::CredentialTenantRead;
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let t = project_tenancy(
+            None,
+            None,
+            &CredentialTenantRead::Resolved(Some(b)),
+            BindingTenantRead::Bound(a),
+            Some(a),
+            None,
+        );
+        assert_eq!(t.row.device_default_tenant_id, Some(a.to_string()));
+        assert!(t.diverged);
+        let agreeing = project_tenancy(
+            None,
+            None,
+            &CredentialTenantRead::Resolved(Some(a)),
+            BindingTenantRead::Bound(a),
+            Some(a),
+            None,
+        );
+        assert!(!agreeing.diverged);
     }
 
     #[test]

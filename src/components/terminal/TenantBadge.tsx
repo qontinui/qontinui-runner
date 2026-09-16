@@ -89,7 +89,12 @@ export function tenantBadgeLabel(
     const text = `${stamped ? stem(stamped) : "?"}≠${credential ? stem(credential) : "?"}`;
     const lines = [
       `TENANT MISMATCH — this session does not act as one tenant.`,
-      `Spawned for: ${stamped ?? "not recorded"}`,
+      `Spawned for: ${
+        stamped ??
+        (tenancy.row.deviceDefaultTenantId
+          ? `no choice (device default ${tenancy.row.deviceDefaultTenantId})`
+          : "not recorded")
+      }`,
       `Runner writes: ${tenancy.dataPlane.tenantId ?? tenancy.dataPlane.status}`,
       `coord-mcp writes (memory, prompt documents, gates): ${
         credential ?? `unknown (${tenancy.credential.reason ?? "no reason given"})`

@@ -218,6 +218,18 @@ pub async fn list_terminals_handler(
     }))))
 }
 
+/// `POST /terminals`' spawn-tenant admission: the shared
+/// [`crate::commands::terminal::admit_spawn_tenant`], answered as a 400 naming
+/// the refusal (a malformed or unpaired tenant is the caller's to fix).
+fn spawn_tenant_or_bad_request(
+    raw: Option<&str>,
+) -> Result<Option<uuid::Uuid>, (StatusCode, Json<ApiResponse<()>>)> {
+    crate::commands::terminal::admit_spawn_tenant(raw).map_err(|e| {
+        warn!("HTTP: rejecting terminal create — {e}");
+        (StatusCode::BAD_REQUEST, Json(api_error(e)))
+    })
+}
+
 /// Create a new terminal session.
 pub async fn create_terminal_handler(
     State(state): State<Arc<ApiState>>,
@@ -252,12 +264,7 @@ pub async fn create_terminal_handler(
     // The spawn tenant is judged BEFORE the worktree allocation below, which a
     // refusal would otherwise leak. A malformed or unpaired tenant is the
     // caller's to fix, so both are a 400 naming the heal.
-    let spawn_tenant = crate::commands::terminal::parse_spawn_tenant(request.tenant_id.as_deref())
-        .and_then(|tenant| crate::coord_mcp::precheck_spawn_tenant(tenant).map(|()| tenant))
-        .map_err(|e| {
-            warn!("HTTP: rejecting terminal create — {e}");
-            (StatusCode::BAD_REQUEST, Json(api_error(e)))
-        })?;
+    let spawn_tenant = spawn_tenant_or_bad_request(request.tenant_id.as_deref())?;
 
     // Phase 2 round 2 — route through the shared `acquire_for_terminal`
     // helper so this entry point matches the other five
@@ -1039,6 +1046,37 @@ pub fn route_entries() -> &'static [(&'static str, &'static str)] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N4 (review of plan 2026-09-10). `POST /terminals` answers a tenant this
+    /// runner holds no credential for with a 400 naming the pairing command —
+    /// before any allocation — and a malformed one with a 400 too.
+    #[test]
+    fn post_terminals_refuses_an_unpaired_spawn_tenant_with_a_400() {
+        let amb = crate::test_env::isolated_ambient();
+        let (a, b) = (uuid::Uuid::from_u128(0xA1), uuid::Uuid::from_u128(0xB2));
+        amb.write_active_tenant_id(a);
+        crate::auth::AuthManager::new()
+            .store_tenant_device_jwt(&a, "header.payload.signature")
+            .unwrap();
+
+        let (status, Json(body)) =
+            spawn_tenant_or_bad_request(Some(&b.to_string())).expect_err("unpaired → refused");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(text.contains("terminal:tenant_not_paired"), "{text}");
+        assert!(
+            text.contains("qontinui_profile device pair --tenant-id"),
+            "{text}"
+        );
+
+        let (status, _) = spawn_tenant_or_bad_request(Some("not-a-uuid")).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            spawn_tenant_or_bad_request(Some(&a.to_string())).unwrap(),
+            Some(a)
+        );
+        assert_eq!(spawn_tenant_or_bad_request(None).unwrap(), None);
+    }
 
     #[test]
     fn strip_ansi_removes_sgr_color_codes() {
