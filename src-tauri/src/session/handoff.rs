@@ -21,8 +21,11 @@
 //! So the receiver is **push-driven, not poll-driven**:
 //!
 //! 1. **Real-time push.** The receiver opens a coord `/ws` subscription
-//!    scoped to `?pattern=qontinui.sessions.*` and filters inbound
-//!    envelopes for `…<self-device>.handoff_request`. Server-side fan-out
+//!    under the closed-set name `sessions`
+//!    (`qontinui_runner_lib::coord_ws::Subscription::Sessions`), which coord
+//!    resolves server-side to `qontinui.sessions.<tenant>.<self-device>.*`
+//!    from the upgrade credential's claims, and filters inbound envelopes
+//!    for `…<self-device>.handoff_request`. Server-side fan-out
 //!    (coord PUBLISHes to the target machine's subject) means no
 //!    N-runners-polling — the target machine sees the request the instant
 //!    coord records it. This reuses the existing runner↔coord relay
@@ -114,13 +117,6 @@ use super::{SessionKind, SessionRegistry};
 const RECONNECT_BACKOFF_FLOOR: Duration = Duration::from_secs(2);
 /// Reconnect backoff ceiling.
 const RECONNECT_BACKOFF_CEIL: Duration = Duration::from_secs(60);
-
-/// Coord `/ws` Redis-pub/sub glob the receiver subscribes to. Scopes the
-/// fan-out to session subjects only (NOT the broader `events.*` family
-/// `agent_runtime.rs` consumes), so coord's PSUBSCRIBE doesn't relay every
-/// build/claim event to this socket. The handoff payload lands on
-/// `qontinui.sessions.<tenant>.<target-machine>.handoff_request`.
-const SESSION_WS_PATTERN: &str = "qontinui.sessions.*";
 
 /// Purpose suffix a HANDOFF stamps on the child intent. Parameterised (rather
 /// than inlined) because the respawn receiver reuses
@@ -258,9 +254,10 @@ pub async fn trigger_handoff(
 /// Start the handoff-receiver task. Returns the [`JoinHandle`] so
 /// `main.rs` can keep it alive for the lifetime of the process.
 ///
-/// The task is **push-driven**: it opens a coord `/ws` subscription scoped
-/// to `qontinui.sessions.*` and materializes each `handoff_request`
-/// addressed to this device the instant coord fans it out. On every
+/// The task is **push-driven**: it opens a coord `/ws` subscription under
+/// the `sessions` name (this tenant's subjects for this device) and
+/// materializes each `handoff_request` addressed to this device the
+/// instant coord fans it out. On every
 /// (re)connect it also runs a single catch-up GET so anything published
 /// while the runner was offline is replayed. Plan §Phase 7.
 ///
@@ -275,30 +272,19 @@ pub fn start_receiver_task(
     tokio::spawn(run_receiver_loop(registry, lifecycle_store))
 }
 
-/// Derive coord's `/ws` URL (with the session pattern) from the resolved
-/// coord HTTP base in `CoordSync`. The runner's `CoordSync` stores the
-/// coord base in HTTP(S) form; the WS upgrade endpoint is the same host
-/// with the scheme swapped and `/ws` appended.
+/// Derive coord's `/ws` URL (with the `sessions` subscription) from the
+/// resolved coord HTTP base in `CoordSync`. The runner's `CoordSync` stores
+/// the coord base in HTTP(S) form; the shared builder swaps the scheme and
+/// appends `/ws` idempotently. Coord narrows the subscription to
+/// `qontinui.sessions.<tenant>.<device>.*` from the upgrade credential — the
+/// receiver's own filter ([`parse_handoff_push`]) already matches on
+/// `.<self-device>.handoff_request`, so the tighter server-side scope
+/// removes only frames it discarded anyway.
 fn coord_ws_url(coord_http_base: &str) -> String {
-    let base = coord_http_base.trim_end_matches('/');
-    let ws_base = base
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .or_else(|| {
-            base.strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-        })
-        .unwrap_or_else(|| base.to_string());
-    format!(
-        "{ws_base}/ws?pattern={}",
-        urlencode_pattern(SESSION_WS_PATTERN)
+    qontinui_runner_lib::coord_ws::build_ws_url(
+        coord_http_base,
+        qontinui_runner_lib::coord_ws::Subscription::Sessions,
     )
-}
-
-/// Minimal percent-encoding for the one glob char (`*`) we put in the
-/// query string. Avoids pulling a urlencoding dep for a single literal.
-fn urlencode_pattern(pattern: &str) -> String {
-    pattern.replace('*', "%2A")
 }
 
 /// The receiver loop. Reconnects the coord `/ws` push subscription with
@@ -361,7 +347,7 @@ async fn connect_and_pump(
     ws_url: &str,
     device_id: Uuid,
 ) -> Result<(), HandoffError> {
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url)
+    let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "session handoff")
         .await
         .map_err(|e| HandoffError::Http(format!("connect coord /ws {ws_url}: {e}")))?;
 
@@ -1383,14 +1369,14 @@ mod tests {
     }
 
     #[test]
-    fn coord_ws_url_swaps_scheme_and_appends_pattern() {
+    fn coord_ws_url_swaps_scheme_and_subscribes_as_sessions() {
         assert_eq!(
             coord_ws_url("http://localhost:9870"),
-            "ws://localhost:9870/ws?pattern=qontinui.sessions.%2A"
+            "ws://localhost:9870/ws?subscribe=sessions"
         );
         assert_eq!(
             coord_ws_url("https://coord.qontinui.io/"),
-            "wss://coord.qontinui.io/ws?pattern=qontinui.sessions.%2A"
+            "wss://coord.qontinui.io/ws?subscribe=sessions"
         );
     }
 

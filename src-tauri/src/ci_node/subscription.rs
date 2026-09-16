@@ -1,19 +1,22 @@
 //! Coord `/ws` subscription for CI dispatches.
 //!
 //! Design choice (plan Phase 2): a SECOND, dedicated subscription socket
-//! with its own `?pattern=` rather than broadening the agent-spawn
-//! subscription's glob. Coord's `/ws` is a Redis PSUBSCRIBE bridge (one
-//! pattern per connection), so widening the existing pattern would change
+//! with its own subscription rather than broadening the agent-spawn
+//! subscription. Coord's `/ws` is a Redis PSUBSCRIBE bridge (one
+//! subscription per connection), so widening the existing one would change
 //! the agent-runtime connection's URL and delivery set — this keeps the
 //! spawn path byte-for-byte unchanged and gives the CI channel family its
 //! own independently-reconnecting socket.
 //!
-//! The Redis glob `events.ci.*.<device_id>` matches the whole CI channel
-//! family — `build_requested`, `build_cancelled` and `settings_requested`
-//! (`*` in Redis patterns crosses word boundaries but the trailing
-//! `.<device_id>` still anchors the device), so one pattern covers all
-//! three; exact-match routing in [`route_ci_channel`] decides what each
-//! frame is.
+//! The subscription is the closed-set name `device_ci`
+//! (`qontinui_runner_lib::coord_ws::Subscription::DeviceCi`), which coord
+//! resolves server-side to the glob `events.ci.*.<device_id>` for the
+//! device_id of the credential presented at upgrade. That glob matches the
+//! whole CI channel family — `build_requested`, `build_cancelled` and
+//! `settings_requested` (`*` in Redis patterns crosses word boundaries but
+//! the trailing `.<device_id>` still anchors the device), so one
+//! subscription covers all three; exact-match routing in
+//! [`route_ci_channel`] decides what each frame is.
 //!
 //! # Why the socket is now held even when `ci_node` is DISABLED
 //!
@@ -58,27 +61,6 @@ const CI_KEEPALIVE_INTERVAL_SECS: u64 = 20;
 /// socket to hold, so poll for one at a lazy interval.
 const CI_NO_COORD_URL_RETRY_SECS: u64 = 60;
 
-/// Pure builder for the CI-dispatch WS subscription URL. Same
-/// normalization rules as `agent_runtime::build_coord_ws_url` (scheme swap,
-/// idempotent `/ws` append), but with the CI channel-family pattern.
-pub(crate) fn build_ci_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String {
-    let base = coord_url.trim().trim_end_matches('/');
-    let ws_base = base
-        .strip_prefix("https://")
-        .map(|rest| format!("wss://{rest}"))
-        .or_else(|| {
-            base.strip_prefix("http://")
-                .map(|rest| format!("ws://{rest}"))
-        })
-        .unwrap_or_else(|| base.to_string());
-    let ws_base = if ws_base.ends_with("/ws") {
-        ws_base
-    } else {
-        format!("{ws_base}/ws")
-    };
-    format!("{ws_base}?pattern=events.ci.*.{device_id}")
-}
-
 /// Resolve the CI-dispatch WS URL through [`profiles::connected_coord_base`] —
 /// the SAME door `ci_node::spawn_ci_node_runtime`'s gate uses, and the same
 /// source of truth as `agent_runtime::coord_ws_url`.
@@ -91,11 +73,15 @@ pub(crate) fn build_ci_ws_url(coord_url: &str, device_id: uuid::Uuid) -> String 
 /// read the same fact.
 ///
 /// The base arrives with any `/ws` suffix already stripped
-/// (`profiles::coord_ws_to_http`); [`build_ci_ws_url`] flips the scheme and
-/// re-appends it idempotently.
-fn ci_ws_url(device_id: uuid::Uuid) -> Option<String> {
+/// (`profiles::coord_ws_to_http`); the shared builder flips the scheme and
+/// re-appends it idempotently. The device is not part of the URL: coord
+/// resolves the `device_ci` subscription from the upgrade credential.
+fn ci_ws_url() -> Option<String> {
     let coord_base = qontinui_runner_lib::profiles::connected_coord_base()?;
-    Some(build_ci_ws_url(&coord_base, device_id))
+    Some(qontinui_runner_lib::coord_ws::build_ws_url(
+        &coord_base,
+        qontinui_runner_lib::coord_ws::Subscription::DeviceCi,
+    ))
 }
 
 /// The CI channels this device consumes.
@@ -151,7 +137,7 @@ pub(crate) fn parse_envelope_json(envelope: &serde_json::Value) -> Option<serde_
 pub(crate) async fn subscribe_loop(device_id: uuid::Uuid) {
     let mut backoff_ms: u64 = CI_BACKOFF_BASE_MS;
     loop {
-        let Some(ws_url) = ci_ws_url(device_id) else {
+        let Some(ws_url) = ci_ws_url() else {
             warn!(
                 "ci_node: runner is ISOLATED (no coord configured, not a hosted tier); \
                  retrying in {CI_NO_COORD_URL_RETRY_SECS}s"
@@ -196,7 +182,7 @@ async fn connect_and_pump_ci(ws_url: &str, device_id: uuid::Uuid) -> anyhow::Res
     use tokio::time::MissedTickBehavior;
     use tokio_tungstenite::tungstenite::Message;
 
-    let (mut ws, _resp) = tokio_tungstenite::connect_async(ws_url).await?;
+    let mut ws = qontinui_runner_lib::coord_ws::connect(ws_url, "ci_node").await?;
     info!("ci_node: WS connected for device_id={device_id}");
 
     let mut keepalive = tokio::time::interval(Duration::from_secs(CI_KEEPALIVE_INTERVAL_SECS));
@@ -276,19 +262,6 @@ fn handle_ci_message(txt: &str, device_id: uuid::Uuid) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ci_ws_url_appends_ws_to_bare_host() {
-        let device = uuid::Uuid::nil();
-        assert_eq!(
-            build_ci_ws_url("http://localhost:9870", device),
-            format!("ws://localhost:9870/ws?pattern=events.ci.*.{device}")
-        );
-        assert_eq!(
-            build_ci_ws_url("https://coord.qontinui.io", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}")
-        );
-    }
-
     /// REGRESSION (P2a review #2): `spawn_ci_node_runtime` gates on
     /// `connected_coord_base().is_none()`, so `ci_ws_url` must resolve from the
     /// same door. Reading the raw profile `coord_url` left a hosted
@@ -303,14 +276,11 @@ mod tests {
         // case below resolves `qontinui_account` on a developer box that is
         // paired or headless. `isolated_ambient()` pins the whole declared
         // surface (`ambient::AMBIENT_ENV_KEYS`) and owns the settings.json.
-        let device = uuid::Uuid::nil();
         // (settings.json body, expected ws url)
         let cases: [(&str, Option<String>); 3] = [
             (
                 r#"{"tier":"qontinui_account"}"#,
-                Some(format!(
-                    "wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}"
-                )),
+                Some("wss://coord.qontinui.io/ws?subscribe=device_ci".to_string()),
             ),
             // Non-hosted: isolated — no dev-localhost guess leaks through.
             (r#"{"tier":"local"}"#, None),
@@ -326,7 +296,7 @@ mod tests {
             // See `crate::test_env::coord_base_diagnostic`.
             let before = crate::test_env::coord_base_diagnostic();
             let gate = qontinui_runner_lib::profiles::connected_coord_base();
-            let ws = ci_ws_url(device);
+            let ws = ci_ws_url();
             assert_eq!(
                 gate.is_some(),
                 ws.is_some(),
@@ -341,21 +311,6 @@ mod tests {
                 crate::test_env::coord_base_diagnostic()
             );
         }
-    }
-
-    #[test]
-    fn ci_ws_url_does_not_double_append_ws() {
-        // The shipped profiles' coord_url already ends in `/ws` — must stay
-        // a single `/ws` (a `/ws/ws` 401s at the ALB).
-        let device = uuid::Uuid::nil();
-        assert_eq!(
-            build_ci_ws_url("wss://coord.qontinui.io/ws", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}")
-        );
-        assert_eq!(
-            build_ci_ws_url("https://coord.qontinui.io/ws/", device),
-            format!("wss://coord.qontinui.io/ws?pattern=events.ci.*.{device}")
-        );
     }
 
     /// Channel routing: the NEW channels route to their arms; the OLD
