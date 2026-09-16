@@ -42,10 +42,7 @@ use crate::mcp::types::ApiResponse;
 /// segment.
 /// Verified against the live route registrations + handler bodies.
 const DB_BACKED_PREFIXES: &[&str] = &[
-    // Coordinator / planning / tasks
-    "/coordinator",
-    "/workers",
-    "/tasks", // completion_reports: /tasks/{id}/report, /add-dependency
+    // task runs
     "/task-run",
     "/task-runs",
     "/current-execution",
@@ -62,7 +59,6 @@ const DB_BACKED_PREFIXES: &[&str] = &[
     "/triggers", // (exempt: /triggers/status)
     "/hooks",
     // Reflection / productivity / learning
-    "/productivity", // reflection module
     "/productivity-knowledge",
     "/reflection", // reflection_api
     "/reflection-fixes",
@@ -155,9 +151,6 @@ const DB_BACKED_EXACT: &[&str] = &[
     "/run-workflow",
     // api_requests
     "/api-request/import-to-library",
-    // completion_sources (ci-pipeline is a DB-free stub)
-    "/completion-sources/github-merge",
-    "/completion-sources/manual-user-fire",
     // api_spec_verify (api-specs GET is filesystem)
     "/ui-bridge/specs/verify-api",
     // state_machine (runtime/bridge routes are DB-free)
@@ -284,8 +277,6 @@ mod tests {
     #[test]
     fn whole_db_families_match_at_and_under_prefix() {
         for p in [
-            "/coordinator/state",
-            "/workers",
             "/task-runs",
             "/task-runs/abc-123/output",
             "/task-run/abc/events",
@@ -321,7 +312,6 @@ mod tests {
             "/instances",
             "/instances/purge-stale",
             "/api-request/import-to-library",
-            "/completion-sources/github-merge",
             "/ui-bridge/specs/verify-api",
             "/state-machine/configs/import",
             "/state-machine/current",
@@ -357,7 +347,6 @@ mod tests {
             "/instances/spawn",
             "/instances/abc/heartbeat",
             "/api-request/test",
-            "/completion-sources/ci-pipeline",
             "/api-surface/scan",
             "/memory/invalidate-graph-cache",
             "/graph/neighborhood",
@@ -383,10 +372,10 @@ mod tests {
 
     #[test]
     fn segment_boundary_not_substring() {
-        // /productivity must not catch /productivity-knowledge (different segment).
-        assert!(route_requires_db("/productivity/reflection/p1"));
-        assert!(route_requires_db("/productivity-knowledge/search")); // its own prefix
-                                                                      // A lookalike that is neither prefix:
+        // /productivity-knowledge is its own segment; a lookalike prefix and
+        // the deleted board's /productivity family must not match.
+        assert!(route_requires_db("/productivity-knowledge/search"));
+        assert!(!route_requires_db("/productivity/reflection/p1"));
         assert!(!route_requires_db("/productivityx"));
         // /trace vs /traces (distinct segments).
         assert!(route_requires_db("/traces/abc")); // task_runs /traces prefix

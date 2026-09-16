@@ -11,10 +11,13 @@
 //!   exactly 1536 long before insert.
 //!
 //! Search path:
-//! - `GET /productivity-knowledge/search?q=&area=&topK=` — FTS-only in v1.
-//!   Vector search is exposed via the Tauri command in
-//!   `commands/productivity.rs::search_knowledge` once a frontend wants it;
-//!   the HTTP path is intentionally narrow.
+//! - `GET /productivity-knowledge/search?q=&area=&topK=` — FTS-only, as is
+//!   the `commands::knowledge::search_knowledge` Tauri command beside it.
+//!   Vector search is exposed NOWHERE today: its only reader went with the
+//!   plan/task board in Phase 4 of
+//!   `2026-09-12-consolidate-local-orchestration-onto-conductor`, and the
+//!   `search_knowledge_vector` query was deleted with it. The embeddings are
+//!   still written on insert, so restoring it is a read-side change.
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

@@ -1,17 +1,14 @@
 //! PostgreSQL CRUD for the `project.coordinator_decisions` table.
 //!
-//! See §4 of `qontinui-dev-notes/plans/productivity-stack.md`. Every decision
-//! the Coordinator makes — cheap-rule fires, escalations, and even no-ops —
-//! is logged here. The dashboard's Decision Log renders these
-//! chronologically; the Escalations panel filters for unresolved rows whose
-//! action is destructive (`escalate`, `kill-session`,
-//! `force-promote-to-worktree`).
-//!
-//! Inserts come from `mcp::coordinator::POST /coordinator/act`. Reads come
-//! from the dashboard via Tauri commands in `commands::productivity`.
+//! See §4 of `qontinui-dev-notes/plans/productivity-stack.md`. Since Phase 4
+//! of `2026-09-12-consolidate-local-orchestration-onto-conductor` deleted
+//! the Productivity scheduler and its dashboard, the only writer is the
+//! `crate::deconflict` loop (`advise-with-text` advisories) and the only
+//! reader/resolver is `commands::deconflict::resolve_escalation` behind the
+//! in-session advisory banner.
 //!
 //! UUIDs round-trip as TEXT because tokio-postgres in this crate does not
-//! enable `with-uuid-1` — same convention as `pg::plans` / `pg::tasks`.
+//! enable `with-uuid-1` — same convention as `pg::tasks`.
 //!
 //! ## Schema authority — the runner authors this table
 //!
@@ -37,10 +34,10 @@ use uuid::Uuid;
 /// `camelCase` fields; the `serde(rename_all)` attribute lets Tauri
 /// commands return this type directly to the React frontend.
 ///
-/// `observation_hash` is added by the shadow-decisions migration
+/// `observation_hash` was added by the shadow-decisions migration
 /// (`sd01_coord_coordinator_shadow_decisions`). Empty string for legacy
-/// rows and any callers that don't pass a hash; the Rust scheduler
-/// stamps real SHA-256 hex digests so the diff endpoint can join shadow
+/// rows and any callers that don't pass a hash; the deleted Rust scheduler
+/// stamped real SHA-256 hex digests so its diff endpoint could join shadow
 /// vs live by observation snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,8 +55,7 @@ pub struct CoordinatorDecisionRow {
     pub resolved_at: Option<String>,
     pub created_at: String,
     /// SHA-256 hex of the observation snapshot the decision was based on.
-    /// Empty string for legacy rows or HTTP callers (`POST /coordinator/act`)
-    /// that don't supply one.
+    /// Empty string for legacy rows or callers that don't supply one.
     #[serde(default)]
     pub observation_hash: String,
 }
@@ -81,9 +77,7 @@ pub struct InsertCoordinatorDecisionInput<'a> {
     pub reasoning: &'a str,
     pub auto_acted: bool,
     /// SHA-256 hex of the observation snapshot. Pass `""` from callers
-    /// that don't observe (HTTP `POST /coordinator/act`, manual user-fire
-    /// audit rows, etc.). The Rust scheduler always passes a real hash
-    /// so the diff endpoint can join shadow ↔ live.
+    /// that don't observe (the deconflicter's advisory rows).
     pub observation_hash: &'a str,
 }
 
@@ -160,134 +154,6 @@ impl PgDb {
         Ok(row_to_decision(&row))
     }
 
-    /// Look up a single decision by id.
-    pub async fn get_coordinator_decision(
-        &self,
-        decision_id: &str,
-    ) -> Result<Option<CoordinatorDecisionRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let decision_uuid =
-            Uuid::parse_str(decision_id).map_err(|e| format!("invalid decision_id uuid: {}", e))?;
-        let row = conn
-            .query_opt(
-                &format!(
-                    "SELECT {} FROM project.coordinator_decisions WHERE id = $1::uuid",
-                    SELECT_COLS
-                ),
-                &[&decision_uuid],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to load coordinator decision", &e))?;
-
-        Ok(row.as_ref().map(row_to_decision))
-    }
-
-    /// List the most-recent N decisions, newest-first. Optional rule and
-    /// action filters mirror the Decision Log filter UI.
-    pub async fn list_recent_coordinator_decisions(
-        &self,
-        limit: i64,
-        rule_filter: Option<&str>,
-        action_filter: Option<&str>,
-    ) -> Result<Vec<CoordinatorDecisionRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        // Filters compose so the dashboard can pivot freely without a
-        // matrix of stored procedures. NULL on either filter param means
-        // "no filter for that column".
-        let rows = conn
-            .query(
-                &format!(
-                    r#"
-                    SELECT {}
-                    FROM project.coordinator_decisions
-                    WHERE ($2::text IS NULL OR rule = $2)
-                      AND ($3::text IS NULL OR action = $3)
-                    ORDER BY created_at DESC
-                    LIMIT $1
-                    "#,
-                    SELECT_COLS
-                ),
-                &[&limit, &rule_filter, &action_filter],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to list coordinator decisions", &e))?;
-
-        Ok(rows.iter().map(row_to_decision).collect())
-    }
-
-    /// List decisions for a single Coordinator session, newest-first.
-    pub async fn list_coordinator_decisions_for_session(
-        &self,
-        session_id: &str,
-        limit: i64,
-    ) -> Result<Vec<CoordinatorDecisionRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let rows = conn
-            .query(
-                &format!(
-                    r#"
-                    SELECT {}
-                    FROM project.coordinator_decisions
-                    WHERE session_id = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2
-                    "#,
-                    SELECT_COLS
-                ),
-                &[&session_id, &limit],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to list session decisions", &e))?;
-
-        Ok(rows.iter().map(row_to_decision).collect())
-    }
-
-    /// List **open escalations**: rows that recommended a destructive action
-    /// the user hasn't yet resolved. Matches the Escalations panel in
-    /// productivity-stack §6.
-    pub async fn list_open_escalations(&self) -> Result<Vec<CoordinatorDecisionRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let rows = conn
-            .query(
-                &format!(
-                    r#"
-                    SELECT {}
-                    FROM project.coordinator_decisions
-                    WHERE resolved = FALSE
-                      AND auto_acted = FALSE
-                      AND action IN ('escalate', 'kill-session', 'force-promote-to-worktree')
-                    ORDER BY created_at DESC
-                    "#,
-                    SELECT_COLS
-                ),
-                &[],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to list open escalations", &e))?;
-
-        Ok(rows.iter().map(row_to_decision).collect())
-    }
-
     /// Mark an escalation as resolved with a free-form `resolution` note.
     /// Returns `true` if the row was updated (i.e. it existed and wasn't
     /// already resolved).
@@ -323,11 +189,4 @@ impl PgDb {
 
         Ok(n > 0)
     }
-}
-
-#[cfg(test)]
-mod tests {
-    // Integration tests require a live PG; tracked alongside the sibling
-    // `pg::plans` / `pg::tasks` placeholders. No executable tests at this
-    // module per productivity-stack §8 Phase 2.
 }

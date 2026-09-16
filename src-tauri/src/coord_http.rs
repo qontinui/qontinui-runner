@@ -163,7 +163,7 @@ pub fn coord_get_for(
 ///
 /// Callers that must distinguish "unpaired" (no token locally) from
 /// "token present but rejected" (coord 401/403) use this — e.g.
-/// `get_fleet_health`'s structured `auth` state. Mirrors the availability
+/// `prompt_library`'s structured `auth` state. Mirrors the availability
 /// check inside [`coord_get`]; never fatal, never panics.
 pub fn have_device_token() -> bool {
     qontinui_runner_lib::auth::device_bearer().is_some()

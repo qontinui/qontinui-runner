@@ -5,7 +5,7 @@
 //! mailbox (`GET /coord/session-messages/pending`) and delivers each message
 //! as a prompt injected into the *live local session* it targets — queued
 //! safely if the session is mid-turn (SDK path), gated on terminal idle for
-//! PTY/Worker sessions, then acked via
+//! typed interactive terminals, then acked via
 //! `POST /coord/session-messages/mark-delivered`.
 //!
 //! ## Why this supersedes `session_bus.rs`
@@ -38,17 +38,20 @@
 //!   QUEUES the message when the session is `Processing`
 //!   (`claude_session/session.rs`), so it is safe by construction and never
 //!   clobbers a turn.
-//! - **PTY** — a registered `WorkerSession` (the coordinator's `Worker N`
-//!   PTYs) OR a typed interactive terminal known only to the lifecycle store
+//! - **PTY** — a typed interactive terminal known only to the lifecycle store
 //!   (an operator opened a terminal and typed `claude`; it has a
-//!   `TerminalManager` PTY and a `record_open` row but NEVER a
-//!   `WorkerSession`, because `worker_sessions` has one production writer,
-//!   `spawn_worker_session`). Both inject through
+//!   `TerminalManager` PTY and a `record_open` row). It injects through
 //!   `TerminalSession::submit_prompt`, which writes raw bracketed-paste + CR
 //!   with NO state check, so injecting mid-turn corrupts the running turn.
 //!   We FIRST check the idle gate ([`idle_gate`]); only inject when
 //!   the terminal is quiescent and showing its input prompt. If not idle we
 //!   SKIP this tick (leave the message unacked; retry next poll).
+//!
+//! The registered-`WorkerSession` PTY plane (the Productivity board's
+//! `Worker N` sessions) was deleted by Phase 4 of
+//! `2026-09-12-consolidate-local-orchestration-onto-conductor`: nothing
+//! registers a worker any more, so that arm could never resolve. Only the SDK
+//! and typed-terminal arms remain.
 //!
 //! ## Safety rails
 //!
@@ -347,31 +350,26 @@ impl BlockReason {
 // never reach the threshold for a message that was pulled by hand. These
 // counters are what is left to prove push missed.
 
-/// Which injection primitive actually carried a delivered message.
+/// Which injection primitive actually carried a delivered message. The
+/// `worker_pty` arm went with the registered-`WorkerSession` plane in Phase 4
+/// of `2026-09-12-consolidate-local-orchestration-onto-conductor`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeliveredArm {
     /// SDK `ClaudeSession::send_user_message` (queues when Processing).
     Sdk,
-    /// A registered `WorkerSession` — `send_user_message` → `submit_prompt`.
-    WorkerPty,
-    /// A lifecycle-recorded typed terminal with no `WorkerSession` —
-    /// `TerminalSession::submit_prompt` directly.
+    /// A lifecycle-recorded typed terminal — `TerminalSession::submit_prompt`
+    /// directly.
     Terminal,
 }
 
 impl DeliveredArm {
     /// Every arm, for rendering the counter family with no series absent.
-    const ALL: [DeliveredArm; 3] = [
-        DeliveredArm::Sdk,
-        DeliveredArm::WorkerPty,
-        DeliveredArm::Terminal,
-    ];
+    const ALL: [DeliveredArm; 2] = [DeliveredArm::Sdk, DeliveredArm::Terminal];
 
     /// The `/health` key and the log label for this arm.
     fn as_str(self) -> &'static str {
         match self {
             DeliveredArm::Sdk => "sdk",
-            DeliveredArm::WorkerPty => "worker_pty",
             DeliveredArm::Terminal => "terminal",
         }
     }
@@ -423,7 +421,7 @@ fn record_push_ok(arm: DeliveredArm) {
 /// ```json
 /// { "push_ok": n,
 ///   "push_miss": { "target_not_live": n, "pty_never_idle": n },
-///   "delivered_arm": { "sdk": n, "worker_pty": n, "terminal": n } }
+///   "delivered_arm": { "sdk": n, "terminal": n } }
 /// ```
 ///
 /// Every series is present even at zero — an absent key would read as "this
@@ -899,9 +897,7 @@ impl GateMiss {
 /// debounce), and for a typed terminal (`typed`) additionally [`claude_live`]
 /// and then [`typed_prompt_ready`] on a fresh read taken after the probe, so
 /// the last check before the paste is the screen as it is now. Hands back
-/// the live terminal, which the `Terminal` arm injects into directly; the `Pty`
-/// arm ignores it and goes through `send_message_to_worker_via_handle`, which
-/// does its own lookup so the worker's `STATE_PROCESSING` stamp is kept.
+/// the live terminal, which the `Terminal` arm injects into directly.
 async fn idle_gate(
     terminal_manager: Option<&Arc<crate::terminal::TerminalManager>>,
     terminal_id: &str,
@@ -930,25 +926,17 @@ async fn idle_gate(
 // Session resolution
 // ===========================================================================
 
-/// Where a `to_session` resolved to, and how to inject into it.
+/// Where a `to_session` resolved to, and how to inject into it. The `Pty`
+/// variant — a registered `WorkerSession` — went with the worker plane in
+/// Phase 4 of `2026-09-12-consolidate-local-orchestration-onto-conductor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedTarget {
     /// SDK `ClaudeSession` — inject immediately; it queues if Processing.
     /// Carries the runner `task_run_id` to pass to
     /// `send_message_to_worker_via_handle`.
     Sdk { task_run_id: String },
-    /// A registered `WorkerSession` PTY — gate on idle first. Carries the
-    /// worker's `task_run_id` (for `send_message_to_worker_via_handle`, which
-    /// dispatches through `WorkerSession::send_user_message` and so keeps the
-    /// worker's `STATE_PROCESSING` stamp) and `terminal_id` (for the grid
-    /// read).
-    Pty {
-        task_run_id: String,
-        terminal_id: String,
-    },
-    /// A typed interactive terminal the lifecycle store records as `open`
-    /// but that has NO `WorkerSession` (the typed plane never registers
-    /// one) — gate on idle first, then inject straight through
+    /// A typed interactive terminal the lifecycle store records as `open` —
+    /// gate on idle first, then inject straight through
     /// `TerminalSession::submit_prompt`. `terminal_id` is the record's own
     /// binding, 1:1 — nothing is guessed; `claude_session_id` is carried for
     /// the log line.
@@ -958,22 +946,14 @@ enum ResolvedTarget {
     },
 }
 
-/// Resolve an `open` lifecycle record to its live PTY: a registered
-/// `WorkerSession` on that terminal wins (`Pty`), else the terminal itself
-/// (`Terminal`). A record in any other state resolves nothing — a closed
-/// session's terminal may already host someone else.
+/// Resolve an `open` lifecycle record to its live PTY: the terminal the record
+/// is bound to (`Terminal`). A record in any other state resolves nothing — a
+/// closed session's terminal may already host someone else.
 fn resolve_open_record(
-    session_manager: &crate::claude_session::SessionManager,
     rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
 ) -> Option<ResolvedTarget> {
     if rec.state != "open" {
         return None;
-    }
-    if let Some(worker) = session_manager.find_worker_by_terminal_id(&rec.terminal_id) {
-        return Some(ResolvedTarget::Pty {
-            task_run_id: worker.task_run_id().to_string(),
-            terminal_id: rec.terminal_id.clone(),
-        });
     }
     if !typed_record_is_bound(rec) {
         return None;
@@ -984,9 +964,9 @@ fn resolve_open_record(
     })
 }
 
-/// May a typed terminal's record route a message by itself, with no
-/// `WorkerSession` to corroborate it? Only when its binding is KNOWN and a
-/// provider actually started there:
+/// May a typed terminal's record route a message by itself, with nothing to
+/// corroborate it? Only when its binding is KNOWN and a provider actually
+/// started there:
 ///
 /// - `origin` is `authoritative` (the runner knows the id exactly) or
 ///   `observed` (a process-start-anchored, uniquely correlated transcript
@@ -1020,27 +1000,22 @@ fn typed_record_is_bound(
 /// against, in order:
 ///
 /// 1. The durable lifecycle store (`claude_session_id -> terminal_id`, the
-///    proven `session_bus` path). An `open` record resolves to the
-///    `WorkerSession` on that terminal when one is registered (`Pty`), and
-///    otherwise to the terminal itself (`Terminal`). The second outcome is
-///    the whole typed interactive plane: `worker_sessions` has exactly one
-///    production writer (`commands/productivity.rs` `spawn_worker_session`),
-///    so a terminal the operator opened and typed `claude` into has a
-///    lifecycle record and a `TerminalManager` PTY but never a worker — it
-///    used to resolve `None` here and the message stayed pending forever
-///    while the session was demonstrably alive.
+///    proven `session_bus` path). An `open` record resolves to the terminal it
+///    is bound to (`Terminal`) — the whole typed interactive plane: a terminal
+///    the operator opened and typed `claude` into has a lifecycle record and a
+///    `TerminalManager` PTY, and used to resolve `None` here while the session
+///    was demonstrably alive.
 /// 2. A direct SDK `SessionManager::get(to_session)` — covers a session whose
 ///    runner `task_run_id` IS what coord addressed (SDK sessions).
 /// 3. The `AiCoordRegistrar` forward index (coord UUIDv7 → the registered
 ///    `claude_session_id`, which is the runner `task_run_id` for the pinned
 ///    plane), if `to_session` parses as a coord session UUID — covers agentic
-///    SDK sessions, PTY workers, and (fabric Phase 3) sniffed interactive
-///    sessions, whose index value resolves through the lifecycle store like
-///    arm (1) — `Pty` or `Terminal` by the same rule.
+///    SDK sessions and (fabric Phase 3) sniffed interactive sessions, whose
+///    index value resolves through the lifecycle store like arm (1).
 ///
-/// Precedence: SDK matches win (the SDK queue is clobber-safe), then a
-/// registered worker, then the bare terminal — so we probe (2)/(3) before
-/// falling back to the lifecycle record from (1).
+/// Precedence: SDK matches win (the SDK queue is clobber-safe), then the bare
+/// terminal — so we probe (2)/(3) before falling back to the lifecycle record
+/// from (1).
 fn resolve_target(
     session_manager: &crate::claude_session::SessionManager,
     registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -1061,13 +1036,6 @@ fn resolve_target(
                 if session_manager.get(&task_run_id).is_some() {
                     return Some(ResolvedTarget::Sdk { task_run_id });
                 }
-                // Resolved to a worker task_run_id?
-                if let Some(worker) = session_manager.get_worker(&task_run_id) {
-                    return Some(ResolvedTarget::Pty {
-                        task_run_id,
-                        terminal_id: worker.terminal_id().to_string(),
-                    });
-                }
                 // Sniffed interactive session (fabric Phase 3, review N2):
                 // the registrar index value IS the claude_session_id (no
                 // SessionManager entry exists for a typed `--resume`
@@ -1075,7 +1043,7 @@ fn resolve_target(
                 // exactly like arm (1) — coord-id addressing then reaches
                 // the same PTY that csid addressing already could.
                 if let Some(rec) = lifecycle_store.get(&task_run_id) {
-                    if let Some(target) = resolve_open_record(session_manager, &rec) {
+                    if let Some(target) = resolve_open_record(&rec) {
                         return Some(target);
                     }
                 }
@@ -1084,9 +1052,9 @@ fn resolve_target(
     }
 
     // (1) Lifecycle store: claude_session_id == to_session → terminal_id →
-    // the WorkerSession on it, else the terminal itself.
+    // the terminal itself.
     if let Some(rec) = lifecycle_store.get(to_session) {
-        if let Some(target) = resolve_open_record(session_manager, &rec) {
+        if let Some(target) = resolve_open_record(&rec) {
             return Some(target);
         }
     }
@@ -1342,7 +1310,7 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
 }
 
 /// The injectable form of a resolved target once the idle gate has run:
-/// SDK and worker sessions inject by `task_run_id` through
+/// an SDK session injects by `task_run_id` through
 /// `send_message_to_worker_via_handle`; a typed terminal injects into the
 /// very `TerminalSession` the gate admitted. Folding the gate result into the
 /// variant is what makes "a `Terminal` target with no admitted terminal"
@@ -1350,7 +1318,6 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
 /// as `target_not_live`.
 enum Inject {
     Sdk(String),
-    Worker(String),
     Terminal(Arc<crate::terminal::session::TerminalSession>),
 }
 
@@ -1524,33 +1491,12 @@ async fn deliver_once(
             continue;
         };
 
-        // Turn arbitration: SDK queues safely; a PTY — worker or typed
-        // terminal alike — must be idle, and a typed terminal's input box
-        // must also be EMPTY (an operator may be typing into it). The gate's
-        // result is folded into the injectable form so the `Terminal` arm
-        // carries the very terminal it was admitted on.
+        // Turn arbitration: SDK queues safely; a typed terminal must be idle,
+        // and its input box must also be EMPTY (an operator may be typing into
+        // it). The gate's result is folded into the injectable form so the
+        // `Terminal` arm carries the very terminal it was admitted on.
         let inject = match &target {
             ResolvedTarget::Sdk { task_run_id } => Inject::Sdk(task_run_id.clone()),
-            ResolvedTarget::Pty {
-                task_run_id,
-                terminal_id,
-            } => match idle_gate(terminal_manager.as_ref(), terminal_id, false).await {
-                Ok(_admitted) => Inject::Worker(task_run_id.clone()),
-                Err(miss) => {
-                    report_gate_miss(
-                        &ctx,
-                        tracker,
-                        msg,
-                        to_session,
-                        terminal_id,
-                        miss,
-                        now,
-                        &mut no_manager_warned,
-                    )
-                    .await;
-                    continue;
-                }
-            },
             ResolvedTarget::Terminal { terminal_id, .. } => {
                 match idle_gate(terminal_manager.as_ref(), terminal_id, true).await {
                     Ok(term) => Inject::Terminal(term),
@@ -1572,15 +1518,14 @@ async fn deliver_once(
             }
         };
 
-        // 3. Inject. SDK sessions and registered workers go through the
-        // in-process primitive (`send_message_to_worker_via_handle` — the
-        // SDK queue / `WorkerSession::send_user_message`); a typed terminal
-        // has no worker to dispatch through, so it takes the primitive that
-        // `send_user_message` itself delegates to, `submit_prompt`, on the
-        // terminal the idle gate just admitted. `submit_prompt` is
-        // liveness-gated (TERMINAL_EXITED) — a refusal leaves the message
-        // pending rather than marking a keystroke that reached no process as
-        // delivered.
+        // 3. Inject. SDK sessions go through the in-process primitive
+        // (`send_message_to_worker_via_handle` — the SDK queue); a typed
+        // terminal has no SDK session to dispatch through, so it takes the
+        // primitive that `send_user_message` itself delegates to,
+        // `submit_prompt`, on the terminal the idle gate just admitted.
+        // `submit_prompt` is liveness-gated (TERMINAL_EXITED) — a refusal
+        // leaves the message pending rather than marking a keystroke that
+        // reached no process as delivered.
         let framed = frame_message(msg);
         let injected: Result<DeliveredArm, String> = match inject {
             Inject::Sdk(task_run_id) => {
@@ -1591,15 +1536,6 @@ async fn deliver_once(
                 )
                 .await
                 .map(|()| DeliveredArm::Sdk)
-            }
-            Inject::Worker(task_run_id) => {
-                crate::claude_session::worker_message::send_message_to_worker_via_handle(
-                    &api_state.app_handle,
-                    &task_run_id,
-                    &framed,
-                )
-                .await
-                .map(|()| DeliveredArm::WorkerPty)
             }
             Inject::Terminal(term) => term
                 .submit_prompt(
@@ -2274,20 +2210,18 @@ mod tests {
     // ---- typed-terminal resolution (plan 2026-09-07-session-message-
     // delivery-is-blind-…, Phase 1) ------------------------------------------
     //
-    // `worker_sessions` has one production writer (`spawn_worker_session`),
-    // so a typed interactive terminal has a lifecycle record and a PTY but
-    // never a `WorkerSession`. Every arm of `resolve_target` used to end in
-    // `find_worker_by_terminal_id` over that map, so a live typed session
-    // resolved `None` and its messages stayed pending forever. These fixtures
-    // use a real `SessionLifecycleStore` in a tempdir, an empty
+    // A typed interactive terminal has a lifecycle record and a PTY. Every arm
+    // of `resolve_target` used to end in a worker-registry lookup, so a live
+    // typed session resolved `None` and its messages stayed pending forever.
+    // (That registry, and the `Pty` arm over it, were deleted by Phase 4 of
+    // `2026-09-12-consolidate-local-orchestration-onto-conductor`.) These
+    // fixtures use a real `SessionLifecycleStore` in a tempdir, an empty
     // `SessionManager`, and no registrar — the substrate arm (1) reads.
 
-    use crate::claude_session::worker_session::WorkerSession;
     use crate::claude_session::SessionManager;
     use crate::session::session_lifecycle_store::{
         SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER,
     };
-    use crate::terminal::TerminalManager;
 
     fn lifecycle_fixture() -> (tempfile::TempDir, SessionLifecycleStore) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2333,10 +2267,10 @@ mod tests {
     }
 
     #[test]
-    fn open_record_with_no_worker_resolves_terminal() {
-        // (a) The spaceship measurement: a live, refreshed `open` row whose
-        // terminal has no WorkerSession. Must resolve to the record's own
-        // terminal — nothing guessed — not to `None`.
+    fn open_record_resolves_terminal() {
+        // (a) The spaceship measurement: a live, refreshed `open` row for a
+        // typed terminal. Must resolve to the record's own terminal —
+        // nothing guessed — not to `None`.
         let (_dir, store) = lifecycle_fixture();
         store.record_open(open_record("f0a5755d-csid", "7a977da8-term"));
         let sm = SessionManager::new();
@@ -2352,8 +2286,8 @@ mod tests {
 
     #[test]
     fn a_typed_record_routes_only_when_its_binding_is_known_and_confirmed() {
-        // With no WorkerSession to corroborate it, the record alone decides
-        // where a message goes, so a guess must not route one.
+        // With nothing to corroborate it, the record alone decides where a
+        // message goes, so a guess must not route one.
         use crate::session::session_lifecycle_store::{ORIGIN_OBSERVED, ORIGIN_RECONCILED};
         let sm = SessionManager::new();
         let cases: [(Option<&str>, Option<i64>, bool); 5] = [
@@ -2386,35 +2320,9 @@ mod tests {
     }
 
     #[test]
-    fn open_record_with_registered_worker_resolves_pty() {
-        // (b) Precedence: a WorkerSession registered on the record's terminal
-        // still wins over the bare terminal, keyed by the worker's own
-        // task_run_id (the `send_message_to_worker` key).
-        let (_dir, store) = lifecycle_fixture();
-        store.record_open(open_record("csid-w", "term-w"));
-        let sm = SessionManager::new();
-        let tm = Arc::new(TerminalManager::new());
-        sm.register_worker(Arc::new(WorkerSession::new(
-            "task-w".to_string(),
-            "term-w".to_string(),
-            "Worker 1".to_string(),
-            tm,
-        )))
-        .expect("register worker");
-        let target = resolve_target(&sm, None, &store, "csid-w");
-        assert_eq!(
-            target,
-            Some(ResolvedTarget::Pty {
-                task_run_id: "task-w".to_string(),
-                terminal_id: "term-w".to_string(),
-            })
-        );
-    }
-
-    #[test]
     fn closed_record_resolves_none() {
-        // (c) A closed session's terminal may already host someone else — a
-        // record in any state but `open` must resolve nothing, worker or not.
+        // (b) A closed session's terminal may already host someone else — a
+        // record in any state but `open` must resolve nothing.
         let (_dir, store) = lifecycle_fixture();
         store.record_open(open_record("csid-c", "term-c"));
         store.record_close("csid-c", "test");
@@ -2624,8 +2532,8 @@ mod tests {
             "deliver_once must not gate reporting on priority"
         );
         // Two miss sites report directly (target not live, inject refused);
-        // the idle-gate misses of the worker and typed-terminal arms route
-        // through `report_gate_miss`, which is the same door one call up.
+        // the idle-gate miss of the typed-terminal arm routes through
+        // `report_gate_miss`, which is the same door one call up.
         let direct_sites = loop_src.matches("surface_blocked_delivery(").count();
         let gate_sites = loop_src.matches("report_gate_miss(").count();
         assert!(
@@ -2634,8 +2542,8 @@ mod tests {
              to report; found {direct_sites}"
         );
         assert!(
-            gate_sites >= 2,
-            "expected both PTY arms (worker, typed terminal) to report gate misses; \
+            gate_sites >= 1,
+            "expected the typed-terminal PTY arm to report gate misses; \
              found {gate_sites}"
         );
     }
@@ -2655,10 +2563,7 @@ mod tests {
             keys(&snap["push_miss"]),
             ["pty_never_idle", "target_not_live"]
         );
-        assert_eq!(
-            keys(&snap["delivered_arm"]),
-            ["sdk", "terminal", "worker_pty"]
-        );
+        assert_eq!(keys(&snap["delivered_arm"]), ["sdk", "terminal"]);
 
         // A bump moves exactly its own series. Exact deltas on a
         // process-global counter are only sound under the serial lock —
@@ -2694,15 +2599,14 @@ mod tests {
     #[test]
     fn delivered_arm_labels_match_health_keys() {
         assert_eq!(DeliveredArm::Sdk.as_str(), "sdk");
-        assert_eq!(DeliveredArm::WorkerPty.as_str(), "worker_pty");
         assert_eq!(DeliveredArm::Terminal.as_str(), "terminal");
     }
 
     // ---- typed-terminal gate ------------------------------------------------
     //
     // `submit_prompt` bracket-pastes onto whatever is in the input box and
-    // presses CR. On a worker PTY nobody types, so the shared "turn complete"
-    // predicate is enough. On a typed terminal an operator may be mid-prompt,
+    // presses CR. Where nobody types, the shared "turn complete" predicate is
+    // enough. On a typed terminal an operator may be mid-prompt,
     // and the pane's root is their SHELL, which may be showing a `❯` prompt of
     // its own after `/exit`. So the typed arm adds two conjuncts on top of the
     // shared predicate: an empty, focused Claude Code input box, and a live
