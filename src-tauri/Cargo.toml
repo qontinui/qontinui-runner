@@ -101,7 +101,7 @@ adb_client = { version = "3", features = ["usb", "mdns"] }
 # scripts/reqwest-client-construction-baseline.json) and is removed once that
 # baseline is empty. Plan
 # 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes.
-reqwest ={ version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
