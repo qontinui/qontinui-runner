@@ -60,6 +60,17 @@
 //! back to the device-JWT. On a headless/fleet runner with no Cognito session
 //! the fallback 401s, and the honest answer there is `unknown` with the 401
 //! recorded — not a fabricated `true`, and not a `false`.
+//!
+//! **Coord first** (plan
+//! `2026-09-17-remote-attach-to-a-pre-feature-target-times-out-silently`,
+//! Phase 3). That 401 was permanent on every headless runner, so the field
+//! never observed anything on exactly the machines that most need it. The fact
+//! lives in one coord column (`coord.devices.ws_session_id`), and coord serves
+//! it to the device itself at `GET /coord/devices/me/routing` under the device
+//! JWT. The poller asks there first; only when coord gives no answer (an older
+//! coord without the route, no device JWT, coord down) does it fall back to the
+//! web route above — and a 401 there now says which credential was presented
+//! instead of pasting the body.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -279,20 +290,88 @@ pub(crate) fn classify(status: u16, body: &str) -> Readback {
     }
 }
 
-/// Resolve the bearer for the read-back, preferring the Cognito user session
-/// the route actually accepts. See the module docs on why the device-JWT is
-/// only a fallback.
-async fn readback_bearer(auth_manager: &crate::auth::AuthManager) -> Option<String> {
+/// Which credential the web read-back presented — the web route admits only
+/// the first, so a 401 means something different for each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BearerKind {
+    CognitoUser,
+    DeviceJwt,
+}
+
+/// Resolve the bearer for the web read-back, preferring the Cognito user
+/// session the route actually accepts. See the module docs on why the
+/// device-JWT is only a fallback.
+async fn readback_bearer(auth_manager: &crate::auth::AuthManager) -> Option<(String, BearerKind)> {
     if let Some(t) =
         crate::mcp::device_jwt_refresher::ensure_fresh_cognito_bearer(auth_manager).await
     {
         if !t.trim().is_empty() {
-            return Some(t);
+            return Some((t, BearerKind::CognitoUser));
         }
     }
     match auth_manager.get_access_token() {
-        Ok(t) if crate::auth::looks_like_jwt(&t) && !crate::auth::jwt_is_expired(&t) => Some(t),
+        Ok(t) if crate::auth::looks_like_jwt(&t) && !crate::auth::jwt_is_expired(&t) => {
+            Some((t, BearerKind::DeviceJwt))
+        }
         _ => None,
+    }
+}
+
+/// Pure: classify coord's `GET /coord/devices/me/routing` answer. `Err` means
+/// coord gave no usable answer and the caller should try the web route; the
+/// string says why, for the combined UNKNOWN reason. A miss is never `false`.
+pub(crate) fn classify_coord(status: u16, body: &str) -> Result<Readback, String> {
+    if status != 200 {
+        let excerpt: String = body.chars().take(200).collect();
+        return Err(format!(
+            "coord GET /coord/devices/me/routing returned HTTP {status}: {excerpt}"
+        ));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| format!("coord routing read 200 but body is not JSON: {e}"))?;
+    match parsed.get("ws_connected").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(Readback::Routable),
+        Some(false) => Ok(Readback::NotRoutable),
+        None => Err("coord routing read 200 but carries no boolean `ws_connected`".to_string()),
+    }
+}
+
+/// Coord's answer, or why there was none.
+async fn coord_read_back_at(coord_base: &str) -> Result<Readback, String> {
+    let Some(client) = crate::coord_http::coord_client() else {
+        return Err("coord HTTP client unavailable".to_string());
+    };
+    if !crate::coord_http::have_device_token() {
+        return Err("no device JWT stored — coord routing read skipped".to_string());
+    }
+    let url = format!(
+        "{}/coord/devices/me/routing",
+        coord_base.trim_end_matches('/')
+    );
+    let resp = crate::coord_http::coord_get(client, &url)
+        .timeout(READBACK_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("coord routing read to {url} failed: {e}"))?;
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    classify_coord(status, &body)
+}
+
+/// Pure: name the cause of a web read-back 401 when the credential presented
+/// was the device JWT — the route admits only a Cognito user session.
+pub(crate) fn explain_web_readback(outcome: Readback, kind: BearerKind) -> Readback {
+    match (outcome, kind) {
+        (Readback::Unknown(reason), BearerKind::DeviceJwt)
+            if reason.contains("returned HTTP 401") =>
+        {
+            Readback::Unknown(
+                "read-back GET /api/v1/devices/{id} returned HTTP 401: that route admits only a \
+                 Cognito user session and this runner has none (it presented its device JWT)"
+                    .to_string(),
+            )
+        }
+        (other, _) => other,
     }
 }
 
@@ -323,15 +402,25 @@ async fn read_back_once() -> Readback {
         Ok(_) => return Readback::Unknown("device id is empty — cannot read back".to_string()),
         Err(e) => return Readback::Unknown(format!("device id unreadable: {e}")),
     };
-    let Some(bearer) = readback_bearer(&auth_manager).await else {
-        return Readback::Unknown(
-            "no usable bearer for the read-back (no Cognito session, no unexpired device-JWT)"
-                .to_string(),
-        );
+    // Coord first: the one door a headless runner's device JWT can open.
+    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
+    let coord_miss = match coord_read_back_at(&coord_base).await {
+        Ok(answer) => return answer,
+        Err(why) => why,
+    };
+
+    let Some((bearer, kind)) = readback_bearer(&auth_manager).await else {
+        return Readback::Unknown(format!(
+            "{coord_miss}; and no usable bearer for the web read-back (no Cognito session, no \
+             unexpired device-JWT)"
+        ));
     };
 
     let base = crate::api_config::get_api_base_url();
-    read_back_at(&base, &device_id, &bearer).await
+    match explain_web_readback(read_back_at(&base, &device_id, &bearer).await, kind) {
+        Readback::Unknown(web) => Readback::Unknown(format!("{coord_miss}; then {web}")),
+        answer => answer,
+    }
 }
 
 /// The HTTP leg, with every input passed in. Split from
@@ -635,6 +724,43 @@ mod tests {
             }
             other => panic!("an unreachable backend must be UNKNOWN, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn coord_routing_answer_is_classified_and_a_miss_is_never_false() {
+        assert_eq!(
+            classify_coord(200, r#"{"device_id":"d","ws_connected":true}"#),
+            Ok(Readback::Routable)
+        );
+        assert_eq!(
+            classify_coord(200, r#"{"device_id":"d","ws_connected":false}"#),
+            Ok(Readback::NotRoutable)
+        );
+        // An older coord without the route, a missing row, a body without the
+        // field: each is a MISS (fall back), never a `false`.
+        assert!(classify_coord(404, "").is_err());
+        assert!(classify_coord(404, r#"{"error":"device_not_found"}"#).is_err());
+        assert!(classify_coord(200, r#"{"device_id":"d"}"#).is_err());
+        assert!(classify_coord(200, "not json").is_err());
+    }
+
+    #[test]
+    fn a_device_jwt_401_names_the_credential_mismatch() {
+        let raw = classify(401, r#"{"error":"UNAUTHORIZED"}"#);
+        match explain_web_readback(raw.clone(), BearerKind::DeviceJwt) {
+            Readback::Unknown(r) => {
+                assert!(r.contains("Cognito user session"), "{r}");
+                assert!(r.contains("device JWT"), "{r}");
+            }
+            other => panic!("must stay UNKNOWN, got {other:?}"),
+        }
+        // A Cognito bearer rejected is a different fault — left verbatim.
+        assert_eq!(explain_web_readback(raw.clone(), BearerKind::CognitoUser), raw);
+        // A success is never rewritten.
+        assert_eq!(
+            explain_web_readback(Readback::Routable, BearerKind::DeviceJwt),
+            Readback::Routable
+        );
     }
 
     #[test]

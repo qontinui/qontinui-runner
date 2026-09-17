@@ -510,6 +510,9 @@ pub struct CreateGrantResponse {
     pub target_device_id: Option<String>,
     #[serde(default)]
     pub expires_at: Option<serde_json::Value>,
+    /// See [`super::remote_attach::TargetRunner`]. Absent from an older coord.
+    #[serde(default)]
+    pub target_runner: Option<super::remote_attach::TargetRunner>,
 }
 
 /// Turn a non-2xx from the mint into a typed refusal, PRESERVING coord's body.
@@ -668,7 +671,20 @@ pub async fn terminal_create_remote(
         .map_err(|e| RemoteCreateError {
             stage: "create",
             code: e.code.clone(),
-            message: e.message.clone(),
+            message: if e.code == "timeout" {
+                format!(
+                    "{} The grant is single-use; if the target did spawn a terminal it is \
+                     running there unattached.",
+                    super::remote_attach::explain_relay_timeout(
+                        "remote_terminal_created",
+                        &target.to_string(),
+                        minted.target_runner.as_ref(),
+                        crate::mcp::remote_terminal::CREATE_TIMEOUT.as_secs(),
+                    )
+                )
+            } else {
+                e.message.clone()
+            },
             detail: Some(json!({
                 "grantJti": minted.grant_jti,
                 "targetDeviceId": target.to_string(),

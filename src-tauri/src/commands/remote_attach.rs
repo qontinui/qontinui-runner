@@ -154,6 +154,57 @@ pub(crate) struct AttachGrantResponse {
     pub target_device_id: Option<String>,
     #[serde(default)]
     pub expires_at: Option<Value>,
+    /// What coord could establish about the TARGET's runner build (plan
+    /// `2026-09-17-remote-attach-to-a-pre-feature-target-times-out-silently`).
+    /// Absent from a coord that predates it.
+    #[serde(default)]
+    pub target_runner: Option<TargetRunner>,
+}
+
+/// Coord's `target_runner` block on a grant mint: `state` is `supports` or
+/// `unknown` (a positive `predates` is a 409, never a 201).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub(crate) struct TargetRunner {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub required_sha: Option<String>,
+}
+
+/// Explain a relay timeout — the target never answered — with what is actually
+/// known, instead of guessing "relay disconnected or target offline".
+///
+/// A runner built before the target-side handler IGNORES the frame without a
+/// reply, which is indistinguishable from a wedged target on the wire; coord's
+/// `target_runner` block is the only evidence that separates them. `what` is
+/// the reply that never came (`remote_terminal_attached` /
+/// `remote_terminal_created`). Pure, so every arm is a unit test.
+pub(crate) fn explain_relay_timeout(
+    what: &str,
+    target_device_id: &str,
+    target_runner: Option<&TargetRunner>,
+    timeout_secs: u64,
+) -> String {
+    let head = format!("no {what} from target device {target_device_id} within {timeout_secs}s");
+    match target_runner {
+        Some(tr) if tr.state == "supports" => format!(
+            "{head}. Coord observed that device serving a runner build that carries the handler, \
+             so the target runner is wedged or offline, or the relay lost the frame — its own \
+             runner log says which."
+        ),
+        Some(tr) if tr.state == "unknown" => format!(
+            "{head}. Coord could not establish the target's runner build ({}). A runner older \
+             than {} ignores this request without answering, which looks exactly like this.",
+            tr.reason.as_deref().unwrap_or("no reason given"),
+            tr.required_sha.as_deref().unwrap_or("the remote-terminal handler"),
+        ),
+        _ => format!(
+            "{head}. Coord did not report the target's runner build. The target may be offline, \
+             or running a runner too old to answer — such a runner ignores the request silently."
+        ),
+    }
 }
 
 /// Coord learns about a session through the registry's OUTBOX, not through the
@@ -228,8 +279,15 @@ async fn mint_attach_grant(
             .and_then(|v| v.as_str())
             .map(|r| format!(":{r}"))
             .unwrap_or_default();
+        // A `hint` is coord's sentence for the operator (e.g. which runner build
+        // the target serves and which it needs) — lead with it when present.
+        let hint = parsed
+            .get("hint")
+            .and_then(|v| v.as_str())
+            .map(|h| format!("{h} "))
+            .unwrap_or_default();
         return Err(format!(
-            "remote_attach:{code}{reason}: coord answered {} for POST {url}",
+            "remote_attach:{code}{reason}: {hint}(coord answered {} for POST {url})",
             status.as_u16()
         ));
     }
@@ -360,7 +418,17 @@ pub(crate) async fn open_remote_tab(
     let attached = client()
         .attach(&minted.grant, cols, rows, ATTACH_TIMEOUT)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|mut e| {
+            if e.code == "timeout" {
+                e.message = explain_relay_timeout(
+                    "remote_terminal_attached",
+                    minted.target_device_id.as_deref().unwrap_or(device_id.trim()),
+                    minted.target_runner.as_ref(),
+                    ATTACH_TIMEOUT.as_secs(),
+                );
+            }
+            e.to_string()
+        })?;
     if attached.grant_jti != minted.grant_jti {
         client().discard_pending_output(&attached.grant_jti);
         return Err(format!(
@@ -729,6 +797,69 @@ pub(crate) fn coord_places_session_on(asked: &str, coord_placed: Option<&str>) -
     match coord_placed.map(str::trim).filter(|p| !p.is_empty()) {
         None => false,
         Some(placed) => placed.eq_ignore_ascii_case(asked),
+    }
+}
+
+#[cfg(test)]
+mod relay_timeout_tests {
+    use super::{explain_relay_timeout, AttachGrantResponse, TargetRunner};
+
+    const DEV: &str = "84c02292-32cb-4983-be85-d00f868b7003";
+
+    #[test]
+    fn every_arm_names_the_target_device_and_never_guesses_a_relay_disconnect() {
+        let supports = TargetRunner {
+            state: "supports".into(),
+            ..Default::default()
+        };
+        let unknown = TargetRunner {
+            state: "unknown".into(),
+            reason: Some("served-sha heartbeat is STALE".into()),
+            required_sha: Some("f521e1012e1e".into()),
+        };
+        for tr in [None, Some(&supports), Some(&unknown)] {
+            let m = explain_relay_timeout("remote_terminal_attached", DEV, tr, 20);
+            assert!(m.contains(DEV), "{m}");
+            assert!(m.contains("20s"), "{m}");
+            assert!(!m.contains("relay may be disconnected"), "{m}");
+        }
+    }
+
+    #[test]
+    fn unknown_carries_coords_reason_and_the_required_build() {
+        let tr = TargetRunner {
+            state: "unknown".into(),
+            reason: Some("served-sha heartbeat is STALE".into()),
+            required_sha: Some("f521e1012e1e".into()),
+        };
+        let m = explain_relay_timeout("remote_terminal_attached", DEV, Some(&tr), 20);
+        assert!(m.contains("served-sha heartbeat is STALE"), "{m}");
+        assert!(m.contains("f521e1012e1e"), "{m}");
+    }
+
+    #[test]
+    fn supports_points_away_from_the_build() {
+        let tr = TargetRunner {
+            state: "supports".into(),
+            ..Default::default()
+        };
+        let m = explain_relay_timeout("remote_terminal_created", DEV, Some(&tr), 45);
+        assert!(m.contains("wedged or offline"), "{m}");
+        assert!(!m.contains("older"), "{m}");
+    }
+
+    #[test]
+    fn the_mint_response_tolerates_a_coord_without_the_block_and_reads_it_when_present() {
+        let old: AttachGrantResponse =
+            serde_json::from_str(r#"{"grant":"g","grant_jti":"j"}"#).unwrap();
+        assert!(old.target_runner.is_none());
+        let new: AttachGrantResponse = serde_json::from_str(
+            r#"{"grant":"g","grant_jti":"j","target_runner":{"state":"unknown","required_sha":"abc","reason":"why"}}"#,
+        )
+        .unwrap();
+        let tr = new.target_runner.unwrap();
+        assert_eq!(tr.state, "unknown");
+        assert_eq!(tr.reason.as_deref(), Some("why"));
     }
 }
 
