@@ -288,18 +288,26 @@ pub(crate) fn format_mint_refusal(status: u16, body: &str, url: &str) -> String 
         .get("error")
         .and_then(|v| v.as_str())
         .unwrap_or("coord_error");
-    let reason = parsed
+    let raw_reason = parsed
         .get("reason")
         .and_then(|v| v.as_str())
-        .filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .filter(|r| !r.is_empty());
+    let liftable = |r: &str| r.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    let reason = raw_reason
+        .filter(|r| liftable(r))
         .map(|r| format!(":{r}"))
+        .unwrap_or_default();
+    // A reason the picker cannot lift into the code still reaches the detail.
+    let unliftable = raw_reason
+        .filter(|r| !liftable(r))
+        .map(|r| format!("reason: {r}; "))
         .unwrap_or_default();
     let hint = parsed
         .get("hint")
         .and_then(|v| v.as_str())
         .map(|h| format!("{h} "))
         .unwrap_or_default();
-    format!("remote_attach:{code}{reason}: {hint}(coord answered {status} for POST {url})")
+    format!("remote_attach:{code}{reason}: {hint}({unliftable}coord answered {status} for POST {url})")
 }
 
 fn short_id(id: &str) -> String {
@@ -813,9 +821,10 @@ mod relay_timeout_tests {
 
     const DEV: &str = "84c02292-32cb-4983-be85-d00f868b7003";
 
-    /// A relay drop is settled as `relay_disconnected` before the timeout can
-    /// fire (`RemoteAttachClient::on_relay_disconnected`), so no arm blames the
-    /// relay.
+    /// A relay that is not connected refuses the attach at once as
+    /// `relay_unavailable`, and a relay drop mid-wait settles it as
+    /// `relay_disconnected` (`RemoteAttachClient::attach` /
+    /// `on_relay_disconnected`), so no timeout arm blames the relay.
     #[test]
     fn every_arm_names_the_target_device_and_never_guesses_a_relay_disconnect() {
         let supports = TargetRunner {
@@ -876,7 +885,7 @@ mod relay_timeout_tests {
         // A reason the picker's `[a-z_]+` cannot lift is not folded into the code.
         assert_eq!(
             super::format_mint_refusal(409, r#"{"error":"x","reason":"sha-3472fc6a"}"#, "u"),
-            "remote_attach:x: (coord answered 409 for POST u)"
+            "remote_attach:x: (reason: sha-3472fc6a; coord answered 409 for POST u)"
         );
         // A non-JSON body still yields a typed code.
         assert!(super::format_mint_refusal(502, "<html>", "u").starts_with("remote_attach:coord_error: "));
