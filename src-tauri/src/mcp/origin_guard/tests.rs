@@ -911,6 +911,29 @@ fn canonical_allowed_origin_validates() {
     assert!(canonical_allowed_origin("null").is_err());
     assert!(canonical_allowed_origin("http://localhost:5173/app").is_err());
     assert!(canonical_allowed_origin("localhost:5173").is_err());
+    assert!(canonical_allowed_origin("tauri://localhost").is_err());
+}
+
+/// A rathole-tunnelled request keeps the tunnel server's Host; it is admitted
+/// only while that tunnel is up.
+#[tokio::test]
+async fn tunnel_host_admitted_only_while_tunnel_up() {
+    let h = harness("off");
+    let r = || req("GET", "/sessions", &[("host", "relay.example.test:5202")], "");
+    set_tunnel_server_addr(Some("relay.example.test:2333"));
+    let (status, _, _) = send(&h, r()).await;
+    set_tunnel_server_addr(None);
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(&h, r()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Review finding: a server-side fetch of a caller URL launders a browser
+/// request into a NonBrowser one, so it is a door even for Trusted.
+#[test]
+fn loopback_laundering_routes_are_doors() {
+    assert!(is_credential_door("POST", "/api-request/test"));
+    assert!(is_credential_door("POST", "/ui-bridge/ai/network-probe"));
 }
 
 #[test]
