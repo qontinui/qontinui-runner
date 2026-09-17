@@ -362,9 +362,21 @@ async fn dispatch(state: Arc<ApiState>, req: TauriInvokeRequest) -> TauriInvokeR
                 .state::<Arc<TerminalManager>>()
                 .inner()
                 .clone();
+            // Same honest remote-close outcome as the Tauri command (plan
+            // 2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed,
+            // Phase 1) — this door is what a headless harness drives.
+            let remote_probe =
+                crate::commands::remote_attach::probe_remote_close(&tm, &a.terminal_id);
             let id = a.terminal_id.clone();
             match spawn_blocking_tracked(move || tm.close(&id)).await {
-                Ok(Ok(())) => TauriInvokeResponse::ok(serde_json::json!({ "success": true })),
+                Ok(Ok(())) => {
+                    let mut body = serde_json::json!({ "success": true });
+                    if let Some(report) = remote_probe.map(|probe| probe.report()) {
+                        body["message"] = Value::String(report.message);
+                        body["remoteDetach"] = report.remote_detach;
+                    }
+                    TauriInvokeResponse::ok(body)
+                }
                 Ok(Err(e)) => TauriInvokeResponse::err(e),
                 Err(e) => TauriInvokeResponse::err(format!("Join error: {}", e)),
             }

@@ -529,6 +529,11 @@ pub async fn terminal_close(
         .get(&terminal_id)
         .and_then(|s| s.coord_session_id());
 
+    // A remote tab's close must say what it did about the relay binding
+    // (plan 2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed,
+    // Phase 1). Probed BEFORE the close, which removes the identity.
+    let remote_probe = super::remote_attach::probe_remote_close(&terminal_manager, &terminal_id);
+
     let manager = terminal_manager.inner().clone();
     let id = terminal_id.clone();
     spawn_blocking_tracked(move || manager.close(&id))
@@ -547,10 +552,11 @@ pub async fn terminal_close(
         }
     }
 
+    let report = remote_probe.map(|probe| probe.report());
     Ok(CommandResponse {
         success: true,
-        message: None,
-        data: None,
+        message: report.as_ref().map(|r| r.message.clone()),
+        data: report.map(|r| serde_json::json!({ "remoteDetach": r.remote_detach })),
     })
 }
 

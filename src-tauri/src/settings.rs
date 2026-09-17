@@ -1122,6 +1122,25 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
 
+    /// Where a repo that does NOT live under the workspace root is checked out
+    /// on THIS device, keyed by its coord slug (`owner/name`, matched
+    /// case-insensitively), e.g.
+    /// `"portofino-pizzeria/mobile": "D:/portofino-pizzeria/mobile"`.
+    ///
+    /// Default (when empty): nothing mapped. A repo owned by anyone other than
+    /// `qontinui` is then looked for at `<parent-of-workspace-root>/<owner>/<name>`
+    /// and finally at `<workspace-root>/<name>`; `qontinui/*` repos always use
+    /// `<workspace-root>/<name>` and never read this map. Resolution:
+    /// `agent_worktree::canonical_paths`. Plan
+    /// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`.
+    ///
+    /// Re-read on every resolution, so a change made in the Paths settings
+    /// section applies to the next spawn with no runner restart. An entry is
+    /// the operator's assertion: it is used whenever it is a git checkout, with
+    /// no check of its `origin` remote.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repo_checkouts: std::collections::BTreeMap<String, String>,
+
     /// When true, enforce workspace-scoped working directory resolution globally.
     /// Steps cannot resolve paths outside the workspace root.
     /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
@@ -1227,6 +1246,12 @@ mod path_settings_tests {
             plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
             prompts_dir: Some("/w/prompts".to_string()),
             workspace_root: Some("/w".to_string()),
+            repo_checkouts: [(
+                "portofino-pizzeria/mobile".to_string(),
+                "/elsewhere/mobile".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             strict_mode: false,
         };
 
@@ -1239,6 +1264,13 @@ mod path_settings_tests {
             Some("/w/dev-notes/plans")
         );
         assert_eq!(parsed.prompts_dir.as_deref(), Some("/w/prompts"));
+        assert_eq!(
+            parsed
+                .repo_checkouts
+                .get("portofino-pizzeria/mobile")
+                .map(String::as_str),
+            Some("/elsewhere/mobile")
+        );
         assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
         assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
     }

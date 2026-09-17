@@ -12,6 +12,7 @@
 //! directory segment, so callers no longer need per-callsite
 //! `repo_canonical_paths` overrides for the standard layout.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use qontinui_runner_lib::observable_bridge::git_ops::repo_basename_from_url;
@@ -87,7 +88,19 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
     // unguarded test reaching this from the plan's `on_demand` ledger row is
     // deflected there rather than measuring the box.
     let root = crate::workspace_paths::runner_workspace_root().require()?;
-    Ok(root.join(segment))
+    if !has_foreign_owner(repo) {
+        // `qontinui/*` and bare slugs: the layout rule, with no settings read
+        // and no filesystem probe — byte-for-byte what this returned before
+        // external repos existed.
+        return Ok(root.join(segment));
+    }
+    default_canonical_path_resolved_in(
+        &root,
+        repo,
+        &repo_checkouts_setting(),
+        is_git_checkout,
+        qontinui_runner_lib::observable_bridge::git_ops::origin_url,
+    )
 }
 
 /// Pure core of [`default_canonical_path`]: the workspace root is injected, so
@@ -96,6 +109,316 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
 /// [`agent_worktree_root`] / [`agent_worktree_root_inner`] below.
 fn default_canonical_path_in(root: &Path, repo: &str) -> Result<PathBuf, String> {
     Ok(root.join(canonical_segment(repo)?))
+}
+
+// ---------------------------------------------------------------------------
+// Repos that do not live under the workspace root
+// ---------------------------------------------------------------------------
+//
+// Plan `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`.
+// The `<root>/<name>` rule above was made deliberate on the premise that every
+// repo coord dispatches for is a `qontinui/*` repo checked out under the
+// workspace root. A tenant's own repos (`portofino-pizzeria/mobile`) break that
+// premise: they live wherever their operator keeps them, typically per owner
+// (`D:/portofino-pizzeria/mobile`). The rule then names a directory that does
+// not exist, and a continuation was spawned into it — or, after the root-first
+// fallback, into the workspace root — reporting `spawned` both times.
+
+/// The leading token of every error this module raises when a repo has no
+/// verified checkout. Stable: it is what coord stores as the gate's
+/// `spawn_failed: <detail>` line, and what a reader greps for.
+pub const WORKDIR_NOT_A_CHECKOUT: &str = "workdir_not_a_checkout";
+
+/// The owner segment of a coord slug or git URL: `acme` for `acme/app`,
+/// `https://github.com/acme/app.git` and `git@github.com:acme/app.git`; `None`
+/// for a bare `app`. Splits on `/` and `:` exactly as
+/// [`repo_basename_from_url`] does, so the name and the owner are always read
+/// from the same tokenization.
+pub fn slug_owner(repo: &str) -> Option<String> {
+    let trimmed = repo.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let parts: Vec<&str> = trimmed
+        .split(['/', ':'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    (parts.len() >= 2).then(|| parts[parts.len() - 2].to_string())
+}
+
+/// `true` when `repo` names an owner and that owner is not `qontinui` — the
+/// only slugs for which the settings map and the owner-root convention are
+/// consulted at all.
+pub fn has_foreign_owner(repo: &str) -> bool {
+    slug_owner(repo).is_some_and(|o| !o.eq_ignore_ascii_case("qontinui"))
+}
+
+/// Where a candidate checkout path came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSource {
+    /// `paths.repo_checkouts` — the operator's assertion.
+    SettingsMap,
+    /// `<parent-of-workspace-root>/<owner>/<name>`.
+    OwnerRoot,
+    /// `<workspace-root>/<name>`, the flat layout rule.
+    LayoutRule,
+}
+
+impl CandidateSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SettingsMap => "settings paths.repo_checkouts",
+            Self::OwnerRoot => "owner-root convention",
+            Self::LayoutRule => "workspace layout rule",
+        }
+    }
+}
+
+/// The paths `repo` may be checked out at on this device, most specific first.
+/// The layout rule is always last, so it is the fallback when nothing better
+/// exists. Only a slug with a non-`qontinui` owner gets the first two.
+fn checkout_candidates_in(
+    root: &Path,
+    repo: &str,
+    map: &BTreeMap<String, String>,
+) -> Result<Vec<(PathBuf, CandidateSource)>, String> {
+    let segment = canonical_segment(repo)?;
+    let mut out = Vec::with_capacity(3);
+    if has_foreign_owner(repo) {
+        // A relative map path would resolve against the runner's own cwd,
+        // which names nothing an operator chose; it is not a candidate.
+        // `has_root` rather than `is_absolute`: on Windows a `/src/app` entry
+        // is rooted on the current drive, which is what an operator means.
+        if let Some(path) = map_entry_for(map, repo).map(PathBuf::from) {
+            if path.has_root() {
+                out.push((path, CandidateSource::SettingsMap));
+            }
+        }
+        // The owner and name come from coord's slug and are JOINED onto a
+        // filesystem path, so each must be one plain segment: never `..`, a
+        // separator, or a drive prefix.
+        if let (Some(parent), Some(owner)) = (root.parent(), slug_owner(repo)) {
+            if is_plain_segment(&owner) && is_plain_segment(&segment) {
+                out.push((
+                    parent.join(owner).join(&segment),
+                    CandidateSource::OwnerRoot,
+                ));
+            }
+        }
+    }
+    out.push((root.join(&segment), CandidateSource::LayoutRule));
+    Ok(out)
+}
+
+/// One plain path segment of GitHub's slug alphabet: ASCII alphanumerics, `-`,
+/// `_` and `.`, and not `.` or `..`.
+fn is_plain_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Every path the worktree claim for `repo` may have been keyed on, whatever
+/// the filesystem or the settings map looked like when it was taken — so a
+/// release finds the claim even if a checkout appeared, disappeared or was
+/// re-mapped in between. No filesystem probe.
+pub fn canonical_path_candidates(repo: &str) -> Vec<PathBuf> {
+    let Ok(root) = crate::workspace_paths::runner_workspace_root().require() else {
+        return Vec::new();
+    };
+    let map = if has_foreign_owner(repo) {
+        repo_checkouts_setting()
+    } else {
+        BTreeMap::new()
+    };
+    checkout_candidates_in(&root, repo, &map)
+        .map(|c| c.into_iter().map(|(p, _)| p).collect())
+        .unwrap_or_default()
+}
+
+/// The settings-map entry for `repo`: a key naming the same owner and name,
+/// compared case-insensitively (GitHub slugs are case-insensitive). A blank
+/// value is not an entry.
+fn map_entry_for<'a>(map: &'a BTreeMap<String, String>, repo: &str) -> Option<&'a str> {
+    let want = slug_key(repo)?;
+    map.iter()
+        .find(|(k, v)| !v.trim().is_empty() && slug_key(k).as_ref() == Some(&want))
+        .map(|(_, v)| v.trim())
+}
+
+/// `(owner, name)`, lowercased — the identity two spellings of a slug share.
+fn slug_key(repo: &str) -> Option<(String, String)> {
+    let name = canonical_segment(repo).ok()?.to_lowercase();
+    Some((slug_owner(repo)?.to_lowercase(), name))
+}
+
+/// Pure core of the foreign-owner arm of [`default_canonical_path`]: the
+/// VERIFIED checkout ([`resolve_checkout_in`] — the same check a spawn cwd
+/// gets, so a worktree is never materialized from a directory the continuation
+/// fallback would refuse), else the layout rule, so a caller that only needs a
+/// path to key or report still gets one when nothing is checked out anywhere.
+fn default_canonical_path_resolved_in(
+    root: &Path,
+    repo: &str,
+    map: &BTreeMap<String, String>,
+    is_checkout: impl Fn(&Path) -> bool,
+    origin_of: impl Fn(&Path) -> Option<String>,
+) -> Result<PathBuf, String> {
+    let rule = root.join(canonical_segment(repo)?);
+    Ok(resolve_checkout_in(root, repo, map, is_checkout, origin_of).unwrap_or(rule))
+}
+
+/// `repo` has no checkout on this device that could be verified as a checkout
+/// OF `repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutUnresolved {
+    pub repo: String,
+    /// Every candidate tried, with why it was rejected.
+    pub tried: Vec<(PathBuf, String)>,
+    /// Set when no candidate could be built at all (a malformed slug, or no
+    /// workspace root).
+    pub detail: Option<String>,
+}
+
+impl std::fmt::Display for CheckoutUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{WORKDIR_NOT_A_CHECKOUT}: no verified checkout of {} on this device",
+            self.repo
+        )?;
+        if let Some(d) = &self.detail {
+            write!(f, " ({d})")?;
+        }
+        if !self.tried.is_empty() {
+            let tried: Vec<String> = self
+                .tried
+                .iter()
+                .map(|(p, why)| format!("{} ({why})", p.display()))
+                .collect();
+            write!(f, "; tried: {}", tried.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CheckoutUnresolved {}
+
+/// Whether a remote URL names `repo`: the same name always, and the same owner
+/// whenever `repo` states one. Case-insensitive, as GitHub is.
+pub fn origin_names_repo(url: &str, repo: &str) -> bool {
+    let (Ok(want_name), Ok(got_name)) = (canonical_segment(repo), canonical_segment(url)) else {
+        return false;
+    };
+    if !want_name.eq_ignore_ascii_case(&got_name) {
+        return false;
+    }
+    match slug_owner(repo) {
+        None => true,
+        Some(want_owner) => {
+            slug_owner(url).is_some_and(|got| got.eq_ignore_ascii_case(&want_owner))
+        }
+    }
+}
+
+/// The checkout a session for `repo` may be SPAWNED in: the first candidate
+/// that is a git checkout AND is verifiably `repo` — a settings-map entry on
+/// the operator's word, anything else by its `origin` remote. Unlike
+/// [`default_canonical_path`] this never falls back to a path that is not
+/// there: a cwd is a claim that the repo is in it.
+pub fn resolve_checkout(repo: &str) -> Result<PathBuf, CheckoutUnresolved> {
+    let unresolved = |detail: String| CheckoutUnresolved {
+        repo: repo.to_string(),
+        tried: Vec::new(),
+        detail: Some(detail),
+    };
+    let root = crate::workspace_paths::runner_workspace_root()
+        .require()
+        .map_err(unresolved)?;
+    let map = if has_foreign_owner(repo) {
+        repo_checkouts_setting()
+    } else {
+        BTreeMap::new()
+    };
+    resolve_checkout_in(
+        &root,
+        repo,
+        &map,
+        is_git_checkout,
+        qontinui_runner_lib::observable_bridge::git_ops::origin_url,
+    )
+}
+
+/// Pure core of [`resolve_checkout`]: the root, the map, the checkout probe and
+/// the origin reader are all injected.
+fn resolve_checkout_in(
+    root: &Path,
+    repo: &str,
+    map: &BTreeMap<String, String>,
+    is_checkout: impl Fn(&Path) -> bool,
+    origin_of: impl Fn(&Path) -> Option<String>,
+) -> Result<PathBuf, CheckoutUnresolved> {
+    let candidates = checkout_candidates_in(root, repo, map).map_err(|e| CheckoutUnresolved {
+        repo: repo.to_string(),
+        tried: Vec::new(),
+        detail: Some(e),
+    })?;
+    let mut tried = Vec::with_capacity(candidates.len());
+    for (path, source) in candidates {
+        if !is_checkout(&path) {
+            tried.push((path, format!("{}: not a git checkout", source.label())));
+            continue;
+        }
+        if source == CandidateSource::SettingsMap {
+            return Ok(path);
+        }
+        match origin_of(&path) {
+            Some(url) if origin_names_repo(&url, repo) => return Ok(path),
+            Some(url) => tried.push((
+                path,
+                format!("{}: origin is {url}, not {repo}", source.label()),
+            )),
+            None => tried.push((path, format!("{}: no origin remote", source.label()))),
+        }
+    }
+    Err(CheckoutUnresolved {
+        repo: repo.to_string(),
+        tried,
+        detail: None,
+    })
+}
+
+/// `.git` present — a directory for a primary checkout, a file for a linked
+/// worktree.
+fn is_git_checkout(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+/// `paths.repo_checkouts`, read fresh so a Paths-panel edit applies to the
+/// next resolution. A test with no `isolated_ambient()` guard is deflected to
+/// an empty map rather than reading this machine's settings file.
+fn repo_checkouts_setting() -> BTreeMap<String, String> {
+    if qontinui_runner_lib::ambient::canary("settings paths.repo_checkouts (canonical_paths)")
+        == qontinui_runner_lib::ambient::Verdict::Deflect
+    {
+        return BTreeMap::new();
+    }
+    crate::config_facade::get_setting::<crate::settings::PathSettings>().repo_checkouts
+}
+
+/// `true` when `path` is `root` or lies beneath it — separator- and
+/// case-insensitive, and with a segment boundary, so `<root>-old/x` is not
+/// under `<root>`. Lexical: neither path needs to exist.
+pub fn path_is_within(root: &Path, path: &Path) -> bool {
+    // Case folds only where the filesystem does: on Linux `/x/Work` and
+    // `/x/work` are different directories.
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = if cfg!(windows) { s.to_lowercase() } else { s };
+        s.trim_end_matches('/').to_string()
+    };
+    let (root, path) = (norm(root), norm(path));
+    path == root || path.starts_with(&format!("{root}/"))
 }
 
 /// Resolve the external root under which all agent worktrees for `canonical`
@@ -779,5 +1102,285 @@ mod allocated_worktree_probe_tests {
             "the returned path is rebuilt from the caller's root, so it keeps the \
              root's canonical casing"
         );
+    }
+}
+
+/// Plan `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`,
+/// Phase 1: every probe is injected, so these assert the resolution order, not
+/// what this machine has on disk.
+#[cfg(test)]
+mod checkout_resolution_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// `<parent>/workspace` — the parent is where owner dirs sit beside it.
+    fn root() -> PathBuf {
+        PathBuf::from("/box/workspace")
+    }
+
+    fn checkouts(paths: &[&str]) -> impl Fn(&Path) -> bool {
+        let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |p: &Path| set.contains(p)
+    }
+
+    fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn origins(pairs: &[(&str, &str)]) -> impl Fn(&Path) -> Option<String> {
+        let m: Vec<(PathBuf, String)> = pairs
+            .iter()
+            .map(|(p, u)| (PathBuf::from(p), u.to_string()))
+            .collect();
+        move |p: &Path| m.iter().find(|(k, _)| k == p).map(|(_, u)| u.clone())
+    }
+
+    #[test]
+    fn slug_owner_reads_every_slug_shape() {
+        assert_eq!(slug_owner("acme/app").as_deref(), Some("acme"));
+        assert_eq!(
+            slug_owner("https://github.com/acme/app.git").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(
+            slug_owner("git@github.com:acme/app.git").as_deref(),
+            Some("acme")
+        );
+        assert_eq!(slug_owner("app"), None);
+        assert!(!has_foreign_owner("qontinui/qontinui-runner"));
+        assert!(!has_foreign_owner("QONTINUI/qontinui-runner"));
+        assert!(!has_foreign_owner("qontinui-runner"));
+        assert!(has_foreign_owner("portofino-pizzeria/mobile"));
+    }
+
+    /// The measured occurrence: `portofino-pizzeria/mobile` lives at
+    /// `<parent>/portofino-pizzeria/mobile`, not `<root>/mobile`.
+    #[test]
+    fn a_foreign_owner_resolves_to_its_owner_root_checkout() {
+        let got = default_canonical_path_resolved_in(
+            &root(),
+            "portofino-pizzeria/mobile",
+            &BTreeMap::new(),
+            checkouts(&["/box/portofino-pizzeria/mobile"]),
+            origins(&[(
+                "/box/portofino-pizzeria/mobile",
+                "https://github.com/portofino-pizzeria/mobile.git",
+            )]),
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/box/portofino-pizzeria/mobile"));
+    }
+
+    #[test]
+    fn a_settings_entry_beats_the_owner_root_convention() {
+        let got = default_canonical_path_resolved_in(
+            &root(),
+            "Portofino-Pizzeria/Mobile",
+            &map(&[("portofino-pizzeria/mobile", "/elsewhere/mobile")]),
+            checkouts(&["/elsewhere/mobile", "/box/portofino-pizzeria/mobile"]),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/elsewhere/mobile"),
+            "slug keys match case-insensitively"
+        );
+    }
+
+    /// With nothing checked out anywhere the layout rule is still returned, so
+    /// the ~20 callers that use this as a key or a report keep working.
+    #[test]
+    fn nothing_checked_out_falls_back_to_the_layout_rule() {
+        let got = default_canonical_path_resolved_in(
+            &root(),
+            "portofino-pizzeria/mobile",
+            &map(&[("portofino-pizzeria/mobile", "/elsewhere/mobile")]),
+            checkouts(&[]),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/box/workspace/mobile"));
+    }
+
+    /// `qontinui/*` never consults the map or the owner root, even when both
+    /// would name an existing checkout.
+    #[test]
+    fn a_qontinui_repo_takes_only_the_layout_rule() {
+        let candidates = checkout_candidates_in(
+            &root(),
+            "qontinui/qontinui-runner",
+            &map(&[("qontinui/qontinui-runner", "/elsewhere/runner")]),
+        )
+        .unwrap();
+        assert_eq!(
+            candidates,
+            vec![(
+                PathBuf::from("/box/workspace/qontinui-runner"),
+                CandidateSource::LayoutRule
+            )]
+        );
+    }
+
+    #[test]
+    fn strict_resolution_verifies_the_origin_remote() {
+        let got = resolve_checkout_in(
+            &root(),
+            "portofino-pizzeria/mobile",
+            &BTreeMap::new(),
+            checkouts(&["/box/portofino-pizzeria/mobile"]),
+            origins(&[(
+                "/box/portofino-pizzeria/mobile",
+                "git@github.com:Portofino-Pizzeria/mobile.git",
+            )]),
+        );
+        assert_eq!(got, Ok(PathBuf::from("/box/portofino-pizzeria/mobile")));
+    }
+
+    /// A same-named checkout of ANOTHER owner's repo under the workspace root
+    /// is exactly the wrong-repo cwd this refuses.
+    #[test]
+    fn a_checkout_of_a_different_owners_repo_is_refused() {
+        let err = resolve_checkout_in(
+            &root(),
+            "portofino-pizzeria/infra",
+            &BTreeMap::new(),
+            checkouts(&["/box/workspace/infra"]),
+            origins(&[(
+                "/box/workspace/infra",
+                "https://github.com/qontinui/infra.git",
+            )]),
+        )
+        .unwrap_err();
+        assert_eq!(err.tried.len(), 2);
+        assert!(err.tried[1]
+            .1
+            .contains("origin is https://github.com/qontinui/infra.git"));
+    }
+
+    #[test]
+    fn a_settings_entry_needs_no_origin_but_must_exist() {
+        let m = map(&[("acme/app", "/src/app")]);
+        assert_eq!(
+            resolve_checkout_in(&root(), "acme/app", &m, checkouts(&["/src/app"]), |_| None),
+            Ok(PathBuf::from("/src/app"))
+        );
+        // Present in the map but not on disk → falls through, and names it.
+        let err =
+            resolve_checkout_in(&root(), "acme/app", &m, checkouts(&[]), |_| None).unwrap_err();
+        assert!(err.tried[0]
+            .1
+            .contains("settings paths.repo_checkouts: not a git checkout"));
+    }
+
+    /// No candidate at all: the error names every path, its source and why,
+    /// behind the stable token coord stores.
+    #[test]
+    fn no_checkout_anywhere_lists_every_candidate() {
+        let err = resolve_checkout_in(
+            &root(),
+            "portofino-pizzeria/mobile",
+            &map(&[("portofino-pizzeria/mobile", "/elsewhere/mobile")]),
+            checkouts(&[]),
+            |_| None,
+        )
+        .unwrap_err();
+        // Separator-normalised: a Windows `PathBuf::join` renders `\`.
+        let shown = err.to_string().replace('\\', "/");
+        assert!(shown.starts_with("workdir_not_a_checkout: "), "{shown}");
+        for p in [
+            "/elsewhere/mobile",
+            "/box/portofino-pizzeria/mobile",
+            "/box/workspace/mobile",
+        ] {
+            assert!(shown.contains(p), "{p} missing from {shown}");
+        }
+    }
+
+    #[test]
+    fn a_checkout_with_no_origin_is_not_verified() {
+        let err = resolve_checkout_in(
+            &root(),
+            "qontinui/qontinui-runner",
+            &BTreeMap::new(),
+            checkouts(&["/box/workspace/qontinui-runner"]),
+            |_| None,
+        )
+        .unwrap_err();
+        assert!(err.tried[0].1.contains("no origin remote"));
+    }
+
+    /// Review round 1: the loose resolver used to hand `materialize_repos` a
+    /// `.git`-bearing owner-root dir whose origin is some OTHER repo.
+    #[test]
+    fn the_worktree_source_path_is_verified_too() {
+        let got = default_canonical_path_resolved_in(
+            &root(),
+            "acme/app",
+            &BTreeMap::new(),
+            checkouts(&["/box/acme/app"]),
+            origins(&[("/box/acme/app", "https://github.com/someone-else/app.git")]),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/box/workspace/app"),
+            "unverified → layout rule"
+        );
+    }
+
+    #[test]
+    fn a_traversal_owner_or_relative_map_path_is_never_a_candidate() {
+        let c = checkout_candidates_in(&root(), "../app", &BTreeMap::new()).unwrap();
+        assert_eq!(c.len(), 1, "`..` owner gets no owner-root candidate: {c:?}");
+        let c = checkout_candidates_in(&root(), "acme/app", &map(&[("acme/app", "relative/app")]))
+            .unwrap();
+        assert!(
+            c.iter().all(|(_, s)| *s != CandidateSource::SettingsMap),
+            "a relative map path is not a candidate: {c:?}"
+        );
+    }
+
+    #[test]
+    fn origin_matching_is_by_name_and_stated_owner() {
+        assert!(origin_names_repo("https://github.com/acme/app", "acme/app"));
+        assert!(origin_names_repo("https://github.com/acme/app.git", "app"));
+        assert!(!origin_names_repo(
+            "https://github.com/other/app.git",
+            "acme/app"
+        ));
+        assert!(!origin_names_repo(
+            "https://github.com/acme/app2.git",
+            "acme/app"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_needs_a_segment_boundary() {
+        assert!(path_is_within(
+            Path::new("/box/workspace"),
+            Path::new("/box/workspace")
+        ));
+        assert!(path_is_within(
+            Path::new("/box/workspace"),
+            Path::new("/box/workspace/qontinui-runner")
+        ));
+        assert!(!path_is_within(
+            Path::new("/box/workspace"),
+            Path::new("/box/workspace-old/app")
+        ));
+        assert!(!path_is_within(
+            Path::new("/box/workspace"),
+            Path::new("/box/portofino-pizzeria/mobile")
+        ));
+        if !cfg!(windows) {
+            assert!(!path_is_within(
+                Path::new("/box/Workspace"),
+                Path::new("/box/workspace/app")
+            ));
+        }
     }
 }

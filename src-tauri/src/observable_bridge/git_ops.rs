@@ -176,6 +176,12 @@ fn resolve_repo_name(working_dir: &Path, git_dir: &Path) -> String {
 /// URL basename without a trailing `.git`. Handles both `git@host:org/x.git`
 /// and `https://host/org/x.git` forms.
 fn origin_url_basename(config_path: &Path) -> Option<String> {
+    origin_url_from_config(config_path).map(|url| repo_basename_from_url(&url))
+}
+
+/// The raw `[remote "origin"] url` of one git config file, or `None` when the
+/// file is unreadable or declares no origin URL.
+fn origin_url_from_config(config_path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(config_path).ok()?;
     let mut in_origin = false;
     for line in text.lines() {
@@ -191,12 +197,54 @@ fn origin_url_basename(config_path: &Path) -> Option<String> {
                 let rest = rest.trim_start();
                 if let Some(eq) = rest.strip_prefix('=') {
                     let url = eq.trim();
-                    return Some(repo_basename_from_url(url));
+                    if !url.is_empty() {
+                        return Some(url.to_string());
+                    }
                 }
             }
         }
     }
     None
+}
+
+/// The `origin` remote URL of the checkout at `checkout`, read from its git
+/// config with no `git` process.
+///
+/// Resolves both checkout shapes: a primary checkout's `.git` DIRECTORY
+/// (`<checkout>/.git/config`), and a linked worktree's `.git` FILE
+/// (`gitdir: <dir>`), whose remotes live in the COMMON dir that
+/// `<dir>/commondir` names. `None` when `checkout` is not a git checkout, the
+/// config is unreadable, or no origin URL is declared — the caller treats all
+/// three as "not verified", never as a match.
+pub fn origin_url(checkout: &Path) -> Option<String> {
+    let dot_git = checkout.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+            .trim();
+        let target = PathBuf::from(target);
+        if target.is_absolute() {
+            target
+        } else {
+            checkout.join(target)
+        }
+    };
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(c) if !c.trim().is_empty() => {
+            let c = PathBuf::from(c.trim());
+            if c.is_absolute() {
+                c
+            } else {
+                git_dir.join(c)
+            }
+        }
+        _ => git_dir,
+    };
+    origin_url_from_config(&common.join("config"))
 }
 
 /// `git@github.com:org/repo.git` / `https://github.com/org/repo.git`
@@ -1109,6 +1157,39 @@ mod tests {
             origin_url_basename(&config).as_deref(),
             Some("qontinui-runner")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn origin_url_reads_a_primary_checkout_and_a_linked_worktree() {
+        let dir = std::env::temp_dir().join(format!("qontinui-gitop-origin-{}", Uuid::new_v4()));
+        let primary = dir.join("mobile");
+        std::fs::create_dir_all(primary.join(".git/worktrees/wt")).unwrap();
+        std::fs::write(
+            primary.join(".git/config"),
+            "[core]\n\tbare = false\n[remote \"upstream\"]\n\turl = https://github.com/other/mobile.git\n[remote \"origin\"]\n\turl = https://github.com/portofino-pizzeria/mobile.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            origin_url(&primary).as_deref(),
+            Some("https://github.com/portofino-pizzeria/mobile.git"),
+            "the origin section wins, not the first remote"
+        );
+
+        // A linked worktree: `.git` is a FILE naming a per-worktree git dir
+        // whose `commondir` points back at the primary's `.git`.
+        let wt = dir.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let wt_git = primary.join(".git/worktrees/wt");
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+        assert_eq!(
+            origin_url(&wt).as_deref(),
+            Some("https://github.com/portofino-pizzeria/mobile.git")
+        );
+
+        // Not a checkout at all.
+        assert_eq!(origin_url(&dir.join("absent")), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 

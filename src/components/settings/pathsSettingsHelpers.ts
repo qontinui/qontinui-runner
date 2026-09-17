@@ -43,6 +43,13 @@ export interface PathSettings {
   plans_archive_dir?: string;
   prompts_dir?: string;
   workspace_root?: string;
+  /**
+   * Where a repo that is NOT under the workspace root is checked out on this
+   * device, keyed by coord slug (`owner/name`). Absent when empty — the Rust
+   * side skips serializing an empty map. Edited as text through
+   * {@link formatRepoCheckouts} / {@link parseRepoCheckouts}.
+   */
+  repo_checkouts?: Record<string, string>;
   strict_mode: boolean;
 }
 
@@ -216,7 +223,11 @@ export function draftsFrom(configured: PathSettings): PathDrafts {
  * only the four edited fields — DELETING a key whose draft is blank rather
  * than writing `""`, because absent is the wire form of unset.
  */
-export function buildPathSettingsPayload(saved: PathSettings, drafts: PathDrafts): PathSettings {
+export function buildPathSettingsPayload(
+  saved: PathSettings,
+  drafts: PathDrafts,
+  repoCheckouts?: Record<string, string>,
+): PathSettings {
   const next: PathSettings = { ...saved };
   for (const field of PATH_FIELDS) {
     const value = normalizePathInput(drafts[field]);
@@ -226,7 +237,97 @@ export function buildPathSettingsPayload(saved: PathSettings, drafts: PathDrafts
       next[field] = value;
     }
   }
+  if (repoCheckouts !== undefined) {
+    // Same absent-is-unset rule as the path fields: an empty map is omitted.
+    if (Object.keys(repoCheckouts).length === 0) {
+      delete next.repo_checkouts;
+    } else {
+      next.repo_checkouts = { ...repoCheckouts };
+    }
+  }
   return next;
+}
+
+// ── Repo checkouts (repos outside the workspace root) ──────────────────────
+
+/**
+ * The saved map as editable text: one `owner/name = path` line per entry,
+ * sorted by slug so a load-then-format is stable.
+ */
+export function formatRepoCheckouts(map: Record<string, string> | undefined): string {
+  if (!map) return "";
+  return Object.keys(map)
+    .sort((a, b) => a.localeCompare(b))
+    .map((slug) => `${slug} = ${map[slug]}`)
+    .join("\n");
+}
+
+export interface ParsedRepoCheckouts {
+  entries: Record<string, string>;
+  /** One message per rejected line, naming the line number. Empty = valid. */
+  errors: string[];
+}
+
+/** `owner/name`: two non-empty segments, no whitespace. */
+const REPO_SLUG = /^[^\s/]+\/[^\s/]+$/;
+
+/**
+ * Parse the text box. Blank lines and `#` comments are ignored; every other
+ * line must be `owner/name = path`. A malformed line or a slug repeated
+ * (case-insensitively, as the runner matches it) is an error rather than a
+ * silently dropped mapping — the panel refuses to save until it is fixed.
+ */
+export function parseRepoCheckouts(text: string): ParsedRepoCheckouts {
+  const entries: Record<string, string> = {};
+  const seen = new Set<string>();
+  const errors: string[] = [];
+  text.split(/\r?\n/).forEach((raw, index) => {
+    const line = raw.trim();
+    if (line.length === 0 || line.startsWith("#")) return;
+    const lineNo = index + 1;
+    const eq = line.indexOf("=");
+    if (eq < 0) {
+      errors.push(`Line ${lineNo}: expected "owner/name = path".`);
+      return;
+    }
+    const slug = line.slice(0, eq).trim();
+    const path = line.slice(eq + 1).trim();
+    if (!REPO_SLUG.test(slug)) {
+      errors.push(`Line ${lineNo}: "${slug}" is not an owner/name repo slug.`);
+      return;
+    }
+    if (slug.toLowerCase().startsWith("qontinui/")) {
+      errors.push(
+        `Line ${lineNo}: qontinui repositories always use the workspace root; remove ${slug}.`,
+      );
+      return;
+    }
+    if (path.length === 0) {
+      errors.push(`Line ${lineNo}: no path for ${slug}.`);
+      return;
+    }
+    // Mirrors the runner's `has_root` test: a relative path would resolve
+    // against the runner's own working directory, so it is never used.
+    if (!/^(\/|\\|[A-Za-z]:[\\/])/.test(path)) {
+      errors.push(`Line ${lineNo}: ${path} is not an absolute path.`);
+      return;
+    }
+    const key = slug.toLowerCase();
+    if (seen.has(key)) {
+      errors.push(`Line ${lineNo}: ${slug} is listed more than once.`);
+      return;
+    }
+    seen.add(key);
+    entries[slug] = path;
+  });
+  return { entries, errors };
+}
+
+/** `true` when the text box would persist a map other than the saved one. */
+export function repoCheckoutsDirty(saved: PathSettings, text: string): boolean {
+  const { entries, errors } = parseRepoCheckouts(text);
+  if (errors.length > 0) return true;
+  return formatRepoCheckouts(entries) !== formatRepoCheckouts(saved.repo_checkouts);
 }
 
 /** `true` when a draft would persist something other than what is saved. */
