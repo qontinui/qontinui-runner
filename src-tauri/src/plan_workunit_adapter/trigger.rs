@@ -2562,6 +2562,12 @@ impl LoopState {
                     // was not enough — the bulk prime is one-shot per cycle
                     // and abstains on `Err`/`Ok(None)`, while the per-slug
                     // seed fires only for slugs the memory does not hold.
+                    // The clear forfeits the "disappeared from the active dir"
+                    // warn (`newly_disappeared_slugs` walks `last_applied`'s
+                    // keys) for any slug whose file vanished while writes were
+                    // withheld — informational only, no write depends on it,
+                    // and the same trade `apply_resolution` accepts on a
+                    // corpus switch.
                     self.last_applied.clear();
                     self.bulk_seeded = false;
                     match reading.coord {
@@ -9003,9 +9009,11 @@ mod tests {
     /// withholding is not re-pushed as a transition out of frozen memory.
     ///
     /// Neuter check: drop `self.last_applied.clear()` from the resume arm of
-    /// `note_write_posture` and the sink records one `transition` (draft →
-    /// vetted, from a memory that still says draft) with no `current_status`
-    /// read ahead of it.
+    /// `note_write_posture` and the resumed cycle's second call is
+    /// `last_actor` (a transition being decided from memory that still says
+    /// draft), the conflict check then reads `current_status` and warns
+    /// "file wins", and one `transition` is recorded — the ledger reads
+    /// `[list_statuses, last_actor, current_status, upsert, transition]`.
     #[tokio::test]
     async fn a_resume_whose_bulk_read_fails_still_re_primes_per_slug_before_pushing() {
         let dir = one_plan_dir();
@@ -9070,7 +9078,7 @@ mod tests {
                 .get("2026-01-01-one-plan")
                 .map(String::as_str),
             Some("vetted"),
-            "the memory was re-primed from coord, not carried over"
+            "the memory ends at vetted (the neutered path lands here too; the call order and the zero transition count above are what discriminate)"
         );
         assert!(
             !state.bulk_seeded,
