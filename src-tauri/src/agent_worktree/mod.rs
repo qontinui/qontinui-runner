@@ -652,7 +652,9 @@ async fn heartbeat_loop<F>(
 
 enum HeartbeatTickOutcome {
     Ok,
-    Stolen { current_holder: Option<String> },
+    Stolen {
+        current_holder: Option<String>,
+    },
     /// The claim EXPIRED or was never held: coord says nobody holds it. We no
     /// longer hold it either, so the task stops exactly as it does on `Stolen`
     /// — the difference is that no rival is named.

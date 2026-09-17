@@ -364,7 +364,10 @@ mod tests {
     /// deleting the `"not_held"` arm turns this red.
     #[test]
     fn heartbeat_not_held_drops_the_lease_and_is_not_an_unavailable() {
-        assert_eq!(parse_heartbeat_result("not_held"), HeartbeatOutcome::NotHeld);
+        assert_eq!(
+            parse_heartbeat_result("not_held"),
+            HeartbeatOutcome::NotHeld
+        );
         assert!(
             !still_held_after_heartbeat(&parse_heartbeat_result("not_held")),
             "an expired claim is not held, however politely coord says so"
