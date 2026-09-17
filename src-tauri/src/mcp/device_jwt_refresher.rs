@@ -78,6 +78,69 @@ pub(crate) enum RefreshOutcome {
     /// untouched (store_tokens is atomic; a failure aborts before
     /// rewriting the slot).
     PersistFailed(String),
+    /// Coord returned a fresh JWT, but its OWN `tenant_id` claim named a
+    /// DIFFERENT tenant than the one this refresh asked for — refused at
+    /// [`crate::auth::AuthManager::store_tokens_expecting`] and never
+    /// persisted. The existing JWT in the access_token slot is left
+    /// untouched.
+    ///
+    /// This is the exact defect plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+    /// names: coord fell back to the operator's home tenant and this runner
+    /// silently adopted it as its default. D2/D3: defence in depth against an
+    /// older web backend, or a coord bug, that mints for the wrong tenant.
+    TenantMismatch {
+        expected: uuid::Uuid,
+        returned: Option<uuid::Uuid>,
+    },
+}
+
+/// Cumulative count, since process start, of mint-stores refused by
+/// [`crate::auth::AuthManager::store_tokens_expecting`] across all three
+/// refresher mint paths (Cognito pair-cli, device self-refresh,
+/// device-machine-key exchange). A number that climbs is a live instance of
+/// the defect plan
+/// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+/// fixes — read via [`device_jwt_refresh_tenant_mismatch_total`].
+static DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Snapshot of [`DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL`]. `allow(dead_code)`:
+/// wiring this into a `/health` surface is a later phase; the tests exercise
+/// it directly.
+#[allow(dead_code)]
+pub(crate) fn device_jwt_refresh_tenant_mismatch_total() -> u64 {
+    DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// (expected, returned) pairs already `warn!`ed this process — D3: "One
+/// `warn!` per (expected, returned) pair per process", so a mismatch that
+/// keeps recurring every 5-minute tick does not spam the log the way the
+/// Phase 2c doc-comment on [`TenantSlotHealth`] describes for an unrelated
+/// condition (15,826 identical lines in six weeks, unnoticed).
+static WARNED_TENANT_MISMATCHES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashSet<(uuid::Uuid, Option<uuid::Uuid>)>>,
+> = std::sync::OnceLock::new();
+
+/// Emit the operator-facing tenant-mismatch `warn!` at most once per
+/// (expected, returned) pair per process. Naming both tenants and the remedy
+/// (upgrade qontinui-web, or re-pair the runner to the expected tenant) is
+/// the whole reason this exists as a distinct message rather than reusing
+/// the generic persist-failure log line.
+fn warn_tenant_mismatch_once(expected: uuid::Uuid, returned: Option<uuid::Uuid>) {
+    let cell = WARNED_TENANT_MISMATCHES
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut seen = cell
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.insert((expected, returned)) {
+        warn!(
+            "device_jwt_refresher: device-JWT re-mint returned tenant {returned:?} but \
+             {expected} was requested — refusing to persist. If this recurs: upgrade \
+             qontinui-web (older backends silently drop the requested tenant_id), or \
+             re-pair this runner to tenant {expected} if it should now be bound elsewhere."
+        );
+    }
 }
 
 /// How often the loop wakes to check whether the JWT is approaching
@@ -396,6 +459,17 @@ pub(crate) enum PairProgress {
     /// credential-dark even though it tried. Degraded, not gate-blocking-by-
     /// config: the tenant resolved, the mint just failed.
     BailRefreshFailedExpired,
+    /// `try_refresh_once` returned [`RefreshOutcome::TenantMismatch`]: coord
+    /// minted a JWT for a DIFFERENT tenant than the one requested, and it was
+    /// refused rather than persisted. Terminal for the tick — D3 of plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`:
+    /// this must NOT fall through to the device-machine-key exchange, which
+    /// would mint from the same (possibly still-wrong) tenant coord has on
+    /// file for this device.
+    BailTenantMismatch {
+        expected: uuid::Uuid,
+        returned: Option<uuid::Uuid>,
+    },
     /// The `Pair` arm completed with a usable JWT — either a fresh `Replaced`
     /// or a `KeptExisting`/`PersistFailed` whose existing JWT is still valid.
     Healthy,
@@ -465,6 +539,13 @@ pub(crate) fn coord_credential_health(
                 "device-JWT re-mint failed (coord non-2xx or persist error) and the \
                  existing JWT is expired — runner is credential-dark",
             ),
+            Some(PairProgress::BailTenantMismatch { expected, returned }) => {
+                CoordCredentialHealth::bad(format!(
+                    "device-JWT re-mint returned tenant {returned:?} but {expected} was \
+                     requested — refused rather than persisted; upgrade qontinui-web or \
+                     re-pair this runner to tenant {expected}"
+                ))
+            }
         },
     }
 }
@@ -935,8 +1016,9 @@ pub(crate) async fn try_refresh_once(
 
     // Coord returned 2xx → persist the new JWT into the access_token
     // slot. The refresh-token slot stays empty (device-JWT lifecycle is
-    // owned by coord, not by an OAuth refresh chain).
-    match auth_manager.store_tokens(&resp.token, "") {
+    // owned by coord, not by an OAuth refresh chain). Guarded by the
+    // tenant we just asked pair-cli to mint for — see `RefreshOutcome::TenantMismatch`.
+    match auth_manager.store_tokens_expecting(&resp.token, "", Some(tenant_id)) {
         Ok(()) => {
             // M1: a NEW credential is in the slot — and, via the mirror, in
             // its tenant's slot — so every rejection coord recorded against
@@ -948,8 +1030,17 @@ pub(crate) async fn try_refresh_once(
             }
         }
         Err(e) => {
-            warn!("device_jwt_refresher: persist new JWT failed: {e}");
-            RefreshOutcome::PersistFailed(e.to_string())
+            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
+                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                RefreshOutcome::TenantMismatch {
+                    expected: mismatch.expected,
+                    returned: mismatch.returned,
+                }
+            } else {
+                warn!("device_jwt_refresher: persist new JWT failed: {e}");
+                RefreshOutcome::PersistFailed(e.to_string())
+            }
         }
     }
 }
@@ -1080,8 +1171,12 @@ pub(crate) async fn try_device_self_refresh(
         return None;
     }
     // Persist into the access_token slot (refresh-token slot stays empty — the
-    // device-JWT lifecycle is coord-owned, not an OAuth refresh chain).
-    match auth_manager.store_tokens(&body.token, "") {
+    // device-JWT lifecycle is coord-owned, not an OAuth refresh chain). Guarded
+    // by the OUTGOING token's own tenant claim: coord authenticated this
+    // request against `current`, so a re-mint for any other tenant is a coord
+    // bug or a stale slot, never a legitimate answer to THIS request.
+    let expected_tenant = crate::auth::jwt_tenant_claim(&current);
+    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -1093,10 +1188,21 @@ pub(crate) async fn try_device_self_refresh(
             Some(body.token)
         }
         Err(e) => {
-            warn!(
-                "device_jwt_refresher: persist self-refreshed JWT failed: {e} \
-                 — falling back to Cognito (existing JWT preserved)"
-            );
+            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
+                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "device_jwt_refresher: device self-refresh re-minted for tenant \
+                     {:?}, not the requested {} — refusing to persist and falling back \
+                     to Cognito (existing JWT preserved)",
+                    mismatch.returned, mismatch.expected
+                );
+            } else {
+                warn!(
+                    "device_jwt_refresher: persist self-refreshed JWT failed: {e} \
+                     — falling back to Cognito (existing JWT preserved)"
+                );
+            }
             None
         }
     }
@@ -2997,13 +3103,16 @@ pub(crate) fn tenant_slot_outcome_token(outcome: TenantSlotOutcome) -> String {
 ///
 /// [`try_device_machine_key_exchange`] is the one credential path that needs
 /// neither a live device JWT nor a Cognito session, which is exactly the
-/// situation a dead slot is in. The re-minted JWT is written back into this
-/// tenant's slot ONLY when its own `tenant_id` claim names this tenant —
-/// keyed by the tenant coord actually issued for, never by the key we happened
-/// to be repairing. When it names another tenant (or none), the slot stays
-/// cleared: the exchange has already refreshed the default slot, and seeding a
-/// tenant-keyed slot with a credential for a different tenant is the
-/// cross-tenant substitution `select_device_bearer` refuses by design.
+/// situation a dead slot is in. It is called with `expected_tenant =
+/// Some(*tenant)`, so — per plan
+/// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+/// D2 — it refuses to persist ANYTHING, including the legacy default slot,
+/// when the re-minted JWT's own `tenant_id` claim names a different tenant:
+/// coord alone decides which tenant a device-machine-key exchange mints for,
+/// so a mismatch here means `coord.devices.tenant_id` is not (or no longer)
+/// `tenant`, and seeding either slot with that credential would be the exact
+/// cross-tenant substitution `select_device_bearer` refuses by design. A
+/// `None` return (mismatch, or any other failure) leaves this slot cleared.
 async fn clear_and_rederive_tenant_slot(
     auth_manager: &crate::auth::AuthManager,
     tenant: &uuid::Uuid,
@@ -3046,25 +3155,17 @@ async fn clear_and_rederive_tenant_slot(
             rederived: false,
         };
     }
-    let Some(jwt) = try_device_machine_key_exchange(auth_manager, web_base, device_id).await else {
+    // expected_tenant = Some(*tenant): a mismatched mint is already refused
+    // (both slots) inside try_device_machine_key_exchange, so a `Some` here
+    // is guaranteed to be tenant's own credential — see the doc comment above.
+    let Some(jwt) =
+        try_device_machine_key_exchange(auth_manager, web_base, device_id, Some(*tenant)).await
+    else {
         return TenantSlotOutcome::Cleared {
             cause,
             rederived: false,
         };
     };
-    let minted_for = qontinui_runner_lib::pair::tenant_id_from_oauth_claim(jwt.trim())
-        .and_then(|raw| uuid::Uuid::parse_str(raw.trim()).ok());
-    if minted_for != Some(*tenant) {
-        warn!(
-            "device_jwt_refresher: device-machine-key exchange re-minted for {minted_for:?}, \
-             not tenant {tenant} — leaving that slot cleared rather than seeding it with \
-             another tenant's credential (the default slot was refreshed)"
-        );
-        return TenantSlotOutcome::Cleared {
-            cause,
-            rederived: false,
-        };
-    }
     match auth_manager.store_tenant_device_jwt(tenant, &jwt) {
         Ok(()) => {
             info!(
@@ -3458,15 +3559,25 @@ pub(crate) async fn refresh_tenant_slots(
 /// bail — when:
 ///   - no `dmk_` is stored (this device was never issued one),
 ///   - web returns ANY non-2xx (401/403 revoked/expired/mismatch, 503 when
-///     web's `COORD_ADMIN_SECRET` is unset, anything else), OR
-///   - the network call fails, the body fails to decode, or the token is empty.
+///     web's `COORD_ADMIN_SECRET` is unset, anything else),
+///   - the network call fails, the body fails to decode, or the token is empty, OR
+///   - `expected_tenant` is `Some` and the minted token's own `tenant_id`
+///     claim names a DIFFERENT tenant (D2/D3 of plan
+///     `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`;
+///     the exchange authenticates by device-machine-key alone, so coord
+///     alone decides which tenant to mint for — a mismatch means
+///     `coord.devices.tenant_id` is not (or no longer) the tenant this
+///     runner asked for, exactly the residue an earlier wrong pairing can
+///     leave behind).
 ///
-/// REPLACE-not-REVOKE: on ANY failure the existing JWT is left UNTOUCHED — a
-/// missed exchange means "stay credential-dark", NEVER "clear the slot".
+/// REPLACE-not-REVOKE: on ANY failure — including a tenant mismatch — the
+/// existing JWT is left UNTOUCHED — a missed exchange means "stay
+/// credential-dark", NEVER "clear the slot".
 pub(crate) async fn try_device_machine_key_exchange(
     auth_manager: &crate::auth::AuthManager,
     web_base: &str,
     device_id: &str,
+    expected_tenant: Option<uuid::Uuid>,
 ) -> Option<String> {
     // No dmk_ stored → this recovery path is unavailable for this device.
     let dmk = match auth_manager.get_device_machine_key() {
@@ -3527,8 +3638,10 @@ pub(crate) async fn try_device_machine_key_exchange(
         return None;
     }
     // Persist into the access_token slot (refresh-token slot stays empty — the
-    // device-JWT lifecycle is coord-owned).
-    match auth_manager.store_tokens(&body.token, "") {
+    // device-JWT lifecycle is coord-owned). Guarded by `expected_tenant`: see
+    // the doc comment above for why a mismatch here is exactly the incident
+    // this exchange path was found to bypass.
+    match auth_manager.store_tokens_expecting(&body.token, "", expected_tenant) {
         Ok(()) => {
             // M1: the old credential's rejections are spent evidence — for the
             // default bucket and for the tenant slot the mirror just wrote.
@@ -3541,7 +3654,17 @@ pub(crate) async fn try_device_machine_key_exchange(
             Some(body.token)
         }
         Err(e) => {
-            warn!("device_jwt_refresher: persist dmk-exchanged JWT failed: {e}");
+            if let Some(mismatch) = e.downcast_ref::<crate::auth::TenantMismatch>() {
+                DEVICE_JWT_REFRESH_TENANT_MISMATCH_TOTAL
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "device_jwt_refresher: dmk exchange re-minted for tenant {:?}, not the \
+                     requested {} — refusing to persist (existing JWT preserved)",
+                    mismatch.returned, mismatch.expected
+                );
+            } else {
+                warn!("device_jwt_refresher: persist dmk-exchanged JWT failed: {e}");
+            }
             None
         }
     }
@@ -4100,9 +4223,9 @@ async fn refresher_loop(
                 // + the same OAuth/outgoing-JWT fallback chain.
                 let machine_tenant = crate::session::dual_write::resolve_active_tenant_id();
                 let outgoing_jwt = auth_manager.get_access_token().ok();
-                let tenant_resolved =
-                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant)
-                        .is_some();
+                let resolved_tenant =
+                    resolve_pair_tenant_id(&bearer_token, outgoing_jwt.as_deref(), machine_tenant);
+                let tenant_resolved = resolved_tenant.is_some();
 
                 // Phase 5.2: try_refresh_once encapsulates the
                 // pair-cli HTTP call + JWT persistence. It preserves
@@ -4144,27 +4267,53 @@ async fn refresher_loop(
                             PairProgress::Healthy
                         }
                     }
+                    // D3: terminal for the tick — see `PairProgress::BailTenantMismatch`.
+                    // Deliberately NOT `PersistFailed`'s arm: that path still falls
+                    // through to the dmk-exchange fallback below, which this must not.
+                    RefreshOutcome::TenantMismatch { expected, returned } => {
+                        warn_tenant_mismatch_once(*expected, *returned);
+                        PairProgress::BailTenantMismatch {
+                            expected: *expected,
+                            returned: *returned,
+                        }
+                    }
                 };
 
                 // Phase 4b: FINAL cold-start fallback. Self-refresh (4a) AND the
                 // Cognito pair-cli path have BOTH failed to advance the slot this
-                // tick (progress != Healthy). If a device machine key (`dmk_`) is
-                // stored, exchange it with web for a fresh device JWT — this
-                // recovers a runner offline past both the device-JWT TTL and the
-                // Cognito refresh-token window (>30d) with no user session. On
-                // success: same healthy-tick handling as the other re-mints (kick
-                // relay, publish healthy, reset backoff, emit "resumed" if we were
-                // dark, continue). On None: fall through to the existing bail.
+                // tick. If a device machine key (`dmk_`) is stored, exchange it
+                // with web for a fresh device JWT — this recovers a runner offline
+                // past both the device-JWT TTL and the Cognito refresh-token window
+                // (>30d) with no user session. On success: same healthy-tick
+                // handling as the other re-mints (kick relay, publish healthy,
+                // reset backoff, emit "resumed" if we were dark, continue). On
+                // None: fall through to the existing bail.
                 // REPLACE-not-REVOKE: a miss never clears the existing JWT.
-                if !matches!(progress, PairProgress::Healthy) {
+                //
+                // D3: gated on the SPECIFIC bail reasons this fallback answers —
+                // NOT a blanket "anything but Healthy". `BailTenantMismatch` is
+                // deliberately excluded: coord already minted for the wrong
+                // tenant once this tick, and a dmk exchange mints from the SAME
+                // `coord.devices.tenant_id` column that wrong mint may have just
+                // overwritten, so falling through here would repeat the incident
+                // this plan closes rather than recover from it.
+                if matches!(
+                    progress,
+                    PairProgress::BailNoTenant | PairProgress::BailRefreshFailedExpired
+                ) {
                     let dmk_device_id = std::env::var("QONTINUI_MACHINE_ID")
                         .ok()
                         .filter(|s| !s.trim().is_empty())
                         .map(|s| s.trim().to_string())
                         .or_else(|| qontinui_runner_lib::pair::read_device_id_from_disk().ok());
                     if let Some(did) = dmk_device_id {
-                        if let Some(new_jwt) =
-                            try_device_machine_key_exchange(&auth_manager, &pair_base, &did).await
+                        if let Some(new_jwt) = try_device_machine_key_exchange(
+                            &auth_manager,
+                            &pair_base,
+                            &did,
+                            resolved_tenant.map(|(t, _)| t),
+                        )
+                        .await
                         {
                             info!(
                                 "device_jwt_refresher: device JWT recovered via \
@@ -4898,6 +5047,55 @@ mod try_refresh_once_tests {
         );
     }
 
+    /// D2/D3: coord mints a 2xx JWT, but its OWN `tenant_id` claim names a
+    /// DIFFERENT tenant than the one `tok()` asked for. Must be refused, not
+    /// persisted — the exact defect plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+    /// fixes: the old behaviour stored whatever coord returned.
+    #[tokio::test]
+    async fn refresher_refuses_a_mismatched_tenant_and_preserves_jwt() {
+        let mgr = test_auth_manager("refuses_mismatched_tenant");
+        let old_jwt = synth_jwt_with_tenant(
+            chrono::Utc::now().timestamp() + 30 * 60,
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc", // matches tok()'s claim
+        );
+        mgr.store_tokens(&old_jwt, "").expect("store");
+
+        // Minted for a tenant `tok()` never asked for — the home-tenant
+        // fallback this plan closes.
+        let wrong_tenant_jwt = synth_jwt_with_tenant(
+            chrono::Utc::now().timestamp() + 4 * 60 * 60,
+            "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        );
+        // `PairCompleteResponse::user_id` has no `#[serde(default)]` — omitting
+        // it would fail decode and collapse to KeptExisting before the tenant
+        // guard is ever reached, masking this test's actual assertion.
+        let body = serde_json::json!({ "token": wrong_tenant_jwt, "user_id": UID }).to_string();
+        let (base, _cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let outcome = try_refresh_once(&mgr, &base, &tok(), DID, UID, None).await;
+        match outcome {
+            RefreshOutcome::TenantMismatch { expected, returned } => {
+                assert_eq!(
+                    expected.to_string(),
+                    "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    "expected must be the tenant tok() asked for"
+                );
+                assert_eq!(
+                    returned.map(|u| u.to_string()),
+                    Some("dddddddd-dddd-4ddd-8ddd-dddddddddddd".to_string()),
+                    "returned must be the tenant coord actually minted for"
+                );
+            }
+            other => panic!("expected TenantMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            mgr.get_access_token().expect("token present"),
+            old_jwt,
+            "a tenant mismatch must leave the existing JWT untouched"
+        );
+    }
+
     /// Phase 5.4 migration guard: a legacy opaque token in the
     /// access_token slot must report `Ok(true)` from
     /// `device_jwt_needs_refresh` so the refresher heals it on the next
@@ -5099,6 +5297,14 @@ mod device_self_refresh_tests {
         format!("{header}.{payload}.{sig}")
     }
 
+    /// As [`synth_jwt`], but also carrying a `tenant_id` claim.
+    fn synth_jwt_with_tenant(tenant: &str, exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{tenant}\"}}").as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
     fn test_auth_manager(name: &str) -> crate::auth::AuthManager {
         let dir = std::env::temp_dir().join("qontinui_test_self_refresh");
         let _ = std::fs::create_dir_all(&dir);
@@ -5256,6 +5462,36 @@ mod device_self_refresh_tests {
             *cap.hits.lock().unwrap(),
             0,
             "coord must NOT be hit when no device-JWT is held"
+        );
+    }
+
+    /// D2/D3: coord authenticated this self-refresh against `existing`'s own
+    /// tenant, but the re-minted JWT names a DIFFERENT one. Refused, not
+    /// persisted — the existing (still-valid) JWT is left untouched and the
+    /// caller falls back to Cognito exactly as any other self-refresh miss.
+    #[tokio::test]
+    async fn self_refresh_refuses_a_mismatched_tenant_and_preserves_jwt() {
+        let mgr = test_auth_manager("refuses_mismatched_tenant");
+        let existing = synth_jwt_with_tenant(
+            "11111111-2222-4333-8444-555555555561",
+            chrono::Utc::now().timestamp() + 30 * 60,
+        );
+        mgr.store_tokens(&existing, "").expect("store");
+
+        let wrong_tenant_jwt = synth_jwt_with_tenant(
+            "22222222-3333-4444-5555-666666666672",
+            chrono::Utc::now().timestamp() + 4 * 60 * 60,
+        );
+        let body = serde_json::json!({ "token": wrong_tenant_jwt }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let got = try_device_self_refresh(&mgr, &base, DID).await;
+        assert!(got.is_none(), "a mismatched tenant must be refused");
+        assert_eq!(*cap.hits.lock().unwrap(), 1, "coord was still hit once");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "a tenant mismatch must leave the existing JWT untouched"
         );
     }
 
@@ -8618,6 +8854,14 @@ mod device_machine_key_exchange_tests {
         format!("{header}.{payload}.{sig}")
     }
 
+    /// As [`synth_jwt`], but also carrying a `tenant_id` claim.
+    fn synth_jwt_with_tenant(tenant: &uuid::Uuid, exp: i64) -> String {
+        let header = b64url(b"{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+        let payload = b64url(format!("{{\"exp\":{exp},\"tenant_id\":\"{tenant}\"}}").as_bytes());
+        let sig = b64url(b"fake-sig");
+        format!("{header}.{payload}.{sig}")
+    }
+
     /// Build an isolated AuthManager over a temp `.enc`, optionally pre-seeding
     /// a stored `dmk_` and/or a device JWT. The seed writes go through a sibling
     /// `SecureStorage` at the SAME path (AuthManager exposes only a `dmk_`
@@ -8735,7 +8979,7 @@ mod device_machine_key_exchange_tests {
         let body = serde_json::json!({ "token": new_jwt }).to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
         assert_eq!(
             got.as_deref(),
             Some(new_jwt.as_str()),
@@ -8767,7 +9011,7 @@ mod device_machine_key_exchange_tests {
         let body = serde_json::json!({ "token": new_jwt }).to_string();
         let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
 
-        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
         assert!(got.is_none(), "no dmk_ stored → None");
         assert_eq!(
             *cap.hits.lock().unwrap(),
@@ -8788,7 +9032,7 @@ mod device_machine_key_exchange_tests {
         let (base, cap, _shutdown) =
             spawn_mock(StatusCode::FORBIDDEN, r#"{"error":"revoked"}"#.to_string());
 
-        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
         assert!(got.is_none(), "403 → None");
         assert_eq!(*cap.hits.lock().unwrap(), 1, "attempted exactly once");
         assert_eq!(
@@ -8811,12 +9055,49 @@ mod device_machine_key_exchange_tests {
             r#"{"error":"coord admin secret unset"}"#.to_string(),
         );
 
-        let got = try_device_machine_key_exchange(&mgr, &base, DID).await;
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, None).await;
         assert!(got.is_none(), "503 → None");
         assert_eq!(
             mgr.get_access_token().unwrap(),
             existing,
             "existing JWT must be UNCHANGED after a 503"
+        );
+    }
+
+    /// D2/D3: a 2xx exchange that mints for a DIFFERENT tenant than
+    /// `expected_tenant` is refused at the seam — `None`, nothing persisted
+    /// (not even the legacy slot), existing JWT untouched. This is the exact
+    /// bypass plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+    /// names: the dmk exchange used to call `store_tokens` unconditionally.
+    #[tokio::test]
+    async fn exchange_refuses_a_foreign_tenant_and_preserves_jwt() {
+        let expected = uuid::Uuid::parse_str("11111111-2222-4333-8444-555555555560").unwrap();
+        let foreign = uuid::Uuid::parse_str("22222222-3333-4444-5555-666666666670").unwrap();
+        let existing = synth_jwt(chrono::Utc::now().timestamp() - 60); // expired, cold-start
+        let mgr = setup(
+            "dmk_foreign_tenant_refused",
+            Some("dmk_ok"),
+            Some(&existing),
+        );
+
+        let minted_for_foreign =
+            synth_jwt_with_tenant(&foreign, chrono::Utc::now().timestamp() + 4 * 60 * 60);
+        let body = serde_json::json!({ "token": minted_for_foreign }).to_string();
+        let (base, cap, _shutdown) = spawn_mock(StatusCode::OK, body);
+
+        let got = try_device_machine_key_exchange(&mgr, &base, DID, Some(expected)).await;
+        assert!(got.is_none(), "a foreign-tenant mint must be refused");
+        assert_eq!(*cap.hits.lock().unwrap(), 1, "the exchange was still attempted");
+        assert_eq!(
+            mgr.get_access_token().unwrap(),
+            existing,
+            "REPLACE-not-REVOKE: a tenant mismatch must not touch the legacy slot either"
+        );
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&foreign).unwrap(),
+            None,
+            "the foreign tenant's slot must not be seeded either"
         );
     }
 }
