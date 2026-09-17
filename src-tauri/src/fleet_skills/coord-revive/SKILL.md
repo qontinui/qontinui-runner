@@ -313,6 +313,21 @@ Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` (P3 on
 the runner, P5a on coord). A device bound to more than one tenant can no longer
 be asked for "a" credential without saying whose:
 
+- **The runner's nonce mint (L4 source 3).** `POST /coord-mcp/provision-session`
+  takes an optional `tenant_id` and pins the minted nonce to it (P2); the script
+  passes it through `coord-provision-nonce.sh --tenant`. A runner build predating
+  P2 **ignores** the field and mints for the machine's tenant with a plain `200`,
+  so a nonce minted for a known tenant is never called LIVE on the mint's word:
+  after the door probe, `coord_query_identity` is called over the nonce and its
+  top-level `tenant_id` (the tenant whose credential the proxy forwarded) must
+  name the tenant asked for. A mismatch is `NONCE_MINT_WRONG_TENANT`; an answer
+  that names no tenant is `NONCE_MINT_UNVERIFIED_TENANT`; neither is LIVE, and the
+  cascade moves on. P2's refusals are typed: `400 COORD_MCP_PROVISION_INVALID_TENANT`
+  → `NONCE_MINT_TENANT_INVALID`, `422 COORD_MCP_PROVISION_TENANT_NOT_PAIRED` →
+  `NONCE_MINT_TENANT_NOT_PAIRED`, `503 COORD_MCP_PROVISION_TENANT_UNKNOWN` →
+  `NONCE_MINT_TENANT_UNKNOWN` — none of them is `MINT_REFUSED`, which stays the
+  opt-in/handshake verdict. With no tenant known the body is `{cwd}` and nothing
+  extra is read, exactly as before.
 - **The runner door.** `get_coord_device_token` takes an optional tenant —
   `{"tenantId": "<uuid>"}` over `/ui-bridge/invoke` (`tenant_id` is accepted as an
   alias), `tenantId` over Tauri IPC. **With a tenant** it answers THAT tenant's
@@ -352,10 +367,13 @@ caught, not trusted:** when a tenant was asked for, the minted token's own
 `tenant_id` claim must name it, or the rung fails `RUNNER_MINT_WRONG_TENANT`
 without ever sending the token — a pre-P3 build answers its default slot, which
 would otherwise probe LIVE for the wrong tenant. The refusals are typed (see the
-verdict table): `RUNNER_MINT_TENANT_REQUIRED`, `RUNNER_MINT_TENANT_INVALID`,
-`RUNNER_MINT_WRONG_TENANT`, `BOOTSTRAP_TENANT_AMBIGUOUS`. None of them is a
+verdict table): `NONCE_MINT_WRONG_TENANT`, `NONCE_MINT_UNVERIFIED_TENANT`,
+`NONCE_MINT_TENANT_INVALID`, `NONCE_MINT_TENANT_NOT_PAIRED`,
+`NONCE_MINT_TENANT_UNKNOWN`, `RUNNER_MINT_TENANT_REQUIRED`,
+`RUNNER_MINT_TENANT_INVALID`, `RUNNER_MINT_WRONG_TENANT`,
+`BOOTSTRAP_TENANT_AMBIGUOUS`. None of them is a
 sign-in problem, and a `tenant_required` refusal never falls through to the
-default-slot `get_access_token_for_websocket` door. Pinned by
+default-slot `get_access_token_for_websocket` door. Both runner mints and L5 are pinned by
 `tenant-arg-test.sh` beside this file.
 
 ### L5 — the bootstrap credential: WIRED, PROBED, and LIVE
@@ -553,6 +571,9 @@ client's mask):
 | `INVOKE_MINT_ROUTE_ABSENT` (stderr line, not a final verdict) | L4 mint: the in-process invoke door answered the allowlist **400** (or 404) for that command name — this runner build does not carry that entry. Emitted once per command tried | The verb moves to the next command name, then falls back to the WebView eval mint on its own. An allowlist entry lives in the **binary**, so a runner start picks up only a build that has it; never restart a running runner over it |
 | `RUNNER_TIER_TOO_LOW` | L4 mint: the runner is **Tier 0/1** (`Local` / `LocalProvider`), where the Qontinui account commands do not exist at all | Change the runner's tier (Settings → Account), or use another door. The runner is **not** signed out and signing in will not help |
 | `RUNNER_TIER_UNKNOWN` | L4 mint: the runner could not resolve its own tier — a corrupt or unreadable `settings.json`. Its account state is unchanged | Repair `settings.json`. A sign-in CTA here is the exact mistake the runner's own `NO-DOWNGRADE (C4)` comment records |
+| `NONCE_MINT_WRONG_TENANT` | L4 source 3: a nonce minted for a known tenant answers, and `coord_query_identity` over it names a DIFFERENT tenant — a runner build predating the provision-session `tenant_id` field minted for the machine's tenant | NOT used; the cascade moves on. Use a runner build carrying P2; never restart a running runner over it |
+| `NONCE_MINT_UNVERIFIED_TENANT` | L4 source 3: the minted nonce answered, but its acting tenant could not be read back (the line names why) | Not reported LIVE — an unverified tenant on a multi-tenant device is exactly the silent wrong-tenant write. Another door, or re-run |
+| `NONCE_MINT_TENANT_INVALID` / `_NOT_PAIRED` / `_UNKNOWN` | L4 source 3: the runner refused the tenant sent — `400 COORD_MCP_PROVISION_INVALID_TENANT`, `422 …TENANT_NOT_PAIRED`, `503 …TENANT_UNKNOWN`. Nothing was minted | INVALID: fix `$QONTINUI_TENANT_ID` / the census value. NOT_PAIRED: pair this device for that tenant, or name the tenant the session acts for. UNKNOWN: the runner's credential store was unreadable — not "unpaired"; re-run and read the runner log |
 | `RUNNER_MINT_TENANT_REQUIRED` | L4 mint: the runner holds credentials for **more than one tenant** and refused a tenant-less `get_coord_device_token` (`409 get_coord_device_token:tenant_required`); the line also says why no tenant was sent | NOT a sign-in problem. Set `$QONTINUI_TENANT_ID` to the tenant this session acts for, or run in a runner terminal whose session census names it. Never "fix" it by asking the default-slot websocket door — that is the wrong-tenant write the refusal exists to stop |
 | `RUNNER_MINT_TENANT_INVALID` | L4 mint: the runner rejected the tenant sent as malformed (`get_coord_device_token:tenant_invalid`) | A LOCAL input fault — check `$QONTINUI_TENANT_ID` / the census value it names |
 | `RUNNER_MINT_WRONG_TENANT` | L4 mint: a tenant was asked for and the token that came back claims a different one (or none) — a runner build predating the `tenantId` argument answered its default slot | The token is NOT sent. Use L5, or a runner build carrying P3; never restart a running runner over it |

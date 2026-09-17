@@ -3460,146 +3460,12 @@ else
   l4_fail "device-jwt@$STATIC_JWT_FILE" "FILE_ABSENT (no readable ~/.qontinui/coord-device-jwt - source 2 of the fleet's three-source device-JWT cascade)"
 fi
 
-# ----- L4 source 3: the runner's IN-PROCESS nonce mint --------------------------
-# Preferred AHEAD of the UI-Bridge mint below, because it is the only one of the
-# two that can answer on a headless runner: POST /coord-mcp/provision-session
-# runs entirely inside the runner process, with no /ui-bridge/* hop. The whole
-# /ui-bridge/* family is a FRONTEND PROXY — it bounces the request through the
-# WebView to reach the Rust process that holds the credential — so with no
-# WebView it cannot answer, and re-wording the mint as an `invoke` does not help
-# (measured: 504 after a full 30.0s).
-#
-# The mint is bounded by the header's MINTING note: it is reachable only after
-# L1 and L2 have each probed a door and found it dead, it mints for $PWD, and
-# $COORD_REVIVE_NO_MINT=1 turns it off. The helper is shared with /gate rather
-# than inlined here — the six credential doors were byte-similar and all six
-# broke identically, which is exactly why this one lives in scripts/.
-#
-# Origins come from the configs already read (so a runner on a non-default port
-# is found without configuration), passed through to the helper.
-#
-# The documented default (127.0.0.1:9876) is passed EXPLICITLY rather than left
-# to the helper: `--origin` suppresses the helper's own default, so naming the
-# discovered origins without it would silently drop the fallback that finds a
-# runner no .mcp.json pointed at.
-#
-# $QONTINUI_RUNNER_URL genuinely OVERRIDES that default here, exactly as it does
-# in the UI-Bridge loop below and for the same reason. Until 2026-09-11 this
-# line appended the literal default unconditionally and the comment above it
-# claimed the variable "still wins inside the helper" - it did win the FIRST
-# slot there, and the default was still probed after it. So the in-process
-# mint (and the /health frontend-state read that rides on this same list, which
-# now stamps the floor claim's runner_build= and health_ms=) reached the REAL
-# runner on 9876 from every suite that had pinned the variable to a dead port
-# to be hermetic - the 2026-08-29 defect, one loop over. Found by
-# floor-claim-test.sh, whose runner_build= assertion read a live build id from
-# a sandbox whose only runner was a stub.
-MINT_ORIGIN_ARGS=""
-for o in $RUNNER_ORIGINS ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}; do
-  case " $MINT_ORIGIN_ARGS " in *" $o "*) continue ;; esac
-  MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
-done
-
-__resolve_fleet_script "coord-provision-nonce.sh"; CPN="$__RFS_PATH"
-
-if [ -n "${COORD_REVIVE_NO_MINT:-}" ]; then
-  l4_fail "nonce-mint" "SKIPPED_BY_ENV (\$COORD_REVIVE_NO_MINT is set, so the in-process mint was not attempted. That is a CHOICE, not a fault, and it says nothing about whether the mint would have worked)"
-elif [ -z "$CPN" ]; then
-  l4_fail "nonce-mint" "HELPER_NOT_FOUND (coord-provision-nonce.sh: $(__fleet_script_searched "coord-provision-nonce.sh")). LOCAL fault - it says nothing about the runner"
-else
-  # The helper prints `url=` / `nonce=` on STDOUT and its named diagnosis on
-  # STDERR, which flows straight through to this script's probe log. The nonce
-  # never reaches argv: it is read into a variable and handed to probe_door,
-  # which stages it into a private header file.
-  NOUT="$(bash "$CPN" mint --cwd "$PWD" $MINT_ORIGIN_ARGS)"
-  NRC=$?
-  NURL="$(printf '%s\n' "$NOUT" | sed -n 's/^url=//p' | head -n 1 | tr -d '\r')"
-  NKEY="$(printf '%s\n' "$NOUT" | sed -n 's/^nonce=//p' | head -n 1 | tr -d '\r')"
-  if [ "$NRC" = "0" ] && [ -n "$NURL" ] && [ -n "$NKEY" ]; then
-    # $NURL VERBATIM: the nonce is paired to the runner's own bound port, and a
-    # scanned or assumed port 401s.
-    probe_door "L4" "nonce-mint@$NURL" "$NURL" "X-Coord-Mcp-Proxy-Key" "$NKEY" \
-      "PROXY_UNAUTHORIZED (the runner minted this nonce and then refused it - the registry was rotated or the slot re-provisioned between the two calls; re-run)" \
-      && live_exit "loopback-proxy-minted"
-  else
-    case "$NRC" in
-      2)   NV="NO_HANDSHAKE_KEY (no readable ~/.qontinui/runner-loopback-key. The runner writes that 0600 file at startup, so an absent one means this runner's build predates the same-user handshake, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
-      3)   NV="MINT_REFUSED (the runner answered with a TYPED refusal - see the coord-provision-nonce line above for which: the opt-in marker ~/.qontinui/allow-session-coord-identity is absent, or the handshake was missing/wrong. Each has a different fix, which is why they are three codes and not one)" ;;
-      5)   NV="MINT_ROUTE_ABSENT (the runner answered 404 - this build predates the in-process mint. Do NOT restart a running runner over this: served policy production-and-cost runner-lifecycle. The next runner start picks it up)" ;;
-      127) NV="HELPER_DEPS_MISSING (coord-provision-nonce.sh: curl missing, or no working JSON reader)" ;;
-      *)   NV="MINT_UNKNOWN (no runner answered, or the answer was unrecognised - see the coord-provision-nonce line above. UNKNOWN, not a refusal and not an absent credential)" ;;
-    esac
-    l4_fail "nonce-mint" "$NV"
-  fi
-fi
-
-# ----- L4 source 4: the runner's bearer mint - invoke first, eval fallback -----
-# TWO doors per origin. The IN-PROCESS invoke door
-# (POST /ui-bridge/invoke/get_access_token_for_websocket, body {}) answers on
-# a headless runner because it never touches the WebView; it is tried FIRST,
-# always. The WebView eval mint is KEPT rather than deleted - it is correct on
-# a runner build that predates the invoke entry and has a WebView - but it is
-# reached ONLY through that build's own answer: HTTP 400 "not in UI Bridge
-# allowlist" (or 404 for the route). Every other invoke answer is a verdict in
-# its own right (signed out, tier too low, refused) and the eval door, which
-# fronts the SAME Rust fn through a WebView hop, adds nothing to it. Plan
-# 2026-09-02-steering-layers-unreadable-without-a-credential, Phase 1f.
-#
-# Origins come from the configs already read, so a runner on a non-default port
-# is found without configuration; $QONTINUI_RUNNER_URL overrides, and 9876 is
-# the documented default (spelled as the IPv4 loopback deliberately).
-#
-# $QONTINUI_RUNNER_URL genuinely OVERRIDES the default, which is what SKILL.md
-# has always claimed and what this line did NOT do until 2026-08-29: the literal
-# `http://127.0.0.1:9876` sat outside the expansion, so setting the variable
-# PREPENDED an origin and the default was still probed afterwards. Pointing this
-# script at a dead port therefore did not stop it reaching the real runner --
-# it minted a live Cognito access token there and sent it to production coord,
-# on every run. Found by pre-PR review of the approval half, whose self-test
-# relied on the documented override to stay hermetic and silently did not: 13
-# real mints per suite run, invisible on a CI box with nothing on 9876. The
-# default now applies only when the variable is unset, so an override is one.
-MINT_BODY='{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'
-
-# THE HEADLESS ARM, and what it keys on.
-#
-# A WebView timeout used to land in the same bucket as "the runner is signed
-# out", so a headless box was told to sign in a runner that was already holding
-# a valid token. The fix keys on /health.frontendReady — a fact the runner
-# STATES — and deliberately NOT on the timeout string: a desktop runner that is
-# merely slow to boot its WebView produces the same timeout, and keying on the
-# text would leave that ambiguity exactly where it was. A probe that FAILED
-# leaves this `unknown`, and `unknown` never suppresses the mint.
-FE_ORIGIN=""; FE_READY="unknown"; FE_STATE="unknown"
-if [ -n "$CPN" ]; then
-  FEOUT="$(bash "$CPN" frontend-state $MINT_ORIGIN_ARGS 2>/dev/null)"
-  FERC=$?
-  # healthMs= is read on BOTH exits: the helper prints `healthMs=timeout` on
-  # its no-answer path when an origin timed out, and that is a LOAD signal the
-  # floor claim must carry (a refused connect prints nothing and stays UNKNOWN).
-  FE_MS="$(printf '%s\n' "$FEOUT" | sed -n 's/^healthMs=//p' | head -n 1 | tr -d '\r')"
-  case "$FE_MS" in
-    timeout|[0-9]*) HEALTH_MS="$FE_MS" ;;
-  esac
-  if [ "$FERC" = "0" ]; then
-    FE_ORIGIN="$(printf '%s\n' "$FEOUT" | sed -n 's/^origin=//p' | head -n 1 | tr -d '\r')"
-    FE_READY="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendReady=//p' | head -n 1 | tr -d '\r')"
-    FE_STATE="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendState=//p' | head -n 1 | tr -d '\r')"
-    # The runner's own buildId from the SAME body: the floor claim's
-    # `runner_build=` binding. `unknown` from the helper (no string field on
-    # this build) keeps the `UNKNOWN — unrecorded` arm rather than a default.
-    FE_BUILD="$(printf '%s\n' "$FEOUT" | sed -n 's/^buildId=//p' | head -n 1 | tr -d '\r')"
-    case "$FE_BUILD" in
-      ""|unknown) ;;
-      *) RUNNER_BUILD_ID="$FE_BUILD" ;;
-    esac
-  fi
-fi
-
-# ----- The SESSION'S TENANT, resolved once for L4's mint and L5's bootstrap -----
+# ----- The SESSION'S TENANT, resolved once for L4's two mints and L5's bootstrap -
 # Plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential, P3 and
-# P5a. A device bound to more than one tenant can no longer be asked for "a"
-# credential: the runner's get_coord_device_token refuses a tenant-less call on a
+# P2/P5a. A device bound to more than one tenant can no longer be asked for "a"
+# credential: L4 source 3's nonce mint pins the nonce to the tenant it is sent
+# (and, on a runner predating P2, silently to the machine's tenant instead - so
+# it is VERIFIED below), the runner's get_coord_device_token refuses a tenant-less call on a
 # multi-slot runner, and coord's /agents/credential in `live` mode refuses a
 # multi-bound device that names none (422 tenant_ambiguous). So both rungs send
 # the tenant THIS session acts for, resolved in this order:
@@ -3720,6 +3586,236 @@ except Exception: v=None
 print(v if isinstance(v,str) else "")' 2>/dev/null
   fi
 }
+
+# nonce_acting_tenant <proxy-url> <nonce> -> sets NACT to the tenant coord names
+# for a request carried over that nonce, or leaves it empty with NACT_REASON set
+# when it cannot be read. Globals, not stdout: a $(...) call would run it in a
+# subshell and lose the reason. One JSON-RPC tools/call of coord_query_identity (read-only),
+# the nonce staged in a private header file exactly as probe_door stages it.
+NACT=""; NACT_REASON=""
+nonce_acting_tenant() {
+  local url="$1" key="$2" hdr="$TMPD/nact-hdr" body="$TMPD/nact-body" code ce payload
+  NACT=""; NACT_REASON=""
+  { printf 'X-Coord-Mcp-Proxy-Key: %s\n' "$key" > "$hdr"; } 2>/dev/null
+  if [ ! -s "$hdr" ]; then NACT_REASON="header staging failed under $TMPD (LOCAL)"; return 0; fi
+  payload="$(build_rpc tools/call coord_query_identity '{}')"
+  : > "$body"
+  code=$(curl -sS -o "$(curl_path "$body")" -w '%{http_code}' --connect-timeout "$PROBE_CONNECT_TIMEOUT" -m "$PROBE_TIMEOUT" \
+    -X POST "$url" -H "Content-Type: application/json" -H "Accept: application/json, text/event-stream" \
+    -H "@$(curl_path "$hdr")" -d "$payload" 2>/dev/null)
+  ce=$?
+  rm -f "$hdr"
+  if [ "$ce" != "0" ] || [ "$code" != "200" ]; then
+    NACT_REASON="coord_query_identity over the nonce answered curl exit $ce / HTTP ${code:-none}"; return 0
+  fi
+  local out py
+  # python, not jq: the answer may be SSE-framed, and the tenant sits inside a
+  # JSON string inside content[]. A JSON_READER that is itself python is reused.
+  case "$JSON_READER" in
+    jq) py="$(command -v python3 || command -v python || true)" ;;
+    *) py="$JSON_READER" ;;
+  esac
+  if [ -z "$py" ]; then NACT_REASON="no python to read the identity answer (LOCAL)"; return 0; fi
+  out="$(NACT_BODY="$(curl_path "$body")" "$py" -c 'import json,os,re,sys
+raw=open(os.environ["NACT_BODY"],encoding="utf-8",errors="replace").read()
+# An SSE-framed answer carries the JSON on its data: line.
+m=re.search(r"^data:\s*(\{.*\})\s*$", raw, re.M)
+try: d=json.loads(m.group(1) if m else raw)
+except Exception: print("reason: not JSON"); sys.exit(0)
+if not isinstance(d,dict): print("reason: not a JSON-RPC object"); sys.exit(0)
+if "error" in d: print("reason: JSON-RPC error %s" % json.dumps(d.get("error"))[:160]); sys.exit(0)
+r=d.get("result")  # envelope-ok: a missing result prints a named reason below, never a tenant
+if not isinstance(r,dict): print("reason: no result object"); sys.exit(0)
+if r.get("isError"): print("reason: the tool reported isError"); sys.exit(0)
+texts=[c.get("text") for c in (r.get("content") or []) if isinstance(c,dict) and isinstance(c.get("text"),str)]
+for t in texts:
+    try: o=json.loads(t)
+    except Exception: continue
+    v=o.get("tenant_id") if isinstance(o,dict) else None
+    if isinstance(v,str) and v: print("tenant: "+v); sys.exit(0)
+print("reason: the identity answer carried no string tenant_id")' 2>/dev/null)"
+  case "$out" in
+    "tenant: "*) NACT="${out#tenant: }" ;;
+    "reason: "*) NACT_REASON="${out#reason: }" ;;
+    *) NACT_REASON="no python to read the identity answer (LOCAL)" ;;
+  esac
+}
+
+# ----- L4 source 3: the runner's IN-PROCESS nonce mint --------------------------
+# Preferred AHEAD of the UI-Bridge mint below, because it is the only one of the
+# two that can answer on a headless runner: POST /coord-mcp/provision-session
+# runs entirely inside the runner process, with no /ui-bridge/* hop. The whole
+# /ui-bridge/* family is a FRONTEND PROXY — it bounces the request through the
+# WebView to reach the Rust process that holds the credential — so with no
+# WebView it cannot answer, and re-wording the mint as an `invoke` does not help
+# (measured: 504 after a full 30.0s).
+#
+# The mint is bounded by the header's MINTING note: it is reachable only after
+# L1 and L2 have each probed a door and found it dead, it mints for $PWD, and
+# $COORD_REVIVE_NO_MINT=1 turns it off. The helper is shared with /gate rather
+# than inlined here — the six credential doors were byte-similar and all six
+# broke identically, which is exactly why this one lives in scripts/.
+#
+# Origins come from the configs already read (so a runner on a non-default port
+# is found without configuration), passed through to the helper.
+#
+# The documented default (127.0.0.1:9876) is passed EXPLICITLY rather than left
+# to the helper: `--origin` suppresses the helper's own default, so naming the
+# discovered origins without it would silently drop the fallback that finds a
+# runner no .mcp.json pointed at.
+#
+# $QONTINUI_RUNNER_URL genuinely OVERRIDES that default here, exactly as it does
+# in the UI-Bridge loop below and for the same reason. Until 2026-09-11 this
+# line appended the literal default unconditionally and the comment above it
+# claimed the variable "still wins inside the helper" - it did win the FIRST
+# slot there, and the default was still probed after it. So the in-process
+# mint (and the /health frontend-state read that rides on this same list, which
+# now stamps the floor claim's runner_build= and health_ms=) reached the REAL
+# runner on 9876 from every suite that had pinned the variable to a dead port
+# to be hermetic - the 2026-08-29 defect, one loop over. Found by
+# floor-claim-test.sh, whose runner_build= assertion read a live build id from
+# a sandbox whose only runner was a stub.
+MINT_ORIGIN_ARGS=""
+for o in $RUNNER_ORIGINS ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}; do
+  case " $MINT_ORIGIN_ARGS " in *" $o "*) continue ;; esac
+  MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
+done
+
+__resolve_fleet_script "coord-provision-nonce.sh"; CPN="$__RFS_PATH"
+
+if [ -n "${COORD_REVIVE_NO_MINT:-}" ]; then
+  l4_fail "nonce-mint" "SKIPPED_BY_ENV (\$COORD_REVIVE_NO_MINT is set, so the in-process mint was not attempted. That is a CHOICE, not a fault, and it says nothing about whether the mint would have worked)"
+elif [ -z "$CPN" ]; then
+  l4_fail "nonce-mint" "HELPER_NOT_FOUND (coord-provision-nonce.sh: $(__fleet_script_searched "coord-provision-nonce.sh")). LOCAL fault - it says nothing about the runner"
+else
+  # The session's tenant rides on the mint (plan
+  # 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P2): the
+  # runner pins the nonce to it. `--tenant` is passed only to a helper that
+  # understands it - an older copy would exit 4 on the unknown argument and read
+  # as MINT_UNKNOWN - and an unsent tenant still gets VERIFIED below.
+  resolve_session_tenant
+  NTENANT_ARGS=""
+  NTENANT_NOTE=""
+  if [ -n "$SESSION_TENANT" ]; then
+    if grep -q -- '--tenant)' "$CPN" 2>/dev/null; then
+      NTENANT_ARGS="--tenant $SESSION_TENANT"
+    else
+      NTENANT_NOTE=" (the resolved coord-provision-nonce.sh predates --tenant, so the tenant was NOT sent)"
+    fi
+  fi
+  # The helper prints `url=` / `nonce=` on STDOUT and its named diagnosis on
+  # STDERR, which flows straight through to this script's probe log. The nonce
+  # never reaches argv: it is read into a variable and handed to probe_door,
+  # which stages it into a private header file.
+  NOUT="$(bash "$CPN" mint --cwd "$PWD" $NTENANT_ARGS $MINT_ORIGIN_ARGS)"
+  NRC=$?
+  NURL="$(printf '%s\n' "$NOUT" | sed -n 's/^url=//p' | head -n 1 | tr -d '\r')"
+  NKEY="$(printf '%s\n' "$NOUT" | sed -n 's/^nonce=//p' | head -n 1 | tr -d '\r')"
+  if [ "$NRC" = "0" ] && [ -n "$NURL" ] && [ -n "$NKEY" ]; then
+    # $NURL VERBATIM: the nonce is paired to the runner's own bound port, and a
+    # scanned or assumed port 401s.
+    if probe_door "L4" "nonce-mint@$NURL" "$NURL" "X-Coord-Mcp-Proxy-Key" "$NKEY" \
+      "PROXY_UNAUTHORIZED (the runner minted this nonce and then refused it - the registry was rotated or the slot re-provisioned between the two calls; re-run)"; then
+      if [ -z "$SESSION_TENANT" ]; then
+        live_exit "loopback-proxy-minted"
+      else
+        # A runner predating P2 ignores tenant_id and pins the nonce to the
+        # MACHINE's tenant, answering 200 all the same - a door that would probe
+        # LIVE for the wrong tenant. So the nonce's ACTING tenant is read back
+        # from coord itself (coord_query_identity's top-level tenant_id is the
+        # tenant whose credential the proxy forwarded) before it is called LIVE.
+        # Unreadable is UNVERIFIED-TENANT, never LIVE.
+        nonce_acting_tenant "$NURL" "$NKEY"
+        if [ -z "$NACT" ]; then
+          l4_fail "nonce-mint@$NURL" "NONCE_MINT_UNVERIFIED_TENANT (the nonce answered, but its acting tenant could not be read back - ${NACT_REASON:-no reason}. Asked for $(describe_session_tenant)$NTENANT_NOTE. A runner predating the tenant_id field mints for the machine's tenant and says nothing, so this door is NOT reported LIVE)"
+        elif [ "$(printf '%s' "$NACT" | tr 'A-F' 'a-f')" = "$(printf '%s' "$SESSION_TENANT" | tr 'A-F' 'a-f')" ]; then
+          live_exit "loopback-proxy-minted"
+        else
+          l4_fail "nonce-mint@$NURL" "NONCE_MINT_WRONG_TENANT (asked the runner for a nonce for $(describe_session_tenant)$NTENANT_NOTE and coord_query_identity over it names tenant $NACT - this runner build predates the provision-session tenant_id field (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P2) and minted for the machine's tenant. NOT used: it would write in the wrong tenant. Use a runner build carrying P2; never restart a running runner over it)"
+        fi
+      fi
+    fi
+  else
+    case "$NRC" in
+      2)   NV="NO_HANDSHAKE_KEY (no readable ~/.qontinui/runner-loopback-key. The runner writes that 0600 file at startup, so an absent one means this runner's build predates the same-user handshake, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
+      3)   NV="MINT_REFUSED (the runner answered with a TYPED refusal - see the coord-provision-nonce line above for which: the opt-in marker ~/.qontinui/allow-session-coord-identity is absent, or the handshake was missing/wrong. Each has a different fix, which is why they are three codes and not one)" ;;
+      6)   NREF="$(printf '%s\n' "$NOUT" | sed -n 's/^refusal=//p' | head -n 1 | tr -d '\r')"
+           case "$NREF" in
+             *_INVALID_TENANT) NV="NONCE_MINT_TENANT_INVALID (the runner rejected the tenant sent - $(describe_session_tenant) - as not a uuid (400 $NREF). A LOCAL input fault: check \$QONTINUI_TENANT_ID or the census value named)" ;;
+             *_TENANT_NOT_PAIRED) NV="NONCE_MINT_TENANT_NOT_PAIRED (422 $NREF: this runner holds no coord credential for $(describe_session_tenant), so it minted nothing rather than a credential for another tenant. Pair this device for that tenant (qontinui_profile device pair --tenant-id <uuid>), or name the tenant this session actually acts for)" ;;
+             *_TENANT_UNKNOWN) NV="NONCE_MINT_TENANT_UNKNOWN (503 $NREF: the runner could not read its credential store, so whether it holds a credential for $(describe_session_tenant) is UNKNOWN - nothing minted. NOT 'unpaired'; re-run, and read the runner log for the store error)" ;;
+             *) NV="NONCE_MINT_TENANT_REFUSED (${NREF:-no code}: the runner refused to mint for $(describe_session_tenant) - see the coord-provision-nonce line above)" ;;
+           esac ;;
+      5)   NV="MINT_ROUTE_ABSENT (the runner answered 404 - this build predates the in-process mint. Do NOT restart a running runner over this: served policy production-and-cost runner-lifecycle. The next runner start picks it up)" ;;
+      127) NV="HELPER_DEPS_MISSING (coord-provision-nonce.sh: curl missing, or no working JSON reader)" ;;
+      *)   NV="MINT_UNKNOWN (no runner answered, or the answer was unrecognised - see the coord-provision-nonce line above. UNKNOWN, not a refusal and not an absent credential)" ;;
+    esac
+    l4_fail "nonce-mint" "$NV"
+  fi
+fi
+
+# ----- L4 source 4: the runner's bearer mint - invoke first, eval fallback -----
+# TWO doors per origin. The IN-PROCESS invoke door
+# (POST /ui-bridge/invoke/get_access_token_for_websocket, body {}) answers on
+# a headless runner because it never touches the WebView; it is tried FIRST,
+# always. The WebView eval mint is KEPT rather than deleted - it is correct on
+# a runner build that predates the invoke entry and has a WebView - but it is
+# reached ONLY through that build's own answer: HTTP 400 "not in UI Bridge
+# allowlist" (or 404 for the route). Every other invoke answer is a verdict in
+# its own right (signed out, tier too low, refused) and the eval door, which
+# fronts the SAME Rust fn through a WebView hop, adds nothing to it. Plan
+# 2026-09-02-steering-layers-unreadable-without-a-credential, Phase 1f.
+#
+# Origins come from the configs already read, so a runner on a non-default port
+# is found without configuration; $QONTINUI_RUNNER_URL overrides, and 9876 is
+# the documented default (spelled as the IPv4 loopback deliberately).
+#
+# $QONTINUI_RUNNER_URL genuinely OVERRIDES the default, which is what SKILL.md
+# has always claimed and what this line did NOT do until 2026-08-29: the literal
+# `http://127.0.0.1:9876` sat outside the expansion, so setting the variable
+# PREPENDED an origin and the default was still probed afterwards. Pointing this
+# script at a dead port therefore did not stop it reaching the real runner --
+# it minted a live Cognito access token there and sent it to production coord,
+# on every run. Found by pre-PR review of the approval half, whose self-test
+# relied on the documented override to stay hermetic and silently did not: 13
+# real mints per suite run, invisible on a CI box with nothing on 9876. The
+# default now applies only when the variable is unset, so an override is one.
+MINT_BODY='{"expression":"window.__TAURI__ ? window.__TAURI__.core.invoke(\"get_access_token_for_websocket\") : invoke(\"get_access_token_for_websocket\")","await_promise":true}'
+
+# THE HEADLESS ARM, and what it keys on.
+#
+# A WebView timeout used to land in the same bucket as "the runner is signed
+# out", so a headless box was told to sign in a runner that was already holding
+# a valid token. The fix keys on /health.frontendReady — a fact the runner
+# STATES — and deliberately NOT on the timeout string: a desktop runner that is
+# merely slow to boot its WebView produces the same timeout, and keying on the
+# text would leave that ambiguity exactly where it was. A probe that FAILED
+# leaves this `unknown`, and `unknown` never suppresses the mint.
+FE_ORIGIN=""; FE_READY="unknown"; FE_STATE="unknown"
+if [ -n "$CPN" ]; then
+  FEOUT="$(bash "$CPN" frontend-state $MINT_ORIGIN_ARGS 2>/dev/null)"
+  FERC=$?
+  # healthMs= is read on BOTH exits: the helper prints `healthMs=timeout` on
+  # its no-answer path when an origin timed out, and that is a LOAD signal the
+  # floor claim must carry (a refused connect prints nothing and stays UNKNOWN).
+  FE_MS="$(printf '%s\n' "$FEOUT" | sed -n 's/^healthMs=//p' | head -n 1 | tr -d '\r')"
+  case "$FE_MS" in
+    timeout|[0-9]*) HEALTH_MS="$FE_MS" ;;
+  esac
+  if [ "$FERC" = "0" ]; then
+    FE_ORIGIN="$(printf '%s\n' "$FEOUT" | sed -n 's/^origin=//p' | head -n 1 | tr -d '\r')"
+    FE_READY="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendReady=//p' | head -n 1 | tr -d '\r')"
+    FE_STATE="$(printf '%s\n' "$FEOUT" | sed -n 's/^frontendState=//p' | head -n 1 | tr -d '\r')"
+    # The runner's own buildId from the SAME body: the floor claim's
+    # `runner_build=` binding. `unknown` from the helper (no string field on
+    # this build) keeps the `UNKNOWN — unrecorded` arm rather than a default.
+    FE_BUILD="$(printf '%s\n' "$FEOUT" | sed -n 's/^buildId=//p' | head -n 1 | tr -d '\r')"
+    case "$FE_BUILD" in
+      ""|unknown) ;;
+      *) RUNNER_BUILD_ID="$FE_BUILD" ;;
+    esac
+  fi
+fi
 
 L4_SEEN=""
 for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do

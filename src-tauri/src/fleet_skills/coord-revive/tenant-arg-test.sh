@@ -26,9 +26,22 @@
 #   (t8) L5 with no tenant, coord in `live` mode -> 422 tenant_ambiguous surfaces as
 #                                                   BOOTSTRAP_TENANT_AMBIGUOUS naming the remedy
 #
+# L4 SOURCE 3 (the in-process nonce mint, POST /coord-mcp/provision-session, P2):
+#   (n1) tenant B, a P2 runner pins the nonce    -> provision body carries tenant_id B,
+#                                                   coord_query_identity over it names B,
+#                                                   VERDICT LIVE transport=loopback-proxy-minted
+#   (n2) tenant B, a runner that ignores the field mints for A
+#                                                -> NONCE_MINT_WRONG_TENANT, not LIVE
+#   (n3) tenant B, the identity read-back fails  -> NONCE_MINT_UNVERIFIED_TENANT, not LIVE
+#   (n4) 422 COORD_MCP_PROVISION_TENANT_NOT_PAIRED -> NONCE_MINT_TENANT_NOT_PAIRED
+#   (n5) 400 COORD_MCP_PROVISION_INVALID_TENANT    -> NONCE_MINT_TENANT_INVALID
+#   (n6) 503 COORD_MCP_PROVISION_TENANT_UNKNOWN    -> NONCE_MINT_TENANT_UNKNOWN
+#   (n7) no tenant known                         -> body {cwd} only, no identity read, LIVE
+#
 # THE DISCHARGE (last section): staged copies of coord-revive.sh with the tenant
-# dropped from the invoke body, the wrong-tenant check deleted, and the L5
-# tenant_id dropped must each redden a re-run.
+# dropped from the invoke body, the wrong-tenant check deleted, the L5 tenant_id
+# dropped, the nonce mint's tenant dropped, its identity verification skipped,
+# and its tenant refusals collapsed must each redden a re-run.
 #
 # ISOLATION: $HOME and $CLAUDE_CONFIG_DIR are a throwaway home; $QONTINUI_ROOT is
 # the sandbox (one symlink to this repo's scripts/); $QONTINUI_RUNNER_URL,
@@ -61,6 +74,7 @@ cleanup() { [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null; rm -rf "$SANDBOX
 trap cleanup EXIT
 
 FAKE_HOME="$SANDBOX/home"; mkdir -p "$FAKE_HOME/.qontinui"
+printf 'stub-loopback-key\n' > "$FAKE_HOME/.qontinui/runner-loopback-key"
 printf '{"device_id":"11111111-1111-4111-8111-111111111111"}\n' > "$FAKE_HOME/.qontinui/machine.json"
 ROOT="$SANDBOX/root"; mkdir -p "$ROOT/qontinui-claude-config"
 ln -s "$REPO_ROOT/scripts" "$ROOT/qontinui-claude-config/scripts"
@@ -141,10 +155,57 @@ class H(BaseHTTPRequestHandler):
             req = json.loads(raw.decode("utf-8")) if raw else {}
         except Exception:
             req = {}
+        if self.path == "/coord-mcp/provision-session":
+            if self.headers.get("X-Qontinui-Loopback-Key") != "stub-loopback-key":
+                self._send(403, {"success": False, "code": "COORD_MCP_PROVISION_NO_HANDSHAKE", "error": "no handshake"})
+                return
+            nm = mode("nonce_runner", "absent")
+            port = self.server.server_address[1]
+            refusals = {
+                "refuse-invalid": (400, "COORD_MCP_PROVISION_INVALID_TENANT"),
+                "refuse-not-paired": (422, "COORD_MCP_PROVISION_TENANT_NOT_PAIRED"),
+                "refuse-unknown": (503, "COORD_MCP_PROVISION_TENANT_UNKNOWN"),
+            }
+            if nm == "absent":
+                self._send(404, {"error": "not found"})
+                return
+            if nm in refusals:
+                code, c = refusals[nm]
+                self._send(code, {"success": False, "code": c, "error": "stub refusal"})
+                return
+            tenant = req.get("tenant_id") if nm == "p2" else None
+            nonce = "n-" + (tenant or mode("default_tenant"))
+            url = "http://127.0.0.1:%d/coord-mcp" % port
+            self._send(200, {"mcpServers": {"coord-mcp": {"type": "http", "url": url,
+                "headers": {"Authorization": "Bearer " + nonce, "X-Coord-Mcp-Proxy-Key": nonce}}}})
+            return
+        if self.path == "/coord-mcp":
+            key = self.headers.get("X-Coord-Mcp-Proxy-Key") or ""
+            if not key.startswith("n-"):
+                self._send(401, {"code": "COORD_MCP_PROXY_UNAUTHORIZED"})
+                return
+            rid = req.get("id", 1)
+            if req.get("method") == "tools/list":
+                self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "coord_query_identity"}, {"name": "coord_memory_search"}]}})
+                return
+            name = (req.get("params") or {}).get("name")
+            if name == "coord_query_identity":
+                if mode("identity", "ok") == "no-tenant":
+                    text = json.dumps({"principal_kind": "device", "tenant_slug": "x"})
+                    self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+                    return
+                text = json.dumps({"principal_kind": "device", "tenant_id": key[2:]})
+                self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+                return
+            text = json.dumps({"hits": [{"id": "m1", "title": "x"}], "count": 1})
+            self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": text}]}})
+            return
         if self.path == "/ui-bridge/invoke/get_coord_device_token":
             asked = req.get("tenantId")
             runner = mode("runner", "p3")
-            if runner == "old":
+            if runner == "absent":
+                self._send(404, {"error": "not found"})
+            elif runner == "old":
                 self._send(200, {"success": True, "data": token(mode("default_tenant"))})
             elif runner == "p3-multi":
                 if asked:
@@ -203,6 +264,8 @@ run_case() {
   ERR="$(cat "$SANDBOX/err")"
   REQS="$(cat "$REQLOG")"
 }
+identity_calls() { printf '%s\n' "$REQS" | grep -c 'coord_query_identity'; }
+provision_body() { printf '%s\n' "$REQS" | sed -n 's#^POST /coord-mcp/provision-session ##p' | head -n 1; }
 invoke_body() { printf '%s\n' "$REQS" | sed -n 's#^POST /ui-bridge/invoke/get_coord_device_token ##p' | head -n 1; }
 cred_body() { printf '%s\n' "$REQS" | sed -n 's#^POST /agents/credential ##p' | head -n 1; }
 
@@ -263,6 +326,56 @@ assert_has "(t8) BOOTSTRAP_TENANT_AMBIGUOUS" "BOOTSTRAP_TENANT_AMBIGUOUS" "$ERR"
 assert_has "(t8) the remedy names the variable" "QONTINUI_TENANT_ID" "$ERR"
 assert_lacks "(t8) not the generic device-rejected verdict" "BOOTSTRAP_DEVICE_REJECTED" "$ERR"
 
+# ================================================================ L4 source 3
+# The nonce mint runs only with the mint enabled (COORD_REVIVE_NO_MINT= empty) and
+# BEFORE the invoke door, so the invoke door is made absent (404) and L5 is off:
+# a LIVE here can only be the nonce's.
+setmode runner absent; setmode census none; setmode default_tenant "$TA"; setmode identity ok
+
+echo "== (n1) tenant B, a P2 runner pins the nonce -> verified, LIVE"
+setmode nonce_runner p2
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(n1) the provision body names tenant_id B" "\"tenant_id\": \"$TB\"" "$(provision_body | sed 's/":"/": "/g')"
+assert_eq "(n1) the acting tenant was read back (probe e2e + verification)" "2" "$(identity_calls)"
+assert_has "(n1) VERDICT LIVE over the minted nonce" "transport=loopback-proxy-minted" "$OUT"
+
+echo "== (n2) tenant B, a runner that ignores tenant_id mints for A -> WRONG_TENANT, not LIVE"
+setmode nonce_runner old
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has "(n2) NONCE_MINT_WRONG_TENANT" "NONCE_MINT_WRONG_TENANT" "$ERR"
+assert_has "(n2) names the tenant coord reported" "names tenant $TA" "$ERR"
+assert_lacks "(n2) not LIVE" "VERDICT: LIVE" "$OUT"
+
+echo "== (n3) tenant B, the identity answer names no tenant -> UNVERIFIED_TENANT, not LIVE"
+setmode nonce_runner p2; setmode identity no-tenant
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+setmode identity ok
+assert_has "(n3) NONCE_MINT_UNVERIFIED_TENANT" "NONCE_MINT_UNVERIFIED_TENANT" "$ERR"
+assert_has "(n3) names why it could not be read" "carried no string tenant_id" "$ERR"
+assert_lacks "(n3) not LIVE" "VERDICT: LIVE" "$OUT"
+
+for spec in "n4 refuse-not-paired NONCE_MINT_TENANT_NOT_PAIRED device pair --tenant-id" \
+            "n5 refuse-invalid NONCE_MINT_TENANT_INVALID not a uuid" \
+            "n6 refuse-unknown NONCE_MINT_TENANT_UNKNOWN NOT 'unpaired'"; do
+  set -- $spec
+  cid="$1"; rmode="$2"; verdict="$3"; shift 3; hint="$*"
+  echo "== ($cid) $rmode -> $verdict"
+  setmode nonce_runner "$rmode"
+  run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+  assert_has "($cid) $verdict" "$verdict" "$ERR"
+  assert_has "($cid) names its remedy" "$hint" "$ERR"
+  assert_lacks "($cid) never MINT_REFUSED (the opt-in/handshake verdict)" "MINT_REFUSED (" "$ERR"
+  assert_lacks "($cid) not LIVE" "VERDICT: LIVE" "$OUT"
+done
+
+echo "== (n7) no tenant known -> {cwd} only, no identity read, LIVE as before"
+setmode nonce_runner p2
+run_case "$STUB" "$DEAD" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+assert_lacks "(n7) no tenant_id sent" "tenant_id" "$(provision_body)"
+assert_eq "(n7) only the probe's own end-to-end identity call, no tenant read-back" "1" "$(identity_calls)"
+assert_has "(n7) VERDICT LIVE over the minted nonce" "transport=loopback-proxy-minted" "$OUT"
+setmode nonce_runner absent
+
 # ================================================================ the discharge
 if [ "${MC_MUTANT:-0}" = "1" ]; then
   :
@@ -288,6 +401,15 @@ else
       -- bash "$0"
     mc_expect_red "trust whatever token comes back, whichever tenant it claims" \
       "$SCRIPT" 's/^      if \[ "\$MCLAIM" != /      if false \&\& [ "$MCLAIM" != /' \
+      -- bash "$0"
+    mc_expect_red "never send the tenant to the nonce mint" \
+      "$SCRIPT" 's/^      NTENANT_ARGS="--tenant \$SESSION_TENANT"$/      NTENANT_ARGS=""/' \
+      -- bash "$0"
+    mc_expect_red "call a minted nonce LIVE without reading its tenant back" \
+      "$SCRIPT" 's/^      if \[ -z "\$SESSION_TENANT" \]; then$/      if true; then/' \
+      -- bash "$0"
+    mc_expect_red "collapse the nonce mint's tenant refusals into MINT_UNKNOWN" \
+      "$SCRIPT" '/^      6)   NREF=/,/^           esac ;;$/d' \
       -- bash "$0"
     mc_expect_red "never put the tenant on the L5 credential body" \
       "$SCRIPT" '/^    \[ -n "\$SESSION_TENANT" \] && BOOT_REQ=/d' \
