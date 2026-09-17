@@ -27,6 +27,15 @@
 //!    `{heartbeat: true}` which refreshes `last_heartbeat_at = now()` on
 //!    coord-side. Stale-detection at 45s, auto-close at 180s.
 //!
+//!    It also HOSTS the cadence of [`crate::coord_outside_observer`] — the
+//!    outside observer of coord's own liveness (plan
+//!    `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
+//!    Phase 3b). Every N-th tick, N chosen so the probe lands at about one a
+//!    minute, it spawns a detached `coord_query_workers` read. This loop is
+//!    the host because it already runs on coord's own cadence; the probe is
+//!    detached so it can never delay a heartbeat, and the observer never
+//!    writes into a coord it could not read.
+//!
 //! ## Wire mapping
 //!
 //! - `event_kind = "started"`  → `POST   /sessions` with the full create
@@ -159,6 +168,18 @@ struct CoordSyncInner {
     /// permanent failure is ACK-dropped from the outbox but NOT synced.
     /// Unattached (tests, pre-wiring) → the flag is never stamped.
     finished_ack_observer: OnceLock<FinishedAckObserver>,
+    /// The outside observer of coord's OWN liveness (plan
+    /// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing`
+    /// Phase 3b). `Some` in production, `None` under
+    /// [`CoordSync::new_for_test`] — so the fake-coord harness never issues a
+    /// `tools/call` at the real upstream, and the observer's own predicates
+    /// are tested where they live instead.
+    ///
+    /// Hosted HERE rather than in `health_monitor` because this loop already
+    /// runs on coord's own cadence (15 s, backing off to 60 s on transport
+    /// errors) while `health_monitor`'s 5 s self-probe thread is coord-blind
+    /// and far too hot for a `POST /mcp` per runner.
+    outside_observer: Option<Arc<crate::coord_outside_observer::CoordOutsideObserver>>,
 }
 
 /// Boxed `finished`-ACK callback (see `CoordSyncInner::finished_ack_observer`).
@@ -209,6 +230,9 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new(),
                 finished_ack_observer: OnceLock::new(),
+                outside_observer: Some(Arc::new(
+                    crate::coord_outside_observer::CoordOutsideObserver::new(),
+                )),
             }),
         }
     }
@@ -238,6 +262,11 @@ impl CoordSync {
                 registry: Mutex::new(None),
                 dual_write: DualWriteGate::new_for_test(None, Duration::from_secs(60)),
                 finished_ack_observer: OnceLock::new(),
+                // Inert by construction under test: the heartbeat harness
+                // drives this loop on a millisecond cadence against a fake
+                // coord that serves no `/mcp`, and an observer here would
+                // probe the REAL upstream from a unit test.
+                outside_observer: None,
             }),
         }
     }
@@ -1837,8 +1866,28 @@ async fn run_heartbeat_loop(inner: Arc<CoordSyncInner>) {
         "coord_sync: heartbeat loop starting"
     );
 
+    let mut tick: u64 = 0;
+
     loop {
         tokio::time::sleep(interval).await;
+        tick = tick.wrapping_add(1);
+
+        // Phase 3b: the outside observer of coord's OWN liveness rides this
+        // tick. It is hosted here and evaluated BEFORE the registry upgrade
+        // deliberately — coord liveness is a property of the fleet, not of
+        // this runner's session population, so a runner with no live session
+        // (the `continue` below) must still observe it. `on_host_tick`
+        // spawns detached and returns immediately, so a slow coord can never
+        // delay a session heartbeat, and its own single-flight latch drops a
+        // tick rather than stacking probes.
+        if let Some(observer) = inner.outside_observer.as_ref() {
+            let app = inner
+                .app_handle
+                .lock()
+                .expect("coord_sync app_handle slot poisoned")
+                .clone();
+            observer.on_host_tick(tick, interval, app);
+        }
 
         let reg = match inner
             .registry

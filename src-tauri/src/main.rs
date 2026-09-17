@@ -88,6 +88,12 @@ mod coord_doctor_cmd;
 mod coord_http;
 mod coord_mcp;
 mod coord_mcp_config;
+// The OUTSIDE observer of coord's own liveness — the one fault class coord's
+// leader-gated pager cannot report about itself (plan
+// 2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing Phase 3b).
+// Its cadence is hosted by `session::coord_sync`'s heartbeat loop; it lives
+// in the runner process and NEVER in the dev-only supervisor.
+mod coord_outside_observer;
 mod coord_questions;
 mod coordinator;
 mod cost_management;
