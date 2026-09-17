@@ -413,6 +413,31 @@ async fn in_process_dismiss_recent_crash(
 /// headless runner and on a CSP-enforcing build, the two shapes `page/evaluate`
 /// cannot serve.
 ///
+/// # Who may call this, and why a tenant argument does not widen it (security trigger 3)
+///
+/// With `tenantId` this door returns ANY tenant's device JWT this runner holds,
+/// not only the default binding's. That is deliberate (autonomy is the axis), and
+/// the argument is that the caller principal and the trust boundary are
+/// UNCHANGED — traced 2026-09-17 on the runner branch that carries this change:
+///
+/// - **The only gates in front of `POST /ui-bridge/invoke/{command}`** are
+///   (1) the API listener binding the IPv4 loopback only
+///   (`mcp_api::try_bind_port`, `127.0.0.1`), (2) the command-NAME allowlist
+///   ([`is_allowlisted`] — it gates which command, never who calls), and (3) the
+///   backend relay's closed path allowlist (`mcp::relay_path_policy`), which
+///   refuses this exact route to the remote `http_request` arm. There is NO
+///   caller authentication, handshake or nonce on this route: local-caller
+///   trust is the runner API's whole model. The router's CORS layer answers ANY
+///   origin, method and header (`mcp_api.rs`, `CorsLayer::new().allow_origin(Any)`);
+///   whether a browser's Private Network Access checks stop a web page from
+///   reading this route was NOT measured.
+/// - **Before the argument existed**, that same loopback caller already obtained
+///   the default binding's JWT here with `{}` — a device credential of this
+///   runner. After it, every token the door can return is still one this runner
+///   holds FOR THIS DEVICE; the argument only stops the caller having to take
+///   whichever tenant happens to be the default. No new principal gains a
+///   credential it could not already reach.
+///
 /// # Args (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3)
 ///
 /// `{"tenantId": "<uuid>"}` names the tenant whose token the caller wants --
@@ -440,19 +465,32 @@ async fn in_process_get_coord_device_token(
     match crate::commands::auth::get_coord_device_token(tenant) {
         Ok(Some(token)) => Ok(Value::String(token)),
         Ok(None) => Ok(Value::Null),
-        Err(e) if e.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_INVALID) => {
-            Err(in_process_bad_args(COMMAND, &e))
-        }
-        // A refusal is the caller's to fix (name a tenant), so it is a 409 --
-        // distinct from the 500 an unreadable store answers, which is not.
-        Err(e) if e.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) => Err((
-            StatusCode::CONFLICT,
-            Json(api_error(format!(
-                "invoke proxy: in-process invoke of '{}' refused: {}",
-                COMMAND, e
-            ))),
-        )),
-        Err(e) => Err(in_process_command_failed(COMMAND, e)),
+        Err(e) => Err(match coord_device_token_error_status(&e) {
+            StatusCode::BAD_REQUEST => in_process_bad_args(COMMAND, &e),
+            StatusCode::CONFLICT => (
+                StatusCode::CONFLICT,
+                Json(api_error(format!(
+                    "invoke proxy: in-process invoke of '{}' refused: {}",
+                    COMMAND, e
+                ))),
+            ),
+            _ => in_process_command_failed(COMMAND, e),
+        }),
+    }
+}
+
+/// The HTTP status a `get_coord_device_token` error maps to. A refusal is the
+/// caller's to fix — 409 `tenant_required` (name a tenant), 400
+/// `tenant_invalid` (the tenant named is malformed) — while anything else is the
+/// runner failing to read its own store, a 500 the caller cannot fix by changing
+/// the request.
+fn coord_device_token_error_status(err: &str) -> StatusCode {
+    if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_REQUIRED) {
+        StatusCode::CONFLICT
+    } else if err.starts_with(crate::commands::auth::DEVICE_TOKEN_TENANT_INVALID) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
     }
 }
 
@@ -1130,6 +1168,30 @@ mod in_process_dispatch_tests {
 mod coord_device_token_arg_tests {
     use super::coord_device_token_tenant_arg as parse;
     use serde_json::json;
+
+    /// R4 (review): the status table, pinned row by row.
+    #[test]
+    fn device_token_errors_map_to_their_statuses() {
+        use super::coord_device_token_error_status as status_for;
+        use crate::commands::auth::{DEVICE_TOKEN_TENANT_INVALID, DEVICE_TOKEN_TENANT_REQUIRED};
+        use axum::http::StatusCode;
+        for (err, want) in [
+            (
+                format!("{DEVICE_TOKEN_TENANT_REQUIRED}: holds 2 tenants"),
+                StatusCode::CONFLICT,
+            ),
+            (
+                format!("{DEVICE_TOKEN_TENANT_INVALID}: tenant_id \"x\" is not a tenant uuid"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "Could not read the credential store, so ... unknown".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+        ] {
+            assert_eq!(status_for(&err), want, "{err}");
+        }
+    }
 
     #[test]
     fn the_tenant_arg_is_read_under_either_spelling_and_nothing_else() {

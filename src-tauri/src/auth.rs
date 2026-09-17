@@ -1973,6 +1973,136 @@ pub(crate) enum BindingTenantRead {
     Unknown,
 }
 
+/// Every tenant this runner holds a coord device credential for — ONE definition
+/// shared by the spawn/provision-session tenant admission (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1/P2)
+/// and the device-token door's "is a tenant-less answer ambiguous?" refusal (P3),
+/// so the two can never disagree about what the runner holds.
+///
+/// A credential is held for a tenant through either route
+/// [`select_device_bearer`] can serve it from: the tenant's own `device_jwt:<t>`
+/// slot, or the legacy `access_token` slot — which belongs to the DEFAULT
+/// binding, so it counts for that tenant only when the slot actually holds a
+/// JWT-shaped value. Counting slots alone missed a default binding that lives
+/// only in the legacy slot: a runner holding that plus ONE other tenant slot
+/// read as single-tenant, and a tenant-less door call silently answered the
+/// default tenant's token.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldDeviceTenants {
+    /// The per-tenant slot enumeration; `Err` = the store could not be read.
+    pub(crate) slots: std::result::Result<Vec<Uuid>, String>,
+    /// The default binding (`paired_user.json`).
+    pub(crate) default_binding: BindingTenantRead,
+    /// Whether the legacy slot holds a JWT-shaped value; `Err` = unreadable.
+    pub(crate) legacy_slot: std::result::Result<bool, String>,
+}
+
+/// Why [`HeldDeviceTenants`] could not establish an answer. Each is UNKNOWN,
+/// never an empty set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HeldTenantsUnknown {
+    /// The per-tenant slot store could not be read.
+    SlotStore(String),
+    /// `paired_user.json` could not be read, so whose the legacy slot is — and
+    /// whether the default binding is one of the held tenants — is unknown.
+    DefaultBinding,
+    /// The legacy slot could not be read.
+    LegacySlot(String),
+}
+
+impl std::fmt::Display for HeldTenantsUnknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeldTenantsUnknown::SlotStore(e) => {
+                write!(f, "the per-tenant credential slots could not be read ({e})")
+            }
+            HeldTenantsUnknown::DefaultBinding => {
+                write!(
+                    f,
+                    "the default-binding record (paired_user.json) could not be read"
+                )
+            }
+            HeldTenantsUnknown::LegacySlot(e) => {
+                write!(f, "the default credential slot could not be read ({e})")
+            }
+        }
+    }
+}
+
+impl HeldDeviceTenants {
+    /// Read all three inputs from `am` and the live default-binding probe.
+    pub(crate) fn read(am: &AuthManager) -> Self {
+        Self::read_with(am, default_binding_tenant_probe())
+    }
+
+    /// [`Self::read`] with the default binding injected (tests).
+    pub(crate) fn read_with(am: &AuthManager, default_binding: BindingTenantRead) -> Self {
+        use crate::secure_storage::StoredTokenRead;
+        Self {
+            slots: am
+                .try_list_tenant_device_jwt_tenants()
+                .map_err(|e| format!("{e:#}")),
+            default_binding,
+            legacy_slot: match am.probe_access_token() {
+                StoredTokenRead::Present(token) => Ok(looks_like_jwt(&token)),
+                StoredTokenRead::Absent => Ok(false),
+                StoredTokenRead::Unreadable(e) => Err(e),
+            },
+        }
+    }
+
+    /// The held set: the slot tenants ∪ {the default binding, when the legacy
+    /// slot holds a credential}. Any input that could not be read is `Err` —
+    /// an Unknown default binding included, because it is not a count.
+    pub(crate) fn set(
+        &self,
+    ) -> std::result::Result<std::collections::BTreeSet<Uuid>, HeldTenantsUnknown> {
+        let mut held: std::collections::BTreeSet<Uuid> = self
+            .slots
+            .clone()
+            .map_err(HeldTenantsUnknown::SlotStore)?
+            .into_iter()
+            .collect();
+        match self.default_binding {
+            BindingTenantRead::Unknown => return Err(HeldTenantsUnknown::DefaultBinding),
+            BindingTenantRead::Bound(d) => {
+                if self
+                    .legacy_slot
+                    .clone()
+                    .map_err(HeldTenantsUnknown::LegacySlot)?
+                {
+                    held.insert(d);
+                }
+            }
+            BindingTenantRead::Unbound => {}
+        }
+        Ok(held)
+    }
+
+    /// Does this runner hold a credential for `tenant`? A positive read on
+    /// either route answers `true` even when the other route is unreadable;
+    /// `false` requires every route that could hold it to have been read.
+    pub(crate) fn holds(&self, tenant: Uuid) -> std::result::Result<bool, HeldTenantsUnknown> {
+        if matches!(&self.slots, Ok(slots) if slots.contains(&tenant)) {
+            return Ok(true);
+        }
+        if self.default_binding == BindingTenantRead::Bound(tenant) {
+            match &self.legacy_slot {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => return Err(HeldTenantsUnknown::LegacySlot(e.clone())),
+            }
+        }
+        if let Err(e) = &self.slots {
+            return Err(HeldTenantsUnknown::SlotStore(e.clone()));
+        }
+        if self.default_binding == BindingTenantRead::Unknown {
+            return Err(HeldTenantsUnknown::DefaultBinding);
+        }
+        Ok(false)
+    }
+}
+
 /// The device's DEFAULT binding tenant, read from `paired_user.json`
 /// (v2 `default_tenant_id`, legacy `tenant_id` fallback). Kept as a local
 /// minimal reader because `auth` compiles into BOTH the lib and bin crates
