@@ -2331,9 +2331,12 @@ struct LoopState {
     /// Whether the cold-start BULK seed has been attempted for the current
     /// corpus. `false` means the next tick will try to prime `last_applied`
     /// from one paged read instead of paying `reconcile_once`'s per-slug seed
-    /// on every plan. Re-armed by [`LoopState::apply_resolution`] whenever the
-    /// active plans dir moves, because that clears `last_applied` and the
-    /// per-slug fallback would otherwise cost one round-trip per plan again.
+    /// on every plan. Re-armed at two sites, both of which clear `last_applied`
+    /// and would otherwise leave the per-slug fallback to pay one round-trip
+    /// per plan: [`LoopState::apply_resolution`] whenever the active plans dir
+    /// moves, and [`LoopState::tick`] when work-unit writes RESUME after a
+    /// withheld [`WorkUnitWritePosture`] (the memory is frozen at the last
+    /// Write cycle, so the resumed cycle must re-prime from coord).
     bulk_seeded: bool,
     /// Test-only: the scan-root reporter every rebuilt [`BodySync`] gets
     /// instead of its sink, so a tick-level test can observe reports.
@@ -2399,6 +2402,18 @@ impl LoopState {
     #[cfg(test)]
     fn with_binding_count(mut self, local: usize, coord: Option<usize>) -> Self {
         self.binding_count = std::sync::Arc::new(move || BindingCountReading { local, coord });
+        self
+    }
+
+    /// Like [`Self::with_binding_count`], but the reading lives in a cell the
+    /// test can move between ticks — how a posture FLIP is staged.
+    #[cfg(test)]
+    fn with_binding_count_cell(
+        mut self,
+        cell: std::sync::Arc<std::sync::Mutex<BindingCountReading>>,
+    ) -> Self {
+        self.binding_count =
+            std::sync::Arc::new(move || *cell.lock().unwrap_or_else(|e| e.into_inner()));
         self
     }
 
@@ -2710,6 +2725,32 @@ impl LoopState {
                     _ => tracing::warn!("{line}"),
                 }
             }
+        }
+        // Writes RESUMING after a withheld posture: the edge memory is frozen
+        // at the last Write cycle, and while writes were withheld sessions
+        // kept upserting and transitioning units in coord and plan files kept
+        // moving. Deciding transitions from that stale memory reads every
+        // such move as a remote-divergence conflict — `push_work_unit` drops
+        // the CAS `from_status` guard and warns "file wins (loud override)"
+        // for a status the file never contradicted. Cold start has no such
+        // hole because its memory is empty, so make the resumed cycle a cold
+        // start: clear the memory and re-arm the bulk seed, exactly as
+        // `apply_resolution` does for a corpus switch. The bulk `list_statuses`
+        // read primes it in one round-trip; should that read fail, the
+        // per-slug `current_status` seed still fires for every scanned slug
+        // because the memory is empty. `forbidden` / `forbidden_deps` stay (a
+        // 403 is coord's verdict on the slug regardless of posture),
+        // `last_deps` stays (the edge replace-set is idempotent) and
+        // `warned_disappeared` stays (those verdicts stand). Forfeited, as on
+        // a corpus switch: the "disappeared from the active dir" warn for a
+        // slug whose file vanished WHILE withheld — `newly_disappeared_slugs`
+        // walks `last_applied`'s keys, and that slug is no longer among them.
+        // Informational only; coord's row is untouched either way.
+        if posture == WorkUnitWritePosture::Write
+            && matches!(self.last_write_posture, Some(p) if p != WorkUnitWritePosture::Write)
+        {
+            self.last_applied.clear();
+            self.bulk_seeded = false;
         }
         self.last_write_posture = Some(posture);
         if posture != WorkUnitWritePosture::Write {
@@ -6496,10 +6537,28 @@ mod tests {
         /// Total `list_statuses` reads served, so "attempted once per corpus"
         /// is asserted rather than assumed.
         list_statuses_calls: Mutex<u64>,
+        /// When set, every `list_statuses` read hard-errors — the bulk seed's
+        /// retry arm, which leaves the per-slug seed to carry correctness.
+        /// Atomic so a test can flip it between ticks through `&sink`.
+        fail_list_statuses: std::sync::atomic::AtomicBool,
+        /// EVERY sink method, in call order, so a test can assert what a cycle
+        /// asked coord FIRST — a count alone cannot tell a re-prime that ran
+        /// before the push from a conflict-check read that ran after it.
+        calls: Mutex<Vec<&'static str>>,
+    }
+    impl FakeSink {
+        fn record(&self, method: &'static str) {
+            self.calls.lock().unwrap().push(method);
+        }
+        /// The ledger, cloned out so no guard is held across an `assert!`.
+        fn ledger(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, slug: &str) -> Result<Option<String>> {
+            self.record("current_status");
             *self.current_status_calls.lock().unwrap() += 1;
             if self.fail_current_status {
                 anyhow::bail!("simulated current_status failure");
@@ -6510,13 +6569,19 @@ mod tests {
             Ok(self.statuses.lock().unwrap().get(slug).cloned())
         }
         async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
+            self.record("list_statuses");
             *self.list_statuses_calls.lock().unwrap() += 1;
+            if self.fail_list_statuses.load(Ordering::Relaxed) {
+                anyhow::bail!("simulated list_statuses failure");
+            }
             Ok(self.bulk.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            self.record("last_actor");
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
+            self.record("upsert");
             *self.upsert_calls.lock().unwrap() += 1;
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
@@ -6555,6 +6620,7 @@ mod tests {
             Ok(())
         }
         async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
+            self.record("transition");
             *self.transitions.lock().unwrap() += 1;
             self.statuses
                 .lock()
@@ -6563,6 +6629,7 @@ mod tests {
             Ok(())
         }
         async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+            self.record("set_deps");
             self.deps_calls
                 .lock()
                 .unwrap()
@@ -8380,6 +8447,183 @@ mod tests {
         assert!(work_unit_write_posture_message(Some(h), h).is_none());
         assert!(work_unit_write_posture_message(Some(u), h).is_some());
         assert!(work_unit_write_posture_message(Some(h), w).is_some());
+    }
+
+    /// Writes RESUMING after a withheld posture re-prime the edge memory from
+    /// coord: the resumed cycle's FIRST coord call is the bulk `list_statuses`
+    /// read, and it primes again. Follow-up to #1565 — the withheld cycles
+    /// themselves make no coord call of any kind (asserted here through the
+    /// call ledger, not per-method counters), but `bulk_seeded` was already
+    /// armed before the withhold, so without the re-arm the resumed cycle
+    /// would run on memory frozen at the last Write cycle.
+    ///
+    /// Neuter check: drop `self.bulk_seeded = false;` from the flip arm in
+    /// `tick` and the resumed cycle's ledger starts with `current_status`
+    /// (or, with `last_applied` still populated, with `upsert`).
+    #[tokio::test]
+    async fn writes_resuming_after_a_withheld_posture_re_prime_from_the_bulk_seed() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink {
+            bulk: Some(
+                [("2026-01-01-one-plan".to_string(), "draft".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let bindings = std::sync::Arc::new(std::sync::Mutex::new(BindingCountReading {
+            local: 1,
+            coord: Some(1),
+        }));
+        let mut state = tick_state(reader).with_binding_count_cell(bindings.clone());
+
+        // Write cycle: bulk seed primes the one slug, then a refresh.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
+        assert_eq!(metrics.snapshot().seeded_total, 1);
+        let after_write = sink.ledger();
+        assert_eq!(after_write.first().copied(), Some("list_statuses"));
+
+        // Two withheld cycles: coord reports three bindings. No call at all.
+        bindings.lock().unwrap().coord = Some(3);
+        state.tick(&sink, &metrics).await;
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            sink.ledger(),
+            after_write,
+            "a withheld cycle makes no coord work-unit call of any kind"
+        );
+        assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 2);
+
+        // Flip back to single-bound: the resumed cycle re-primes FIRST.
+        bindings.lock().unwrap().coord = Some(1);
+        state.tick(&sink, &metrics).await;
+        let resumed: Vec<&str> = sink.ledger()[after_write.len()..].to_vec();
+        assert_eq!(
+            resumed.first().copied(),
+            Some("list_statuses"),
+            "the resumed cycle's first coord call is the bulk seed: {resumed:?}"
+        );
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            2,
+            "the bulk seed re-armed on the flip"
+        );
+        assert_eq!(
+            metrics.snapshot().seeded_total,
+            2,
+            "the re-primed memory came from coord, not from the frozen last Write cycle"
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+    }
+
+    /// The discriminating case for the re-prime. While writes were withheld
+    /// an agent moved the unit in coord (`draft` -> `vetted`) AND the plan
+    /// file was edited to VETTED — the file and coord AGREE. On the flip the
+    /// bulk read fails, so the memory must be re-primed per slug: the resumed
+    /// cycle reads `current_status` before any push, sees `vetted`, and
+    /// refreshes. With the memory frozen at `draft` the same cycle would decide
+    /// a `draft -> vetted` transition, read coord's `vetted` as a divergence
+    /// from `draft`, warn "file wins (loud override)" and emit a
+    /// `transition` with the CAS `from_status` guard dropped — for a status
+    /// the file never contradicted.
+    ///
+    /// Neuter check: drop `self.last_applied.clear();` from the flip arm in
+    /// `tick` and this fails with one `transition` recorded.
+    #[tokio::test]
+    async fn writes_resuming_after_a_withheld_posture_do_not_transition_on_frozen_memory() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        // The bulk door answers (empty) on the Write cycle, so `bulk_seeded`
+        // is ARMED before the withhold — the shape the defect needs.
+        let sink = FakeSink {
+            bulk: Some(HashMap::new()),
+            ..Default::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let bindings = std::sync::Arc::new(std::sync::Mutex::new(BindingCountReading {
+            local: 1,
+            coord: Some(1),
+        }));
+        let mut state = tick_state(reader).with_binding_count_cell(bindings.clone());
+
+        // Write cycle: the unit is created as `draft` and remembered as such.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            state
+                .last_applied
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("draft")
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+
+        // Withheld cycle, during which a session vets the unit in coord and
+        // the plan file is edited to match.
+        bindings.lock().unwrap().coord = Some(3);
+        state.tick(&sink, &metrics).await;
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("2026-01-01-one-plan".to_string(), "vetted".to_string());
+        std::fs::write(
+            dir.path().join("2026-01-01-one-plan.md"),
+            "# One plan
+
+> **Status: VETTED**
+
+Body.
+",
+        )
+        .unwrap();
+        let before_flip = sink.ledger();
+
+        // Flip back with the bulk read FAILING for this cycle.
+        bindings.lock().unwrap().coord = Some(1);
+        sink.fail_list_statuses.store(true, Ordering::Relaxed);
+        state.tick(&sink, &metrics).await;
+
+        let resumed: Vec<&str> = sink.ledger()[before_flip.len()..].to_vec();
+        let first_read = resumed.iter().position(|m| *m == "current_status");
+        let first_push = resumed
+            .iter()
+            .position(|m| *m == "upsert" || *m == "transition");
+        assert_eq!(
+            resumed.first().copied(),
+            Some("list_statuses"),
+            "the bulk seed is attempted first: {resumed:?}"
+        );
+        assert!(
+            matches!((first_read, first_push), (Some(r), Some(p)) if r < p),
+            "the per-slug seed must read coord before any push: {resumed:?}"
+        );
+        assert!(
+            !resumed.contains(&"transition"),
+            "file and coord agree on `vetted`; nothing to transition: {resumed:?}"
+        );
+        assert_eq!(
+            state
+                .last_applied
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("vetted"),
+            "the memory was re-primed from coord"
+        );
+        assert_eq!(
+            metrics.snapshot().seeded_total,
+            1,
+            "the per-slug seed fired because the memory was empty"
+        );
+        assert!(
+            !logs.text().contains("loud override"),
+            "no spurious conflict on a status the file never contradicted: {}",
+            logs.text()
+        );
     }
 
     /// **The no-fallback contract at the TICK** — the level the question is
