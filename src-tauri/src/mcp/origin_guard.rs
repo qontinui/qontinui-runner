@@ -1374,22 +1374,12 @@ pub struct NormOrigin {
 }
 
 impl NormOrigin {
-    /// Scheme, lowercased.
-    pub fn scheme(&self) -> &str {
-        &self.scheme
-    }
-
-    /// Host, lowercased (an IPv6 literal keeps its brackets).
-    pub fn host(&self) -> &str {
-        &self.host
-    }
-
-    /// Port, with the scheme's default made explicit when it has one.
-    pub fn port(&self) -> Option<u16> {
-        self.port
-    }
-
     /// Parse an `Origin` value. `None` for empty, `null` or unparseable input.
+    ///
+    /// The type is `pub` because it rides on [`RequesterPrincipal`]; it is
+    /// compared with `PartialEq` (scheme + host + port, the scheme's default
+    /// port made explicit) and carries no accessors until a rule needs one —
+    /// Phase 1's `Principal::same` and `verified_origin` are where that lands.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim().trim_end_matches('/');
         if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
