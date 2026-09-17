@@ -2052,6 +2052,16 @@ impl RemoteAttachClient {
         self.out_rx.lock().await
     }
 
+    /// True when a relay connection currently holds the outbound pump — i.e.
+    /// a frame queued now is drained onto a live socket. `false` means no
+    /// connection holds it: a queued frame waits and is discarded by
+    /// [`Self::discard_backlog`] when the next connection starts. The pump is
+    /// the only holder of this lock ([`Self::lock_outbound`]), so a failed
+    /// `try_lock` is the pump, never a contender.
+    pub fn outbound_pump_attached(&self) -> bool {
+        self.out_rx.try_lock().is_err()
+    }
+
     /// Drop every frame queued before this connection existed. The backend
     /// tore every attachment down when the previous socket dropped, so each
     /// queued input / resize / flow / detach would be refused as stale — and
