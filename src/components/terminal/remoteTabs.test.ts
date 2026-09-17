@@ -92,6 +92,16 @@ describe("attachErrorMessage (typed runner errors, shown inline)", () => {
     );
   });
 
+  it("renders coord's target-runner refusal with its hint as the detail", () => {
+    expect(
+      attachErrorMessage(
+        "remote_attach:target_runner_predates_remote_attach: The target device 84c02292 is serving qontinui-runner 3472fc6a1c58, which predates remote attach. (coord answered 409 for POST https://coord/x)",
+      ),
+    ).toBe(
+      "target_runner_predates_remote_attach — The target device 84c02292 is serving qontinui-runner 3472fc6a1c58, which predates remote attach. (coord answered 409 for POST https://coord/x)",
+    );
+  });
+
   it("passes an untyped message through and never returns an empty string", () => {
     expect(attachErrorMessage("relay closed")).toBe("relay closed");
     expect(attachErrorMessage("")).toMatch(/no reason/);

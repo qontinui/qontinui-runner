@@ -2417,6 +2417,25 @@ impl RemoteAttachClient {
                     .to_string(),
             }));
         }
+        // The same for an ATTACH still waiting for its first reply: the relay
+        // released the attachment with the socket and the reply can never
+        // arrive on a new one, so a "timeout" 20 s from now would mean nothing.
+        // Settling it here is what lets a timeout mean "the target never
+        // answered" (plan
+        // `2026-09-17-remote-attach-to-a-pre-feature-target-times-out-silently`).
+        let stranded_attaches: Vec<PendingAttach> = self
+            .pending
+            .lock()
+            .map(|mut p| p.drain().map(|(_, tx)| tx).collect())
+            .unwrap_or_default();
+        for tx in stranded_attaches {
+            let _ = tx.send(Err(AttachError {
+                code: "relay_disconnected".to_string(),
+                message: "the relay connection dropped before the target answered the attach — \
+                          retry mints a new grant"
+                    .to_string(),
+            }));
+        }
         let panes: Vec<Arc<RemotePaneIo>> = self
             .panes
             .lock()
@@ -3573,6 +3592,20 @@ mod tests {
             !client.handle_inbound("error", &json!({"type": "error", "request_id": "ghost"})),
             "an error for no pending request is left to the relay's warn arm"
         );
+    }
+
+    /// A relay drop settles an attach still waiting for its reply, so the
+    /// attach timeout is left meaning only "the target never answered".
+    #[tokio::test]
+    async fn a_relay_drop_settles_a_pending_attach_as_relay_disconnected() {
+        let client = RemoteAttachClient::new();
+        let fut = client.attach("g", 80, 24, Duration::from_secs(60));
+        tokio::pin!(fut);
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        client.on_relay_disconnected();
+        let err = fut.await.expect_err("settled by the drop");
+        assert_eq!(err.code, "relay_disconnected");
+        assert!(client.pending.lock().unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]

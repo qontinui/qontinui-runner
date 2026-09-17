@@ -268,31 +268,38 @@ async fn mint_attach_grant(
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        // Coord answers typed bodies: {"error": "...", "reason": "..."}.
-        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        let code = parsed
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("coord_error");
-        let reason = parsed
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .map(|r| format!(":{r}"))
-            .unwrap_or_default();
-        // A `hint` is coord's sentence for the operator (e.g. which runner build
-        // the target serves and which it needs) — lead with it when present.
-        let hint = parsed
-            .get("hint")
-            .and_then(|v| v.as_str())
-            .map(|h| format!("{h} "))
-            .unwrap_or_default();
-        return Err(format!(
-            "remote_attach:{code}{reason}: {hint}(coord answered {} for POST {url})",
-            status.as_u16()
-        ));
+        return Err(format_mint_refusal(status.as_u16(), &body, &url));
     }
     serde_json::from_str(&body)
         .map_err(|e| format!("remote_attach:coord_parse: could not decode the grant response: {e}"))
+}
+
+/// Pure: the typed error string for a non-2xx attach-grant mint.
+///
+/// Shape `remote_attach:<error>[:<reason>]: [<hint> ](coord answered <status>
+/// for POST <url>)` — the picker's `attachErrorMessage` lifts the code out of
+/// it. Coord's `hint` (e.g. which runner build the target serves and which it
+/// needs) leads the detail when present. `reason` is only folded into the code
+/// when it is a bare `[a-z_]+` token, because the picker's pattern admits
+/// nothing else there and a non-matching string would be shown raw.
+pub(crate) fn format_mint_refusal(status: u16, body: &str, url: &str) -> String {
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let code = parsed
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or("coord_error");
+    let reason = parsed
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        .map(|r| format!(":{r}"))
+        .unwrap_or_default();
+    let hint = parsed
+        .get("hint")
+        .and_then(|v| v.as_str())
+        .map(|h| format!("{h} "))
+        .unwrap_or_default();
+    format!("remote_attach:{code}{reason}: {hint}(coord answered {status} for POST {url})")
 }
 
 fn short_id(id: &str) -> String {
@@ -806,6 +813,9 @@ mod relay_timeout_tests {
 
     const DEV: &str = "84c02292-32cb-4983-be85-d00f868b7003";
 
+    /// A relay drop is settled as `relay_disconnected` before the timeout can
+    /// fire (`RemoteAttachClient::on_relay_disconnected`), so no arm blames the
+    /// relay.
     #[test]
     fn every_arm_names_the_target_device_and_never_guesses_a_relay_disconnect() {
         let supports = TargetRunner {
@@ -846,6 +856,30 @@ mod relay_timeout_tests {
         let m = explain_relay_timeout("remote_terminal_created", DEV, Some(&tr), 45);
         assert!(m.contains("wedged or offline"), "{m}");
         assert!(!m.contains("older"), "{m}");
+    }
+
+    #[test]
+    fn a_mint_refusal_leads_with_coords_hint_and_keeps_the_picker_shape() {
+        let body = r#"{"error":"target_runner_predates_remote_attach","target_device_id":"84c02292-32cb-4983-be85-d00f868b7003","served_sha":"3472fc6a1c58","required_sha":"f521e1012e1e3f84e1dd62ec90dbc3d274f322b0","hint":"The target device 84c02292 is serving qontinui-runner 3472fc6a1c58, which predates remote attach."}"#;
+        let m = super::format_mint_refusal(409, body, "https://coord/x");
+        assert_eq!(
+            m,
+            "remote_attach:target_runner_predates_remote_attach: The target device 84c02292 is \
+             serving qontinui-runner 3472fc6a1c58, which predates remote attach. (coord answered \
+             409 for POST https://coord/x)"
+        );
+        // The existing reason arm is unchanged.
+        assert_eq!(
+            super::format_mint_refusal(403, r#"{"error":"attach_forbidden","reason":"preference_off"}"#, "u"),
+            "remote_attach:attach_forbidden:preference_off: (coord answered 403 for POST u)"
+        );
+        // A reason the picker's `[a-z_]+` cannot lift is not folded into the code.
+        assert_eq!(
+            super::format_mint_refusal(409, r#"{"error":"x","reason":"sha-3472fc6a"}"#, "u"),
+            "remote_attach:x: (coord answered 409 for POST u)"
+        );
+        // A non-JSON body still yields a typed code.
+        assert!(super::format_mint_refusal(502, "<html>", "u").starts_with("remote_attach:coord_error: "));
     }
 
     #[test]

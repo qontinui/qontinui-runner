@@ -671,6 +671,9 @@ pub async fn terminal_create_remote(
         .map_err(|e| RemoteCreateError {
             stage: "create",
             code: e.code.clone(),
+            // Against a coord carrying the target-runner check, a minted create
+            // grant is always `supports` (coord refuses `unknown` for create), so
+            // the `unknown` arm of the explanation only serves an older coord.
             message: if e.code == "timeout" {
                 format!(
                     "{} The grant is single-use; if the target did spawn a terminal it is \
@@ -843,6 +846,18 @@ pub async fn terminal_create_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_grant_response_reads_target_runner_when_present_and_tolerates_absence() {
+        let old: CreateGrantResponse =
+            serde_json::from_str(r#"{"grant":"g","grant_jti":"j"}"#).unwrap();
+        assert!(old.target_runner.is_none());
+        let new: CreateGrantResponse = serde_json::from_str(
+            r#"{"grant":"g","grant_jti":"j","target_runner":{"state":"supports","required_sha":"abc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(new.target_runner.unwrap().state, "supports");
+    }
 
     #[test]
     fn agreement_needs_the_same_value_and_nothing_less() {

@@ -320,7 +320,15 @@ async fn readback_bearer(auth_manager: &crate::auth::AuthManager) -> Option<(Str
 /// Pure: classify coord's `GET /coord/devices/me/routing` answer. `Err` means
 /// coord gave no usable answer and the caller should try the web route; the
 /// string says why, for the combined UNKNOWN reason. A miss is never `false`.
-pub(crate) fn classify_coord(status: u16, body: &str) -> Result<Readback, String> {
+///
+/// The answer is about the device the BEARER names, which is not guaranteed to
+/// be this runner's `device_id` (a mirrored or multi-bound credential slot), so
+/// an answer for any other device is a miss, never a verdict.
+pub(crate) fn classify_coord(
+    status: u16,
+    body: &str,
+    expected_device_id: &str,
+) -> Result<Readback, String> {
     if status != 200 {
         let excerpt: String = body.chars().take(200).collect();
         return Err(format!(
@@ -329,6 +337,17 @@ pub(crate) fn classify_coord(status: u16, body: &str) -> Result<Readback, String
     }
     let parsed: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| format!("coord routing read 200 but body is not JSON: {e}"))?;
+    let answered_for = parsed
+        .get("device_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or_default();
+    if answered_for.is_empty() || !answered_for.eq_ignore_ascii_case(expected_device_id.trim()) {
+        return Err(format!(
+            "coord routing read answered for device {answered_for:?}, but this runner is \
+             {expected_device_id}"
+        ));
+    }
     match parsed.get("ws_connected").and_then(|v| v.as_bool()) {
         Some(true) => Ok(Readback::Routable),
         Some(false) => Ok(Readback::NotRoutable),
@@ -337,7 +356,7 @@ pub(crate) fn classify_coord(status: u16, body: &str) -> Result<Readback, String
 }
 
 /// Coord's answer, or why there was none.
-async fn coord_read_back_at(coord_base: &str) -> Result<Readback, String> {
+async fn coord_read_back_at(coord_base: &str, device_id: &str) -> Result<Readback, String> {
     let Some(client) = crate::coord_http::coord_client() else {
         return Err("coord HTTP client unavailable".to_string());
     };
@@ -355,7 +374,26 @@ async fn coord_read_back_at(coord_base: &str) -> Result<Readback, String> {
         .map_err(|e| format!("coord routing read to {url} failed: {e}"))?;
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
-    classify_coord(status, &body)
+    classify_coord(status, &body, device_id)
+}
+
+/// Pure: fold coord's answer and the web fallback into one reading. A coord
+/// answer wins outright; a coord miss defers to the web read, and when that is
+/// UNKNOWN too the reason carries both misses. Nothing here ever turns a miss
+/// into `false`.
+pub(crate) fn combine(coord: Result<Readback, String>, web: Option<Readback>) -> Readback {
+    let coord_miss = match coord {
+        Ok(answer) => return answer,
+        Err(why) => why,
+    };
+    match web {
+        None => Readback::Unknown(format!(
+            "{coord_miss}; and no usable bearer for the web read-back (no Cognito session, no \
+             unexpired device-JWT)"
+        )),
+        Some(Readback::Unknown(web)) => Readback::Unknown(format!("{coord_miss}; then {web}")),
+        Some(answer) => answer,
+    }
 }
 
 /// Pure: name the cause of a web read-back 401 when the credential presented
@@ -402,25 +440,33 @@ async fn read_back_once() -> Readback {
         Ok(_) => return Readback::Unknown("device id is empty — cannot read back".to_string()),
         Err(e) => return Readback::Unknown(format!("device id unreadable: {e}")),
     };
-    // Coord first: the one door a headless runner's device JWT can open.
-    let coord_base = qontinui_runner_lib::profiles::coord_base_with_source().0;
-    let coord_miss = match coord_read_back_at(&coord_base).await {
-        Ok(answer) => return answer,
-        Err(why) => why,
+    // Coord first: the one door a headless runner's device JWT can open. A
+    // coord base that is only the dev-localhost GUESS is skipped: a local coord
+    // need not share `coord.devices` with the web relay this runner dials, and
+    // its answer would be a confident reading about the wrong database.
+    let (coord_base, coord_source) = qontinui_runner_lib::profiles::coord_base_with_source();
+    let coord = if coord_source == qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback {
+        Err(format!(
+            "coord routing read skipped: coord base {coord_base} is the dev-localhost fallback"
+        ))
+    } else {
+        coord_read_back_at(&coord_base, &device_id).await
     };
-
-    let Some((bearer, kind)) = readback_bearer(&auth_manager).await else {
-        return Readback::Unknown(format!(
-            "{coord_miss}; and no usable bearer for the web read-back (no Cognito session, no \
-             unexpired device-JWT)"
-        ));
-    };
-
-    let base = crate::api_config::get_api_base_url();
-    match explain_web_readback(read_back_at(&base, &device_id, &bearer).await, kind) {
-        Readback::Unknown(web) => Readback::Unknown(format!("{coord_miss}; then {web}")),
-        answer => answer,
+    if coord.is_ok() {
+        return combine(coord, None);
     }
+
+    let web = match readback_bearer(&auth_manager).await {
+        Some((bearer, kind)) => {
+            let base = crate::api_config::get_api_base_url();
+            Some(explain_web_readback(
+                read_back_at(&base, &device_id, &bearer).await,
+                kind,
+            ))
+        }
+        None => None,
+    };
+    combine(coord, web)
 }
 
 /// The HTTP leg, with every input passed in. Split from
@@ -729,19 +775,44 @@ mod tests {
     #[test]
     fn coord_routing_answer_is_classified_and_a_miss_is_never_false() {
         assert_eq!(
-            classify_coord(200, r#"{"device_id":"d","ws_connected":true}"#),
+            classify_coord(200, r#"{"device_id":"D","ws_connected":true}"#, "d"),
             Ok(Readback::Routable)
         );
         assert_eq!(
-            classify_coord(200, r#"{"device_id":"d","ws_connected":false}"#),
+            classify_coord(200, r#"{"device_id":"d","ws_connected":false}"#, "d"),
             Ok(Readback::NotRoutable)
         );
         // An older coord without the route, a missing row, a body without the
         // field: each is a MISS (fall back), never a `false`.
-        assert!(classify_coord(404, "").is_err());
-        assert!(classify_coord(404, r#"{"error":"device_not_found"}"#).is_err());
-        assert!(classify_coord(200, r#"{"device_id":"d"}"#).is_err());
-        assert!(classify_coord(200, "not json").is_err());
+        assert!(classify_coord(404, "", "d").is_err());
+        assert!(classify_coord(404, r#"{"error":"device_not_found"}"#, "d").is_err());
+        assert!(classify_coord(200, r#"{"device_id":"d"}"#, "d").is_err());
+        assert!(classify_coord(200, "not json", "d").is_err());
+        // An answer about ANOTHER device (or none named) is a miss, not `false`.
+        assert!(classify_coord(200, r#"{"device_id":"other","ws_connected":false}"#, "d").is_err());
+        assert!(classify_coord(200, r#"{"ws_connected":false}"#, "d").is_err());
+    }
+
+    #[test]
+    fn combine_never_turns_a_miss_into_false() {
+        assert_eq!(combine(Ok(Readback::NotRoutable), None), Readback::NotRoutable);
+        assert_eq!(
+            combine(Err("coord miss".into()), Some(Readback::Routable)),
+            Readback::Routable
+        );
+        match combine(
+            Err("coord miss".into()),
+            Some(Readback::Unknown("web 401".into())),
+        ) {
+            Readback::Unknown(r) => {
+                assert!(r.contains("coord miss") && r.contains("web 401"), "{r}")
+            }
+            other => panic!("two misses must be UNKNOWN, got {other:?}"),
+        }
+        match combine(Err("coord miss".into()), None) {
+            Readback::Unknown(r) => assert!(r.contains("coord miss") && r.contains("no usable bearer"), "{r}"),
+            other => panic!("a miss with no web bearer must be UNKNOWN, got {other:?}"),
+        }
     }
 
     #[test]
