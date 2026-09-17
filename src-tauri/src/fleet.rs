@@ -1861,6 +1861,14 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
+            // Record coord's set as-is BEFORE reconciling: the reconcile below
+            // never adds a binding it holds no JWT for, so the local file
+            // under-counts a multi-bound device by design, and the plan
+            // adapter's write gate reads this sidecar to see what coord sees.
+            // Best-effort — never fails the heartbeat.
+            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
+                tracing::debug!("fleet::heartbeat: coord_bound_tenants sidecar non-fatal: {e}");
+            }
             match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
                 Ok(report) => {
                     if report.changed() {

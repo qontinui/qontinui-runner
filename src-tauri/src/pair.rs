@@ -115,6 +115,15 @@ struct PairStartResponseWire {
 use crate::machine_identity::machine_file_path;
 pub use crate::machine_identity::read_device_id_at;
 
+// Coord's hydrated binding set as the heartbeat last recorded it — the sidecar
+// beside `paired_user.json` that the plan adapter's write gate reads
+// (`crate::coord_bound_tenants`). Re-exported here so it is reached by the
+// same path as the reconcile it complements; it is NOT consulted by the
+// reconcile, and it never writes `paired_user.json`.
+pub use crate::coord_bound_tenants::{
+    coord_bound_tenant_count, record_coord_bound_tenants, RecordOutcome,
+};
+
 /// Read `device_id` from `~/.qontinui/machine.json`. Returns a clear
 /// error if the file is missing — the caller (pair-cli) cannot proceed
 /// without a stable device identity.

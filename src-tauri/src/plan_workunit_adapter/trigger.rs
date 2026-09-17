@@ -135,6 +135,13 @@ pub struct AdapterMetrics {
     /// counted here was not pushed at all this cycle — see [`reconcile_once`]
     /// for why an unreadable remote status must abstain rather than overwrite.
     pub seed_errors_total: AtomicU64,
+    /// Total cycles whose work-unit writes were WITHHELD because this device
+    /// is bound to more than one tenant and the adapter cannot say which one
+    /// owns the plans dir (counter) — see [`WorkUnitWritePosture`]. A cycle
+    /// counted here still scanned, still ran the body sync and still counts in
+    /// `cycles_total`; it made no coord work-unit read or write at all. Zero
+    /// on a single-bound device, always.
+    pub work_unit_writes_withheld_total: AtomicU64,
 }
 
 /// A point-in-time read of [`AdapterMetrics`].
@@ -160,6 +167,7 @@ pub struct MetricsSnapshot {
     pub deps_forbidden_total: u64,
     pub seeded_total: u64,
     pub seed_errors_total: u64,
+    pub work_unit_writes_withheld_total: u64,
 }
 
 impl AdapterMetrics {
@@ -193,6 +201,9 @@ impl AdapterMetrics {
             deps_forbidden_total: self.deps_forbidden_total.load(Ordering::Relaxed),
             seeded_total: self.seeded_total.load(Ordering::Relaxed),
             seed_errors_total: self.seed_errors_total.load(Ordering::Relaxed),
+            work_unit_writes_withheld_total: self
+                .work_unit_writes_withheld_total
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -2269,6 +2280,130 @@ impl ResolvedDirs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Work-unit write posture — plan
+// `2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device`
+// (D2).
+//
+// Every work-unit write this loop makes presents the device's DEFAULT
+// credential (`push::HttpWorkUnitSink` → `auth::attach_device_auth` →
+// `TenantScope::Device`). On a device bound to one tenant that credential IS
+// the tenant, and the write is right by construction. On a device bound to
+// several it is whichever tenant currently holds the legacy slot, and nothing
+// in a plans dir says which tenant its plans belong to — so every fresh plan
+// landed under the slot's tenant, and every later session `work_unit_upsert`
+// from the tenant that actually owned it answered `409
+// slug_owned_by_another_tenant`. Measured on spaceship: three bindings, one
+// slot, every plan minted under the wrong one.
+//
+// The adapter cannot resolve the owner, so it refuses to guess: on a
+// multi-bound device the cycle scans, runs the body sync (a different store,
+// keyed by the artifact rather than the tenant slot), and makes NO coord
+// work-unit read or write. Sessions keep their own `coord_work_unit_upsert`,
+// which carries the session's tenant, so the plans still reach coord — under
+// the right tenant, and later.
+//
+// The count the gate keys on is the MAX of two readings, because each one
+// under-counts in a different way. The local `paired_user.json` never
+// records a binding the runner holds no JWT for (`pair::reconcile_paired_bindings_with`
+// reports those as `coord_only`), so spaceship reads as single-bound there.
+// Coord's own set reaches this process only through the register heartbeat,
+// which `coord_bound_tenants` makes durable — and that sidecar is UNKNOWN
+// (`None`) at boot, when stale, and on a machine whose heartbeat has never
+// answered with a set. `max(local, coord.unwrap_or(0))` can therefore never
+// LOWER today's figure: a single-bound device stays byte-for-byte on today's
+// path, and only a device SOME reading says is multi-bound is withheld.
+// ---------------------------------------------------------------------------
+
+/// Whether this cycle may write work units to coord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkUnitWritePosture {
+    /// The device resolves to one tenant (or none this process can see) —
+    /// today's behaviour, unchanged.
+    Write,
+    /// The device is bound to `binding_count` (≥ 2) tenants and the adapter
+    /// cannot say which one owns the plans dir, so it writes nothing.
+    Withheld { binding_count: usize },
+}
+
+/// The two binding counts a posture is decided from, kept apart so the
+/// withheld log can say WHICH reading made the device multi-bound — an
+/// operator on a box whose local file says one and whose sidecar says three
+/// needs to know it is the sidecar, and that pairing the missing tenants is
+/// not what fixes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingCountReading {
+    /// `auth::device_binding_count()` — the `paired_user.json` count, which
+    /// answers `1` for every unreadable state (its documented direction).
+    pub local: usize,
+    /// `pair::coord_bound_tenant_count()` — coord's set as the heartbeat last
+    /// recorded it; `None` is UNKNOWN (absent, stale, unparseable sidecar).
+    pub coord: Option<usize>,
+}
+
+impl BindingCountReading {
+    /// The figure the gate keys on — see [`combine_binding_counts`].
+    pub fn combined(&self) -> usize {
+        combine_binding_counts(self.local, self.coord)
+    }
+}
+
+/// `max(local, coord.unwrap_or(0))`: never below the local figure the D2
+/// bearer degrade already keys on, raised by coord's reading when there is
+/// one. An UNKNOWN sidecar contributes nothing — it does not count as zero
+/// bindings AND it does not count as a multi-bound device.
+pub(crate) fn combine_binding_counts(local: usize, coord: Option<usize>) -> usize {
+    local.max(coord.unwrap_or(0))
+}
+
+/// The posture for a binding count: two or more bindings withhold.
+pub fn work_unit_write_posture(binding_count: usize) -> WorkUnitWritePosture {
+    if binding_count >= 2 {
+        WorkUnitWritePosture::Withheld { binding_count }
+    } else {
+        WorkUnitWritePosture::Write
+    }
+}
+
+/// Read both counts off this device's real files. The production
+/// [`BindingCountReader`]; the CLI backfill reads the same pair so its refusal
+/// and the loop's withholding can never disagree about one device.
+pub fn device_work_unit_binding_reading() -> BindingCountReading {
+    BindingCountReading {
+        local: crate::auth::device_binding_count(),
+        coord: crate::pair::coord_bound_tenant_count(),
+    }
+}
+
+/// Per-tick reader of the binding counts. A closure for the same reason
+/// [`PathReader`] is: the counts must be re-read every cycle — the sidecar
+/// fills in after the first heartbeat, a pairing can add a binding, a
+/// reconcile can drop one — and a test must be able to hand the loop a
+/// constant so no tick reads the operator's real store.
+pub type BindingCountReader = std::sync::Arc<dyn Fn() -> BindingCountReading + Send + Sync>;
+
+/// The one `warn!` a flip to [`WorkUnitWritePosture::Withheld`] emits. Names
+/// the count, BOTH readings, why the adapter will not guess, who still writes
+/// the units, and what the catch-up CLI does on the same device — it refuses
+/// for the same reason, so recommending it bare would send the operator to a
+/// second refusal.
+pub fn work_unit_writes_withheld_message(reading: &BindingCountReading) -> String {
+    let coord = match reading.coord {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    format!(
+        "plan adapter: work-unit writes WITHHELD — this device is bound to {} tenants (coord \
+         says {coord}, local file says {}) and the adapter cannot resolve which tenant owns the \
+         plans dir, so it will not mint units under the default credential; sessions keep their \
+         own coord_work_unit_upsert. `qontinui-pr plan-workunit-backfill` refuses on this device \
+         for the same reason unless run with --allow-multi-bound. Plans are still scanned and \
+         the plan-library body sync still runs.",
+        reading.combined(),
+        reading.local,
+    )
+}
+
 /// Everything one reconcile loop carries from tick to tick.
 ///
 /// Factored out of [`run_loop`] so a tick is a plain `async fn` a test can
@@ -2321,6 +2456,19 @@ struct LoopState {
     /// Handed to every rebuilt [`BodySync`] — see [`ScanReportGate`]. Closed
     /// until [`Self::with_scan_report_gate`] supplies the binary's predicate.
     scan_report_gate: ScanReportGate,
+    /// The binding counts the write posture is decided from, re-read every
+    /// armed cycle. [`device_work_unit_binding_reading`] in production;
+    /// injected in tests so no tick reads the operator's real store.
+    binding_count: BindingCountReader,
+    /// The posture the last armed cycle ran under, so a flip is logged ONCE
+    /// rather than once per minute for as long as it holds. `None` before
+    /// the first armed cycle — and a first cycle that is `Write` logs
+    /// nothing, because that is today's behaviour and a single-bound device
+    /// must stay silent about a gate it never met.
+    last_posture: Option<WorkUnitWritePosture>,
+    /// How many posture lines this loop has logged. What a test asserts
+    /// "exactly one warn per flip" against, since the log itself is prose.
+    posture_transitions: u64,
 }
 
 impl LoopState {
@@ -2347,7 +2495,57 @@ impl LoopState {
             #[cfg(test)]
             scan_reporter: None,
             scan_report_gate: scan_report_gate_closed(),
+            binding_count: std::sync::Arc::new(device_work_unit_binding_reading),
+            last_posture: None,
+            posture_transitions: 0,
         }
+    }
+
+    /// Hand the loop a constant binding reading. Test-only, like
+    /// [`Self::with_git`] and for the same reason: production always reads
+    /// the device's real files, and a seam that can be reconfigured at
+    /// runtime would be a way for the gate to be quietly disarmed.
+    #[cfg(test)]
+    fn with_binding_count(mut self, reading: BindingCountReading) -> Self {
+        self.binding_count = std::sync::Arc::new(move || reading);
+        self
+    }
+
+    /// Decide this cycle's posture and log it when — and only when — it
+    /// flipped. A flip INTO `Withheld` is a `warn!` with the full reason; a
+    /// flip back to `Write` is an `info!`, because the device resolved and the
+    /// operator watching the warn wants to see it end.
+    fn note_write_posture(&mut self, reading: &BindingCountReading) -> WorkUnitWritePosture {
+        let posture = work_unit_write_posture(reading.combined());
+        // Compared by VARIANT: a count that moves from 3 to 4 while withheld is
+        // the same posture, and re-logging it would be the per-minute noise the
+        // dedup exists to stop.
+        let flipped = match (self.last_posture, posture) {
+            (
+                Some(WorkUnitWritePosture::Withheld { .. }),
+                WorkUnitWritePosture::Withheld { .. },
+            ) => false,
+            (Some(WorkUnitWritePosture::Write), WorkUnitWritePosture::Write) => false,
+            // First armed cycle on today's path: nothing to say.
+            (None, WorkUnitWritePosture::Write) => false,
+            _ => true,
+        };
+        self.last_posture = Some(posture);
+        if flipped {
+            self.posture_transitions += 1;
+            match posture {
+                WorkUnitWritePosture::Withheld { .. } => {
+                    tracing::warn!("{}", work_unit_writes_withheld_message(reading));
+                }
+                WorkUnitWritePosture::Write => tracing::info!(
+                    local_bindings = reading.local,
+                    coord_bindings = ?reading.coord,
+                    "plan adapter: work-unit writes RESUMED — this device now resolves to a \
+                     single tenant"
+                ),
+            }
+        }
+        posture
     }
 
     /// Supply the instance-ownership predicate every rebuilt [`BodySync`]
@@ -2455,7 +2653,9 @@ impl LoopState {
                  coord from this runner. Arm it by setting `paths.plans_dir` in the Paths \
                  section of the runner's settings; it takes effect within one scan interval, \
                  no restart needed. Catch a machine up immediately with \
-                 `qontinui-pr plan-workunit-backfill --plans-dir <dir>`"
+                 `qontinui-pr plan-workunit-backfill --plans-dir <dir>` — on a device bound \
+                 to more than one tenant it refuses, like this adapter, unless run with \
+                 --allow-multi-bound"
             ),
         }
     }
@@ -2706,6 +2906,29 @@ impl LoopState {
         };
         // Read something, so the next unavailability is news again.
         self.last_scan_unavailable = None;
+
+        // The write gate (D2) — AFTER the scan, so a withheld cycle still
+        // measures and still reads the corpus, and BEFORE the bulk seed, which
+        // is the first coord work-unit READ of the cycle. Withheld means no
+        // seed, no reconcile, no archive stamp, no dep edges: none of those
+        // can be attributed to a tenant this device cannot name. The body
+        // sync below is NOT withheld — it writes plan bodies to the plan
+        // library, a different store, and the same reasoning does not apply.
+        let reading = (self.binding_count)();
+        if let WorkUnitWritePosture::Withheld { .. } = self.note_write_posture(&reading) {
+            metrics
+                .work_unit_writes_withheld_total
+                .fetch_add(1, Ordering::Relaxed);
+            if let Some(bs) = self.body_sync.as_mut() {
+                bs.run_cycle(&self.conv, metrics).await;
+            }
+            // Counted like every other cycle, for the same reason as the
+            // scan-failure arms above: a frozen `cycles_total` reads as a dead
+            // loop, and this loop is alive and deliberately abstaining.
+            metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
             &units,
@@ -5852,6 +6075,7 @@ mod tests {
             )),
             std::sync::Arc::new(|| true) as CaptureGate,
         )
+        .with_binding_count(single_bound())
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
         .with_scan_reporter(reporter.clone());
         state
@@ -5939,6 +6163,7 @@ mod tests {
             )),
             std::sync::Arc::new(|| true) as CaptureGate,
         )
+        .with_binding_count(single_bound())
         .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
         .with_scan_reporter(reporter.clone())
         .with_scan_report_gate(owns_the_machine());
@@ -7815,13 +8040,26 @@ mod tests {
     /// repo the Ref arm is taken, `<ref>:tmp/…` does not resolve, and the tick
     /// returns early: a previously hermetic suite would start failing on a
     /// property of the host. Injecting the answer removes the host from it.
+    /// The reading every tick-level test runs under unless it says otherwise:
+    /// one local binding, no sidecar — today's single-bound device. Injected
+    /// for the same reason `tick_state` injects its git reader: the production
+    /// reader opens the OPERATOR'S `paired_user.json`, and on a multi-bound
+    /// box every armed tick would withhold and a hermetic suite would fail on
+    /// a property of the host (which is how this helper was found necessary).
+    fn single_bound() -> BindingCountReading {
+        BindingCountReading {
+            local: 1,
+            coord: None,
+        }
+    }
+
     fn tick_state(reader: PathReader) -> LoopState {
-        LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate).with_git(
-            std::sync::Arc::new(FakeGit {
+        LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_binding_count(single_bound())
+            .with_git(std::sync::Arc::new(FakeGit {
                 root: Ok(None),
                 ..FakeGit::healthy(0, 0)
-            }),
-        )
+            }))
     }
 
     /// The phase's headline acceptance criterion, pinned at the TICK — the
@@ -7841,6 +8079,7 @@ mod tests {
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
         let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_binding_count(single_bound())
             .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
 
         assert_eq!(
@@ -7874,6 +8113,7 @@ mod tests {
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
         let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_binding_count(single_bound())
             .with_git(std::sync::Arc::new(FakeGit::healthy(2153, 11)));
 
         state.tick(&sink, &metrics).await;
@@ -8047,6 +8287,7 @@ mod tests {
             )),
             std::sync::Arc::new(|| true) as CaptureGate,
         )
+        .with_binding_count(single_bound())
         .with_scan_report_gate(std::sync::Arc::new(|| true) as ScanReportGate)
         .with_scan_reporter(reporter.clone())
         .with_git(std::sync::Arc::new(FakeGit {
@@ -8092,6 +8333,7 @@ mod tests {
         let sink = FakeSink::default();
         let metrics = AdapterMetrics::default();
         let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_binding_count(single_bound())
             .with_git(std::sync::Arc::new(FakeGit {
                 root: Ok(Some(dir.path().to_path_buf())),
                 default_ref: Err("no `origin/HEAD` in this clone".to_string()),
@@ -8345,5 +8587,237 @@ mod tests {
         let mut warned: HashSet<String> = HashSet::new();
         assert!(newly_disappeared_slugs(&known, &active, &archive, &mut warned).is_empty());
         assert!(warned.is_empty());
+    }
+    // ---- work-unit write posture (plan 2026-09-17-plan-adapter-mints-work-units…, D2) ----
+
+    fn reading(local: usize, coord: Option<usize>) -> BindingCountReading {
+        BindingCountReading { local, coord }
+    }
+
+    /// The combine rule, arm by arm: coord raises, an UNKNOWN sidecar
+    /// contributes nothing, and the local count alone can still withhold.
+    #[test]
+    fn combine_binding_counts_is_a_max_that_treats_unknown_as_nothing() {
+        // spaceship's shape: one credential slot, three coord bindings.
+        assert_eq!(combine_binding_counts(1, Some(3)), 3);
+        assert!(matches!(
+            work_unit_write_posture(reading(1, Some(3)).combined()),
+            WorkUnitWritePosture::Withheld { binding_count: 3 }
+        ));
+        // No sidecar yet (boot, stale, unparseable): today's figure stands.
+        assert_eq!(combine_binding_counts(1, None), 1);
+        assert_eq!(
+            work_unit_write_posture(reading(1, None).combined()),
+            WorkUnitWritePosture::Write
+        );
+        // Two local bindings withhold on their own.
+        assert_eq!(combine_binding_counts(2, None), 2);
+        assert!(matches!(
+            work_unit_write_posture(reading(2, None).combined()),
+            WorkUnitWritePosture::Withheld { binding_count: 2 }
+        ));
+        // Coord saying ZERO never lowers the local figure.
+        assert_eq!(combine_binding_counts(1, Some(0)), 1);
+        assert_eq!(combine_binding_counts(3, Some(1)), 3);
+        // The boundary: one writes, two withholds.
+        assert_eq!(work_unit_write_posture(0), WorkUnitWritePosture::Write);
+        assert_eq!(work_unit_write_posture(1), WorkUnitWritePosture::Write);
+        assert_eq!(
+            work_unit_write_posture(2),
+            WorkUnitWritePosture::Withheld { binding_count: 2 }
+        );
+    }
+
+    /// The warn names the combined count, BOTH readings, the reason, who still
+    /// writes, and is honest about the CLI's own refusal.
+    #[test]
+    fn the_withheld_message_names_both_readings_and_the_flag() {
+        let msg = work_unit_writes_withheld_message(&reading(1, Some(3)));
+        assert!(msg.contains("WITHHELD"), "{msg}");
+        assert!(msg.contains("bound to 3 tenants"), "{msg}");
+        assert!(msg.contains("coord says 3"), "{msg}");
+        assert!(msg.contains("local file says 1"), "{msg}");
+        assert!(
+            msg.contains("cannot resolve which tenant owns the plans dir"),
+            "{msg}"
+        );
+        assert!(msg.contains("default credential"), "{msg}");
+        assert!(
+            msg.contains("sessions keep their own coord_work_unit_upsert"),
+            "{msg}"
+        );
+        assert!(msg.contains("plan-workunit-backfill"), "{msg}");
+        assert!(msg.contains("--allow-multi-bound"), "{msg}");
+        // An UNKNOWN sidecar is said to be unknown, never rendered as a number.
+        let msg = work_unit_writes_withheld_message(&reading(2, None));
+        assert!(msg.contains("coord says unknown"), "{msg}");
+        assert!(msg.contains("local file says 2"), "{msg}");
+    }
+
+    /// THE property of the phase, pinned at the tick: on a multi-bound device
+    /// two armed cycles make ZERO coord work-unit calls of any kind — no
+    /// upsert, no per-slug seed read, no bulk seed read — while the loop
+    /// still counts its cycles, counts the withholding, and says why exactly
+    /// once.
+    ///
+    /// Neuter check: move the gate in `tick` below `bulk_seed` and the
+    /// `list_statuses` assertion fails; drop the `return` and the upsert one
+    /// does.
+    #[tokio::test]
+    async fn a_multi_bound_device_withholds_every_work_unit_call_and_says_so_once() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        // A sink WITH a bulk door, so the bulk seed would be observable if it ran.
+        let sink = FakeSink {
+            bulk: Some(HashMap::new()),
+            ..FakeSink::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader).with_binding_count(reading(1, Some(3)));
+
+        state.tick(&sink, &metrics).await;
+        state.tick(&sink, &metrics).await;
+
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 0, "no upsert");
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            0,
+            "no per-slug seed read"
+        );
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            0,
+            "no bulk seed read"
+        );
+        assert!(sink.deps_calls.lock().unwrap().is_empty(), "no dep edges");
+        assert_eq!(*sink.transitions.lock().unwrap(), 0, "no transitions");
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cycles_total, 2, "a withheld cycle is still a cycle");
+        assert_eq!(snap.work_unit_writes_withheld_total, 2);
+        assert_eq!(snap.scanned, 0, "nothing reached reconcile's scanned gauge");
+        assert_eq!(
+            snap.scan_divergence.map(|d| d.state),
+            Some(ScanDivergenceState::NotAGitWorkTree),
+            "the scan-source measurement still runs on a withheld cycle"
+        );
+        assert_eq!(
+            state.posture_transitions, 1,
+            "one flip into Withheld, logged once — not once per cycle"
+        );
+        assert_eq!(
+            state.last_posture,
+            Some(WorkUnitWritePosture::Withheld { binding_count: 3 })
+        );
+        assert!(
+            state.last_applied.is_empty(),
+            "no unit entered the edge memory — nothing was seeded"
+        );
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("work-unit writes WITHHELD").count(),
+            1,
+            "exactly one warn across two ticks; got: {logged}"
+        );
+        assert!(
+            logged.contains("WARN"),
+            "the line must be `warn`; got: {logged}"
+        );
+        assert!(
+            logged.contains("coord says 3, local file says 1"),
+            "{logged}"
+        );
+    }
+
+    /// The single-bound device is byte-for-byte on today's path: one upsert,
+    /// no withholding counted, and NO posture line at all — a device that never
+    /// met the gate must not be told about it.
+    #[tokio::test]
+    async fn a_single_bound_device_writes_as_before_and_logs_no_posture() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader).with_binding_count(reading(1, None));
+
+        state.tick(&sink, &metrics).await;
+
+        let upserts = sink.upserts.lock().unwrap();
+        assert_eq!(upserts.len(), 1, "today's single upsert");
+        assert_eq!(upserts[0].slug, "2026-01-01-one-plan");
+        drop(upserts);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.cycles_total, 1);
+        assert_eq!(snap.work_unit_writes_withheld_total, 0);
+        assert_eq!(state.posture_transitions, 0);
+        assert_eq!(state.last_posture, Some(WorkUnitWritePosture::Write));
+        let logged = logs.text();
+        assert!(!logged.contains("WITHHELD"), "{logged}");
+        assert!(!logged.contains("RESUMED"), "{logged}");
+    }
+
+    /// A device that resolves mid-life (the sidecar shrinks, or a binding is
+    /// unpaired) flips back to writing on the very next cycle, says so once
+    /// at `info`, and a second flip is logged again — dedup is per flip, not
+    /// per process.
+    #[tokio::test]
+    async fn a_flip_back_to_write_resumes_and_is_logged_once_per_flip() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        // A reading the test can move between ticks, like the sidecar would.
+        let current = std::sync::Arc::new(Mutex::new(reading(1, Some(3))));
+        let mut state = tick_state(reader);
+        state.binding_count = {
+            let current = current.clone();
+            std::sync::Arc::new(move || *current.lock().unwrap())
+        };
+
+        state.tick(&sink, &metrics).await; // withheld
+        *current.lock().unwrap() = reading(1, Some(1));
+        state.tick(&sink, &metrics).await; // resumed — writes
+        *current.lock().unwrap() = reading(1, Some(2));
+        state.tick(&sink, &metrics).await; // withheld again
+
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "only the resumed cycle wrote"
+        );
+        assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 2);
+        assert_eq!(metrics.snapshot().cycles_total, 3);
+        assert_eq!(state.posture_transitions, 3, "withheld, resumed, withheld");
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("work-unit writes WITHHELD").count(),
+            2,
+            "{logged}"
+        );
+        assert_eq!(
+            logged.matches("work-unit writes RESUMED").count(),
+            1,
+            "{logged}"
+        );
+    }
+
+    /// The OFF line's catch-up recommendation must be honest about the CLI's
+    /// own refusal on a multi-bound device — sending the operator to a second
+    /// refusal is the thing the flag mention prevents.
+    #[tokio::test]
+    async fn the_tier_off_line_is_honest_about_the_backfill_flag() {
+        let logs = CapturedLogs::start();
+        let (_cell, reader) = switchable_paths();
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert!(logged.contains("--allow-multi-bound"), "{logged}");
     }
 }

@@ -118,6 +118,13 @@ OPTIONS (plan-workunit-backfill):
   --coord <url>         coord base URL. OVERRIDES the environment
                         ($COORD_HTTP_URL) and the active runner profile.
   --limit <n>           Push at most N work units (ordering is the scan order)
+  --allow-multi-bound   Push even though this device is bound to more than one
+                        tenant. WITHOUT it the run refuses (exit 2) on such a
+                        device, for the same reason the runner's own plan
+                        adapter withholds there: every unit lands under the
+                        DEFAULT credential's tenant, and nothing in a plans dir
+                        says which tenant owns it. Pass it only when the
+                        default binding IS the tenant that owns this corpus.
 
 OPTIONS (session-archive-backfill):
   --dry-run             Scan, detect and attribute — but send nothing
@@ -630,6 +637,7 @@ struct WorkUnitBackfillArgs {
     plans_dir: Option<String>,
     coord: Option<String>,
     limit: Option<usize>,
+    allow_multi_bound: bool,
 }
 
 fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs, String> {
@@ -662,6 +670,7 @@ fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs,
         };
         match flag {
             "--dry-run" => out.dry_run = true,
+            "--allow-multi-bound" => out.allow_multi_bound = true,
             "--plans-dir" => out.plans_dir = Some(value(&mut consumed)?),
             "--coord" => out.coord = Some(value(&mut consumed)?),
             "--limit" => {
@@ -748,6 +757,51 @@ fn reject_zero_limit(args: &WorkUnitBackfillArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// The multi-bound refusal, as a pure decision over the SAME posture the
+/// runner's plan adapter withholds on (plan
+/// `2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device`
+/// D2). This command exists to route around the adapter's `paths.plans_dir`
+/// gate — it must not also route around the adapter's tenant gate by accident:
+/// it drives the same `push_work_unit` path under the same default credential,
+/// so on a device bound to several tenants it would mint every unit under the
+/// wrong one exactly as the loop did.
+///
+/// `Err` is the refusal text (exit 2); `Ok(Some(..))` is the note a run that
+/// was explicitly allowed through prints first, so the transcript says the
+/// operator chose the default binding; `Ok(None)` is a single-bound device.
+fn multi_bound_verdict(
+    posture: qontinui_runner_lib::plan_workunit_adapter::WorkUnitWritePosture,
+    reading: &qontinui_runner_lib::plan_workunit_adapter::BindingCountReading,
+    allow_multi_bound: bool,
+) -> Result<Option<String>, String> {
+    use qontinui_runner_lib::plan_workunit_adapter::WorkUnitWritePosture;
+    let WorkUnitWritePosture::Withheld { binding_count } = posture else {
+        return Ok(None);
+    };
+    let coord = match reading.coord {
+        Some(n) => n.to_string(),
+        None => "unknown".to_string(),
+    };
+    if allow_multi_bound {
+        return Ok(Some(format!(
+            "note: this device is bound to {binding_count} tenants (coord says {coord}, local \
+             file says {}); --allow-multi-bound was passed, so every unit below is pushed under \
+             the DEFAULT credential's tenant.",
+            reading.local
+        )));
+    }
+    Err(format!(
+        "this device is bound to {binding_count} tenants (coord says {coord}, local file says \
+         {}), and nothing in a plans dir says which tenant owns it — every unit would land under \
+         the DEFAULT credential's tenant, which is how spaceship's plans were minted under the \
+         wrong one. Refusing, exactly as the runner's plan adapter withholds on this device. If \
+         the default binding IS the tenant that owns this corpus, re-run with \
+         --allow-multi-bound. Sessions' own coord_work_unit_upsert carries the right tenant and \
+         needs no backfill.",
+        reading.local
+    ))
+}
+
 fn plan_workunit_backfill(args: &[String]) -> ExitCode {
     use qontinui_runner_lib::plan_workunit_adapter as pwa;
     // `current_status` is a trait method — the preflight probe below calls it
@@ -812,6 +866,27 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         Some(n) if n < all.len() => &all[..n],
         _ => &all,
     };
+
+    // The tenant gate, ahead of the preflight probe and of every sink call —
+    // and ahead of the dry run too, so a dry run that lists forty units is not
+    // followed by a real run that refuses them. Reads the same two counts the
+    // runner's adapter reads (`paired_user.json`, and the heartbeat's
+    // `coord_bound_tenants.json` sidecar beside it).
+    let reading = pwa::device_work_unit_binding_reading();
+    let posture = pwa::work_unit_write_posture(reading.combined());
+    match multi_bound_verdict(posture, &reading, parsed.allow_multi_bound) {
+        Ok(None) => {}
+        Ok(Some(note)) => println!("{note}"),
+        Err(refusal) if parsed.dry_run => {
+            // A dry run contacts nothing, so it is allowed to finish — but it
+            // must say the real run would not.
+            println!("note: a real run would refuse on this device — {refusal}");
+        }
+        Err(refusal) => {
+            eprintln!("qontinui-pr: {refusal}");
+            return ExitCode::from(2);
+        }
+    }
 
     if parsed.dry_run {
         for u in to_push {
@@ -1518,6 +1593,73 @@ mod backfill_tests {
         assert!(USAGE.contains("paths.plans_dir"));
         // The dry run's blind spot must be documented, not discovered.
         assert!(USAGE.contains("it cannot tell you which units would transition"));
+        // The multi-bound refusal and its override — the adapter's own withheld
+        // log points here, so the flag must be discoverable from `--help`.
+        assert!(USAGE.contains("--allow-multi-bound"));
+        assert!(USAGE.contains("exit 2"));
+    }
+
+    #[test]
+    fn workunit_backfill_parses_allow_multi_bound() {
+        let parsed =
+            parse_workunit_backfill_args(&argv(&["--allow-multi-bound", "--dry-run"])).unwrap();
+        assert!(parsed.allow_multi_bound);
+        assert!(parsed.dry_run);
+        assert!(!parse_workunit_backfill_args(&[]).unwrap().allow_multi_bound);
+        // It takes no value: a following flag is the NEXT flag, not its value.
+        let parsed =
+            parse_workunit_backfill_args(&argv(&["--allow-multi-bound", "--limit", "3"])).unwrap();
+        assert!(parsed.allow_multi_bound);
+        assert_eq!(parsed.limit, Some(3));
+    }
+
+    /// The refusal fires on the SAME posture the runner's adapter withholds
+    /// on, and only the flag lets a multi-bound device through — a single-bound
+    /// one never sees either message.
+    #[test]
+    fn workunit_backfill_refuses_a_multi_bound_device_unless_allowed() {
+        use qontinui_runner_lib::plan_workunit_adapter::{
+            work_unit_write_posture, BindingCountReading,
+        };
+        let multi = BindingCountReading {
+            local: 1,
+            coord: Some(3),
+        };
+        let posture = work_unit_write_posture(multi.combined());
+        let refusal = multi_bound_verdict(posture, &multi, false).unwrap_err();
+        assert!(refusal.contains("bound to 3 tenants"), "{refusal}");
+        assert!(
+            refusal.contains("coord says 3, local file says 1"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("--allow-multi-bound"), "{refusal}");
+        assert!(refusal.contains("DEFAULT credential"), "{refusal}");
+
+        let note = multi_bound_verdict(posture, &multi, true)
+            .unwrap()
+            .expect("an allowed run still says what it is doing");
+        assert!(note.contains("--allow-multi-bound was passed"), "{note}");
+        assert!(note.contains("bound to 3 tenants"), "{note}");
+
+        // Two LOCAL bindings and no sidecar refuse too — the local count alone
+        // is enough, and the sidecar is reported as unknown, not as zero.
+        let local_two = BindingCountReading {
+            local: 2,
+            coord: None,
+        };
+        let posture = work_unit_write_posture(local_two.combined());
+        let refusal = multi_bound_verdict(posture, &local_two, false).unwrap_err();
+        assert!(refusal.contains("bound to 2 tenants"), "{refusal}");
+        assert!(refusal.contains("coord says unknown"), "{refusal}");
+
+        // Single-bound: nothing to say, flag or no flag.
+        let single = BindingCountReading {
+            local: 1,
+            coord: None,
+        };
+        let posture = work_unit_write_posture(single.combined());
+        assert_eq!(multi_bound_verdict(posture, &single, false).unwrap(), None);
+        assert_eq!(multi_bound_verdict(posture, &single, true).unwrap(), None);
     }
 }
 

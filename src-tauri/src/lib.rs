@@ -128,6 +128,13 @@ pub mod util {
 // `bin/qontinui_profile.rs` so both the CLI and the Tauri runner GUI
 // share one code path. See `pair.rs` for the canonical wire shapes.
 pub mod pair;
+// Coord's hydrated binding set, recorded by the register heartbeat beside
+// `paired_user.json` and read ONLY by the plan adapter's write gate (plan
+// `2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device`
+// D1). Its own module rather than a `pair` addition so it lands beside — not
+// inside — the reconcile that a sibling change is rewriting; `pair` re-exports
+// the public surface so `pair::coord_bound_tenant_count()` resolves.
+pub mod coord_bound_tenants;
 
 // Cognito Hosted-UI sign-in (RFC 8252 PKCE). Phase 5 of the
 // unified-Cognito-identity plan. Tauri-free (loopback + system browser); the
