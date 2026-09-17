@@ -2297,11 +2297,18 @@ impl ResolvedDirs {
 // slot, every plan minted under the wrong one.
 //
 // The adapter cannot resolve the owner, so it refuses to guess: on a
-// multi-bound device the cycle scans, runs the body sync (a different store,
-// keyed by the artifact rather than the tenant slot), and makes NO coord
+// multi-bound device the cycle scans, runs the body sync, and makes NO coord
 // work-unit read or write. Sessions keep their own `coord_work_unit_upsert`,
 // which carries the session's tenant, so the plans still reach coord — under
 // the right tenant, and later.
+//
+// The body sync is deliberately NOT withheld by this plan, and not because it
+// is safe: it presents the SAME default device bearer (`body_push.rs`, every
+// `attach_device_auth` site), qontinui-web derives `organization_id` from that
+// bearer and never from the body, and the coord-tenant → web-organization
+// mapping is unresolved (E3) — so the same misattribution can occur in the
+// plan library. That is recorded as a follow-up (vet defect 7) and is out of
+// scope here; this gate bounds the coord work-unit writes only.
 //
 // The count the gate keys on is the MAX of two readings, because each one
 // under-counts in a different way. The local `paired_user.json` never
@@ -2537,12 +2544,32 @@ impl LoopState {
                 WorkUnitWritePosture::Withheld { .. } => {
                     tracing::warn!("{}", work_unit_writes_withheld_message(reading));
                 }
-                WorkUnitWritePosture::Write => tracing::info!(
-                    local_bindings = reading.local,
-                    coord_bindings = ?reading.coord,
-                    "plan adapter: work-unit writes RESUMED — this device now resolves to a \
-                     single tenant"
-                ),
+                WorkUnitWritePosture::Write => {
+                    // `last_applied` is frozen at the last Write cycle: every
+                    // withheld cycle since then made no coord read, so a
+                    // status an agent set in the meantime is unknown to the
+                    // edge memory, and reconciling against it would re-push a
+                    // stale status as a transition. Re-arm the bulk seed so
+                    // the next cycle re-primes from ONE `list_statuses` read
+                    // — the same posture as a corpus switch.
+                    self.bulk_seeded = false;
+                    match reading.coord {
+                        Some(_) => tracing::info!(
+                            local_bindings = reading.local,
+                            coord_bindings = ?reading.coord,
+                            "plan adapter: work-unit writes RESUMED — coord now reports this \
+                             device bound to a single tenant"
+                        ),
+                        // The two arms say different things: this one is NOT
+                        // coord saying one — it is coord saying nothing.
+                        None => tracing::info!(
+                            local_bindings = reading.local,
+                            "plan adapter: work-unit writes RESUMED — the coord binding reading \
+                             is absent or aged out and the local file says one tenant; coord \
+                             did not say this device is single-bound"
+                        ),
+                    }
+                }
             }
         }
         posture
@@ -2912,8 +2939,11 @@ impl LoopState {
         // is the first coord work-unit READ of the cycle. Withheld means no
         // seed, no reconcile, no archive stamp, no dep edges: none of those
         // can be attributed to a tenant this device cannot name. The body
-        // sync below is NOT withheld — it writes plan bodies to the plan
-        // library, a different store, and the same reasoning does not apply.
+        // sync below is deliberately NOT withheld by this plan — not because
+        // it is safe (it presents the same default bearer, and qontinui-web
+        // derives the organization from it, so the same misattribution can
+        // occur there; vet defect 7, a follow-up) but because bounding the
+        // plan library is out of this plan's scope.
         let reading = (self.binding_count)();
         if let WorkUnitWritePosture::Withheld { .. } = self.note_write_posture(&reading) {
             metrics
@@ -6490,11 +6520,15 @@ mod tests {
         /// Total `list_statuses` reads served, so "attempted once per corpus"
         /// is asserted rather than assumed.
         list_statuses_calls: Mutex<u64>,
+        /// Every coord call in arrival order, so a test can assert WHICH read
+        /// came first — the bulk prime must precede any per-slug read.
+        call_order: Mutex<Vec<&'static str>>,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
         async fn current_status(&self, slug: &str) -> Result<Option<String>> {
             *self.current_status_calls.lock().unwrap() += 1;
+            self.call_order.lock().unwrap().push("current_status");
             if self.fail_current_status {
                 anyhow::bail!("simulated current_status failure");
             }
@@ -6505,6 +6539,7 @@ mod tests {
         }
         async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
             *self.list_statuses_calls.lock().unwrap() += 1;
+            self.call_order.lock().unwrap().push("list_statuses");
             Ok(self.bulk.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
@@ -6512,6 +6547,7 @@ mod tests {
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
             *self.upsert_calls.lock().unwrap() += 1;
+            self.call_order.lock().unwrap().push("upsert");
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
             }
@@ -8803,6 +8839,137 @@ mod tests {
             logged.matches("work-unit writes RESUMED").count(),
             1,
             "{logged}"
+        );
+        assert!(
+            logged.contains("coord now reports this device bound to a single tenant"),
+            "coord said one, so the line must attribute the resume to coord; got: {logged}"
+        );
+    }
+
+    /// A resume whose coord reading is ABSENT must not be narrated as coord
+    /// saying one — coord said nothing, and the line has to say so.
+    #[tokio::test]
+    async fn a_resume_on_an_absent_coord_reading_says_coord_did_not_say_so() {
+        let logs = CapturedLogs::start();
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let current = std::sync::Arc::new(Mutex::new(reading(1, Some(3))));
+        let mut state = tick_state(reader);
+        state.binding_count = {
+            let current = current.clone();
+            std::sync::Arc::new(move || *current.lock().unwrap())
+        };
+
+        state.tick(&sink, &metrics).await;
+        *current.lock().unwrap() = reading(1, None);
+        state.tick(&sink, &metrics).await;
+
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("work-unit writes RESUMED").count(),
+            1,
+            "{logged}"
+        );
+        assert!(logged.contains("absent or aged out"), "{logged}");
+        assert!(
+            logged.contains("coord did not say this device is single-bound"),
+            "{logged}"
+        );
+        assert!(
+            !logged.contains("coord now reports"),
+            "an absent reading is not coord reporting anything; got: {logged}"
+        );
+    }
+
+    /// A flip back to Write re-primes the edge memory from ONE bulk read
+    /// before any per-slug read: the withheld cycles made no coord read at
+    /// all, so `last_applied` is frozen at the last Write cycle and a status
+    /// an agent set meanwhile would otherwise be reconciled against stale
+    /// memory.
+    ///
+    /// Neuter check: drop `self.bulk_seeded = false` from the resume arm of
+    /// `note_write_posture` and the second `list_statuses` assertion fails.
+    #[tokio::test]
+    async fn a_flip_back_to_write_re_primes_from_the_bulk_seed_first() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        // A sink WITH a bulk door that already knows the plan, so the re-prime
+        // is observable as one bulk read and ZERO per-slug reads.
+        let sink = FakeSink {
+            bulk: Some(
+                [("2026-01-01-one-plan".to_string(), "draft".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..FakeSink::default()
+        };
+        let metrics = AdapterMetrics::default();
+        let current = std::sync::Arc::new(Mutex::new(reading(1, Some(1))));
+        let mut state = tick_state(reader);
+        state.binding_count = {
+            let current = current.clone();
+            std::sync::Arc::new(move || *current.lock().unwrap())
+        };
+
+        // Cycle 1, single-bound: the cold-start bulk seed runs once, and it is
+        // the FIRST coord call. (The push that follows reads the slug's remote
+        // status for its own divergence comparison — that is `push_work_unit`,
+        // not the seed, and it is the baseline the withheld delta is measured
+        // against.)
+        state.tick(&sink, &metrics).await;
+        assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
+        assert_eq!(
+            sink.call_order.lock().unwrap().first(),
+            Some(&"list_statuses")
+        );
+        assert!(state.bulk_seeded);
+        let calls_after_cycle_1 = sink.call_order.lock().unwrap().len();
+
+        // Cycles 2 and 3, withheld: no coord call of any kind.
+        *current.lock().unwrap() = reading(1, Some(3));
+        state.tick(&sink, &metrics).await;
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            sink.call_order.lock().unwrap().len(),
+            calls_after_cycle_1,
+            "withheld: not one coord call"
+        );
+        assert!(
+            state.bulk_seeded,
+            "withholding itself leaves the flag alone; the flip back is what re-arms it"
+        );
+
+        // Cycle 4, resumed: the bulk read runs AGAIN, and it is the first
+        // coord call of the resumed cycle — ahead of any per-slug read.
+        *current.lock().unwrap() = reading(1, Some(1));
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            2,
+            "the resume re-primes from the bulk door"
+        );
+        assert_eq!(
+            sink.call_order.lock().unwrap().get(calls_after_cycle_1),
+            Some(&"list_statuses"),
+            "the resumed cycle's first coord call is the bulk prime; got: {:?}",
+            sink.call_order.lock().unwrap()
+        );
+        assert!(state.bulk_seeded);
+        assert_eq!(
+            metrics.snapshot().seeded_total,
+            2,
+            "primed once per Write epoch"
+        );
+        assert_eq!(
+            state
+                .last_applied
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("draft")
         );
     }
 

@@ -39,16 +39,30 @@
 //!   the plan adapter's write gate
 //!   (`plan_workunit_adapter::trigger::device_work_unit_binding_reading`).
 //!
-//! ## Freshness
+//! ## Freshness — and which way staleness fails
 //!
-//! A reading is answered as `Some(count)` only while its stamp is younger than
-//! [`COORD_BOUND_TENANTS_MAX_AGE_SECS`] and not from the future; every other
-//! state — absent, unparseable, stale, future — is `None`, UNKNOWN, which the
-//! consumer combines with the local count by `max` so it can never LOWER
-//! today's figure. The writer rewrites only when the set changes or the stamp
-//! is older than [`COORD_BOUND_TENANTS_RESTAMP_SECS`], so the 30 s heartbeat
-//! cadence costs no disk write at steady state and the stamp still proves,
-//! hourly, that coord was recently heard from.
+//! Absent, unparseable and future-stamped (beyond a small skew) all read as
+//! `None`, UNKNOWN, which the consumer combines with the local count by `max`
+//! so it can never LOWER today's figure.
+//!
+//! Age is different, and it is asymmetric on purpose. A stamp older than
+//! [`COORD_BOUND_TENANTS_MAX_AGE_SECS`] lowers confidence in a SINGLE-bound
+//! reading (≤ 1 tenant) to `None` — but a stale set that still names two or
+//! more tenants keeps answering `Some(count)`. The first cut read every stale
+//! sidecar as `None`, and that failed toward the unsafe side: after 24 h with
+//! no coord answer a device that had said three dropped to the local count of
+//! one, the adapter logged RESUMED and went back to minting under the wrong
+//! tenant. The heartbeat overwrites this file within 30 s of any set change, so
+//! the only way to be stale is to have had NO coord answer at all — and that
+//! is precisely when continuing to withhold is the honest posture. A stale
+//! multi-bound reading is the safer one; a stale single-bound reading proves
+//! nothing either way, so it is UNKNOWN. A far-future stamp is corruption, not
+//! age, and stays `None` whatever it names.
+//!
+//! The writer rewrites only when the set changes or the stamp is older than
+//! [`COORD_BOUND_TENANTS_RESTAMP_SECS`], so the 30 s heartbeat cadence costs no
+//! disk write at steady state and the stamp still proves, hourly, that coord
+//! was recently heard from.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -64,9 +78,11 @@ pub const COORD_BOUND_TENANTS_FILE: &str = "coord_bound_tenants.json";
 /// once, some time ago".
 pub const COORD_BOUND_TENANTS_RESTAMP_SECS: i64 = 60 * 60;
 
-/// A stamp older than this is UNKNOWN to the reader. Sized against the
-/// restamp window with a wide margin: a runner that has not heard from coord
-/// for a day is not one whose binding set anyone should be acting on.
+/// A stamp older than this makes a SINGLE-bound reading UNKNOWN to the
+/// reader; a multi-bound one is still answered (see the module doc — the
+/// asymmetry is the whole point). Sized against the restamp window with a wide
+/// margin: a runner that has not heard from coord for a day cannot vouch that
+/// its bindings have not GROWN, which is the direction the reader guards.
 pub const COORD_BOUND_TENANTS_MAX_AGE_SECS: i64 = 24 * 60 * 60;
 
 /// How far into the future a stamp may sit before the reader calls it
@@ -161,10 +177,12 @@ pub fn record_coord_bound_tenants_at(
 }
 
 /// How many tenants coord says this device is bound to, per the sidecar —
-/// or `None` when the sidecar cannot answer (absent, unparseable, stale,
-/// future-stamped). `None` is UNKNOWN, never zero: the consumer folds it in
-/// with `max` against the local count, so an unknown can only ever leave
-/// today's figure standing.
+/// or `None` when the sidecar cannot answer (absent, unparseable,
+/// future-stamped, or stale while naming at most one tenant). `None` is
+/// UNKNOWN, never zero: the consumer folds it in with `max` against the local
+/// count, so an unknown can only ever leave today's figure standing. A stale
+/// reading of two or more tenants is still answered — staleness never turns a
+/// multi-bound device back into a single-bound one.
 pub fn coord_bound_tenant_count() -> Option<usize> {
     let path = coord_bound_tenants_path()?;
     coord_bound_tenant_count_at(&path, Utc::now())
@@ -174,10 +192,16 @@ pub fn coord_bound_tenant_count() -> Option<usize> {
 pub fn coord_bound_tenant_count_at(path: &Path, now: DateTime<Utc>) -> Option<usize> {
     let sidecar = read_sidecar(path)?;
     let observed_at = sidecar.observed_at?;
-    if !stamp_is_fresh(observed_at, now) {
-        return None;
+    let count = sidecar.tenant_ids.len();
+    match stamp_age(observed_at, now) {
+        StampAge::Fresh => Some(count),
+        // Stale fails toward withholding: a set that still names several
+        // tenants is answered, a set that names at most one proves nothing.
+        StampAge::Stale if count >= 2 => Some(count),
+        StampAge::Stale => None,
+        // Beyond the skew allowance a future stamp is corruption, not age.
+        StampAge::Future => None,
     }
-    Some(sidecar.tenant_ids.len())
 }
 
 /// The sidecar as read: the DISTINCT valid UUIDs it names (junk elements
@@ -206,11 +230,26 @@ fn read_sidecar(path: &Path) -> Option<SidecarRead> {
     })
 }
 
-/// Reader freshness: not older than the max age, not further ahead of `now`
-/// than the skew allowance.
-fn stamp_is_fresh(stamp: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+/// The reader's three-way classification of a stamp against `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampAge {
+    /// Inside the max age and not further ahead of `now` than the skew.
+    Fresh,
+    /// Older than the max age.
+    Stale,
+    /// Ahead of `now` by more than the skew allowance.
+    Future,
+}
+
+fn stamp_age(stamp: DateTime<Utc>, now: DateTime<Utc>) -> StampAge {
     let age = (now - stamp).num_seconds();
-    (-COORD_BOUND_TENANTS_FUTURE_SKEW_SECS..=COORD_BOUND_TENANTS_MAX_AGE_SECS).contains(&age)
+    if age > COORD_BOUND_TENANTS_MAX_AGE_SECS {
+        StampAge::Stale
+    } else if age < -COORD_BOUND_TENANTS_FUTURE_SKEW_SECS {
+        StampAge::Future
+    } else {
+        StampAge::Fresh
+    }
 }
 
 /// Writer steady state: the stamp is inside the restamp window and not from
@@ -350,15 +389,18 @@ mod tests {
         // Absent.
         assert_eq!(coord_bound_tenant_count_at(&sidecar, now()), None);
 
-        // Stale: one second past the max age.
-        record_coord_bound_tenants_at(&sidecar, &tenants(3), now()).unwrap();
+        // Stale with a SINGLE-bound set: one second past the max age reads
+        // as unknown (the multi-bound arm is pinned separately below).
+        record_coord_bound_tenants_at(&sidecar, &tenants(1), now()).unwrap();
         let stale_now = now() + Duration::seconds(COORD_BOUND_TENANTS_MAX_AGE_SECS + 1);
         assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), None);
         // …and exactly at the max age it still answers.
         let edge = now() + Duration::seconds(COORD_BOUND_TENANTS_MAX_AGE_SECS);
-        assert_eq!(coord_bound_tenant_count_at(&sidecar, edge), Some(3));
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, edge), Some(1));
 
-        // Future: stamped an hour ahead of the reader's clock.
+        // Future: stamped an hour ahead of the reader's clock — corruption,
+        // not age, so even a multi-bound set is refused.
+        record_coord_bound_tenants_at(&sidecar, &tenants(3), now()).unwrap();
         let early_now = now() - Duration::hours(1);
         assert_eq!(coord_bound_tenant_count_at(&sidecar, early_now), None);
         // …while a stamp inside the skew allowance is a stepped clock, not a
@@ -379,6 +421,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(coord_bound_tenant_count_at(&sidecar, now()), None);
+    }
+
+    /// Staleness fails toward WITHHOLDING. The first cut answered `None` for
+    /// every stale sidecar, which after 24 h without a coord answer dropped a
+    /// three-tenant device back to its local count of one and resumed the
+    /// wrong-tenant writes this module exists to stop.
+    ///
+    /// Neuter check: make `coord_bound_tenant_count_at` return `None` for
+    /// every `Stale` and the first assertion fails.
+    #[test]
+    fn a_stale_multi_bound_reading_still_answers_but_a_stale_single_one_does_not() {
+        let (_tmp, _paired, sidecar) = store();
+        // Every record below is stamped within a few seconds of `now()`, so a
+        // reader two days on sees all of them as stale.
+        let stale_now = now() + Duration::days(2);
+        let very_stale = now() + Duration::days(400);
+
+        record_coord_bound_tenants_at(&sidecar, &tenants(3), now()).unwrap();
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), Some(3));
+        assert_eq!(
+            coord_bound_tenant_count_at(&sidecar, very_stale),
+            Some(3),
+            "no amount of age turns a multi-bound device single-bound"
+        );
+
+        // Exactly two is still multi-bound.
+        record_coord_bound_tenants_at(&sidecar, &tenants(2), now() + Duration::seconds(1)).unwrap();
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), Some(2));
+
+        // One, or none, stale: UNKNOWN.
+        record_coord_bound_tenants_at(&sidecar, &tenants(1), now() + Duration::seconds(2)).unwrap();
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), None);
+        record_coord_bound_tenants_at(&sidecar, &[], now() + Duration::seconds(3)).unwrap();
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), None);
+
+        // Stale AND junk-laden: only the valid distinct set counts, so two
+        // junk entries beside one tenant are still a single-bound stale read.
+        let body = format!(
+            r#"{{"tenant_ids":["{}","junk","also-junk"],"observed_at":"{}"}}"#,
+            tenants(1)[0],
+            now().to_rfc3339()
+        );
+        std::fs::write(&sidecar, body).unwrap();
+        assert_eq!(coord_bound_tenant_count_at(&sidecar, stale_now), None);
     }
 
     #[test]
