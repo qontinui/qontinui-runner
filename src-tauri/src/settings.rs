@@ -3091,6 +3091,33 @@ pub struct Settings {
     /// change is live for the next run with no restart.
     #[serde(default)]
     pub cost_budget: crate::cost_management::budget::TokenBudget,
+    /// The loopback HTTP API's browser-origin surface (plan
+    /// `2026-09-17-runner-loopback-api-accepts-any-origin` Phase 3). Re-read
+    /// by `mcp::origin_guard` with a ~2 s TTL, so a change is live with no
+    /// runner restart.
+    #[serde(default)]
+    pub api: ApiSettings,
+}
+
+/// Settings → Runner → "Allowed browser origins".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiSettings {
+    /// Extra browser origins (`scheme://host[:port]`) admitted as the
+    /// `trusted` class by `mcp::origin_guard` — the settings twin of
+    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. Trusted means local trust for
+    /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
+    /// checks) and never the credential doors (secrets, caller-named paths,
+    /// caller-directed requests, process execution). Origins listed HERE never
+    /// get a door. Only the four built-in default dev origins
+    /// (`http://localhost:3001`, `http://127.0.0.1:3001`,
+    /// `http://localhost:9875`, `http://127.0.0.1:9875`) currently retain the
+    /// graced doors — including local
+    /// command execution and file reads — until qontinui-web #1380 deploys
+    /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
+    /// software trusted like the runner. Agents and scripts send no
+    /// `Origin` and need no entry.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {

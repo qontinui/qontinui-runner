@@ -628,6 +628,18 @@ async fn heartbeat_loop<F>(
                     on_stolen(current_holder);
                     return;
                 }
+                Ok(HeartbeatTickOutcome::NotHeld) => {
+                    warn!(
+                        "claim-heartbeat: claim lapsed (expired, nobody holds it) kind={kind_owned} key={resource_clone} — re-acquire before further work"
+                    );
+                    // `on_stolen` is the "we no longer hold this claim" callback,
+                    // and it already received `None` for this case while coord
+                    // spelled an expiry `stolen` with a null holder — so passing
+                    // `None` here keeps every consumer's behaviour identical
+                    // across the wire change.
+                    on_stolen(None);
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         "claim-heartbeat: tick failed kind={kind_owned} key={resource_clone}: {e}"
@@ -640,7 +652,13 @@ async fn heartbeat_loop<F>(
 
 enum HeartbeatTickOutcome {
     Ok,
-    Stolen { current_holder: Option<String> },
+    Stolen {
+        current_holder: Option<String>,
+    },
+    /// The claim EXPIRED or was never held: coord says nobody holds it. We no
+    /// longer hold it either, so the task stops exactly as it does on `Stolen`
+    /// — the difference is that no rival is named.
+    NotHeld,
 }
 
 async fn heartbeat_once(
@@ -694,6 +712,12 @@ async fn heartbeat_once(
                 .map(|s| s.to_string());
             Ok(HeartbeatTickOutcome::Stolen { current_holder: h })
         }
+        // An expired or absent claim — coord's own verdict, not a transport
+        // fault. It MUST NOT fall to the `Err` arm below: that arm only warns
+        // and loops, so the task would beat a dead claim forever and never run
+        // `on_stolen`. Plan
+        // `2026-09-15-coord-claims-heartbeat-answers-an-expired-claim-as-stolen-with-no-holder`.
+        Some("not_held") => Ok(HeartbeatTickOutcome::NotHeld),
         _ => Err(format!("heartbeat: unexpected body: {body_text}")),
     }
 }

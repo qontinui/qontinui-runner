@@ -118,6 +118,11 @@ OPTIONS (plan-workunit-backfill):
   --coord <url>         coord base URL. OVERRIDES the environment
                         ($COORD_HTTP_URL) and the active runner profile.
   --limit <n>           Push at most N work units (ordering is the scan order)
+  --allow-multi-bound   Push even though this device is bound to more than one
+                        tenant (or coord's binding record is absent/stale).
+                        Every unit lands in the tenant of this device's
+                        DEFAULT credential; pass this only when that tenant
+                        owns every plan in the dir.
 
 OPTIONS (session-archive-backfill):
   --dry-run             Scan, detect and attribute — but send nothing
@@ -630,6 +635,7 @@ struct WorkUnitBackfillArgs {
     plans_dir: Option<String>,
     coord: Option<String>,
     limit: Option<usize>,
+    allow_multi_bound: bool,
 }
 
 fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs, String> {
@@ -664,6 +670,7 @@ fn parse_workunit_backfill_args(args: &[String]) -> Result<WorkUnitBackfillArgs,
             "--dry-run" => out.dry_run = true,
             "--plans-dir" => out.plans_dir = Some(value(&mut consumed)?),
             "--coord" => out.coord = Some(value(&mut consumed)?),
+            "--allow-multi-bound" => out.allow_multi_bound = true,
             "--limit" => {
                 let raw = value(&mut consumed)?;
                 out.limit = Some(
@@ -837,6 +844,46 @@ fn plan_workunit_backfill(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(2);
     };
+    // The same gate the runner's adapter loop applies (plan
+    // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device):
+    // every call below presents this device's DEFAULT credential, and coord files
+    // a new unit under that credential's tenant. On a multi-bound device that is
+    // a guess about who owns the plans, and a wrong guess is a unit the owning
+    // tenant's sessions can then neither see nor register.
+    let reading = pwa::read_device_binding_count();
+    match pwa::work_unit_write_posture(reading) {
+        pwa::WorkUnitWritePosture::Write => {}
+        withheld if !parsed.allow_multi_bound => {
+            let why = match withheld {
+                pwa::WorkUnitWritePosture::WithheldMultiBound(n) => {
+                    format!("this device is bound to {n} tenants")
+                }
+                _ => format!(
+                    "coord's binding set for this device is UNKNOWN — no fresh record at {} \
+                     (refreshed by the PRIMARY runner's register heartbeat — checked every 30 s, \
+                     re-stamped hourly, stale after 24 h — in its own storage dir; this shell's \
+                     QONTINUI_SECURE_STORAGE_DIR must match it)",
+                    qontinui_runner_lib::pair::coord_bound_tenants_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unresolvable data dir>".to_string())
+                ),
+            };
+            eprintln!(
+                "qontinui-pr: {why}, and every unit this backfill creates would be filed under \
+                 the tenant of this device's DEFAULT credential — NOTHING was pushed. If that \
+                 tenant owns every plan in {plans_dir}, re-run with --allow-multi-bound; \
+                 otherwise register each plan from a session in its owning tenant \
+                 (coord_work_unit_upsert)."
+            );
+            return ExitCode::from(2);
+        }
+        withheld => {
+            eprintln!(
+                "qontinui-pr: --allow-multi-bound ({withheld:?}): pushing under the default \
+                 credential's tenant."
+            );
+        }
+    }
     let sink = pwa::HttpWorkUnitSink::new(&base);
 
     // `push_work_unit` is async (it shares the runner's `reqwest` async client);

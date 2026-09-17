@@ -1712,7 +1712,7 @@ pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenant
 /// Kept as a local minimal reader for the same reason [`default_binding_tenant`]
 /// is: `auth` compiles into BOTH the lib and bin crates while `pair` is
 /// lib-only.
-fn device_binding_count() -> usize {
+pub(crate) fn device_binding_count() -> usize {
     let Some(base) = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
         .ok()
         .filter(|s| !s.is_empty())
