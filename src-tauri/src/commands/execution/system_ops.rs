@@ -4,7 +4,7 @@
 
 use crate::error::UserFacingError;
 use std::process::Command;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 use tracing::{error, info};
 
 use super::super::CommandResponse;
@@ -24,12 +24,11 @@ use super::super::CommandResponse;
 pub fn handle_error(error: UserFacingError, app_handle: AppHandle) -> Result<(), String> {
     error!("User-facing error: {:?}", error);
 
-    // Emit error event to frontend
-    app_handle
-        .emit("error", &error)
-        .map_err(|e| format!("Failed to emit error event: {}", e))?;
-
-    Ok(())
+    // Emit through the shared sink rather than inline, so a backend module
+    // that needs the same card does not have to invoke this command for its
+    // side effect — and so the two cannot drift about the channel name. The
+    // failure is still propagated to the caller, exactly as before.
+    crate::error::emit_user_facing_error(&app_handle, &error)
 }
 
 /// Check for application updates.

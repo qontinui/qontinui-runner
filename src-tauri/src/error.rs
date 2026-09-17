@@ -154,6 +154,36 @@ pub struct UserFacingError {
     pub suggested_action: Option<String>,
 }
 
+/// Put a [`UserFacingError`] in front of the operator.
+///
+/// **The one emit site for the `"error"` channel**, so a backend module does
+/// not have to invoke a `#[tauri::command]` for its side effect. The frontend
+/// half is `src/components/StatusIndicator.tsx`, mounted app-level in
+/// `src/App.tsx`: a severity-coloured, dismissible card carrying the title,
+/// the message, `details` verbatim inside a collapsed "Technical Details"
+/// `<pre>`, the suggested action and the error code. `severity: Info`
+/// auto-hides after 5 s; everything else stays until dismissed.
+///
+/// A failed emit is BOTH logged and returned, so neither caller has to choose
+/// on the other's behalf: the IPC door propagates it to the frontend that
+/// asked, while a background reporter discards it (`let _ = …`) because
+/// failing to report a condition must not become a second failure.
+///
+/// Callers: `commands::execution::system_ops::handle_error` (the IPC door the
+/// frontend calls) and `coord_outside_observer` (plan
+/// `2026-09-12-merge-train-alerts-page-a-reader-and-act-on-nothing` Phase 3b).
+pub fn emit_user_facing_error(
+    app: &tauri::AppHandle,
+    error: &UserFacingError,
+) -> Result<(), String> {
+    use tauri::Emitter;
+    app.emit("error", error).map_err(|e| {
+        let msg = format!("Failed to emit error event: {e}");
+        tracing::warn!(error_code = %error.error_code, "{msg}");
+        msg
+    })
+}
+
 // ErrorSeverity is re-exported from crate::error_monitor::types above
 
 impl AppError {
