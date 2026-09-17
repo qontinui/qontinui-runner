@@ -226,13 +226,15 @@ describe("repo checkouts — repos outside the workspace root", () => {
 
   it("rejects malformed lines and case-insensitive duplicates with line numbers", () => {
     const { errors } = parseRepoCheckouts(
-      "acme/app = /a\nno-equals-sign\nbare = /b\nacme/app2 =\nACME/APP = /c",
+      "acme/app = /a\nno-equals-sign\nbare = /b\nacme/app2 =\nACME/APP = /c\nqontinui/qontinui-web = /w\nacme/rel = src/rel\nacme/win = D:\\src\\win",
     );
     expect(errors).toEqual([
       'Line 2: expected "owner/name = path".',
       'Line 3: "bare" is not an owner/name repo slug.',
       "Line 4: no path for acme/app2.",
       "Line 5: ACME/APP is listed more than once.",
+      "Line 6: qontinui repositories always use the workspace root; remove qontinui/qontinui-web.",
+      "Line 7: src/rel is not an absolute path.",
     ]);
   });
 
