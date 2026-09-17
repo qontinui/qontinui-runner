@@ -1566,6 +1566,66 @@ pub(crate) fn select_device_bearer(
     select_device_bearer_result(am, tenant, default_tenant).ok()
 }
 
+/// Whether a token found in the LEGACY `access_token` slot may be presented as
+/// tenant `t`'s credential, where `t` is the device's default binding (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
+/// re-review F2 then P2).
+///
+/// - A `tenant_id` claim decides outright: it must be `t`. A claim naming
+///   another tenant is never `t`'s credential.
+/// - A token with NO claim (a pairing that predates the claim) is accepted only
+///   where no other tenant could be its owner: the per-tenant slot store was
+///   READ and holds no slot for `t` (so the legacy slot is `t`'s only route),
+///   AND this device holds at most one binding. On a multi-binding device a
+///   claimless token's tenant is unknowable, and it is refused. Accepting one
+///   warns once that a re-pair is due.
+///
+/// `binding_count` is injected ([`device_binding_count`] in production, which
+/// fails toward ONE on an unreadable file — the same direction the D2 degrade
+/// rule chose, so an unreadable pairing file keeps a single-binding runner's
+/// unattended path working).
+pub(crate) fn legacy_token_serves_tenant(
+    am: &AuthManager,
+    token: &str,
+    t: &Uuid,
+    binding_count: usize,
+) -> bool {
+    match jwt_tenant_claim(token) {
+        Some(claim) => claim == *t,
+        None => {
+            let slot_free = matches!(
+                am.try_list_tenant_device_jwt_tenants(),
+                Ok(slots) if !slots.contains(t)
+            );
+            let accepted = slot_free && binding_count <= 1;
+            if accepted {
+                CLAIMLESS_LEGACY_WARNED.call_once(|| {
+                    warn!(
+                        "coord data-plane: the default device-JWT slot holds a token with no \
+                         tenant_id claim; presenting it for the device's single binding {t}. \
+                         Re-pair this runner so its credential names its tenant — on a device \
+                         with more than one binding such a token is refused"
+                    );
+                });
+            }
+            accepted
+        }
+    }
+}
+
+/// Gate so the claimless-legacy-token warning is logged at most once per process.
+static CLAIMLESS_LEGACY_WARNED: std::sync::Once = std::sync::Once::new();
+
+/// [`select_device_bearer`] with the device's binding count injected.
+pub(crate) fn select_device_bearer_with(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+    binding_count: usize,
+) -> Option<String> {
+    select_device_bearer_result_with(am, tenant, default_tenant, binding_count).ok()
+}
+
 /// [`select_device_bearer`], keeping the CAUSE of a miss instead of discarding
 /// it — ONE implementation, two shapes.
 ///
@@ -1588,6 +1648,18 @@ pub(crate) fn select_device_bearer_result(
     am: &AuthManager,
     tenant: Option<&Uuid>,
     default_tenant: Option<Uuid>,
+) -> Result<String, NoCredential> {
+    select_device_bearer_result_with(am, tenant, default_tenant, device_binding_count())
+}
+
+/// [`select_device_bearer_result`] with the device's binding count injected —
+/// THE implementation every other shape and arity above delegates to, so the
+/// typed cause and the injected count can never be decided by two bodies.
+pub(crate) fn select_device_bearer_result_with(
+    am: &AuthManager,
+    tenant: Option<&Uuid>,
+    default_tenant: Option<Uuid>,
+    binding_count: usize,
 ) -> Result<String, NoCredential> {
     let Some(t) = tenant else {
         return legacy_slot_bearer(am).map_err(NoCredential::Slot);
@@ -1613,20 +1685,22 @@ pub(crate) fn select_device_bearer_result(
     }
     // Slot miss. The default binding may legitimately live only in the
     // legacy slot (pre-8a install, or a pairing that predates per-tenant
-    // slots), so fall back to it — but only to a token that NAMES `t`. The
-    // legacy slot holds whatever was last written there, and a binding file
-    // that says A beside a slot holding B's token would otherwise present B's
-    // credential as A's (plan
+    // slots), so fall back to it — but only to a token that is `t`'s by
+    // [`legacy_token_serves_tenant`]. The legacy slot holds whatever was last
+    // written there, and a binding file that says A beside a slot holding B's
+    // token would otherwise present B's credential as A's (plan
     // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential,
-    // re-review F2). An absent or different `tenant_id` claim is no bearer.
+    // re-review F2/P2).
     if default_tenant.as_ref() == Some(t) {
         return match legacy_slot_bearer(am) {
             Ok(jwt) => {
-                let claimed = jwt_tenant_claim(&jwt);
-                if claimed == Some(*t) {
+                if legacy_token_serves_tenant(am, &jwt, t, binding_count) {
                     Ok(jwt)
                 } else {
-                    Err(NoCredential::DefaultBindingClaimMismatch { own, claimed })
+                    Err(NoCredential::DefaultBindingClaimMismatch {
+                        own,
+                        claimed: jwt_tenant_claim(&jwt),
+                    })
                 }
             }
             Err(legacy) => Err(NoCredential::DefaultBindingFallback { own, legacy }),
@@ -2007,10 +2081,11 @@ pub(crate) struct HeldDeviceTenants {
     pub(crate) slots: std::result::Result<Vec<Uuid>, String>,
     /// The default binding (`paired_user.json`).
     pub(crate) default_binding: BindingTenantRead,
-    /// Whether the legacy slot holds a JWT whose `tenant_id` claim names the
-    /// DEFAULT binding — i.e. a credential for that binding, not merely a JWT
-    /// (re-review F2: a B token in the slot beside an A binding is NOT A's
-    /// credential). `Ok(false)` when there is no bound default to name. `Err` =
+    /// Whether the legacy slot holds a JWT that is the DEFAULT binding's
+    /// credential by [`legacy_token_serves_tenant`] — its claim names the
+    /// binding, or it carries no claim on a single-binding device with no slot
+    /// for that tenant — not merely a JWT (re-review F2: a B token in the slot
+    /// beside an A binding is NOT A's credential). `Ok(false)` when there is no bound default to name. `Err` =
     /// the slot could not be read.
     pub(crate) legacy_slot: std::result::Result<bool, String>,
 }
@@ -2055,6 +2130,15 @@ impl HeldDeviceTenants {
 
     /// [`Self::read`] with the default binding injected (tests).
     pub(crate) fn read_with(am: &AuthManager, default_binding: BindingTenantRead) -> Self {
+        Self::read_with_count(am, default_binding, device_binding_count())
+    }
+
+    /// [`Self::read_with`] with the device's binding count injected (tests).
+    pub(crate) fn read_with_count(
+        am: &AuthManager,
+        default_binding: BindingTenantRead,
+        binding_count: usize,
+    ) -> Self {
         use crate::secure_storage::StoredTokenRead;
         Self {
             slots: am
@@ -2064,7 +2148,8 @@ impl HeldDeviceTenants {
             legacy_slot: match am.probe_access_token() {
                 StoredTokenRead::Present(token) => Ok(match default_binding {
                     BindingTenantRead::Bound(d) => {
-                        looks_like_jwt(&token) && jwt_tenant_claim(&token) == Some(d)
+                        looks_like_jwt(&token)
+                            && legacy_token_serves_tenant(am, &token, &d, binding_count)
                     }
                     BindingTenantRead::Unbound | BindingTenantRead::Unknown => false,
                 }),
@@ -2500,14 +2585,16 @@ pub enum NoCredential {
     /// them here would be the same unmeasured guess this type exists to stop.
     DefaultBindingFallback { own: SlotState, legacy: SlotState },
     /// The queried tenant IS this device's default binding and the legacy
-    /// `access_token` slot holds a USABLE token — but its `tenant_id` claim
-    /// names someone else, or nothing at all, so it is not a credential for
-    /// the queried tenant. Presenting it would forward another tenant's token
-    /// under this tenant's name: a silent cross-tenant write rather than a
-    /// refusal (plan
+    /// `access_token` slot holds a USABLE token — but that token is not the
+    /// queried tenant's by [`legacy_token_serves_tenant`]: its `tenant_id`
+    /// claim names someone else, or it carries no claim on a device where the
+    /// claimless rule cannot admit it. Presenting it would forward another
+    /// tenant's token under this tenant's name: a silent cross-tenant write
+    /// rather than a refusal (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
-    /// re-review F2). NOT a slot state — the slot is `Usable`; what missed is
-    /// the claim.
+    /// re-review F2/P2). NOT a slot state — the slot is `Usable`; what missed
+    /// is the token's claim to be this tenant's. `claimed` is `None` for a
+    /// claimless token, which is UNKNOWN ownership, never "no owner".
     DefaultBindingClaimMismatch {
         own: SlotState,
         claimed: Option<Uuid>,
@@ -3719,9 +3806,10 @@ mod bearer_selection_tests {
         let (a, b) = (tenant(0x41), tenant(0x42));
         store_legacy_only(&mgr, &b);
         assert_eq!(select_device_bearer(&mgr, Some(&a), Some(a)), None);
-        // A claimless legacy token is not A's either.
+        // A claimless legacy token is not A's either on a two-binding device
+        // (the single-binding case is the P2 test below).
         mgr.store_tokens(&live_jwt("claimless"), "").unwrap();
-        assert_eq!(select_device_bearer(&mgr, Some(&a), Some(a)), None);
+        assert_eq!(select_device_bearer_with(&mgr, Some(&a), Some(a), 2), None);
         // The tenant-less caller still reads the legacy slot as before.
         assert!(select_device_bearer(&mgr, None, Some(a)).is_some());
     }
@@ -3760,6 +3848,48 @@ mod bearer_selection_tests {
             ..unreadable
         };
         assert_eq!(slotted.holds(a), Ok(true));
+    }
+
+    /// Re-review P2. A CLAIMLESS legacy token is served for the default binding
+    /// on a single-binding device whose slot store holds nothing for it, and
+    /// refused on a two-binding device; a claim naming another tenant is refused
+    /// whatever the binding count. The held set agrees in every case.
+    #[test]
+    fn a_claimless_legacy_token_is_served_only_on_a_single_binding_device() {
+        let mgr = create_test_auth_manager("claimless_legacy_single_binding");
+        let (a, b) = (tenant(0x61), tenant(0x62));
+        let claimless = live_jwt("claimless");
+        mgr.store_tokens(&claimless, "").unwrap();
+
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), 1).as_deref(),
+            Some(claimless.as_str()),
+            "single binding, no slot for a: the claimless token is a's"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), 1).holds(a),
+            Ok(true)
+        );
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), 2),
+            None,
+            "two bindings: a claimless token's tenant is unknowable"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), 2).holds(a),
+            Ok(false)
+        );
+
+        store_legacy_only(&mgr, &b);
+        assert_eq!(
+            select_device_bearer_with(&mgr, Some(&a), Some(a), 1),
+            None,
+            "a claim naming b is never a's, even on a single binding"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with_count(&mgr, BindingTenantRead::Bound(a), 1).holds(a),
+            Ok(false)
+        );
     }
 
     /// DEFAULT-tenant slot miss falls back to the legacy slot — the legacy

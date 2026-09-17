@@ -1679,8 +1679,19 @@ pub(crate) fn coord_device_token_for(
         // The token must NAME the tenant asked for. A token whose claim names
         // another tenant — or none — is not a credential for `t`, and is treated
         // exactly like no token: the miss path below.
-        if let Some(jwt) = crate::auth::select_device_bearer(am, Some(&t), default_tenant)
-            .filter(|jwt| crate::auth::jwt_tenant_claim(jwt) == Some(t))
+        if let Some(jwt) =
+            crate::auth::select_device_bearer(am, Some(&t), default_tenant).filter(|jwt| {
+                match crate::auth::jwt_tenant_claim(jwt) {
+                    Some(claim) => claim == t,
+                    // No claim: only the legacy-slot route can have produced it (a
+                    // per-tenant slot is keyed by its tenant), and the selector has
+                    // already applied the single-binding rule to it.
+                    None => {
+                        default_tenant == Some(t)
+                            && !matches!(&held.slots, Ok(slots) if slots.contains(&t))
+                    }
+                }
+            })
         {
             return Ok(Some(jwt));
         }
@@ -2213,6 +2224,22 @@ mod device_token_door_tests {
                 .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
         );
         am.store_tokens(&claimless, "").unwrap();
+        // Re-review P2: on this single-binding ambient the claimless token IS
+        // a's (no slot for a, one binding)...
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(Some(claimless.clone()))
+        );
+        // ...and on a two-binding device it is not.
+        std::fs::write(
+            _amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a,
+                "bindings": [{"tenant_id": a}, {"tenant_id": b}]
+            })
+            .to_string(),
+        )
+        .unwrap();
         assert_eq!(
             coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
             Ok(None)
