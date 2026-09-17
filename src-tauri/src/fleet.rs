@@ -1381,10 +1381,12 @@ fn host_capabilities() -> Vec<String> {
 /// would need re-deciding per continuation kind.
 pub const WEBVIEW_RUNTIME_CAPABILITY: &str = "runtime:webview";
 
-/// True when this process holds a Tauri `AppHandle`.
+/// True when this process's Tauri runtime is ready to host a visible terminal:
+/// the `AppHandle` is set AND `SessionRegistry` is managed
+/// (`crate::tauri_app_handle::runtime_ready()`, marked in `setup()`).
 ///
-/// **Probes the real thing.** `crate::tauri_app_handle::current().is_some()` is
-/// not a proxy for the capability — it IS the branch that decides whether
+/// **Probes the real thing.** The handle plus the managed registry are not a
+/// proxy for the capability — they ARE what decides whether
 /// `run_continuation_terminal` and `run_condition_check_terminal` can open a
 /// visible terminal at all. It is deliberately not inferred from the OS: a
 /// Linux box can have a display and a Windows box can be running headless, and
@@ -1409,7 +1411,10 @@ pub const WEBVIEW_RUNTIME_CAPABILITY: &str = "runtime:webview";
 /// set-once `OnceLock`, so the value only ever transitions `false -> true` and
 /// never back.
 fn webview_runtime_available() -> bool {
-    let present = crate::tauri_app_handle::current().is_some();
+    // `runtime_ready`, not merely the AppHandle: `.setup()` stores the handle
+    // before it manages `SessionRegistry`, and a terminal continuation routed
+    // here inside that window fails `SessionRegistry state not managed`.
+    let present = crate::tauri_app_handle::runtime_ready();
     if !present {
         // debug!, not warn!: on a headless runner this is a standing, correct
         // property of the device rather than a fault, and the heartbeat asks
