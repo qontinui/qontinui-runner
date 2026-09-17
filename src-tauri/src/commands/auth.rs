@@ -1628,7 +1628,8 @@ pub fn get_coord_device_token(tenant_id: Option<String>) -> Result<Option<String
 /// Runner kill switch for P3's refusal: exactly `1` makes a tenant-less
 /// [`get_coord_device_token`] answer the default slot again on a runner holding
 /// several tenant slots. Read per call, so it applies without a restart.
-pub(crate) const DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV: &str = "QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT";
+pub(crate) const DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV: &str =
+    "QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT";
 
 /// Stable prefix of the refusal a tenant-less call gets on a multi-slot runner.
 pub(crate) const DEVICE_TOKEN_TENANT_REQUIRED: &str = "get_coord_device_token:tenant_required";
@@ -1638,7 +1639,9 @@ pub(crate) const DEVICE_TOKEN_TENANT_INVALID: &str = "get_coord_device_token:ten
 
 fn device_token_door_default_slot_enabled() -> bool {
     device_token_door_default_slot_enabled_from(
-        std::env::var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV).ok().as_deref(),
+        std::env::var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV)
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -2040,9 +2043,15 @@ mod device_token_door_tests {
         let (am, a, _) = two_slot_runner();
         let refusal = coord_device_token_for(&am, None, Some(a), false)
             .expect_err("two slots and no tenant must refuse");
-        assert!(refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED), "{refusal}");
+        assert!(
+            refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED),
+            "{refusal}"
+        );
         assert!(refusal.contains("tenant_id"), "{refusal}");
-        assert!(!refusal.contains(&jwt_for(a)), "a refusal never carries a token");
+        assert!(
+            !refusal.contains(&jwt_for(a)),
+            "a refusal never carries a token"
+        );
     }
 
     /// P3 acceptance 2. Argument B returns B's slot, not the default's.
@@ -2051,9 +2060,15 @@ mod device_token_door_tests {
         let _amb = crate::test_env::isolated_ambient();
         let (am, a, b) = two_slot_runner();
         let token = coord_device_token_for(&am, Some(b), Some(a), false).unwrap();
-        assert_eq!(token.as_deref().and_then(crate::auth::jwt_tenant_claim), Some(b));
+        assert_eq!(
+            token.as_deref().and_then(crate::auth::jwt_tenant_claim),
+            Some(b)
+        );
         let token = coord_device_token_for(&am, Some(a), Some(a), false).unwrap();
-        assert_eq!(token.as_deref().and_then(crate::auth::jwt_tenant_claim), Some(a));
+        assert_eq!(
+            token.as_deref().and_then(crate::auth::jwt_tenant_claim),
+            Some(a)
+        );
     }
 
     /// P3 acceptance 3. A tenant this runner is not paired for gets `None` —
@@ -2064,7 +2079,10 @@ mod device_token_door_tests {
         let (am, a, _) = two_slot_runner();
         let c = tenant(0xC3);
         for switch in [false, true] {
-            assert_eq!(coord_device_token_for(&am, Some(c), Some(a), switch), Ok(None));
+            assert_eq!(
+                coord_device_token_for(&am, Some(c), Some(a), switch),
+                Ok(None)
+            );
         }
     }
 
