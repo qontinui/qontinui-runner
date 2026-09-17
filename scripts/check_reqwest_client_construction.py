@@ -62,13 +62,13 @@ THE BASELINE (a ratchet)
 unconverted constructions are accepted today. The check FAILS when a file has
 MORE constructions than its entry (a new site) and ALSO when it has FEWER (a site
 was converted: tighten the entry, so the baseline can only shrink). A file absent
-from the baseline allows zero. Wave B of the plan converts the remaining sites
-and empties the baseline.
+from the baseline allows zero. Wave B of the plan converted every site and
+emptied the baseline; it is kept (empty) so the file format stays checked, and
+must not grow — use the escape comment for a genuine exception.
 
 A per-file COUNT cannot see a swap (one site converted and a new one added in
-the same file in the same change). That hole is accepted for a baseline that is
-being driven to empty; once it is empty, every construction outside the factory
-fails outright.
+the same file in the same change). With the baseline empty that hole is closed:
+every construction outside the factory fails outright.
 
 USAGE
 -----
@@ -374,11 +374,12 @@ def write_baseline(path: Path, counts: dict[str, int]) -> None:
     data = {
         "_comment": [
             "reqwest clients constructed outside src-tauri/src/util/http.rs that are",
-            "ACCEPTED for now, as a count per file. Enforced by",
+            "ACCEPTED, as a count per file. Enforced by",
             "scripts/check_reqwest_client_construction.py (a ratchet: more OR fewer",
-            "than recorded fails). Wave B of plan",
+            "than recorded fails). Plan",
             "2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes",
-            "converts these to util::http::client_builder() and empties this file.",
+            "Wave B converted every site and emptied it; it must stay empty -- mark a",
+            "genuine exception with `// reqwest-client-ok: <reason>` instead.",
         ],
         "format": BASELINE_FORMAT,
         "files": dict(sorted(counts.items())),
@@ -399,10 +400,11 @@ def teach(lines: list[str], ci: bool) -> str:
     body += [f"{err}  {s}" for s in lines]
     body += [
         f"{err}",
-        f"{err}WHY THIS IS A DEFECT: a reqwest Client owns its DNS resolver. With the",
-        f"{err}hickory-dns feature it snapshots the DNS servers once and never recovers from",
-        f"{err}a network change (2026-09-16: 90+ min coord outage); without it, GaiResolver",
-        f"{err}spends a tokio blocking-pool thread per lookup (runner #918's starvation flood).",
+        f"{err}WHY THIS IS A DEFECT: a reqwest Client owns its DNS resolver. A client built",
+        f"{err}outside the factory gets reqwest's default GaiResolver, which spends a tokio",
+        f"{err}blocking-pool thread per lookup (runner #918's starvation flood). The hickory-dns",
+        f"{err}feature that once masked that snapshots DNS servers once per client and never",
+        f"{err}recovers from a network change (2026-09-16: 90+ min coord outage); it is removed.",
         f"{err}",
         f"{err}FIX IT by starting from src-tauri/src/util/http.rs:",
         f"{err}  crate::util::http::client_builder()           // async; add your settings, .build()",

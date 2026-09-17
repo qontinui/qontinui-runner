@@ -84,24 +84,29 @@ mdns-sd = "0.11"
 # Plan mention: cocool97/adb_client. Features: `usb` for direct USB device I/O,
 # `mdns` for adb mDNS services. The crate is sync; call via tokio::spawn_blocking.
 adb_client = { version = "3", features = ["usb", "mdns"] }
-# `hickory-dns` swaps reqwest's default `GaiResolver` — which resolves through
-# blocking `getaddrinfo` dispatched onto tokio's blocking pool — for the async
-# hickory resolver. Without it, every request costs a blocking-pool slot; the
-# runner pinned that pool near its 512-thread ceiling and DNS resolution queued
-# until requests hit their own timeouts (coord answers in <0.5s but calls failed
-# as `operation timed out`). `coord_http::coord_client` fixes the coord paths by
-# sharing one pooled client; this feature protects the ~160 call sites that
-# still construct clients per request.
+# reqwest DNS: every client resolves through ONE process-wide resolver,
+# `util::dns::shared()` -- the OS resolver (getaddrinfo, which follows network
+# changes, VPN/NRPT and the hosts file) on a dedicated, bounded `dns-lane-*`
+# thread lane with a hard per-lookup deadline. Clients are built only through
+# `util::http::client_builder()` / `blocking_client_builder()`, which install it.
 #
-# BUT each hickory client snapshots the DNS servers once and never rebuilds, so
-# a process-lifetime client stays broken after a network change (2026-09-16).
-# Clients built via `util::http::client_builder()` override it with the shared
-# OS resolver on a dedicated bounded lane (`util::dns`). The feature stays on
-# only for the not-yet-converted per-call sites (see
-# scripts/reqwest-client-construction-baseline.json) and is removed once that
-# baseline is empty. Plan
+# Why NOT `hickory-dns` (removed 2026-09-16; enabled by #918 on 2026-08-01): in
+# reqwest 0.13 each client owns a hickory resolver created on first lookup from
+# a ONE-TIME snapshot of the adapter DNS servers, with per-client cache and
+# name-server health state, never rebuilt. After a WLAN blip on 2026-09-16 every
+# process-lifetime coord client stayed broken for 90+ minutes while curl, git
+# and freshly built clients recovered at once.
+#
+# Why NOT reqwest's default `GaiResolver`: it runs blocking getaddrinfo on
+# tokio's BLOCKING POOL, one slot per lookup; the runner pinned that pool near
+# its 512-thread ceiling and requests timed out queueing for DNS (#918). The
+# dedicated lane keeps that guarantee without hickory's frozen snapshot.
+#
+# Enforced by scripts/check_reqwest_client_construction.py (CI): a client
+# constructed outside util/http.rs fails the build, because it would silently
+# get GaiResolver. Plan
 # 2026-09-16-runner-long-lived-http-clients-freeze-dns-state-across-network-changes.
-reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form", "hickory-dns"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "blocking", "stream", "form"] }
 open = "5"
 hostname = "0.4"
 # Row 2 Phase 1 (fleet topology): used by `fleet::detect_resources` to
