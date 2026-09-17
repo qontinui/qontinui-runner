@@ -1729,11 +1729,7 @@ pub fn read_plans_for_cycle(
                 // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
                 // ancestor chain for a `.git` and every entry shares the answer.
                 let source_root = super::body_push::derive_source_repo(dir);
-                let ref_census = super::body_push::PlanSlugCensus::new(
-                    super::body_push::SLUG_CENSUS_SOURCE_REF,
-                    listing.ref_sha.clone(),
-                    listing.names.iter().map(|n| slug_from_filename(n)),
-                );
+                let ref_census = ref_census_from_names(&listing.names, listing.ref_sha.clone());
                 Ok(CycleScan {
                     units: listing
                         .files
@@ -1753,6 +1749,73 @@ pub fn read_plans_for_cycle(
             }
             Err(e) => Err(format!(
                 "could not read `{ref_name}:{rel_dir}` in {}: {e}",
+                repo_root.display()
+            )),
+        },
+    }
+}
+
+/// The REF census of an already-taken listing.
+///
+/// One constructor for both doors — the scanning arm of
+/// [`read_plans_for_cycle`] and the listing-only [`ref_census_only`] — so the
+/// two cannot drift on the source label, on how a name becomes a stem, or on
+/// whether the sha travels with it.
+fn ref_census_from_names(
+    names: &[String],
+    ref_sha: Option<String>,
+) -> super::body_push::PlanSlugCensus {
+    super::body_push::PlanSlugCensus::new(
+        super::body_push::SLUG_CENSUS_SOURCE_REF,
+        ref_sha,
+        names.iter().map(|n| slug_from_filename(n)),
+    )
+}
+
+/// The REF side's stem census ALONE: one `git ls-tree` at the ref this clone
+/// already holds. No fetch, no blob read, no parse, and no coord call.
+///
+/// This is what a cycle that will publish NO corpus can still honestly
+/// produce. The work-unit write posture
+/// ([`work_unit_write_posture`]) withholds coord work-unit READS AND WRITES on
+/// a multi-bound (or unknown-bound) device — a standing property of the
+/// device, not a passing failure. Withholding the census along with them made
+/// the ref side of the coverage question ABSENT on every cycle FOREVER on
+/// exactly the devices that hold both sides of it, and the first such cycle
+/// cleared the stems the web had already stored, because a report whose
+/// `censuses` omits a source stores that source as NULL. The cost objection
+/// that justifies skipping the SCAN does not reach the listing: the expensive
+/// part is the ~1,100 blob reads, and this door takes none of them.
+///
+/// Three outcomes, kept apart on purpose:
+///
+/// * `Ok(Some(census))` — the ref was listed; this is the reading.
+/// * `Ok(None)` — there is no ref side to read at all (the plans dir is not in
+///   a work tree, which is a supported layout). ABSENT, and an ANSWER.
+/// * `Err(reason)` — the listing could not be taken. Also ABSENT, but it is
+///   a FAULT, so the caller logs it (deduped — a clone with no `origin/HEAD`
+///   is one unchanging fault, and a WARN a minute for it is how the line that
+///   matters gets missed) [policy: `unknown-must-not-render-as-a-default`].
+pub fn ref_census_only(
+    dir: &Path,
+    git: &dyn GitRefReader,
+) -> Result<Option<super::body_push::PlanSlugCensus>, String> {
+    use super::ref_scan::{list_ref_plan_names, resolve_ref_listing_source, ScanSource};
+    match resolve_ref_listing_source(git, dir) {
+        // Not in a repo: the same `None` the WorkTree arm of
+        // `read_plans_for_cycle` reports. There is no ref, so there is no ref
+        // set — never an empty one, which would claim a default branch holds
+        // no plans.
+        ScanSource::WorkTree => Ok(None),
+        ScanSource::Unavailable { reason } => Err(reason),
+        ScanSource::Ref {
+            repo_root,
+            ref_name,
+            rel_dir,
+        } => match list_ref_plan_names(git, &repo_root, &ref_name, &rel_dir) {
+            Ok(listing) => Ok(Some(ref_census_from_names(&listing.names, listing.ref_sha))),
+            Err(e) => Err(format!(
+                "could not list `{ref_name}:{rel_dir}` in {}: {e}",
                 repo_root.display()
             )),
         },
@@ -2734,7 +2797,8 @@ impl LoopState {
             match self.unknown_posture_streak {
                 1 => tracing::info!(
                     "plan adapter: coord's binding record is not available (fresh boot, or aged out) — withholding \
-                     work-unit pushes this cycle and re-checking next cycle"
+                     work-unit pushes this cycle and re-checking next cycle. The stem censuses are \
+                     unaffected: this cycle still LISTS the ref and the work tree and reports both"
                 ),
                 2 => tracing::warn!("{}", unknown_bindings_message()),
                 _ => {}
@@ -2754,13 +2818,64 @@ impl LoopState {
                 .work_unit_writes_withheld_total
                 .fetch_add(1, Ordering::Relaxed);
             metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
+            // The posture withholds coord WORK-UNIT reads and writes. A stem
+            // census is NEITHER — it is one `git ls-tree` at the ref this
+            // clone already holds (see [`ref_census_only`]: no fetch, no blob
+            // read, no coord call), so the cost that justifies skipping the
+            // scan above does not reach it, and nothing here re-opens a
+            // withheld coord door.
+            //
+            // Withholding it too made the census permanently dark: a posture
+            // is a STANDING property of the device, so the ref side would have
+            // been ABSENT on every cycle forever — and the first such cycle
+            // would have cleared the stems the web already stored for this
+            // device, because a report whose `censuses` omits a source stores
+            // that source as NULL. The device that holds both sides of the
+            // coverage question is exactly the one most likely to be
+            // multi-bound.
+            let ref_census = {
+                let scan_dir = dir.clone();
+                let git = std::sync::Arc::clone(&self.git);
+                match tokio::task::spawn_blocking(move || ref_census_only(&scan_dir, git.as_ref()))
+                    .await
+                {
+                    Ok(Ok(census)) => {
+                        // Listed something, so the next unavailability is news
+                        // again — the same clearing the scanning arm does.
+                        self.last_scan_unavailable = None;
+                        census
+                    }
+                    // Deduped on the reason, like both scan-failure arms
+                    // below: one unchanging fault costs one line, not one a
+                    // minute.
+                    Ok(Err(reason)) => {
+                        if self.last_scan_unavailable.as_deref() != Some(reason.as_str()) {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                reason = %reason,
+                                "plan adapter: could not list the ref for the stem census on a \
+                                 withheld cycle; that side is reported ABSENT (never an empty set)"
+                            );
+                            self.last_scan_unavailable = Some(reason);
+                        }
+                        None
+                    }
+                    // The listing task did not complete, so the enumeration
+                    // never happened at all: ABSENT, never a fabricated zero.
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "plan adapter: the ref stem-census task did not complete on a \
+                             withheld cycle; that side is reported ABSENT"
+                        );
+                        None
+                    }
+                }
+            };
             if let Some(bs) = self.body_sync.as_mut() {
-                // `None` ref census: this cycle deliberately listed no ref (the
-                // comment above — a withheld cycle would read ~1,100 blobs only
-                // to discard them), so that side of the coverage question is
-                // ABSENT. Never an empty set, which would claim the ref holds
-                // no plans.
-                bs.run_cycle(&self.conv, metrics, None).await;
+                // Both sides travel: the ref census listed just above, and the
+                // work-tree census `run_cycle` takes of the active plans root.
+                bs.run_cycle(&self.conv, metrics, ref_census).await;
             }
             return;
         }
@@ -3042,7 +3157,8 @@ fn unknown_bindings_message() -> String {
     format!(
         "plan adapter: coord's binding set for this device is UNKNOWN — no fresh record at \
          {path} — so every coord work-unit read and write is WITHHELD rather than assuming this \
-         device is bound to one tenant. The record is written only by the PRIMARY runner's \
+         device is bound to one tenant (the stem censuses still travel: a listing is not a \
+         coord call). The record is written only by the PRIMARY runner's \
          register heartbeat: a supervisor-spawned secondary or temp runner never writes one \
          (and reads its own storage dir), so this posture is permanent there; on a primary, \
          check machine.json, the active profile's coord_url, and `fleet::heartbeat` warnings"
@@ -3064,8 +3180,10 @@ fn work_unit_write_posture_message(
             "plan adapter: this device is bound to {n} tenants and a plan's owning tenant is not \
              resolvable here — WITHHOLDING every coord work-unit read and write rather than filing \
              units under the default credential's tenant. The plan-library body sync is \
-             unaffected; a session registers its own plan's unit with coord_work_unit_upsert in \
-             its own tenant"
+             unaffected, and so are the stem censuses: this cycle still LISTS the ref (one \
+             `git ls-tree`, no fetch and no blob read) and the work tree, and reports both, so \
+             this device's coverage reading does not go dark. A session registers its own plan's \
+             unit with coord_work_unit_upsert in its own tenant"
         )),
         // `LoopState::tick` logs this posture through its own streak logic (info
         // first, warn once on a second consecutive cycle) and does not call here
@@ -3672,12 +3790,18 @@ impl BodySync {
                 //    conservative arm costs one extra full census on an
                 //    ambiguous ack, which is rare by construction
                 //    [policy: `unknown-must-not-render-as-a-default`].
-                //  * `created: Some(true)` — the row was INSERTED, and the
-                //    insert arm stores the census verbatim rather than
-                //    carrying a withheld one forward, so a `slugs: null` in
-                //    THIS report was stored as UNKNOWN. Costs nothing in the
-                //    normal case: a first report already has an empty memory.
-                let stored_the_set = ack.applied == Some(true) && ack.created != Some(true);
+                //  * `created` anything but `Some(false)` — `Some(true)` is
+                //    the row being INSERTED, and the insert arm stores the
+                //    census verbatim rather than carrying a withheld one
+                //    forward, so a `slugs: null` in THIS report was stored as
+                //    UNKNOWN. `None` is the SAME UNKNOWN as `applied`'s (an
+                //    older web build, an unparseable body) and gets the same
+                //    treatment — not-stored — which is why the spelling is
+                //    `== Some(false)` and not `!= Some(true)`: only a positive
+                //    "this UPDATED an existing row" licenses a withhold.
+                //    Costs nothing in the normal case: a first report already
+                //    has an empty memory.
+                let stored_the_set = ack.applied == Some(true) && ack.created == Some(false);
                 self.last_census_digests = if stored_the_set {
                     report.census_digests()
                 } else {
@@ -6990,6 +7114,47 @@ mod tests {
         );
     }
 
+    /// **An ack that does not say `created` is UNKNOWN too — and UNKNOWN is
+    /// not "stored" on this axis either.**
+    ///
+    /// The doc on `ScanRootAck::created` calls `None` "the same UNKNOWN as
+    /// `applied`'s, and is treated the same way — as not-stored". The code
+    /// spelled it `created != Some(true)`, which KEPT the digest memory on
+    /// `None` and withheld the next report's stems against a row that may hold
+    /// none: the last non-conservative cell of the truth table, and the same
+    /// defect as the `applied` one beside it. Only a positive `created: false`
+    /// — "this UPDATED an existing row" — licenses a withhold, because only the
+    /// update arm carries a withheld census forward.
+    ///
+    /// Neuter check: spell it `created != Some(true)` and the second report
+    /// below goes out withheld.
+    #[tokio::test]
+    async fn an_ack_that_does_not_say_created_does_not_license_a_withhold() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().applied = Some(true);
+        reporter.ack.lock().unwrap().created = None;
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "a report that does not say whether it INSERTED is not evidence the web holds the set"
+        );
+    }
+
     /// Only the instance that owns the machine's shared state publishes its
     /// scan-root reading — one web row per device, so a secondary or temp
     /// runner reporting too would flip the machine's row. The gate is checked
@@ -9278,6 +9443,117 @@ mod tests {
             "the active plan and the archive stamp both push when single-bound"
         );
         assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 0);
+    }
+
+    /// **A WITHHELD cycle still LISTS the ref, and still reports both stem
+    /// censuses.**
+    ///
+    /// The posture withholds coord work-unit reads and writes. A `git ls-tree`
+    /// is neither, and the cost objection that justifies skipping the SCAN —
+    /// ~1,100 blob reads to discard — does not reach a listing that reads no
+    /// blob at all.
+    ///
+    /// Withholding the census with them made it permanently dark on exactly
+    /// the device that holds BOTH sides of the coverage question: a posture is
+    /// a STANDING property (here the operator box's own shape — two local
+    /// bindings, no coord record — which is `WithheldMultiBound` on every tick
+    /// forever), so "not this cycle" meant "not ever". Worse, the first such
+    /// cycle CLEARED the stems the web already held, because a report whose
+    /// `censuses` omits a source stores that source as NULL.
+    ///
+    /// The fake's `fetch` is `Err`: the census reads the tracking ref this
+    /// clone already holds, so a failing fetch must not reach it — which also
+    /// proves no fetch sits on this path.
+    ///
+    /// Neuter check: hand `run_cycle` a `None` ref census on the withheld arm
+    /// (main's behaviour) and the REF assertion below fails.
+    #[tokio::test]
+    async fn a_withheld_cycle_still_lists_the_ref_stem_census() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        .with_binding_count(2, None)
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            fetch: Err("a census-only listing must never fetch".to_string()),
+            ref_dir: Ok(vec![
+                // Out of order, and with a non-plan entry, so the census's own
+                // predicate and sort are what produce the answer.
+                RefDirEntry {
+                    name: "2026-01-02-two.md".to_string(),
+                    id: "blob-two".to_string(),
+                },
+                RefDirEntry {
+                    name: "2026-01-01-one.md".to_string(),
+                    id: "blob-one".to_string(),
+                },
+                RefDirEntry {
+                    name: "README.txt".to_string(),
+                    id: "blob-readme".to_string(),
+                },
+            ]),
+            ..FakeGit::healthy(3, 0)
+        }));
+
+        state.tick(&sink, &metrics).await;
+
+        // Still withheld: not one coord work-unit call, on any route.
+        assert_eq!(*sink.upsert_calls.lock().unwrap(), 0, "no upsert");
+        assert_eq!(
+            *sink.list_statuses_calls.lock().unwrap(),
+            0,
+            "no bulk seed read"
+        );
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            0,
+            "no per-slug read"
+        );
+        assert!(sink.deps_calls.lock().unwrap().is_empty(), "no deps call");
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(metrics.snapshot().work_unit_writes_withheld_total, 1);
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "the withheld cycle still reports");
+        let censuses = sent[0]
+            .censuses
+            .clone()
+            .expect("a withheld cycle enumerated both sides, so it carries censuses");
+        let ref_census = censuses
+            .iter()
+            .find(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_REF)
+            .expect("the REF side is a READING on a withheld cycle, not ABSENT");
+        assert_eq!(
+            ref_census.slugs,
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "the `*.md` entries at the ref, sorted — and nothing else"
+        );
+        assert_eq!(
+            ref_census.ref_sha,
+            Some("a".repeat(40)),
+            "listed AT the resolved object id, and saying so"
+        );
+        assert!(
+            censuses
+                .iter()
+                .any(|c| c.source == super::super::body_push::SLUG_CENSUS_SOURCE_WORK_TREE),
+            "and the work-tree side travels with it: {censuses:?}"
+        );
     }
 
     /// An UNKNOWN coord binding set does not fall open to the local slot count

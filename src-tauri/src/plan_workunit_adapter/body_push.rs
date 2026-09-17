@@ -647,8 +647,16 @@ struct RootListing {
     /// there" when the truth is "this was never looked at". Absence of a
     /// report is not a report of absence.
     subdirs: Vec<PathBuf>,
-    /// At least one entry of this directory could NOT be read or classified —
-    /// a `read_dir` iteration error, or metadata that would not load.
+    /// At least one entry of this directory that COULD have been a plan was
+    /// not read or classified — a `read_dir` iteration error (where the name
+    /// itself is unknown, so nothing can be ruled out), or metadata that would
+    /// not load for a `*.md` name.
+    ///
+    /// Scoped to entries that could be stems because the flag's only job is to
+    /// say whether the `*.md` set is a floor. A dangling symlink named
+    /// `notes.txt` is a PERMANENT metadata failure that could never have
+    /// changed that set, and letting it raise this flag put the census ABSENT
+    /// forever with no way back.
     ///
     /// Both lists above are then FLOORS rather than the whole directory, and
     /// the two consumers part company on that: the scan publishes what it
@@ -668,6 +676,17 @@ enum EntryKind {
     /// Neither — a socket, a fifo, a device node. An ANSWER rather than a
     /// failure, so it belongs in no list and taints nothing.
     Other,
+}
+
+/// Whether a path's NAME could carry a plan stem — `extension() == "md"`,
+/// matching [`super::trigger::read_plan_dir`].
+///
+/// A NAME test, deliberately: `read_dir` hands the name over before any
+/// further syscall, so this answer survives the metadata read failing. That is
+/// what lets [`collect_listing`] decide whether a failed entry could ever have
+/// joined the stem set.
+fn could_be_a_stem(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("md")
 }
 
 /// Classify one entry the way `Path::is_dir` / `Path::is_file` do — FOLLOWING
@@ -754,11 +773,44 @@ where
         match classify(&path) {
             Ok(EntryKind::Dir) => subdirs.push(path),
             Ok(EntryKind::File) => {
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if could_be_a_stem(&path) {
                     files.push(path);
                 }
             }
             Ok(EntryKind::Other) => {}
+            // NARROWED on purpose: only an entry that could be a stem may
+            // poison the listing.
+            //
+            // `classify` FOLLOWS links, so a dangling symlink — and any
+            // permanently unreadable entry — answers `Err(NotFound)` every
+            // cycle. That is a knowable, standing answer, not a blip. Letting
+            // `notes.txt` or a broken link taint the listing sent this side
+            // ABSENT forever, with no recovery short of operator action, over
+            // an entry that could never have joined the `*.md` stem set the
+            // census is about.
+            //
+            // The test is on the NAME, which `read_dir` already handed us and
+            // which no failing syscall can take away. An entry whose name
+            // COULD be a stem is still unknown in kind (a directory named
+            // `x.md` is not a plan), so it still taints: in doubt, ABSENT.
+            // The `read_dir` ITERATION error above is different again and
+            // taints unconditionally — there not even the name is known, so
+            // nothing can be ruled out.
+            //
+            // Cost of the narrowing, stated: a non-`*.md` entry that fails to
+            // classify no longer raises `entries_errored`, so `scan_listing`
+            // files no `unreadable_entry` skip for it either. It is logged at
+            // debug and nothing else, which is the right weight for an entry
+            // the scanner would have ignored had it read cleanly.
+            Err(e) if !could_be_a_stem(&path) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan library: a directory entry's metadata could not be read; its name is \
+                     not a `*.md` one, so it could not have been a plan and this root's listing \
+                     is NOT a floor"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -2709,6 +2761,58 @@ mod tests {
         let zero = census_from_listing(dir, &empty).expect("a clean enumeration is a reading");
         assert_eq!((zero.count, zero.truncated), (0, false));
         assert_eq!(zero.slugs, Some(Vec::new()));
+    }
+
+    /// **An entry that could never have been a plan must not send the census
+    /// ABSENT.**
+    ///
+    /// `classify_entry` FOLLOWS links, so a dangling symlink — and any
+    /// permanently unreadable entry — answers `Err` on every cycle. That is a
+    /// knowable, standing answer. Tainting on it made a `notes.txt` in that
+    /// state report this side ABSENT *forever*, with no recovery short of
+    /// operator action, over an entry that could not have changed the `*.md`
+    /// stem set the census is an assertion about.
+    ///
+    /// The conservative direction is kept where it buys something: a failure
+    /// on a `*.md` NAME still taints, because there the entry could have been
+    /// a stem and its kind is exactly what was not established.
+    ///
+    /// Neuter check: taint on every classify error (the previous behaviour)
+    /// and the first census below goes ABSENT.
+    #[test]
+    fn an_entry_that_could_not_be_a_plan_does_not_taint_the_census() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+
+        // The dangling-symlink shape, spelled as the metadata failure it
+        // produces: `classify_entry` on a path whose target is not there.
+        // Written this way rather than with a real symlink because creating
+        // one needs a privilege Windows does not grant by default, and the
+        // syscall answer is identical.
+        let dangling = dir.join("notes.txt");
+        assert!(classify_entry(&dangling).is_err(), "the premise");
+
+        let listing = collect_listing(dir, [Ok(good.clone()), Ok(dangling)], &classify_entry);
+        assert!(
+            !listing.entries_errored,
+            "a non-`*.md` name could not have joined the stem set, so the listing is not a floor"
+        );
+        let census = census_from_listing(dir, &listing).expect("the `*.md` set was read in full");
+        assert_eq!(census.slugs, Some(vec!["2026-01-01-good".to_string()]));
+        assert_eq!((census.count, census.truncated), (1, false));
+
+        // The same failure on a name that COULD be a stem still taints.
+        let missing_md = dir.join("2026-01-02-missing.md");
+        assert!(classify_entry(&missing_md).is_err(), "the premise");
+        let tainted = collect_listing(dir, [Ok(good), Ok(missing_md)], &classify_entry);
+        assert!(tainted.entries_errored);
+        assert_eq!(
+            census_from_listing(dir, &tainted),
+            None,
+            "in doubt about an entry that could be a stem: ABSENT"
+        );
     }
 
     /// UNKNOWN stays UNKNOWN on the wire: every absent field is an explicit
