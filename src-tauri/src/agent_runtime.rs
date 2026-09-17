@@ -6179,12 +6179,15 @@ fn continuation_acquire_failure_detail(err: &str) -> String {
 ///
 /// **A held worktree claim falls through; it never waits** (plan
 /// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`,
-/// Phase 3). The holder is typically a sibling continuation for another PR of
-/// the same repo, and its claim heartbeat is owned by that session's terminal
-/// for the session's whole life — released when the operator closes it, hours
-/// later, not seconds. Waiting would stall this continuation for that long; the
-/// fallback keeps a `qontinui/*` repo's root-first order and refuses a foreign
-/// repo with a typed reason.
+/// Phase 3). The claim is keyed on the directory a session is given, not on the
+/// repo (plan
+/// `2026-09-17-the-worktree-claim-is-keyed-on-the-shared-checkout-so-a-second-concurrent-session-of-a-repo-gets-no-worktree`),
+/// so a sibling continuation for another PR of the same repo gets its own
+/// worktree and no longer lands here; a `Held` now means a genuine conflict on
+/// one directory (a `shared_branch` checkout another session holds), whose
+/// holder keeps it for its whole terminal session. Waiting would stall this
+/// continuation for that long; the fallback keeps a `qontinui/*` repo's
+/// root-first order and refuses a foreign repo with a typed reason.
 fn settle_continuation_acquire<C>(
     acquired: Result<Option<C>, crate::agent_worktree::AllocateError>,
 ) -> Result<C, String> {
@@ -11346,9 +11349,11 @@ mod tests {
         );
     }
 
-    /// Phase 3 of the same plan: a held worktree claim (the sibling-continuation
-    /// race) settles to the fallback immediately — there is no wait arm, because
-    /// the holder's claim lives as long as its terminal session.
+    /// Phase 3 of the same plan: a held worktree claim settles to the fallback
+    /// immediately — there is no wait arm, because the holder's claim lives as
+    /// long as its terminal session. Since the claim is keyed per directory, a
+    /// `Held` is a genuine conflict on one directory (a `shared_branch` checkout
+    /// another session holds), no longer a sibling continuation of the repo.
     #[test]
     fn a_held_worktree_claim_falls_through_without_waiting() {
         use crate::agent_worktree::{AllocateError, ClaimConflict};

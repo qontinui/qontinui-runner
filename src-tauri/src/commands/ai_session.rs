@@ -1482,9 +1482,10 @@ fn transcript_exists_for(working_dir: &str, cli_session_id: &str) -> bool {
 /// Closes the P0c gap: the legacy resume path never re-`acquire`d the worktree
 /// claim, orphaning it for the TTL (a peer could steal it). We derive the same
 /// stable `agent_session_id` Phase 2's drain used
-/// (`drain::stable_ai_session_id(task_run_id)`), so the re-acquire idempotently
-/// RENEWS the original claim if still within TTL, or cleanly re-takes it if the
-/// TTL expired.
+/// (`drain::stable_ai_session_id(task_run_id)`) as the claim owner token. The
+/// re-acquire allocates a FRESH worktree (coord mints a new agent id, and the
+/// `kind=worktree` claim is keyed on that worktree's path), so it takes a new
+/// claim rather than renewing the original; the original's expires with its TTL.
 ///
 /// Returns the effective working dir for the re-spawn (the worktree path when
 /// re-acquire succeeded, else `None` → caller keeps the shared cwd); any

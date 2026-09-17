@@ -3459,7 +3459,7 @@ impl TerminalSession {
                     app_handle.clone(),
                     self.id.clone(),
                     self.working_dir.clone(),
-                    self.coord_session_id(),
+                    self.coord_warn_own_session_ids(),
                     line,
                 );
             }
@@ -4075,6 +4075,24 @@ impl TerminalSession {
         if let Ok(mut slot) = self.isolated_edit_ctx.lock() {
             *slot = Some(ctx);
         }
+    }
+
+    /// Every owner-token session id a worktree claim held BY this terminal can
+    /// carry: its coord session id, and the discriminator its parked
+    /// `IsolatedEditContext` acquired its claims under (a gate continuation's is
+    /// derived from its anchor, not the coord session). The claim is keyed on
+    /// the worktree this terminal runs in, so the coord-warn lookup finds this
+    /// terminal's own claim and must recognise it as ours.
+    fn coord_warn_own_session_ids(&self) -> Vec<uuid::Uuid> {
+        let mut ids: Vec<uuid::Uuid> = self.coord_session_id().into_iter().collect();
+        if let Ok(slot) = self.isolated_edit_ctx.lock() {
+            if let Some(id) = slot.as_ref().and_then(|ctx| ctx.session_id()) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+        ids
     }
 
     /// Clone the per-session grid handle so callers can snapshot or read text.

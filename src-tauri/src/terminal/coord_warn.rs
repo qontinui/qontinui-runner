@@ -86,14 +86,15 @@ pub struct CoordWarning {
 /// observer lives inside `TerminalSession::write` (the single input funnel),
 /// which is reachable from bare OS threads — `tokio::spawn` would panic there.
 ///
-/// `our_session_id` is this terminal's coord session id (if wired); it is
-/// used to distinguish a same-machine peer (different session) from
-/// ourselves.
+/// `our_session_ids` are the owner-token session ids a claim held by this
+/// terminal can carry (its coord session id, and the discriminator its own
+/// worktree claim was acquired under); they distinguish a same-machine peer
+/// (a different session) from ourselves.
 pub fn spawn_check_and_warn(
     app_handle: AppHandle,
     terminal_id: String,
     working_dir: String,
-    our_session_id: Option<uuid::Uuid>,
+    our_session_ids: Vec<uuid::Uuid>,
     command: String,
 ) {
     tauri::async_runtime::spawn(async move {
@@ -101,7 +102,7 @@ pub fn spawn_check_and_warn(
             &app_handle,
             &terminal_id,
             &working_dir,
-            our_session_id,
+            &our_session_ids,
             &command,
         )
         .await
@@ -122,7 +123,7 @@ async fn check_and_warn(
     app_handle: &AppHandle,
     terminal_id: &str,
     working_dir: &str,
-    our_session_id: Option<uuid::Uuid>,
+    our_session_ids: &[uuid::Uuid],
     command: &str,
 ) -> Result<(), String> {
     // 1. Resolve the repo's canonical path → the coord `worktree`
@@ -180,26 +181,12 @@ async fn check_and_warn(
         .map(|s| s.to_string());
 
     // 4. Decide whether the holder is a PEER (someone else) or us.
-    //    - Foreign machine => always a peer.
-    //    - Same machine but a different coord session => a same-machine
-    //      peer (another terminal/agent on this host).
-    //    - Same machine + same session (or our session unknown but the
-    //      machine is ours with no session distinction) => it's us; no
-    //      warning.
-    let our_machine_str = our_machine_id.to_string();
-    let is_peer = if holder_machine != our_machine_str {
-        true
-    } else {
-        match (our_session_id, holder_session.as_deref()) {
-            (Some(ours), Some(theirs)) => ours.to_string() != theirs,
-            // Same machine, holder reports no session: can't prove it's a
-            // peer, so stay quiet (avoid warning on our own claim).
-            (Some(_), None) => false,
-            // We have no session id: same-machine holder is ambiguous —
-            // treat as us to avoid false positives.
-            (None, _) => false,
-        }
-    };
+    let is_peer = holder_is_peer(
+        holder_machine,
+        holder_session.as_deref(),
+        &our_machine_id.to_string(),
+        our_session_ids,
+    );
 
     if !is_peer {
         return Ok(());
@@ -219,17 +206,44 @@ async fn check_and_warn(
     Ok(())
 }
 
+/// Is the live claim holder a PEER rather than this terminal?
+///
+/// - Foreign machine → always a peer.
+/// - Same machine, holder session one of `our_session_ids` → us.
+/// - Same machine, a different holder session → a same-machine peer.
+/// - Same machine, and either side has no session to compare → treated as us,
+///   so the advisory never fires on a claim that may be our own.
+fn holder_is_peer(
+    holder_machine: &str,
+    holder_session: Option<&str>,
+    our_machine: &str,
+    our_session_ids: &[uuid::Uuid],
+) -> bool {
+    if holder_machine != our_machine {
+        return true;
+    }
+    match holder_session {
+        Some(theirs) if !our_session_ids.is_empty() => !our_session_ids
+            .iter()
+            .any(|ours| ours.to_string() == theirs),
+        _ => false,
+    }
+}
+
 /// Resolve `working_dir` to `(repo_slug, resource_key)` where
 /// `resource_key` is the canonical-path string coord stores for the
 /// `worktree` claim.
 ///
 /// Preference order:
-///   1. If `working_dir` maps to a known canonical repo (L2 helper), use
+///   1. If `working_dir` is inside a live allocated agent worktree, use that
+///      worktree's root (slug = its basename) — the directory a worktree
+///      session's claim is keyed on.
+///   2. If `working_dir` maps to a known canonical repo (L2 helper), use
 ///      that repo's canonical path (slug = repo name).
-///   2. Otherwise fall back to `git rev-parse --show-toplevel` and use the
+///   3. Otherwise fall back to `git rev-parse --show-toplevel` and use the
 ///      toplevel path as the key (slug = its basename).
 ///
-/// Both branches run the path through
+/// Every branch runs the path through
 /// [`worktree_resource_key`](crate::agent_worktree::worktree_resource_key),
 /// which is the form the claim side registers and the coord-guard's
 /// `by-resource` lookup expects (forward slashes, lowercase, no trailing
@@ -239,6 +253,18 @@ async fn check_and_warn(
 /// root comes from a setting rather than a forward-slash literal.
 fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
     let wd = Path::new(working_dir);
+    // A terminal inside an allocated agent worktree is keyed on THAT worktree —
+    // the directory its `kind=worktree` claim names (plan
+    // `2026-09-17-the-worktree-claim-is-keyed-on-the-shared-checkout-so-a-second-concurrent-session-of-a-repo-gets-no-worktree`).
+    // Checked first: the default worktree root sits under the workspace root,
+    // where the repo-slug walk below would otherwise read `qontinui-worktrees`
+    // itself as the repo.
+    if let Some(found) = allocated_worktree_key(
+        wd,
+        crate::agent_worktree::canonical_paths::allocated_worktree_for_path,
+    ) {
+        return Some(found);
+    }
     if let Some(slug) = crate::agent_worktree::canonical_paths::repo_slug_for_path(wd) {
         if let Ok(canonical) = crate::agent_worktree::canonical_paths::default_canonical_path(&slug)
         {
@@ -257,6 +283,25 @@ fn resolve_repo(working_dir: &str) -> Option<(String, String)> {
     Some((
         slug,
         crate::agent_worktree::worktree_resource_key(&toplevel),
+    ))
+}
+
+/// `(slug, resource_key)` for a `working_dir` inside a live allocated agent
+/// worktree, keyed on that worktree's root; `None` when it is not in one. The
+/// probe is injected so the keying is testable without a worktree on disk.
+fn allocated_worktree_key(
+    wd: &Path,
+    allocated: impl Fn(&Path) -> Option<PathBuf>,
+) -> Option<(String, String)> {
+    let worktree = allocated(wd)?;
+    let slug = worktree
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string();
+    Some((
+        slug,
+        crate::agent_worktree::worktree_resource_key(&worktree),
     ))
 }
 
@@ -317,6 +362,50 @@ fn read_device_id() -> Result<uuid::Uuid, String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_terminal_in_an_agent_worktree_is_keyed_on_that_worktree() {
+        let wt = PathBuf::from("/ws/qontinui-worktrees/agent-1/qontinui-runner");
+        let deep = wt.join("src-tauri/src");
+        let got = allocated_worktree_key(&deep, |_| Some(wt.clone())).unwrap();
+        assert_eq!(got.0, "qontinui-runner");
+        assert_eq!(got.1, crate::agent_worktree::worktree_resource_key(&wt));
+        assert!(allocated_worktree_key(&deep, |_| None).is_none());
+    }
+
+    #[test]
+    fn own_worktree_claim_under_a_continuation_discriminator_is_not_a_peer() {
+        let coord_session = uuid::Uuid::new_v4();
+        let claim_session = uuid::Uuid::new_v4();
+        let ours = [coord_session, claim_session];
+        // The terminal's own worktree claim carries the continuation's derived
+        // id, not its coord session id — still us.
+        assert!(!holder_is_peer(
+            "m1",
+            Some(&claim_session.to_string()),
+            "m1",
+            &ours
+        ));
+        assert!(!holder_is_peer(
+            "m1",
+            Some(&coord_session.to_string()),
+            "m1",
+            &ours
+        ));
+        // Another session on this machine is a peer; another machine always is.
+        let other = uuid::Uuid::new_v4().to_string();
+        assert!(holder_is_peer("m1", Some(&other), "m1", &ours));
+        assert!(holder_is_peer(
+            "m2",
+            Some(&claim_session.to_string()),
+            "m1",
+            &ours
+        ));
+        // Nothing to compare on this machine → stay quiet.
+        assert!(!holder_is_peer("m1", None, "m1", &ours));
+        assert!(!holder_is_peer("m1", Some(&other), "m1", &[]));
+    }
+
     use super::*;
 
     #[test]

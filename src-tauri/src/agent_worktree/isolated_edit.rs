@@ -283,58 +283,23 @@ impl IsolatedEditContext {
     /// Returns `true` if `repo` was present and released, `false` if it was
     /// not joined (idempotent no-op).
     pub async fn release_repo(&mut self, repo: &str) -> bool {
-        // Find the repo's worktree so we can compute its canonical-path
-        // claim key (the worktree's `worktree_path` is the canonical
-        // checkout for the SharedBranch case; for a real worktree it is the
-        // worktree dir, so we re-derive the canonical checkout from the repo
-        // slug to match the acquire-side key exactly).
         let Some(pos) = self.worktrees.iter().position(|w| w.repo == repo) else {
             return false;
         };
 
-        // Re-derive the canonical checkout path → resource_key the SAME way
-        // the acquire side did (`worktree_for_path` over
-        // `default_canonical_path`), so we release the byte-identical key.
-        //
-        // For a repo outside the workspace root that path depends on which
-        // candidate checkout was verified at ACQUIRE time (plan
-        // `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`),
-        // and a checkout appearing or a settings edit in between would move it.
-        // So every candidate's key is accepted, tried in order with the key the
-        // resolver gives NOW first (a context joining two repos that share a
-        // name must release the one it was asked about). For `qontinui/*` repos
-        // there is exactly one key, the same as before.
-        // A key another repo joined to THIS context currently resolves to is
-        // that repo's claim, never this one's (`acme/infra`'s layout-rule
-        // candidate is `qontinui/infra`'s real key) — whichever position the
-        // key would take below.
-        let others: Vec<String> = self
-            .worktrees
+        // The `kind=worktree` claim is keyed on the directory the row was
+        // materialized at — the agent worktree, or the canonical checkout for a
+        // `shared_branch` row, which `worktree_path` also names (plan
+        // `2026-09-17-the-worktree-claim-is-keyed-on-the-shared-checkout-so-a-second-concurrent-session-of-a-repo-gets-no-worktree`).
+        // That path is fixed for the row's life, so the key is re-derived
+        // exactly, whatever the canonical-path resolver answers now. Matching on
+        // the worktree kind as well means a coexisting phase/file_glob claim is
+        // never released here.
+        let key = super::worktree_resource_key(&self.worktrees[pos].worktree_path);
+        let found = self
+            .active_claims
             .iter()
-            .filter(|w| w.repo != repo)
-            .filter_map(|w| super::canonical_paths::default_canonical_path(&w.repo).ok())
-            .map(|p| super::worktree_resource_key(&p))
-            .collect();
-        let mut want_keys: Vec<String> = Vec::new();
-        let current = super::canonical_paths::default_canonical_path(repo).ok();
-        for p in current
-            .into_iter()
-            .chain(super::canonical_paths::canonical_path_candidates(repo))
-        {
-            let key = super::worktree_resource_key(&p);
-            if !want_keys.contains(&key) && !others.contains(&key) {
-                want_keys.push(key);
-            }
-        }
-
-        // Drop the matching worktree claim + its heartbeat. Match on the
-        // worktree kind AND a derived key (so we never release a
-        // phase/file_glob claim that happens to coexist).
-        let found = want_keys.iter().find_map(|key| {
-            self.active_claims
-                .iter()
-                .position(|c| c.kind == "worktree" && &c.resource_key == key)
-        });
+            .position(|c| c.kind == "worktree" && c.resource_key == key);
         if let Some(cpos) = found {
             let claim = self.active_claims.remove(cpos);
             // Abort the heartbeat whose resource_key matches.
@@ -369,7 +334,7 @@ impl IsolatedEditContext {
     /// claims (all claims share it). `None` for a context whose claims were
     /// acquired machine-level. Used to keep `acquire_additional`'s new claim
     /// on the same owner token as the rest of the context.
-    fn session_id(&self) -> Option<uuid::Uuid> {
+    pub(crate) fn session_id(&self) -> Option<uuid::Uuid> {
         self.active_claims.first().and_then(|c| c.agent_session_id)
     }
 }
@@ -777,9 +742,11 @@ pub async fn acquire_for_terminal(
     // otherwise have allocated, and only for the pane's OWN allocation:
     //
     //  * `intent_repo.is_some() && worktree_mode_enabled()` — the two gates the
-    //    allocate arm itself is behind. Without this the reuse ran on the
-    //    DEFAULT configuration (mode off, no intent repo), where this helper is
-    //    documented to be a no-op, and rewrote the pane's cwd.
+    //    allocate arm itself is behind. Without this the reuse ran even when
+    //    the allocate arm would not have (mode explicitly disabled, or no
+    //    intent repo declared — the mode itself is ON by default, see
+    //    `worktree_mode_enabled`), where this helper is documented to be a
+    //    no-op, and rewrote the pane's cwd.
     //  * the allocation's repo segment must equal the repo being asked for —
     //    otherwise a session standing in a `qontinui-runner` worktree that asks
     //    for `qontinui-web` was handed the runner one and the web allocation
@@ -1245,17 +1212,34 @@ mod tests {
         );
     }
 
-    /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for
-    /// `repo`, with the claim keyed on the SAME canonical-path resource_key
-    /// the acquire side derives — so `release_repo`'s key match works.
+    /// Build a `(MaterializedWorktree, worktree-kind ActiveClaim)` pair for a
+    /// `worktree` allocation of `repo`, with the claim keyed on the agent
+    /// worktree path exactly as the acquire side derives it — so
+    /// `release_repo`'s key match works.
     fn repo_fixture(repo: &str) -> (MaterializedWorktree, ActiveClaim) {
+        repo_fixture_at(repo, agent_worktree_fixture_path(repo))
+    }
+
+    /// The agent worktree a `worktree` allocation of `repo` lands at.
+    fn agent_worktree_fixture_path(repo: &str) -> std::path::PathBuf {
         let canonical = super::super::canonical_paths::default_canonical_path(repo).unwrap();
-        let key = super::super::worktree_resource_key(&canonical);
+        super::super::canonical_paths::agent_worktree_root(&canonical)
+            .join("test-agent")
+            .join(repo)
+    }
+
+    /// A joined row materialized at `worktree_path`, with the `kind=worktree`
+    /// claim the acquire side takes on that same directory.
+    fn repo_fixture_at(
+        repo: &str,
+        worktree_path: std::path::PathBuf,
+    ) -> (MaterializedWorktree, ActiveClaim) {
+        let key = super::super::worktree_resource_key(&worktree_path);
         let wt = MaterializedWorktree {
             repo: repo.to_string(),
             branch: format!("agent/test-{repo}"),
             parent_sha: "0".repeat(40),
-            worktree_path: canonical,
+            worktree_path,
             push_ref: format!("refs/agent/test-{repo}"),
         };
         let claim = ActiveClaim {
@@ -1331,8 +1315,8 @@ mod tests {
         let _amb = crate::test_env::isolated_ambient();
         // Mirrors the multi-repo acquire outcome: a context materialized for
         // [A, B] carries exactly one kind=worktree claim per repo, each keyed
-        // on that repo's canonical checkout path (the guard's by-resource
-        // form). Asserts the bookkeeping the acquire path produces without
+        // on the agent worktree that repo was materialized at (the guard's
+        // by-resource form) — never on the shared canonical checkout. Asserts the bookkeeping the acquire path produces without
         // needing a live coord.
         let (wa, ca) = repo_fixture("qontinui-runner");
         let (wb, cb) = repo_fixture("qontinui-coord");
@@ -1349,9 +1333,7 @@ mod tests {
         // to `D:/qontinui-root/...` on Windows and `$HOME/qontinui-root/...` on
         // POSIX, and `worktree_resource_key` normalizes both to the guard form.
         for repo in ["qontinui-runner", "qontinui-coord"] {
-            let expected = super::super::worktree_resource_key(
-                &super::super::canonical_paths::default_canonical_path(repo).unwrap(),
-            );
+            let expected = super::super::worktree_resource_key(&agent_worktree_fixture_path(repo));
             assert!(
                 worktree_claims.iter().any(|c| c.resource_key == expected),
                 "missing worktree claim keyed on {expected}"
@@ -1382,9 +1364,8 @@ mod tests {
         assert_eq!(ctx.active_claims.len(), 1, "one worktree claim remains");
         assert_eq!(ctx.worktrees.len(), 1);
         assert_eq!(ctx.worktrees[0].repo, "qontinui-coord");
-        let expected_coord = super::super::worktree_resource_key(
-            &super::super::canonical_paths::default_canonical_path("qontinui-coord").unwrap(),
-        );
+        let expected_coord =
+            super::super::worktree_resource_key(&agent_worktree_fixture_path("qontinui-coord"));
         assert_eq!(ctx.active_claims[0].resource_key, expected_coord);
 
         // Idempotent: releasing a repo that's no longer joined is a no-op.
@@ -1420,6 +1401,49 @@ mod tests {
 
         ctx.active_claims.clear();
         ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn release_repo_releases_a_shared_branch_rows_canonical_key() {
+        let _amb = crate::test_env::isolated_ambient();
+        // A `shared_branch` row is materialized AT the canonical checkout, so
+        // its claim is keyed there; an agent-worktree row of another repo keeps
+        // its own claim.
+        let canonical =
+            super::super::canonical_paths::default_canonical_path("qontinui-web").unwrap();
+        let (wa, ca) = repo_fixture_at("qontinui-web", canonical.clone());
+        let (wb, cb) = repo_fixture("qontinui-coord");
+        let mut ctx = IsolatedEditContext::for_test(vec![wa, wb], vec![ca, cb]);
+
+        assert!(ctx.release_repo("qontinui-web").await);
+        assert_eq!(ctx.active_claims.len(), 1);
+        assert_eq!(
+            ctx.active_claims[0].resource_key,
+            super::super::worktree_resource_key(&agent_worktree_fixture_path("qontinui-coord"))
+        );
+        assert_ne!(
+            ctx.active_claims[0].resource_key,
+            super::super::worktree_resource_key(&canonical)
+        );
+
+        ctx.active_claims.clear();
+        ctx.worktrees.clear();
+    }
+
+    #[tokio::test]
+    async fn release_repo_keys_on_the_rows_own_directory() {
+        let _amb = crate::test_env::isolated_ambient();
+        // The key is the row's own directory, not something re-resolved from the
+        // repo slug, so a context whose claim names a worktree that the resolver
+        // would no longer derive (a settings edit, a checkout moving) still
+        // releases exactly that claim.
+        let moved =
+            std::path::PathBuf::from("/elsewhere/qontinui-worktrees/agent-x/qontinui-runner");
+        let (wa, ca) = repo_fixture_at("qontinui-runner", moved.clone());
+        let mut ctx = IsolatedEditContext::for_test(vec![wa], vec![ca]);
+        assert!(ctx.release_repo("qontinui-runner").await);
+        assert!(ctx.active_claims.is_empty());
+        assert!(ctx.worktrees.is_empty());
     }
 
     #[tokio::test]
@@ -1494,7 +1518,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_none_when_flag_off() {
-        // Mirrors the `flag_off_by_default` test in `mod.rs` — if any
+        // Companion to the `flag_on_by_default` test in `mod.rs` — if any
         // other test has flipped `QONTINUI_AGENT_WORKTREE_MODE`, this
         // assertion is moot (the env mutation is global). Skip in that
         // case to keep the suite parallel-safe.
@@ -1522,8 +1546,7 @@ mod tests {
     /// derive both sides from the same helpers (platform-portable; never a
     /// hardcoded `d:/qontinui-root/...` literal).
     fn expected_env_segment(repo: &str) -> String {
-        let canonical = super::super::canonical_paths::default_canonical_path(repo).unwrap();
-        format!("{}={}", repo, canonical.display())
+        format!("{}={}", repo, agent_worktree_fixture_path(repo).display())
     }
 
     #[test]
@@ -1545,7 +1568,7 @@ mod tests {
         );
         assert_eq!(value, expected);
 
-        // Every repo is represented, with its canonical path.
+        // Every repo is represented, with its worktree path.
         for repo in ["qontinui-runner", "qontinui-coord"] {
             assert!(
                 value.contains(&expected_env_segment(repo)),
@@ -1575,8 +1598,7 @@ mod tests {
 
         let args = claude_add_dir_args(&worktrees);
 
-        let coord_path = super::super::canonical_paths::default_canonical_path("qontinui-coord")
-            .unwrap()
+        let coord_path = agent_worktree_fixture_path("qontinui-coord")
             .display()
             .to_string();
         assert_eq!(
