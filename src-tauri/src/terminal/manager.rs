@@ -309,6 +309,9 @@ impl TerminalManager {
             .is_some_and(command_implies_bypass_permissions);
 
         let emitter = app_handle.clone();
+        // W-B: taken BEFORE the spawn, so the spawn-default stamp below can tell
+        // a record this spawn created from one a resume/restore re-opened.
+        let spawn_started_ms = chrono::Utc::now().timestamp_millis();
         let session = TerminalSession::spawn(
             id.clone(),
             title,
@@ -373,6 +376,21 @@ impl TerminalManager {
                         ..Default::default()
                     },
                 );
+                // W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-
+                // coord-credential): the device default the identity seam read
+                // for THIS spawn, made durable so a restart compares a restored
+                // tenant-less session against it rather than against whatever
+                // the default is at restore. Set-once, and only onto a record
+                // this spawn created.
+                if let Some(spawn_default) =
+                    crate::coord_mcp::terminal_spawn_default_tenant(&info.id)
+                {
+                    store.record_spawn_device_default(
+                        &info.id,
+                        spawn_default.map(|t| t.to_string()),
+                        spawn_started_ms,
+                    );
+                }
             }
         }
 

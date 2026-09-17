@@ -52,11 +52,15 @@ function tenancy(overrides: {
   credentialStatus?: "resolved" | "unknown";
   credentialReason?: string | null;
   diverged: boolean;
+  divergence?: SessionTenancy["divergence"];
+  spawnDefault?: { status: string; tenantId?: string | null; reason?: string | null };
 }): SessionTenancy {
   return {
     row: {
       tenantId: overrides.row ?? null,
-      spawnDeviceDefaultTenantId: null,
+      spawnDeviceDefaultTenantId: overrides.spawnDefault?.tenantId ?? null,
+      spawnDeviceDefaultStatus: overrides.spawnDefault?.status ?? "unknown",
+      spawnDeviceDefaultReason: overrides.spawnDefault?.reason ?? "not_recorded",
       currentDeviceDefaultTenantId: null,
     },
     dataPlane: {
@@ -72,6 +76,7 @@ function tenancy(overrides: {
       posture: { status: "unknown", value: null, canAnswer: null, reason: "no_posture_published" },
     },
     diverged: overrides.diverged,
+    divergence: overrides.divergence ?? (overrides.diverged ? "diverged" : "agree"),
   };
 }
 
@@ -123,6 +128,38 @@ describe("tenantBadgeLabel — the session's tenancy (plan 2026-09-10 P0)", () =
       tenancy({ row: B, dataPlane: B, credential: B, diverged: false }),
     );
     expect(label).toMatchObject({ text: "91ffaa20", diverged: false, credentialUnknown: false });
+  });
+
+  it("names an unrecorded spawn default as not recorded, never as a device default (W-B)", () => {
+    const label = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({ credential: A, dataPlane: B, diverged: true }),
+    );
+    expect(label?.title).toContain("device default at spawn not recorded: not_recorded");
+    const recorded = tenantBadgeLabel(
+      undefined,
+      true,
+      tenancy({
+        credential: A,
+        dataPlane: B,
+        diverged: true,
+        spawnDefault: { status: "recorded", tenantId: B, reason: null },
+      }),
+    );
+    expect(recorded?.title).toContain(`device default at spawn: ${B}`);
+  });
+
+  it("does not present an unknown comparison as confirmed agreement (W-B)", () => {
+    const label = tenantBadgeLabel(
+      B,
+      true,
+      tenancy({ row: B, credential: B, diverged: false, divergence: "unknown" }),
+    );
+    expect(label?.diverged).toBe(false);
+    expect(label?.title).toContain("could not be compared");
+    const agree = tenantBadgeLabel(B, true, tenancy({ row: B, credential: B, diverged: false }));
+    expect(agree?.title).not.toContain("could not be compared");
   });
 
   it("stays hidden on a single-tenant device even when the halves disagree (D12)", () => {

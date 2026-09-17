@@ -11512,6 +11512,7 @@ mod self_id_chain_tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -15325,23 +15326,38 @@ mod coord_provision_session_gate_tests {
         };
 
         // A malformed tenant is a 400, never dropped into a machine-pin mint.
-        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": "not-a-uuid"}), Some(23_950));
+        let resp = post(
+            serde_json::json!({"cwd": cwd, "tenant_id": "not-a-uuid"}),
+            Some(23_950),
+        );
         assert_eq!(resp.status(), 400);
-        assert_eq!(body_json(resp).await["code"], "COORD_MCP_PROVISION_INVALID_TENANT");
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_INVALID_TENANT"
+        );
 
         // An unpaired tenant is a typed 422 naming the pairing heal.
         let unpaired = uuid::Uuid::from_u128(0xC3);
-        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": unpaired}), Some(23_950));
+        let resp = post(
+            serde_json::json!({"cwd": cwd, "tenant_id": unpaired}),
+            Some(23_950),
+        );
         assert_eq!(resp.status(), 422);
         let v = body_json(resp).await;
         assert_eq!(v["code"], "COORD_MCP_PROVISION_TENANT_NOT_PAIRED");
         assert!(
-            v["error"].as_str().unwrap_or_default().contains("device pair --tenant-id"),
+            v["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("device pair --tenant-id"),
             "{v}"
         );
 
         // A paired tenant mints the http document.
-        let resp = post(serde_json::json!({"cwd": cwd, "tenant_id": tenant_b}), Some(23_950));
+        let resp = post(
+            serde_json::json!({"cwd": cwd, "tenant_id": tenant_b}),
+            Some(23_950),
+        );
         assert_eq!(resp.status(), 200);
         let doc = body_json(resp).await;
         assert_eq!(
@@ -15360,7 +15376,10 @@ mod coord_provision_session_gate_tests {
         // ...and the unresolvable port keeps its 503 for a tenant-less body.
         let resp = post(serde_json::json!({"cwd": cwd}), None);
         assert_eq!(resp.status(), 503);
-        assert_eq!(body_json(resp).await["code"], "COORD_MCP_PROVISION_PORT_UNRESOLVABLE");
+        assert_eq!(
+            body_json(resp).await["code"],
+            "COORD_MCP_PROVISION_PORT_UNRESOLVABLE"
+        );
     }
 
     /// The two CSP rules a substring search gets wrong. Both were live defects

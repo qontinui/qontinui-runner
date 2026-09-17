@@ -1882,6 +1882,7 @@ mod tests {
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         let finished_at = store.set_finished(csid, true, None).unwrap().finished_at;
@@ -1975,6 +1976,7 @@ mod tests {
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         let coord_id = reg
