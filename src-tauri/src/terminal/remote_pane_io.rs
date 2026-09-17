@@ -770,6 +770,31 @@ pub(crate) mod tests {
         assert_eq!(detach_frames(&sink.frames.lock().unwrap()), 1);
     }
 
+    /// The lock is held across the queue attempt, so racing closers still
+    /// queue exactly one detach.
+    #[test]
+    fn concurrent_kill_and_release_queue_exactly_one_detach() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = Arc::new(pane(&sink, AttachedRing::default()));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let p = pane.clone();
+                thread::spawn(move || {
+                    if i % 2 == 0 {
+                        let _ = p.kill(Duration::from_millis(10));
+                    } else {
+                        let _ = p.release(Duration::from_millis(10));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+        assert_eq!(detach_frames(&sink.frames()), 1);
+    }
+
     /// Both attempts failing leaves the outcome `Failed` with the last
     /// error — the state a close must report as "not released".
     #[test]
