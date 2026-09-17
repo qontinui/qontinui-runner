@@ -264,6 +264,9 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, {"success": True, "data": token(asked or mode("default_tenant"))})
             return
         if self.path == "/ui-bridge/invoke/get_access_token_for_websocket":
+            if mode("websocket", "live") == "absent":
+                self._send(404, {"error": "not found"})
+                return
             self._send(200, {"success": True, "data": token(mode("default_tenant"))})
             return
         if self.path == "/mcp":
@@ -611,15 +614,18 @@ else
   echo "== (c1b) the ONLY barrier is the websocket answer's claim check (coord would accept any bearer)"
   # Runner A: its get_coord_device_token route is absent, so the cascade falls to
   # get_access_token_for_websocket, which never takes a tenant and returns A's
-  # default slot - tenant A. The sibling B serves no mint of any kind. coord is a
-  # stub whose /mcp accepts every bearer, so a skipped claim check would go LIVE.
+  # default slot - tenant A. The sibling B serves no mint of any kind: both mint
+  # routes AND its websocket route 404, so the refusal asserted below can only be
+  # A's answer. coord is a stub whose /mcp accepts every bearer, so a skipped
+  # claim check would go LIVE.
   setmode runner absent; setmode nonce_runner absent; setmode census row; setmode row_tenant "$TB"
   printf 'absent' > "$MODE_DIR_B/runner"; printf 'absent' > "$MODE_DIR_B/nonce_runner"
+  printf 'absent' > "$MODE_DIR_B/websocket"
   mkdir -p "$ROOT/sibling-b"
   printf '{"mcpServers":{"coord-mcp":{"type":"http","url":"%s/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"stale"}}}}\n' "$STUB_B" > "$ROOT/sibling-b/.mcp.json"
   run_case - "$STUB" QONTINUI_RUNNER_API_PORT="$PORT" QONTINUI_TERMINAL_ID=term-1 \
     COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
-  rm -rf "$ROOT/sibling-b"
+  rm -rf "$ROOT/sibling-b"; rm -f "$MODE_DIR_B/websocket"
   assert_has   "(c1b) the websocket answer is refused by its claim" "source=runner-invoke:get_access_token_for_websocket -> RUNNER_MINT_WRONG_TENANT" "$ERR"
   assert_has   "(c1b) and the reason names the door, not a runner build" "get_access_token_for_websocket never takes a tenant" "$ERR"
   assert_lacks "(c1b) never LIVE" "VERDICT: LIVE" "$OUT"

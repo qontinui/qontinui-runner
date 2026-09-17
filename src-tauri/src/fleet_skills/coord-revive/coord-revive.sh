@@ -1006,6 +1006,9 @@ DOORS_PROBED=0
 LIVE_FILE=""
 LIVE_URL=""
 SEEN=""
+# A suffix probe_door appends to its LIVE log line. Set around the nonce door's
+# pre-tenant-check probe so that line reads as a transport probe, not a verdict.
+PROBE_DOOR_TAG=""
 
 # The verdict probe_door actually won with. `live_exit` prints it, so a
 # qualified live verdict cannot reach the reader spelled as a bare LIVE.
