@@ -66,6 +66,9 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("GET", "/health", "health"),
     ("GET", "/ui-bridge/ws", "ui_bridge_ws"),
     ("POST", "/ui-bridge/apps/register", "register"),
+    ("GET", "/backup", "backup"),
+    ("GET", "/ui-bridge/control/elements", "elements"),
+    ("POST", "/shell-commands/{id}/run", "shell_run"),
 ];
 
 fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>) -> Harness {
@@ -139,6 +142,18 @@ fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>
             }
         };
     }
+    // `/graphql/ws` is a `route_service` in `create_router`; mirror that shape.
+    let c = calls.clone();
+    let router = router.route_service(
+        "/graphql/ws",
+        tower::service_fn(move |_req: HttpRequest<Body>| {
+            let c = c.clone();
+            async move {
+                c.hit("graphql_ws");
+                Ok::<_, std::convert::Infallible>(axum::response::Response::new(Body::empty()))
+            }
+        }),
+    );
     let router = apply(router, guard.clone());
     Harness {
         guard,
@@ -328,7 +343,13 @@ async fn p1_05_simple_request_close_refused_nothing_enqueued() {
 /// P1-6: the autonomy regression guard — no Origin, loopback Host → as today.
 #[tokio::test]
 async fn p1_06_agent_request_without_origin_unchanged() {
-    for policy in ["enforce", "enforce-foreign", "shadow", "off"] {
+    for policy in [
+        "enforce",
+        "enforce-foreign",
+        "enforce-doors",
+        "shadow",
+        "off",
+    ] {
         let h = harness(policy);
         let (status, _, body) = send(
             &h,
@@ -804,6 +825,20 @@ async fn p2_09_foreign_refusal_opaque_and_health_tuples_withheld() {
     let v: Value = serde_json::from_str(&body).unwrap();
     assert!(v["originGuard"].get("recent").is_none(), "{v}");
     assert!(!body.contains("evil.example"));
+    for origin in [WEB, "chrome-extension://abcdefghijklmnop"] {
+        let (_, _, body) = send(
+            &h,
+            req(
+                "GET",
+                "/health",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert!(v["originGuard"].get("recent").is_none(), "{origin}: {v}");
+    }
     let (_, _, body) = send(
         &h,
         req(
@@ -820,37 +855,275 @@ async fn p2_09_foreign_refusal_opaque_and_health_tuples_withheld() {
     );
 }
 
-/// The shipped default: Foreign enforced, Trusted shadowed.
+/// The shipped default `enforce-doors`: doors refused to every browser class
+/// (Trusted grace logged), non-door allowlists shadowed for every class.
 #[tokio::test]
-async fn default_policy_enforces_foreign_and_shadows_trusted() {
-    assert_eq!(RoutePolicy::parse(None), RoutePolicy::EnforceForeign);
+async fn default_policy_enforces_doors_and_shadows_allowlists() {
+    assert_eq!(RoutePolicy::parse(None), RoutePolicy::EnforceDoors);
     assert_eq!(RoutePolicy::parse(Some("bogus")), DEFAULT_ROUTE_POLICY);
     assert_eq!(RoutePolicy::parse(Some(" ENFORCE ")), RoutePolicy::Enforce);
+    assert_eq!(
+        RoutePolicy::parse(Some("enforce-foreign")),
+        RoutePolicy::EnforceForeign
+    );
     let h = harness("");
-    assert_eq!(h.guard.route_policy(), RoutePolicy::EnforceForeign);
+    assert_eq!(h.guard.route_policy(), RoutePolicy::EnforceDoors);
+    let send_o = |method: &'static str, uri: &'static str, origin: &'static str| {
+        req(method, uri, &[("host", &host(&h)), ("origin", origin)], "")
+    };
+    // Foreign, non-door, off-allowlist: shadowed (admitted, metered).
+    let (status, _, _) = send(&h, send_o("GET", "/sessions", EVIL)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "foreign allowlist shadowed by default"
+    );
+    assert_eq!(h.guard.health_json(None)["shadowWouldRefuse"]["foreign"], 1);
+    // Foreign door: refused.
+    let (status, _, _) = send(&h, send_o("POST", "/ui-bridge/invoke/x", EVIL)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Trusted grace door: logged, not refused.
+    let (status, _, _) = send(&h, send_o("POST", "/shell-commands/abc/run", WEB)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "trusted grace door admitted by default"
+    );
+    assert_eq!(h.calls.get("shell_run"), 1);
+    // ...but the same grace door from Foreign is refused.
+    let (status, _, _) = send(&h, send_o("POST", "/shell-commands/abc/run", EVIL)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // Trusted non-grace door: refused.
+    let (status, _, body) = send(&h, send_o("POST", "/ui-bridge/invoke/x", WEB)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // Trusted off-allowlist non-door: shadowed.
+    let (status, _, _) = send(&h, send_o("POST", "/scheduler/reconcile-now", WEB)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.guard.health_json(None)["shadowWouldRefuse"]["trusted"], 2);
+    // Grace does NOT apply under an explicit stricter policy.
+    for policy in ["enforce", "enforce-foreign", "shadow", "off"] {
+        let h2 = harness(policy);
+        let (status, _, _) = send(
+            &h2,
+            req(
+                "POST",
+                "/shell-commands/abc/run",
+                &[("host", &host(&h2)), ("origin", WEB)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{policy}");
+    }
+}
+
+/// S2: the element inventory is not readable by any web page origin, in any
+/// policy; the webview and the extension's own pages keep it.
+#[tokio::test]
+async fn elements_inventory_extension_and_first_party_only() {
+    for policy in [
+        "enforce",
+        "enforce-foreign",
+        "enforce-doors",
+        "shadow",
+        "off",
+    ] {
+        let h = harness(policy);
+        for (origin, want) in [
+            ("https://github.com", StatusCode::FORBIDDEN),
+            (WEB, StatusCode::FORBIDDEN),
+            ("chrome-extension://abcdefghijklmnop", StatusCode::OK),
+            ("tauri://localhost", StatusCode::OK),
+        ] {
+            let (status, _, body) = send(
+                &h,
+                req(
+                    "GET",
+                    "/ui-bridge/control/elements",
+                    &[("host", &host(&h)), ("origin", origin)],
+                    "",
+                ),
+            )
+            .await;
+            assert_eq!(status, want, "{policy} {origin}: {body}");
+        }
+        let (status, _, _) = send(
+            &h,
+            req(
+                "GET",
+                "/ui-bridge/control/elements",
+                &[("host", &host(&h))],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "non-browser keeps it");
+        assert_eq!(h.calls.get("elements"), 3, "{policy}");
+    }
+}
+
+/// S6: `Origin: null` (sandboxed documents, the sandboxed DOM capture) at a door.
+#[tokio::test]
+async fn null_origin_refused_at_door() {
+    let h = harness("enforce-doors");
+    let (status, _, body) = send(
+        &h,
+        req(
+            "POST",
+            "/ui-bridge/invoke/x",
+            &[("host", &host(&h)), ("origin", "null")],
+            "{}",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(code(&body).as_deref(), Some(CODE_CROSS_ORIGIN_REFUSED));
+    assert_eq!(h.calls.get("token"), 0);
+}
+
+/// S6: HEAD is judged as the GET it runs, so a GET-only door refuses it.
+#[tokio::test]
+async fn head_on_get_only_door_refused() {
+    assert!(is_credential_door("GET", "/backup"));
+    assert!(!is_credential_door("POST", "/backup"));
+    let h = harness("enforce-doors");
     let (status, _, _) = send(
         &h,
         req(
-            "GET",
-            "/sessions",
+            "HEAD",
+            "/backup",
             &[("host", &host(&h)), ("origin", EVIL)],
             "",
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "foreign enforced by default");
-    let (status, _, _) = send(
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(h.calls.get("backup"), 0);
+}
+
+/// S6: `Sec-Fetch-Site: same-site` with no Origin (a localhost:3001 page's
+/// `<img src>`) is a browser, classed Foreign.
+#[tokio::test]
+async fn same_site_fetch_metadata_is_foreign() {
+    let h = harness("enforce-doors");
+    let (status, _, body) = send(
         &h,
         req(
-            "POST",
-            "/scheduler/reconcile-now",
-            &[("host", &host(&h)), ("origin", WEB)],
+            "GET",
+            "/files/read",
+            &[("host", &host(&h)), ("sec-fetch-site", "same-site")],
             "",
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "trusted shadowed by default");
-    assert_eq!(h.guard.health_json(None)["shadowWouldRefuse"]["trusted"], 1);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["context"]["class"], "foreign");
+    assert_eq!(h.calls.get("files_read"), 0);
+}
+
+/// S6: the `/graphql/ws` `route_service` is guarded like a `.route`.
+#[tokio::test]
+async fn graphql_ws_route_service_guarded() {
+    let h = harness("enforce-doors");
+    let (status, _, _) = send(
+        &h,
+        req(
+            "GET",
+            "/graphql/ws",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(h.calls.get("graphql_ws"), 0);
+    let (status, _, _) = send(&h, req("GET", "/graphql/ws", &[("host", &host(&h))], "")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(h.calls.get("graphql_ws"), 1);
+}
+
+/// S5: the Android emulator's host-loopback aliases on the bound port.
+#[tokio::test]
+async fn emulator_ip_literal_hosts_admitted_on_bound_port() {
+    let h = harness("enforce-doors");
+    let port = h.port.load(Ordering::Relaxed);
+    for (hv, want) in [
+        (format!("10.0.2.2:{port}"), StatusCode::OK),
+        (format!("10.0.3.2:{port}"), StatusCode::OK),
+        (
+            format!("10.0.2.2:{}", port.wrapping_add(1)),
+            StatusCode::FORBIDDEN,
+        ),
+        (format!("10.0.2.3:{port}"), StatusCode::FORBIDDEN),
+    ] {
+        let (status, _, _) = send(&h, req("GET", "/sessions", &[("host", &hv)], "")).await;
+        assert_eq!(status, want, "{hv}");
+    }
+}
+
+/// S1: routes that launder a browser request (server-side fetch of a caller
+/// URL) or read a caller-named path are doors; hook mutation/test too.
+#[test]
+fn second_review_doors() {
+    for (m, p) in [
+        ("POST", "/awas/execute"),
+        ("POST", "/contexts/{scope}/from-file"),
+        ("POST", "/skills/sync/pull"),
+        ("POST", "/configs/parse"),
+        ("POST", "/code-semantics/symbol-lookup"),
+        ("GET", "/state-explorer/{run_id}"),
+        ("GET", "/hooks/{id}"),
+        ("PUT", "/hooks/{id}"),
+        ("POST", "/hooks/{id}/test"),
+    ] {
+        assert!(is_credential_door(m, p), "{m} {p}");
+    }
+    // A placeholder in a door entry never swallows a literal sibling route.
+    assert!(!is_credential_door("GET", "/state-explorer/history"));
+}
+
+/// Grace tripwire: every graced route is a door and a registered route, and
+/// nothing is both extension-only and allowlisted or a door.
+#[test]
+fn grace_and_extension_only_lists_are_well_formed() {
+    let registered = crate::mcp::relay_path_policy::tests::registered_routes();
+    let reg = |m: &str, p: &str| {
+        registered
+            .iter()
+            .any(|(rm, rp)| rp == p && (rm == m || rm == "ANY"))
+    };
+    for (m, p) in TRUSTED_DOOR_GRACE {
+        assert!(
+            is_credential_door(m, p),
+            "grace entry is not a door: {m} {p}"
+        );
+        assert!(reg(m, p), "grace entry not registered: {m} {p}");
+    }
+    for (m, p) in EXTENSION_ONLY_ROUTES {
+        assert!(reg(m, p), "extension-only entry not registered: {m} {p}");
+        assert!(!is_credential_door(m, p));
+        assert!(!FOREIGN_ROUTES.contains(&(*m, *p)) && !TRUSTED_ROUTES.contains(&(*m, *p)));
+    }
+}
+
+/// S6 tripwire: nothing is routed after `origin_guard::apply` in
+/// `create_router` (it would bypass the guard). Proven on synthetic source.
+#[test]
+fn no_route_registered_after_apply() {
+    let synthetic_bad = "pub fn create_router() -> Router {\n    let r = base.route(\"/a\", get(h));\n    let r = crate::mcp::origin_guard::apply(r, g)\n        .layer(x);\n    r.route(\"/late\", get(h))\n}\n";
+    assert_eq!(registrations_after_apply(synthetic_bad).len(), 1);
+    let synthetic_ok = "pub fn create_router() -> Router {\n    let r = base.route(\"/a\", get(h)).fallback(nf);\n    crate::mcp::origin_guard::apply(r, g).layer(x).with_state(s)\n}\n";
+    assert!(registrations_after_apply(synthetic_ok).is_empty());
+    let src = std::fs::read_to_string(
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+    )
+    .unwrap();
+    let hits = registrations_after_apply(&src);
+    assert!(
+        hits.is_empty(),
+        "routes registered after origin_guard::apply: {hits:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +1181,9 @@ fn p3_settings_field_round_trips() {
 fn probe_patterns_are_real_routes() {
     let registered = crate::mcp::relay_path_policy::tests::registered_routes();
     for (m, p, _) in PROBES {
+        if *p == "/graphql/ws" {
+            continue;
+        }
         assert!(
             registered
                 .iter()
@@ -1134,6 +1410,12 @@ fn canonical_allowed_origin_validates() {
     assert!(canonical_allowed_origin("http://localhost:5173/app").is_err());
     assert!(canonical_allowed_origin("localhost:5173").is_err());
     assert!(canonical_allowed_origin("tauri://localhost").is_err());
+    assert!(canonical_allowed_origin("http://tauri.localhost").is_err());
+    assert_eq!(
+        canonical_allowed_origin("http://mytauri.dev:8080").unwrap(),
+        "http://mytauri.dev:8080",
+        "only the exact webview origins are refused"
+    );
 }
 
 /// A rathole-tunnelled request keeps the tunnel server's Host; it is admitted

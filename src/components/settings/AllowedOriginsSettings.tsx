@@ -4,9 +4,9 @@
  * Extra browser origins the runner's loopback API admits as "trusted"
  * (plan 2026-09-17-runner-loopback-api-accepts-any-origin, Phase 3).
  *
- * A trusted origin reaches only the guard's route allowlist and never a
- * credential door — but that allowlist includes features that execute
- * workflows, checks and hooks. Agents, scripts and MCP clients send no Origin
+ * Trusted = local trust for non-door routes (which include running workflows
+ * and checks), never credential doors — except the guard's named transitional
+ * TRUSTED_DOOR_GRACE, logged rather than refused under the default policy. Agents, scripts and MCP clients send no Origin
  * and need no entry here. Saved values are live within ~2 s — no restart.
  */
 
@@ -117,7 +117,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     <div className="space-y-4 mt-8" data-ui-bridge-content="allowed-origins-settings">
       <SectionHeader
         title="Allowed Browser Origins"
-        description={`Web pages at these origins may call this runner's API on the trusted route allowlist. That allowlist never includes credential or file-read routes, but it does include features that run workflows, checks and hooks, so add only origins served by software you trust as much as the runner itself. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
+        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. They never get credential routes (secrets, file reads, server-side requests, command execution); a short transitional list the web dev frontend still uses is logged rather than refused for now. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
         icon={<Globe className="w-6 h-6" />}
       />
       <div className="space-y-3 rounded-lg bg-card/50 p-4">

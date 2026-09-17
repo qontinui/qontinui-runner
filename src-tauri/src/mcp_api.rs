@@ -10578,8 +10578,16 @@ pub fn create_router(
     //   [CatchPanicLayer]              ← outermost: panics → 500 JSON
     //     [envelope_audit_middleware]  ← debug-only: REPORTS non-JSON errors
     //       [envelope_rewrite_middleware] ← rewrites 4xx/5xx text/plain → JSON
-    //         [TraceLayer, CORS, BodyLimit, ...]
-    //           [handlers]
+    //         [Extension(graphql), RequestBodyLimit]
+    //           [origin_guard]             ← Host gate + origin policy (mcp::origin_guard)
+    //             [CORS]                   ← exact-origin echo, never `*`
+    //               [TraceLayer, trace_propagation, pg_degraded_guard]
+    //                 [handlers]
+    //
+    // NOTHING may be routed, merged, nested or given a fallback after
+    // `origin_guard::apply` below: `Router::layer` wraps only the routes that
+    // exist when it is called, so a later route would bypass the guard.
+    // Pinned by `origin_guard::tests::no_route_registered_after_apply`.
     //
     // The panic layer must remain outermost so it can catch panics that
     // originate in any layer below, including the audit and envelope layers.
