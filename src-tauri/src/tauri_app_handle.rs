@@ -28,3 +28,27 @@ pub fn set(handle: AppHandle) {
 pub fn current() -> Option<AppHandle> {
     APP_HANDLE.get().cloned()
 }
+
+/// Set once the Tauri runtime a VISIBLE continuation needs is fully in place:
+/// the `AppHandle` above AND the managed `SessionRegistry` a terminal session
+/// registers into. The handle alone is not enough — `.setup()` stores it
+/// before it manages the registry, and a dispatch that lands between the two
+/// fails with `SessionRegistry state not managed`.
+///
+/// Plan
+/// `2026-09-17-a-gate-continuation-delivered-before-the-runner-finishes-booting-is-consumed-as-spawn-failed-and-never-retried`:
+/// the continuation runtime starts before `.setup()`, so a boot delivers the
+/// pending backlog while this is still unset. `agent_runtime` defers such a
+/// dispatch UNCLAIMED instead of claiming it and recording `spawn_failed`.
+static RUNTIME_READY: OnceLock<()> = OnceLock::new();
+
+/// Mark the visible-terminal runtime ready. Idempotent. Called from
+/// `main.rs::setup()` immediately after `SessionRegistry` is managed.
+pub fn mark_runtime_ready() {
+    let _ = RUNTIME_READY.set(());
+}
+
+/// Whether [`mark_runtime_ready`] has run in this process.
+pub fn runtime_ready() -> bool {
+    RUNTIME_READY.get().is_some()
+}
