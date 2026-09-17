@@ -726,10 +726,20 @@ impl RoutePolicy {
     }
 }
 
-/// Inserted into every admitted request's extensions, so a handler (`/health`)
-/// can tailor what it reveals to the class of its caller.
-#[derive(Debug, Clone, Copy)]
-pub struct RequesterClass(pub OriginClass);
+/// Inserted into every admitted request's extensions (including under the
+/// `off` kill switch, where [`OriginGuard::decide`] still classifies), so a
+/// handler can tailor what it reveals to its caller (`/health`) and the UI
+/// Bridge relays can bind a registration to WHO made it (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`).
+///
+/// `origin` is the parsed `Origin` header: `None` when the header is absent,
+/// unparseable or `null` — for a browser class that is an opaque origin, for
+/// [`OriginClass::NonBrowser`] it is the normal case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequesterPrincipal {
+    pub class: OriginClass,
+    pub origin: Option<NormOrigin>,
+}
 
 /// What the CORS layer may grant this request. Set by the guard; the CORS
 /// layer sits inside it and reads this instead of re-classifying.
@@ -1195,7 +1205,11 @@ async fn origin_guard_middleware(
                 allow_origin: true,
                 private_network: matches!(d.class, OriginClass::FirstParty | OriginClass::Trusted),
             });
-            req.extensions_mut().insert(RequesterClass(d.class));
+            let origin = d.origin.as_deref().and_then(NormOrigin::parse);
+            req.extensions_mut().insert(RequesterPrincipal {
+                class: d.class,
+                origin,
+            });
             next.run(req).await
         }
         Verdict::RefuseHost => {
@@ -1353,14 +1367,30 @@ fn split_list(raw: Option<&str>) -> Vec<String> {
 /// An origin compared on scheme + host + port, the way
 /// `commands/web_integration.rs` compares origins.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NormOrigin {
+pub struct NormOrigin {
     scheme: String,
     host: String,
     port: Option<u16>,
 }
 
 impl NormOrigin {
-    fn parse(raw: &str) -> Option<Self> {
+    /// Scheme, lowercased.
+    pub fn scheme(&self) -> &str {
+        &self.scheme
+    }
+
+    /// Host, lowercased (an IPv6 literal keeps its brackets).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Port, with the scheme's default made explicit when it has one.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// Parse an `Origin` value. `None` for empty, `null` or unparseable input.
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim().trim_end_matches('/');
         if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
             return None;
