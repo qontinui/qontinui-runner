@@ -198,7 +198,9 @@ pub(crate) fn explain_relay_timeout(
             "{head}. Coord could not establish the target's runner build ({}). A runner older \
              than {} ignores this request without answering, which looks exactly like this.",
             tr.reason.as_deref().unwrap_or("no reason given"),
-            tr.required_sha.as_deref().unwrap_or("the remote-terminal handler"),
+            tr.required_sha
+                .as_deref()
+                .unwrap_or("the remote-terminal handler"),
         ),
         _ => format!(
             "{head}. Coord did not report the target's runner build. The target may be offline, \
@@ -307,7 +309,9 @@ pub(crate) fn format_mint_refusal(status: u16, body: &str, url: &str) -> String 
         .and_then(|v| v.as_str())
         .map(|h| format!("{h} "))
         .unwrap_or_default();
-    format!("remote_attach:{code}{reason}: {hint}({unliftable}coord answered {status} for POST {url})")
+    format!(
+        "remote_attach:{code}{reason}: {hint}({unliftable}coord answered {status} for POST {url})"
+    )
 }
 
 fn short_id(id: &str) -> String {
@@ -437,7 +441,10 @@ pub(crate) async fn open_remote_tab(
             if e.code == "timeout" {
                 e.message = explain_relay_timeout(
                     "remote_terminal_attached",
-                    minted.target_device_id.as_deref().unwrap_or(device_id.trim()),
+                    minted
+                        .target_device_id
+                        .as_deref()
+                        .unwrap_or(device_id.trim()),
                     minted.target_runner.as_ref(),
                     ATTACH_TIMEOUT.as_secs(),
                 );
@@ -879,7 +886,11 @@ mod relay_timeout_tests {
         );
         // The existing reason arm is unchanged.
         assert_eq!(
-            super::format_mint_refusal(403, r#"{"error":"attach_forbidden","reason":"preference_off"}"#, "u"),
+            super::format_mint_refusal(
+                403,
+                r#"{"error":"attach_forbidden","reason":"preference_off"}"#,
+                "u"
+            ),
             "remote_attach:attach_forbidden:preference_off: (coord answered 403 for POST u)"
         );
         // A reason the picker's `[a-z_]+` cannot lift is not folded into the code.
@@ -888,7 +899,8 @@ mod relay_timeout_tests {
             "remote_attach:x: (reason: sha-3472fc6a; coord answered 409 for POST u)"
         );
         // A non-JSON body still yields a typed code.
-        assert!(super::format_mint_refusal(502, "<html>", "u").starts_with("remote_attach:coord_error: "));
+        assert!(super::format_mint_refusal(502, "<html>", "u")
+            .starts_with("remote_attach:coord_error: "));
     }
 
     #[test]

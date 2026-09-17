@@ -2243,13 +2243,18 @@ impl RemoteAttachClient {
         // discarded by the next connection's `discard_backlog`, so waiting out
         // the timeout would only end in blaming the target for a request that
         // never left this machine.
-        if !self.outbound_pump_state().0 {
-            return Err(relay_not_connected("attach"));
-        }
+        //
+        // The waiter is registered BEFORE the check: the pump lock is always
+        // released before `on_relay_disconnected` drains `pending`, so either
+        // that drain settles this waiter or this check sees the pump unheld.
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
+        }
+        if !self.outbound_pump_state().0 {
+            self.take_pending(&request_id);
+            return Err(relay_not_connected("attach"));
         }
         let frame = json!({
             "type": "remote_terminal_attach",
@@ -2314,13 +2319,15 @@ impl RemoteAttachClient {
         timeout: Duration,
     ) -> Result<CreatedReply, AttachError> {
         // See `attach`: an unheld pump means the frame would never be sent.
-        if !self.outbound_pump_state().0 {
-            return Err(relay_not_connected("create"));
-        }
+        // Registered before the check, for the reason `attach` gives.
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending_create.lock() {
             pending.insert(request_id.clone(), tx);
+        }
+        if !self.outbound_pump_state().0 {
+            self.take_pending_create(&request_id);
+            return Err(relay_not_connected("create"));
         }
         let mut frame = json!({
             "type": "remote_terminal_create",
@@ -3574,8 +3581,7 @@ mod tests {
             futures_util::poll!(fut.as_mut()).is_pending(),
             "attach must wait for the reply"
         );
-        let frame = pump.try_recv()
-            .expect("the attach frame was queued");
+        let frame = pump.try_recv().expect("the attach frame was queued");
         assert_eq!(frame["type"], "remote_terminal_attach");
         assert_eq!(frame["grant"], "grant.jwt");
         assert_eq!(frame["cols"], 120);
@@ -3649,7 +3655,7 @@ mod tests {
     async fn a_relay_drop_settles_a_pending_attach_as_relay_disconnected() {
         let client = RemoteAttachClient::new();
         // A relay connection holds the pump, as it does in production.
-        let mut pump = client.lock_outbound().await;
+        let _pump = client.lock_outbound().await;
         let fut = client.attach("g", 80, 24, Duration::from_secs(60));
         tokio::pin!(fut);
         assert!(futures_util::poll!(fut.as_mut()).is_pending());
@@ -3663,7 +3669,7 @@ mod tests {
     async fn attach_times_out_with_a_typed_error_and_clears_the_pending_slot() {
         let client = RemoteAttachClient::new();
         // A relay connection holds the pump, as it does in production.
-        let mut pump = client.lock_outbound().await;
+        let _pump = client.lock_outbound().await;
         let err = client
             .attach("g", 80, 24, Duration::from_millis(50))
             .await

@@ -445,13 +445,14 @@ async fn read_back_once() -> Readback {
     // need not share `coord.devices` with the web relay this runner dials, and
     // its answer would be a confident reading about the wrong database.
     let (coord_base, coord_source) = qontinui_runner_lib::profiles::coord_base_with_source();
-    let coord = if coord_source == qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback {
-        Err(format!(
-            "coord routing read skipped: coord base {coord_base} is the dev-localhost fallback"
-        ))
-    } else {
-        coord_read_back_at(&coord_base, &device_id).await
-    };
+    let coord =
+        if coord_source == qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback {
+            Err(format!(
+                "coord routing read skipped: coord base {coord_base} is the dev-localhost fallback"
+            ))
+        } else {
+            coord_read_back_at(&coord_base, &device_id).await
+        };
     if coord.is_ok() {
         return combine(coord, None);
     }
@@ -795,7 +796,10 @@ mod tests {
 
     #[test]
     fn combine_never_turns_a_miss_into_false() {
-        assert_eq!(combine(Ok(Readback::NotRoutable), None), Readback::NotRoutable);
+        assert_eq!(
+            combine(Ok(Readback::NotRoutable), None),
+            Readback::NotRoutable
+        );
         assert_eq!(
             combine(Err("coord miss".into()), Some(Readback::Routable)),
             Readback::Routable
@@ -810,7 +814,10 @@ mod tests {
             other => panic!("two misses must be UNKNOWN, got {other:?}"),
         }
         match combine(Err("coord miss".into()), None) {
-            Readback::Unknown(r) => assert!(r.contains("coord miss") && r.contains("no usable bearer"), "{r}"),
+            Readback::Unknown(r) => assert!(
+                r.contains("coord miss") && r.contains("no usable bearer"),
+                "{r}"
+            ),
             other => panic!("a miss with no web bearer must be UNKNOWN, got {other:?}"),
         }
     }
@@ -826,7 +833,10 @@ mod tests {
             other => panic!("must stay UNKNOWN, got {other:?}"),
         }
         // A Cognito bearer rejected is a different fault — left verbatim.
-        assert_eq!(explain_web_readback(raw.clone(), BearerKind::CognitoUser), raw);
+        assert_eq!(
+            explain_web_readback(raw.clone(), BearerKind::CognitoUser),
+            raw
+        );
         // A success is never rewritten.
         assert_eq!(
             explain_web_readback(Readback::Routable, BearerKind::DeviceJwt),
