@@ -2014,6 +2014,35 @@ pub struct RemoteAttachClient {
     pending_output: Mutex<HashMap<String, PendingOutput>>,
 }
 
+/// One relay connection's hold on the outbound queue, from
+/// [`RemoteAttachClient::lock_outbound`]. Derefs to the receiver; dropping it
+/// bumps the pump generation so the release is observable to
+/// [`RemoteAttachClient::outbound_pump_state`].
+pub struct OutboundPump<'a> {
+    guard: tokio::sync::MutexGuard<'a, mpsc::Receiver<Value>>,
+    generation: &'a std::sync::atomic::AtomicU64,
+}
+
+impl std::ops::Deref for OutboundPump<'_> {
+    type Target = mpsc::Receiver<Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for OutboundPump<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for OutboundPump<'_> {
+    fn drop(&mut self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 static CLIENT: OnceLock<RemoteAttachClient> = OnceLock::new();
 
 /// The process-wide client.
@@ -2054,11 +2083,19 @@ impl RemoteAttachClient {
     /// Exclusive access to the outbound queue for the life of one relay
     /// connection. The relay's pump holds the guard while it drains; when the
     /// connection ends the guard drops and the next connection takes over.
-    pub async fn lock_outbound(&self) -> tokio::sync::MutexGuard<'_, mpsc::Receiver<Value>> {
+    ///
+    /// The generation is bumped when a connection TAKES the pump and again
+    /// when it LETS GO (see [`OutboundPump`]), so a reading taken in the
+    /// instant between a new holder acquiring the lock and bumping the
+    /// counter still differs from one taken while the previous holder had it.
+    pub async fn lock_outbound(&self) -> OutboundPump<'_> {
         let guard = self.out_rx.lock().await;
         self.pump_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        guard
+        OutboundPump {
+            guard,
+            generation: &self.pump_generation,
+        }
     }
 
     /// `(attached, generation)`: whether a relay connection currently holds
@@ -2787,9 +2824,11 @@ mod tests {
             assert!(attached);
             assert_eq!(g1, g0 + 1);
         }
-        assert_eq!(client.outbound_pump_state(), (false, g0 + 1));
+        // Letting go bumps it too, so take-then-release is never mistaken
+        // for the same connection still holding the pump.
+        assert_eq!(client.outbound_pump_state(), (false, g0 + 2));
         let _next = client.lock_outbound().await;
-        assert_eq!(client.outbound_pump_state(), (true, g0 + 2));
+        assert_eq!(client.outbound_pump_state(), (true, g0 + 3));
     }
 
     const NOW: u64 = 1_700_000_000;

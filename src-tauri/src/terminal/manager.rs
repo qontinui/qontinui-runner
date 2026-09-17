@@ -739,6 +739,12 @@ impl TerminalManager {
                 }
             }
         };
+        if let Ok(mut map) = self.remote_identities.lock() {
+            map.clear();
+        }
+        if let Ok(mut map) = self.remote_panes.lock() {
+            map.clear();
+        }
 
         if sessions.is_empty() {
             return;
