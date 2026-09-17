@@ -1991,6 +1991,11 @@ type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
 
 /// The source side's routing table and outbound queue.
 pub struct RemoteAttachClient {
+    /// Bumped each time a relay connection takes the outbound pump, so a
+    /// reader can tell "the same connection" from "a different one that
+    /// happens to also be attached" across a window (see
+    /// [`Self::outbound_pump_state`]).
+    pump_generation: std::sync::atomic::AtomicU64,
     out_tx: mpsc::Sender<Value>,
     out_rx: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     panes: Mutex<HashMap<String, Arc<RemotePaneIo>>>,
@@ -2026,6 +2031,7 @@ impl RemoteAttachClient {
     pub fn new() -> Self {
         let (out_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
         Self {
+            pump_generation: std::sync::atomic::AtomicU64::new(0),
             out_tx,
             out_rx: tokio::sync::Mutex::new(out_rx),
             panes: Mutex::new(HashMap::new()),
@@ -2049,17 +2055,29 @@ impl RemoteAttachClient {
     /// connection. The relay's pump holds the guard while it drains; when the
     /// connection ends the guard drops and the next connection takes over.
     pub async fn lock_outbound(&self) -> tokio::sync::MutexGuard<'_, mpsc::Receiver<Value>> {
-        self.out_rx.lock().await
+        let guard = self.out_rx.lock().await;
+        self.pump_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        guard
     }
 
-    /// True when a relay connection currently holds the outbound pump — i.e.
-    /// a frame queued now is drained onto a live socket. `false` means no
+    /// `(attached, generation)`: whether a relay connection currently holds
+    /// the outbound pump — i.e. a frame queued now is drained onto a socket —
+    /// plus which connection took it most recently. `false` means no
     /// connection holds it: a queued frame waits and is discarded by
     /// [`Self::discard_backlog`] when the next connection starts. The pump is
     /// the only holder of this lock ([`Self::lock_outbound`]), so a failed
-    /// `try_lock` is the pump, never a contender.
-    pub fn outbound_pump_attached(&self) -> bool {
-        self.out_rx.try_lock().is_err()
+    /// `try_lock` is the pump, never a contender. Two readings that differ in
+    /// either half bracket a window in which the connection changed.
+    /// `attached` means a connection HOLDS the pump, not that its socket is
+    /// alive: a half-open socket still holds it until its write fails.
+    pub fn outbound_pump_state(&self) -> (bool, u64) {
+        let attached = self.out_rx.try_lock().is_err();
+        (
+            attached,
+            self.pump_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Drop every frame queued before this connection existed. The backend
@@ -2754,6 +2772,25 @@ mod tests {
     use super::*;
     use crate::terminal::pane_io::PaneIo;
     use std::sync::Mutex as StdMutex;
+
+    /// Plan 2026-09-16 Phase 1: the pump state reads "attached" exactly while
+    /// a connection holds `lock_outbound`, and a new connection bumps the
+    /// generation so a close spanning a reconnect is detectable.
+    #[tokio::test]
+    async fn outbound_pump_state_tracks_the_connection_holding_the_pump() {
+        let client = RemoteAttachClient::new();
+        let (attached, g0) = client.outbound_pump_state();
+        assert!(!attached);
+        {
+            let _pump = client.lock_outbound().await;
+            let (attached, g1) = client.outbound_pump_state();
+            assert!(attached);
+            assert_eq!(g1, g0 + 1);
+        }
+        assert_eq!(client.outbound_pump_state(), (false, g0 + 1));
+        let _next = client.lock_outbound().await;
+        assert_eq!(client.outbound_pump_state(), (true, g0 + 2));
+    }
 
     const NOW: u64 = 1_700_000_000;
 

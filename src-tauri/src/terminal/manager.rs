@@ -22,6 +22,14 @@ pub struct TerminalManager {
     /// than on it because `TerminalInfo` is a shared-schema type that cannot
     /// carry it; removed with the session in [`Self::close`].
     remote_identities: Mutex<HashMap<TerminalId, super::types::RemoteTabIdentity>>,
+    /// The `RemotePaneIo` behind each remote tab, keyed like
+    /// `remote_identities`. The attach client's routing table drops a pane
+    /// the moment its remote side exits, but the DEAD tab stays open and is
+    /// closed later — this is what lets that close still report the detach
+    /// it queued (plan
+    /// `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`).
+    /// Removed with the session in [`Self::close`].
+    remote_panes: Mutex<HashMap<TerminalId, Arc<super::remote_pane_io::RemotePaneIo>>>,
 }
 
 /// Whether opening a terminal in `dir` should pre-accept Claude's workspace
@@ -156,7 +164,20 @@ impl TerminalManager {
             sessions: Mutex::new(HashMap::new()),
             interceptor: Arc::new(OutputInterceptor::new()),
             remote_identities: Mutex::new(HashMap::new()),
+            remote_panes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Record the pane behind a remote tab (see `remote_panes`).
+    pub fn set_remote_pane(&self, id: &str, pane: Arc<super::remote_pane_io::RemotePaneIo>) {
+        if let Ok(mut map) = self.remote_panes.lock() {
+            map.insert(id.to_string(), pane);
+        }
+    }
+
+    /// The pane behind a remote tab, if it is one.
+    pub fn remote_pane(&self, id: &str) -> Option<Arc<super::remote_pane_io::RemotePaneIo>> {
+        self.remote_panes.lock().ok()?.get(id).cloned()
     }
 
     /// Record which remote session a local terminal mirrors (Phase 4).
@@ -577,6 +598,9 @@ impl TerminalManager {
         };
 
         if let Ok(mut map) = self.remote_identities.lock() {
+            map.remove(id);
+        }
+        if let Ok(mut map) = self.remote_panes.lock() {
             map.remove(id);
         }
 
