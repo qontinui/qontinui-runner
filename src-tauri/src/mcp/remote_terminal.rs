@@ -2019,25 +2019,35 @@ pub struct RemoteAttachClient {
 /// bumps the pump generation so the release is observable to
 /// [`RemoteAttachClient::outbound_pump_state`].
 pub struct OutboundPump<'a> {
-    guard: tokio::sync::MutexGuard<'a, mpsc::Receiver<Value>>,
+    /// `Some` for the pump's whole life; taken only in `drop`, so the lock
+    /// is released BEFORE the generation moves.
+    guard: Option<tokio::sync::MutexGuard<'a, mpsc::Receiver<Value>>>,
     generation: &'a std::sync::atomic::AtomicU64,
 }
 
 impl std::ops::Deref for OutboundPump<'_> {
     type Target = mpsc::Receiver<Value>;
     fn deref(&self) -> &Self::Target {
-        &self.guard
+        self.guard
+            .as_ref()
+            .expect("outbound pump guard is held until drop")
     }
 }
 
 impl std::ops::DerefMut for OutboundPump<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.guard
+        self.guard
+            .as_mut()
+            .expect("outbound pump guard is held until drop")
     }
 }
 
 impl Drop for OutboundPump<'_> {
     fn drop(&mut self) {
+        // Free the lock first: a bump while it is still held would read as
+        // the SAME connection to a sample taken just after the next holder
+        // acquires it but before that holder bumps.
+        drop(self.guard.take());
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
@@ -2093,7 +2103,7 @@ impl RemoteAttachClient {
         self.pump_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         OutboundPump {
-            guard,
+            guard: Some(guard),
             generation: &self.pump_generation,
         }
     }
