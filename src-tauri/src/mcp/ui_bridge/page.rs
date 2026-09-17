@@ -849,20 +849,21 @@ pub struct ForceCloseRequest {
 ///
 /// # Why a header, on this route specifically
 ///
-/// The MCP API's CORS layer is `allow_origin(Any)` by deliberate design
-/// (`mcp_api.rs`: MCP clients, WSL, and the `tauri://localhost` webview all
-/// have to reach it, and the security boundary is the loopback bind). A
-/// **simple** cross-origin `POST` — no custom header, no JSON `Content-Type`,
-/// no body — is exempt from the CORS preflight entirely, so any page in the
-/// operator's browser could previously force-close the runner and, with it,
-/// `taskkill /F /T` every tracked agent tree. `close-request` and
-/// `/restart-runner` share that shape, so the class is not new; what is new is
-/// that force-close is the most *reliable* of the three and the only one that
-/// still works when the others refuse.
+/// A **simple** cross-origin `POST` — no custom header, no JSON
+/// `Content-Type`, no body — is exempt from the CORS preflight entirely, so any
+/// page in the operator's browser could once force-close the runner and, with
+/// it, `taskkill /F /T` every tracked agent tree. `close-request` and
+/// `/restart-runner` share that shape.
 ///
-/// Requiring ANY custom header takes the request out of the simple-request set
-/// and forces an `OPTIONS` preflight, which a drive-by page cannot satisfy
-/// without the runner opting in. It costs a legitimate caller one flag:
+/// This header was the first patch for that class, and on its own it did NOT
+/// hold: a custom header forces a preflight, but the API's CORS layer was
+/// `allow_origin(Any)` + `allow_headers(Any)`, which IS the runner opting in,
+/// so a page that sent the header passed the preflight. The class is now
+/// closed by `mcp::origin_guard`, which refuses every
+/// `/ui-bridge/control/page/*` request (preflight or not) from any browser
+/// origin other than the runner's own webview (plan
+/// `2026-09-17-runner-loopback-api-accepts-any-origin`). The header stays as
+/// an explicit-intent flag for non-browser callers; it costs one flag:
 ///
 /// ```text
 /// curl -X POST -H "X-Qontinui-Force-Close: 1" http://127.0.0.1:9876/ui-bridge/control/page/force-close
@@ -3725,13 +3726,12 @@ mod close_door_tests {
 
     /// FINDING 11 — force-close is CSRF-gated by a mandatory custom header.
     ///
-    /// The MCP API is `CorsLayer::new().allow_origin(Any)` by design, and the
-    /// body parser never rejects, so a **simple** cross-origin `POST` (no
+    /// The body parser never rejects, so a **simple** cross-origin `POST` (no
     /// custom header, no JSON `Content-Type`, no body) is exempt from the CORS
-    /// preflight entirely — any page in the operator's browser could
-    /// force-close the runner and `taskkill /F /T` every tracked agent tree.
-    /// Requiring any custom header takes the request out of the simple set and
-    /// forces a preflight a drive-by page cannot satisfy.
+    /// preflight entirely. Requiring a custom header takes the request out of
+    /// the simple set. The browser-origin refusal itself is
+    /// `mcp::origin_guard`'s (a credential door covers
+    /// `/ui-bridge/control/page/*`); this test pins only the header half.
     #[test]
     fn force_close_requires_a_header_a_simple_cross_origin_post_cannot_send() {
         use axum::http::HeaderMap;

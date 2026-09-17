@@ -60,7 +60,7 @@
 //! [CatchPanicLayer]               ← outermost: panics → 500 JSON
 //!   [envelope_audit_middleware]   ← THIS LAYER (debug builds only)
 //!     [envelope_rewrite_middleware] ← rewrites non-JSON 4xx/5xx → JSON
-//!       [TraceLayer, CORS, BodyLimit, ...]
+//!       [TraceLayer, CORS, origin guard, BodyLimit, ...]
 //!         [handlers]
 //! ```
 //!

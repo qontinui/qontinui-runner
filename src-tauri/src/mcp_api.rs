@@ -63,7 +63,6 @@ use axum::{
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
@@ -909,6 +908,7 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
 /// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
 async fn health(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
+    requester: Option<axum::Extension<crate::mcp::origin_guard::RequesterClass>>,
 ) -> Json<serde_json::Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
     let last_pong = state.app_state.ui_bridge_last_pong.load(Ordering::Relaxed);
@@ -1523,6 +1523,12 @@ async fn health(
         // sessions close means coord is refusing the POSTs.
         "agent_log_emitter_agents":
             crate::claude_session::coord_register::agent_log_emitter_agents(),
+        // Browser-origin guard (plan 2026-09-17-runner-loopback-api-accepts-
+        // any-origin): kill-switch state, route-policy mode, per-class refusal
+        // and shadow counts, and the last 20 non-admit tuples — withheld from a
+        // Foreign requester, since they name the other sites that reached this
+        // runner.
+        "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0 .0)),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -10097,17 +10103,16 @@ pub fn create_router(
     // Build GraphQL schema with ApiState as context data
     let graphql_schema = crate::graphql::build_schema(api_state.clone());
 
-    // CORS: Permissive (allow any origin) is intentional.
-    // This localhost-only API (port 9876) must be accessible from:
-    //   - The Tauri webview (tauri://localhost origin)
-    //   - External MCP clients (Claude Desktop, Cursor, etc.)
-    //   - WSL environments
-    // Adding origin restrictions would break MCP client compatibility.
-    // Security is enforced by binding to localhost, not by CORS.
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // Browser-origin policy: the loopback bind keeps other MACHINES out, but a
+    // page in the operator's own browser is already on loopback. CORS no longer
+    // answers `*`; the Host gate, origin classification, credential-door
+    // refusal and per-class route allowlists live in `mcp::origin_guard`, which
+    // also builds the CORS layer. Agents and MCP clients send no `Origin` and
+    // are unaffected (see that module's invariant).
+    let origin_guard = Arc::new(crate::mcp::origin_guard::OriginGuard::from_env(
+        api_state.app_state.clone(),
+    ));
+    origin_guard.install();
 
     // GraphQL sub-router with concurrency limit (max 20 concurrent GraphQL requests).
     // This prevents a burst of expensive queries from starving REST endpoints.
@@ -10600,8 +10605,12 @@ pub fn create_router(
         .layer(axum::middleware::from_fn(
             crate::middleware::trace_propagation_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
-        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+    // CORS, then the origin guard OUTSIDE it (so a refused request — preflight
+    // included — never reaches CORS or a handler). Both are `Router::layer`, so
+    // the guard keys on `MatchedPath`.
+    let router_with_inner_layers =
+        crate::mcp::origin_guard::apply(router_with_inner_layers, origin_guard)
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .layer(axum::Extension(graphql_schema))
         .layer(axum::middleware::from_fn(
