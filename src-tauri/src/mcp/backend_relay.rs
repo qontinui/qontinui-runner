@@ -5164,8 +5164,16 @@ mod tests {
         assert_eq!(reply["status"], 200);
         let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
         let parsed: Value = serde_json::from_str(&body).unwrap();
-        assert_eq!(parsed["origin"], Value::Null, "origin must not reach the loopback call");
-        assert_eq!(parsed["sec_fetch_site"], Value::Null, "sec-fetch-site must not reach it either");
+        assert_eq!(
+            parsed["origin"],
+            Value::Null,
+            "origin must not reach the loopback call"
+        );
+        assert_eq!(
+            parsed["sec_fetch_site"],
+            Value::Null,
+            "sec-fetch-site must not reach it either"
+        );
         assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
 

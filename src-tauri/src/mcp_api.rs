@@ -10611,11 +10611,11 @@ pub fn create_router(
     // the guard keys on `MatchedPath`.
     let router_with_inner_layers =
         crate::mcp::origin_guard::apply(router_with_inner_layers, origin_guard)
-        .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
-        .layer(axum::Extension(graphql_schema))
-        .layer(axum::middleware::from_fn(
-            crate::mcp::envelope::envelope_rewrite_middleware,
-        ));
+            .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
+            .layer(axum::Extension(graphql_schema))
+            .layer(axum::middleware::from_fn(
+                crate::mcp::envelope::envelope_rewrite_middleware,
+            ));
 
     // Debug-only audit layer: asserts every error response is application/json.
     // Placed between envelope_rewrite (inner) and CatchPanicLayer (outer) so:

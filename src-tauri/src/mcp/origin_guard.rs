@@ -363,7 +363,10 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/extraction/status"),
     ("POST", "/extraction/stop"),
     ("POST", "/extraction/vision"),
-    ("GET", "/extraction/{extraction_id}/screenshot/{screenshot_id}"),
+    (
+        "GET",
+        "/extraction/{extraction_id}/screenshot/{screenshot_id}",
+    ),
     ("GET", "/findings/summary"),
     ("POST", "/findings/task/{task_run_id}/clear-all"),
     ("POST", "/findings/{finding_id}/resolve"),
@@ -966,7 +969,10 @@ where
 {
     router
         .layer(cors_layer())
-        .layer(axum::middleware::from_fn_with_state(guard, origin_guard_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            guard,
+            origin_guard_middleware,
+        ))
 }
 
 /// CORS that echoes only what the guard granted — never `*`.
@@ -1017,10 +1023,7 @@ async fn origin_guard_middleware(
             // the webview and configured origins.
             req.extensions_mut().insert(CorsGrant {
                 allow_origin: true,
-                private_network: matches!(
-                    d.class,
-                    OriginClass::FirstParty | OriginClass::Trusted
-                ),
+                private_network: matches!(d.class, OriginClass::FirstParty | OriginClass::Trusted),
             });
             req.extensions_mut().insert(RequesterClass(d.class));
             next.run(req).await
@@ -1074,7 +1077,12 @@ async fn origin_guard_middleware(
     }
 }
 
-fn refusal(code: &str, message: &str, context: Value, echo_origin: Option<HeaderValue>) -> Response {
+fn refusal(
+    code: &str,
+    message: &str,
+    context: Value,
+    echo_origin: Option<HeaderValue>,
+) -> Response {
     let body = json!({
         "success": false,
         "error": message,
@@ -1145,7 +1153,9 @@ pub(crate) fn door_matches(entry: &str, method: &str, route: &str) -> bool {
 }
 
 pub(crate) fn is_credential_door(method: &str, route: &str) -> bool {
-    CREDENTIAL_DOORS.iter().any(|e| door_matches(e, method, route))
+    CREDENTIAL_DOORS
+        .iter()
+        .any(|e| door_matches(e, method, route))
 }
 
 fn route_allowed(class: OriginClass, method: &str, route: &str) -> bool {
@@ -1199,14 +1209,20 @@ impl NormOrigin {
 pub fn canonical_allowed_origin(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.to_ascii_lowercase().contains("tauri") {
-        return Err(format!("{trimmed:?}: the runner webview's own origin needs no entry"));
+        return Err(format!(
+            "{trimmed:?}: the runner webview's own origin needs no entry"
+        ));
     }
     if trimmed.contains('*') {
-        return Err(format!("{trimmed:?}: wildcards are not accepted; list exact origins"));
+        return Err(format!(
+            "{trimmed:?}: wildcards are not accepted; list exact origins"
+        ));
     }
     let u = url::Url::parse(trimmed).map_err(|e| format!("{trimmed:?}: not a URL ({e})"))?;
     if !(u.path().is_empty() || u.path() == "/") || u.query().is_some() || u.fragment().is_some() {
-        return Err(format!("{trimmed:?}: an origin has no path, query or fragment"));
+        return Err(format!(
+            "{trimmed:?}: an origin has no path, query or fragment"
+        ));
     }
     let n = NormOrigin::parse(trimmed).ok_or_else(|| format!("{trimmed:?}: no host"))?;
     let default_port = url::Url::parse(&format!("{}://{}", n.scheme, n.host))
@@ -1234,7 +1250,10 @@ pub fn set_tunnel_server_addr(server_addr: Option<&str>) {
                 .split_once(']')
                 .map(|(i, _)| format!("[{i}]"))
                 .unwrap_or_else(|| a.clone()),
-            None => a.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(a.clone()),
+            None => a
+                .rsplit_once(':')
+                .map(|(h, _)| h.to_string())
+                .unwrap_or(a.clone()),
         }
     });
     if let Ok(mut g) = TUNNEL_HOST.lock() {
@@ -1255,7 +1274,13 @@ fn tunnel_host_admitted(name: &str) -> bool {
 /// `/health` counters still count them all).
 fn first_shadow_sighting(d: &Decision) -> bool {
     static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
-    let key = format!("{}|{:?}|{}|{:?}", d.class.as_str(), d.origin, d.method, d.route);
+    let key = format!(
+        "{}|{:?}|{}|{:?}",
+        d.class.as_str(),
+        d.origin,
+        d.method,
+        d.route
+    );
     let Ok(mut g) = SEEN.lock() else {
         return false;
     };

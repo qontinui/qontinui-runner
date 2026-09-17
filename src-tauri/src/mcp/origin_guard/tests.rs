@@ -53,7 +53,11 @@ const PROBES: &[(&str, &str, &str)] = &[
     ("GET", "/files/read", "files_read"),
     ("GET", "/terminals/{id}/ws", "terminal_ws"),
     ("POST", "/ui-bridge/control/page/close-request", "close"),
-    ("POST", "/ui-bridge/integration/read-file", "integration_read"),
+    (
+        "POST",
+        "/ui-bridge/integration/read-file",
+        "integration_read",
+    ),
     ("POST", "/ui-bridge/tauri/invoke", "tauri_invoke"),
     ("POST", "/graphql", "graphql"),
     ("GET", "/sessions", "sessions"),
@@ -161,7 +165,9 @@ async fn send(h: &Harness, r: HttpRequest<Body>) -> (StatusCode, HeaderMap, Stri
     let resp = h.router.clone().oneshot(r).await.unwrap();
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
     (status, headers, String::from_utf8_lossy(&bytes).to_string())
 }
 
@@ -192,7 +198,9 @@ async fn ws_upgrade_status(h: &Harness, path: &str, origin: Option<&str>) -> Str
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
-    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let mut raw = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n"
@@ -250,7 +258,11 @@ async fn p1_02_foreign_post_to_token_door_refused_and_stub_not_called() {
         req(
             "POST",
             "/ui-bridge/invoke/get_coord_device_token",
-            &[("host", &host(&h)), ("origin", EVIL), ("content-type", "application/json")],
+            &[
+                ("host", &host(&h)),
+                ("origin", EVIL),
+                ("content-type", "application/json"),
+            ],
             "{}",
         ),
     )
@@ -300,7 +312,11 @@ async fn p1_05_simple_request_close_refused_nothing_enqueued() {
         req(
             "POST",
             "/ui-bridge/control/page/close-request",
-            &[("host", &host(&h)), ("origin", EVIL), ("content-type", "text/plain")],
+            &[
+                ("host", &host(&h)),
+                ("origin", EVIL),
+                ("content-type", "text/plain"),
+            ],
             "",
         ),
     )
@@ -332,14 +348,22 @@ async fn p1_06_agent_request_without_origin_unchanged() {
 /// P1-7: the webview regression guard.
 #[tokio::test]
 async fn p1_07_webview_origins_admitted() {
-    for origin in ["http://tauri.localhost", "tauri://localhost", "https://tauri.localhost"] {
+    for origin in [
+        "http://tauri.localhost",
+        "tauri://localhost",
+        "https://tauri.localhost",
+    ] {
         let h = harness("enforce");
         let (status, headers, _) = send(
             &h,
             req(
                 "POST",
                 "/ui-bridge/invoke/get_coord_device_token",
-                &[("host", &host(&h)), ("origin", origin), ("content-type", "application/json")],
+                &[
+                    ("host", &host(&h)),
+                    ("origin", origin),
+                    ("content-type", "application/json"),
+                ],
                 "{}",
             ),
         )
@@ -360,7 +384,11 @@ async fn p1_08_kill_switch_disables_the_guard() {
         req(
             "POST",
             "/ui-bridge/invoke/get_coord_device_token",
-            &[("host", "evil.example:1"), ("origin", EVIL), ("content-type", "application/json")],
+            &[
+                ("host", "evil.example:1"),
+                ("origin", EVIL),
+                ("content-type", "application/json"),
+            ],
             "{}",
         ),
     )
@@ -392,10 +420,19 @@ async fn p1_09_host_gate_uses_the_bound_port() {
     }
     let (status, _, body) = send(
         &h,
-        req("GET", "/sessions", &[("host", &format!("127.0.0.1:{desired}"))], ""),
+        req(
+            "GET",
+            "/sessions",
+            &[("host", &format!("127.0.0.1:{desired}"))],
+            "",
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "desired-but-unbound port admitted");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "desired-but-unbound port admitted"
+    );
     assert_eq!(code(&body).as_deref(), Some(CODE_HOST_NOT_LOOPBACK));
     // Missing Host (HTTP/1.0) is admitted.
     let (status, _, _) = send(&h, req("GET", "/sessions", &[], "")).await;
@@ -407,17 +444,45 @@ async fn p1_09_host_gate_uses_the_bound_port() {
 async fn p1_10_integration_read_file_tauri_invoke_and_graphql_refused() {
     let h = harness("off");
     for (path, ctype, body, key) in [
-        ("/ui-bridge/integration/read-file", "application/json", r#"{"project_path":"/","file_path":"x"}"#, "integration_read"),
-        ("/ui-bridge/tauri/invoke", "application/json", r#"{"command":"terminal_create"}"#, "tauri_invoke"),
-        ("/graphql", "text/plain", r#"{"query":"mutation { uiBridgeEvaluate(code: \"1\") }"}"#, "graphql"),
+        (
+            "/ui-bridge/integration/read-file",
+            "application/json",
+            r#"{"project_path":"/","file_path":"x"}"#,
+            "integration_read",
+        ),
+        (
+            "/ui-bridge/tauri/invoke",
+            "application/json",
+            r#"{"command":"terminal_create"}"#,
+            "tauri_invoke",
+        ),
+        (
+            "/graphql",
+            "text/plain",
+            r#"{"query":"mutation { uiBridgeEvaluate(code: \"1\") }"}"#,
+            "graphql",
+        ),
     ] {
         let (status, _, resp) = send(
             &h,
-            req("POST", path, &[("host", &host(&h)), ("origin", EVIL), ("content-type", ctype)], body),
+            req(
+                "POST",
+                path,
+                &[
+                    ("host", &host(&h)),
+                    ("origin", EVIL),
+                    ("content-type", ctype),
+                ],
+                body,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
-        assert_eq!(code(&resp).as_deref(), Some(CODE_CROSS_ORIGIN_REFUSED), "{path}");
+        assert_eq!(
+            code(&resp).as_deref(),
+            Some(CODE_CROSS_ORIGIN_REFUSED),
+            "{path}"
+        );
         assert_eq!(h.calls.get(key), 0, "{path}");
     }
 }
@@ -442,7 +507,12 @@ async fn p1_11_cross_site_fetch_metadata_without_origin_is_foreign() {
     assert!(!body.contains("SECRET-FILE-CONTENT"));
     let (status, _, body) = send(
         &h,
-        req("GET", "/files/read?path=/tmp/x.json", &[("host", &host(&h))], ""),
+        req(
+            "GET",
+            "/files/read?path=/tmp/x.json",
+            &[("host", &host(&h))],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -451,7 +521,12 @@ async fn p1_11_cross_site_fetch_metadata_without_origin_is_foreign() {
     for sfs in ["none", "same-origin"] {
         let (status, _, _) = send(
             &h,
-            req("GET", "/files/read", &[("host", &host(&h)), ("sec-fetch-site", sfs)], ""),
+            req(
+                "GET",
+                "/files/read",
+                &[("host", &host(&h)), ("sec-fetch-site", sfs)],
+                "",
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{sfs}");
@@ -481,7 +556,11 @@ async fn p1_14_webview_preflight_admitted_with_exact_origin() {
     .await;
     assert!(status.is_success(), "{status}");
     assert_eq!(acao(&headers).as_deref(), Some("http://tauri.localhost"));
-    assert_eq!(h.calls.get("token"), 0, "a preflight never reaches the handler");
+    assert_eq!(
+        h.calls.get("token"),
+        0,
+        "a preflight never reaches the handler"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +573,12 @@ async fn p2_01_foreign_ordinary_route_refused() {
     let h = harness("enforce");
     let (status, headers, body) = send(
         &h,
-        req("GET", "/sessions", &[("host", &host(&h)), ("origin", EVIL)], ""),
+        req(
+            "GET",
+            "/sessions",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
@@ -508,7 +592,12 @@ async fn p2_02_trusted_allowlisted_route_echoes_exact_origin() {
     let h = harness("enforce");
     let (status, headers, _) = send(
         &h,
-        req("GET", "/unified-workflows", &[("host", &host(&h)), ("origin", WEB)], ""),
+        req(
+            "GET",
+            "/unified-workflows",
+            &[("host", &host(&h)), ("origin", WEB)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -531,7 +620,12 @@ async fn p2_03_trusted_off_allowlist_route_refused_readably() {
     let h = harness("enforce");
     let (status, headers, body) = send(
         &h,
-        req("POST", "/scheduler/reconcile-now", &[("host", &host(&h)), ("origin", WEB)], ""),
+        req(
+            "POST",
+            "/scheduler/reconcile-now",
+            &[("host", &host(&h)), ("origin", WEB)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -551,7 +645,12 @@ async fn p2_04_extension_page_origin_reaches_health_and_ui_bridge_ws() {
     let origin = "https://github.com";
     let (status, headers, _) = send(
         &h,
-        req("GET", "/health", &[("host", &host(&h)), ("origin", origin)], ""),
+        req(
+            "GET",
+            "/health",
+            &[("host", &host(&h)), ("origin", origin)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -563,21 +662,39 @@ async fn p2_04_extension_page_origin_reaches_health_and_ui_bridge_ws() {
 /// P2-5: an env-configured origin is admitted on the trusted allowlist only.
 #[tokio::test]
 async fn p2_05_env_allowed_origin_is_trusted() {
-    let h = harness_with("enforce", None, Some("http://localhost:5173, http://example.test:8080"));
+    let h = harness_with(
+        "enforce",
+        None,
+        Some("http://localhost:5173, http://example.test:8080"),
+    );
     let o = "http://localhost:5173";
     let (status, headers, _) = send(
         &h,
-        req("GET", "/unified-workflows", &[("host", &host(&h)), ("origin", o)], ""),
+        req(
+            "GET",
+            "/unified-workflows",
+            &[("host", &host(&h)), ("origin", o)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(acao(&headers).as_deref(), Some(o));
     let (status, _, body) = send(
         &h,
-        req("POST", "/ui-bridge/invoke/get_coord_device_token", &[("host", &host(&h)), ("origin", o)], "{}"),
+        req(
+            "POST",
+            "/ui-bridge/invoke/get_coord_device_token",
+            &[("host", &host(&h)), ("origin", o)],
+            "{}",
+        ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "trusted never reaches a door");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "trusted never reaches a door"
+    );
     assert_eq!(code(&body).as_deref(), Some(CODE_CROSS_ORIGIN_REFUSED));
 }
 
@@ -592,7 +709,10 @@ fn p2_06_credential_doors_disjoint_from_allowlists() {
             bad.push(format!("{m} {p}"));
         }
     }
-    assert!(bad.is_empty(), "credential doors on a browser allowlist: {bad:?}");
+    assert!(
+        bad.is_empty(),
+        "credential doors on a browser allowlist: {bad:?}"
+    );
 }
 
 /// P2-7 tripwire: every allowlist entry names a registered route EXACTLY
@@ -601,7 +721,11 @@ fn p2_06_credential_doors_disjoint_from_allowlists() {
 #[test]
 fn p2_07_every_allowlist_entry_is_a_registered_route() {
     let registered = crate::mcp::relay_path_policy::tests::registered_routes();
-    assert!(registered.len() > 500, "route scan broken: {}", registered.len());
+    assert!(
+        registered.len() > 500,
+        "route scan broken: {}",
+        registered.len()
+    );
     let mut missing = Vec::new();
     for (m, p) in TRUSTED_ROUTES.iter().chain(FOREIGN_ROUTES.iter()) {
         let hit = registered
@@ -611,7 +735,10 @@ fn p2_07_every_allowlist_entry_is_a_registered_route() {
             missing.push(format!("{m} {p}"));
         }
     }
-    assert!(missing.is_empty(), "allowlisted but not registered: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "allowlisted but not registered: {missing:?}"
+    );
 }
 
 /// P2-8: shadow admits, and says so.
@@ -620,7 +747,12 @@ async fn p2_08_shadow_admits_and_counts() {
     let h = harness("shadow");
     let (status, _, _) = send(
         &h,
-        req("GET", "/sessions", &[("host", &host(&h)), ("origin", EVIL)], ""),
+        req(
+            "GET",
+            "/sessions",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
     )
     .await;
     assert_ne!(status, StatusCode::FORBIDDEN);
@@ -631,7 +763,12 @@ async fn p2_08_shadow_admits_and_counts() {
     // Shadow never lifts the Phase 1 door refusal.
     let (status, _, _) = send(
         &h,
-        req("POST", "/ui-bridge/invoke/x", &[("host", &host(&h)), ("origin", EVIL)], ""),
+        req(
+            "POST",
+            "/ui-bridge/invoke/x",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -644,13 +781,23 @@ async fn p2_09_foreign_refusal_opaque_and_health_tuples_withheld() {
     let h = harness("enforce");
     let (_, headers, _) = send(
         &h,
-        req("GET", "/sessions", &[("host", &host(&h)), ("origin", EVIL)], ""),
+        req(
+            "GET",
+            "/sessions",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
     )
     .await;
     assert_eq!(acao(&headers), None);
     let (status, _, body) = send(
         &h,
-        req("GET", "/health", &[("host", &host(&h)), ("origin", "https://github.com")], ""),
+        req(
+            "GET",
+            "/health",
+            &[("host", &host(&h)), ("origin", "https://github.com")],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -659,10 +806,18 @@ async fn p2_09_foreign_refusal_opaque_and_health_tuples_withheld() {
     assert!(!body.contains("evil.example"));
     let (_, _, body) = send(
         &h,
-        req("GET", "/health", &[("host", &host(&h)), ("origin", "tauri://localhost")], ""),
+        req(
+            "GET",
+            "/health",
+            &[("host", &host(&h)), ("origin", "tauri://localhost")],
+            "",
+        ),
     )
     .await;
-    assert!(body.contains("evil.example"), "first party sees the tuples: {body}");
+    assert!(
+        body.contains("evil.example"),
+        "first party sees the tuples: {body}"
+    );
 }
 
 /// The shipped default: Foreign enforced, Trusted shadowed.
@@ -675,13 +830,23 @@ async fn default_policy_enforces_foreign_and_shadows_trusted() {
     assert_eq!(h.guard.route_policy(), RoutePolicy::EnforceForeign);
     let (status, _, _) = send(
         &h,
-        req("GET", "/sessions", &[("host", &host(&h)), ("origin", EVIL)], ""),
+        req(
+            "GET",
+            "/sessions",
+            &[("host", &host(&h)), ("origin", EVIL)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "foreign enforced by default");
     let (status, _, _) = send(
         &h,
-        req("POST", "/scheduler/reconcile-now", &[("host", &host(&h)), ("origin", WEB)], ""),
+        req(
+            "POST",
+            "/scheduler/reconcile-now",
+            &[("host", &host(&h)), ("origin", WEB)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "trusted shadowed by default");
@@ -698,14 +863,24 @@ async fn p3_settings_origin_admitted_on_next_request_without_rebuild() {
     let o = "http://localhost:4200";
     let (status, _, _) = send(
         &h,
-        req("GET", "/unified-workflows", &[("host", &host(&h)), ("origin", o)], ""),
+        req(
+            "GET",
+            "/unified-workflows",
+            &[("host", &host(&h)), ("origin", o)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "not yet configured");
     h.settings.lock().unwrap().push(o.to_string());
     let (status, headers, _) = send(
         &h,
-        req("GET", "/unified-workflows", &[("host", &host(&h)), ("origin", o)], ""),
+        req(
+            "GET",
+            "/unified-workflows",
+            &[("host", &host(&h)), ("origin", o)],
+            "",
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "same router, next request");
@@ -716,7 +891,10 @@ async fn p3_settings_origin_admitted_on_next_request_without_rebuild() {
 fn p3_settings_field_round_trips() {
     let s: crate::settings::Settings =
         serde_json::from_str(r#"{"api":{"allowed_origins":["http://localhost:4200"]}}"#).unwrap();
-    assert_eq!(s.api.allowed_origins, vec!["http://localhost:4200".to_string()]);
+    assert_eq!(
+        s.api.allowed_origins,
+        vec!["http://localhost:4200".to_string()]
+    );
     let d = crate::settings::Settings::default();
     assert!(d.api.allowed_origins.is_empty());
 }
@@ -731,7 +909,9 @@ fn probe_patterns_are_real_routes() {
     let registered = crate::mcp::relay_path_policy::tests::registered_routes();
     for (m, p, _) in PROBES {
         assert!(
-            registered.iter().any(|(rm, rp)| rp == p && (rm == m || rm == "ANY")),
+            registered
+                .iter()
+                .any(|(rm, rp)| rp == p && (rm == m || rm == "ANY")),
             "probe {m} {p} is not a registered route"
         );
     }
@@ -761,7 +941,10 @@ fn every_credential_door_covers_a_registered_route() {
             dead.push(*entry);
         }
     }
-    assert!(dead.is_empty(), "doors covering no registered route: {dead:?}");
+    assert!(
+        dead.is_empty(),
+        "doors covering no registered route: {dead:?}"
+    );
 }
 
 /// Routes whose path is SHAPED like a credential, file or execution door —
@@ -786,7 +969,10 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
     ("GET", "/analytics/token-usage/task-runs"),
     ("POST", "/api/v1/devices/pair-cli"),
     ("POST", "/api/v1/devices/pair-codes/{code}/redeem"),
-    ("POST", "/api/v1/devices/{device_id}/machine-credential/exchange"),
+    (
+        "POST",
+        "/api/v1/devices/{device_id}/machine-credential/exchange",
+    ),
     ("GET", "/auth/runner-token-callback"),
     ("POST", "/backup/info"),
     ("POST", "/checks/repair-associations"),
@@ -857,10 +1043,40 @@ const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
 
 /// Path fragments that make a route a door suspect.
 const SENSITIVE_SHAPE: &[&str] = &[
-    "token", "credential", "secret", "password", "api-key", "exec", "spawn", "/run", "shell",
-    "terminal", "file", "invoke", "evaluat", "restart", "drain", "install", "backup", "restore",
-    "transcript", "clipboard", "pair", "launch", "script", "python", "process", "worktree",
-    "webhook", "hook", "trigger", "tunnel", "jwt", "nonce", "/write", "/read",
+    "token",
+    "credential",
+    "secret",
+    "password",
+    "api-key",
+    "exec",
+    "spawn",
+    "/run",
+    "shell",
+    "terminal",
+    "file",
+    "invoke",
+    "evaluat",
+    "restart",
+    "drain",
+    "install",
+    "backup",
+    "restore",
+    "transcript",
+    "clipboard",
+    "pair",
+    "launch",
+    "script",
+    "python",
+    "process",
+    "worktree",
+    "webhook",
+    "hook",
+    "trigger",
+    "tunnel",
+    "jwt",
+    "nonce",
+    "/write",
+    "/read",
 ];
 
 /// The census tripwire: a route added tomorrow whose path looks like a door
@@ -905,8 +1121,14 @@ fn every_door_shaped_route_is_classified() {
 
 #[test]
 fn canonical_allowed_origin_validates() {
-    assert_eq!(canonical_allowed_origin(" http://LocalHost:5173/ ").unwrap(), "http://localhost:5173");
-    assert_eq!(canonical_allowed_origin("https://example.test:443").unwrap(), "https://example.test");
+    assert_eq!(
+        canonical_allowed_origin(" http://LocalHost:5173/ ").unwrap(),
+        "http://localhost:5173"
+    );
+    assert_eq!(
+        canonical_allowed_origin("https://example.test:443").unwrap(),
+        "https://example.test"
+    );
     assert!(canonical_allowed_origin("*").is_err());
     assert!(canonical_allowed_origin("null").is_err());
     assert!(canonical_allowed_origin("http://localhost:5173/app").is_err());
@@ -919,7 +1141,14 @@ fn canonical_allowed_origin_validates() {
 #[tokio::test]
 async fn tunnel_host_admitted_only_while_tunnel_up() {
     let h = harness("off");
-    let r = || req("GET", "/sessions", &[("host", "relay.example.test:5202")], "");
+    let r = || {
+        req(
+            "GET",
+            "/sessions",
+            &[("host", "relay.example.test:5202")],
+            "",
+        )
+    };
     set_tunnel_server_addr(Some("relay.example.test:2333"));
     let (status, _, _) = send(&h, r()).await;
     set_tunnel_server_addr(None);
@@ -941,17 +1170,37 @@ fn door_grammar() {
     assert!(door_matches("/files/*", "GET", "/files/read"));
     assert!(!door_matches("/files/*", "GET", "/files"));
     assert!(door_matches("/terminals", "POST", "/terminals"));
-    assert!(door_matches("/wrappers/{id}/credentials/*", "PUT", "/wrappers/{wid}/credentials/{name}"));
-    assert!(door_matches("POST /ui-bridge/control/*", "POST", "/ui-bridge/control/fill"));
-    assert!(!door_matches("POST /ui-bridge/control/*", "GET", "/ui-bridge/control/elements"));
-    assert!(!door_matches("/sessions/spawn", "POST", "/sessions/spawned"));
+    assert!(door_matches(
+        "/wrappers/{id}/credentials/*",
+        "PUT",
+        "/wrappers/{wid}/credentials/{name}"
+    ));
+    assert!(door_matches(
+        "POST /ui-bridge/control/*",
+        "POST",
+        "/ui-bridge/control/fill"
+    ));
+    assert!(!door_matches(
+        "POST /ui-bridge/control/*",
+        "GET",
+        "/ui-bridge/control/elements"
+    ));
+    assert!(!door_matches(
+        "/sessions/spawn",
+        "POST",
+        "/sessions/spawned"
+    ));
 }
 
 #[test]
 fn origin_normalisation() {
     let g = harness("off").guard;
     let p = (g.bound_port)();
-    let fp = |o: &str| NormOrigin::parse(o).map(|n| g.is_first_party(&n)).unwrap_or(false);
+    let fp = |o: &str| {
+        NormOrigin::parse(o)
+            .map(|n| g.is_first_party(&n))
+            .unwrap_or(false)
+    };
     assert!(fp("tauri://localhost"));
     assert!(fp("http://tauri.localhost"));
     assert!(fp("HTTP://Tauri.Localhost/"));
