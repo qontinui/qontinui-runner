@@ -157,10 +157,12 @@ pub async fn terminal_create(
     // `working_dir`: if that directory sits inside a known canonical
     // checkout (`<root>/<repo>/...`), treat the session as editing that
     // repo. This makes `acquire_for_terminal` route through isolated
-    // worktree acquisition when `QONTINUI_AGENT_WORKTREE_MODE` is on.
-    // SAFE: when the flag is off (the default), `acquire_for_terminal`
-    // still returns `(working_dir, None)`, so the derivation has ZERO
-    // effect until the operator flips the flag.
+    // worktree acquisition when `QONTINUI_AGENT_WORKTREE_MODE` is on —
+    // which is the DEFAULT (`agent_worktree::worktree_mode_enabled`
+    // reads `.unwrap_or(true)`; only an explicit `0`/`false`/`no`
+    // disables it). When the operator has disabled the flag,
+    // `acquire_for_terminal` still returns `(working_dir, None)`, so the
+    // derivation has ZERO effect there.
     let effective_intent_repo: Option<String> = intent_repo.clone().or_else(|| {
         working_dir.as_deref().and_then(|wd| {
             let derived = crate::agent_worktree::canonical_paths::repo_slug_for_path(
