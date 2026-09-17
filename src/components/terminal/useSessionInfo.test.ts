@@ -939,6 +939,45 @@ describe("normalizeTenancy (plan 2026-09-10 P0)", () => {
     expect(t?.credential.posture.value).toBe("live");
   });
 
+  it("carries the three-way divergence and the spawn-default status verbatim (W-B)", () => {
+    const t = normalizeTenancy({
+      row: {
+        tenantId: null,
+        spawnDeviceDefaultTenantId: null,
+        spawnDeviceDefaultStatus: "unknown",
+        spawnDeviceDefaultReason: "not_recorded",
+        currentDeviceDefaultTenantId: "a",
+      },
+      dataPlane: { status: "unknown", tenantId: null, reason: "no_coord_session" },
+      credential: { status: "resolved", tenantId: "b", slot: "tenant", reason: null, posture: {} },
+      diverged: false,
+      divergence: "unknown",
+    });
+    expect(t?.divergence).toBe("unknown");
+    expect(t?.row.spawnDeviceDefaultStatus).toBe("unknown");
+    expect(t?.row.spawnDeviceDefaultReason).toBe("not_recorded");
+  });
+
+  it("reads a runner that predates `divergence` as unknown, never as agreement (W-B)", () => {
+    const base = {
+      row: { tenantId: "b", spawnDeviceDefaultTenantId: null },
+      dataPlane: { status: "owned", tenantId: "b", reason: null },
+      credential: { status: "resolved", tenantId: "b", slot: "tenant", reason: null, posture: {} },
+    };
+    const agreeing = normalizeTenancy({ ...base, diverged: false });
+    expect(agreeing?.divergence).toBe("unknown");
+    expect(agreeing?.row.spawnDeviceDefaultStatus).toBe("unknown");
+    expect(agreeing?.row.spawnDeviceDefaultReason).toBe("runner_predates_status");
+    expect(normalizeTenancy({ ...base, diverged: true })?.divergence).toBe("diverged");
+    const named = normalizeTenancy({
+      ...base,
+      row: { tenantId: null, spawnDeviceDefaultTenantId: "a" },
+      diverged: false,
+    });
+    expect(named?.row.spawnDeviceDefaultStatus).toBe("recorded");
+    expect(named?.row.spawnDeviceDefaultReason).toBeNull();
+  });
+
   it("reads an absent or malformed block as null (unknown), never as agreeing", () => {
     expect(normalizeTenancy(undefined)).toBeNull();
     expect(normalizeTenancy({ row: { tenantId: "b" } })).toBeNull();

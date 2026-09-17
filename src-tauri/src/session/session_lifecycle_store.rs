@@ -703,6 +703,35 @@ pub struct TerminalSessionRecord {
     /// stays `false`, which is the honest reading.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub finish_synced: bool,
+    /// The machine's default tenant for new sessions AS READ WHEN THIS SESSION
+    /// WAS SPAWNED (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
+    /// review follow-up W-B).
+    ///
+    /// It is the expected tenant of a spawn that chose none, and the session-info
+    /// tenancy report compares a tenant-less session against it. It used to
+    /// live only in a process-lifetime map, so after a runner restart a restored
+    /// session was compared against the RESTORE-time default — a default switch
+    /// between the two made a correct session read diverged, or a wrong one read
+    /// agreeing. Persisting it here, beside the record restore already reads,
+    /// keeps the value of the spawn.
+    ///
+    /// `None` = NOT RECORDED (a record written before the field, or a session
+    /// whose spawn this runner did not see) — reported as UNKNOWN, never as
+    /// agreement. `Some({tenantId: None})` = recorded, and the machine named no
+    /// default then. SET ONCE: [`SessionLifecycleStore::record_spawn_device_default`]
+    /// writes it only onto a record the spawn itself created, and neither a
+    /// re-record nor a restore re-spawn overwrites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_device_default: Option<SpawnDeviceDefault>,
+}
+
+/// See [`TerminalSessionRecord::spawn_device_default`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnDeviceDefault {
+    /// The default tenant read at spawn, or `None` when the machine named none.
+    pub tenant_id: Option<String>,
 }
 
 /// One durable, self-contained mutation appended to the write-ahead log.
@@ -1159,6 +1188,24 @@ impl SessionLifecycleStore {
                     return;
                 }
             };
+            // W-B: a BRAND-NEW record binding a terminal inherits the spawn-time
+            // device default another open record on that terminal already
+            // carries. The seam records a provisional row at spawn; an account
+            // launcher then types `claude --session-id <its own id>`, whose row
+            // is the one the tenancy report reads — without this it would lose
+            // the value the spawn recorded. A record that already EXISTED (a
+            // resume/restore) never inherits: its spawn was not this terminal's.
+            let is_new_record = !m.contains_key(&rec.claude_session_id);
+            let inherited_spawn_default = if is_new_record
+                && rec.spawn_device_default.is_none()
+                && !new_terminal_id.trim().is_empty()
+            {
+                m.values()
+                    .filter(|o| o.state == "open" && o.terminal_id == new_terminal_id)
+                    .find_map(|o| o.spawn_device_default.clone())
+            } else {
+                None
+            };
             let entry =
                 m.entry(rec.claude_session_id.clone())
                     .or_insert_with(|| TerminalSessionRecord {
@@ -1251,6 +1298,12 @@ impl SessionLifecycleStore {
             }
             if rec.restore_tier.is_some() {
                 entry.restore_tier = rec.restore_tier;
+            }
+            // W-B: set ONCE — the default a session was spawned under never
+            // changes, so a re-record can fill an absent value but never replace
+            // a recorded one.
+            if entry.spawn_device_default.is_none() {
+                entry.spawn_device_default = rec.spawn_device_default.or(inherited_spawn_default);
             }
             entry.state = "open".to_string();
             entry.closed_at = None;
@@ -2167,6 +2220,55 @@ impl SessionLifecycleStore {
             return false;
         };
         self.update_identity(&rec.claude_session_id, update)
+    }
+
+    /// Record the device default tenant a session was SPAWNED under (W-B of plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`) on
+    /// the open record for `terminal_id` — but only when that record was CREATED
+    /// by this spawn (`opened_at >= spawned_since_ms`) and carries none yet.
+    ///
+    /// A record that pre-dates the spawn is a resume or boot restore of an older
+    /// session: the default read now is the RESTORE-time default, which is
+    /// exactly the value W-B exists not to report as the spawn's. Such a record
+    /// keeps whatever it had, and one that predates the field stays unrecorded
+    /// (UNKNOWN). Returns whether anything was written.
+    pub fn record_spawn_device_default(
+        &self,
+        terminal_id: &str,
+        default_tenant: Option<String>,
+        spawned_since_ms: i64,
+    ) -> bool {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on record_spawn_device_default");
+                return false;
+            }
+        };
+        let Some(rec) = m
+            .values_mut()
+            .find(|r| r.state == "open" && r.terminal_id == terminal_id)
+        else {
+            debug!(
+                terminal_id,
+                "session_lifecycle_store: no open record for terminal — spawn default dropped"
+            );
+            return false;
+        };
+        if rec.spawn_device_default.is_some() || rec.opened_at < spawned_since_ms {
+            return false;
+        }
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: non_empty(default_tenant),
+        });
+        let changed = rec.clone();
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+        true
     }
 
     /// Stamp the boot-restore markers on a present record: `restored_from_boot_at`
@@ -3915,6 +4017,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -3951,6 +4054,91 @@ mod tests {
     // rewrite. These prove the three properties that buys us nothing without:
     // deltas survive a reopen, a torn tail loses only the uncommitted line, and
     // compaction is idempotent against replay.
+
+    /// W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential):
+    /// the spawn-time device default is written onto a record THIS spawn created,
+    /// survives a reopen (a runner restart), and is never replaced — not by a
+    /// second stamp, not by a re-record, and not by a restore re-spawn whose
+    /// record pre-dates it.
+    #[test]
+    fn the_spawn_device_default_is_recorded_once_and_survives_a_restart() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminal-sessions.json");
+        {
+            let store = SessionLifecycleStore::open(&path).unwrap();
+            let before_spawn = Utc::now().timestamp_millis();
+            store.record_open(rec("sess-spawn"));
+            assert!(store.record_spawn_device_default(
+                "term-abc",
+                Some("tenant-a".into()),
+                before_spawn
+            ));
+            // A later stamp (a restore-time default) never overwrites it.
+            assert!(!store.record_spawn_device_default(
+                "term-abc",
+                Some("tenant-b".into()),
+                before_spawn
+            ));
+            // Nor does a re-record carrying nothing.
+            store.record_open(rec("sess-spawn"));
+        }
+        let reopened = SessionLifecycleStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.get("sess-spawn").unwrap().spawn_device_default,
+            Some(SpawnDeviceDefault {
+                tenant_id: Some("tenant-a".into())
+            }),
+            "the value of the SPAWN must survive a restart"
+        );
+    }
+
+    /// A record that existed BEFORE the spawn (a resume / boot restore of an
+    /// older session, possibly one that predates the field) is not stamped with
+    /// the default read now: that is the restore-time default, and it stays
+    /// unrecorded rather than wrong.
+    #[test]
+    fn a_restore_re_spawn_never_stamps_a_pre_existing_record() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        store.record_open(rec("sess-old"));
+        let spawn_after_the_record = Utc::now().timestamp_millis() + 60_000;
+        assert!(!store.record_spawn_device_default(
+            "term-abc",
+            Some("tenant-restore-time".into()),
+            spawn_after_the_record
+        ));
+        assert_eq!(store.get("sess-old").unwrap().spawn_device_default, None);
+    }
+
+    /// The row the tenancy report reads is often NOT the seam's provisional row
+    /// but the one an account launcher's typed `claude --session-id` creates on
+    /// the same terminal. A brand-new record inherits the terminal's recorded
+    /// spawn default; a record that already existed does not.
+    #[test]
+    fn a_new_record_on_the_terminal_inherits_the_recorded_spawn_default() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
+        let before = Utc::now().timestamp_millis();
+        store.record_open(rec("seam-row"));
+        assert!(store.record_spawn_device_default("term-abc", None, before));
+        store.record_open(rec("launcher-row"));
+        assert_eq!(
+            store.get("launcher-row").unwrap().spawn_device_default,
+            Some(SpawnDeviceDefault { tenant_id: None }),
+            "recorded-with-no-default is inherited as recorded, not as absent"
+        );
+
+        let mut elsewhere = rec("older-session");
+        elsewhere.terminal_id = "term-other".to_string();
+        store.record_open(elsewhere.clone());
+        elsewhere.terminal_id = "term-abc".to_string();
+        store.record_open(elsewhere);
+        assert_eq!(
+            store.get("older-session").unwrap().spawn_device_default,
+            None,
+            "a pre-existing record re-bound to the terminal is a resume, not this spawn"
+        );
+    }
 
     /// A mutation is durable via the WAL alone — no compaction needed — and the
     /// JSON snapshot has NOT been rewritten (that is the whole O(1) point).
@@ -7479,6 +7667,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

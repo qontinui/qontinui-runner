@@ -189,6 +189,22 @@ pub struct StoredNonceBinding {
     /// needed and an old store restores byte-for-byte as it used to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant: Option<uuid::Uuid>,
+    /// Whether [`Self::session_tenant`] was CHOSEN for the session or SAMPLED
+    /// from the machine at mint (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`
+    /// follow-up W-C). Written only beside a tenant. ABSENT beside a tenant —
+    /// an entry written before the field — restores as `explicit`, the
+    /// conservative arm (`coord_mcp::PinOrigin::restored` says why).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tenant_origin: Option<StoredPinOrigin>,
+}
+
+/// On-disk spelling of `coord_mcp::PinOrigin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredPinOrigin {
+    Explicit,
+    MachineSampled,
 }
 
 /// What loading the persisted proxy-nonce set actually found. See
@@ -271,6 +287,7 @@ impl From<StoredNonceEntry> for StoredNonceBinding {
                 minted_at_unix: None,
                 // Pre-Phase-4 entries predate the tenant too: restore-time pin.
                 session_tenant: None,
+                session_tenant_origin: None,
             },
             StoredNonceEntry::Modern(b) => b,
         }
@@ -2189,6 +2206,7 @@ mod tests {
             terminal_id: None,
             minted_at_unix: Some(1_755_000_000),
             session_tenant: None,
+            session_tenant_origin: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2206,6 +2224,7 @@ mod tests {
             terminal_id: None,
             minted_at_unix: Some(0),
             session_tenant: None,
+            session_tenant_origin: None,
         }))
         .unwrap();
         assert_eq!(
@@ -2239,6 +2258,7 @@ mod tests {
             terminal_id: None,
             minted_at_unix: None,
             session_tenant: None,
+            session_tenant_origin: None,
         }))
         .unwrap();
         assert_eq!(modern, serde_json::json!({"workdir": "D:\\wd-c"}));
@@ -2263,6 +2283,7 @@ mod tests {
                 terminal_id: Some("term-1".into()),
                 minted_at_unix: Some(1_700_000_000),
                 session_tenant: None,
+                session_tenant_origin: None,
             },
         )]);
         let graced = std::collections::HashMap::from([(
@@ -2298,6 +2319,7 @@ mod tests {
                 terminal_id: Some("term-1".into()),
                 minted_at_unix: Some(1_700_000_123),
                 session_tenant: None,
+                session_tenant_origin: None,
             },
         );
         map.insert(
@@ -2307,6 +2329,7 @@ mod tests {
                 terminal_id: None,
                 minted_at_unix: None,
                 session_tenant: None,
+                session_tenant_origin: None,
             },
         );
         storage.store_coord_mcp_nonces(&map).unwrap();

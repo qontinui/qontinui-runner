@@ -361,6 +361,39 @@ pub const TENANCY_RESOLVED: &str = "resolved";
 pub const TENANCY_OBSERVED: &str = "observed";
 /// Any tenancy value that could not be established — always with a `reason`.
 pub const TENANCY_UNKNOWN: &str = "unknown";
+/// `tenancy.row.spawnDeviceDefaultStatus`: the spawn-time default was recorded.
+pub const TENANCY_RECORDED: &str = "recorded";
+/// `tenancy.divergence`: the known tenants name more than one tenant.
+pub const DIVERGENCE_DIVERGED: &str = "diverged";
+/// `tenancy.divergence`: the credential tenant AND an expected tenant are both
+/// known, and they are one tenant.
+pub const DIVERGENCE_AGREE: &str = "agree";
+
+/// What the lifecycle record says about the device default a session was
+/// spawned under (W-B). `NotRecorded` is UNKNOWN — the comparison it feeds is
+/// then unknown too, never agreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnDefaultRead {
+    /// Recorded; `None` = the machine named no default at spawn.
+    Recorded(Option<uuid::Uuid>),
+    /// Not recorded, with the reason.
+    NotRecorded(&'static str),
+}
+
+impl SpawnDefaultRead {
+    /// Read the persisted value off a lifecycle record.
+    pub(crate) fn from_record(rec: &TerminalSessionRecord) -> Self {
+        match &rec.spawn_device_default {
+            None => SpawnDefaultRead::NotRecorded("not_recorded"),
+            Some(sd) => match sd.tenant_id.as_deref().map(str::trim) {
+                None | Some("") => SpawnDefaultRead::Recorded(None),
+                Some(t) => uuid::Uuid::parse_str(t)
+                    .map(|u| SpawnDefaultRead::Recorded(Some(u)))
+                    .unwrap_or(SpawnDefaultRead::NotRecorded("unparseable")),
+            },
+        }
+    }
+}
 
 /// The coord row tenant: what the session was stamped with at spawn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -377,8 +410,15 @@ pub struct TenancyRow {
     /// `tenantId` nor the data plane names a tenant, so a session presenting
     /// another tenant's key (a tenant-pinned cwd `.mcp.json`) is never silently
     /// reported as agreeing. `None` when this runner process did not record the
-    /// spawn.
+    /// spawn — see [`Self::spawn_device_default_status`].
     pub spawn_device_default_tenant_id: Option<String>,
+    /// [`TENANCY_RECORDED`] (the spawn's default was recorded — `tenantId` may
+    /// still be `None` when the machine named no default then) | [`TENANCY_UNKNOWN`]
+    /// (NOT recorded: never compared, and never read as "no default").
+    pub spawn_device_default_status: String,
+    /// Set when the status is unknown: `not_recorded` (a record older than the
+    /// field, or a spawn this runner never saw) | `unparseable`.
+    pub spawn_device_default_reason: Option<String>,
     /// The machine's CURRENT default tenant. Context only, NEVER compared: after
     /// an operator switches the default, every running session legitimately
     /// differs from it (a switch re-points future sessions only).
@@ -458,7 +498,16 @@ pub struct SessionTenancy {
     pub credential: TenancyCredential,
     /// True iff the tenants that ARE known name more than one tenant. An
     /// unknown value never manufactures a divergence, and never hides one.
+    /// `false` is NOT agreement — read [`Self::divergence`] for that.
     pub diverged: bool,
+    /// [`DIVERGENCE_DIVERGED`] | [`DIVERGENCE_AGREE`] | [`TENANCY_UNKNOWN`].
+    ///
+    /// `agree` requires BOTH halves of the comparison to be known: the
+    /// credential tenant, and an expected tenant (the row stamp, the data plane,
+    /// or a RECORDED spawn-time default). A tenant-less session whose spawn
+    /// default was not recorded, or a session whose credential is unknown, is
+    /// `unknown` — the boolean alone used to render both as "not diverged".
+    pub divergence: String,
 }
 
 /// Project the three tenancy reads into [`SessionTenancy`]. Pure.
@@ -479,7 +528,7 @@ pub(crate) fn project_tenancy(
     data_plane: Option<crate::auth::TenantScope>,
     credential: &crate::coord_mcp::CredentialTenantRead,
     default_binding: crate::auth::BindingTenantRead,
-    spawn_default: Option<uuid::Uuid>,
+    spawn_default: SpawnDefaultRead,
     current_default: Option<uuid::Uuid>,
     posture: Option<&crate::mcp::device_jwt_refresher::CoordCredentialStatus>,
 ) -> SessionTenancy {
@@ -593,7 +642,10 @@ pub(crate) fn project_tenancy(
     // registry) names one. The live default is never compared: an operator's
     // switch would otherwise make every running tenant-less session read
     // diverged, a false signal rendered as a fact.
-    let spawn_default = spawn_default.map(|t| t.to_string());
+    let (spawn_default, spawn_default_status, spawn_default_reason) = match spawn_default {
+        SpawnDefaultRead::Recorded(t) => (t.map(|t| t.to_string()), TENANCY_RECORDED, None),
+        SpawnDefaultRead::NotRecorded(reason) => (None, TENANCY_UNKNOWN, Some(reason.to_string())),
+    };
     let expected = row_tenant
         .map(String::from)
         .or_else(|| data_plane.tenant_id.clone())
@@ -605,16 +657,27 @@ pub(crate) fn project_tenancy(
     known.extend(credential.tenant_id.as_deref().map(str::to_ascii_lowercase));
     known.sort();
     known.dedup();
+    let diverged = known.len() > 1;
+    let divergence = if diverged {
+        DIVERGENCE_DIVERGED
+    } else if credential.tenant_id.is_some() && expected.is_some() {
+        DIVERGENCE_AGREE
+    } else {
+        TENANCY_UNKNOWN
+    };
 
     SessionTenancy {
         row: TenancyRow {
             tenant_id: row_tenant.map(String::from),
             spawn_device_default_tenant_id: spawn_default,
+            spawn_device_default_status: spawn_default_status.to_string(),
+            spawn_device_default_reason: spawn_default_reason,
             current_device_default_tenant_id: current_default.map(|t| t.to_string()),
         },
         data_plane,
         credential,
-        diverged: known.len() > 1,
+        diverged,
+        divergence: divergence.to_string(),
     }
 }
 
@@ -648,7 +711,9 @@ pub(crate) fn read_session_tenancy(rec: &TerminalSessionRecord) -> SessionTenanc
         data_plane,
         &credential,
         crate::auth::default_binding_tenant_probe(),
-        crate::coord_mcp::terminal_spawn_default_tenant(&rec.terminal_id).flatten(),
+        // W-B: the PERSISTED spawn-time default, never the process map — after
+        // a restart that map holds the restore-time default for this terminal.
+        SpawnDefaultRead::from_record(rec),
         crate::session::tenant_pin::resolve_tenant_pin().pinned(),
         crate::mcp::device_jwt_refresher::coord_credential_posture().as_ref(),
     )
@@ -1115,6 +1180,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 
@@ -1141,7 +1207,7 @@ mod tests {
             None,
             &crate::coord_mcp::CredentialTenantRead::NoNonce,
             crate::auth::BindingTenantRead::Unknown,
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         )
@@ -1181,7 +1247,7 @@ mod tests {
             Some(crate::auth::TenantScope::Owned(b)),
             &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
             crate::auth::BindingTenantRead::Unknown,
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             Some(&status),
         );
@@ -1205,7 +1271,7 @@ mod tests {
             None,
             &crate::coord_mcp::CredentialTenantRead::Resolved(Some(b)),
             crate::auth::BindingTenantRead::Unknown,
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             Some(&status),
         );
@@ -1229,7 +1295,7 @@ mod tests {
             None,
             &crate::coord_mcp::CredentialTenantRead::Resolved(None),
             crate::auth::BindingTenantRead::Bound(a),
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -1248,7 +1314,7 @@ mod tests {
             None,
             &crate::coord_mcp::CredentialTenantRead::NoNonce,
             crate::auth::BindingTenantRead::Bound(tenant(0xA1)),
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -1276,7 +1342,7 @@ mod tests {
                 None,
                 &CredentialTenantRead::Resolved(None),
                 binding,
-                None,
+                SpawnDefaultRead::NotRecorded("not_recorded"),
                 None,
                 None,
             );
@@ -1289,7 +1355,7 @@ mod tests {
             None,
             &CredentialTenantRead::NotLive,
             BindingTenantRead::Bound(b),
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -1310,7 +1376,7 @@ mod tests {
             Some(TenantScope::Device),
             &CredentialTenantRead::Resolved(Some(b)),
             BindingTenantRead::Bound(a),
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -1326,7 +1392,7 @@ mod tests {
             Some(TenantScope::Device),
             &CredentialTenantRead::Resolved(Some(b)),
             BindingTenantRead::Unknown,
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -1350,7 +1416,7 @@ mod tests {
             None,
             &CredentialTenantRead::Resolved(Some(b)),
             BindingTenantRead::Bound(a),
-            Some(a),
+            SpawnDefaultRead::Recorded(Some(a)),
             None,
             None,
         );
@@ -1361,7 +1427,7 @@ mod tests {
             None,
             &CredentialTenantRead::Resolved(Some(a)),
             BindingTenantRead::Bound(a),
-            Some(a),
+            SpawnDefaultRead::Recorded(Some(a)),
             None,
             None,
         );
@@ -1381,13 +1447,127 @@ mod tests {
             None,
             &CredentialTenantRead::Resolved(Some(a)),
             BindingTenantRead::Bound(a),
-            None,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
             Some(b),
             None,
         );
         assert!(!t.diverged);
         assert_eq!(t.row.current_device_default_tenant_id, Some(b.to_string()));
         assert_eq!(t.row.spawn_device_default_tenant_id, None);
+    }
+
+    /// W-B. A tenant-less session whose spawn-time default was NOT recorded (a
+    /// record from before the field, after a restart) cannot be compared: the
+    /// status says so, and the comparison is `unknown` — not `diverged: false`
+    /// read as agreement, which is what flattening "not recorded" used to do.
+    #[test]
+    fn tenancy_with_an_unrecorded_spawn_default_is_unknown_not_agreement() {
+        use crate::auth::BindingTenantRead;
+        use crate::coord_mcp::CredentialTenantRead;
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let t = project_tenancy(
+            None,
+            None,
+            &CredentialTenantRead::Resolved(Some(b)),
+            BindingTenantRead::Bound(a),
+            SpawnDefaultRead::NotRecorded("not_recorded"),
+            Some(a),
+            None,
+        );
+        assert_eq!(t.row.spawn_device_default_status, TENANCY_UNKNOWN);
+        assert_eq!(
+            t.row.spawn_device_default_reason.as_deref(),
+            Some("not_recorded")
+        );
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, TENANCY_UNKNOWN);
+
+        // Recorded, the same credential is a real comparison either way.
+        let agree = project_tenancy(
+            None,
+            None,
+            &CredentialTenantRead::Resolved(Some(a)),
+            BindingTenantRead::Bound(a),
+            SpawnDefaultRead::Recorded(Some(a)),
+            Some(b),
+            None,
+        );
+        assert_eq!(agree.row.spawn_device_default_status, TENANCY_RECORDED);
+        assert_eq!(agree.divergence, DIVERGENCE_AGREE);
+        let diverged = project_tenancy(
+            None,
+            None,
+            &CredentialTenantRead::Resolved(Some(b)),
+            BindingTenantRead::Bound(a),
+            SpawnDefaultRead::Recorded(Some(a)),
+            None,
+            None,
+        );
+        assert!(diverged.diverged);
+        assert_eq!(diverged.divergence, DIVERGENCE_DIVERGED);
+    }
+
+    /// An unknown credential leaves the comparison unknown even when the row
+    /// names a tenant — `agree` needs both halves.
+    #[test]
+    fn tenancy_divergence_is_unknown_while_the_credential_is() {
+        let b = tenant(0xB2);
+        let t = project_tenancy(
+            Some(&b.to_string()),
+            None,
+            &crate::coord_mcp::CredentialTenantRead::NoNonce,
+            crate::auth::BindingTenantRead::Unknown,
+            SpawnDefaultRead::NotRecorded("not_recorded"),
+            None,
+            None,
+        );
+        assert!(!t.diverged);
+        assert_eq!(t.divergence, TENANCY_UNKNOWN);
+    }
+
+    /// The persisted value is what the report reads: absent is not recorded,
+    /// a recorded `None` is "no default then", and junk is not a tenant.
+    #[test]
+    fn the_spawn_default_is_read_off_the_record() {
+        use crate::session::session_lifecycle_store::SpawnDeviceDefault;
+        let mut rec = record("88888888-8888-4888-8888-888888888888");
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::NotRecorded("not_recorded")
+        );
+        rec.spawn_device_default = Some(SpawnDeviceDefault { tenant_id: None });
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::Recorded(None)
+        );
+        let a = tenant(0xA1);
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: Some(a.to_string()),
+        });
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::Recorded(Some(a))
+        );
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: Some("not-a-uuid".into()),
+        });
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::NotRecorded("unparseable")
+        );
+        let v = serde_json::to_value(project_tenancy(
+            None,
+            None,
+            &crate::coord_mcp::CredentialTenantRead::NoNonce,
+            crate::auth::BindingTenantRead::Unknown,
+            SpawnDefaultRead::from_record(&rec),
+            None,
+            None,
+        ))
+        .unwrap();
+        assert_eq!(v["row"]["spawnDeviceDefaultStatus"], "unknown");
+        assert_eq!(v["row"]["spawnDeviceDefaultReason"], "unparseable");
+        assert_eq!(v["divergence"], "unknown");
     }
 
     #[test]
