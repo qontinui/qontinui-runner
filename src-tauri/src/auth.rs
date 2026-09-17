@@ -3489,7 +3489,10 @@ mod bearer_selection_tests {
         mgr.store_tokens_expecting(&jwt, "", Some(t)).unwrap();
 
         assert_eq!(mgr.get_access_token().unwrap(), jwt);
-        assert_eq!(mgr.get_tenant_device_jwt(&t).unwrap().as_deref(), Some(jwt.as_str()));
+        assert_eq!(
+            mgr.get_tenant_device_jwt(&t).unwrap().as_deref(),
+            Some(jwt.as_str())
+        );
     }
 
     /// A token whose `tenant_id` claim DISAGREES with `expected_tenant` is
@@ -3523,7 +3526,8 @@ mod bearer_selection_tests {
         let expected = Uuid::parse_str("11111111-2222-4333-8444-55555555555a").unwrap();
         let jwt = live_jwt("no-tenant-claim");
 
-        mgr.store_tokens_expecting(&jwt, "", Some(expected)).unwrap();
+        mgr.store_tokens_expecting(&jwt, "", Some(expected))
+            .unwrap();
 
         assert_eq!(mgr.get_access_token().unwrap(), jwt);
     }

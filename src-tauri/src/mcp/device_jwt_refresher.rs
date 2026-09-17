@@ -130,9 +130,7 @@ static WARNED_TENANT_MISMATCHES: std::sync::OnceLock<
 fn warn_tenant_mismatch_once(expected: uuid::Uuid, returned: Option<uuid::Uuid>) {
     let cell = WARNED_TENANT_MISMATCHES
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mut seen = cell
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut seen = cell.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if seen.insert((expected, returned)) {
         warn!(
             "device_jwt_refresher: device-JWT re-mint returned tenant {returned:?} but \
@@ -9088,7 +9086,11 @@ mod device_machine_key_exchange_tests {
 
         let got = try_device_machine_key_exchange(&mgr, &base, DID, Some(expected)).await;
         assert!(got.is_none(), "a foreign-tenant mint must be refused");
-        assert_eq!(*cap.hits.lock().unwrap(), 1, "the exchange was still attempted");
+        assert_eq!(
+            *cap.hits.lock().unwrap(),
+            1,
+            "the exchange was still attempted"
+        );
         assert_eq!(
             mgr.get_access_token().unwrap(),
             existing,
