@@ -22,7 +22,9 @@
  * the runner actually stored rather than from what it sent.
  *
  * Four fields are edited here — `plans_dir`, `prompts_dir`, `workspace_root`,
- * `dev_logs_dir`. `plans_archive_dir` is not shown (runner PR #1288 removes
+ * `dev_logs_dir` — plus `repo_checkouts`, the map of repos that live outside
+ * the workspace root (plan
+ * `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`). `plans_archive_dir` is not shown (runner PR #1288 removes
  * it) and `strict_mode` is a behaviour flag that belongs with the workflow
  * settings; both round-trip through a save untouched
  * (`buildPathSettingsPayload`).
@@ -48,8 +50,11 @@ import {
   divergenceKind,
   draftsAreDirty,
   draftsFrom,
+  formatRepoCheckouts,
   normalizePathInput,
+  parseRepoCheckouts,
   planScanStatusLabel,
+  repoCheckoutsDirty,
   scanSourceStatus,
   type PathDrafts,
   type PathField,
@@ -113,6 +118,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
   // `plans_archive_dir` to save over the real ones.
   const [view, setView] = useState<PathSettingsView | null>(null);
   const [drafts, setDrafts] = useState<PathDrafts>(() => draftsFrom({ strict_mode: false }));
+  const [checkoutsDraft, setCheckoutsDraft] = useState("");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -128,6 +134,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
         if (cancelled) return;
         setView(loaded);
         setDrafts(draftsFrom(loaded.configured));
+        setCheckoutsDraft(formatRepoCheckouts(loaded.configured.repo_checkouts));
         setError(null);
         onLog("debug", "Path settings loaded");
       } catch (err) {
@@ -181,13 +188,16 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
     setError(null);
     setSaveSuccess(false);
     try {
-      const payload = buildPathSettingsPayload(view.configured, drafts);
+      const checkouts = parseRepoCheckouts(checkoutsDraft);
+      if (checkouts.errors.length > 0) return;
+      const payload = buildPathSettingsPayload(view.configured, drafts, checkouts.entries);
       const fresh = await invoke<PathSettingsView>("save_path_settings", { settings: payload });
       // Re-render from what the runner STORED, not from what was sent: the
       // resolved half is what tells the operator whether the change is in
       // effect yet, and only the runner can answer that.
       setView(fresh);
       setDrafts(draftsFrom(fresh.configured));
+      setCheckoutsDraft(formatRepoCheckouts(fresh.configured.repo_checkouts));
       setSaveSuccess(true);
       onLog("success", "Path settings saved");
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -214,7 +224,10 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
     );
   }
 
-  const dirty = view ? draftsAreDirty(view.configured, drafts) : false;
+  const checkoutErrors = parseRepoCheckouts(checkoutsDraft).errors;
+  const dirty = view
+    ? draftsAreDirty(view.configured, drafts) || repoCheckoutsDirty(view.configured, checkoutsDraft)
+    : false;
 
   return (
     <div className="space-y-6">
@@ -276,6 +289,12 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
               />
             ))}
 
+            <RepoCheckoutsField
+              draft={checkoutsDraft}
+              errors={checkoutErrors}
+              onChange={setCheckoutsDraft}
+            />
+
             <div className={`p-3 ${getAccentColors("blue").bg} rounded-lg flex gap-2`}>
               <Info className={`w-4 h-4 ${getAccentColors("blue").text} shrink-0 mt-0.5`} />
               <p className={`text-xs ${getAccentColors("blue").text}`}>
@@ -299,7 +318,7 @@ export function PathsSettings({ onLog }: PathsSettingsProps) {
               type="button"
               data-ui-bridge-id="settings.paths-save"
               onClick={saveSettings}
-              disabled={saving || !dirty}
+              disabled={saving || !dirty || checkoutErrors.length > 0}
               className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
             >
               {saving ? (
@@ -477,6 +496,64 @@ function PathFieldRow({
         {copy.does} <strong>{copy.whenUnset}</strong>
       </p>
       <InEffect field={field} kind={kind} configured={configured} resolved={resolved} />
+    </div>
+  );
+}
+
+// ── Repos outside the workspace root ────────────────────────────────────────
+
+interface RepoCheckoutsFieldProps {
+  draft: string;
+  errors: string[];
+  onChange: (value: string) => void;
+}
+
+/**
+ * `paths.repo_checkouts` as one `owner/name = path` line per repo. Without an
+ * entry the runner looks for a repo owned by anyone but `qontinui` at
+ * `<parent of workspace root>/<owner>/<name>`, then `<workspace root>/<name>`;
+ * a continuation whose repo is at none of them is refused rather than started
+ * in a directory that does not hold it.
+ */
+function RepoCheckoutsField({ draft, errors, onChange }: RepoCheckoutsFieldProps) {
+  return (
+    <div className="space-y-1.5">
+      <label className="text-xs font-medium" htmlFor="paths-repo-checkouts">
+        Repositories outside the workspace root
+      </label>
+      <textarea
+        id="paths-repo-checkouts"
+        data-ui-bridge-id="settings.paths-repo-checkouts"
+        spellCheck={false}
+        autoComplete="off"
+        rows={3}
+        value={draft}
+        placeholder="e.g. your-org/your-app = /home/you/your-org/your-app"
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-2.5 py-1.5 text-sm font-mono bg-muted/50 rounded-md outline-hidden focus:ring-1 focus:ring-primary/50"
+      />
+      <p className="text-[10px] text-muted-foreground">
+        One <code>owner/name = path</code> line per repository this runner works on that is not
+        checked out under the workspace root. Sessions for that repository start in its checkout.{" "}
+        <strong>
+          Without a line, a repository owned by anyone but qontinui is looked for at &lt;parent of
+          the workspace root&gt;/&lt;owner&gt;/&lt;name&gt;, then &lt;workspace
+          root&gt;/&lt;name&gt;; a session whose repository is in none of those places is refused
+          instead of being started somewhere the repository is not.
+        </strong>
+      </p>
+      {errors.length > 0 && (
+        <div
+          data-ui-bridge-id="settings.paths-repo-checkouts-errors"
+          className={`p-2 ${getAccentColors("red").bg} rounded-md`}
+        >
+          {errors.map((e) => (
+            <p key={e} className={`text-[10px] ${getAccentColors("red").text}`}>
+              {e}
+            </p>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

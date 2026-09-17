@@ -160,6 +160,15 @@ pub fn normalize(settings: PathSettings) -> PathSettings {
         plans_archive_dir: non_blank(settings.plans_archive_dir),
         prompts_dir: non_blank(settings.prompts_dir),
         workspace_root: non_blank(settings.workspace_root),
+        // A blank slug or a blank path is not a mapping; both sides trimmed.
+        repo_checkouts: settings
+            .repo_checkouts
+            .into_iter()
+            .filter_map(|(slug, path)| {
+                let (slug, path) = (slug.trim().to_string(), path.trim().to_string());
+                (!slug.is_empty() && !path.is_empty()).then_some((slug, path))
+            })
+            .collect(),
         strict_mode: settings.strict_mode,
     }
 }
@@ -289,6 +298,13 @@ mod tests {
             plans_archive_dir: Some("\t".to_string()),
             prompts_dir: Some(" /prompts ".to_string()),
             workspace_root: None,
+            repo_checkouts: [
+                (" acme/app ".to_string(), " /src/acme/app ".to_string()),
+                ("acme/blank-path".to_string(), "   ".to_string()),
+                ("  ".to_string(), "/src/no-slug".to_string()),
+            ]
+            .into_iter()
+            .collect(),
             strict_mode: true,
         };
         let stored = normalize(typed);
@@ -301,6 +317,11 @@ mod tests {
             "surrounding whitespace is trimmed, as the migration trims it"
         );
         assert_eq!(stored.workspace_root, None);
+        assert_eq!(
+            stored.repo_checkouts.into_iter().collect::<Vec<_>>(),
+            vec![("acme/app".to_string(), "/src/acme/app".to_string())],
+            "a mapping with a blank side is dropped; the survivor is trimmed"
+        );
         assert!(stored.strict_mode);
     }
 
@@ -314,6 +335,9 @@ mod tests {
             plans_archive_dir: Some("/root/archive".to_string()),
             prompts_dir: None,
             workspace_root: Some("/root".to_string()),
+            repo_checkouts: [("acme/app".to_string(), "/src/acme/app".to_string())]
+                .into_iter()
+                .collect(),
             strict_mode: true,
         };
         let once = normalize(on_disk.clone());
