@@ -10,7 +10,12 @@ import { describe, expect, it } from "vitest";
 
 import { tenantBadgeLabel } from "./TenantBadge";
 import type { SessionTenancy } from "./useSessionInfo";
-import { pickSpawnTenant, resolveSpawnTenant, shortTenantId } from "./SpawnTenantPicker";
+import {
+  explicitSpawnTenant,
+  pickSpawnTenant,
+  resolveSpawnTenant,
+  shortTenantId,
+} from "./SpawnTenantPicker";
 
 const A = "6b1f4b0e-1111-4000-8000-000000000001";
 const B = "91ffaa20-2222-4000-8000-000000000002";
@@ -216,39 +221,49 @@ describe("resolveSpawnTenant", () => {
   });
 });
 
-describe("pickSpawnTenant (every spawn path records the acting tenant)", () => {
-  it("resolves a button/component spawn to the device default for new sessions on a multi-tenant device", () => {
-    // The button / launch-menu / Ctrl+Shift+T paths pass no picker selection
-    // (`spawnTenantId` null), but a paired multi-tenant device HAS a default
-    // tenant for new sessions. The spawn (and therefore `tab.tenantId`) must bind to it — not
-    // undefined — so `TenantBadge` renders on these paths, matching the tenant
-    // Rust stamps onto `Intent.tenant_id`. This is the F1 defect this fix closes.
-    expect(pickSpawnTenant({ spawnTenantId: null, defaultTenantIdForNewSessions: A })).toBe(A);
-  });
-
-  it("prefers the picker's published selection over the device default for new sessions", () => {
-    expect(pickSpawnTenant({ spawnTenantId: B, defaultTenantIdForNewSessions: A })).toBe(B);
-  });
-
-  it("prefers an explicit per-invocation tenant (the /spawn-ai --tenant flag) over all else", () => {
-    expect(
-      pickSpawnTenant({ explicit: B, spawnTenantId: A, defaultTenantIdForNewSessions: A }),
-    ).toBe(B);
-  });
-
-  it("ignores a blank / whitespace explicit override and falls through", () => {
-    expect(
-      pickSpawnTenant({ explicit: "   ", spawnTenantId: null, defaultTenantIdForNewSessions: A }),
-    ).toBe(A);
-  });
-
-  it("stays undefined on a single-tenant / unpaired device (byte-identical to pre-F2)", () => {
-    // Nothing to send → the caller omits `tenant_id` → Rust device-default
-    // stamping, exactly as before. `TenantBadge` stays hidden (showSwitcher is
-    // also false in the single-tenant case), so no clutter and no wire change.
-    expect(
-      pickSpawnTenant({ spawnTenantId: null, defaultTenantIdForNewSessions: null }),
-    ).toBeUndefined();
+describe("pickSpawnTenant (only an explicit choice is sent — re-review F1)", () => {
+  it("sends NO tenant when nothing was explicitly chosen, whatever the device default", () => {
+    // A plain shell tab must never be refused for a tenant it did not ask for.
+    expect(pickSpawnTenant({ spawnTenantId: null })).toBeUndefined();
     expect(pickSpawnTenant({})).toBeUndefined();
+    // A caller still holding the device default must not get it sent: the
+    // function takes no default any more, and one smuggled in is ignored.
+    const withDefault = {
+      spawnTenantId: null,
+      defaultTenantIdForNewSessions: A,
+    } as unknown as Parameters<typeof pickSpawnTenant>[0];
+    expect(pickSpawnTenant(withDefault)).toBeUndefined();
+  });
+
+  it("sends the picker's explicit pick", () => {
+    expect(pickSpawnTenant({ spawnTenantId: B })).toBe(B);
+  });
+
+  it("prefers an explicit per-invocation tenant (the /spawn-ai --tenant flag) over the pick", () => {
+    expect(pickSpawnTenant({ explicit: B, spawnTenantId: A })).toBe(B);
+  });
+
+  it("ignores a blank / whitespace explicit tenant and falls through to the pick, then to none", () => {
+    expect(pickSpawnTenant({ explicit: "   ", spawnTenantId: A })).toBe(A);
+    expect(pickSpawnTenant({ explicit: "   ", spawnTenantId: null })).toBeUndefined();
+  });
+});
+
+describe("explicitSpawnTenant (what the picker publishes — re-review F1)", () => {
+  it("publishes nothing without a pick, even when a default or inference is displayed", () => {
+    expect(explicitSpawnTenant({ override: null, candidates: [A, B] })).toBeNull();
+    expect(resolveSpawnTenant({ inferred: B, defaultForNewSessions: A, candidates: [A, B] })).toBe(
+      B,
+    );
+  });
+
+  it("publishes the operator's pick when the device is bound to it", () => {
+    expect(explicitSpawnTenant({ override: A, candidates: [A, B] })).toBe(A);
+  });
+
+  it("publishes nothing for a pick the device is not bound to", () => {
+    expect(
+      explicitSpawnTenant({ override: "ffffffff-0000-4000-8000-00000000ffff", candidates: [A, B] }),
+    ).toBeNull();
   });
 });

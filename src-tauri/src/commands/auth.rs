@@ -1676,19 +1676,17 @@ pub(crate) fn coord_device_token_for(
             crate::auth::BindingTenantRead::Bound(d) => Some(d),
             _ => None,
         };
-        if let Some(jwt) = crate::auth::select_device_bearer(am, Some(&t), default_tenant) {
-            // The token must NAME the tenant asked for. The selector can serve a
-            // named tenant from the legacy slot (the default binding's), and that
-            // slot is only as current as the last write to it: a token whose
-            // claim names another tenant — or names none — is not a credential
-            // for `t`, so the answer is "none held", never that token.
-            return Ok(match crate::auth::jwt_tenant_claim(&jwt) {
-                Some(claim) if claim == t => Some(jwt),
-                _ => None,
-            });
+        // The token must NAME the tenant asked for. A token whose claim names
+        // another tenant — or none — is not a credential for `t`, and is treated
+        // exactly like no token: the miss path below.
+        if let Some(jwt) = crate::auth::select_device_bearer(am, Some(&t), default_tenant)
+            .filter(|jwt| crate::auth::jwt_tenant_claim(jwt) == Some(t))
+        {
+            return Ok(Some(jwt));
         }
-        // A miss is "no credential for t" only if the slot store was READ. An
-        // unreadable store is UNKNOWN — the same no-downgrade rule as below.
+        // A miss (including a mismatched claim) is "no credential for t" only if
+        // the slot store was READ. An unreadable store is UNKNOWN — the same
+        // no-downgrade rule as below.
         return match &held.slots {
             Ok(_) => Ok(None),
             Err(e) => Err(format!(
@@ -2219,6 +2217,25 @@ mod device_token_door_tests {
             coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
             Ok(None)
         );
+    }
+
+    /// Nit (re-review). A named-tenant lookup whose only candidate names another
+    /// tenant is a MISS, and a miss on an unreadable slot store is the typed
+    /// unreadable error — never `Ok(None)`.
+    #[test]
+    fn a_claim_mismatch_on_an_unreadable_store_is_the_unreadable_error() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = AuthManager::new();
+        am.store_tokens(&jwt_for(b), "").unwrap();
+        am.clear_tenant_device_jwt(&b).unwrap();
+        let held = crate::auth::HeldDeviceTenants {
+            slots: Err("slot store io".into()),
+            default_binding: crate::auth::BindingTenantRead::Bound(a),
+            legacy_slot: Ok(false),
+        };
+        let err = coord_device_token_for(&am, Some(a), &held, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
     }
 
     #[test]
