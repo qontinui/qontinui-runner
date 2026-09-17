@@ -1683,9 +1683,15 @@ pub(crate) fn coord_device_token_for(
             crate::auth::select_device_bearer(am, Some(&t), default_tenant).filter(|jwt| {
                 match crate::auth::jwt_tenant_claim(jwt) {
                     Some(claim) => claim == t,
-                    // No claim: only the legacy-slot route can have produced it (a
-                    // per-tenant slot is keyed by its tenant), and the selector has
-                    // already applied the single-binding rule to it.
+                    // No claim. The selector can return one from TWO routes: t's own
+                    // per-tenant slot (a slot hit), or the legacy-slot fallback for
+                    // the default binding, where it has already applied the
+                    // measured single-binding rule. This door accepts only the
+                    // second: t must be the default binding AND the slot store must
+                    // hold no slot for t. A claimless token found IN t's slot is
+                    // refused here and takes the miss path below — the door hands
+                    // out only tokens whose provenance it can state, and a re-pair
+                    // (which writes a claim) is the recovery.
                     None => {
                         default_tenant == Some(t)
                             && !matches!(&held.slots, Ok(slots) if slots.contains(&t))
@@ -2224,15 +2230,49 @@ mod device_token_door_tests {
                 .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
         );
         am.store_tokens(&claimless, "").unwrap();
-        // Re-review P2: on this single-binding ambient the claimless token IS
-        // a's (no slot for a, one binding)...
+        let paired = _amb.dir().join("paired_user.json");
+        // Should-fix (fail closed): with NO paired_user.json the binding count
+        // is unmeasured, and the claimless token is refused...
+        let _ = std::fs::remove_file(&paired);
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        // ...as it is for an unparseable file and for malformed v2 shapes...
+        for body in [
+            "{not json".to_string(),
+            serde_json::json!({"default_tenant_id": a, "bindings": "a"}).to_string(),
+            serde_json::json!({"default_tenant_id": a, "bindings": []}).to_string(),
+        ] {
+            std::fs::write(&paired, &body).unwrap();
+            assert_eq!(
+                coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+                Ok(None),
+                "claimless token must be refused beside {body}"
+            );
+        }
+        // Re-review P2: on a device MEASURED to hold one binding the claimless
+        // token IS a's (no slot for a)...
+        std::fs::write(
+            &paired,
+            serde_json::json!({"default_tenant_id": a, "bindings": [{"tenant_id": a}]}).to_string(),
+        )
+        .unwrap();
         assert_eq!(
             coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
             Ok(Some(claimless.clone()))
         );
+        // ...a claimless token sitting in a's OWN slot is not handed out by the
+        // door (its provenance is the slot key alone)...
+        am.store_tenant_device_jwt(&a, &claimless).unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        am.clear_tenant_device_jwt(&a).unwrap();
         // ...and on a two-binding device it is not.
         std::fs::write(
-            _amb.dir().join("paired_user.json"),
+            &paired,
             serde_json::json!({
                 "default_tenant_id": a,
                 "bindings": [{"tenant_id": a}, {"tenant_id": b}]
