@@ -2467,7 +2467,10 @@ fn tenant_bindings_verdict(
             }
         };
     let (slots_ok, slots_line) = tenant_slots_half(coord_set.as_ref(), slots, slot_note);
-    (bindings_ok && slots_ok, format!("{bindings_line}{slots_line}"))
+    (
+        bindings_ok && slots_ok,
+        format!("{bindings_line}{slots_line}"),
+    )
 }
 
 /// The slots half of [`tenant_bindings_verdict`]'s detail: the local slot
@@ -2995,11 +2998,7 @@ mod tests {
     /// the shape almost every case wants, since the legacy fallback only ever
     /// applies to the default tenant.
     fn census(states: &[(uuid::Uuid, crate::auth::SlotState)]) -> SlotCensus {
-        SlotCensus::new(
-            states.iter().copied(),
-            None,
-            crate::auth::SlotState::Absent,
-        )
+        SlotCensus::new(states.iter().copied(), None, crate::auth::SlotState::Absent)
     }
 
     /// A census in which every listed tenant holds a usable slot.
@@ -3015,8 +3014,14 @@ mod tests {
     /// APPLICABLE, and it must not read as "bound to zero tenants".
     #[test]
     fn tenant_bindings_unpaired_is_green_not_applicable() {
-        let (ok, detail) =
-            tenant_bindings_verdict(false, &[], None, "device not paired", None, "device not paired");
+        let (ok, detail) = tenant_bindings_verdict(
+            false,
+            &[],
+            None,
+            "device not paired",
+            None,
+            "device not paired",
+        );
         assert!(ok, "{detail}");
         assert!(detail.contains("NOT APPLICABLE"), "{detail}");
         assert!(detail.contains("coord was not asked"), "{detail}");
@@ -3116,8 +3121,14 @@ mod tests {
         assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
         assert!(detail.contains("the two sets agree"), "{detail}");
 
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![])), "", Some(&none), "0 slots");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1)],
+            Some(Some(vec![])),
+            "",
+            Some(&none),
+            "0 slots",
+        );
         assert!(!ok);
         assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
         assert!(detail.contains("DRIFT"), "{detail}");
@@ -3214,7 +3225,10 @@ mod tests {
             "1 tenant slot(s) enumerated from the per-tenant device-JWT store",
         );
 
-        assert!(!ok, "a device that cannot act in 2 of 3 bindings is not green");
+        assert!(
+            !ok,
+            "a device that cannot act in 2 of 3 bindings is not green"
+        );
         assert!(detail.contains("BINDINGS vs SLOTS DIVERGE"), "{detail}");
         assert!(
             detail.contains(&format!("{} (absent)", t(1))),
@@ -3235,13 +3249,22 @@ mod tests {
     fn bindings_vs_slots_in_step_says_so() {
         let bound = vec![t(1), t(2)];
         let slots = all_usable(&bound);
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "",
+        );
 
         assert!(ok, "{detail}");
         assert!(detail.contains("BINDINGS vs SLOTS in step"), "{detail}");
         assert!(!detail.contains("DIVERGE"), "{detail}");
-        assert!(!detail.contains("UNKNOWN"), "nothing here is unmeasured: {detail}");
+        assert!(
+            !detail.contains("UNKNOWN"),
+            "nothing here is unmeasured: {detail}"
+        );
     }
 
     /// ZERO slots is the arm most in need of a signal — a device that can act
@@ -3279,8 +3302,14 @@ mod tests {
             (t(1), crate::auth::SlotState::Usable),
             (t(9), crate::auth::SlotState::Usable),
         ]);
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "",
+        );
 
         assert!(!ok, "{detail}");
         assert!(
@@ -3301,8 +3330,14 @@ mod tests {
         let bound = vec![t(1), t(2)];
         // t1 holds a slot whose credential is dead; t2 holds nothing at all.
         let slots = census(&[(t(1), crate::auth::SlotState::PresentButDead)]);
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "",
+        );
 
         assert!(!ok, "{detail}");
         assert!(
@@ -3348,7 +3383,10 @@ mod tests {
             detail.contains("1 usable"),
             "the slot census is local and still prints: {detail}"
         );
-        assert!(detail.contains("BINDINGS vs SLOTS not computed"), "{detail}");
+        assert!(
+            detail.contains("BINDINGS vs SLOTS not computed"),
+            "{detail}"
+        );
         assert!(!detail.contains("DIVERGE"), "{detail}");
         assert!(!detail.contains("in step"), "{detail}");
 
@@ -3362,7 +3400,10 @@ mod tests {
             "1 slot",
         );
         assert!(detail.contains("did not hydrate bindings"), "{detail}");
-        assert!(detail.contains("BINDINGS vs SLOTS not computed"), "{detail}");
+        assert!(
+            detail.contains("BINDINGS vs SLOTS not computed"),
+            "{detail}"
+        );
 
         // (c) Slot store UNREADABLE, coord MEASURED. UNKNOWN, never "no
         //     slots", and again no difference.
@@ -3393,12 +3434,21 @@ mod tests {
     fn a_bound_tenant_with_an_unreadable_slot_is_unknown_not_a_defect() {
         let bound = vec![t(1)];
         let slots = census(&[(t(1), crate::auth::SlotState::Unreadable)]);
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "",
+        );
 
         assert!(!ok, "{detail}");
         assert!(
-            detail.contains(&format!("slot state UNKNOWN for bound tenant(s) [{}]", t(1))),
+            detail.contains(&format!(
+                "slot state UNKNOWN for bound tenant(s) [{}]",
+                t(1)
+            )),
             "{detail}"
         );
         assert!(
@@ -3423,14 +3473,17 @@ mod tests {
             crate::auth::SlotState::Usable,
         );
         let bound = vec![default, other];
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "",
+        );
 
         assert!(!ok, "the NON-default tenant is still a finding: {detail}");
-        assert!(
-            detail.contains(&format!("{} (absent)", other)),
-            "{detail}"
-        );
+        assert!(detail.contains(&format!("{} (absent)", other)), "{detail}");
         assert!(
             !detail.contains(&format!("{} (absent)", default)),
             "the default tenant is served by the legacy slot — naming it would send an \
