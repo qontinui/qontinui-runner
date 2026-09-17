@@ -20,6 +20,25 @@ use uuid::Uuid;
 /// Service name used for keychain entries (legacy)
 const SERVICE_NAME: &str = "com.qontinui.runner";
 
+/// The minted token's own `tenant_id` claim (decoded, unverified — see
+/// [`jwt_tenant_claim`]) disagreed with the tenant a caller asked coord to
+/// mint for. Returned (wrapped in `anyhow::Error`) by
+/// [`AuthManager::store_tokens_expecting`], which refuses to persist a
+/// mismatched token.
+///
+/// Plan
+/// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+/// D2: on 2026-09-16 a device-JWT re-mint silently re-pointed a runner's
+/// default credential slot at the operator's home tenant instead of the one
+/// it asked for. This is the one seam every refresher mint-store routes
+/// through so a mint path added later cannot forget the check.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("minted device JWT is for tenant {returned:?}, not the requested tenant {expected}")]
+pub(crate) struct TenantMismatch {
+    pub expected: Uuid,
+    pub returned: Option<Uuid>,
+}
+
 /// Refresh the device-JWT once we're within TTL/3 of expiry.
 ///
 /// Coord mints 4-hour device-JWTs (14_400s). TTL/3 = 4_800s = 80 min.
@@ -526,6 +545,36 @@ impl AuthManager {
 
         info!("Tokens stored successfully in secure storage");
         Ok(())
+    }
+
+    /// [`Self::store_tokens`], refusing to persist when `expected_tenant` is
+    /// `Some` and the minted token's own `tenant_id` claim names a DIFFERENT
+    /// tenant. A token with no decodable claim, or `expected_tenant == None`,
+    /// stores exactly as `store_tokens` would — this guards against a wrong
+    /// mint, it does not require every mint to carry a claim.
+    ///
+    /// On a mismatch the returned error downcasts to [`TenantMismatch`]
+    /// (`err.downcast_ref::<TenantMismatch>()`), so a caller can distinguish
+    /// "the mint was for the wrong tenant" from an ordinary storage failure.
+    ///
+    /// Every refresher mint-store (Cognito pair-cli, device self-refresh,
+    /// device-machine-key exchange) routes through this instead of
+    /// [`Self::store_tokens`] directly — plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+    /// D2.
+    pub fn store_tokens_expecting(
+        &self,
+        access_token: &str,
+        refresh_token: &str,
+        expected_tenant: Option<Uuid>,
+    ) -> Result<()> {
+        if let Some(expected) = expected_tenant {
+            let returned = jwt_tenant_claim(access_token);
+            if returned.is_some_and(|t| t != expected) {
+                return Err(TenantMismatch { expected, returned }.into());
+            }
+        }
+        self.store_tokens(access_token, refresh_token)
     }
 
     /// Keep the tenant-keyed slot in step with a write to the legacy
@@ -3427,6 +3476,69 @@ mod bearer_selection_tests {
         assert_eq!(jwt_tenant_claim(&live_jwt("x")), None);
         assert_eq!(jwt_tenant_claim("qontinui_runner_opaque"), None);
         assert_eq!(jwt_tenant_claim(""), None);
+    }
+
+    /// A token whose `tenant_id` claim MATCHES `expected_tenant` stores
+    /// exactly as [`AuthManager::store_tokens`] would.
+    #[test]
+    fn store_tokens_expecting_stores_on_a_matching_tenant() {
+        let mgr = create_test_auth_manager("store_expecting_match");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-555555555557").unwrap();
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 60);
+
+        mgr.store_tokens_expecting(&jwt, "", Some(t)).unwrap();
+
+        assert_eq!(mgr.get_access_token().unwrap(), jwt);
+        assert_eq!(mgr.get_tenant_device_jwt(&t).unwrap().as_deref(), Some(jwt.as_str()));
+    }
+
+    /// A token whose `tenant_id` claim DISAGREES with `expected_tenant` is
+    /// refused: nothing is stored, and the error names both tenants.
+    #[test]
+    fn store_tokens_expecting_refuses_a_mismatched_tenant() {
+        let mgr = create_test_auth_manager("store_expecting_mismatch");
+        let expected = Uuid::parse_str("11111111-2222-4333-8444-555555555558").unwrap();
+        let returned = Uuid::parse_str("22222222-3333-4444-5555-666666666669").unwrap();
+        let jwt = jwt_with_tenant(&returned, chrono::Utc::now().timestamp() + 60);
+
+        let err = mgr
+            .store_tokens_expecting(&jwt, "", Some(expected))
+            .expect_err("a mismatched tenant must be refused");
+        let mismatch = err
+            .downcast_ref::<TenantMismatch>()
+            .expect("error must downcast to TenantMismatch");
+        assert_eq!(mismatch.expected, expected);
+        assert_eq!(mismatch.returned, Some(returned));
+
+        // Nothing was persisted — the legacy slot is still empty.
+        assert!(mgr.get_access_token().is_err() || mgr.get_access_token().unwrap().is_empty());
+        assert_eq!(mgr.get_tenant_device_jwt(&returned).unwrap(), None);
+    }
+
+    /// A token with NO decodable `tenant_id` claim has nothing to compare
+    /// against, so it stores as today even when a tenant was expected.
+    #[test]
+    fn store_tokens_expecting_stores_an_untenanted_token_regardless_of_expectation() {
+        let mgr = create_test_auth_manager("store_expecting_no_claim");
+        let expected = Uuid::parse_str("11111111-2222-4333-8444-55555555555a").unwrap();
+        let jwt = live_jwt("no-tenant-claim");
+
+        mgr.store_tokens_expecting(&jwt, "", Some(expected)).unwrap();
+
+        assert_eq!(mgr.get_access_token().unwrap(), jwt);
+    }
+
+    /// `expected_tenant == None` disables the check entirely — identical to
+    /// `store_tokens`.
+    #[test]
+    fn store_tokens_expecting_with_no_expectation_stores_unconditionally() {
+        let mgr = create_test_auth_manager("store_expecting_none");
+        let t = Uuid::parse_str("11111111-2222-4333-8444-55555555555b").unwrap();
+        let jwt = jwt_with_tenant(&t, chrono::Utc::now().timestamp() + 60);
+
+        mgr.store_tokens_expecting(&jwt, "", None).unwrap();
+
+        assert_eq!(mgr.get_access_token().unwrap(), jwt);
     }
 
     /// [`slot_jwt_is_usable`] itself, over the three unusable shapes and the
