@@ -2755,7 +2755,12 @@ impl LoopState {
                 .fetch_add(1, Ordering::Relaxed);
             metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
             if let Some(bs) = self.body_sync.as_mut() {
-                bs.run_cycle(&self.conv, metrics).await;
+                // `None` ref census: this cycle deliberately listed no ref (the
+                // comment above — a withheld cycle would read ~1,100 blobs only
+                // to discard them), so that side of the coverage question is
+                // ABSENT. Never an empty set, which would claim the ref holds
+                // no plans.
+                bs.run_cycle(&self.conv, metrics, None).await;
             }
             return;
         }
@@ -3652,13 +3657,31 @@ impl BodySync {
                 }
                 // REPLACED, never merged: a source this report left out is
                 // stored by the web as UNKNOWN, so a digest kept for it would
-                // re-assert a set the web no longer holds. And a report that
-                // was NOT applied stored nothing at all, so the next one must
-                // carry the stems in full rather than a digest.
-                self.last_census_digests = if ack.applied == Some(false) {
-                    HashMap::new()
-                } else {
+                // re-assert a set the web no longer holds.
+                //
+                // The memory is kept ONLY on a positive, updating store, and
+                // each of the other three arms is a way the web does not hold
+                // the set this digest names:
+                //
+                //  * `applied: Some(false)` — a NEWER reading is stored and
+                //    this one changed nothing.
+                //  * `applied: None` — the body did not say (an older web
+                //    build, an unparseable answer). That is UNKNOWN, and
+                //    UNKNOWN does not get to render as "stored": withholding
+                //    against it bets a set the web may not hold. The
+                //    conservative arm costs one extra full census on an
+                //    ambiguous ack, which is rare by construction
+                //    [policy: `unknown-must-not-render-as-a-default`].
+                //  * `created: Some(true)` — the row was INSERTED, and the
+                //    insert arm stores the census verbatim rather than
+                //    carrying a withheld one forward, so a `slugs: null` in
+                //    THIS report was stored as UNKNOWN. Costs nothing in the
+                //    normal case: a first report already has an empty memory.
+                let stored_the_set = ack.applied == Some(true) && ack.created != Some(true);
+                self.last_census_digests = if stored_the_set {
                     report.census_digests()
+                } else {
+                    HashMap::new()
                 };
                 if self.last_scan_report_failure.take().is_some() {
                     tracing::info!(
@@ -4031,6 +4054,13 @@ mod tests {
         fetch: Result<(), String>,
         /// Phase 2: the canned depth-1 listing of `<ref>:<dir>`.
         ref_dir: Result<Vec<RefDirEntry>, String>,
+        /// Listings keyed by the ref `list_ref_dir` was ASKED for — a name or
+        /// an object id. Consulted before `ref_dir`, so a test can make the
+        /// listing at a resolved sha differ from the listing at the moving ref
+        /// name it resolved from.
+        ref_dir_by_rev: HashMap<String, Result<Vec<RefDirEntry>, String>>,
+        /// Every rev `list_ref_dir` was called with, in order.
+        listed_revs: Mutex<Vec<String>>,
         /// Phase 2: blob id -> its bytes, for `read_blobs`.
         blobs: HashMap<String, Result<String, String>>,
         /// Panic instead of answering `work_tree_root`. The only way to make
@@ -4060,6 +4090,8 @@ mod tests {
                 refresh_stamps: vec![Ok(Some(NOW - 60))],
                 fetch: Ok(()),
                 ref_dir: Ok(Vec::new()),
+                ref_dir_by_rev: HashMap::new(),
+                listed_revs: Mutex::new(Vec::new()),
                 blobs: HashMap::new(),
                 panic_on_work_tree_root: false,
             }
@@ -4124,10 +4156,14 @@ mod tests {
         fn list_ref_dir(
             &self,
             _repo_root: &Path,
-            _ref_name: &str,
+            ref_name: &str,
             _rel_dir: &str,
         ) -> Result<Vec<RefDirEntry>, String> {
-            self.ref_dir.clone()
+            self.listed_revs.lock().unwrap().push(ref_name.to_string());
+            self.ref_dir_by_rev
+                .get(ref_name)
+                .cloned()
+                .unwrap_or_else(|| self.ref_dir.clone())
         }
 
         fn read_blobs(&self, _repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
@@ -4340,6 +4376,92 @@ mod tests {
         let names: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["real.md"]);
         assert_eq!(got.names, vec!["real.md"], "and not in the census either");
+    }
+
+    /// **The census's stems and its `ref_sha` come from ONE resolution.**
+    ///
+    /// `rev_parse` runs FIRST and the listing is addressed by the object id it
+    /// returned. Resolving after the listing, by ref NAME, made them two reads
+    /// of a moving target in two `git` processes: a concurrent `git fetch` in
+    /// the same clone — routine on this fleet's shared checkouts — advances
+    /// `origin/main` between them, and the census then asserts stems listed at
+    /// A under a sha of B. Nothing about the report looks wrong afterwards,
+    /// which is why this needs a test rather than a comment.
+    ///
+    /// The fake answers the sha and the name with DIFFERENT listings, which is
+    /// what a fetch landing between the two calls looks like from in here.
+    ///
+    /// Neuter check: list at `ref_name` again and the stems come back as the
+    /// post-fetch set while `ref_sha` still names the pre-fetch commit.
+    #[test]
+    fn the_ref_listing_is_taken_at_the_resolved_sha_not_at_the_moving_ref_name() {
+        let sha = "a".repeat(40);
+        let git = FakeGit {
+            // What `origin/main` answers AFTER the concurrent fetch.
+            ref_dir: Ok(vec![RefDirEntry {
+                name: "2026-01-02-landed-since.md".into(),
+                id: "id-after".into(),
+            }]),
+            // What the resolved commit holds — the set actually being reported.
+            ref_dir_by_rev: [(
+                sha.clone(),
+                Ok(vec![RefDirEntry {
+                    name: "2026-01-01-at-the-sha.md".into(),
+                    id: "id-at".into(),
+                }]),
+            )]
+            .into_iter()
+            .collect(),
+            blobs: [
+                ("id-at".to_string(), Ok("# at the sha".to_string())),
+                ("id-after".to_string(), Ok("# landed since".to_string())),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("listing succeeded");
+        assert_eq!(
+            *git.listed_revs.lock().unwrap(),
+            vec![sha.clone()],
+            "the listing is addressed by object id, not by the ref name"
+        );
+        assert_eq!(got.ref_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            got.names,
+            vec!["2026-01-01-at-the-sha.md"],
+            "the stems are the ones the reported sha holds"
+        );
+        let files: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(files, vec!["2026-01-01-at-the-sha.md"]);
+    }
+
+    /// A rev that will not resolve leaves `ref_sha` UNKNOWN and still LISTS —
+    /// at the ref name, which is the only address left. The stems are the
+    /// reading; the sha only qualifies it, so losing the qualifier must not
+    /// lose the reading.
+    #[test]
+    fn an_unresolvable_rev_still_lists_at_the_name_with_an_unknown_sha() {
+        let git = FakeGit {
+            revs: HashMap::new(),
+            ref_dir: Ok(vec![RefDirEntry {
+                name: "2026-01-01-plan.md".into(),
+                id: "id-1".into(),
+            }]),
+            blobs: [("id-1".to_string(), Ok("# a plan".to_string()))]
+                .into_iter()
+                .collect(),
+            ..FakeGit::healthy(0, 0)
+        };
+        let got =
+            super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
+                .expect("an unresolvable rev must not fail the listing");
+        assert_eq!(got.ref_sha, None, "UNKNOWN, never a guess");
+        assert_eq!(got.names, vec!["2026-01-01-plan.md"]);
+        assert_eq!(*git.listed_revs.lock().unwrap(), vec!["origin/main"]);
     }
 
     /// **The commit's headline claim, and the one nothing asserted before:**
@@ -5986,12 +6108,28 @@ mod tests {
     // ---- BodySync's ordering rules, over a recording reporter ----
 
     /// Records every scan-root report it is handed; answers as configured.
-    #[derive(Default)]
     struct FakeReporter {
         sent: Mutex<Vec<super::super::body_push::ScanRootReport>>,
         fail: bool,
-        /// What a delivered report's `applied` says; `None` = `Some(true)`.
-        applied: Mutex<Option<bool>>,
+        /// The whole ack a delivered report gets. `applied: None` and
+        /// `created: None` are the UNKNOWN arms (an older web build, an
+        /// unparseable body) and are settable, because how the body sync
+        /// treats an UNKNOWN ack is itself a property under test.
+        ack: Mutex<super::super::body_push::ScanRootAck>,
+    }
+
+    impl Default for FakeReporter {
+        /// The ordinary answer: stored, onto a row that already existed.
+        fn default() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail: false,
+                ack: Mutex::new(super::super::body_push::ScanRootAck {
+                    applied: Some(true),
+                    created: Some(false),
+                }),
+            }
+        }
     }
 
     impl FakeReporter {
@@ -6027,9 +6165,7 @@ mod tests {
                     message: format!("report scan root -> 422 {{\"input\": \"attempt {n}\"}}"),
                 })
             } else {
-                Ok(super::super::body_push::ScanRootAck {
-                    applied: Some(self.applied.lock().unwrap().unwrap_or(true)),
-                })
+                Ok(self.ack.lock().unwrap().clone())
             }
         }
     }
@@ -6509,7 +6645,7 @@ mod tests {
 
         // (a) a delivered report the web DECLINED (it kept a newer reading).
         let reporter = std::sync::Arc::new(FakeReporter::default());
-        *reporter.applied.lock().unwrap() = Some(false);
+        reporter.ack.lock().unwrap().applied = Some(false);
         let mut bs = body_sync_over(dir.path(), reporter.clone());
         bs.run_cycle(
             &conv,
@@ -6696,7 +6832,7 @@ mod tests {
     #[tokio::test]
     async fn an_unapplied_report_is_delivered_and_tracked_once() {
         let reporter = std::sync::Arc::new(FakeReporter::default());
-        *reporter.applied.lock().unwrap() = Some(false);
+        reporter.ack.lock().unwrap().applied = Some(false);
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
@@ -6718,12 +6854,140 @@ mod tests {
         assert_eq!(reporter.states().len(), 1);
 
         // The next post is applied: the episode ends.
-        *reporter.applied.lock().unwrap() = Some(true);
+        reporter.ack.lock().unwrap().applied = Some(true);
         let changed = metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0));
         bs.run_cycle(&PlanConvention::operator_default(), &changed, None)
             .await;
         assert_eq!(reporter.states().len(), 2);
         assert!(!bs.last_scan_report_unapplied);
+    }
+
+    /// One ref census of a fixed set, for the withhold tests below.
+    fn one_ref_census() -> ScanCensusInputs {
+        ScanCensusInputs {
+            ref_census: Some(super::super::body_push::PlanSlugCensus::new(
+                "ref",
+                Some("a".repeat(40)),
+                ["2026-01-01-one".to_string(), "2026-01-02-two".to_string()],
+            )),
+            work_tree_dir: None,
+        }
+    }
+
+    /// The stems of the one census in report `n`, or `None` when it was
+    /// WITHHELD (`slugs: null` beside the digest that re-asserts them).
+    fn sent_slugs(reporter: &FakeReporter, n: usize) -> Option<Vec<String>> {
+        let sent = reporter.sent.lock().unwrap();
+        let censuses = sent[n]
+            .censuses
+            .clone()
+            .expect("the report carries censuses");
+        assert_eq!(censuses.len(), 1);
+        censuses[0].slugs.clone()
+    }
+
+    /// **A report that INSERTED the device's row must not be withheld
+    /// against.**
+    ///
+    /// The web carries a withheld census forward only on its UPDATE arm; an
+    /// INSERT stores what it was sent, so a `slugs: null` landing on a fresh
+    /// row stores the stem set as UNKNOWN. The runner would never re-send it,
+    /// because its own digest memory still matches its own re-enumeration —
+    /// the set would sit at UNKNOWN until a disk change or a restart moved the
+    /// digest. `created` is already on the wire; this reads it.
+    ///
+    /// Neuter check: stop clearing on `created == Some(true)` and the second
+    /// report below goes out withheld, against a row that holds no set.
+    #[tokio::test]
+    async fn a_created_row_is_never_withheld_against() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().created = Some(true);
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert!(
+            sent_slugs(&reporter, 0).is_some(),
+            "the first report always carries the stems"
+        );
+
+        // A changed reading, so the next report is due. The row was CREATED by
+        // the first one, so the set it holds is UNKNOWN and the stems travel
+        // again.
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "an insert stores a withheld census as NULL, so the stems must be re-sent"
+        );
+
+        // Once the web is UPDATING the row, the steady state is restored: the
+        // set travels only when it moves.
+        reporter.ack.lock().unwrap().created = Some(false);
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 7, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert!(sent_slugs(&reporter, 2).is_some(), "stored, so remembered");
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 8, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 3),
+            None,
+            "the withhold still works — this fix must not cost the heartbeat its bandwidth"
+        );
+    }
+
+    /// **An ack that does not say `applied` is UNKNOWN, and UNKNOWN does not
+    /// render as "stored".**
+    ///
+    /// `None` is an older web build or an unparseable body. Withholding
+    /// against it bets the stems on a set the web may not hold, and the losing
+    /// side of that bet is silent: the row keeps a stale set, or none. The
+    /// conservative arm costs one extra full census (~100-200 KB) per
+    /// ambiguous ack [policy: `unknown-must-not-render-as-a-default`].
+    ///
+    /// Neuter check: key the memory off `applied != Some(false)` and the
+    /// second report goes out withheld.
+    #[tokio::test]
+    async fn an_ack_that_does_not_say_applied_does_not_license_a_withhold() {
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        reporter.ack.lock().unwrap().applied = None;
+        reporter.ack.lock().unwrap().created = None;
+        let mut bs = body_sync_reporting_to(reporter.clone(), true);
+
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            one_ref_census(),
+        )
+        .await;
+        bs.report_while_idle(
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            one_ref_census(),
+        )
+        .await;
+        assert_eq!(
+            sent_slugs(&reporter, 1),
+            Some(vec![
+                "2026-01-01-one".to_string(),
+                "2026-01-02-two".to_string()
+            ]),
+            "a delivered-but-unconfirmed report is not evidence the web holds the set"
+        );
     }
 
     /// Only the instance that owns the machine's shared state publishes its
@@ -6833,7 +7097,7 @@ mod tests {
     #[tokio::test]
     async fn the_body_sync_reposts_an_unapplied_reading_after_the_retry_interval() {
         let reporter = std::sync::Arc::new(FakeReporter::default());
-        *reporter.applied.lock().unwrap() = Some(false);
+        reporter.ack.lock().unwrap().applied = Some(false);
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 

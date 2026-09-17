@@ -180,7 +180,34 @@ pub fn read_ref_dir(
     ref_name: &str,
     rel_dir: &str,
 ) -> Result<RefListing, String> {
-    let entries = git.list_ref_dir(repo_root, ref_name, rel_dir)?;
+    // Resolved FIRST, then LISTED AT THE RESOLVED OBJECT ID — so the census
+    // carries the sha its stems were actually listed at.
+    //
+    // Naming `ref_name` twice would be two reads of a MOVING target: these are
+    // separate `git` processes, and a concurrent `git fetch` in the same clone
+    // (the norm on a shared, hot checkout) advances `origin/main` between them.
+    // The census would then assert stems listed at A under a sha of B — a set
+    // difference computed against the wrong side, and invisible, because every
+    // field would look well-formed. Addressing the listing by object id makes
+    // the pair atomic by construction rather than by luck.
+    //
+    // A rev that will not resolve leaves the sha UNKNOWN and falls back to the
+    // ref name for the listing, rather than failing it: the stems are the
+    // reading, the sha only qualifies it.
+    let ref_sha = match git.rev_parse(repo_root, ref_name) {
+        Ok(sha) => Some(sha),
+        Err(e) => {
+            tracing::debug!(
+                ref_name = %ref_name,
+                error = %e,
+                "plan adapter: could not resolve the ref to an object id before listing it; the \
+                 slug census carries ref_sha UNKNOWN and the listing is taken at the ref name"
+            );
+            None
+        }
+    };
+    let listed_at = ref_sha.as_deref().unwrap_or(ref_name);
+    let entries = git.list_ref_dir(repo_root, listed_at, rel_dir)?;
     let wanted: Vec<_> = entries
         .into_iter()
         .filter(|e| is_plan_file(&e.name))
@@ -190,22 +217,6 @@ pub fn read_ref_dir(
     // read out of it.
     let mut names: Vec<String> = wanted.iter().map(|e| e.name.clone()).collect();
     names.sort();
-    // Resolved HERE, at the listing, so the census carries the sha its stems
-    // were listed AT — not one read at some other moment of the cycle. A rev
-    // that will not resolve leaves it UNKNOWN rather than failing the listing:
-    // the stems are the reading, the sha only qualifies it.
-    let ref_sha = match git.rev_parse(repo_root, ref_name) {
-        Ok(sha) => Some(sha),
-        Err(e) => {
-            tracing::debug!(
-                ref_name = %ref_name,
-                error = %e,
-                "plan adapter: listed the ref but could not resolve it to an object id; the \
-                 slug census carries ref_sha UNKNOWN"
-            );
-            None
-        }
-    };
     if wanted.is_empty() {
         return Ok(RefListing {
             files: Vec::new(),

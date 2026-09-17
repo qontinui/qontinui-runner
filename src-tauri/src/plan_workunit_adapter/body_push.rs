@@ -647,6 +647,41 @@ struct RootListing {
     /// there" when the truth is "this was never looked at". Absence of a
     /// report is not a report of absence.
     subdirs: Vec<PathBuf>,
+    /// At least one entry of this directory could NOT be read or classified —
+    /// a `read_dir` iteration error, or metadata that would not load.
+    ///
+    /// Both lists above are then FLOORS rather than the whole directory, and
+    /// the two consumers part company on that: the scan publishes what it
+    /// could read (a partial corpus is still a corpus), while the work-tree
+    /// SLUG CENSUS reports ABSENT, because a census is an assertion about a
+    /// whole SET and a floor presented as a set under-reports the coverage
+    /// denominator — silently, with `count == len(slugs)` and
+    /// `truncated: false` [policy: `unknown-must-not-render-as-a-default`].
+    entries_errored: bool,
+}
+
+/// What one directory entry is, as far as this walk cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Dir,
+    File,
+    /// Neither — a socket, a fifo, a device node. An ANSWER rather than a
+    /// failure, so it belongs in no list and taints nothing.
+    Other,
+}
+
+/// Classify one entry the way `Path::is_dir` / `Path::is_file` do — FOLLOWING
+/// links — but returning the metadata error instead of swallowing it into a
+/// `false` that would land the entry in neither list, unreported.
+fn classify_entry(path: &Path) -> std::io::Result<EntryKind> {
+    let meta = std::fs::metadata(path)?;
+    Ok(if meta.is_dir() {
+        EntryKind::Dir
+    } else if meta.is_file() {
+        EntryKind::File
+    } else {
+        EntryKind::Other
+    })
 }
 
 /// Enumerate one root, depth 1.
@@ -657,21 +692,91 @@ struct RootListing {
 /// the scan cannot drift into two different answers about one directory.
 ///
 /// `Err` is the directory read failing — which is UNKNOWN, not an empty
-/// directory, and the two callers keep that split.
+/// directory, and the two callers keep that split. A PER-ENTRY failure is the
+/// same distinction one level down, and is reported through
+/// [`RootListing::entries_errored`] rather than through this `Result`: the
+/// directory did open, and what it yielded is a FLOOR. See [`collect_listing`].
 fn enumerate_root(dir: &Path) -> std::io::Result<RootListing> {
     let entries = std::fs::read_dir(dir)?;
+    Ok(collect_listing(
+        dir,
+        entries.map(|e| e.map(|e| e.path())),
+        &classify_entry,
+    ))
+}
+
+/// The half of [`enumerate_root`] that runs after `read_dir` itself succeeded:
+/// classify each entry, and RECORD that any of them failed.
+///
+/// `read_dir` succeeding says only that the directory opened. Each entry is a
+/// separate syscall that can fail on its own — a transient Windows sharing
+/// violation, a permission blip, a mount hiccup — and so is the metadata read
+/// that decides whether an entry is a file or a directory. An entry failing
+/// either one is invisible to both lists, so a listing that did not record the
+/// failure would present a FLOOR as a complete reading, and a census built on
+/// it would assert `count == len(slugs)`, `truncated: false` for a directory it
+/// only partly saw. In the limit — every entry erroring — that is
+/// `count: 0, truncated: false`: a fabricated zero, reached without passing
+/// through any of the idle arms [policy: `unknown-must-not-render-as-a-default`].
+///
+/// Injecting `entries` and `classify` is what puts those arms under test: a
+/// test can create files, and cannot create a directory entry that errors.
+///
+/// The shared-construction property [`work_tree_census`] relies on survives the
+/// split, because it is about the PREDICATE — which paths count as plans — and
+/// both callers still take that from here. Error TOLERANCE is a separate axis,
+/// and the two callers are deliberately different on it.
+fn collect_listing<I>(
+    dir: &Path,
+    entries: I,
+    classify: &dyn Fn(&Path) -> std::io::Result<EntryKind>,
+) -> RootListing
+where
+    I: IntoIterator<Item = std::io::Result<PathBuf>>,
+{
     let mut files: Vec<PathBuf> = Vec::new();
     let mut subdirs: Vec<PathBuf> = Vec::new();
-    for path in entries.flatten().map(|e| e.path()) {
-        if path.is_dir() {
-            subdirs.push(path);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("md") && path.is_file() {
-            files.push(path);
+    let mut entries_errored = false;
+    for entry in entries {
+        let path = match entry {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "plan library: a directory entry could not be read; this root's listing is a \
+                     FLOOR, not the whole directory"
+                );
+                entries_errored = true;
+                continue;
+            }
+        };
+        match classify(&path) {
+            Ok(EntryKind::Dir) => subdirs.push(path),
+            Ok(EntryKind::File) => {
+                if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    files.push(path);
+                }
+            }
+            Ok(EntryKind::Other) => {}
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan library: a directory entry's metadata could not be read, so it counts \
+                     as neither a file nor a subdirectory; this root's listing is a FLOOR"
+                );
+                entries_errored = true;
+            }
         }
     }
     files.sort();
     subdirs.sort();
-    Ok(RootListing { files, subdirs })
+    RootListing {
+        files,
+        subdirs,
+        entries_errored,
+    }
 }
 
 /// Read + classify every `*.md` in one root (non-recursive, matching the flat
@@ -682,7 +787,7 @@ pub fn scan_one_root(
     conv: &PlanConvention,
     skipped: &mut Vec<SkippedFile>,
 ) -> Vec<ScannedArtifact> {
-    let RootListing { files, subdirs } = match enumerate_root(&root.dir) {
+    let listing = match enumerate_root(&root.dir) {
         Ok(listing) => listing,
         Err(e) => {
             tracing::warn!(
@@ -697,6 +802,33 @@ pub fn scan_one_root(
             return Vec::new();
         }
     };
+    scan_listing(root, listing, conv, skipped)
+}
+
+/// [`scan_one_root`] over an already-taken listing.
+///
+/// Split out so the PARTIAL-listing arm is reachable from a test — and so the
+/// deliberate asymmetry with [`work_tree_census`] is stated where both halves
+/// can be read together. An entry this listing could not read is recorded as a
+/// skip and the scan continues: what it could read is still worth publishing,
+/// and unlike a census the corpus walk makes no claim to be a complete set.
+fn scan_listing(
+    root: &ScanRoot,
+    listing: RootListing,
+    conv: &PlanConvention,
+    skipped: &mut Vec<SkippedFile>,
+) -> Vec<ScannedArtifact> {
+    let RootListing {
+        files,
+        subdirs,
+        entries_errored,
+    } = listing;
+    if entries_errored {
+        skipped.push(SkippedFile {
+            path: root.dir.to_string_lossy().to_string(),
+            reason: "unreadable_entry",
+        });
+    }
     let mut out = Vec::new();
     for dir in subdirs {
         skipped.push(SkippedFile {
@@ -1426,15 +1558,38 @@ pub struct ScanRootAck {
     /// and kept it — this report was delivered but not stored. `None`: the
     /// body did not say (an older web build, or an unparseable body).
     pub applied: Option<bool>,
+    /// `Some(true)`: this report INSERTED the device's row rather than
+    /// updating one.
+    ///
+    /// It matters because the two arms store a WITHHELD census differently.
+    /// The carry-forward that turns `slugs: null` back into the stored set
+    /// only runs on the update arm; an insert stores the census verbatim, so a
+    /// withheld one lands as NULL — the stem set stored as UNKNOWN. The runner
+    /// would never re-send it, because its own memory still matches its own
+    /// re-enumeration, and the set would stay UNKNOWN until a disk change or a
+    /// restart moved the digest. So an insert CLEARS the digest memory: the
+    /// next report carries the stems in full.
+    ///
+    /// `None` is the same UNKNOWN as `applied`'s, and is treated the same way
+    /// — as not-stored — by [`super::trigger::BodySync`].
+    pub created: Option<bool>,
 }
 
 impl ScanRootAck {
-    /// Read `applied` out of the web's `{created, applied, row}` answer.
+    /// Read `applied` and `created` out of the web's `{created, applied, row}`
+    /// answer.
     pub fn from_body(body: &str) -> Self {
-        let applied = serde_json::from_str::<serde_json::Value>(body)
-            .ok()
-            .and_then(|v| v.get("applied").and_then(serde_json::Value::as_bool));
-        Self { applied }
+        let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+        let flag = |key: &str| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(key))
+                .and_then(serde_json::Value::as_bool)
+        };
+        Self {
+            applied: flag("applied"),
+            created: flag("created"),
+        }
     }
 }
 
@@ -1746,6 +1901,30 @@ pub fn work_tree_census(dir: &Path) -> Option<PlanSlugCensus> {
             return None;
         }
     };
+    census_from_listing(dir, &listing)
+}
+
+/// The census of an already-taken listing, or `None` when that listing is a
+/// FLOOR.
+///
+/// A partly-failed enumeration is not a smaller reading, it is NOT A READING:
+/// the wire carries `count` and `truncated: false` as the assertion that this
+/// is the whole side, and the web derives coverage as a set difference against
+/// it. An under-reported denominator does not surface as an error — it
+/// surfaces as "coverage is fine" for plans the census never saw. So the whole
+/// side goes ABSENT, which the reader already knows how to handle
+/// [policy: `unknown-must-not-render-as-a-default`].
+fn census_from_listing(dir: &Path, listing: &RootListing) -> Option<PlanSlugCensus> {
+    if listing.entries_errored {
+        tracing::warn!(
+            dir = %dir.display(),
+            files_seen = listing.files.len(),
+            "plan library: at least one entry of the plans dir could not be read, so this \
+             enumeration is a FLOOR; reporting the work-tree slug census ABSENT rather than \
+             asserting a partial set as the whole side"
+        );
+        return None;
+    }
     Some(PlanSlugCensus::new(
         SLUG_CENSUS_SOURCE_WORK_TREE,
         None,
@@ -2405,6 +2584,131 @@ mod tests {
         assert_eq!((zero.count, zero.truncated), (0, false));
         assert_eq!(zero.slugs, Some(Vec::new()));
         assert_eq!(zero.digest, slug_census_digest(&[]));
+    }
+
+    /// **A partly failed enumeration is ABSENT, never a smaller reading.**
+    ///
+    /// `read_dir` succeeding says only that the directory OPENED. Each entry is
+    /// its own syscall, and so is the metadata read that classifies it; either
+    /// can fail on a transient sharing violation, a permission blip, a mount
+    /// hiccup. Both failures used to be swallowed — `entries.flatten()` dropped
+    /// an erroring entry, and `is_dir()`/`is_file()` turned an unreadable
+    /// metadata into a `false` that landed the entry in NEITHER list — and the
+    /// census then went out as `count == len(slugs)` with `truncated: false`,
+    /// which is the wire's assertion that this is the WHOLE side. The web
+    /// computes coverage as a set difference against it, so an under-reported
+    /// denominator does not surface as an error: it surfaces as "coverage is
+    /// fine" for plans the census never saw. All entries erroring is the limit
+    /// case — `count: 0, truncated: false`, a fabricated zero reached without
+    /// passing through any of the three idle arms.
+    ///
+    /// Neither failure is constructible by a test that can only create files,
+    /// which is exactly why [`collect_listing`] takes its entries and its
+    /// classifier. The two consumers are pinned on the same listing, because
+    /// the point is that they DIFFER: the census goes ABSENT, the scan still
+    /// publishes what it read.
+    #[test]
+    fn a_partly_failed_enumeration_is_absent_on_the_census_and_still_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = dir.join("2026-01-01-good.md");
+        std::fs::write(&good, "# A plan\n\nBody.\n").unwrap();
+        // Present on disk, but its metadata will not read this cycle.
+        let blocked = dir.join("2026-01-02-blocked.md");
+        std::fs::write(&blocked, "# Also a plan\n\nBody.\n").unwrap();
+
+        let blocked_for_closure = blocked.clone();
+        let sharing_violation = move |path: &Path| -> std::io::Result<EntryKind> {
+            if path == blocked_for_closure {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "the process cannot access the file because it is being used by another process",
+                ))
+            } else {
+                classify_entry(path)
+            }
+        };
+
+        let listing = collect_listing(
+            dir,
+            [Ok(good.clone()), Ok(blocked.clone())],
+            &sharing_violation,
+        );
+        assert!(
+            listing.entries_errored,
+            "an entry whose metadata would not read must be REPORTED, not dropped"
+        );
+        assert_eq!(
+            listing.files,
+            vec![good.clone()],
+            "and the entries that DID read are still listed"
+        );
+
+        assert_eq!(
+            census_from_listing(dir, &listing),
+            None,
+            "the census side is ABSENT: a floor must never be sent as a complete set"
+        );
+
+        let root = ScanRoot::new(dir, ScanRootKind::Plans, PLANS_ROOT_LABEL);
+        let mut skipped = Vec::new();
+        let scanned = scan_listing(
+            &root,
+            listing,
+            &PlanConvention::operator_default(),
+            &mut skipped,
+        );
+        assert_eq!(
+            scanned.len(),
+            1,
+            "the corpus walk still publishes what it could read"
+        );
+        assert!(
+            skipped.iter().any(|s| s.reason == "unreadable_entry"),
+            "and the dry-run report says an entry was lost: {skipped:?}"
+        );
+
+        // The `read_dir` ITERATION error is the same verdict — the other half
+        // of what `entries.flatten()` used to discard.
+        let iterated = collect_listing(
+            dir,
+            [
+                Ok(good.clone()),
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "readdir failed mid-iteration",
+                )),
+            ],
+            &classify_entry,
+        );
+        assert!(iterated.entries_errored);
+        assert_eq!(census_from_listing(dir, &iterated), None);
+
+        // THE limit case: every entry errored. A `count: 0, truncated: false`
+        // census here is the fabricated zero, and it is precisely the shape an
+        // honest empty directory has — which is why the reading has to be
+        // ABSENT rather than small.
+        let all_failed = collect_listing(
+            dir,
+            [Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "readdir failed at the first entry",
+            ))],
+            &classify_entry,
+        );
+        assert!(all_failed.files.is_empty());
+        assert_eq!(
+            census_from_listing(dir, &all_failed),
+            None,
+            "zero-because-nothing-was-read is UNKNOWN, not an empty corpus"
+        );
+
+        // The honest empty reading is unchanged: a clean enumeration of an
+        // empty dir IS a zero, and still says so.
+        let empty = collect_listing(dir, Vec::new(), &classify_entry);
+        let zero = census_from_listing(dir, &empty).expect("a clean enumeration is a reading");
+        assert_eq!((zero.count, zero.truncated), (0, false));
+        assert_eq!(zero.slugs, Some(Vec::new()));
     }
 
     /// UNKNOWN stays UNKNOWN on the wire: every absent field is an explicit
