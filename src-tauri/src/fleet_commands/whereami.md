@@ -519,7 +519,8 @@ the binary I am talking to", not "the binary is current".
 
 A session has **three** tenants, decided by three different mechanisms, and they
 can disagree (plan
-`2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P0):
+`2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P0; served
+by a runner build carrying qontinui-runner PR #1558):
 
 | Half | What decides it | Field in the runner's census |
 |---|---|---|
@@ -536,12 +537,16 @@ included — never pick one tenant as "the" tenant.
 `divergence` is the comparison verdict: `diverged`, `agree`, or `unknown` (a
 tenant-less session whose spawn-time device default was not recorded — after a
 runner restart on a build that does not persist it — cannot be compared, and
-`unknown` is NOT agreement). A runner build that serves the `tenancy` block but
-no `divergence` field predates that three-way verdict: its boolean `diverged:
-false` also covers "could not compare", so the card reports it as
-`unknown (runner predates the divergence field)` rather than as `agree`. A build
-that serves **no `tenancy` block at all** predates P0: the whole tenancy row is
-UNKNOWN (absent field), never agreement.
+`unknown` is NOT agreement). Which fields answer depends on the runner BUILD:
+
+- a build carrying the runner P2/P3 change (same plan) serves `divergence`,
+  `row.spawnDeviceDefaultStatus` and `row.spawnDeviceDefaultReason`;
+- a build carrying qontinui-runner PR #1558 (P0/P1) but not that change serves
+  the `tenancy` block with only the boolean `diverged`, whose `false` also covers
+  "could not compare" — so the card reports
+  `unknown (runner predates the divergence field)`, never `agree`;
+- a build with neither serves **no `tenancy` block at all**: the whole tenancy
+  row is UNKNOWN (absent field), never agreement.
 
 This is a REACHABILITY-class read (it needs the runner up right now) about an
 IDENTITY-class fact, so it prints under its own header, after both blocks.

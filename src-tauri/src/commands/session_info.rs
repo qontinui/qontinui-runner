@@ -380,11 +380,23 @@ pub(crate) enum SpawnDefaultRead {
     NotRecorded(&'static str),
 }
 
+impl From<crate::coord_mcp::SpawnDefaultSample> for SpawnDefaultRead {
+    fn from(sample: crate::coord_mcp::SpawnDefaultSample) -> Self {
+        use crate::coord_mcp::SpawnDefaultSample;
+        match sample {
+            SpawnDefaultSample::Named(t) => SpawnDefaultRead::Recorded(Some(t)),
+            SpawnDefaultSample::NoDefault => SpawnDefaultRead::Recorded(None),
+            SpawnDefaultSample::Unresolvable => SpawnDefaultRead::NotRecorded("unresolvable"),
+        }
+    }
+}
+
 impl SpawnDefaultRead {
     /// Read the persisted value off a lifecycle record.
     pub(crate) fn from_record(rec: &TerminalSessionRecord) -> Self {
         match &rec.spawn_device_default {
             None => SpawnDefaultRead::NotRecorded("not_recorded"),
+            Some(sd) if sd.unresolvable => SpawnDefaultRead::NotRecorded("unresolvable"),
             Some(sd) => match sd.tenant_id.as_deref().map(str::trim) {
                 None | Some("") => SpawnDefaultRead::Recorded(None),
                 Some(t) => uuid::Uuid::parse_str(t)
@@ -417,7 +429,8 @@ pub struct TenancyRow {
     /// (NOT recorded: never compared, and never read as "no default").
     pub spawn_device_default_status: String,
     /// Set when the status is unknown: `not_recorded` (a record older than the
-    /// field, or a spawn this runner never saw) | `unparseable`.
+    /// field, or a spawn this runner never saw) | `unresolvable` (the machine's
+    /// pin could not be read at spawn) | `unparseable`.
     pub spawn_device_default_reason: Option<String>,
     /// The machine's CURRENT default tenant. Context only, NEVER compared: after
     /// an operator switches the default, every running session legitimately
@@ -1535,7 +1548,10 @@ mod tests {
             SpawnDefaultRead::from_record(&rec),
             SpawnDefaultRead::NotRecorded("not_recorded")
         );
-        rec.spawn_device_default = Some(SpawnDeviceDefault { tenant_id: None });
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: None,
+            unresolvable: false,
+        });
         assert_eq!(
             SpawnDefaultRead::from_record(&rec),
             SpawnDefaultRead::Recorded(None)
@@ -1543,6 +1559,7 @@ mod tests {
         let a = tenant(0xA1);
         rec.spawn_device_default = Some(SpawnDeviceDefault {
             tenant_id: Some(a.to_string()),
+            unresolvable: false,
         });
         assert_eq!(
             SpawnDefaultRead::from_record(&rec),
@@ -1550,6 +1567,32 @@ mod tests {
         );
         rec.spawn_device_default = Some(SpawnDeviceDefault {
             tenant_id: Some("not-a-uuid".into()),
+            unresolvable: false,
+        });
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::NotRecorded("unparseable")
+        );
+        // Review nit: an unreadable pin at spawn is UNKNOWN, not "no default".
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: None,
+            unresolvable: true,
+        });
+        assert_eq!(
+            SpawnDefaultRead::from_record(&rec),
+            SpawnDefaultRead::NotRecorded("unresolvable")
+        );
+        assert_eq!(
+            SpawnDefaultRead::from(crate::coord_mcp::SpawnDefaultSample::Unresolvable),
+            SpawnDefaultRead::NotRecorded("unresolvable")
+        );
+        assert_eq!(
+            SpawnDefaultRead::from(crate::coord_mcp::SpawnDefaultSample::NoDefault),
+            SpawnDefaultRead::Recorded(None)
+        );
+        rec.spawn_device_default = Some(SpawnDeviceDefault {
+            tenant_id: Some("not-a-uuid".into()),
+            unresolvable: false,
         });
         assert_eq!(
             SpawnDefaultRead::from_record(&rec),

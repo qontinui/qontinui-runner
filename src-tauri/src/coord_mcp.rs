@@ -1819,6 +1819,9 @@ struct GracedNonce {
     /// it was issued for rather than to whatever the machine reads now (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
     session_tenant: Option<Uuid>,
+    /// The evicted binding's [`PinOrigin`], so a rewrite that carries a graced
+    /// key's pin keeps a machine-sampled pin machine-sampled (review nit on W-A).
+    pin_origin: PinOrigin,
 }
 
 /// Transient grace registry: an evicted DEVICE nonce → its expiry and the
@@ -1871,6 +1874,7 @@ fn grace_evicted_device_nonces(evicted: &[(String, NonceBinding)]) {
                 workdir: b.workdir.clone(),
                 terminal_id: b.terminal_id.clone(),
                 session_tenant: b.session_pin.pinned(),
+                pin_origin: b.pin_origin,
             },
         );
     }
@@ -1917,6 +1921,7 @@ fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGrace
                     terminal_id: g.terminal_id.clone(),
                     grace_until_unix: minted_at_to_unix(g.grace_until),
                     session_tenant: g.session_tenant,
+                    session_tenant_origin: g.session_tenant.map(|_| g.pin_origin.into()),
                 },
             )
         })
@@ -1957,6 +1962,7 @@ fn restore_graced_nonces(
                     workdir: g.workdir.clone(),
                     terminal_id: g.terminal_id.clone(),
                     session_tenant: g.session_tenant,
+                    pin_origin: PinOrigin::restored(g.session_tenant, g.session_tenant_origin),
                 },
             );
             restored.push((nonce, g.workdir, g.terminal_id, grace_until));
@@ -6526,10 +6532,10 @@ pub(crate) fn write_coord_mcp_proxy_config(
 /// replacement from the machine's pin turned a tenant-B worktree's key into an
 /// A key at the first restart that moved the port — the labelled-B-writes-A
 /// defect, re-entered through the self-heal. So the old nonce's pin and origin
-/// are carried: from its live binding, else from its grace entry (whose origin
-/// is not recorded and reads [`PinOrigin::Explicit`], the conservative arm — see
-/// [`PinOrigin::restored`]). A key with no pin, or none at all, samples the
-/// machine as before.
+/// are carried: from its live binding, else from its grace entry (which records
+/// the origin too; a grace entry persisted before it did restores as
+/// [`PinOrigin::Explicit`], the conservative arm — see [`PinOrigin::restored`]).
+/// A key with no pin, or none at all, samples the machine as before.
 fn carried_pin_for_rewrite(old_nonce: Option<&str>) -> MintPin {
     use crate::session::tenant_pin::TenantPin;
     let Some(old) = old_nonce.filter(|n| !n.is_empty()) else {
@@ -6541,10 +6547,14 @@ fn carried_pin_for_rewrite(old_nonce: Option<&str>) -> MintPin {
             _ => MintPin::MachineNow,
         };
     }
-    match proxy_session_pin_for_nonce(old) {
-        TenantPin::Pinned(t) => MintPin::Carried(t, PinOrigin::Explicit),
-        _ => MintPin::MachineNow,
-    }
+    let now = std::time::Instant::now();
+    graced_nonces()
+        .lock()
+        .expect("graced nonce map poisoned")
+        .get(old)
+        .filter(|g| g.expires_at > now)
+        .and_then(|g| g.session_tenant.map(|t| MintPin::Carried(t, g.pin_origin)))
+        .unwrap_or(MintPin::MachineNow)
 }
 
 /// [`write_coord_mcp_proxy_config`] with the pin spelled out.
@@ -9165,13 +9175,38 @@ struct TerminalDeliveryRecord {
     /// minted key's pin is. Switching the active tenant later re-points future
     /// sessions only, so this, not the live default, is what such a session is
     /// compared against.
-    spawn_default_tenant: Option<Uuid>,
+    spawn_default_tenant: SpawnDefaultSample,
+}
+
+/// What the machine's default-tenant pin read AT SPAWN (review nit, plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` W-B).
+/// Three states, because "no default" and "the pin could not be read" are
+/// different facts: the second is recorded as UNKNOWN, never as a null default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnDefaultSample {
+    /// The machine named this default tenant.
+    Named(Uuid),
+    /// The machine named no default (an unpinned install).
+    NoDefault,
+    /// `machine.json` could not state a tenant (`TenantPin::Unresolvable`).
+    Unresolvable,
+}
+
+impl From<crate::session::tenant_pin::TenantPin> for SpawnDefaultSample {
+    fn from(pin: crate::session::tenant_pin::TenantPin) -> Self {
+        use crate::session::tenant_pin::TenantPin;
+        match pin {
+            TenantPin::Pinned(t) => SpawnDefaultSample::Named(t),
+            TenantPin::Unpinned => SpawnDefaultSample::NoDefault,
+            TenantPin::Unresolvable => SpawnDefaultSample::Unresolvable,
+        }
+    }
 }
 
 fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDelivery) {
     let record = TerminalDeliveryRecord {
         delivery,
-        spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().pinned(),
+        spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().into(),
     };
     terminal_coord_mcp_deliveries()
         .lock()
@@ -9179,10 +9214,9 @@ fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDeliv
         .insert(terminal_id.to_string(), record);
 }
 
-/// The default tenant the seam read when it spawned `terminal_id`: `None` when
-/// this process never recorded the terminal, `Some(None)` when the machine
-/// named no default then.
-pub(crate) fn terminal_spawn_default_tenant(terminal_id: &str) -> Option<Option<Uuid>> {
+/// The default-tenant pin the seam read when it spawned `terminal_id`: `None`
+/// when this process never recorded the terminal.
+pub(crate) fn terminal_spawn_default_tenant(terminal_id: &str) -> Option<SpawnDefaultSample> {
     terminal_coord_mcp_deliveries()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -9377,37 +9411,29 @@ impl std::fmt::Display for SpawnTenantRefusal {
 pub(crate) fn validate_spawn_tenant(tenant: Uuid) -> Result<(), SpawnTenantRefusal> {
     spawn_tenant_admission(
         tenant,
-        crate::auth::AuthManager::new()
-            .try_list_tenant_device_jwt_tenants()
-            .map_err(|e| format!("{e:#}")),
-        crate::auth::default_binding_tenant_probe(),
+        &crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new()),
     )
 }
 
-/// Pure core of [`validate_spawn_tenant`].
+/// Pure core of [`validate_spawn_tenant`], over the SAME held-tenants definition
+/// the device-token door counts ([`crate::auth::HeldDeviceTenants`]).
 ///
-/// "Not paired" is a claim that BOTH routes were read and neither holds the
-/// tenant. An unreadable slot store or an unreadable default-binding file
-/// establishes nothing, so either one refuses as
-/// [`SpawnTenantRefusal::CredentialStoreUnreadable`] — the heal differs, and an
-/// operator sent to pair a tenant that is already paired would be sent wrong.
+/// "Not paired" is a claim that every route was read and none holds the tenant.
+/// An unreadable slot store, default-binding file or default slot establishes
+/// nothing, so each refuses as [`SpawnTenantRefusal::CredentialStoreUnreadable`]
+/// — the heal differs, and an operator sent to pair a tenant that is already
+/// paired would be sent wrong.
 fn spawn_tenant_admission(
     tenant: Uuid,
-    held: Result<Vec<Uuid>, String>,
-    default_binding: crate::auth::BindingTenantRead,
+    held: &crate::auth::HeldDeviceTenants,
 ) -> Result<(), SpawnTenantRefusal> {
-    use crate::auth::BindingTenantRead;
-    if default_binding == BindingTenantRead::Bound(tenant) {
-        return Ok(());
-    }
-    match (held, default_binding) {
-        (Ok(slots), _) if slots.contains(&tenant) => Ok(()),
-        (Err(error), _) => Err(SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error }),
-        (Ok(_), BindingTenantRead::Unknown) => Err(SpawnTenantRefusal::CredentialStoreUnreadable {
+    match held.holds(tenant) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SpawnTenantRefusal::NotPaired { tenant }),
+        Err(unknown) => Err(SpawnTenantRefusal::CredentialStoreUnreadable {
             tenant,
-            error: "the default-binding record (paired_user.json) could not be read".to_string(),
+            error: unknown.to_string(),
         }),
-        (Ok(_), _) => Err(SpawnTenantRefusal::NotPaired { tenant }),
     }
 }
 
@@ -16899,6 +16925,7 @@ mod tests {
                 workdir: "D:/grace-expired-wt".to_string(),
                 terminal_id: None,
                 session_tenant: None,
+                pin_origin: PinOrigin::MachineSampled,
             },
         );
         assert!(
@@ -19221,6 +19248,7 @@ mod reject_row_workdir_sentinel_tests {
                         terminal_id: None,
                         grace_until_unix: now.saturating_sub(60),
                         session_tenant: None,
+                        session_tenant_origin: None,
                     },
                 )]),
             )
@@ -20707,26 +20735,57 @@ mod spawn_tenant_credential_tests {
         // The entry-point early-out refuses identically, before any allocation.
         let early = precheck_spawn_tenant(Some(tenant_b())).expect_err("precheck refuses too");
         assert!(early.starts_with("terminal:tenant_not_paired:"), "{early}");
-        // The device's default binding is admitted even with no tenant slot.
-        use crate::auth::BindingTenantRead;
+        // The device's default binding is admitted with no tenant slot when the
+        // legacy slot holds its credential — and NOT when it holds none.
+        use crate::auth::{BindingTenantRead, HeldDeviceTenants};
+        let held = |slots: Result<Vec<Uuid>, String>, binding, legacy: Result<bool, String>| {
+            HeldDeviceTenants {
+                slots,
+                default_binding: binding,
+                legacy_slot: legacy,
+            }
+        };
         assert_eq!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Bound(tenant_b())),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Bound(tenant_b()), Ok(true))
+            ),
             Ok(())
+        );
+        assert_eq!(
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Bound(tenant_b()), Ok(false))
+            ),
+            Err(SpawnTenantRefusal::NotPaired { tenant: tenant_b() })
         );
         // An unreadable store is UNKNOWN, refused rather than guessed.
         assert!(matches!(
-            spawn_tenant_admission(tenant_b(), Err("io".into()), BindingTenantRead::Unbound),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Err("io".into()), BindingTenantRead::Unbound, Ok(false))
+            ),
             Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
         ));
         // S4 (review): so is an unreadable DEFAULT-BINDING record — "not paired"
         // would send the operator to pair a tenant that may already be paired.
         assert!(matches!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Unknown),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Unknown, Ok(true))
+            ),
             Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
         ));
         // ...while a slot for the tenant admits it whatever the binding file says.
         assert_eq!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![tenant_b()]), BindingTenantRead::Unknown),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(
+                    Ok(vec![tenant_b()]),
+                    BindingTenantRead::Unknown,
+                    Err("io".into())
+                )
+            ),
             Ok(())
         );
     }
@@ -21034,13 +21093,16 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Bound(tenant_a()),
-            crate::commands::session_info::SpawnDefaultRead::Recorded(
-                terminal_spawn_default_tenant(&term).flatten(),
+            crate::commands::session_info::SpawnDefaultRead::from(
+                terminal_spawn_default_tenant(&term).expect("the seam recorded this spawn"),
             ),
             crate::session::tenant_pin::resolve_tenant_pin().pinned(),
             None,
         );
-        assert_eq!(terminal_spawn_default_tenant(&term), Some(Some(tenant_a())));
+        assert_eq!(
+            terminal_spawn_default_tenant(&term),
+            Some(SpawnDefaultSample::Named(tenant_a()))
+        );
         assert!(
             report.diverged,
             "a B credential on an A-default session must diverge"
@@ -21148,8 +21210,8 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Bound(tenant_a()),
-            crate::commands::session_info::SpawnDefaultRead::Recorded(
-                terminal_spawn_default_tenant(&term).flatten(),
+            crate::commands::session_info::SpawnDefaultRead::from(
+                terminal_spawn_default_tenant(&term).expect("the seam recorded this spawn"),
             ),
             crate::session::tenant_pin::resolve_tenant_pin().pinned(),
             None,
@@ -21475,6 +21537,21 @@ mod spawn_tenant_credential_tests {
         assert_eq!(
             live_binding(&fresh).unwrap().pin_origin,
             PinOrigin::MachineSampled
+        );
+
+        // Review nit: a GRACED key keeps its origin too. Supersede a
+        // machine-sampled B key (minted while B was the default); the carried
+        // pin for the graced nonce is B, still machine-sampled.
+        amb.write_active_tenant_id(tenant_b());
+        let wd_g = workdir(&amb, "wa-graced");
+        write_coord_mcp_proxy_config(&wd_g, PORT, None);
+        let graced = read_proxy_nonce(&Path::new(&wd_g).join(".mcp.json")).unwrap();
+        amb.write_active_tenant_id(tenant_a());
+        write_coord_mcp_proxy_config(&wd_g, PORT, None); // evicts + graces `graced`
+        assert!(live_binding(&graced).is_none() && graced_nonce_is_valid(&graced));
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&graced)),
+            MintPin::Carried(tenant_b(), PinOrigin::MachineSampled)
         );
 
         // No key to carry from: the machine's pin, as before.

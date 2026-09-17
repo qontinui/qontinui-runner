@@ -1578,16 +1578,20 @@ pub fn device_jwt_present() -> Result<bool, String> {
 ///   core): `t`'s own `device_jwt:<t>` slot, or the legacy `access_token` slot
 ///   ONLY when `t` is the device's default binding. The no-substitution rule is
 ///   intact — a tenant this runner holds no usable credential for is `Ok(None)`,
-///   never another tenant's token. That path also applies the selector's
+///   never another tenant's token, and a token whose `tenant_id` claim does not
+///   name `t` (or names none) is not returned for it. That path also applies the selector's
 ///   validity gate: an expired or opaque slot reads as `None`.
-/// - **`tenant_id: None` on a runner holding at most one tenant slot** — the
+/// - **`tenant_id: None` on a runner holding credentials for at most one
+///   tenant** ([`crate::auth::HeldDeviceTenants`]: the per-tenant slots plus the
+///   default binding when the legacy slot holds its JWT) — the
 ///   legacy `access_token` slot, exactly as before P3. That slot holds the
 ///   DEFAULT binding's coord device JWT: every non-test writer of it
 ///   (`pair::persist_pairing`, `pair::reconcile`, and the refresher's Cognito
 ///   pair, device self-refresh and device-machine-key exchange paths) stores a
 ///   coord-minted device token, and Cognito's own tokens live in the separate
 ///   OAuth slots. This arm stays a PROBE: it does not check `exp`.
-/// - **`tenant_id: None` on a runner holding more than one tenant slot** —
+/// - **`tenant_id: None` on a runner holding credentials for more than one
+///   tenant** (same definition; an unreadable input is an error, not a count) —
 ///   REFUSED with [`DEVICE_TOKEN_TENANT_REQUIRED`]. Which tenant the default slot
 ///   belongs to is not something a caller of this door can see, and a skill that
 ///   silently gets the default tenant's token writes to the wrong tenant with a
@@ -1615,16 +1619,13 @@ pub fn device_jwt_present() -> Result<bool, String> {
 pub fn get_coord_device_token(tenant_id: Option<String>) -> Result<Option<String>, String> {
     let tenant = parse_device_token_tenant(tenant_id.as_deref())?;
     let am = AuthManager::new();
-    coord_device_token_for(
-        &am,
-        tenant,
-        crate::auth::default_binding_tenant(),
-        device_token_door_default_slot_enabled(),
+    let held = crate::auth::HeldDeviceTenants::read(&am);
+    coord_device_token_for(&am, tenant, &held, device_token_door_default_slot_enabled()).map_err(
+        |e| {
+            error!("get_coord_device_token: {e}");
+            e
+        },
     )
-    .map_err(|e| {
-        error!("get_coord_device_token: {e}");
-        e
-    })
 }
 
 /// Runner kill switch for P3's refusal: exactly `1` makes a tenant-less
@@ -1667,41 +1668,57 @@ pub(crate) fn parse_device_token_tenant(raw: Option<&str>) -> Result<Option<uuid
 pub(crate) fn coord_device_token_for(
     am: &AuthManager,
     tenant: Option<uuid::Uuid>,
-    default_tenant: Option<uuid::Uuid>,
+    held: &crate::auth::HeldDeviceTenants,
     default_slot_switch: bool,
 ) -> Result<Option<String>, String> {
     use crate::secure_storage::StoredTokenRead;
 
     if let Some(t) = tenant {
+        let default_tenant = match held.default_binding {
+            crate::auth::BindingTenantRead::Bound(d) => Some(d),
+            _ => None,
+        };
         if let Some(jwt) = crate::auth::select_device_bearer(am, Some(&t), default_tenant) {
-            return Ok(Some(jwt));
+            // The token must NAME the tenant asked for. The selector can serve a
+            // named tenant from the legacy slot (the default binding's), and that
+            // slot is only as current as the last write to it: a token whose
+            // claim names another tenant — or names none — is not a credential
+            // for `t`, so the answer is "none held", never that token.
+            return Ok(match crate::auth::jwt_tenant_claim(&jwt) {
+                Some(claim) if claim == t => Some(jwt),
+                _ => None,
+            });
         }
         // A miss is "no credential for t" only if the slot store was READ. An
         // unreadable store is UNKNOWN — the same no-downgrade rule as below.
-        return match am.try_list_tenant_device_jwt_tenants() {
+        return match &held.slots {
             Ok(_) => Ok(None),
             Err(e) => Err(format!(
                 "Could not read the credential store, so whether this runner holds a device \
-                 token for tenant {t} is unknown (it has NOT been unpaired): {e:#}"
+                 token for tenant {t} is unknown (it has NOT been unpaired): {e}"
             )),
         };
     }
 
     if !default_slot_switch {
-        let slots = am.try_list_tenant_device_jwt_tenants().map_err(|e| {
+        // The SAME held-tenants definition the spawn / provision-session tenant
+        // admission uses, so a default binding that lives only in the legacy slot
+        // counts.
+        let held_set = held.set().map_err(|unknown| {
             format!(
-                "Could not read the credential store, so whether a tenant-less answer is \
-                 unambiguous is unknown (it has NOT been unpaired): {e:#}"
+                "Could not establish which tenants this runner holds credentials for, so \
+                 whether a tenant-less answer is unambiguous is unknown (it has NOT been \
+                 unpaired): {unknown}"
             )
         })?;
-        if slots.len() > 1 {
+        if held_set.len() > 1 {
             return Err(format!(
                 "{DEVICE_TOKEN_TENANT_REQUIRED}: this runner holds coord credentials for {} \
                  tenants, so a token requested without a tenant could belong to the wrong one \
                  — pass `tenant_id` (UI Bridge invoke args: {{\"tenantId\": \"<uuid>\"}}) naming \
                  the tenant the caller acts for. Operator override: set \
                  {DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV}=1 on the runner to answer the default slot",
-                slots.len()
+                held_set.len()
             ));
         }
     }
@@ -2026,6 +2043,18 @@ mod device_token_door_tests {
         format!("{header}.{payload}.sig")
     }
 
+    /// The held-tenants read the door would make, with the default binding
+    /// injected (the ambient has no `paired_user.json`).
+    fn held(am: &AuthManager, default: Option<uuid::Uuid>) -> crate::auth::HeldDeviceTenants {
+        crate::auth::HeldDeviceTenants::read_with(
+            am,
+            default.map_or(
+                crate::auth::BindingTenantRead::Unbound,
+                crate::auth::BindingTenantRead::Bound,
+            ),
+        )
+    }
+
     /// A runner paired for A (the default binding, in the legacy slot and — by
     /// the mirror — its own slot) and for B.
     fn two_slot_runner() -> (AuthManager, uuid::Uuid, uuid::Uuid) {
@@ -2043,7 +2072,7 @@ mod device_token_door_tests {
     fn a_tenantless_call_on_a_two_slot_runner_refuses() {
         let _amb = crate::test_env::isolated_ambient();
         let (am, a, _) = two_slot_runner();
-        let refusal = coord_device_token_for(&am, None, Some(a), false)
+        let refusal = coord_device_token_for(&am, None, &held(&am, Some(a)), false)
             .expect_err("two slots and no tenant must refuse");
         assert!(
             refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED),
@@ -2061,12 +2090,12 @@ mod device_token_door_tests {
     fn a_named_tenant_gets_that_tenants_slot() {
         let _amb = crate::test_env::isolated_ambient();
         let (am, a, b) = two_slot_runner();
-        let token = coord_device_token_for(&am, Some(b), Some(a), false).unwrap();
+        let token = coord_device_token_for(&am, Some(b), &held(&am, Some(a)), false).unwrap();
         assert_eq!(
             token.as_deref().and_then(crate::auth::jwt_tenant_claim),
             Some(b)
         );
-        let token = coord_device_token_for(&am, Some(a), Some(a), false).unwrap();
+        let token = coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false).unwrap();
         assert_eq!(
             token.as_deref().and_then(crate::auth::jwt_tenant_claim),
             Some(a)
@@ -2082,7 +2111,7 @@ mod device_token_door_tests {
         let c = tenant(0xC3);
         for switch in [false, true] {
             assert_eq!(
-                coord_device_token_for(&am, Some(c), Some(a), switch),
+                coord_device_token_for(&am, Some(c), &held(&am, Some(a)), switch),
                 Ok(None)
             );
         }
@@ -2096,9 +2125,13 @@ mod device_token_door_tests {
         let _amb = crate::test_env::isolated_ambient();
         let (am, a, _) = two_slot_runner();
         assert_eq!(
-            coord_device_token_for(&am, None, Some(a), true),
+            coord_device_token_for(&am, None, &held(&am, Some(a)), true),
             Ok(Some(jwt_for(a)))
         );
+        // Safe to mutate the process env: `isolated_ambient` holds the process-wide
+        // env lock for this whole test, and the key is in
+        // `ambient::AMBIENT_ENV_KEYS`, so the fixture restores it on drop even if
+        // an assertion panics first.
         std::env::set_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV, "1");
         assert!(device_token_door_default_slot_enabled());
         std::env::remove_var(DEVICE_TOKEN_DOOR_DEFAULT_SLOT_ENV);
@@ -2114,12 +2147,79 @@ mod device_token_door_tests {
     fn a_single_slot_runner_is_unchanged() {
         let _amb = crate::test_env::isolated_ambient();
         let am = AuthManager::new();
-        assert_eq!(coord_device_token_for(&am, None, None, false), Ok(None));
+        assert_eq!(
+            coord_device_token_for(&am, None, &held(&am, None), false),
+            Ok(None)
+        );
         let a = tenant(0xA1);
         am.store_tokens(&jwt_for(a), "").unwrap();
         assert_eq!(
-            coord_device_token_for(&am, None, Some(a), false),
+            coord_device_token_for(&am, None, &held(&am, Some(a)), false),
             Ok(Some(jwt_for(a)))
+        );
+    }
+
+    /// R1 (review). A default binding whose credential lives ONLY in the legacy
+    /// slot, plus one other tenant slot, is two held tenants: a tenant-less call
+    /// refuses. Counting per-tenant slots alone read it as one and answered the
+    /// default tenant's token.
+    #[test]
+    fn a_legacy_only_default_plus_one_slot_is_two_tenants_and_refuses() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = AuthManager::new();
+        am.store_tokens(&jwt_for(a), "").unwrap();
+        am.clear_tenant_device_jwt(&a).unwrap(); // the mirror's copy gone: legacy only
+        am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
+        assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap(), vec![b]);
+
+        let refusal = coord_device_token_for(&am, None, &held(&am, Some(a)), false)
+            .expect_err("legacy-only default A + slot B is two tenants");
+        assert!(
+            refusal.starts_with(DEVICE_TOKEN_TENANT_REQUIRED),
+            "{refusal}"
+        );
+        assert!(refusal.contains("for 2 tenants"), "{refusal}");
+
+        // An unreadable default binding is not a count: UNKNOWN, an error.
+        let unknown =
+            crate::auth::HeldDeviceTenants::read_with(&am, crate::auth::BindingTenantRead::Unknown);
+        let err = coord_device_token_for(&am, None, &unknown, false).unwrap_err();
+        assert!(!err.starts_with(DEVICE_TOKEN_TENANT_REQUIRED), "{err}");
+        assert!(err.contains("paired_user.json"), "{err}");
+    }
+
+    /// Nit (review). A named tenant served from the legacy slot must be that
+    /// token's own tenant: a legacy token naming another tenant, or none, is
+    /// "no credential for t".
+    #[test]
+    fn a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant() {
+        let _amb = crate::test_env::isolated_ambient();
+        let (a, b) = (tenant(0xA1), tenant(0xB2));
+        let am = AuthManager::new();
+        // The legacy slot holds B's token while the binding file says A.
+        am.store_tokens(&jwt_for(b), "").unwrap();
+        am.clear_tenant_device_jwt(&b).unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
+        );
+        // An opaque-claimless but otherwise usable legacy token: also none.
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let claimless = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD
+                .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
+        );
+        am.store_tokens(&claimless, "").unwrap();
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(None)
         );
     }
 

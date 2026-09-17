@@ -7825,6 +7825,14 @@ struct ProvisionSessionBody {
     /// the session's coord-mcp writes land in THAT tenant instead of whichever
     /// one the machine-global pin names. A tenant the runner cannot present is
     /// refused, never silently swapped for the machine's.
+    ///
+    /// **Caveat — the P1 kill switch.** With `QONTINUI_SPAWN_TENANT_CREDENTIAL=0`
+    /// in the runner's environment the named tenant is NOT validated and NOT
+    /// pinned: the route answers `200` with a nonce on the machine's pin, exactly
+    /// as if the field were absent, and the response does not say so (the body
+    /// is the verbatim `.mcp.json` document, which has no field for it). A
+    /// caller that named a tenant must therefore verify the nonce's acting tenant
+    /// (`coord_query_identity` over it) rather than trust the `200`.
     #[serde(default)]
     tenant_id: Option<String>,
 }

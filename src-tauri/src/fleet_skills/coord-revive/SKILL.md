@@ -309,14 +309,20 @@ one.
 
 ### The session's tenant — what both mints send, and the two refusals it answers
 
-Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` (P3 on
-the runner, P5a on coord). A device bound to more than one tenant can no longer
-be asked for "a" credential without saying whose:
+Plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`. What a
+door does depends on the BUILD that answers, so every behaviour below is scoped
+to one: a runner build carrying qontinui-runner PR #1558 (P1, which also serves
+the census `tenancy` block), a runner build carrying the runner P2/P3 change (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`), and a coord
+carrying P5a. The script does not assume any of them: it sends the tenant, and
+then checks what came back. On a device bound to more than one tenant, a build
+carrying these changes can no longer be asked for "a" credential without saying
+whose:
 
-- **The runner's nonce mint (L4 source 3).** `POST /coord-mcp/provision-session`
-  takes an optional `tenant_id` and pins the minted nonce to it (P2); the script
-  passes it through `coord-provision-nonce.sh --tenant`. A runner build predating
-  P2 **ignores** the field and mints for the machine's tenant with a plain `200`,
+- **The runner's nonce mint (L4 source 3).** On a runner build carrying the P2/P3
+  change, `POST /coord-mcp/provision-session` takes an optional `tenant_id` and
+  pins the minted nonce to it; the script passes it through
+  `coord-provision-nonce.sh --tenant` when that helper's `--capabilities` line
+  lists `tenant`. A runner build without that change **ignores** the field and mints for the machine's tenant with a plain `200`,
   so a nonce minted for a known tenant is never called LIVE on the mint's word:
   after the door probe, `coord_query_identity` is called over the nonce and its
   top-level `tenant_id` (the tenant whose credential the proxy forwarded) must
@@ -326,9 +332,11 @@ be asked for "a" credential without saying whose:
   → `NONCE_MINT_TENANT_INVALID`, `422 COORD_MCP_PROVISION_TENANT_NOT_PAIRED` →
   `NONCE_MINT_TENANT_NOT_PAIRED`, `503 COORD_MCP_PROVISION_TENANT_UNKNOWN` →
   `NONCE_MINT_TENANT_UNKNOWN` — none of them is `MINT_REFUSED`, which stays the
-  opt-in/handshake verdict. With no tenant known the body is `{cwd}` and nothing
-  extra is read, exactly as before.
-- **The runner door.** `get_coord_device_token` takes an optional tenant —
+  opt-in/handshake verdict. With no tenant known the body is `{cwd}`; the acting
+  tenant is still read back, so the LIVE names it (`TENANT:` line) or says it is
+  UNKNOWN.
+- **The runner door.** On a runner build carrying the P2/P3 change,
+  `get_coord_device_token` takes an optional tenant —
   `{"tenantId": "<uuid>"}` over `/ui-bridge/invoke` (`tenant_id` is accepted as an
   alias), `tenantId` over Tauri IPC. **With a tenant** it answers THAT tenant's
   device JWT — its own slot, or the default slot only when that tenant is the
@@ -338,28 +346,54 @@ be asked for "a" credential without saying whose:
   `get_coord_device_token:tenant_required` (runner kill switch
   `QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT=1` restores the default-slot answer).
   A single-tenant runner answers the default slot exactly as before.
-  `get_access_token_for_websocket` is unchanged and takes no tenant. Both names
-  read the legacy `access_token` slot on a tenant-less call, and that slot holds
-  the **default binding's coord device JWT** — not a Cognito token, as this file
-  and the runner's own doc comment used to say (P3 Step 0 read every writer of
-  the slot).
-- **The coord door.** `POST /agents/credential` accepts an optional,
-  binding-validated `tenant_id`. In coord's `live` mode
-  (`COORD_ALLOCATE_TENANT_RESOLUTION_MODE`) a device bound to several tenants that
-  sends none gets **`422 tenant_ambiguous`** instead of a token for the legacy
-  pointer's tenant. A coord predating P5a ignores the field.
+  `get_access_token_for_websocket` is unchanged and takes no tenant. A build
+  without the change ignores the argument and answers its default slot; the
+  script catches that by the token's own claim (below). A named tenant answered
+  `null` is `RUNNER_MINT_TENANT_NOT_PAIRED`, never `RUNNER_SIGNED_OUT`. On a
+  tenant-less call both names read the legacy `access_token` slot. A source read
+  of that slot's writers (2026-09-17: `pair::persist_pairing`, `pair::reconcile`,
+  the device-JWT refresher's pair / self-refresh / machine-key paths) finds only
+  coord-minted device JWTs for the **default binding** there — not a Cognito
+  token, which is what this file used to call it. The runner's own doc comment
+  says "Cognito" in any build that lacks the P2/P3 change's doc fix.
+- **The coord door.** On a coord carrying P5a, `POST /agents/credential` accepts
+  an optional `tenant_id` validated against the device's bindings: an unbound one
+  is **`400 tenant_not_bound`** (`BOOTSTRAP_TENANT_NOT_BOUND` — a stale
+  `$QONTINUI_TENANT_ID` is the usual cause). In coord's `live` mode
+  (`COORD_ALLOCATE_TENANT_RESOLUTION_MODE`) a device bound to several tenants
+  that sends none gets **`422 tenant_ambiguous`** instead of a token for the
+  legacy pointer's tenant. A coord without P5a ignores the field and mints for
+  the legacy pointer, so the minted token's `tenant_id` claim is checked before
+  anything is called LIVE: a different tenant is `BOOTSTRAP_WRONG_TENANT`, no
+  claim is `BOOTSTRAP_UNVERIFIED_TENANT`.
 
 **How the script resolves the tenant**, once, lazily, for both rungs:
 
 1. `$QONTINUI_TENANT_ID`, when it is a uuid (a malformed value is noted and not sent);
-2. the runner's session census, `GET http://127.0.0.1:9876/control/sessions/info`
-   (`$QONTINUI_RUNNER_URL` overrides): the entry whose `identity.terminalId` is
+2. the session census of the runner that SPAWNED this session,
+   `GET http://127.0.0.1:<port>/control/sessions/info` — `$QONTINUI_RUNNER_URL`
+   if set, else the port the spawning runner exported as
+   `$QONTINUI_RUNNER_API_PORT`, else 9876; and once a mint origin has answered,
+   that origin's census is preferred: the entry whose `identity.terminalId` is
    `$QONTINUI_TERMINAL_ID` — `tenancy.row.tenantId`, else
    `tenancy.credential.tenantId` when `tenancy.credential.status` is `resolved`;
 3. otherwise **no tenant is sent**, and the reason is kept for the verdict
    (`$QONTINUI_TERMINAL_ID is unset`, `terminal_not_listed`,
-   `tenancy_block_absent` — a runner build predating the block, never read as
-   agreement — `tenant_unstated:…`, or a census that did not answer).
+   `tenancy_block_absent` — a runner build without PR #1558, never read as
+   agreement — `tenant_unstated:…`, `census_unavailable:<reason>`, or a census
+   that did not answer).
+
+**Decided, not overlooked: no fallback to the census row's older
+`identity.tenantId`.** On a runner build without the `tenancy` block that field is
+the coord row stamp, which for a tenant-less spawn is the default the registry
+chose, not a tenant the session named. Sending it would turn that build's working
+default-slot answer into a `WRONG_TENANT` refusal and buy nothing.
+
+**Every LIVE names the tenant it established.** The nonce mint prints a
+`TENANT:` line with the acting tenant `coord_query_identity` reported (or
+UNKNOWN and why), the invoke mint adds a `PARTIAL: tenant established:` line
+with the token's claim, and L5 prints a `TENANT:` line with the minted token's
+claim.
 
 Omitting it is exactly today's call, so a single-tenant device, an older runner
 and an older coord all keep working. **A runner that ignores the argument is
@@ -370,8 +404,10 @@ would otherwise probe LIVE for the wrong tenant. The refusals are typed (see the
 verdict table): `NONCE_MINT_WRONG_TENANT`, `NONCE_MINT_UNVERIFIED_TENANT`,
 `NONCE_MINT_TENANT_INVALID`, `NONCE_MINT_TENANT_NOT_PAIRED`,
 `NONCE_MINT_TENANT_UNKNOWN`, `RUNNER_MINT_TENANT_REQUIRED`,
-`RUNNER_MINT_TENANT_INVALID`, `RUNNER_MINT_WRONG_TENANT`,
-`BOOTSTRAP_TENANT_AMBIGUOUS`. None of them is a
+`RUNNER_MINT_TENANT_INVALID`, `RUNNER_MINT_TENANT_NOT_PAIRED`,
+`RUNNER_MINT_WRONG_TENANT`, `BOOTSTRAP_TENANT_AMBIGUOUS`,
+`BOOTSTRAP_TENANT_NOT_BOUND`, `BOOTSTRAP_WRONG_TENANT`,
+`BOOTSTRAP_UNVERIFIED_TENANT`. None of them is a
 sign-in problem, and a `tenant_required` refusal never falls through to the
 default-slot `get_access_token_for_websocket` door. Both runner mints and L5 are pinned by
 `tenant-arg-test.sh` beside this file.
@@ -575,6 +611,7 @@ client's mask):
 | `NONCE_MINT_UNVERIFIED_TENANT` | L4 source 3: the minted nonce answered, but its acting tenant could not be read back (the line names why) | Not reported LIVE — an unverified tenant on a multi-tenant device is exactly the silent wrong-tenant write. Another door, or re-run |
 | `NONCE_MINT_TENANT_INVALID` / `_NOT_PAIRED` / `_UNKNOWN` | L4 source 3: the runner refused the tenant sent — `400 COORD_MCP_PROVISION_INVALID_TENANT`, `422 …TENANT_NOT_PAIRED`, `503 …TENANT_UNKNOWN`. Nothing was minted | INVALID: fix `$QONTINUI_TENANT_ID` / the census value. NOT_PAIRED: pair this device for that tenant, or name the tenant the session acts for. UNKNOWN: the runner's credential store was unreadable — not "unpaired"; re-run and read the runner log |
 | `RUNNER_MINT_TENANT_REQUIRED` | L4 mint: the runner holds credentials for **more than one tenant** and refused a tenant-less `get_coord_device_token` (`409 get_coord_device_token:tenant_required`); the line also says why no tenant was sent | NOT a sign-in problem. Set `$QONTINUI_TENANT_ID` to the tenant this session acts for, or run in a runner terminal whose session census names it. Never "fix" it by asking the default-slot websocket door — that is the wrong-tenant write the refusal exists to stop |
+| `RUNNER_MINT_TENANT_NOT_PAIRED` | L4 mint: `get_coord_device_token` was asked for a named tenant and answered `null` — this runner holds no usable credential for THAT tenant (it may hold others) | NOT signed out. Pair this device for that tenant, or name the tenant the session actually acts for |
 | `RUNNER_MINT_TENANT_INVALID` | L4 mint: the runner rejected the tenant sent as malformed (`get_coord_device_token:tenant_invalid`) | A LOCAL input fault — check `$QONTINUI_TENANT_ID` / the census value it names |
 | `RUNNER_MINT_WRONG_TENANT` | L4 mint: a tenant was asked for and the token that came back claims a different one (or none) — a runner build predating the `tenantId` argument answered its default slot | The token is NOT sent. Use L5, or a runner build carrying P3; never restart a running runner over it |
 | `RUNNER_SIGNED_OUT` | L4 mint: it answered and genuinely holds no token — a non-JWT-shaped value, its own `Not authenticated` error, or a 2xx `null` from `get_coord_device_token`, which is that command's documented "this device is unpaired" result rather than a fault | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
@@ -585,6 +622,9 @@ client's mask):
 | `DEVICE_JWT_UNAUTHORIZED` | L4: coord rejected a device JWT | Expired, or bound to another tenant. From a **static** source this is expected and **not terminal** — the cascade falls through to the next source |
 | `BOOTSTRAP_NO_DEVICE_ID` | L5: no `device_id` resolvable — `$QONTINUI_MACHINE_ID` unset **and** `~/.qontinui/machine.json` absent or unreadable. A statement of **absence**, and a LOCAL one | Nothing about coord. Export `$QONTINUI_MACHINE_ID`, or pair this machine so the runner writes `machine.json`. Nothing is sent — an empty `device_id` would draw a 4xx this script would then blame on coord |
 | `BOOTSTRAP_MACHINE_FILE_MALFORMED` | L5: `~/.qontinui/machine.json` is readable but carries neither a `device_id` nor the legacy `machine_id` (or is not JSON) | Also LOCAL, and kept apart from the row above on purpose: "the file is not there" and "the file is there and says nothing" have different fixes. Repair the file; nothing was sent |
+| `BOOTSTRAP_TENANT_NOT_BOUND` | L5: `400 tenant_not_bound` — a coord carrying P5a refused the `tenant_id` sent because this device is not bound to it | A stale `$QONTINUI_TENANT_ID` is the usual cause: unset it, or set the tenant this device is paired for. The `device_id` is fine |
+| `BOOTSTRAP_WRONG_TENANT` | L5: a tenant was asked for and the minted token's `tenant_id` claim names another — a coord without P5a minted for the legacy pointer | Not used, and no control read is made with it. The honest outcome is another door, or UNKNOWN |
+| `BOOTSTRAP_UNVERIFIED_TENANT` | L5: a tenant was asked for and the minted token carries no readable `tenant_id` claim | Not used — which tenant it acts in is UNKNOWN |
 | `BOOTSTRAP_TENANT_AMBIGUOUS` | L5: `422 tenant_ambiguous` — this device is bound to more than one tenant and no `tenant_id` was sent, so coord (in `live` resolution mode) will not mint for a guessed tenant | Name the tenant: set `$QONTINUI_TENANT_ID`, or run in a runner terminal whose session census names it. The `device_id` is fine; nothing about coord is broken |
 | `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is **UNKNOWN, not an open ruling**: gate `ece99898-30c6-4f8c-be8e-1de5f09abebc` was **withdrawn** 2026-09-02 as over-broad — four of its five arms were resolved by policy (`security-and-autonomy` `implement_tier: proceed`, "tightening is ordinary work"; `decision_record/operational-work-is-autonomous`); the dedicated route and the anonymous-mint tightening are qontinui-coord#1850 (ff-landed, `5dd99cc3`); the ONE arm still the operator's is gate `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (arm (b), `agent_tool_access` rows), which gates no cascade rung. UNKNOWN is not permission. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
 | `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405 (an unknown or unregistered `device_id`, or a malformed UUID) | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
@@ -1089,11 +1129,11 @@ unqualified `LIVE`; the L4 device-JWT doors and L5 qualify it.
 For the **runner mint** the limit is measured, not hypothetical. Get the
 terminology right, because it is what makes the caveat land. Both runner names
 return a **coord device JWT scoped to ONE tenant** — the one `tenantId` named,
-else the device's default binding (`AuthManager`'s legacy `access_token` slot,
-every writer of which stores a coord-minted device token; **corrected**
-2026-09-17 by plan
-`2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P3 Step 0 —
-this section used to call it "the runner's Cognito access token"). coord accepts
+else the device's default binding (`AuthManager`'s legacy `access_token` slot;
+a 2026-09-17 source read of every writer of that slot finds only coord-minted
+device tokens there, while this section used to call it "the runner's Cognito
+access token"; the `tenantId` argument exists only on a runner build carrying
+the runner P2/P3 change (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`)). coord accepts
 it as a **device principal in that tenant** — not as a fleet service identity.
 That is precisely why the fleet's `canonical_repos` authority rows are absent
 over it when that tenant does not hold them. The door is real; the **identity**

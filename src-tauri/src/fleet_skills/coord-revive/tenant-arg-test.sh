@@ -36,7 +36,19 @@
 #   (n4) 422 COORD_MCP_PROVISION_TENANT_NOT_PAIRED -> NONCE_MINT_TENANT_NOT_PAIRED
 #   (n5) 400 COORD_MCP_PROVISION_INVALID_TENANT    -> NONCE_MINT_TENANT_INVALID
 #   (n6) 503 COORD_MCP_PROVISION_TENANT_UNKNOWN    -> NONCE_MINT_TENANT_UNKNOWN
-#   (n7) no tenant known                         -> body {cwd} only, no identity read, LIVE
+#   (n7) no tenant known                         -> body {cwd} only, LIVE, and the LIVE
+#                                                   names the acting tenant it read
+#
+# REVIEW ROUND (W1-W4, S2):
+#   (w1) a named tenant answered 2xx null        -> RUNNER_MINT_TENANT_NOT_PAIRED
+#   (w2) L5 400 tenant_not_bound                 -> BOOTSTRAP_TENANT_NOT_BOUND (stale var named)
+#   (w3) $QONTINUI_RUNNER_URL unset              -> the census and the mint go to the port in
+#                                                   $QONTINUI_RUNNER_API_PORT (a non-9876 stub)
+#   (w4) every LIVE names its tenant; L5 checks the minted token's claim
+#        (legacy coord -> BOOTSTRAP_WRONG_TENANT, claimless -> BOOTSTRAP_UNVERIFIED_TENANT)
+#   (s2) TERMINAL_ID unset, census non-200, census status != ok, malformed
+#        $QONTINUI_TENANT_ID, row outranks credential, RUNNER_MINT_TENANT_INVALID,
+#        and base64url `-`/`_` + every padding length in the claim decode
 #
 # THE DISCHARGE (last section): staged copies of coord-revive.sh with the tenant
 # dropped from the invoke body, the wrong-tenant check deleted, the L5 tenant_id
@@ -106,7 +118,18 @@ def b64(obj):
 
 def token(tenant):
     exp = int(time.time()) + 3600
-    return "%s.%s.sig" % (b64({"alg": "none"}), b64({"sub_type": "device", "tenant_id": tenant, "exp": exp}))
+    payload = {"sub_type": "device", "exp": exp}
+    if tenant:
+        payload["tenant_id"] = tenant
+    # `claim_pad`: a filler that puts base64url `-` and `_` into the payload
+    # segment and moves its length through every value mod 4.
+    pad = mode("claim_pad", "")
+    if pad != "":
+        payload["f"] = "??~~" * 3 + "x" * int(pad)
+    seg = b64(payload)
+    with open(os.path.join(MODE_DIR, "last_payload_segment"), "w", encoding="utf-8") as fh:
+        fh.write(seg)
+    return "%s.%s.sig" % (b64({"alg": "none"}), seg)
 
 
 class H(BaseHTTPRequestHandler):
@@ -137,13 +160,24 @@ class H(BaseHTTPRequestHandler):
                 row["tenancy"] = {"row": {"tenantId": mode("row_tenant")}, "credential": {"status": "unknown", "tenantId": None, "reason": "no_session_nonce"}}
             elif census == "credential":
                 row["tenancy"] = {"row": {"tenantId": None}, "credential": {"status": "resolved", "tenantId": mode("cred_tenant"), "slot": "tenant"}}
+            elif census == "both":
+                row["tenancy"] = {"row": {"tenantId": mode("row_tenant")}, "credential": {"status": "resolved", "tenantId": mode("cred_tenant"), "slot": "tenant"}}
             elif census == "no-tenancy":
                 pass
+            elif census == "down":
+                self._send(503, {"error": "census down"})
+                return
+            elif census == "unavailable":
+                self._send(200, {"success": True, "data": {"status": "unavailable", "reason": "lifecycle_store_unavailable", "sessions": []}})
+                return
             else:
                 self._send(404, {"error": "not found"})
                 return
             other = {"identity": {"terminalId": "term-other"}, "tenancy": {"row": {"tenantId": "dddddddd-0000-4000-8000-00000000000d"}}}
             self._send(200, {"success": True, "data": {"status": "ok", "reason": None, "sessions": [other, row]}})
+            return
+        if self.path.startswith("/coord/agent-findings"):
+            self._send(200, {"findings": [], "count": 0})
             return
         self._send(404, {"error": "not found"})
 
@@ -207,6 +241,10 @@ class H(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
             elif runner == "old":
                 self._send(200, {"success": True, "data": token(mode("default_tenant"))})
+            elif runner == "p3-null-named":
+                self._send(200, {"success": True, "data": None})
+            elif runner == "p3-invalid":
+                self._send(400, {"success": False, "error": "invoke proxy: invalid args for in-process command 'get_coord_device_token': get_coord_device_token:tenant_invalid: tenant_id is not a tenant uuid"})
             elif runner == "p3-multi":
                 if asked:
                     self._send(200, {"success": True, "data": token(asked)})
@@ -223,7 +261,17 @@ class H(BaseHTTPRequestHandler):
             self._send(200, {"jsonrpc": "2.0", "id": rid, "result": {"tools": [{"name": "coord_query_identity"}, {"name": "coord_memory_search"}]}})
             return
         if self.path == "/agents/credential":
-            if not req.get("tenant_id") and mode("coord", "live") == "live":
+            cm = mode("coord", "live")
+            if cm == "not-bound" and req.get("tenant_id"):
+                self._send(400, {"error": "tenant_not_bound"})
+                return
+            if cm == "legacy":
+                self._send(200, {"token": token(mode("default_tenant")), "token_exp": 0})
+                return
+            if cm == "claimless":
+                self._send(200, {"token": token(None), "token_exp": 0})
+                return
+            if not req.get("tenant_id") and cm == "live":
                 self._send(422, {"error": "tenant_ambiguous", "code": "tenant_ambiguous", "message": "device bound to 2 tenants; send tenant_id"})
                 return
             self._send(200, {"token": token(req.get("tenant_id") or mode("default_tenant")), "token_exp": 0})
@@ -254,9 +302,16 @@ run_case() {
   CASE_N=$((CASE_N + 1))
   local cwd="$SANDBOX/case-$CASE_N"; mkdir -p "$cwd"
   : > "$REQLOG"
+  # `-` as the runner leaves $QONTINUI_RUNNER_URL UNSET (the W3 case passes the
+  # stub through $QONTINUI_RUNNER_API_PORT instead). Every other case pins it,
+  # and the session's own runner variables are always cleared, so no case can
+  # reach a real runner on this box.
+  local runner_env="QONTINUI_RUNNER_URL=$runner"
+  [ "$runner" = "-" ] && runner_env="COORD_REVIVE_TEST_NO_RUNNER_URL=1"
   OUT="$(cd "$cwd" && env -u QONTINUI_TENANT_ID -u QONTINUI_TERMINAL_ID -u COORD_DEVICE_JWT -u COORD_AGENT_JWT \
+        -u QONTINUI_RUNNER_URL -u QONTINUI_RUNNER_API_PORT -u QONTINUI_RUNNER_PORT \
         HOME="$FAKE_HOME" USERPROFILE="$FAKE_HOME" CLAUDE_CONFIG_DIR="$FAKE_HOME/cc" \
-        QONTINUI_ROOT="$ROOT" QONTINUI_RUNNER_URL="$runner" COORD_HTTP_URL="$coord" \
+        QONTINUI_ROOT="$ROOT" "$runner_env" COORD_HTTP_URL="$coord" \
         QONTINUI_WEB_HTTP_URL="$DEAD" QONTINUI_MACHINE_ID= \
         COORD_REVIVE_NO_MINT=1 COORD_REVIVE_PROBE_TIMEOUT=5 COORD_REVIVE_MINT_TIMEOUT=10 \
         "$@" bash "$SCRIPT" 2>"$SANDBOX/err")"
@@ -274,6 +329,7 @@ setmode runner p3-multi; setmode census none; setmode default_tenant "$TA"
 run_case "$STUB" "$STUB" QONTINUI_TENANT_ID="$TB"
 assert_eq  "(t1) the invoke body names tenant B" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
 assert_has "(t1) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
+assert_has "(t1) the PARTIAL block states the tenant established" "PARTIAL: tenant established: the minted token's tenant_id claim is $TB; tenant $TB from \$QONTINUI_TENANT_ID" "$OUT"
 assert_lacks "(t1) no token on stdout" "sig" "$(printf '%s' "$OUT" | grep -o 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.sig' || true)"
 
 echo "== (t2) the runner's session census row names the tenant"
@@ -318,6 +374,8 @@ setmode coord live
 run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
 assert_has "(t7) the credential body names tenant_id B" "\"tenant_id\":\"$TB\"" "$(cred_body)"
 assert_has "(t7) the device_id is still sent" "\"device_id\":\"11111111-1111-4111-8111-111111111111\"" "$(cred_body)"
+assert_has "(t7) L5 LIVE" "transport=https-bootstrap-agent-jwt" "$OUT"
+assert_has "(t7) the LIVE names the token's tenant claim" "TENANT: token tenant_id claim $TB; tenant $TB from" "$OUT"
 
 echo "== (t8) L5 with no tenant on a multi-bound device -> BOOTSTRAP_TENANT_AMBIGUOUS"
 run_case "$DEAD" "$STUB"
@@ -338,6 +396,7 @@ run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_MINT= COORD_RE
 assert_has "(n1) the provision body names tenant_id B" "\"tenant_id\": \"$TB\"" "$(provision_body | sed 's/":"/": "/g')"
 assert_eq "(n1) the acting tenant was read back (probe e2e + verification)" "2" "$(identity_calls)"
 assert_has "(n1) VERDICT LIVE over the minted nonce" "transport=loopback-proxy-minted" "$OUT"
+assert_has "(n1) the LIVE names the verified acting tenant" "TENANT: acting tenant $TB, verified" "$OUT"
 
 echo "== (n2) tenant B, a runner that ignores tenant_id mints for A -> WRONG_TENANT, not LIVE"
 setmode nonce_runner old
@@ -372,9 +431,125 @@ echo "== (n7) no tenant known -> {cwd} only, no identity read, LIVE as before"
 setmode nonce_runner p2
 run_case "$STUB" "$DEAD" COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
 assert_lacks "(n7) no tenant_id sent" "tenant_id" "$(provision_body)"
-assert_eq "(n7) only the probe's own end-to-end identity call, no tenant read-back" "1" "$(identity_calls)"
+assert_eq "(n7) the probe's end-to-end identity call plus the tenant read-back" "2" "$(identity_calls)"
+assert_has "(n7) the LIVE still names the acting tenant it read" "TENANT: acting tenant $TA (coord_query_identity" "$OUT"
 assert_has "(n7) VERDICT LIVE over the minted nonce" "transport=loopback-proxy-minted" "$OUT"
 setmode nonce_runner absent
+
+# ================================================================ review round
+setmode nonce_runner absent; setmode census none; setmode default_tenant "$TA"; setmode coord live
+
+echo "== (w1) a named tenant answered with null -> RUNNER_MINT_TENANT_NOT_PAIRED"
+setmode runner p3-null-named
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has   "(w1) RUNNER_MINT_TENANT_NOT_PAIRED" "RUNNER_MINT_TENANT_NOT_PAIRED" "$ERR"
+assert_has   "(w1) names the tenant asked for" "tenant $TB from" "$ERR"
+assert_lacks "(w1) never RUNNER_SIGNED_OUT" "RUNNER_SIGNED_OUT" "$ERR"
+
+echo "== (w1b) a tenant-less null is still RUNNER_SIGNED_OUT"
+run_case "$STUB" "$DEAD" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has   "(w1b) RUNNER_SIGNED_OUT" "RUNNER_SIGNED_OUT" "$ERR"
+
+echo "== (w2) L5 400 tenant_not_bound -> BOOTSTRAP_TENANT_NOT_BOUND"
+setmode coord not-bound
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
+assert_has   "(w2) BOOTSTRAP_TENANT_NOT_BOUND" "BOOTSTRAP_TENANT_NOT_BOUND" "$ERR"
+assert_has   "(w2) names a stale variable as the likely cause" "STALE \$QONTINUI_TENANT_ID" "$ERR"
+assert_lacks "(w2) not the generic device-rejected verdict" "BOOTSTRAP_DEVICE_REJECTED" "$ERR"
+
+echo "== (w4) L5 against a coord that ignores tenant_id -> BOOTSTRAP_WRONG_TENANT"
+setmode coord legacy
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
+assert_has   "(w4) BOOTSTRAP_WRONG_TENANT" "BOOTSTRAP_WRONG_TENANT" "$ERR"
+assert_has   "(w4) names the claim" "claims tenant $TA" "$ERR"
+assert_lacks "(w4) not LIVE" "VERDICT: LIVE" "$OUT"
+assert_lacks "(w4) the wrong token is not used for the control read" "GET /coord/agent-findings" "$REQS"
+
+echo "== (w4b) L5 token with no tenant claim -> BOOTSTRAP_UNVERIFIED_TENANT"
+setmode coord claimless
+run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
+assert_has   "(w4b) BOOTSTRAP_UNVERIFIED_TENANT" "BOOTSTRAP_UNVERIFIED_TENANT" "$ERR"
+assert_lacks "(w4b) not LIVE" "VERDICT: LIVE" "$OUT"
+setmode coord live
+
+echo "== (w3) \$QONTINUI_RUNNER_URL unset -> the spawning runner's \$QONTINUI_RUNNER_API_PORT"
+setmode runner p3-multi; setmode census row; setmode row_tenant "$TB"
+case "$PORT" in 9876) bad "(w3) the stub must not be on 9876 for this case to mean anything" ;; esac
+run_case - "$STUB" QONTINUI_RUNNER_API_PORT="$PORT" QONTINUI_TERMINAL_ID=term-1
+assert_has "(w3) the census on the API_PORT runner was asked" "GET /control/sessions/info" "$REQS"
+assert_eq  "(w3) and its row tenant was sent to that runner's mint" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+assert_has "(w3) the mint that went LIVE was that runner's" "device-jwt@http://127.0.0.1:$PORT source=runner-invoke" "$ERR"
+assert_has "(w3) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
+
+echo "== (s2) \$QONTINUI_TERMINAL_ID unset -> census not asked, the refusal says why"
+setmode census row
+run_case "$STUB" "$DEAD" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_lacks "(s2a) census not asked" "GET /control/sessions/info" "$REQS"
+assert_has   "(s2a) reason named" "QONTINUI_TERMINAL_ID is unset" "$ERR"
+
+echo "== (s2) census answers non-200 -> UNKNOWN, reason names the HTTP code"
+setmode census down
+run_case "$STUB" "$DEAD" QONTINUI_TERMINAL_ID=term-1 COORD_REVIVE_NO_BOOTSTRAP=1
+assert_eq  "(s2b) no tenant sent" "{}" "$(invoke_body)"
+assert_has "(s2b) reason names the census HTTP code" "HTTP 503" "$ERR"
+
+echo "== (s2) census status != ok -> UNKNOWN with its reason"
+setmode census unavailable
+run_case "$STUB" "$DEAD" QONTINUI_TERMINAL_ID=term-1 COORD_REVIVE_NO_BOOTSTRAP=1
+assert_eq  "(s2c) no tenant sent" "{}" "$(invoke_body)"
+assert_has "(s2c) reason names the census's own reason" "census_unavailable:lifecycle_store_unavailable" "$ERR"
+
+echo "== (s2) malformed \$QONTINUI_TENANT_ID -> not sent, and said"
+setmode census none
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID=not-a-uuid COORD_REVIVE_NO_BOOTSTRAP=1
+assert_eq  "(s2d) nothing sent" "{}" "$(invoke_body)"
+assert_has "(s2d) reason names the variable" "QONTINUI_TENANT_ID is set but is not a uuid" "$ERR"
+
+echo "== (s2) the census row outranks the credential"
+setmode census both; setmode row_tenant "$TB"; setmode cred_tenant "$TC"
+run_case "$STUB" "$STUB" QONTINUI_TERMINAL_ID=term-1
+assert_eq "(s2e) the row tenant is sent" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
+
+echo "== (s2) the runner answers tenant_invalid -> RUNNER_MINT_TENANT_INVALID"
+setmode runner p3-invalid; setmode census none
+run_case "$STUB" "$DEAD" QONTINUI_TENANT_ID="$TB" COORD_REVIVE_NO_BOOTSTRAP=1
+assert_has   "(s2f) RUNNER_MINT_TENANT_INVALID" "RUNNER_MINT_TENANT_INVALID" "$ERR"
+assert_lacks "(s2f) never RUNNER_SIGNED_OUT" "RUNNER_SIGNED_OUT" "$ERR"
+
+echo "== (s2) base64url '-'/'_' and every padding length decode to the right claim"
+# GNU base64 decodes unpadded input, so on this box a missing pad step would go
+# unseen. A STRICT decoder (the BSD/macOS shape) refuses input whose length is
+# not a multiple of 4; the shim below stands in for it, so the padding the
+# script restores is actually exercised.
+REAL_BASE64="$(command -v base64)"
+mkdir -p "$SANDBOX/strictbin"
+cat > "$SANDBOX/strictbin/base64" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "-d" ]; then
+  in="\$(cat)"
+  if [ \$(( \${#in} % 4 )) -ne 0 ]; then echo "base64: invalid input (strict: unpadded)" >&2; exit 1; fi
+  printf '%s' "\$in" | "$REAL_BASE64" -d
+  exit \$?
+fi
+exec "$REAL_BASE64" "\$@"
+EOF
+chmod +x "$SANDBOX/strictbin/base64"
+setmode runner p3-multi
+SEEN_LENS=""
+for n in 0 1 2 3; do
+  setmode claim_pad "$n"
+  run_case "$STUB" "$STUB" QONTINUI_TENANT_ID="$TB" PATH="$SANDBOX/strictbin:$PATH"
+  seg="$(cat "$MODE_DIR/last_payload_segment")"
+  SEEN_LENS="$SEEN_LENS $(( ${#seg} % 4 ))"
+  case "$seg" in *-*) ;; *) bad "(s2g) pad=$n: the payload segment carries no '-' (fixture did not exercise it)" ;; esac
+  case "$seg" in *_*) ;; *) bad "(s2g) pad=$n: the payload segment carries no '_' (fixture did not exercise it)" ;; esac
+  assert_lacks "(s2g) pad=$n: no false WRONG_TENANT" "RUNNER_MINT_WRONG_TENANT" "$ERR"
+  assert_has   "(s2g) pad=$n: LIVE" "VERDICT: LIVE" "$OUT"
+done
+rm -f "$MODE_DIR/claim_pad"
+for want in 0 2 3; do
+  case " $SEEN_LENS " in *" $want "*) ok "(s2g) payload length mod 4 = $want was exercised" ;; *) bad "(s2g) payload length mod 4 = $want never exercised (saw:$SEEN_LENS)" ;; esac
+done
 
 # ================================================================ the discharge
 if [ "${MC_MUTANT:-0}" = "1" ]; then
@@ -410,6 +585,23 @@ else
       -- bash "$0"
     mc_expect_red "collapse the nonce mint's tenant refusals into MINT_UNKNOWN" \
       "$SCRIPT" '/^      6)   NREF=/,/^           esac ;;$/d' \
+      -- bash "$0"
+    mc_expect_red "decode the claim without mapping base64url - and _" \
+      "$SCRIPT" "s/ | cut -d. -f2 | tr '_-' '\\/+')\"\$/ | cut -d. -f2)\"/" \
+      -- bash "$0"
+    mc_expect_red "decode the claim without restoring base64 padding" \
+      "$SCRIPT" '/^  \[ "\$pad" -gt 0 \] && seg=/d' \
+      -- bash "$0"
+    mc_expect_red "read a named tenant's null as RUNNER_SIGNED_OUT" \
+      "$SCRIPT" 's/^                 \*get_coord_device_token) if \[ -n "\$SESSION_TENANT" \]; then$/                 *get_coord_device_token) if false; then/' \
+      -- bash "$0"
+    # Mutated to a DEAD port, never to the real default: a mutant that reached
+    # 9876 would talk to whatever runner really runs on this box.
+    mc_expect_red "ignore QONTINUI_RUNNER_API_PORT when choosing the runner" \
+      "$SCRIPT" 's/^  \*) RUNNER_DEFAULT_ORIGIN=.*$/  *) RUNNER_DEFAULT_ORIGIN="${QONTINUI_RUNNER_URL:-http:\/\/127.0.0.1:1}" ;;/' \
+      -- bash "$0"
+    mc_expect_red "trust an L5 token whatever tenant it claims" \
+      "$SCRIPT" 's/^            if \[ -n "\$SESSION_TENANT" \]; then$/            if false; then/' \
       -- bash "$0"
     mc_expect_red "never put the tenant on the L5 credential body" \
       "$SCRIPT" '/^    \[ -n "\$SESSION_TENANT" \] && BOOT_REQ=/d' \

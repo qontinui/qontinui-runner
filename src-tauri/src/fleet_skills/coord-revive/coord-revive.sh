@@ -318,6 +318,15 @@ WEB_URL="${QONTINUI_WEB_HTTP_URL:-https://api.qontinui.io}"
 # TCP connect ONLY. A loopback connect either happens at once or the port is
 # dead; 5s is already generous, and its only real job is to stop a black-holed
 # remote host from hanging the whole cascade before the transfer even starts.
+# The runner this session came from. $QONTINUI_RUNNER_URL wins; else the port the
+# SPAWNING runner exported into the session ($QONTINUI_RUNNER_API_PORT - a
+# secondary runner on 9877 is not the one on 9876); else the documented default.
+# Spelled as the IPv4 loopback (lint check #14). Every runner read below - the
+# mints, /health, the session census - starts from this origin.
+case "${QONTINUI_RUNNER_API_PORT:-}" in
+  ''|*[!0-9]*) RUNNER_DEFAULT_ORIGIN="${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}" ;;
+  *) RUNNER_DEFAULT_ORIGIN="${QONTINUI_RUNNER_URL:-http://127.0.0.1:$QONTINUI_RUNNER_API_PORT}" ;;
+esac
 PROBE_CONNECT_TIMEOUT="${COORD_REVIVE_CONNECT_TIMEOUT:-5}"
 
 # The whole `tools/list` probe in probe_door(), start to finish. Cheap by
@@ -1731,6 +1740,11 @@ live_exit() {
   else
     echo "VERDICT: $v door=$LIVE_FILE url=$LIVE_URL transport=$transport"
   fi
+  # The tenant a runner-mint or bootstrap door established, when the rung set
+  # one (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential):
+  # on a multi-tenant device a LIVE that does not say whose credential it carries
+  # invites exactly the wrong-tenant write this line exists to prevent.
+  [ -n "${LIVE_TENANT_NOTE:-}" ] && echo "TENANT: $LIVE_TENANT_NOTE"
   # The stamped claim, ALWAYS - a LIVE door is a measurement too, and a pasted
   # LIVE block that carries its probe time is what lets a later reader tell it
   # from a stale one. Under --floor-claim the prose NOTEs below are suppressed
@@ -1877,14 +1891,15 @@ approval_verdict_block() {
 # The runner-mint door's PARTIAL block. Every clause here was MEASURED over a
 # live L4 door on 2026-08-13; do not soften it into a hypothetical.
 #
-# Terminology matters and is the whole reason the caveat lands. CORRECTED by plan
-# 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P3 Step 0:
-# both names read AuthManager's legacy `access_token` slot, and every writer of
-# that slot (pair::persist_pairing, pair::reconcile, the device-JWT refresher's
-# Cognito-pair / self-refresh / machine-key paths) stores a COORD-MINTED DEVICE
-# JWT - the device's DEFAULT binding - while the operator's Cognito tokens live
-# in separate OAuth slots. This block used to say "the runner's COGNITO ACCESS
-# TOKEN", as the runner's own doc comment did until the same step. What was
+# Terminology matters and is the whole reason the caveat lands. A source read on
+# 2026-09-17 (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-
+# credential): both names read AuthManager's legacy `access_token` slot, and every
+# writer of that slot (pair::persist_pairing, pair::reconcile, the device-JWT
+# refresher's Cognito-pair / self-refresh / machine-key paths) stores a
+# COORD-MINTED DEVICE JWT - the device's DEFAULT binding - while the operator's
+# Cognito tokens live in separate OAuth slots. This block used to say "the
+# runner's COGNITO ACCESS TOKEN", as the runner's own doc comment still does on
+# every build without the runner P2/P3 change. What was
 # MEASURED on 2026-08-13 stands: the token is a device principal in ONE tenant,
 # not a fleet service identity, so the fleet's canonical_repos authority rows
 # are absent when that tenant is not the one holding them. The door is real;
@@ -3481,16 +3496,37 @@ fi
 #      refusal downstream can say why no tenant was sent. A runner build that
 #      predates the tenancy block is "tenancy_block_absent", never a tenant.
 #
+# WHICH runner's census: the one that spawned this session. With no argument it
+# is $RUNNER_DEFAULT_ORIGIN ($QONTINUI_RUNNER_URL, else the spawning runner's
+# $QONTINUI_RUNNER_API_PORT, else 9876). A caller that already has an origin
+# that ANSWERED (a mint origin) passes it, and that origin is preferred: the
+# census is re-read there if it was read elsewhere first.
+#
+# DECIDED, NOT OVERLOOKED: no fallback to the census row's pre-P0
+# `identity.tenantId`. On a runner build predating the tenancy block that field
+# is the coord row stamp, which on a tenant-less spawn is the device default the
+# REGISTRY chose - not a tenant this session named. Sending it would turn an
+# older runner's working default-slot answer into a WRONG_TENANT refusal and buy
+# nothing, so `tenancy_block_absent` stays "no tenant sent".
+#
 # Omitting it is what a single-tenant device and an older runner or coord need,
 # so absence degrades to today's call rather than failing. Resolved LAZILY: the
 # census costs one loopback GET, paid only by a run that reaches L4's mint.
 SESSION_TENANT=""; SESSION_TENANT_SRC=""; SESSION_TENANT_NOTE=""; SESSION_TENANT_DONE=""
+SESSION_TENANT_ORIGIN=""
 is_uuid() {
   local re='^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'
   [[ "$1" =~ $re ]]
 }
 resolve_session_tenant() {
-  [ -n "$SESSION_TENANT_DONE" ] && return 0
+  local want_origin="${1:-}"
+  if [ -n "$SESSION_TENANT_DONE" ]; then
+    # Already resolved. Re-read the census only when a caller brings an origin
+    # that ANSWERED and the census was read (or would have been read) elsewhere.
+    { [ -z "$want_origin" ] || [ "$SESSION_TENANT_SRC" = "\$QONTINUI_TENANT_ID" ] \
+      || [ "$want_origin" = "$SESSION_TENANT_ORIGIN" ] || [ -z "$SESSION_TENANT_ORIGIN" ]; } && return 0
+    SESSION_TENANT=""; SESSION_TENANT_SRC=""; SESSION_TENANT_NOTE=""
+  fi
   SESSION_TENANT_DONE=1
   if [ -n "${QONTINUI_TENANT_ID:-}" ]; then
     if is_uuid "$QONTINUI_TENANT_ID"; then
@@ -3503,7 +3539,8 @@ resolve_session_tenant() {
     SESSION_TENANT_NOTE="${SESSION_TENANT_NOTE}\$QONTINUI_TERMINAL_ID is unset, so the runner's session census cannot name this session (not a runner-spawned terminal)"
     return 0
   fi
-  local url="${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}/control/sessions/info"
+  SESSION_TENANT_ORIGIN="${want_origin:-$RUNNER_DEFAULT_ORIGIN}"
+  local url="$SESSION_TENANT_ORIGIN/control/sessions/info"
   local body="$TMPD/sessinfo" code ce
   : > "$body"
   code=$(curl -sS -o "$(curl_path "$body")" -w '%{http_code}' \
@@ -3676,7 +3713,7 @@ print("reason: the identity answer carried no string tenant_id")' 2>/dev/null)"
 # floor-claim-test.sh, whose runner_build= assertion read a live build id from
 # a sandbox whose only runner was a stub.
 MINT_ORIGIN_ARGS=""
-for o in $RUNNER_ORIGINS ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876}; do
+for o in $RUNNER_ORIGINS $RUNNER_DEFAULT_ORIGIN; do
   case " $MINT_ORIGIN_ARGS " in *" $o "*) continue ;; esac
   MINT_ORIGIN_ARGS="$MINT_ORIGIN_ARGS --origin $o"
 done
@@ -3690,14 +3727,15 @@ elif [ -z "$CPN" ]; then
 else
   # The session's tenant rides on the mint (plan
   # 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P2): the
-  # runner pins the nonce to it. `--tenant` is passed only to a helper that
-  # understands it - an older copy would exit 4 on the unknown argument and read
-  # as MINT_UNKNOWN - and an unsent tenant still gets VERIFIED below.
+  # runner pins the nonce to it. `--tenant` is passed only to a helper whose
+  # `--capabilities` line lists `tenant` - an older copy has no such line (it
+  # exits 4 on the unknown flag) and would also exit 4 on `--tenant`, reading as
+  # MINT_UNKNOWN - and an unsent tenant still gets VERIFIED below.
   resolve_session_tenant
   NTENANT_ARGS=""
   NTENANT_NOTE=""
   if [ -n "$SESSION_TENANT" ]; then
-    if grep -q -- '--tenant)' "$CPN" 2>/dev/null; then
+    if bash "$CPN" --capabilities 2>/dev/null | grep -Eq '^capabilities=(.*,)?tenant(,|$)'; then
       NTENANT_ARGS="--tenant $SESSION_TENANT"
     else
       NTENANT_NOTE=" (the resolved coord-provision-nonce.sh predates --tenant, so the tenant was NOT sent)"
@@ -3716,7 +3754,17 @@ else
     # scanned or assumed port 401s.
     if probe_door "L4" "nonce-mint@$NURL" "$NURL" "X-Coord-Mcp-Proxy-Key" "$NKEY" \
       "PROXY_UNAUTHORIZED (the runner minted this nonce and then refused it - the registry was rotated or the slot re-provisioned between the two calls; re-run)"; then
+      # The census of the runner that ANSWERED the mint is the one to trust.
+      resolve_session_tenant "${NURL%/coord-mcp}"
+      nonce_acting_tenant "$NURL" "$NKEY"
       if [ -z "$SESSION_TENANT" ]; then
+        # No tenant was asked for, so nothing can be WRONG - but the LIVE still
+        # states which tenant the door acts as, or that it could not be read.
+        if [ -n "$NACT" ]; then
+          LIVE_TENANT_NOTE="acting tenant $NACT (coord_query_identity over the minted nonce); $(describe_session_tenant)"
+        else
+          LIVE_TENANT_NOTE="acting tenant UNKNOWN (${NACT_REASON:-no reason}); $(describe_session_tenant)"
+        fi
         live_exit "loopback-proxy-minted"
       else
         # A runner predating P2 ignores tenant_id and pins the nonce to the
@@ -3725,10 +3773,10 @@ else
         # from coord itself (coord_query_identity's top-level tenant_id is the
         # tenant whose credential the proxy forwarded) before it is called LIVE.
         # Unreadable is UNVERIFIED-TENANT, never LIVE.
-        nonce_acting_tenant "$NURL" "$NKEY"
         if [ -z "$NACT" ]; then
           l4_fail "nonce-mint@$NURL" "NONCE_MINT_UNVERIFIED_TENANT (the nonce answered, but its acting tenant could not be read back - ${NACT_REASON:-no reason}. Asked for $(describe_session_tenant)$NTENANT_NOTE. A runner predating the tenant_id field mints for the machine's tenant and says nothing, so this door is NOT reported LIVE)"
         elif [ "$(printf '%s' "$NACT" | tr 'A-F' 'a-f')" = "$(printf '%s' "$SESSION_TENANT" | tr 'A-F' 'a-f')" ]; then
+          LIVE_TENANT_NOTE="acting tenant $NACT, verified by coord_query_identity over the minted nonce; asked for $(describe_session_tenant)"
           live_exit "loopback-proxy-minted"
         else
           l4_fail "nonce-mint@$NURL" "NONCE_MINT_WRONG_TENANT (asked the runner for a nonce for $(describe_session_tenant)$NTENANT_NOTE and coord_query_identity over it names tenant $NACT - this runner build predates the provision-session tenant_id field (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P2) and minted for the machine's tenant. NOT used: it would write in the wrong tenant. Use a runner build carrying P2; never restart a running runner over it)"
@@ -3818,7 +3866,7 @@ if [ -n "$CPN" ]; then
 fi
 
 L4_SEEN=""
-for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
+for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
   case " $L4_SEEN " in *" $origin "*) continue ;; esac
   L4_SEEN="$L4_SEEN $origin"
   # The mint is the single most expensive step in the cascade ($MINT_TIMEOUT is
@@ -3855,7 +3903,12 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
   # comes back DEVICE_JWT_UNAUTHORIZED rather than being handed on as a
   # credential. Probe the door; do not infer from the name.
   MINT_INVOKE_COMMANDS="get_coord_device_token get_access_token_for_websocket"
-  resolve_session_tenant
+  # The census of the runner that answered /health here, when one did.
+  if [ -n "$FE_ORIGIN" ] && [ "$origin" = "$FE_ORIGIN" ]; then
+    resolve_session_tenant "$FE_ORIGIN"
+  else
+    resolve_session_tenant
+  fi
   # THE ONE ANSWER THAT OPENS THE FALLBACK: this build serves neither name.
   MFALLBACK=""
   for MCMD in $MINT_INVOKE_COMMANDS; do
@@ -3983,9 +4036,11 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
         continue
       fi
     fi
+    MTOKEN_CLAIM="$(jwt_tenant_claim "$MJWT" | tr -d '\r\n')"
     probe_door "L4" "device-jwt@$origin source=$MINT_SOURCE" "${COORD_URL}/mcp" "Authorization" "Bearer $MJWT" \
       "DEVICE_JWT_UNAUTHORIZED (coord rejected the runner-minted token - expired, or bound to another tenant)" \
-      && live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT"
+      && live_exit "https-device-jwt" "$PARTIAL_RUNNER_MINT
+PARTIAL: tenant established: the minted token's tenant_id claim is ${MTOKEN_CLAIM:-<absent - UNKNOWN>}; $(describe_session_tenant)"
     continue
   fi
 
@@ -4073,7 +4128,9 @@ for origin in ${QONTINUI_RUNNER_URL:-http://127.0.0.1:9876} $RUNNER_ORIGINS; do
           # as "the UI-Bridge response shape has changed" would send the reader
           # hunting a renamed route for a runner that answered correctly.
           2??) case "$MINT_SOURCE" in
-                 *get_coord_device_token) mint_fail "RUNNER_SIGNED_OUT (${MHTTP}get_coord_device_token answered normally with null, which is its documented 'this device is unpaired' result - the runner is healthy, the credential slot is empty. Pair or sign this runner in; nothing here is broken)" ;;
+                 *get_coord_device_token) if [ -n "$SESSION_TENANT" ]; then
+                     mint_fail "RUNNER_MINT_TENANT_NOT_PAIRED (${MHTTP}get_coord_device_token was asked for $(describe_session_tenant) and answered null: this runner holds no usable coord credential for THAT tenant. It is NOT signed out - it may hold other tenants' credentials. Pair this device for that tenant (qontinui_profile device pair --tenant-id <uuid>), or name the tenant this session actually acts for)"
+                   else mint_fail "RUNNER_SIGNED_OUT (${MHTTP}get_coord_device_token answered normally with null, which is its documented 'this device is unpaired' result - the runner is healthy, the credential slot is empty. Pair or sign this runner in; nothing here is broken)"; fi ;;
                  *) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE but the body carried neither a .data.value / .data.result.value nor an error string - the UI-Bridge response shape has changed)" ;;
                esac ;;
           4??) mint_fail "RUNNER_EVAL_FAILED (HTTP $MCODE from $MINT_URL with no error string in the body - the route is absent/renamed, or something else answers on this port. NOT a sign-in problem)" ;;
@@ -4278,10 +4335,31 @@ for k in ("token","agent_jwt","jwt","access_token"):
 print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
           fi
           [ "$BOOT_TOKEN" = "null" ] && BOOT_TOKEN=""
+          BOOT_TENANT_OK=""; BOOT_CLAIM=""
           if ! jwt_shaped "$BOOT_TOKEN"; then
             l5_fail "BOOTSTRAP_NO_TOKEN_IN_RESPONSE (HTTP $BOOT_CODE from $BOOT_URL but the body carried no JWT-shaped token - a JWT is 3 dot-separated base64url parts. The route's response shape changed, or something else answers on this host. NOT sent onward: an unshaped bearer would draw a 401 this script would then report against coord)"
             l5_count unknown l5-token-unverified
           else
+            # --- THE TOKEN'S OWN TENANT, before anything is named -------------
+            # A coord predating P5a ignores tenant_id and mints for the legacy
+            # pointer's tenant. The token's tenant_id claim says which tenant it
+            # is; when a tenant was asked for, it must name that one (absent is
+            # UNVERIFIED, never assumed).
+            BOOT_CLAIM="$(jwt_tenant_claim "$BOOT_TOKEN" | tr -d '\r\n')"
+            BOOT_TENANT_OK=1
+            if [ -n "$SESSION_TENANT" ]; then
+              if [ -z "$BOOT_CLAIM" ]; then
+                BOOT_TENANT_OK=""
+                l5_fail "BOOTSTRAP_UNVERIFIED_TENANT (HTTP $BOOT_CODE from $BOOT_URL minted a token for $(describe_session_tenant), but the token carries no readable tenant_id claim, so which tenant it acts in is UNKNOWN. NOT used)"
+                l5_count unknown l5-token-unverified
+              elif [ "$(printf '%s' "$BOOT_CLAIM" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SESSION_TENANT" | tr 'A-F' 'a-f')" ]; then
+                BOOT_TENANT_OK=""
+                l5_fail "BOOTSTRAP_WRONG_TENANT (asked $BOOT_URL for $(describe_session_tenant) and the minted token claims tenant $BOOT_CLAIM - this coord predates the tenant_id field (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P5a) and minted for the device's legacy pointer. NOT used: it would act in the wrong tenant)"
+                l5_count unknown l5-wrong-tenant
+              fi
+            fi
+          fi
+          if [ -n "${BOOT_TENANT_OK:-}" ] && jwt_shaped "$BOOT_TOKEN"; then
             # --- VERIFY BEFORE DECLARING LIVE ---------------------------------
             # A minted token that does not authenticate is a FALSE GREEN, and a
             # false green is what cost the 2026-08-28 closeout its output. The
@@ -4309,6 +4387,7 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
               if [ "$CTRL_CE" = "0" ] && [ "$CTRL_CODE" = "200" ]; then
                 echo "L5: bootstrap-credential -> LIVE (minted at $BOOT_URL with $(describe_session_tenant), verified by $CTRL_URL -> 200)" >&2
                 l5_count allow l5-live
+                LIVE_TENANT_NOTE="token tenant_id claim ${BOOT_CLAIM:-<absent - UNKNOWN>}; $(describe_session_tenant)"
                 LIVE_FILE="bootstrap-credential (device_id from $DEV_ID_SRC)"
                 LIVE_URL="$BOOT_URL"
                 live_exit "https-bootstrap-agent-jwt" "$PARTIAL_BOOTSTRAP"
@@ -4326,7 +4405,17 @@ print()' < "$BOOT_BODY" 2>/dev/null | tr -d '[:space:]')"
               l5_fail "BOOTSTRAP_TENANT_AMBIGUOUS (HTTP 422 tenant_ambiguous from $BOOT_URL - this device is bound to more than one tenant, and coord will not mint for a guessed one. $(describe_session_tenant). Remedy: set \$QONTINUI_TENANT_ID to the tenant this session acts for (or run inside a runner terminal whose session census names it) and re-run; the device_id is fine)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}"
               l5_count unknown l5-tenant-ambiguous ;;
             *)
-              l5_fail "BOOTSTRAP_DEVICE_REJECTED (HTTP 422 from $BOOT_URL - the route answered and refused this request ($(describe_session_tenant)). A tenant_id the device is not bound to is refused this way too; check it and the id resolved from $DEV_ID_SRC)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}${BOOT_CURLERR:+ [curl: $BOOT_CURLERR]}"
+              l5_fail "BOOTSTRAP_DEVICE_REJECTED (HTTP 422 from $BOOT_URL - the route answered and refused this request ($(describe_session_tenant)) for a reason other than tenant ambiguity; read coord's message and check the id resolved from $DEV_ID_SRC)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}${BOOT_CURLERR:+ [curl: $BOOT_CURLERR]}"
+              l5_count unknown l5-device-rejected ;;
+          esac ;;
+        400)
+          case "$BOOT_RESP" in
+            *tenant_not_bound*)
+              # P5a validates a sent tenant_id against the device's bindings.
+              l5_fail "BOOTSTRAP_TENANT_NOT_BOUND (HTTP 400 tenant_not_bound from $BOOT_URL - this device is not bound to the tenant sent: $(describe_session_tenant). A STALE \$QONTINUI_TENANT_ID (left over from another session or tenant) is the likely cause; unset it or set the tenant this device is paired for. The device_id itself is fine)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}"
+              l5_count unknown l5-tenant-not-bound ;;
+            *)
+              l5_fail "BOOTSTRAP_DEVICE_REJECTED (HTTP 400 from $BOOT_URL - the route answered and refused this device_id. Check that the id resolved from $DEV_ID_SRC is the one coord knows)${BOOT_MSG:+ coord said: \"$BOOT_MSG\"}${BOOT_CURLERR:+ [curl: $BOOT_CURLERR]}"
               l5_count unknown l5-device-rejected ;;
           esac ;;
         *)

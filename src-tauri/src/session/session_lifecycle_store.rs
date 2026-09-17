@@ -732,6 +732,11 @@ pub struct TerminalSessionRecord {
 pub struct SpawnDeviceDefault {
     /// The default tenant read at spawn, or `None` when the machine named none.
     pub tenant_id: Option<String>,
+    /// The machine's pin could NOT be read at spawn (`machine.json` unresolvable).
+    /// Kept so the report says UNKNOWN (`unresolvable`) rather than reading the
+    /// absent tenant as "no default". Set once like the rest of the value.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unresolvable: bool,
 }
 
 /// One durable, self-contained mutation appended to the write-ahead log.
@@ -2138,7 +2143,7 @@ impl SessionLifecycleStore {
     pub fn record_spawn_device_default(
         &self,
         terminal_id: &str,
-        default_tenant: Option<String>,
+        spawn_default: SpawnDeviceDefault,
         spawned_since_ms: i64,
     ) -> bool {
         let mut m = match self.map.lock() {
@@ -2148,6 +2153,11 @@ impl SessionLifecycleStore {
                 return false;
             }
         };
+        // The FIRST open record on the terminal. That is the spawn's record
+        // because a terminal hosts at most ONE live provider session — the
+        // single-tenant-terminal invariant `record_open` enforces by superseding
+        // siblings. If that invariant ever loosened, this pick would become a
+        // guess and must be keyed by session id instead.
         let Some(rec) = m
             .values_mut()
             .find(|r| r.state == "open" && r.terminal_id == terminal_id)
@@ -2162,7 +2172,8 @@ impl SessionLifecycleStore {
             return false;
         }
         rec.spawn_device_default = Some(SpawnDeviceDefault {
-            tenant_id: non_empty(default_tenant),
+            tenant_id: non_empty(spawn_default.tenant_id),
+            unresolvable: spawn_default.unresolvable,
         });
         let changed = rec.clone();
         self.persist(
@@ -3944,6 +3955,13 @@ mod tests {
     // deltas survive a reopen, a torn tail loses only the uncommitted line, and
     // compaction is idempotent against replay.
 
+    fn sdd(tenant: Option<&str>) -> SpawnDeviceDefault {
+        SpawnDeviceDefault {
+            tenant_id: tenant.map(str::to_string),
+            unresolvable: false,
+        }
+    }
+
     /// W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential):
     /// the spawn-time device default is written onto a record THIS spawn created,
     /// survives a reopen (a runner restart), and is never replaced — not by a
@@ -3959,13 +3977,13 @@ mod tests {
             store.record_open(rec("sess-spawn"));
             assert!(store.record_spawn_device_default(
                 "term-abc",
-                Some("tenant-a".into()),
+                sdd(Some("tenant-a")),
                 before_spawn
             ));
             // A later stamp (a restore-time default) never overwrites it.
             assert!(!store.record_spawn_device_default(
                 "term-abc",
-                Some("tenant-b".into()),
+                sdd(Some("tenant-b")),
                 before_spawn
             ));
             // Nor does a re-record carrying nothing.
@@ -3974,9 +3992,7 @@ mod tests {
         let reopened = SessionLifecycleStore::open(&path).unwrap();
         assert_eq!(
             reopened.get("sess-spawn").unwrap().spawn_device_default,
-            Some(SpawnDeviceDefault {
-                tenant_id: Some("tenant-a".into())
-            }),
+            Some(sdd(Some("tenant-a"))),
             "the value of the SPAWN must survive a restart"
         );
     }
@@ -3993,7 +4009,7 @@ mod tests {
         let spawn_after_the_record = Utc::now().timestamp_millis() + 60_000;
         assert!(!store.record_spawn_device_default(
             "term-abc",
-            Some("tenant-restore-time".into()),
+            sdd(Some("tenant-restore-time")),
             spawn_after_the_record
         ));
         assert_eq!(store.get("sess-old").unwrap().spawn_device_default, None);
@@ -4009,11 +4025,11 @@ mod tests {
         let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json")).unwrap();
         let before = Utc::now().timestamp_millis();
         store.record_open(rec("seam-row"));
-        assert!(store.record_spawn_device_default("term-abc", None, before));
+        assert!(store.record_spawn_device_default("term-abc", sdd(None), before));
         store.record_open(rec("launcher-row"));
         assert_eq!(
             store.get("launcher-row").unwrap().spawn_device_default,
-            Some(SpawnDeviceDefault { tenant_id: None }),
+            Some(sdd(None)),
             "recorded-with-no-default is inherited as recorded, not as absent"
         );
 
