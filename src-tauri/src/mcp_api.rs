@@ -908,7 +908,7 @@ async fn capability_manifest() -> impl axum::response::IntoResponse {
 /// Returns rich diagnostics: frontend responsiveness, uptime, circuit breaker state.
 async fn health(
     axum::extract::State(state): axum::extract::State<Arc<ApiState>>,
-    requester: Option<axum::Extension<crate::mcp::origin_guard::RequesterClass>>,
+    requester: Option<axum::Extension<crate::mcp::origin_guard::RequesterPrincipal>>,
 ) -> Json<serde_json::Value> {
     let uptime_secs = state.started_at.elapsed().as_secs();
     let last_pong = state.app_state.ui_bridge_last_pong.load(Ordering::Relaxed);
@@ -1528,7 +1528,7 @@ async fn health(
         // and shadow counts, and the last 20 non-admit tuples — withheld from a
         // Foreign requester, since they name the other sites that reached this
         // runner.
-        "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0 .0)),
+        "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,

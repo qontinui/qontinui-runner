@@ -115,12 +115,12 @@ fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>
             }
             ("GET", "/health") => router.route(
                 pattern,
-                get(move |r: Option<axum::Extension<RequesterClass>>| {
+                get(move |r: Option<axum::Extension<RequesterPrincipal>>| {
                     let c = c.clone();
                     let g = g.clone();
                     async move {
                         c.hit(key);
-                        axum::Json(json!({ "originGuard": g.health_json(r.map(|e| e.0 .0)) }))
+                        axum::Json(json!({ "originGuard": g.health_json(r.map(|e| e.0.class)) }))
                     }
                 }),
             ),
