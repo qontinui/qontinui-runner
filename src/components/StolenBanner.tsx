@@ -20,6 +20,8 @@ interface StolenEvent {
   resourceKey: string;
   currentHolder?: string | null;
   agentId: string;
+  /** `true` iff the claim EXPIRED with no rival holder — not an actual theft. */
+  lapsed?: boolean;
 }
 
 interface ActiveStolenNotice extends StolenEvent {
@@ -66,19 +68,25 @@ export function StolenBanner() {
       {notices.map((n) => (
         <div key={n.id} role="status" aria-live="polite" style={bannerStyle}>
           <div style={{ flex: 1 }}>
-            <p style={titleStyle}>Claim stolen</p>
+            <p style={titleStyle}>{n.lapsed ? "Claim lapsed" : "Claim stolen"}</p>
             <p style={messageStyle}>
               Your claim{" "}
               <code style={codeStyle}>
                 {n.kind}:{n.resourceKey}
               </code>{" "}
-              was revoked
-              {n.currentHolder ? (
+              {n.lapsed ? (
+                "expired and is no longer held — nobody else has taken it"
+              ) : (
                 <>
-                  {" "}by machine{" "}
-                  <code style={codeStyle}>{n.currentHolder.slice(0, 8)}</code>
+                  was revoked
+                  {n.currentHolder ? (
+                    <>
+                      {" "}by machine{" "}
+                      <code style={codeStyle}>{n.currentHolder.slice(0, 8)}</code>
+                    </>
+                  ) : null}
                 </>
-              ) : null}
+              )}
               . Agent{" "}
               <code style={codeStyle}>{n.agentId.slice(0, 8)}</code>
               {" "}has been notified.

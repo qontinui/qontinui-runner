@@ -517,9 +517,13 @@ impl Drop for ClaimHeartbeatHandle {
 }
 
 /// Spawn a tokio task that posts `/claims/heartbeat` every TTL/3 seconds.
-/// On `HeartbeatResult::Stolen`, the task invokes `on_stolen` with the
-/// optional `current_holder` and exits — the displaced agent's runner
-/// is responsible for surfacing the banner from there.
+/// On `HeartbeatResult::Stolen` or a `not_held` lapse, the task invokes
+/// `on_stolen(current_holder, lapsed)` and exits — the displaced agent's
+/// runner is responsible for surfacing the banner from there. `lapsed` is
+/// `true` only for the no-rival `NotHeld` case, so a consumer that wants to
+/// keep pre-#1557 behaviour (one generic "no longer held" message) can
+/// still ignore it, while one that wants to stop calling an expiry a theft
+/// can act on it.
 ///
 /// The cancellation token returned via the handle's `Drop` is the
 /// shutdown signal — the task exits on the next tick boundary.
@@ -533,7 +537,7 @@ pub fn spawn_heartbeat_task<F>(
     on_stolen: F,
 ) -> ClaimHeartbeatHandle
 where
-    F: Fn(Option<String>) + Send + Sync + 'static,
+    F: Fn(Option<String>, bool) + Send + Sync + 'static,
 {
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -580,7 +584,7 @@ async fn heartbeat_loop<F>(
     cancel_clone: CancellationToken,
     on_stolen: F,
 ) where
-    F: Fn(Option<String>) + Send + Sync + 'static,
+    F: Fn(Option<String>, bool) + Send + Sync + 'static,
 {
     {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -625,19 +629,17 @@ async fn heartbeat_loop<F>(
                         "claim-heartbeat: stolen kind={kind_owned} key={resource_clone} \
                          current_holder={current_holder:?}"
                     );
-                    on_stolen(current_holder);
+                    on_stolen(current_holder, false);
                     return;
                 }
                 Ok(HeartbeatTickOutcome::NotHeld) => {
                     warn!(
                         "claim-heartbeat: claim lapsed (expired, nobody holds it) kind={kind_owned} key={resource_clone} — re-acquire before further work"
                     );
-                    // `on_stolen` is the "we no longer hold this claim" callback,
-                    // and it already received `None` for this case while coord
-                    // spelled an expiry `stolen` with a null holder — so passing
-                    // `None` here keeps every consumer's behaviour identical
-                    // across the wire change.
-                    on_stolen(None);
+                    // `lapsed=true` lets a consumer distinguish this no-rival
+                    // expiry from an actual theft; `current_holder` stays
+                    // `None` either way since nothing names a stealer here.
+                    on_stolen(None, true);
                     return;
                 }
                 Err(e) => {
@@ -2294,7 +2296,7 @@ mod tests {
             "plan:test:phase:1".to_string(),
             3600,
             cancel.clone(),
-            |_| {},
+            |_, _| {},
         ));
         tokio::task::yield_now().await;
         assert!(!join.is_finished(), "task should be running before cancel");

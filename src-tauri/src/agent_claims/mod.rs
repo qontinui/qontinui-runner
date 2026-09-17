@@ -71,6 +71,13 @@ pub struct StolenEventPayload {
     pub resource_key: String,
     pub current_holder: Option<String>,
     pub agent_id: String,
+    /// `true` iff coord answered `not_held` — the claim EXPIRED or was
+    /// never held, and no rival is named. `false` for a genuine `stolen`
+    /// (including the legacy pre-`not_held` wire shape, `stolen` with a
+    /// null `current_holder`, which a coord not yet carrying #2206 still
+    /// sends for an expiry). A consumer that ignores this field keeps the
+    /// exact pre-existing behaviour.
+    pub lapsed: bool,
     /// Phase 6: typed reason provided by the stealer (passed through
     /// from `POST /sessions/:id/steal`). `None` for legacy steals or
     /// non-session claims.
@@ -116,12 +123,13 @@ pub fn register_active_claim(
         &kind,
         resource_key.clone(),
         ttl_seconds,
-        move |current_holder| {
+        move |current_holder, lapsed| {
             emit_stolen_event(
                 &on_stolen_agent_id,
                 &on_stolen_kind,
                 &on_stolen_key,
                 current_holder,
+                lapsed,
             );
         },
     );
@@ -198,8 +206,17 @@ fn emit_stolen_event(
     kind: &str,
     resource_key: &str,
     current_holder: Option<String>,
+    lapsed: bool,
 ) {
-    emit_stolen_event_with_context(agent_id, kind, resource_key, current_holder, None, None);
+    emit_stolen_event_with_context(
+        agent_id,
+        kind,
+        resource_key,
+        current_holder,
+        lapsed,
+        None,
+        None,
+    );
 }
 
 /// Phase 6 extension of [`emit_stolen_event`] that carries the stealer's
@@ -212,6 +229,7 @@ pub fn emit_stolen_event_with_context(
     kind: &str,
     resource_key: &str,
     current_holder: Option<String>,
+    lapsed: bool,
     reason: Option<String>,
     session_metadata: Option<SessionMetadata>,
 ) {
@@ -226,6 +244,7 @@ pub fn emit_stolen_event_with_context(
         resource_key: resource_key.to_string(),
         current_holder,
         agent_id: agent_id.to_string(),
+        lapsed,
         reason,
         session_metadata,
     };
@@ -330,5 +349,31 @@ mod tests {
             // No handle registered for this id — should be a silent no-op.
             release_for_agent("00000000-0000-0000-0000-0000000000ff").await;
         });
+    }
+
+    /// `lapsed` is the field `StolenBanner.tsx` reads to stop rendering a
+    /// no-rival expiry as a theft — a required (non-`Option`) camelCase key,
+    /// deleting it silently regresses the frontend back to always saying
+    /// "Claim stolen".
+    #[test]
+    fn stolen_event_payload_serializes_lapsed_as_required_camel_case() {
+        let payload = StolenEventPayload {
+            kind: "phase".to_string(),
+            resource_key: "plan:test:phase:1".to_string(),
+            current_holder: None,
+            agent_id: "agent-1".to_string(),
+            lapsed: true,
+            reason: None,
+            session_metadata: None,
+        };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v.get("lapsed").and_then(|x| x.as_bool()), Some(true));
+
+        let stolen = StolenEventPayload {
+            lapsed: false,
+            ..payload
+        };
+        let v = serde_json::to_value(&stolen).unwrap();
+        assert_eq!(v.get("lapsed").and_then(|x| x.as_bool()), Some(false));
     }
 }
