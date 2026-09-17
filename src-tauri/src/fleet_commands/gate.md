@@ -672,17 +672,29 @@ proved every readable `.mcp.json` — including this workdir's — dead.
 The typed refusals each have a different fix, so read WHICH one you got rather
 than collapsing them: `..._NOT_OPTED_IN` (create the operator's opt-in marker
 `~/.qontinui/allow-session-coord-identity`; deleting it is the live kill switch,
-re-read per request), `..._NO_HANDSHAKE` / `..._HANDSHAKE_MISMATCH` (the 0600
-`~/.qontinui/runner-loopback-key` was not sent, or is stale — the runner
-rewrites it at every start), `..._INVALID_BODY` / `..._INVALID_CWD`,
+re-read per request), `..._NO_HANDSHAKE` / `..._HANDSHAKE_MISMATCH` (no
+handshake key was sent, or the one sent is not the key of the runner on THAT
+port — the primary's key posted to a secondary's port, or a stale one. The key
+is PER RUNNER: `~/.qontinui/runner-loopback-key-<bound port>`, 0600, rewritten
+at every start, and the runner names it as `loopback_key_path` in its
+breadcrumb record `~/.qontinui/runner/api-port*.json` (`"schema": 2`; a
+`"schema": 1` record is a runner built before the per-port key and still means
+the legacy bare `~/.qontinui/runner-loopback-key`, which is never deleted). The
+helper resolves it per origin from the record whose `.port` matches, never by
+deriving a file name; `$QONTINUI_RUNNER_LOOPBACK_KEY` overrides that for every
+origin, so one set from another runner, or before this one restarted, is the
+usual cause when it is set; when it is not, a `"schema": 1` record read beside a
+bare file another runner start has since rewritten), `..._INVALID_BODY` /
+`..._INVALID_CWD`,
 `..._PORT_UNRESOLVABLE`. A `404` means this runner's build predates the route —
 **do not restart a running runner over it** (served policy
 `production-and-cost` `runner-lifecycle`); the next start picks it up.
 
 > ⚠️ **Probe a second, independent instance before you name a cause.** Every
-> refusal above is a *local* verdict — this workdir's slot, this box's key file,
-> this runner's build. None of them licenses the claim a session at this point
-> actually wants to write, which is *"coord is unreachable"* or *"the gate door
+> refusal above is a *local* verdict — this workdir's slot, the key file of the
+> runner on this port, this runner's build. None of them licenses the claim a
+> session at this point actually wants to write, which is *"coord is
+> unreachable"* or *"the gate door
 > is gone"*. Before writing either, ask a **second, independent instance** of the
 > door:
 >
@@ -999,8 +1011,11 @@ Falsify it first, cheapest rung first.
    answers `401` anonymous and `422` with a device JWT — a `422` there means the
    door is OPEN and only the body was wrong. (ii) **Prefix, not credential:**
    `POST https://coord.qontinui.io/agents/allocate` answers `422` anonymous while
-   `POST https://coord.qontinui.io/coord/agents/allocate` answers `401` — the
-   same capability, one path segment apart, two different-looking verdicts.
+   `POST https://coord.qontinui.io/coord/agents/allocate` answers `404`
+   `no_such_route` (measured 2026-09-13; it answered `401` through 2026-09-06) —
+   the same capability, one path segment apart, two different-looking verdicts.
+   The 404 body now says outright that it is about the PATH and not about your
+   credential, and its `did_you_mean` names `POST /agents/allocate`.
 2. **Then ask the same host — the weak instance.** `coord.qontinui.io` serves a
    credential-free route:
    `curl -sS -o /dev/null -w '%{http_code}\n' -m 10 "${COORD_HTTP_URL:-https://coord.qontinui.io}/coord/agent-prompt-documents"`.
@@ -1308,12 +1323,17 @@ either arm.
 
 (If a `.coord-mcp-status` breadcrumb exists in your cwd, quote its reason here —
 **with its age**. It is the RUNNER's own record of why this workdir got no
-working coord-mcp, and **six of its thirteen reasons mean that provisioning pass
+working coord-mcp, and **six of its fourteen reasons mean that provisioning pass
 wrote no `.mcp.json`** — which explains the missing door rather than adding a
-second fault to chase. The other seven are the probe's typed verdicts
+second fault to chase. The other eight are the probe's typed verdicts
 (`TIMEOUT`, `CONNECT_REFUSED`, `UNAUTHORIZED (401)`, `CREDENTIAL_REFRESHING
-(503)`, `HTTP <observed>`, `HTTP_200_NOT_MCP`, `TRANSPORT`) and mean the
-opposite: a config WAS written and gave no usable answer at spawn. Only `TIMEOUT` establishes
+(503)`, `HTTP <observed>`, `HTTP_200_NOT_MCP`, `TRANSPORT`, and the
+runner-credential verdict — that last one meaning the `.mcp.json` and its nonce
+are FINE and the RUNNER's own coord credential cannot answer) and mean the
+opposite: a config WAS written — the first seven because the probe got no usable
+answer at spawn, the eighth because the runner's own credential is dark — which its
+provision-time writer records before any probe runs at all, though its other
+writer IS the probe, on a 401 carrying a `runner_credential_*` code. Only `TIMEOUT` establishes
 nothing — its own text says `NOT known dead`, and a merely SATURATED runner
 produces it — so quote that one as the fault the runner recorded rather than
 as a diagnosis; a breadcrumb still guessing a three-way cause in its
