@@ -273,10 +273,7 @@ static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
 > = std::sync::OnceLock::new();
 
-fn warn_coord_only_binding_once(
-    tenant: uuid::Uuid,
-    slot: qontinui_runner_lib::auth::SlotState,
-) {
+fn warn_coord_only_binding_once(tenant: uuid::Uuid, slot: qontinui_runner_lib::auth::SlotState) {
     let set = COORD_ONLY_BINDINGS_WARNED
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let fresh = set.lock().map(|mut g| g.insert(tenant)).unwrap_or(false);

@@ -2830,7 +2830,10 @@ mod tests {
 
         let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
         assert!(report.dropped.is_empty());
-        assert_eq!(report.coord_only, vec![(ta(), crate::auth::SlotState::Absent)]);
+        assert_eq!(
+            report.coord_only,
+            vec![(ta(), crate::auth::SlotState::Absent)]
+        );
         assert!(!path.exists(), "no file must be created");
     }
 
