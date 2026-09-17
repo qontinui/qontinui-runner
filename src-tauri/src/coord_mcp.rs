@@ -13636,12 +13636,26 @@ mod tests {
     #[test]
     fn in_cwd_reprovision_reuses_the_live_nonce_and_evicts_no_sibling() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        // Hold the ambient for the whole test: both provisions must see ONE
+        // home. Without the fixture a co-selected `isolated_ambient()` test on
+        // another thread (e.g. `spawn_tenant_credential_tests::
+        // a_tenantless_provision_never_evicts_another_tenants_cwd_key`) has its
+        // fixture home live while the FIRST mint freezes its tenant pin, so the
+        // pin reads THROUGH that home (`Pinned(A)`); by the second provision the
+        // fixture has dropped, the read deflects to an empty home
+        // (`Unresolvable`), the reuse is refused as pinned-away and the
+        // tenant-less guard returns `WorkdirDeclared` without writing: no mint,
+        // no reuse line (`mint=1, reuse=0`, file byte-identical). The fixture
+        // takes the reentrant `env_lock()`, so the two tests serialise instead.
+        let amb = crate::test_env::isolated_ambient();
         let log_dir = rotation_log_test_dir();
         let dev = {
             let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
             format!("h.{payload}.s")
         };
-        let d = std::env::temp_dir().join(format!("coord-mcp-f4-reuse-{}", uuid::Uuid::now_v7()));
+        let d = amb
+            .dir()
+            .join(format!("coord-mcp-f4-reuse-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         let wd = d.to_string_lossy().to_string();
 
@@ -14049,6 +14063,12 @@ mod tests {
     /// The last arm additionally pins that a mint is the only recovery — an
     /// unregistered on-disk nonce is never adopted here (that would widen the
     /// accept set; adoption belongs to the boot self-heal alone).
+    // Deliberately NOT pinned to `isolated_ambient()`: every arm below makes
+    // `live_cwd_device_binding` return `None` before any frozen-vs-live pin
+    // compare is reached, so a co-selected fixture moving the home between
+    // reads has nothing to steer. Add the pin if an arm ever leaves a live,
+    // registered key for this cwd ON THE BOUND PORT for a later provision to
+    // read — that is the shape the pinned test above and the one below had.
     #[test]
     fn in_cwd_reprovision_mints_when_the_on_disk_nonce_is_not_reusable() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -14153,12 +14173,21 @@ mod tests {
     #[test]
     fn in_cwd_reuse_upgrades_a_legacy_header_shape_without_rotating() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        // Same pin as `in_cwd_reprovision_reuses_the_live_nonce_and_evicts_no_sibling`
+        // above: the setup mint and the provision must see ONE home, or the
+        // mint's frozen pin reads through a co-selected fixture's home while
+        // the provision reads a deflected empty one, and the reuse is refused
+        // as pinned-away (`WorkdirDeclared`, file untouched, header never
+        // upgraded).
+        let amb = crate::test_env::isolated_ambient();
         let log_dir = rotation_log_test_dir();
         let dev = {
             let payload = URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#);
             format!("h.{payload}.s")
         };
-        let d = std::env::temp_dir().join(format!("coord-mcp-f4-legacy-{}", uuid::Uuid::now_v7()));
+        let d = amb
+            .dir()
+            .join(format!("coord-mcp-f4-legacy-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&d).unwrap();
         let wd = d.to_string_lossy().to_string();
         let live = register_proxy_nonce(&wd, None, None);
