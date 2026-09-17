@@ -218,24 +218,6 @@ fn is_plain_segment(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Every path the worktree claim for `repo` may have been keyed on, whatever
-/// the filesystem or the settings map looked like when it was taken — so a
-/// release finds the claim even if a checkout appeared, disappeared or was
-/// re-mapped in between. No filesystem probe.
-pub fn canonical_path_candidates(repo: &str) -> Vec<PathBuf> {
-    let Ok(root) = crate::workspace_paths::runner_workspace_root().require() else {
-        return Vec::new();
-    };
-    let map = if has_foreign_owner(repo) {
-        repo_checkouts_setting()
-    } else {
-        BTreeMap::new()
-    };
-    checkout_candidates_in(&root, repo, &map)
-        .map(|c| c.into_iter().map(|(p, _)| p).collect())
-        .unwrap_or_default()
-}
-
 /// The settings-map entry for `repo`: a key naming the same owner and name,
 /// compared case-insensitively (GitHub slugs are case-insensitive). A blank
 /// value is not an entry.

@@ -11,12 +11,16 @@
 //! POSTs the drift to coord's existing `POST /coord/fs/observations` ingest
 //! tagged `source: "canonical_drift"`.
 //!
-//! "Dirty AND unclaimed" is the leak signature: Phases 1+2 register a
-//! `kind=worktree` claim for every checkout a session legitimately
-//! materializes / shared-branches in (keyed on the canonical path via
-//! [`super::worktree_resource_key`]). So a checkout that is dirty with NO
-//! holder is an edit the runner never provisioned — e.g. a VS Code
-//! native-panel agent operating directly in the canonical tree.
+//! "Dirty AND unclaimed" is the leak signature: the runner registers a
+//! `kind=worktree` claim on the directory every session is given (via
+//! [`super::worktree_resource_key`]) — the agent worktree for a `worktree`
+//! allocation, the canonical checkout itself only for a `shared_branch` one.
+//! So a canonical checkout that is dirty with NO holder is an edit the runner
+//! never provisioned there — e.g. a VS Code native-panel agent operating
+//! directly in the canonical tree, or a worktree session that wrote outside its
+//! own worktree. A live worktree session of the same repo no longer excuses it
+//! (plan
+//! `2026-09-17-the-worktree-claim-is-keyed-on-the-shared-checkout-so-a-second-concurrent-session-of-a-repo-gets-no-worktree`).
 //!
 //! ## Why reuse `/coord/fs/observations` (not a new endpoint)
 //!

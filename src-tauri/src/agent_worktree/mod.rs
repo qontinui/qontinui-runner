@@ -1376,21 +1376,30 @@ fn allocate_tenant_scope(
 /// `agent_session_id` resolves no registry tenant — see
 /// [`allocate_tenant_scope`].
 ///
-/// Claim acquisition (Phase 1, plan
-/// 2026-06-06-session-scoped-multi-repo-workspace-coordination). BEFORE
-/// `/agents/allocate` and before any `git worktree add`, this acquires:
-///   1. One `kind=worktree` claim per repo, keyed on the canonical
-///      checkout path normalized to the guard's `by-resource` form
-///      (always — even when no plan_id/phase/paths were declared, which is
-///      the gate-continuation case the old code left unclaimed).
-///   2. The optional `phase`/`file_glob` claim (Phase 3 behavior) when a
-///      plan_id + phase or non-empty `declared_overlap_paths` was supplied.
-/// A `Held` on ANY claim unwinds the claims already acquired and returns
-/// `Err(AllocateError::ClaimConflict)` WITHOUT touching `/agents/allocate`.
-/// On full success it proceeds to allocate; the caller spawns one heartbeat
-/// task per claim and releases every claim on agent completion (see
-/// [`spawn_heartbeat_task`] and [`release_claim_best_effort`]). The returned
-/// [`AllocateResult::active_claims`] carries them all for that purpose.
+/// Claim acquisition. Two kinds of claim, taken at two different moments:
+///   1. The optional `phase`/`file_glob` claim, when a plan_id + phase or
+///      non-empty `declared_overlap_paths` was supplied — BEFORE
+///      `/agents/allocate`, so a real scope conflict fails fast without minting
+///      an allocation. A `Held` returns `Err(AllocateError::ClaimConflict)`.
+///   2. One `kind=worktree` claim per materialized row, keyed on the directory
+///      the session is actually given (normalized to the guard's `by-resource`
+///      form): the agent worktree path in the `worktree` arm, the canonical
+///      checkout in the `shared_branch` arm. Taken AFTER coord answers, because
+///      only then is that directory known, and BEFORE anything touches disk.
+///      It is per-directory, not per-repo, so N concurrent sessions of one repo
+///      each get their own worktree instead of the second one being refused
+///      (plan
+///      `2026-09-17-the-worktree-claim-is-keyed-on-the-shared-checkout-so-a-second-concurrent-session-of-a-repo-gets-no-worktree`).
+///
+/// Every failure arm after the first claim releases every claim acquired so
+/// far. Because the directory claims follow the allocate, a `Held` or a
+/// transport failure on one of them leaves coord's allocation row (and, for
+/// `shared_branch`, its primary-park stamp) to coord's sweeper; with a fresh
+/// agent id in every worktree target a `Held` there is practically
+/// unreachable. On success the caller spawns one heartbeat task per claim and
+/// releases every claim on agent completion (see [`spawn_heartbeat_task`] and
+/// [`release_claim_best_effort`]); [`AllocateResult::active_claims`] carries
+/// them all for that purpose.
 ///
 /// On success returns `AllocateResult`. On any non-claim error,
 /// returns `Err(AllocateError::Other(String))`. Partial failure is
@@ -1422,8 +1431,7 @@ pub async fn allocate_and_materialize_with_claim(
 
     // Pre-flight: every requested repo must have a canonical path the
     // runner can `git worktree add` from. Surface this BEFORE acquiring any
-    // claim (canonical paths are also the source of the worktree claim
-    // keys, so they must resolve first).
+    // claim or minting an allocation.
     for r in repos {
         if !repo_canonical_paths.contains_key(&r.repo) {
             return Err(AllocateError::Other(format!(
@@ -1434,35 +1442,10 @@ pub async fn allocate_and_materialize_with_claim(
         }
     }
 
-    // Phase 1 (plan 2026-06-06-session-scoped-multi-repo-workspace-coordination):
-    // acquire the per-repo `kind=worktree` claims BEFORE materializing any
-    // worktree — fail-fast, mirroring the original `pre_allocate_claim`
-    // placement. The claim key is the canonical checkout path normalized to
-    // the guard's `by-resource` form (see `worktree_resource_key`), so a
-    // gate-continuation (which declares no plan_id/phase/paths) still claims
-    // every checkout it touches. A `Held` on ANY repo means another session
-    // owns that checkout → unwind the claims already acquired and return the
-    // ClaimConflict so the caller surfaces it instead of clobbering.
-    //
-    // Then acquire the OPTIONAL phase/file_glob claim (when a plan_id/phase
-    // or `declared_overlap_paths` was declared) as just one more entry.
+    // The per-directory `kind=worktree` claims are taken once coord has
+    // answered (see the fn doc); only the optional phase/file_glob claim is
+    // taken here, fail-fast, before an allocation is minted.
     let mut active_claims: Vec<ActiveClaim> = Vec::with_capacity(repos.len() + 1);
-
-    for r in repos {
-        let canonical = repo_canonical_paths
-            .get(&r.repo)
-            .expect("canonical path presence checked above");
-        let ctx = ClaimSpawnContext::worktree_for_path(canonical, intent);
-        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
-            Ok(claim) => active_claims.push(claim),
-            Err(e) => {
-                // Unwind every worktree claim we acquired before this one so
-                // a partial acquire doesn't strand held checkouts.
-                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
-                return Err(e);
-            }
-        }
-    }
 
     let claim_ctx =
         ClaimSpawnContext::from_intent_and_paths(intent, plan_id, phase, declared_overlap_paths);
@@ -1490,13 +1473,22 @@ pub async fn allocate_and_materialize_with_claim(
     );
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
-    let resp =
-        crate::auth::attach_device_auth_for(reqwest::Client::new().post(&url).json(&body), scope)
-            .send()
-            .await
-            .map_err(|e| AllocateError::Other(format!("POST {url}: {e}")))?;
+    let resp = match crate::auth::attach_device_auth_for(
+        reqwest::Client::new().post(&url).json(&body),
+        scope,
+    )
+    .send()
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            return Err(AllocateError::Other(format!("POST {url}: {e}")));
+        }
+    };
     let status = resp.status();
     if !status.is_success() {
+        release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
         let body_text = resp.text().await.unwrap_or_default();
         // Coord's `decide_parent_sha` → RepoNotRegistered surfaces as a
         // 409 with body `{"error":"repo_not_registered","repo":<repo>}`.
@@ -1521,10 +1513,13 @@ pub async fn allocate_and_materialize_with_claim(
             body_text
         )));
     }
-    let coord_resp: CoordAllocateResponse = resp
-        .json()
-        .await
-        .map_err(|e| AllocateError::Other(format!("decode coord response: {e}")))?;
+    let coord_resp: CoordAllocateResponse = match resp.json().await {
+        Ok(r) => r,
+        Err(e) => {
+            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            return Err(AllocateError::Other(format!("decode coord response: {e}")));
+        }
+    };
 
     // Phase 3 — honor coord's `isolation` directive. Absent (older
     // coord) → the junctioned-worktree default (today's behavior).
@@ -1611,6 +1606,20 @@ pub async fn allocate_and_materialize_with_claim(
                 }
             }
         }
+        // The session's cwd in this arm IS the canonical checkout, so that is
+        // the directory its `kind=worktree` claim names — taken before the lease
+        // and the branch switch, and unwound with everything else on a `Held`.
+        for (_, canonical) in &targets {
+            let ctx = ClaimSpawnContext::worktree_for_path(canonical, intent);
+            match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
+                Ok(claim) => active_claims.push(claim),
+                Err(e) => {
+                    release_all_claims_best_effort(coord_http_base, machine_id, &active_claims)
+                        .await;
+                    return Err(e);
+                }
+            }
+        }
         let mut lease_outcomes: Vec<Result<ActiveClaim, AllocateError>> =
             Vec::with_capacity(targets.len());
         for (w, _) in &targets {
@@ -1671,126 +1680,51 @@ pub async fn allocate_and_materialize_with_claim(
         _ => TargetMode::Junctioned,
     };
 
-    let mut materialized: Vec<MaterializedWorktree> = Vec::with_capacity(repos.len());
-    for w in coord_resp.worktrees {
-        let canonical = repo_canonical_paths.get(&w.repo).ok_or_else(|| {
-            AllocateError::Other(format!("missing canonical path for repo '{}'", w.repo))
-        })?;
-        // Bare repo name (`qontinui/qontinui-runner` -> `qontinui-runner`) for
-        // the relocated, out-of-tree worktree layout.
-        let repo_name = canonical_paths::canonical_segment(&w.repo)
-            .map_err(|e| AllocateError::Other(format!("repo slug for '{}': {e}", w.repo)))?;
-        let target = local_worktree_target(canonical, &coord_resp.agent_id, &repo_name);
-
-        // Ensure the parent dir exists. `git worktree add` will create
-        // the leaf, but the parent (`D:/qontinui-root.wt/<agent>/`)
-        // doesn't exist on first allocation.
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                AllocateError::Other(format!(
-                    "create parent dir {} for worktree {}: {}",
-                    parent.display(),
-                    w.repo,
-                    e
-                ))
-            })?;
+    // Resolve every row's checkout and target BEFORE any claim or disk write.
+    let planned = match plan_worktree_rows(
+        coord_resp.worktrees,
+        repo_canonical_paths,
+        &coord_resp.agent_id,
+        declared_sibling_checkout,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            return Err(e);
         }
+    };
 
-        // Locality fetch (Phase 2a): coord's decided base
-        // (`coord_main_sha`) may be a commit this local repo hasn't fetched
-        // yet, which would make the `worktree add` below fail with a missing
-        // object. Best-effort fetch the default branch (NOT the raw SHA —
-        // servers commonly reject `git fetch origin <sha>`); fetching the
-        // default branch brings `coord_main_sha` (its tip or an ancestor)
-        // into the local object store. On failure, warn and still attempt
-        // the add — it errors clearly if the object is truly absent.
-        let default_branch = resolve_local_default_branch(canonical);
-        match run_git_command(canonical, &["fetch", "origin", &default_branch]) {
-            Ok(_) => debug!(
-                "locality fetch ok: repo={} origin/{}",
-                w.repo, default_branch
-            ),
-            Err(e) => warn!(
-                "locality fetch failed (continuing): repo={} origin/{}: {e}",
-                w.repo, default_branch
-            ),
-        }
-
-        // `git -C <canonical> worktree add <target> -b <branch> <parent_sha>`.
-        // Plan §4.1 step 4 spelled this exact command.
-        let target_str = target.to_string_lossy().to_string();
-        let args: [&str; 6] = [
-            "worktree",
-            "add",
-            &target_str,
-            "-b",
-            &w.branch,
-            &w.parent_sha,
-        ];
-        match run_git_command(canonical, &args) {
-            Ok(stdout) => {
-                info!(
-                    "git worktree add ok: repo={} branch={} path={} target_mode={:?} stdout={}",
-                    w.repo,
-                    w.branch,
-                    target.display(),
-                    target_mode,
-                    stdout.trim()
-                );
-            }
+    // One `kind=worktree` claim per row, keyed on the worktree THIS session is
+    // given — never on the shared checkout it is cut from, which every
+    // concurrent session of the repo would otherwise contend for.
+    for ctx in worktree_claim_contexts(&planned, intent) {
+        match acquire_one_claim(coord_http_base, machine_id, agent_session_id, &ctx).await {
+            Ok(claim) => active_claims.push(claim),
             Err(e) => {
-                warn!(
-                    "git worktree add failed: repo={} branch={} path={}: {}",
-                    w.repo,
-                    w.branch,
-                    target.display(),
-                    e
-                );
-                return Err(AllocateError::Other(format!(
-                    "git worktree add for repo '{}' (branch {}) failed: {}",
-                    w.repo, w.branch, e
-                )));
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(e);
             }
         }
+    }
 
-        // Build-`target` junction policy (Phase 3). `Junctioned` (the
-        // default) shares the canonical tree's compiled `target`;
-        // `Dedicated` leaves a real per-worktree target. The junction
-        // step itself runs out-of-band (the runner does not junction
-        // `target` inside this fn today — node_modules/dist/target
-        // junctioning is performed by the spawn wrapper), so honoring
-        // `Dedicated` here means recording the intent + skipping any
-        // junction the wrapper would otherwise apply. We surface the
-        // decision via the log line above; a dedicated target needs no
-        // affirmative action (absence of the junction IS the dedicated
-        // target).
-        match target_mode {
-            TargetMode::Junctioned => {
-                debug!(
-                    "isolation: repo={} target=junctioned (shares canonical build target)",
-                    w.repo
-                );
-            }
-            TargetMode::Dedicated => {
-                debug!(
-                    "isolation: repo={} target=dedicated (no build-target junction)",
-                    w.repo
-                );
+    let mut materialized: Vec<MaterializedWorktree> = Vec::with_capacity(planned.len());
+    for row in planned {
+        // Concurrent sessions of one repo now materialize side by side, so the
+        // locality fetch and `git worktree add` against one shared checkout are
+        // serialized in-process rather than racing on its ref and worktree locks.
+        // In-process only: a second runner instance on the box can still race
+        // this checkout, and git's own ref/worktree locks then fail it loudly.
+        let checkout_lock = checkout_materialize_lock(&row.canonical);
+        let serialized = checkout_lock.lock().await;
+        let outcome = materialize_one_worktree(row, target_mode);
+        drop(serialized);
+        match outcome {
+            Ok(m) => materialized.push(m),
+            Err(e) => {
+                release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+                return Err(e);
             }
         }
-
-        let push_ref = if w.push_ref.is_empty() {
-            remote_agent_ref(&w.branch)
-        } else {
-            w.push_ref
-        };
-        materialized.push(MaterializedWorktree {
-            repo: w.repo,
-            branch: w.branch,
-            parent_sha: w.parent_sha,
-            worktree_path: target,
-            push_ref,
-        });
     }
 
     // Coordination Phase 5 / Row 5 — write coord's per-agent Cargo
@@ -1872,6 +1806,242 @@ pub async fn allocate_and_materialize_with_claim(
         token_exp: coord_resp.token_exp.unwrap_or(0),
         active_claims,
     }))
+}
+
+/// One row of a `worktree` allocation, resolved before anything touches disk.
+struct PlannedWorktreeRow {
+    row: CoordAllocatedWorktree,
+    canonical: PathBuf,
+    target: PathBuf,
+}
+
+/// The checkout a `declared_sibling` row is cut from when the caller did not
+/// request that repo: its canonical checkout, only if one is actually there.
+fn declared_sibling_checkout(repo: &str) -> Option<PathBuf> {
+    canonical_paths::default_canonical_path(repo)
+        .ok()
+        .filter(|p| p.join(".git").exists())
+}
+
+/// Resolve every row of a `worktree` allocation to `(canonical, target)`.
+///
+/// A REQUESTED row with no canonical path is an error. A `declared_sibling`
+/// row coord added for a repo the caller did not request is resolved through
+/// `sibling_checkout`, and SKIPPED with a warning when this box holds no
+/// checkout of it — a missing build sibling degrades the session, it must not
+/// fail the allocation the caller asked for (plan
+/// `2026-08-27-coord-allocate-provisions-sibling-build-dependencies`).
+///
+/// Every target is `agent_worktree_root(canonical)/<agent_id>/<repo>`, so two
+/// allocations of one repo never share a target — which is what lets the
+/// `kind=worktree` claim be keyed on it.
+fn plan_worktree_rows(
+    rows: Vec<CoordAllocatedWorktree>,
+    repo_canonical_paths: &std::collections::HashMap<String, PathBuf>,
+    agent_id: &str,
+    sibling_checkout: impl Fn(&str) -> Option<PathBuf>,
+) -> Result<Vec<PlannedWorktreeRow>, AllocateError> {
+    // Requested rows first, in coord's order, so `worktrees[0]` — the session's
+    // cwd — is always a repo the caller asked for, never a build sibling.
+    let (mut rows, siblings): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|r| r.origin.as_deref() != Some("declared_sibling"));
+    rows.extend(siblings);
+    // A build sibling is placed beside the FIRST requested worktree, at the same
+    // depth, whatever root its own checkout lives under — that placement is
+    // what the consumer's `../<sibling>` path dependencies resolve against.
+    let primary_agent_root = rows
+        .iter()
+        .find_map(|r| repo_canonical_paths.get(&r.repo))
+        .map(|c| canonical_paths::agent_worktree_root(c).join(agent_id));
+    let mut planned = Vec::with_capacity(rows.len());
+    for row in rows {
+        let is_sibling = row.origin.as_deref() == Some("declared_sibling");
+        let canonical = match repo_canonical_paths.get(&row.repo) {
+            Some(c) => c.clone(),
+            None if is_sibling => match sibling_checkout(&row.repo) {
+                Some(c) => c,
+                None => {
+                    warn!(
+                        "allocate: skipping declared build sibling '{}' — no checkout of it \
+                             on this device",
+                        row.repo
+                    );
+                    continue;
+                }
+            },
+            None => {
+                return Err(AllocateError::Other(format!(
+                    "missing canonical path for repo '{}'",
+                    row.repo
+                )))
+            }
+        };
+        // Bare repo name (`qontinui/qontinui-runner` -> `qontinui-runner`) for
+        // the relocated, out-of-tree worktree layout.
+        let repo_name = canonical_paths::canonical_segment(&row.repo)
+            .map_err(|e| AllocateError::Other(format!("repo slug for '{}': {e}", row.repo)))?;
+        let target = match (&primary_agent_root, is_sibling) {
+            (Some(root), true) if !repo_canonical_paths.contains_key(&row.repo) => {
+                root.join(&repo_name)
+            }
+            _ => local_worktree_target(&canonical, agent_id, &repo_name),
+        };
+        planned.push(PlannedWorktreeRow {
+            row,
+            canonical,
+            target,
+        });
+    }
+    Ok(planned)
+}
+
+/// The in-process lock serializing worktree materialization against one shared
+/// checkout (see the `worktree` arm of [`allocate_and_materialize_with_claim`]).
+fn checkout_materialize_lock(canonical: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: once_cell::sync::Lazy<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = once_cell::sync::Lazy::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks
+        .entry(worktree_resource_key(canonical))
+        .or_default()
+        .clone()
+}
+
+/// The `kind=worktree` claim for each planned row: keyed on the row's TARGET,
+/// the agent worktree the session is given — never on the shared checkout it
+/// is cut from.
+fn worktree_claim_contexts(
+    planned: &[PlannedWorktreeRow],
+    intent: Option<&str>,
+) -> Vec<ClaimSpawnContext> {
+    planned
+        .iter()
+        .map(|row| ClaimSpawnContext::worktree_for_path(&row.target, intent))
+        .collect()
+}
+
+/// Materialize one planned row: locality fetch, `git worktree add`, push ref.
+fn materialize_one_worktree(
+    planned: PlannedWorktreeRow,
+    target_mode: TargetMode,
+) -> Result<MaterializedWorktree, AllocateError> {
+    let PlannedWorktreeRow {
+        row: w,
+        canonical,
+        target,
+    } = planned;
+    let canonical = canonical.as_path();
+    // Ensure the parent dir exists. `git worktree add` will create
+    // the leaf, but the parent (`D:/qontinui-root.wt/<agent>/`)
+    // doesn't exist on first allocation.
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AllocateError::Other(format!(
+                "create parent dir {} for worktree {}: {}",
+                parent.display(),
+                w.repo,
+                e
+            ))
+        })?;
+    }
+
+    // Locality fetch (Phase 2a): coord's decided base
+    // (`coord_main_sha`) may be a commit this local repo hasn't fetched
+    // yet, which would make the `worktree add` below fail with a missing
+    // object. Best-effort fetch the default branch (NOT the raw SHA —
+    // servers commonly reject `git fetch origin <sha>`); fetching the
+    // default branch brings `coord_main_sha` (its tip or an ancestor)
+    // into the local object store. On failure, warn and still attempt
+    // the add — it errors clearly if the object is truly absent.
+    let default_branch = resolve_local_default_branch(canonical);
+    match run_git_command(canonical, &["fetch", "origin", &default_branch]) {
+        Ok(_) => debug!(
+            "locality fetch ok: repo={} origin/{}",
+            w.repo, default_branch
+        ),
+        Err(e) => warn!(
+            "locality fetch failed (continuing): repo={} origin/{}: {e}",
+            w.repo, default_branch
+        ),
+    }
+
+    // `git -C <canonical> worktree add <target> -b <branch> <parent_sha>`.
+    // Plan §4.1 step 4 spelled this exact command.
+    let target_str = target.to_string_lossy().to_string();
+    let args: [&str; 6] = [
+        "worktree",
+        "add",
+        &target_str,
+        "-b",
+        &w.branch,
+        &w.parent_sha,
+    ];
+    match run_git_command(canonical, &args) {
+        Ok(stdout) => {
+            info!(
+                "git worktree add ok: repo={} branch={} path={} target_mode={:?} stdout={}",
+                w.repo,
+                w.branch,
+                target.display(),
+                target_mode,
+                stdout.trim()
+            );
+        }
+        Err(e) => {
+            warn!(
+                "git worktree add failed: repo={} branch={} path={}: {}",
+                w.repo,
+                w.branch,
+                target.display(),
+                e
+            );
+            return Err(AllocateError::Other(format!(
+                "git worktree add for repo '{}' (branch {}) failed: {}",
+                w.repo, w.branch, e
+            )));
+        }
+    }
+
+    // Build-`target` junction policy (Phase 3). `Junctioned` (the
+    // default) shares the canonical tree's compiled `target`;
+    // `Dedicated` leaves a real per-worktree target. The junction
+    // step itself runs out-of-band (the runner does not junction
+    // `target` inside this fn today — node_modules/dist/target
+    // junctioning is performed by the spawn wrapper), so honoring
+    // `Dedicated` here means recording the intent + skipping any
+    // junction the wrapper would otherwise apply. We surface the
+    // decision via the log line above; a dedicated target needs no
+    // affirmative action (absence of the junction IS the dedicated
+    // target).
+    match target_mode {
+        TargetMode::Junctioned => {
+            debug!(
+                "isolation: repo={} target=junctioned (shares canonical build target)",
+                w.repo
+            );
+        }
+        TargetMode::Dedicated => {
+            debug!(
+                "isolation: repo={} target=dedicated (no build-target junction)",
+                w.repo
+            );
+        }
+    }
+
+    let push_ref = if w.push_ref.is_empty() {
+        remote_agent_ref(&w.branch)
+    } else {
+        w.push_ref
+    };
+    Ok(MaterializedWorktree {
+        repo: w.repo,
+        branch: w.branch,
+        parent_sha: w.parent_sha,
+        worktree_path: target,
+        push_ref,
+    })
 }
 
 /// `Some(refusal)` when a `shared_branch` answer would switch the checkout of a
@@ -2704,6 +2874,117 @@ mod tests {
             .collect();
         // A sibling is never switched; a row from an older coord (no origin) is.
         assert_eq!(placed, vec!["qontinui-runner", "qontinui-web"]);
+    }
+
+    fn allocated_rows(json: serde_json::Value) -> Vec<CoordAllocatedWorktree> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn two_allocations_of_one_repo_claim_two_different_directories() {
+        let _amb = crate::test_env::isolated_ambient();
+        // The defect: the worktree claim was keyed on the canonical checkout, so
+        // a second concurrent session of a repo was `Held` for the first one's
+        // whole life. Keyed on the planned target, two allocations (two coord
+        // agent ids) never contend.
+        let canonical = PathBuf::from("/ws/qontinui-root/qontinui-runner");
+        let map: std::collections::HashMap<String, PathBuf> =
+            [("qontinui-runner".to_string(), canonical.clone())].into();
+        let row = || {
+            allocated_rows(serde_json::json!([
+                {"repo": "qontinui-runner", "branch": "b", "parent_sha": "p",
+                 "worktree_path": "w", "status": "allocated", "origin": "requested"}
+            ]))
+        };
+        let first = plan_worktree_rows(row(), &map, "agent-1", |_| None).unwrap();
+        let second = plan_worktree_rows(row(), &map, "agent-2", |_| None).unwrap();
+        let key =
+            |p: &[PlannedWorktreeRow]| worktree_claim_contexts(p, None)[0].resource_key.clone();
+        assert_ne!(key(&first), key(&second));
+        assert_eq!(
+            key(&first),
+            worktree_resource_key(&local_worktree_target(
+                &canonical,
+                "agent-1",
+                "qontinui-runner"
+            ))
+        );
+        assert_ne!(key(&first), worktree_resource_key(&canonical));
+    }
+
+    #[test]
+    fn a_declared_sibling_is_resolved_or_skipped_never_fatal() {
+        let _amb = crate::test_env::isolated_ambient();
+        let map: std::collections::HashMap<String, PathBuf> = [(
+            "qontinui-runner".to_string(),
+            PathBuf::from("/ws/qontinui-root/qontinui-runner"),
+        )]
+        .into();
+        let rows = || {
+            allocated_rows(serde_json::json!([
+                {"repo": "qontinui-runner", "branch": "b", "parent_sha": "p",
+                 "worktree_path": "w", "status": "allocated", "origin": "requested"},
+                {"repo": "qontinui-schemas", "branch": "b", "parent_sha": "p",
+                 "worktree_path": "w", "status": "allocated", "origin": "declared_sibling"},
+                {"repo": "qontinui-web", "branch": "b", "parent_sha": "p",
+                 "worktree_path": "w", "status": "allocated", "origin": "declared_sibling"}
+            ]))
+        };
+        // schemas has a checkout here, web does not.
+        let resolve = |repo: &str| {
+            (repo == "qontinui-schemas")
+                .then(|| PathBuf::from("/ws/qontinui-root/qontinui-schemas"))
+        };
+        let planned = plan_worktree_rows(rows(), &map, "agent-1", resolve).unwrap();
+        let repos: Vec<&str> = planned.iter().map(|p| p.row.repo.as_str()).collect();
+        assert_eq!(repos, vec!["qontinui-runner", "qontinui-schemas"]);
+        // The sibling lands beside the consumer, at the same depth.
+        assert_eq!(planned[0].target.parent(), planned[1].target.parent());
+    }
+
+    #[test]
+    fn a_sibling_is_placed_beside_the_consumer_even_when_its_checkout_lives_elsewhere() {
+        let _amb = crate::test_env::isolated_ambient();
+        // Consumer checked out OUTSIDE the workspace root, sibling inside it;
+        // coord listed the sibling first.
+        let map: std::collections::HashMap<String, PathBuf> =
+            [("acme/app".to_string(), PathBuf::from("/home/op/acme/app"))].into();
+        let rows = allocated_rows(serde_json::json!([
+            {"repo": "qontinui-schemas", "branch": "b", "parent_sha": "p",
+             "worktree_path": "w", "status": "allocated", "origin": "declared_sibling"},
+            {"repo": "acme/app", "branch": "b", "parent_sha": "p",
+             "worktree_path": "w", "status": "allocated", "origin": "requested"}
+        ]));
+        let planned = plan_worktree_rows(rows, &map, "agent-9", |_| {
+            Some(PathBuf::from("/ws/qontinui-root/qontinui-schemas"))
+        })
+        .unwrap();
+        assert_eq!(
+            planned[0].row.repo, "acme/app",
+            "the requested row is the cwd"
+        );
+        assert_eq!(planned[1].row.repo, "qontinui-schemas");
+        assert_eq!(planned[0].target.parent(), planned[1].target.parent());
+        assert_eq!(
+            planned[1].canonical,
+            PathBuf::from("/ws/qontinui-root/qontinui-schemas"),
+            "still cut from its own checkout"
+        );
+    }
+
+    #[test]
+    fn a_requested_row_with_no_checkout_is_still_an_error() {
+        let _amb = crate::test_env::isolated_ambient();
+        let map = std::collections::HashMap::new();
+        let rows = allocated_rows(serde_json::json!([
+            {"repo": "qontinui-runner", "branch": "b", "parent_sha": "p",
+             "worktree_path": "w", "status": "allocated", "origin": "requested"},
+        ]));
+        // Even a resolver that would answer must not be consulted for it.
+        let err = plan_worktree_rows(rows, &map, "agent-1", |_| Some(PathBuf::from("/x")))
+            .err()
+            .expect("a requested row with no canonical path fails");
+        assert!(err.to_string().contains("missing canonical path"), "{err}");
     }
 
     #[test]
