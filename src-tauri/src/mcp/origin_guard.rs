@@ -38,16 +38,29 @@
 //!      server-side request to a caller-chosen URL (which would launder a
 //!      browser request into a NonBrowser one), or spawns/drives a process.
 //!      The one transitional exception is [`TRUSTED_DOOR_GRACE`] — doors the
-//!      qontinui-web dev frontend calls today — which under the default
-//!      [`RoutePolicy::EnforceDoors`] is logged and metered for Trusted rather
-//!      than refused, until qontinui-web #1380 deploys.
+//!      qontinui-web dev frontend calls today. Under the default
+//!      [`RoutePolicy::EnforceDoors`] it admits ONLY the built-in
+//!      [`DEFAULT_TRUSTED_ORIGINS`] (the dev frontends it was justified for),
+//!      metered as `graceAdmitted` on `/health`. Stated plainly: until
+//!      qontinui-web #1380 deploys and the grace is removed, those default dev
+//!      origins RETAIN local command execution (hooks and their `sh -c` test,
+//!      shell-command run, backup import), arbitrary file reads and
+//!      caller-directed server-side requests through the graced doors.
+//!      Operator-added Trusted origins (env / settings) get every door
+//!      refused.
 //!    - `Trusted` is local trust for NON-door routes: [`TRUSTED_ROUTES`] holds
 //!      app features that run workflows and checks, because that is what the
 //!      web dev frontend is for. List only origins trusted like the runner.
 //!    - [`EXTENSION_ONLY_ROUTES`] (the DOM element inventory) are reachable
-//!      from the webview and the ui-bridge extension's own
-//!      `chrome-extension://` pages only — never from a web page's origin, so
-//!      the extension's content-script fallback loses them.
+//!      from the webview and extension pages only — never from a web page's
+//!      origin, so the ui-bridge extension's content-script fallback loses
+//!      them. The Extension class is decided by SCHEME, not tied to the
+//!      ui-bridge extension's ID: any installed extension's own pages qualify.
+//!      An extension request that carries no `Origin` and no cross-site Fetch
+//!      Metadata (e.g. host-permission fetches reporting
+//!      `Sec-Fetch-Site: none`) classifies as NonBrowser — a residual of
+//!      granting an extension host permissions, not something headers can
+//!      distinguish.
 //!    - Where the route policy enforces for their class, browser classes
 //!      additionally reach only [`FOREIGN_ROUTES`] (all browser classes) and
 //!      [`TRUSTED_ROUTES`] (Trusted) — a TOTAL allowlist, so a route added
@@ -728,6 +741,9 @@ enum Verdict {
     Admit,
     /// Admitted only because the route policy shadows this class.
     ShadowWouldRefuse,
+    /// A [`TRUSTED_DOOR_GRACE`] door admitted for a built-in default Trusted
+    /// origin under `enforce-doors`. Distinct from a shadow: this is a DOOR.
+    GraceAdmitted,
     RefuseHost,
     /// A [`CREDENTIAL_DOORS`] route from a non-first-party browser origin.
     RefuseDoor,
@@ -742,6 +758,7 @@ impl Verdict {
         match self {
             Self::Admit => "admit",
             Self::ShadowWouldRefuse => "shadow_would_refuse",
+            Self::GraceAdmitted => "grace_admitted",
             Self::RefuseHost => "refused_host",
             Self::RefuseDoor => "refused_credential_door",
             Self::RefuseExtensionOnly => "refused_extension_only",
@@ -751,7 +768,7 @@ impl Verdict {
 }
 
 type PortSource = Arc<dyn Fn() -> u16 + Send + Sync>;
-type OriginsSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+type OriginsSource = Arc<dyn Fn() -> Arc<Vec<NormOrigin>> + Send + Sync>;
 
 #[derive(Default)]
 struct Stats {
@@ -760,6 +777,7 @@ struct Stats {
     refused_foreign: AtomicU64,
     refused_extension: AtomicU64,
     shadow_trusted: AtomicU64,
+    grace_trusted: AtomicU64,
     shadow_foreign: AtomicU64,
     shadow_extension: AtomicU64,
     recent: Mutex<VecDeque<Value>>,
@@ -858,7 +876,7 @@ impl OriginGuard {
             return false;
         };
         let host = host.trim().to_ascii_lowercase();
-        if self.env_hosts.iter().any(|h| *h == host) {
+        if self.env_hosts.contains(&host) {
             return true;
         }
         let (name, port) = if let Some(rest) = host.strip_prefix('[') {
@@ -887,13 +905,7 @@ impl OriginGuard {
     }
 
     fn classify(&self, headers: &HeaderMap) -> OriginClass {
-        static DEFAULTS: OnceLock<Vec<NormOrigin>> = OnceLock::new();
-        let defaults = DEFAULTS.get_or_init(|| {
-            DEFAULT_TRUSTED_ORIGINS
-                .iter()
-                .filter_map(|o| NormOrigin::parse(o))
-                .collect()
-        });
+        let defaults = default_trusted_origins();
         let Some(origin) = headers.get(header::ORIGIN) else {
             let sfs = headers
                 .get("sec-fetch-site")
@@ -918,10 +930,7 @@ impl OriginGuard {
         }
         if defaults.contains(&norm)
             || self.env_origins.contains(&norm)
-            || (self.settings_origins)()
-                .iter()
-                .filter_map(|o| parse_configured_origin(SETTINGS_FIELD, o))
-                .any(|o| o == norm)
+            || (self.settings_origins)().contains(&norm)
         {
             return OriginClass::Trusted;
         }
@@ -977,8 +986,9 @@ impl OriginGuard {
             if class == OriginClass::Trusted
                 && self.route_policy == RoutePolicy::EnforceDoors
                 && listed(TRUSTED_DOOR_GRACE, &method, route)
+                && is_default_trusted_origin(headers)
             {
-                return mk(Verdict::ShadowWouldRefuse);
+                return mk(Verdict::GraceAdmitted);
             }
             return mk(Verdict::RefuseDoor);
         }
@@ -1005,6 +1015,7 @@ impl OriginGuard {
         match (d.verdict, d.class) {
             (Verdict::Admit, _) => return,
             (Verdict::RefuseHost, _) => s.refused_host.fetch_add(1, Ordering::Relaxed),
+            (Verdict::GraceAdmitted, _) => s.grace_trusted.fetch_add(1, Ordering::Relaxed),
             (Verdict::ShadowWouldRefuse, OriginClass::Trusted) => {
                 s.shadow_trusted.fetch_add(1, Ordering::Relaxed)
             }
@@ -1054,6 +1065,10 @@ impl OriginGuard {
                 "trusted": load(&s.shadow_trusted),
                 "foreign": load(&s.shadow_foreign),
                 "extension": load(&s.shadow_extension),
+            },
+            // Doors admitted under TRUSTED_DOOR_GRACE (default dev origins only).
+            "graceAdmitted": {
+                "trusted": load(&s.grace_trusted),
             },
             "trustedDoorGrace": TRUSTED_DOOR_GRACE.len(),
             "admitOriginEnv": ENV_ALLOWED_ORIGINS,
@@ -1144,7 +1159,15 @@ async fn origin_guard_middleware(
     let d = guard.decide(req.method(), req.headers(), route.as_deref());
     guard.record(&d);
     match d.verdict {
-        Verdict::Admit | Verdict::ShadowWouldRefuse => {
+        Verdict::Admit | Verdict::ShadowWouldRefuse | Verdict::GraceAdmitted => {
+            if d.verdict == Verdict::GraceAdmitted && first_shadow_sighting(&d) {
+                tracing::warn!(
+                    origin = ?d.origin,
+                    method = %d.method,
+                    route = ?d.route,
+                    "origin guard (grace): ADMITTED a credential door for a default dev origin under TRUSTED_DOOR_GRACE (removed when qontinui-web #1380 deploys; logged once per origin+route; counted on /health graceAdmitted)"
+                );
+            }
             if d.verdict == Verdict::ShadowWouldRefuse && first_shadow_sighting(&d) {
                 tracing::warn!(
                     origin = ?d.origin,
@@ -1319,7 +1342,7 @@ fn split_list(raw: Option<&str>) -> Vec<String> {
 /// An origin compared on scheme + host + port, the way
 /// `commands/web_integration.rs` compares origins.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct NormOrigin {
+pub(crate) struct NormOrigin {
     scheme: String,
     host: String,
     port: Option<u16>,
@@ -1363,6 +1386,19 @@ pub fn canonical_allowed_origin(raw: &str) -> Result<String, String> {
                 "{trimmed:?}: the runner webview's own origin needs no entry"
             ));
         }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if [
+        "chrome-extension:",
+        "moz-extension:",
+        "safari-web-extension:",
+    ]
+    .iter()
+    .any(|p| lower.starts_with(p))
+    {
+        return Err(format!(
+            "{trimmed:?}: extension origins are classified as the extension class by scheme, never Trusted; an entry would have no effect"
+        ));
     }
     if trimmed.contains('*') {
         return Err(format!(
@@ -1463,16 +1499,45 @@ fn parse_configured_origin(source: &str, raw: &str) -> Option<NormOrigin> {
     parsed
 }
 
-/// Cached [`SETTINGS_FIELD`] value and when it was read.
-static SETTINGS_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+/// Cached, already-parsed [`SETTINGS_FIELD`] value and when it was read.
+#[allow(clippy::type_complexity)]
+static SETTINGS_CACHE: Mutex<Option<(Instant, Arc<Vec<NormOrigin>>)>> = Mutex::new(None);
 static SETTINGS_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn read_settings_origins() -> Vec<String> {
-    crate::settings::read_settings_from_disk()
-        .settings
-        .api
-        .allowed_origins
+/// Read and parse once per refresh (never per request); unparseable entries
+/// WARN once.
+fn read_settings_origins() -> Arc<Vec<NormOrigin>> {
+    Arc::new(
+        crate::settings::read_settings_from_disk()
+            .settings
+            .api
+            .allowed_origins
+            .iter()
+            .filter_map(|o| parse_configured_origin(SETTINGS_FIELD, o))
+            .collect(),
+    )
+}
+
+fn default_trusted_origins() -> &'static [NormOrigin] {
+    static DEFAULTS: OnceLock<Vec<NormOrigin>> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        DEFAULT_TRUSTED_ORIGINS
+            .iter()
+            .filter_map(|o| NormOrigin::parse(o))
+            .collect()
+    })
+}
+
+/// Is this request's `Origin` one of the built-in [`DEFAULT_TRUSTED_ORIGINS`]
+/// (not merely configured as Trusted)? Gates [`TRUSTED_DOOR_GRACE`].
+fn is_default_trusted_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .and_then(NormOrigin::parse)
+        .map(|n| default_trusted_origins().contains(&n))
+        .unwrap_or(false)
 }
 
 /// Synchronous first read, at router build (startup), so the request path
@@ -1488,13 +1553,13 @@ fn prime_settings_origins() {
 /// when the cached value is older than [`SETTINGS_TTL`] it is returned as-is
 /// and ONE background thread re-reads the settings file (the non-mutating,
 /// mtime-cached reader), so a save is live within about the TTL.
-fn settings_allowed_origins() -> Vec<String> {
+fn settings_allowed_origins() -> Arc<Vec<NormOrigin>> {
     let (value, stale) = match SETTINGS_CACHE.lock() {
         Ok(g) => match g.as_ref() {
             Some((at, v)) => (v.clone(), at.elapsed() >= SETTINGS_TTL),
-            None => (Vec::new(), true),
+            None => (Arc::new(Vec::new()), true),
         },
-        Err(_) => (Vec::new(), false),
+        Err(_) => (Arc::new(Vec::new()), false),
     };
     if stale && !SETTINGS_REFRESH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         let spawned = std::thread::Builder::new()

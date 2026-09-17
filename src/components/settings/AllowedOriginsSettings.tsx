@@ -5,8 +5,11 @@
  * (plan 2026-09-17-runner-loopback-api-accepts-any-origin, Phase 3).
  *
  * Trusted = local trust for non-door routes (which include running workflows
- * and checks), never credential doors — except the guard's named transitional
- * TRUSTED_DOOR_GRACE, logged rather than refused under the default policy. Agents, scripts and MCP clients send no Origin
+ * and checks). Origins added here never get credential doors. Only the
+ * built-in default dev origins (localhost:3001, localhost:9875) still reach
+ * the guard's transitional TRUSTED_DOOR_GRACE doors — local command execution
+ * and file reads included — until qontinui-web#1380 deploys and the grace is
+ * removed. Agents, scripts and MCP clients send no Origin
  * and need no entry here. Saved values are live within ~2 s — no restart.
  */
 
@@ -117,7 +120,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     <div className="space-y-4 mt-8" data-ui-bridge-content="allowed-origins-settings">
       <SectionHeader
         title="Allowed Browser Origins"
-        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. They never get credential routes (secrets, file reads, server-side requests, command execution); a short transitional list the web dev frontend still uses is logged rather than refused for now. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
+        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. Origins you add here never get credential routes (secrets, file reads, server-side requests, command execution). Note: the built-in default dev origins (localhost:3001 and localhost:9875) currently still reach a transitional set of credential routes, including command execution and file reads, until the web app update that removes that need is deployed. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
         icon={<Globe className="w-6 h-6" />}
       />
       <div className="space-y-3 rounded-lg bg-card/50 p-4">

@@ -3075,10 +3075,12 @@ pub struct ApiSettings {
     /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. Trusted means local trust for
     /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
     /// checks) and never the credential doors (secrets, caller-named paths,
-    /// caller-directed requests, process execution) — apart from the named
-    /// transitional `TRUSTED_DOOR_GRACE`, logged rather than refused under the
-    /// default policy until qontinui-web #1380 deploys. List only origins
-    /// served by software trusted like the runner. Agents and scripts send no
+    /// caller-directed requests, process execution). Origins listed HERE never
+    /// get a door. Only the built-in default dev origins (`localhost:3001`,
+    /// `localhost:9875`) currently retain the graced doors — including local
+    /// command execution and file reads — until qontinui-web #1380 deploys
+    /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
+    /// software trusted like the runner. Agents and scripts send no
     /// `Origin` and need no entry.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
