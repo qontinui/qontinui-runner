@@ -96,7 +96,17 @@ cleanup() {
 trap cleanup EXIT
 
 FAKE_HOME="$SANDBOX/home"; mkdir -p "$FAKE_HOME/.qontinui"
-printf 'stub-loopback-key\n' > "$FAKE_HOME/.qontinui/runner-loopback-key"
+mkdir -p "$FAKE_HOME/.qontinui/runner"
+# The handshake secret is resolved PER ORIGIN from the runner's breadcrumb
+# record (scripts/coord-provision-nonce.sh, #993): a schema-2 record whose .port
+# is the stub's port names the per-port key file. write_stub_breadcrumb runs
+# once each stub has reported its port.
+write_stub_breadcrumb() {
+  local port="$1" key="$FAKE_HOME/.qontinui/runner-loopback-key-$1"
+  printf 'stub-loopback-key\n' > "$key"
+  printf '{\n  "schema": 2,\n  "port": %s,\n  "pid": 4242,\n  "started_at_ms": 1789000000000,\n  "primary": false,\n  "loopback_key_path": "%s"\n}\n' \
+    "$port" "$key" > "$FAKE_HOME/.qontinui/runner/api-port-$port.json"
+}
 printf '{"device_id":"11111111-1111-4111-8111-111111111111"}\n' > "$FAKE_HOME/.qontinui/machine.json"
 ROOT="$SANDBOX/root"; mkdir -p "$ROOT/qontinui-claude-config"
 ln -s "$REPO_ROOT/scripts" "$ROOT/qontinui-claude-config/scripts"
@@ -307,6 +317,7 @@ for _ in $(seq 1 25); do
 done
 [ -n "$PORT" ] || { echo "FATAL: the stub never reported a port"; cat "$SANDBOX/stub.err"; exit 1; }
 STUB="http://127.0.0.1:$PORT"
+write_stub_breadcrumb "$PORT"
 
 # run_case <runner-url> <coord-url> [env assignments...] -> RC, OUT, ERR; REQLOG reset per case
 CASE_N=0
@@ -581,6 +592,7 @@ if [ -z "$PORT_B" ]; then
   bad "(c1) the sibling stub never reported a port"
 else
   STUB_B="http://127.0.0.1:$PORT_B"
+  write_stub_breadcrumb "$PORT_B"
   # Runner A: the spawning runner. Its census lists term-1 with tenant B; it
   # cannot mint (both mint routes 404, and its websocket door hands back a
   # claimless default-slot token).

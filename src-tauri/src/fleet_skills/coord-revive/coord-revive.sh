@@ -3802,7 +3802,7 @@ else
     PROBE_DOOR_TAG=""
   else
     case "$NRC" in
-      2)   NV="NO_HANDSHAKE_KEY (no readable ~/.qontinui/runner-loopback-key. The runner writes that 0600 file at startup, so an absent one means this runner's build predates the same-user handshake, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
+      2)   NV="NO_HANDSHAKE_KEY (no origin had a readable handshake secret - the coord-provision-nonce line above names why, per origin: no runner breadcrumb under ~/.qontinui/runner/ for that port, a record naming no key file, or a key file that is absent or unreadable. The runner writes both at startup, so this usually means that runner's build predates them, it has exited, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
       3)   NV="MINT_REFUSED (the runner answered with a TYPED refusal - see the coord-provision-nonce line above for which: the opt-in marker ~/.qontinui/allow-session-coord-identity is absent, or the handshake was missing/wrong. Each has a different fix, which is why they are three codes and not one)" ;;
       6)   NREF="$(printf '%s\n' "$NOUT" | sed -n 's/^refusal=//p' | head -n 1 | tr -d '\r')"
            case "$NREF" in
