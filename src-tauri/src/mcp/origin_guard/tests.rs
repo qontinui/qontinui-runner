@@ -82,7 +82,15 @@ fn harness_with(policy: &str, guard_env: Option<&str>, origins_env: Option<&str>
         origins_env,
         None,
         Arc::new(move || p.load(Ordering::Relaxed)),
-        Arc::new(move || s.lock().unwrap().clone()),
+        Arc::new(move || {
+            Arc::new(
+                s.lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|o| NormOrigin::parse(o))
+                    .collect(),
+            )
+        }),
     ));
     let calls = Calls::default();
     let mut router: Router = Router::new();
@@ -890,6 +898,12 @@ async fn default_policy_enforces_doors_and_shadows_allowlists() {
         "trusted grace door admitted by default"
     );
     assert_eq!(h.calls.get("shell_run"), 1);
+    assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 1);
+    assert_eq!(
+        h.guard.health_json(None)["shadowWouldRefuse"]["trusted"],
+        0,
+        "a grace admit is not a shadow"
+    );
     // ...but the same grace door from Foreign is refused.
     let (status, _, _) = send(&h, send_o("POST", "/shell-commands/abc/run", EVIL)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
@@ -899,7 +913,7 @@ async fn default_policy_enforces_doors_and_shadows_allowlists() {
     // Trusted off-allowlist non-door: shadowed.
     let (status, _, _) = send(&h, send_o("POST", "/scheduler/reconcile-now", WEB)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(h.guard.health_json(None)["shadowWouldRefuse"]["trusted"], 2);
+    assert_eq!(h.guard.health_json(None)["shadowWouldRefuse"]["trusted"], 1);
     // Grace does NOT apply under an explicit stricter policy.
     for policy in ["enforce", "enforce-foreign", "shadow", "off"] {
         let h2 = harness(policy);
@@ -915,6 +929,118 @@ async fn default_policy_enforces_doors_and_shadows_allowlists() {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{policy}");
     }
+}
+
+/// R1: the grace admits ONLY the built-in default dev origins. An
+/// operator-added Trusted origin (env or settings) is refused at a graced
+/// door, while still Trusted for non-door routes.
+#[tokio::test]
+async fn operator_added_trusted_origin_refused_at_graced_door() {
+    let added = "http://localhost:5173";
+    let h = harness_with("enforce-doors", None, Some(added));
+    let from_settings = "http://localhost:4200";
+    h.settings.lock().unwrap().push(from_settings.to_string());
+    for origin in [added, from_settings] {
+        let (status, _, body) = send(
+            &h,
+            req(
+                "POST",
+                "/shell-commands/abc/run",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["context"]["class"], "trusted");
+        // Still Trusted on a non-door route.
+        let (status, headers, _) = send(
+            &h,
+            req(
+                "GET",
+                "/unified-workflows",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{origin}");
+        assert_eq!(acao(&headers).as_deref(), Some(origin));
+    }
+    assert_eq!(h.calls.get("shell_run"), 0);
+    assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 0);
+    // The default dev origins are admitted, and the grace counter moves.
+    for origin in ["http://localhost:3001", "http://127.0.0.1:9875"] {
+        let (status, _, _) = send(
+            &h,
+            req(
+                "POST",
+                "/shell-commands/abc/run",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{origin}");
+    }
+    assert_eq!(h.calls.get("shell_run"), 2);
+    assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 2);
+}
+
+/// R2: every extension scheme is the Extension class; Extension never gets a
+/// door (graced or not) under the default, and is not Trusted.
+#[tokio::test]
+async fn extension_schemes_classify_and_are_refused_doors_and_trusted_routes() {
+    let schemes = [
+        "chrome-extension://abcdefghijklmnop",
+        "moz-extension://0b1c2d3e-aaaa-bbbb-cccc-111122223333",
+        "safari-web-extension://ABCDEF12-3456-7890-ABCD-EF1234567890",
+    ];
+    let g = harness("enforce-doors").guard;
+    for o in schemes {
+        let mut hm = HeaderMap::new();
+        hm.insert(header::ORIGIN, HeaderValue::from_str(o).unwrap());
+        assert_eq!(g.classify(&hm), OriginClass::Extension, "{o}");
+        assert!(
+            canonical_allowed_origin(o).is_err(),
+            "{o} must not be configurable"
+        );
+    }
+    let h = harness("");
+    for o in schemes {
+        for (uri, key) in [
+            ("/ui-bridge/invoke/x", "token"),
+            ("/shell-commands/abc/run", "shell_run"),
+        ] {
+            let (status, _, body) = send(
+                &h,
+                req("POST", uri, &[("host", &host(&h)), ("origin", o)], ""),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{o} {uri}: {body}");
+            assert_eq!(h.calls.get(key), 0, "{o} {uri}");
+        }
+    }
+    let h = harness("enforce");
+    for o in schemes {
+        let (status, _, _) = send(
+            &h,
+            req(
+                "GET",
+                "/unified-workflows",
+                &[("host", &host(&h)), ("origin", o)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{o} on a TRUSTED_ROUTES entry"
+        );
+    }
+    assert_eq!(h.calls.get("workflows"), 0);
 }
 
 /// S2: the element inventory is not readable by any web page origin, in any
