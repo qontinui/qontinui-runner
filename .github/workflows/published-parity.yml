@@ -90,10 +90,23 @@ jobs:
   published-parity:
     name: Published-build parity (windows)
     runs-on: windows-latest
-    # Dev build (~25m worst case on this repo's windows leg) + installer
-    # download/install + two contract-smoke passes. 75m leaves headroom without
-    # letting a hang sit for GitHub's 360-minute default.
-    timeout-minutes: 75
+    # 150, matching ci.yml's windows leg, which runs this SAME
+    # `pnpm run tauri build --debug --no-bundle` and sized itself from 90
+    # sampled successful runs (windows p90 87.2m, max 110.6m). This job's
+    # first revision said "dev build ~25m worst case" and budgeted 75m; that
+    # figure was the WARM number. Measured 2026-09-13 (run 34751720151,
+    # dispatched on a PR branch): the rust-cache restore missed (see the
+    # shared-key note below), the release-profile sidecar prebuild alone took
+    # 15m20s cold, the dev-profile build then went silent for 52 minutes after
+    # `Compiling git2`, and the job was killed by THIS timeout at 75m36s. The
+    # kill renders as `cancelled` on the head sha, and coord's merge gate
+    # treats any non-green check as ci-not-green, so a workflow that "gates
+    # nothing" blocked qontinui-runner#1511 for four days (coord_pr_status
+    # on that PR read 2026-09-17T06:43Z: block_reason_code ci-not-green,
+    # block_reason_repeat_count 540, first seen 2026-09-13T12:47Z). A hang
+    # still cannot sit past 150m; what changes is that a cold night reports
+    # instead of dying.
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@v5
@@ -131,6 +144,24 @@ jobs:
         with:
           repo: qontinui/ui-bridge
 
+      # Same guard, same size, same reason as ci.yml's windows leg ("Configure
+      # pagefile (Windows -- guard against link-time OOM)"): windows-latest
+      # ships 16 GB RAM and a small pagefile, and this job runs the same
+      # `pnpm run tauri build --debug --no-bundle` that step exists for. ci.yml
+      # measured the failure as rustc-LLVM "out of memory" aborts; what this
+      # job saw on 2026-09-13 (run 34751720151, no pagefile, cold cache) was
+      # the other shape Windows takes under commit pressure -- not an abort but
+      # a 52-minute silence after `Compiling git2` until the job timeout killed
+      # it. The build never fails loudly here; it stops making progress. Keep
+      # this in lockstep with ci.yml's step: if that one moves its size, move
+      # this one.
+      - name: Configure pagefile (Windows — guard against link-time OOM)
+        uses: al-cheb/configure-pagefile-action@v1.4
+        with:
+          minimum-size: 32GB
+          maximum-size: 32GB
+          disk-root: "D:"
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:
@@ -155,11 +186,27 @@ jobs:
           # not src-tauri. Pointing this at src-tauri caches a path that does not
           # exist -- the exact defect ci.yml documents at its own rust-cache step.
           workspaces: ". -> target"
+          # SHARE ci.yml's cache. rust-cache keys on `github.job` by default
+          # (`add-job-id-key: true`), so without this the key here was
+          # `v0-rust-published-parity-Windows_NT-x64-<env>-<lock>` while ci.yml's
+          # windows leg saves `v0-rust-test-Windows_NT-x64-<env>-<lock>` -- same
+          # env hash (c72906ae on both, measured 2026-09-13 / 2026-09-17),
+          # different job segment, never a hit. The earlier comment here said
+          # "this job still gets main's warm cache"; it did not, and every
+          # nightly ran cold ("No cache found."). `shared-key` REPLACES the
+          # job-id segment, so this reads exactly the key ci.yml's `test` job
+          # writes on main, restore-keys prefix included (a Cargo.lock change
+          # since main's last save still restores the nearest prefix match).
+          # COUPLING: the value is ci.yml's job id. If that job is renamed,
+          # rename this too, or the nightly silently goes cold again.
+          shared-key: "test"
           # Read-only. This job is not on the merge path, and a ~2.6 GB save per
           # nightly run under this workflow's own ref would add another consumer
           # to the repo's 10 GB cache cap and evict main's -- the eviction
           # problem ci.yml's save-if guard exists to prevent. Restores are
-          # unrestricted, so this job still gets main's warm cache.
+          # unrestricted, so with the shared key above this job gets main's
+          # warm cache (measured 2026-09-17 on ci main run 35179013554: the
+          # same build took 4m34s + 17m35s warm).
           save-if: "false"
 
       - name: Install frontend dependencies
