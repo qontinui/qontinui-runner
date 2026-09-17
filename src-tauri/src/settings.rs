@@ -3061,8 +3061,8 @@ pub struct Settings {
     pub cost_budget: crate::cost_management::budget::TokenBudget,
     /// The loopback HTTP API's browser-origin surface (plan
     /// `2026-09-17-runner-loopback-api-accepts-any-origin` Phase 3). Re-read
-    /// per request (short TTL) by `mcp::origin_guard`, so a change is live
-    /// with no runner restart.
+    /// by `mcp::origin_guard` with a ~2 s TTL, so a change is live with no
+    /// runner restart.
     #[serde(default)]
     pub api: ApiSettings,
 }
@@ -3072,9 +3072,11 @@ pub struct Settings {
 pub struct ApiSettings {
     /// Extra browser origins (`scheme://host[:port]`) admitted as the
     /// `trusted` class by `mcp::origin_guard` — the settings twin of
-    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. A trusted origin reaches only the
-    /// guard's `TRUSTED_ROUTES` / `FOREIGN_ROUTES` allowlists and never a
-    /// credential door; agents and scripts send no `Origin` and need none.
+    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. A trusted origin never reaches a
+    /// credential door, but `TRUSTED_ROUTES` includes app features that run
+    /// things (workflows, checks, hook tests): list only origins served by
+    /// software trusted like the runner. Agents and scripts send no `Origin`
+    /// and need no entry.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }

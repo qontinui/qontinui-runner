@@ -34,7 +34,11 @@
 //!    exactly when the real request would be.
 //!    - `NonBrowser` and `FirstParty` reach every route.
 //!    - `Trusted` and `Foreign` never reach a [`CREDENTIAL_DOORS`] route
-//!      (Phase 1, always enforced while the guard is on).
+//!      (Phase 1, always enforced while the guard is on). NOTE what that does
+//!      NOT mean: [`TRUSTED_ROUTES`] deliberately includes app features that
+//!      execute things (run a workflow, a check, a hook test), because that is
+//!      what the web dev frontend is for. A Trusted origin can drive this
+//!      runner; add only origins served by software you trust like the runner.
 //!    - Where the route policy enforces for their class, they additionally
 //!      reach only [`FOREIGN_ROUTES`] (both classes) and [`TRUSTED_ROUTES`]
 //!      (Trusted) — a TOTAL allowlist, so a route added tomorrow is refused
@@ -97,17 +101,21 @@ pub const CODE_CROSS_ORIGIN_REFUSED: &str = "CROSS_ORIGIN_REFUSED";
 /// The plan names `enforce` as the default, gated on one prerequisite:
 /// qontinui-web's `runner-proxy` header filters must strip `origin` (plan F4)
 /// before enforcement, or proxied web/mobile calls arrive carrying the END
-/// USER's browser origin and are refused. That strip is not yet on
-/// qontinui-web `origin/main`. Measured by code reading, the prerequisite
-/// bites only the TRUSTED class:
+/// USER's browser origin and are refused. That strip landed on qontinui-web
+/// `origin/main` as `5c3533f07`; whether it is DEPLOYED was not measured when
+/// this shipped. By code reading:
 ///
-/// - the production path (web backend → WebSocket relay → `http_request`
+/// - the remote-relay path (web backend → WebSocket relay → `http_request`
 ///   self-call) is stripped runner-side by `backend_relay`'s
 ///   `RELAY_SKIP_REQUEST_HEADERS`, which ships with this guard, so it
-///   arrives NonBrowser;
-/// - the co-located `httpx` hop exists only when the web backend runs on the
-///   runner's own box — local dev, where the end user's page is the
-///   `localhost:3001` dev frontend, a Trusted origin.
+///   arrives NonBrowser whatever the web deploy state;
+/// - the co-located `httpx` hop (web backend on the runner's own box — local
+///   dev, and the demo box) forwards the page's origin until the web strip is
+///   deployed. In local dev that page is the Trusted `localhost:3001`
+///   frontend (shadowed below). On the DEMO BOX it is a public origin, which
+///   is Foreign and enforced: that box needs the qontinui-web deploy before it
+///   runs this runner build, or `QONTINUI_RUNNER_ORIGIN_ROUTE_POLICY=shadow`
+///   in its spawn environment.
 ///
 /// Meanwhile Phase 0's route census found that a Phase-1-only posture leaves
 /// Foreign pages hundreds of exec-shaped routes (e.g. `POST /hooks` then
@@ -280,6 +288,9 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "GET /hooks/{id}",
     // a browser origin must never be able to widen browser trust
     "/settings/api/allowed-origins",
+    // server-side request to a caller-chosen URL whose response is returned:
+    // aimed at 127.0.0.1 it launders a browser request into a NonBrowser one
+    "POST /api-request/test",
     "GET /processes",
 ];
 
@@ -324,7 +335,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/ai/generate-test"),
     ("POST", "/ai/suggest-exploration-strategy"),
     ("POST", "/api-request/import-curl"),
-    ("POST", "/api-request/test"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/awas/actions"),
     ("POST", "/awas/check-support"),
@@ -760,12 +770,22 @@ impl OriginGuard {
                 None => (host.clone(), None),
             }
         };
+        if tunnel_host_admitted(&name) {
+            return true;
+        }
         let loopback = matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]");
         let bound = (self.bound_port)();
         loopback && port.and_then(|p| p.parse::<u16>().ok()) == Some(bound)
     }
 
     fn classify(&self, headers: &HeaderMap) -> OriginClass {
+        static DEFAULTS: OnceLock<Vec<NormOrigin>> = OnceLock::new();
+        let defaults = DEFAULTS.get_or_init(|| {
+            DEFAULT_TRUSTED_ORIGINS
+                .iter()
+                .filter_map(|o| NormOrigin::parse(o))
+                .collect()
+        });
         let Some(origin) = headers.get(header::ORIGIN) else {
             let sfs = headers
                 .get("sec-fetch-site")
@@ -782,10 +802,7 @@ impl OriginGuard {
         if self.is_first_party(&norm) {
             return OriginClass::FirstParty;
         }
-        if DEFAULT_TRUSTED_ORIGINS
-            .iter()
-            .filter_map(|o| NormOrigin::parse(o))
-            .any(|o| o == norm)
+        if defaults.contains(&norm)
             || self.env_origins.contains(&norm)
             || (self.settings_origins)()
                 .iter()
@@ -986,13 +1003,13 @@ async fn origin_guard_middleware(
     guard.record(&d);
     match d.verdict {
         Verdict::Admit | Verdict::ShadowWouldRefuse => {
-            if d.verdict == Verdict::ShadowWouldRefuse {
+            if d.verdict == Verdict::ShadowWouldRefuse && first_shadow_sighting(&d) {
                 tracing::warn!(
                     origin = ?d.origin,
                     class = d.class.as_str(),
                     method = %d.method,
                     route = ?d.route,
-                    "origin guard (shadow): would refuse where {ENV_ROUTE_POLICY} enforces this class"
+                    "origin guard (shadow): would refuse where {ENV_ROUTE_POLICY} enforces this class (logged once per origin+route; counted on /health)"
                 );
             }
             // Everything admitted may read its reply: the exact origin is
@@ -1176,9 +1193,14 @@ impl NormOrigin {
 
 /// Validate and canonicalise one operator-supplied origin for
 /// [`SETTINGS_FIELD`]: `scheme://host[:port]`, no path, no wildcard, not
-/// `null`, and not one of the first-party webview origins (which need no entry).
+/// and not `null`. The runner webview's own `tauri` origins are refused as
+/// pointless (they are first-party already); a loopback origin is accepted,
+/// since which port is "first-party" depends on the bind.
 pub fn canonical_allowed_origin(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
+    if trimmed.to_ascii_lowercase().contains("tauri") {
+        return Err(format!("{trimmed:?}: the runner webview's own origin needs no entry"));
+    }
     if trimmed.contains('*') {
         return Err(format!("{trimmed:?}: wildcards are not accepted; list exact origins"));
     }
@@ -1194,6 +1216,54 @@ pub fn canonical_allowed_origin(raw: &str) -> Result<String, String> {
         Some(p) if Some(p) != default_port => format!("{}://{}:{}", n.scheme, n.host, p),
         _ => format!("{}://{}", n.scheme, n.host),
     })
+}
+
+/// Hostname of the active rathole tunnel server, if one is running. A
+/// tunnelled request is a raw TCP forward to `127.0.0.1:<port>` that keeps the
+/// remote client's `Host` (the tunnel server's name), so the Host gate admits
+/// that hostname, on any port, while the tunnel is up. Set by
+/// `mcp::tunnel_api` on start/stop.
+static TUNNEL_HOST: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_tunnel_server_addr(server_addr: Option<&str>) {
+    let host = server_addr.map(|a| {
+        let a = a.trim().to_ascii_lowercase();
+        let a = a.split_once("://").map(|(_, r)| r.to_string()).unwrap_or(a);
+        match a.strip_prefix('[') {
+            Some(rest) => rest
+                .split_once(']')
+                .map(|(i, _)| format!("[{i}]"))
+                .unwrap_or_else(|| a.clone()),
+            None => a.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or(a.clone()),
+        }
+    });
+    if let Ok(mut g) = TUNNEL_HOST.lock() {
+        *g = host.filter(|h| !h.is_empty());
+    }
+}
+
+fn tunnel_host_admitted(name: &str) -> bool {
+    TUNNEL_HOST
+        .lock()
+        .map(|g| g.as_deref() == Some(name))
+        .unwrap_or(false)
+}
+
+/// True the first time a shadow would-refuse is seen for this
+/// (class, origin, method, route) — so a polling page logs one WARN, not one
+/// per poll. Bounded; past the bound every sighting is "not first" (the
+/// `/health` counters still count them all).
+fn first_shadow_sighting(d: &Decision) -> bool {
+    static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let key = format!("{}|{:?}|{}|{:?}", d.class.as_str(), d.origin, d.method, d.route);
+    let Ok(mut g) = SEEN.lock() else {
+        return false;
+    };
+    let set = g.get_or_insert_with(Default::default);
+    if set.len() >= 512 {
+        return false;
+    }
+    set.insert(key)
 }
 
 /// [`SETTINGS_FIELD`] from the settings file, re-read at most every

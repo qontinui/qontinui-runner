@@ -5,8 +5,9 @@
  * (plan 2026-09-17-runner-loopback-api-accepts-any-origin, Phase 3).
  *
  * A trusted origin reaches only the guard's route allowlist and never a
- * credential door. Agents, scripts and MCP clients send no Origin and need no
- * entry here. Saved values are live on the next request — no restart.
+ * credential door — but that allowlist includes features that execute
+ * workflows, checks and hooks. Agents, scripts and MCP clients send no Origin
+ * and need no entry here. Saved values are live within ~2 s — no restart.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -116,7 +117,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     <div className="space-y-4 mt-8" data-ui-bridge-content="allowed-origins-settings">
       <SectionHeader
         title="Allowed Browser Origins"
-        description={`Web pages at these origins may call this runner's API (routes on the trusted allowlist only; never credential, file or execution routes). Agents and scripts need no entry. Takes effect without a restart. Headless equivalent: ${envVar}.`}
+        description={`Web pages at these origins may call this runner's API on the trusted route allowlist. That allowlist never includes credential or file-read routes, but it does include features that run workflows, checks and hooks, so add only origins served by software you trust as much as the runner itself. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
         icon={<Globe className="w-6 h-6" />}
       />
       <div className="space-y-3 rounded-lg bg-card/50 p-4">

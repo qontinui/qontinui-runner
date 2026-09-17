@@ -1025,8 +1025,8 @@ async fn get_allowed_origins_setting() -> Json<ApiResponse<serde_json::Value>> {
     })))
 }
 
-/// PUT /settings/api/allowed-origins — validated and canonicalised; live on
-/// the next request (no restart). A credential door in `mcp::origin_guard`, so
+/// PUT /settings/api/allowed-origins — validated and canonicalised; live
+/// within ~2 s (the guard's read TTL), no restart. A credential door in `mcp::origin_guard`, so
 /// only the runner's own webview and non-browser callers can change it.
 async fn save_allowed_origins_setting(
     Json(payload): Json<AllowedOriginsPayload>,

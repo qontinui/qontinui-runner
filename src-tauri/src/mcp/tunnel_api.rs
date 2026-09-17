@@ -80,6 +80,9 @@ async fn start_tunnel(
             Json(ApiResponse::error(format!("tunnel start failed: {e}"))),
         )
     })?;
+    // Tunnelled requests keep the tunnel server's Host; admit it through the
+    // origin guard's Host gate while the tunnel is up.
+    crate::mcp::origin_guard::set_tunnel_server_addr(Some(&req.server_addr));
 
     Ok(Json(ApiResponse::success(TunnelStatusResponse {
         connected: state.tunnel_client.is_connected().await,
@@ -92,6 +95,7 @@ async fn stop_tunnel(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     state.tunnel_client.stop().await;
+    crate::mcp::origin_guard::set_tunnel_server_addr(None);
     Ok(Json(ApiResponse::success(())))
 }
 
