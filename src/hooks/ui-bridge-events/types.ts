@@ -3,6 +3,7 @@ import type {
   RegisteredComponent,
   ElementIdentifier,
   ElementState,
+  SerializedElementAction,
   StyleGuideConfig,
 } from "@qontinui/ui-bridge";
 
@@ -663,20 +664,18 @@ export interface SerializedElement {
    * casts the result to this interface, so whatever the SDK emits is what goes
    * on the wire — this declaration only describes it.
    *
-   * The SDK widened that projection from bare names to `ElementActionInfo`
-   * objects on 2026-09-11 (plan
+   * Since `@qontinui/ui-bridge` 0.27.0 (the pin this repo now carries) that
+   * projection emits the canonical `SerializedElementAction` objects —
+   * `{ id, label?, description?, paramSchema?, effect? }`, `id` being the
+   * invocable registry key — so an element's custom action carries the
+   * author's `effect` safety class (plan
    * `2026-09-04-effect-calculus-joins-the-component-action-registry`, Design
-   * decision 4 step 3), so an element's custom action now carries the author's
-   * `effect` safety class. This type stays `string[]` for exactly as long as
-   * this repo pins `@qontinui/ui-bridge ^0.24.0`, whose published projection
-   * still emits names; because `serializeElement` reaches this interface through
-   * an `as` cast, a mismatch here is silent rather than a compile error, which
-   * is why it is called out rather than left to be noticed.
-   *
-   * AT DD4 STEP 4 — the SDK pin bump — this becomes
-   * `SerializedElementAction[]`, re-exported from `@qontinui/ui-bridge`.
+   * decision 4). `effect` is undefaulted: absent means UNCLASSIFIED, not
+   * `'read'`. Because `serializeElement` reaches this interface through an
+   * `as` cast, a future mismatch here would be silent rather than a compile
+   * error — keep it in step with the SDK's own type.
    */
-  customActions?: string[];
+  customActions?: SerializedElementAction[];
   identifier: ElementIdentifier;
   state: ElementState;
   registeredAt: number;

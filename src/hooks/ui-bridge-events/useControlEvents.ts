@@ -347,37 +347,12 @@ export function useControlEvents(
           const { createActionExecutor } = await import("@qontinui/ui-bridge/control");
           const executor = createActionExecutor(getGlobalRegistry());
 
-          // `predictComponentAction` lives on `DefaultActionExecutor`
-          // (ui-bridge `control/action-executor.ts`, ui-bridge PR #202) but
-          // is not yet on the PUBLISHED `ActionExecutor` type this
-          // package.json's `@qontinui/ui-bridge` range resolves against --
-          // the predict feature has not shipped to npm yet. Widen the type
-          // rather than block on the publish, and guard the runtime call the
-          // same way the SDK's own HTTP handler does for the identical gap
-          // (`server/handlers.ts` `predictComponentAction`): a wiring gap
-          // said as one, never smoothed into a `predicted: null` answer.
-          const predictExecutor = executor as typeof executor & {
-            predictComponentAction?: (
-              id: string,
-              actionId: string,
-              request?: { params?: Record<string, unknown>; requestId?: string },
-            ) => Promise<Record<string, unknown> & { success: boolean; error?: string }>;
-          };
-          if (!predictExecutor.predictComponentAction) {
-            await sendResponse({
-              requestId,
-              type,
-              success: false,
-              error:
-                "This UI Bridge host does not support effect prediction: its action executor " +
-                "implements no `predictComponentAction`. This is NOT a statement about the " +
-                `action "${componentId}.${actionId}" -- nothing was evaluated, so nothing here ` +
-                "says it is safe to invoke.",
-              timestamp: Date.now(),
-            });
-            return true;
-          }
-          const prediction = await predictExecutor.predictComponentAction(
+          // `predictComponentAction` is a required member of the published
+          // `ActionExecutor` type since `@qontinui/ui-bridge` 0.27.0 (ui-bridge
+          // PR #202), so it is called directly. Before that pin it was not on
+          // the published type and this site widened it and guarded a missing
+          // method at runtime.
+          const prediction = await executor.predictComponentAction(
             componentId,
             actionId,
             request ?? {},

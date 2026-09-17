@@ -743,9 +743,17 @@ pub(crate) fn extract_supported_actions(elem_data: &serde_json::Value) -> Option
 /// `get_element` / discover payload.
 ///
 /// The SDK serializes registered elements with a separate `customActions`
-/// field (see `@qontinui/ui-bridge`'s `serializeRegisteredElement` —
-/// `customActions: el.customActions ? Object.keys(el.customActions) : void 0`),
-/// distinct from the built-in `actions` array. These are arbitrary
+/// field, distinct from the built-in `actions` array. Since
+/// `@qontinui/ui-bridge` 0.27.0 every projection that emits it —
+/// `serializeRegisteredElement` and the `find()`/`discover` path alike — goes
+/// through `serializeElementCustomActions` (`core/element-actions.ts`) and
+/// emits the canonical `SerializedElementAction` / `ElementActionInfo` OBJECT
+/// shape: `[{ id, label?, description?, paramSchema?, effect? }]`, where `id`
+/// is the key the action is registered under in
+/// `RegisteredElement.customActions` — i.e. the invocable name, and the value
+/// this function returns. Before 0.27.0 `discover` did not emit the key at all
+/// and the registry path emitted bare names (`Object.keys(el.customActions)`),
+/// which is why bare strings are still accepted. These are arbitrary
 /// per-element handlers (e.g. `pasteText`, `getScrollback`, `sendKeys` on a
 /// `terminal-input-<id>` element) that the frontend's control-event handler
 /// dispatches via `registered.customActions[action].handler(params)` — they
@@ -754,9 +762,13 @@ pub(crate) fn extract_supported_actions(elem_data: &serde_json::Value) -> Option
 ///
 /// Returns `None` when the field is absent OR present but not an array
 /// (mirrors `extract_supported_actions` — `None` = "we don't know"); an
-/// explicit empty array → `Some(vec![])`. Entries are accepted as bare
-/// strings (the canonical SDK shape) or `{ name | action }` objects for
-/// parity with `extract_supported_actions`.
+/// explicit empty array → `Some(vec![])`. Entries are accepted as objects
+/// (the canonical SDK shape since 0.27.0 — the name is read from `id`; `name`
+/// and `action` are also honoured, in that order before `id`, for parity with
+/// `extract_supported_actions`) or as bare strings (the pre-0.27.0 registry
+/// shape). An entry that is neither, or an object with none of those string
+/// keys, is skipped. Other object fields (`label`, `effect`, …) are not read
+/// here.
 ///
 /// Used by the `/control/element/{id}/action` handler so a registered custom
 /// action (a) passes the action-name gate instead of a blanket 400
@@ -791,8 +803,10 @@ pub(crate) fn extract_custom_actions(elem_data: &serde_json::Value) -> Option<Ve
 ///
 /// Background: the SDK serializes an element with built-in actions in `actions`
 /// (a string array) and registered custom actions in a SEPARATE `customActions`
-/// string array (`Object.keys(el.customActions)` — see
-/// `serializeRegisteredElement` in `@qontinui/ui-bridge`). An agent inspecting
+/// array — `SerializedElementAction` objects (`{ id, label?, effect?, … }`)
+/// since `@qontinui/ui-bridge` 0.27.0, bare names before it; see
+/// [`extract_custom_actions`]. Only the names are folded into `actions`, which
+/// stays a string array; `effect` and the rest stay on `customActions`. An agent inspecting
 /// the discover/snapshot output's `actions` list therefore could NOT see
 /// `pasteText`/`getScrollback` on a `terminal-input-<id>` element even though
 /// the `/control/element/{id}/action` route dispatches them. This mirrors the
@@ -5902,8 +5916,9 @@ mod action_not_supported_tests {
 
     #[test]
     fn extract_custom_actions_from_string_array() {
-        // The SDK serializes `customActions` as a bare string array
-        // (`Object.keys(el.customActions)`), distinct from `actions`.
+        // Pre-0.27.0 registry shape: a bare string array
+        // (`Object.keys(el.customActions)`), distinct from `actions`. Still
+        // accepted; the current SDK shape is covered by the object tests.
         let elem = json!({
             "id": "terminal-input-abc",
             "actions": ["focus", "blur"],
@@ -6119,6 +6134,64 @@ mod action_not_supported_tests {
         let once = payload.clone();
         advertise_custom_actions_in_payload(&mut payload);
         assert_eq!(payload, once, "fold must be idempotent");
+    }
+
+    /// The shape `@qontinui/ui-bridge` 0.27.0's `find()`/`discover` actually
+    /// emits: `customActions` as `SerializedElementAction` OBJECTS keyed by
+    /// `id` (with `label`/`description`/`effect` riding along), not bare
+    /// names. This is the payload that finally activates the fold — before
+    /// 0.27.0 discover emitted no `customActions` key, so a virtualized
+    /// terminal pane advertised `actions: []` while dispatching all five.
+    /// Over `extract_custom_actions_from_object_array` (which pins the `id`
+    /// read alone) this adds the end-to-end fold into an EMPTY `actions`, that
+    /// no object leaks into `actions`, that `effect` survives on
+    /// `customActions`, and idempotence on the object shape.
+    #[test]
+    fn advertise_custom_actions_folds_sdk_object_shape() {
+        let mut payload = json!({
+            "elements": [
+                {
+                    "id": "terminal-pane-term-1",
+                    "type": "custom",
+                    "actions": [],
+                    "customActions": [
+                        { "id": "sendKeys", "label": "Send keys", "effect": "write" },
+                        { "id": "writeToTerminal", "description": "Write raw text" },
+                        { "id": "paste" },
+                        { "id": "pasteText", "effect": "write" },
+                        { "id": "getScrollback", "label": "Read scrollback", "effect": "read" },
+                    ],
+                },
+            ],
+            "count": 1,
+        });
+        advertise_custom_actions_in_payload(&mut payload);
+
+        let term = &payload["elements"][0];
+        assert_eq!(
+            extract_supported_actions(term).expect("actions present"),
+            vec![
+                "sendKeys".to_string(),
+                "writeToTerminal".to_string(),
+                "paste".to_string(),
+                "pasteText".to_string(),
+                "getScrollback".to_string(),
+            ],
+            "every object-shaped custom action must be advertised by its `id`"
+        );
+        // `actions` stays a string array — no object leaks into it.
+        assert!(term["actions"]
+            .as_array()
+            .expect("actions array")
+            .iter()
+            .all(|v| v.is_string()));
+        // The objects themselves (with `effect`) are left intact.
+        assert_eq!(term["customActions"][0]["effect"], "write");
+
+        // Idempotent on the object shape too.
+        let once = payload.clone();
+        advertise_custom_actions_in_payload(&mut payload);
+        assert_eq!(payload, once);
     }
 
     /// A recovery counts only when it chose a command AND the original action
