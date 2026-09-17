@@ -996,6 +996,13 @@ pub enum PtyWriteCaller {
     /// The steward-launch route's deferred launch command line
     /// (`mcp/steward.rs`).
     StewardLaunchCommand,
+    /// The wind-down `graceful_exit` driver
+    /// (`terminal/graceful_exit.rs`) — the `/exit` it types at an empty
+    /// prompt, the `\r` that submits it, and the Ctrl-U that clears the line
+    /// when the echo never arrives. The only producer that writes to a pane
+    /// in order to END it, so it gets its own tag rather than riding one of
+    /// the keystroke variants above.
+    GracefulExit,
     /// Unit-test fixtures only.
     #[cfg(test)]
     Test,
@@ -1023,6 +1030,7 @@ impl PtyWriteCaller {
             Self::LaunchInitialCommand => "launch_initial_command",
             Self::HttpCreateInitialCommand => "http_create_initial_command",
             Self::StewardLaunchCommand => "steward_launch_command",
+            Self::GracefulExit => "graceful_exit",
             #[cfg(test)]
             Self::Test => "test",
         })
@@ -4242,7 +4250,7 @@ impl TerminalSession {
             "graceful_exit: starting"
         );
         let outcome = drive(
-            |bytes| self.write(bytes),
+            |bytes| self.write(bytes, PtyWriteCaller::GracefulExit),
             || self.grid_screen(),
             probe,
             close_tab,
