@@ -274,6 +274,16 @@ pub(crate) struct NonceBinding {
     minted_at: std::time::SystemTime,
 }
 
+#[cfg(test)]
+impl NonceBinding {
+    /// The session workdir this nonce was provisioned into — read-only, for
+    /// tests outside this module that need to scope a registry assertion to
+    /// one cwd (the mint route's tests) without cloning the whole binding.
+    pub(crate) fn workdir(&self) -> &str {
+        &self.workdir
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session-provisioned coord identity: the TWO gates
 // (plan 2026-07-17 §1/§3, re-cut by plan
