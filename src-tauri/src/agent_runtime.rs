@@ -6055,7 +6055,7 @@ async fn acquire_continuation_workdir(
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
     // Why no worktree came back, carried into a foreign repo's refusal.
-    let mut no_worktree_because = "no repos".to_string();
+    let mut no_worktree_because = String::new();
     if !repos.is_empty() {
         let acquired = acquire(AcquireRequest {
             repos,
@@ -6086,6 +6086,24 @@ async fn acquire_continuation_workdir(
                 .ok_or_else(|| {
                     anyhow::anyhow!("gate-continuation: acquire returned no worktrees")
                 })?;
+            // coord may answer `shared_branch`, whose "worktree" IS the canonical
+            // checkout. For a repo outside the workspace root that is the same
+            // unexcluded shared tree the fallback refuses, so it is refused the
+            // same way (dropping `ctx` releases its claims).
+            if is_foreign_shared_checkout(
+                &repos[0],
+                std::path::Path::new(&workdir),
+                crate::agent_worktree::canonical_paths::has_foreign_owner,
+                |r: &str| crate::agent_worktree::canonical_paths::resolve_checkout(r).ok(),
+            ) {
+                drop(ctx);
+                return Err(anyhow::anyhow!(
+                    "{NO_ISOLATED_WORKTREE}: {} got a shared-branch checkout at {workdir} \
+                     rather than a worktree; refusing to start a session in that shared \
+                     checkout",
+                    repos[0]
+                ));
+            }
             // coord's agent_id is canonically a UUID; if it isn't, fall back
             // to a fresh one for lifecycle correlation only.
             let agent_id =
@@ -6204,6 +6222,20 @@ fn settle_continuation_acquire<C>(
     }
 }
 
+/// `true` when the cwd acquired for a foreign-owner `repo` IS its verified
+/// canonical checkout — coord's `shared_branch` answer, whose "worktree" is the
+/// operator's own checkout rather than an agent worktree beside it.
+fn is_foreign_shared_checkout(
+    repo: &str,
+    workdir: &std::path::Path,
+    foreign_owner: impl Fn(&str) -> bool,
+    checkout_of: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> bool {
+    foreign_owner(repo)
+        && checkout_of(repo)
+            .is_some_and(|c| crate::agent_worktree::canonical_paths::paths_equal(&c, workdir))
+}
+
 /// The leading token of a foreign-repo continuation refused because it got no
 /// worktree of its own. Stable, like
 /// [`crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
@@ -6259,9 +6291,9 @@ fn continuation_fallback_workdir<E: std::fmt::Display>(
             Ok(lossy(&root))
         }
         _ => Err(format!(
-            "{NO_ISOLATED_WORKTREE}: {repo} is checked out outside the workspace root at {} \
-             and no worktree was acquired ({no_worktree_because}); refusing to start a \
-             session in that shared checkout",
+            "{NO_ISOLATED_WORKTREE}: {repo} is checked out outside the workspace root at {}, \
+             no worktree was acquired, and a session is not started in that shared \
+             checkout; cause: {no_worktree_because}",
             checkout.display()
         )),
     }
@@ -11303,6 +11335,45 @@ mod tests {
             "off"
         )
         .is_err());
+    }
+
+    /// Review round 3: coord's `shared_branch` answer makes the "worktree" the
+    /// canonical checkout itself — for a foreign repo, refused like no worktree.
+    #[test]
+    fn a_foreign_shared_branch_checkout_is_detected() {
+        let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
+        let checkout = |r: &str| {
+            Some(std::path::PathBuf::from(format!(
+                "D:/portofino-pizzeria/{}",
+                r.rsplit('/').next().unwrap()
+            )))
+        };
+        assert!(is_foreign_shared_checkout(
+            "portofino-pizzeria/backend",
+            std::path::Path::new("d:/Portofino-Pizzeria/backend"),
+            foreign,
+            checkout
+        ));
+        // A real agent worktree beside it is not the checkout.
+        assert!(!is_foreign_shared_checkout(
+            "portofino-pizzeria/backend",
+            std::path::Path::new("D:/portofino-pizzeria/qontinui-worktrees/019e/backend"),
+            foreign,
+            checkout
+        ));
+        // `qontinui/*` shared-branch behaviour is untouched.
+        assert!(!is_foreign_shared_checkout(
+            "qontinui/qontinui-runner",
+            std::path::Path::new("D:/portofino-pizzeria/qontinui-runner"),
+            foreign,
+            checkout
+        ));
+        assert!(!is_foreign_shared_checkout(
+            "portofino-pizzeria/backend",
+            std::path::Path::new("D:/portofino-pizzeria/backend"),
+            foreign,
+            |_: &str| None
+        ));
     }
 
     /// No verified checkout anywhere → refused, carrying the resolver's typed
