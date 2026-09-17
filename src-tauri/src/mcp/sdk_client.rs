@@ -121,7 +121,7 @@ struct SdkStatusResponse {
 /// Information about a single connection in the manager
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ConnectionInfo {
+pub(crate) struct ConnectionInfo {
     url: String,
     app: SdkAppInfo,
     connected_at: i64,
@@ -131,7 +131,7 @@ struct ConnectionInfo {
 /// Request body for switching active connection
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SwitchRequest {
+pub(crate) struct SwitchRequest {
     url: String,
 }
 
@@ -2666,8 +2666,8 @@ async fn handle_debug_highlight(
 }
 
 /// POST /ui-bridge/sdk/switch — Switch active connection to a different URL
-async fn handle_switch(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn handle_switch(
+    State(state): State<crate::mcp::relay_binding::RelayState>,
     Json(req): Json<SwitchRequest>,
 ) -> Json<ApiResponse<ConnectResponse>> {
     let url = req.url.trim_end_matches('/').to_string();
@@ -2701,8 +2701,8 @@ async fn handle_switch(
 }
 
 /// GET /ui-bridge/sdk/connections — List all connections
-async fn handle_connections(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn handle_connections(
+    State(state): State<crate::mcp::relay_binding::RelayState>,
 ) -> Json<ApiResponse<Vec<ConnectionInfo>>> {
     let manager = state.sdk_connection.lock().await;
 

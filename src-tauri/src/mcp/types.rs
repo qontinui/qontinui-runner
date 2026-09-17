@@ -243,6 +243,11 @@ pub struct ApiState {
     /// proxy to a specific `app_id` should use this instead of reqwest
     /// directly.
     pub app_dispatcher: Arc<crate::mcp::app_dispatch::AppDispatcher>,
+    /// UI Bridge relay principal binding: the kill-switch config and the
+    /// per-rule counters, ONE instance shared by every request (and by every
+    /// `RelayState` extracted from this state). Plan
+    /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`.
+    pub relay_binding: Arc<crate::mcp::relay_binding::RelayBinding>,
     /// Pairing manager for LAN and Cloud device authentication
     pub pairing_manager: Arc<crate::mcp::transport::pairing::PairingManager>,
     /// Rathole tunnel client (Plan 1B). Singleton — only one tunnel active.

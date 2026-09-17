@@ -13,7 +13,7 @@ use axum::{
     http::StatusCode,
     response::Json,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,8 @@ use tokio::time::timeout;
 use tracing::debug;
 
 use crate::mcp::app_dispatch::DispatchError;
+use crate::mcp::origin_guard::RequesterPrincipal;
+use crate::mcp::relay_binding::RelayState;
 use crate::mcp::types::{ApiResponse, ApiState};
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 
@@ -618,8 +620,14 @@ async fn ios_forward(
 /// Phone-home registration from the SDK's `CommandRelayListener`.
 /// Also accepts the legacy manual `{url, port, basePath}` shape when `baseUrl`
 /// is absent, so existing callers keep working.
-async fn register_app(
-    State(state): State<Arc<ApiState>>,
+///
+/// `_principal` (the origin guard's classification of the caller) is carried
+/// for the principal binding of plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`; not consulted
+/// yet.
+pub(crate) async fn register_app(
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
     Json(req): Json<RegisterAppRequest>,
 ) -> Result<Json<ApiResponse<RegisterAppResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::mcp::app_registry::AppTransport;
@@ -743,8 +751,8 @@ async fn register_app(
 /// List apps that have phoned home and are still within the TTL window.
 /// Returns the transport discriminator per entry so the integration tool
 /// can distinguish HTTP-phone-home apps from WebSocket-registered wrappers.
-async fn list_registered_apps(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn list_registered_apps(
+    State(state): State<RelayState>,
 ) -> Json<ApiResponse<Vec<RegisterAppResponse>>> {
     let apps = state
         .app_registry
@@ -761,8 +769,9 @@ async fn list_registered_apps(
 
 /// Explicit deregistration — useful on `beforeunload` when the SDK can still
 /// send a beacon. Returns `true` if an entry was removed.
-async fn deregister_app(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn deregister_app(
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
     Path(app_id): Path<String>,
 ) -> Json<ApiResponse<bool>> {
     let removed = state.app_registry.remove(&app_id).await;
@@ -1023,8 +1032,8 @@ async fn dispatch_to_app_inner(
 /// Failures map to:
 ///   - `404` when `app_id` is not in the registry,
 ///   - `502` for transport-level errors (HTTP non-2xx, WS disconnect, etc.).
-async fn dispatch_to_app(
-    State(state): State<Arc<ApiState>>,
+pub(crate) async fn dispatch_to_app(
+    State(state): State<RelayState>,
     Path(app_id): Path<String>,
     Json(req): Json<AppDispatchRequest>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {

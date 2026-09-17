@@ -8584,6 +8584,9 @@ pub fn create_router(
         ws_connection_manager: shared_ws_manager,
         ws_command_relay: shared_command_relay,
         app_dispatcher: shared_app_dispatcher,
+        relay_binding: crate::mcp::relay_binding::RelayBinding::new(
+            crate::mcp::relay_binding::BindingConfig::from_env(),
+        ),
         pairing_manager: Arc::new(crate::mcp::transport::pairing::PairingManager::new()),
         tunnel_client: Arc::new(crate::tunnel::RatholeClient::new()),
         ios_transport: Arc::new(crate::mcp::transport::ios::IosTransport::new()),
