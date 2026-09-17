@@ -535,8 +535,9 @@ function RepoCheckoutsField({ draft, errors, onChange }: RepoCheckoutsFieldProps
       />
       <p className="text-[10px] text-muted-foreground">
         One <code>owner/name = path</code> line per repository this runner works on that is not
-        checked out under the workspace root, as an absolute path. Sessions for that repository get
-        a worktree made from it, or start in the folder that holds it.{" "}
+        checked out under the workspace root, as an absolute path. Sessions for that repository work
+        in a worktree made from it, and are refused rather than started in the shared checkout when
+        no worktree can be made.{" "}
         <strong>
           Without a line, a repository owned by anyone but qontinui is looked for at &lt;parent of
           the workspace root&gt;/&lt;owner&gt;/&lt;name&gt;, then &lt;workspace
