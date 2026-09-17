@@ -2340,8 +2340,10 @@ pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
 
 /// The parse half of [`measured_device_binding_count`].
 ///
-/// - A `bindings` key that is a NON-EMPTY array: its length.
-/// - A `bindings` key that is anything else (empty, a string, a number):
+/// - A `bindings` key that is a NON-EMPTY array whose EVERY entry is a valid
+///   binding (an object with a string `tenant_id`): the number of entries.
+/// - A `bindings` key that is anything else (empty, a string, a number, or an
+///   array holding any entry that is not a valid binding — `[7]`, `[{}]`):
 ///   `Unknown` — a half-written or malformed v2 file states no count.
 /// - No `bindings` key, and a legacy v1 `tenant_id` string: one (the v1 shape
 ///   can only ever name one binding).
@@ -2349,7 +2351,14 @@ pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
 pub(crate) fn measured_binding_count_from_value(value: &serde_json::Value) -> MeasuredBindingCount {
     match value.get("bindings") {
         Some(b) => match b.as_array() {
-            Some(arr) if !arr.is_empty() => MeasuredBindingCount::Measured(arr.len()),
+            Some(arr)
+                if !arr.is_empty()
+                    && arr
+                        .iter()
+                        .all(|e| e.get("tenant_id").and_then(|v| v.as_str()).is_some()) =>
+            {
+                MeasuredBindingCount::Measured(arr.len())
+            }
             _ => MeasuredBindingCount::Unknown,
         },
         None if value.get("tenant_id").and_then(|v| v.as_str()).is_some() => {
@@ -2365,13 +2374,17 @@ pub(crate) fn measured_binding_count_from_value(value: &serde_json::Value) -> Me
 /// A `bindings` array that is present but EMPTY falls through to the legacy
 /// shape rather than reporting zero — `effective_bindings` does the same, and
 /// an empty array is an unpaired or half-written file, not a statement that the
-/// device holds no tenant. Every state [`measured_binding_count_from_value`]
-/// calls `Unknown` counts as one here.
+/// device holds no tenant. This count is deliberately LOOSER than
+/// [`measured_binding_count_from_value`]: it counts array entries without
+/// validating them, and every other shape is one — the D2 degrade rule's
+/// failure direction, unchanged.
 pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
-    match measured_binding_count_from_value(value) {
-        MeasuredBindingCount::Measured(n) => n,
-        MeasuredBindingCount::Unknown => 1,
+    if let Some(arr) = value.get("bindings").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            return arr.len();
+        }
     }
+    1
 }
 
 /// What a call site knows about the tenant that owns the row it is writing —
@@ -3993,6 +4006,30 @@ mod bearer_selection_tests {
                 1,
                 "D2 still reads one: {what}"
             );
+            assert_eq!(
+                select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
+                None,
+                "{what}: a claimless token must be refused"
+            );
+        }
+        // Nit (b): an array entry that is not a valid binding (an object with a
+        // string `tenant_id`) makes the whole count Unknown.
+        for (v, what) in [
+            (
+                serde_json::json!({"bindings": [7]}),
+                "a non-object binding entry",
+            ),
+            (
+                serde_json::json!({"bindings": [{}]}),
+                "a binding entry with no tenant_id",
+            ),
+            (
+                serde_json::json!({"bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]}),
+                "one valid entry beside a numeric tenant_id",
+            ),
+        ] {
+            let measured = measured_binding_count_from_value(&v);
+            assert_eq!(measured, MeasuredBindingCount::Unknown, "{what}: {v}");
             assert_eq!(
                 select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
                 None,
