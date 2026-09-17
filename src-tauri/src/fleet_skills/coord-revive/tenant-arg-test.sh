@@ -601,8 +601,28 @@ else
   assert_has   "(c1) and names the tenant it acts in" "names tenant $TA" "$ERR"
   assert_has   "(c1) the sibling's invoke token is WRONG_TENANT too" "RUNNER_MINT_WRONG_TENANT" "$ERR"
   assert_lacks "(c1) never reported LIVE" "VERDICT: LIVE" "$OUT"
-  assert_lacks "(c1) the session tenant was never lost" "no tenant sent (the session census" "$ERR"
+  # Both spellings the lost-tenant state has had: the pre-C1 describe_session_tenant
+  # ("no tenant sent (") and describe_sent_tenant ("sent no tenant ("), on stdout
+  # AND stderr — the old bug printed it on the LIVE line.
+  assert_lacks "(c1) the session tenant was never lost (old spelling)" "no tenant sent (the session census" "$OUT$ERR"
+  assert_lacks "(c1) the session tenant was never lost (new spelling)" "sent no tenant (the session census" "$OUT$ERR"
   printf '%s' "$TA" > "$MODE_DIR/default_tenant"
+
+  echo "== (c1b) the ONLY barrier is the websocket answer's claim check (coord would accept any bearer)"
+  # Runner A: its get_coord_device_token route is absent, so the cascade falls to
+  # get_access_token_for_websocket, which never takes a tenant and returns A's
+  # default slot - tenant A. The sibling B serves no mint of any kind. coord is a
+  # stub whose /mcp accepts every bearer, so a skipped claim check would go LIVE.
+  setmode runner absent; setmode nonce_runner absent; setmode census row; setmode row_tenant "$TB"
+  printf 'absent' > "$MODE_DIR_B/runner"; printf 'absent' > "$MODE_DIR_B/nonce_runner"
+  mkdir -p "$ROOT/sibling-b"
+  printf '{"mcpServers":{"coord-mcp":{"type":"http","url":"%s/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"stale"}}}}\n' "$STUB_B" > "$ROOT/sibling-b/.mcp.json"
+  run_case - "$STUB" QONTINUI_RUNNER_API_PORT="$PORT" QONTINUI_TERMINAL_ID=term-1 \
+    COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+  rm -rf "$ROOT/sibling-b"
+  assert_has   "(c1b) the websocket answer is refused by its claim" "source=runner-invoke:get_access_token_for_websocket -> RUNNER_MINT_WRONG_TENANT" "$ERR"
+  assert_has   "(c1b) and the reason names the door, not a runner build" "get_access_token_for_websocket never takes a tenant" "$ERR"
+  assert_lacks "(c1b) never LIVE" "VERDICT: LIVE" "$OUT"
 fi
 
 # ================================================================ the discharge
@@ -659,6 +679,9 @@ else
       -- bash "$0"
     mc_expect_red "re-read the census on the runner that answered the mint (C1)" \
       "$SCRIPT" '/^      # The session tenant was resolved ONCE, before the mint; nothing here re-reads it\.$/a\      SESSION_TENANT_DONE=""; SESSION_TENANT=""; SESSION_TENANT_SRC=""; RUNNER_DEFAULT_ORIGIN="${NURL%/coord-mcp}"; resolve_session_tenant' \
+      -- bash "$0"
+    mc_expect_red "check the invoke token's claim only for get_coord_device_token (W1)" \
+      "$SCRIPT" 's/^    if \[ -n "\$SESSION_TENANT" \]; then$/    if [ -n "$SESSION_TENANT" ] \&\& [ "$MCMD" = get_coord_device_token ]; then/' \
       -- bash "$0"
     mc_expect_red "never put the tenant on the L5 credential body" \
       "$SCRIPT" '/^    \[ -n "\$SESSION_TENANT" \] && BOOT_REQ=/d' \

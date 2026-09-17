@@ -388,7 +388,9 @@ A door that later answers from a DIFFERENT runner (one a sibling `.mcp.json`
 names) does not re-read the census there: that runner does not list this
 terminal, and re-reading it once turned a known tenant into "none", skipped every
 tenant check, and reported another tenant's credential LIVE. Both runner mints
-try the spawning runner's origin FIRST, so a sibling is reached only when the
+try the spawning runner's origin FIRST (`coord-provision-nonce.sh` tries the
+origins it is handed ahead of an ambient `$QONTINUI_RUNNER_URL` or
+`$QONTINUI_RUNNER_PORT`), so a sibling is reached only when the
 spawning runner cannot mint — and its answer is still checked against the tenant
 resolved here. Each mint records the tenant it actually SENT, and its
 `TENANT:` / `PARTIAL:` line says so.

@@ -1447,7 +1447,7 @@ probe_door() {
     # DEAD over a door that answered — read is_live_verdict's header.
     if is_live_verdict "$verdict"; then
       rm -f "$hdrfile"
-      echo "$label: $name -> $verdict ($url)" >&2
+      echo "$label: $name -> $verdict ($url)${PROBE_DOOR_TAG:+ $PROBE_DOOR_TAG}" >&2
       LIVE_FILE="$name"
       LIVE_URL="$url"
       LIVE_VERDICT="$verdict"
@@ -3762,8 +3762,12 @@ else
   if [ "$NRC" = "0" ] && [ -n "$NURL" ] && [ -n "$NKEY" ]; then
     # $NURL VERBATIM: the nonce is paired to the runner's own bound port, and a
     # scanned or assumed port 401s.
+    # The probe answers only "does this transport work"; the tenant check below
+    # decides LIVE. The tag keeps a probe LIVE followed by WRONG_TENANT readable.
+    PROBE_DOOR_TAG="[transport probe - tenant check follows]"
     if probe_door "L4" "nonce-mint@$NURL" "$NURL" "X-Coord-Mcp-Proxy-Key" "$NKEY" \
       "PROXY_UNAUTHORIZED (the runner minted this nonce and then refused it - the registry was rotated or the slot re-provisioned between the two calls; re-run)"; then
+      PROBE_DOOR_TAG=""
       # The session tenant was resolved ONCE, before the mint; nothing here re-reads it.
       nonce_acting_tenant "$NURL" "$NKEY"
       if [ -z "$SESSION_TENANT" ]; then
@@ -3792,6 +3796,7 @@ else
         fi
       fi
     fi
+    PROBE_DOOR_TAG=""
   else
     case "$NRC" in
       2)   NV="NO_HANDSHAKE_KEY (no readable ~/.qontinui/runner-loopback-key. The runner writes that 0600 file at startup, so an absent one means this runner's build predates the same-user handshake, or it runs as another user. LOCAL fault - NOT 'no credential')" ;;
@@ -4042,7 +4047,13 @@ for origin in $RUNNER_DEFAULT_ORIGIN $RUNNER_ORIGINS; do
     if [ -n "$SESSION_TENANT" ]; then
       MCLAIM="$(jwt_tenant_claim "$MJWT" | tr -d '\r\n' | tr 'A-F' 'a-f')"
       if [ "$MCLAIM" != "$(printf '%s' "$SESSION_TENANT" | tr 'A-F' 'a-f')" ]; then
-        mint_fail "RUNNER_MINT_WRONG_TENANT ($(describe_sent_tenant "$MSENT") to $MINT_URL and the token that came back claims tenant ${MCLAIM:-<no readable tenant_id claim>}. This runner build predates the tenantId argument (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P3) and answered its default slot instead. NOT sent: it would authenticate this session in the wrong tenant. Use L5, or a runner build carrying P3)"
+        case "$MCMD" in
+          get_access_token_for_websocket)
+            MWHY="get_access_token_for_websocket never takes a tenant: it returned this runner's DEFAULT slot, which belongs to another tenant" ;;
+          *)
+            MWHY="this runner build predates the tenantId argument (plan 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential P3) and answered its default slot instead" ;;
+        esac
+        mint_fail "RUNNER_MINT_WRONG_TENANT ($(describe_sent_tenant "$MSENT") to $MINT_URL and the token that came back claims tenant ${MCLAIM:-<no readable tenant_id claim>}. $MWHY. NOT sent: it would authenticate this session in the wrong tenant. Use L5, or a runner build carrying P3)"
         continue
       fi
     fi
