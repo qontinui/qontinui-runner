@@ -941,7 +941,19 @@ pub async fn transcript_find_external_processes(
     // runner, so a hang here is expected rather than exotic — and an empty
     // list reported as `success: true` is indistinguishable from a genuine
     // "no external processes", which is the one answer a caller acts on.
-    match transcript::scan_external_claude_processes(&managed_pids) {
+    //
+    // The scan blocks for up to its 30 s probe budget, so it runs on the
+    // tracked blocking lane, never on this async worker: the frontend polls
+    // this command every 30 s, and a degraded WMI provider would otherwise pin
+    // an app-runtime worker per poll. A panicked or cancelled scan task is
+    // likewise UNKNOWN, not zero.
+    let scan =
+        spawn_blocking_tracked(move || transcript::scan_external_claude_processes(&managed_pids))
+            .await
+            .unwrap_or_else(|e| transcript::ExternalClaudeScan::Degraded {
+                reason: format!("the scan task did not complete: {e}"),
+            });
+    match scan {
         transcript::ExternalClaudeScan::Complete(external) => Ok(CommandResponse {
             success: true,
             message: Some(format!(
