@@ -37,7 +37,7 @@
 //! [`ERROR_EXIT_CODE`] (`1`), matching `LocalPty`'s "non-zero falls back to 1".
 
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -51,6 +51,27 @@ use super::pane_io::{CredentialScrub, PaneIo};
 pub const DETACH_EXIT_CODE: i32 = 0;
 /// Exit code `wait` reports after a `remote_terminal_error`.
 pub const ERROR_EXIT_CODE: i32 = 1;
+
+/// What happened to this pane's `remote_terminal_detach` — the one frame
+/// that asks the relay to drop the `(target, terminal)` binding.
+///
+/// Plan `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`
+/// (Phase 1). `Queued` means the frame was accepted by the relay's outbound
+/// queue — NOT that the relay or the target acted on it; only a re-attach of
+/// the same terminal observes that. A close reports this value rather than a
+/// bare success, because a detach that never queued leaves the binding held
+/// until the source socket drops or the grant expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachOutcome {
+    /// No detach has been tried (the pane was never closed).
+    NotAttempted,
+    /// The frame was accepted by the outbound queue. Terminal: no second
+    /// detach is ever queued for this pane.
+    Queued,
+    /// The last attempt could not queue the frame; carries the sink's error.
+    /// Not terminal — the next `kill`/`release` tries again.
+    Failed(String),
+}
 
 /// Where a remote pane's outbound frames go. The relay owns the socket and
 /// hands the pane only this; a test hands it a recorder.
@@ -124,8 +145,10 @@ pub struct RemotePaneIo {
     /// The settled exit code; `wait` parks on the condvar until it is `Some`.
     exit: Mutex<Option<i32>>,
     exit_cv: Condvar,
-    /// `remote_terminal_detach` is sent at most once per pane.
-    detach_sent: AtomicBool,
+    /// `remote_terminal_detach` is QUEUED at most once per pane. A failed
+    /// attempt does not latch, so the `release()` that follows a failed
+    /// `kill()` on the close path retries it.
+    detach: Mutex<DetachOutcome>,
     /// Absolute target offset of the next byte this pane expects — the
     /// reconnect splice point.
     remote_offset: AtomicU64,
@@ -172,7 +195,7 @@ impl RemotePaneIo {
             output_rx: Mutex::new(Some(rx)),
             exit: Mutex::new(None),
             exit_cv: Condvar::new(),
-            detach_sent: AtomicBool::new(false),
+            detach: Mutex::new(DetachOutcome::NotAttempted),
             remote_offset: AtomicU64::new(next_offset),
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
@@ -330,15 +353,44 @@ impl RemotePaneIo {
         self.sink.send_frame(frame)
     }
 
+    /// What this pane's detach has come to so far. See [`DetachOutcome`].
+    pub fn detach_outcome(&self) -> DetachOutcome {
+        match self.detach.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    /// Queue `remote_terminal_detach` unless one is already queued. The lock
+    /// is held across the (non-blocking) queue attempt so a concurrent
+    /// `kill`/`release` cannot queue a second frame. Only a successful queue
+    /// latches: a failure is recorded and left retryable.
     fn send_detach_once(&self) -> Result<(), String> {
-        if self.detach_sent.swap(true, Ordering::AcqRel) {
+        let mut slot = match self.detach.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *slot == DetachOutcome::Queued {
             return Ok(());
         }
-        self.send(json!({
+        let sent = self.send(json!({
             "type": "remote_terminal_detach",
             "grant_jti": self.grant_jti,
             "terminal_id": self.terminal_id,
-        }))
+        }));
+        *slot = match &sent {
+            Ok(()) => DetachOutcome::Queued,
+            Err(e) => {
+                warn!(
+                    grant_jti = %self.grant_jti,
+                    terminal_id = %self.terminal_id,
+                    error = %e,
+                    "remote pane: remote_terminal_detach could not be queued — the relay keeps the binding until the source socket drops or the grant expires"
+                );
+                DetachOutcome::Failed(e.clone())
+            }
+        };
+        sent
     }
 
     /// The `remote_terminal_attach` frame a reconnect re-presents for this
@@ -635,6 +687,123 @@ pub(crate) mod tests {
         // The reader sees EOF after release even with no exit frame.
         let bytes = read_to_end_blocking(pane.reader().unwrap());
         assert!(bytes.is_empty());
+    }
+
+    /// A sink that refuses the first `fail_first` frames, then records.
+    #[derive(Default)]
+    struct FlakySink {
+        fail_first: Mutex<usize>,
+        frames: Mutex<Vec<Value>>,
+    }
+
+    impl RemoteFrameSink for FlakySink {
+        fn send_frame(&self, frame: Value) -> Result<(), String> {
+            let mut left = self.fail_first.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Err("remote attach: relay outbound backlog is full".to_string());
+            }
+            self.frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+    }
+
+    fn flaky_pane(fail_first: usize) -> (Arc<FlakySink>, RemotePaneIo) {
+        let sink = Arc::new(FlakySink {
+            fail_first: Mutex::new(fail_first),
+            frames: Mutex::new(Vec::new()),
+        });
+        let dyn_sink: Arc<dyn RemoteFrameSink> = sink.clone();
+        let pane = RemotePaneIo::new(
+            "jti-1",
+            "term-9",
+            "grant.jwt",
+            dyn_sink,
+            100,
+            40,
+            AttachedRing::default(),
+        );
+        (sink, pane)
+    }
+
+    fn detach_frames(frames: &[Value]) -> usize {
+        frames
+            .iter()
+            .filter(|f| f["type"] == "remote_terminal_detach")
+            .count()
+    }
+
+    /// Plan 2026-09-16 Phase 1, R1: the close path runs `kill` then
+    /// `release`. When `kill`'s queue attempt fails, the failure must NOT
+    /// latch — `release` retries and exactly one detach reaches the sink.
+    #[test]
+    fn a_failed_detach_is_retried_by_the_following_release() {
+        let (sink, pane) = flaky_pane(1);
+        assert_eq!(pane.detach_outcome(), DetachOutcome::NotAttempted);
+
+        let killed = pane.kill(Duration::from_millis(10));
+        assert!(
+            killed.is_err(),
+            "a refused queue is reported, not swallowed"
+        );
+        assert!(
+            matches!(pane.detach_outcome(), DetachOutcome::Failed(ref e) if e.contains("backlog"))
+        );
+
+        pane.release(Duration::from_millis(10))
+            .expect("retry queues");
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+        assert_eq!(detach_frames(&sink.frames.lock().unwrap()), 1);
+        // A local kill still settles `wait` with the detach code.
+        assert_eq!(pane.wait(), Ok(DETACH_EXIT_CODE));
+    }
+
+    /// A successful detach latches: a later `kill`/`release` never queues a
+    /// second frame.
+    #[test]
+    fn a_queued_detach_is_never_queued_twice() {
+        let (sink, pane) = flaky_pane(0);
+        pane.kill(Duration::from_millis(10)).unwrap();
+        pane.release(Duration::from_millis(10)).unwrap();
+        pane.kill(Duration::from_millis(10)).unwrap();
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+        assert_eq!(detach_frames(&sink.frames.lock().unwrap()), 1);
+    }
+
+    /// The lock is held across the queue attempt, so racing closers still
+    /// queue exactly one detach.
+    #[test]
+    fn concurrent_kill_and_release_queue_exactly_one_detach() {
+        let sink = Arc::new(RecordingSink::default());
+        let pane = Arc::new(pane(&sink, AttachedRing::default()));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let p = pane.clone();
+                thread::spawn(move || {
+                    if i % 2 == 0 {
+                        let _ = p.kill(Duration::from_millis(10));
+                    } else {
+                        let _ = p.release(Duration::from_millis(10));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(pane.detach_outcome(), DetachOutcome::Queued);
+        assert_eq!(detach_frames(&sink.frames()), 1);
+    }
+
+    /// Both attempts failing leaves the outcome `Failed` with the last
+    /// error — the state a close must report as "not released".
+    #[test]
+    fn a_detach_that_never_queues_stays_failed() {
+        let (sink, pane) = flaky_pane(2);
+        assert!(pane.kill(Duration::from_millis(10)).is_err());
+        assert!(pane.release(Duration::from_millis(10)).is_err());
+        assert!(matches!(pane.detach_outcome(), DetachOutcome::Failed(_)));
+        assert_eq!(detach_frames(&sink.frames.lock().unwrap()), 0);
     }
 
     /// A target error closes the pane with the error exit code.

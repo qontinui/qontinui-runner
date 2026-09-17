@@ -16,6 +16,7 @@ import { AiSettings } from "./AiSettings";
 import { AgenticSettings } from "./AgenticSettings";
 import { BackupSettings } from "./BackupSettings";
 import { DiscoverySettings } from "./DiscoverySettings";
+import { AllowedOriginsSettings } from "./AllowedOriginsSettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
 import { SelfHealingSettings } from "./SelfHealingSettings";
 import { WorldStateVerifierSettings } from "./WorldStateVerifierSettings";
@@ -274,7 +275,12 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
       case "app-freshness":
         return <AppFreshnessSettings onLog={onLog} />;
       case "security":
-        return <SecuritySettings onLog={onLog} />;
+        return (
+          <>
+            <SecuritySettings onLog={onLog} />
+            <AllowedOriginsSettings onLog={onLog} />
+          </>
+        );
       case "lock-yield":
         return <LockYieldPolicySettings onLog={onLog} />;
       case "resource-guard":

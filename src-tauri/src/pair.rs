@@ -670,6 +670,114 @@ pub fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
     Some(out)
 }
 
+// ============================================================================
+// Coord's authoritative binding COUNT — a heartbeat-owned sidecar
+// ============================================================================
+
+/// `coord_bound_tenants.json`: the set of tenants coord's register echo says
+/// this device is bound to, stamped with when it was observed.
+///
+/// Plan `2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device`.
+/// `paired_user.json` `bindings` deliberately holds only tenants this runner
+/// has a credential for ([`reconcile_paired_bindings_with`] flags the rest as
+/// `coord_only` and never fabricates an entry), so it cannot answer "is this
+/// device bound to more than one tenant?" — a device coord knows as 3-bound,
+/// holding one slot, reads as single-bound there. The plan adapter needs the
+/// true answer before it files a plan under the default credential's tenant.
+///
+/// A SIDECAR, not a `paired_user.json` field, for two reasons: only the
+/// heartbeat writes it, so it can never race `persist_pairing`'s
+/// read-modify-write of the binding file (a stale heartbeat rewrite could
+/// otherwise drop a binding that pairing just added); and it is a COUNT
+/// carrier, not a binding — nothing selects a credential slot from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CoordBoundTenantsFile {
+    /// Stringified tenant UUIDs, sorted and distinct.
+    tenant_ids: Vec<String>,
+    /// Unix seconds when a register echo last carried this set.
+    observed_at: i64,
+}
+
+/// Past this age a recorded set is UNKNOWN, not evidence: coord may have
+/// stopped echoing `tenant_ids`, or the heartbeat may be down, and an unpair
+/// seen by neither would otherwise be counted forever. The heartbeat restamps
+/// every [`COORD_BOUND_TENANTS_RESTAMP_SECS`], so a live runner never ages out.
+pub const COORD_BOUND_TENANTS_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+
+/// An unchanged set is re-written at most this often — the heartbeat's 30 s
+/// cadence must not churn the disk just to move a timestamp.
+pub const COORD_BOUND_TENANTS_RESTAMP_SECS: i64 = 60 * 60;
+
+/// Where the heartbeat records coord's binding set for THIS process's storage
+/// dir (`QONTINUI_SECURE_STORAGE_DIR`, else the data-local default).
+pub fn coord_bound_tenants_path() -> Option<PathBuf> {
+    paired_user_path().map(|p| p.with_file_name("coord_bound_tenants.json"))
+}
+
+/// Record coord's echoed binding set (heartbeat-only writer). Returns whether
+/// the file was written. Best-effort for the caller: an `Err` means the count
+/// stays whatever the previous record (or its absence) says.
+pub fn record_coord_bound_tenants(coord_set: &[uuid::Uuid]) -> Result<bool, String> {
+    let path =
+        coord_bound_tenants_path().ok_or_else(|| "could not resolve data_local_dir".to_string())?;
+    record_coord_bound_tenants_at(&path, coord_set, chrono::Utc::now().timestamp())
+}
+
+pub(crate) fn record_coord_bound_tenants_at(
+    path: &std::path::Path,
+    coord_set: &[uuid::Uuid],
+    now_unix: i64,
+) -> Result<bool, String> {
+    let mut ids: Vec<String> = coord_set.iter().map(|t| t.to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    if let Some(existing) = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CoordBoundTenantsFile>(&b).ok())
+    {
+        let age = now_unix - existing.observed_at;
+        if existing.tenant_ids == ids && (0..COORD_BOUND_TENANTS_RESTAMP_SECS).contains(&age) {
+            return Ok(false);
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    let body = serde_json::to_vec_pretty(&CoordBoundTenantsFile {
+        tenant_ids: ids,
+        observed_at: now_unix,
+    })
+    .map_err(|e| format!("serialize coord_bound_tenants.json: {e}"))?;
+    // Its own tmp name: never the `json.tmp` `write_paired_user_file` uses.
+    let tmp = path.with_extension("json.coord-bound.tmp");
+    std::fs::write(&tmp, &body).map_err(|e| format!("write tmp: {e}"))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {e}"))?;
+    Ok(true)
+}
+
+/// How many tenants coord last said this device is bound to, or `None` when
+/// that is UNKNOWN: no record, an unreadable one, or one older than
+/// [`COORD_BOUND_TENANTS_MAX_AGE_SECS`] (or stamped implausibly far in the
+/// future). Only well-formed, distinct UUIDs count.
+pub fn coord_bound_tenant_count() -> Option<usize> {
+    coord_bound_tenant_count_at(&coord_bound_tenants_path()?, chrono::Utc::now().timestamp())
+}
+
+pub(crate) fn coord_bound_tenant_count_at(path: &std::path::Path, now_unix: i64) -> Option<usize> {
+    let file: CoordBoundTenantsFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let age = now_unix - file.observed_at;
+    if !(-300..=COORD_BOUND_TENANTS_MAX_AGE_SECS).contains(&age) {
+        return None;
+    }
+    Some(
+        file.tenant_ids
+            .iter()
+            .filter_map(|s| uuid::Uuid::parse_str(s.trim()).ok())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+    )
+}
+
 /// Reconcile the local binding state (`paired_user.json` v2 entries +
 /// per-tenant JWT slots) against coord's authoritative server-side
 /// binding set, as echoed in the register response's `tenant_ids` field
@@ -2756,6 +2864,100 @@ mod tests {
             before,
             "steady state must not rewrite the file"
         );
+    }
+
+    /// The sidecar round-trips a coord set larger than the local slots, does
+    /// not churn at steady state, restamps an unchanged set only past the
+    /// restamp window, and ages out to UNKNOWN.
+    #[test]
+    fn coord_bound_tenants_sidecar_records_counts_and_ages_out() {
+        let dir = temp_dir_for("coord_bound_sidecar");
+        let path = dir.join("coord_bound_tenants.json");
+        let t0 = 1_800_000_000;
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, t0),
+            None,
+            "absent is UNKNOWN"
+        );
+
+        assert!(record_coord_bound_tenants_at(&path, &[tc(), ta(), tb(), ta()], t0).unwrap());
+        assert_eq!(coord_bound_tenant_count_at(&path, t0), Some(3), "deduped");
+
+        let before = std::fs::read(&path).unwrap();
+        assert!(!record_coord_bound_tenants_at(&path, &[ta(), tb(), tc()], t0 + 30).unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "steady state writes nothing"
+        );
+
+        assert!(
+            record_coord_bound_tenants_at(
+                &path,
+                &[ta(), tb(), tc()],
+                t0 + COORD_BOUND_TENANTS_RESTAMP_SECS
+            )
+            .unwrap(),
+            "an unchanged set is restamped past the window"
+        );
+        assert!(record_coord_bound_tenants_at(
+            &path,
+            &[ta()],
+            t0 + COORD_BOUND_TENANTS_RESTAMP_SECS + 30
+        )
+        .unwrap());
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, t0 + COORD_BOUND_TENANTS_RESTAMP_SECS + 30),
+            Some(1),
+            "a shrink is recorded at once"
+        );
+
+        let stamp = t0 + COORD_BOUND_TENANTS_RESTAMP_SECS + 30;
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, stamp + COORD_BOUND_TENANTS_MAX_AGE_SECS + 1),
+            None,
+            "a stale record is UNKNOWN, never evidence"
+        );
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, stamp - 3600),
+            None,
+            "future stamp"
+        );
+
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, t0),
+            None,
+            "unreadable is UNKNOWN"
+        );
+        std::fs::write(
+            &path,
+            format!(r#"{{"tenant_ids":["{T_A}","junk","{T_A}"],"observed_at":{t0}}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            coord_bound_tenant_count_at(&path, t0),
+            Some(1),
+            "junk never inflates"
+        );
+    }
+
+    /// The sidecar never touches `paired_user.json` — the property that keeps
+    /// the heartbeat out of `persist_pairing`'s read-modify-write.
+    #[test]
+    fn coord_bound_sidecar_never_rewrites_the_binding_file() {
+        let dir = temp_dir_for("coord_bound_no_binding_write");
+        let mgr = test_mgr(&dir);
+        let paired = dir.join("paired_user.json");
+        persist_pairing_with(&mgr, &paired, &pair_resp("jwt.a.1"), ta()).unwrap();
+        let before = std::fs::read(&paired).unwrap();
+        record_coord_bound_tenants_at(
+            &paired.with_file_name("coord_bound_tenants.json"),
+            &[ta(), tb(), tc()],
+            1_800_000_000,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&paired).unwrap(), before);
     }
 
     /// Reconcile with NO local file: nothing to drop, coord-side

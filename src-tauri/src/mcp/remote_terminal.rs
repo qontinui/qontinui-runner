@@ -1986,11 +1986,28 @@ impl std::fmt::Display for AttachError {
     }
 }
 
+/// The refusal for a request made while no relay connection holds the
+/// outbound pump — the request was NOT sent.
+fn relay_not_connected(what: &str) -> AttachError {
+    AttachError {
+        code: "relay_unavailable".to_string(),
+        message: format!(
+            "this runner's relay is not connected — the {what} request was not sent; retry once \
+             the relay reconnects"
+        ),
+    }
+}
+
 type PendingAttach = oneshot::Sender<Result<AttachedReply, AttachError>>;
 type PendingCreate = oneshot::Sender<Result<CreatedReply, AttachError>>;
 
 /// The source side's routing table and outbound queue.
 pub struct RemoteAttachClient {
+    /// Bumped each time a relay connection takes the outbound pump, so a
+    /// reader can tell "the same connection" from "a different one that
+    /// happens to also be attached" across a window (see
+    /// [`Self::outbound_pump_state`]).
+    pump_generation: std::sync::atomic::AtomicU64,
     out_tx: mpsc::Sender<Value>,
     out_rx: tokio::sync::Mutex<mpsc::Receiver<Value>>,
     panes: Mutex<HashMap<String, Arc<RemotePaneIo>>>,
@@ -2007,6 +2024,45 @@ pub struct RemoteAttachClient {
     /// fell behind the target's, so the next reattach splice skipped the
     /// wrong prefix.
     pending_output: Mutex<HashMap<String, PendingOutput>>,
+}
+
+/// One relay connection's hold on the outbound queue, from
+/// [`RemoteAttachClient::lock_outbound`]. Derefs to the receiver; dropping it
+/// bumps the pump generation so the release is observable to
+/// [`RemoteAttachClient::outbound_pump_state`].
+pub struct OutboundPump<'a> {
+    /// `Some` for the pump's whole life; taken only in `drop`, so the lock
+    /// is released BEFORE the generation moves.
+    guard: Option<tokio::sync::MutexGuard<'a, mpsc::Receiver<Value>>>,
+    generation: &'a std::sync::atomic::AtomicU64,
+}
+
+impl std::ops::Deref for OutboundPump<'_> {
+    type Target = mpsc::Receiver<Value>;
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("outbound pump guard is held until drop")
+    }
+}
+
+impl std::ops::DerefMut for OutboundPump<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("outbound pump guard is held until drop")
+    }
+}
+
+impl Drop for OutboundPump<'_> {
+    fn drop(&mut self) {
+        // Free the lock first: a bump while it is still held would read as
+        // the SAME connection to a sample taken just after the next holder
+        // acquires it but before that holder bumps.
+        drop(self.guard.take());
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 static CLIENT: OnceLock<RemoteAttachClient> = OnceLock::new();
@@ -2026,6 +2082,7 @@ impl RemoteAttachClient {
     pub fn new() -> Self {
         let (out_tx, out_rx) = mpsc::channel(OUTBOUND_QUEUE);
         Self {
+            pump_generation: std::sync::atomic::AtomicU64::new(0),
             out_tx,
             out_rx: tokio::sync::Mutex::new(out_rx),
             panes: Mutex::new(HashMap::new()),
@@ -2048,8 +2105,38 @@ impl RemoteAttachClient {
     /// Exclusive access to the outbound queue for the life of one relay
     /// connection. The relay's pump holds the guard while it drains; when the
     /// connection ends the guard drops and the next connection takes over.
-    pub async fn lock_outbound(&self) -> tokio::sync::MutexGuard<'_, mpsc::Receiver<Value>> {
-        self.out_rx.lock().await
+    ///
+    /// The generation is bumped when a connection TAKES the pump and again
+    /// when it LETS GO (see [`OutboundPump`]), so a reading taken in the
+    /// instant between a new holder acquiring the lock and bumping the
+    /// counter still differs from one taken while the previous holder had it.
+    pub async fn lock_outbound(&self) -> OutboundPump<'_> {
+        let guard = self.out_rx.lock().await;
+        self.pump_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        OutboundPump {
+            guard: Some(guard),
+            generation: &self.pump_generation,
+        }
+    }
+
+    /// `(attached, generation)`: whether a relay connection currently holds
+    /// the outbound pump — i.e. a frame queued now is drained onto a socket —
+    /// plus which connection took it most recently. `false` means no
+    /// connection holds it: a queued frame waits and is discarded by
+    /// [`Self::discard_backlog`] when the next connection starts. The pump is
+    /// the only holder of this lock ([`Self::lock_outbound`]), so a failed
+    /// `try_lock` is the pump, never a contender. Two readings that differ in
+    /// either half bracket a window in which the connection changed.
+    /// `attached` means a connection HOLDS the pump, not that its socket is
+    /// alive: a half-open socket still holds it until its write fails.
+    pub fn outbound_pump_state(&self) -> (bool, u64) {
+        let attached = self.out_rx.try_lock().is_err();
+        (
+            attached,
+            self.pump_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Drop every frame queued before this connection existed. The backend
@@ -2152,10 +2239,22 @@ impl RemoteAttachClient {
         rows: u16,
         timeout: Duration,
     ) -> Result<AttachedReply, AttachError> {
+        // No relay connection holds the outbound pump: a frame queued now is
+        // discarded by the next connection's `discard_backlog`, so waiting out
+        // the timeout would only end in blaming the target for a request that
+        // never left this machine.
+        //
+        // The waiter is registered BEFORE the check: the pump lock is always
+        // released before `on_relay_disconnected` drains `pending`, so either
+        // that drain settles this waiter or this check sees the pump unheld.
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending.lock() {
             pending.insert(request_id.clone(), tx);
+        }
+        if !self.outbound_pump_state().0 {
+            self.take_pending(&request_id);
+            return Err(relay_not_connected("attach"));
         }
         let frame = json!({
             "type": "remote_terminal_attach",
@@ -2219,10 +2318,16 @@ impl RemoteAttachClient {
         intent_repo: Option<&str>,
         timeout: Duration,
     ) -> Result<CreatedReply, AttachError> {
+        // See `attach`: an unheld pump means the frame would never be sent.
+        // Registered before the check, for the reason `attach` gives.
         let request_id = Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         if let Ok(mut pending) = self.pending_create.lock() {
             pending.insert(request_id.clone(), tx);
+        }
+        if !self.outbound_pump_state().0 {
+            self.take_pending_create(&request_id);
+            return Err(relay_not_connected("create"));
         }
         let mut frame = json!({
             "type": "remote_terminal_create",
@@ -2340,6 +2445,31 @@ impl RemoteAttachClient {
                           grant is spent whether or not the target spawned a terminal; retry \
                           mints a new one"
                     .to_string(),
+            }));
+        }
+        // The same for an ATTACH still waiting for its first reply: the relay
+        // released the attachment with the socket and the reply can never
+        // arrive on a new one, so a "timeout" 20 s from now would mean nothing.
+        // Settling it here is what lets a timeout mean "the target never
+        // answered" (plan
+        // `2026-09-17-remote-attach-to-a-pre-feature-target-times-out-silently`).
+        // History requests share this map (`history:` keys) and are settled
+        // too, with their own wording.
+        let stranded_attaches: Vec<(String, PendingAttach)> = self
+            .pending
+            .lock()
+            .map(|mut p| p.drain().collect())
+            .unwrap_or_default();
+        for (rid, tx) in stranded_attaches {
+            let message = if rid.starts_with(HISTORY_PREFIX) {
+                "the relay connection dropped before the target answered the history request"
+            } else {
+                "the relay connection dropped before the target answered the attach — retry mints \
+                 a new grant"
+            };
+            let _ = tx.send(Err(AttachError {
+                code: "relay_disconnected".to_string(),
+                message: message.to_string(),
             }));
         }
         let panes: Vec<Arc<RemotePaneIo>> = self
@@ -2744,6 +2874,27 @@ mod tests {
     use super::*;
     use crate::terminal::pane_io::PaneIo;
     use std::sync::Mutex as StdMutex;
+
+    /// Plan 2026-09-16 Phase 1: the pump state reads "attached" exactly while
+    /// a connection holds `lock_outbound`, and a new connection bumps the
+    /// generation so a close spanning a reconnect is detectable.
+    #[tokio::test]
+    async fn outbound_pump_state_tracks_the_connection_holding_the_pump() {
+        let client = RemoteAttachClient::new();
+        let (attached, g0) = client.outbound_pump_state();
+        assert!(!attached);
+        {
+            let _pump = client.lock_outbound().await;
+            let (attached, g1) = client.outbound_pump_state();
+            assert!(attached);
+            assert_eq!(g1, g0 + 1);
+        }
+        // Letting go bumps it too, so take-then-release is never mistaken
+        // for the same connection still holding the pump.
+        assert_eq!(client.outbound_pump_state(), (false, g0 + 2));
+        let _next = client.lock_outbound().await;
+        assert_eq!(client.outbound_pump_state(), (true, g0 + 3));
+    }
 
     const NOW: u64 = 1_700_000_000;
 
@@ -3421,6 +3572,8 @@ mod tests {
     #[tokio::test]
     async fn attach_round_trips_through_the_outbound_queue() {
         let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let mut pump = client.lock_outbound().await;
         let fut = client.attach("grant.jwt", 120, 40, Duration::from_secs(5));
         tokio::pin!(fut);
         // Poll once so the frame is queued and the pending entry registered.
@@ -3428,11 +3581,7 @@ mod tests {
             futures_util::poll!(fut.as_mut()).is_pending(),
             "attach must wait for the reply"
         );
-        let frame = client
-            .lock_outbound()
-            .await
-            .try_recv()
-            .expect("the attach frame was queued");
+        let frame = pump.try_recv().expect("the attach frame was queued");
         assert_eq!(frame["type"], "remote_terminal_attach");
         assert_eq!(frame["grant"], "grant.jwt");
         assert_eq!(frame["cols"], 120);
@@ -3457,6 +3606,8 @@ mod tests {
     #[tokio::test]
     async fn attach_refusals_resolve_with_typed_codes() {
         let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let mut pump = client.lock_outbound().await;
         for (msg_type, code) in [
             ("error", "attach_grant_wrong_source"),
             ("remote_terminal_error", "session_not_local"),
@@ -3464,7 +3615,7 @@ mod tests {
             let fut = client.attach("g", 80, 24, Duration::from_secs(5));
             tokio::pin!(fut);
             assert!(futures_util::poll!(fut.as_mut()).is_pending());
-            let frame = client.lock_outbound().await.try_recv().unwrap();
+            let frame = pump.try_recv().unwrap();
             let rid = frame["request_id"].as_str().unwrap().to_string();
             assert!(client.handle_inbound(
                 msg_type,
@@ -3479,9 +3630,46 @@ mod tests {
         );
     }
 
+    /// With no relay connection holding the pump, attach and create refuse at
+    /// once as `relay_unavailable` — nothing was sent, nothing is left pending.
+    #[tokio::test]
+    async fn attach_and_create_refuse_immediately_when_no_relay_holds_the_pump() {
+        let client = RemoteAttachClient::new();
+        let err = client
+            .attach("g", 80, 24, Duration::from_secs(60))
+            .await
+            .expect_err("no relay");
+        assert_eq!(err.code, "relay_unavailable");
+        assert!(client.pending.lock().unwrap().is_empty());
+        let err = client
+            .create("g", 80, 24, None, None, None, Duration::from_secs(60))
+            .await
+            .expect_err("no relay");
+        assert_eq!(err.code, "relay_unavailable");
+        assert!(client.pending_create.lock().unwrap().is_empty());
+    }
+
+    /// A relay drop settles an attach still waiting for its reply, so the
+    /// attach timeout is left meaning only "the target never answered".
+    #[tokio::test]
+    async fn a_relay_drop_settles_a_pending_attach_as_relay_disconnected() {
+        let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let _pump = client.lock_outbound().await;
+        let fut = client.attach("g", 80, 24, Duration::from_secs(60));
+        tokio::pin!(fut);
+        assert!(futures_util::poll!(fut.as_mut()).is_pending());
+        client.on_relay_disconnected();
+        let err = fut.await.expect_err("settled by the drop");
+        assert_eq!(err.code, "relay_disconnected");
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn attach_times_out_with_a_typed_error_and_clears_the_pending_slot() {
         let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let _pump = client.lock_outbound().await;
         let err = client
             .attach("g", 80, 24, Duration::from_millis(50))
             .await
@@ -3822,10 +4010,12 @@ mod tests {
     #[tokio::test]
     async fn output_delivered_before_register_pane_is_readable_after_it() {
         let client = RemoteAttachClient::new();
+        // A relay connection holds the pump, as it does in production.
+        let mut pump = client.lock_outbound().await;
         let fut = client.attach("grant.jwt", 80, 24, Duration::from_secs(5));
         tokio::pin!(fut);
         assert!(futures_util::poll!(fut.as_mut()).is_pending());
-        let frame = client.lock_outbound().await.try_recv().unwrap();
+        let frame = pump.try_recv().unwrap();
         let rid = frame["request_id"].as_str().unwrap().to_string();
 
         // Before the reply: no slot, the frame is dropped as before (it is

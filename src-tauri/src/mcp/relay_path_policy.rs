@@ -366,7 +366,7 @@ pub fn relay_path_verdict(method: &str, raw_path: &str) -> RelayPathVerdict {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ------------------------------------------------------------------
@@ -719,7 +719,10 @@ mod tests {
     /// only makes this tripwire accept an allowlist entry it should have
     /// questioned; a false NEGATIVE would fail a correct entry, which is the
     /// error worth avoiding in a test nobody can debug at 2am.
-    fn registered_routes() -> std::collections::HashSet<(String, String)> {
+    ///
+    /// `pub(crate)` so `mcp::origin_guard`'s allowlist tripwires reuse this
+    /// one enumerator rather than growing a second.
+    pub(crate) fn registered_routes() -> std::collections::HashSet<(String, String)> {
         const VERBS: &[&str] = &[
             "get", "post", "put", "patch", "delete", "head", "options", "any",
         ];

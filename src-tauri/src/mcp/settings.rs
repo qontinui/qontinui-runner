@@ -1006,6 +1006,72 @@ async fn save_claude_config_dirs_setting(
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowedOriginsPayload {
+    /// Exact browser origins (`scheme://host[:port]`) admitted as the
+    /// `trusted` class by `mcp::origin_guard`.
+    pub origins: Vec<String>,
+}
+
+/// GET /settings/api/allowed-origins
+async fn get_allowed_origins_setting() -> Json<ApiResponse<serde_json::Value>> {
+    let origins = spawn_blocking_tracked(|| {
+        settings::read_settings_from_disk()
+            .settings
+            .api
+            .allowed_origins
+    })
+    .await
+    .unwrap_or_default();
+    Json(ApiResponse::success(serde_json::json!({
+        "origins": origins,
+        "defaults": crate::mcp::origin_guard::DEFAULT_TRUSTED_ORIGINS,
+        "envVar": crate::mcp::origin_guard::ENV_ALLOWED_ORIGINS,
+    })))
+}
+
+/// PUT /settings/api/allowed-origins — validated and canonicalised; live
+/// within ~2 s (the guard's read TTL), no restart. A credential door in `mcp::origin_guard`, so
+/// only the runner's own webview and non-browser callers can change it.
+async fn save_allowed_origins_setting(
+    Json(payload): Json<AllowedOriginsPayload>,
+) -> Result<Json<ApiResponse<AllowedOriginsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut origins = Vec::new();
+    for raw in &payload.origins {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let o = crate::mcp::origin_guard::canonical_allowed_origin(raw)
+            .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, Json(api_error(e))))?;
+        if !origins.contains(&o) {
+            origins.push(o);
+        }
+    }
+    let to_save = origins.clone();
+    let result = spawn_blocking_tracked(move || {
+        settings::update_settings(move |s| s.api.allowed_origins = to_save)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Task failed: {}", e))),
+        )
+    })?;
+    match result {
+        Ok(()) => {
+            info!(
+                count = origins.len(),
+                "Saved allowed browser origins via HTTP"
+            );
+            Ok(Json(ApiResponse::success(AllowedOriginsPayload {
+                origins,
+            })))
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
 /// GET /settings/discovery-ports
 async fn get_discovery_ports_setting(
 ) -> Result<Json<ApiResponse<DiscoveryPortsPayload>>, (StatusCode, Json<ApiResponse<()>>)> {
@@ -1185,6 +1251,12 @@ pub fn routes() -> Router<Arc<ApiState>> {
         )
         // Accessibility settings
         .route("/settings/accessibility", get(get_accessibility_settings))
+        // Browser origins the loopback API admits as `trusted`
+        // (`mcp::origin_guard`; re-read per request, no restart).
+        .route(
+            "/settings/api/allowed-origins",
+            get(get_allowed_origins_setting).put(save_allowed_origins_setting),
+        )
         // UI Bridge discovery — user-configurable port list
         .route(
             "/settings/discovery-ports",

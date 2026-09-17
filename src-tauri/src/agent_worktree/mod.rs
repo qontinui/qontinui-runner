@@ -628,6 +628,18 @@ async fn heartbeat_loop<F>(
                     on_stolen(current_holder);
                     return;
                 }
+                Ok(HeartbeatTickOutcome::NotHeld) => {
+                    warn!(
+                        "claim-heartbeat: claim lapsed (expired, nobody holds it) kind={kind_owned} key={resource_clone} — re-acquire before further work"
+                    );
+                    // `on_stolen` is the "we no longer hold this claim" callback,
+                    // and it already received `None` for this case while coord
+                    // spelled an expiry `stolen` with a null holder — so passing
+                    // `None` here keeps every consumer's behaviour identical
+                    // across the wire change.
+                    on_stolen(None);
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         "claim-heartbeat: tick failed kind={kind_owned} key={resource_clone}: {e}"
@@ -640,7 +652,13 @@ async fn heartbeat_loop<F>(
 
 enum HeartbeatTickOutcome {
     Ok,
-    Stolen { current_holder: Option<String> },
+    Stolen {
+        current_holder: Option<String>,
+    },
+    /// The claim EXPIRED or was never held: coord says nobody holds it. We no
+    /// longer hold it either, so the task stops exactly as it does on `Stolen`
+    /// — the difference is that no rival is named.
+    NotHeld,
 }
 
 async fn heartbeat_once(
@@ -694,6 +712,12 @@ async fn heartbeat_once(
                 .map(|s| s.to_string());
             Ok(HeartbeatTickOutcome::Stolen { current_holder: h })
         }
+        // An expired or absent claim — coord's own verdict, not a transport
+        // fault. It MUST NOT fall to the `Err` arm below: that arm only warns
+        // and loops, so the task would beat a dead claim forever and never run
+        // `on_stolen`. Plan
+        // `2026-09-15-coord-claims-heartbeat-answers-an-expired-claim-as-stolen-with-no-holder`.
+        Some("not_held") => Ok(HeartbeatTickOutcome::NotHeld),
         _ => Err(format!("heartbeat: unexpected body: {body_text}")),
     }
 }
@@ -1566,6 +1590,16 @@ pub async fn allocate_and_materialize_with_claim(
     // path as the materialized cwd. A real branch, never a silent
     // worktree fallthrough.
     if matches!(isolation, Isolation::SharedBranch) {
+        // A repo outside the workspace root is never switched in place: its
+        // checkout is the operator's own tree, on no managed repo's
+        // `.git/info/exclude` roster, so the session's `.mcp.json` nonce and
+        // provisioned `.claude/` would land untracked in it. Refused BEFORE any
+        // lease or branch switch, so nothing needs putting back. Plan
+        // `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`.
+        if let Some(refusal) = shared_branch_foreign_refusal(repos) {
+            release_all_claims_best_effort(coord_http_base, machine_id, &active_claims).await;
+            return Err(AllocateError::Other(refusal));
+        }
         // Ξ_Worktree Phase 7.5b — BEFORE switching any canonical checkout's
         // branch, acquire an exclusive `canonical_checkout` lease per repo so
         // coord's already-deployed Rule-2 P3 probe (`load_canonical_lease_claim`,
@@ -1862,6 +1896,25 @@ pub async fn allocate_and_materialize_with_claim(
         token_exp: coord_resp.token_exp.unwrap_or(0),
         active_claims,
     }))
+}
+
+/// `Some(refusal)` when a `shared_branch` answer would switch the checkout of a
+/// repo owned by anyone but `qontinui` — see the shared-branch arm of
+/// [`allocate_and_materialize_with_claim`]. Keyed on the REQUESTED slugs, which
+/// carry the owner; coord's rows may name a bare repo.
+fn shared_branch_foreign_refusal(repos: &[RepoRequest]) -> Option<String> {
+    let foreign: Vec<&str> = repos
+        .iter()
+        .map(|r| r.repo.as_str())
+        .filter(|r| canonical_paths::has_foreign_owner(r))
+        .collect();
+    (!foreign.is_empty()).then(|| {
+        format!(
+            "no_isolated_worktree: coord chose shared_branch for {}, which would switch a \
+             checkout outside the workspace root in place; refused before any branch switch",
+            foreign.join(", ")
+        )
+    })
 }
 
 /// The rows of a `shared_branch` allocation that the runner places: every row
@@ -2636,6 +2689,26 @@ mod tests {
             allocate_tenant_scope(TenantScope::Owned(a), Some(b)),
             TenantScope::Owned(a)
         );
+    }
+
+    #[test]
+    fn shared_branch_is_refused_for_a_foreign_repo_only() {
+        let req = |r: &str| RepoRequest {
+            repo: r.to_string(),
+            parent_sha: None,
+        };
+        assert_eq!(
+            shared_branch_foreign_refusal(&[req("qontinui/qontinui-runner"), req("qontinui-web")]),
+            None
+        );
+        let refusal = shared_branch_foreign_refusal(&[
+            req("qontinui/qontinui-runner"),
+            req("portofino-pizzeria/backend"),
+        ])
+        .expect("a foreign repo refuses");
+        assert!(refusal.starts_with("no_isolated_worktree: "), "{refusal}");
+        assert!(refusal.contains("portofino-pizzeria/backend"), "{refusal}");
+        assert!(!refusal.contains("qontinui/qontinui-runner"), "{refusal}");
     }
 
     #[test]

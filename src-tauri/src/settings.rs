@@ -1122,6 +1122,25 @@ pub struct PathSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
 
+    /// Where a repo that does NOT live under the workspace root is checked out
+    /// on THIS device, keyed by its coord slug (`owner/name`, matched
+    /// case-insensitively), e.g.
+    /// `"portofino-pizzeria/mobile": "D:/portofino-pizzeria/mobile"`.
+    ///
+    /// Default (when empty): nothing mapped. A repo owned by anyone other than
+    /// `qontinui` is then looked for at `<parent-of-workspace-root>/<owner>/<name>`
+    /// and finally at `<workspace-root>/<name>`; `qontinui/*` repos always use
+    /// `<workspace-root>/<name>` and never read this map. Resolution:
+    /// `agent_worktree::canonical_paths`. Plan
+    /// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`.
+    ///
+    /// Re-read on every resolution, so a change made in the Paths settings
+    /// section applies to the next spawn with no runner restart. An entry is
+    /// the operator's assertion: it is used whenever it is a git checkout, with
+    /// no check of its `origin` remote.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub repo_checkouts: std::collections::BTreeMap<String, String>,
+
     /// When true, enforce workspace-scoped working directory resolution globally.
     /// Steps cannot resolve paths outside the workspace root.
     /// Default: false (permissive). Individual workflows can override via `strict_cwd`.
@@ -1227,6 +1246,12 @@ mod path_settings_tests {
             plans_archive_dir: Some("/w/dev-notes/plans".to_string()),
             prompts_dir: Some("/w/prompts".to_string()),
             workspace_root: Some("/w".to_string()),
+            repo_checkouts: [(
+                "portofino-pizzeria/mobile".to_string(),
+                "/elsewhere/mobile".to_string(),
+            )]
+            .into_iter()
+            .collect(),
             strict_mode: false,
         };
 
@@ -1239,6 +1264,13 @@ mod path_settings_tests {
             Some("/w/dev-notes/plans")
         );
         assert_eq!(parsed.prompts_dir.as_deref(), Some("/w/prompts"));
+        assert_eq!(
+            parsed
+                .repo_checkouts
+                .get("portofino-pizzeria/mobile")
+                .map(String::as_str),
+            Some("/elsewhere/mobile")
+        );
         assert_eq!(parsed.dev_logs_dir.as_deref(), Some("/w/.dev-logs"));
         assert_eq!(parsed.workspace_root.as_deref(), Some("/w"));
     }
@@ -3059,6 +3091,33 @@ pub struct Settings {
     /// change is live for the next run with no restart.
     #[serde(default)]
     pub cost_budget: crate::cost_management::budget::TokenBudget,
+    /// The loopback HTTP API's browser-origin surface (plan
+    /// `2026-09-17-runner-loopback-api-accepts-any-origin` Phase 3). Re-read
+    /// by `mcp::origin_guard` with a ~2 s TTL, so a change is live with no
+    /// runner restart.
+    #[serde(default)]
+    pub api: ApiSettings,
+}
+
+/// Settings → Runner → "Allowed browser origins".
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiSettings {
+    /// Extra browser origins (`scheme://host[:port]`) admitted as the
+    /// `trusted` class by `mcp::origin_guard` — the settings twin of
+    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. Trusted means local trust for
+    /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
+    /// checks) and never the credential doors (secrets, caller-named paths,
+    /// caller-directed requests, process execution). Origins listed HERE never
+    /// get a door. Only the four built-in default dev origins
+    /// (`http://localhost:3001`, `http://127.0.0.1:3001`,
+    /// `http://localhost:9875`, `http://127.0.0.1:9875`) currently retain the
+    /// graced doors — including local
+    /// command execution and file reads — until qontinui-web #1380 deploys
+    /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
+    /// software trusted like the runner. Agents and scripts send no
+    /// `Origin` and need no entry.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 fn default_session_metadata_sync_enabled() -> bool {

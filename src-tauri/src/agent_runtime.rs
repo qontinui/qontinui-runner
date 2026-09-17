@@ -4743,7 +4743,8 @@ async fn run_gate_continuation_inner(
     // terminal session (see below), so the heartbeat lives for the visible
     // session's lifetime and releases when the operator closes the terminal —
     // the visible session keeps the SAME claim bookkeeping the headless path
-    // has. `None` (worktree mode off / acquire declined) → canonical checkout.
+    // has. `None` (worktree mode off / acquire declined) → the verified
+    // fallback cwd, or a refusal when the repo has no checkout here.
     let intent = payload
         .anchor_key
         .as_deref()
@@ -4781,7 +4782,9 @@ async fn run_gate_continuation_inner(
                     gate_id,
                     device_id,
                     ContinuationOutcome::SpawnFailed,
-                    Some(first_line(&format!("worktree acquisition failed: {e}"))),
+                    Some(first_line(&continuation_acquire_failure_detail(
+                        &e.to_string(),
+                    ))),
                 )
                 .await;
             }
@@ -6006,11 +6009,12 @@ async fn run_condition_check_terminal(
 ///   the held `IsolatedEditContext` (keeps the claim heartbeat alive), and the
 ///   coord-allocated agent_id (parsed to a UUID; a fresh UUID if coord returned
 ///   a non-UUID id, used only for lifecycle correlation).
-/// - Worktree mode OFF / acquire declined / `repos` empty → the canonical
-///   checkout of the first repo (or `QONTINUI_ROOT`), `None` context, and a
-///   fresh correlation UUID. The continuation still runs, just without
-///   per-agent isolation — the same graceful degrade `acquire_for_terminal`
-///   uses.
+/// - Worktree mode OFF / acquire declined / `repos` empty → the cwd
+///   [`continuation_fallback_workdir`] picks (the workspace root when the
+///   repo's verified checkout is under it, else that checkout), `None`
+///   context, and a fresh correlation UUID; `Err` with a
+///   `workdir_not_a_checkout` detail when the repo has no verified checkout on
+///   this device.
 /// Derive a stable per-session UUID discriminator for a gate continuation's
 /// worktree claims (Phase 1b, plan
 /// 2026-06-06-session-scoped-multi-repo-workspace-coordination).
@@ -6050,8 +6054,10 @@ async fn acquire_continuation_workdir(
 )> {
     use crate::agent_worktree::isolated_edit::{acquire, AcquireRequest};
 
+    // Why no worktree came back, carried into a foreign repo's refusal.
+    let mut no_worktree_because = String::new();
     if !repos.is_empty() {
-        match acquire(AcquireRequest {
+        let acquired = acquire(AcquireRequest {
             repos,
             intent: Some(intent),
             declared_overlap_paths: None,
@@ -6064,33 +6070,27 @@ async fn acquire_continuation_workdir(
             // tenant, and its session id resolves its own.
             spawn_tenant: None,
         })
-        .await
-        {
-            Ok(Some(ctx)) => {
-                let workdir = ctx
-                    .worktrees
-                    .first()
-                    .map(|w| w.worktree_path.to_string_lossy().to_string())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("gate-continuation: acquire returned no worktrees")
-                    })?;
-                // coord's agent_id is canonically a UUID; if it isn't, fall back
-                // to a fresh one for lifecycle correlation only.
-                let agent_id =
-                    uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
-                return Ok((workdir, Some(ctx), agent_id));
+        .await;
+        let ctx = match settle_continuation_acquire(acquired) {
+            Ok(ctx) => Some(ctx),
+            Err(because) => {
+                no_worktree_because = because;
+                None
             }
-            Ok(None) => {
-                debug!(
-                    "agent_runtime: gate-continuation worktree mode off — using canonical checkout"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "agent_runtime: gate-continuation acquire failed ({e}); \
-                     falling back to canonical checkout"
-                );
-            }
+        };
+        if let Some(ctx) = ctx {
+            let workdir = ctx
+                .worktrees
+                .first()
+                .map(|w| w.worktree_path.to_string_lossy().to_string())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("gate-continuation: acquire returned no worktrees")
+                })?;
+            // coord's agent_id is canonically a UUID; if it isn't, fall back
+            // to a fresh one for lifecycle correlation only.
+            let agent_id =
+                uuid::Uuid::parse_str(&ctx.agent_id).unwrap_or_else(|_| uuid::Uuid::now_v7());
+            return Ok((workdir, Some(ctx), agent_id));
         }
     }
 
@@ -6134,32 +6134,137 @@ async fn acquire_continuation_workdir(
     // Extracted into a pure resolver for the reason `headless_continuation_bound_port`
     // right below states: a priority order expressed as a literal at a call site
     // is untestable, and this one is a behaviour change worth pinning.
+    //
+    // **A continuation never runs where its repo is not** (plan
+    // `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`,
+    // Phase 2). The root is only a sane cwd for a repo checked out UNDER it; a
+    // tenant's own repo lives elsewhere, and landing it at the root (or, before
+    // the root-first order, in a directory `<root>/<name>` that provisioning then
+    // created) reported `spawned` for a session with no repo in reach. So the
+    // repo's checkout is VERIFIED first, and a continuation with none is
+    // refused here — before coord-mcp or command provisioning can create
+    // anything — with the `workdir_not_a_checkout` detail the caller posts as
+    // the gate's `spawn_failed` outcome.
     let workdir = continuation_fallback_workdir(
         qontinui_root_dir(),
         repos,
+        crate::agent_worktree::canonical_paths::has_foreign_owner,
         crate::agent_worktree::canonical_paths::default_canonical_path,
+        crate::agent_worktree::canonical_paths::resolve_checkout,
+        &no_worktree_because,
     )
-    .ok_or_else(|| {
-        anyhow::anyhow!("gate-continuation: no QONTINUI_ROOT or canonical checkout resolved")
-    })?;
+    // Unprefixed: the refusal's detail must START with its stable token.
+    .map_err(|e| anyhow::anyhow!(e))?;
     Ok((workdir, None, uuid::Uuid::now_v7()))
 }
 
-/// Pure core of the Phase-3 fallback order: the workspace root, else the
-/// canonical checkout of the first repo, else nothing.
+/// The `spawn_failed` detail posted for a continuation whose cwd could not be
+/// acquired. A typed refusal (`workdir_not_a_checkout`, `no_isolated_worktree`)
+/// is posted verbatim so its token
+/// LEADS the line coord stores (coord keeps the first line, truncated); every
+/// other failure keeps its historical prefix.
+fn continuation_acquire_failure_detail(err: &str) -> String {
+    if err.starts_with(crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT)
+        || err.starts_with(NO_ISOLATED_WORKTREE)
+    {
+        err.to_string()
+    } else {
+        format!("worktree acquisition failed: {err}")
+    }
+}
+
+/// Settle the worktree acquire for a gate continuation: the context when one was
+/// materialized, else `Err(why)` — the fallback is taken and `why` is carried
+/// into a foreign repo's refusal.
 ///
-/// Both resolvers are INJECTED so the order is asserted against synthetic paths
+/// **A held worktree claim falls through; it never waits** (plan
+/// `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`,
+/// Phase 3). The holder is typically a sibling continuation for another PR of
+/// the same repo, and its claim heartbeat is owned by that session's terminal
+/// for the session's whole life — released when the operator closes it, hours
+/// later, not seconds. Waiting would stall this continuation for that long; the
+/// fallback keeps a `qontinui/*` repo's root-first order and refuses a foreign
+/// repo with a typed reason.
+fn settle_continuation_acquire<C>(
+    acquired: Result<Option<C>, crate::agent_worktree::AllocateError>,
+) -> Result<C, String> {
+    match acquired {
+        Ok(Some(ctx)) => Ok(ctx),
+        Ok(None) => {
+            debug!("agent_runtime: gate-continuation worktree mode off — using the fallback cwd");
+            Err("worktree mode is off or the acquire was declined".to_string())
+        }
+        Err(e) => {
+            warn!(
+                "agent_runtime: gate-continuation acquire failed ({e}); \
+                 taking the fallback cwd"
+            );
+            Err(format!("worktree acquire failed: {e}"))
+        }
+    }
+}
+
+/// The leading token of a foreign-repo continuation refused because it got no
+/// worktree of its own. Stable, like
+/// [`crate::agent_worktree::canonical_paths::WORKDIR_NOT_A_CHECKOUT`].
+const NO_ISOLATED_WORKTREE: &str = "no_isolated_worktree";
+
+/// Pure core of the continuation fallback cwd — reached only when no worktree
+/// was acquired.
+///
+/// - no repos → the workspace root, else `Err`;
+/// - a `qontinui/*` or bare-slug repo → EXACTLY the pre-existing order: the
+///   workspace root (Phase 3 of
+///   `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions` — the trusted,
+///   non-shared cwd), else its canonical checkout, else `Err`. Unverified on
+///   purpose: a fork-origin clone or a box holding a subset of the repos must
+///   keep working as it did;
+/// - a repo with any other owner whose VERIFIED checkout is under the root →
+///   the root, as above;
+/// - one whose verified checkout is elsewhere → `Err` `no_isolated_worktree`.
+///   There is no safe cwd left: the checkout itself is a shared tree that may
+///   hold a peer's WIP and is not in any managed repo's `.git/info/exclude`
+///   roster (so the session's `.mcp.json` nonce and provisioned `.claude/`
+///   would land untracked in the operator's repo), and any directory above it
+///   is not the operator's to write `.claude/` and `.mcp.json` into — it may be
+///   their home directory;
+/// - no verified checkout at all → `Err` with the resolver's
+///   `workdir_not_a_checkout` detail.
+///
+/// Every resolver is INJECTED so the order is asserted against synthetic paths
 /// rather than against whatever this machine happens to have on disk.
-fn continuation_fallback_workdir(
+fn continuation_fallback_workdir<E: std::fmt::Display>(
     root: Option<std::path::PathBuf>,
     repos: &[String],
+    foreign_owner: impl Fn(&str) -> bool,
     canonical: impl Fn(&str) -> Result<std::path::PathBuf, String>,
-) -> Option<String> {
-    root.map(|p| p.to_string_lossy().to_string()).or_else(|| {
-        repos
-            .first()
-            .and_then(|r| canonical(r).ok().map(|p| p.to_string_lossy().to_string()))
-    })
+    resolve_checkout: impl Fn(&str) -> Result<std::path::PathBuf, E>,
+    no_worktree_because: &str,
+) -> Result<String, String> {
+    let lossy = |p: &std::path::Path| p.to_string_lossy().to_string();
+    let Some(repo) = repos.first() else {
+        return root
+            .map(|p| lossy(&p))
+            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+    };
+    if !foreign_owner(repo) {
+        return root
+            .map(|p| lossy(&p))
+            .or_else(|| canonical(repo).ok().map(|p| lossy(&p)))
+            .ok_or_else(|| "no QONTINUI_ROOT or canonical checkout resolved".to_string());
+    }
+    let checkout = resolve_checkout(repo).map_err(|e| e.to_string())?;
+    match root {
+        Some(root) if crate::agent_worktree::canonical_paths::path_is_within(&root, &checkout) => {
+            Ok(lossy(&root))
+        }
+        _ => Err(format!(
+            "{NO_ISOLATED_WORKTREE}: {repo} is checked out outside the workspace root at {}, \
+             no worktree was acquired, and a session is not started in that shared \
+             checkout; cause: {no_worktree_because}",
+            checkout.display()
+        )),
+    }
 }
 
 /// The `bound_port` argument the headless gate continuation hands to coord-mcp
@@ -11092,40 +11197,172 @@ mod tests {
     }
 
     /// Phase 3 of `2026-08-20-worktree-spawn-autonomy-and-trust-preconditions`:
-    /// a non-worktree continuation with no cwd argument lands at the WORKSPACE
-    /// ROOT, not at the canonical checkout of its first repo. That is the
-    /// phase's whole gate, and before this the order was the other way round.
+    /// a non-worktree `qontinui/*` continuation lands at the WORKSPACE ROOT, not
+    /// at the canonical checkout of its first repo — and, since the resolver for
+    /// foreign repos landed, WITHOUT any verification of that checkout (review
+    /// round 1: a fork-origin clone or a subset box must not start refusing).
     #[test]
-    fn a_non_worktree_continuation_defaults_to_the_workspace_root() {
+    fn a_qontinui_continuation_keeps_the_root_first_order_unverified() {
         let root = std::path::PathBuf::from("D:/qontinui-root");
-        let repos = vec!["qontinui-runner".to_string()];
-        let canonical = |r: &str| Ok(std::path::PathBuf::from(format!("D:/qontinui-root/{r}")));
+        let repos = vec!["qontinui/qontinui-runner".to_string()];
+        let canonical = |r: &str| {
+            Ok(std::path::PathBuf::from(format!(
+                "D:/qontinui-root/{}",
+                r.rsplit('/').next().unwrap()
+            )))
+        };
+        let refuse = |_: &str| Err::<std::path::PathBuf, _>("verification must not run");
+        let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
 
         assert_eq!(
-            continuation_fallback_workdir(Some(root.clone()), &repos, canonical),
-            Some("D:/qontinui-root".to_string()),
-            "the root wins over the first repo's canonical checkout"
+            continuation_fallback_workdir(
+                Some(root.clone()),
+                &repos,
+                foreign,
+                canonical,
+                refuse,
+                "off"
+            ),
+            Ok("D:/qontinui-root".to_string()),
+            "the root wins, and a failing verifier is never consulted"
         );
-        // With no repos at all it is still the root — the previous order could
-        // only reach the root through an `or_else`, so this arm used to depend
-        // on the canonical resolver failing.
         assert_eq!(
-            continuation_fallback_workdir(Some(root), &[], canonical),
-            Some("D:/qontinui-root".to_string())
+            continuation_fallback_workdir(Some(root), &[], foreign, canonical, refuse, "off"),
+            Ok("D:/qontinui-root".to_string())
         );
-        // The canonical checkout survives as the LAST resort, not as the first
-        // choice: on a box where the workspace root does not resolve it still
-        // beats refusing the continuation.
+        // No root: the canonical checkout survives as the last resort.
         assert_eq!(
-            continuation_fallback_workdir(None, &repos, canonical),
-            Some("D:/qontinui-root/qontinui-runner".to_string())
+            continuation_fallback_workdir(None, &repos, foreign, canonical, refuse, "off"),
+            Ok("D:/qontinui-root/qontinui-runner".to_string())
         );
-        // Neither resolves → the caller raises, rather than inventing a cwd.
+        assert!(continuation_fallback_workdir(
+            None,
+            &repos,
+            foreign,
+            |_: &str| Err("no root".to_string()),
+            refuse,
+            "off"
+        )
+        .is_err());
+        assert!(
+            continuation_fallback_workdir(None, &[], foreign, canonical, refuse, "off").is_err()
+        );
+    }
+
+    /// Plan `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`,
+    /// Phase 2, the measured occurrences: a continuation for
+    /// `portofino-pizzeria/backend` spawned at the workspace root, where the
+    /// repo is not. With no worktree of its own there is no safe cwd (review
+    /// round 2: the checkout is a shared, unexcluded tree and its parent may be
+    /// `$HOME`), so it is refused with a typed reason naming why no worktree
+    /// came back.
+    #[test]
+    fn a_foreign_repo_without_a_worktree_is_refused_not_placed() {
+        let root = std::path::PathBuf::from("D:/qontinui-root");
+        let repos = vec!["portofino-pizzeria/backend".to_string()];
+        let foreign = crate::agent_worktree::canonical_paths::has_foreign_owner;
+        let canonical = |_: &str| Err("the layout rule must not be used".to_string());
+        let resolve =
+            |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/portofino-pizzeria/backend"));
+        let err = continuation_fallback_workdir(
+            Some(root.clone()),
+            &repos,
+            foreign,
+            canonical,
+            resolve,
+            "worktree acquire failed: claim already held",
+        )
+        .unwrap_err();
+        assert!(err.starts_with("no_isolated_worktree: "), "{err}");
+        assert!(err.contains("D:/portofino-pizzeria/backend"), "{err}");
+        assert!(err.contains("claim already held"), "{err}");
+        assert_eq!(continuation_acquire_failure_detail(&err), err);
+
+        // A foreign repo whose verified checkout IS under the root → the root.
+        let under = |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root/backend"));
         assert_eq!(
-            continuation_fallback_workdir(None, &repos, |_: &str| Err("no root".to_string())),
-            None
+            continuation_fallback_workdir(
+                Some(root.clone()),
+                &repos,
+                foreign,
+                canonical,
+                under,
+                "off"
+            ),
+            Ok("D:/qontinui-root".to_string())
         );
-        assert_eq!(continuation_fallback_workdir(None, &[], canonical), None);
+        // A sibling of the root sharing its prefix is NOT under it.
+        let sibling =
+            |_: &str| Ok::<_, String>(std::path::PathBuf::from("D:/qontinui-root-old/backend"));
+        assert!(continuation_fallback_workdir(
+            Some(root),
+            &repos,
+            foreign,
+            canonical,
+            sibling,
+            "off"
+        )
+        .is_err());
+    }
+
+    /// No verified checkout anywhere → refused, carrying the resolver's typed
+    /// detail at the START of the posted line. Before this the root (or,
+    /// earlier, an empty `<root>/<name>` that provisioning then created) was
+    /// returned and the spawn reported `spawned`. A resolvable root must not
+    /// rescue it.
+    #[test]
+    fn a_repo_with_no_verified_checkout_is_refused_not_rooted() {
+        let repos = vec!["portofino-pizzeria/mobile".to_string()];
+        let resolve = |repo: &str| {
+            Err::<std::path::PathBuf, _>(
+                crate::agent_worktree::canonical_paths::CheckoutUnresolved {
+                    repo: repo.to_string(),
+                    tried: vec![(
+                        std::path::PathBuf::from("D:/portofino-pizzeria/mobile"),
+                        "owner-root convention: not a git checkout".to_string(),
+                    )],
+                    detail: None,
+                },
+            )
+        };
+        let err = continuation_fallback_workdir(
+            Some(std::path::PathBuf::from("D:/qontinui-root")),
+            &repos,
+            crate::agent_worktree::canonical_paths::has_foreign_owner,
+            |_: &str| Ok(std::path::PathBuf::from("D:/qontinui-root/mobile")),
+            resolve,
+            "off",
+        )
+        .unwrap_err();
+        assert!(err.starts_with("workdir_not_a_checkout: "), "{err}");
+        assert!(err.contains("portofino-pizzeria/mobile"), "{err}");
+
+        let detail = continuation_acquire_failure_detail(&err);
+        assert!(detail.starts_with("workdir_not_a_checkout: "), "{detail}");
+        assert_eq!(
+            continuation_acquire_failure_detail("coord unreachable"),
+            "worktree acquisition failed: coord unreachable",
+            "every other failure keeps its historical prefix"
+        );
+    }
+
+    /// Phase 3 of the same plan: a held worktree claim (the sibling-continuation
+    /// race) settles to the fallback immediately — there is no wait arm, because
+    /// the holder's claim lives as long as its terminal session.
+    #[test]
+    fn a_held_worktree_claim_falls_through_without_waiting() {
+        use crate::agent_worktree::{AllocateError, ClaimConflict};
+        let conflict: Result<Option<u8>, AllocateError> =
+            Err(AllocateError::ClaimConflict(ClaimConflict {
+                kind: "worktree".to_string(),
+                resource_key: "d:/portofino-pizzeria/mobile".to_string(),
+                current_holder: "sibling-continuation".to_string(),
+                intent: None,
+            }));
+        let because = settle_continuation_acquire(conflict).unwrap_err();
+        assert!(because.contains("claim already held"), "{because}");
+        assert!(settle_continuation_acquire::<u8>(Ok(None)).is_err());
+        assert_eq!(settle_continuation_acquire(Ok(Some(7u8))), Ok(7));
     }
 
     /// The terminal presentation's refusal arrives as text. A trust-gate
