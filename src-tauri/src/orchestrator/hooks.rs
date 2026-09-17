@@ -553,7 +553,7 @@ impl HookExecutor {
         let url = context.substitute(url);
         info!("Executing hook webhook: {} {}", method, url);
 
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::util::http::blocking_client_builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

@@ -2086,7 +2086,7 @@ pub async fn resume_ai_sessions(
 /// Tries both the cached external app specs and the runner's own specs.
 /// Returns a JSON string of whatever specs are available, or an empty message.
 pub(crate) async fn fetch_existing_specs(app_state: &AppState) -> String {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap_or_default();

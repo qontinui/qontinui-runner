@@ -275,7 +275,7 @@ pub fn start_heartbeat(app_state: Arc<AppState>) {
         // Wait 5 seconds for the API to be ready before the first heartbeat
         tokio::time::sleep(Duration::from_secs(5)).await;
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(Duration::from_secs(5))
             .build()
         {

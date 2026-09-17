@@ -99,7 +99,7 @@ impl EmbeddingClient {
     /// Create a new embedding client with default URL.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::util::http::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
@@ -110,7 +110,7 @@ impl EmbeddingClient {
     /// Create a new embedding client with a custom URL.
     pub fn with_url(url: &str) -> Self {
         Self {
-            client: reqwest::Client::builder()
+            client: crate::util::http::client_builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),

@@ -1388,7 +1388,7 @@ fn register_with_coord(
         "tenant_id":    tenant_id,
         "health_url":   serde_json::Value::Null,
     });
-    let client = reqwest::blocking::Client::builder()
+    let client = qontinui_runner_lib::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;

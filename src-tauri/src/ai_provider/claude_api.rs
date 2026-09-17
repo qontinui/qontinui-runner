@@ -83,7 +83,7 @@ pub(super) fn run_claude_api(
 
     // Use blocking reqwest client for synchronous HTTP request.
     // No timeout — the Doctor service monitors process health externally.
-    let client = match reqwest::blocking::Client::builder().build() {
+    let client = match crate::util::http::blocking_client_builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
@@ -187,7 +187,7 @@ pub(super) fn run_claude_api_with_overrides(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    let client = match reqwest::blocking::Client::builder().build() {
+    let client = match crate::util::http::blocking_client_builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
@@ -296,7 +296,7 @@ pub(super) fn run_claude_api_multimodal(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    let client = match reqwest::blocking::Client::builder().build() {
+    let client = match crate::util::http::blocking_client_builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
@@ -413,7 +413,7 @@ pub(super) fn run_claude_api_cached(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    let client = match reqwest::blocking::Client::builder().build() {
+    let client = match crate::util::http::blocking_client_builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };
@@ -535,7 +535,7 @@ pub(super) fn run_claude_api_with_structured_output(
         Err(e) => return AiResponse::error(format!("Failed to retrieve API key: {}", e)),
     };
 
-    let client = match reqwest::blocking::Client::builder().build() {
+    let client = match crate::util::http::blocking_client_builder().build() {
         Ok(c) => c,
         Err(e) => return AiResponse::error(format!("Failed to create HTTP client: {}", e)),
     };

@@ -462,7 +462,7 @@ async fn get_heatmap_live(
         "{}/coord/worktree-dirty?heatmap=true",
         base.trim_end_matches('/')
     );
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     match crate::coord_http::coord_get(&client, &url)
         .timeout(std::time::Duration::from_secs(3))
         .send()

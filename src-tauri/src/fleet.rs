@@ -491,7 +491,7 @@ async fn post_budget_with_retry(
     body: &DeviceBudgetRequest,
 ) -> Result<(), String> {
     let url = format!("{}/coord/devices/{}/budget", coord_base, device_id);
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("reqwest client build: {e}"))?;
@@ -1860,7 +1860,7 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
     };
     let url = format!("{base}/coord/devices/register");
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
@@ -4817,7 +4817,7 @@ pub async fn publish_tree_state() -> Result<(), String> {
         Err(e) => return Err(format!("read_dir {root}: {e}", root = root.display())),
     };
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
@@ -5089,7 +5089,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
         coord_base, device_id
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     // coord-tenant-scope(device): device_id (:3310) is the only identity; read-only, and coord serves the union of this device's own bindings unless a tenant_id query param narrows it.
     let response = crate::auth::attach_device_auth(client.get(&url))
         .send()
@@ -5146,7 +5146,7 @@ async fn run_auto_fresh_cycle() -> Result<(), String> {
 async fn runner_has_active_tasks() -> bool {
     let port = crate::mcp::types::get_mcp_api_port();
     let probe = async move {
-        let resp = reqwest::Client::new()
+        let resp = crate::util::http::new_client()
             .get(format!("http://localhost:{port}/task-runs/running"))
             .send()
             .await

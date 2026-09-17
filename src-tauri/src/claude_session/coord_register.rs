@@ -1433,7 +1433,7 @@ fn flush_batch(
         return Flush::Skipped; // coord not configured — keep buffering (capped).
     };
     if client.is_none() {
-        *client = reqwest::blocking::Client::builder()
+        *client = crate::util::http::blocking_client_builder()
             // Connect separately from total: a blackholed coord should cost
             // this thread 2 s per probe, not the full request budget.
             .connect_timeout(Duration::from_secs(2))

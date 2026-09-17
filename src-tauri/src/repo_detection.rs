@@ -79,7 +79,7 @@ async fn fetch_registered_repos() -> Result<CanonicalRepos, String> {
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
@@ -236,7 +236,7 @@ pub async fn register_repo_with_coord(repo: String) -> Result<serde_json::Value,
     let base = base.trim_end_matches('/');
     let url = format!("{base}/coord/canonical-repos");
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

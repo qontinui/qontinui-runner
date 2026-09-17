@@ -1174,7 +1174,7 @@ pub fn pair_with_auth_token_with_ids(
 ) -> Result<PairCompleteResponse, String> {
     let url = format!("{}/api/v1/devices/pair-cli", base);
     let body = pair_cli_request_body(device_id, tenant_id);
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;
@@ -1291,7 +1291,7 @@ pub fn pair_with_pair_code(
         code.trim().to_uppercase()
     );
     let body = pair_code_request_body(device_id);
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {}", e))?;
@@ -1419,7 +1419,7 @@ pub fn pair_via_browser(
         &web_pair_url,
         tenant_id,
     );
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?;

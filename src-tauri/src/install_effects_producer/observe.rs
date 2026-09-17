@@ -217,7 +217,7 @@ pub async fn run_typecheck_loopback(
     if affected_files.is_empty() {
         return (Vec::new(), false);
     }
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(TYPECHECK_TIMEOUT)
         .build()
     {

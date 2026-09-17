@@ -510,7 +510,7 @@ pub async fn connect_sdk_app(
     // Create HTTP client with timeout
     // 30s request timeout matches the UI Bridge IPC timeout — the app's snapshot/elements
     // endpoints proxy through the IPC layer and can take >10s on cold pages.
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5));
 
@@ -2727,7 +2727,7 @@ async fn handle_check_health(State(state): State<Arc<ApiState>>) -> Json<serde_j
     let mut stale_urls = Vec::new();
 
     // Create a short-timeout client for health checks
-    let health_client = reqwest::Client::builder()
+    let health_client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(2))
         .connect_timeout(std::time::Duration::from_secs(2))
         .build()
@@ -2957,7 +2957,7 @@ async fn handle_discover_and_cache(
     info!(url = %url, app_name = %app_name, "Discover-and-cache specs");
 
     // Step 1: Ensure connected to the app
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()
@@ -7072,7 +7072,7 @@ mod tests {
             app_url: url.to_string(),
             base_path: "".into(),
             app_info: info,
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

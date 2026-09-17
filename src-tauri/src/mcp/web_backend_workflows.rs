@@ -31,7 +31,7 @@ impl WebBackendWorkflowClient {
     pub fn new() -> Self {
         Self {
             auth_manager: AuthManager::new(),
-            client: reqwest::Client::builder()
+            client: crate::util::http::client_builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default(),

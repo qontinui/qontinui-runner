@@ -1209,7 +1209,7 @@ pub mod coord {
             return Ok(None);
         };
         let url = format!("{}/coord/sessions/worktrees", base.trim_end_matches('/'));
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| format!("build custody http client: {e}"))?;

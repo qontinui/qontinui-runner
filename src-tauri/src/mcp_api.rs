@@ -125,7 +125,7 @@ async fn embedding_service_health() -> serde_json::Value {
     {
         // Status endpoint is at the same base minus the last path segment.
         let status_url = url.replace("/compute-text", "/status");
-        let ok = match reqwest::Client::builder()
+        let ok = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
         {
@@ -4388,7 +4388,7 @@ async fn post_coord_mcp_drift_finding(coord_base: String, bearer: String, drifte
         "topic": "coord-mcp",
         "resource_keys": ["qontinui-runner/src-tauri/src/mcp_api.rs"],
     });
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
     {
@@ -9837,10 +9837,10 @@ pub fn create_router(
                     {
                         Ok(local_port) => {
                             // Quick health check
-                            let client = reqwest::Client::builder()
+                            let client = crate::util::http::client_builder()
                                 .timeout(std::time::Duration::from_secs(2))
                                 .build()
-                                .unwrap_or_else(|_| reqwest::Client::new());
+                                .unwrap_or_else(|_| crate::util::http::new_client());
                             let url = format!("http://127.0.0.1:{}/ui-bridge/health", local_port);
                             if client.get(&url).send().await.is_ok() {
                                 let now = chrono::Utc::now().timestamp_millis();
@@ -9941,10 +9941,10 @@ pub fn create_router(
             // Wait for USB scanner to do its first pass
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
-            let client = reqwest::Client::builder()
+            let client = crate::util::http::client_builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new());
+                .unwrap_or_else(|_| crate::util::http::new_client());
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
             // Intentionally leaked — monitor runs for the entire app lifetime
@@ -14073,7 +14073,7 @@ mod coord_mcp_tool_policy_tests {
         // 127.0.0.1 literal, never `localhost`: Windows resolves `localhost`
         // to ::1 first and pays a doomed IPv6 connect before the socket that
         // answers.
-        let resp = reqwest::Client::new()
+        let resp = crate::util::http::new_client()
             .get(format!("http://{addr}/coord-mcp/tool-policy"))
             .send()
             .await

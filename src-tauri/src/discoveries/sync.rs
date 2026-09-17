@@ -66,7 +66,7 @@ pub async fn push_discovery(payload: &DiscoveryPayload) -> Result<DiscoveryRespo
         .map_err(|e| format!("Failed to get access token: {}", e))?;
 
     // Build request
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

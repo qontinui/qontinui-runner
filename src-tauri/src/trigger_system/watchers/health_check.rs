@@ -35,7 +35,7 @@ pub fn start_health_check(
         // Track when we last fired for each URL (for re-trigger interval)
         let mut last_fired: HashMap<String, std::time::Instant> = HashMap::new();
 
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();

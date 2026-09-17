@@ -128,7 +128,7 @@ fn sanitize_action_id(action_id: &str) -> String {
 /// succeeds — Claude can later call `tools/list` again after the runner
 /// boots, but typically the user just relaunches.
 fn fetch_tools(base: &str) -> Vec<ToolEntry> {
-    let client = match reqwest::blocking::Client::builder()
+    let client = match qontinui_runner_lib::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
@@ -348,7 +348,7 @@ fn dispatch_subagent_call(base: &str, arguments: Value) -> Value {
         .unwrap_or(300);
 
     // Client timeout = subagent budget + headroom for staging/queueing.
-    let client = match reqwest::blocking::Client::builder()
+    let client = match qontinui_runner_lib::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(timeout_secs + 60))
         .build()
     {
@@ -610,7 +610,7 @@ fn dispatch_tool_call(
 
     // Use a generous timeout — wrappers do real work. The runner itself
     // bounds dispatch at ~60s by default; we add headroom on the client.
-    let client = match reqwest::blocking::Client::builder()
+    let client = match qontinui_runner_lib::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(120))
         .build()
     {
@@ -1434,7 +1434,10 @@ fn sse_consumer_loop(
         // SSE is a long-lived stream — disable per-request timeout. The
         // server's keep-alive comments will keep TCP healthy; we only
         // detect disconnect via stream EOF / read error.
-        let client = match reqwest::blocking::Client::builder().timeout(None).build() {
+        let client = match qontinui_runner_lib::util::http::blocking_client_builder()
+            .timeout(None)
+            .build()
+        {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(

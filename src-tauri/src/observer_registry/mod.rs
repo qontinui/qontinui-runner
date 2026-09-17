@@ -289,7 +289,7 @@ mod tests {
                 capabilities: Vec::new(),
                 port: 0,
             },
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

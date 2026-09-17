@@ -60,7 +60,7 @@ impl StepExecutor {
         &self,
         script_id: &str,
     ) -> (bool, Option<String>, Option<String>) {
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = crate::mcp::types::get_self_base_url(&self.app_state);
         let url = format!("{}/playwright/tests/{}/run", base_url, script_id);
 
@@ -1516,7 +1516,7 @@ impl StepExecutor {
 
         // Make the HTTP request
         let start = std::time::Instant::now();
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
+        let client = match crate::util::http::client_builder().timeout(timeout).build() {
             Ok(c) => c,
             Err(e) => {
                 let error_msg = format!("Failed to create HTTP client: {}", e);

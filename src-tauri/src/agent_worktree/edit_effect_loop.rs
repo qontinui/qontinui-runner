@@ -230,7 +230,7 @@ async fn post_predict_and_check(
         "{}/coord/edits/predict-and-check",
         coord_http_base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_secs(COORD_CALL_TIMEOUT_SECS))
         .build()
     {
@@ -293,7 +293,7 @@ async fn post_verify(
         "{}/coord/edits/verify",
         coord_http_base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_secs(COORD_CALL_TIMEOUT_SECS))
         .build()
     {

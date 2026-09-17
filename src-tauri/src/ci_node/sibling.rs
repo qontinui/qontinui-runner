@@ -1126,7 +1126,7 @@ pub(crate) async fn provision(
              declaration probes will run unauthenticated at 60 requests/hour"
         );
     }
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(API_TIMEOUT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

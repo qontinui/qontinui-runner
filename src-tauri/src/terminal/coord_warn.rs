@@ -152,7 +152,7 @@ async fn check_and_warn(
         coord_base.trim_end_matches('/'),
         urlencoding::encode(&resource_key),
     );
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("build client: {e}"))?;

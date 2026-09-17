@@ -333,7 +333,7 @@ pub(crate) fn refresh_credentials_blocking(creds_path: &Path) -> Option<String> 
         "scope": scope_str,
     });
     let http_result: Result<(bool, u16, String), String> = std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::new();
+        let client = crate::util::http::new_blocking_client();
         let response = client
             .post(TOKEN_URL)
             .header("Content-Type", "application/json")

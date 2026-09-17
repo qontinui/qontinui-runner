@@ -105,10 +105,10 @@ impl DispatchContext {
     pub fn new(registry: Arc<WrapperRegistry>, manager: Arc<WrapperManager>) -> Arc<Self> {
         // No global timeout on the client — we apply per-call timeouts
         // via tokio::time::timeout so the header override is exact.
-        let http = reqwest::Client::builder()
+        let http = crate::util::http::client_builder()
             .pool_max_idle_per_host(4)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_client());
         Arc::new(Self {
             registry,
             manager,

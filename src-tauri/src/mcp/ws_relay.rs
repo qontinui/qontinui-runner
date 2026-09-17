@@ -77,7 +77,7 @@ async fn install_ws_sdk_connection(
         app_url: synthetic_url.clone(),
         base_path: String::new(),
         app_info,
-        client: reqwest::Client::new(),
+        client: crate::util::http::new_client(),
         connected_at: chrono::Utc::now().timestamp_millis(),
         transport_kind: None,
         physical_device_id: None,

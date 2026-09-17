@@ -1065,7 +1065,7 @@ impl CheckHandler {
             Self::emit_started(context, &action_id, &action_name, metadata).await;
 
         let start = std::time::Instant::now();
-        let client = match reqwest::Client::builder().timeout(timeout).build() {
+        let client = match crate::util::http::client_builder().timeout(timeout).build() {
             Ok(c) => c,
             Err(e) => {
                 return StepHandlerResult::failure(format!("Failed to create HTTP client: {}", e));

@@ -58,7 +58,7 @@ impl CloudRegistryPoller {
 
         debug!("[cloud-registry] Polling {}", url);
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let resp = client.get(&url).bearer_auth(auth_token).send().await?;
 
         // Treat non-2xx as an error via response error handling

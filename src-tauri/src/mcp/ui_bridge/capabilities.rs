@@ -796,7 +796,7 @@ pub async fn ui_bridge_run_workflow_handler(
         .map(|Json(v)| v)
         .unwrap_or_else(|| serde_json::json!({ "force_fresh_start": false }));
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     match client.post(&url).json(&request_body).send().await {
         Ok(resp) => {
             let status = resp.status();

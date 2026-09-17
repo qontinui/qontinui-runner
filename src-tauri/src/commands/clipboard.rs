@@ -88,7 +88,7 @@ async fn share_to_mobile_impl(text: String) -> Result<ClipboardEntryResponse, Ap
         text_content: Some(text),
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!("{}/api/v1/clipboard", get_api_base_url()))
         .bearer_auth(&access_token)
@@ -210,7 +210,7 @@ async fn share_file_to_mobile_impl(file_path: String) -> Result<SharedFileRespon
         .text("source_device_id", device_id)
         .part("file", file_part);
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!("{}/api/v1/files/upload", get_api_base_url()))
         .bearer_auth(&access_token)

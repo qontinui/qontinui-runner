@@ -467,7 +467,7 @@ async fn tick_once() -> Result<usize, String> {
         None => return Ok(0),
     };
     let base = base.trim_end_matches('/').to_string();
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("client build: {e}"))?;

@@ -659,7 +659,7 @@ impl ChunkPoster {
                     base.trim_end_matches('/'),
                     device_id
                 );
-                match reqwest::Client::builder()
+                match crate::util::http::client_builder()
                     .timeout(Duration::from_secs(census_post_timeout_secs()))
                     .build()
                 {

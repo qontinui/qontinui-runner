@@ -54,7 +54,7 @@ pub struct CoordInstallClient {
 
 impl CoordInstallClient {
     pub fn new(base: impl Into<String>) -> Result<Self, CoordError> {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| CoordError::Client(e.to_string()))?;
@@ -117,7 +117,7 @@ impl CoordInstallClient {
         let url = self.url("/coord/fs/observations");
         // Use a tighter client than the 30s declare/verify one — this is
         // best-effort and must not stall the route.
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
         {

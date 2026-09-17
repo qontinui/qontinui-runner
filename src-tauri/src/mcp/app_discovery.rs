@@ -185,7 +185,7 @@ const SCAN_TIMEOUT_MS: u64 = 1500;
 
 /// Build a shared HTTP client for scanning (avoids creating one per port check)
 fn build_scan_client() -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(Duration::from_millis(SCAN_TIMEOUT_MS))
         .pool_max_idle_per_host(2)
         .build()

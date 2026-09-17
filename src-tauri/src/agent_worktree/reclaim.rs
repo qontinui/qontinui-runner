@@ -1547,7 +1547,7 @@ pub(super) async fn fetch_pull() -> Result<Option<(Uuid, ReclaimPull)>, String> 
         base.trim_end_matches('/'),
         device_id
     );
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("build reclaim http client: {}", error_chain(&e)))?;

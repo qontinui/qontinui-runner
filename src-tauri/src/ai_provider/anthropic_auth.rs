@@ -81,7 +81,7 @@ mod tests {
     /// directly so the test never touches the network.
     #[test]
     fn apply_async_routes_oauth_to_bearer() {
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let req = apply_async(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-oat01-deadbeef",
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn apply_async_routes_api_key_to_x_api_key() {
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let req = apply_async(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-api03-cafebabe",
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn apply_blocking_routes_oauth_to_bearer() {
-        let client = reqwest::blocking::Client::new();
+        let client = crate::util::http::new_blocking_client();
         let req = apply_blocking(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-oat01-token",
@@ -159,7 +159,7 @@ mod tests {
 
     #[test]
     fn apply_blocking_routes_api_key_to_x_api_key() {
-        let client = reqwest::blocking::Client::new();
+        let client = crate::util::http::new_blocking_client();
         let req = apply_blocking(
             client.post("https://api.anthropic.com/v1/messages"),
             "sk-ant-api03-key",

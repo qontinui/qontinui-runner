@@ -17,7 +17,6 @@ use providers::sploitus::{ExploitType, SortOrder, Sploitus};
 use providers::tavily::Tavily;
 use providers::ui_bridge_fetch::{SnapshotType, UiBridgeFetch};
 use providers::AvailableProviders;
-use reqwest::Client;
 use stats::KnowledgeStats;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -84,7 +83,7 @@ impl KnowledgeAcquisition {
     }
 
     fn create(config: KnowledgeAcquisitionConfig) -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(config.timeout_per_call_secs))
             .build()
             .unwrap_or_default();

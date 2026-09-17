@@ -1017,7 +1017,7 @@ fn sweep_stale_staging_at(staging_root: &Path, now: std::time::SystemTime) {
 /// only run after thousands of files are already on disk, so it is the wrong
 /// place to catch a hostile archive.
 async fn download(url: &str, expected_sha256: Option<&str>) -> Result<Vec<u8>, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

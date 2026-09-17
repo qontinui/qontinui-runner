@@ -43,7 +43,7 @@ struct ApiResponse<T> {
 
 /// Shared HTTP client for all proxy requests (reuses connections).
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .build()
@@ -278,7 +278,7 @@ async fn delete_json<R: for<'de> Deserialize<'de>>(url: &str) -> Result<R, Proxy
 /// 10s `CLIENT` timeout is too tight. Use a fresh long-timeout client.
 pub async fn install_wrapper(req: &InstallRequest) -> Result<InstallResponse, ProxyError> {
     let url = format!("{}/wrappers/install", base_url());
-    let long_client = reqwest::Client::builder()
+    let long_client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| ProxyError::other(format!("Failed to create HTTP client: {}", e)))?;
@@ -306,7 +306,7 @@ pub async fn update_wrapper(
 ) -> Result<InstallResponse, ProxyError> {
     let url = format!("{}/wrappers/{}/update", base_url(), id);
     let body = UpdateBody { version };
-    let long_client = reqwest::Client::builder()
+    let long_client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| ProxyError::other(format!("Failed to create HTTP client: {}", e)))?;
@@ -435,7 +435,7 @@ pub async fn dispatch(
     // Add a 30s cushion so network round-trip overhead doesn't preempt
     // the primary's per-call timeout.
     let net_timeout = timeout.saturating_add(Duration::from_secs(30));
-    let dispatch_client = reqwest::Client::builder()
+    let dispatch_client = crate::util::http::client_builder()
         .timeout(net_timeout)
         .pool_max_idle_per_host(4)
         .build()

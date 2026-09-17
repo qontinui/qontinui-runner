@@ -146,7 +146,7 @@ async fn probe_deepseek_balance(base_url: &str, api_key: &str) -> PrepaidBalance
     const LABEL: &str = "DeepSeek";
 
     let url = format!("{}/user/balance", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .get(&url)
         .bearer_auth(api_key)

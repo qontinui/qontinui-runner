@@ -256,7 +256,7 @@ async fn fetch_self_snapshot() -> Result<
     let port = crate::mcp::types::get_mcp_api_port();
     let url = format!("http://127.0.0.1:{port}/ui-bridge/control/snapshot");
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| E::Network(format!("reqwest client init: {e}")))?;

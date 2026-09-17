@@ -520,7 +520,7 @@ fn initiate_auth_user_password(
     email: &str,
     password: &str,
 ) -> Result<CognitoAuthenticationResult, String> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?;
@@ -722,7 +722,7 @@ pub fn refresh_tokens(refresh_token: &str) -> Result<CognitoTokenResponse, Cogni
 /// are classified ([`CognitoRefreshError`]); the code-exchange path flattens
 /// them to a `String`.
 fn post_token_form(form: &[(&str, &str)]) -> Result<CognitoTokenResponse, CognitoRefreshError> {
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| CognitoRefreshError::Transient(format!("reqwest client build failed: {e}")))?;

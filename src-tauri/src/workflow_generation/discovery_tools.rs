@@ -1765,7 +1765,7 @@ fn execute_architecture_specs(config: &DiscoveryConfig) -> Result<String, String
 
 /// Build a blocking HTTP client with timeout.
 fn build_http_client(config: &DiscoveryConfig) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+    crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(config.per_tool_timeout_secs))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))

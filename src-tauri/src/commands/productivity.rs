@@ -2158,7 +2158,7 @@ pub async fn spawn_from_plan(
         &declared_overlap_paths,
     );
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
@@ -2214,7 +2214,7 @@ pub async fn spawn_from_plan(
 pub async fn get_fleet_health() -> Result<serde_json::Value, String> {
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

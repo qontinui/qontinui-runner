@@ -398,7 +398,7 @@ async fn post_observations(
         "{}/coord/fs/observations",
         coord_http_base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

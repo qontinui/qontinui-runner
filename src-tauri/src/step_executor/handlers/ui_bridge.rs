@@ -837,7 +837,7 @@ impl StepHandler for UiBridgeHandler {
                 .await;
         }
 
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e));
@@ -858,7 +858,7 @@ impl StepHandler for UiBridgeHandler {
                 // The SDK proxy is independent of the runner's Tauri webview — the proxy
                 // can be functional even when the webview is temporarily unavailable.
                 let status_url = format!("{}/sdk/status", base_url.trim_end_matches('/'));
-                let health_client = reqwest::Client::builder()
+                let health_client = crate::util::http::client_builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .build()
                     .ok();
@@ -948,7 +948,7 @@ impl StepHandler for UiBridgeHandler {
             } else {
                 // For non-SDK operations (compare, etc.), check control endpoint
                 let health_url = format!("{}/control/snapshot", base_url.trim_end_matches('/'));
-                let health_client = reqwest::Client::builder()
+                let health_client = crate::util::http::client_builder()
                     .timeout(std::time::Duration::from_secs(5))
                     .build()
                     .ok();
@@ -1364,7 +1364,7 @@ impl UiBridgeHandler {
             .join("\n");
 
         // Best-effort snapshot for additional context
-        let snapshot_text = match reqwest::Client::builder()
+        let snapshot_text = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
         {
@@ -1478,7 +1478,7 @@ impl UiBridgeHandler {
             }
         };
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()
         {
@@ -1650,7 +1650,7 @@ impl UiBridgeHandler {
             }
         };
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
         {
@@ -1760,7 +1760,7 @@ impl UiBridgeHandler {
             }
         };
 
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_millis(timeout_ms))
             .build()
         {

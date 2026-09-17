@@ -70,7 +70,7 @@ pub async fn fetch_verifier_ui_context(
         if !use_screenshots {
             return None;
         }
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .ok()?;
@@ -86,7 +86,7 @@ pub async fn fetch_verifier_ui_context(
         if !include_console_errors {
             return Vec::new();
         }
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
         {
@@ -124,7 +124,7 @@ pub async fn fetch_verifier_ui_context(
         if !include_app_health {
             return None;
         }
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
             .ok()?;
@@ -385,7 +385,7 @@ pub struct HealthBaseline {
 /// Capture a health baseline from the SDK app before the agentic phase.
 /// Returns None if the SDK app isn't connected (best-effort).
 pub async fn fetch_pre_agentic_health_baseline() -> Option<HealthBaseline> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
@@ -423,7 +423,7 @@ pub async fn fetch_pre_agentic_health_baseline() -> Option<HealthBaseline> {
 pub async fn detect_health_regression(baseline: &Option<HealthBaseline>) -> Option<String> {
     let baseline = baseline.as_ref()?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;

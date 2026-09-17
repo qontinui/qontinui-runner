@@ -102,7 +102,7 @@ pub async fn push_agentic_scores_to_backend(
         format!("Failed to get access token: {}", e)
     })?;
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let url = format!("{}/api/v1/feedback-scores/batch", get_api_base_url());
 
     // Collect all scores into a single batch payload.

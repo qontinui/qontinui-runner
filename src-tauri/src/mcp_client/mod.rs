@@ -463,7 +463,7 @@ impl McpClientManager {
             .as_ref()
             .ok_or("HTTP config missing for HTTP transport")?;
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let url = format!("{}/tools/list", http_config.url.trim_end_matches('/'));
 
         let mut request = client.post(&url);
@@ -526,7 +526,7 @@ impl McpClientManager {
             .as_ref()
             .ok_or("HTTP config missing for HTTP transport")?;
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let url = format!("{}/tools/call", http_config.url.trim_end_matches('/'));
 
         let mut request = client.post(&url);

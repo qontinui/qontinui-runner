@@ -555,7 +555,7 @@ async fn create_extraction_session_impl(
     };
 
     // Call the backend API — reqwest::Error and serde_json::Error convert via `?`.
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!(
             "{}/api/v1/projects/{}/extractions",
@@ -633,7 +633,7 @@ async fn update_extraction_session_impl(
         error_message: request.error_message,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .patch(format!(
             "{}/api/v1/extractions/{}",
@@ -729,7 +729,7 @@ async fn upload_extraction_annotations_impl(
         states: request.states,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .put(format!(
             "{}/api/v1/extractions/{}/annotations",
@@ -811,7 +811,7 @@ async fn upload_state_structure_impl(
         state_structure: request.state_structure,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .put(format!(
             "{}/api/v1/extractions/{}/state-structure",
@@ -864,7 +864,7 @@ async fn get_project_extractions_impl(
 
     let access_token = auth_manager.get_access_token()?;
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .get(format!(
             "{}/api/v1/projects/{}/extractions",

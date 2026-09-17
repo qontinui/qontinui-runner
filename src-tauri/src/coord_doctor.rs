@@ -2313,7 +2313,7 @@ fn read_coord_tenant_bindings() -> (Option<Option<Vec<uuid::Uuid>>>, String) {
 /// `coord_reachable_check` and [`read_coord_tenant_bindings`] so the two
 /// probes can never disagree about timeouts.
 fn doctor_http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
-    reqwest::blocking::Client::builder()
+    crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
 }

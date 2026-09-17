@@ -231,7 +231,7 @@ async fn flusher_loop(
         coord_base.trim_end_matches('/'),
         dispatch_id
     );
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .ok();
@@ -452,7 +452,7 @@ pub(crate) async fn post_result(
             body["test_results"] = v;
         }
     }
-    let Ok(client) = reqwest::Client::builder()
+    let Ok(client) = crate::util::http::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
     else {

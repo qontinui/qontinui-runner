@@ -56,10 +56,10 @@ pub struct PrmTrajectoryScoreResponse {
 
 impl PrmClient {
     pub fn new(base_url: &str) -> Self {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::util::http::blocking_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_blocking_client());
 
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),

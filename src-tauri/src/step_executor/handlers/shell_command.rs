@@ -604,7 +604,7 @@ impl ShellCommandHandler {
     /// its own error).
     async fn check_state_machine_loaded(port: u16) -> Result<bool, String> {
         let url = format!("http://localhost:{}/state-machine/status", port);
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .map_err(|e| format!("client build: {}", e))?;

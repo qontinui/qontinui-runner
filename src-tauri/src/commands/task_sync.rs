@@ -463,7 +463,7 @@ impl AITaskSyncService {
     pub fn new() -> Self {
         Self {
             auth_manager: AuthManager::new(),
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
         }
     }
 

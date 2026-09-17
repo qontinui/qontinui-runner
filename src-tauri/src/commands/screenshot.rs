@@ -346,7 +346,7 @@ pub async fn capture_and_upload_screenshot(
     let form = reqwest::multipart::Form::new().part("file", part);
 
     // 5. Build upload URL with query parameters
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let api_url = get_api_base_url();
 
     let mut upload_url = format!(

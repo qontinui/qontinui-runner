@@ -64,6 +64,33 @@ pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
 }
 
+/// The factory's `reqwest::Client::new()`: [`client_builder`] with no further
+/// settings.
+///
+/// # Panics
+///
+/// Exactly when `reqwest::Client::new()` does — if the TLS backend cannot be
+/// initialised or the system configuration cannot be loaded. Call sites that
+/// used `Client::new()` accepted that panic; one that must not panic should
+/// use `client_builder().build()` and handle the error.
+pub fn new_client() -> reqwest::Client {
+    client_builder()
+        .build()
+        .expect("util::http::new_client: reqwest client construction failed (TLS backend init)")
+}
+
+/// The `reqwest::blocking` twin of [`new_client`].
+///
+/// # Panics
+///
+/// Exactly when `reqwest::blocking::Client::new()` does (TLS backend init,
+/// or when called from inside an async runtime's execution context).
+pub fn new_blocking_client() -> reqwest::blocking::Client {
+    blocking_client_builder().build().expect(
+        "util::http::new_blocking_client: reqwest client construction failed (TLS backend init)",
+    )
+}
+
 /// A failure of the transport itself — connect (which includes DNS) or a
 /// timeout — as opposed to coord answering badly. Only these count toward a
 /// rebuild: a 5xx proves the transport works.

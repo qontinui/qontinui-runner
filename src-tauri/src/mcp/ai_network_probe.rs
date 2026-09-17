@@ -157,7 +157,7 @@ pub async fn ai_network_probe_handler(
 
     // Build reqwest client (use a per-request client so we can scope the
     // timeout exactly; reqwest::ClientBuilder is cheap).
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_millis(effective_timeout_ms))
         .redirect(reqwest::redirect::Policy::limited(2))
         .build()

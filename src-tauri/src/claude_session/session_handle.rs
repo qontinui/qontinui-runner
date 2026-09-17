@@ -313,7 +313,7 @@ fn register_blocking(req: &HandleRegisterRequest) -> Option<String> {
         record_outcome(HandleRegisterOutcome::NoCoordBase);
         return None;
     };
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(REGISTER_TIMEOUT)
         .build()
         .ok()?;

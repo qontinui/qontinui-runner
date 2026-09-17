@@ -225,7 +225,7 @@ fn run_enroll_locked(params: EnrollParams) -> Result<EnrollOutcome, String> {
     };
     let url = format!("{backend}/api/v1/devenv/agent/enroll");
 
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| format!("reqwest client build failed: {e}"))?;

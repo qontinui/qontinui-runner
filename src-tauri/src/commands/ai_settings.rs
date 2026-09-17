@@ -527,7 +527,7 @@ async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<Stri
     );
 
     // Make a minimal API request to test the connection
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     // coord-auth-exempt(not-coord): Anthropic's API. A coord bearer here would be
     // a credential leak to a third party.
     let response = client
@@ -741,7 +741,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
 
     // Make a minimal API request to test the connection
     // Using the Gemini API generateContent endpoint
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         settings.model, api_key
@@ -797,7 +797,7 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
 async fn test_ollama_connection(settings: &OllamaSettings) -> Result<String, String> {
     let url = format!("{}/api/tags", settings.base_url.trim_end_matches('/'));
     info!("Testing Ollama connection: GET {}", url);
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
@@ -830,7 +830,7 @@ async fn test_openai_compatible_connection(
     let url = format!("{}/models", settings.base_url.trim_end_matches('/'));
     info!("Testing OpenAI-compatible: GET {}", url);
     let api_key = get_ai_api_key("openai_compatible").ok().flatten();
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;
@@ -1269,7 +1269,7 @@ async fn probe_account_usage_uncached(config_dir: String) -> AccountUsageInfo {
     // OAuth tokens (`sk-ant-oat*`) must go via `Authorization: Bearer` +
     // `anthropic-beta: oauth-2025-04-20`; API keys (`sk-ant-api*`) go via
     // `x-api-key`. `anthropic_auth::apply_async` dispatches on token prefix.
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let request = crate::ai_provider::anthropic_auth::apply_async(
         // coord-auth-exempt(not-coord): Anthropic's API, authenticated by the
         // operator's own OAuth/API credential via `anthropic_auth::apply_async`.
@@ -1561,7 +1561,7 @@ mod usage_twin_report {
                 .collect(),
             account_selection_mode: crate::claude_accounts::effective_selection_mode().as_str(),
         };
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
         {
@@ -2142,7 +2142,7 @@ pub async fn test_wsv_connection(endpoint: String) -> Result<WsvConnectionTestRe
     let url = format!("{}/v1/models", endpoint.trim().trim_end_matches('/'));
     info!("Testing WSV connection: GET {}", url);
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| String::from(AppError::NetworkError(e.to_string())))?;

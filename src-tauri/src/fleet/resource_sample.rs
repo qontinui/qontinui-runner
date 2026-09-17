@@ -1556,7 +1556,10 @@ pub(crate) async fn publish_once() {
         device.device_id
     );
 
-    let client = match reqwest::Client::builder().timeout(POST_TIMEOUT).build() {
+    let client = match crate::util::http::client_builder()
+        .timeout(POST_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             debug!("fleet::resource_sample: http client build failed: {e}");

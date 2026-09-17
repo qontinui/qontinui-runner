@@ -901,7 +901,7 @@ async fn deliver_once(
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/').to_string();
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 

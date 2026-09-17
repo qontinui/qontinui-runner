@@ -34,7 +34,7 @@ const TENANT_HEADER: &str = "X-Qontinui-Tenant-Id";
 /// a pooled client with a 300s idle timeout + 60s TCP keepalive so the
 /// TLS connection survives between a session's git ops.
 pub fn build_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(REQUEST_TIMEOUT)
         .pool_idle_timeout(Duration::from_secs(300))
         .tcp_keepalive(Duration::from_secs(60))

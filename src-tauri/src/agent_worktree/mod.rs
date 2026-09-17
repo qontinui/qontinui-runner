@@ -1498,7 +1498,7 @@ pub async fn allocate_and_materialize_with_claim(
 
     let url = format!("{}/agents/allocate", coord_http_base.trim_end_matches('/'));
     let resp = match crate::auth::attach_device_auth_for(
-        reqwest::Client::new().post(&url).json(&body),
+        crate::util::http::new_client().post(&url).json(&body),
         scope,
     )
     .send()

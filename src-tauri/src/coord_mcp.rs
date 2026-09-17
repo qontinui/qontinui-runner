@@ -7662,7 +7662,7 @@ fn probe_proxy_verdict(port: u16, nonce: &str) -> Option<ProbeVerdict> {
         "method": "tools/list",
         "params": {}
     });
-    let client = match reqwest::blocking::Client::builder()
+    let client = match crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(PROBE_TIMEOUT_SECS))
         .build()
     {

@@ -73,7 +73,7 @@ pub struct GitHubTicketProvider {
 
 impl GitHubTicketProvider {
     pub fn new() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

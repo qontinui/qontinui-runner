@@ -477,7 +477,10 @@ async fn read_back_once() -> Readback {
 /// `backend_relay::relay_http_to_base` uses.
 async fn read_back_at(base: &str, device_id: &str, bearer: &str) -> Readback {
     let url = format!("{base}/api/v1/devices/{device_id}");
-    let client = match reqwest::Client::builder().timeout(READBACK_TIMEOUT).build() {
+    let client = match crate::util::http::client_builder()
+        .timeout(READBACK_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return Readback::Unknown(format!("read-back client build failed: {e}")),
     };

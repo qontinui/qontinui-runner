@@ -83,7 +83,7 @@ async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, 
         .get_access_token()
         .map_err(|e| format!("get device token: {e}"))?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;
@@ -122,7 +122,7 @@ async fn fetch_push_token(coord_base: &str, session_id: &str) -> Result<String, 
 async fn fetch_registered_repos(coord_base: &str) -> Result<Vec<String>, String> {
     let url = format!("{}/coord/canonical-repos", coord_base.trim_end_matches('/'));
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

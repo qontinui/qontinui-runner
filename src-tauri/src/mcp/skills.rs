@@ -540,7 +540,7 @@ pub async fn sync_push(
         }
     }
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let mut pushed = 0;
     let mut errors = Vec::new();
 
@@ -600,7 +600,7 @@ pub async fn sync_pull(
     State(state): State<Arc<ApiState>>,
     Json(req): Json<SyncPullRequest>,
 ) -> Result<Json<ApiResponse<SyncPullResult>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
 
     // Fetch org skills from web backend
     let resp = match client

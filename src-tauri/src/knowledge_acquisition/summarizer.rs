@@ -73,7 +73,7 @@ async fn llm_summarize(content: &str, query: &str, max_length: usize) -> Result<
 
     // Use spawn_blocking to wrap the blocking HTTP call
     let summary = spawn_blocking_tracked(move || {
-        let client = reqwest::blocking::Client::builder()
+        let client = crate::util::http::blocking_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| format!("HTTP client error: {e}"))?;

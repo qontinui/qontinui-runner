@@ -527,7 +527,7 @@ impl GepaIntegration {
             optimization_cooldown: std::time::Duration::from_secs(30 * 60), // 30 minutes
             min_runs_between_optimizations: Self::MIN_RUNS_BETWEEN_OPTIMIZATIONS,
             last_optimization: None,
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
         }
     }
 

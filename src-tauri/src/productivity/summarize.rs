@@ -381,7 +381,7 @@ fn build_user_prompt(task_run_id: &str, verdict: &str, transcript: &str) -> Stri
 }
 
 fn build_client() -> Result<reqwest::Client, SummarizeError> {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| SummarizeError::HttpPost(format!("client build: {}", e)))

@@ -77,7 +77,7 @@ async fn tick() -> Result<(), String> {
     let (base, _coord_base_source) = qontinui_runner_lib::profiles::coord_base_with_source();
     let base = base.trim_end_matches('/');
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("http client init: {e}"))?;

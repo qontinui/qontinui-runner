@@ -201,7 +201,7 @@ async fn sync_issues_to_backend_impl(
     };
 
     // Send to backend
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!("{}/api/v1/issues/sync", get_api_base_url()))
         .bearer_auth(&access_token)

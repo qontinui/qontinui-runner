@@ -37,7 +37,7 @@ pub fn start_instance_health_monitor(pg_db: Arc<PgDb>, instance_manager: Arc<Ins
         // Wait for startup to settle
         tokio::time::sleep(Duration::from_secs(15)).await;
 
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap_or_default();
@@ -121,7 +121,7 @@ pub async fn purge_stale_instances(pg_db: &PgDb, instance_manager: &InstanceMana
     // For on-demand purge: first probe unhealthy instances to give them a
     // chance to respond before deletion.
     if let Ok(instances) = pg_db.get_all_runner_instances().await {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(2))
             .build()
             .unwrap_or_default();
@@ -161,7 +161,7 @@ pub async fn startup_cleanup(pg_db: &PgDb) {
         }
     };
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_default();

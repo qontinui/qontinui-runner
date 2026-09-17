@@ -480,7 +480,10 @@ pub(crate) async fn send_publish_http(
     token: String,
     request: PublishRequest,
 ) -> SendOutcome {
-    let client = match reqwest::Client::builder().timeout(PUBLISH_TIMEOUT).build() {
+    let client = match crate::util::http::client_builder()
+        .timeout(PUBLISH_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => return SendOutcome::Unavailable(format!("could not build an HTTP client: {e}")),
     };

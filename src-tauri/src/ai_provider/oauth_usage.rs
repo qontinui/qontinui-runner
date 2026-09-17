@@ -141,7 +141,7 @@ fn snapshot_from_wire(wire: WireUsage) -> OauthUsageSnapshot {
 /// (`sk-ant-oat*`); API keys have no usage windows, so callers should skip
 /// straight to the probe for those.
 pub async fn fetch(token: &str) -> Result<OauthUsageSnapshot, String> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;

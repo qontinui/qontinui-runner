@@ -113,7 +113,7 @@ impl StepHandler for WrapperActionHandler {
         let timeout_secs = step
             .timeout_seconds
             .unwrap_or(DEFAULT_DISPATCH_TIMEOUT_SECS);
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(Duration::from_secs(timeout_secs.max(1)))
             .build()
         {

@@ -199,7 +199,7 @@ fn resolve_oauth_from_path(creds_path: &Path) -> Option<String> {
 fn warm_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
+        crate::util::http::blocking_client_builder()
             .pool_idle_timeout(Duration::from_secs(300))
             .tcp_keepalive(Duration::from_secs(60))
             .build()
@@ -208,7 +208,7 @@ fn warm_client() -> &'static reqwest::blocking::Client {
                     "Warm client: reqwest builder failed ({}); falling back to default",
                     e
                 );
-                reqwest::blocking::Client::new()
+                crate::util::http::new_blocking_client()
             })
     })
 }

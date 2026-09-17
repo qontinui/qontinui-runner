@@ -823,7 +823,7 @@ impl HttpWorkUnitSink {
     pub fn new(base: impl Into<String>) -> Self {
         Self {
             base: base.into(),
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
         }
     }
 

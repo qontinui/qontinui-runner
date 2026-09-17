@@ -670,7 +670,7 @@ async fn spawn_continuation(
     let url = format!("http://127.0.0.1:{port}/sessions/spawn");
     let inherited = inherited_context(terminal_id);
     let body = spawn_body(terminal_id, title, coord_session_id, &inherited);
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         // The spawn handler blocks through the CLI init handshake; give it
         // room.
         .timeout(std::time::Duration::from_secs(60))

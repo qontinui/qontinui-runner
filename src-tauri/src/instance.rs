@@ -216,7 +216,7 @@ pub async fn register_with_primary() -> Option<String> {
         primary, own_name, own_port
     );
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;

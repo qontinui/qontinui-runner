@@ -835,7 +835,7 @@ mod resolve {
         title: Option<String>,
     ) -> Option<String> {
         let url = resolve_endpoint_url()?;
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .ok()?;
@@ -950,7 +950,7 @@ mod report {
         // Resolve the terminal identity the same way the scheduler submits;
         // still report (with nulls) if the session has since gone away.
         let ident = super::resolve_session_identity(tid);
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(Duration::from_secs(10))
             .build()
         {

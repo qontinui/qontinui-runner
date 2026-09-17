@@ -296,7 +296,7 @@ impl HttpSessionSink {
             // the connection pool and the TLS config, so building one per file
             // would rebuild both 8,308 times and defeat connection reuse
             // entirely.
-            client: reqwest::Client::builder()
+            client: crate::util::http::client_builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_else(|e| {
@@ -305,7 +305,7 @@ impl HttpSessionSink {
                         "session archive: could not build a timeout-bearing HTTP client; \
                          falling back to the default (no timeout)"
                     );
-                    reqwest::Client::new()
+                    crate::util::http::new_client()
                 }),
         }
     }

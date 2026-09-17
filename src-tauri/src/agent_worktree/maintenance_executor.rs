@@ -623,7 +623,7 @@ pub async fn tick_once() -> Result<(), String> {
         base.trim_end_matches('/'),
         device_id
     );
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("build maintenance http client: {e}"))?;

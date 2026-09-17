@@ -662,7 +662,7 @@ async fn check_auth_status_impl() -> Result<AuthStatus, AppError> {
 /// existing summary line (never logged separately) so the diagnosis costs no
 /// extra log volume on a path that runs on every auth check.
 async fn fetch_user_info(access_token: &str) -> Result<UserInfo, EnrichmentReason> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|_| EnrichmentReason::HttpClientBuildFailed)?;
@@ -755,7 +755,7 @@ async fn get_user_projects_impl() -> Result<Vec<Project>, AppError> {
     let access_token = web_backend_user_bearer(&auth_manager).await?;
 
     // Call backend API
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .get(format!("{}/api/v1/projects", get_api_base_url()))
         .bearer_auth(&access_token)

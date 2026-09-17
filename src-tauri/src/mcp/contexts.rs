@@ -740,7 +740,7 @@ async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result
     // Get the API base URL
     let api_url = crate::api_config::get_api_base_url();
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
 
     // First, get the current project configuration
     let get_response = client

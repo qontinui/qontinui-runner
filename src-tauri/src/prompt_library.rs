@@ -457,7 +457,7 @@ pub async fn list_prompt_templates() -> Result<PromptLibraryResponse, String> {
         return Ok(PromptLibraryResponse::ok(entry.prompts, None));
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .map_err(|e| format!("build http client: {e}"))?;

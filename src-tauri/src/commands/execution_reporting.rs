@@ -558,7 +558,7 @@ async fn create_execution_run_impl(
     }
 
     // Send to backend — reqwest::Error and serde_json::Error convert via `?`.
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!("{}/api/v1/execution/runs", get_api_base_url()))
         .bearer_auth(&access_token)
@@ -640,7 +640,7 @@ async fn report_action_executions_impl(
 
     let request = ActionExecutionBatchRequest { actions };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!(
             "{}/api/v1/execution/runs/{}/actions",
@@ -741,7 +741,7 @@ async fn upload_execution_screenshot_impl(
         .part("image", image_part)
         .part("metadata", metadata_part);
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!(
             "{}/api/v1/execution/runs/{}/screenshots",
@@ -820,7 +820,7 @@ async fn report_execution_issues_impl(
 
     let request = ExecutionIssueBatchRequest { issues };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(format!(
             "{}/api/v1/execution/runs/{}/issues",
@@ -901,7 +901,7 @@ async fn complete_execution_run_impl(
         error_message: input.error_message,
     };
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .put(format!(
             "{}/api/v1/execution/runs/{}/complete",

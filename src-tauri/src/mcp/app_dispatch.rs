@@ -94,11 +94,11 @@ pub struct AppDispatcher {
 
 impl AppDispatcher {
     pub fn new(registry: Arc<AppRegistry>, command_relay: Arc<CommandRelay>) -> Arc<Self> {
-        let http = reqwest::Client::builder()
+        let http = crate::util::http::client_builder()
             .timeout(HTTP_DISPATCH_TIMEOUT)
             .pool_max_idle_per_host(4)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_client());
         Arc::new(Self {
             registry,
             command_relay,
@@ -515,7 +515,7 @@ mod tests {
             app_url: url.to_string(),
             base_path: base_path.to_string(),
             app_info: info,
-            client: reqwest::Client::new(),
+            client: crate::util::http::new_client(),
             connected_at: 0,
             transport_kind: None,
             physical_device_id: None,

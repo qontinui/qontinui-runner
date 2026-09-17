@@ -284,7 +284,7 @@ Now implement the fix, prioritizing:
 /// Called at the start of each verification phase so each iteration
 /// only captures its own console errors.
 pub(super) async fn clear_console_errors() {
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
     {
@@ -331,7 +331,7 @@ pub(super) fn extract_console_errors_from_response(
 /// no SDK app connected), they silently return empty results.
 pub(super) async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_json::Value>, String>
 {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
@@ -377,7 +377,7 @@ pub(super) async fn fetch_console_errors_from_ui_bridge() -> Result<Vec<serde_js
 /// Returns the health assessment (status, score, breakdown, top issue).
 /// Best-effort — returns None if the SDK app isn't connected.
 pub(super) async fn fetch_health_from_ui_bridge() -> Option<serde_json::Value> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .ok()?;
@@ -401,7 +401,7 @@ pub(super) async fn fetch_health_from_ui_bridge() -> Option<serde_json::Value> {
 /// HMR failures, network errors, resource errors) since the given timestamp.
 /// These provide richer context than console-errors alone.
 pub(super) async fn fetch_browser_events_from_ui_bridge(since: u64) -> Vec<serde_json::Value> {
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -447,7 +447,7 @@ pub(super) async fn fetch_browser_events_from_ui_bridge(since: u64) -> Vec<serde
 /// Returns HTTP requests that failed (4xx/5xx, timeouts, CORS) since the
 /// given timestamp. Helps identify broken API calls during verification.
 pub(super) async fn fetch_network_failures_from_ui_bridge(since: u64) -> Vec<serde_json::Value> {
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -554,7 +554,7 @@ pub async fn check_environment_readiness(
     workflow_name: &str,
     check_sdk: bool,
 ) -> EnvironmentReadinessResult {
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
     {
@@ -915,7 +915,7 @@ pub async fn try_auto_connect_sdk_for_ui_workflow(workflow_name: &str) {
     }
 
     let base_url = format!("http://127.0.0.1:{}", MCP_API_PORT);
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {
@@ -1313,7 +1313,7 @@ pub(super) fn compute_embedding_sync(text: &str) -> Result<Vec<f32>, String> {
     // tokio worker, and use Tauri's process-wide runtime for the async work.
     std::thread::spawn(move || {
         tauri::async_runtime::block_on(async {
-            let client = reqwest::Client::builder()
+            let client = crate::util::http::client_builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .map_err(|e| format!("Failed to build HTTP client: {}", e))?;

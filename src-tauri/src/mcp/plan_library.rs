@@ -148,7 +148,7 @@ const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30)
 fn upstream_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(UPSTREAM_TIMEOUT)
             .build()
             // `build()` only fails on a broken TLS backend, which the default
@@ -159,7 +159,7 @@ fn upstream_client() -> &'static reqwest::Client {
                     "plan-library door: could not build a timeout-bearing HTTP client; \
                      falling back to the default (no timeout)"
                 );
-                reqwest::Client::new()
+                crate::util::http::new_client()
             })
     })
 }

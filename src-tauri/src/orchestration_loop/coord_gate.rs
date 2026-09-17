@@ -435,7 +435,7 @@ impl LiveCoordGateClient {
     }
 
     fn http_client(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(self.timeout)
             .build()
             .map_err(|e| format!("coord_gate: http client build: {e:#}"))

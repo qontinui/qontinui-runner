@@ -311,7 +311,10 @@ pub async fn fetch(ids: &[String]) -> StatusFetch {
             )
         }
     };
-    let client = match reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() {
+    let client = match crate::util::http::client_builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             return StatusFetch::degraded(

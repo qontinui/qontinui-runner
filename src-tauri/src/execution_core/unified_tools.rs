@@ -418,7 +418,7 @@ async fn execute_api_request(
     );
 
     // Build the HTTP client with timeout
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
     {
@@ -741,7 +741,7 @@ async fn execute_mcp_call(step_id: &str, inputs: &HashMap<String, Value>) -> Ste
     );
 
     // Build the request to the runner's MCP API
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
     {

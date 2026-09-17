@@ -27,7 +27,7 @@ pub async fn collect_from_ui_bridge() -> Vec<AnnotatedElement> {
     let port = get_mcp_api_port();
     let url = format!("http://127.0.0.1:{}/ui-bridge/sdk/control/snapshot", port);
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {

@@ -27,7 +27,7 @@ impl LanTransport {
     /// Validate that the device at `address` is reachable and has UI Bridge
     /// running.  Returns a `DiscoveredApp` with the device's metadata.
     pub async fn check_device(&self, address: SocketAddr) -> Result<DiscoveredApp, TransportError> {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .map_err(|e| TransportError::HealthCheckFailed {

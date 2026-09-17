@@ -336,7 +336,7 @@ pub async fn verify_api_spec(
         .base_url
         .unwrap_or_else(|| format!("http://localhost:{}", port));
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|e| {

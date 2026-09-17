@@ -339,7 +339,7 @@ pub fn ui_thread_wedged() -> bool {
 fn probe_livez_blocking() -> bool {
     let port = crate::mcp::types::get_mcp_api_port();
     let url = format!("http://127.0.0.1:{port}/livez");
-    let client = match reqwest::blocking::Client::builder()
+    let client = match crate::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(SELF_PROBE_TIMEOUT_SECS))
         .build()
     {

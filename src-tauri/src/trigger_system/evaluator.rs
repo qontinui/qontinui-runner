@@ -240,7 +240,7 @@ impl TriggerEvaluator {
 
     /// Check if the runner is idle (no workflows running).
     async fn check_idle_condition(&self) -> bool {
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base = match &self.app_state {
             Some(state) => crate::mcp::types::get_self_base_url(state),
             None => crate::mcp::types::get_self_base_url_from_env(),

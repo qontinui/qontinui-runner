@@ -98,7 +98,7 @@ async fn check_sunshine() -> Option<(String, Option<String>)> {
     let url = format!("{}/api/currentclients", sunshine_base_url());
 
     // Sunshine uses a self-signed cert, so we must accept invalid certs
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -269,7 +269,7 @@ fn encode_rgba_to_jpeg(image: &image::RgbaImage, quality: u8) -> Result<Vec<u8>,
 pub async fn post_pair(AxumState(_state): AxumState<Arc<ApiState>>) -> Json<PairResponse> {
     let host_ip = get_local_ip();
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -441,7 +441,7 @@ pub async fn post_focus(
 
 /// Configure Sunshine to capture a specific application by window title.
 async fn configure_sunshine_app(window_title: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
         .build()
@@ -488,7 +488,7 @@ async fn configure_sunshine_app(window_title: &str) -> Result<(), String> {
 async fn configure_sunshine_desktop() -> Result<(), String> {
     // When no specific app is configured, Sunshine defaults to desktop capture.
     // We can also explicitly set it via the apps API with an empty app name.
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(5))
         .build()

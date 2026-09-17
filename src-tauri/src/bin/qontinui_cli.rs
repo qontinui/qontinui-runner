@@ -352,7 +352,7 @@ fn pr_create(args: &[String]) -> ExitCode {
         payload["draft"] = serde_json::json!(true);
     }
 
-    let client = match reqwest::blocking::Client::builder()
+    let client = match qontinui_runner_lib::util::http::blocking_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
     {

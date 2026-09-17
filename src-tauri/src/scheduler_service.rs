@@ -1040,7 +1040,7 @@ impl SchedulerService {
         );
 
         // Build the request to run workflow via HTTP API
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         // Load config if specified
@@ -1119,7 +1119,7 @@ impl SchedulerService {
             workflow_id, monitor_index
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         let mut request_body = serde_json::json!({});
@@ -1181,7 +1181,7 @@ impl SchedulerService {
             prompt_id, max_sessions
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         let mut request_body = serde_json::json!({
@@ -1225,7 +1225,7 @@ impl SchedulerService {
     ) -> Result<String, String> {
         info!("Launching auto-fix (check_findings: {})", check_findings);
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         let prompt = if check_findings {
@@ -1322,7 +1322,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
             task_name, model, max_turns, timeout_seconds
         );
 
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         // Plan defaults (see tmp_scheduler_reliability_plan.md, Phase D §5).
@@ -1530,7 +1530,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
             .replace("{{query}}", &watcher.timeline_query);
 
         // 4. Send to AI for reasoning via the runner's prompt execution API
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let base_url = self.self_base_url();
 
         let request_body = serde_json::json!({
@@ -1699,7 +1699,7 @@ impl SchedulerService {
 
     /// Check if runner is idle (not executing workflows or AI tasks)
     async fn check_idle(&self) -> bool {
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let status_url = format!("{}/status", self.self_base_url());
         match client.get(&status_url).send().await {
             Ok(resp) => {

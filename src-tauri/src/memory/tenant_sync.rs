@@ -662,12 +662,12 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 
 async fn run_drain_loop(sync: Arc<TenantMemorySync>) {
     tracing::info!("tenant_sync: memory drain loop starting");
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "tenant_sync: reqwest client build failed; using default");
-            reqwest::Client::new()
+            crate::util::http::new_client()
         });
     let warned_no_base = std::sync::Once::new();
     let mut backoff = BACKOFF_INITIAL;
@@ -1466,7 +1466,7 @@ mod tests {
         sync.enqueue(record("r3", "content three"));
 
         let (base, rec) = spawn_fake_web(None).await;
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let outcome = sync.flush_once(&client, &base).await;
         assert_eq!(outcome, FlushOutcome::Flushed(3));
 
@@ -1516,7 +1516,8 @@ mod tests {
 
         let (base, rec) = spawn_fake_web(None).await;
         assert_eq!(
-            sync.flush_once(&reqwest::Client::new(), &base).await,
+            sync.flush_once(&crate::util::http::new_client(), &base)
+                .await,
             FlushOutcome::Flushed(2)
         );
 
@@ -1555,7 +1556,9 @@ mod tests {
         sync.enqueue(record("r1", "content one"));
 
         let (base, rec) = spawn_fake_web(None).await;
-        let outcome = sync.flush_once(&reqwest::Client::new(), &base).await;
+        let outcome = sync
+            .flush_once(&crate::util::http::new_client(), &base)
+            .await;
 
         assert_eq!(
             outcome,
@@ -1591,7 +1594,7 @@ mod tests {
         sync.enqueue(record("r2", "content two"));
 
         let (base, _rec) = spawn_fake_web(Some(429)).await;
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let outcome = sync.flush_once(&client, &base).await;
         assert_eq!(outcome, FlushOutcome::RateLimited);
         assert_eq!(
@@ -1609,7 +1612,7 @@ mod tests {
         sync.enqueue(record("r1", "content one"));
 
         let (base, _rec) = spawn_fake_web(Some(422)).await;
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let outcome = sync.flush_once(&client, &base).await;
         assert_eq!(outcome, FlushOutcome::Dropped(1));
         assert!(
@@ -1627,7 +1630,7 @@ mod tests {
         sync.enqueue(record("r1", "content one"));
 
         let (base, rec) = spawn_fake_web(None).await;
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         let outcome = sync.flush_once(&client, &base).await;
         assert_eq!(
             outcome,
@@ -1651,7 +1654,7 @@ mod tests {
         sync.enqueue(record("r1", "content one"));
 
         // Unroutable port — connection refused.
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
@@ -1674,7 +1677,7 @@ mod tests {
         }
 
         let (base, rec) = spawn_fake_web(None).await;
-        let client = reqwest::Client::new();
+        let client = crate::util::http::new_client();
         assert_eq!(
             sync.flush_once(&client, &base).await,
             FlushOutcome::Flushed(MAX_BATCH)

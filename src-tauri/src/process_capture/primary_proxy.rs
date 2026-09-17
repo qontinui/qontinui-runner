@@ -37,7 +37,7 @@ struct ApiResponse<T> {
 
 /// Shared HTTP client for all proxy requests (reuses connections).
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(10))
         .pool_max_idle_per_host(4)
         .build()
@@ -199,7 +199,7 @@ pub async fn restart_process(id: &str) -> Result<(), String> {
 pub async fn rebuild_and_restart_process(id: &str) -> Result<(), String> {
     let url = format!("{}/processes/{}/rebuild-and-restart", base_url(), id);
     // Builds can take minutes — use a longer timeout (build=300s + stop/start overhead)
-    let long_client = reqwest::Client::builder()
+    let long_client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;

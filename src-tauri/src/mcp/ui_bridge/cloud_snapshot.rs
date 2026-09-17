@@ -283,7 +283,7 @@ pub async fn ui_bridge_cloud_snapshot_handler(
 /// unit-testable against a local mock server without a live relay.
 async fn fetch_snapshot_via_tunnel(local_port: u16) -> Result<serde_json::Value, String> {
     let url = format!("http://127.0.0.1:{local_port}{DEVICE_SNAPSHOT_PATH}");
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(SNAPSHOT_GET_TIMEOUT)
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;

@@ -96,7 +96,7 @@ async fn deliver_once() -> anyhow::Result<()> {
         .get_access_token()
         .map_err(|e| anyhow::anyhow!("no device JWT available: {e}"))?;
 
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()?;
 

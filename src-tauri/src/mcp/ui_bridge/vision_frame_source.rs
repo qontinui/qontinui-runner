@@ -84,7 +84,7 @@ impl FrameProvider for DeviceScreenshotSource {
         let base = self.base_url.trim_end_matches('/');
         let url = format!("{base}/ui-bridge/control/screenshot");
 
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(SCREENSHOT_HTTP_TIMEOUT)
             // A short connect timeout so a dead/unreachable host fails fast
             // instead of stalling the whole vision call on the (longer) total

@@ -30,7 +30,7 @@ pub async fn launch_workflow_via_restate(
         execution_id, url
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(&url)
         .json(input)
@@ -69,7 +69,7 @@ pub async fn request_workflow_stop(execution_id: &str, ingress_url: &str) -> Res
         ingress_url, execution_id
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(&url)
         .json(&serde_json::json!(null))
@@ -101,7 +101,7 @@ pub async fn resolve_awakeable(
         ingress_url, awakeable_id
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(&url)
         .json(payload)

@@ -128,7 +128,7 @@ const EXPORT_MAX_BYTES: usize = 40 * 1024 * 1024;
 fn upstream_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(UPSTREAM_TIMEOUT)
             .build()
             // `build()` only fails on a broken TLS backend, which the default
@@ -139,7 +139,7 @@ fn upstream_client() -> &'static reqwest::Client {
                     "session-repository door: could not build a timeout-bearing HTTP client; \
                      falling back to the default (no timeout)"
                 );
-                reqwest::Client::new()
+                crate::util::http::new_client()
             })
     })
 }
@@ -150,7 +150,7 @@ fn upstream_client() -> &'static reqwest::Client {
 fn export_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(EXPORT_TIMEOUT)
             .build()
             .unwrap_or_else(|e| {
@@ -158,7 +158,7 @@ fn export_client() -> &'static reqwest::Client {
                     error = %e,
                     "session-repository door: could not build a timeout-bearing export client;                      falling back to the default (no timeout)"
                 );
-                reqwest::Client::new()
+                crate::util::http::new_client()
             })
     })
 }

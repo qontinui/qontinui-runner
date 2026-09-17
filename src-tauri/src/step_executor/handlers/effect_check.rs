@@ -122,7 +122,7 @@ impl StepHandler for EffectCheckHandler {
 
         // 2. Trigger the action via the runner's own SDK action endpoint.
         let self_base = crate::mcp::types::get_self_base_url(&context.app_state);
-        let client = match reqwest::Client::builder()
+        let client = match crate::util::http::client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
         {

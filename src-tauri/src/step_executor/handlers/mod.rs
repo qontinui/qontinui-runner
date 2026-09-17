@@ -1079,7 +1079,7 @@ You MUST output PASS or FAIL. No other format is acceptable.
 /// Makes a quick HTTP request to the SDK elements endpoint.
 /// Returns None if the request fails or times out.
 async fn try_gather_ui_context() -> Option<String> {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
         .ok()?;

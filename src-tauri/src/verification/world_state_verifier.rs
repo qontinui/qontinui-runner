@@ -86,7 +86,7 @@ pub struct WorldStateVerifier {
 
 impl WorldStateVerifier {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             // llama-swap may cold-start the model on first request (weight
             // download on the very first call, ~14GB). 5 minutes is enough
             // for cached starts; cold starts will exceed this and fall back
@@ -94,7 +94,7 @@ impl WorldStateVerifier {
             // don't want to block the agentic loop on a one-time download.
             .timeout(Duration::from_secs(300))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_client());
         Self {
             client,
             endpoint: endpoint.into(),

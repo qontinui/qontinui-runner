@@ -129,7 +129,7 @@ pub fn collect_diagnostics() -> DiagnosticInfo {
 /// Check if the extension endpoint is reachable by sending a simple command
 fn check_extension_reachability() -> Result<bool, String> {
     // Use blocking client with a short timeout for quick check
-    let client = match reqwest::blocking::Client::builder()
+    let client = match crate::util::http::blocking_client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
     {

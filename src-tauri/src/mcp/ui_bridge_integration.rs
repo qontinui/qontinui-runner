@@ -9,7 +9,6 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1930,7 +1929,7 @@ async fn handle_health_check(
         Err(e) => return Json(ApiResponse::error(e)),
     };
 
-    let client = Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap_or_default();

@@ -70,7 +70,7 @@ fn mask_runner_token(token: &str) -> String {
 }
 
 fn build_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| {

@@ -709,10 +709,10 @@ const LOCAL_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 fn tenant_query_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(TENANT_QUERY_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .unwrap_or_else(|_| crate::util::http::new_client())
     })
 }
 
@@ -1710,7 +1710,7 @@ mod tenant_memory_arm_tests {
     }
 
     fn client() -> reqwest::Client {
-        reqwest::Client::builder()
+        crate::util::http::client_builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap()

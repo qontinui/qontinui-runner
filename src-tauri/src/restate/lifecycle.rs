@@ -318,7 +318,7 @@ pub async fn is_restate_healthy_for(config: &RestateSettings) -> bool {
 
 async fn probe_health(admin_base_url: &str) -> bool {
     let url = format!("{}/health", admin_base_url.trim_end_matches('/'));
-    match reqwest::Client::new()
+    match crate::util::http::new_client()
         .get(&url)
         .timeout(Duration::from_secs(2))
         .send()
@@ -347,7 +347,7 @@ pub async fn register_service_endpoint(
         admin_url, service_url
     );
 
-    let client = reqwest::Client::new();
+    let client = crate::util::http::new_client();
     let response = client
         .post(&admin_url)
         .json(&serde_json::json!({

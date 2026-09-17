@@ -313,7 +313,7 @@ fn build_failure_context_block(summary: &SummarizeResult) -> String {
 }
 
 fn build_client() -> Result<reqwest::Client, RewindError> {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| RewindError::HttpRewind(format!("client build: {}", e)))

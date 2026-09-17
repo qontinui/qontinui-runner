@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_base_url_normalization() {
-        let fetch = UiBridgeFetch::new(Client::new(), "http://localhost:3000/");
+        let fetch = UiBridgeFetch::new(crate::util::http::new_client(), "http://localhost:3000/");
         assert_eq!(fetch.base_url, "http://localhost:3000");
     }
 }

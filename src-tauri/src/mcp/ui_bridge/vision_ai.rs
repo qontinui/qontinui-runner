@@ -147,12 +147,12 @@ pub struct OcrClient {
 
 impl OcrClient {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             // OCR is fast (≤300ms warm). Cold model-load through llama-swap can
             // take a minute on first invocation. Match WSM's 5-minute ceiling.
             .timeout(Duration::from_secs(300))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_client());
         Self {
             client,
             endpoint: endpoint.into(),
@@ -500,10 +500,10 @@ pub struct VlmClient {
 
 impl VlmClient {
     pub fn new(endpoint: impl Into<String>, model: impl Into<String>) -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(300))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| crate::util::http::new_client());
         Self {
             client,
             endpoint: endpoint.into(),

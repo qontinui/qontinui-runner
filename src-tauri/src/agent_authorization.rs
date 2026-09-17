@@ -1179,7 +1179,7 @@ static CACHE: Lazy<RegistryCache> =
 /// One reusable client: rebuilding the TLS root store on every refresh is
 /// avoidable work, and the connection is warm across refreshes.
 static HTTP: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
-    reqwest::Client::builder()
+    crate::util::http::client_builder()
         .timeout(HTTP_TIMEOUT)
         .build()
         .ok()

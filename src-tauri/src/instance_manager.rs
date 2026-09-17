@@ -739,7 +739,7 @@ fn is_process_alive(child: &mut std::process::Child) -> bool {
 /// Probe an instance's HTTP API to check if it's ready to accept requests.
 /// Returns true if the `/status` endpoint responds within 1 second.
 async fn probe_instance_api(port: u16) -> bool {
-    let client = reqwest::Client::builder()
+    let client = crate::util::http::client_builder()
         .timeout(std::time::Duration::from_secs(1))
         .build();
 

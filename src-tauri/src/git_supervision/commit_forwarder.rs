@@ -155,7 +155,7 @@ async fn post_commit_observation(coord_http_base: &str, body: &CommitObservation
         "{}/coord/commits/observations",
         coord_http_base.trim_end_matches('/')
     );
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_secs(10))
         .build()
     {

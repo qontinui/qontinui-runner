@@ -2932,7 +2932,7 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
         }
     }
 
-    let client = match reqwest::Client::builder()
+    let client = match crate::util::http::client_builder()
         .timeout(Duration::from_secs(120))
         .build()
     {

@@ -24,7 +24,7 @@ struct ApiResponse<T> {
 
 impl RunnerClient {
     pub fn new(port: u16) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(15))
             .build()
             .expect("Failed to create HTTP client");
@@ -615,7 +615,7 @@ impl RunnerClient {
 
 impl SupervisorClient {
     pub fn new(port: u16) -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");

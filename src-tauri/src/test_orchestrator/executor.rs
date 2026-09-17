@@ -45,7 +45,7 @@ impl Default for TestOrchestrator {
 impl TestOrchestrator {
     /// Create a new TestOrchestrator
     pub fn new() -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to build HTTP client");
@@ -72,7 +72,7 @@ impl TestOrchestrator {
 
     /// Create with custom timeout
     pub fn with_timeout(timeout_seconds: u64) -> Self {
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .timeout(Duration::from_secs(timeout_seconds))
             .build()
             .expect("Failed to build HTTP client");

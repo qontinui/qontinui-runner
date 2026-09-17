@@ -40,7 +40,7 @@ impl ApiRequestExecutor {
     /// Create a new API request executor
     pub fn new() -> Self {
         // No global timeout - each request specifies its own timeout (or no timeout)
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .build()
             .expect("Failed to build HTTP client");
 
@@ -53,7 +53,7 @@ impl ApiRequestExecutor {
     /// Create executor with a shared variable resolver
     pub fn with_resolver(resolver: VariableResolver) -> Self {
         // No global timeout - each request specifies its own timeout (or no timeout)
-        let client = Client::builder()
+        let client = crate::util::http::client_builder()
             .build()
             .expect("Failed to build HTTP client");
 

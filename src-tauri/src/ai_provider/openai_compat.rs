@@ -101,7 +101,7 @@ fn execute_chat_completion(
         api_key.is_some()
     );
 
-    let mut builder = reqwest::blocking::Client::builder();
+    let mut builder = crate::util::http::blocking_client_builder();
     if settings.timeout_seconds > 0 {
         builder = builder.timeout(std::time::Duration::from_secs(settings.timeout_seconds));
     }
