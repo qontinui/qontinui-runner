@@ -123,24 +123,22 @@ static BOUND_PORT: AtomicU16 = AtomicU16::new(0);
 /// after `app_state.api_port.store(...)` so the terminal env-seam (which has no
 /// `app_state`) can read the correct port for the shim loopback.
 ///
-/// This is ALSO the single moment the true bound port is known to the process,
-/// so it is where the OUT-of-process breadcrumb is published (plan
-/// `2026-07-17-universal-coord-device-identity-for-any-session` §4). A separate
-/// process — the identity shim launching `claude` in a bare terminal — has no
-/// way to read [`BOUND_PORT`] or the managed `AppState`; the breadcrumb is its
-/// only honest answer. See `qontinui_runner_lib::runner_breadcrumb`.
+/// This is the plain atomic store its name says, and nothing else. The
+/// OUT-of-process breadcrumb (plan
+/// `2026-07-17-universal-coord-device-identity-for-any-session` §4 — the
+/// identity shim launching `claude` in a bare terminal has no way to read
+/// [`BOUND_PORT`] or the managed `AppState`) used to be published from here as
+/// a side effect; it is now published one line later by the only production
+/// caller, the bind-success arm of `mcp_api::start_server`, TOGETHER with the
+/// per-port loopback handshake key path the record must name (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
+/// That also removed the `!cfg!(test)` guard this function carried so the bin
+/// crate's unit tests (which call this with synthetic ports) could not write a
+/// fake advertisement into the developer's real `~/.qontinui/runner/`: with no
+/// side effect here there is nothing to guard. See
+/// `qontinui_runner_lib::runner_breadcrumb`.
 pub fn set_bound_port(port: u16) {
     BOUND_PORT.store(port, Ordering::Relaxed);
-    // Skipped under `cfg(test)` so the bin crate's unit tests (which call this
-    // with synthetic ports) never write a fake runner advertisement into the
-    // DEVELOPER's real `~/.qontinui/runner/` — a bare session on this machine
-    // would then try to mint against a port nothing is listening on. Same
-    // discipline as `coord_mcp::nonce_persistence_enabled`'s `!cfg!(test)`
-    // default. The publish path itself is unit-tested in `runner_breadcrumb`
-    // against a temp dir.
-    if !cfg!(test) {
-        qontinui_runner_lib::runner_breadcrumb::publish(port);
-    }
 }
 
 /// Test-only RAII restore for [`BOUND_PORT`].
@@ -153,8 +151,9 @@ pub fn set_bound_port(port: u16) {
 /// assertion would otherwise leave a scratch port behind and turn one real
 /// failure into a cascade of unrelated ones.
 ///
-/// Restores by storing directly rather than through [`set_bound_port`], which
-/// has a publish side effect this must not re-trigger.
+/// Restores by storing directly; equivalent to [`set_bound_port`] now that
+/// the latter is a bare store (its former breadcrumb-publish side effect moved
+/// to `mcp_api::start_server`'s bind arm).
 #[cfg(test)]
 pub(crate) struct BoundPortRestore(u16);
 
