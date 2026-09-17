@@ -1697,6 +1697,23 @@ impl PlanSlugCensus {
     /// the digest matches and **clears it to UNKNOWN when it does not** — that
     /// asymmetry is the integrity property, and it is why the caller may only
     /// withhold against a digest it knows was stored.
+    ///
+    /// **`count` and `truncated` are carried through UNTOUCHED, and that is
+    /// load-bearing rather than incidental.** The server verifies the digest
+    /// but cannot verify the `truncated` flag, so it DERIVES truncation as
+    /// `flag or count != <size of the set it holds>`. A placeholder here — a
+    /// rounded number, a stale count, and worst of all a `0` — therefore reads
+    /// as a truncated census, and a truncated census is a FLOOR, which takes
+    /// the whole `source_repo`'s coverage block to UNKNOWN. Silently, and on
+    /// the steady-state arm that runs on almost every cycle.
+    ///
+    /// The invariant that keeps it honest: the caller withholds only when this
+    /// census's digest equals the stored one, and the digest is over the stems
+    /// SENT — so `count` is this cycle's true enumeration of a set the server
+    /// holds the same digest for. When the two genuinely disagree (the kept
+    /// set is unchanged but this cycle enumerated something it had to drop),
+    /// `count > listed` and `truncated` is already `true`: the derived verdict
+    /// and the flag agree, and both say FLOOR, which is the truth.
     #[must_use]
     pub fn withheld(mut self) -> Self {
         self.slugs = None;

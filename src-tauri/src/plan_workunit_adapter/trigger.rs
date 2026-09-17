@@ -6174,6 +6174,99 @@ mod tests {
         );
     }
 
+    /// **On the withheld arm, `count` is the EXACT size of the set the digest
+    /// names.** The server verifies the digest but cannot verify the
+    /// `truncated` flag, so it derives truncation as
+    /// `flag or count != <the size of the set it holds>`. A placeholder count
+    /// on this arm — a rounded number, a stale one, and worst of all a `0`,
+    /// which is `< listed` and so derives truncated too — makes the server read
+    /// the census as a FLOOR and take the whole `source_repo`'s coverage block
+    /// to UNKNOWN. It would do that SILENTLY, on the steady-state arm that runs
+    /// on almost every cycle, and nothing on the wire would complain: the
+    /// digest would still verify.
+    ///
+    /// So this asserts the equality the server derives its verdict from,
+    /// against the set the PREVIOUS report actually sent — not against
+    /// `count`'s own provenance, which is what a future refactor would break.
+    ///
+    /// Mutation proof (run 2026-09-17): setting `self.count = 0` inside
+    /// `PlanSlugCensus::withheld` fails this test on `count` while every other
+    /// assertion here — `slugs: None`, the matching digest, `truncated: false`
+    /// — still passes, which is exactly the silence the derived verdict exists
+    /// to catch.
+    #[tokio::test]
+    async fn a_withheld_census_carries_the_exact_size_of_the_set_its_digest_names() {
+        let dir = one_plan_dir();
+        std::fs::write(
+            dir.path().join("2026-01-02-second.md"),
+            "# Second\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let conv = PlanConvention::operator_default();
+        let refc = || Some(a_ref_census(&["2026-01-01-one-plan", "2026-01-02-second"]));
+
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            refc(),
+        )
+        .await;
+        // The reading moves so the heartbeat is due again; neither SET does.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            refc(),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        let census = |i: usize, source: &str| {
+            sent[i]
+                .censuses
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.source == source)
+                .cloned()
+                .unwrap_or_else(|| panic!("report {i} carries a {source} census"))
+        };
+        for source in ["ref", "work_tree"] {
+            let first = census(0, source);
+            let held = census(1, source);
+            let listed = first
+                .slugs
+                .as_ref()
+                .expect("the first report sent the stems")
+                .len() as u64;
+            assert_eq!(listed, 2, "{source}: the fixture holds two stems");
+            assert_eq!(held.slugs, None, "{source}: the second report withholds");
+            assert_eq!(
+                held.digest, first.digest,
+                "{source}: withheld against the SAME set"
+            );
+            // The assertion the whole clause is about.
+            assert_eq!(
+                held.count, listed,
+                "{source}: a withheld census must carry the exact cardinality of the set its \
+                 digest names — the server derives `truncated` as `flag or count != listed`, so \
+                 any other value silently takes this source_repo's coverage to UNKNOWN"
+            );
+            assert!(
+                !held.truncated,
+                "{source}: and the flag agrees with the derived verdict"
+            );
+            // Stated as the server states it, so this fails on ANY divergence
+            // rather than only on the `count` field being wrong.
+            assert!(
+                !(held.truncated || held.count != listed),
+                "{source}: the server would derive TRUNCATED from this census"
+            );
+        }
+    }
+
     /// A report the web did NOT store may not be re-asserted by digest: a
     /// digest MISMATCH clears the stored set to UNKNOWN, so withholding
     /// against a set the web never took would destroy it. Both ways of not
