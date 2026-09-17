@@ -46,9 +46,10 @@ mod parity;
 
 pub use body_push::{
     backfill_once, build_artifact, build_report, classify_kind, extract_repos, push_artifact,
-    render_report, scan_all_roots, scan_roots, ArtifactKind, ArtifactSink, ArtifactSyncState,
-    ArtifactUpsert, BackfillReport, BackfillSummary, BodyPushOutcome, HttpArtifactSink, ScanRoot,
-    ScanRootAck, ScanRootFailure, ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
+    render_report, scan_all_roots, scan_roots, slug_census_digest, work_tree_census, ArtifactKind,
+    ArtifactSink, ArtifactSyncState, ArtifactUpsert, BackfillReport, BackfillSummary,
+    BodyPushOutcome, HttpArtifactSink, PlanSlugCensus, ScanRoot, ScanRootAck, ScanRootFailure,
+    ScanRootKind, ScanRootReport, ScanRootReporter, ScannedArtifact,
 };
 pub use parser::{
     parse_work_unit, slug_from_filename, ParsedPhase, ParsedWorkUnit, PlanConvention,
@@ -57,7 +58,7 @@ pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, W
 pub use trigger::{
     adapter_metrics, backfill_work_units_once, measure_scan_divergence, newly_disappeared_slugs,
     read_plan_dir, reconcile_archive_once, reconcile_once, resolve_plans_archive_dir,
-    resolve_plans_dir, resolve_prompts_dir, spawn_if_configured, ArchiveSummary, GitRefReader,
-    MetricsSnapshot, PathInputs, PathReader, ProcessGit, ReconcileSummary, ScanDivergence,
-    ScanDivergenceState, WorkUnitBackfillSummary,
+    resolve_plans_dir, resolve_prompts_dir, spawn_if_configured, ArchiveSummary, CycleScan,
+    GitRefReader, MetricsSnapshot, PathInputs, PathReader, ProcessGit, ReconcileSummary,
+    ScanCensusInputs, ScanDivergence, ScanDivergenceState, WorkUnitBackfillSummary,
 };

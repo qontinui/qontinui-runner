@@ -143,6 +143,26 @@ pub struct RefPlanFile {
     pub body: String,
 }
 
+/// What one ref listing produced: the files whose bytes were read, and the
+/// CENSUS of the listing itself.
+///
+/// The two are deliberately different sets. `files` is what the scan could
+/// USE; `names` is what the listing SAW — including an entry whose blob would
+/// not read, which is skipped below with a warning. The census is the
+/// denominator of a coverage question, so it has to be the second: a file the
+/// scan chokes on must not vanish from both sides of the set difference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefListing {
+    /// Files whose blobs read, sorted by name.
+    pub files: Vec<RefPlanFile>,
+    /// Every depth-1 `*.md` name at the ref, sorted — blob-readable or not.
+    pub names: Vec<String>,
+    /// What `ref_name` resolved to when this listing was taken. `None` when
+    /// the rev would not resolve: UNKNOWN, and the census still stands —
+    /// the stems WERE listed, only the sha they were listed at is missing.
+    pub ref_sha: Option<String>,
+}
+
 /// Read every depth-1 `*.md` of `rel_dir` at `ref_name`.
 ///
 /// Two `git` invocations for the whole directory — one listing, one batched
@@ -159,14 +179,39 @@ pub fn read_ref_dir(
     repo_root: &Path,
     ref_name: &str,
     rel_dir: &str,
-) -> Result<Vec<RefPlanFile>, String> {
+) -> Result<RefListing, String> {
     let entries = git.list_ref_dir(repo_root, ref_name, rel_dir)?;
     let wanted: Vec<_> = entries
         .into_iter()
         .filter(|e| is_plan_file(&e.name))
         .collect();
+    // The census is taken from the LISTING, before a single blob is read, so
+    // it names what the ref side holds rather than what this cycle managed to
+    // read out of it.
+    let mut names: Vec<String> = wanted.iter().map(|e| e.name.clone()).collect();
+    names.sort();
+    // Resolved HERE, at the listing, so the census carries the sha its stems
+    // were listed AT — not one read at some other moment of the cycle. A rev
+    // that will not resolve leaves it UNKNOWN rather than failing the listing:
+    // the stems are the reading, the sha only qualifies it.
+    let ref_sha = match git.rev_parse(repo_root, ref_name) {
+        Ok(sha) => Some(sha),
+        Err(e) => {
+            tracing::debug!(
+                ref_name = %ref_name,
+                error = %e,
+                "plan adapter: listed the ref but could not resolve it to an object id; the \
+                 slug census carries ref_sha UNKNOWN"
+            );
+            None
+        }
+    };
     if wanted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(RefListing {
+            files: Vec::new(),
+            names,
+            ref_sha,
+        });
     }
     let asked = wanted.len();
     let ids: Vec<String> = wanted.iter().map(|e| e.id.clone()).collect();
@@ -204,7 +249,11 @@ pub fn read_ref_dir(
     // `ls-tree` already emits in tree order, which is byte order on the name —
     // sorted anyway so a dry-run report is reproducible across git versions.
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    Ok(RefListing {
+        files: out,
+        names,
+        ref_sha,
+    })
 }
 
 /// The ref arm's `*.md` predicate.

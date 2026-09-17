@@ -1688,32 +1688,47 @@ pub fn read_plans_for_cycle(
     dir: &Path,
     conv: &PlanConvention,
     git: &dyn GitRefReader,
-) -> Result<Vec<ParsedWorkUnit>, String> {
+) -> Result<CycleScan, String> {
     use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
     match resolve_scan_source(git, dir) {
-        ScanSource::WorkTree => Ok(read_plan_dir(dir, conv)),
+        ScanSource::WorkTree => Ok(CycleScan {
+            units: read_plan_dir(dir, conv),
+            // No ref was listed, so the REF side is ABSENT — UNKNOWN, never
+            // an empty set. A zero here would be the claim that the default
+            // branch holds no plans, which nothing measured.
+            ref_census: None,
+        }),
         ScanSource::Unavailable { reason } => Err(reason),
         ScanSource::Ref {
             repo_root,
             ref_name,
             rel_dir,
         } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
-            Ok(files) => {
+            Ok(listing) => {
                 // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
                 // ancestor chain for a `.git` and every entry shares the answer.
                 let source_root = super::body_push::derive_source_repo(dir);
-                Ok(files
-                    .into_iter()
-                    .map(|f| {
-                        // The path a unit RECORDS is the one the tree scan
-                        // would have recorded — the ref is where the bytes
-                        // came from, not a different plan corpus.
-                        let path = dir.join(&f.name);
-                        let source_path = relative_source_path(source_root.as_deref(), &path);
-                        let slug = slug_from_filename(&path.to_string_lossy());
-                        parse_work_unit(&slug, &source_path, &f.body, conv)
-                    })
-                    .collect())
+                let ref_census = super::body_push::PlanSlugCensus::new(
+                    super::body_push::SLUG_CENSUS_SOURCE_REF,
+                    listing.ref_sha.clone(),
+                    listing.names.iter().map(|n| slug_from_filename(n)),
+                );
+                Ok(CycleScan {
+                    units: listing
+                        .files
+                        .into_iter()
+                        .map(|f| {
+                            // The path a unit RECORDS is the one the tree scan
+                            // would have recorded — the ref is where the bytes
+                            // came from, not a different plan corpus.
+                            let path = dir.join(&f.name);
+                            let source_path = relative_source_path(source_root.as_deref(), &path);
+                            let slug = slug_from_filename(&path.to_string_lossy());
+                            parse_work_unit(&slug, &source_path, &f.body, conv)
+                        })
+                        .collect(),
+                    ref_census: Some(ref_census),
+                })
             }
             Err(e) => Err(format!(
                 "could not read `{ref_name}:{rel_dir}` in {}: {e}",
@@ -1721,6 +1736,23 @@ pub fn read_plans_for_cycle(
             )),
         },
     }
+}
+
+/// One cycle's scan: the parsed units, and what the cycle can say about the
+/// REF side's stem set.
+///
+/// The two halves of this adapter scan different sources — the work-unit half
+/// reads the fetched REF, the body sync reads the WORKING TREE — so one device
+/// is the only thing in the fleet that holds both answers. This carries the
+/// ref half out to the scan-root report, where the web can difference it
+/// against the tree half instead of computing a ratio off one of them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CycleScan {
+    pub units: Vec<ParsedWorkUnit>,
+    /// The `ref` census this cycle listed. `None` on the WORK-TREE arm: the
+    /// plans dir is not in a repo at all, so there is no ref side to report —
+    /// ABSENT (UNKNOWN), never an empty set.
+    pub ref_census: Option<super::body_push::PlanSlugCensus>,
 }
 
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
@@ -2611,7 +2643,12 @@ impl LoopState {
             // keeps being quoted until it ages out. The body sync's library
             // scan stays off here (unchanged); only its scan-root report runs.
             if let Some(bs) = self.body_sync.as_mut() {
-                bs.report_while_idle(metrics).await;
+                // BOTH stem sets ABSENT: no directory was enumerated and no
+                // ref was listed, so there is no census to take. (`state` is
+                // `not_scanning` here, which the web door forbids a census on
+                // for exactly this reason.)
+                bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                    .await;
             }
             return;
         };
@@ -2630,7 +2667,7 @@ impl LoopState {
         // the scan duration. That is the mechanism behind a 20s keepalive firing
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
-        let units = {
+        let CycleScan { units, ref_census } = {
             let scan_dir = dir.clone();
             let conv = self.conv.clone();
             // The loop's OWN git reader, not a hardcoded `ProcessGit`: the
@@ -2644,7 +2681,7 @@ impl LoopState {
             })
             .await
             {
-                Ok(Ok(u)) => u,
+                Ok(Ok(scan)) => scan,
                 // Phase 2: `Err` is the ref saying it could not be read. It is
                 // NOT an empty corpus — publishing `Vec::new()` here would let
                 // reconcile treat every plan as disappeared.
@@ -2665,7 +2702,14 @@ impl LoopState {
                     // the reason the scan-root report sits ahead of the
                     // breaker pause and the `artifacts.is_empty()` return.
                     if let Some(bs) = self.body_sync.as_mut() {
-                        bs.report_while_idle(metrics).await;
+                        // BOTH stem sets ABSENT. The scan source was
+                        // unavailable, so nothing was listed — and a set that
+                        // was never listed is UNKNOWN. Sending `count: 0`
+                        // here would say "this side holds no plans", which is
+                        // the false zero this whole plan family exists to
+                        // remove.
+                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                            .await;
                     }
                     metrics.cycles_total.fetch_add(1, Ordering::Relaxed);
                     return;
@@ -2694,7 +2738,15 @@ impl LoopState {
                         self.last_scan_unavailable = Some(reason);
                     }
                     if let Some(bs) = self.body_sync.as_mut() {
-                        bs.report_while_idle(metrics).await;
+                        // BOTH stem sets ABSENT, and this is the arm where it
+                        // matters most: the scan task did not COMPLETE, so the
+                        // enumeration never happened at all. A zero census
+                        // here would not even be stale — it would be
+                        // FABRICATED, a set nothing on this device ever
+                        // listed, and the web would store it as this device's
+                        // answer for the side.
+                        bs.report_while_idle(metrics, ScanCensusInputs::absent())
+                            .await;
                     }
                     // Counted like every other cycle: a FROZEN `cycles_total`
                     // reads as "the loop is dead", which is a different and
@@ -2766,7 +2818,10 @@ impl LoopState {
         }
         // Plan & prompt library body sync — opt-in, see `BodySync`.
         if let Some(bs) = self.body_sync.as_mut() {
-            bs.run_cycle(&self.conv, metrics).await;
+            // The ref census this cycle's listing produced travels with the
+            // body sync's own work-tree census, so ONE report carries both
+            // sides of the set difference as of ONE cycle.
+            bs.run_cycle(&self.conv, metrics, ref_census).await;
         }
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
@@ -3141,6 +3196,44 @@ pub struct BodySync {
     /// Whether the closed gate has been announced, so it is said once per
     /// body sync rather than every cycle.
     scan_report_gate_announced: bool,
+    /// `source -> digest` of the stem set the web last DELIVERED-AND-STORED
+    /// for that source, so an unchanged set travels as `slugs: null` plus its
+    /// digest instead of ~100 KB of stems on every heartbeat — which is what
+    /// keeps this report a heartbeat.
+    ///
+    /// Emptied whenever the web did NOT store the report (a failure, or a
+    /// `applied: false` that kept a newer reading): withholding a set the web
+    /// does not hold would have it clear that set to UNKNOWN on the digest
+    /// mismatch, which is the integrity property working against us.
+    last_census_digests: HashMap<String, String>,
+}
+
+/// What one cycle can say about the two stem sets, handed to the scan-root
+/// report.
+///
+/// The work-tree side is a DIRECTORY rather than a census because the report
+/// is deliberately sequenced ahead of the body sync's own walk (a paused or
+/// empty cycle is the one that most needs to report), so the enumeration
+/// happens inside the report — and only once the report is actually due.
+#[derive(Debug, Clone, Default)]
+pub struct ScanCensusInputs {
+    /// The REF listing this cycle made. `None` = ABSENT (UNKNOWN), never an
+    /// empty set.
+    pub ref_census: Option<super::body_push::PlanSlugCensus>,
+    /// The plans root to enumerate for the WORK-TREE census. `None` = this
+    /// cycle enumerated nothing, so that side is ABSENT too.
+    pub work_tree_dir: Option<PathBuf>,
+}
+
+impl ScanCensusInputs {
+    /// Both sides ABSENT — what every cycle that enumerated nothing sends.
+    ///
+    /// Named rather than defaulted so each idle call site says out loud that
+    /// it is reporting UNKNOWN, and so a reviewer can see at a glance that no
+    /// idle arm fabricates a zero.
+    pub fn absent() -> Self {
+        Self::default()
+    }
 }
 
 impl BodySync {
@@ -3162,6 +3255,7 @@ impl BodySync {
             last_scan_report_unapplied: false,
             scan_report_gate: scan_report_gate_closed(),
             scan_report_gate_announced: false,
+            last_census_digests: HashMap::new(),
         }
     }
 
@@ -3199,12 +3293,25 @@ impl BodySync {
     /// posting policy as an armed cycle. Without it a device whose plans dir
     /// was cleared goes silent and its last `measured` row is quoted until it
     /// ages out.
-    pub async fn report_while_idle(&mut self, metrics: &AdapterMetrics) {
+    ///
+    /// `censuses` is [`ScanCensusInputs::absent`] at every idle call site, and
+    /// is a PARAMETER rather than an assumption so each of those sites states
+    /// it: an idle cycle enumerated nothing, and nothing enumerated is
+    /// UNKNOWN, never zero.
+    pub async fn report_while_idle(
+        &mut self,
+        metrics: &AdapterMetrics,
+        censuses: ScanCensusInputs,
+    ) {
         if !(self.capture_gate)() {
             return;
         }
-        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
-            .await;
+        self.report_scan_root_if_due(
+            Self::current_reading(metrics),
+            std::time::Instant::now(),
+            censuses,
+        )
+        .await;
     }
 
     /// Publish this device's scan-root reading to the web read side
@@ -3222,6 +3329,7 @@ impl BodySync {
         &mut self,
         current: Option<ScanDivergence>,
         now: std::time::Instant,
+        censuses: ScanCensusInputs,
     ) {
         // Machine-scoped state: only the instance that owns shared root state
         // publishes it (see `ScanReportGate`). Checked first, on BOTH paths
@@ -3247,8 +3355,42 @@ impl BodySync {
         let Some(current) = current.filter(|_| due) else {
             return;
         };
+        // Enumerated only once the report is DUE: the work-tree listing is a
+        // `read_dir` this cycle would otherwise pay for and throw away.
+        let mut resolved: Vec<super::body_push::PlanSlugCensus> = Vec::new();
+        if let Some(ref_census) = censuses.ref_census {
+            resolved.push(ref_census);
+        }
+        if let Some(dir) = censuses.work_tree_dir {
+            // Small (one `read_dir` of ~1,800 entries) but still synchronous
+            // filesystem work on a runtime built with `worker_threads(1)`, so
+            // it goes to the blocking pool for the same reason the scan does.
+            match spawn_blocking_tracked(move || super::body_push::work_tree_census(&dir)).await {
+                Ok(census) => resolved.extend(census),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "plan library: the work-tree slug census task did not complete; that side \
+                     is reported ABSENT (never an empty set)"
+                ),
+            }
+        }
+        // Withhold a set the web already holds: `slugs: null` plus the digest
+        // that re-asserts it. The web KEEPS its stored set on a digest match
+        // and clears it to UNKNOWN on a mismatch, so this is only ever done
+        // against a digest a previous report is known to have landed.
+        let resolved: Vec<_> = resolved
+            .into_iter()
+            .map(|census| {
+                if self.last_census_digests.get(&census.source) == Some(&census.digest) {
+                    census.withheld()
+                } else {
+                    census
+                }
+            })
+            .collect();
         let report =
-            super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now());
+            super::body_push::ScanRootReport::from_divergence(&current, chrono::Utc::now())
+                .with_censuses(resolved);
         match self.reporter.report_scan_root(&report).await {
             Ok(ack) => {
                 // Delivered either way — scheduling treats any 2xx as sent.
@@ -3277,6 +3419,16 @@ impl BodySync {
                     }
                     _ => {}
                 }
+                // REPLACED, never merged: a source this report left out is
+                // stored by the web as UNKNOWN, so a digest kept for it would
+                // re-assert a set the web no longer holds. And a report that
+                // was NOT applied stored nothing at all, so the next one must
+                // carry the stems in full rather than a digest.
+                self.last_census_digests = if ack.applied == Some(false) {
+                    HashMap::new()
+                } else {
+                    report.census_digests()
+                };
                 if self.last_scan_report_failure.take().is_some() {
                     tracing::info!(
                         state = %report.state,
@@ -3324,6 +3476,8 @@ impl BodySync {
                          not count toward its breaker; retrying after the backoff"
                     );
                 }
+                // Nothing landed, so nothing may be withheld next time.
+                self.last_census_digests.clear();
                 self.last_scan_report_failure = Some((failure.kind, now));
             }
         }
@@ -3332,7 +3486,16 @@ impl BodySync {
     /// One body-sync cycle. `metrics` is the reconcile loop's own — the tick
     /// that calls this has just recorded its scan-divergence reading there,
     /// and that reading is what the scan-root report publishes.
-    pub async fn run_cycle(&mut self, conv: &PlanConvention, metrics: &AdapterMetrics) {
+    ///
+    /// `ref_census` is what the work-unit half's ref listing saw this cycle —
+    /// the OTHER side of the coverage question, which only this device holds.
+    /// `None` means no ref was listed, which is ABSENT, never empty.
+    pub async fn run_cycle(
+        &mut self,
+        conv: &PlanConvention,
+        metrics: &AdapterMetrics,
+        ref_census: Option<super::body_push::PlanSlugCensus>,
+    ) {
         let gate_open = (self.capture_gate)();
         if let Some(message) = capture_gate_message(self.last_gate_open, gate_open) {
             tracing::info!(capture_enabled = gate_open, "{message}");
@@ -3347,8 +3510,25 @@ impl BodySync {
         // Those two are exactly the cycles whose corpus is NOT being refreshed
         // — a paused sync, an empty scan — so they are the last ones that
         // should go quiet about the scan source.
-        self.report_scan_root_if_due(Self::current_reading(metrics), std::time::Instant::now())
-            .await;
+        //
+        // The work-tree census is taken of the ACTIVE plans root alone — the
+        // one the reading's `source_repo` names — so the set difference the
+        // web computes stays scoped to a single `source_repo` rather than
+        // mixing the archive and prompts roots into one denominator.
+        let work_tree_dir = self
+            .roots
+            .iter()
+            .find(|r| r.label == super::body_push::PLANS_ROOT_LABEL)
+            .map(|r| r.dir.clone());
+        self.report_scan_root_if_due(
+            Self::current_reading(metrics),
+            std::time::Instant::now(),
+            ScanCensusInputs {
+                ref_census,
+                work_tree_dir,
+            },
+        )
+        .await;
         if self.breaker.should_skip_cycle() {
             return;
         }
@@ -3622,6 +3802,10 @@ mod tests {
         ref_dir: Result<Vec<RefDirEntry>, String>,
         /// Phase 2: blob id -> its bytes, for `read_blobs`.
         blobs: HashMap<String, Result<String, String>>,
+        /// Panic instead of answering `work_tree_root`. The only way to make
+        /// a `spawn_blocking` scan task fail to JOIN, which is the arm where
+        /// the enumeration did not happen at all.
+        panic_on_work_tree_root: bool,
     }
 
     /// The fixed "now" every pure measurement in this module is taken at.
@@ -3646,6 +3830,7 @@ mod tests {
                 fetch: Ok(()),
                 ref_dir: Ok(Vec::new()),
                 blobs: HashMap::new(),
+                panic_on_work_tree_root: false,
             }
         }
 
@@ -3669,6 +3854,10 @@ mod tests {
 
     impl GitRefReader for FakeGit {
         fn work_tree_root(&self, _dir: &Path) -> Result<Option<PathBuf>, String> {
+            assert!(
+                !self.panic_on_work_tree_root,
+                "FakeGit: deliberately panicking so the blocking task fails to join"
+            );
             self.root.clone()
         }
         fn default_ref(&self, _repo_root: &Path) -> Result<String, String> {
@@ -3820,11 +4009,21 @@ mod tests {
         let got =
             super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
                 .expect("listing succeeded");
-        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
         // Sorted, markdown only, the unreadable one dropped. `notes.txt` never
         // appears, and NOTHING from a subdirectory can appear because the
         // listing itself is depth 1.
         assert_eq!(names, vec!["a.md", "b.md"]);
+        // The CENSUS is the other set: what the listing SAW, `bad.md`
+        // included, because a plan whose blob will not read still EXISTS on
+        // the ref side and must stay in the denominator. `notes.txt` is not a
+        // plan on either.
+        assert_eq!(got.names, vec!["a.md", "b.md", "bad.md"]);
+        assert_eq!(
+            got.ref_sha.as_deref(),
+            Some("a".repeat(40)).as_deref(),
+            "the sha the stems were listed AT, resolved at the listing"
+        );
     }
 
     #[test]
@@ -3907,8 +4106,9 @@ mod tests {
         let got =
             super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
                 .expect("listing succeeded");
-        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["real.md"]);
+        assert_eq!(got.names, vec!["real.md"], "and not in the census either");
     }
 
     /// **The commit's headline claim, and the one nothing asserted before:**
@@ -3956,10 +4156,22 @@ mod tests {
         )
         .expect("the ref arm reads");
 
-        assert_eq!(tree.len(), 1, "the fixture holds exactly one plan");
+        assert_eq!(tree.units.len(), 1, "the fixture holds exactly one plan");
         assert_eq!(
-            tree, refd,
+            tree.units, refd.units,
             "same bytes must parse to the same unit, or the source move churns coord"
+        );
+        // The CENSUS is where the arms deliberately differ: the tree arm
+        // listed no ref, so the ref side is ABSENT — UNKNOWN, never the empty
+        // set, which would claim the default branch holds no plans.
+        assert_eq!(tree.ref_census, None);
+        let census = refd.ref_census.expect("the ref arm listed a ref");
+        assert_eq!(census.source, "ref");
+        assert_eq!(census.count, 1);
+        assert_eq!(
+            census.slugs.as_deref(),
+            Some(["2026-01-01-a-plan".to_string()].as_slice()),
+            "STEMS, not file names — the same identity the corpus is keyed on"
         );
     }
 
@@ -5019,18 +5231,32 @@ mod tests {
     fn read_ref_dir_over_real_git_keeps_markdown_and_an_empty_plan() {
         let tmp = ref_scan_fixture();
         let clone = tmp.path().join("clone");
-        let files =
+        let listing =
             super::super::ref_scan::read_ref_dir(&ProcessGit, &clone, "origin/main", "plans")
                 .expect("a real plans dir reads");
-        let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = listing.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["2026-01-01-normal.md", "2026-01-02-empty.md"],
             "markdown only, sorted; `.md`, `notes.txt`, the symlink and the subdir are all out"
         );
         assert_eq!(
-            files[1].body, "",
+            listing.files[1].body, "",
             "the empty plan survives with an empty body"
+        );
+        // The CENSUS runs the same filter over the same listing, and names
+        // the sha it was taken at.
+        assert_eq!(
+            listing.names,
+            vec!["2026-01-01-normal.md", "2026-01-02-empty.md"]
+        );
+        assert_eq!(
+            listing.ref_sha,
+            Some(
+                real_git(&clone, &["rev-parse", "origin/main"], None)
+                    .trim()
+                    .to_string()
+            )
         );
     }
 
@@ -5075,9 +5301,9 @@ mod tests {
         real_git(&clone, &["add", "-A"], None);
         real_git(&clone, &["commit", "-q", "-m", "parked"], None);
 
-        let units = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
+        let scan = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
             .expect("a healthy clone scans");
-        let slugs: Vec<_> = units.iter().map(|u| u.slug.as_str()).collect();
+        let slugs: Vec<_> = scan.units.iter().map(|u| u.slug.as_str()).collect();
         assert!(
             !slugs.contains(&"2026-01-09-only-on-the-parked-branch"),
             "the parked branch's private plan must NOT reach the corpus: {slugs:?}"
@@ -5085,6 +5311,25 @@ mod tests {
         assert!(
             slugs.contains(&"2026-01-01-normal"),
             "the ref's plans must: {slugs:?}"
+        );
+        // And the census is taken from the same ref, over REAL git: the
+        // parked branch's private plan is absent from it too, and the sha it
+        // was listed at is the ref's own.
+        let census = scan.ref_census.expect("the ref arm listed a ref");
+        let listed = census.slugs.clone().expect("a fresh census carries stems");
+        assert!(
+            !listed.contains(&"2026-01-09-only-on-the-parked-branch".to_string()),
+            "the census is of the REF, not of the parked tree: {listed:?}"
+        );
+        assert!(listed.contains(&"2026-01-01-normal".to_string()));
+        assert_eq!(
+            census.ref_sha,
+            Some(
+                real_git(&clone, &["rev-parse", "origin/main"], None)
+                    .trim()
+                    .to_string()
+            ),
+            "the census names the sha its stems were listed at"
         );
     }
 
@@ -5597,7 +5842,7 @@ mod tests {
         };
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 2153, 11));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
 
         assert_eq!(reporter.states(), vec!["measured"]);
@@ -5615,13 +5860,13 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 0, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states(), vec!["measured"]);
 
         // And the posting policy holds across cycles: the same reading is not
         // re-sent inside the heartbeat.
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
     }
@@ -5644,7 +5889,7 @@ mod tests {
         for _ in 0..(TOTAL_FAILURE_CYCLES_BEFORE_PAUSE + 2) {
             // Skip the retry backoff so every cycle really attempts a post.
             bs.last_scan_report_failure = None;
-            bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+            bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
                 .await;
         }
 
@@ -5724,10 +5969,14 @@ mod tests {
         // elapse — the re-post carries the SECOND reading's instant.
         let reporter = std::sync::Arc::new(FakeReporter::default());
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics_with(first))
-            .await;
+        bs.run_cycle(
+            &PlanConvention::operator_default(),
+            &metrics_with(first),
+            None,
+        )
+        .await;
         let later = metrics_with(second);
-        bs.run_cycle(&PlanConvention::operator_default(), &later)
+        bs.run_cycle(&PlanConvention::operator_default(), &later, None)
             .await;
         assert_eq!(
             reporter.states().len(),
@@ -5739,7 +5988,7 @@ mod tests {
             posted,
             std::time::Instant::now() - SCAN_REPORT_HEARTBEAT - Duration::from_secs(1),
         ));
-        bs.run_cycle(&PlanConvention::operator_default(), &later)
+        bs.run_cycle(&PlanConvention::operator_default(), &later, None)
             .await;
         let sent = reporter.sent.lock().unwrap().clone();
         assert_eq!(sent.len(), 2, "the heartbeat re-posted");
@@ -5753,6 +6002,369 @@ mod tests {
         assert_ne!(sent[0].observed_at, sent[1].observed_at);
     }
 
+    // ---- the slug census (plan 2026-09-15-…-a-set-difference, Phase 2) ----
+
+    /// A body sync over one real plans root, so its cycles produce a
+    /// WORK-TREE census of an actual directory.
+    fn body_sync_over(dir: &Path, reporter: std::sync::Arc<FakeReporter>) -> BodySync {
+        BodySync::new(
+            vec![super::super::body_push::ScanRoot::new(
+                dir,
+                super::super::body_push::ScanRootKind::Plans,
+                super::super::body_push::PLANS_ROOT_LABEL,
+            )],
+            super::super::body_push::HttpArtifactSink::new("http://127.0.0.1:9"),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_reporter(reporter)
+        .with_scan_report_gate(owns_the_machine())
+    }
+
+    fn a_ref_census(stems: &[&str]) -> super::super::body_push::PlanSlugCensus {
+        super::super::body_push::PlanSlugCensus::new(
+            super::super::body_push::SLUG_CENSUS_SOURCE_REF,
+            Some("a".repeat(40)),
+            stems.iter().map(|s| (*s).to_string()),
+        )
+    }
+
+    /// One census per SOURCE, and the census of the side that fills the corpus
+    /// is of the ACTIVE plans root — the one the reading's `source_repo`
+    /// names — so the set difference the web computes stays scoped.
+    #[tokio::test]
+    async fn a_cycle_reports_both_sides_of_the_set_difference() {
+        let dir = one_plan_dir();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
+
+        bs.run_cycle(
+            &PlanConvention::operator_default(),
+            &metrics,
+            Some(a_ref_census(&[
+                "2026-01-01-one-plan",
+                "2026-01-02-only-on-the-ref",
+            ])),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        let censuses = sent[0]
+            .censuses
+            .clone()
+            .expect("both sides were enumerated");
+        assert_eq!(
+            censuses
+                .iter()
+                .map(|c| c.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ref", "work_tree"]
+        );
+        assert_eq!(
+            censuses[0].slugs.as_deref(),
+            Some(
+                [
+                    "2026-01-01-one-plan".to_string(),
+                    "2026-01-02-only-on-the-ref".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        // The difference this exists to make computable: the tree is missing
+        // a plan the ref has, and the device says so as two SETS rather than
+        // as a ratio.
+        assert_eq!(
+            censuses[1].slugs.as_deref(),
+            Some(["2026-01-01-one-plan".to_string()].as_slice())
+        );
+        assert_eq!(censuses[1].ref_sha, None, "a tree census names no ref");
+    }
+
+    /// **The withheld-set heartbeat.** ~1,800 stems are ~100 KB and this
+    /// report goes out every cycle, so an UNCHANGED set travels as
+    /// `slugs: null` plus the digest that re-asserts it — and the moment the
+    /// set MOVES, the stems are sent again. Without this, "report the census
+    /// every cycle" would stop being a heartbeat.
+    ///
+    /// Neuter check: drop the `last_census_digests` lookup in
+    /// `report_scan_root_if_due` and the second report carries its stems.
+    #[tokio::test]
+    async fn an_unchanged_census_is_re_asserted_by_digest_not_re_sent() {
+        let dir = one_plan_dir();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        let conv = PlanConvention::operator_default();
+        let refc = || Some(a_ref_census(&["2026-01-01-one-plan"]));
+
+        // 1. First report: both sets in full — the web holds neither yet.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            refc(),
+        )
+        .await;
+        // 2. The READING moved (so the report is due again) but neither set
+        //    did: both are withheld, digests unchanged.
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            refc(),
+        )
+        .await;
+        // 3. A plan lands in the tree. The tree digest moves, so those stems
+        //    travel again — while the ref set, still unchanged, stays withheld.
+        std::fs::write(
+            dir.path().join("2026-01-03-new.md"),
+            "# New\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 7, 0)),
+            refc(),
+        )
+        .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3);
+        let census = |i: usize, source: &str| {
+            sent[i]
+                .censuses
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.source == source)
+                .cloned()
+                .unwrap_or_else(|| panic!("report {i} carries a {source} census"))
+        };
+        assert!(
+            census(0, "ref").slugs.is_some(),
+            "first report sends the set"
+        );
+        assert!(census(0, "work_tree").slugs.is_some());
+
+        assert_eq!(
+            census(1, "ref").slugs,
+            None,
+            "unchanged: withheld, not re-sent"
+        );
+        assert_eq!(census(1, "work_tree").slugs, None);
+        assert_eq!(
+            (census(1, "ref").digest, census(1, "ref").count),
+            (census(0, "ref").digest.clone(), 1),
+            "a withheld set still carries the digest it is re-asserted BY, and its count"
+        );
+
+        assert_eq!(
+            census(2, "work_tree").slugs.as_deref(),
+            Some(
+                [
+                    "2026-01-01-one-plan".to_string(),
+                    "2026-01-03-new".to_string()
+                ]
+                .as_slice()
+            ),
+            "the set MOVED, so it travels in full"
+        );
+        assert_ne!(census(2, "work_tree").digest, census(0, "work_tree").digest);
+        assert_eq!(
+            census(2, "ref").slugs,
+            None,
+            "the other side did not move, and is still withheld"
+        );
+    }
+
+    /// A report the web did NOT store may not be re-asserted by digest: a
+    /// digest MISMATCH clears the stored set to UNKNOWN, so withholding
+    /// against a set the web never took would destroy it. Both ways of not
+    /// being stored — a failure, and a `applied: false` — re-send in full.
+    #[tokio::test]
+    async fn a_report_that_did_not_land_re_sends_the_sets_in_full() {
+        let dir = one_plan_dir();
+        let conv = PlanConvention::operator_default();
+
+        // (a) a delivered report the web DECLINED (it kept a newer reading).
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        *reporter.applied.lock().unwrap() = Some(false);
+        let mut bs = body_sync_over(dir.path(), reporter.clone());
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            None,
+        )
+        .await;
+        assert!(bs.last_census_digests.is_empty(), "nothing was stored");
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0)),
+            None,
+        )
+        .await;
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert!(
+            sent[1].censuses.as_ref().unwrap()[0].slugs.is_some(),
+            "an unapplied report stored no set, so the next sends it in full"
+        );
+
+        // (b) a report that never arrived at all.
+        let failing = std::sync::Arc::new(FakeReporter::failing());
+        let mut bs = body_sync_over(dir.path(), failing.clone());
+        bs.last_census_digests
+            .insert("work_tree".to_string(), "stale".to_string());
+        bs.run_cycle(
+            &conv,
+            &metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0)),
+            None,
+        )
+        .await;
+        assert!(
+            bs.last_census_digests.is_empty(),
+            "a failure forgets what it thought the web held"
+        );
+    }
+
+    /// **Idle arm 1 of 3** — `tick`'s no-plans-dir early return (the first
+    /// `report_while_idle` call site; `trigger.rs:2614` when the plan was
+    /// written). Nothing is configured, so nothing was enumerated on either
+    /// side: both censuses ABSENT, never a zero. The web additionally refuses
+    /// any census on a `not_scanning` report, which is the same rule from the
+    /// other end.
+    #[tokio::test]
+    async fn idle_arm_no_plans_dir_reports_both_censuses_absent() {
+        let (_cell, reader) = switchable_paths();
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_git(std::sync::Arc::new(FakeGit::healthy(0, 0)))
+        .with_scan_reporter(reporter.clone())
+        .with_scan_report_gate(owns_the_machine());
+
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].state, "not_scanning");
+        assert_eq!(
+            sent[0].censuses, None,
+            "an enumeration that did not run is ABSENT, never an empty set"
+        );
+        assert_eq!(
+            serde_json::to_value(&sent[0]).unwrap()["censuses"],
+            serde_json::Value::Null
+        );
+    }
+
+    /// **Idle arm 2 of 3** — the `Ok(Err(reason))` publish-nothing arm (the
+    /// second `report_while_idle` call site; `trigger.rs:2668` when the plan
+    /// was written). The fetch failed, so the ref was never listed and the
+    /// body sync's own walk never ran. A readable plan is sitting in the dir,
+    /// which makes a fabricated work-tree census tempting and wrong: nothing
+    /// enumerated it this cycle.
+    #[tokio::test]
+    async fn idle_arm_unavailable_scan_source_reports_both_censuses_absent() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        .with_git(std::sync::Arc::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            fetch: Err("could not reach origin".to_string()),
+            ..FakeGit::healthy(0, 0)
+        }));
+
+        state
+            .tick(&FakeSink::default(), &AdapterMetrics::default())
+            .await;
+
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the cycle that publishes nothing still reports"
+        );
+        assert_eq!(
+            sent[0].censuses, None,
+            "the scan source was unavailable, so NEITHER side was listed"
+        );
+    }
+
+    /// **Idle arm 3 of 3, and the one that matters most** — the `Err(e)`
+    /// scan-task-FAILED arm (the third `report_while_idle` call site;
+    /// `trigger.rs:2697` when the plan was written).
+    ///
+    /// Here the enumeration did not happen AT ALL — the blocking task did not
+    /// complete — so a `count: 0` would not merely be stale, it would be
+    /// FABRICATED: a set nothing on this device ever listed, which the web
+    /// would then store as this device's answer for that side and difference
+    /// against the other.
+    ///
+    /// Mutation proof (run 2026-09-17): making this arm pass a
+    /// `PlanSlugCensus::new(SLUG_CENSUS_SOURCE_REF, None, [])` instead of
+    /// `ScanCensusInputs::absent()` fails this test on the `censuses, None`
+    /// assertion, and reverting restores it.
+    #[tokio::test]
+    async fn idle_arm_failed_scan_task_reports_both_censuses_absent() {
+        let dir = one_plan_dir();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let reporter = std::sync::Arc::new(FakeReporter::default());
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(
+            reader,
+            Some(super::super::body_push::HttpArtifactSink::new(
+                "http://127.0.0.1:9",
+            )),
+            std::sync::Arc::new(|| true) as CaptureGate,
+        )
+        .with_scan_report_gate(owns_the_machine())
+        .with_scan_reporter(reporter.clone())
+        // A git reader that PANICS is how the `spawn_blocking` scan task
+        // fails to join — the arm's real-world cause (a panicking scan, a
+        // cancelled runtime) rather than a simulated return value.
+        .with_git(std::sync::Arc::new(FakeGit {
+            panic_on_work_tree_root: true,
+            ..FakeGit::healthy(0, 0)
+        }));
+
+        state.tick(&FakeSink::default(), &metrics).await;
+
+        assert_eq!(
+            metrics.snapshot().cycles_total,
+            1,
+            "a cycle that publishes nothing is still a cycle"
+        );
+        let sent = reporter.sent.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the failed cycle still reports its scan root"
+        );
+        assert_eq!(
+            sent[0].state, "unknown",
+            "the divergence probe panicked too, and says so rather than guessing"
+        );
+        assert_eq!(
+            sent[0].censuses, None,
+            "the enumeration never RAN — a zero here would be fabricated, not stale"
+        );
+    }
+
     /// A 2xx that says `applied: false` (the web kept a newer reading) is
     /// still DELIVERED for scheduling — not retried, not a failure — and the
     /// episode is tracked so its WARN fires once, clearing when a report is
@@ -5764,7 +6376,7 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert!(
             bs.last_scan_report.is_some(),
@@ -5777,14 +6389,14 @@ mod tests {
         assert!(bs.last_scan_report_unapplied);
 
         // Inside the heartbeat nothing is re-sent, unapplied or not.
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
 
         // The next post is applied: the episode ends.
         *reporter.applied.lock().unwrap() = Some(true);
         let changed = metrics_with(measured_with(Ok(Some(NOW - 60)), 6, 0));
-        bs.run_cycle(&PlanConvention::operator_default(), &changed)
+        bs.run_cycle(&PlanConvention::operator_default(), &changed, None)
             .await;
         assert_eq!(reporter.states().len(), 2);
         assert!(!bs.last_scan_report_unapplied);
@@ -5806,9 +6418,10 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true).with_scan_report_gate(gate);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        bs.report_while_idle(&metrics).await;
+        bs.report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(
             reporter.states().is_empty(),
             "a secondary publishes nothing, on either path"
@@ -5816,7 +6429,7 @@ mod tests {
         assert!(bs.scan_report_gate_announced, "and says why, once");
 
         owns.store(true, Ordering::SeqCst);
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(
             reporter.states(),
@@ -5833,9 +6446,11 @@ mod tests {
         )
         .with_reporter(silent.clone());
         unconfigured
-            .run_cycle(&PlanConvention::operator_default(), &metrics)
+            .run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        unconfigured.report_while_idle(&metrics).await;
+        unconfigured
+            .report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(silent.states().is_empty());
     }
 
@@ -5898,7 +6513,7 @@ mod tests {
         let mut bs = body_sync_reporting_to(reporter.clone(), true);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
 
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 1);
         let (posted, _) = bs.last_scan_report.take().unwrap();
@@ -5906,7 +6521,7 @@ mod tests {
             posted,
             std::time::Instant::now() - SCAN_REPORT_RETRY_AFTER_FAILURE - Duration::from_secs(1),
         ));
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
         assert_eq!(reporter.states().len(), 2, "re-posted on the 5-min cadence");
     }
@@ -5917,9 +6532,10 @@ mod tests {
         let reporter = std::sync::Arc::new(FakeReporter::default());
         let mut bs = body_sync_reporting_to(reporter.clone(), false);
         let metrics = metrics_with(measured_with(Ok(Some(NOW - 60)), 5, 0));
-        bs.run_cycle(&PlanConvention::operator_default(), &metrics)
+        bs.run_cycle(&PlanConvention::operator_default(), &metrics, None)
             .await;
-        bs.report_while_idle(&metrics).await;
+        bs.report_while_idle(&metrics, ScanCensusInputs::absent())
+            .await;
         assert!(reporter.states().is_empty());
     }
 
