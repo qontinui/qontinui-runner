@@ -4709,6 +4709,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     let _flag_poll = loop_registry.coord_sync().start_flag_poll_task();
                 });
                 app.manage(registry);
+                // The AppHandle (set above) and the SessionRegistry (just
+                // managed) are what a visible gate continuation needs. Until
+                // this runs, `agent_runtime` defers a terminal continuation
+                // UNCLAIMED rather than claiming it and failing the spawn —
+                // plan `2026-09-17-a-gate-continuation-delivered-before-the-
+                // runner-finishes-booting-is-consumed-as-spawn-failed-and-
+                // never-retried`.
+                tauri_app_handle::mark_runtime_ready();
 
             }
 

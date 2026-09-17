@@ -962,6 +962,8 @@ pub(crate) fn resolve_claude_bin() -> String {
 ///
 /// Wired in `main.rs` next to `fleet::spawn_heartbeat()`.
 pub fn spawn_runtime() {
+    // Anchor the presentation boot grace on the moment deliveries can begin.
+    let _ = CONTINUATION_RUNTIME_STARTED.set(std::time::Instant::now());
     let device_id = match load_local_device_id() {
         Some(d) => d,
         None => {
@@ -988,6 +990,9 @@ pub fn spawn_runtime() {
     // exit-hook trigger never fired, a slot freed between WS connects.
     // Spawned independently of the WS pump so it survives subscription flaps.
     spawn_continuation_backstop_poll(device_id);
+    // One catch-up poll when `.setup()` completes, for the terminal
+    // continuations deferred while the Tauri runtime was still booting.
+    spawn_runtime_ready_catch_up(device_id);
     // Supervised (panic net): a panic anywhere inside the WS pump used to kill
     // this bare task silently and permanently disable push delivery for the
     // process lifetime. The supervisor restarts it with backoff instead.
@@ -4291,6 +4296,139 @@ fn thread_pressure_stamp_reason(
     )
 }
 
+/// When [`spawn_runtime`] started — the earliest instant a continuation can be
+/// delivered. Anchors [`presentation_boot_grace`]. Unset (a unit test, or a
+/// runner whose runtime never started) reads as age zero.
+static CONTINUATION_RUNTIME_STARTED: std::sync::OnceLock<std::time::Instant> =
+    std::sync::OnceLock::new();
+
+/// How long after the continuation runtime starts a not-yet-ready Tauri
+/// runtime is read as BOOTING (defer unclaimed) rather than ABSENT (a runner
+/// with no webview runtime at all, which keeps the claim-then-`spawn_failed`
+/// behaviour). `.setup()` completes within seconds of a start; the grace is
+/// sized so a slow, loaded boot still lands inside it.
+///
+/// Twice the default backstop poll interval (300 s): a dispatch deferred at
+/// boot is re-delivered by [`spawn_runtime_ready_catch_up`] the moment setup
+/// completes, and failing that by the backstop poll, whose first tick fires at
+/// one interval — so the grace must outlast that tick with room to spare, or a
+/// slow setup would flip `Booting` to `Absent` exactly at the re-delivery.
+const PRESENTATION_BOOT_GRACE_FLOOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The effective boot grace: [`PRESENTATION_BOOT_GRACE_FLOOR`], or twice the
+/// configured backstop interval when `RUNNER_CONTINUATION_BACKSTOP_POLL_SECS`
+/// raises it — so the grace always outlasts the backstop's first tick.
+fn presentation_boot_grace() -> std::time::Duration {
+    boot_grace_for_backstop(continuation_backstop_poll_secs())
+}
+
+/// Pure core of [`presentation_boot_grace`].
+///
+/// Capped at [`PRESENTATION_BOOT_GRACE_CEILING`]: a headless runner defers
+/// terminal continuations unclaimed for the whole grace, so an absurd backstop
+/// override must not stretch that indefinitely.
+fn boot_grace_for_backstop(backstop_secs: u64) -> std::time::Duration {
+    PRESENTATION_BOOT_GRACE_FLOOR
+        .max(std::time::Duration::from_secs(
+            backstop_secs.saturating_mul(2),
+        ))
+        .min(PRESENTATION_BOOT_GRACE_CEILING)
+}
+
+/// Upper bound on [`presentation_boot_grace`].
+const PRESENTATION_BOOT_GRACE_CEILING: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether the runtime a continuation's presentation needs is in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationRuntime {
+    /// Proceed to the guards and the claim.
+    Ready,
+    /// The Tauri runtime is still coming up: defer UNCLAIMED so the row stays
+    /// pending on coord and is re-delivered once setup has run.
+    Booting,
+    /// No Tauri runtime long past boot — proceed exactly as before, so the
+    /// terminal path records the honest `spawn_failed`.
+    Absent,
+}
+
+/// Pure verdict for [`PresentationRuntime`] (plan
+/// `2026-09-17-a-gate-continuation-delivered-before-the-runner-finishes-booting-is-consumed-as-spawn-failed-and-never-retried`,
+/// Phase 1).
+///
+/// The measured defect: `spawn_runtime` starts before `.setup()` stores the
+/// `AppHandle` and manages `SessionRegistry`, so a boot delivers the pending
+/// backlog into a runtime that cannot open a terminal. Each dispatch used to
+/// CLAIM its gate and then post `spawn_failed: no Tauri AppHandle …`, and a
+/// claimed continuation is never re-driven — ~186 continuations on one box
+/// across five boots. Only the terminal presentation reaches Tauri state;
+/// the headless one spawns a child process and needs none.
+fn presentation_runtime_verdict(
+    presentation: &Presentation,
+    runtime_ready: bool,
+    runtime_age: std::time::Duration,
+    grace: std::time::Duration,
+) -> PresentationRuntime {
+    match presentation {
+        Presentation::Headless => PresentationRuntime::Ready,
+        Presentation::Terminal if runtime_ready => PresentationRuntime::Ready,
+        Presentation::Terminal if runtime_age < grace => PresentationRuntime::Booting,
+        Presentation::Terminal => PresentationRuntime::Absent,
+    }
+}
+
+/// The age of the continuation runtime, zero when it was never anchored.
+fn continuation_runtime_age() -> std::time::Duration {
+    CONTINUATION_RUNTIME_STARTED
+        .get()
+        .map(|t| t.elapsed())
+        .unwrap_or_default()
+}
+
+/// How many catch-up polls [`spawn_runtime_ready_catch_up`] runs once ready.
+const RUNTIME_READY_CATCH_UP_POLLS: u32 = 3;
+
+/// Spacing between those catch-up polls.
+const RUNTIME_READY_CATCH_UP_SPACING: Duration = Duration::from_secs(10);
+
+/// Re-poll pending continuations the moment the Tauri runtime becomes ready.
+///
+/// A boot deferral (see [`presentation_runtime_verdict`]) leaves the row
+/// pending on coord, but nothing else re-delivers it promptly: coord's stall
+/// watcher re-dispatches only rows younger than its alert threshold (a boot
+/// backlog is mostly older), and the backstop poll skips its immediate tick.
+/// So this task waits for [`crate::tauri_app_handle::runtime_ready`], then runs
+/// a short run of catch-up polls. It gives up at [`presentation_boot_grace`] — past that a
+/// dispatch is no longer deferred, so there is nothing to catch up — and then
+/// parks, because the supervisor restarts a task that returns.
+fn spawn_runtime_ready_catch_up(device_id: uuid::Uuid) {
+    spawn_supervised_delivery("continuation-runtime-ready-catch-up", move || async move {
+        let grace = presentation_boot_grace();
+        while !crate::tauri_app_handle::runtime_ready() && continuation_runtime_age() < grace {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        if crate::tauri_app_handle::runtime_ready() {
+            info!(
+                "agent_runtime: presentation runtime ready {}s after start — catch-up polls \
+                 for continuations deferred while booting",
+                continuation_runtime_age().as_secs()
+            );
+            // Several polls, not one: a dispatch that read "not ready" just
+            // before setup finished can still hold its in-process claim when
+            // the first poll lands (that poll then skips it as already
+            // dispatched), and a single GET can fail on a box still busy
+            // booting. Unit dispatches are deferred by the same verdict.
+            for attempt in 0..RUNTIME_READY_CATCH_UP_POLLS {
+                if attempt > 0 {
+                    tokio::time::sleep(RUNTIME_READY_CATCH_UP_SPACING).await;
+                }
+                poll_pending_continuations(device_id).await;
+                poll_pending_unit_dispatches(device_id).await;
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+}
+
 /// The `reason` a concurrency-cap deferral stamps.
 fn at_cap_stamp_reason(cap: usize) -> String {
     format!("at_cap:{cap}")
@@ -4561,6 +4699,40 @@ async fn run_gate_continuation_inner(
         );
         // Local skip, row left pending on coord → release the in-process claim
         // (invariant: claimed only while in-flight or after the consume claim).
+        release_local_dispatch_claim(consume_target);
+        return Ok(());
+    }
+
+    // Step 0b: is the runtime this presentation needs in place yet? A terminal
+    // continuation delivered while `.setup()` is still running (the boot replay
+    // of the pending backlog) is deferred UNCLAIMED — like every local guard
+    // below, it must not burn a coord-side claim, because a claimed
+    // continuation whose spawn then fails is never re-driven. Placed before the
+    // guards so anchor dedupe runs against the real terminal registry once it
+    // exists. `Absent` (no runtime long past boot) proceeds unchanged.
+    let runtime_age = continuation_runtime_age();
+    if !matches!(consume_target, ConsumeTarget::None)
+        && presentation_runtime_verdict(
+            &payload.presentation,
+            crate::tauri_app_handle::runtime_ready(),
+            runtime_age,
+            presentation_boot_grace(),
+        ) == PresentationRuntime::Booting
+    {
+        // Log-only, deliberately NO `continuation-deferred` stamp: that stamp is
+        // rate-limited to one per gate per hour (`should_post_deferred_stamp`),
+        // so a boot-minute stamp would mask the next real reason (a
+        // `thread_pressure:` or `at_cap:` deferral) for an hour. This condition
+        // clears in seconds and re-delivers itself. The legacy no-`gate_id`
+        // path (`ConsumeTarget::None`) is excluded above: it has no re-delivery,
+        // so a deferral there would be a silent drop.
+        warn!(
+            "agent_runtime: gate-continuation deferred: presentation runtime still booting \
+             ({}s after the continuation runtime started) — re-delivered once setup completes \
+             (anchor_key={:?})",
+            runtime_age.as_secs(),
+            payload.anchor_key
+        );
         release_local_dispatch_claim(consume_target);
         return Ok(());
     }
@@ -8580,6 +8752,80 @@ async fn report_launch_deferral(agent_id: uuid::Uuid, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── presentation boot readiness (plan 2026-09-17-a-gate-continuation-
+    //    delivered-before-the-runner-finishes-booting-…, Phase 1) ──
+
+    const TEST_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
+
+    #[test]
+    fn headless_presentation_never_waits_for_tauri() {
+        for age in [0, 599, 600, 10_000] {
+            assert_eq!(
+                presentation_runtime_verdict(
+                    &Presentation::Headless,
+                    false,
+                    std::time::Duration::from_secs(age),
+                    TEST_GRACE,
+                ),
+                PresentationRuntime::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_presentation_is_ready_once_setup_marked_it() {
+        for age in [0, 599, 600, 10_000] {
+            assert_eq!(
+                presentation_runtime_verdict(
+                    &Presentation::Terminal,
+                    true,
+                    std::time::Duration::from_secs(age),
+                    TEST_GRACE,
+                ),
+                PresentationRuntime::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_presentation_defers_while_booting_and_is_absent_past_the_grace() {
+        let v = |secs| {
+            presentation_runtime_verdict(
+                &Presentation::Terminal,
+                false,
+                std::time::Duration::from_secs(secs),
+                TEST_GRACE,
+            )
+        };
+        assert_eq!(v(0), PresentationRuntime::Booting);
+        assert_eq!(v(599), PresentationRuntime::Booting);
+        assert_eq!(v(600), PresentationRuntime::Absent);
+        assert_eq!(v(86_400), PresentationRuntime::Absent);
+    }
+
+    #[test]
+    fn presentation_boot_grace_outlasts_the_backstop_tick() {
+        // Default backstop (300s) → the 600s floor, exactly twice it.
+        assert_eq!(
+            boot_grace_for_backstop(CONTINUATION_BACKSTOP_POLL_SECS_DEFAULT),
+            std::time::Duration::from_secs(600)
+        );
+        // A raised backstop raises the grace with it.
+        assert_eq!(
+            boot_grace_for_backstop(900),
+            std::time::Duration::from_secs(1800)
+        );
+        // A lowered one never drops it below the floor.
+        assert_eq!(
+            boot_grace_for_backstop(CONTINUATION_BACKSTOP_POLL_SECS_FLOOR),
+            PRESENTATION_BOOT_GRACE_FLOOR
+        );
+        assert_eq!(
+            boot_grace_for_backstop(u64::MAX),
+            PRESENTATION_BOOT_GRACE_CEILING
+        );
+    }
 
     use crate::test_env::env_lock;
 
