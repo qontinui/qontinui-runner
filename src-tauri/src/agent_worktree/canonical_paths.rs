@@ -94,7 +94,13 @@ pub fn default_canonical_path(repo: &str) -> Result<PathBuf, String> {
         // external repos existed.
         return Ok(root.join(segment));
     }
-    default_canonical_path_resolved_in(&root, repo, &repo_checkouts_setting(), is_git_checkout)
+    default_canonical_path_resolved_in(
+        &root,
+        repo,
+        &repo_checkouts_setting(),
+        is_git_checkout,
+        qontinui_runner_lib::observable_bridge::git_ops::origin_url,
+    )
 }
 
 /// Pure core of [`default_canonical_path`]: the workspace root is injected, so
@@ -141,7 +147,7 @@ pub fn slug_owner(repo: &str) -> Option<String> {
 /// `true` when `repo` names an owner and that owner is not `qontinui` — the
 /// only slugs for which the settings map and the owner-root convention are
 /// consulted at all.
-fn has_foreign_owner(repo: &str) -> bool {
+pub fn has_foreign_owner(repo: &str) -> bool {
     slug_owner(repo).is_some_and(|o| !o.eq_ignore_ascii_case("qontinui"))
 }
 
@@ -177,18 +183,57 @@ fn checkout_candidates_in(
     let segment = canonical_segment(repo)?;
     let mut out = Vec::with_capacity(3);
     if has_foreign_owner(repo) {
-        if let Some(path) = map_entry_for(map, repo) {
-            out.push((PathBuf::from(path), CandidateSource::SettingsMap));
+        // A relative map path would resolve against the runner's own cwd,
+        // which names nothing an operator chose; it is not a candidate.
+        // `has_root` rather than `is_absolute`: on Windows a `/src/app` entry
+        // is rooted on the current drive, which is what an operator means.
+        if let Some(path) = map_entry_for(map, repo).map(PathBuf::from) {
+            if path.has_root() {
+                out.push((path, CandidateSource::SettingsMap));
+            }
         }
+        // The owner and name come from coord's slug and are JOINED onto a
+        // filesystem path, so each must be one plain segment: never `..`, a
+        // separator, or a drive prefix.
         if let (Some(parent), Some(owner)) = (root.parent(), slug_owner(repo)) {
-            out.push((
-                parent.join(owner).join(&segment),
-                CandidateSource::OwnerRoot,
-            ));
+            if is_plain_segment(&owner) && is_plain_segment(&segment) {
+                out.push((
+                    parent.join(owner).join(&segment),
+                    CandidateSource::OwnerRoot,
+                ));
+            }
         }
     }
     out.push((root.join(&segment), CandidateSource::LayoutRule));
     Ok(out)
+}
+
+/// One plain path segment of GitHub's slug alphabet: ASCII alphanumerics, `-`,
+/// `_` and `.`, and not `.` or `..`.
+fn is_plain_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Every path the worktree claim for `repo` may have been keyed on, whatever
+/// the filesystem or the settings map looked like when it was taken — so a
+/// release finds the claim even if a checkout appeared, disappeared or was
+/// re-mapped in between. No filesystem probe.
+pub fn canonical_path_candidates(repo: &str) -> Vec<PathBuf> {
+    let Ok(root) = crate::workspace_paths::runner_workspace_root().require() else {
+        return Vec::new();
+    };
+    let map = if has_foreign_owner(repo) {
+        repo_checkouts_setting()
+    } else {
+        BTreeMap::new()
+    };
+    checkout_candidates_in(&root, repo, &map)
+        .map(|c| c.into_iter().map(|(p, _)| p).collect())
+        .unwrap_or_default()
 }
 
 /// The settings-map entry for `repo`: a key naming the same owner and name,
@@ -207,26 +252,20 @@ fn slug_key(repo: &str) -> Option<(String, String)> {
     Some((slug_owner(repo)?.to_lowercase(), name))
 }
 
-/// Pure core of the foreign-owner arm of [`default_canonical_path`]: the first
-/// candidate that is a git checkout, else the layout rule — so a caller that
-/// only needs a stable key or a path to report still gets one when nothing is
-/// checked out anywhere.
+/// Pure core of the foreign-owner arm of [`default_canonical_path`]: the
+/// VERIFIED checkout ([`resolve_checkout_in`] — the same check a spawn cwd
+/// gets, so a worktree is never materialized from a directory the continuation
+/// fallback would refuse), else the layout rule, so a caller that only needs a
+/// path to key or report still gets one when nothing is checked out anywhere.
 fn default_canonical_path_resolved_in(
     root: &Path,
     repo: &str,
     map: &BTreeMap<String, String>,
     is_checkout: impl Fn(&Path) -> bool,
+    origin_of: impl Fn(&Path) -> Option<String>,
 ) -> Result<PathBuf, String> {
-    let candidates = checkout_candidates_in(root, repo, map)?;
-    let rule = candidates
-        .last()
-        .map(|(p, _)| p.clone())
-        .ok_or_else(|| format!("no candidate path for repo {repo:?}"))?;
-    Ok(candidates
-        .into_iter()
-        .map(|(p, _)| p)
-        .find(|p| is_checkout(p))
-        .unwrap_or(rule))
+    let rule = root.join(canonical_segment(repo)?);
+    Ok(resolve_checkout_in(root, repo, map, is_checkout, origin_of).unwrap_or(rule))
 }
 
 /// `repo` has no checkout on this device that could be verified as a checkout
@@ -371,8 +410,14 @@ fn repo_checkouts_setting() -> BTreeMap<String, String> {
 /// case-insensitive, and with a segment boundary, so `<root>-old/x` is not
 /// under `<root>`. Lexical: neither path needs to exist.
 pub fn path_is_within(root: &Path, path: &Path) -> bool {
-    let root = normalize_for_compare(&root.to_string_lossy());
-    let path = normalize_for_compare(&path.to_string_lossy());
+    // Case folds only where the filesystem does: on Linux `/x/Work` and
+    // `/x/work` are different directories.
+    let norm = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        let s = if cfg!(windows) { s.to_lowercase() } else { s };
+        s.trim_end_matches('/').to_string()
+    };
+    let (root, path) = (norm(root), norm(path));
     path == root || path.starts_with(&format!("{root}/"))
 }
 
@@ -1120,6 +1165,10 @@ mod checkout_resolution_tests {
             "portofino-pizzeria/mobile",
             &BTreeMap::new(),
             checkouts(&["/box/portofino-pizzeria/mobile"]),
+            origins(&[(
+                "/box/portofino-pizzeria/mobile",
+                "https://github.com/portofino-pizzeria/mobile.git",
+            )]),
         )
         .unwrap();
         assert_eq!(got, PathBuf::from("/box/portofino-pizzeria/mobile"));
@@ -1132,6 +1181,7 @@ mod checkout_resolution_tests {
             "Portofino-Pizzeria/Mobile",
             &map(&[("portofino-pizzeria/mobile", "/elsewhere/mobile")]),
             checkouts(&["/elsewhere/mobile", "/box/portofino-pizzeria/mobile"]),
+            |_| None,
         )
         .unwrap();
         assert_eq!(
@@ -1150,6 +1200,7 @@ mod checkout_resolution_tests {
             "portofino-pizzeria/mobile",
             &map(&[("portofino-pizzeria/mobile", "/elsewhere/mobile")]),
             checkouts(&[]),
+            |_| None,
         )
         .unwrap();
         assert_eq!(got, PathBuf::from("/box/workspace/mobile"));
@@ -1262,6 +1313,37 @@ mod checkout_resolution_tests {
         assert!(err.tried[0].1.contains("no origin remote"));
     }
 
+    /// Review round 1: the loose resolver used to hand `materialize_repos` a
+    /// `.git`-bearing owner-root dir whose origin is some OTHER repo.
+    #[test]
+    fn the_worktree_source_path_is_verified_too() {
+        let got = default_canonical_path_resolved_in(
+            &root(),
+            "acme/app",
+            &BTreeMap::new(),
+            checkouts(&["/box/acme/app"]),
+            origins(&[("/box/acme/app", "https://github.com/someone-else/app.git")]),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("/box/workspace/app"),
+            "unverified → layout rule"
+        );
+    }
+
+    #[test]
+    fn a_traversal_owner_or_relative_map_path_is_never_a_candidate() {
+        let c = checkout_candidates_in(&root(), "../app", &BTreeMap::new()).unwrap();
+        assert_eq!(c.len(), 1, "`..` owner gets no owner-root candidate: {c:?}");
+        let c = checkout_candidates_in(&root(), "acme/app", &map(&[("acme/app", "relative/app")]))
+            .unwrap();
+        assert!(
+            c.iter().all(|(_, s)| *s != CandidateSource::SettingsMap),
+            "a relative map path is not a candidate: {c:?}"
+        );
+    }
+
     #[test]
     fn origin_matching_is_by_name_and_stated_owner() {
         assert!(origin_names_repo("https://github.com/acme/app", "acme/app"));
@@ -1294,5 +1376,11 @@ mod checkout_resolution_tests {
             Path::new("/box/workspace"),
             Path::new("/box/portofino-pizzeria/mobile")
         ));
+        if !cfg!(windows) {
+            assert!(!path_is_within(
+                Path::new("/box/Workspace"),
+                Path::new("/box/workspace/app")
+            ));
+        }
     }
 }

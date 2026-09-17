@@ -296,8 +296,20 @@ export function parseRepoCheckouts(text: string): ParsedRepoCheckouts {
       errors.push(`Line ${lineNo}: "${slug}" is not an owner/name repo slug.`);
       return;
     }
+    if (slug.toLowerCase().startsWith("qontinui/")) {
+      errors.push(
+        `Line ${lineNo}: qontinui repositories always use the workspace root; remove ${slug}.`,
+      );
+      return;
+    }
     if (path.length === 0) {
       errors.push(`Line ${lineNo}: no path for ${slug}.`);
+      return;
+    }
+    // Mirrors the runner's `has_root` test: a relative path would resolve
+    // against the runner's own working directory, so it is never used.
+    if (!/^(\/|\\|[A-Za-z]:[\\/])/.test(path)) {
+      errors.push(`Line ${lineNo}: ${path} is not an absolute path.`);
       return;
     }
     const key = slug.toLowerCase();

@@ -513,7 +513,8 @@ interface RepoCheckoutsFieldProps {
  * entry the runner looks for a repo owned by anyone but `qontinui` at
  * `<parent of workspace root>/<owner>/<name>`, then `<workspace root>/<name>`;
  * a continuation whose repo is at none of them is refused rather than started
- * in a directory that does not hold it.
+ * in a directory that does not hold it. `qontinui/*` lines and relative paths
+ * are rejected by `parseRepoCheckouts`, because the runner would ignore them.
  */
 function RepoCheckoutsField({ draft, errors, onChange }: RepoCheckoutsFieldProps) {
   return (
@@ -534,7 +535,8 @@ function RepoCheckoutsField({ draft, errors, onChange }: RepoCheckoutsFieldProps
       />
       <p className="text-[10px] text-muted-foreground">
         One <code>owner/name = path</code> line per repository this runner works on that is not
-        checked out under the workspace root. Sessions for that repository start in its checkout.{" "}
+        checked out under the workspace root, as an absolute path. Sessions for that repository get
+        a worktree made from it, or start in the folder that holds it.{" "}
         <strong>
           Without a line, a repository owned by anyone but qontinui is looked for at &lt;parent of
           the workspace root&gt;/&lt;owner&gt;/&lt;name&gt;, then &lt;workspace

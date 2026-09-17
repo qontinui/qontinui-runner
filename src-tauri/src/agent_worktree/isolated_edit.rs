@@ -295,38 +295,54 @@ impl IsolatedEditContext {
         // Re-derive the canonical checkout path → resource_key the SAME way
         // the acquire side did (`worktree_for_path` over
         // `default_canonical_path`), so we release the byte-identical key.
-        let want_key = super::canonical_paths::default_canonical_path(repo)
+        //
+        // For a repo outside the workspace root that path depends on which
+        // candidate checkout was verified at ACQUIRE time (plan
+        // `2026-09-12-continuation-for-a-repo-outside-the-workspace-root-spawns-into-an-empty-directory`),
+        // and a checkout appearing or a settings edit in between would move it.
+        // So every candidate's key is accepted, tried in order with the key the
+        // resolver gives NOW first (a context joining two repos that share a
+        // name must release the one it was asked about). For `qontinui/*` repos
+        // there is exactly one key, the same as before.
+        let mut want_keys: Vec<String> = super::canonical_paths::default_canonical_path(repo)
             .ok()
-            .map(|p| super::worktree_resource_key(&p));
+            .map(|p| super::worktree_resource_key(&p))
+            .into_iter()
+            .collect();
+        for p in super::canonical_paths::canonical_path_candidates(repo) {
+            let key = super::worktree_resource_key(&p);
+            if !want_keys.contains(&key) {
+                want_keys.push(key);
+            }
+        }
 
         // Drop the matching worktree claim + its heartbeat. Match on the
-        // worktree kind AND the derived key (so we never release a
+        // worktree kind AND a derived key (so we never release a
         // phase/file_glob claim that happens to coexist).
-        if let Some(key) = want_key {
-            if let Some(cpos) = self
-                .active_claims
+        let found = want_keys.iter().find_map(|key| {
+            self.active_claims
                 .iter()
-                .position(|c| c.kind == "worktree" && c.resource_key == key)
+                .position(|c| c.kind == "worktree" && &c.resource_key == key)
+        });
+        if let Some(cpos) = found {
+            let claim = self.active_claims.remove(cpos);
+            // Abort the heartbeat whose resource_key matches.
+            if let Some(hpos) = self
+                ._heartbeats
+                .iter()
+                .position(|h| h.kind == "worktree" && h.resource_key == claim.resource_key)
             {
-                let claim = self.active_claims.remove(cpos);
-                // Abort the heartbeat whose resource_key matches.
-                if let Some(hpos) = self
-                    ._heartbeats
-                    .iter()
-                    .position(|h| h.kind == "worktree" && h.resource_key == key)
-                {
-                    // Dropping the handle notifies its cancel token.
-                    let _ = self._heartbeats.remove(hpos);
-                }
-                release_claim_best_effort(
-                    &self.coord_http_base,
-                    self.device_id,
-                    claim.agent_session_id,
-                    &claim.kind,
-                    &claim.resource_key,
-                )
-                .await;
+                // Dropping the handle notifies its cancel token.
+                let _ = self._heartbeats.remove(hpos);
             }
+            release_claim_best_effort(
+                &self.coord_http_base,
+                self.device_id,
+                claim.agent_session_id,
+                &claim.kind,
+                &claim.resource_key,
+            )
+            .await;
         }
 
         // Drop the worktree bookkeeping (leave the on-disk dir for reclaim).
