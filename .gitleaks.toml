@@ -41,4 +41,11 @@ regexes = [
   # on the neighbouring lines stay scanned.
   '''9f1c4b2ad0e34f7a8b6c5d4e3f2a1b09''',
   '''0123456789abcdef0123456789abcdef''',
+  # The RFC 6455 section 1.3 example `Sec-WebSocket-Key` -- base64 of the ASCII
+  # "the sample nonce" -- sent by the origin guard's WebSocket handshake test in
+  # src-tauri/src/mcp/origin_guard/tests.rs to prove a refused Origin never gets
+  # a 101. A handshake key is a per-connection nonce the client makes up, never
+  # a credential; `generic-api-key` fires on it only because of the header name.
+  # Exact literal, matching the entries above: any other key value stays scanned.
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
 ]
