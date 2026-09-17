@@ -15,6 +15,7 @@ import {
   pickSpawnTenant,
   resolveSpawnTenant,
   shortTenantId,
+  spawnTenantPickerModel,
 } from "./SpawnTenantPicker";
 
 const A = "6b1f4b0e-1111-4000-8000-000000000001";
@@ -265,5 +266,32 @@ describe("explicitSpawnTenant (what the picker publishes — re-review F1)", () 
     expect(
       explicitSpawnTenant({ override: "ffffffff-0000-4000-8000-00000000ffff", candidates: [A, B] }),
     ).toBeNull();
+  });
+});
+
+describe("spawnTenantPickerModel (the picker shows what it sends — re-review P1)", () => {
+  // Repo inference B, device default A: the case where the old picker showed B
+  // while the spawn stamped A.
+  const base = { inferred: B, defaultForNewSessions: A, candidates: [A, B] };
+
+  it("with no pick, shows the device default option and sends no tenant", () => {
+    const model = spawnTenantPickerModel({ ...base, override: null });
+    expect(model.value).toBe("");
+    expect(model.options[0]).toEqual({ value: "", label: "device default (6b1f4b0e)" });
+    expect(model.published).toBeNull();
+    expect(pickSpawnTenant({ spawnTenantId: model.published })).toBeUndefined();
+  });
+
+  it("labels the repo inference as a hint, not a selected value", () => {
+    const model = spawnTenantPickerModel({ ...base, override: null });
+    expect(model.options.find((o) => o.value === B)?.label).toBe("91ffaa20 (repo)");
+    expect(model.value).not.toBe(B);
+  });
+
+  it("picking the inferred B publishes B, shows B, and sends B", () => {
+    const model = spawnTenantPickerModel({ ...base, override: B });
+    expect(model.value).toBe(B);
+    expect(model.published).toBe(B);
+    expect(pickSpawnTenant({ spawnTenantId: model.published })).toBe(B);
   });
 });

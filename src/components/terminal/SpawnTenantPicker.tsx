@@ -108,6 +108,43 @@ export function explicitSpawnTenant(args: {
   return override && candidates.includes(override) ? override : null;
 }
 
+/** One `<option>` of the picker. */
+export interface SpawnTenantOption {
+  value: string;
+  label: string;
+}
+
+/**
+ * What the picker SHOWS, derived from what it SENDS (re-review P1). The select's
+ * value is the published explicit pick, or `""` — a leading "device default"
+ * option — when there is none, so the display always matches what a spawn will
+ * carry: nothing picked shows "device default (A)" and sends no tenant. The
+ * repo inference is a hint on its option's label ("B (repo)"), never a
+ * pre-selected value; choosing it is an explicit pick like any other.
+ */
+export function spawnTenantPickerModel(args: {
+  override?: string | null;
+  inferred?: string | null;
+  defaultForNewSessions?: string | null;
+  candidates: readonly string[];
+}): { value: string; published: string | null; options: SpawnTenantOption[] } {
+  const { override, inferred, defaultForNewSessions, candidates } = args;
+  const published = explicitSpawnTenant({ override, candidates });
+  const options: SpawnTenantOption[] = [
+    {
+      value: "",
+      label: defaultForNewSessions
+        ? `device default (${shortTenantId(defaultForNewSessions)})`
+        : "device default",
+    },
+    ...candidates.map((id) => ({
+      value: id,
+      label: `${shortTenantId(id)}${id === inferred ? " (repo)" : ""}`,
+    })),
+  ];
+  return { value: published ?? "", published, options };
+}
+
 /** Short display form for a tenant id (uuids share a long tail). */
 export function shortTenantId(tenantId: string): string {
   return tenantId.length > 8 ? tenantId.slice(0, 8) : tenantId;
@@ -165,18 +202,17 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
     };
   }, [cwd, showSwitcher]);
 
-  const resolved = resolveSpawnTenant({
+  // Publish ONLY an explicit pick for the page's spawn handlers (see
+  // `pickSpawnTenant`), and DISPLAY exactly that (see `spawnTenantPickerModel`):
+  // no pick shows "device default", the repo inference is a label hint. The
+  // onChange below and this effect are the only writers of `spawnTenantId`.
+  const model = spawnTenantPickerModel({
     override,
     inferred,
     defaultForNewSessions: defaultTenantIdForNewSessions,
     candidates,
   });
-
-  // Publish ONLY an explicit pick for the page's spawn handlers (see
-  // `pickSpawnTenant`); the resolved value — inference or device default — is
-  // what the select DISPLAYS. The onChange below and this effect are the only
-  // writers of `spawnTenantId`.
-  const published = explicitSpawnTenant({ override, candidates });
+  const published = model.published;
   useEffect(() => {
     setSpawnTenantId(published);
   }, [published, setSpawnTenantId]);
@@ -188,7 +224,8 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
       className={`flex items-center gap-1 shrink-0 text-[10px] text-[#565f89] ${className ?? ""}`}
       title={
         "Tenant for the NEXT session spawned from this page. " +
-        "Defaults to the tenant coord associates with this repo. " +
+        '"device default" sends no tenant, and the runner uses this device\'s default. ' +
+        '"(repo)" marks the tenant coord associates with this repo — a hint; pick it to use it. ' +
         "A running session's tenant never changes."
       }
     >
@@ -196,17 +233,20 @@ export function SpawnTenantPicker({ cwd, className }: SpawnTenantPickerProps) {
       <select
         data-ui-bridge-id="terminal.spawn-tenant-picker"
         aria-label="Tenant for the next spawned session"
-        value={resolved ?? ""}
+        value={model.value}
         onChange={(e) => {
           setOverriddenForCwd(cwd ?? "");
           setSpawnTenantId(e.target.value || null);
         }}
         className="bg-transparent text-[10px] text-[#7aa2f7] font-mono outline-none cursor-pointer hover:text-[#c0caf5]"
       >
-        {candidates.map((id) => (
-          <option key={id} value={id} className="bg-[#1a1b26] text-[#c0caf5]">
-            {shortTenantId(id)}
-            {id === inferred ? " (repo)" : ""}
+        {model.options.map((option) => (
+          <option
+            key={option.value || "device-default"}
+            value={option.value}
+            className="bg-[#1a1b26] text-[#c0caf5]"
+          >
+            {option.label}
           </option>
         ))}
       </select>
