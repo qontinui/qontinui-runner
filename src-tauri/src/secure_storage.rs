@@ -256,6 +256,9 @@ pub struct StoredGracedNonce {
     /// every entry written before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_tenant: Option<uuid::Uuid>,
+    /// The pin's provenance — see [`StoredNonceBinding::session_tenant_origin`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_tenant_origin: Option<StoredPinOrigin>,
 }
 
 /// The on-disk value shape for `coord_mcp_nonces`, with the legacy arm kept
@@ -2293,6 +2296,7 @@ mod tests {
                 terminal_id: Some("term-1".into()),
                 grace_until_unix: 1_700_021_600,
                 session_tenant: None,
+                session_tenant_origin: None,
             },
         )]);
         storage

@@ -382,12 +382,20 @@ impl TerminalManager {
                 // tenant-less session against it rather than against whatever
                 // the default is at restore. Set-once, and only onto a record
                 // this spawn created.
-                if let Some(spawn_default) =
-                    crate::coord_mcp::terminal_spawn_default_tenant(&info.id)
-                {
+                if let Some(sample) = crate::coord_mcp::terminal_spawn_default_tenant(&info.id) {
+                    use crate::coord_mcp::SpawnDefaultSample;
                     store.record_spawn_device_default(
                         &info.id,
-                        spawn_default.map(|t| t.to_string()),
+                        crate::session::session_lifecycle_store::SpawnDeviceDefault {
+                            tenant_id: match sample {
+                                SpawnDefaultSample::Named(t) => Some(t.to_string()),
+                                SpawnDefaultSample::NoDefault
+                                | SpawnDefaultSample::Unresolvable => None,
+                            },
+                            // An unreadable pin is recorded as UNKNOWN, not as
+                            // "no default".
+                            unresolvable: sample == SpawnDefaultSample::Unresolvable,
+                        },
                         spawn_started_ms,
                     );
                 }
