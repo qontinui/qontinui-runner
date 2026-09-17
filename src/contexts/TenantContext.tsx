@@ -131,13 +131,16 @@ export interface TenantContextValue {
   /** Re-pull from Rust. */
   refresh: () => Promise<void>;
   /**
-   * F2 — the tenant the NEXT spawn will bind to. `null` means "nothing has
-   * been resolved yet; fall back to `defaultTenantIdForNewSessions`".
+   * F2 — the tenant the operator EXPLICITLY picked for the next spawn. `null`
+   * means no pick: the spawn sends no tenant and Rust stamps the device default.
+   * The picker still DISPLAYS its inferred / default tenant; only a pick is
+   * published here (plan
+   * 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential re-review
+   * F1 — a sent tenant is admitted fail-closed, so an unpicked one must not be sent).
    *
    * This is deliberately SEPARATE from `defaultTenantIdForNewSessions`: that
    * is the persisted device default (written to machine.json), whereas this is a
-   * transient, un-persisted, per-spawn selection driven by repo→tenant
-   * inference and the operator's picker. Setting it never writes machine.json
+   * transient, un-persisted, per-spawn choice made in the operator's picker. Setting it never writes machine.json
    * and — per D12 — never migrates a RUNNING session; a session's tenant is
    * stamped at spawn and immortal.
    *
