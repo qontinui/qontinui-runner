@@ -61,13 +61,21 @@ struct Server {
     http: reqwest::Client,
 }
 
+/// A server under the runner's DEFAULT route policy.
 async fn spawn(config: BindingConfig) -> Server {
+    spawn_with_policy(None, config).await
+}
+
+/// A server under an explicit route policy (`None` = the default,
+/// `EnforceDoors`). R7 claims its refusal holds in EVERY route policy, so its
+/// test exercises more than one.
+async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let bound = Arc::new(AtomicU16::new(port));
     let guard = Arc::new(OriginGuard::new(
         None,
-        None,
+        policy,
         None,
         None,
         Arc::new(move || bound.load(Ordering::Relaxed)),
@@ -89,8 +97,13 @@ async fn spawn(config: BindingConfig) -> Server {
     }
 }
 
-/// The relay routes at their production patterns, over `RelayState`. `/health`
-/// stands in for the production handler's `uiBridgeBinding` block (Phase 1).
+/// The relay routes at their production patterns, over `RelayState`.
+///
+/// `/test-health` is the HARNESS's own counter read — deliberately NOT spelled
+/// `/health`, because the production `/health` handler serves no
+/// `uiBridgeBinding` block yet. Wiring `RelayBinding::health_json` into it, and
+/// asserting the counters against the REAL handler, is Phase 1's job; until
+/// then nothing here is evidence that an operator can see a counter.
 fn relay_router(relay: RelayState) -> Router {
     use crate::mcp::app_discovery::{
         deregister_app, dispatch_to_app, list_registered_apps, register_app,
@@ -128,7 +141,7 @@ fn relay_router(relay: RelayState) -> Router {
             post(ui_bridge_relay_dispatch_handler),
         )
         .route(
-            "/health",
+            "/test-health",
             get(|State(s): State<RelayState>| async move {
                 Json(json!({ "uiBridgeBinding": s.binding.health_json() }))
             }),
@@ -428,8 +441,10 @@ impl Server {
         self.relay.sdk_connection.lock().await.active_url.clone()
     }
 
+    /// A rule's counters, read from the HARNESS stub — see `relay_router`:
+    /// the production `/health` does not serve this block until Phase 1.
     async fn rule(&self, rule: &str) -> Value {
-        let (_, body) = self.get("/health", agent()).await;
+        let (_, body) = self.get("/test-health", agent()).await;
         body["uiBridgeBinding"]["rules"][rule].clone()
     }
 }
@@ -839,17 +854,30 @@ async fn reload_race_tombstone() {
 #[tokio::test]
 #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn sdk_switch_refused_to_foreign() {
-    let s = spawn(BindingConfig::default()).await;
-    let (_w, ack) = s.ws_register(None, "app").await;
-    assert_eq!(ack["type"], "registered");
-    let (status, body) = s
-        .post(
-            "/ui-bridge/sdk/switch",
-            browser(EVIL),
-            json!({ "url": "ws-app://app" }),
-        )
-        .await;
-    assert_eq!(status, 403, "a foreign origin reached sdk/switch: {body}");
+    // R7 holds in EVERY route policy, so exercise the default
+    // (`enforce-doors`, which only shadows this route today) and `off`, where
+    // no allowlist is metered at all.
+    for policy in [None, Some("off")] {
+        let s = spawn_with_policy(policy, BindingConfig::default()).await;
+        let (_w, ack) = s.ws_register(None, "app").await;
+        assert_eq!(ack["type"], "registered");
+        let (status, body) = s
+            .post(
+                "/ui-bridge/sdk/switch",
+                browser(EVIL),
+                json!({ "url": "ws-app://app" }),
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "a foreign origin reached sdk/switch under routePolicy={policy:?}: {body}"
+        );
+        assert_eq!(
+            code(&body),
+            Some(origin_guard::CODE_CROSS_ORIGIN_REFUSED),
+            "{body}"
+        );
+    }
 }
 
 /// R1 is checked and written under one lock.
@@ -974,8 +1002,23 @@ async fn untargeted_dispatch_not_captured_during_reconnect() {
     );
     assert_eq!(status, 409, "{body}");
     assert_eq!(code(&body), Some("AMBIGUOUS_TAB"), "{body}");
-    let listed = body["error"].as_str().unwrap_or_default().to_string() + &body.to_string();
-    assert!(listed.contains("t1") && listed.contains("t9"), "{body}");
+    // The candidates are a structured field, not prose: `suggestions` carries
+    // one `retry with {"tabId": "…"}` entry per candidate. Each candidate gains
+    // its `verifiedOrigin` in Phase 3 — assert that when it lands.
+    let suggestions: Vec<String> = body["suggestions"]
+        .as_array()
+        .expect("AmbiguousTab lists its candidates in `suggestions`")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    for tab in ["t1", "t9"] {
+        assert!(
+            suggestions
+                .iter()
+                .any(|s| s.contains(&format!("\"tabId\": \"{tab}\""))),
+            "{tab} is not among the candidates: {suggestions:?}"
+        );
+    }
 }
 
 /// R9.
@@ -986,6 +1029,7 @@ async fn pinned_tab_key_binds_across_origins() {
     let s = spawn(BindingConfig::default()).await;
     let first = s.attach("t1", keyed(APP, K)).await.expect("keyed attach");
     first.drop_stream();
+    s.wait_tab_disconnected("t1").await;
 
     let mut hop = s
         .attach("t1", keyed(ACCOUNTS, K))
@@ -1000,6 +1044,12 @@ async fn pinned_tab_key_binds_across_origins() {
     assert_eq!(status, 200);
     assert_eq!(dispatch.await.unwrap().0, 200);
 
+    // The hop's stream is LIVE here, so the refusals below defend the keyed
+    // holder rather than a stale record.
+    assert_eq!(
+        s.tab_entry("t1").await.expect("t1 listed")["connected"],
+        true
+    );
     for from in [browser(EVIL), keyed(EVIL, "k-some-other-key")] {
         match s.attach("t1", from).await {
             Err((status, body)) => assert_eq!(status, 409, "{body}"),
@@ -1070,10 +1120,17 @@ mod pinned_tab_opaque_first_attach_then_real_origin {
             .await
             .expect("a keyed opaque attach is admitted");
         blank.drop_stream();
+        s.wait_tab_disconnected("t1").await;
         let _real = s
             .attach("t1", keyed(APP, K))
             .await
             .expect("the same key re-attaches from the real origin");
+        // Live holder, so the refusal below is the key binding and not a
+        // tombstone or a stale record.
+        assert_eq!(
+            s.tab_entry("t1").await.expect("t1 listed")["connected"],
+            true
+        );
         match s.attach("t1", browser(APP)).await {
             Err((status, body)) => assert_eq!(status, 409, "{body}"),
             Ok(_) => panic!("t1 was bound to its origin, not to its key"),
@@ -1317,7 +1374,13 @@ async fn phone_home_loopback_alias_same_principal() {
 async fn unkeyed_pinned_tab_origin_hop_shadow() {
     let s = spawn(BindingConfig::default()).await;
     let first = s.attach("t1", browser(APP)).await.expect("attach from app");
+    // Wait for the runner to NOTICE the drop. Without this the re-attach races
+    // a still-live listener, which is a plain cross-principal displacement
+    // (R1, enforce by default) rather than the unkeyed re-attach this test is
+    // the invariant for — so it would go red in Phase 2, or press Phase 2 into
+    // weakening R1.
     first.drop_stream();
+    s.wait_tab_disconnected("t1").await;
     let mut hop = s
         .attach("t1", browser(ACCOUNTS))
         .await
@@ -1387,7 +1450,16 @@ async fn kill_switch_off_restores_today() {
 }
 
 #[test]
-fn binding_config_from_env_parses() {
+fn binding_config_from_values_parses() {
+    // The two names `from_env` reads. Nothing else pins them, and a rename or
+    // a transposition would silently break the documented kill switch while
+    // every other test stayed green.
+    assert_eq!(ENV_BINDING, "QONTINUI_RUNNER_UIBRIDGE_BINDING");
+    assert_eq!(
+        ENV_ACTIVE_BINDING,
+        "QONTINUI_RUNNER_UIBRIDGE_ACTIVE_BINDING"
+    );
+
     let d = BindingConfig::from_values(None, None);
     assert_eq!(d, BindingConfig::default());
     assert_eq!(d.binding, BindingMode::Enforce);
