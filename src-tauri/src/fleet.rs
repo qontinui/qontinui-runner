@@ -273,15 +273,44 @@ static COORD_ONLY_BINDINGS_WARNED: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeSet<uuid::Uuid>>,
 > = std::sync::OnceLock::new();
 
-fn warn_coord_only_binding_once(tenant: uuid::Uuid) {
+fn warn_coord_only_binding_once(
+    tenant: uuid::Uuid,
+    slot: qontinui_runner_lib::auth::SlotState,
+) {
     let set = COORD_ONLY_BINDINGS_WARNED
         .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let fresh = set.lock().map(|mut g| g.insert(tenant)).unwrap_or(false);
     if fresh {
+        // The slot state is the whole of the operator's next move, and the
+        // two are different moves (plan
+        // `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+        // P0): an ABSENT slot was never issued, a PRESENT-BUT-DEAD one rotted.
+        let heal = match slot {
+            qontinui_runner_lib::auth::SlotState::PresentButDead => {
+                "its device-JWT slot holds an expired or opaque token — the device-JWT \
+                 refresher clears and re-derives it, or re-pair for that tenant"
+            }
+            qontinui_runner_lib::auth::SlotState::Unreadable => {
+                "its device-JWT slot could not be READ — this is UNKNOWN, not a missing \
+                 credential; check the credential store before re-pairing"
+            }
+            qontinui_runner_lib::auth::SlotState::Absent => {
+                "the runner holds no device-JWT for it — pair for that tenant to enable \
+                 its sessions"
+            }
+            // A USABLE slot only reaches this flag when the local binding
+            // ENTRY is missing: the credential is fine, paired_user.json is
+            // not. Saying "no device-JWT" there would send the operator after
+            // the wrong thing.
+            qontinui_runner_lib::auth::SlotState::Usable => {
+                "paired_user.json carries no binding entry for it — the device-JWT slot \
+                 is usable, so the next pairing for that tenant restores the entry"
+            }
+        };
         warn!(
-            "fleet::heartbeat: coord reports this device bound to tenant {tenant} but the \
-             runner holds no device-JWT for it — pair for that tenant to enable its \
-             sessions. Logging once per tenant per process."
+            "fleet::heartbeat: coord reports this device bound to tenant {tenant} but {heal} \
+             (slot={}). Logging once per tenant per process.",
+            slot.label()
         );
     }
 }
@@ -1870,8 +1899,8 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
                             report.dropped, report.dropped_slots, report.default_repointed
                         );
                     }
-                    for t in report.coord_only {
-                        warn_coord_only_binding_once(t);
+                    for (t, slot) in report.coord_only {
+                        warn_coord_only_binding_once(t, slot);
                     }
                 }
                 Err(e) => {

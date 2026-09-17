@@ -623,10 +623,23 @@ pub struct BindingReconcileReport {
     /// coord's set doesn't contain them either.
     pub dropped_slots: Vec<uuid::Uuid>,
     /// Tenants coord reports bound to this device for which the runner
-    /// holds NO usable credential (no binding entry, or entry without a
-    /// JWT slot). Flag-only: the runner never fabricates a binding — the
-    /// operator must pair for that tenant to mint its JWT.
-    pub coord_only: Vec<uuid::Uuid>,
+    /// holds NO usable credential (no binding entry, or no slot this
+    /// device could actually act with), each with the state of its own
+    /// per-tenant slot. Flag-only: the runner never fabricates a binding —
+    /// the operator must pair for that tenant to mint its JWT.
+    ///
+    /// **VALIDITY, not presence, and the state is carried because the two
+    /// heals differ** (plan
+    /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    /// P0). This flag used to test `!jwt.trim().is_empty()`, so a tenant
+    /// whose slot had EXPIRED did not appear here at all — the runner
+    /// reported itself able to act in a tenant whose credential was dead,
+    /// while `auth::select_device_bearer` had been refusing that same slot
+    /// since Phase 1a. Both now go through `auth::credential_state`.
+    /// `SlotState::Absent` means pair for that tenant;
+    /// `SlotState::PresentButDead` means the refresher re-derives it (or
+    /// re-pair); `SlotState::Unreadable` established nothing.
+    pub coord_only: Vec<(uuid::Uuid, crate::auth::SlotState)>,
     /// `Some` when the default binding was dropped and the default was
     /// re-pointed (`Some(tenant)`) or cleared entirely (`None` — no
     /// bindings remain).
@@ -680,8 +693,9 @@ pub fn response_tenant_ids(body: &str) -> Option<Vec<uuid::Uuid>> {
 ///   are removed, and their `device_jwt:<tenant>` slots cleared (coord
 ///   Phase 3's refresh gate would 403 them anyway). Orphan slots with no
 ///   binding entry are cleared by the same rule.
-/// - **Flag**: tenants in `coord_set` the runner lacks a JWT for are
-///   reported (`coord_only`) — never fabricated locally; pair to heal.
+/// - **Flag**: tenants in `coord_set` the runner holds no USABLE credential
+///   for are reported (`coord_only`, with each one's slot state) — never
+///   fabricated locally; pair, or let the refresher re-derive, to heal.
 /// - **Default re-point**: if the default binding was dropped, the most
 ///   recently paired surviving binding becomes the default and its slot
 ///   JWT is copied into the legacy `access_token` slot (D4: the legacy
@@ -722,8 +736,14 @@ pub(crate) fn reconcile_paired_bindings_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Never paired locally — nothing to reconcile. Coord-side
             // bindings without ANY local file are still worth flagging.
+            // No file means no default binding, so no legacy-slot fallback
+            // applies to any of them; the slot state is reported anyway
+            // because an orphan slot with no file is a real (and different)
+            // state from never having been issued one.
             for t in coord_set {
-                report.coord_only.push(*t);
+                report
+                    .coord_only
+                    .push((*t, crate::auth::read_tenant_slot(mgr, t).state()));
             }
             return Ok(report);
         }
@@ -774,21 +794,36 @@ pub(crate) fn reconcile_paired_bindings_with(
         }
     }
 
-    // Flag coord-side bindings the runner cannot act for: no entry, or an
-    // entry without a JWT slot.
+    let old_default = pf
+        .effective_default_tenant_id()
+        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
+
+    // Flag coord-side bindings the runner cannot ACT for: no entry, or no
+    // credential `auth::select_device_bearer` would hand out for that tenant.
+    //
+    // VALIDITY, not presence. The legacy `access_token` slot holds the DEFAULT
+    // binding's JWT (D4), so it is read once here and folded into the answer
+    // for the default tenant and no other — exactly as the selector does.
+    // Flagging a tenant the selector serves would send an operator to re-pair
+    // something that works; NOT flagging one whose slot expired is the defect
+    // this predicate was unified to end.
+    let default_slot = crate::auth::read_legacy_slot(mgr).state();
     for t in coord_set {
         let has_entry = kept_tenants.contains(t);
-        let has_jwt =
-            matches!(mgr.get_tenant_device_jwt(t), Ok(Some(ref j)) if !j.trim().is_empty());
-        if !has_entry || !has_jwt {
-            report.coord_only.push(*t);
+        let cred = crate::auth::credential_state(
+            crate::auth::read_tenant_slot(mgr, t).state(),
+            old_default.as_ref() == Some(t),
+            default_slot,
+        );
+        // `can_act() != Some(true)` and not `== Some(false)`: an UNREADABLE
+        // store established nothing, and an unflagged unknown would read as
+        // an all-clear.
+        if !has_entry || cred.can_act() != Some(true) {
+            report.coord_only.push((*t, cred.slot));
         }
     }
 
     // Default re-point when the default binding was dropped.
-    let old_default = pf
-        .effective_default_tenant_id()
-        .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok());
     let new_default: Option<uuid::Uuid> = match old_default {
         Some(d) if kept_tenants.contains(&d) => Some(d),
         _ => {
@@ -2383,6 +2418,25 @@ mod tests {
         crate::auth::AuthManager::with_storage(storage)
     }
 
+    /// A syntactically-valid JWT with an explicit `exp`, so the reconciler's
+    /// VALIDITY predicate (`auth::slot_jwt_is_usable`) can be driven in both
+    /// directions. The opaque `"jwt.a.1"` literals the older fixtures use are
+    /// deliberately NOT valid: they exercise the present-but-dead arm.
+    fn jwt_exp(tag: &str, offset_secs: i64) -> String {
+        use base64::Engine as _;
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let exp = chrono::Utc::now().timestamp() + offset_secs;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"sub":"{tag}","exp":{exp}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    /// Comfortably unexpired.
+    fn live_jwt(tag: &str) -> String {
+        jwt_exp(tag, 3 * 60 * 60)
+    }
+
     fn pair_resp(token: &str) -> PairCompleteResponse {
         PairCompleteResponse {
             token: token.to_string(),
@@ -2647,8 +2701,12 @@ mod tests {
         let dir = temp_dir_for("reconcile_drop_flag");
         let mgr = test_mgr(&dir);
         let path = dir.join("paired_user.json");
-        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
-        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
+        // LIVE JWTs: the flag applies validity, so an opaque fixture would be
+        // flagged as present-but-dead and drown the signal this test is about.
+        let ja = live_jwt("a");
+        let jb = live_jwt("b");
+        persist_pairing_with(&mgr, &path, &pair_resp(&ja), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&jb), tb()).unwrap();
 
         // Coord says: A still bound, B gone, C newly bound elsewhere.
         let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tc()]).expect("reconcile");
@@ -2656,8 +2714,8 @@ mod tests {
         assert_eq!(report.dropped, vec![tb()]);
         assert_eq!(
             report.coord_only,
-            vec![tc()],
-            "no local JWT for C → flagged"
+            vec![(tc(), crate::auth::SlotState::Absent)],
+            "no local JWT for C → flagged, and the flag says WHICH heal"
         );
         assert_eq!(report.default_repointed, None, "default A survived");
         assert!(
@@ -2670,7 +2728,7 @@ mod tests {
         assert_eq!(pf.default_tenant_id.as_deref(), Some(T_A));
         assert_eq!(
             mgr.get_access_token().unwrap(),
-            "jwt.a.1",
+            ja,
             "legacy slot untouched when the default survives"
         );
     }
@@ -2743,14 +2801,18 @@ mod tests {
         let dir = temp_dir_for("reconcile_noop");
         let mgr = test_mgr(&dir);
         let path = dir.join("paired_user.json");
-        persist_pairing_with(&mgr, &path, &pair_resp("jwt.a.1"), ta()).unwrap();
-        persist_pairing_with(&mgr, &path, &pair_resp("jwt.b.1"), tb()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
         let before = std::fs::read(&path).unwrap();
 
         let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tb()]).expect("reconcile");
 
         assert!(!report.changed(), "nothing changed: {report:?}");
-        assert!(report.coord_only.is_empty(), "both tenants hold JWTs");
+        assert!(
+            report.coord_only.is_empty(),
+            "both tenants hold USABLE JWTs: {:?}",
+            report.coord_only
+        );
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
@@ -2768,8 +2830,52 @@ mod tests {
 
         let report = reconcile_paired_bindings_with(&mgr, &path, &[ta()]).expect("reconcile");
         assert!(report.dropped.is_empty());
-        assert_eq!(report.coord_only, vec![ta()]);
+        assert_eq!(report.coord_only, vec![(ta(), crate::auth::SlotState::Absent)]);
         assert!(!path.exists(), "no file must be created");
+    }
+
+    /// **A bound tenant whose slot has EXPIRED must be flagged.** Plan
+    /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    /// P0: this flag used to test `!jwt.trim().is_empty()`, so an expired
+    /// credential read as one the runner could act with — while
+    /// `auth::select_device_bearer` had been refusing that same slot since
+    /// Phase 1a. The reconciler was the OPTIMISTIC one, in the one place an
+    /// operator would have looked.
+    ///
+    /// Both directions are asserted in the same pass, because the value of
+    /// the flag is the DIFFERENCE between them: A (usable) must stay out, B
+    /// (expired) must come in, and B must arrive labelled `PresentButDead`
+    /// rather than `Absent` — a rotted slot is a refresher/re-pair, a missing
+    /// one is a pairing.
+    #[test]
+    fn reconcile_flags_a_bound_tenant_whose_slot_has_expired() {
+        let dir = temp_dir_for("reconcile_expired_slot");
+        let mgr = test_mgr(&dir);
+        let path = dir.join("paired_user.json");
+        // A is the default binding and holds a live JWT; B is bound too and
+        // its slot has expired.
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("a")), ta()).unwrap();
+        persist_pairing_with(&mgr, &path, &pair_resp(&live_jwt("b")), tb()).unwrap();
+        mgr.store_tenant_device_jwt(&tb(), &jwt_exp("b", -3600))
+            .unwrap();
+
+        let report = reconcile_paired_bindings_with(&mgr, &path, &[ta(), tb()]).expect("reconcile");
+
+        assert_eq!(
+            report.coord_only,
+            vec![(tb(), crate::auth::SlotState::PresentButDead)],
+            "an EXPIRED slot is not a credential this runner can act with — presence is not \
+             validity, and the selector already refuses it"
+        );
+        assert!(
+            report.dropped.is_empty() && report.dropped_slots.is_empty(),
+            "flag-only: a dead slot is never CLEARED by the flag path: {report:?}"
+        );
+        // The selector's own verdict, on the same store — they must agree.
+        assert!(
+            crate::auth::select_device_bearer(&mgr, Some(&tb()), Some(ta())).is_none(),
+            "the selector refuses the expired slot, which is why the flag must too"
+        );
     }
 
     /// Reconcile clears ORPHAN slots (credential without a binding

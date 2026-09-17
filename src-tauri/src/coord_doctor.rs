@@ -408,25 +408,37 @@ pub const CHECK_SPECS: &[CheckSpec] = &[
     },
     CheckSpec {
         name: "tenant_bindings",
-        title: "Tenant bindings in step with coord",
-        verifies: "which tenants this device is paired to, from BOTH sides: the \
-                   local binding set in paired_user.json (no network) and the \
-                   server-side set coord serves on GET /coord/devices/:id/state \
-                   \u{2014} the read the register heartbeat reconciles the local \
-                   set against every 30s. Coord's `tenant_ids` is tri-state and \
+        title: "Tenant bindings in step with coord, and a usable slot for each",
+        verifies: "which tenants this device is paired to AND which of them it \
+                   can actually act in, from THREE sides: the local binding set \
+                   in paired_user.json (no network), the server-side set coord \
+                   serves on GET /coord/devices/:id/state \u{2014} the read the \
+                   register heartbeat reconciles the local set against every 30s \
+                   \u{2014} and the per-tenant device-JWT SLOT census this \
+                   device holds, each slot classed usable / present-but-dead / \
+                   absent (validity, not presence). The bindings-vs-slots \
+                   difference is reported in BOTH directions: a tenant coord \
+                   binds that has no usable slot is one a session can see and \
+                   cannot work in; a slot held for a tenant coord does not bind \
+                   is a stale credential. Coord's `tenant_ids` is tri-state and \
                    is reported as such: `null` is UNKNOWN (coord did not hydrate \
-                   bindings), `[]` is ZERO bindings, never the other way round. \
-                   A device that is not paired reports NOT APPLICABLE",
+                   bindings), `[]` is ZERO bindings, never the other way round; \
+                   an unreadable slot store is likewise UNKNOWN, never zero \
+                   slots, and a difference is computed only when BOTH sides are \
+                   measured. A device that is not paired reports NOT APPLICABLE",
         fix: "a local/coord drift closes on the next register heartbeat \
               (fleet.rs heartbeat \u{2192} pair::reconcile_paired_bindings): \
               local-only entries are dropped with their JWT slots, and a \
               coord-only binding is one this runner holds no device-JWT for \
               \u{2014} pair for that tenant (`qontinui_profile device pair \
-              --pair-code <code>`) to enable its sessions. A coord side that \
-              reads UNKNOWN was not measured: the detail names why (no live \
-              device JWT, coord unreachable, or coord answered without \
-              hydrating `tenant_ids`) \u{2014} see device_jwt_live and \
-              coord_reachable",
+              --pair-code <code>`) to enable its sessions. A coord binding whose \
+              slot reads `absent` was never issued \u{2014} pair for that \
+              tenant; one that reads `present-but-dead` was issued and rotted \
+              \u{2014} the device-JWT refresher clears and re-derives it, or \
+              re-pair. A coord side that reads UNKNOWN was not measured: the \
+              detail names why (no live device JWT, coord unreachable, or coord \
+              answered without hydrating `tenant_ids`) \u{2014} see \
+              device_jwt_live and coord_reachable",
         advisory: true,
         always_run: false,
     },
@@ -691,8 +703,12 @@ pub struct DoctorInputs {
 ///   `device_jwt_refresher::resolve_pair_tenant_id`).
 /// - **Tenant bindings** (ADVISORY) — the local binding set
 ///   (`pair::read_paired_binding_tenant_ids`) against coord's
-///   (`GET /coord/devices/:id/state` `tenant_ids`, tri-state kept honest);
-///   a drift or an UNKNOWN coord side warns — see [`tenant_bindings_verdict`].
+///   (`GET /coord/devices/:id/state` `tenant_ids`, tri-state kept honest),
+///   AND coord's set against the per-tenant device-JWT slot census
+///   ([`read_local_slot_census`]) in both directions, so a tenant this device
+///   is bound to but holds no usable credential for is named rather than
+///   silent; a drift, a divergence, or an UNKNOWN on either side warns — see
+///   [`tenant_bindings_verdict`].
 /// - **Device JWT live** — `auth::AuthManager::device_jwt_needs_refresh()` ==
 ///   `Ok(false)` with a token present.
 /// - **`.mcp.json` valid** (ADVISORY) — its coord-mcp port == the bound port
@@ -1932,19 +1948,244 @@ fn coord_reachable_check() -> (bool, String) {
 // does not invent an activity column; when coord grows the field, extend the
 // parser (`pair::response_tenant_ids`) rather than this renderer.
 //
+// A THIRD side was added by plan
+// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+// P0: the per-tenant device-JWT SLOT census. Bindings and slots are different
+// facts and they diverge — measured on the operator box, coord bound device
+// c79a07d5 to THREE tenants while the runner held a usable slot for ONE, so a
+// session could see it was bound to a tenant and be unable to act in it, and
+// nothing on either side reported it. The check now differences coord's
+// binding set against the slot census in BOTH directions (bound with no usable
+// slot; slot held for a tenant coord does not bind) and classes each slot
+// usable / present-but-dead / absent — see `auth::SlotState` for why the middle one
+// is not folded into "missing". P0 is OBSERVATION ONLY: nothing here issues,
+// refreshes or clears a credential.
+//
 // Advisory, not blocking: the report answers "can this runner set gates?",
 // and a binding drift does not withhold gate registration — the pinned
 // slot's JWT still authenticates. A warning is the honest tier, and being
 // advisory it also runs after an earlier red, which is exactly where a stale
-// binding set is most likely to be found.
+// binding set is most likely to be found. The slot divergence is advisory for
+// the same reason and a stronger one: the gate-registering credential is the
+// PINNED tenant's, so a missing slot for some other bound tenant does not stop
+// this runner setting gates — it stops a session working that tenant, which is
+// a warning about reach, not about access.
 // ---------------------------------------------------------------------------
 
-/// Gather the two binding sets and hand them to [`tenant_bindings_verdict`].
+/// The MEASURED local credential picture: every tenant the per-tenant
+/// device-JWT store enumerated with the state of its slot, plus the DEFAULT
+/// binding and the legacy `access_token` slot's state — because the legacy
+/// slot IS the default binding's JWT (D4) and `auth::select_device_bearer`
+/// falls back to it for that one tenant. A census that left it out would
+/// report a device unable to act in a tenant the selector serves happily.
 ///
-/// This closure only OBSERVES: the local half is two plain file reads, the
-/// coord half is [`read_coord_tenant_bindings`], and the verdict is the pure
-/// function. Coord is not asked at all for an unpaired device — there is no
-/// binding set to compare, and the verdict reports NOT APPLICABLE.
+/// A tenant absent from the map is [`crate::auth::SlotState::Absent`]: the
+/// map holds exactly the tenants the store itself named, so "not in the map"
+/// is a measurement rather than a gap.
+///
+/// The census is tri-stated by its CONTAINER, never by a sentinel inside it:
+/// [`read_local_slot_census`] returns `Option<SlotCensus>` and `None` means
+/// the store could not be enumerated at all. An EMPTY census is therefore a
+/// device that holds zero slots — a real observation, and the arm most in
+/// need of a signal, not an unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlotCensus {
+    states: std::collections::BTreeMap<uuid::Uuid, crate::auth::SlotState>,
+    default_tenant: Option<uuid::Uuid>,
+    default_slot: crate::auth::SlotState,
+}
+
+impl SlotCensus {
+    /// Build from measured state. The only constructor, so no caller can
+    /// invent a census the store did not produce.
+    fn new(
+        states: impl IntoIterator<Item = (uuid::Uuid, crate::auth::SlotState)>,
+        default_tenant: Option<uuid::Uuid>,
+        default_slot: crate::auth::SlotState,
+    ) -> Self {
+        Self {
+            states: states.into_iter().collect(),
+            default_tenant,
+            default_slot,
+        }
+    }
+
+    /// This tenant's own slot state; not enumerated ⇒ `Absent`.
+    fn state_of(&self, tenant: &uuid::Uuid) -> crate::auth::SlotState {
+        self.states
+            .get(tenant)
+            .copied()
+            .unwrap_or(crate::auth::SlotState::Absent)
+    }
+
+    /// Can this device act in `tenant`, and on the strength of what —
+    /// answered by `auth::credential_state`, the SAME rule
+    /// `auth::select_device_bearer` selects by. Sharing the rule is the
+    /// point: a doctor that reported "cannot act" where the selector hands
+    /// out a bearer (or the reverse) would be worse than silence.
+    fn credential_for(&self, tenant: &uuid::Uuid) -> crate::auth::TenantCredential {
+        crate::auth::credential_state(
+            self.state_of(tenant),
+            self.default_tenant.as_ref() == Some(tenant),
+            self.default_slot,
+        )
+    }
+
+    /// Every enumerated tenant in `state`, sorted (BTreeMap order), so the
+    /// rendered line is identical across machines.
+    fn in_state(&self, state: crate::auth::SlotState) -> std::collections::BTreeSet<uuid::Uuid> {
+        self.states
+            .iter()
+            .filter(|(_, s)| **s == state)
+            .map(|(t, _)| *t)
+            .collect()
+    }
+
+    /// Every enumerated tenant that actually HOLDS a slot (any state but
+    /// `Absent`, which only appears here when a slot was cleared between the
+    /// enumeration and the read), with that state.
+    fn held(&self) -> impl Iterator<Item = (uuid::Uuid, crate::auth::SlotState)> + '_ {
+        self.states
+            .iter()
+            .filter(|(_, s)| **s != crate::auth::SlotState::Absent)
+            .map(|(t, s)| (*t, *s))
+    }
+}
+
+/// The LOCAL half of the bindings-vs-slots comparison, as the tri-state the
+/// verdict consumes plus a note explaining it.
+///
+/// * `None` — the per-tenant slot store could not be ENUMERATED. UNKNOWN; the
+///   verdict must not read it as "this device holds no slots". That is why
+///   this goes through `try_list_tenant_device_jwt_tenants` and not
+///   `list_tenant_device_jwt_tenants`, whose empty `Vec` means "no slots" and
+///   "unreadable store" alike (the collapse its own doc comment warns about).
+/// * `Some(census)` — measured, possibly empty.
+///
+/// READ-ONLY and WARNING-FREE by construction: it goes through
+/// `auth::read_tenant_slot` / `auth::read_legacy_slot`, which neither mutate
+/// state nor fire the selector's once-per-process operator warnings. It must
+/// never go through `pair::reconcile_paired_bindings*`, which shares the same
+/// question and CLEARS slots and rewrites `paired_user.json` to answer it —
+/// a doctor that healed what it measured could not report what it found.
+fn read_local_slot_census() -> (Option<SlotCensus>, String) {
+    let auth = crate::auth::AuthManager::new();
+    let tenants = match auth.try_list_tenant_device_jwt_tenants() {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                None,
+                format!(
+                    "the per-tenant device-JWT store could not be enumerated ({e}) — the \
+                     slot set is UNKNOWN, not empty, and this runner has NOT been signed out"
+                ),
+            )
+        }
+    };
+    let states: Vec<(uuid::Uuid, crate::auth::SlotState)> = tenants
+        .into_iter()
+        .map(|t| {
+            let state = crate::auth::read_tenant_slot(&auth, &t).state();
+            (t, state)
+        })
+        .collect();
+    let n = states.len();
+    let default_tenant = crate::auth::default_binding_tenant();
+    let default_slot = crate::auth::read_legacy_slot(&auth).state();
+    (
+        Some(SlotCensus::new(states, default_tenant, default_slot)),
+        format!("{n} tenant slot(s) enumerated from the per-tenant device-JWT store"),
+    )
+}
+
+/// The three-way comparison, as DATA rather than as a sentence: which bound
+/// tenants this device cannot act in, which of those it cannot even judge,
+/// and which slots it holds for tenants that are not bound.
+///
+/// Computed ONLY from two MEASURED sides (see [`bindings_vs_slots`]); there
+/// is deliberately no arm that produces a difference from an unknown one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct BindingsVsSlots {
+    /// Coord binds these and this device holds NO credential it could act
+    /// with — THE defect the plan names: a session can see it is bound and
+    /// cannot work the tenant. The carried state is `Absent` or
+    /// `PresentButDead`, which is the whole point of keeping those two apart
+    /// (they are different operator actions).
+    bound_without_usable_slot: Vec<(uuid::Uuid, crate::auth::SlotState)>,
+    /// Coord binds these and the credential state could not be READ. Not a
+    /// defect and not an all-clear — UNKNOWN, reported as itself.
+    bound_slot_unknown: Vec<uuid::Uuid>,
+    /// Coord binds these, their own per-tenant slot is not usable, and the
+    /// device can still act in them through the LEGACY default slot. Not a
+    /// divergence — recorded so the report does not send an operator after a
+    /// tenant that works.
+    usable_via_default_slot: Vec<uuid::Uuid>,
+    /// A slot exists for these and coord binds none of them — the other
+    /// direction: a stale credential for a tenant this device is no longer
+    /// bound to.
+    slot_not_bound: Vec<(uuid::Uuid, crate::auth::SlotState)>,
+}
+
+impl BindingsVsSlots {
+    /// True iff the two measured sides agree in BOTH directions and nothing
+    /// was unreadable. `usable_via_default_slot` is deliberately not a term:
+    /// the device CAN act in those tenants, which is agreement.
+    fn in_step(&self) -> bool {
+        self.bound_without_usable_slot.is_empty()
+            && self.bound_slot_unknown.is_empty()
+            && self.slot_not_bound.is_empty()
+    }
+}
+
+/// Difference the MEASURED binding set against the MEASURED credential census,
+/// in both directions. Pure, total, and never called with an unknown side —
+/// [`tenant_slots_half`] is the only caller and it guards both.
+fn bindings_vs_slots(
+    bound: &std::collections::BTreeSet<uuid::Uuid>,
+    census: &SlotCensus,
+) -> BindingsVsSlots {
+    let mut out = BindingsVsSlots::default();
+    for tenant in bound {
+        let cred = census.credential_for(tenant);
+        match cred.can_act() {
+            Some(true) => {
+                if cred.via_default_slot {
+                    out.usable_via_default_slot.push(*tenant);
+                }
+            }
+            // UNKNOWN: a read failed and nothing was established. Not folded
+            // into the defect list, which would claim a measurement we do not
+            // have, and not into the all-clear, which would hide it.
+            None => out.bound_slot_unknown.push(*tenant),
+            Some(false) => out.bound_without_usable_slot.push((*tenant, cred.slot)),
+        }
+    }
+    for (tenant, state) in census.held() {
+        if !bound.contains(&tenant) {
+            out.slot_not_bound.push((tenant, state));
+        }
+    }
+    out
+}
+
+/// Render `(tenant, state)` pairs for the report: `[<uuid> (absent), …]`,
+/// in the sorted order the census and the binding set already carry.
+fn render_slot_pairs(pairs: &[(uuid::Uuid, crate::auth::SlotState)]) -> String {
+    let rendered: Vec<String> = pairs
+        .iter()
+        .map(|(t, s)| format!("{t} ({})", s.label()))
+        .collect();
+    format!("[{}]", rendered.join(", "))
+}
+
+/// Gather the three sets and hand them to [`tenant_bindings_verdict`].
+///
+/// This closure only OBSERVES: the local binding half is two plain file
+/// reads, the coord half is [`read_coord_tenant_bindings`], the slot half is
+/// [`read_local_slot_census`] (secure storage, no network), and the verdict
+/// is the pure function. Coord is not asked at all for an unpaired device —
+/// there is no binding set to compare, and the verdict reports NOT
+/// APPLICABLE.
 fn tenant_bindings_check() -> (bool, String) {
     let paired = crate::pair::device_is_paired();
     let local = crate::pair::read_paired_binding_tenant_ids();
@@ -1953,7 +2194,14 @@ fn tenant_bindings_check() -> (bool, String) {
     } else {
         (None, "device not paired".to_string())
     };
-    tenant_bindings_verdict(paired, &local, coord, &note)
+    // Measured even when coord is dark: it is a local read, and a device
+    // holding ZERO usable slots is the state most in need of a signal.
+    let (slots, slot_note) = if paired {
+        read_local_slot_census()
+    } else {
+        (None, "device not paired".to_string())
+    };
+    tenant_bindings_verdict(paired, &local, coord, &note, slots.as_ref(), &slot_note)
 }
 
 /// The coord half of the tenant-bindings check, as the tri-state the verdict
@@ -2077,21 +2325,47 @@ fn render_tenant_set<'a>(set: impl IntoIterator<Item = &'a uuid::Uuid>) -> Strin
     format!("[{}]", ids.join(", "))
 }
 
-/// The tenant-bindings verdict: PURE over `(paired, local, coord, note)`.
+/// The tenant-bindings verdict: PURE over
+/// `(paired, local, coord, coord_note, slots, slot_note)`.
 ///
 /// `coord` is the tri-state [`read_coord_tenant_bindings`] documents —
 /// `None` = not measured, `Some(None)` = coord did not hydrate, `Some(Some(v))`
 /// = measured — and `coord_note` is that function's explanation of the first
-/// two arms, quoted into the detail so the report says WHICH unknown. Sets
-/// are compared as sets: order is irrelevant (the file keeps pairing order,
-/// coord serves `last_active_at` DESC) and duplicates cannot occur.
+/// two arms, quoted into the detail so the report says WHICH unknown. `slots`
+/// is the second tri-state, from [`read_local_slot_census`]: `None` = the
+/// slot store could not be enumerated (UNKNOWN, never "no slots"),
+/// `Some(census)` = measured, possibly empty. Sets are compared as sets:
+/// order is irrelevant (the file keeps pairing order, coord serves
+/// `last_active_at` DESC) and duplicates cannot occur.
 ///
-/// # The five shapes it distinguishes
+/// # Two comparisons, not one
 ///
-/// 1. **Not paired** — green, NOT APPLICABLE. No binding set exists to
-///    compare, and coord was not asked. Following check 6's and check 10's
-///    precedent, a green with an explicit not-applicable detail rather than
-///    a permanent warning on every unpaired box.
+/// The detail carries a BINDINGS half and a SLOTS half, and they answer
+/// different questions. The bindings half is "do this device and coord agree
+/// about which tenants it is paired to". The slots half is
+/// "**for the tenants coord says it is bound to, can it actually act?**" —
+/// plan `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+/// P0, measured on the operator box as 3 coord bindings against 1 device-JWT
+/// slot, with nothing on either side reporting the divergence.
+///
+/// The slots half is differenced against COORD's set, never against the local
+/// file's. Coord is the authority on bindings, and the local set is written
+/// FROM coord's answer by the same reconciler that drops local-only slots
+/// (`pair::reconcile_paired_bindings`) — so local-vs-slots would measure a
+/// reconciler against itself, while coord-vs-slots measures the thing that
+/// actually stops a session working. When coord's set is UNKNOWN the slot
+/// CENSUS still prints (it is a local measurement) and no difference is
+/// computed in either direction.
+///
+/// # The shapes it distinguishes
+///
+/// Bindings half:
+///
+/// 1. **Not paired** — green, NOT APPLICABLE, and the slots half is not
+///    reached. No binding set exists to compare, coord was not asked.
+///    Following check 6's and check 10's precedent, a green with an explicit
+///    not-applicable detail rather than a permanent warning on every unpaired
+///    box.
 /// 2. **Coord not measured** — warn. The local set is still printed (it
 ///    needs no network); the coord side is UNKNOWN and the note says why.
 /// 3. **Coord did not hydrate** — warn. `null` is not `[]`: no comparison
@@ -2102,11 +2376,25 @@ fn render_tenant_set<'a>(set: impl IntoIterator<Item = &'a uuid::Uuid>) -> Strin
 /// 5. **Drift** — warn, with the symmetric difference spelled out
 ///    (local-only / coord-only) and the remediation: the next heartbeat's
 ///    reconcile drops local-only entries; a coord-only binding needs a pair.
+///
+/// Slots half ([`tenant_slots_half`]):
+///
+/// 6. **Slot store unreadable** — warn, UNKNOWN, and no difference.
+/// 7. **Census measured, coord UNKNOWN** — warn: the census prints, the
+///    difference does not exist.
+/// 8. **Both measured, in step** — green.
+/// 9. **Both measured, divergent** — warn, naming the tenant ids in both
+///    directions with each one's slot state.
+///
+/// The two halves are `&&`-ed: the check stays ADVISORY either way, so a
+/// divergence warns and never withholds gate registration.
 fn tenant_bindings_verdict(
     paired: bool,
     local: &[uuid::Uuid],
     coord: Option<Option<Vec<uuid::Uuid>>>,
     coord_note: &str,
+    slots: Option<&SlotCensus>,
+    slot_note: &str,
 ) -> (bool, String) {
     use std::collections::BTreeSet;
 
@@ -2124,51 +2412,170 @@ fn tenant_bindings_verdict(
         local_set.len(),
         render_tenant_set(&local_set)
     );
-    match coord {
-        None => (
-            false,
-            format!("{local_line}; coord bindings UNKNOWN — not measured: {coord_note}"),
-        ),
-        Some(None) => (
-            false,
-            format!(
-                "{local_line}; coord bindings UNKNOWN — coord answered but did not hydrate \
-                 bindings (tenant_ids absent or null; {coord_note}). A null is not an empty \
-                 set, so no comparison was made"
+    // The bindings half, plus the MEASURED coord set (and only a measured
+    // one) for the slots half to difference against.
+    let (bindings_ok, bindings_line, coord_set): (bool, String, Option<BTreeSet<uuid::Uuid>>) =
+        match coord {
+            None => (
+                false,
+                format!("{local_line}; coord bindings UNKNOWN — not measured: {coord_note}"),
+                None,
             ),
-        ),
-        Some(Some(remote)) => {
-            let coord_set: BTreeSet<uuid::Uuid> = remote.into_iter().collect();
-            let coord_line = if coord_set.is_empty() {
-                "coord reports ZERO bindings".to_string()
-            } else {
-                format!(
-                    "coord reports {} binding(s) {}",
-                    coord_set.len(),
-                    render_tenant_set(&coord_set)
-                )
-            };
-            if local_set == coord_set {
-                return (
-                    true,
-                    format!("{local_line}; {coord_line} — the two sets agree"),
-                );
-            }
-            let local_only = render_tenant_set(local_set.difference(&coord_set));
-            let coord_only = render_tenant_set(coord_set.difference(&local_set));
-            (
+            Some(None) => (
                 false,
                 format!(
-                    "{local_line}; {coord_line}; DRIFT — local-only {local_only}, coord-only \
-                     {coord_only}. The next register heartbeat (every 30s) reconciles the \
-                     local set against coord's (fleet.rs heartbeat → \
-                     pair::reconcile_paired_bindings): local-only entries and their JWT \
-                     slots are dropped; a coord-only binding is one this runner holds no \
-                     device-JWT for — pair for that tenant to enable its sessions"
+                    "{local_line}; coord bindings UNKNOWN — coord answered but did not hydrate \
+                     bindings (tenant_ids absent or null; {coord_note}). A null is not an empty \
+                     set, so no comparison was made"
                 ),
-            )
-        }
+                None,
+            ),
+            Some(Some(remote)) => {
+                let coord_set: BTreeSet<uuid::Uuid> = remote.into_iter().collect();
+                let coord_line = if coord_set.is_empty() {
+                    "coord reports ZERO bindings".to_string()
+                } else {
+                    format!(
+                        "coord reports {} binding(s) {}",
+                        coord_set.len(),
+                        render_tenant_set(&coord_set)
+                    )
+                };
+                if local_set == coord_set {
+                    (
+                        true,
+                        format!("{local_line}; {coord_line} — the two sets agree"),
+                        Some(coord_set),
+                    )
+                } else {
+                    let local_only = render_tenant_set(local_set.difference(&coord_set));
+                    let coord_only = render_tenant_set(coord_set.difference(&local_set));
+                    (
+                        false,
+                        format!(
+                            "{local_line}; {coord_line}; DRIFT — local-only {local_only}, \
+                             coord-only {coord_only}. The next register heartbeat (every 30s) \
+                             reconciles the local set against coord's (fleet.rs heartbeat → \
+                             pair::reconcile_paired_bindings): local-only entries and their \
+                             JWT slots are dropped; a coord-only binding is one this runner \
+                             holds no device-JWT for — pair for that tenant to enable its \
+                             sessions"
+                        ),
+                        Some(coord_set),
+                    )
+                }
+            }
+        };
+    let (slots_ok, slots_line) = tenant_slots_half(coord_set.as_ref(), slots, slot_note);
+    (bindings_ok && slots_ok, format!("{bindings_line}{slots_line}"))
+}
+
+/// The slots half of [`tenant_bindings_verdict`]'s detail: the local slot
+/// census, and — only when BOTH sides are measured — the bindings-vs-slots
+/// difference in both directions.
+///
+/// Returns `(ok, line)` where `line` is pre-joined with `"; "` so the caller
+/// concatenates it straight onto the bindings half.
+///
+/// Every arm keeps an unmeasured side unmeasured. `coord_set == None` is
+/// coord's UNKNOWN and `slots == None` is the slot store's; neither is ever
+/// substituted with an empty set, and no difference is computed from either.
+/// A measured-empty on either side is a real observation and IS differenced —
+/// a device holding zero slots against two coord bindings is the whole
+/// finding, not a silent pass.
+fn tenant_slots_half(
+    coord_set: Option<&std::collections::BTreeSet<uuid::Uuid>>,
+    slots: Option<&SlotCensus>,
+    slot_note: &str,
+) -> (bool, String) {
+    let Some(census) = slots else {
+        return (
+            false,
+            format!(
+                "; device-JWT slots UNKNOWN — {slot_note}; no bindings-vs-slots comparison \
+                 was made in either direction"
+            ),
+        );
+    };
+    let usable = census.in_state(crate::auth::SlotState::Usable);
+    let dead = census.in_state(crate::auth::SlotState::PresentButDead);
+    let unreadable = census.in_state(crate::auth::SlotState::Unreadable);
+    // The census prints whatever the binding side did, because it is a local
+    // measurement and a zero here is the signal, not the absence of one. The
+    // legacy slot is named too: it is the default binding's credential, so it
+    // is part of the answer for that one tenant.
+    let census_line = format!(
+        "; device-JWT slots: {} usable {}, {} present-but-dead {}, {} unreadable {} \
+         (legacy/default slot {})",
+        usable.len(),
+        render_tenant_set(&usable),
+        dead.len(),
+        render_tenant_set(&dead),
+        unreadable.len(),
+        render_tenant_set(&unreadable),
+        census.default_slot.label(),
+    );
+    let Some(bound) = coord_set else {
+        return (
+            false,
+            format!(
+                "{census_line}; BINDINGS vs SLOTS not computed — coord's binding set was not \
+                 measured (above), and a difference against an unmeasured side would be an \
+                 invention"
+            ),
+        );
+    };
+    let diff = bindings_vs_slots(bound, census);
+    // Named whenever present: a bound tenant with no slot of its own that the
+    // selector nonetheless serves from the legacy default slot is NOT a
+    // finding, and an operator told to re-pair it would be chasing nothing.
+    let via_default = if diff.usable_via_default_slot.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ({} of them served by the legacy/default slot {})",
+            diff.usable_via_default_slot.len(),
+            render_tenant_set(&diff.usable_via_default_slot)
+        )
+    };
+    if diff.in_step() {
+        return (
+            true,
+            format!(
+                "{census_line}; BINDINGS vs SLOTS in step — every tenant coord binds has a \
+                 credential this device can act with{via_default}, and no slot is held for \
+                 a tenant coord does not bind"
+            ),
+        );
     }
+    // Named only when non-empty: an all-measured divergence must not carry
+    // the word UNKNOWN, which would make it unreadable as the measurement it
+    // is.
+    let unknown_clause = if diff.bound_slot_unknown.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", slot state UNKNOWN for bound tenant(s) {}",
+            render_tenant_set(&diff.bound_slot_unknown)
+        )
+    };
+    (
+        false,
+        format!(
+            "{census_line}; BINDINGS vs SLOTS DIVERGE — bound with no usable credential \
+             {}{}{}, slot held but NOT bound {}. A bound tenant with no usable credential is \
+             one a session can SEE it is bound to and cannot act in — the same verdict \
+             auth::select_device_bearer reaches for it: `absent` was never issued (pair this \
+             runner for that tenant, `qontinui_profile device pair --pair-code <code>`), \
+             `present-but-dead` was issued and rotted (the device-JWT refresher clears and \
+             re-derives it, or re-pair). A slot held for a tenant coord does not bind is a \
+             stale credential the next register heartbeat's reconcile drops",
+            render_slot_pairs(&diff.bound_without_usable_slot),
+            unknown_clause,
+            via_default,
+            render_slot_pairs(&diff.slot_not_bound),
+        ),
+    )
 }
 
 // ===========================================================================
@@ -2584,11 +2991,32 @@ mod tests {
         uuid::Uuid::from_bytes([n; 16])
     }
 
+    /// A MEASURED slot census with no default binding and no legacy slot —
+    /// the shape almost every case wants, since the legacy fallback only ever
+    /// applies to the default tenant.
+    fn census(states: &[(uuid::Uuid, crate::auth::SlotState)]) -> SlotCensus {
+        SlotCensus::new(
+            states.iter().copied(),
+            None,
+            crate::auth::SlotState::Absent,
+        )
+    }
+
+    /// A census in which every listed tenant holds a usable slot.
+    fn all_usable(tenants: &[uuid::Uuid]) -> SlotCensus {
+        let states: Vec<_> = tenants
+            .iter()
+            .map(|t| (*t, crate::auth::SlotState::Usable))
+            .collect();
+        census(&states)
+    }
+
     /// An unpaired device has no binding set to compare: green, NOT
     /// APPLICABLE, and it must not read as "bound to zero tenants".
     #[test]
     fn tenant_bindings_unpaired_is_green_not_applicable() {
-        let (ok, detail) = tenant_bindings_verdict(false, &[], None, "device not paired");
+        let (ok, detail) =
+            tenant_bindings_verdict(false, &[], None, "device not paired", None, "device not paired");
         assert!(ok, "{detail}");
         assert!(detail.contains("NOT APPLICABLE"), "{detail}");
         assert!(detail.contains("coord was not asked"), "{detail}");
@@ -2600,11 +3028,14 @@ mod tests {
     /// the coord side is UNKNOWN, and the note says WHICH unknown.
     #[test]
     fn tenant_bindings_coord_not_measured_warns_and_names_why() {
+        let slots = all_usable(&[t(1)]);
         let (ok, detail) = tenant_bindings_verdict(
             true,
             &[t(1)],
             None,
             "no live device JWT (device JWT missing, expired, or near expiry (needs refresh)) — see device_jwt_live; coord was not asked",
+            Some(&slots),
+            "1 tenant slot(s) enumerated from the per-tenant device-JWT store",
         );
         assert!(!ok);
         assert!(
@@ -2630,11 +3061,14 @@ mod tests {
     /// UNKNOWN, it is not `[]`, and no comparison is made against it.
     #[test]
     fn tenant_bindings_null_from_coord_is_unknown_never_empty() {
+        let slots = all_usable(&[t(1), t(2)]);
         let (ok, detail) = tenant_bindings_verdict(
             true,
             &[t(1), t(2)],
             Some(None),
             "https://coord/x, source=test",
+            Some(&slots),
+            "2 tenant slot(s) enumerated from the per-tenant device-JWT store",
         );
         assert!(!ok);
         assert!(detail.contains("did not hydrate bindings"), "{detail}");
@@ -2649,15 +3083,24 @@ mod tests {
     /// the ids in is irrelevant (file order vs coord's last_active_at DESC).
     #[test]
     fn tenant_bindings_equal_sets_pass_regardless_of_order() {
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &[t(2), t(1)], Some(Some(vec![t(1), t(2)])), "");
+        let slots = all_usable(&[t(1), t(2)]);
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(2), t(1)],
+            Some(Some(vec![t(1), t(2)])),
+            "",
+            Some(&slots),
+            "",
+        );
         assert!(ok, "{detail}");
         assert!(detail.contains("the two sets agree"), "{detail}");
         assert!(detail.contains("local 2 binding(s)"), "{detail}");
         assert!(detail.contains("coord reports 2 binding(s)"), "{detail}");
-        // Rendered sorted, so the line is identical across machines.
+        // Rendered sorted, so the line is identical across machines. THREE
+        // occurrences now: local, coord, and the usable-slot census — the
+        // slot half prints the same set through the same renderer.
         let sorted = format!("[{}, {}]", t(1), t(2));
-        assert_eq!(detail.matches(&sorted).count(), 2, "{detail}");
+        assert_eq!(detail.matches(&sorted).count(), 3, "{detail}");
         assert!(!detail.contains("DRIFT"), "{detail}");
     }
 
@@ -2666,12 +3109,15 @@ mod tests {
     /// zero it passes, against a local binding it is a drift.
     #[test]
     fn tenant_bindings_measured_zero_is_spelled_zero() {
-        let (ok, detail) = tenant_bindings_verdict(true, &[], Some(Some(vec![])), "");
+        let none = census(&[]);
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &[], Some(Some(vec![])), "", Some(&none), "0 slots");
         assert!(ok, "{detail}");
         assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
         assert!(detail.contains("the two sets agree"), "{detail}");
 
-        let (ok, detail) = tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![])), "");
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![])), "", Some(&none), "0 slots");
         assert!(!ok);
         assert!(detail.contains("coord reports ZERO bindings"), "{detail}");
         assert!(detail.contains("DRIFT"), "{detail}");
@@ -2686,8 +3132,17 @@ mod tests {
     /// for coord-only.
     #[test]
     fn tenant_bindings_drift_reports_the_symmetric_difference_and_remediation() {
-        let (ok, detail) =
-            tenant_bindings_verdict(true, &[t(1), t(2)], Some(Some(vec![t(2), t(3)])), "");
+        // A census in step with COORD's set, so the only finding is the
+        // local/coord drift this test is about.
+        let slots = all_usable(&[t(2), t(3)]);
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1), t(2)],
+            Some(Some(vec![t(2), t(3)])),
+            "",
+            Some(&slots),
+            "",
+        );
         assert!(!ok);
         assert!(detail.contains("DRIFT"), "{detail}");
         assert!(
@@ -2726,13 +3181,265 @@ mod tests {
     /// drifted box's advisory red both leave the verdict alone.
     #[test]
     fn tenant_bindings_never_changes_the_gate_verdict() {
+        let slots = all_usable(&[t(2)]);
         let report = run_checks(vec![Check::from_spec(spec("tenant_bindings"), || {
-            tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![t(2)])), "")
+            tenant_bindings_verdict(true, &[t(1)], Some(Some(vec![t(2)])), "", Some(&slots), "")
         })]);
         assert!(report.overall_ok, "a drift must not block gate access");
         assert!(!report.checks[0].ok);
         assert!(report.checks[0].advisory);
         assert!(report.render().contains("[WARN] tenant_bindings"));
+    }
+
+    // ------------------------------------------------------------------
+    // BINDINGS vs SLOTS — plan
+    // `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    // P0. The comparison is pure over (coord set, census), so every arm is
+    // driven directly: no credential store, no coord, no runner.
+    // ------------------------------------------------------------------
+
+    /// THE defect, reduced from the operator box: coord binds three tenants
+    /// and the device holds ONE usable slot. The report must NAME the two it
+    /// cannot act in — a count, or a green, is what let this run unseen.
+    #[test]
+    fn bindings_vs_slots_names_the_bound_tenants_with_no_usable_slot() {
+        let bound = vec![t(1), t(2), t(3)];
+        let slots = census(&[(t(3), crate::auth::SlotState::Usable)]);
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "1 tenant slot(s) enumerated from the per-tenant device-JWT store",
+        );
+
+        assert!(!ok, "a device that cannot act in 2 of 3 bindings is not green");
+        assert!(detail.contains("BINDINGS vs SLOTS DIVERGE"), "{detail}");
+        assert!(
+            detail.contains(&format!("{} (absent)", t(1))),
+            "the missing tenant must be named, not counted: {detail}"
+        );
+        assert!(detail.contains(&format!("{} (absent)", t(2))), "{detail}");
+        assert!(
+            !detail.contains(&format!("{} (absent)", t(3))),
+            "the tenant that HAS a usable slot must not be named as missing: {detail}"
+        );
+        assert!(detail.contains("1 usable"), "{detail}");
+        // The bindings half is in step — this finding is the slot axis alone.
+        assert!(detail.contains("the two sets agree"), "{detail}");
+    }
+
+    /// Bindings and slots matching says so, in both directions.
+    #[test]
+    fn bindings_vs_slots_in_step_says_so() {
+        let bound = vec![t(1), t(2)];
+        let slots = all_usable(&bound);
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+
+        assert!(ok, "{detail}");
+        assert!(detail.contains("BINDINGS vs SLOTS in step"), "{detail}");
+        assert!(!detail.contains("DIVERGE"), "{detail}");
+        assert!(!detail.contains("UNKNOWN"), "nothing here is unmeasured: {detail}");
+    }
+
+    /// ZERO slots is the arm most in need of a signal — a device that can act
+    /// in NOTHING it is bound to. It must report, not return silently and not
+    /// render as "matched".
+    #[test]
+    fn bindings_vs_slots_reports_a_device_holding_zero_slots() {
+        let bound = vec![t(1), t(2)];
+        let slots = census(&[]);
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &bound,
+            Some(Some(bound.clone())),
+            "",
+            Some(&slots),
+            "0 tenant slot(s) enumerated from the per-tenant device-JWT store",
+        );
+
+        assert!(!ok, "{detail}");
+        assert!(detail.contains("0 usable []"), "{detail}");
+        assert!(detail.contains("BINDINGS vs SLOTS DIVERGE"), "{detail}");
+        assert!(detail.contains(&format!("{} (absent)", t(1))), "{detail}");
+        assert!(detail.contains(&format!("{} (absent)", t(2))), "{detail}");
+        assert!(
+            !detail.contains("in step"),
+            "a measured zero must never render as agreement: {detail}"
+        );
+    }
+
+    /// The OTHER direction: a slot held for a tenant coord does not bind.
+    #[test]
+    fn bindings_vs_slots_names_a_slot_held_for_an_unbound_tenant() {
+        let bound = vec![t(1)];
+        let slots = census(&[
+            (t(1), crate::auth::SlotState::Usable),
+            (t(9), crate::auth::SlotState::Usable),
+        ]);
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+
+        assert!(!ok, "{detail}");
+        assert!(
+            detail.contains(&format!("slot held but NOT bound [{} (usable)]", t(9))),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("bound with no usable credential []"),
+            "the other direction is empty and says so: {detail}"
+        );
+    }
+
+    /// GATE: `present_but_dead` is not `absent`. They are different operator
+    /// actions — `select_device_bearer` keeps two separate warn-once sets for
+    /// exactly this reason — so the report must keep them apart too.
+    #[test]
+    fn bindings_vs_slots_distinguishes_a_rotted_slot_from_an_absent_one() {
+        let bound = vec![t(1), t(2)];
+        // t1 holds a slot whose credential is dead; t2 holds nothing at all.
+        let slots = census(&[(t(1), crate::auth::SlotState::PresentButDead)]);
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+
+        assert!(!ok, "{detail}");
+        assert!(
+            detail.contains(&format!("{} (present-but-dead)", t(1))),
+            "a rotted slot must not report as missing: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("{} (absent)", t(2))),
+            "an absent slot must not report as rotted: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("1 present-but-dead [{}]", t(1))),
+            "the census counts it as its own state: {detail}"
+        );
+        // Both heals are named, because they are different actions.
+        assert!(detail.contains("was never issued"), "{detail}");
+        assert!(detail.contains("rotted"), "{detail}");
+    }
+
+    /// GATE: UNKNOWN never renders as a default, on EITHER side, and a
+    /// difference is computed ONLY when both sides are measured.
+    #[test]
+    fn bindings_vs_slots_computes_nothing_against_an_unmeasured_side() {
+        let slots = all_usable(&[t(1)]);
+
+        // (a) Coord NOT MEASURED, slots measured. The local census still
+        //     prints — it is a measurement — but no difference exists.
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1), t(2)],
+            None,
+            "coord was not asked",
+            Some(&slots),
+            "1 tenant slot(s) enumerated from the per-tenant device-JWT store",
+        );
+        assert!(!ok);
+        assert!(detail.contains("coord bindings UNKNOWN"), "{detail}");
+        assert!(
+            !detail.contains("bound to nothing") && !detail.contains("ZERO bindings"),
+            "an unmeasured coord side is never zero bindings: {detail}"
+        );
+        assert!(
+            detail.contains("1 usable"),
+            "the slot census is local and still prints: {detail}"
+        );
+        assert!(detail.contains("BINDINGS vs SLOTS not computed"), "{detail}");
+        assert!(!detail.contains("DIVERGE"), "{detail}");
+        assert!(!detail.contains("in step"), "{detail}");
+
+        // (b) Coord answered WITHOUT hydrating — the middle tri-state arm.
+        let (_, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1)],
+            Some(None),
+            "https://coord/x",
+            Some(&slots),
+            "1 slot",
+        );
+        assert!(detail.contains("did not hydrate bindings"), "{detail}");
+        assert!(detail.contains("BINDINGS vs SLOTS not computed"), "{detail}");
+
+        // (c) Slot store UNREADABLE, coord MEASURED. UNKNOWN, never "no
+        //     slots", and again no difference.
+        let (ok, detail) = tenant_bindings_verdict(
+            true,
+            &[t(1)],
+            Some(Some(vec![t(1)])),
+            "",
+            None,
+            "the per-tenant device-JWT store could not be enumerated (permission denied) — \
+             the slot set is UNKNOWN, not empty, and this runner has NOT been signed out",
+        );
+        assert!(!ok);
+        assert!(detail.contains("device-JWT slots UNKNOWN"), "{detail}");
+        assert!(detail.contains("permission denied"), "{detail}");
+        assert!(
+            !detail.contains("0 usable"),
+            "an unreadable store must NEVER render as zero slots: {detail}"
+        );
+        assert!(!detail.contains("DIVERGE"), "{detail}");
+        assert!(!detail.contains("in step"), "{detail}");
+    }
+
+    /// A bound tenant whose slot could not be READ is neither a defect nor an
+    /// all-clear: it reports as its own UNKNOWN and stays out of the
+    /// cannot-act list, which is a claim we have no measurement for.
+    #[test]
+    fn a_bound_tenant_with_an_unreadable_slot_is_unknown_not_a_defect() {
+        let bound = vec![t(1)];
+        let slots = census(&[(t(1), crate::auth::SlotState::Unreadable)]);
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+
+        assert!(!ok, "{detail}");
+        assert!(
+            detail.contains(&format!("slot state UNKNOWN for bound tenant(s) [{}]", t(1))),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("bound with no usable credential []"),
+            "an unreadable slot is not a MEASURED cannot-act: {detail}"
+        );
+    }
+
+    /// The legacy `access_token` slot IS the default binding's credential
+    /// (D4), and `auth::select_device_bearer` falls back to it for that one
+    /// tenant. A census that ignored it would tell an operator to re-pair a
+    /// tenant that works — so the doctor folds it in, for the default tenant
+    /// and for no other.
+    #[test]
+    fn the_default_tenant_is_served_by_the_legacy_slot_and_is_not_a_finding() {
+        let default = t(1);
+        let other = t(2);
+        // Neither tenant has a per-tenant slot; the legacy slot is usable.
+        let slots = SlotCensus::new(
+            std::iter::empty::<(uuid::Uuid, crate::auth::SlotState)>(),
+            Some(default),
+            crate::auth::SlotState::Usable,
+        );
+        let bound = vec![default, other];
+        let (ok, detail) =
+            tenant_bindings_verdict(true, &bound, Some(Some(bound.clone())), "", Some(&slots), "");
+
+        assert!(!ok, "the NON-default tenant is still a finding: {detail}");
+        assert!(
+            detail.contains(&format!("{} (absent)", other)),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains(&format!("{} (absent)", default)),
+            "the default tenant is served by the legacy slot — naming it would send an \
+             operator after a tenant that works: {detail}"
+        );
+        assert!(
+            detail.contains(&format!("served by the legacy/default slot [{}]", default)),
+            "and the report says on the strength of WHAT: {detail}"
+        );
     }
 
     /// The renderer is what makes the report machine-identical: sorted, and
