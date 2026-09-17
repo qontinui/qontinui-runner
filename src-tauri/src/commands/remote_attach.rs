@@ -895,6 +895,46 @@ mod remote_close_tests {
         assert_eq!(stable_pump((true, 3), (false, 3)), None);
     }
 
+    /// Review round 2, nit B: a DEAD tab's pane is gone from the attach
+    /// client's routing table (it is dropped on `remote_terminal_exit`), but
+    /// the manager still holds it — the probe must read the manager's copy
+    /// and report the detach the close queued, not "unknown".
+    #[test]
+    fn a_dead_tab_still_reports_the_detach_its_close_queued() {
+        use crate::terminal::pane_io::PaneIo;
+        use crate::terminal::remote_pane_io::tests::RecordingSink;
+        use crate::terminal::remote_pane_io::{AttachedRing, RemoteFrameSink, RemotePaneIo};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tm = TerminalManager::new();
+        let mut id = identity();
+        id.grant_jti = "jti-never-registered-with-the-client".into();
+        tm.set_remote_identity("local-tab-1", id);
+        let sink = Arc::new(RecordingSink::default());
+        let dyn_sink: Arc<dyn RemoteFrameSink> = sink.clone();
+        let pane = Arc::new(RemotePaneIo::new(
+            "jti-never-registered-with-the-client",
+            "490212f5-aaaa-bbbb-cccc-dddddddddddd",
+            "grant.jwt",
+            dyn_sink,
+            80,
+            24,
+            AttachedRing::default(),
+        ));
+        tm.set_remote_pane("local-tab-1", pane.clone());
+
+        let probe = probe_remote_close(&tm, "local-tab-1").expect("a remote tab");
+        pane.kill(Duration::from_millis(10)).unwrap();
+        let report = probe.report();
+        assert_eq!(
+            report.remote_detach["outcome"], "queued",
+            "{}",
+            report.message
+        );
+        assert_eq!(sink.frames().len(), 1);
+    }
+
     /// A local tab has no remote identity, so both close doors keep their
     /// unchanged response.
     #[test]
