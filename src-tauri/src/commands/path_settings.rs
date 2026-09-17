@@ -262,6 +262,8 @@ mod tests {
             deps_forbidden_total: 0,
             seeded_total: 0,
             seed_errors_total: 0,
+            work_unit_writes_withheld_total: 0,
+            work_unit_writes_withheld_unknown_total: 0,
             scan_roots,
             path_resolutions_total,
             active_plans_dir: None,

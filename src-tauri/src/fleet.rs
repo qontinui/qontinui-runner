@@ -1861,6 +1861,13 @@ pub async fn heartbeat_to_coord() -> Result<(), String> {
         // Best-effort throughout: a parse/IO miss just retries next tick.
         let body = resp.text().await.unwrap_or_default();
         if let Some(coord_set) = qontinui_runner_lib::pair::response_tenant_ids(&body) {
+            // Record coord's COUNT before reconciling: the plan adapter asks
+            // "is this device bound to more than one tenant?", which the
+            // slot-backed binding file cannot answer (plan
+            // 2026-09-17-plan-adapter-mints-work-units-under-the-default-binding-of-a-multi-bound-device).
+            if let Err(e) = qontinui_runner_lib::pair::record_coord_bound_tenants(&coord_set) {
+                tracing::debug!("fleet::heartbeat: coord-bound tenant record non-fatal: {e}");
+            }
             match qontinui_runner_lib::pair::reconcile_paired_bindings(&coord_set) {
                 Ok(report) => {
                     if report.changed() {

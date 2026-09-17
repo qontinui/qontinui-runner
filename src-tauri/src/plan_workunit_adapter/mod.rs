@@ -56,8 +56,9 @@ pub use parser::{
 pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, WorkUnitSink};
 pub use trigger::{
     adapter_metrics, backfill_work_units_once, measure_scan_divergence, newly_disappeared_slugs,
-    read_plan_dir, reconcile_archive_once, reconcile_once, resolve_plans_archive_dir,
-    resolve_plans_dir, resolve_prompts_dir, spawn_if_configured, ArchiveSummary, GitRefReader,
-    MetricsSnapshot, PathInputs, PathReader, ProcessGit, ReconcileSummary, ScanDivergence,
-    ScanDivergenceState, WorkUnitBackfillSummary,
+    read_device_binding_count, read_plan_dir, reconcile_archive_once, reconcile_once,
+    resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir, spawn_if_configured,
+    work_unit_write_posture, ArchiveSummary, BindingCountReading, GitRefReader, MetricsSnapshot,
+    PathInputs, PathReader, ProcessGit, ReconcileSummary, ScanDivergence, ScanDivergenceState,
+    WorkUnitBackfillSummary, WorkUnitWritePosture,
 };
