@@ -91,12 +91,22 @@ curl -s --max-time 120 -X POST "$COORD_HTTP_URL/claims/acquire" \
 > send no key rather than an empty string; coord's `None` fallback then
 > preserves the old machine-only behaviour. Any later
 > `/claims/heartbeat` or `/claims/release` MUST replay the SAME
-> `agent_session_id`, or it will not match and returns `not_held`.
+> `agent_session_id`, or it will not match. **The two doors spell that
+> non-match differently, and only one of them says `not_held`:**
+> `/claims/release` answers `not_held`; `/claims/heartbeat` answers `stolen`,
+> because coord's `HEARTBEAT_LUA` (`claims.rs`) finds the key PRESENT and the
+> token different, so `heartbeat` reports a holder - and the holder it names is
+> your OWN machine and session, since you are still the stored owner. On that
+> door `stolen` ALSO covers an EXPIRED claim, spelled `current_holder: null`, so
+> `current_holder` is the discriminator rather than the verdict word;
+> `coord-claim-heartbeat.sh` makes the split and records the null case `lapsed`.
+> (qontinui/qontinui-coord#2206, still OPEN, gives the expired case its own
+> `not_held` verdict on this door; `hb_row` already maps it.)
 > `scripts/coord-claim-heartbeat.sh` (step 6) replays the pair for you on every
 > tick — **and a HAND heartbeat must too.** A hand-rolled `curl` that drops the
-> owner token does not fail loudly: it answers `not_held` while the claim quietly
-> ages out, which is the same unprotected-work outcome as never heartbeating at
-> all.
+> owner token does not fail loudly: it answers `stolen` naming YOU as the
+> holder, while the claim quietly ages out - the same unprotected-work outcome
+> as never heartbeating at all.
 
 **The `--max-time 120` is a floor, not a target — and it is load-bearing.** This
 reserve used to pay a fleet-wide collision scan on top of the SET-NX, and that
