@@ -49,7 +49,11 @@
 //! - **Device principal — the SESSION's tenant by construction (B3).** A
 //!   device nonce freezes the tenant it was provisioned under
 //!   (`machine.json::active_tenant_id` — the same source
-//!   `stamp_session_tenant` records on the session's coord row) on its
+//!   `stamp_session_tenant` records on the session's coord row — or the
+//!   tenant its minter CHOSE: the spawn picker's `--tenant`, and since plan
+//!   `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+//!   the mint route's optional `tenant` body field, both admitted through
+//!   `validate_spawn_tenant` first) on its
 //!   [`NonceBinding::session_tenant`]. The proxy injects that tenant's
 //!   credential via `auth::device_bearer_for(session_tenant)`, NOT the
 //!   legacy `access_token` slot: when the session tenant IS the default
@@ -4558,13 +4562,31 @@ fn register_proxy_nonce(
 /// terminal to name, and caller self-identification falls back to the workdir
 /// leg for these nonces. Do not invent one here — a fabricated terminal id would
 /// resolve confidently to somebody else's session.
-fn register_session_proxy_nonce(workdir: &str) -> String {
+///
+/// # The tenant the mint chooses
+///
+/// `session_tenant` is the tenant the CALLER chose, when it chose one — the
+/// mint route's optional `tenant` body field (plan
+/// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`,
+/// Design decision 8). It reaches [`mint_and_register_nonce`] exactly as the
+/// spawn picker's `--tenant` does (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1),
+/// so the binding freezes `TenantPin::Pinned(t)` and the proxy's B3 invariant
+/// then serves THAT tenant's credential per request, or refuses on a slot miss
+/// — never another slot's token. The raw device JWT still never leaves the
+/// process: what the caller selects is a nonce binding, not a bearer.
+///
+/// Validation is the ROUTE's, not this function's: the caller has already
+/// admitted the tenant through [`validate_spawn_tenant`] (a typed `NotPaired`
+/// / `CredentialStoreUnreadable` refusal, never a fallback slot), and this is
+/// the mint. `None` keeps the machine pin, exactly as before.
+fn register_session_proxy_nonce(workdir: &str, session_tenant: Option<Uuid>) -> String {
     let (nonce, _snapshot) = mint_and_register_nonce(
         workdir,
         ProxyPrincipal::Device,
         NonceLifetime::ephemeral(),
         None,
-        None,
+        session_tenant,
     );
     nonce
 }
@@ -4646,7 +4668,10 @@ pub(crate) fn register_agent_proxy_nonce(workdir: &str, agent_id: Uuid) -> Strin
 ///
 /// **`session_tenant`** (plan
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1): the
-/// tenant the spawn picker / `--tenant` flag chose for THIS session. `Some(t)`
+/// tenant the spawn picker / `--tenant` flag chose for THIS session — or, on the
+/// mint-route path, the `tenant` its caller's body named (plan
+/// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+/// Design decision 8; see [`register_session_proxy_nonce`]). `Some(t)`
 /// freezes `Pinned(t)` as the binding's pin instead of sampling the machine,
 /// and Row 1 of [`resolve_session_tenant`] already makes a `Pinned` binding
 /// outrank the live machine pin — so the session's coord-mcp writes land in the
@@ -9586,6 +9611,12 @@ fn deliver_terminal_coord_mcp_unrecorded(
 /// not spawn, so there is no terminal to bind (see
 /// [`register_session_proxy_nonce`]).
 ///
+/// `session_tenant` is the tenant the route's caller chose (its optional
+/// `tenant` body field), ALREADY admitted by [`validate_spawn_tenant`] at the
+/// route — this is the mint, not the gate. It is frozen onto the binding as
+/// `TenantPin::Pinned(t)`; `None` keeps the machine pin. See
+/// [`register_session_proxy_nonce`].
+///
 /// **Always the http shape, whatever [`stdio_shim_gate`] says.** This route's
 /// consumers are not MCP clients: `scripts/coord-provision-nonce.sh`,
 /// `scripts/lib/coord-credential.psm1` and, through them, `/coord-revive`'s L4
@@ -9595,15 +9626,26 @@ fn deliver_terminal_coord_mcp_unrecorded(
 /// as `PROVISION_SHAPE_UNRECOGNISED` and silently kill that rung on every
 /// machine the day the gate opened - the route is pinned to
 /// [`http_proxy_config_json`] and a test holds it there.
-pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
+pub(crate) fn provision_session_proxy_config(
+    workdir: &str,
+    session_tenant: Option<Uuid>,
+) -> Option<serde_json::Value> {
     let bound_port = resolve_bound_api_port()?;
-    Some(provision_session_proxy_config_at(workdir, bound_port))
+    Some(provision_session_proxy_config_at(
+        workdir,
+        bound_port,
+        session_tenant,
+    ))
 }
 
 /// [`provision_session_proxy_config`] over an explicit bound port (the part a
 /// test can reach without a listening API).
-fn provision_session_proxy_config_at(workdir: &str, bound_port: u16) -> serde_json::Value {
-    let nonce = register_session_proxy_nonce(workdir);
+fn provision_session_proxy_config_at(
+    workdir: &str,
+    bound_port: u16,
+    session_tenant: Option<Uuid>,
+) -> serde_json::Value {
+    let nonce = register_session_proxy_nonce(workdir, session_tenant);
     http_proxy_config_json(bound_port, &nonce, false)
 }
 
@@ -11336,7 +11378,7 @@ mod tests {
         // A live PTY terminal's nonce for this cwd (runner-spawn class).
         let pty_nonce = register_proxy_nonce(&wd, None, None);
         // A bare session mints for the SAME cwd (mint-route class).
-        let bare_nonce = register_session_proxy_nonce(&wd);
+        let bare_nonce = register_session_proxy_nonce(&wd, None);
         assert_ne!(pty_nonce, bare_nonce);
 
         // The bare mint did NOT evict the PTY nonce — an unprivileged mint-route
@@ -11380,7 +11422,7 @@ mod tests {
         );
 
         // Both mint DEVICE principals — the route can never elevate to agent.
-        let bare_again = register_session_proxy_nonce(&wd);
+        let bare_again = register_session_proxy_nonce(&wd, None);
         assert!(matches!(
             proxy_nonces()
                 .lock()
@@ -11645,7 +11687,7 @@ mod tests {
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
         let persistent = register_proxy_nonce(&wd, None, None);
-        let ephemeral = register_session_proxy_nonce(&wd);
+        let ephemeral = register_session_proxy_nonce(&wd, None);
 
         let snapshot = proxy_nonces().lock().unwrap().clone();
         persist_proxy_nonces_with_store(&store, &snapshot);
@@ -11703,7 +11745,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         assert!(
-            provision_session_proxy_config(&wd).is_none(),
+            provision_session_proxy_config(&wd, None).is_none(),
             "no bound port ⇒ the mint route refuses to mint (fail-closed, shared with the seam)"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -12263,7 +12305,7 @@ mod tests {
                 interpreter: std::path::PathBuf::from("/usr/bin/python3"),
                 shim,
             }));
-        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), 9876);
+        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), 9876, None);
         let entry = &doc["mcpServers"]["coord-mcp"];
         assert_ne!(
             entry["type"], "stdio",
@@ -16747,7 +16789,7 @@ mod tests {
         // ephemeral device nonce (grace checks only expiry, so gracing one
         // would bypass the session-identity kill switch for the whole window).
         let ewd = format!("D:/grace-ttl-ephemeral-wt-{}", uuid::Uuid::now_v7());
-        let e = register_session_proxy_nonce(&ewd);
+        let e = register_session_proxy_nonce(&ewd, None);
         evict_proxy_nonces_for_workdir(&ewd);
         assert!(
             !graced_nonces().lock().unwrap().contains_key(&e),
@@ -20511,6 +20553,55 @@ mod spawn_tenant_credential_tests {
         assert_eq!(
             spawn_tenant_admission(tenant_b(), Ok(vec![tenant_b()]), BindingTenantRead::Unknown),
             Ok(())
+        );
+    }
+
+    /// The mint route's `tenant` (plan
+    /// `2026-09-17-findings-carry-a-triage-stamp-and-the-steward-reads-since-last-run`
+    /// Design decision 8) rides the same plumbing as the spawn picker's
+    /// `--tenant`: a chosen tenant freezes `Pinned(t)` on the minted binding
+    /// even though the machine pin says another tenant, while a mint that
+    /// chose nothing still freezes the machine pin. The binding stays the
+    /// mint route's own class — Device principal, ephemeral lifetime — so the
+    /// tenant selection elevates nothing.
+    #[test]
+    fn a_mint_route_tenant_freezes_pinned_on_the_ephemeral_binding() {
+        let amb = crate::test_env::isolated_ambient();
+        // An ephemeral binding is only LIVE while the operator's opt-in marker
+        // exists (the live-revocation property) — pin the switch on, or the
+        // nonce reads as revoked and its pin as `Unpinned` for that reason.
+        let _marker = MarkerOverride::set(true);
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "mint-route-tenant");
+
+        // The route's admission gate says yes to a paired tenant...
+        assert_eq!(validate_spawn_tenant(tenant_b()), Ok(()));
+
+        // ...and the mint freezes it, not the machine's A.
+        let doc = provision_session_proxy_config_at(&wd, PORT, Some(tenant_b()));
+        let nonce = proxy_nonce_from_config_doc(&doc).expect("the document carries the nonce");
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b()),
+            "a chosen tenant must be frozen on the mint-route binding"
+        );
+        let binding = live_binding(&nonce).expect("the minted nonce is live");
+        assert_eq!(binding.principal, ProxyPrincipal::Device);
+        assert!(
+            binding.lifetime.is_ephemeral(),
+            "the mint route stays ephemeral whatever tenant it chose"
+        );
+        assert_eq!(workdir_for_nonce(&nonce).as_deref(), Some(wd.as_str()));
+
+        // A mint that chose nothing freezes the machine pin, as before.
+        let unchosen = provision_session_proxy_config_at(&wd, PORT, None);
+        let unchosen = proxy_nonce_from_config_doc(&unchosen).unwrap();
+        assert_ne!(unchosen, nonce);
+        assert_eq!(
+            proxy_session_pin_for_nonce(&unchosen),
+            TenantPin::Pinned(tenant_a()),
+            "no tenant named ⇒ the machine pin, exactly the pre-field behavior"
         );
     }
 
