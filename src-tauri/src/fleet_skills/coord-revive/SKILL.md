@@ -484,6 +484,7 @@ client's mask):
 | Verdict | Meaning | Next move |
 |---|---|---|
 | `COORD_MCP_PROXY_UNAUTHORIZED` | Stale/evicted/superseded proxy key (HTTP 401). **Read the rotation log before you name a cause** — see "Diagnosing a 401: read the rotation log FIRST" | Use the door the cascade finds; the file that 401'd is stale. Do NOT re-provision on this alone |
+| `RUNNER_CREDENTIAL_<POSTURE>` | **The other 401, and the opposite fault.** `EXPIRED` / `ABSENT` / `UNREFRESHABLE` / `DARK`: the runner answered the call **itself** instead of forwarding it, because its OWN coord device JWT cannot answer — body `{"code":"runner_credential_<posture>","since","remedy"}`, read BEFORE the nonce arm. **Your nonce is FINE**, and so is the `.mcp.json` the runner wrote beside this fault: a valid config plus a dead credential is precisely the combination this verdict exists to name | **The nonce is fine; the runner's credential is `<posture>`; the L4/L5 doors will work and a re-provision will NOT.** Re-issue over L4 (`$COORD_DEVICE_JWT`, `~/.qontinui/coord-device-jwt`, the runner mint) or L5 (the bootstrap credential) — they carry their own credentials and never traverse this forwarder. Do **not** rotate the key, do **not** re-provision (a fresh nonce for a credential that stays dead, and it evicts this workdir's live slot), do **not** start a new session (every session on the box shares the refusing runner), and do **not** restart it (served policy `production-and-cost` `runner-lifecycle`) |
 | `CREDENTIAL_REFRESHING` | Proxy up, deliberately withholding while its device JWT refreshes (HTTP 503) | Retry-safe — the script itself re-probes once; transient |
 | `CONNECT_REFUSED` | Dead port, no listener | Runner gone/moved; a sibling config or L3 must carry it |
 | `TIMEOUT` | **Nothing reached this box** inside the probe budget — the request was abandoned client-side, so whether the proxy answered at all is UNKNOWN | Retry-safe; the script re-probes once. Often saturation. Do not hammer it, and do NOT restart the runner on this alone |
@@ -626,8 +627,14 @@ not help. Those are the words on **line 1**; line
 them: `UNAUTHORIZED (401)` is `PROXY_UNAUTHORIZED` there, and `HTTP <status>`
 is `HTTP_<code>` (for example `HTTP_502`). The other six read the same on both
 lines. The seven PROBE verdicts reuse the same vocabulary this script's own
-per-door table uses, rather than being invented twice; the runner-credential
-verdict (`BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_*`) is not in that table yet.
+per-door table uses, rather than being invented twice — and since this change
+the runner-credential verdict does too: `RUNNER_CREDENTIAL_<POSTURE>` is a row
+in that table, and `classify()` prints it when the forwarder answers
+`401 {"code":"runner_credential_<posture>"}` rather than forwarding. The
+breadcrumb's `BREADCRUMB_VERDICT_RUNNER_CREDENTIAL_*` and this script's verdict
+are the same word on purpose, so one grep spans the artifact and the live door,
+and the recovery is the same from either: L4/L5, never a re-provision and never
+a new session.
 Fourteen
 reasons in all, across **sixteen** call sites in the writer's two files.
 

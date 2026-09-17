@@ -55,6 +55,20 @@
 # Every failed probe gets a TYPED verdict instead of the client's mask:
 #   COORD_MCP_PROXY_UNAUTHORIZED — stale/evicted proxy key (HTTP 401): the
 #                                  one-slot workdir key rotated under you
+#   RUNNER_CREDENTIAL_<POSTURE>  — ALSO an HTTP 401, and NOT about your nonce.
+#                                  The runner answered the call ITSELF rather
+#                                  than forwarding it, because its OWN coord
+#                                  device-JWT posture is EXPIRED, ABSENT,
+#                                  UNREFRESHABLE or DARK (the 401 body carries
+#                                  {"code":"runner_credential_<posture>",
+#                                  "since","remedy"}). The key in your
+#                                  .mcp.json is FINE and a re-provision mints a
+#                                  fresh nonce for a credential that is still
+#                                  dead — so it is NOT offered on this verdict.
+#                                  L4 (device JWT) and L5 (the bootstrap
+#                                  credential) carry their own credentials and
+#                                  DO work. Arrives with Phase 3 of plan
+#                                  2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody
 #   CREDENTIAL_REFRESHING        — proxy up, deliberately withholding while its
 #                                  device JWT refreshes (HTTP 503; the ONLY
 #                                  retry-safe verdict — earns the second probe)
@@ -558,6 +572,61 @@ print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
   fi
 }
 
+# runner_credential_field <body> <field> -> the TOP-LEVEL field's string value,
+# or "" when it is absent, non-string, or the body will not parse.
+#
+# The runner's OWN 401 (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+# DD4) carries {"code":"runner_credential_<posture>","since":…,"remedy":…} at the
+# TOP LEVEL, and DD4 also has coord's `credential_free_doors` catalogue riding
+# along in the same object — an array of door records whose keys this script does
+# not get to constrain, because they are copied from coord's last answer.
+#
+# A TEXTUAL read cannot be made safe against that, and the first cut of this
+# function proved it. `grep -o … | head -1` was chosen over a greedy `sed` so a
+# first-match beats a last-match, which is right — but it only helps for a key
+# that sorts BEFORE the catalogue. serde_json here is a BTreeMap (1.0.149, no
+# `indexmap`, so `preserve_order` is off), so the refusal body serializes SORTED:
+# cause, code, credential_free_doors, error, layer, next_door, posture,
+# posture_cause, probed_at, remedy, retryable, since, since_unix, success.
+# `code` sorts before the catalogue; `since`, `remedy`, `posture` and `next_door`
+# all sort AFTER it. Measured against a decoy catalogue, the textual reader
+# returned coord's catalogue entry for every one of those four.
+#
+# So the read is a real top-level parse, exactly as the METHOD_NOT_ALLOWED arm
+# below reads `error.data.cause`. `$JSON_READER` is guaranteed non-empty — this
+# script exits 127 at startup when neither jq nor a working python is present —
+# so there is no rung here that can silently degrade to the textual guess.
+runner_credential_field() {
+  if [ "$JSON_READER" = jq ]; then
+    printf '%s' "$1" | jq -r --arg k "$2" '((.[$k]?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n'  # envelope-ok: one TOP-LEVEL key of the runner's own 401 body; a nested catalogue entry is unreachable from `.[$k]`, which is the whole point
+  else
+    printf '%s' "$1" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get(sys.argv[1]) if isinstance(d,dict) else None  # envelope-ok: same TOP-LEVEL read, python arm; a non-object body reads as absent, never as a value
+print(v if isinstance(v,str) else "")' "$2" 2>/dev/null | tr -d '\r\n'
+  fi
+}
+
+# runner_credential_code_textual <body> -> the `code` value, read without a parser.
+#
+# The ONE fallback, and only for `code`, because only `code` has a bound that
+# makes a textual read exact: it sorts before `credential_free_doors`, so
+# everything up to the catalogue is a region the catalogue cannot contaminate.
+# It exists so a body that will not PARSE — truncated mid-transfer, or an
+# envelope shape this script has not seen — still yields the posture rather than
+# collapsing the class verdict to `unstated`. `since` and `remedy` get no such
+# fallback: there is no safe textual read for a key that sorts after the
+# catalogue, and inventing one is how the defect above happened.
+runner_credential_code_textual() {
+  local head
+  head="${1%%\"credential_free_doors\"*}"
+  printf '%s' "$head" | tr -d '\n\r' \
+    | grep -o '"code"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
 # classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
 # 401 wording is parameterized because on a loopback proxy it means "stale
 # proxy key" while on the direct bearer door it means "rejected bearer".
@@ -607,6 +676,27 @@ classify() {
       case "$body" in
         *COORD_MCP_PROXY_CREDENTIAL_REFRESHING*|*CREDENTIAL_REFRESHING*)
           echo "CREDENTIAL_REFRESHING (retry-safe - proxy up, withholding while its device JWT refreshes)"; return ;;
+        *runner_credential_*)
+          # READ BEFORE the nonce arm, and that order is the whole point. This
+          # 401 is the runner refusing the call out of its OWN credential state
+          # while the nonce it was handed is perfectly good; classified as
+          # COORD_MCP_PROXY_UNAUTHORIZED it would send the reader to rotate a
+          # key that is fine, and — worse — to re-provision, which evicts the
+          # live slot and still leaves the runner's dead device JWT dead. The
+          # runner's own breadcrumb spells the same fact RUNNER_CREDENTIAL_<POSTURE>;
+          # the verdict word is shared with it on purpose.
+          local rc_posture rc_since rc_remedy
+          rc_posture="$(runner_credential_field "$body" code)"
+          # Parser first, text only when the body would not parse at all.
+          [ -n "$rc_posture" ] || rc_posture="$(runner_credential_code_textual "$body")"
+          rc_posture="${rc_posture#runner_credential_}"
+          rc_since="$(runner_credential_field "$body" since)"
+          rc_remedy="$(runner_credential_field "$body" remedy)"
+          # An UNPARSEABLE posture is still this class — the marker matched —
+          # so it gets the class verdict with the posture named UNSTATED rather
+          # than silently falling through to the nonce arm.
+          [ -n "$rc_posture" ] || rc_posture="unstated"
+          echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
         *COORD_MCP_PROXY_UNAUTHORIZED*)
           echo "$unauth"; return ;;
         *COORD_MCP_PROXY_METHOD_NOT_ALLOWED*)
@@ -1002,6 +1092,10 @@ verdict_plane() {
     TIMEOUT*|CONNECT_REFUSED*|UNREACHABLE*)             echo transport ;;
     LIVE|LIVE_APP_ERROR*|PROXY_LIVE_*|CREDENTIAL_REFRESHING*|HTTP_*) echo http ;;
     *UNAUTHORIZED*)                                     echo http ;;
+    # A runner-credential refusal is an HTTP-plane ANSWER (the proxy replied
+    # 401 out of its own state machine), exactly as a nonce 401 is. Leaving it
+    # to the `none` arm would hide one half of a wedge from record_plane.
+    RUNNER_CREDENTIAL_*)                                echo http ;;
     *)                                                  echo none ;;
   esac
 }
@@ -1040,6 +1134,29 @@ record_plane() {
   case "$WEDGE_HTTP" in      *"|$hp|"*) ;; *) return 0 ;; esac
   case " $WEDGED_ENDPOINTS " in *" $hp "*) return 0 ;; esac
   WEDGED_ENDPOINTS="$WEDGED_ENDPOINTS $hp"
+}
+
+# ----- the RUNNER-CREDENTIAL fact, carried to the Next: line -------------------
+# classify() runs inside a command substitution, so anything it learns dies with
+# that subshell — the same reason record_plane() is called by the PARENT beside
+# it rather than from inside. This records the one fact the closing advice has
+# to branch on: a door answered 401 because THIS RUNNER's coord credential is
+# dead, not because the nonce it was handed is.
+#
+# It is deliberately about a POSTURE and not an endpoint. Every loopback door on
+# this box is served by the same runner process, so one runner-credential answer
+# settles it for all of them; a second door repeating it adds nothing.
+RUNNER_CREDENTIAL_POSTURE=""
+note_runner_credential() {
+  case "$1" in
+    RUNNER_CREDENTIAL_*) ;;
+    *) return 0 ;;
+  esac
+  [ -z "$RUNNER_CREDENTIAL_POSTURE" ] || return 0
+  # "RUNNER_CREDENTIAL_EXPIRED (…)" -> "expired". The verdict word is the
+  # authority here, not the body: classify() has already read the body and
+  # settled the posture, including the UNSTATED arm.
+  RUNNER_CREDENTIAL_POSTURE="$(printf '%s' "${1%% *}" | sed 's/^RUNNER_CREDENTIAL_//' | tr '[:upper:]' '[:lower:]')"
 }
 
 # ----- the sweep's wall-clock bound -------------------------------------------
@@ -1259,6 +1376,7 @@ probe_door() {
     ce=$?
     verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
     record_plane "$url" "$verdict"
+    note_runner_credential "$verdict"
 
     # ----- STAGE 2: the END-TO-END probe ---------------------------------------
     # A bare LIVE here means only that the PROXY framed a tools/list. Spend one
@@ -1285,6 +1403,7 @@ probe_door() {
           ce=$?
           verdict="$(classify "$ce" "$code" "$(cat "$bodyfile" 2>/dev/null)" ${unauth:+"$unauth"})"
           record_plane "$url" "$verdict"
+          note_runner_credential "$verdict"
           if [ "$e2e_attempt" = "1" ]; then
             case "$verdict" in
               PROXY_LIVE_UPSTREAM_DEAD*|TIMEOUT*|CREDENTIAL_REFRESHING*)
@@ -2138,6 +2257,23 @@ if [ $# -gt 0 ]; then
         *) echo "coord-revive: $VERB -> HTTP_200_NOT_MCP (200 without a JSON-RPC result or error - treat the door as dead: $(printf '%s' "$VBODY" | one_line 200))" >&2; exit 1 ;;
       esac ;;
     *:401)
+      # TWO different 401s arrive here and they have OPPOSITE recoveries, so the
+      # body decides before the wording does. `runner_credential_*` is the
+      # runner refusing the call out of its own dead coord credential while the
+      # nonce is fine (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+      # DD4); everything else is the nonce.
+      case "$VBODY" in
+        *runner_credential_*)
+          VRC_POSTURE="$(runner_credential_field "$VBODY" code)"
+          [ -n "$VRC_POSTURE" ] || VRC_POSTURE="$(runner_credential_code_textual "$VBODY")"
+          VRC_POSTURE="${VRC_POSTURE#runner_credential_}"
+          [ -n "$VRC_POSTURE" ] || VRC_POSTURE="unstated"
+          VRC_SINCE="$(runner_credential_field "$VBODY" since)"
+          VRC_REMEDY="$(runner_credential_field "$VBODY" remedy)"
+          echo "coord-revive: $VERB -> RUNNER_CREDENTIAL_$(printf '%s' "$VRC_POSTURE" | tr '[:lower:]' '[:upper:]') (the forwarder at $CFG_URL answered 401 ITSELF; HTTP 401 with code=runner_credential_$VRC_POSTURE since ${VRC_SINCE:-unstated}). The nonce in $OWN_CFG_PATH is FINE and the TRANSPORT is healthy - what is dead is THIS RUNNER's own coord credential." >&2
+          echo "  Next: the nonce is fine; the runner's credential is $VRC_POSTURE; the L4/L5 doors will work and a re-provision will NOT. Run 'bash coord-revive.sh' (no verb) and re-issue over the bearer rung it names - L4 (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the runner mint) and L5 (the bootstrap credential) carry their OWN credentials and do not go through this forwarder. A new session will not help either: every session on this box shares the runner that is refusing. Do NOT rotate the key, do NOT re-provision (it mints a fresh nonce for a credential that stays dead and evicts whatever holds this workdir's slot), and do NOT restart the runner (served policy production-and-cost runner-lifecycle). remedy=${VRC_REMEDY:-unstated}" >&2
+          exit 1 ;;
+      esac
       echo "coord-revive: $VERB -> COORD_MCP_PROXY_UNAUTHORIZED (the forwarder at $CFG_URL rejected the nonce in $OWN_CFG_PATH; HTTP 401). The BINDING was superseded or never registered - the TRANSPORT is healthy." >&2
       echo "  Recovery for THIS caller: the file was re-read just now, so the key on disk is itself stale - run 'bash coord-revive.sh' (no verb) for the full cascade, which finds a sibling key or a bearer. Recovery for the NATIVE MCP client: it cannot re-read .mcp.json, so start a NEW SESSION. NEVER restart the runner over this, and this verb never mints (a /coord-mcp/provision-session mint evicts the live peer holding this workdir's slot)." >&2
       exit 1 ;;
@@ -2179,8 +2315,11 @@ fi
 # got no usable answer at spawn; the eighth says the RUNNER's own credential is
 # dark, and its provision-time writer runs before any probe at all.
 # The first seven reuse the same vocabulary this script's own per-door table
-# uses, on purpose. The runner-credential verdict is NOT in that table: this
-# script has no arm for a runner_credential_* 401 yet. Fourteen reasons across SIXTEEN call sites (the writer's own two
+# uses, on purpose, and so does the eighth: classify() has a runner_credential_*
+# arm, read BEFORE the nonce arm, and prints RUNNER_CREDENTIAL_<POSTURE>. Same
+# word in the breadcrumb and at the live door, so one grep spans both — and the
+# same recovery from either, which is L4/L5 rather than a re-provision.
+# Fourteen reasons across SIXTEEN call sites (the writer's own two
 # files): two reasons are each written from two of them. A breadcrumb whose
 # parenthetical still GUESSES a three-way cause — a dead port, or a stale nonce
 # 401, or coord being down — came from a runner build predating those verdicts.
@@ -4114,6 +4253,17 @@ echo "So BEFORE applying the lost-write doctrine, issue one cheap native coord r
 # so the route is not mentioned on this path at all.
 if [ -n "$WEDGED_ENDPOINTS" ]; then
   echo "Next: the RUNNER_WEDGED verdict above governs. Do NOT re-provision, rotate a key, or restart the runner; probe /livez on the wedged endpoint, treat in-flight coord writes as LOST and verify by read, and re-run this cascade in a few minutes - observed wedges have cleared on their own. ('coord doctor' is still safe to run: it is a read-only self-check.)"
+elif [ -n "$RUNNER_CREDENTIAL_POSTURE" ]; then
+  # READ BEFORE the ordinary advice, and the re-provision route is not named at
+  # all on this path - the same suppression a wedge gets, for a related reason.
+  # The ordinary line points at /coord-mcp/provision-session to explain why
+  # re-running it by hand is pointless; a reader who has just been told their
+  # 401 was a credential fault acts on the route rather than on the explanation,
+  # and here a re-provision mints a perfectly good new nonce for a credential
+  # that is still dead - while evicting whatever holds this workdir's slot.
+  echo "Next: the nonce is fine; the runner's credential is $RUNNER_CREDENTIAL_POSTURE; the L4/L5 doors will work and a re-provision will NOT."
+  echo "  A door above answered RUNNER_CREDENTIAL_$(printf '%s' "$RUNNER_CREDENTIAL_POSTURE" | tr '[:lower:]' '[:upper:]'): the runner refused the call ITSELF rather than forwarding it, because its own coord device JWT is $RUNNER_CREDENTIAL_POSTURE. That is a statement about THE RUNNER, not about your key and not about coord - coord may be perfectly healthy behind it. Re-issue over the L4 or L5 rung above (\$COORD_DEVICE_JWT, ~/.qontinui/coord-device-jwt, the runner mint, or the bootstrap credential): those carry their OWN credentials and never traverse this forwarder."
+  echo "  Do NOT rotate the proxy key, do NOT re-provision, and do NOT start a new session hoping for a fresh nonce - every session on this box shares the one runner that is refusing, so all three cost work and change nothing. Do NOT restart or kill the runner either (served policy production-and-cost runner-lifecycle): the credential heals through the runner's own refresh rungs or a re-pair, not through a restart. Treat any coord write already in flight through this forwarder as LOST and verify it by read. ('coord doctor' is safe: it is a read-only self-check.)"
 else
   echo "Next: run 'coord doctor' (runner self-check) to name the failing credential-chain link. L4 source 3 ALREADY attempted /coord-mcp/provision-session for this cwd (bounded: only after L1+L2 proved this workdir's key dead, so there was no live slot here to evict) - re-running it by hand will not find a door this did not, and calling it for ANOTHER workdir would evict that workdir's live key."
 fi
