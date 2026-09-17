@@ -181,11 +181,17 @@ static STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
 /// ([`published`]) without a second store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Published {
-    /// The port this process advertised.
+    /// The port this process bound.
     pub port: u16,
-    /// The breadcrumb file this process wrote.
-    pub breadcrumb_path: PathBuf,
-    /// The loopback handshake key file the record names, if one was written.
+    /// The breadcrumb file this process wrote, or `None` when the record could
+    /// not be written (the key file may still exist — see
+    /// [`Published::loopback_key_path`]): out-of-process readers will not find
+    /// this runner, but the key it wrote is real and must still be named and
+    /// removed.
+    pub breadcrumb_path: Option<PathBuf>,
+    /// The loopback handshake key file this process wrote, if any. Recorded
+    /// whether or not the breadcrumb naming it was written, so a graceful
+    /// shutdown removes it either way and the mint route's refusal names it.
     pub loopback_key_path: Option<PathBuf>,
 }
 
@@ -196,11 +202,11 @@ fn published_cell() -> &'static std::sync::Mutex<Option<Published>> {
 }
 
 /// What this process has published, if anything: the port, the breadcrumb path
-/// and the key path it wrote. `None` before the first successful [`publish`]
-/// and after [`remove_published`]. Read by the mint route's denial message so a
-/// refused caller is told which port THIS runner bound and which key file it
-/// actually wrote — the discriminating fact when the caller read a different
-/// runner's key.
+/// (if the record was written) and the key path it wrote. `None` before the
+/// first [`publish`] and after [`remove_published`]. Read by the mint route's
+/// denial message so a refused caller is told which port THIS runner bound and
+/// which key file it actually wrote — the discriminating fact when the caller
+/// read a different runner's key.
 pub fn published() -> Option<Published> {
     published_cell()
         .lock()
@@ -243,9 +249,33 @@ fn breadcrumb_for_with_primary(
 /// unpublished breadcrumb degrades a bare session to "no coord identity"
 /// (fail-open), never to a broken runner. Idempotent; a re-publish overwrites
 /// in place.
+///
+/// # The key is recorded even when the record is not
+///
+/// `loopback_key_path` names a file that ALREADY EXISTS and DOES open the mint
+/// route on this runner, whether or not the breadcrumb naming it can be
+/// written. So every failure arm here still stores
+/// `Published { breadcrumb_path: None, loopback_key_path }`: [`remove_published`]
+/// then deletes the key on graceful shutdown instead of orphaning it, and the
+/// mint route's refusal names the real path (and says the record was not
+/// published) instead of claiming no key exists. One failure this arm bounds:
+/// `PathBuf` serializes as a string, so a home directory whose path is not
+/// valid UTF-8 makes `serde_json` refuse the record ("path contains invalid
+/// UTF-8") — that lands here as an unpublished breadcrumb beside a working key,
+/// never as a lost key.
 pub fn publish(port: u16, loopback_key_path: Option<PathBuf>) {
+    let record = |breadcrumb_path: Option<PathBuf>| {
+        Some(Published {
+            port,
+            breadcrumb_path,
+            loopback_key_path: loopback_key_path.clone(),
+        })
+    };
     let Some(path) = breadcrumb_path(port) else {
         warn!("runner_breadcrumb: home dir unresolvable — API port :{port} not advertised");
+        *published_cell()
+            .lock()
+            .expect("breadcrumb publish record poisoned") = record(None);
         return;
     };
     if let Err(e) = write_at(&path, &breadcrumb_for(port, loopback_key_path.clone())) {
@@ -254,15 +284,14 @@ pub fn publish(port: u16, loopback_key_path: Option<PathBuf>) {
             path = %path.display(),
             "runner_breadcrumb: publish failed — out-of-process port discovery off for this runner"
         );
+        *published_cell()
+            .lock()
+            .expect("breadcrumb publish record poisoned") = record(None);
         return;
     }
     *published_cell()
         .lock()
-        .expect("breadcrumb publish record poisoned") = Some(Published {
-        port,
-        breadcrumb_path: path,
-        loopback_key_path,
-    });
+        .expect("breadcrumb publish record poisoned") = record(Some(path));
 }
 
 /// Remove the breadcrumb this process published, if any, AND the loopback
@@ -287,7 +316,9 @@ pub fn remove_published() {
         ..
     }) = published
     {
-        let _ = std::fs::remove_file(breadcrumb_path);
+        if let Some(record) = breadcrumb_path {
+            let _ = std::fs::remove_file(record);
+        }
         if let Some(key) = loopback_key_path {
             let _ = std::fs::remove_file(key);
         }
@@ -667,7 +698,7 @@ mod tests {
         write_at(&path, &rec(9899, 7, 1)).unwrap();
         *published_cell().lock().unwrap() = Some(Published {
             port: 9899,
-            breadcrumb_path: path.clone(),
+            breadcrumb_path: Some(path.clone()),
             loopback_key_path: None,
         });
 
@@ -778,7 +809,7 @@ mod tests {
             published(),
             Some(Published {
                 port,
-                breadcrumb_path: expected_record.clone(),
+                breadcrumb_path: Some(expected_record.clone()),
                 loopback_key_path: Some(key.clone()),
             })
         );
@@ -794,5 +825,50 @@ mod tests {
         );
         assert_eq!(published(), None);
         remove_published(); // idempotent
+    }
+
+    /// Review fix: a key that WAS written but whose breadcrumb could NOT be
+    /// (here `~/.qontinui/runner` is a FILE, so `write_at`'s `create_dir_all`
+    /// fails) is still recorded — the cell holds the key path with no
+    /// breadcrumb path — so `remove_published()` deletes the key on shutdown
+    /// instead of orphaning a live secret, and the mint route's refusal can
+    /// name the real path rather than claiming no key exists.
+    #[test]
+    fn publish_records_the_key_even_when_the_breadcrumb_write_fails() {
+        let amb = isolated_ambient();
+        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
+        std::env::remove_var(PRIMARY_PORT_ENV);
+        remove_published();
+
+        let port = 9892;
+        let key = amb.dir().join(format!("runner-loopback-key-{port}"));
+        std::fs::write(&key, b"0123456789abcdef").unwrap();
+        // The breadcrumb dir's path is occupied by a FILE ⇒ the record cannot
+        // be written.
+        std::fs::write(amb.dir().join("runner"), b"not a directory").unwrap();
+
+        publish(port, Some(key.clone()));
+
+        assert!(
+            amb.dir().join("runner").is_file(),
+            "the fixture's blocker must survive the attempt"
+        );
+        assert_eq!(
+            published(),
+            Some(Published {
+                port,
+                breadcrumb_path: None,
+                loopback_key_path: Some(key.clone()),
+            }),
+            "the key path is recorded even though the breadcrumb was not written"
+        );
+        assert!(key.exists(), "publish never touches the key file itself");
+
+        remove_published();
+        assert!(
+            !key.exists(),
+            "the key written by this process is removed on shutdown even without a breadcrumb"
+        );
+        assert_eq!(published(), None);
     }
 }

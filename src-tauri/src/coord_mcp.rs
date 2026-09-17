@@ -524,14 +524,26 @@ impl SessionIdentityDenial {
         published: Option<&qontinui_runner_lib::runner_breadcrumb::Published>,
     ) -> String {
         // What THIS runner advertised: its bound port and the key file it wrote.
+        // Three arms: (i) record + key published; (ii) the key was written but
+        // the breadcrumb naming it could not be — the key still opens the
+        // route, so name it and say readers of the record will not find it;
+        // (iii) no key at all — the route is closed and no file will help.
         let key_location = match published {
-            Some(p) => match &p.loopback_key_path {
-                Some(key) => format!(
+            Some(p) => match (&p.loopback_key_path, &p.breadcrumb_path) {
+                (Some(key), Some(_)) => format!(
                     "this runner bound port {} and wrote its key at {}",
                     p.port,
                     key.display()
                 ),
-                None => format!(
+                (Some(key), None) => format!(
+                    "this runner bound port {} and wrote its key at {}, but could not \
+                     publish its port breadcrumb — a reader of the records under \
+                     ~/.qontinui/runner/ will not find this runner, so read that key \
+                     file directly",
+                    p.port,
+                    key.display()
+                ),
+                (None, _) => format!(
                     "this runner bound port {} but published no key — the route is \
                      closed on this runner and no {RUNNER_LOOPBACK_KEY_FILE}-* file \
                      will open it",
@@ -11161,9 +11173,9 @@ mod tests {
         let key_path = std::path::PathBuf::from("/fixture/.qontinui/runner-loopback-key-9877");
         let published = Published {
             port: 9877,
-            breadcrumb_path: std::path::PathBuf::from(
+            breadcrumb_path: Some(std::path::PathBuf::from(
                 "/fixture/.qontinui/runner/api-port-9877.json",
-            ),
+            )),
             loopback_key_path: Some(key_path.clone()),
         };
         let mismatch = SessionIdentityDenial::HandshakeMismatch.message_for(Some(&published));
@@ -11189,9 +11201,34 @@ mod tests {
             "{none_sent}"
         );
 
-        // A runner that bound a port but could NOT write its key says so — the
-        // route is closed and no file will help — rather than naming a path
-        // that does not exist.
+        // Arm (ii): the key WAS written but the breadcrumb naming it could not
+        // be. The key still opens the route, so the message names the port and
+        // the real path, and says the record will not be found — it must NOT
+        // claim the route is closed.
+        let recordless = Published {
+            breadcrumb_path: None,
+            ..published.clone()
+        };
+        for d in [
+            SessionIdentityDenial::NoHandshake,
+            SessionIdentityDenial::HandshakeMismatch,
+        ] {
+            let msg = d.message_for(Some(&recordless));
+            assert!(msg.contains("port 9877"), "{msg}");
+            assert!(msg.contains(&key_path.display().to_string()), "{msg}");
+            assert!(
+                msg.contains("could not publish its port breadcrumb"),
+                "{msg}"
+            );
+            assert!(msg.contains(RUNNER_LOOPBACK_KEY_FILE), "{msg}");
+            assert!(!msg.contains("route is closed"), "{msg}");
+            assert!(!msg.contains("published no key"), "{msg}");
+            assert!(!msg.contains(KEY));
+        }
+
+        // Arm (iii): a runner that bound a port but could NOT write its key
+        // says so — the route is closed and no file will help — rather than
+        // naming a path that does not exist.
         let keyless = Published {
             loopback_key_path: None,
             ..published.clone()

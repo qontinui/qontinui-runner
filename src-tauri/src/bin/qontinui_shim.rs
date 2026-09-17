@@ -370,9 +370,21 @@ fn session_identity_marker_exists() -> bool {
 /// The caller resolves the live runner FIRST and hands its declared path in,
 /// so this reads the key of the SAME runner it is about to POST to.
 ///
+/// One VALIDATION before the read — not a derivation: the file name must start
+/// with the shared stem (`RUNNER_LOOPBACK_KEY_FILE`, i.e. `runner-loopback-key`).
+/// The record is a plain JSON file in the user's app-data dir and this process
+/// posts whatever it reads here as a credential, so a record naming some other
+/// file (a corrupt or hand-edited breadcrumb) must not turn the shim into an
+/// arbitrary-file reader. Fail-open `None`, and nothing about the path or its
+/// contents is logged.
+///
 /// The value is a secret: it is passed straight into the request header and is
 /// never logged, printed, or written anywhere by this process.
 fn read_loopback_handshake_key(path: &std::path::Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    if !name.starts_with(qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_FILE) {
+        return None;
+    }
     let key = std::fs::read_to_string(path).ok()?;
     let key = key.trim().to_string();
     (!key.is_empty()).then_some(key)
@@ -1682,6 +1694,48 @@ mod tests {
                 "marker absent ⇒ no mint attempt, fail-open to None"
             );
         }
+    }
+
+    /// The record-named key reader: fail-open `None` for a missing file, an
+    /// empty or whitespace-only file, and a path whose file name does not carry
+    /// the shared `runner-loopback-key` stem (validation, not derivation — the
+    /// path still comes from the record); `Some(trimmed)` otherwise. Pure
+    /// temp-dir I/O, no env, no process-global state.
+    #[test]
+    fn read_loopback_handshake_key_trims_and_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let stem = qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_FILE;
+        let named = |n: &str| dir.path().join(n);
+
+        // Missing ⇒ None.
+        assert_eq!(
+            read_loopback_handshake_key(&named(&format!("{stem}-9876"))),
+            None
+        );
+
+        // Empty / whitespace-only ⇒ None (not an empty header).
+        let empty = named(&format!("{stem}-9877"));
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(read_loopback_handshake_key(&empty), None);
+        std::fs::write(&empty, b"  \n\t \n").unwrap();
+        assert_eq!(read_loopback_handshake_key(&empty), None);
+
+        // Content with surrounding whitespace ⇒ Some(trimmed).
+        let good = named(&format!("{stem}-9878"));
+        std::fs::write(&good, b"  0123456789abcdef\n").unwrap();
+        assert_eq!(
+            read_loopback_handshake_key(&good).as_deref(),
+            Some("0123456789abcdef")
+        );
+
+        // A readable file whose name lacks the stem ⇒ None, unread. The record
+        // told us where the key is; it may not turn us into a reader of an
+        // arbitrary file.
+        let foreign = named("not-a-key-file");
+        std::fs::write(&foreign, b"0123456789abcdef").unwrap();
+        assert_eq!(read_loopback_handshake_key(&foreign), None);
+        let bare_dir = dir.path();
+        assert_eq!(read_loopback_handshake_key(bare_dir), None);
     }
 
     /// §6 wedged-runner guard: the self-provision mint uses a SHORT read timeout
