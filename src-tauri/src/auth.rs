@@ -1517,17 +1517,20 @@ pub(crate) fn select_device_bearer(
     let Some(t) = tenant else {
         return legacy_slot_bearer(am);
     };
-    match am.get_tenant_device_jwt(t) {
+    // Routed through [`read_tenant_slot`] so this selector and every REPORTER
+    // of "can this device act in tenant T" apply one predicate. They did not:
+    // `pair::reconcile_paired_bindings_with` tested non-empty PRESENCE, so a
+    // bound tenant whose slot had EXPIRED was reported as workable while this
+    // function had refused it since Phase 1a. See [`credential_state`].
+    match read_tenant_slot(am, t) {
         // VALIDITY, not presence (Phase 1a). A slot that holds an expired or
         // opaque token is a MISS and falls through below exactly as an absent
         // slot does — never returned verbatim for the proxy to forward into a
         // 401 the caller sees only as "Command failed with no output".
-        Ok(Some(jwt)) if slot_jwt_is_usable(&jwt) => return Some(jwt),
-        Ok(Some(jwt)) if !jwt.trim().is_empty() => {
-            warn_once_per_tenant_dead_slot(t);
-        }
-        Ok(_) => {}
-        Err(e) => {
+        SlotRead::Usable(jwt) => return Some(jwt),
+        SlotRead::PresentButDead => warn_once_per_tenant_dead_slot(t),
+        SlotRead::Absent => {}
+        SlotRead::Unreadable(e) => {
             debug!("coord data-plane: tenant {t} device-JWT slot read failed ({e})");
         }
     }
@@ -1544,12 +1547,12 @@ pub(crate) fn select_device_bearer(
 /// Read the legacy `access_token` slot (the DEFAULT binding's JWT) with the
 /// original never-fatal posture + once-per-process missing-token warning.
 fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
-    match am.get_access_token() {
+    match read_legacy_slot(am) {
         // Same validity gate as the per-tenant slot (Phase 1a): a dead default
         // credential must degrade to "no bearer" — which the proxy answers with
         // a typed refreshing/refusal status — rather than being forwarded.
-        Ok(token) if slot_jwt_is_usable(&token) => Some(token),
-        Ok(token) if !token.trim().is_empty() => {
+        SlotRead::Usable(token) => Some(token),
+        SlotRead::PresentButDead => {
             DEAD_LEGACY_SLOT_WARNED.call_once(|| {
                 warn!(
                     "coord data-plane: the default device-JWT slot holds an expired or                      opaque token — treating it as ABSENT and sending coord calls                      unauthenticated rather than forwarding a credential coord will                      reject; the refresher re-mints it, or re-pair this runner"
@@ -1557,7 +1560,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
             });
             None
         }
-        Ok(_) => {
+        SlotRead::Absent => {
             MISSING_TOKEN_WARNED.call_once(|| {
                 warn!(
                     "coord data-plane: no device-JWT stored (empty token) — \
@@ -1566,7 +1569,7 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
             });
             None
         }
-        Err(e) => {
+        SlotRead::Unreadable(e) => {
             MISSING_TOKEN_WARNED.call_once(|| {
                 warn!(
                     "coord data-plane: device-JWT unavailable ({e}) — \
@@ -1575,6 +1578,211 @@ fn legacy_slot_bearer(am: &AuthManager) -> Option<String> {
             });
             None
         }
+    }
+}
+
+// ===========================================================================
+// ONE credential-state predicate, shared by the SELECTOR above and by every
+// REPORTER of "can this device act in tenant T".
+//
+// Plan
+// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+// P0. Before it there were two rules for that question and they disagreed:
+//
+// * [`select_device_bearer`] applied VALIDITY — [`slot_jwt_is_usable`]:
+//   non-empty, decodable, unexpired — and returned `None` otherwise (Phase 1a);
+// * `pair::reconcile_paired_bindings_with`'s `coord_only` flag applied
+//   PRESENCE — `matches!(…, Ok(Some(ref j)) if !j.trim().is_empty())`.
+//
+// So a bound tenant whose slot had EXPIRED was REPORTED as one this runner
+// could act in while the selector was already refusing it — the optimistic
+// reading, in the one place an operator would have looked. Routing both
+// through [`read_tenant_slot`] + [`credential_state`] is what stops them
+// drifting again; a second copy of the predicate is the thing to avoid.
+//
+// Nothing here mints, refreshes, clears or stores a credential, and nothing
+// here warns: a reporter must be able to ask without firing the selector's
+// once-per-process operator warnings or touching any state.
+// ===========================================================================
+
+/// What ONE read of ONE credential slot found, classified by exactly the
+/// predicate [`select_device_bearer`] selects by. Carries the credential on
+/// the one arm that has one, so the selector needs no second read.
+pub(crate) enum SlotRead {
+    /// [`slot_jwt_is_usable`] holds: a decodable JWT, not past `exp`.
+    Usable(String),
+    /// A credential IS stored and is unusable — an opaque bearer, or a JWT
+    /// past `exp`. A stored-but-empty string is NOT this arm; it is `Absent`,
+    /// because it is indistinguishable from nothing stored to every consumer.
+    PresentButDead,
+    /// Nothing stored (or stored empty).
+    Absent,
+    /// The store could not be READ. UNKNOWN — never "absent". Carries the
+    /// error text so a caller can say which unknown.
+    Unreadable(String),
+}
+
+impl SlotRead {
+    /// The part a REPORT may carry: the classification without the secret.
+    pub(crate) fn state(&self) -> SlotState {
+        match self {
+            Self::Usable(_) => SlotState::Usable,
+            Self::PresentButDead => SlotState::PresentButDead,
+            Self::Absent => SlotState::Absent,
+            Self::Unreadable(_) => SlotState::Unreadable,
+        }
+    }
+}
+
+/// [`SlotRead`] with the credential dropped — safe to store in a report, a
+/// log line or a doctor detail.
+///
+/// The middle two are kept APART on purpose, and that is the distinction this
+/// whole predicate exists to preserve: [`select_device_bearer`] already warns
+/// through two separate once-sets ([`warn_once_per_tenant_dead_slot`] vs
+/// [`warn_once_per_tenant_slot_miss`]) because the heals differ — an `Absent`
+/// slot was never issued for that tenant (pair for it), a `PresentButDead`
+/// one was issued and rotted (the refresher re-derives it, or re-pair).
+/// `Unreadable` is the fourth for the same reason [`BindingTenantRead`] has a
+/// third: an unreadable store is UNKNOWN, never absence (served policy
+/// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
+///
+/// `pub` rather than `pub(crate)` because `pair::BindingReconcileReport` — a
+/// public type — carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SlotState {
+    /// Usable credential: a decodable, unexpired JWT.
+    Usable,
+    /// A credential is stored and is expired or opaque.
+    PresentButDead,
+    /// No credential stored for this tenant.
+    Absent,
+    /// The store errored. Nothing established.
+    Unreadable,
+}
+
+impl SlotState {
+    /// The label reports print. Stable — operators and tests read it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Usable => "usable",
+            Self::PresentButDead => "present-but-dead",
+            Self::Absent => "absent",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+/// Read and classify ONE tenant's per-tenant device-JWT slot.
+pub(crate) fn read_tenant_slot(am: &AuthManager, tenant: &Uuid) -> SlotRead {
+    match am.get_tenant_device_jwt(tenant) {
+        Ok(Some(jwt)) if slot_jwt_is_usable(&jwt) => SlotRead::Usable(jwt),
+        Ok(Some(jwt)) if !jwt.trim().is_empty() => SlotRead::PresentButDead,
+        Ok(_) => SlotRead::Absent,
+        Err(e) => SlotRead::Unreadable(e.to_string()),
+    }
+}
+
+/// Read and classify the LEGACY `access_token` slot — which holds the DEFAULT
+/// binding's JWT (D4), and is therefore part of the answer for the default
+/// tenant and for no other.
+///
+/// Goes through [`AuthManager::probe_access_token`], NOT `get_access_token`,
+/// and the difference is the whole of [`SlotState::Unreadable`]'s meaning:
+/// `get_access_token()` answers `Err` for an UNPAIRED runner as readily as
+/// for a corrupt store, so classifying off it made "nobody has signed in
+/// here" indistinguishable from "the store is damaged" and turned the
+/// commonest state on a fresh box into an UNKNOWN. The probe is the
+/// tri-state that already exists for exactly this distinction
+/// (`StoredTokenRead`), and it is what keeps this classification in step with
+/// the doctor's own `credential_store_readable` check. Caught by
+/// `credential_state_agrees_with_select_device_bearer_on_every_slot_state`,
+/// which is the point of driving the report and the selector over one store.
+pub(crate) fn read_legacy_slot(am: &AuthManager) -> SlotRead {
+    use crate::secure_storage::StoredTokenRead;
+    match am.probe_access_token() {
+        StoredTokenRead::Present(token) if slot_jwt_is_usable(&token) => SlotRead::Usable(token),
+        StoredTokenRead::Present(_) => SlotRead::PresentButDead,
+        // MEASURED absence: no token stored, or one stored empty. This is an
+        // unpaired / signed-out runner, and it is a fact, not a failure.
+        StoredTokenRead::Absent => SlotRead::Absent,
+        StoredTokenRead::Unreadable(e) => SlotRead::Unreadable(e),
+    }
+}
+
+/// Whether this device can ACT in one tenant, and on the strength of what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TenantCredential {
+    /// The state of the tenant's OWN per-tenant slot. This is the
+    /// operator-action axis — see [`SlotState`].
+    pub slot: SlotState,
+    /// What [`select_device_bearer`] would conclude: `Some(true)` it would
+    /// hand out a bearer, `Some(false)` it would return `None`, and `None`
+    /// when a read FAILED and nothing was established. Never defaulted: an
+    /// unreadable store is not a "no".
+    pub selectable: Option<bool>,
+    /// `true` when a `Some(true)` is carried by the LEGACY default slot
+    /// rather than by the tenant's own — a pre-8a install, or a pairing that
+    /// predates per-tenant slots. A report that ignored this would tell an
+    /// operator to re-pair a tenant that already works.
+    pub via_default_slot: bool,
+}
+
+impl TenantCredential {
+    /// Can a session act in this tenant? `None` is UNKNOWN, not `false`.
+    pub fn can_act(self) -> Option<bool> {
+        self.selectable
+    }
+}
+
+/// The shared rule, PURE over the two slot states it is handed: no I/O, so
+/// the doctor and the reconciler can drive it from states they already
+/// measured, and a unit test can drive every combination with no store at all.
+///
+/// It mirrors [`select_device_bearer`] arm for arm, INCLUDING the legacy
+/// fallback that function applies when the requested tenant is the default
+/// binding. Omitting that arm is not a simplification — it would report a
+/// device unable to act in a tenant the selector serves happily.
+pub fn credential_state(
+    slot: SlotState,
+    is_default: bool,
+    default_slot: SlotState,
+) -> TenantCredential {
+    // A measured "cannot act" is only measurable when the tenant's own read
+    // established something; an `Unreadable` slot with no usable fallback
+    // stays UNKNOWN.
+    let no_fallback = TenantCredential {
+        slot,
+        selectable: if slot == SlotState::Unreadable {
+            None
+        } else {
+            Some(false)
+        },
+        via_default_slot: false,
+    };
+    if slot == SlotState::Usable {
+        return TenantCredential {
+            slot,
+            selectable: Some(true),
+            via_default_slot: false,
+        };
+    }
+    if !is_default {
+        return no_fallback;
+    }
+    match default_slot {
+        SlotState::Usable => TenantCredential {
+            slot,
+            selectable: Some(true),
+            via_default_slot: true,
+        },
+        // Neither slot established anything.
+        SlotState::Unreadable => TenantCredential {
+            slot,
+            selectable: None,
+            via_default_slot: false,
+        },
+        SlotState::PresentButDead | SlotState::Absent => no_fallback,
     }
 }
 
@@ -2840,6 +3048,149 @@ mod bearer_selection_tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!(r#"{{"sub":"{tag}","exp":{exp}}}"#).as_bytes());
         format!("{header}.{payload}.sig")
+    }
+
+    /// THE agreement gate for plan
+    /// `2026-09-17-device-holds-one-credential-slot-so-a-session-cannot-work-a-bound-tenant`
+    /// P0: whatever a REPORT concludes about "can this device act in tenant
+    /// T" has to be what the SELECTOR does — for every slot state, for the
+    /// default tenant and for a stranger, and including the legacy fallback.
+    ///
+    /// The two rules were written separately and disagreed on exactly one
+    /// cell: a present-but-EXPIRED slot, which
+    /// `pair::reconcile_paired_bindings_with` counted as a credential
+    /// (`!jwt.trim().is_empty()`) while [`select_device_bearer`] had refused
+    /// it since Phase 1a. Driving both over one real store is what stops a
+    /// future edit re-opening that gap.
+    #[test]
+    fn credential_state_agrees_with_select_device_bearer_on_every_slot_state() {
+        let expired = jwt_for("expired", chrono::Utc::now().timestamp() - 3600);
+        let slot_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("slot"))),
+            ("expired", Some(expired.clone())),
+            ("opaque", Some("qontinui_runner_deadbeef".to_string())),
+            ("absent", None),
+        ];
+        let legacy_cases: Vec<(&str, Option<String>)> = vec![
+            ("usable", Some(live_jwt("legacy"))),
+            ("expired", Some(expired)),
+            ("absent", None),
+        ];
+
+        let t = tenant(0x11);
+        let stranger = tenant(0x22);
+        for (si, (slot_label, slot)) in slot_cases.iter().enumerate() {
+            for (li, (legacy_label, legacy)) in legacy_cases.iter().enumerate() {
+                for is_default in [false, true] {
+                    let mgr = create_test_auth_manager(&format!(
+                        "agreement_{si}_{li}_{}",
+                        u8::from(is_default)
+                    ));
+                    if let Some(j) = slot {
+                        mgr.store_tenant_device_jwt(&t, j).unwrap();
+                    }
+                    if let Some(j) = legacy {
+                        mgr.store_tokens(j, "").unwrap();
+                    }
+                    let default_tenant = Some(if is_default { t } else { stranger });
+
+                    // What the SELECTOR does — the thing that actually stops a
+                    // session working.
+                    let selected = select_device_bearer(&mgr, Some(&t), default_tenant);
+                    // What a REPORT would say, through the shared rule.
+                    let cred = credential_state(
+                        read_tenant_slot(&mgr, &t).state(),
+                        default_tenant == Some(t),
+                        read_legacy_slot(&mgr).state(),
+                    );
+
+                    assert_eq!(
+                        cred.can_act(),
+                        Some(selected.is_some()),
+                        "slot={slot_label} legacy={legacy_label} is_default={is_default}: a \
+                         report and the selector disagreeing about whether this device can \
+                         act in a tenant is the whole defect"
+                    );
+                    if cred.via_default_slot {
+                        assert!(
+                            is_default && cred.slot != SlotState::Usable,
+                            "via_default_slot is only ever the DEFAULT tenant falling back: \
+                             slot={slot_label} legacy={legacy_label}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A present-but-EXPIRED slot is `PresentButDead`, not `Absent` and not
+    /// `Usable` — the classification the whole report rests on.
+    #[test]
+    fn read_tenant_slot_classifies_expired_opaque_and_absent_apart() {
+        let mgr = create_test_auth_manager("classify_slot_states");
+        let a = tenant(0xA1);
+        let b = tenant(0xB1);
+        let c = tenant(0xC1);
+        let d = tenant(0xD1);
+
+        mgr.store_tenant_device_jwt(&a, &live_jwt("a")).unwrap();
+        mgr.store_tenant_device_jwt(&b, &jwt_for("b", chrono::Utc::now().timestamp() - 60))
+            .unwrap();
+        mgr.store_tenant_device_jwt(&c, "qontinui_runner_opaque")
+            .unwrap();
+        // d: never issued.
+
+        assert_eq!(read_tenant_slot(&mgr, &a).state(), SlotState::Usable);
+        assert_eq!(
+            read_tenant_slot(&mgr, &b).state(),
+            SlotState::PresentButDead,
+            "an EXPIRED slot is present-but-dead — the cell the reconciler used to call a \
+             credential"
+        );
+        assert_eq!(
+            read_tenant_slot(&mgr, &c).state(),
+            SlotState::PresentButDead,
+            "an opaque bearer cannot be judged usable, and 'cannot judge' is not 'fine'"
+        );
+        assert_eq!(read_tenant_slot(&mgr, &d).state(), SlotState::Absent);
+        assert_eq!(
+            SlotState::PresentButDead.label(),
+            "present-but-dead",
+            "the label is what operators and reports read"
+        );
+    }
+
+    /// `credential_state` is pure, so every combination is drivable with no
+    /// store at all — including the two UNKNOWN arms, which must not collapse
+    /// into `Some(false)`.
+    #[test]
+    fn credential_state_keeps_an_unreadable_slot_unknown() {
+        // Non-default tenant, nothing readable about it.
+        let c = credential_state(SlotState::Unreadable, false, SlotState::Usable);
+        assert_eq!(
+            c.can_act(),
+            None,
+            "an unreadable slot for a NON-default tenant establishes nothing"
+        );
+        // Default tenant whose own slot is unreadable but whose legacy slot
+        // is usable: the selector WOULD serve it, so this is a measured yes.
+        let c = credential_state(SlotState::Unreadable, true, SlotState::Usable);
+        assert_eq!(c.can_act(), Some(true));
+        assert!(c.via_default_slot);
+        // Default tenant, both unreadable: still nothing established.
+        assert_eq!(
+            credential_state(SlotState::Unreadable, true, SlotState::Unreadable).can_act(),
+            None
+        );
+        // A measured absence on both is a measured no.
+        assert_eq!(
+            credential_state(SlotState::Absent, true, SlotState::Absent).can_act(),
+            Some(false)
+        );
+        // A usable own slot never needs (or claims) the fallback.
+        let c = credential_state(SlotState::Usable, true, SlotState::Usable);
+        assert_eq!(c.can_act(), Some(true));
+        assert!(!c.via_default_slot);
     }
 
     /// No tenant in scope → the legacy `access_token` slot (default binding)

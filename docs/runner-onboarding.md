@@ -36,13 +36,13 @@ Verifies: a tenant_id resolves from the OAuth/runner-bearer claim, the outgoing 
 
 **Fix:** machine.json missing active_tenant_id
 
-### 6. Tenant bindings in step with coord (`tenant_bindings`) — ADVISORY
+### 6. Tenant bindings in step with coord, and a usable slot for each (`tenant_bindings`) — ADVISORY
 
-Verifies: which tenants this device is paired to, from BOTH sides: the local binding set in paired_user.json (no network) and the server-side set coord serves on GET /coord/devices/:id/state — the read the register heartbeat reconciles the local set against every 30s. Coord's `tenant_ids` is tri-state and is reported as such: `null` is UNKNOWN (coord did not hydrate bindings), `[]` is ZERO bindings, never the other way round. A device that is not paired reports NOT APPLICABLE
+Verifies: which tenants this device is paired to AND which of them it can actually act in, from THREE sides: the local binding set in paired_user.json (no network), the server-side set coord serves on GET /coord/devices/:id/state — the read the register heartbeat reconciles the local set against every 30s — and the per-tenant device-JWT SLOT census this device holds, each slot classed usable / present-but-dead / absent (validity, not presence). The bindings-vs-slots difference is reported in BOTH directions: a tenant coord binds that has no usable slot is one a session can see and cannot work in; a slot held for a tenant coord does not bind is a stale credential. Coord's `tenant_ids` is tri-state and is reported as such: `null` is UNKNOWN (coord did not hydrate bindings), `[]` is ZERO bindings, never the other way round; an unreadable slot store is likewise UNKNOWN, never zero slots, and a difference is computed only when BOTH sides are measured. A device that is not paired reports NOT APPLICABLE
 
 Advisory: a failure here is a **warning**, not a blocker — it does not stop gate registration and does not fail the report. It also runs even when an earlier check went red.
 
-**Fix:** a local/coord drift closes on the next register heartbeat (fleet.rs heartbeat → pair::reconcile_paired_bindings): local-only entries are dropped with their JWT slots, and a coord-only binding is one this runner holds no device-JWT for — pair for that tenant (`qontinui_profile device pair --pair-code <code>`) to enable its sessions. A coord side that reads UNKNOWN was not measured: the detail names why (no live device JWT, coord unreachable, or coord answered without hydrating `tenant_ids`) — see device_jwt_live and coord_reachable
+**Fix:** a local/coord drift closes on the next register heartbeat (fleet.rs heartbeat → pair::reconcile_paired_bindings): local-only entries are dropped with their JWT slots, and a coord-only binding is one this runner holds no device-JWT for — pair for that tenant (`qontinui_profile device pair --pair-code <code>`) to enable its sessions. A coord binding whose slot reads `absent` was never issued — pair for that tenant; one that reads `present-but-dead` was issued and rotted — the device-JWT refresher clears and re-derives it, or re-pair. A coord side that reads UNKNOWN was not measured: the detail names why (no live device JWT, coord unreachable, or coord answered without hydrating `tenant_ids`) — see device_jwt_live and coord_reachable
 
 ### 7. Coord device JWT live (`device_jwt_live`)
 
