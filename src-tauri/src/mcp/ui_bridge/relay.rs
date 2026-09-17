@@ -40,6 +40,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use axum::Extension;
+
+use crate::mcp::origin_guard::RequesterPrincipal;
+use crate::mcp::relay_binding::RelayState;
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 
 /// Tabs with no live SSE listener are evicted from the registry once their
@@ -457,7 +461,8 @@ impl Drop for StreamGuard {
 /// `connected` event. The drop guard deregisters the listener when the
 /// client disconnects.
 pub async fn ui_bridge_relay_command_stream_handler(
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let registry = state.ui_bridge_relay.clone();
@@ -504,7 +509,8 @@ pub async fn ui_bridge_relay_command_stream_handler(
 /// response's `data.tabRegistered` reports whether this tab currently holds
 /// a live SSE listener — the client forces a stream reconnect on `false`.
 pub async fn ui_bridge_relay_heartbeat_handler(
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let Some(tab_id) = body
@@ -531,7 +537,8 @@ pub async fn ui_bridge_relay_heartbeat_handler(
 /// `commandId` (it timed out, or the id is unknown) — not an error, the tab
 /// fire-and-forgets these.
 pub async fn ui_bridge_relay_command_result_handler(
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let Some(command_id) = body
@@ -571,7 +578,7 @@ pub async fn ui_bridge_relay_command_result_handler(
 /// `ui-bridge-headless`'s `waitForUiBridgeRegistration` polls for:
 /// `{ success, data: { tabs: [{ tabId, ... }] } }`.
 pub async fn ui_bridge_relay_tabs_handler(
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     Ok(Json(ApiResponse::success(tabs_response_body(
         state.ui_bridge_relay.list_tabs(),
@@ -580,8 +587,9 @@ pub async fn ui_bridge_relay_tabs_handler(
 
 /// The `data` payload of `GET /ui-bridge/tabs`.
 ///
-/// Split out of the handler because the handler itself is not unit-testable: it
-/// takes an `ApiState`, which owns a `tauri::AppHandle` no test can build. These
+/// Split out of the handler when the handler took an `ApiState`, which owns a
+/// `tauri::AppHandle` no test can build (it now takes `RelayState`, which
+/// `relay_binding/tests.rs` drives over a real socket). These
 /// key names are a WIRE CONTRACT other products read, and until this split
 /// nothing in the repo pinned them — which is why the rename below could be made
 /// safely, and equally why the next one would have gone unnoticed.
@@ -632,7 +640,7 @@ pub struct RelayDispatchRequest {
 /// the runner-side entry point for driving injected/relay tabs (the analog
 /// of the web relay's per-route `queueCommand` dispatch).
 pub async fn ui_bridge_relay_dispatch_handler(
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
     Json(request): Json<RelayDispatchRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     if request.action.trim().is_empty() {

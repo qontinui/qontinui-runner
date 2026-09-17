@@ -33,7 +33,7 @@ use axum::{
     extract::State,
     response::IntoResponse,
     routing::any,
-    Router,
+    Extension, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,8 @@ use tracing::{debug, info, warn};
 use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
+use super::origin_guard::RequesterPrincipal;
+use super::relay_binding::RelayState;
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
 
@@ -305,9 +307,15 @@ struct RegisterAck<'a> {
 // ============================================================================
 
 /// `any /ui-bridge/ws` — axum upgrade handler.
+///
+/// `_principal` is the origin guard's classification of the upgrade request
+/// (the `Origin` a browser always sends on a WebSocket handshake). Phase 1 of
+/// plan `2026-09-17-ui-bridge-relay-registration-is-unauthenticated` binds the
+/// registration to it; today it is carried but not consulted.
 pub async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
-    State(state): State<Arc<ApiState>>,
+    State(state): State<RelayState>,
+    _principal: Option<Extension<RequesterPrincipal>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| drive_connection(socket, state))
 }
@@ -315,7 +323,7 @@ pub async fn ws_upgrade_handler(
 /// Split the socket, wait for the register frame, then run the send/recv
 /// tasks until either side closes. Always cleans up registry + connection
 /// manager state on exit.
-async fn drive_connection(socket: WebSocket, state: Arc<ApiState>) {
+async fn drive_connection(socket: WebSocket, state: RelayState) {
     let ws_manager = state.ws_connection_manager.clone();
     let relay = state.ws_command_relay.clone();
     let registry = state.app_registry.clone();
