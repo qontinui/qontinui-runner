@@ -20,8 +20,11 @@ import {
   draftsAreDirty,
   draftsFrom,
   formatRefAge,
+  formatRepoCheckouts,
   normalizePathInput,
+  parseRepoCheckouts,
   planScanStatusLabel,
+  repoCheckoutsDirty,
   resolvedDiffers,
   scanSourceStatus,
   type PathSettings,
@@ -192,6 +195,63 @@ describe("draftsAreDirty", () => {
   it("sees a cleared field and a new value", () => {
     expect(draftsAreDirty(SAVED, { ...draftsFrom(SAVED), plans_dir: "" })).toBe(true);
     expect(draftsAreDirty(SAVED, { ...draftsFrom(SAVED), prompts_dir: "/p" })).toBe(true);
+  });
+});
+
+describe("repo checkouts — repos outside the workspace root", () => {
+  const WITH_MAP: PathSettings = {
+    ...SAVED,
+    repo_checkouts: {
+      "portofino-pizzeria/mobile": "D:/portofino-pizzeria/mobile",
+      "acme/app": "/src/acme/app",
+    },
+  };
+
+  it("formats sorted and parses back to the same map", () => {
+    const text = formatRepoCheckouts(WITH_MAP.repo_checkouts);
+    expect(text).toBe(
+      "acme/app = /src/acme/app\nportofino-pizzeria/mobile = D:/portofino-pizzeria/mobile",
+    );
+    expect(parseRepoCheckouts(text)).toEqual({
+      entries: WITH_MAP.repo_checkouts,
+      errors: [],
+    });
+    expect(repoCheckoutsDirty(WITH_MAP, text)).toBe(false);
+  });
+
+  it("ignores blank lines and comments, trims both sides, keeps = inside a path", () => {
+    const parsed = parseRepoCheckouts("# per-owner checkouts\r\n\n  acme/app =  /src/a=b  \n");
+    expect(parsed).toEqual({ entries: { "acme/app": "/src/a=b" }, errors: [] });
+  });
+
+  it("rejects malformed lines and case-insensitive duplicates with line numbers", () => {
+    const { errors } = parseRepoCheckouts(
+      "acme/app = /a\nno-equals-sign\nbare = /b\nacme/app2 =\nACME/APP = /c",
+    );
+    expect(errors).toEqual([
+      'Line 2: expected "owner/name = path".',
+      'Line 3: "bare" is not an owner/name repo slug.',
+      "Line 4: no path for acme/app2.",
+      "Line 5: ACME/APP is listed more than once.",
+    ]);
+  });
+
+  it("an emptied box removes the key; a filled one sets it; untouched leaves it", () => {
+    const cleared = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP), {});
+    expect("repo_checkouts" in cleared).toBe(false);
+    expect(repoCheckoutsDirty(WITH_MAP, "")).toBe(true);
+
+    const set = buildPathSettingsPayload(SAVED, draftsFrom(SAVED), { "acme/app": "/x" });
+    expect(set.repo_checkouts).toEqual({ "acme/app": "/x" });
+    expect(repoCheckoutsDirty(SAVED, "acme/app = /x")).toBe(true);
+    expect(repoCheckoutsDirty(SAVED, "")).toBe(false);
+
+    const untouched = buildPathSettingsPayload(WITH_MAP, draftsFrom(WITH_MAP));
+    expect(untouched.repo_checkouts).toEqual(WITH_MAP.repo_checkouts);
+  });
+
+  it("a box with errors is dirty, so the panel never reads it as saved", () => {
+    expect(repoCheckoutsDirty(SAVED, "nonsense")).toBe(true);
   });
 });
 
