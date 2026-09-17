@@ -469,6 +469,61 @@ print(rows(res))' 2>/dev/null  # envelope-ok: same closed-list count, python arm
   fi
 }
 
+# runner_credential_field <body> <field> -> the TOP-LEVEL field's string value,
+# or "" when it is absent, non-string, or the body will not parse.
+#
+# The runner's OWN 401 (plan 2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody,
+# DD4) carries {"code":"runner_credential_<posture>","since":…,"remedy":…} at the
+# TOP LEVEL, and DD4 also has coord's `credential_free_doors` catalogue riding
+# along in the same object — an array of door records whose keys this script does
+# not get to constrain, because they are copied from coord's last answer.
+#
+# A TEXTUAL read cannot be made safe against that, and the first cut of this
+# function proved it. `grep -o … | head -1` was chosen over a greedy `sed` so a
+# first-match beats a last-match, which is right — but it only helps for a key
+# that sorts BEFORE the catalogue. serde_json here is a BTreeMap (1.0.149, no
+# `indexmap`, so `preserve_order` is off), so the refusal body serializes SORTED:
+# cause, code, credential_free_doors, error, layer, next_door, posture,
+# posture_cause, probed_at, remedy, retryable, since, since_unix, success.
+# `code` sorts before the catalogue; `since`, `remedy`, `posture` and `next_door`
+# all sort AFTER it. Measured against a decoy catalogue, the textual reader
+# returned coord's catalogue entry for every one of those four.
+#
+# So the read is a real top-level parse, exactly as the METHOD_NOT_ALLOWED arm
+# below reads `error.data.cause`. `$JSON_READER` is guaranteed non-empty — this
+# script exits 127 at startup when neither jq nor a working python is present —
+# so there is no rung here that can silently degrade to the textual guess.
+runner_credential_field() {
+  if [ "$JSON_READER" = jq ]; then
+    printf '%s' "$1" | jq -r --arg k "$2" '((.[$k]?) // "") | if type == "string" then . else "" end' 2>/dev/null | tr -d '\r\n'  # envelope-ok: one TOP-LEVEL key of the runner's own 401 body; a nested catalogue entry is unreachable from `.[$k]`, which is the whole point
+  else
+    printf '%s' "$1" | "$JSON_READER" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print(); sys.exit(0)
+v=d.get(sys.argv[1]) if isinstance(d,dict) else None  # envelope-ok: same TOP-LEVEL read, python arm; a non-object body reads as absent, never as a value
+print(v if isinstance(v,str) else "")' "$2" 2>/dev/null | tr -d '\r\n'
+  fi
+}
+
+# runner_credential_code_textual <body> -> the `code` value, read without a parser.
+#
+# The ONE fallback, and only for `code`, because only `code` has a bound that
+# makes a textual read exact: it sorts before `credential_free_doors`, so
+# everything up to the catalogue is a region the catalogue cannot contaminate.
+# It exists so a body that will not PARSE — truncated mid-transfer, or an
+# envelope shape this script has not seen — still yields the posture rather than
+# collapsing the class verdict to `unstated`. `since` and `remedy` get no such
+# fallback: there is no safe textual read for a key that sorts after the
+# catalogue, and inventing one is how the defect above happened.
+runner_credential_code_textual() {
+  local head
+  head="${1%%\"credential_free_doors\"*}"
+  printf '%s' "$head" | tr -d '\n\r' \
+    | grep -o '"code"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed 's/.*"\([^"]*\)"$/\1/'
+}
+
 # classify <curl_exit> <http_code> <body> [unauth-wording] -> typed verdict.
 # 401 wording is parameterized because on a loopback proxy it means "stale
 # proxy key" while on the direct bearer door it means "rejected bearer".
@@ -518,6 +573,27 @@ classify() {
       case "$body" in
         *COORD_MCP_PROXY_CREDENTIAL_REFRESHING*|*CREDENTIAL_REFRESHING*)
           echo "CREDENTIAL_REFRESHING (retry-safe - proxy up, withholding while its device JWT refreshes)"; return ;;
+        *runner_credential_*)
+          # READ BEFORE the nonce arm, and that order is the whole point. This
+          # 401 is the runner refusing the call out of its OWN credential state
+          # while the nonce it was handed is perfectly good; classified as
+          # COORD_MCP_PROXY_UNAUTHORIZED it would send the reader to rotate a
+          # key that is fine, and — worse — to re-provision, which evicts the
+          # live slot and still leaves the runner's dead device JWT dead. The
+          # runner's own breadcrumb spells the same fact RUNNER_CREDENTIAL_<POSTURE>;
+          # the verdict word is shared with it on purpose.
+          local rc_posture rc_since rc_remedy
+          rc_posture="$(runner_credential_field "$body" code)"
+          # Parser first, text only when the body would not parse at all.
+          [ -n "$rc_posture" ] || rc_posture="$(runner_credential_code_textual "$body")"
+          rc_posture="${rc_posture#runner_credential_}"
+          rc_since="$(runner_credential_field "$body" since)"
+          rc_remedy="$(runner_credential_field "$body" remedy)"
+          # An UNPARSEABLE posture is still this class — the marker matched —
+          # so it gets the class verdict with the posture named UNSTATED rather
+          # than silently falling through to the nonce arm.
+          [ -n "$rc_posture" ] || rc_posture="unstated"
+          echo "RUNNER_CREDENTIAL_$(printf '%s' "$rc_posture" | tr '[:lower:]' '[:upper:]') (HTTP 401 from the RUNNER, not from coord and NOT about your nonce: the forwarder refused to carry this call because its own coord credential is $rc_posture since ${rc_since:-unstated}. The key in this .mcp.json is FINE - do NOT rotate it and do NOT re-provision, which mints a new nonce for a credential that stays dead and evicts whatever holds this workdir's slot. L4/L5 carry their own credentials and DO answer. remedy=${rc_remedy:-unstated})"; return ;;
         *COORD_MCP_PROXY_UNAUTHORIZED*)
           echo "$unauth"; return ;;
         *COORD_MCP_PROXY_METHOD_NOT_ALLOWED*)
