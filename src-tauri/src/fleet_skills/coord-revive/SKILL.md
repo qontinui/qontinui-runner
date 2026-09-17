@@ -367,14 +367,15 @@ whose:
   anything is called LIVE: a different tenant is `BOOTSTRAP_WRONG_TENANT`, no
   claim is `BOOTSTRAP_UNVERIFIED_TENANT`.
 
-**How the script resolves the tenant**, once, lazily, for both rungs:
+**How the script resolves the tenant** — ONCE per run, lazily, for every mint
+and for L5, and never overwritten afterwards:
 
 1. `$QONTINUI_TENANT_ID`, when it is a uuid (a malformed value is noted and not sent);
 2. the session census of the runner that SPAWNED this session,
    `GET http://127.0.0.1:<port>/control/sessions/info` — `$QONTINUI_RUNNER_URL`
    if set, else the port the spawning runner exported as
-   `$QONTINUI_RUNNER_API_PORT`, else 9876; and once a mint origin has answered,
-   that origin's census is preferred: the entry whose `identity.terminalId` is
+   `$QONTINUI_RUNNER_API_PORT`, else 9876 — and ONLY that runner's census: the
+   entry whose `identity.terminalId` is
    `$QONTINUI_TERMINAL_ID` — `tenancy.row.tenantId`, else
    `tenancy.credential.tenantId` when `tenancy.credential.status` is `resolved`;
 3. otherwise **no tenant is sent**, and the reason is kept for the verdict
@@ -383,13 +384,23 @@ whose:
    agreement — `tenant_unstated:…`, `census_unavailable:<reason>`, or a census
    that did not answer).
 
+A door that later answers from a DIFFERENT runner (one a sibling `.mcp.json`
+names) does not re-read the census there: that runner does not list this
+terminal, and re-reading it once turned a known tenant into "none", skipped every
+tenant check, and reported another tenant's credential LIVE. Both runner mints
+try the spawning runner's origin FIRST, so a sibling is reached only when the
+spawning runner cannot mint — and its answer is still checked against the tenant
+resolved here. Each mint records the tenant it actually SENT, and its
+`TENANT:` / `PARTIAL:` line says so.
+
 **Decided, not overlooked: no fallback to the census row's older
 `identity.tenantId`.** On a runner build without the `tenancy` block that field is
 the coord row stamp, which for a tenant-less spawn is the default the registry
 chose, not a tenant the session named. Sending it would turn that build's working
 default-slot answer into a `WRONG_TENANT` refusal and buy nothing.
 
-**Every LIVE names the tenant it established.** The nonce mint prints a
+**Every LIVE from a runner mint or the bootstrap credential names the tenant it
+established** (the L1/L2 proxy doors and L3 are unchanged). The nonce mint prints a
 `TENANT:` line with the acting tenant `coord_query_identity` reported (or
 UNKNOWN and why), the invoke mint adds a `PARTIAL: tenant established:` line
 with the token's claim, and L5 prints a `TENANT:` line with the minted token's
@@ -614,7 +625,7 @@ client's mask):
 | `RUNNER_MINT_TENANT_NOT_PAIRED` | L4 mint: `get_coord_device_token` was asked for a named tenant and answered `null` — this runner holds no usable credential for THAT tenant (it may hold others) | NOT signed out. Pair this device for that tenant, or name the tenant the session actually acts for |
 | `RUNNER_MINT_TENANT_INVALID` | L4 mint: the runner rejected the tenant sent as malformed (`get_coord_device_token:tenant_invalid`) | A LOCAL input fault — check `$QONTINUI_TENANT_ID` / the census value it names |
 | `RUNNER_MINT_WRONG_TENANT` | L4 mint: a tenant was asked for and the token that came back claims a different one (or none) — a runner build predating the `tenantId` argument answered its default slot | The token is NOT sent. Use L5, or a runner build carrying P3; never restart a running runner over it |
-| `RUNNER_SIGNED_OUT` | L4 mint: it answered and genuinely holds no token — a non-JWT-shaped value, its own `Not authenticated` error, or a 2xx `null` from `get_coord_device_token`, which is that command's documented "this device is unpaired" result rather than a fault | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
+| `RUNNER_SIGNED_OUT` | L4 mint, on a tenant-less call: it answered and genuinely holds no token — a non-JWT-shaped value, its own `Not authenticated` error, or a 2xx `null` from `get_coord_device_token` asked for no tenant, which is that command's documented "this device is unpaired" result rather than a fault (a `null` for a NAMED tenant is `RUNNER_MINT_TENANT_NOT_PAIRED`) | Sign the runner in. The shape check fires before the token is ever sent, so this is never reported as coord rejecting you |
 | `ENV_UNSET` / `FILE_ABSENT` | L4: that static credential source is simply not present — a statement of **absence**, not a fault | Nothing to do unless you meant to provide one; the cascade moves to the next source |
 | `HOME_UNRESOLVED` | L4: neither `$HOME` nor `$USERPROFILE` is set, so source 2 has no path to read | A **local** environment fault; it says nothing about whether the credential exists |
 | `DEVICE_JWT_ENV_MALFORMED` | L4: `$COORD_DEVICE_JWT` is set but is not JWT-shaped (3 dot-separated base64url parts) | Not sent — an unshaped bearer would draw a 401 this script would then blame on coord. Fix or unset the variable |
@@ -627,7 +638,7 @@ client's mask):
 | `BOOTSTRAP_UNVERIFIED_TENANT` | L5: a tenant was asked for and the minted token carries no readable `tenant_id` claim | Not used — which tenant it acts in is UNKNOWN |
 | `BOOTSTRAP_TENANT_AMBIGUOUS` | L5: `422 tenant_ambiguous` — this device is bound to more than one tenant and no `tenant_id` was sent, so coord (in `live` resolution mode) will not mint for a guessed tenant | Name the tenant: set `$QONTINUI_TENANT_ID`, or run in a runner terminal whose session census names it. The `device_id` is fine; nothing about coord is broken |
 | `BOOTSTRAP_ROUTE_ABSENT` | L5: the dedicated `POST /agents/credential` answered **404 or 405** — the route is not answering on this coord. `405` is how an unregistered POST under `/agents/` reads on this router (measured 2026-09-02 and re-confirmed 2026-09-04 with `POST /agents/definitely-not-a-route`), so it is classified here and NOT as a refusal. ⚠️ **This is NOT the expected outcome any more** — the same POST answered `200` against production coord on 2026-09-04, so hitting this arm means a regression, a rollback, or a different deployment | Report it as a regression, naming the code you saw. Still **not a licence to substitute `POST /agents/allocate`** — three shipped documents forbid carrying a coord rung on that door, and whether it may ever be used this way is **UNKNOWN, not an open ruling**: gate `ece99898-30c6-4f8c-be8e-1de5f09abebc` was **withdrawn** 2026-09-02 as over-broad — four of its five arms were resolved by policy (`security-and-autonomy` `implement_tier: proceed`, "tightening is ordinary work"; `decision_record/operational-work-is-autonomous`); the dedicated route and the anonymous-mint tightening are qontinui-coord#1850 (ff-landed, `5dd99cc3`); the ONE arm still the operator's is gate `3c9b18ca-3300-4dbe-a2f4-1d6db5e5a6d5` (arm (b), `agent_tool_access` rows), which gates no cascade rung. UNKNOWN is not permission. With no other door, report `DEAD` **plus a durably recorded blocker**: write the gate/finding SPEC verbatim for a peer with a working transport |
-| `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405 (an unknown or unregistered `device_id`, or a malformed UUID) | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
+| `BOOTSTRAP_DEVICE_REJECTED` | L5: the route answered and **refused this device** — a non-2xx that is neither 404 nor 405, and not `400 tenant_not_bound` (`BOOTSTRAP_TENANT_NOT_BOUND`) or `422 tenant_ambiguous` (`BOOTSTRAP_TENANT_AMBIGUOUS`): an unknown or unregistered `device_id`, or a malformed UUID | A verdict about the DEVICE, not about coord's health. Check the `device_id` you resolved is the one coord knows; the response's own error string is quoted in the verdict |
 | `BOOTSTRAP_NO_TOKEN_IN_RESPONSE` | L5: the route answered `2xx` but the body carried no JWT-shaped token (3 dot-separated base64url parts) | The route's response shape changed, or something else answers on that host. NOT sent onward — an unshaped bearer would draw a 401 this script would then report against coord |
 | `BOOTSTRAP_TOKEN_UNVERIFIED` | L5: a token WAS minted, and the control read `GET /coord/agent-findings?limit=1` did not answer `200`. **The whole point of the rung's verification half** | Never report LIVE on this. A mint is not an authentication: say the mint succeeded AND the credential did not verify, and name the control read's status — the two facts together are the diagnosis |
 | `BOOTSTRAP_UNREACHABLE` | L5: the mint POST never completed — connect refused, DNS, TLS, or a timeout on `$COORD_HTTP_URL`. Carries curl's own `[curl: …]` line | The one L5 verdict that IS about coord (or this box's network). Every other L5 verdict is about a local file, the device, or the token |

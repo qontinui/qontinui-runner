@@ -1585,9 +1585,14 @@ pub(crate) fn select_device_bearer(
     }
     // Slot miss. The default binding may legitimately live only in the
     // legacy slot (pre-8a install, or a pairing that predates per-tenant
-    // slots) — that slot IS this tenant's JWT, so fall back to it.
+    // slots), so fall back to it — but only to a token that NAMES `t`. The
+    // legacy slot holds whatever was last written there, and a binding file
+    // that says A beside a slot holding B's token would otherwise present B's
+    // credential as A's (plan
+    // 2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential,
+    // re-review F2). An absent or different `tenant_id` claim is no bearer.
     if default_tenant.as_ref() == Some(t) {
-        return legacy_slot_bearer(am);
+        return legacy_slot_bearer(am).filter(|jwt| jwt_tenant_claim(jwt) == Some(*t));
     }
     warn_once_per_tenant_slot_miss(t);
     None
@@ -1910,7 +1915,11 @@ pub(crate) struct HeldDeviceTenants {
     pub(crate) slots: std::result::Result<Vec<Uuid>, String>,
     /// The default binding (`paired_user.json`).
     pub(crate) default_binding: BindingTenantRead,
-    /// Whether the legacy slot holds a JWT-shaped value; `Err` = unreadable.
+    /// Whether the legacy slot holds a JWT whose `tenant_id` claim names the
+    /// DEFAULT binding — i.e. a credential for that binding, not merely a JWT
+    /// (re-review F2: a B token in the slot beside an A binding is NOT A's
+    /// credential). `Ok(false)` when there is no bound default to name. `Err` =
+    /// the slot could not be read.
     pub(crate) legacy_slot: std::result::Result<bool, String>,
 }
 
@@ -1961,7 +1970,12 @@ impl HeldDeviceTenants {
                 .map_err(|e| format!("{e:#}")),
             default_binding,
             legacy_slot: match am.probe_access_token() {
-                StoredTokenRead::Present(token) => Ok(looks_like_jwt(&token)),
+                StoredTokenRead::Present(token) => Ok(match default_binding {
+                    BindingTenantRead::Bound(d) => {
+                        looks_like_jwt(&token) && jwt_tenant_claim(&token) == Some(d)
+                    }
+                    BindingTenantRead::Unbound | BindingTenantRead::Unknown => false,
+                }),
                 StoredTokenRead::Absent => Ok(false),
                 StoredTokenRead::Unreadable(e) => Err(e),
             },
@@ -3220,6 +3234,16 @@ mod bearer_selection_tests {
         format!("{header}.{payload}.sig")
     }
 
+    /// A live JWT naming `tenant`, stored ONLY in the legacy `access_token`
+    /// slot: the write mirrors into `device_jwt:<tenant>`, which is cleared so
+    /// the legacy fallback is what a lookup actually reaches.
+    fn store_legacy_only(mgr: &AuthManager, tenant: &Uuid) -> String {
+        let jwt = jwt_with_tenant(tenant, chrono::Utc::now().timestamp() + 3 * 60 * 60);
+        mgr.store_tokens(&jwt, "").unwrap();
+        mgr.clear_tenant_device_jwt(tenant).unwrap();
+        jwt
+    }
+
     fn jwt_for(tag: &str, exp: i64) -> String {
         use base64::Engine as _;
         let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -3415,14 +3439,66 @@ mod bearer_selection_tests {
         );
     }
 
+    /// Re-review F2. The legacy slot is served for the default binding ONLY when
+    /// its token names that binding: a binding file saying A beside a legacy
+    /// slot holding B's token, or a token with no `tenant_id` claim, is no
+    /// bearer for A — never B's credential presented as A's.
+    #[test]
+    fn the_legacy_fallback_never_presents_another_tenants_token_as_the_default() {
+        let mgr = create_test_auth_manager("legacy_fallback_claim_mismatch");
+        let (a, b) = (tenant(0x41), tenant(0x42));
+        store_legacy_only(&mgr, &b);
+        assert_eq!(select_device_bearer(&mgr, Some(&a), Some(a)), None);
+        // A claimless legacy token is not A's either.
+        mgr.store_tokens(&live_jwt("claimless"), "").unwrap();
+        assert_eq!(select_device_bearer(&mgr, Some(&a), Some(a)), None);
+        // The tenant-less caller still reads the legacy slot as before.
+        assert!(select_device_bearer(&mgr, None, Some(a)).is_some());
+    }
+
+    /// Re-review F2 on the admission side: the held set counts the legacy slot
+    /// for the default binding only when the token names it, and an unreadable
+    /// legacy slot is UNKNOWN for both `holds` and `set`.
+    #[test]
+    fn held_tenants_count_the_legacy_slot_only_for_the_tenant_it_names() {
+        let mgr = create_test_auth_manager("held_tenants_legacy_claim");
+        let (a, b) = (tenant(0x51), tenant(0x52));
+        store_legacy_only(&mgr, &b);
+        let held = HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(a));
+        assert_eq!(held.legacy_slot, Ok(false));
+        assert_eq!(held.holds(a), Ok(false));
+        assert!(held.set().unwrap().is_empty());
+        let named = HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(b));
+        assert_eq!(named.holds(b), Ok(true));
+
+        let unreadable = HeldDeviceTenants {
+            slots: Ok(vec![]),
+            default_binding: BindingTenantRead::Bound(a),
+            legacy_slot: Err("io".into()),
+        };
+        assert_eq!(
+            unreadable.holds(a),
+            Err(HeldTenantsUnknown::LegacySlot("io".into()))
+        );
+        assert_eq!(
+            unreadable.set(),
+            Err(HeldTenantsUnknown::LegacySlot("io".into()))
+        );
+        // ...but a slot for the tenant still answers `true` beside it.
+        let slotted = HeldDeviceTenants {
+            slots: Ok(vec![a]),
+            ..unreadable
+        };
+        assert_eq!(slotted.holds(a), Ok(true));
+    }
+
     /// DEFAULT-tenant slot miss falls back to the legacy slot — the legacy
     /// slot holds the same binding's JWT (pre-8a installs have only it).
     #[test]
     fn default_tenant_slot_miss_falls_back_to_legacy_slot() {
         let mgr = create_test_auth_manager("default_miss_legacy_fallback");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xC3);
+        let default_jwt = store_legacy_only(&mgr, &a);
         // No per-tenant slot stored for `a`, but `a` IS the default binding.
         assert_eq!(
             select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
@@ -3465,9 +3541,8 @@ mod bearer_selection_tests {
     #[test]
     fn a_slotless_non_default_tenant_gets_no_bearer_even_beside_a_live_legacy_slot() {
         let mgr = create_test_auth_manager("sweep_invariant_slotless_stranger");
-        let legacy = live_jwt("legacy.jwt");
-        mgr.store_tokens(&legacy, "").unwrap();
         let stranger = tenant(0xC7);
+        let legacy = store_legacy_only(&mgr, &stranger);
 
         assert_eq!(
             select_device_bearer(&mgr, Some(&stranger), None),
@@ -3491,9 +3566,8 @@ mod bearer_selection_tests {
     #[test]
     fn empty_slot_value_counts_as_miss() {
         let mgr = create_test_auth_manager("empty_slot_is_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0xF6);
+        let default_jwt = store_legacy_only(&mgr, &a);
         mgr.store_tenant_device_jwt(&a, "   ").unwrap();
 
         assert_eq!(
@@ -3786,9 +3860,8 @@ mod bearer_selection_tests {
     #[test]
     fn expired_tenant_slot_is_a_miss_not_a_hit() {
         let mgr = create_test_auth_manager("expired_tenant_slot_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0x31);
+        let default_jwt = store_legacy_only(&mgr, &a);
         let rotted = dead_jwt("a.rotted");
         mgr.store_tenant_device_jwt(&a, &rotted).unwrap();
 
@@ -3811,9 +3884,8 @@ mod bearer_selection_tests {
     #[test]
     fn opaque_tenant_slot_is_a_miss_not_a_hit() {
         let mgr = create_test_auth_manager("opaque_tenant_slot_miss");
-        let default_jwt = live_jwt("default.jwt");
-        mgr.store_tokens(&default_jwt, "").unwrap();
         let a = tenant(0x32);
+        let default_jwt = store_legacy_only(&mgr, &a);
         mgr.store_tenant_device_jwt(&a, "qontinui_runner_abc123")
             .unwrap();
 

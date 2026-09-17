@@ -46,6 +46,12 @@
 #                                                   $QONTINUI_RUNNER_API_PORT (a non-9876 stub)
 #   (w4) every LIVE names its tenant; L5 checks the minted token's claim
 #        (legacy coord -> BOOTSTRAP_WRONG_TENANT, claimless -> BOOTSTRAP_UNVERIFIED_TENANT)
+#   (c1) TWO runners: the spawning runner A ($QONTINUI_RUNNER_API_PORT) lists the
+#        terminal with tenant B but cannot mint; a SIBLING runner B (named by a
+#        sibling .mcp.json) 404s the census and ignores tenant arguments
+#                                                -> the session tenant stays B (never
+#                                                   re-read from the sibling), both mints
+#                                                   are WRONG_TENANT, never LIVE
 #   (s2) TERMINAL_ID unset, census non-200, census status != ok, malformed
 #        $QONTINUI_TENANT_ID, row outranks credential, RUNNER_MINT_TENANT_INVALID,
 #        and base64url `-`/`_` + every padding length in the claim decode
@@ -81,8 +87,12 @@ assert_has() { case "$3" in *"$2"*) ok "$1" ;; *) bad "$1 (missing '$2')" ;; esa
 assert_lacks() { case "$3" in *"$2"*) bad "$1 (found '$2')" ;; *) ok "$1" ;; esac; }
 
 SANDBOX="$(mktemp -d)" || { echo "FATAL: mktemp -d failed"; exit 1; }
-STUB_PID=""
-cleanup() { [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null; rm -rf "$SANDBOX"; }
+STUB_PID=""; STUB_B_PID=""
+cleanup() {
+  [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null
+  [ -n "$STUB_B_PID" ] && kill "$STUB_B_PID" 2>/dev/null
+  rm -rf "$SANDBOX"
+}
 trap cleanup EXIT
 
 FAKE_HOME="$SANDBOX/home"; mkdir -p "$FAKE_HOME/.qontinui"
@@ -329,7 +339,7 @@ setmode runner p3-multi; setmode census none; setmode default_tenant "$TA"
 run_case "$STUB" "$STUB" QONTINUI_TENANT_ID="$TB"
 assert_eq  "(t1) the invoke body names tenant B" "{\"tenantId\":\"$TB\"}" "$(invoke_body)"
 assert_has "(t1) VERDICT: LIVE" "VERDICT: LIVE" "$OUT"
-assert_has "(t1) the PARTIAL block states the tenant established" "PARTIAL: tenant established: the minted token's tenant_id claim is $TB; tenant $TB from \$QONTINUI_TENANT_ID" "$OUT"
+assert_has "(t1) the PARTIAL block states the tenant established" "PARTIAL: tenant established: the minted token's tenant_id claim is $TB; sent tenant $TB (from \$QONTINUI_TENANT_ID)" "$OUT"
 assert_lacks "(t1) no token on stdout" "sig" "$(printf '%s' "$OUT" | grep -o 'eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.sig' || true)"
 
 echo "== (t2) the runner's session census row names the tenant"
@@ -375,7 +385,7 @@ run_case "$DEAD" "$STUB" QONTINUI_TENANT_ID="$TB"
 assert_has "(t7) the credential body names tenant_id B" "\"tenant_id\":\"$TB\"" "$(cred_body)"
 assert_has "(t7) the device_id is still sent" "\"device_id\":\"11111111-1111-4111-8111-111111111111\"" "$(cred_body)"
 assert_has "(t7) L5 LIVE" "transport=https-bootstrap-agent-jwt" "$OUT"
-assert_has "(t7) the LIVE names the token's tenant claim" "TENANT: token tenant_id claim $TB; tenant $TB from" "$OUT"
+assert_has "(t7) the LIVE names the token's tenant claim" "TENANT: token tenant_id claim $TB; sent tenant $TB (from" "$OUT"
 
 echo "== (t8) L5 with no tenant on a multi-bound device -> BOOTSTRAP_TENANT_AMBIGUOUS"
 run_case "$DEAD" "$STUB"
@@ -397,6 +407,7 @@ assert_has "(n1) the provision body names tenant_id B" "\"tenant_id\": \"$TB\"" 
 assert_eq "(n1) the acting tenant was read back (probe e2e + verification)" "2" "$(identity_calls)"
 assert_has "(n1) VERDICT LIVE over the minted nonce" "transport=loopback-proxy-minted" "$OUT"
 assert_has "(n1) the LIVE names the verified acting tenant" "TENANT: acting tenant $TB, verified" "$OUT"
+assert_has "(n1) and says what was sent" "sent tenant $TB (from \$QONTINUI_TENANT_ID)" "$OUT"
 
 echo "== (n2) tenant B, a runner that ignores tenant_id mints for A -> WRONG_TENANT, not LIVE"
 setmode nonce_runner old
@@ -551,6 +562,49 @@ for want in 0 2 3; do
   case " $SEEN_LENS " in *" $want "*) ok "(s2g) payload length mod 4 = $want was exercised" ;; *) bad "(s2g) payload length mod 4 = $want never exercised (saw:$SEEN_LENS)" ;; esac
 done
 
+# ================================================================ (c1) two runners
+echo "== (c1) spawning runner A names tenant B; a sibling runner B ignores it -> never LIVE"
+MODE_DIR_B="$SANDBOX/mode-b"; mkdir -p "$MODE_DIR_B"
+REQLOG_B="$SANDBOX/requests-b.log"; : > "$REQLOG_B"
+"$PY" "$SANDBOX/stub.py" "$MODE_DIR_B" "$REQLOG_B" > "$SANDBOX/port-b" 2>"$SANDBOX/stub-b.err" &
+STUB_B_PID=$!
+PORT_B=""
+for _ in $(seq 1 25); do
+  PORT_B="$(tr -d '[:space:]' < "$SANDBOX/port-b" 2>/dev/null)"
+  [ -n "$PORT_B" ] && break
+  sleep 0.2
+done
+if [ -z "$PORT_B" ]; then
+  bad "(c1) the sibling stub never reported a port"
+else
+  STUB_B="http://127.0.0.1:$PORT_B"
+  # Runner A: the spawning runner. Its census lists term-1 with tenant B; it
+  # cannot mint (both mint routes 404, and its websocket door hands back a
+  # claimless default-slot token).
+  setmode runner absent; setmode nonce_runner absent; setmode census row; setmode row_tenant "$TB"
+  rm -f "$MODE_DIR/default_tenant"
+  # Runner B: a sibling, reached only through a sibling .mcp.json. It does not
+  # list this terminal and IGNORES tenant arguments, minting for tenant A.
+  printf 'absent' > "$MODE_DIR_B/census"; printf 'old' > "$MODE_DIR_B/nonce_runner"
+  printf 'old' > "$MODE_DIR_B/runner"; printf '%s' "$TA" > "$MODE_DIR_B/default_tenant"
+  mkdir -p "$ROOT/sibling-b"
+  printf '{"mcpServers":{"coord-mcp":{"type":"http","url":"%s/coord-mcp","headers":{"X-Coord-Mcp-Proxy-Key":"stale"}}}}\n' "$STUB_B" > "$ROOT/sibling-b/.mcp.json"
+  : > "$REQLOG_B"
+  run_case - "$DEAD" QONTINUI_RUNNER_API_PORT="$PORT" QONTINUI_TERMINAL_ID=term-1 \
+    COORD_REVIVE_NO_MINT= COORD_REVIVE_NO_BOOTSTRAP=1
+  REQS_B="$(cat "$REQLOG_B")"
+  rm -rf "$ROOT/sibling-b"
+  assert_has   "(c1) the spawning runner's census was read" "GET /control/sessions/info" "$REQS"
+  assert_lacks "(c1) the sibling's census is never read" "GET /control/sessions/info" "$REQS_B"
+  assert_has   "(c1) the spawning runner was asked to mint first" "POST /coord-mcp/provision-session" "$REQS"
+  assert_has   "(c1) the sibling's nonce is WRONG_TENANT" "NONCE_MINT_WRONG_TENANT" "$ERR"
+  assert_has   "(c1) and names the tenant it acts in" "names tenant $TA" "$ERR"
+  assert_has   "(c1) the sibling's invoke token is WRONG_TENANT too" "RUNNER_MINT_WRONG_TENANT" "$ERR"
+  assert_lacks "(c1) never reported LIVE" "VERDICT: LIVE" "$OUT"
+  assert_lacks "(c1) the session tenant was never lost" "no tenant sent (the session census" "$ERR"
+  printf '%s' "$TA" > "$MODE_DIR/default_tenant"
+fi
+
 # ================================================================ the discharge
 if [ "${MC_MUTANT:-0}" = "1" ]; then
   :
@@ -602,6 +656,9 @@ else
       -- bash "$0"
     mc_expect_red "trust an L5 token whatever tenant it claims" \
       "$SCRIPT" 's/^            if \[ -n "\$SESSION_TENANT" \]; then$/            if false; then/' \
+      -- bash "$0"
+    mc_expect_red "re-read the census on the runner that answered the mint (C1)" \
+      "$SCRIPT" '/^      # The session tenant was resolved ONCE, before the mint; nothing here re-reads it\.$/a\      SESSION_TENANT_DONE=""; SESSION_TENANT=""; SESSION_TENANT_SRC=""; RUNNER_DEFAULT_ORIGIN="${NURL%/coord-mcp}"; resolve_session_tenant' \
       -- bash "$0"
     mc_expect_red "never put the tenant on the L5 credential body" \
       "$SCRIPT" '/^    \[ -n "\$SESSION_TENANT" \] && BOOT_REQ=/d' \

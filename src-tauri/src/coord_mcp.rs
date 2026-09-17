@@ -21562,6 +21562,40 @@ mod spawn_tenant_credential_tests {
         );
     }
 
+    /// Nit (re-review): a graced key persisted with a MachineSampled origin is
+    /// restored MachineSampled, and one persisted with a tenant but no origin
+    /// restores Explicit (the conservative arm).
+    #[test]
+    fn restore_graced_nonces_reloads_the_stored_pin_origin() {
+        use crate::secure_storage::{StoredGracedNonce, StoredPinOrigin};
+        let _amb = crate::test_env::isolated_ambient();
+        let until = minted_at_to_unix(std::time::SystemTime::now()) + 3_600;
+        let sampled = format!("graced-sampled-{}", Uuid::new_v4().simple());
+        let legacy = format!("graced-legacy-{}", Uuid::new_v4().simple());
+        let entry = |origin| StoredGracedNonce {
+            workdir: "D:/graced-origin".to_string(),
+            terminal_id: None,
+            grace_until_unix: until,
+            session_tenant: Some(tenant_b()),
+            session_tenant_origin: origin,
+        };
+        restore_graced_nonces(HashMap::from([
+            (
+                sampled.clone(),
+                entry(Some(StoredPinOrigin::MachineSampled)),
+            ),
+            (legacy.clone(), entry(None)),
+        ]));
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&sampled)),
+            MintPin::Carried(tenant_b(), PinOrigin::MachineSampled)
+        );
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&legacy)),
+            MintPin::Carried(tenant_b(), PinOrigin::Explicit)
+        );
+    }
+
     #[test]
     fn the_kill_switch_is_off_only_for_exactly_zero() {
         assert!(spawn_tenant_credential_enabled_from(None));

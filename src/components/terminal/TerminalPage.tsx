@@ -136,7 +136,7 @@ function TerminalPageInner({
   const pageRootRef = useRef<HTMLDivElement>(null);
   // F2 — the tenant the next spawn binds to (`SpawnTenantPicker` writes it)
   // and the device's persisted pin as the fallback.
-  const { spawnTenantId, defaultTenantIdForNewSessions, candidates: tenantCandidates } = useTenant();
+  const { spawnTenantId, candidates: tenantCandidates } = useTenant();
   // Auth state at reset time, forwarded into the tree-reset report (P0
   // tree-reset observability) — the tree's usual killer IS an auth flip.
   const { authStatus } = useAuth();
@@ -212,9 +212,8 @@ function TerminalPageInner({
         id: "create-terminal",
         label: "Create Terminal",
         description: "Spawn a new PTY-backed terminal tab and assign it to the next free zone.",
-        // Thread the acting tenant (picker choice ?? active pin) so `tab.tenantId`
-        // matches what Rust stamps onto `Intent.tenant_id`; the badge then renders
-        // on this spawn path too. Deferred read (see the `resolveTenantForSpawn`
+        // Thread the explicitly chosen tenant (flag or picker pick, never the
+        // device default) so a chosen `tab.tenantId` matches what Rust stamps. Deferred read (see the `resolveTenantForSpawn`
         // note below) — the handler runs long after that const is initialized.
         // `write` — spawns a PTY in the user's default shell with NO command typed into
         // it. A shell that runs nothing has no blast radius of its own; closing the tab
@@ -1179,14 +1178,13 @@ function TerminalPageInner({
   // prior inline definitions; no useCallback wrap since the originals
   // weren't memoized either and downstream consumers don't depend on
   // stable identity.
-  // F2/F3 — resolve the tenant a spawn binds to. An explicit per-invocation
-  // tenant (the `/spawn-ai --tenant` flag) wins; otherwise the picker's
-  // current selection; otherwise the device's active pin. `undefined` leaves
-  // `tenant_id` off the wire and Rust stamps its own default (pre-F2
-  // behavior), which is what a single-tenant/unpaired device gets. Delegates
-  // to the pure `pickSpawnTenant` so the precedence contract is unit-testable.
+  // F2/F3 — the tenant a spawn SENDS: an explicit per-invocation tenant (the
+  // `/spawn-ai --tenant` flag), else the tenant the operator picked in the
+  // picker. Never the device default: `undefined` leaves `tenant_id` off the
+  // wire and Rust stamps its own default, so a spawn that named no tenant can
+  // never be refused for one (see `pickSpawnTenant`).
   const resolveTenantForSpawn = (explicit?: string): string | undefined =>
-    pickSpawnTenant({ explicit, spawnTenantId, defaultTenantIdForNewSessions });
+    pickSpawnTenant({ explicit, spawnTenantId });
 
   // Zone-profile application, lifted out of the `ZoneProfilePicker`'s inline
   // `onLoadProfile` so the SAME logic also backs restore-by-name. The picker
