@@ -33,19 +33,43 @@
 //!    method it names in `Access-Control-Request-Method`, so it is admitted
 //!    exactly when the real request would be.
 //!    - `NonBrowser` and `FirstParty` reach every route.
-//!    - `Trusted` and `Foreign` never reach a [`CREDENTIAL_DOORS`] route
-//!      (Phase 1, always enforced while the guard is on). NOTE what that does
-//!      NOT mean: [`TRUSTED_ROUTES`] deliberately includes app features that
-//!      execute things (run a workflow, a check, a hook test), because that is
-//!      what the web dev frontend is for. A Trusted origin can drive this
-//!      runner; add only origins served by software you trust like the runner.
-//!    - Where the route policy enforces for their class, they additionally
-//!      reach only [`FOREIGN_ROUTES`] (both classes) and [`TRUSTED_ROUTES`]
-//!      (Trusted) — a TOTAL allowlist, so a route added tomorrow is refused
-//!      to browsers by default (Phase 2; the same reasoning that turned
-//!      `relay_path_policy` from a denylist into an allowlist). Where it
-//!      shadows, the verdict is computed, admitted, logged at WARN and
-//!      counted; [`RoutePolicy::Off`] skips it.
+//!    - `Trusted`, `Extension` and `Foreign` never reach a [`CREDENTIAL_DOORS`]
+//!      route: a door returns a secret, reads a caller-named path, makes a
+//!      server-side request to a caller-chosen URL (which would launder a
+//!      browser request into a NonBrowser one), or spawns/drives a process.
+//!      The one transitional exception is [`TRUSTED_DOOR_GRACE`] — doors the
+//!      qontinui-web dev frontend calls today — which under the default
+//!      [`RoutePolicy::EnforceDoors`] is logged and metered for Trusted rather
+//!      than refused, until qontinui-web #1380 deploys.
+//!    - `Trusted` is local trust for NON-door routes: [`TRUSTED_ROUTES`] holds
+//!      app features that run workflows and checks, because that is what the
+//!      web dev frontend is for. List only origins trusted like the runner.
+//!    - [`EXTENSION_ONLY_ROUTES`] (the DOM element inventory) are reachable
+//!      from the webview and the ui-bridge extension's own
+//!      `chrome-extension://` pages only — never from a web page's origin, so
+//!      the extension's content-script fallback loses them.
+//!    - Where the route policy enforces for their class, browser classes
+//!      additionally reach only [`FOREIGN_ROUTES`] (all browser classes) and
+//!      [`TRUSTED_ROUTES`] (Trusted) — a TOTAL allowlist, so a route added
+//!      tomorrow is refused to browsers by default (Phase 2; the same
+//!      reasoning that turned `relay_path_policy` from a denylist into an
+//!      allowlist). Where it shadows, the verdict is computed, admitted,
+//!      logged at WARN once per origin+route and counted; `off` skips it.
+//!
+//! # Known non-browser paths and residuals
+//!
+//! - A rathole-tunnelled request (`/tunnel/start`) keeps the tunnel server's
+//!   `Host`; the Host gate admits that hostname while the tunnel is
+//!   registered. A tunnelled request with no `Origin` therefore has
+//!   NonBrowser (full local) access — the tunnel's reach is the tunnel
+//!   server's access control, not this guard's. The hostname stays registered
+//!   until `/tunnel/stop` or the next `/tunnel/start`, even if the child dies;
+//!   a stale entry admits only a `Host` naming the tunnel server, which a
+//!   rebinding page cannot produce without controlling that server's DNS.
+//! - `GET /graphql` (GraphiQL) is served by `async_graphql::GraphiQLSource`,
+//!   which loads its scripts from a CDN without SRI; those scripts run as the
+//!   runner's own loopback origin (FirstParty). The generator exposes no SRI
+//!   hook, so this is recorded rather than fixed here.
 //!
 //! The guard is middleware on the upgrade request, so it runs BEFORE axum's
 //! `WebSocketUpgrade` extractor — CORS never covered WebSockets; this does.
@@ -60,9 +84,9 @@
 //!
 //! - [`ENV_GUARD`]`=0` turns BOTH checks off (CORS still echoes the exact
 //!   origin rather than `*`). Absent or any other value leaves them on.
-//! - [`ENV_ROUTE_POLICY`] = `enforce` | `enforce-foreign` | `shadow` | `off`.
-//!   Default [`DEFAULT_ROUTE_POLICY`] — see its doc for why that is
-//!   `enforce-foreign` today.
+//! - [`ENV_ROUTE_POLICY`] = `enforce` | `enforce-foreign` | `enforce-doors` |
+//!   `shadow` | `off`. Default [`DEFAULT_ROUTE_POLICY`] (`enforce-doors`) —
+//!   see its doc.
 //!
 //! Extra trusted origins come from [`ENV_ALLOWED_ORIGINS`] (headless path,
 //! read at spawn) and the settings field [`SETTINGS_FIELD`] (re-read without a
@@ -83,7 +107,7 @@ use tower_http::cors::{AllowOrigin, AllowPrivateNetwork, Any, CorsLayer};
 
 /// `0` disables the whole guard (Host gate and origin checks).
 pub const ENV_GUARD: &str = "QONTINUI_RUNNER_ORIGIN_GUARD";
-/// `enforce` | `enforce-foreign` | `shadow` | `off` — the Phase 2 mode.
+/// `enforce` | `enforce-foreign` | `enforce-doors` | `shadow` | `off`.
 pub const ENV_ROUTE_POLICY: &str = "QONTINUI_RUNNER_ORIGIN_ROUTE_POLICY";
 /// Comma list of extra origins admitted as [`OriginClass::Trusted`].
 pub const ENV_ALLOWED_ORIGINS: &str = "QONTINUI_RUNNER_ALLOWED_ORIGINS";
@@ -96,35 +120,25 @@ pub const CODE_HOST_NOT_LOOPBACK: &str = "HOST_NOT_LOOPBACK";
 pub const CODE_CROSS_ORIGIN_REFUSED: &str = "CROSS_ORIGIN_REFUSED";
 
 /// The route-policy default when [`ENV_ROUTE_POLICY`] is unset:
-/// **enforce for Foreign origins, shadow for Trusted ones.**
+/// **`enforce-doors`** — credential doors refused to every non-first-party
+/// browser origin (with the Trusted [`TRUSTED_DOOR_GRACE`] logged instead),
+/// and the non-door route allowlists SHADOWED for every browser class.
 ///
-/// The plan names `enforce` as the default, gated on one prerequisite:
-/// qontinui-web's `runner-proxy` header filters must strip `origin` (plan F4)
-/// before enforcement, or proxied web/mobile calls arrive carrying the END
-/// USER's browser origin and are refused. That strip landed on qontinui-web
-/// `origin/main` as `5c3533f07`; whether it is DEPLOYED was not measured when
-/// this shipped. By code reading:
+/// Why not the plan's `enforce`, nor `enforce-foreign`:
 ///
-/// - the remote-relay path (web backend → WebSocket relay → `http_request`
-///   self-call) is stripped runner-side by `backend_relay`'s
-///   `RELAY_SKIP_REQUEST_HEADERS`, which ships with this guard, so it
-///   arrives NonBrowser whatever the web deploy state;
-/// - the co-located `httpx` hop (web backend on the runner's own box — local
-///   dev, and the demo box) forwards the page's origin until the web strip is
-///   deployed. In local dev that page is the Trusted `localhost:3001`
-///   frontend (shadowed below). On the DEMO BOX it is a public origin, which
-///   is Foreign and enforced: that box needs the qontinui-web deploy before it
-///   runs this runner build, or `QONTINUI_RUNNER_ORIGIN_ROUTE_POLICY=shadow`
-///   in its spawn environment.
+/// - qontinui-web production builds default their runner base URL to
+///   `http://127.0.0.1:9876`, and whether deployed `https://app.qontinui.io`
+///   pages actually call a loopback runner is UNMEASURED (Phase 0 live
+///   capture). Enforcing the Foreign allowlist could break a shipped product
+///   path; shadowing it meters exactly that question on `/health`.
+/// - qontinui-web's `runner-proxy` Origin strip (plan F4) landed as
+///   `5c3533f07`; its deploy is not measured. Until it is, the co-located
+///   proxy hop (local dev, the demo box) forwards the end user's origin.
+/// - The doors are what carry the exposure (tokens, files, execution), and no
+///   browser caller other than the dev frontend's graced list uses one.
 ///
-/// Meanwhile Phase 0's route census found that a Phase-1-only posture leaves
-/// Foreign pages hundreds of exec-shaped routes (e.g. `POST /hooks` then
-/// `POST /hooks/{id}/test` runs `sh -c`) that no Foreign caller uses, and the
-/// Foreign callers (the ui-bridge extension's content scripts and SDK pages)
-/// are fully enumerated in [`FOREIGN_ROUTES`]. So Foreign is enforced now and
-/// Trusted is shadowed until the web strip is deployed and the Trusted table
-/// is confirmed live; switching this constant to `Enforce` is that graduation.
-pub const DEFAULT_ROUTE_POLICY: RoutePolicy = RoutePolicy::EnforceForeign;
+/// Graduation: `enforce-foreign`, then `enforce`, once the live readings exist.
+pub const DEFAULT_ROUTE_POLICY: RoutePolicy = RoutePolicy::EnforceDoors;
 
 /// How many recent non-admit tuples `/health` carries.
 const RECENT_CAP: usize = 20;
@@ -144,8 +158,9 @@ pub const DEFAULT_TRUSTED_ORIGINS: &[&str] = &[
 /// whatever the route policy.
 ///
 /// Grammar: `"[METHOD ]pattern"`. Patterns are `MatchedPath`-form; a trailing
-/// `/*` matches one or more further segments and a `{placeholder}` matches any
-/// segment. An entry with no method covers every method (for a preflight, the
+/// `/*` matches one or more further segments and a `{placeholder}` matches a
+/// placeholder segment of the route pattern (never a literal one, so
+/// `GET /state-explorer/{run_id}` does not cover `GET /state-explorer/history`). An entry with no method covers every method (for a preflight, the
 /// method it names).
 ///
 /// The first block is the plan's vetted floor. The rest came from the Phase 0
@@ -292,10 +307,104 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     // aimed at 127.0.0.1 it launders a browser request into a NonBrowser one
     "POST /api-request/test",
     "GET /processes",
+    // --- second review: laundering / caller-named paths / hook execution ---
+    // server-side requests to a caller-chosen URL, response returned
+    "POST /awas/execute",
+    "POST /awas/discover",
+    "POST /awas/check-support",
+    "POST /skills/sync/push",
+    "POST /skills/sync/pull",
+    "POST /evaluation/workflow",
+    "POST /ui-bridge/specs/verify-api",
+    "POST /extraction/start",
+    "POST /uitars-extraction/start",
+    "POST /ui-bridge/explore",
+    "POST /knowledge/fetch-page",
+    // reads (or writes under) a caller-named path
+    "POST /contexts/{scope}/from-file",
+    "POST /configs",
+    "POST /configs/parse",
+    "POST /load-config",
+    "POST /vision-extraction/extract",
+    "POST /extraction/vision",
+    "POST /pattern/find",
+    "POST /pattern/find-all",
+    "GET /extraction/{extraction_id}/screenshot/{screenshot_id}",
+    "POST /checks/scan-workspace",
+    "POST /rag/import",
+    "POST /rag/{project_id}/load",
+    "POST /capture-screenshot",
+    "GET /apps/{app_id}/spec/get",
+    "POST /sessions/{id}/continuation-verdict",
+    "GET /state-explorer/{run_id}",
+    "GET /state-explorer/{run_id}/prompt",
+    "POST /code-graph/*",
+    "POST /code-semantics/*",
+    "POST /development-intelligence/feature-health",
+    "POST /file-registry/probe-conflicts",
+    "GET /constraints/active",
+    "GET /debug/app/errors",
+    // hooks: stored commands run by `sh -c`; GET returns webhook headers/env
+    "/hooks",
+    "/hooks/*",
 ];
 
+/// Doors the qontinui-web dev frontend (`http://localhost:3001`) calls today,
+/// per the Phase 0 caller census. Under [`RoutePolicy::EnforceDoors`] (the
+/// default) a TRUSTED origin reaching one is admitted, logged and metered as
+/// `shadow_would_refuse` instead of refused, until qontinui-web #1380 deploys.
+/// Under every other policy, and for every other class, they are refused like
+/// any door. Every entry must be a door (tripwire) and a registered route.
+pub const TRUSTED_DOOR_GRACE: &[(&str, &str)] = &[
+    ("POST", "/settings/ai/api-key"),
+    ("DELETE", "/settings/ai/api-key/{provider}"),
+    ("POST", "/settings/self-healing/api-key"),
+    ("DELETE", "/settings/self-healing/api-key/{provider}"),
+    ("GET", "/settings/backup/summary"),
+    ("POST", "/settings/backup/export"),
+    ("POST", "/settings/backup/import"),
+    ("GET", "/shell-commands/{id}"),
+    ("POST", "/shell-commands/{id}/run"),
+    ("POST", "/awas/discover"),
+    ("POST", "/awas/check-support"),
+    ("POST", "/awas/execute"),
+    ("POST", "/contexts/{scope}/from-file"),
+    ("POST", "/configs/parse"),
+    ("POST", "/load-config"),
+    ("POST", "/vision-extraction/extract"),
+    ("POST", "/extraction/vision"),
+    ("POST", "/pattern/find"),
+    ("POST", "/pattern/find-all"),
+    (
+        "GET",
+        "/extraction/{extraction_id}/screenshot/{screenshot_id}",
+    ),
+    ("POST", "/checks/scan-workspace"),
+    ("POST", "/rag/import"),
+    ("POST", "/rag/{project_id}/load"),
+    ("POST", "/capture-screenshot"),
+    ("POST", "/extraction/start"),
+    ("POST", "/uitars-extraction/start"),
+    ("POST", "/ui-bridge/explore"),
+    ("GET", "/hooks"),
+    ("POST", "/hooks"),
+    ("PUT", "/hooks/{id}"),
+    ("DELETE", "/hooks/{id}"),
+    ("PUT", "/hooks/{id}/enabled"),
+    ("POST", "/hooks/{id}/test"),
+];
+
+/// Routes reachable only from the webview (FirstParty), non-browser callers
+/// and [`OriginClass::Extension`] — never from a web page origin (Foreign or
+/// Trusted), in EVERY route policy. `GET /ui-bridge/control/elements` is the
+/// runner webview's full element inventory (rendered values included); the
+/// ui-bridge extension's side panel runs as `chrome-extension://…` and keeps
+/// it, while its content-script fallback (which carries the page's origin)
+/// loses it.
+pub const EXTENSION_ONLY_ROUTES: &[(&str, &str)] = &[("GET", "/ui-bridge/control/elements")];
+
 /// `(METHOD, MatchedPath pattern)` pairs reachable from ANY browser origin
-/// (Foreign and Trusted) under `enforce`. Derived from the Phase 0 caller
+/// (Foreign, Extension and Trusted) under `enforce`. Derived from the Phase 0 caller
 /// census: the ui-bridge extension's content scripts (which send the visited
 /// page's origin, `https://*` included) and `useCommandRelay` pages.
 pub const FOREIGN_ROUTES: &[(&str, &str)] = &[
@@ -314,7 +423,6 @@ pub const FOREIGN_ROUTES: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/annotations/{id}"),
     ("PUT", "/ui-bridge/annotations/{id}"),
     ("DELETE", "/ui-bridge/annotations/{id}"),
-    ("GET", "/ui-bridge/control/elements"),
     // injected relay client pointed at the runner (relay-client.ts)
     ("GET", "/ui-bridge/commands/stream"),
     ("POST", "/ui-bridge/commands"),
@@ -337,21 +445,14 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api-request/import-curl"),
     ("GET", "/apps/{app_id}/spec/list"),
     ("GET", "/awas/actions"),
-    ("POST", "/awas/check-support"),
-    ("POST", "/awas/discover"),
-    ("POST", "/awas/execute"),
-    ("POST", "/capture-screenshot"),
     ("GET", "/check-groups"),
     ("GET", "/check-groups/{id}"),
     ("POST", "/check-groups/{id}/run"),
     ("GET", "/checks"),
     ("POST", "/checks/generate"),
-    ("POST", "/checks/scan-workspace"),
     ("GET", "/checks/{id}"),
     ("POST", "/checks/{id}/run"),
-    ("POST", "/configs/parse"),
     ("GET", "/contexts"),
-    ("POST", "/contexts/{scope}/from-file"),
     ("GET", "/current-execution/batch"),
     ("GET", "/disk/reclaimable"),
     ("GET", "/error-monitor/errors"),
@@ -359,25 +460,13 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/error-monitor/errors/{id}/resolve"),
     ("POST", "/error-monitor/fix-workflow"),
     ("POST", "/execute"),
-    ("POST", "/extraction/start"),
     ("GET", "/extraction/status"),
     ("POST", "/extraction/stop"),
-    ("POST", "/extraction/vision"),
-    (
-        "GET",
-        "/extraction/{extraction_id}/screenshot/{screenshot_id}",
-    ),
     ("GET", "/findings/summary"),
     ("POST", "/findings/task/{task_run_id}/clear-all"),
     ("POST", "/findings/{finding_id}/resolve"),
     ("PUT", "/findings/{finding_id}/status"),
     ("POST", "/findings/{finding_id}/user-response"),
-    ("GET", "/hooks"),
-    ("POST", "/hooks"),
-    ("DELETE", "/hooks/{id}"),
-    ("PUT", "/hooks/{id}"),
-    ("PUT", "/hooks/{id}/enabled"),
-    ("POST", "/hooks/{id}/test"),
     ("GET", "/inngest/circuit-breaker"),
     ("GET", "/inngest/events"),
     ("GET", "/inngest/queue"),
@@ -385,7 +474,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/interaction-recording/start"),
     ("GET", "/interaction-recording/status"),
     ("POST", "/interaction-recording/stop"),
-    ("POST", "/load-config"),
     ("POST", "/log-sources/migrate"),
     ("GET", "/log-sources/settings"),
     ("PUT", "/log-sources/settings"),
@@ -405,8 +493,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/observations/temporal-search"),
     ("GET", "/observations/trends"),
     ("GET", "/observations/{id}/history"),
-    ("POST", "/pattern/find"),
-    ("POST", "/pattern/find-all"),
     ("GET", "/playwright-collection/results"),
     ("POST", "/playwright-collection/start"),
     ("GET", "/playwright-collection/status"),
@@ -429,11 +515,9 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/provider-health"),
     ("POST", "/provider-health/{provider_key}/reset"),
     ("GET", "/rag/availability"),
-    ("POST", "/rag/import"),
     ("GET", "/rag/list"),
     ("POST", "/rag/segment"),
     ("DELETE", "/rag/{project_id}"),
-    ("POST", "/rag/{project_id}/load"),
     ("GET", "/rag/{project_id}/status"),
     ("POST", "/run-workflow"),
     ("GET", "/saved-api-requests"),
@@ -518,7 +602,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/apps/scan/desktop"),
     ("GET", "/ui-bridge/apps/scan/web"),
     ("GET", "/ui-bridge/control/snapshot"),
-    ("POST", "/ui-bridge/explore"),
     ("GET", "/ui-bridge/explore/results"),
     ("GET", "/ui-bridge/explore/status"),
     ("POST", "/ui-bridge/explore/stop"),
@@ -532,7 +615,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/ui-bridge/sdk/snapshot"),
     ("POST", "/ui-bridge/sdk/switch"),
     ("GET", "/ui-bridge/sdk/tabs"),
-    ("POST", "/uitars-extraction/start"),
     ("GET", "/uitars-extraction/status"),
     ("POST", "/uitars-extraction/stop"),
     ("GET", "/unified-workflows"),
@@ -540,7 +622,6 @@ pub const TRUSTED_ROUTES: &[(&str, &str)] = &[
     ("POST", "/unified-workflows/generate-async"),
     ("POST", "/unified-workflows/run-composed"),
     ("POST", "/unified-workflows/{id}/run"),
-    ("POST", "/vision-extraction/extract"),
     ("GET", "/ws/events"),
 ];
 
@@ -557,6 +638,10 @@ pub enum OriginClass {
     FirstParty,
     /// A configured browser origin (defaults + env + settings).
     Trusted,
+    /// A browser extension's own page (`chrome-extension://`, `moz-extension://`,
+    /// `safari-web-extension://`) — the ui-bridge side panel. NOT an extension
+    /// content script, which carries the visited page's origin.
+    Extension,
     /// Any other browser origin, including `null` and a cross-site no-cors
     /// request that carries no `Origin` at all.
     Foreign,
@@ -568,6 +653,7 @@ impl OriginClass {
             Self::NonBrowser => "non_browser",
             Self::FirstParty => "first_party",
             Self::Trusted => "trusted",
+            Self::Extension => "extension",
             Self::Foreign => "foreign",
         }
     }
@@ -578,11 +664,15 @@ impl OriginClass {
 pub enum RoutePolicy {
     /// Both browser classes are held to their allowlists.
     Enforce,
-    /// Foreign is held to [`FOREIGN_ROUTES`]; Trusted is shadowed.
+    /// Foreign and Extension are held to their allowlists; Trusted is shadowed.
     EnforceForeign,
-    /// Both classes shadowed: would-be refusals are logged and counted.
+    /// Doors enforced (Trusted [`TRUSTED_DOOR_GRACE`] logged, not refused);
+    /// every allowlist shadowed. The default.
+    EnforceDoors,
+    /// Doors enforced with no grace; allowlists shadowed (logged + counted).
     Shadow,
-    /// No route allowlist (Phase 1 behaviour; never CORS `*`).
+    /// Doors enforced with no grace; no allowlist metering (Phase 1; never
+    /// CORS `*`).
     Off,
 }
 
@@ -591,6 +681,7 @@ impl RoutePolicy {
         match self {
             Self::Enforce => "enforce",
             Self::EnforceForeign => "enforce-foreign",
+            Self::EnforceDoors => "enforce-doors",
             Self::Shadow => "shadow",
             Self::Off => "off",
         }
@@ -604,6 +695,7 @@ impl RoutePolicy {
             Some(v) if v.is_empty() => DEFAULT_ROUTE_POLICY,
             Some(v) if v == "enforce" => Self::Enforce,
             Some(v) if v == "enforce-foreign" || v == "enforce_foreign" => Self::EnforceForeign,
+            Some(v) if v == "enforce-doors" || v == "enforce_doors" => Self::EnforceDoors,
             Some(v) if v == "shadow" => Self::Shadow,
             Some(v) if v == "off" => Self::Off,
             Some(v) => {
@@ -639,6 +731,8 @@ enum Verdict {
     RefuseHost,
     /// A [`CREDENTIAL_DOORS`] route from a non-first-party browser origin.
     RefuseDoor,
+    /// An [`EXTENSION_ONLY_ROUTES`] route from a web page origin.
+    RefuseExtensionOnly,
     /// Not on the class's allowlist, and the policy enforces for the class.
     RefuseRoute,
 }
@@ -650,6 +744,7 @@ impl Verdict {
             Self::ShadowWouldRefuse => "shadow_would_refuse",
             Self::RefuseHost => "refused_host",
             Self::RefuseDoor => "refused_credential_door",
+            Self::RefuseExtensionOnly => "refused_extension_only",
             Self::RefuseRoute => "refused_route_policy",
         }
     }
@@ -663,8 +758,10 @@ struct Stats {
     refused_host: AtomicU64,
     refused_trusted: AtomicU64,
     refused_foreign: AtomicU64,
+    refused_extension: AtomicU64,
     shadow_trusted: AtomicU64,
     shadow_foreign: AtomicU64,
+    shadow_extension: AtomicU64,
     recent: Mutex<VecDeque<Value>>,
 }
 
@@ -701,7 +798,7 @@ impl OriginGuard {
             bound_port,
             env_origins: split_list(origins_env)
                 .iter()
-                .filter_map(|o| NormOrigin::parse(o))
+                .filter_map(|o| parse_configured_origin(ENV_ALLOWED_ORIGINS, o))
                 .collect(),
             env_hosts: split_list(hosts_env)
                 .into_iter()
@@ -714,9 +811,11 @@ impl OriginGuard {
 
     /// The production guard: env read now (once, at spawn), the bound port
     /// read per request from `AppState.api_port`, and [`SETTINGS_FIELD`]
-    /// re-read from the settings file (bounded by a short TTL) so an operator
-    /// can admit a dev origin without a restart.
+    /// refreshed from the settings file OFF the request path (primed here, then
+    /// a background re-read at most every [`SETTINGS_TTL`]) so an operator can
+    /// admit a dev origin without a restart.
     pub fn from_env(app_state: Arc<crate::commands::AppState>) -> Self {
+        prime_settings_origins();
         let env = |k: &str| std::env::var(k).ok();
         Self::new(
             env(ENV_GUARD).as_deref(),
@@ -776,7 +875,13 @@ impl OriginGuard {
         if tunnel_host_admitted(&name) {
             return true;
         }
-        let loopback = matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]");
+        // 10.0.2.2 / 10.0.3.2 are the Android emulator's (AVD / Genymotion)
+        // aliases for the host's loopback. An IP-literal Host cannot be
+        // produced by DNS rebinding, which needs a hostname.
+        let loopback = matches!(
+            name.as_str(),
+            "127.0.0.1" | "localhost" | "[::1]" | "10.0.2.2" | "10.0.3.2"
+        );
         let bound = (self.bound_port)();
         loopback && port.and_then(|p| p.parse::<u16>().ok()) == Some(bound)
     }
@@ -805,11 +910,17 @@ impl OriginGuard {
         if self.is_first_party(&norm) {
             return OriginClass::FirstParty;
         }
+        if matches!(
+            norm.scheme.as_str(),
+            "chrome-extension" | "moz-extension" | "safari-web-extension"
+        ) {
+            return OriginClass::Extension;
+        }
         if defaults.contains(&norm)
             || self.env_origins.contains(&norm)
             || (self.settings_origins)()
                 .iter()
-                .filter_map(|o| NormOrigin::parse(o))
+                .filter_map(|o| parse_configured_origin(SETTINGS_FIELD, o))
                 .any(|o| o == norm)
         {
             return OriginClass::Trusted;
@@ -855,7 +966,20 @@ impl OriginGuard {
         if matches!(class, OriginClass::NonBrowser | OriginClass::FirstParty) {
             return mk(Verdict::Admit);
         }
+        if listed(EXTENSION_ONLY_ROUTES, &method, route) {
+            return if class == OriginClass::Extension {
+                mk(Verdict::Admit)
+            } else {
+                mk(Verdict::RefuseExtensionOnly)
+            };
+        }
         if is_credential_door(&method, route) {
+            if class == OriginClass::Trusted
+                && self.route_policy == RoutePolicy::EnforceDoors
+                && listed(TRUSTED_DOOR_GRACE, &method, route)
+            {
+                return mk(Verdict::ShadowWouldRefuse);
+            }
             return mk(Verdict::RefuseDoor);
         }
         if self.route_policy == RoutePolicy::Off {
@@ -866,8 +990,8 @@ impl OriginGuard {
         }
         let enforced = match self.route_policy {
             RoutePolicy::Enforce => true,
-            RoutePolicy::EnforceForeign => class == OriginClass::Foreign,
-            RoutePolicy::Shadow | RoutePolicy::Off => false,
+            RoutePolicy::EnforceForeign => class != OriginClass::Trusted,
+            RoutePolicy::EnforceDoors | RoutePolicy::Shadow | RoutePolicy::Off => false,
         };
         if enforced {
             mk(Verdict::RefuseRoute)
@@ -884,8 +1008,12 @@ impl OriginGuard {
             (Verdict::ShadowWouldRefuse, OriginClass::Trusted) => {
                 s.shadow_trusted.fetch_add(1, Ordering::Relaxed)
             }
+            (Verdict::ShadowWouldRefuse, OriginClass::Extension) => {
+                s.shadow_extension.fetch_add(1, Ordering::Relaxed)
+            }
             (Verdict::ShadowWouldRefuse, _) => s.shadow_foreign.fetch_add(1, Ordering::Relaxed),
             (_, OriginClass::Trusted) => s.refused_trusted.fetch_add(1, Ordering::Relaxed),
+            (_, OriginClass::Extension) => s.refused_extension.fetch_add(1, Ordering::Relaxed),
             (_, _) => s.refused_foreign.fetch_add(1, Ordering::Relaxed),
         };
         if let Ok(mut recent) = s.recent.lock() {
@@ -903,8 +1031,10 @@ impl OriginGuard {
     }
 
     /// The `/health` `originGuard` block. The recent tuples name other sites
-    /// the operator's browser pointed at this runner, so they are withheld
-    /// from a Foreign requester (`/health` is on [`FOREIGN_ROUTES`]).
+    /// the operator's browser pointed at this runner, so they are shown only
+    /// to the webview and non-browser callers (`None` = a direct in-process
+    /// read) and withheld from every browser class — `/health` is on
+    /// [`FOREIGN_ROUTES`].
     pub fn health_json(&self, requester: Option<OriginClass>) -> Value {
         let s = &self.stats;
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
@@ -916,19 +1046,25 @@ impl OriginGuard {
                 "host": load(&s.refused_host),
                 "trusted": load(&s.refused_trusted),
                 "foreign": load(&s.refused_foreign),
+                "extension": load(&s.refused_extension),
                 // Never refused by design; present so a reader sees an explicit 0.
                 "first_party": 0,
             },
             "shadowWouldRefuse": {
                 "trusted": load(&s.shadow_trusted),
                 "foreign": load(&s.shadow_foreign),
+                "extension": load(&s.shadow_extension),
             },
+            "trustedDoorGrace": TRUSTED_DOOR_GRACE.len(),
             "admitOriginEnv": ENV_ALLOWED_ORIGINS,
             "admitOriginSetting": SETTINGS_FIELD,
             "killSwitchEnv": ENV_GUARD,
             "routePolicyEnv": ENV_ROUTE_POLICY,
         });
-        if requester != Some(OriginClass::Foreign) {
+        if matches!(
+            requester,
+            None | Some(OriginClass::NonBrowser) | Some(OriginClass::FirstParty)
+        ) {
             let recent: Vec<Value> = s
                 .recent
                 .lock()
@@ -1040,7 +1176,7 @@ async fn origin_guard_middleware(
                 None,
             )
         }
-        Verdict::RefuseDoor | Verdict::RefuseRoute => {
+        Verdict::RefuseDoor | Verdict::RefuseExtensionOnly | Verdict::RefuseRoute => {
             tracing::warn!(
                 origin = ?d.origin,
                 class = d.class.as_str(),
@@ -1049,10 +1185,10 @@ async fn origin_guard_middleware(
                 verdict = d.verdict.as_str(),
                 "origin guard: refused a browser origin"
             );
-            let message = if d.verdict == Verdict::RefuseDoor {
-                "This route returns credentials, reads files or executes code, and is not reachable from a browser origin other than the runner's own webview"
-            } else {
-                "This route is not on the allowlist for this origin class"
+            let message = match d.verdict {
+                Verdict::RefuseDoor => "This route returns credentials, reads caller-named paths, makes caller-directed requests or executes code, and is not reachable from a browser origin other than the runner's own webview",
+                Verdict::RefuseExtensionOnly => "This route is reachable only from the runner's webview and the ui-bridge extension's own pages, not from a web page origin",
+                _ => "This route is not on the allowlist for this origin class",
             };
             let echo = (d.class == OriginClass::Trusted)
                 .then(|| req.headers().get(header::ORIGIN).cloned())
@@ -1149,7 +1285,11 @@ pub(crate) fn door_matches(entry: &str, method: &str, route: &str) -> bool {
     }
     e.iter()
         .zip(r.iter())
-        .all(|(a, b)| is_placeholder(a) || a.eq_ignore_ascii_case(b))
+        .all(|(a, b)| (is_placeholder(a) && is_placeholder(b)) || a.eq_ignore_ascii_case(b))
+}
+
+fn listed(list: &[(&str, &str)], method: &str, route: &str) -> bool {
+    list.iter().any(|(m, p)| *m == method && *p == route)
 }
 
 pub(crate) fn is_credential_door(method: &str, route: &str) -> bool {
@@ -1163,7 +1303,7 @@ fn route_allowed(class: OriginClass, method: &str, route: &str) -> bool {
     match class {
         OriginClass::NonBrowser | OriginClass::FirstParty => true,
         OriginClass::Trusted => hit(FOREIGN_ROUTES) || hit(TRUSTED_ROUTES),
-        OriginClass::Foreign => hit(FOREIGN_ROUTES),
+        OriginClass::Foreign | OriginClass::Extension => hit(FOREIGN_ROUTES),
     }
 }
 
@@ -1203,15 +1343,26 @@ impl NormOrigin {
 
 /// Validate and canonicalise one operator-supplied origin for
 /// [`SETTINGS_FIELD`]: `scheme://host[:port]`, no path, no wildcard, not
-/// and not `null`. The runner webview's own `tauri` origins are refused as
-/// pointless (they are first-party already); a loopback origin is accepted,
-/// since which port is "first-party" depends on the bind.
+/// `null`. Exactly the runner webview's own origins (`tauri://localhost`,
+/// `http(s)://tauri.localhost`) are refused as pointless; a loopback origin is
+/// accepted, since which port is "first-party" depends on the bind.
 pub fn canonical_allowed_origin(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
-    if trimmed.to_ascii_lowercase().contains("tauri") {
-        return Err(format!(
-            "{trimmed:?}: the runner webview's own origin needs no entry"
-        ));
+    let webview = [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+    ];
+    if let Some(n) = NormOrigin::parse(trimmed) {
+        if webview
+            .iter()
+            .filter_map(|w| NormOrigin::parse(w))
+            .any(|w| w == n)
+        {
+            return Err(format!(
+                "{trimmed:?}: the runner webview's own origin needs no entry"
+            ));
+        }
     }
     if trimmed.contains('*') {
         return Err(format!(
@@ -1291,26 +1442,112 @@ fn first_shadow_sighting(d: &Decision) -> bool {
     set.insert(key)
 }
 
-/// [`SETTINGS_FIELD`] from the settings file, re-read at most every
-/// [`SETTINGS_TTL`]. Uses the NON-mutating reader, which is itself
-/// mtime-cached, so a save is live on the next request after the TTL.
+/// Parse a configured origin, WARN-logging (once per value) one that does not
+/// parse, so a typo in the env var or settings is visible rather than silently
+/// never matching.
+fn parse_configured_origin(source: &str, raw: &str) -> Option<NormOrigin> {
+    let parsed = NormOrigin::parse(raw);
+    if parsed.is_none() {
+        static WARNED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+        let first = WARNED
+            .lock()
+            .map(|mut g| {
+                let set = g.get_or_insert_with(Default::default);
+                set.len() < 256 && set.insert(format!("{source}|{raw}"))
+            })
+            .unwrap_or(false);
+        if first {
+            tracing::warn!(source, value = %raw, "origin guard: ignoring an unparseable allowed origin");
+        }
+    }
+    parsed
+}
+
+/// Cached [`SETTINGS_FIELD`] value and when it was read.
+static SETTINGS_CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
+static SETTINGS_REFRESH_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn read_settings_origins() -> Vec<String> {
+    crate::settings::read_settings_from_disk()
+        .settings
+        .api
+        .allowed_origins
+}
+
+/// Synchronous first read, at router build (startup), so the request path
+/// never blocks on disk.
+fn prime_settings_origins() {
+    let fresh = read_settings_origins();
+    if let Ok(mut g) = SETTINGS_CACHE.lock() {
+        *g = Some((Instant::now(), fresh));
+    }
+}
+
+/// [`SETTINGS_FIELD`] as last read. Never touches disk on the calling thread:
+/// when the cached value is older than [`SETTINGS_TTL`] it is returned as-is
+/// and ONE background thread re-reads the settings file (the non-mutating,
+/// mtime-cached reader), so a save is live within about the TTL.
 fn settings_allowed_origins() -> Vec<String> {
-    static CACHE: Mutex<Option<(Instant, Vec<String>)>> = Mutex::new(None);
-    if let Ok(guard) = CACHE.lock() {
-        if let Some((at, v)) = guard.as_ref() {
-            if at.elapsed() < SETTINGS_TTL {
-                return v.clone();
+    let (value, stale) = match SETTINGS_CACHE.lock() {
+        Ok(g) => match g.as_ref() {
+            Some((at, v)) => (v.clone(), at.elapsed() >= SETTINGS_TTL),
+            None => (Vec::new(), true),
+        },
+        Err(_) => (Vec::new(), false),
+    };
+    if stale && !SETTINGS_REFRESH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        let spawned = std::thread::Builder::new()
+            .name("origin-guard-settings".into())
+            .spawn(|| {
+                let fresh = read_settings_origins();
+                if let Ok(mut g) = SETTINGS_CACHE.lock() {
+                    *g = Some((Instant::now(), fresh));
+                }
+                SETTINGS_REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+            });
+        if spawned.is_err() {
+            SETTINGS_REFRESH_IN_FLIGHT.store(false, Ordering::SeqCst);
+        }
+    }
+    value
+}
+
+/// `.route`/`.merge`/`.nest`/`.fallback` calls that `create_router`'s source
+/// makes AFTER `origin_guard::apply(` — each would register a route the guard
+/// does not wrap (axum applies `Router::layer` only to routes present when it
+/// is called). Pure over source text so the tripwire can be proven on a
+/// synthetic input.
+#[cfg(test)]
+pub(crate) fn registrations_after_apply(src: &str) -> Vec<String> {
+    let Some(start) = src.find("pub fn create_router(") else {
+        return vec!["create_router not found".to_string()];
+    };
+    let body = &src[start..];
+    let end = body.find("\n}\n").map(|i| i + 1).unwrap_or(body.len());
+    let body = &body[..end];
+    let Some(apply_at) = body.find("origin_guard::apply(") else {
+        return vec!["origin_guard::apply( not found in create_router".to_string()];
+    };
+    let tail = &body[apply_at..];
+    let mut hits = Vec::new();
+    for (n, line) in tail.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        for needle in [
+            ".route(",
+            ".route_service(",
+            ".merge(",
+            ".nest(",
+            ".nest_service(",
+            ".fallback(",
+            ".fallback_service(",
+        ] {
+            if code.contains(needle) {
+                hits.push(format!("+{n}: {}", line.trim()));
             }
         }
     }
-    let fresh = crate::settings::read_settings_from_disk()
-        .settings
-        .api
-        .allowed_origins;
-    if let Ok(mut guard) = CACHE.lock() {
-        *guard = Some((Instant::now(), fresh.clone()));
-    }
-    fresh
+    hits
 }
 
 #[cfg(test)]

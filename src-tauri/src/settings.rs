@@ -3104,11 +3104,14 @@ pub struct Settings {
 pub struct ApiSettings {
     /// Extra browser origins (`scheme://host[:port]`) admitted as the
     /// `trusted` class by `mcp::origin_guard` — the settings twin of
-    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. A trusted origin never reaches a
-    /// credential door, but `TRUSTED_ROUTES` includes app features that run
-    /// things (workflows, checks, hook tests): list only origins served by
-    /// software trusted like the runner. Agents and scripts send no `Origin`
-    /// and need no entry.
+    /// `QONTINUI_RUNNER_ALLOWED_ORIGINS`. Trusted means local trust for
+    /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
+    /// checks) and never the credential doors (secrets, caller-named paths,
+    /// caller-directed requests, process execution) — apart from the named
+    /// transitional `TRUSTED_DOOR_GRACE`, logged rather than refused under the
+    /// default policy until qontinui-web #1380 deploys. List only origins
+    /// served by software trusted like the runner. Agents and scripts send no
+    /// `Origin` and need no entry.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
 }
