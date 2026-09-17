@@ -5,12 +5,13 @@
  * (plan 2026-09-17-runner-loopback-api-accepts-any-origin, Phase 3).
  *
  * Trusted = local trust for non-door routes (which include running workflows
- * and checks). Origins added here never get credential doors. Only the
- * built-in default dev origins (localhost:3001, localhost:9875) still reach
- * the guard's transitional TRUSTED_DOOR_GRACE doors — local command execution
- * and file reads included — until qontinui-web#1380 deploys and the grace is
- * removed. Agents, scripts and MCP clients send no Origin
- * and need no entry here. Saved values are live within ~2 s — no restart.
+ * and checks). Origins added here never get credential doors. Only the four
+ * built-in default dev origins (http://localhost:3001, http://127.0.0.1:3001,
+ * http://localhost:9875, http://127.0.0.1:9875) still reach the guard's
+ * transitional TRUSTED_DOOR_GRACE doors — local command execution and file
+ * reads included — until qontinui-web#1380 deploys and the grace is removed.
+ * Agents, scripts and MCP clients send no Origin and need no entry here.
+ * Saved values are live within ~2 s — no restart.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -120,7 +121,7 @@ export function AllowedOriginsSettings({ onLog }: AllowedOriginsSettingsProps) {
     <div className="space-y-4 mt-8" data-ui-bridge-content="allowed-origins-settings">
       <SectionHeader
         title="Allowed Browser Origins"
-        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. Origins you add here never get credential routes (secrets, file reads, server-side requests, command execution). Note: the built-in default dev origins (localhost:3001 and localhost:9875) currently still reach a transitional set of credential routes, including command execution and file reads, until the web app update that removes that need is deployed. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
+        description={`Web pages at these origins get local trust for this runner's ordinary routes, including running workflows and checks, so add only origins served by software you trust as much as the runner itself. Origins you add here never get credential routes (secrets, file reads, server-side requests, command execution). Note: the four built-in default dev origins (localhost and 127.0.0.1, ports 3001 and 9875) currently still reach a transitional set of credential routes, including command execution and file reads, until the web app update that removes that need is deployed. Agents and scripts need no entry. Takes effect within a few seconds, no restart. Headless equivalent: ${envVar}.`}
         icon={<Globe className="w-6 h-6" />}
       />
       <div className="space-y-3 rounded-lg bg-card/50 p-4">

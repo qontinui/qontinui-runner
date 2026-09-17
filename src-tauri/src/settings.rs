@@ -3076,8 +3076,10 @@ pub struct ApiSettings {
     /// NON-door routes (`TRUSTED_ROUTES`, which include running workflows and
     /// checks) and never the credential doors (secrets, caller-named paths,
     /// caller-directed requests, process execution). Origins listed HERE never
-    /// get a door. Only the built-in default dev origins (`localhost:3001`,
-    /// `localhost:9875`) currently retain the graced doors — including local
+    /// get a door. Only the four built-in default dev origins
+    /// (`http://localhost:3001`, `http://127.0.0.1:3001`,
+    /// `http://localhost:9875`, `http://127.0.0.1:9875`) currently retain the
+    /// graced doors — including local
     /// command execution and file reads — until qontinui-web #1380 deploys
     /// and `TRUSTED_DOOR_GRACE` is removed. List only origins served by
     /// software trusted like the runner. Agents and scripts send no

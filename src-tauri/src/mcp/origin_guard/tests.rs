@@ -988,6 +988,36 @@ async fn operator_added_trusted_origin_refused_at_graced_door() {
     assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 2);
 }
 
+/// N2: exact-match pin. Look-alikes of the default dev origins (IPv6 loopback,
+/// https, a longer port), configured as operator-added Trusted origins, are
+/// Trusted for non-door routes but refused at a graced door.
+#[tokio::test]
+async fn default_origin_lookalikes_do_not_get_the_grace() {
+    let lookalikes = [
+        "http://[::1]:3001",
+        "https://localhost:3001",
+        "http://localhost:30010",
+    ];
+    let h = harness_with("enforce-doors", None, Some(&lookalikes.join(",")));
+    for origin in lookalikes {
+        let (status, _, body) = send(
+            &h,
+            req(
+                "POST",
+                "/shell-commands/abc/run",
+                &[("host", &host(&h)), ("origin", origin)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{origin}: {body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["context"]["class"], "trusted", "{origin}");
+    }
+    assert_eq!(h.calls.get("shell_run"), 0);
+    assert_eq!(h.guard.health_json(None)["graceAdmitted"]["trusted"], 0);
+}
+
 /// R2: every extension scheme is the Extension class; Extension never gets a
 /// door (graced or not) under the default, and is not Trusted.
 #[tokio::test]

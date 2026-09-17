@@ -364,10 +364,13 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
 
 /// Doors the qontinui-web dev frontend (`http://localhost:3001`) calls today,
 /// per the Phase 0 caller census. Under [`RoutePolicy::EnforceDoors`] (the
-/// default) a TRUSTED origin reaching one is admitted, logged and metered as
-/// `shadow_would_refuse` instead of refused, until qontinui-web #1380 deploys.
-/// Under every other policy, and for every other class, they are refused like
-/// any door. Every entry must be a door (tripwire) and a registered route.
+/// default) a request whose `Origin` is EXACTLY one of the four built-in
+/// [`DEFAULT_TRUSTED_ORIGINS`] (`http://localhost:3001`,
+/// `http://127.0.0.1:3001`, `http://localhost:9875`, `http://127.0.0.1:9875`)
+/// is admitted, logged once per origin+route and counted as `graceAdmitted`
+/// on `/health`, until qontinui-web #1380 deploys and this list is removed.
+/// Operator-added Trusted origins (env or settings), every other policy and
+/// every other class are refused like any door. Every entry must be a door (tripwire) and a registered route.
 pub const TRUSTED_DOOR_GRACE: &[(&str, &str)] = &[
     ("POST", "/settings/ai/api-key"),
     ("DELETE", "/settings/ai/api-key/{provider}"),
@@ -904,37 +907,45 @@ impl OriginGuard {
         loopback && port.and_then(|p| p.parse::<u16>().ok()) == Some(bound)
     }
 
+    #[cfg(test)]
     fn classify(&self, headers: &HeaderMap) -> OriginClass {
-        let defaults = default_trusted_origins();
+        self.classify_detail(headers).0
+    }
+
+    /// The origin class, and whether the (already-parsed) `Origin` is exactly
+    /// one of the built-in [`DEFAULT_TRUSTED_ORIGINS`] — the gate for
+    /// [`TRUSTED_DOOR_GRACE`]. Parsed once here, not again by the grace check.
+    fn classify_detail(&self, headers: &HeaderMap) -> (OriginClass, bool) {
         let Some(origin) = headers.get(header::ORIGIN) else {
             let sfs = headers
                 .get("sec-fetch-site")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v.trim().to_ascii_lowercase());
-            return match sfs.as_deref() {
+            let class = match sfs.as_deref() {
                 Some("cross-site") | Some("same-site") => OriginClass::Foreign,
                 _ => OriginClass::NonBrowser,
             };
+            return (class, false);
         };
         let Some(norm) = origin.to_str().ok().and_then(NormOrigin::parse) else {
-            return OriginClass::Foreign;
+            return (OriginClass::Foreign, false);
         };
         if self.is_first_party(&norm) {
-            return OriginClass::FirstParty;
+            return (OriginClass::FirstParty, false);
         }
         if matches!(
             norm.scheme.as_str(),
             "chrome-extension" | "moz-extension" | "safari-web-extension"
         ) {
-            return OriginClass::Extension;
+            return (OriginClass::Extension, false);
         }
-        if defaults.contains(&norm)
-            || self.env_origins.contains(&norm)
-            || (self.settings_origins)().contains(&norm)
-        {
-            return OriginClass::Trusted;
+        if default_trusted_origins().contains(&norm) {
+            return (OriginClass::Trusted, true);
         }
-        OriginClass::Foreign
+        if self.env_origins.contains(&norm) || (self.settings_origins)().contains(&norm) {
+            return (OriginClass::Trusted, false);
+        }
+        (OriginClass::Foreign, false)
     }
 
     fn is_first_party(&self, o: &NormOrigin) -> bool {
@@ -949,7 +960,7 @@ impl OriginGuard {
 
     /// The whole decision for one request's head.
     fn decide(&self, parts_method: &Method, headers: &HeaderMap, route: Option<&str>) -> Decision {
-        let class = self.classify(headers);
+        let (class, default_trusted) = self.classify_detail(headers);
         let method = effective_method(parts_method, headers);
         let origin = headers
             .get(header::ORIGIN)
@@ -986,7 +997,7 @@ impl OriginGuard {
             if class == OriginClass::Trusted
                 && self.route_policy == RoutePolicy::EnforceDoors
                 && listed(TRUSTED_DOOR_GRACE, &method, route)
-                && is_default_trusted_origin(headers)
+                && default_trusted
             {
                 return mk(Verdict::GraceAdmitted);
             }
@@ -1527,17 +1538,6 @@ fn default_trusted_origins() -> &'static [NormOrigin] {
             .filter_map(|o| NormOrigin::parse(o))
             .collect()
     })
-}
-
-/// Is this request's `Origin` one of the built-in [`DEFAULT_TRUSTED_ORIGINS`]
-/// (not merely configured as Trusted)? Gates [`TRUSTED_DOOR_GRACE`].
-fn is_default_trusted_origin(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-        .and_then(NormOrigin::parse)
-        .map(|n| default_trusted_origins().contains(&n))
-        .unwrap_or(false)
 }
 
 /// Synchronous first read, at router build (startup), so the request path
