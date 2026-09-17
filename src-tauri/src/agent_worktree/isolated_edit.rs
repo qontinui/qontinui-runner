@@ -777,9 +777,11 @@ pub async fn acquire_for_terminal(
     // otherwise have allocated, and only for the pane's OWN allocation:
     //
     //  * `intent_repo.is_some() && worktree_mode_enabled()` — the two gates the
-    //    allocate arm itself is behind. Without this the reuse ran on the
-    //    DEFAULT configuration (mode off, no intent repo), where this helper is
-    //    documented to be a no-op, and rewrote the pane's cwd.
+    //    allocate arm itself is behind. Without this the reuse ran even when
+    //    the allocate arm would not have (mode explicitly disabled, or no
+    //    intent repo declared — the mode itself is ON by default, see
+    //    `worktree_mode_enabled`), where this helper is documented to be a
+    //    no-op, and rewrote the pane's cwd.
     //  * the allocation's repo segment must equal the repo being asked for —
     //    otherwise a session standing in a `qontinui-runner` worktree that asks
     //    for `qontinui-web` was handed the runner one and the web allocation
@@ -1494,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_none_when_flag_off() {
-        // Mirrors the `flag_off_by_default` test in `mod.rs` — if any
+        // Companion to the `flag_on_by_default` test in `mod.rs` — if any
         // other test has flipped `QONTINUI_AGENT_WORKTREE_MODE`, this
         // assertion is moot (the env mutation is global). Skip in that
         // case to keep the suite parallel-safe.
