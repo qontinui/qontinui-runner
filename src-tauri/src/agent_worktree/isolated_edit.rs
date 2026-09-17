@@ -615,11 +615,18 @@ fn spawn_claim_heartbeat(
         &claim.kind,
         claim.resource_key.clone(),
         claim.ttl_seconds,
-        |displaced_by| {
-            warn!(
-                displaced_by = ?displaced_by,
-                "isolated_edit: claim stolen — edits in this worktree may now race"
-            );
+        |displaced_by, lapsed| {
+            if lapsed {
+                warn!(
+                    "isolated_edit: claim lapsed (expired, nobody holds it) — edits in this \
+                     worktree may now race with a re-acquire"
+                );
+            } else {
+                warn!(
+                    displaced_by = ?displaced_by,
+                    "isolated_edit: claim stolen — edits in this worktree may now race"
+                );
+            }
         },
     )
 }
