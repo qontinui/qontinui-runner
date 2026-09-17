@@ -2744,11 +2744,24 @@ where
     }
 }
 
-/// Hop-by-hop request headers that must NOT be forwarded to the local
-/// loopback call (they describe the WS-relayed transport, not the inner
-/// request). Lowercased for case-insensitive comparison.
-const RELAY_SKIP_REQUEST_HEADERS: &[&str] =
-    &["host", "connection", "transfer-encoding", "content-length"];
+/// Request headers that must NOT be forwarded to the local loopback call.
+/// Lowercased for case-insensitive comparison.
+///
+/// The first four are hop-by-hop: they describe the WS-relayed transport, not
+/// the inner request. `origin` and `sec-fetch-site` describe the END USER's
+/// browser, which the web backend relays verbatim: forwarded, they would make
+/// `mcp::origin_guard` classify a server-mediated call — already authorised by
+/// the backend and gated by `relay_path_policy` — as a browser page, and
+/// refuse it (plan `2026-09-17-runner-loopback-api-accepts-any-origin`, F4).
+/// The self-call is a NonBrowser request and must look like one.
+const RELAY_SKIP_REQUEST_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "transfer-encoding",
+    "content-length",
+    "origin",
+    "sec-fetch-site",
+];
 
 /// Hop-by-hop / framing response headers that must NOT be echoed back over
 /// the WS (reqwest already decoded the body; `content-length` would be
@@ -5116,6 +5129,44 @@ mod tests {
         let parsed: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["foo"], "bar", "query forwarded");
         assert_eq!(parsed["x_test"], "hello", "request header forwarded");
+    }
+
+    /// Plan `2026-09-17-runner-loopback-api-accepts-any-origin` Phase 1 test
+    /// 12: a frame relayed from a browser session carries that browser's
+    /// `origin` (and Fetch Metadata); the loopback self-call must not, or the
+    /// origin guard classifies a server-mediated call as a browser page.
+    #[tokio::test]
+    async fn relay_strips_browser_origin_and_fetch_metadata() {
+        async fn handler(headers: HeaderMap) -> impl axum::response::IntoResponse {
+            let body = json!({
+                "origin": headers.get("origin").and_then(|v| v.to_str().ok()),
+                "sec_fetch_site": headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()),
+                "x_test": headers.get("x-test").and_then(|v| v.to_str().ok()),
+            })
+            .to_string();
+            (AxumStatus::OK, [("content-type", "application/json")], body)
+        }
+        // `/status` is RELAY_ALLOWED (see the GET round trip above).
+        let base = spawn_test_server(Router::new().route("/status", get(handler))).await;
+        let env = json!({
+            "type": "http_request",
+            "request_id": "req-origin",
+            "method": "GET",
+            "path": "/status",
+            "headers": {
+                "Origin": "https://app.qontinui.io",
+                "Sec-Fetch-Site": "cross-site",
+                "x-test": "kept"
+            },
+            "body_b64": ""
+        });
+        let reply = relay_http_to_base(&base, &env).await;
+        assert_eq!(reply["status"], 200);
+        let body = String::from_utf8(b64_decode(reply["body_b64"].as_str().unwrap())).unwrap();
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["origin"], Value::Null, "origin must not reach the loopback call");
+        assert_eq!(parsed["sec_fetch_site"], Value::Null, "sec-fetch-site must not reach it either");
+        assert_eq!(parsed["x_test"], "kept", "ordinary headers still forwarded");
     }
 
     #[tokio::test]

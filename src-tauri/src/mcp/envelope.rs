@@ -23,7 +23,7 @@
 //! [CatchPanicLayer]           <- outermost: converts panics → 500 JSON
 //!   [envelope_audit_middleware]    <- debug-only: REPORTS non-JSON errors
 //!     [envelope_rewrite_middleware]  <- rewrites 4xx/5xx text/plain → JSON
-//!       [TraceLayer, CORS, ...]
+//!       [TraceLayer, CORS, origin guard, ...]
 //!         [handlers]
 //! ```
 //!

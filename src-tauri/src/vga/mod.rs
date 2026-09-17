@@ -13,7 +13,8 @@
 //! - `GET /vga/monitors` — monitor enumeration for the builder UI.
 //!
 //! The router is mounted from [`crate::mcp_api`] alongside `/ui-bridge/*`
-//! and inherits the permissive CORS layer applied there.
+//! and inherits the origin guard and exact-origin CORS layer applied there
+//! (`mcp::origin_guard`).
 
 use axum::{
     body::Body,

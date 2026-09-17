@@ -44,12 +44,26 @@ pub async fn get_dom_capture_html(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
     match DomCaptureLogger::get_capture_html(&id) {
-        Ok(html) => Ok((
-            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-            html,
-        )),
+        Ok(html) => Ok(captured_html_response(html)),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
+}
+
+/// Serve captured page HTML. Captures arrive from the browser extension on
+/// ARBITRARY sites, and this route serves them from the runner's own loopback
+/// origin — which `mcp::origin_guard` admits as first-party. Any script in the
+/// capture would run AS that origin. `Content-Security-Policy: sandbox` gives
+/// the document an opaque origin (its requests carry `Origin: null`, classed
+/// Foreign) and disables script. Plan
+/// `2026-09-17-runner-loopback-api-accepts-any-origin` F3.
+fn captured_html_response(html: String) -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CONTENT_SECURITY_POLICY, "sandbox"),
+        ],
+        html,
+    )
 }
 
 /// Receive DOM capture from browser extension
@@ -95,4 +109,28 @@ pub fn routes() -> axum::Router<std::sync::Arc<crate::mcp::types::ApiState>> {
         .route("/dom/captures/{id}", get(get_dom_capture))
         .route("/dom/captures/{id}/html", get(get_dom_capture_html))
         .route("/dom/receive", post(receive_dom_from_extension))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Plan `2026-09-17-runner-loopback-api-accepts-any-origin` Phase 1 test 13.
+    #[tokio::test]
+    async fn captured_html_is_served_sandboxed() {
+        let resp = captured_html_response("<script>fetch('/files/read')</script>".to_string())
+            .into_response();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("sandbox")
+        );
+        assert!(resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .starts_with("text/html"));
+    }
 }
