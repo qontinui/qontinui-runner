@@ -19,10 +19,13 @@
 //! # Why it lives in the lib crate
 //!
 //! Exactly the reason `intercept_core` was lifted here: the WRITER is the
-//! runner bin (`set_bound_port`) and a READER is the standalone
-//! `qontinui-shim` `.exe`, and a second bin cannot import from the runner bin's
-//! module tree. One module ⇒ one schema ⇒ the reader and writer can never
-//! drift.
+//! runner bin (the bind-success arm of `mcp_api::start_server`, right after
+//! `set_bound_port`) and a READER is the standalone `qontinui-shim` `.exe`,
+//! and a second bin cannot import from the runner bin's module tree. One
+//! module ⇒ one schema ⇒ the reader and writer can never drift. The same
+//! record now also carries the path of the runner's per-port loopback
+//! handshake key ([`PortBreadcrumb::loopback_key_path`]), for the same
+//! writer/reader pair and the same reason.
 //!
 //! # Liveness is load-bearing, not defensive padding
 //!
@@ -63,7 +66,17 @@ use tracing::warn;
 /// Schema version of the on-disk record. Bump only on a BREAKING shape change —
 /// an out-of-tree reader (the shim) is expected to ignore a record whose
 /// `schema` it does not know rather than misparse it.
-pub const BREADCRUMB_SCHEMA: u32 = 1;
+///
+/// **2** (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`):
+/// adds [`PortBreadcrumb::loopback_key_path`]. The bump is deliberate even
+/// though serde would tolerate the new field: a schema-1 record read by a
+/// fix-build shim carries NO key path, and a schema-2 record read by a pre-fix
+/// shim would have it pair this port with the legacy bare key file it would
+/// then go and read. Either mixed pair must fail OPEN (no identity that
+/// launch), never pair a port with a guessed key — so both reject the record
+/// outright as "a schema this build does not know" ([`read_at`]).
+pub const BREADCRUMB_SCHEMA: u32 = 2;
 
 /// The conventional primary runner port. Used both for the un-suffixed file
 /// name and as the default preferred port when `QONTINUI_PRIMARY_PORT` is unset.
@@ -98,6 +111,20 @@ pub struct PortBreadcrumb {
     /// `true` iff `port` is the conventional primary port ([`PRIMARY_PORT`]).
     /// Denormalized for out-of-tree readers that do not want to re-derive it.
     pub primary: bool,
+    /// Absolute path of the owner-only loopback handshake key THIS runner
+    /// wrote for `port` (`~/.qontinui/runner-loopback-key-<port>`, see
+    /// `profile_cli::runner_loopback_key_file_name`), or `None` when it could
+    /// not write one — in which case its mint route denies every request and
+    /// no file anywhere will help.
+    ///
+    /// Denormalized for exactly the reason `primary` is: the WRITER and the
+    /// READER are different processes with independent envs, so a reader must
+    /// never DERIVE the key's name (from a primary notion, an instance name, or
+    /// an env var) — it reads the path the writer declares here and nothing
+    /// else. This is what lets a caller find the key of the SAME runner it is
+    /// about to POST to, and what stops a second runner's key from being
+    /// mistaken for this one's.
+    pub loopback_key_path: Option<PathBuf>,
 }
 
 /// `~/.qontinui/runner/` — the established runner app-data dir (the lifecycle
@@ -144,47 +171,84 @@ pub fn breadcrumb_path(port: u16) -> Option<PathBuf> {
 /// actually came up rather than resetting its age.
 static STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
 
-/// The path this process last published to, so [`remove_published`] can delete
-/// exactly the file we wrote — immune to the port drifting between publish and
-/// shutdown (the bound port is NOT always the configured port, which is the bug
-/// the sibling shutdown marker's `get_mcp_api_port()`-keyed path can hit).
-static PUBLISHED_PATH: OnceLock<std::sync::Mutex<Option<PathBuf>>> = OnceLock::new();
-
-fn published_path() -> &'static std::sync::Mutex<Option<PathBuf>> {
-    PUBLISHED_PATH.get_or_init(|| std::sync::Mutex::new(None))
+/// What this process last published: the breadcrumb file it wrote, and the
+/// loopback handshake key file that record names. Held so
+/// [`remove_published`] can delete exactly the files we wrote — immune to the
+/// port drifting between publish and shutdown (the bound port is NOT always the
+/// configured port, which is the bug the sibling shutdown marker's
+/// `get_mcp_api_port()`-keyed path can hit) — and so the mint route's refusal
+/// can name the port this runner bound and the key path it actually wrote
+/// ([`published`]) without a second store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    /// The port this process advertised.
+    pub port: u16,
+    /// The breadcrumb file this process wrote.
+    pub breadcrumb_path: PathBuf,
+    /// The loopback handshake key file the record names, if one was written.
+    pub loopback_key_path: Option<PathBuf>,
 }
 
-/// Build the record this process would publish for `port`. The `primary` flag is
+static PUBLISHED: OnceLock<std::sync::Mutex<Option<Published>>> = OnceLock::new();
+
+fn published_cell() -> &'static std::sync::Mutex<Option<Published>> {
+    PUBLISHED.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// What this process has published, if anything: the port, the breadcrumb path
+/// and the key path it wrote. `None` before the first successful [`publish`]
+/// and after [`remove_published`]. Read by the mint route's denial message so a
+/// refused caller is told which port THIS runner bound and which key file it
+/// actually wrote — the discriminating fact when the caller read a different
+/// runner's key.
+pub fn published() -> Option<Published> {
+    published_cell()
+        .lock()
+        .expect("breadcrumb publish record poisoned")
+        .clone()
+}
+
+/// Build the record this process would publish for `port`, naming
+/// `loopback_key_path` as the handshake key it wrote. The `primary` flag is
 /// derived from [`preferred_primary_port`] — the SAME notion the reader uses — so
 /// a `QONTINUI_PRIMARY_PORT`-configured primary advertises itself as primary
 /// rather than being mislabeled a temp runner (see [`breadcrumb_file_name`]).
-pub fn breadcrumb_for(port: u16) -> PortBreadcrumb {
-    breadcrumb_for_with_primary(port, preferred_primary_port())
+pub fn breadcrumb_for(port: u16, loopback_key_path: Option<PathBuf>) -> PortBreadcrumb {
+    breadcrumb_for_with_primary(port, preferred_primary_port(), loopback_key_path)
 }
 
 /// Inner, env-free helper behind [`breadcrumb_for`]: build the record treating
 /// `primary` as the primary port. Split out so the writer's primary-labeling is
 /// unit-testable with an explicit primary rather than the process-global env.
-fn breadcrumb_for_with_primary(port: u16, primary: u16) -> PortBreadcrumb {
+fn breadcrumb_for_with_primary(
+    port: u16,
+    primary: u16,
+    loopback_key_path: Option<PathBuf>,
+) -> PortBreadcrumb {
     PortBreadcrumb {
         schema: BREADCRUMB_SCHEMA,
         port,
         pid: std::process::id(),
         started_at_ms: *STARTED_AT_MS.get_or_init(|| chrono::Utc::now().timestamp_millis()),
         primary: port == primary,
+        loopback_key_path,
     }
 }
 
-/// Publish this process's breadcrumb for `port` into [`breadcrumb_dir`].
-/// Best-effort: every failure only warns — an unpublished breadcrumb degrades a
-/// bare session to "no coord identity" (fail-open), never to a broken runner.
-/// Idempotent; a re-publish overwrites in place.
-pub fn publish(port: u16) {
+/// Publish this process's breadcrumb for `port` into [`breadcrumb_dir`], naming
+/// `loopback_key_path` — the handshake key file the runner wrote for that port
+/// (`None` when it could not; the record then says so and a reader does not
+/// go looking). Call it AFTER the key is written, so a reader that sees the
+/// record can already read the key. Best-effort: every failure only warns — an
+/// unpublished breadcrumb degrades a bare session to "no coord identity"
+/// (fail-open), never to a broken runner. Idempotent; a re-publish overwrites
+/// in place.
+pub fn publish(port: u16, loopback_key_path: Option<PathBuf>) {
     let Some(path) = breadcrumb_path(port) else {
         warn!("runner_breadcrumb: home dir unresolvable — API port :{port} not advertised");
         return;
     };
-    if let Err(e) = write_at(&path, &breadcrumb_for(port)) {
+    if let Err(e) = write_at(&path, &breadcrumb_for(port, loopback_key_path.clone())) {
         warn!(
             error = %e,
             path = %path.display(),
@@ -192,21 +256,41 @@ pub fn publish(port: u16) {
         );
         return;
     }
-    *published_path().lock().expect("breadcrumb path poisoned") = Some(path);
+    *published_cell()
+        .lock()
+        .expect("breadcrumb publish record poisoned") = Some(Published {
+        port,
+        breadcrumb_path: path,
+        loopback_key_path,
+    });
 }
 
-/// Remove the breadcrumb this process published, if any. Call from the graceful
-/// shutdown paths — a record left behind by a clean exit would make a reader
-/// pay a pid probe (and, on a pid recycle, an outright wrong answer) for a
-/// runner that deliberately went away. Idempotent; a crashed runner's stale
-/// record is what [`pid_is_live`] exists to catch.
+/// Remove the breadcrumb this process published, if any, AND the loopback
+/// handshake key file that record named. Call from the graceful shutdown paths
+/// — a record left behind by a clean exit would make a reader pay a pid probe
+/// (and, on a pid recycle, an outright wrong answer) for a runner that
+/// deliberately went away, and a key left behind is worthless (its process,
+/// and so the in-memory secret it matched, is gone). Idempotent; a crashed
+/// runner's stale record is what [`pid_is_live`] exists to catch.
+///
+/// Deletes ONLY the files THIS process wrote — never a legacy bare
+/// `runner-loopback-key`, which may be a still-running pre-fix primary's live
+/// secret.
 pub fn remove_published() {
-    let path = published_path()
+    let published = published_cell()
         .lock()
-        .expect("breadcrumb path poisoned")
+        .expect("breadcrumb publish record poisoned")
         .take();
-    if let Some(path) = path {
-        let _ = std::fs::remove_file(path);
+    if let Some(Published {
+        breadcrumb_path,
+        loopback_key_path,
+        ..
+    }) = published
+    {
+        let _ = std::fs::remove_file(breadcrumb_path);
+        if let Some(key) = loopback_key_path {
+            let _ = std::fs::remove_file(key);
+        }
     }
 }
 
@@ -350,7 +434,7 @@ pub fn resolve_live_runner() -> Option<PortBreadcrumb> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_env::{env_lock, EnvVarRestore};
+    use crate::test_env::{env_lock, isolated_ambient, EnvVarRestore};
 
     fn rec(port: u16, pid: u32, started_at_ms: i64) -> PortBreadcrumb {
         PortBreadcrumb {
@@ -359,6 +443,7 @@ mod tests {
             pid,
             started_at_ms,
             primary: port == PRIMARY_PORT,
+            loopback_key_path: None,
         }
     }
 
@@ -404,7 +489,7 @@ mod tests {
 
         // Writer side: the configured-primary record is labeled primary and gets
         // the bare (un-suffixed) file name the reader looks for first.
-        let primary_rec = breadcrumb_for_with_primary(configured_primary, configured_primary);
+        let primary_rec = breadcrumb_for_with_primary(configured_primary, configured_primary, None);
         assert!(
             primary_rec.primary,
             "a record on the configured primary port must be marked primary"
@@ -414,7 +499,7 @@ mod tests {
             "api-port.json"
         );
         // A temp runner (9877) under the same configured primary stays non-primary.
-        let temp_rec = breadcrumb_for_with_primary(9877, configured_primary);
+        let temp_rec = breadcrumb_for_with_primary(9877, configured_primary, None);
         assert!(!temp_rec.primary);
         assert_eq!(
             file_name_for(9877, configured_primary),
@@ -449,10 +534,10 @@ mod tests {
         std::env::set_var(PRIMARY_PORT_ENV, "9878");
 
         assert_eq!(breadcrumb_file_name(9878), "api-port.json");
-        assert!(breadcrumb_for(9878).primary);
+        assert!(breadcrumb_for(9878, None).primary);
         // The hardcoded default port is NOT primary once the env names a different one.
         assert_eq!(breadcrumb_file_name(PRIMARY_PORT), "api-port-9876.json");
-        assert!(!breadcrumb_for(PRIMARY_PORT).primary);
+        assert!(!breadcrumb_for(PRIMARY_PORT, None).primary);
 
         match prev {
             Some(v) => std::env::set_var(PRIMARY_PORT_ENV, v),
@@ -473,7 +558,7 @@ mod tests {
 
         std::fs::write(
             &path,
-            br#"{"schema":999,"port":9876,"pid":1,"started_at_ms":0,"primary":true}"#,
+            br#"{"schema":999,"port":9876,"pid":1,"started_at_ms":0,"primary":true,"loopback_key_path":null}"#,
         )
         .unwrap();
         assert_eq!(read_at(&path), None, "an unknown schema reads as absent");
@@ -569,19 +654,145 @@ mod tests {
 
     /// `remove_published` deletes exactly the file publish wrote, and is
     /// idempotent (a second call, or one with nothing published, is a no-op).
+    ///
+    /// Holds [`env_lock`] because the `PUBLISHED` cell is process-global and
+    /// the sibling tests that go through `publish` hold that lock (via the
+    /// ambient fixture) — an unlocked `take()` here could steal their record.
     #[test]
     fn remove_published_is_idempotent() {
+        let _env_lock = env_lock();
         remove_published();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api-port-9899.json");
         write_at(&path, &rec(9899, 7, 1)).unwrap();
-        *published_path().lock().unwrap() = Some(path.clone());
+        *published_cell().lock().unwrap() = Some(Published {
+            port: 9899,
+            breadcrumb_path: path.clone(),
+            loopback_key_path: None,
+        });
 
         remove_published();
         assert!(
             !path.exists(),
             "the published record is removed on shutdown"
         );
+        assert_eq!(published(), None, "nothing is published after removal");
         remove_published(); // no-op, no panic
+    }
+
+    // -----------------------------------------------------------------------
+    // The loopback key path rides the record (plan
+    // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it)
+    // -----------------------------------------------------------------------
+
+    /// THE test that would have caught a writer/reader desync: a record for
+    /// port P naming its key path round-trips byte-for-byte through the atomic
+    /// writer, `read_at`, the directory listing and `select_live` — so the shim
+    /// (which goes through exactly those) reads the path the runner declared,
+    /// never one it derived.
+    #[test]
+    fn loopback_key_path_round_trips_through_write_read_list_and_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("runner-loopback-key-9877");
+        let record = PortBreadcrumb {
+            loopback_key_path: Some(key.clone()),
+            ..rec(9877, 4242, 1_752_768_000_000)
+        };
+        let path = dir.path().join("api-port-9877.json");
+        write_at(&path, &record).unwrap();
+
+        let read = read_at(&path).expect("a schema-2 record with a key path must read");
+        assert_eq!(read, record);
+        assert_eq!(read.loopback_key_path.as_deref(), Some(key.as_path()));
+        assert_eq!(read.schema, 2, "the field rides schema 2");
+
+        let listed = list_breadcrumbs_in(dir.path());
+        assert_eq!(listed, vec![record.clone()]);
+        let selected = select_live(&listed, |_| true).expect("a live record is selected");
+        assert_eq!(selected.loopback_key_path.as_deref(), Some(key.as_path()));
+        assert_eq!(selected.port, 9877);
+
+        // A runner that could not write its key says so with `null`, and that
+        // survives the round-trip as `None` rather than as a path.
+        let no_key = rec(9878, 1, 2);
+        let path2 = dir.path().join("api-port-9878.json");
+        write_at(&path2, &no_key).unwrap();
+        assert_eq!(read_at(&path2).unwrap().loopback_key_path, None);
+    }
+
+    /// A schema-1 record — what a runner built before this plan writes, with no
+    /// `loopback_key_path` — is rejected by `read_at` outright. A fix-build
+    /// reader must never pair that record's port with a key file it would then
+    /// have to GUESS the name of; it fails open instead.
+    #[test]
+    fn schema_one_record_without_a_key_path_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-port.json");
+        std::fs::write(
+            &path,
+            br#"{"schema":1,"port":9876,"pid":1,"started_at_ms":0,"primary":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_at(&path),
+            None,
+            "a pre-fix schema-1 record must read as absent, not as a record with no key"
+        );
+        assert!(list_breadcrumbs_in(dir.path()).is_empty());
+    }
+
+    /// The real writer entry point: `publish(P, Some(key))` writes the record
+    /// naming the key under the ambient runner dir, `published()` reports both
+    /// paths, and `remove_published()` deletes BOTH files (Phase 3 — the key
+    /// gets every graceful-shutdown path the breadcrumb already has). Driven
+    /// under the ambient fixture so nothing touches the developer's real
+    /// `~/.qontinui/runner/`; the fixture's lock also serializes the
+    /// process-global `PUBLISHED` cell against its sibling tests.
+    #[test]
+    fn publish_with_key_then_remove_published_deletes_both_files() {
+        let amb = isolated_ambient();
+        let _restore = EnvVarRestore::capture(&[PRIMARY_PORT_ENV]);
+        std::env::remove_var(PRIMARY_PORT_ENV);
+        remove_published(); // a clean slate whatever a sibling left behind
+
+        let port = 9891;
+        let key = amb.dir().join(format!("runner-loopback-key-{port}"));
+        std::fs::write(&key, b"0123456789abcdef").unwrap();
+
+        publish(port, Some(key.clone()));
+
+        let expected_record = amb
+            .dir()
+            .join("runner")
+            .join(format!("api-port-{port}.json"));
+        assert!(
+            expected_record.is_file(),
+            "the record is written under the ambient runner dir"
+        );
+        let read = read_at(&expected_record).expect("the published record must read back");
+        assert_eq!(read.port, port);
+        assert_eq!(read.pid, std::process::id());
+        assert_eq!(read.loopback_key_path.as_deref(), Some(key.as_path()));
+
+        assert_eq!(
+            published(),
+            Some(Published {
+                port,
+                breadcrumb_path: expected_record.clone(),
+                loopback_key_path: Some(key.clone()),
+            })
+        );
+
+        remove_published();
+        assert!(
+            !expected_record.exists(),
+            "the breadcrumb is removed on shutdown"
+        );
+        assert!(
+            !key.exists(),
+            "the loopback key file is removed on shutdown too"
+        );
+        assert_eq!(published(), None);
+        remove_published(); // idempotent
     }
 }

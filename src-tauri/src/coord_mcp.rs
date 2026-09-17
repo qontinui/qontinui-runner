@@ -306,11 +306,15 @@ pub(crate) use qontinui_runner_lib::profile_cli::SESSION_IDENTITY_MARKER_FILE;
 /// The loopback handshake contract, re-exported from the LIB crate for exactly
 /// the same reason as the marker above: the runner BIN WRITES the key and the
 /// standalone `qontinui-shim` `.exe` READS it, and the two must agree on the
-/// path and the header name byte-for-byte. See
-/// [`qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_FILE`] for why the
-/// handshake exists at all.
+/// header name byte-for-byte. The key's PATH is per bound port
+/// (`runner-loopback-key-<port>`) and the shim does not derive it — the runner
+/// publishes the path it wrote in its port breadcrumb record and the shim reads
+/// that (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
+/// See [`qontinui_runner_lib::profile_cli::RUNNER_LOOPBACK_KEY_FILE`] for why
+/// the handshake exists at all.
 pub(crate) use qontinui_runner_lib::profile_cli::{
-    runner_loopback_key_path, RUNNER_LOOPBACK_KEY_FILE, RUNNER_LOOPBACK_KEY_HEADER,
+    runner_loopback_key_path_for, RUNNER_LOOPBACK_KEY_FILE, RUNNER_LOOPBACK_KEY_HEADER,
 };
 
 /// Absolute path of the opt-in marker (`~/.qontinui/allow-session-coord-identity`).
@@ -324,9 +328,10 @@ pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
 
 /// THIS runner start's loopback handshake secret, held in memory.
 ///
-/// The file at [`runner_loopback_key_path`] is the DELIVERY channel; this cell
-/// is the truth the gate compares against. Seeded exactly once per process by
-/// [`init_loopback_handshake_key`] at server start, so:
+/// The file at [`runner_loopback_key_path_for`] (the bound port) is the
+/// DELIVERY channel; this cell is the truth the gate compares against. Seeded
+/// exactly once per process by [`publish_loopback_handshake_key`] once the API
+/// port is bound, so:
 ///
 /// * a caller that cannot read the owner-only file cannot learn the secret, and
 /// * a failed file write leaves the route denying every request (fail-closed)
@@ -337,12 +342,36 @@ pub(crate) fn session_identity_marker_path() -> Option<std::path::PathBuf> {
 static LOOPBACK_HANDSHAKE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Generate this start's handshake secret and publish it owner-only at
-/// [`runner_loopback_key_path`]. Idempotent per process (the `OnceLock` is the
-/// guard), and best-effort on the write: a write failure is warned about and
-/// leaves the route CLOSED, never open.
+/// [`runner_loopback_key_path_for`]`(port)` — the port this runner ACTUALLY
+/// bound. Idempotent per process (the `OnceLock` is the guard), and best-effort
+/// on the write: a write failure is warned about and leaves the route CLOSED,
+/// never open.
 ///
-/// Called synchronously from [`crate::mcp_api::start_server`] before the socket
-/// is served, so a caller that can reach `/health` can already read the key.
+/// Returns the path actually written, or `None` on any failure — the caller
+/// hands that straight to `runner_breadcrumb::publish` so the record this
+/// runner advertises names the exact file it wrote (or says, with `null`, that
+/// there is none). The key is written BEFORE the record that names it.
+///
+/// Called synchronously from the bind-success arm of
+/// [`crate::mcp_api::start_server`], after the port is known and before the
+/// socket is served, so a caller that can reach `/health` can already read the
+/// key. It must NOT be called before the bind loop: `start_server` falls back
+/// to `port + 1` / `port + 2` when the requested port is blocked, and a key
+/// written at the requested port's path would then advertise under a port
+/// this runner does not answer on.
+///
+/// # Why the path is per bound port
+///
+/// `~/.qontinui` is deliberately shared between the primary and every
+/// supervisor-spawned instance, so a single bare file was one writer too many:
+/// a temp runner's start overwrote the primary's advertised key while the
+/// primary kept comparing against its own `OnceLock`, and the mint door was
+/// closed to every file-reading caller until the operator happened to restart
+/// the primary (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
+/// N runners are now N files. A legacy bare `runner-loopback-key` left by a
+/// pre-fix runner is NEVER deleted here — it may be a still-running pre-fix
+/// primary's live secret.
 ///
 /// # Entropy and rotation
 ///
@@ -353,7 +382,7 @@ static LOOPBACK_HANDSHAKE_KEY: std::sync::OnceLock<String> = std::sync::OnceLock
 ///
 /// The secret itself is NEVER logged — the log line names the path and a short
 /// prefix only, matching the rotation log's discipline.
-pub(crate) fn init_loopback_handshake_key() {
+pub(crate) fn publish_loopback_handshake_key(port: u16) -> Option<std::path::PathBuf> {
     let secret = LOOPBACK_HANDSHAKE_KEY.get_or_init(|| {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
@@ -366,12 +395,12 @@ pub(crate) fn init_loopback_handshake_key() {
         rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
     });
-    let Some(path) = runner_loopback_key_path() else {
+    let Some(path) = runner_loopback_key_path_for(port) else {
         warn!(
-            "coord_mcp: home dir unresolvable — no loopback handshake key written; \
-             POST /coord-mcp/provision-session will deny every request"
+            "coord_mcp: home dir unresolvable — no loopback handshake key written for \
+             port {port}; POST /coord-mcp/provision-session will deny every request"
         );
-        return;
+        return None;
     };
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -380,7 +409,7 @@ pub(crate) fn init_loopback_handshake_key() {
                  POST /coord-mcp/provision-session will deny every request",
                 parent.display()
             );
-            return;
+            return None;
         }
         // Harden the DIRECTORY too, not just the file. `write_owner_only`
         // opens with `create(true).truncate(true)` and no `O_NOFOLLOW`, so it
@@ -404,17 +433,23 @@ pub(crate) fn init_loopback_handshake_key() {
         }
     }
     match crate::fs_perms::write_owner_only(&path, secret.as_bytes()) {
-        Ok(()) => info!(
-            "coord_mcp: loopback handshake key rotated for this runner start \
-             (path={}, key_prefix={}…)",
-            path.display(),
-            &secret[..8.min(secret.len())]
-        ),
-        Err(e) => warn!(
-            "coord_mcp: failed to write the loopback handshake key to {}: {e} — \
-             POST /coord-mcp/provision-session will deny every request (fail-closed)",
-            path.display()
-        ),
+        Ok(()) => {
+            info!(
+                "coord_mcp: loopback handshake key rotated for this runner start \
+                 (port={port}, path={}, key_prefix={}…)",
+                path.display(),
+                &secret[..8.min(secret.len())]
+            );
+            Some(path)
+        }
+        Err(e) => {
+            warn!(
+                "coord_mcp: failed to write the loopback handshake key to {}: {e} — \
+                 POST /coord-mcp/provision-session will deny every request (fail-closed)",
+                path.display()
+            );
+            None
+        }
     }
 }
 
@@ -449,8 +484,11 @@ pub(crate) enum SessionIdentityDenial {
     /// attempted the same-user handshake. Fix: read the key file.
     NoHandshake,
     /// A handshake was presented and it is not this runner start's secret.
-    /// Fix: re-read the key file (it rotates per runner start) — or the caller
-    /// is a different local user, and the denial is working as designed.
+    /// Fix: re-read the key file of THIS runner — the one its breadcrumb names
+    /// for the port the caller posted to (it rotates per runner start, and a
+    /// correct-looking file that still mismatches is a DIFFERENT runner's key)
+    /// — or the caller is a different local user, and the denial is working as
+    /// designed.
     HandshakeMismatch,
     /// Same-user proven, but the operator has not dropped the opt-in marker.
     NotOptedIn,
@@ -467,24 +505,63 @@ impl SessionIdentityDenial {
     }
 
     /// Human/agent-actionable explanation — names the exact lever to flip.
+    ///
+    /// The two handshake denials name the port THIS runner bound and the exact
+    /// key file it wrote, read from what it published in its breadcrumb record
+    /// (`runner_breadcrumb::published()`) — never a path re-derived here. When
+    /// nothing was published (home unresolvable, the write failed) they say so:
+    /// the route is closed and no file will help. The `runner-loopback-key`
+    /// stem appears in every arm so a reader can grep for the family; the
+    /// secret itself never does.
     pub(crate) fn message(&self) -> String {
-        let key_path = || {
-            runner_loopback_key_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| format!("~/.qontinui/{RUNNER_LOOPBACK_KEY_FILE}"))
+        self.message_for(qontinui_runner_lib::runner_breadcrumb::published().as_ref())
+    }
+
+    /// Pure body of [`Self::message`], taking what this runner published so the
+    /// wording is unit-testable with and without a publication.
+    fn message_for(
+        &self,
+        published: Option<&qontinui_runner_lib::runner_breadcrumb::Published>,
+    ) -> String {
+        // What THIS runner advertised: its bound port and the key file it wrote.
+        let key_location = match published {
+            Some(p) => match &p.loopback_key_path {
+                Some(key) => format!(
+                    "this runner bound port {} and wrote its key at {}",
+                    p.port,
+                    key.display()
+                ),
+                None => format!(
+                    "this runner bound port {} but published no key — the route is \
+                     closed on this runner and no {RUNNER_LOOPBACK_KEY_FILE}-* file \
+                     will open it",
+                    p.port
+                ),
+            },
+            None => format!(
+                "this runner has published no key (no port advertised) — the route \
+                 is closed on this runner and no {RUNNER_LOOPBACK_KEY_FILE}-* file \
+                 will open it"
+            ),
         };
         match self {
             SessionIdentityDenial::NoHandshake => format!(
-                "no same-user handshake presented — send the contents of {} in the \
-                 {RUNNER_LOOPBACK_KEY_HEADER} header (the file is owner-only, so only \
-                 the user this runner runs as can read it)",
-                key_path()
+                "no same-user handshake presented — send the contents of this runner's \
+                 owner-only {RUNNER_LOOPBACK_KEY_FILE}-<port> file in the \
+                 {RUNNER_LOOPBACK_KEY_HEADER} header (only the user this runner runs \
+                 as can read it; the file's path is the `loopback_key_path` of the \
+                 port breadcrumb this runner published under ~/.qontinui/runner/): \
+                 {key_location}"
             ),
             SessionIdentityDenial::HandshakeMismatch => format!(
                 "the {RUNNER_LOOPBACK_KEY_HEADER} handshake does not match this runner \
-                 start's key — re-read {} (it is rotated on every runner start, so a \
-                 cached value goes stale when the runner restarts)",
-                key_path()
+                 start's key. The key is rotated on every runner start, so a cached \
+                 value goes stale when the runner restarts — and it is keyed PER BOUND \
+                 PORT ({RUNNER_LOOPBACK_KEY_FILE}-<port>), so a mismatch on a \
+                 correct-looking file means you read a DIFFERENT runner's key (a \
+                 second runner on this box, or a runner that bound a fallback port). \
+                 Read the file named by the `loopback_key_path` of the breadcrumb for \
+                 the port you are posting to: {key_location}"
             ),
             SessionIdentityDenial::NotOptedIn => {
                 let path = session_identity_marker_path()
@@ -11073,6 +11150,82 @@ mod tests {
                 "a denial must never echo the handshake secret"
             );
         }
+
+        // The key is PER BOUND PORT (plan 2026-09-07-the-runner-loopback-
+        // handshake-key-is-box-global-and-a-second-runner-clobbers-it), and the
+        // mismatch denial must tell the caller the discriminating fact: which
+        // port THIS runner bound and the exact key file it wrote — read from
+        // what it published, never re-derived. Driven through the pure
+        // `message_for` so the process-global publish cell is untouched.
+        use qontinui_runner_lib::runner_breadcrumb::Published;
+        let key_path = std::path::PathBuf::from("/fixture/.qontinui/runner-loopback-key-9877");
+        let published = Published {
+            port: 9877,
+            breadcrumb_path: std::path::PathBuf::from(
+                "/fixture/.qontinui/runner/api-port-9877.json",
+            ),
+            loopback_key_path: Some(key_path.clone()),
+        };
+        let mismatch = SessionIdentityDenial::HandshakeMismatch.message_for(Some(&published));
+        assert!(mismatch.contains("port 9877"), "{mismatch}");
+        assert!(
+            mismatch.contains(&key_path.display().to_string()),
+            "the mismatch denial must name the exact port-keyed path this runner wrote: {mismatch}"
+        );
+        assert!(mismatch.contains("DIFFERENT runner"), "{mismatch}");
+        assert!(mismatch.contains("PER BOUND PORT"), "{mismatch}");
+        assert!(mismatch.contains(RUNNER_LOOPBACK_KEY_FILE), "{mismatch}");
+        assert!(!mismatch.contains(KEY));
+        // The no-handshake denial names the same location, so a caller that
+        // never sent the header learns which file to read.
+        let none_sent = SessionIdentityDenial::NoHandshake.message_for(Some(&published));
+        assert!(none_sent.contains("port 9877"), "{none_sent}");
+        assert!(
+            none_sent.contains(&key_path.display().to_string()),
+            "{none_sent}"
+        );
+        assert!(
+            none_sent.contains(RUNNER_LOOPBACK_KEY_HEADER),
+            "{none_sent}"
+        );
+
+        // A runner that bound a port but could NOT write its key says so — the
+        // route is closed and no file will help — rather than naming a path
+        // that does not exist.
+        let keyless = Published {
+            loopback_key_path: None,
+            ..published.clone()
+        };
+        let mismatch = SessionIdentityDenial::HandshakeMismatch.message_for(Some(&keyless));
+        assert!(mismatch.contains("port 9877"), "{mismatch}");
+        assert!(mismatch.contains("published no key"), "{mismatch}");
+        assert!(mismatch.contains("route is closed"), "{mismatch}");
+        assert!(mismatch.contains(RUNNER_LOOPBACK_KEY_FILE), "{mismatch}");
+        assert!(!mismatch.contains("wrote its key at"), "{mismatch}");
+
+        // Nothing published at all (home unresolvable / bind not reached): the
+        // stem still appears (the family is greppable) and the text says no key
+        // was published instead of inventing a path.
+        for d in [
+            SessionIdentityDenial::NoHandshake,
+            SessionIdentityDenial::HandshakeMismatch,
+        ] {
+            let msg = d.message_for(None);
+            assert!(msg.contains("published no key"), "{msg}");
+            assert!(msg.contains("route is closed"), "{msg}");
+            assert!(msg.contains(RUNNER_LOOPBACK_KEY_FILE), "{msg}");
+            assert!(!msg.contains("wrote its key at"), "{msg}");
+            assert!(!msg.contains(KEY));
+        }
+        // And the public `message()` in this test process (nothing published —
+        // the bin's tests never bind) takes the same arm.
+        assert!(
+            SessionIdentityDenial::HandshakeMismatch
+                .message()
+                .contains("published no key"),
+            "{}",
+            SessionIdentityDenial::HandshakeMismatch.message()
+        );
     }
 
     /// The DELETED master env flag must not creep back as an override. The

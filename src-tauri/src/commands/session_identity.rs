@@ -30,7 +30,8 @@
 //!    dotfile an operator cannot revoke what they cannot find.
 //! 2. **Mint gate (runner-side).** Will a runner actually mint? The SAME-USER
 //!    loopback handshake (`X-Qontinui-Loopback-Key`, matched against the
-//!    owner-only `~/.qontinui/runner-loopback-key` this runner start wrote) AND
+//!    owner-only `~/.qontinui/runner-loopback-key-<bound port>` this runner
+//!    start wrote and named in its port breadcrumb) AND
 //!    `~/.qontinui/allow-session-coord-identity`. See
 //!    `coord_mcp::session_identity_gate`. The former spawn-time master env flag
 //!    was DELETED by plan

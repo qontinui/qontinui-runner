@@ -604,6 +604,29 @@ pub const SESSION_IDENTITY_MARKER_FILE: &str = "allow-session-coord-identity";
 /// gate side, fail-open on the shim side), never as consent. Both the runner
 /// gate and the shim resolve the marker through THIS one function, so the whole
 /// path (directory + filename) is guaranteed identical, not just the filename.
+///
+/// # Deliberately BOX-WIDE — not per port, unlike its neighbour
+///
+/// The loopback handshake key two functions below is keyed on the runner's
+/// bound port ([`runner_loopback_key_path_for`]); this marker is NOT, and the
+/// asymmetry is intentional (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`,
+/// "The marker question"). Do not "tidy" it into a per-instance file:
+///
+/// 1. It is a CONSENT signal about the MACHINE ("this machine has not opted
+///    in"), and its live-revocation half is re-checked on every request that
+///    presents an ephemeral nonce, so deleting it invalidates already-minted
+///    nonces. Scoped per instance, `rm ~/.qontinui/allow-…` would stop
+///    revoking everywhere — a secondary keeps minting against its own copy —
+///    turning a working kill switch into a partial one (fail-OPEN direction).
+/// 2. The shim stats it FIRST, as ONE syscall, to skip the breadcrumb read and
+///    the loopback POST on every bare `claude` launch on a machine that never
+///    opted in. A port-keyed marker cannot be stat'd until the port is known.
+/// 3. The failure classes differ: a shared marker means a secondary inherits
+///    the operator's box-level consent, which is what the operator expressed;
+///    a shared SECRET means one process clobbers another's authentication.
+///
+/// So `~/.qontinui/` holds ONE box-wide consent marker and N per-port secrets.
 pub fn session_identity_marker_path() -> Option<PathBuf> {
     crate::ambient::qontinui_dir().map(|d| d.join(SESSION_IDENTITY_MARKER_FILE))
 }
@@ -635,20 +658,52 @@ pub fn session_identity_marker_path() -> Option<PathBuf> {
 /// indefinitely, and persistence would buy nothing: the nonce this handshake
 /// unlocks is paired to the runner's *bound port*, so a secret that outlives the
 /// process outlives its own usefulness anyway.
+///
+/// # One file PER BOUND PORT, never a bare box-global file
+///
+/// This is the STEM only. The file a runner actually writes is
+/// `runner-loopback-key-<bound port>` ([`runner_loopback_key_file_name`]), so
+/// two runners on one box (the primary and a supervisor-spawned temp or named
+/// instance — `~/.qontinui` is deliberately SHARED between them, see
+/// `ambient.rs`) write two files and neither clobbers the other's live
+/// secret. The bare, un-suffixed name was the incident: a secondary start
+/// overwrote the primary's advertised key while the primary kept comparing
+/// against its own in-memory one, and the mint door was closed to every
+/// file-reading caller for ~34 h (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
+/// There is NO primary special case: the name is a pure function of a fact
+/// the writer owns (the port it bound), and a reader never derives it — the
+/// runner publishes the path it wrote in its port breadcrumb record
+/// (`runner_breadcrumb::PortBreadcrumb::loopback_key_path`), and every reader
+/// reads that. A legacy bare `runner-loopback-key` left by a pre-fix runner is
+/// never deleted by a fix build (it may be a still-running primary's live key).
 pub const RUNNER_LOOPBACK_KEY_FILE: &str = "runner-loopback-key";
 
-/// Absolute path of the loopback handshake key
-/// (`~/.qontinui/runner-loopback-key`). `None` when the home dir is
-/// unresolvable — the runner then writes no key and the mint route denies every
-/// request (fail-closed: an unresolvable home must never read as consent).
+/// File name of the loopback handshake key for a runner that bound `port`:
+/// `runner-loopback-key-<port>`. Pure — no env read, no primary notion, no
+/// special case for any port — so a writer's name depends on nothing but the
+/// port it bound, and cannot race the parallel test harness on
+/// `QONTINUI_PRIMARY_PORT` the way a "bare name for the primary" rule would.
+pub fn runner_loopback_key_file_name(port: u16) -> String {
+    format!("{RUNNER_LOOPBACK_KEY_FILE}-{port}")
+}
+
+/// Absolute path of the loopback handshake key for the runner that bound
+/// `port` (`~/.qontinui/runner-loopback-key-<port>`). `None` when the home dir
+/// is unresolvable — the runner then writes no key and the mint route denies
+/// every request (fail-closed: an unresolvable home must never read as consent).
 ///
 /// Lives in the LIB crate for the same reason
-/// [`session_identity_marker_path`] does: TWO processes must agree on the whole
-/// path byte-for-byte — the runner BIN's authoritative gate
-/// (`coord_mcp::session_identity_gate`) which WRITES it, and the standalone
-/// `qontinui-shim` `.exe` which READS it to authenticate its own mint POST.
-pub fn runner_loopback_key_path() -> Option<PathBuf> {
-    crate::ambient::qontinui_dir().map(|d| d.join(RUNNER_LOOPBACK_KEY_FILE))
+/// [`session_identity_marker_path`] does: the runner BIN's authoritative gate
+/// (`coord_mcp::session_identity_gate`) WRITES here, and the standalone
+/// `qontinui-shim` `.exe` READS the key to authenticate its own mint POST — but
+/// the shim does NOT call this resolver to find the file: it reads the path the
+/// runner published in its breadcrumb record, so the two processes need not
+/// agree on anything beyond the record. There is deliberately no zero-argument
+/// resolver any more; a caller that does not know which port it is talking to
+/// does not know which runner's key it wants.
+pub fn runner_loopback_key_path_for(port: u16) -> Option<PathBuf> {
+    crate::ambient::qontinui_dir().map(|d| d.join(runner_loopback_key_file_name(port)))
 }
 
 /// The request header the mint route requires the loopback handshake secret in.
@@ -1517,5 +1572,52 @@ mod tests {
             "device",
             "init"
         ])));
+    }
+
+    // ---- loopback handshake key (plan 2026-09-07-…-second-runner-clobbers-it) ----
+
+    /// The key file name is keyed on the BOUND PORT with no bare-name special
+    /// case for any port, and reads no env: the primary's conventional 9876
+    /// gets a suffix exactly like a temp runner's 9877. Pure, so no lock.
+    #[test]
+    fn loopback_key_file_name_is_port_keyed_with_no_primary_special_case() {
+        assert_eq!(
+            runner_loopback_key_file_name(9876),
+            "runner-loopback-key-9876"
+        );
+        assert_eq!(
+            runner_loopback_key_file_name(9877),
+            "runner-loopback-key-9877"
+        );
+        assert_ne!(
+            runner_loopback_key_file_name(9876),
+            RUNNER_LOOPBACK_KEY_FILE,
+            "no port — not even the conventional primary — gets the bare name"
+        );
+    }
+
+    /// The resolver puts the port-keyed name directly under the ambient
+    /// `~/.qontinui` (the fixture pins `QONTINUI_HOME` to a temp dir), so two
+    /// runners on one box resolve two different files.
+    #[test]
+    fn loopback_key_path_for_ends_in_the_port_keyed_name_under_qontinui_home() {
+        let amb = crate::test_env::isolated_ambient();
+        for port in [9876u16, 9877, 9899] {
+            let path = runner_loopback_key_path_for(port).expect("the fixture provides a home");
+            assert_eq!(
+                path,
+                amb.dir().join(runner_loopback_key_file_name(port)),
+                "port {port}"
+            );
+            assert_eq!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some(runner_loopback_key_file_name(port).as_str())
+            );
+        }
+        assert_ne!(
+            runner_loopback_key_path_for(9876),
+            runner_loopback_key_path_for(9877),
+            "two ports must never resolve to one file — that was the clobber"
+        );
     }
 }

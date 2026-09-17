@@ -356,17 +356,23 @@ fn session_identity_marker_exists() -> bool {
         .unwrap_or(false)
 }
 
-/// Read the runner's per-start loopback handshake key
-/// (`~/.qontinui/runner-loopback-key`), trimmed. `None` when the home dir is
-/// unresolvable, no runner has written one, or it is unreadable — which is
-/// exactly the case where reading it is NOT proof of same-user, so the shim
-/// must not ask. Resolved through the ONE shared LIB helper the runner-side
-/// writer uses, so the path can never desync (same rule as the marker above).
+/// Read a runner's per-start loopback handshake key from `path`, trimmed.
+/// `None` when it is absent, unreadable or empty — which is exactly the case
+/// where reading it is NOT proof of same-user, so the shim must not ask.
+///
+/// `path` is NOT derived here. It is the `loopback_key_path` the runner
+/// published in its own port breadcrumb record
+/// (`runner_breadcrumb::PortBreadcrumb::loopback_key_path`) — the key is per
+/// BOUND PORT (`~/.qontinui/runner-loopback-key-<port>`), and the only way a
+/// reader in a bare terminal (no runner env, no supervisor env) can agree with
+/// the writer on a path is for the writer to tell it (plan
+/// `2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-runner-clobbers-it`).
+/// The caller resolves the live runner FIRST and hands its declared path in,
+/// so this reads the key of the SAME runner it is about to POST to.
 ///
 /// The value is a secret: it is passed straight into the request header and is
 /// never logged, printed, or written anywhere by this process.
-fn read_loopback_handshake_key() -> Option<String> {
-    let path = qontinui_runner_lib::profile_cli::runner_loopback_key_path()?;
+fn read_loopback_handshake_key(path: &std::path::Path) -> Option<String> {
     let key = std::fs::read_to_string(path).ok()?;
     let key = key.trim().to_string();
     (!key.is_empty()).then_some(key)
@@ -434,14 +440,21 @@ fn self_provision_mcp_config(tool: IdentityTool) -> Option<tempfile::TempPath> {
     if !session_identity_marker_exists() {
         return None;
     }
-    // Same-user handshake (plan
-    // 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 1).
-    // The runner writes this key owner-only at every start; being able to READ
+    // Resolve the runner FIRST, then read ITS key. Same-user handshake (plan
+    // 2026-08-24-headless-box-has-no-working-coord-credential-door, Phase 1):
+    // the runner writes this key owner-only at every start; being able to READ
     // it is the proof that we are the same OS user the runner runs as, which
-    // loopback itself does not establish. Absent/unreadable ⇒ fail-open: we
-    // simply do not ask (the route would 403 `_NO_HANDSHAKE` anyway).
-    let handshake_key = read_loopback_handshake_key()?;
+    // loopback itself does not establish. The key is per BOUND PORT and the
+    // record we just resolved names the exact file that runner wrote
+    // (`loopback_key_path`), so we read the key of the SAME runner we are about
+    // to POST to with zero derivation and zero env (plan
+    // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-and-a-second-
+    // runner-clobbers-it). A record with a `null` path means that runner could
+    // not write its key — its route is closed anyway — so `None` before any
+    // I/O. Absent/unreadable ⇒ fail-open: we simply do not ask (the route would
+    // 403 `_NO_HANDSHAKE` anyway).
     let runner = qontinui_runner_lib::runner_breadcrumb::resolve_live_runner()?;
+    let handshake_key = read_loopback_handshake_key(runner.loopback_key_path.as_deref()?)?;
     let cwd = env::current_dir().ok()?;
     let body = format!("{{\"cwd\":\"{}\"}}", json_escape(&cwd.to_string_lossy()));
     // Short read timeout on the launch critical path — see [`PROVISION_RW_TIMEOUT`].

@@ -7850,8 +7850,9 @@ struct ProvisionSessionBody {
 /// stands **IN PLACE OF** the nonce check:
 ///
 /// 1. the SAME-USER handshake — the caller must present this runner start's
-///    owner-only loopback key (`~/.qontinui/runner-loopback-key`) in the
-///    `X-Qontinui-Loopback-Key` header; AND
+///    owner-only loopback key (`~/.qontinui/runner-loopback-key-<bound port>`,
+///    the path this runner's port breadcrumb names as `loopback_key_path`) in
+///    the `X-Qontinui-Loopback-Key` header; AND
 /// 2. a per-machine operator opt-in marker
 ///    (`~/.qontinui/allow-session-coord-identity`).
 ///
@@ -10224,8 +10225,9 @@ pub fn create_router(
         // ⚠ THE ONE ROUTE IN THIS FAMILY THAT IS NOT NONCE-GATED, and it cannot
         // be: it is what ISSUES the nonce. It carries the SAME-USER loopback
         // handshake (`X-Qontinui-Loopback-Key`, matched against the owner-only
-        // `~/.qontinui/runner-loopback-key` written at this runner start) + a
-        // per-machine operator opt-in marker IN PLACE OF the nonce check. Read
+        // `~/.qontinui/runner-loopback-key-<bound port>` written at this runner
+        // start and named in its port breadcrumb) + a per-machine operator
+        // opt-in marker IN PLACE OF the nonce check. Read
         // `coord_provision_session_handler`'s doc before touching this.
         .route(
             "/coord-mcp/provision-session",
@@ -10899,13 +10901,10 @@ pub async fn start_server(
     let emitter = app_handle.clone();
     let api_ready_flag = app_state.clone();
 
-    // Rotate this runner start's SAME-USER loopback handshake key BEFORE the
-    // socket is served, so any caller that can reach `/health` can already read
-    // the owner-only key file and drive `POST /coord-mcp/provision-session`.
-    // Synchronous and cheap (32 CSPRNG bytes + one owner-only write); it never
-    // fails the boot — a write failure leaves the mint route denying every
-    // request, which is the fail-closed posture, not an outage.
-    crate::coord_mcp::init_loopback_handshake_key();
+    // NOTE: this runner start's SAME-USER loopback handshake key is rotated in
+    // the bind-success arm below, NOT here — it is keyed on the port this
+    // runner ACTUALLY binds, which is unknown until the bind loop settles (a
+    // blocked primary port silently promotes the runner onto `port + 1`).
 
     info!("MCP API server: building router via create_router...");
     let router = create_router(app_state, rag_state, app_handle, instance_manager);
@@ -10964,6 +10963,24 @@ pub async fn start_server(
                 // secondary/temp runners — plan §6's #1 live-verification
                 // footgun. Set HERE, the same place app_state.api_port lands.
                 crate::install_effects_producer::intercept::set_bound_port(try_port);
+
+                // Rotate this runner start's SAME-USER loopback handshake key at
+                // the BOUND port's path (`~/.qontinui/runner-loopback-key-<port>`)
+                // and then advertise both the port and that path out-of-process
+                // in the breadcrumb record — the key BEFORE the record that
+                // names it, so a reader that sees the record can already read
+                // the key, and both BEFORE the socket is served, so any caller
+                // that can reach `/health` can already drive
+                // `POST /coord-mcp/provision-session`. Keying on the bound port
+                // is what stops a second runner on this box (which shares
+                // `~/.qontinui`) from clobbering this one's key (plan
+                // 2026-09-07-the-runner-loopback-handshake-key-is-box-global-
+                // and-a-second-runner-clobbers-it). Synchronous and cheap; it
+                // never fails the boot — a write failure yields `None`, the
+                // record says so, and the mint route denies every request
+                // (fail-closed), which is a closed door, not an outage.
+                let key_path = crate::coord_mcp::publish_loopback_handshake_key(try_port);
+                qontinui_runner_lib::runner_breadcrumb::publish(try_port, key_path);
 
                 // Port stored in api_ready_flag.api_port above; PG queries accept runner_port as parameter.
 
@@ -15091,7 +15108,10 @@ mod coord_provision_session_gate_tests {
         // The denial names the header and the file, never the secret.
         let err = v["error"].as_str().unwrap_or_default();
         assert!(err.contains("X-Qontinui-Loopback-Key"), "{err}");
-        assert!(err.contains("runner-loopback-key"), "{err}");
+        assert!(
+            err.contains(crate::coord_mcp::RUNNER_LOOPBACK_KEY_FILE),
+            "{err}"
+        );
     }
 
     /// An EMPTY handshake header is "not presented", not "wrong" — the two have
@@ -15289,7 +15309,10 @@ mod coord_provision_session_gate_tests {
             // act on and is deliberately published; the handshake KEY's path is
             // not, and its contents never are.
             let rendered = v.to_string();
-            assert!(!rendered.contains("runner-loopback-key"), "{rendered}");
+            assert!(
+                !rendered.contains(crate::coord_mcp::RUNNER_LOOPBACK_KEY_FILE),
+                "{rendered}"
+            );
             assert!(!rendered.to_lowercase().contains("bearer "), "{rendered}");
         }
     }
