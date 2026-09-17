@@ -435,7 +435,8 @@ async fn in_process_get_coord_device_token(
 ) -> Result<Value, (StatusCode, Json<ApiResponse<()>>)> {
     const COMMAND: &str = "get_coord_device_token";
 
-    let tenant = coord_device_token_tenant_arg(args).map_err(|d| in_process_bad_args(COMMAND, &d))?;
+    let tenant =
+        coord_device_token_tenant_arg(args).map_err(|d| in_process_bad_args(COMMAND, &d))?;
     match crate::commands::auth::get_coord_device_token(tenant) {
         Ok(Some(token)) => Ok(Value::String(token)),
         Ok(None) => Ok(Value::Null),
@@ -464,7 +465,9 @@ fn coord_device_token_tenant_arg(args: &Value) -> Result<Option<String>, String>
         _ => return Err("args must be an object `{\"tenantId\": \"<uuid>\"}` or `{}`".to_string()),
     };
     if let Some(other) = obj.keys().find(|k| *k != "tenantId" && *k != "tenant_id") {
-        return Err(format!("unknown arg `{other}` -- the only arg is `tenantId`"));
+        return Err(format!(
+            "unknown arg `{other}` -- the only arg is `tenantId`"
+        ));
     }
     let canonical = optional_string_arg(args, "tenantId")?;
     let alias = optional_string_arg(args, "tenant_id")?;
