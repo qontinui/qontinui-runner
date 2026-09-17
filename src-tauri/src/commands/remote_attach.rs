@@ -26,7 +26,7 @@ use crate::mcp::remote_terminal::{client, ATTACH_TIMEOUT};
 use crate::session::SessionRegistry;
 use crate::settings::AcceptRemoteAttach;
 use crate::terminal::pane_io::PaneIo;
-use crate::terminal::remote_pane_io::{RemotePaneIo, ERROR_EXIT_CODE};
+use crate::terminal::remote_pane_io::{DetachOutcome, RemotePaneIo, ERROR_EXIT_CODE};
 use crate::terminal::types::{RemoteTabIdentity, RemoteTerminalInfo};
 use crate::terminal::TerminalManager;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
@@ -458,6 +458,120 @@ pub(crate) async fn open_remote_tab(
     }
 }
 
+/// What closing a remote tab did about the relay's `(target, terminal)`
+/// binding — plan
+/// `2026-09-16-remote-tab-cannot-be-released-so-the-target-terminal-stays-claimed`,
+/// Phase 1.
+///
+/// `terminal_close` used to answer a bare `success: true` for a remote tab
+/// whether or not its `remote_terminal_detach` was ever queued, so an
+/// operator (or a headless harness) could not tell "released" from "closed
+/// locally, binding still held until the grant expires". Capture the probe
+/// BEFORE the close — the close removes the identity — and render it after.
+pub(crate) struct RemoteCloseProbe {
+    identity: RemoteTabIdentity,
+    pane: Option<Arc<RemotePaneIo>>,
+}
+
+/// `None` for a local tab: its close response is unchanged.
+pub(crate) fn probe_remote_close(
+    tm: &TerminalManager,
+    terminal_id: &str,
+) -> Option<RemoteCloseProbe> {
+    let identity = tm.remote_identity(terminal_id)?;
+    let pane = client().pane(&identity.grant_jti);
+    Some(RemoteCloseProbe { identity, pane })
+}
+
+/// The rendered outcome: a one-line `message` and the `remoteDetach` object.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RemoteCloseReport {
+    pub message: String,
+    pub remote_detach: Value,
+}
+
+impl RemoteCloseProbe {
+    /// Read the pane's detach outcome now (after the close ran).
+    pub(crate) fn report(&self) -> RemoteCloseReport {
+        render_remote_close(
+            &self.identity,
+            self.pane.as_ref().map(|p| p.detach_outcome()),
+            client().outbound_pump_attached(),
+        )
+    }
+}
+
+/// Pure rendering, unit-tested per outcome. `outcome` is `None` when this
+/// runner no longer tracks the pane (it had already finished and was swept),
+/// which is UNKNOWN — never reported as released. `Queued` is only ever
+/// "queued": the relay's handling of the frame is not observable from here.
+pub(crate) fn render_remote_close(
+    identity: &RemoteTabIdentity,
+    outcome: Option<DetachOutcome>,
+    pump_attached: bool,
+) -> RemoteCloseReport {
+    let what = format!(
+        "remote terminal {} on {}",
+        short_id(&identity.remote_terminal_id),
+        identity.device_label
+    );
+    let (code, error, message) = match outcome {
+        Some(DetachOutcome::Queued) if pump_attached => (
+            "queued",
+            None,
+            format!(
+                "Closed; detach for {what} queued to the relay, which drops the binding when it \
+                 processes the frame."
+            ),
+        ),
+        Some(DetachOutcome::Queued) => (
+            "queued",
+            None,
+            format!(
+                "Closed; detach for {what} queued, but no relay connection is draining the \
+                 queue — the frame will be discarded on reconnect. The relay drops a source's \
+                 bindings when its connection closes, so this binding is released by that, \
+                 not by this detach."
+            ),
+        ),
+        Some(DetachOutcome::Failed(e)) => (
+            "failed",
+            Some(e.clone()),
+            format!(
+                "Closed locally, but the detach for {what} could not be queued ({e}). The relay \
+                 keeps the binding until this runner's relay connection drops or the grant \
+                 expires."
+            ),
+        ),
+        Some(DetachOutcome::NotAttempted) => (
+            "not_attempted",
+            None,
+            format!(
+                "Closed locally, but no detach was attempted for {what}. The relay keeps the \
+                 binding until this runner's relay connection drops or the grant expires."
+            ),
+        ),
+        None => (
+            "unknown",
+            None,
+            format!(
+                "Closed; this runner no longer tracks the pane for {what}, so whether a detach \
+                 was queued is unknown. The binding lasts no longer than its grant."
+            ),
+        ),
+    };
+    RemoteCloseReport {
+        message,
+        remote_detach: json!({
+            "outcome": code,
+            "error": error,
+            "relayPumpAttached": pump_attached,
+            "targetDeviceId": identity.device_id,
+            "remoteTerminalId": identity.remote_terminal_id,
+        }),
+    }
+}
+
 /// Every live remote tab's identity keyed by LOCAL terminal id — what a
 /// reconnecting webview reads after `terminal_list`, whose shared-schema
 /// `TerminalInfo` cannot carry the remote identity.
@@ -616,5 +730,89 @@ mod placement_tests {
         assert!(!coord_places_session_on("", Some("device-c")));
         assert!(!coord_places_session_on("   ", Some("device-c")));
         assert!(!coord_places_session_on("", None));
+    }
+}
+
+#[cfg(test)]
+mod remote_close_tests {
+    use super::{render_remote_close, DetachOutcome, RemoteTabIdentity};
+    use serde_json::Value;
+
+    fn identity() -> RemoteTabIdentity {
+        RemoteTabIdentity {
+            device_id: "c79a07d5-0000-0000-0000-000000000000".into(),
+            device_label: "spaceship".into(),
+            session_id: "11111111-2222-3333-4444-555555555555".into(),
+            remote_terminal_id: "490212f5-aaaa-bbbb-cccc-dddddddddddd".into(),
+            grant_jti: "01a0905e".into(),
+            history_available: false,
+        }
+    }
+
+    /// Plan 2026-09-16 Phase 1, R2/R3: a remote close names the outcome it
+    /// actually got — never a bare success.
+    #[test]
+    fn remote_close_reports_each_detach_outcome() {
+        let id = identity();
+
+        let r = render_remote_close(&id, Some(DetachOutcome::Queued), true);
+        assert_eq!(r.remote_detach["outcome"], "queued");
+        assert_eq!(r.remote_detach["relayPumpAttached"], true);
+        assert!(r.message.contains("queued to the relay"), "{}", r.message);
+        assert!(
+            !r.message.contains("released"),
+            "queued must never read as released: {}",
+            r.message
+        );
+
+        let r = render_remote_close(&id, Some(DetachOutcome::Queued), false);
+        assert_eq!(r.remote_detach["outcome"], "queued");
+        assert_eq!(r.remote_detach["relayPumpAttached"], false);
+        assert!(
+            r.message.contains("discarded on reconnect"),
+            "{}",
+            r.message
+        );
+
+        let r = render_remote_close(
+            &id,
+            Some(DetachOutcome::Failed("backlog is full".into())),
+            true,
+        );
+        assert_eq!(r.remote_detach["outcome"], "failed");
+        assert_eq!(r.remote_detach["error"], "backlog is full");
+        assert!(
+            r.message.contains("could not be queued (backlog is full)"),
+            "{}",
+            r.message
+        );
+        assert!(r.message.contains("grant"), "{}", r.message);
+
+        let r = render_remote_close(&id, Some(DetachOutcome::NotAttempted), true);
+        assert_eq!(r.remote_detach["outcome"], "not_attempted");
+        assert_eq!(r.remote_detach["error"], Value::Null);
+
+        let r = render_remote_close(&id, None, true);
+        assert_eq!(r.remote_detach["outcome"], "unknown");
+        assert!(r.message.contains("unknown"), "{}", r.message);
+    }
+
+    /// The report identifies the remote terminal and device, and carries no
+    /// capability id: `RemoteTabIdentity` withholds `grant_jti` from the
+    /// frontend and so does this.
+    #[test]
+    fn remote_close_report_names_the_target_and_never_the_grant() {
+        let r = render_remote_close(&identity(), Some(DetachOutcome::Queued), true);
+        assert_eq!(
+            r.remote_detach["targetDeviceId"],
+            "c79a07d5-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            r.remote_detach["remoteTerminalId"],
+            "490212f5-aaaa-bbbb-cccc-dddddddddddd"
+        );
+        assert!(r.message.contains("spaceship"), "{}", r.message);
+        let text = r.remote_detach.to_string() + &r.message;
+        assert!(!text.contains("01a0905e"), "grant jti leaked: {text}");
     }
 }
