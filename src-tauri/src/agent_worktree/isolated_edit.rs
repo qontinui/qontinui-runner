@@ -304,14 +304,10 @@ impl IsolatedEditContext {
         // resolver gives NOW first (a context joining two repos that share a
         // name must release the one it was asked about). For `qontinui/*` repos
         // there is exactly one key, the same as before.
-        let mut want_keys: Vec<String> = super::canonical_paths::default_canonical_path(repo)
-            .ok()
-            .map(|p| super::worktree_resource_key(&p))
-            .into_iter()
-            .collect();
         // A key another repo joined to THIS context currently resolves to is
         // that repo's claim, never this one's (`acme/infra`'s layout-rule
-        // candidate is `qontinui/infra`'s real key).
+        // candidate is `qontinui/infra`'s real key) — whichever position the
+        // key would take below.
         let others: Vec<String> = self
             .worktrees
             .iter()
@@ -319,7 +315,12 @@ impl IsolatedEditContext {
             .filter_map(|w| super::canonical_paths::default_canonical_path(&w.repo).ok())
             .map(|p| super::worktree_resource_key(&p))
             .collect();
-        for p in super::canonical_paths::canonical_path_candidates(repo) {
+        let mut want_keys: Vec<String> = Vec::new();
+        let current = super::canonical_paths::default_canonical_path(repo).ok();
+        for p in current
+            .into_iter()
+            .chain(super::canonical_paths::canonical_path_candidates(repo))
+        {
             let key = super::worktree_resource_key(&p);
             if !want_keys.contains(&key) && !others.contains(&key) {
                 want_keys.push(key);
