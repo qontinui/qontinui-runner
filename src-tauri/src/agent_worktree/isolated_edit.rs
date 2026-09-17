@@ -309,9 +309,19 @@ impl IsolatedEditContext {
             .map(|p| super::worktree_resource_key(&p))
             .into_iter()
             .collect();
+        // A key another repo joined to THIS context currently resolves to is
+        // that repo's claim, never this one's (`acme/infra`'s layout-rule
+        // candidate is `qontinui/infra`'s real key).
+        let others: Vec<String> = self
+            .worktrees
+            .iter()
+            .filter(|w| w.repo != repo)
+            .filter_map(|w| super::canonical_paths::default_canonical_path(&w.repo).ok())
+            .map(|p| super::worktree_resource_key(&p))
+            .collect();
         for p in super::canonical_paths::canonical_path_candidates(repo) {
             let key = super::worktree_resource_key(&p);
-            if !want_keys.contains(&key) {
+            if !want_keys.contains(&key) && !others.contains(&key) {
                 want_keys.push(key);
             }
         }
@@ -504,8 +514,17 @@ async fn materialize_repos(
 ) -> Result<super::AllocateResult, AllocateError> {
     let mut canonical_paths: HashMap<String, PathBuf> = HashMap::with_capacity(repos.len());
     for repo in repos {
-        let path = super::canonical_paths::default_canonical_path(repo)
-            .map_err(|e| AllocateError::Other(format!("canonical path for repo {repo:?}: {e}")))?;
+        // A repo outside the workspace root is materialized only from a
+        // VERIFIED checkout of it: `default_canonical_path`'s layout-rule
+        // fallback may name a same-named checkout of a different owner's repo.
+        let path = if super::canonical_paths::has_foreign_owner(repo) {
+            super::canonical_paths::resolve_checkout(repo)
+                .map_err(|e| AllocateError::Other(e.to_string()))?
+        } else {
+            super::canonical_paths::default_canonical_path(repo).map_err(|e| {
+                AllocateError::Other(format!("canonical path for repo {repo:?}: {e}"))
+            })?
+        };
         canonical_paths.insert(repo.clone(), path);
     }
 
