@@ -731,13 +731,19 @@ const SPINNER_GLYPHS: &[char] = &['✻', '✶', '✳', '✽', '✢', '·', '∗'
 const PROMPT_MARKER: char = '❯';
 
 /// What an EMPTY Claude Code input box shows after the `❯` caret: a hint
-/// placeholder (`Try "fix lint errors"`, `Try "how do I…"`). This is an
-/// OBSERVED RENDERING of the Claude Code TUI, not a contract — the wording
-/// may drift with a Claude Code release, in which case an empty box that no
-/// longer starts with this prefix reads as "not empty" and the typed-terminal
-/// arm defers (fail-closed: a deferred message is recoverable, a keystroke
-/// injected onto an operator's half-typed prompt is not).
-const PROMPT_PLACEHOLDER_PREFIX: &str = "Try ";
+/// placeholder (`Try "fix lint errors"`, `Try "how do I…"`). The opening
+/// quote is part of the prefix on purpose: the installed bundle renders the
+/// hint as the template string `Try "${te[(x>>>8)%te.length]}"` — measured
+/// 2026-09-08 in `@anthropic-ai/claude-code` 2.1.263 (`bin/claude.exe`, the
+/// node v24.19.0 nvm install, `grep -a`), which always emits the quote — so
+/// a bare `Try ` would class an operator's half-typed `Try running the tests`
+/// as empty. This is an OBSERVED RENDERING of the Claude Code TUI, not a
+/// contract — the wording may drift with a Claude Code release, in which case
+/// an empty box that no longer starts with this prefix reads as "not empty"
+/// and the typed-terminal arm defers (fail-closed: a deferred message is
+/// recoverable, a keystroke injected onto an operator's half-typed prompt is
+/// not).
+const PROMPT_PLACEHOLDER_PREFIX: &str = "Try \"";
 
 /// Is the input box on the prompt row EMPTY — nothing typed after the `❯`
 /// caret? `rest` is the text following the marker on the prompt row.
@@ -755,23 +761,36 @@ fn prompt_rest_is_empty(rest: &str) -> bool {
 }
 
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for input
-/// — the predicate the worker PTYs have always used ([`snapshot_looks_idle_for`]
+/// — the predicate the worker PTYs have always used ([`snapshot_verdict`]
 /// with `require_empty_prompt = false`).
 fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
-    snapshot_looks_idle_for(lines, cursor_row, false)
+    snapshot_verdict(lines, cursor_row, false).is_ok()
 }
 
-/// Decide whether a single rendered grid snapshot looks IDLE / ready for input.
+/// [`snapshot_verdict`] as a bool, for the typed-terminal arm's tests.
+fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prompt: bool) -> bool {
+    snapshot_verdict(lines, cursor_row, require_empty_prompt).is_ok()
+}
+
+/// Judge a single rendered grid snapshot: `Ok(())` when it looks IDLE / ready
+/// for input, else the [`GateMiss`] naming why — `NotIdle` for rules 1-4,
+/// `PromptNotEmpty` for rule 5 — so both debounce reads can report the
+/// precise miss and rules 1-4 are evaluated once per read.
 ///
 /// Pure over the snapshot so it is unit-testable against synthetic grids.
-/// CONSERVATIVE: returns false (NOT idle) on any ambiguity. Idle requires ALL:
+/// CONSERVATIVE: refuses (NOT idle) on any ambiguity. Idle requires ALL:
 ///
 /// 1. NO processing indicator text anywhere on screen
 ///    ([`PROCESSING_INDICATORS`]).
 /// 2. NO spinner glyph on screen ([`SPINNER_GLYPHS`]) — except that the `·`
 ///    middot is common in static UI, so it only counts when it co-occurs with a
 ///    working line; we treat it via the text indicators, not as a bare glyph.
-/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible.
+/// 3. A prompt row containing [`PROMPT_MARKER`] (`❯`) is visible. The input
+///    box is the BOTTOM-MOST such row: a shell prompt that uses `❯`
+///    (starship's default) leaves `❯ claude` in the inline viewport at
+///    session start, and a Claude Code select menu renders `❯ 1. Yes` above
+///    the box — both carry the glyph, and nothing Claude Code draws BELOW the
+///    input box does, so the last row is the one that is the box.
 /// 4. The cursor sits AT OR BELOW the prompt row (i.e. in the input area), not
 ///    up in streaming output.
 /// 5. With `require_empty_prompt` — the typed-terminal arm — the input box
@@ -779,13 +798,17 @@ fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
 ///    no operator typing into it, so it keeps the four-rule predicate; a typed
 ///    terminal does, and an operator who paused mid-prompt for longer than
 ///    the quiescence debounce would otherwise read as idle.
-fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prompt: bool) -> bool {
+fn snapshot_verdict(
+    lines: &[String],
+    cursor_row: u16,
+    require_empty_prompt: bool,
+) -> Result<(), GateMiss> {
     // (1) any processing-indicator text ⇒ busy.
     let lower: Vec<String> = lines.iter().map(|l| l.to_ascii_lowercase()).collect();
     for line in &lower {
         for ind in PROCESSING_INDICATORS {
             if line.contains(ind) {
-                return false;
+                return Err(GateMiss::NotIdle);
             }
         }
     }
@@ -794,22 +817,23 @@ fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prom
     for line in lines {
         for ch in line.chars() {
             if ch != '·' && SPINNER_GLYPHS.contains(&ch) {
-                return false;
+                return Err(GateMiss::NotIdle);
             }
         }
     }
 
-    // (3) prompt marker visible — and remember its row for (4) and (5).
-    let prompt_row = lines.iter().position(|l| l.contains(PROMPT_MARKER));
+    // (3) prompt marker visible — the BOTTOM-MOST `❯` row is the input box;
+    // remember it for (4) and (5).
+    let prompt_row = lines.iter().rposition(|l| l.contains(PROMPT_MARKER));
     let Some(prompt_row) = prompt_row else {
         // No visible input prompt ⇒ we can't confirm ready-for-input ⇒ not idle.
-        return false;
+        return Err(GateMiss::NotIdle);
     };
 
     // (4) cursor in the input area (at/below the prompt row). A cursor up in
     // the scrollback/output region means output is still being drawn.
     if (cursor_row as usize) < prompt_row {
-        return false;
+        return Err(GateMiss::NotIdle);
     }
 
     // (5) typed-terminal arm only: nothing typed after the caret.
@@ -820,10 +844,10 @@ fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prom
             .map(|(_, rest)| rest)
             .unwrap_or("");
         if !prompt_rest_is_empty(rest) {
-            return false;
+            return Err(GateMiss::PromptNotEmpty);
         }
     }
-    true
+    Ok(())
 }
 
 /// Read a terminal's rendered grid as `(lines, cursor_row)`. Lock-poison
@@ -840,9 +864,9 @@ fn read_grid(session: &crate::terminal::session::TerminalSession) -> (Vec<String
 /// look idle and render identical text (no streaming between them).
 ///
 /// `require_empty_prompt` is the typed-terminal arm's rule 5
-/// ([`snapshot_looks_idle_for`]); it is checked on the FIRST read so a busy or
-/// non-empty prompt is refused before paying the debounce, and the verdict
-/// distinguishes "mid-turn" from "prompt not empty" so the log can name it.
+/// ([`snapshot_verdict`]); both reads go through the one verdict, so a busy
+/// or non-empty prompt is refused before paying the debounce and either read
+/// reports "mid-turn" and "prompt not empty" distinctly for the log.
 ///
 /// Async because it sleeps for the debounce; the two grid reads themselves are
 /// cheap synchronous lock-and-snapshot calls.
@@ -851,17 +875,10 @@ async fn terminal_looks_idle(
     require_empty_prompt: bool,
 ) -> Result<(), GateMiss> {
     let (lines_a, cursor_a) = read_grid(session);
-    if !snapshot_looks_idle(&lines_a, cursor_a) {
-        return Err(GateMiss::NotIdle);
-    }
-    if require_empty_prompt && !snapshot_looks_idle_for(&lines_a, cursor_a, true) {
-        return Err(GateMiss::PromptNotEmpty);
-    }
+    snapshot_verdict(&lines_a, cursor_a, require_empty_prompt)?;
     tokio::time::sleep(IDLE_QUIESCENCE_DEBOUNCE).await;
     let (lines_b, cursor_b) = read_grid(session);
-    if !snapshot_looks_idle_for(&lines_b, cursor_b, require_empty_prompt) {
-        return Err(GateMiss::NotIdle);
-    }
+    snapshot_verdict(&lines_b, cursor_b, require_empty_prompt)?;
     // Quiescent: identical render across the debounce ⇒ nothing streaming.
     if lines_a == lines_b && cursor_a == cursor_b {
         Ok(())
@@ -2664,12 +2681,81 @@ mod tests {
         assert!(prompt_rest_is_empty(""));
         assert!(prompt_rest_is_empty("   "));
         assert!(prompt_rest_is_empty("                          │"));
-        // The Claude Code hint placeholder ⇒ empty (observed rendering).
+        // The Claude Code hint placeholder ⇒ empty (observed rendering,
+        // `Try "${…}"` — the opening quote is always rendered).
         assert!(prompt_rest_is_empty(" Try \"fix lint errors\"            │"));
-        // Anything the operator typed ⇒ NOT empty.
+        assert!(prompt_rest_is_empty("Try \"how do I log an error?\""));
+        // Anything the operator typed ⇒ NOT empty — including a prompt that
+        // happens to begin with the word `Try` but not the quoted hint.
         assert!(!prompt_rest_is_empty(" hello"));
+        assert!(!prompt_rest_is_empty(" Try running the tests             │"));
+        assert!(!prompt_rest_is_empty(" Try"));
         assert!(!prompt_rest_is_empty(" try lowercase is not the placeholder │"));
         assert!(!prompt_rest_is_empty(" /vet-imp 2026-09-07-…               │"));
+    }
+
+    #[test]
+    fn prompt_row_is_the_bottom_most_marker_row() {
+        // A starship-style shell prompt leaves `❯ claude` in the inline
+        // viewport at session start; a select menu renders `❯ 1. Yes`. Both
+        // sit ABOVE the input box and carry the glyph. The box is the
+        // bottom-most `❯` row, so an empty box below them is idle under the
+        // typed-terminal rule — judging the first row would defer as
+        // PromptNotEmpty every tick until the scrollback moved.
+        let shell_prompt_above = lines(&[
+            "~/repo on main",
+            "❯ claude",
+            "Welcome to Claude Code",
+            "╭──────────────────────────────────────────╮",
+            "│ ❯                                          │",
+            "╰──────────────────────────────────────────╯",
+        ]);
+        assert_eq!(
+            snapshot_verdict(&shell_prompt_above, 4, true),
+            Ok(()),
+            "the empty box below a `❯ claude` shell line must read as idle"
+        );
+        assert!(snapshot_looks_idle_for(&shell_prompt_above, 4, true));
+        let select_menu_above = lines(&[
+            "Do you want to proceed?",
+            "❯ 1. Yes",
+            "  2. No",
+            "│ ❯                                          │",
+        ]);
+        assert_eq!(snapshot_verdict(&select_menu_above, 3, true), Ok(()));
+        // And the bottom-most row is the one JUDGED: text there still defers,
+        // even with an empty-looking `❯` row above it.
+        let typing_below = lines(&[
+            "❯ ",
+            "│ ❯ hello                                    │",
+        ]);
+        assert_eq!(
+            snapshot_verdict(&typing_below, 1, true),
+            Err(GateMiss::PromptNotEmpty)
+        );
+        // Rule 4 is measured against the bottom-most row too: a cursor on the
+        // shell line above the box is "above the prompt" ⇒ not idle.
+        assert_eq!(
+            snapshot_verdict(&shell_prompt_above, 1, false),
+            Err(GateMiss::NotIdle)
+        );
+    }
+
+    #[test]
+    fn snapshot_verdict_names_the_precise_miss() {
+        // Rules 1-4 ⇒ NotIdle; rule 5 ⇒ PromptNotEmpty — on either debounce
+        // read, since both go through the one verdict.
+        let busy = lines(&["✻ Thinking… (esc to interrupt)", "│ ❯          │"]);
+        assert_eq!(snapshot_verdict(&busy, 1, true), Err(GateMiss::NotIdle));
+        let no_prompt = lines(&["still streaming output"]);
+        assert_eq!(snapshot_verdict(&no_prompt, 0, true), Err(GateMiss::NotIdle));
+        let half_typed = lines(&["│ ❯ hello    │"]);
+        assert_eq!(
+            snapshot_verdict(&half_typed, 0, true),
+            Err(GateMiss::PromptNotEmpty)
+        );
+        // The worker predicate never raises rule 5.
+        assert_eq!(snapshot_verdict(&half_typed, 0, false), Ok(()));
     }
 
     #[test]
