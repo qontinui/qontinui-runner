@@ -1015,9 +1015,14 @@ pub struct AllowedOriginsPayload {
 
 /// GET /settings/api/allowed-origins
 async fn get_allowed_origins_setting() -> Json<ApiResponse<serde_json::Value>> {
-    let origins = spawn_blocking_tracked(|| settings::read_settings_from_disk().settings.api.allowed_origins)
-        .await
-        .unwrap_or_default();
+    let origins = spawn_blocking_tracked(|| {
+        settings::read_settings_from_disk()
+            .settings
+            .api
+            .allowed_origins
+    })
+    .await
+    .unwrap_or_default();
     Json(ApiResponse::success(serde_json::json!({
         "origins": origins,
         "defaults": crate::mcp::origin_guard::DEFAULT_TRUSTED_ORIGINS,
@@ -1055,8 +1060,13 @@ async fn save_allowed_origins_setting(
     })?;
     match result {
         Ok(()) => {
-            info!(count = origins.len(), "Saved allowed browser origins via HTTP");
-            Ok(Json(ApiResponse::success(AllowedOriginsPayload { origins })))
+            info!(
+                count = origins.len(),
+                "Saved allowed browser origins via HTTP"
+            );
+            Ok(Json(ApiResponse::success(AllowedOriginsPayload {
+                origins,
+            })))
         }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }

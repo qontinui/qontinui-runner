@@ -74,7 +74,6 @@ pub mod error_monitor;
 pub mod executor;
 pub mod extraction;
 pub mod file_browser;
-pub mod origin_guard; // Host gate + browser-origin classification + per-class route allowlists for the loopback API (plan 2026-09-17-runner-loopback-api-accepts-any-origin)
 pub mod file_registry;
 pub mod findings_api;
 pub mod fleet_policy_poller;
@@ -107,6 +106,7 @@ pub mod online_learning_api;
 pub mod orchestration_loop_api;
 pub mod orchestration_report;
 pub mod orchestration_run_api;
+pub mod origin_guard; // Host gate + browser-origin classification + per-class route allowlists for the loopback API (plan 2026-09-17-runner-loopback-api-accepts-any-origin)
 pub mod otel_status;
 pub mod pg_guard;
 pub mod physical_device;
