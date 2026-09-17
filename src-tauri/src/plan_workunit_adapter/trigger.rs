@@ -2316,8 +2316,10 @@ impl ResolvedDirs {
 // reports those as `coord_only`), so spaceship reads as single-bound there.
 // Coord's own set reaches this process only through the register heartbeat,
 // which `coord_bound_tenants` makes durable — and that sidecar is UNKNOWN
-// (`None`) at boot, when stale, and on a machine whose heartbeat has never
-// answered with a set. `max(local, coord.unwrap_or(0))` can therefore never
+// (`None`) at boot, on a machine whose heartbeat has never answered with a
+// set, and when stale while naming at most one tenant (a stale set of two or
+// more keeps answering, so age never turns a multi-bound device single-bound
+// — see that module). `max(local, coord.unwrap_or(0))` can therefore never
 // LOWER today's figure: a single-bound device stays byte-for-byte on today's
 // path, and only a device SOME reading says is multi-bound is withheld.
 // ---------------------------------------------------------------------------
@@ -2344,7 +2346,8 @@ pub struct BindingCountReading {
     /// answers `1` for every unreadable state (its documented direction).
     pub local: usize,
     /// `pair::coord_bound_tenant_count()` — coord's set as the heartbeat last
-    /// recorded it; `None` is UNKNOWN (absent, stale, unparseable sidecar).
+    /// recorded it; `None` is UNKNOWN (absent, unparseable or far-future
+    /// sidecar, or one stale while naming at most one tenant).
     pub coord: Option<usize>,
 }
 
@@ -2452,9 +2455,11 @@ struct LoopState {
     /// Whether the cold-start BULK seed has been attempted for the current
     /// corpus. `false` means the next tick will try to prime `last_applied`
     /// from one paged read instead of paying `reconcile_once`'s per-slug seed
-    /// on every plan. Re-armed by [`LoopState::apply_resolution`] whenever the
-    /// active plans dir moves, because that clears `last_applied` and the
-    /// per-slug fallback would otherwise cost one round-trip per plan again.
+    /// on every plan. Re-armed at the two sites that clear `last_applied`:
+    /// [`LoopState::apply_resolution`] whenever the active plans dir moves, and
+    /// [`LoopState::note_write_posture`] on a `Withheld -> Write` flip —
+    /// because with the memory empty the per-slug fallback would otherwise
+    /// cost one round-trip per plan again.
     bulk_seeded: bool,
     /// Test-only: the scan-root reporter every rebuilt [`BodySync`] gets
     /// instead of its sink, so a tick-level test can observe reports.
@@ -2549,16 +2554,22 @@ impl LoopState {
                     // withheld cycle since then made no coord read, so a
                     // status an agent set in the meantime is unknown to the
                     // edge memory, and reconciling against it would re-push a
-                    // stale status as a transition. Re-arm the bulk seed so
-                    // the next cycle re-primes from ONE `list_statuses` read
-                    // — the same posture as a corpus switch.
+                    // stale status as a transition. Same posture as a corpus
+                    // switch in `apply_resolution`: CLEAR the memory, so the
+                    // per-slug seed re-primes every unit whatever the bulk
+                    // door answers, and re-arm the bulk seed so it does that
+                    // in ONE `list_statuses` read when it can. Re-arming alone
+                    // was not enough — the bulk prime is one-shot per cycle
+                    // and abstains on `Err`/`Ok(None)`, while the per-slug
+                    // seed fires only for slugs the memory does not hold.
+                    self.last_applied.clear();
                     self.bulk_seeded = false;
                     match reading.coord {
-                        Some(_) => tracing::info!(
+                        Some(n) => tracing::info!(
                             local_bindings = reading.local,
-                            coord_bindings = ?reading.coord,
+                            coord_bindings = n,
                             "plan adapter: work-unit writes RESUMED — coord now reports this \
-                             device bound to a single tenant"
+                             device bound to {n} tenant(s)"
                         ),
                         // The two arms say different things: this one is NOT
                         // coord saying one — it is coord saying nothing.
@@ -6520,9 +6531,14 @@ mod tests {
         /// Total `list_statuses` reads served, so "attempted once per corpus"
         /// is asserted rather than assumed.
         list_statuses_calls: Mutex<u64>,
-        /// Every coord call in arrival order, so a test can assert WHICH read
-        /// came first — the bulk prime must precede any per-slug read.
+        /// Every coord call in arrival order — EVERY trait method pushes here —
+        /// so a test can assert which call came first, or that none came.
         call_order: Mutex<Vec<&'static str>>,
+        /// When set, `list_statuses` hard-errors. Atomic rather than a plain
+        /// bool so a test can flip it BETWEEN ticks on a sink it only holds by
+        /// shared reference — the bulk door failing on one cycle and not the
+        /// one before is the shape the resume re-prime must survive.
+        fail_list_statuses: std::sync::atomic::AtomicBool,
     }
     #[async_trait::async_trait]
     impl WorkUnitSink for FakeSink {
@@ -6540,9 +6556,13 @@ mod tests {
         async fn list_statuses(&self) -> Result<Option<HashMap<String, String>>> {
             *self.list_statuses_calls.lock().unwrap() += 1;
             self.call_order.lock().unwrap().push("list_statuses");
+            if self.fail_list_statuses.load(Ordering::Relaxed) {
+                anyhow::bail!("simulated list_statuses failure");
+            }
             Ok(self.bulk.clone())
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
+            self.call_order.lock().unwrap().push("last_actor");
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
@@ -6586,6 +6606,7 @@ mod tests {
         }
         async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
             *self.transitions.lock().unwrap() += 1;
+            self.call_order.lock().unwrap().push("transition");
             self.statuses
                 .lock()
                 .unwrap()
@@ -6593,6 +6614,7 @@ mod tests {
             Ok(())
         }
         async fn set_deps(&self, slug: &str, depends_on: &[String]) -> Result<SetDepsOutcome> {
+            self.call_order.lock().unwrap().push("set_deps");
             self.deps_calls
                 .lock()
                 .unwrap()
@@ -8841,7 +8863,7 @@ mod tests {
             "{logged}"
         );
         assert!(
-            logged.contains("coord now reports this device bound to a single tenant"),
+            logged.contains("coord now reports this device bound to 1 tenant(s)"),
             "coord said one, so the line must attribute the resume to coord; got: {logged}"
         );
     }
@@ -8922,21 +8944,23 @@ mod tests {
         // against.)
         state.tick(&sink, &metrics).await;
         assert_eq!(*sink.list_statuses_calls.lock().unwrap(), 1);
-        assert_eq!(
-            sink.call_order.lock().unwrap().first(),
-            Some(&"list_statuses")
-        );
+        // Cloned out of the mutex before asserting: a guard held in the left
+        // operand while the failure message re-locks the same mutex is a
+        // deadlock instead of a message.
+        let order = sink.call_order.lock().unwrap().clone();
+        assert_eq!(order.first(), Some(&"list_statuses"), "{order:?}");
         assert!(state.bulk_seeded);
-        let calls_after_cycle_1 = sink.call_order.lock().unwrap().len();
+        let calls_after_cycle_1 = order.len();
 
         // Cycles 2 and 3, withheld: no coord call of any kind.
         *current.lock().unwrap() = reading(1, Some(3));
         state.tick(&sink, &metrics).await;
         state.tick(&sink, &metrics).await;
+        let order = sink.call_order.lock().unwrap().clone();
         assert_eq!(
-            sink.call_order.lock().unwrap().len(),
+            order.len(),
             calls_after_cycle_1,
-            "withheld: not one coord call"
+            "withheld: not one coord call; got: {order:?}"
         );
         assert!(
             state.bulk_seeded,
@@ -8952,11 +8976,11 @@ mod tests {
             2,
             "the resume re-primes from the bulk door"
         );
+        let order = sink.call_order.lock().unwrap().clone();
         assert_eq!(
-            sink.call_order.lock().unwrap().get(calls_after_cycle_1),
+            order.get(calls_after_cycle_1),
             Some(&"list_statuses"),
-            "the resumed cycle's first coord call is the bulk prime; got: {:?}",
-            sink.call_order.lock().unwrap()
+            "the resumed cycle's first coord call is the bulk prime; got: {order:?}"
         );
         assert!(state.bulk_seeded);
         assert_eq!(
@@ -8970,6 +8994,87 @@ mod tests {
                 .get("2026-01-01-one-plan")
                 .map(String::as_str),
             Some("draft")
+        );
+    }
+
+    /// The re-prime must not depend on the bulk door: when `list_statuses`
+    /// fails on the resumed cycle, the per-slug seed still re-reads every
+    /// unit BEFORE any push, and a status an agent set while the loop was
+    /// withholding is not re-pushed as a transition out of frozen memory.
+    ///
+    /// Neuter check: drop `self.last_applied.clear()` from the resume arm of
+    /// `note_write_posture` and the sink records one `transition` (draft →
+    /// vetted, from a memory that still says draft) with no `current_status`
+    /// read ahead of it.
+    #[tokio::test]
+    async fn a_resume_whose_bulk_read_fails_still_re_primes_per_slug_before_pushing() {
+        let dir = one_plan_dir();
+        let plan = dir.path().join("2026-01-01-one-plan.md");
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let current = std::sync::Arc::new(Mutex::new(reading(1, Some(1))));
+        let mut state = tick_state(reader);
+        state.binding_count = {
+            let current = current.clone();
+            std::sync::Arc::new(move || *current.lock().unwrap())
+        };
+
+        // Cycle 1, single-bound: the unit is created as draft, memory says draft.
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            state
+                .last_applied
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("draft")
+        );
+
+        // Withheld. Meanwhile an agent vets the unit in coord AND the plan
+        // file is edited to say so — the memory still says draft.
+        *current.lock().unwrap() = reading(1, Some(3));
+        state.tick(&sink, &metrics).await;
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("2026-01-01-one-plan".to_string(), "vetted".to_string());
+        std::fs::write(&plan, "# One plan\n\n> **Status: VETTED**\n\nBody.\n").unwrap();
+        let calls_before_resume = sink.call_order.lock().unwrap().len();
+
+        // Resume with a bulk door that fails on exactly this cycle.
+        *current.lock().unwrap() = reading(1, Some(1));
+        sink.fail_list_statuses.store(true, Ordering::Relaxed);
+        state.tick(&sink, &metrics).await;
+
+        let order = sink.call_order.lock().unwrap()[calls_before_resume..].to_vec();
+        assert_eq!(
+            order.first(),
+            Some(&"list_statuses"),
+            "the bulk prime is still attempted first; got: {order:?}"
+        );
+        assert_eq!(
+            order.get(1),
+            Some(&"current_status"),
+            "with the bulk door failed, the per-slug seed reads the unit next; got: {order:?}"
+        );
+        assert!(
+            !order.contains(&"transition"),
+            "the seed found coord already at vetted, so nothing was transitioned out of \
+             frozen memory; got: {order:?}"
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(
+            state
+                .last_applied
+                .get("2026-01-01-one-plan")
+                .map(String::as_str),
+            Some("vetted"),
+            "the memory was re-primed from coord, not carried over"
+        );
+        assert!(
+            !state.bulk_seeded,
+            "a failed bulk read leaves the seed armed for the next cycle"
         );
     }
 
