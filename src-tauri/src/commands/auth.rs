@@ -1695,8 +1695,10 @@ pub(crate) fn coord_device_token_for(
                     // out only tokens whose provenance it can state, and a re-pair
                     // (which writes a claim) is the recovery.
                     None => {
+                        // Fail closed: an UNREADABLE slot store cannot show that
+                        // t has no slot of its own, so it never admits the token.
                         default_tenant == Some(t)
-                            && !matches!(&held.slots, Ok(slots) if slots.contains(&t))
+                            && matches!(&held.slots, Ok(slots) if !slots.contains(&t))
                     }
                 }
             })
@@ -2304,6 +2306,48 @@ mod device_token_door_tests {
             legacy_slot: Ok(false),
         };
         let err = coord_device_token_for(&am, Some(a), &held, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
+    }
+
+    /// Final-review nit (a): the door fails CLOSED on a claimless token when
+    /// its own slot-store read failed — an unreadable store cannot show that t
+    /// has no slot, so the token is not handed out and the typed unreadable
+    /// error is returned, even though the selector (reading the store itself)
+    /// produced the token.
+    #[test]
+    fn a_claimless_token_is_not_handed_out_beside_an_unreadable_slot_store() {
+        let _amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xA1);
+        let am = AuthManager::new();
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let claimless = format!(
+            "{}.{}.sig",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#),
+            URL_SAFE_NO_PAD
+                .encode(serde_json::json!({"sub_type": "device", "exp": exp}).to_string())
+        );
+        am.store_tokens(&claimless, "").unwrap();
+        am.clear_tenant_device_jwt(&a).unwrap();
+        std::fs::write(
+            _amb.dir().join("paired_user.json"),
+            serde_json::json!({"default_tenant_id": a, "bindings": [{"tenant_id": a}]}).to_string(),
+        )
+        .unwrap();
+        // Precondition: with a READABLE store the door hands the token out.
+        assert_eq!(
+            coord_device_token_for(&am, Some(a), &held(&am, Some(a)), false),
+            Ok(Some(claimless.clone()))
+        );
+        let unreadable = crate::auth::HeldDeviceTenants {
+            slots: Err("slot store io".into()),
+            default_binding: crate::auth::BindingTenantRead::Bound(a),
+            legacy_slot: Ok(true),
+        };
+        let err = coord_device_token_for(&am, Some(a), &unreadable, false).unwrap_err();
         assert!(err.contains("slot store io"), "{err}");
     }
 

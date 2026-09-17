@@ -9404,7 +9404,7 @@ impl std::fmt::Display for SpawnTenantRefusal {
 /// ([`crate::auth::AuthManager::try_list_tenant_device_jwt_tenants`]) plus the
 /// device's default binding, whose JWT may live only in the legacy
 /// `access_token` slot — and only when that token's `tenant_id` claim names it
-/// (or, on a single-binding runner, the token carries no claim; see
+/// (or, on a runner MEASURED to hold a single binding, the token carries no claim; see
 /// [`crate::auth::legacy_token_serves_tenant`]) — the same two routes
 /// [`crate::auth::select_device_bearer`] can serve a tenant from. Membership,
 /// not liveness: a dead slot for a paired tenant is the refresher's to heal, and
