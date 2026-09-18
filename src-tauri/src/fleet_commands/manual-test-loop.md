@@ -22,9 +22,9 @@ Optional flag-style tokens parsed from `$ARGUMENTS`:
 - `--target=runner|web|mobile|both` — restrict scope; forwarded to `/manual-test`
 - `--no-commit` — implement but don't commit between iterations (default each iteration: branch-first → commit → push branch → open PR; never a direct push to the default branch, and never merge — coord lands it)
 
-- `--max-rounds=N` — override the hard-ceiling backstop (default 12; see below)
+- `--max-rounds=N` — impose a hard-ceiling backstop of N iterations. **Default: none — the loop is unlimited** and stops only on its organic conditions (see below)
 
-This loop's PRIMARY stops are organic: clean run and no-progress stall (the two natural signals that it's done), plus repeated hook failure and operator interrupt. Those remain the real termination signals — see "Termination Conditions". There is now also a **hard ceiling of 12 iterations as a BACKSTOP** (arg-overridable via `--max-rounds=N`): if the loop somehow runs 12 iterations without a clean run or a detected stall, stop and emit a structured handoff rather than looping indefinitely. The ceiling is generous on purpose — it should almost never fire (the stall/clean-run stops normally trigger first); it exists only so an unexpected non-converging loop can't burn tokens forever. This is the shared loop-control rubric (`_loop-control.md`): this skill's existing fingerprint-stall logic and per-iteration ledger ARE the rubric's stall-detection and per-round ledger; the 12 ceiling + the structured escalation handoff are the rubric additions.
+This loop's PRIMARY stops are organic: clean run and no-progress stall (the two natural signals that it's done), plus repeated hook failure and operator interrupt. Those remain the real termination signals — see "Termination Conditions". **There is NO iteration ceiling by default.** The loop runs until a primary stop fires. A ceiling exists only if the caller passes `--max-rounds=N`, in which case exceeding it emits the structured handoff below. The default is unlimited because the operator supervises these loops directly, so an unattended runaway is not the risk the ceiling was guarding against — and an arbitrary cutoff mid-convergence throws away a partly-remediated surface. The stall detector is what protects against a non-converging loop: two identical fingerprints means fixes are not taking effect, and that is a stop-and-diagnose, not a reason to keep grinding. This is the shared loop-control rubric (`_loop-control.md`): this skill's fingerprint-stall logic and per-iteration ledger ARE the rubric's stall-detection and per-round ledger; the optional ceiling + the structured escalation handoff are the rubric additions.
 
 ## Loop Structure
 
@@ -33,7 +33,7 @@ This loop's PRIMARY stops are organic: clean run and no-progress stall (the two 
 1. Create a TaskCreate checklist with the first few iteration tasks ("Iter 1: test + remediate", "Iter 2: test + remediate", "Iter 3: test + remediate"). Add tasks for "final clean run" and "summary report" at the end. Add more iter tasks as you go — don't try to predict how many you'll need. Mark each complete the moment it lands — don't batch.
 2. Initialize `LEDGER=""` (in-memory string holding `iter\tdeficiency_count\tfingerprint\tstatus\tending` lines — this IS the rubric's per-round ledger; `ending` is the rubric's Element 5 column, see "Turn-ending classification" under Termination Conditions). Don't write it to a file; it lives in your scratch text.
 3. Set `ITER=1`.
-4. Set `MAX_ROUNDS=12` (the hard-ceiling backstop). If `$ARGUMENTS` contains `--max-rounds=N`, use N instead.
+4. Set `MAX_ROUNDS=unlimited`. **Only** if `$ARGUMENTS` contains `--max-rounds=N`, set `MAX_ROUNDS=N` and treat it as a hard-ceiling backstop.
 
 ### Per-iteration body
 
@@ -56,6 +56,13 @@ Launch one Agent (subagent_type: `general-purpose`) with this contract:
 > 4. **Fingerprint** — a stable hash you compute by sorting the issues by `(repo, file_or_module, issue)` and SHA-256-ing the joined string. Report the first 12 hex chars.
 > 5. **Cleanup status** — confirm any temp runner spawned was stopped (`POST /runners/<id>/stop`).
 > 6. **Goal-observed evidence** — for each user-visible goal in the focus, the page URL you navigated to and the exact rendered text/element that confirms it (or `UNVERIFIED: <reason>`). No element observed = not verified.
+> 7. **Build provenance** — for every finding that says a previously-landed fix is
+>    NOT visible on the page, the sha you tested against and the `commit_provenance.contains`
+>    answer for it (`true` / `false` / `null`), read from
+>    `GET http://127.0.0.1:9875/lkg/coverage?contains=<sha>` (or `build_sha` on the
+>    runner-status payload for a live runner). A finding of that shape with no
+>    provenance line is **not reportable as a bug** — see the classification rule
+>    below.
 >
 > If Phase 5 surfaced no deficiencies **and every focus goal was observed on its page per item 6**, report exactly: `NO_DEFICIENCIES` and stop. If any goal is UNVERIFIED, do NOT report `NO_DEFICIENCIES` — surface it as a `blocked_task`. Do not invent work.
 >
@@ -78,12 +85,50 @@ checks below.) A row still reading `<pending>` when the loop exits is itself
 worth noticing: it means the iteration ended somewhere other than its own end —
 which is exactly what Element 5 is for.
 
+**LKG-sha assertion — a fix you cannot see is DEPLOY LAG until the binary is proven to contain it.**
+Before you accept any finding of the form *"the fix from iteration N is not on the
+page"*, assert that the binary under test actually holds the commit that fix
+landed as:
+
+```
+git merge-base --is-ancestor <fix-sha> <lkg_sha or build_sha>
+```
+
+Ask the supervisor rather than running git yourself — it computes exactly that,
+server-side: `GET http://127.0.0.1:9875/lkg/coverage?contains=<fix-sha>` →
+`data.commit_provenance.contains`. (For a live runner instead of the LKG, the same
+comparison against `build_sha` on the runner-status payload; `build_source_warning`
+is non-null whenever the compiled tree is behind or diverged from `origin/main`.)
+
+| `contains` | This is | What the loop does |
+|---|---|---|
+| `true` | a genuine finding | keep it in the table and remediate |
+| `false` | **deploy lag, NOT a regression** | **drop it from the deficiency count and the fingerprint.** Rebuild (`{"rebuild": true}`) and re-test in the next iteration. Never open remediation work against it |
+| `null` | **UNKNOWN — not computable** | record it as a `blocked_task`, never as a bug and never as clean. Say which cause applied (no `contains` asked / no `lkg_sha` / sha unknown to the local odb) |
+
+⛔ **`null` is not `false` and neither is a bug.** Reading `null` as "absent"
+manufactures a regression; reading `false` as "regression" opens remediation
+against code the binary never ran. Both poison the fingerprint, which is the
+loop's own no-progress detector — an iteration that re-reports the same
+deploy-lag item every round looks like a stall when nothing is stalling but the
+build [policy: `verification-and-evidence` `unknown-must-not-render-as-a-default`].
+
+**Why this is a loop rule and not just a `/manual-test` rule.** Iteration 3 of
+this loop (2026-07-13) classified the whole of iteration 2's landed runner work
+as not-on-page, because the only spawnable binary was the *parent* of the iter2
+commit and the supervisor's build checkout sat on a feature branch 45 commits
+behind `origin/main`. Nothing was regressed; the loop simply could not observe
+its own fixes, and it burned an iteration finding that out. The supervisor since
+grew the exact primitive that settles it (`src/git_provenance.rs`, the
+`commit_provenance` block, `?contains=<sha>`) — this rule is the loop consuming
+it. Plan: `2026-07-13-manual-test-loop-iter3-remediation`.
+
 **Termination checks (run before implementation, PRIMARY stops first, BACKSTOP last):**
 
 - If status is `NO_DEFICIENCIES` → exit loop, go to "Clean run confirmation" below.
 - If the remaining deficiencies cannot clear until an **observable** condition does (a deploy going green, a migration reaching head, a rebuilt runner becoming the serving build) → that is a BLOCK, not a stall. Run `/blocked` to register the typed coord gate FIRST, then exit and report naming the `gate_id`. Checked before the stall rule because a block presents as one. An unmerged PR is **not** a blocker here — the next iteration tests the branch.
 - If `fingerprint` matches the **previous** iteration's fingerprint → no-progress stall. Surface the stalled plan, exit loop, report.
-- If `ITER > MAX_ROUNDS` (default 12, arg-overridable via `--max-rounds=N`) → **hard-ceiling backstop**. This should almost never fire — if it does, a stall normally would have caught it first. Exit loop and emit the structured escalation handoff (see "Hard-ceiling handoff" under Termination Conditions). Don't keep looping.
+- **Only if a ceiling was explicitly set** via `--max-rounds=N`: if `ITER > MAX_ROUNDS` → **hard-ceiling backstop**. Exit loop and emit the structured escalation handoff (see "Hard-ceiling handoff" under Termination Conditions). With no ceiling set (the default) this check does not apply — keep iterating until a primary stop fires.
 - If this iteration is about to end on a `bailout`- or ungated-`user_deflection`-shaped final paragraph (see "Turn-ending classification") → **you are not done**. Run the next iteration, or register the typed coord gate via `/blocked` first. Never stop here silently.
 
 Otherwise, proceed to step 2.
@@ -103,8 +148,17 @@ you: Phase 2 of that plan withdrew removal authority from the `undeclared`
 trigger. The cost of skipping this is now a permanent leak rather than data loss,
 which is a trade made deliberately — not a reason to skip it.)
 
+```bash
+bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh --repo <repo> --intent "<what for>" [--work-unit <uuid>]
 ```
-POST $COORD_HTTP_URL/agents/allocate
+
+The script (plan `2026-09-03-worktree-allocation-is-one-command-and-the-reflex-is-the-script`)
+POSTs the LITERAL `https://coord.qontinui.io/agents/allocate` — anonymous: no
+runner, no mint, no cached credential, no `$COORD_HTTP_URL` — handles every
+response shape below, and materialises the result. What it sends:
+
+```
+POST https://coord.qontinui.io/agents/allocate      # no Authorization header
 {
   "device_id":  "<this machine's device_id>",
   "repos":      [{"repo": "<repo>"}],
@@ -125,8 +179,13 @@ Three response shapes you must handle, or the call is worse than useless:
    `git -C <repo> worktree add -b <worktrees[].branch> <absolute-path> <worktrees[].parent_sha>`.
 2. **`isolation.mode` may be `wait` or `shared_branch`.** On `wait`, coord is out
    of disk/build-slot budget — report `reason` / `blocking` and retry or
-   serialize; do not force a worktree. On `shared_branch`, the canonical checkout
-   can carry the branch.
+   serialize; do not force a worktree. **Never honor `shared_branch` from a
+   session** — it means "put the branch in the primary checkout", which only
+   the runner's lease-taking materializer can do safely; coord answers it only
+   to a request carrying `accepts_shared_branch: true`, which nothing here
+   sends (claude-config #874). If an older coord still answers it, create the
+   ISOLATED worktree as in item 1 and leave the primary checkout alone — the
+   script does exactly that.
 3. **HTTP 409 `repo_not_registered`** — the repo is not in
    `coord.canonical_repos`, so coord cannot decide a parent SHA. Supply
    `parent_sha` explicitly, or fall back to a plain `git worktree add` and say in
@@ -142,7 +201,7 @@ Three response shapes you must handle, or the call is worse than useless:
 > Rules:
 > - Fix the root cause, not symptoms. Don't add scaffolding the items don't ask for.
 > - After each item, run the verification step from the table. Report `PASS | FAIL | DEFERRED` per item with a one-line note.
-> - Run the repo's standard typecheck/lint after all items in your group (`cargo check` + `cargo clippy -D warnings` for Rust, `npx tsc --noEmit` for TS, `ruff check` + `mypy` for Python). Fix any new warnings introduced by your changes.
+> - Run the repo's standard typecheck/lint after all items in your group (`cargo check --all-targets` + `cargo clippy --all-targets -D warnings` for Rust, `npx tsc --noEmit` for TS, `ruff check` + `mypy` for Python). Fix any new warnings introduced by your changes.
 > - If a verification step requires a temp runner, spawn one via supervisor port 9875 with LKG-first per `/manual-test` Phase 0, then stop it when done. Never touch the primary runner.
 > - **Do NOT commit.** The coordinator commits per-iteration after all repo Agents return.
 > - Report back: changed files (with line counts), per-item PASS/FAIL/DEFERRED, any items deferred and why, any verification step that needed adjustment.
@@ -158,9 +217,9 @@ Launch one Agent (subagent_type: `general-purpose`) with this contract:
 >
 > `<repo-prefix>: manual-test-loop iter <N> — <one-line summary>`
 >
-> Body: bullet list of items addressed in this commit (issue → fix), one per line. **Do not include Claude or AI attribution** (the qontinui pre-commit hook blocks `Co-Authored-By: Claude` lines anyway).
+> Body: bullet list of items addressed in this commit (issue → fix), one per line. **End with the harness trailers** (`Co-Authored-By: <model>`, `Claude-Session:`) and no other attribution.
 >
-> **Branch-first — NEVER commit on the default branch.** For each touched repo, before committing run `git -C <repo> symbolic-ref --short HEAD`. If it equals that repo's default branch (`main`), first create a session branch `loop/manual-test-loop-iter<N>-<short-session>` and switch to it — **keep the `<short-session>` discriminator; a bare iteration-numbered name is unusable.** `qontinui-merge-orchestrator[bot]` reaps the head branch of a merged PR on sight, so any name a previous loop run already landed under is permanently burned: the push prints `* [new branch]` and exits 0, the ref is deleted ~2s later, and `gh pr create` then reports "No commits between main and <branch>". Observed 2026-08-05 with `loop/mtl-iter2-runner`, which runner#568 had merged in June. **Verify every push landed** (`git ls-remote --heads origin <branch>`) — a successful-looking push is not proof the ref exists; otherwise commit on the current (already non-default) branch. Then commit there (Session-Id + Session-Name trailers are added by the repo's PER-CLONE `prepare-commit-msg` hook — `/tag-session` only supplies the NAME that hook reads, it injects nothing itself; a clone the installer never ran against emits neither trailer, so fix that with `qontinui-dev-notes/scripts/install-session-id-hook.sh` rather than re-running `/tag-session`), `git push` the BRANCH (never push the default branch directly), `gh pr create` with a title matching the commit subject and a body naming the loop + iteration, and then **STOP — do not merge.** Coord is the sole merge authority for `qontinui/*` repos; agents never run `gh pr merge` or `--admin` (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). Opening the PR IS shipping — coord's merge train lands it. The loop does not wait for the merge: the next iteration's test-and-plan subagent tests the BRANCH build, so an unmerged PR never blocks progress (pass the branch/worktree path to it explicitly, or it will re-find the already-fixed defect on `main`, report an identical fingerprint, and trip the no-progress stall detector with a false positive). **Never push to the default branch directly** ([[feedback_no_direct_pushes_to_main_loops_use_branches]]): a loop on a checkout sitting on `main` that committed + pushed there is exactly what caused the 2026-06-07 fleet-wide fmt-red incident (untrailered, PR-less commit reached `main` via the operator's admin bypass).
+> **Branch-first — NEVER commit on the default branch.** For each touched repo, before committing run `git -C <repo> symbolic-ref --short HEAD`. If it equals that repo's default branch (`main`), first create a session branch `loop/manual-test-loop-iter<N>-<short-session>` and switch to it — **keep the `<short-session>` discriminator; a bare iteration-numbered name is unusable.** `qontinui-merge-orchestrator[bot]` reaps the head branch of a merged PR on sight, so any name a previous loop run already landed under is permanently burned: the push prints `* [new branch]` and exits 0, the ref is deleted ~2s later, and `gh pr create` then reports "No commits between main and <branch>". Observed 2026-08-05 with `loop/mtl-iter2-runner`, which runner#568 had merged in June. **Verify every push landed** (`git ls-remote --heads origin <branch>`) — a successful-looking push is not proof the ref exists; otherwise commit on the current (already non-default) branch. Then commit there (Session-Id + Session-Name trailers are added by the repo's PER-CLONE `prepare-commit-msg` hook — `/tag-session` only supplies the NAME that hook reads, it injects nothing itself; a clone the installer never ran against emits neither trailer, so fix that with `qontinui-claude-config/scripts/install-guard-hooks.sh --git-repo "$(git rev-parse --show-toplevel)"` rather than re-running `/tag-session`), `git push` the BRANCH (never push the default branch directly; and when you are pushing the checkout's CURRENT branch rather than a fresh session branch, first confirm a PR still carries the push — a shared checkout is routinely parked on a branch whose PR coord already landed, and `knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed" decides it, before the push and again after) — and if that push prints NOTHING for 30 s it is a credential prompt you cannot see, not a slow network: kill it, and see `knowledge-base/qontinui-specific/git-push-non-interactive.md`, `gh pr create` with a title matching the commit subject and a body naming the loop + iteration, and then **STOP — do not merge.** Coord is the sole merge authority for `qontinui/*` repos; agents never run `gh pr merge` or `--admin` (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). Opening the PR IS shipping — coord's merge train lands it. The loop does not wait for the merge: the next iteration's test-and-plan subagent tests the BRANCH build, so an unmerged PR never blocks progress (pass the branch/worktree path to it explicitly, or it will re-find the already-fixed defect on `main`, report an identical fingerprint, and trip the no-progress stall detector with a false positive). **Never push to the default branch directly** ([[feedback_no_direct_pushes_to_main_loops_use_branches]]): a loop on a checkout sitting on `main` that committed + pushed there is exactly what caused the 2026-06-07 fleet-wide fmt-red incident (untrailered, PR-less commit reached `main` via the operator's admin bypass).
 >
 > If a pre-commit hook fails, surface the failure with its full output — do not retry with `--no-verify` or any other bypass without explicit operator instruction. If a hook failure looks like an environment issue (path-dep stash, sccache wedge, etc.), diagnose its root cause before bypassing. Report failures back with the hook output verbatim.
 >
@@ -189,13 +248,13 @@ Full contract: `qontinui-runner/src-tauri/src/mcp/test_fixtures.rs` module docs.
 
 ## Termination Conditions
 
-The loop ends on (1–4 and 6 are PRIMARY; the hard ceiling is a BACKSTOP):
+The loop ends on (1–4 and 6 are PRIMARY; the hard ceiling is an OPT-IN BACKSTOP that is absent by default):
 
 1. **Clean run** — two consecutive `NO_DEFICIENCIES` reports. **Primary success condition.**
 2. **No-progress stall** — two consecutive iterations with identical remediation fingerprints. Report the persistent set and stop. (Often means a fix didn't take; the next session will need to diagnose.)
 3. **Repeated hook failure** — same pre-commit hook failure surfaced twice with no obvious env fix. Surface the failure verbatim and exit; do not power through.
 4. **Operator interrupt** — never block on operator input, but if the operator cancels the run, release any coord claims acquired and exit cleanly.
-5. **Hard-ceiling backstop** — `ITER` exceeds `MAX_ROUNDS` (default 12, arg-overridable). Should almost never fire; if it does, the loop is not converging and a stall normally would have caught it. Exit and emit the **Hard-ceiling handoff** below. This is `stop_and_report` — do NOT turn it into an `AskUserQuestion` unless it hits the autonomous-default carve-outs (operator-resource need / observed security anomaly / oversize-plan handoff), per the `implementation-priorities` memory — which supersedes the coord-deploy-or-migration carve-out in `feedback_mtc_loop_autonomous_default`: deploys and migrations proceed autonomously when their documented checks pass.
+5. **Hard-ceiling backstop (opt-in; ABSENT unless `--max-rounds=N` was passed)** — `ITER` exceeds `MAX_ROUNDS`. By default there is no ceiling and this never fires; a non-converging loop is caught by the stall detector instead. Exit and emit the **Hard-ceiling handoff** below. This is `stop_and_report` — do NOT turn it into an `AskUserQuestion` unless it hits the autonomous-default carve-outs (operator-resource need / observed security anomaly / oversize-plan handoff), per the `implementation-priorities` memory — which supersedes the coord-deploy-or-migration carve-out in `feedback_mtc_loop_autonomous_default`: deploys and migrations proceed autonomously when their documented checks pass.
 6. **Blocked on an observable condition** — the remaining deficiencies cannot clear until a deploy goes green, a migration reaches head, or a rebuilt runner becomes the serving build. Register the typed coord gate via `/blocked` FIRST, then exit and emit the handoff naming the `gate_id`. Evaluated before conditions 2 and 5, because a block presents as either a stall or a non-converging ceiling. **An unmerged PR is not this** — the next iteration tests the branch, so the merge train is never a reason to stop.
 
 ### Turn-ending classification
@@ -255,12 +314,12 @@ bailout check waves it through. Ungated, it is still an unwatched blocked item.
 
 ### Hard-ceiling handoff
 
-When the loop exits on the hard-ceiling backstop, emit this structured handoff (assembled mechanically from `LEDGER` — do not re-derive it):
+When the loop exits on an explicitly-set hard-ceiling backstop, emit this structured handoff (assembled mechanically from `LEDGER` — do not re-derive it). With no ceiling set, this section does not apply:
 
 ```
 ## manual-test-loop escalation — <hard-ceiling backstop (non-converging) | blocked on an observable condition>
 
-- Iterations run: <N> / <MAX_ROUNDS>
+- Iterations run: <N> / <MAX_ROUNDS, or "unlimited" if no ceiling was set>
 - Registered gate: <gate_id from /blocked, or "none — blocker has no observable trigger">
 - Current failing signal: <the persistent deficiency set / fingerprint still present>
 - Per-iteration ledger:
@@ -306,9 +365,9 @@ Do NOT regenerate per-iteration plans, transcripts, or evaluations — those liv
 - **NEVER inline `/manual-test` or remediation work in the main context** — always via Agent. The main context is a thin coordinator.
 - **NEVER ask the operator to confirm a fix, restart a service, or look at a log** — the loop is autonomous end-to-end.
 - **NEVER use `--no-verify`, `core.hooksPath=/dev/null`, or any hook bypass** without explicit operator instruction. Surface hook failures verbatim and stop.
-- **NEVER commit Claude / AI attribution** — qontinui's pre-commit hook blocks it; the commit subagent must omit those trailers.
+- **Commit trailers follow the harness attribution rule** — the commit subagent ends the message with the `Co-Authored-By: <model>` and `Claude-Session:` lines the harness supplies and adds no other attribution. (No hook in qontinui-claude-config blocks those trailers; the earlier claim that one did was wrong for this repo — aligned 2026-09-09. Three repos DO declare a `commit-msg` pre-commit hook `no-claude-attribution` that rejects any message containing `claude`, `anthropic` or `co-authored-by` — `qontinui-mcp`, `qontinui-hal-mcp`, `qontinui-prm` — armed only where `pre-commit install --hook-type commit-msg` was run; committing there under the harness rule hits that hook, and the conflict is surfaced as a POLICY_GAP, not resolved here.)
 - **NEVER restart, kill, or rebuild the primary runner** — always spawn temp runners via supervisor port 9875.
-- **Edit work runs in an allocated worktree, never the primary checkout** — see "Worktree isolation — bound rule" under the Remediation subagent section. Sibling to the temp-runner rule: same shape ("never touch the shared primary"), different substrate (git worktree vs supervisor temp runner). Allocate it through `POST $COORD_HTTP_URL/agents/allocate` — see the bound rule for the response shapes and the one legitimate fallback. A plain `git worktree add` produces an undeclared worktree coord cannot attribute, pin, or drain (the HTTP allocate-local endpoint was removed in runner #443).
+- **Edit work runs in an allocated worktree, never the primary checkout** — see "Worktree isolation — bound rule" under the Remediation subagent section. Sibling to the temp-runner rule: same shape ("never touch the shared primary"), different substrate (git worktree vs supervisor temp runner). Allocate it with `scripts/allocate-worktree.sh --repo <repo> --intent "<what for>"` (it POSTs the literal, anonymous `https://coord.qontinui.io/agents/allocate` and materialises the result) — see the bound rule for the response shapes and the one legitimate fallback. A plain `git worktree add` produces an undeclared worktree coord cannot attribute, pin, or drain (the HTTP allocate-local endpoint was removed in runner #443).
 - **NEVER let one iteration's transcript leak into the next** — the test-and-plan subagent returns a fingerprint + table, not narration. If a subagent returns a multi-page transcript, summarize it down to the contract above in the main session before continuing.
 - **Always ship after committing, but NEVER to the default branch directly** — per the autonomous-commit-ship feedback there's no "ready to push?" gating, but shipping means branch-first → push the branch → open the PR — and stop there. Coord is the sole merge authority for `qontinui/*` repos; the loop never merges its own PRs ([[feedback_no_direct_pushes_to_main_loops_use_branches]]). See the commit subagent's branch-first contract above.
 - **Never end an iteration on a `bailout`- or ungated-`user_deflection`-shaped final paragraph** — record the `ending` in the ledger, then either run the next iteration or register a typed coord gate via `/blocked`. A loop that stops on a person nobody asked is an ungated blocked item, which policy forbids outright.

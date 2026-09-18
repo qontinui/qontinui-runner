@@ -468,7 +468,7 @@ poetry run pytest
      git -C "$BASE/$repo" branch -f "<default>" "origin/<default>"   # default ref returns to origin; commits live only on the branch
      ```
    - Push the BRANCH (never the default branch): `git -C "$BASE/$repo" push -u origin "$branch"`.
-   - Open a PR naming the loop: `gh pr create --title "improve-all: <repo> autonomous improvements" --body "Autonomous /improve-all run. Commits: <subjects>."` (Session-Id + Session-Name trailers come from each repo's PER-CLONE `prepare-commit-msg` hook, not from the commit command — a clone the installer never ran against emits neither, so an untrailered commit is a missing hook, not a missing name. Install: `qontinui-dev-notes/scripts/install-session-id-hook.sh`.)
+   - Open a PR naming the loop: `gh pr create --title "improve-all: <repo> autonomous improvements" --body "Autonomous /improve-all run. Commits: <subjects>."` (Session-Id + Session-Name trailers come from each repo's PER-CLONE `prepare-commit-msg` hook, not from the commit command — a clone the installer never ran against emits neither, so an untrailered commit is a missing hook, not a missing name. Install: `qontinui-claude-config/scripts/install-guard-hooks.sh` — add `--git-repo "$(git rev-parse --show-toplevel)"` to repair just the clone you are in.)
    - **Do NOT merge.** Coord is the sole merge authority for `qontinui/*` repos; agents never run `gh pr merge` or `--admin` (CLAUDE.md; coord-served policy `git-operations` `merge-authority`). Opening the PR IS shipping — coord's merge train lands it once checks are green. If checks fail, leave the PR open and surface it in the report.
 3. **`qontinui-claude-config` / `qontinui-dev-notes`** (config/notes only): these have no CI gate; for them only, commit + push the default branch directly per the special-repos rule. (They are the carve-out — code repos always go through the branch-first PR flow above.)
 4. Generate summary report (see format below) — include each repo's branch name, PR URL, and merge status.
@@ -478,6 +478,7 @@ poetry run pytest
 ## Summary Report Format
 
 ```markdown
+tree: root=<checkout-name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
 # Improve All - Summary Report
 Date: {date}
 

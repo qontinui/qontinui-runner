@@ -57,10 +57,10 @@ npx prettier --check .
 cargo fmt -- --check
 
 # Linting
-cargo clippy
+cargo clippy --all-targets
 
 # Type checking (build check)
-cargo check
+cargo check --all-targets
 ```
 
 ### Step 3: Run Tests

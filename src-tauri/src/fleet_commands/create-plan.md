@@ -32,54 +32,136 @@ anything this step already found.
 
 ## Plan directories
 
-Plan paths resolve from two environment variables. The qontinui runner injects them
-into agent sessions from its `paths.plans_dir` / `paths.plans_archive_dir` settings;
-a session launched outside the runner will not have them.
+Plan paths resolve from one environment variable. The qontinui runner injects it
+into agent sessions from its `paths.plans_dir` setting; a session launched outside
+the runner will not have it.
 
+<!-- plan-corpus:start -->
 > **The DB is authoritative for reads; this directory is an AUTHORING surface**
 > *(plan `2026-08-16-plan-corpus-authority-and-run-provenance`, D2/D3 — canonical
 > statement in `CLAUDE.md` -> "Plan corpus authority").* Discovery, search and
 > selection resolve against `agent.work_artifacts` behind qontinui-web; the
-> shipped runner scanner flows filesystem edits INTO it (the half that writes
-> *this* layer is opt-in — see the population caveat below). So:
+> shipped runner scanner flows filesystem edits INTO it. So:
 >
 > * **`$QONTINUI_PLANS_DIR` being unset is NOT an error and NOT a dead end.** It
 >   is a supported configuration — a tenant may author entirely through the web
 >   UI and own no plans directory at all. Resolve the plan from the corpus
 >   instead of asking the operator to invent a path.
-> * **`qontinui-dev-notes` is this fleet's OPTIONAL export target**, never a
->   requirement. No tenant needs a git repo to author, vet or ship a plan.
-> * **A corpus that ANSWERS is not a corpus that is POPULATED.** The scanner
->   flows filesystem edits into the operational layer (`coord.work_units`)
->   whenever a plans dir and a coord base resolve, but the **body sync** that
->   fills the document layer (`body_push.rs` -> `agent.work_artifacts`) is
->   **opt-in** — built only under `QONTINUI_PLAN_LIBRARY_SYNC=1`, and gated
->   again per cycle on the tenant's `plan_capture` dial. **Either missing is a
->   silent no-op**, so a `200` carrying an empty list is **UNKNOWN, not "no
->   such plan"**: treat any zero-result corpus read as UNKNOWN unless you have
->   positively confirmed the body sync is on for this device.
-> * **Do not probe by stem with `q`.** `GET /api/v1/plan-library?q=` matches
->   **title and body, NOT the slug**, so a by-stem `q` probe returns a false
->   negative for a plan that IS present. The exact door is
->   `?kind=plan&work_unit_slug=<stem>`; failing that, page `?kind=plan&limit=200`
->   and match `slug` yourself.
-> * **When qontinui-web is unreachable**, read the local degraded-mode cache:
->   `$QONTINUI_PLAN_CACHE_DIR` (default `C:/claude/plan-corpus-cache/`) —
->   `PLANS-CACHE.md` for the index, `bodies/<kind>__<slug>.md` for bodies.
->   Refresh with `qontinui-claude-config/scripts/render-plan-cache.ps1
->   -MaxAgeHours 0`. **Say plainly that you are reading a cache and quote its
->   Rendered stamp**, and treat a stale or absent cache as **UNKNOWN, never
->   empty** — "this render did not see it" is not "it does not exist".
+> * **`qontinui-dev-notes` is an OPTIONAL export target as a product matter**,
+>   never a requirement — no tenant needs a git repo to author, vet or ship a
+>   plan. Which directory THIS fleet writes new plans to is a local operating
+>   rule (`CLAUDE.md` -> "Plan corpus authority"), not a product one.
+> * **Read the corpus through these doors, in this order** *(plan
+>   `2026-08-27-plan-corpus-read-path-is-dark` Phase 4)*:
+>   1. **The runner door — no credential.**
+>      `GET http://127.0.0.1:9876/plan-library/search?kind=plan&slug=<stem>`,
+>      then `GET http://127.0.0.1:9876/plan-library/artifacts/<id>` for the body
+>      on a runner build that carries it. The runner attaches its own device
+>      JWT; the caller presents nothing. A non-2xx names the host the runner
+>      dialled — that is the runner's configured web base, and the answer is an
+>      observation about that base, never about the corpus.
+>   2. **The git doors — no credential, no service.**
+>      `git -C qontinui-dev-notes show origin/main:plans/<stem>.md` for a body,
+>      `git -C qontinui-dev-notes ls-tree --name-only origin/main plans/` to
+>      enumerate. Authoring layer only (a plan authored through the web UI is
+>      invisible here), exact stem match, `origin/main` as of the last fetch —
+>      so fetch first:
+>      `git -C qontinui-dev-notes fetch origin +refs/heads/main:refs/remotes/origin/main`,
+>      exit code read unpiped (a bare `fetch origin main` in a clone whose
+>      refspec does not cover `main` exits 0 and moves only `FETCH_HEAD`).
+>      When that fetch was skipped or exited non-zero, a git-door MISS is
+>      UNKNOWN (the ref may predate the plan); a hit still shows the plan
+>      reached `origin/main`, but its body may lag it.
+>   3. **The deployed door — a coord DEVICE JWT.**
+>      `https://api.qontinui.io/api/v1/plan-library?kind=plan&slug=<stem>`, bearer
+>      staged off argv. `~/.qontinui/coord-device-jwt` carries the `user_id`
+>      claim the route requires; the agent token `/agents/allocate` mints does
+>      not. `http://127.0.0.1:8000` is a per-box dev backend, not a discovery
+>      door; whatever it answers is an observation about that process.
+>
+>   On every list result **check that the returned `slug` equals the stem** — a
+>   backend predating the `slug` filter ignores the parameter and returns an
+>   unfiltered page (`work_unit_slug=<stem>` is the older exact door; it is null
+>   for a hand-`POST`ed row) — and **read `corpus_health`**: a `plan_count` far
+>   below the `ls-tree` count is a FROZEN corpus, and the sentence to write is
+>   that observation. An `ls-tree` count taken after a skipped or failed fetch
+>   describes an older `origin/main`, not the current one: it can hide a frozen
+>   corpus or suggest one that is not there, so record it as UNKNOWN.
+>   Never `q=<stem>`: it matches title and body, not the slug.
+> * **A zero is UNKNOWN until a count says otherwise.** The body sync that fills
+>   `agent.work_artifacts` is a property of each writing device's runner build
+>   (opt-in under `QONTINUI_PLAN_LIBRARY_SYNC=1` before plan
+>   `2026-09-03-plan-library-write-door-nonce-authorized-and-body-sync-on-by-default`
+>   Phase 3, on by default after it) and is gated per cycle on the tenant's
+>   `plan_capture` dial, so a `200` carrying an empty list from a frozen corpus
+>   is byte-identical to "no such plan". Record `corpus_health` (or the two
+>   counts, with the fetch's exit status beside the `ls-tree` one) beside the
+>   zero, and never write a cause for a door that did not
+>   answer — settle one against a second independent instance first.
+> * **The scan-root roll-up can make a miss UNKNOWN; it never proves a plan
+>   absent.** `corpus_health.scan_roots.by_source_repo` (under `data` on the
+>   runner door) has one roll-up per `source_repo` key: the
+>   `<repo>/<dir relative to the repo root>` of a device's `paths.plans_dir`,
+>   so a hit on `origin/main:plans/<stem>.md` in a checkout named `<repo>` has
+>   the key `<repo>/plans`.
+>   - **No git door found the file:** the roll-up has nothing to add; the miss
+>     is UNKNOWN on its own unless it came after the door-2 fetch exited 0,
+>     and even then it speaks for the authoring layer only.
+>   - **A git door found it, and you read by `slug=<stem>`:** the miss is
+>     UNKNOWN unless both hold: (a) the roll-up for the file's key reads
+>     `state: measured` with `min_behind: 0` (its `min_behind_is_floor` is
+>     then always `false`); (b) after a `git fetch`,
+>     `git -C qontinui-dev-notes cat-file -e <ref_sha>:plans/<stem>.md` exits
+>     0 (any other exit, including an object this clone lacks, is UNKNOWN).
+>     Read `ref_sha` off any `scan_roots.rows[]` entry whose `device_id` is in
+>     `least_behind_device_ids` (they share it); that row's own `state` may
+>     read `unknown` with a `ref_stale:` detail, and the roll-up's verdict is
+>     the one that counts. Everything else is UNKNOWN: no `corpus_health` or
+>     no `scan_roots` (on `/candidates`, `corpus_health_unavailable_reason`
+>     names why), `scan_roots.state: unknown` (`no_observation:` or
+>     `read_failed:`), no roll-up for the key, an `unknown` roll-up,
+>     `min_behind` above 0, or `cat-file` failing.
+>   - **Any other read** — `/candidates`, or a `status`, `q`,
+>     `work_unit_slug`, `repo`, `intent_ref` or `since` filter — stays
+>     UNKNOWN whatever the roll-up says: any writer can replace a row's body
+>     or its metadata (`status`, `work_unit_slug`, `repos`, ...) without the
+>     file changing, and nothing puts the file's values back until a scanner
+>     re-sends it (a runner start or scan-loop restart, a change to its plans,
+>     archive or prompts dir, or a `qontinui-pr plan-library-backfill` run).
+>   - **Even when (a) and (b) hold,** the roll-up only stops adding doubt; the
+>     miss is no stronger than the doors that produced it. The reading can be
+>     up to ~45 min old when you read it (plus one reconcile tick), and the
+>     ref it counted against can have been fetched up to 6 h before that
+>     reading. It establishes neither that the working tree the body sync
+>     scans still held the plan (a commit of its own or uncommitted work can
+>     remove it) nor that the sync wrote it under `kind=plan`: a push not yet
+>     made; a paused or failing sync; a runner that stopped, or a capture dial
+>     shut, within the last 45 min; a file its scan skips (no line whose first
+>     non-blank character is `#` and no `> **Status:` stamp, or unreadable,
+>     including not UTF-8); a kind fork, which writes nothing; or a row whose
+>     kind another write moved away from `plan`, locked or not (retry with
+>     `slug=<stem>` and no `kind`).
+>   - **Never measured:** `min_behind` counts default-branch commits, never
+>     missing plans. The archive and prompts scan roots have no reading, and
+>     neither does a writer that posts none: e.g. the web UI, a hand `POST`,
+>     the runner's write door, `qontinui-pr plan-library-backfill`, a
+>     secondary or temp runner instance, a runner build predating the report.
+> * **The cache is one line.** `scripts/render-plan-cache.ps1` needs a
+>   PowerShell interpreter (`pwsh` on Linux via
+>   `scripts/install-pwsh-linux.sh`); where none is present it is INOPERATIVE,
+>   not a degraded arm. When you read `$QONTINUI_PLAN_CACHE_DIR/PLANS-CACHE.md`,
+>   say so and quote its `Rendered:` stamp with the `api_base` beside it and
+>   its `Last attempt:` line; stale or absent is UNKNOWN, never empty.
+<!-- plan-corpus:end -->
 
 - **`$QONTINUI_PLANS_DIR`** — the directory plans live in, and the directory this
-  command writes into. **If it is unset, ask the user once where plans live, or fall
-  back to `<workspace-root>/plans`** (a `plans/` directory beside the repos this
-  session is working in). Never assume an absolute path from another machine, and
-  never write a plan to a path you had to guess without saying so.
-- **`$QONTINUI_PLANS_ARCHIVE_DIR`** — optional, normally unset. When set and different
-  from `$QONTINUI_PLANS_DIR`, it holds already-archived plans. This command never
-  writes there, but Step 2's duplicate check must search it — an archived plan still
-  counts as an existing plan.
+  command writes into. **If it is unset, ask the user once where plans live, or
+  DISCOVER one: from the workspace root, `ls -d plans */plans 2>/dev/null` and use
+  the directory that actually exists** — say which, and ask when it finds none or
+  more than one. Never fall back to a directory you have not confirmed is there; a
+  named fallback fails silently on every machine that does not have it. Never assume
+  an absolute path from another machine, and never write a plan to a path you had to
+  guess without saying so.
 - **Suite directories** — a multi-plan suite lives in its own directory *beside*
   `$QONTINUI_PLANS_DIR` (`$QONTINUI_PLANS_DIR/../<plan-dir>/`).
 
@@ -96,19 +178,42 @@ Hold the resolved prompt text; everything below is grounded in it.
 
 ### 2. Check for an existing plan first
 
-Before authoring anything, `Glob` `$QONTINUI_PLANS_DIR/*.md` — plus
-`$QONTINUI_PLANS_ARCHIVE_DIR/*.md` if that variable is set and different — for a
-title or slug that plausibly covers the same problem (grep filenames/titles
-for the prompt's key nouns). **Those directories hold shipped AND unshipped
-plans alike** — a plan's
-status comes from its `> **Status:` block, never from which directory it sits
-in (a plan is stamped where it lives). Read the stamp before dismissing
-a match as unrelated.
+Before authoring anything, check **both** layers. They fail in different
+directions, which is the whole reason to ask twice.
+
+**a. The corpus** — the authoritative surface for discovery per the block above.
+Where you already have a candidate stem, use the exact door; there is no `slug`
+filter, so `q` is not the fallback:
+
+```
+GET <web-origin>/api/v1/plan-library?kind=plan&work_unit_slug=<stem>
+```
+
+Otherwise page `?kind=plan&limit=200` and match `slug` and title yourself.
+**Never probe by stem with `?q=`** — it matches title and body, not the slug, so
+it returns a false negative for a plan that is present.
+
+**b. The plan directory**, when `$QONTINUI_PLANS_DIR` is set — `Glob`
+`$QONTINUI_PLANS_DIR/*.md` for a title or slug that plausibly covers the same
+problem (grep filenames/titles for the prompt's key nouns). **That directory
+holds shipped AND unshipped plans alike** — a plan's status comes from its
+`> **Status:` block, never from which directory it sits in (a plan is stamped
+where it lives). Read the stamp before dismissing a match as unrelated. An unset
+`$QONTINUI_PLANS_DIR` skips this half and is **not** an error — (a) is the surface
+of record.
 
 If a close match exists, surface it to the user and ask whether to extend
 the existing plan (open it and add a phase/section) instead of authoring a
-duplicate — do NOT silently create a second plan for the same problem. If
-nothing close exists, proceed.
+duplicate — do NOT silently create a second plan for the same problem.
+
+**Two clean misses are not the same as one.** Proceed only when (a) returned a
+result you can trust — a populated corpus that did not contain it. If (a) was
+UNKNOWN (an empty page with the body sync unconfirmed, no credential, or
+qontinui-web unreachable) then a `$QONTINUI_PLANS_DIR` glob is the only check that
+actually ran: **say so in your report, and say which layer you are relying on**,
+rather than reporting "no existing plan" as though both agreed. On this fleet the
+document layer has measured empty against hundreds of plans on disk, so treating
+its silence as absence is how the same plan gets authored twice.
 
 ### 3. Research the codebase
 
@@ -127,6 +232,19 @@ Then, in parallel:
   common defect in hand-written plans is proposing new code that duplicates
   something that already exists under a different name; don't repeat that
   here.
+
+**The heading carries the TREE, not just the date** *(plan
+`2026-09-05-a-verification-report-never-states-the-tree-it-read`, Phase 4)*.
+`origin/main` moves under a plan continuously — that is this fleet's ordinary
+condition, not an edge case — so every `file:line` and every "SHIPPED / still
+open" judgement in this table is a statement about ONE commit. Two dates alone
+cannot tell a reader whether the corpus moved between them; a sha can, in one
+comparison, instead of a re-check of every row. This is measured on the plan
+that added the rule: its own prior-art table was resolved at `bddef06`, and by
+the time it was vetted the tree was `b579b45` with two of its PR citations gone
+stale in that window. Read the sha with `git -C <repo> rev-parse --short
+origin/main` after a `git fetch`, and name the repo — a bare sha names no
+checkout.
 
 Build a **Discovered prior art** table (`Piece | Location | Notes`) from
 what you find — omit the section entirely if the prompt is truly a
@@ -190,7 +308,7 @@ existing plans do (see `plans/2026-05-24-symbol-claim-tenant-scoping.md`
 §"Design decision" for the shape) and end with **Resolved.** + the
 deciding priority>
 
-## Discovered prior art (verified <YYYY-MM-DD>)
+## Discovered prior art (verified <YYYY-MM-DD> against <repo> `origin/main` <short-sha>)
 | Piece | Location | Notes |
 |---|---|---|
 | ... | `path/file.rs:123` | ... |
@@ -231,18 +349,59 @@ status; the order is write → commit → vet. (If the plans directory is not a 
 repo — see [Plan directories](#plan-directories) — the file on disk is the whole
 ritual.)
 
-Note what publishing the plan does **not** reliably buy you: it does not by itself
-make the coord work unit's `vetted` status reachable. `vetted` is an *attested*
-status whose attester must differ from the unit's recorded owner, and the
-comparison is on the actor key `device:<uuid>` — which carries no session id, so
-two device-JWT sessions on one machine are ONE actor and refuse each other
-`403 self_attestation_forbidden` exactly as the author would be refused. A peer
-holding a genuine agent JWT (`device:<d>:agent:<a>`) is a distinct key and does
-qualify; on a device-JWT-only fleet there is no such peer. `/vet-plan` §5.4 handles
-this by attempting `→ vetted` and falling back to the Free status
-`vetted_unattested`, leaving the attestation outstanding for a different device or
-the operator route. Publish for reviewability, `conflict_check` and the durable
-record — just don't assume it unlocks attestation.
+**The push is not the publication — assert a PR carries the branch's push.**
+`qontinui-dev-notes` is a coord-merge-authority repo, so a branch pushed with no
+pull request never reaches `main`: the plan is published to `origin` and
+permanently invisible to every `origin/main` reader, which is the population a
+peer vetter, `/preflight` and the plan registry all read. Measured 2026-09-02, **9** plan
+stems were pushed to `origin` and never proposed at all — no PR in any state, on
+any branch carrying the stem — one of them a plan authored the day before by this
+very step. So after the push:
+
+```bash
+gh pr list --repo <owner/repo> --head "$(git rev-parse --abbrev-ref HEAD)" \
+  --state all --json number,state,headRefOid,url \
+  --jq '.[] | "\(.number) \(.state) \(.headRefOid) \(.url)"'
+```
+
+Use `--state all`, not `--state open`: an empty open-only answer cannot tell
+"never proposed" from "closed under you". A CLOSED or MERGED PR HAS been
+proposed, but it carries nothing pushed after its close. So apply
+`knowledge-base/qontinui-specific/coord-ff-lands.md` → "Pushing to a branch
+whose PR may already have landed". When it says no PR carries the push and
+commits remain unlanded, take its fresh-branch path and open the new PR:
+**`coord_create_pr` first, then `gh pr create`**, with a line-anchored
+`Plan: <stem>` marker in the body. **Never `gh pr merge`, never `--admin`** —
+coord is the sole merge authority. Runbook:
+`knowledge-base/qontinui-specific/bodyless-work-units-and-stranded-plans.md`.
+
+Note what publishing the plan does **not** by itself buy you: it does not make the
+coord work unit's `vetted` status reachable.
+
+**Do not restate the attestation rule in the plan you write.** Read it live and
+link to it: `/policy get policy plan-discipline` (the Attested bullet and
+`vetting-independence-is-context-independence`) and
+`/policy get policy verification-and-evidence`
+(`independence-is-context-not-credential`). A plan header that hardcodes the
+mechanism goes stale the moment the operator moves it, and a stale rule read at
+session boot for free beats a live one that costs a tool call — so the copy wins
+and the plan misleads every later reader
+[policy: never-pin-a-mutable-policy-value].
+
+That has already happened. This command previously described a six-tier
+`non_author_allows_identities` ladder over `{device, agent, session}` for the
+work-unit check. **That was wrong about the code**: verified on qontinui-coord
+`origin/main` 2026-09-03, `work_unit_registry::authorize_target_transition`
+takes two `Option<&str>` keys and does a flat `owner == attester` compare;
+`non_author_allows_identities` is called only from `gates.rs`. Fourteen plan
+status blocks now carry that invented ladder as fact.
+
+What you may safely rely on, because it is mechanism rather than policy: the
+plan FILE's own status stamp is always yours to write, and the coord transition
+is best-effort — if it refuses, record that the status write was skipped and
+why, and never report the underlying work as blocked because a status string
+could not be written [policy: bookkeeping-writes-waivable-at-the-floor].
+Publish for reviewability, `conflict_check` and the durable record.
 
 ### 6. Report
 

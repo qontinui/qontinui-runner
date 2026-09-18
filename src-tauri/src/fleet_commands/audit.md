@@ -98,6 +98,7 @@ Manually analyze (use Glob, Grep, Read tools):
 Create a structured report with these sections:
 
 ```markdown
+tree: root=<checkout-name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
 # Codebase Audit Report: {project}
 Date: {date}
 

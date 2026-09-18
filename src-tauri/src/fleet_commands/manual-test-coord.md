@@ -373,12 +373,13 @@ Goal: prove every dependency is up before doing anything destructive.
 
 ```bash
 # For --target=staging:
-curl -s --max-time 10 "$STAGING_COORD/health" | python -c "
-import sys, json
-d = json.load(sys.stdin)
-ok = d.get('data', {}).get('ok') is True or d.get('status') == 'ok' or d.get('ok') is True
-sys.exit(0 if ok else 1)
-" || { echo "BLOCKED: staging coord unhealthy at $STAGING_COORD/health"; exit 1; }
+# Every response this runbook reads goes through the envelope helper: an absent
+# key is exit 3 plus an `UNKNOWN:` line on stderr and NOTHING on stdout, never an
+# empty value read as a verdict. The per-door key names live in its docstring.
+ENV_PY="qontinui-claude-config/scripts/lib/envelope.py"
+curl -s --max-time 10 "$STAGING_COORD/health" \
+  | python "$ENV_PY" require --door staging-coord-health --first-of data.ok,ok,status --raw \
+  | grep -qxE 'true|ok' || { echo "BLOCKED: staging coord unhealthy at $STAGING_COORD/health"; exit 1; }
 
 # For --target=local:
 curl -s --max-time 5 "$LOCAL_COORD/health" || { echo "BLOCKED: local coord unhealthy at $LOCAL_COORD/health"; exit 1; }
@@ -397,24 +398,87 @@ curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$LOCAL_DASHBOARD/"
 
 ### Step 0.3 — Watcher freshness alerts (staging only)
 
-```bash
-# Vercel deploy freshness watcher — must be empty (no pending stale-deploy alert)
-ALERTS_VERCEL=$(curl -s "$STAGING_COORD/coord/alerts?source=vercel_deploy_freshness")
-echo "$ALERTS_VERCEL" | python -c "
-import sys, json
-d = json.load(sys.stdin)
-alerts = d.get('data', {}).get('alerts') if isinstance(d.get('data'), dict) else d.get('alerts', [])
-if alerts:
-    print('PRODUCT_GAP / DEFERRED: vercel_deploy_freshness alerts active:', alerts)
-    sys.exit(2)
-" || true   # exit code 2 = DEFERRED, not BLOCKED
+> ⚠️ **This probe used to be unfailable, which is not the same as passing.** It was an
+> **anonymous** `curl "$STAGING_COORD/coord/alerts?source=vercel_deploy_freshness"` whose
+> empty result was read as "watcher quiet". `/coord/alerts` takes a `FleetPrincipal`
+> (operator OIDC bearer OR a coord device/agent JWT) and is **fail-closed** — an anonymous
+> caller gets `403 auth_required` (`qontinui-coord` `crates/coord/src/routes.rs`, the
+> fleet-auth policy comment above `.route("/coord/alerts", …)`). A 403 body carries no
+> `alerts` key, so the parser scored the refusal as "not alerting". **The probe could only
+> ever pass.** Carry a credential.
+>
+> Two further traps, both smaller than that one and neither a reason to distrust `?source=`
+> wholesale:
+>
+> 1. **`?source=ecs_image_freshness` covers only HALF that watcher.** `source` resolves
+>    through `logical_source_prefixes` (`fleet_health.rs`), an alias map that exists *for
+>    this skill* — its doc comment names `/manual-test-coord` as the caller — so
+>    `vercel_deploy_freshness` correctly expands to BOTH `vercel-deploy-stale:*` and
+>    `vercel-build-failed:*`. But `ecs_image_freshness` maps to `ecs-image-stale` alone,
+>    while the same watcher also writes `ecs-image-lags-main:<cluster>:<service>`. Filter on
+>    repeated `?kind=` instead: it matches the `a.kind` column directly, so it cannot drift
+>    from the watcher the way an alias map can.
+> 2. **Whether you can see this class at all depends on your principal's TENANT — measure
+>    it, do not assume it in either direction.** Every one of these rows is written
+>    `device_id: None` and carries no tenant, so the ordinary tenant-membership arm can
+>    never match it. Under production's `COORD_ALERTS_TENANT_STRICT=1` (measured against the
+>    running `qontinui-staging-coord:857`; ccfg#377), a machine principal reaches the class
+>    through `build_get_alerts_query`'s **`is_system_tenant` arm**, *not* through coord#1601's
+>    `FLEET_INFRA_MACHINE_KINDS` arm — that one is gated `!strict_tenant` and never fires in
+>    production. That arm keys on the **tenant**, not on principal kind or on `is_admin`.
+>    Measured on this box 2026-08-29, an agent JWT DID read repo-free infra-global rows —
+>    alert keys `serving_lag:coord`, `route-serving-drift:*` and `memory-embedding-gap:*`,
+>    all `device=None tenant=None repo=None`, whose kinds (`serving_lag`,
+>    `route_serving_drift`, `memory_embedding_gap` — underscores; the hyphenated strings
+>    above are keys) are **not** allowlisted, so they cannot have come through G2. The
+>    operator box's device is on the system tenant and this step is answerable here.
+>    **A customer tenant's device is not**, and there the silence is UNKNOWN, never
+>    "not alerting" [policy: `verification-and-evidence` `silent-empty-is-unknown`] — the
+>    same class `/unattended`'s IMPEDED row is about. Full principal x endpoint table:
+>    `qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`.
 
-# ECS image freshness watcher — same shape
-ALERTS_ECS=$(curl -s "$STAGING_COORD/coord/alerts?source=ecs_image_freshness")
-# (same parsing)
+```bash
+# coord-read.ps1 wraps the credential cascade and defaults to https://coord.qontinui.io —
+# which is the coord the `qontinui-staging-*` resources ARE (there is no separate staging).
+#
+# MSYS_NO_PATHCONV=1 is REQUIRED from Git Bash: without it MSYS rewrites the leading
+# `/coord/...` into a Windows path and coord answers a misleading `401 invalid operator
+# token` — a credential-shaped error from a path bug.
+MSYS_NO_PATHCONV=1 powershell -NoProfile -ExecutionPolicy Bypass -File qontinui-claude-config/scripts/coord-read.ps1 get "/coord/alerts?kind=vercel-deploy-stale&kind=vercel-build-failed&kind=vercel-recovery-reconnect&kind=ecs-image-stale&kind=ecs-image-lags-main"
 ```
 
-If either watcher is alerting, the test surface is suspect — record as DEFERRED for the affected phases (Phase 2/3 for Vercel, Phase 7 for ECS) and continue. Per [[feedback_vercel_autodeploy_silent_break]] Vercel pushes can land but autodeploy stays stuck; the watcher catches that.
+`vercel-recovery-reconnect` is in the list on purpose: it is `Info` severity, but it fires
+exactly when tier-2 recovery had to `vercel git disconnect && connect` because the deploy
+hook did not restore the autotrigger — which IS the
+[[feedback_vercel_autodeploy_silent_break]] condition this step cites.
+
+Read the **exit code**, not just stdout: `0` answered, `2` no credential obtainable (UNKNOWN,
+not empty), `3` coord returned an error, `4` usage. Then check the body: a `0` with
+`unknown_kinds: []` and `total_count: 0` is a real clean read *for a principal that can see
+the class*; anything else is UNKNOWN and the affected phases are recorded as such rather
+than as clean. Baseline from this box, 2026-08-29: all five kinds `total_count: 0`,
+`unknown_kinds: []` — no ECS or Vercel freshness alert firing.
+
+**This step stays on `/coord/alerts?kind=`, not on the agent queue, deliberately.** Coord
+now also serves alerts as claimable agent work — `GET /coord/alerts/queue` (MCP
+`coord_alert_queue`), protocol in
+`qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md` ->
+"The agent alert work queue — claim before you act". The queue answers a different question:
+it carries only agent-responder rows, filtered by `responder_domain`, so it cannot say
+whether five NAMED kinds are firing whatever their responder, which is what this step asks.
+Use it for one follow-up only: when a freshness kind IS firing, read the queue to see whether
+an agent already holds a claim on that row — a claimed row is being worked, and the DEFERRED
+record should name the claimant. This test run **never claims** one; it tests, and a claim
+says it is fixing. A `404` from the queue, or a `503` body naming
+`schema_migration_pending`, means the queue is not served yet — record which, and the step
+above is unaffected. Any other `5xx` is transient: retry. An empty queue is no more
+"not alerting" than an empty `/coord/alerts` is: it shares the same per-principal
+visibility.
+
+If either watcher IS alerting, the test surface is suspect — record as DEFERRED for the
+affected phases (Phase 2/3 for Vercel, Phase 7 for ECS) and continue. Per
+[[feedback_vercel_autodeploy_silent_break]] Vercel pushes can land but autodeploy stays
+stuck; the watcher catches that — but only if the read above could have seen it.
 
 ### Step 0.4 — Backend (local only)
 
@@ -472,7 +536,7 @@ if extra:
     body['extra_env'] = extra
 print(json.dumps(body))
 ")
-SPAWN_RESULT=$(curl -s -X POST "$SUPERVISOR_BASE/runners/spawn-test" \
+SPAWN_RESULT=$(curl -fsS -X POST "$SUPERVISOR_BASE/runners/spawn-test" \
   -H "Content-Type: application/json" -d "$SPAWN_BODY")
 TEST_PORT=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['port'])")
 TEST_ID=$(echo "$SPAWN_RESULT" | python -c "import sys,json; print(json.load(sys.stdin)['id'])")
@@ -482,8 +546,8 @@ echo "Temp runner up: ID=$TEST_ID PORT=$TEST_PORT"
 # Wait for health
 for i in $(seq 1 40); do
   responsive=$(curl -s -m 3 "http://localhost:${TEST_PORT}/health" 2>/dev/null \
-    | python -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('responsive',False))" 2>/dev/null)
-  [ "$responsive" = "True" ] && { echo "Temp runner ready"; break; }
+    | python "$ENV_PY" require --door temp-runner-health --key data.responsive 2>/dev/null)
+  [ "$responsive" = "true" ] && { echo "Temp runner ready"; break; }
   sleep 5
 done
 ```
@@ -512,16 +576,31 @@ A bare pre-auth tab (the old `@qontinui/ui-bridge-headless` launch) can therefor
 # One-time-per-machine prereq: `npx playwright install chromium` (Chromium lands
 # in a shared global cache, so it persists across runs).
 LOGIN_WEB="npx -y -p @qontinui/ui-bridge-wrapper -p @qontinui/ui-bridge -p @qontinui/ui-bridge-headless -p playwright ui-bridge-login-web"
-# Versions this resolved to on the 2026-07-22 verified run (npm `latest` at the
-# time): ui-bridge-wrapper 0.6.0, ui-bridge 0.22.0, ui-bridge-headless 0.3.0.
-# NOTE the peer-range hazard: published wrapper 0.6.0 declares
-# `@qontinui/ui-bridge: ^0.4.0 || … || ^0.21.0` — it does NOT list ^0.22.0, and
-# on a 0.x range a caret locks the MINOR, so 0.22.0 is formally out of range.
-# `npx -p` tolerates it (warns, installs, runs — verified working). A strict
-# `npm install` of the same set would ERESOLVE. The fix (wrapper 0.6.1, which
-# adds ^0.22.0) is on ui-bridge `origin/main` but is NOT PUBLISHED, and cannot
-# be published until its new dependency `@qontinui/ui-bridge-cli-args@0.1.0` is
-# published first (that package returns 404 on the registry today).
+# Versions on the 2026-07-22 verified run (npm `latest` at the time):
+# ui-bridge-wrapper 0.6.0, ui-bridge 0.22.0, ui-bridge-headless 0.3.0. That run
+# hit a PEER-RANGE HAZARD: published wrapper 0.6.0 declared
+# `@qontinui/ui-bridge: ^0.4.0 || … || ^0.21.0`, which does NOT list ^0.22.0 —
+# on a 0.x range a caret locks the MINOR, so 0.22.0 was formally out of range.
+# `npx -p` tolerated it (warned, installed, ran); a strict `npm install` of the
+# same set would ERESOLVE.
+#
+# THAT HAZARD IS GONE, and this note's stated blocker was falsified. Measured
+# against the registry 2026-08-30: `latest` is now wrapper 0.7.1, ui-bridge
+# 0.25.0, headless 0.4.0 — and wrapper 0.7.1 declares `@qontinui/ui-bridge:
+# ">=0.4.0 <1"`, a single range admitting every 0.x from 0.4.0 up — so the caret
+# list is not merely widened to ^0.22.0, it is gone. The fix did not arrive as the 0.6.1 this note predicted
+# (0.6.1 was never published — the ladder went 0.6.0 -> 0.7.0 -> 0.7.1), and
+# `@qontinui/ui-bridge-cli-args` no longer "returns 404 on the registry": it is
+# published at 0.1.0 and is a real dependency of wrapper 0.7.1. Do not re-derive
+# a ceiling of 0.6.0 from the historical line above.
+#
+# Version FLOORS, if you extend this step to capture and replay a storage state
+# (`--storage-state-out` -> `ui-bridge-inject --storage-state`) rather than the
+# `--keep-open` parking it does today: wrapper >= 0.7.0 AND headless >= 0.4.0,
+# floored separately because the wrapper's peer range on headless is
+# `>=0.3.0 <1` and does not force 0.4.0. See
+# `knowledge-base/qontinui-specific/ui-bridge.md` -> "Tab-identity safety on
+# storage-state replay".
 
 # 0.6-PRE — THE CO-PILOT PREFERENCE PRECONDITION (the real reason `GET /tabs`
 # returns 0 tabs after a SUCCESSFUL login). `CommandRelayListener` mounts only
@@ -571,11 +650,9 @@ sleep 2
 
 # 0.6b — record pre-existing (foreign/stale) tabs so we can identify OURS by diff.
 # NOTE: the relay is auth-gated — every health/control call carries "${AUTH_ARGS[@]}".
-BEFORE_TABS=$(curl -s -m 5 "${AUTH_ARGS[@]}" "$DASHBOARD_UB/health" | python -c "
-import sys,json
-try: print(','.join(json.load(sys.stdin).get('data',{}).get('connectedTabs',[])))
-except Exception: print('')
-")
+BEFORE_TABS=$(curl -s -m 5 "${AUTH_ARGS[@]}" "$DASHBOARD_UB/health" \
+  | python "$ENV_PY" require --door dashboard-ub-health --key data.connectedTabs \
+  | python -c "import sys,json; print(','.join(json.load(sys.stdin)))" 2>/dev/null)
 echo "Pre-existing relay tabs (foreign/stale): ${BEFORE_TABS:-<none>}"
 
 # 0.6c — launch our tab via the ui-bridge-login-web bin: real hosted-UI login +
@@ -613,11 +690,9 @@ case "$LOGIN_OK" in ok*) ;; *) echo "BLOCKED: operator login failed — $LOGIN_O
 # its id. We don't need primaryTabId — every /control/* call pins via ?tabId (#51).
 OUR_TAB_ID=""
 for i in $(seq 1 20); do
-  TABS=$(curl -s -m 5 "${AUTH_ARGS[@]}" "$DASHBOARD_UB/health" | python -c "
-import sys,json
-try: print(','.join(json.load(sys.stdin).get('data',{}).get('connectedTabs',[])))
-except Exception: print('')
-" 2>/dev/null)
+  TABS=$(curl -s -m 5 "${AUTH_ARGS[@]}" "$DASHBOARD_UB/health" \
+    | python "$ENV_PY" require --door dashboard-ub-health --key data.connectedTabs \
+    | python -c "import sys,json; print(','.join(json.load(sys.stdin)))" 2>/dev/null)
   OUR_TAB_ID=$(BEFORE_TABS="$BEFORE_TABS" TABS="$TABS" python -c "
 import os
 before=set(os.environ['BEFORE_TABS'].split(',')) - {''}
@@ -681,7 +756,7 @@ if [ -n "$RENDEZVOUS_SLUG" ]; then
 fi
 ```
 
-Note: the coord `ClaimRequest` field is `topic` (per `qontinui-coord/src/claims.rs:96-115`), not `correlation_topic`. Coord owns the topic-to-correlation_id mapping; the skill never derives a correlation_id locally. `RENDEZVOUS_PUBLISHED=1` is checked in Phase 8.1 to decide whether to release or leave the claim for its TTL.
+Note: the coord `ClaimRequest` field is `topic` (per `qontinui-coord/crates/coord/src/claims.rs:96-115`), not `correlation_topic`. Coord owns the topic-to-correlation_id mapping; the skill never derives a correlation_id locally. `RENDEZVOUS_PUBLISHED=1` is checked in Phase 8.1 to decide whether to release or leave the claim for its TTL.
 
 ### Step 0.7 — Forensics helpers (evidence capture for `/control/*` failures)
 
@@ -856,24 +931,21 @@ Two signals, both required: the backend session probe from INSIDE the tab (so it
 AUTH_CHECK=$(curl -s -X POST "${AUTH_ARGS[@]}" "$DASHBOARD_UB/control/page/evaluate${TAB_QS}" \
   -H "Content-Type: application/json" \
   -d '{"expression": "(async()=>{const f=window[\"fet\"+\"ch\"]; const r=await f(\"/api/v1/auth/users/me\",{credentials:\"include\"}); return JSON.stringify({status:r.status});})()"}')
-ME_STATUS=$(echo "$AUTH_CHECK" | python -c "
-import sys, json, re
-try:
-    d = json.load(sys.stdin)
-    raw = d.get('data', {}).get('result') or d.get('result') or ''
-    m = re.search(r'\"status\":\\s*(\\d+)', str(raw))
-    print(m.group(1) if m else '')
-except Exception:
-    print('')
+ME_STATUS=$(echo "$AUTH_CHECK" \
+  | python "$ENV_PY" require --door dashboard-ub-evaluate --first-of data.result,result --raw \
+  | python -c "
+import sys, re
+m = re.search(r'\"status\":\\s*(\\d+)', sys.stdin.read())
+print(m.group(1) if m else '')
 ")
 echo "users/me from inside the tab: ${ME_STATUS:-null}"
 
 # The on-page half of the gate: an authenticated-only landmark in the rendered DOM.
 CF_METHOD=GET CF_URL="$DASHBOARD_UB/control/snapshot" CF_DATA= capture_on_fail > /tmp/post-login-snapshot.json
-AUTH_DOM_HIT=$(python -c "
-import json
-snap = json.load(open('/tmp/post-login-snapshot.json'))
-els = snap.get('data', {}).get('elements', [])
+AUTH_DOM_HIT=$(python "$ENV_PY" require --door dashboard-ub-snapshot --key data.elements < /tmp/post-login-snapshot.json \
+  | python -c "
+import json, sys
+els = json.load(sys.stdin)
 text = ' '.join((e.get('state', {}).get('textContent') or '') for e in els)
 landmarks = ['Sign out', 'New workflow', '$EMAIL']
 print('YES' if any(l in text for l in landmarks) else 'NO')
@@ -935,14 +1007,11 @@ for route in "${!EXPECTED_ROUTES[@]}"; do
     -d "{\"expression\": \"(async()=>{const f=window[\\\"fet\\\"+\\\"ch\\\"]; const r=await f(\\\"${route}\\\",{credentials:\\\"include\\\",redirect:\\\"manual\\\"}); return JSON.stringify({status:r.status,type:r.type,location:r.headers.get(\\\"location\\\")||\\\"\\\",url:r.url});})()\"}")
 
   # page/evaluate returns the JSON string under data.result; parse status + location out of it.
-  read -r http_code location < <(echo "$PROBE" | python -c "
-import sys, json, re
-raw = ''
-try:
-    d = json.load(sys.stdin)
-    raw = d.get('data', {}).get('result') or d.get('result') or ''
-except Exception:
-    pass
+  read -r http_code location < <(echo "$PROBE" \
+    | python "$ENV_PY" require --door dashboard-ub-evaluate --first-of data.result,result --raw 2>/dev/null \
+    | python -c "
+import sys, re
+raw = sys.stdin.read()
 m = re.search(r'\"status\":\\s*(\\d+)', str(raw))
 l = re.search(r'\"location\":\\s*\"([^\"]*)\"', str(raw))
 # A manual-redirect fetch reports status 0 + type \"opaqueredirect\"; treat as 3xx.
@@ -1075,10 +1144,9 @@ CF_METHOD=POST CF_URL="$DASHBOARD_UB/control/discover" CF_DATA='{}' capture_on_f
 # Snapshot, then text-search the elements[] for tenant indicators
 SNAP=$(CF_METHOD=GET CF_URL="$DASHBOARD_UB/control/snapshot" CF_DATA= capture_on_fail)
 # Look for tenant name, tenant_id (UUID), or organization name in any element's text/value/label
-echo "$SNAP" | python -c "
+echo "$SNAP" | python "$ENV_PY" require --door dashboard-ub-snapshot --first-of data.elements,elements | python -c "
 import sys, json, re
-d = json.load(sys.stdin)
-elements = d.get('data', {}).get('elements', d.get('elements', []))
+elements = json.load(sys.stdin)
 hits = []
 for e in elements:
     blob = ' '.join(str(v) for v in [e.get('text'), e.get('label'), e.get('value'),
@@ -1134,10 +1202,9 @@ for i in $(seq 1 6); do
   curl -s -X POST "$DASHBOARD_UB/control/discover${TAB_QS}" -H "Content-Type: application/json" -d '{}' >/dev/null
   SNAP=$(curl -s "$DASHBOARD_UB/control/snapshot${TAB_QS}")
   # Test runner IDs typically contain the test-id suffix too — search both hostname and TEST_ID.
-  MATCHES=$(echo "$SNAP" | python -c "
+  MATCHES=$(echo "$SNAP" | python "$ENV_PY" require --door dashboard-ub-snapshot --first-of data.elements,elements | python -c "
 import sys, json
-d = json.load(sys.stdin)
-elements = d.get('data', {}).get('elements', d.get('elements', []))
+elements = json.load(sys.stdin)
 needle_hostname, needle_test = '$HOSTNAME', '$TEST_ID'
 matches = [e.get('id') for e in elements
            if (needle_hostname and needle_hostname in str(e)) or (needle_test and needle_test in str(e))]
@@ -1182,7 +1249,7 @@ if [ -n "$RENDEZVOUS_SLUG" ] && [ -n "${TENANT_ID:-}" ]; then
 fi
 ```
 
-Note: the coord `ClaimRequest` field is `topic` (per `qontinui-coord/src/claims.rs:96-115`), not `correlation_topic`. TTL for `kind=phase` is 7200s. Coord owns the topic-to-correlation_id mapping; the skill never derives a correlation_id locally.
+Note: the coord `ClaimRequest` field is `topic` (per `qontinui-coord/crates/coord/src/claims.rs:96-115`), not `correlation_topic`. TTL for `kind=phase` is 7200s. Coord owns the topic-to-correlation_id mapping; the skill never derives a correlation_id locally.
 
 **Predicate.**
 - PASS: the temp runner's hostname (or `TEST_ID`) appears as a device/runner row in the dashboard snapshot within ~30s of auto-signin (`DEVICE_ROW_FOUND=YES`). This confirms the real registration path — runner auto-signin via the injected auto-login creds against `QONTINUI_API_URL` (staging) → device-JWT mint via `/api/v1/devices/pair-confirm` → persistent WS to `/api/v1/devices/ws` → heartbeat — landed end-to-end.
@@ -1203,10 +1270,9 @@ curl -s -X POST "$DASHBOARD_UB/control/discover${TAB_QS}" -H "Content-Type: appl
 sleep 2
 SNAP=$(curl -s "$DASHBOARD_UB/control/snapshot${TAB_QS}")
 # Look at the temp runner's row for a status indicator: "online", "connected", "live", a green dot, etc.
-echo "$SNAP" | python -c "
+echo "$SNAP" | python "$ENV_PY" require --door dashboard-ub-snapshot --first-of data.elements,elements | python -c "
 import sys, json
-d = json.load(sys.stdin)
-elements = d.get('data', {}).get('elements', d.get('elements', []))
+elements = json.load(sys.stdin)
 hostname = '$HOSTNAME'
 row_ids = [e for e in elements if hostname and hostname in str(e)]
 for e in row_ids:
@@ -1229,10 +1295,9 @@ Same row, different signal. Many dashboards collapse "WS connected" into the sam
 
 ```bash
 SNAP=$(curl -s "$DASHBOARD_UB/control/snapshot${TAB_QS}")
-echo "$SNAP" | python -c "
+echo "$SNAP" | python "$ENV_PY" require --door dashboard-ub-snapshot --first-of data.elements,elements | python -c "
 import sys, json
-d = json.load(sys.stdin)
-elements = d.get('data', {}).get('elements', d.get('elements', []))
+elements = json.load(sys.stdin)
 hostname = '$HOSTNAME'
 for e in elements:
     if hostname and hostname in str(e):
@@ -1266,10 +1331,9 @@ else
   SIBLING_FOUND=0   # informational only (Phase 8.1 never releases regardless)
   while [ "$ELAPSED" -lt "$TIMEOUT_SECS" ]; do
     RESP=$(curl -s "$STAGING_COORD/coord/claims/by-correlation-topic?topic=${CORR_TOPIC}")
-    SIBLING_JSON=$(echo "$RESP" | python -c "
+    SIBLING_JSON=$(echo "$RESP" | python "$ENV_PY" require --door coord-claims-by-correlation-topic --first-of claims,data.claims | python -c "
 import sys, json
-d = json.load(sys.stdin)
-claims = d.get('claims', d.get('data',{}).get('claims', []))
+claims = json.load(sys.stdin)
 me = '$MACHINE_ID'
 others = [c for c in claims if str(c.get('machine_id') or '') != me]
 if others:
@@ -1304,11 +1368,10 @@ if others:
     sleep 2
     curl -s -X POST "$DASHBOARD_UB/control/discover${TAB_QS}" -H "Content-Type: application/json" -d '{}'
     SNAP=$(curl -s "$DASHBOARD_UB/control/snapshot${TAB_QS}")
-    SIBLING_PRESENT=$(echo "$SNAP" | python -c "
+    SIBLING_PRESENT=$(echo "$SNAP" | python "$ENV_PY" require --door dashboard-ub-snapshot --first-of data.elements,elements | python -c "
 import sys, json
-d = json.load(sys.stdin)
 sibling = '$SIBLING_HOSTNAME'
-elements = d.get('data', {}).get('elements', d.get('elements', []))
+elements = json.load(sys.stdin)
 print('YES' if any(sibling and sibling in str(e) for e in elements) else 'NO')
 ")
     if [ "$SIBLING_PRESENT" = "NO" ]; then
@@ -1399,12 +1462,56 @@ Build from the primary checkout when it is on `main` (it carries a built fronten
 
 ### Tier B — real-coord refresh-past-expiry round-trip (full residual closure)
 Needs a REAL coord-minted agent JWT (the fake one above can't refresh — coord
-rejects it). Source it from `POST $COORD/agents/allocate {device_id, repos:[…]}`
-(`agent_worktrees.rs` `keys.issue(...)` → `resp.token` is a real agent JWT +
-`token_jti`/`token_exp`). **`/agents/allocate` is behind `require_jwt` (a coord
-device/service JWT), so run this FROM a coord-paired context** (a paired runner /
-a device that holds a device JWT) — a bare temp runner has no device identity, the
-one remaining blocker.
+rejects it). **This is a TEST FIXTURE, never a credential rung.** The standing
+fleet prohibition on sourcing a coord credential from `POST /agents/allocate`
+holds here as everywhere else — see `.claude/commands/gate.md`,
+`.claude/commands/policy.md`, `.claude/commands/unattended.md` (the ⛔ at
+Step 2b) and coord finding `65d574cc-8236-40c9-9b2b-d0cf08947f94`. For an
+ordinary credential need the sanctioned door is the leak-free
+`POST $COORD/agents/credential {device_id}`
+(`agent_worktrees.rs` `CredentialRequest`), which mints a token carrying **no**
+`agent_id` and registers no worktree row. **It is DEPLOYED**: measured twice on
+2026-09-03 against production with no `Authorization` header at all, it answers
+`200` with `{token, token_exp, token_jti}`, a 4 h `exp`, `sub_type: agent`, the
+caller's `device_id` and `tenant_id`, no `agent_id`, and **every scope empty or
+false** (`narrow_for_anonymous_mint`, `jwt.rs`). That is identity with no
+capability, which is the whole difference from an allocate mint. Coord finding
+`d315ad53-4d8a-4d22-851d-4e21641792a4` carries the measurement; earlier
+documents that call this route "not deployed / answers 405" are stale, and that
+`405` reading is what an unregistered POST anywhere under `/agents/` returns, so
+do not treat it as this route's answer without re-probing. Because the minted
+token has no `agent_id`, `POST /agents/{agent_id}/refresh-token` will refuse it
+— re-mint rather than refresh.
+
+> **Probe before you name a cause here.** Everything in the paragraph above is a
+> DATED measurement of a door that moves under you — it changed from `405` to
+> `200` between one week and the next, and five shipped documents were still
+> teaching the old answer when it did. So if this route answers you something
+> other than `200`, do not write down a mechanism for it. Ask first:
+> `coord_recent_findings(topic="coord-credential-doors")`, or with
+> `resource_keys=["qontinui-coord/crates/coord/src/agent_worktrees.rs"]` — a peer
+> session may already have measured the same thing today. Then re-run the probe
+> yourself as a **second, independent instance** before you attribute the status
+> to a deployment state, and record what you saw. A named cause with no probe
+> behind it is indistinguishable from a measurement in the report it lands in,
+> and this is the exact site where that has already happened once.
+
+**Correction 2026-09-03: `/agents/allocate` is NOT behind `require_jwt`.** It is
+mounted on the public router *"with NO principal"* (`crates/coord/src/routes.rs`,
+the `/agents/allocate` + `/agents/credential` block and its own comment) — the
+earlier claim in this document was false. An **anonymous** caller therefore
+succeeds, but lands on `MintCaller::Anonymous` (`agent_worktrees.rs`
+`mint_caller_for`) and receives the **narrowed** scope set
+(`narrow_for_anonymous_mint`, `jwt.rs`), which is not enough for this fixture's
+refresh round-trip. Only a `SubType::Device` bearer reaches the `Authenticated`
+arm. So, **for this fixture only**: send the allocate call WITH the paired
+runner's **device** JWT as the bearer, from a coord-paired context, and **against
+a non-production coord**. Two costs to state plainly before you run it: every
+allocate call persists a `coord.agent_worktrees` row that the minting agent
+cannot retire (every release route is operator-gated — see plan
+`2026-09-02-an-agent-cannot-retire-its-own-worktree-allocation`), and an
+anonymous call would additionally leave a phantom row for a worktree nobody
+asked for. A bare temp runner has no device identity — the one remaining blocker.
 1. Allocate → `{token, token_jti, token_exp, agent_id}`.
 2. Seed the temp runner's slot with the REAL token but a short exp:
    `seed-agent-token {agent_id:<allocated>, jwt:<real token>, jwt_exp: now+10, workdir}`.
@@ -1463,8 +1570,16 @@ If the dashboard exposes no delete-device flow, flag `PRODUCT_GAP: dashboard can
 ### Step 8.3 - Stop temp runner
 
 ```bash
-curl -s -X POST "$SUPERVISOR_BASE/runners/${TEST_ID}/stop"
-echo "Temp runner $TEST_ID stopped"
+# -f so the echo cannot claim a stop that returned 404/500 — a leaked temp
+# runner holds one of the supervisor's build-pool slots.
+# if/then/else, not `a && b || c`: the exit code is the contract now, and in the
+# `&&`/`||` form a failing `echo` would report a SUCCESSFUL stop as a failure.
+if curl -fsS -X POST "$SUPERVISOR_BASE/runners/${TEST_ID}/stop"; then
+  echo "Temp runner $TEST_ID stopped"
+else
+  echo "WARNING: stop FAILED for $TEST_ID — re-check GET $SUPERVISOR_BASE/runners" >&2
+  false
+fi
 ```
 
 ### Step 8.4 - Kill headless dashboard tab
@@ -1494,11 +1609,13 @@ if [ "${CONTROL_FAILURE_COUNT:-0}" -gt 0 ]; then
   # before the raw entry, so the SSE-flap discriminator is readable at a glance.
   python -c "
 import json, sys
+sys.path.insert(0, 'qontinui-claude-config/scripts/lib')
+from envelope import EnvelopeUnknown, load
 for line in open('$CONTROL_FAILURES_LOG'):
-    e = json.loads(line)
+    e = json.loads(line)  # envelope-ok: a line of this run's own failure ledger, not a door
     def tabs(s):
-        try: return json.loads(s).get('data', {}).get('connectedTabs', [])
-        except Exception: return '<unparsable>'
+        try: return load(s, door='dashboard-ub-health', source='ledger').require_key('data.connectedTabs')[0]
+        except EnvelopeUnknown as exc: return str(exc)
     print(json.dumps(e))
     print('  connectedTabs @fail : %s' % tabs(e.get('health_snapshot','')))
     print('  connectedTabs @+5s  : %s' % tabs(e.get('health_snapshot_retry','')))
@@ -1599,7 +1716,7 @@ If Phases 0–8 turned up no deficiencies, write `No deficiencies surfaced durin
 - **If an action fails**: check console errors via `GET /control/console-errors`, try alternative approaches, log the failure.
 - **Be thorough but practical** — don't spend more than 3 attempts on a single failing interaction before logging it and moving on.
 - **Be fully autonomous** — the user should not need to intervene at any point during the test.
-- **No `Co-Authored-By: Claude` trailer** if/when committing any remediation work — qontinui-claude-config's pre-commit hook blocks it (per [[feedback_no_claude_attribution]]).
+- **Commit trailers follow the harness attribution rule** if/when committing any remediation work — keep the `Co-Authored-By: <model>` and `Claude-Session:` lines the harness supplies and add no other attribution. (No hook in qontinui-claude-config blocks those trailers; the earlier claim that one did, and the `feedback_no_claude_attribution` memory it cited, were wrong for this repo — aligned 2026-09-09. Three repos DO declare a `commit-msg` pre-commit hook `no-claude-attribution` that rejects any message containing `claude`, `anthropic` or `co-authored-by` — `qontinui-mcp`, `qontinui-hal-mcp`, `qontinui-prm` — armed only where `pre-commit install --hook-type commit-msg` was run; committing there under the harness rule hits that hook, and the conflict is surfaced as a POLICY_GAP, not resolved here.)
 
 ### Related
 - `/manual-test` (`manual-test.md`) — UI-Bridge-on-runner correctness testing; complementary surface.

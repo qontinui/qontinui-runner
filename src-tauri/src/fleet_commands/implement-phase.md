@@ -152,8 +152,14 @@ writes feature code itself — its job is to spawn, review, decide, and unblock.
    relevant file paths, surrounding context, and explicit instructions to
    implement fully (no stubs / TODOs), run type checks + lints, fix what it
    finds, and report a structured summary (files changed, decisions made,
-   issues hit + how resolved, remaining concerns). Launch independent chunks
-   in parallel via multiple Agent tool calls in a single message.
+   issues hit + how resolved, remaining concerns) whose FIRST line is the
+   sentinel `FINAL-REPORT label=<chunk label> status=<STATUS>` (see
+   `scripts/agent-report-verdict.sh template`). Launch independent chunks
+   in parallel via multiple Agent tool calls in a single message. On every
+   return, `failed` or `completed`, classify the result with
+   `scripts/agent-report-verdict.sh classify --expect-label <chunk label> --checkpoint`
+   before reviewing it: `PROGRESS_NOTE` / `MISLABELLED` is an UNFINISHED chunk
+   to resume from its checkpoint, never a result to review.
 2. **Review.** When each agent returns, read its summary critically. Spot-check
    the actual diff with `git diff` / `Read` — don't trust the summary alone
    (see [[feedback_verify_function_exists_before_trusting_stamp]]). Confirm
@@ -280,7 +286,7 @@ trigger is NOT a gate; skip those and just report the blocker.
   `deploy_healthy`, `claim_terminal`, `operator_approval`, `ci_green`,
   `ref_exists`, `metric_threshold`, `time_elapsed`, `unit_ready`,
   `migration_at_head`, `infra_drift_clear`, `file_exists`, `sql_count`,
-  `unit_status`, `gate_cleared`, `commit_live`; plus — **exception cases only,
+  `unit_status`, `gate_cleared`, `commit_live`, `runner_served_sha`; plus — **exception cases only,
   see the Continuation bullet below** — an optional typed `continuation` or legacy
   `continuation_prompt` e.g. `run /implement-phase <stem> "<phase>"`). **HTTP
   fallback** when MCP is unavailable — for a plan-anchored gate it is now TWO
@@ -316,7 +322,25 @@ trigger is NOT a gate; skip those and just report the blocker.
   window drops them permanently — so treat it as best-effort and read the gate's
   `continuation_consumed_outcome` (a **null** outcome means never claimed, which
   is worse than a recorded `spawn_failed`).
-  (Canonical: `_gate-registration` → "Continuation policy".)
+  **When you attach one, populate `hint` — it is the spawned agent's ONLY
+  context.** coord flattens the continuation to `run /<skill> <args>` and appends
+  `\n\n<hint>` only if a hint is present; nothing else in the frame carries the
+  plan, the PR, prior findings or the predicate, so a hintless continuation
+  spawns an agent that knows only the command line — on this path, one that does
+  not know why the phase exited. Six labelled lines, **references before
+  bodies**, **≤2000 characters**: `Plan: <plan-stem>` / `Why: <≤2 sentences —
+  what blocked this phase>` / `PR: <owner/repo#N>` /
+  `Blocked: <block_reason_code>[ ×N since <ISO8601>]` /
+  `Resource-keys: <keys a peer's coord_recent_findings would match>` /
+  `Tried: <what this session did, and what it deliberately did NOT do>`. Omit a
+  line you have no value for; never write `unknown`. Nothing enforces the cap and
+  nothing truncates for you — cut prose, keep references, and end a cut brief
+  with
+  `[hint truncated at 2000 chars -- full context: <plan-stem> / <owner/repo#N>]`.
+  `continuation_prompt` has no hint field: append the brief after a blank line.
+  (Canonical: `_gate-registration` → "Continuation policy" and → "The brief — a
+  continuation with no `hint` is a fresh agent with no context" — keep copies in
+  sync.)
 - **`clearance_audience`:** set `agent` for agent-verifiable facts ("/vet-plan
   was run", "crate exists + tests green", "a dual run emitted evidence") so the
   session that completes the work can attest the gate itself; set `operator` for
@@ -331,11 +355,25 @@ trigger is NOT a gate; skip those and just report the blocker.
   `ops-confirm` for deploy/sweep/migration/config confirmations;
   `routine-review` for mechanical follow-ups. **Omit when none applies** —
   omitting is safe and never a loophole, and a guessed class is worse than none.
-  ⚠️ Do not ask for the `agent_non_author` authority on this fleet: it is a
-  ONE-DEVICE fleet and no gate carries an agent id, so the device floor
-  (`reg_dev == cal_dev`) treats every caller as the author and it resolves to
-  "nobody may attest". A second paired device would also lift it.
-  (Canonical: `_gate-registration` → "`gate_class`".)
+  ⚠️ **The old "`agent_non_author` means nobody may attest — this is a ONE-DEVICE
+  fleet" warning is SUPERSEDED (re-verified 2026-08-30).** Both premises changed:
+  the fleet has **four** device ids (`eb2155ed4152`, `c79a07d57e40`,
+  `84c0229232cb`, `3e7e4b0475de`), and `non_author_allows_identities` is now a
+  six-tier ladder in which **tier 3 (different device)** and **tier 5 (same
+  device, differing VERIFIED sessions)** both resolve to NON-author. It refuses
+  only in tier 6 — same device, no proven session on either side. So
+  `agent_non_author` IS usable when the clearer is a different device or carries
+  proven session identity. ⚠️ **The sentence that used to follow — "the work-unit
+  attestation check now routes through this SAME ladder" — is FALSE and was
+  removed 2026-09-03.** Verified on qontinui-coord `origin/main`:
+  `work_unit_registry::authorize_target_transition` takes two `Option<&str>`
+  keys and does a flat `owner == attester` compare;
+  `non_author_allows_identities` is called only from `gates.rs`. The ladder is
+  real for GATES and fictional for work-unit attestation — do not carry it
+  across. For the work-unit rule read policy live rather than restating it:
+  `/policy get policy plan-discipline` and `verification-and-evidence`
+  [policy: never-pin-a-mutable-policy-value]. (Canonical for gates:
+  `_gate-registration` → "`gate_class`".)
 - **Predicate choice:** wait-on-PR (non-coord repo) → `pr_merged`; work landing
   on a **coord-orchestrated repo** → `commit_live` `{repo, commit_sha}` with a
   **post-land main SHA** (NEVER a pre-land branch-head SHA — rebase-land rewrites
@@ -351,9 +389,11 @@ trigger is NOT a gate; skip those and just report the blocker.
   (**NOT** `operator_approval` — `operator_approval`
   is for genuine human decisions, not a work queue); schema/alembic-at-head →
   `migration_at_head` `{schema}`; infra drift cleared → `infra_drift_clear`; a repo
-  file/workflow existing → ⛔ `file_exists` is **KNOWN BROKEN (2026-08-05): it 403s
-  fleet-wide on the contents API and the gate can never clear — use `commit_live`
-  (post-land SHA) or `unit_status`**;
+  file/workflow existing → `file_exists` `{repo, path, on_ref?}` — **usable again;
+  the 2026-08-05 fleet-wide 403 was FIXED by coord `e6f486b8` (2026-08-15) and that
+  fix is deployed** (ancestor of the serving build, re-probed live 2026-08-31:
+  registered `201`, `verdict: cleared`). Residual: that probe was one PUBLIC repo,
+  so re-probe before relying on it against a private one;
   a coord data count crossing a bound → `sql_count` `{query_id,op,n}` (whitelisted
   `query_id`, never raw SQL); an umbrella plan reaching a status → `unit_status`
   `{work_unit_id,status}`; another cross-anchor gate clearing → `gate_cleared`
@@ -395,19 +435,30 @@ trigger is NOT a gate; skip those and just report the blocker.
   the source of truth; never require it, never read it back as authoritative.
 - **Re-registering for the same plan/anchor:** first cancel the prior gate's
   PENDING continuation so the old queued runner-terminal spawn doesn't fire
-  alongside the new one — `GET .../coord/agent-gates?work_unit_id=<id>` for rows with
-  `continuation_dispatched_at != null ∧ continuation_consumed_at == null ∧
-  continuation_cancelled_at == null`, then
-  `POST .../coord/gates/:gate_id/agent/continuation-cancel {reason}` — the
-  device-authed `/agent/` **infix** twin, so a device session does the whole loop
-  itself: `/coord/agent-gates` discovers the pending continuation and this route
-  retires it. `cancelled_by` derives from the JWT and is not a body field.
+  alongside the new one — `GET .../coord/agent-gates?work_unit_id=<id>` for rows
+  carrying a `continuation_spawn` with `continuation_consumed_at == null ∧
+  continuation_cancelled_at == null`. **Do NOT also require
+  `continuation_dispatched_at != null`**: `cancel_continuation` deliberately omits
+  that guard (*"the pre-dispatch stamp is the whole point"*), so a
+  dispatched-only filter drops exactly the rows the cancel was built to stamp —
+  and pre-dispatch is the EASY case, not the residual. Then fire the cancel,
+  **either transport**: `coord_cancel_continuation` `{gate_id, reason}` (the
+  native MCP tool, allowlisted on the runner's device floor) or
+  `POST .../coord/gates/:gate_id/agent/continuation-cancel {reason}` (the
+  device-authed `/agent/` **infix** twin). Both land on the same
+  `cancel_continuation_inner`; if the MCP tool is not visible that is masking,
+  not absence, so fall through to the REST door rather than concluding the path
+  is closed. `cancelled_by` derives from the JWT and is not a body field.
   Best-effort; 404 = nothing pending, 409 `already_consumed` =
-  a spawn already happened — report it honestly. (This bullet used to say the
-  cancel "stays operator-only" and that a device session had to reach an
+  a spawn already happened — report it honestly. **Expect the 409 on an
+  un-deferred gate**: read `continuation_deferred_count` on the row — `0` means
+  the clear→consumption window is measured in *seconds* (7.18 s, gate `f5940b3f`)
+  and the cancel usually loses; `> 0` bought you hours. (This bullet used to say
+  the cancel "stays operator-only" and that a device session had to reach an
   operator door; that was wrong — it named the unprefixed OPERATOR route, which
-  answers an agent 401.) (canonical spec:
-  `_gate-registration` → "Continuation cancel + refresh".)
+  answers an agent 401. It then named a dispatched-only filter, which was wrong
+  the other way.) (canonical spec: `_gate-registration` → "Continuation cancel +
+  refresh", and → "How long you actually have" for the window.)
 
 **Attest-on-completion (close the loop).** If this phase instead COMPLETES work
 that a registered gate was watching (a previously-blocked phase now finishes), it

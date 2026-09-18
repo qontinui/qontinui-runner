@@ -11,7 +11,12 @@ This is `/babysit-prs` **generalized**: from *this session's PRs, event-triggere
 fleet-level rate-limits, and deploy-batch coordination. It runs as a **visible, stoppable
 Claude session** — a `/loop`, or a coord `continuation_spawn` with
 `presentation:"terminal"` on the operator's device — so the operator watches every step
-live and can kill it any moment.
+live and can kill it any moment. That continuation deliberately carries **no `hint`
+brief**: the spawned session runs this skill, so the skill body IS its brief and every
+input is re-read from live doors on the first pass. The `hint` rule
+(`_gate-registration` → "The brief — a continuation with no `hint` is a fresh agent with
+no context") binds a continuation resuming *particular* work; this one re-arms a standing
+watch that starts from scratch by design.
 
 **The autonomy model is checks, not permission.** Roadmap Phase 3
 (`2026-07-04-coord-merge-robustness-roadmap`) made the steward responsible not by adding
@@ -79,11 +84,31 @@ hit in the closed list, and surface it WITH a recommendation rather than as an o
 
 ## Enablement gate + kill-switch (check FIRST, every iteration)
 
-The steward is armed by an env flag AND is instantly stoppable:
+The steward is **enabled by default** AND is instantly stoppable:
 
-- **`COORD_MERGE_STEWARD_ENABLED`** must be `1`/`true`. If unset/false, do nothing this
-  iteration — report `steward disabled (COORD_MERGE_STEWARD_ENABLED unset)` and stop. This
-  is the fleet-wide off switch.
+- **`COORD_MERGE_STEWARD_ENABLED` is an OFF switch, not an ON switch** (operator-directed
+  2026-08-31). **Unset means ENABLED** — run the iteration. Only an explicit `0` / `false`
+  / `no` / `off` (case-insensitive, trimmed) disables it; on that value do nothing this
+  iteration, report `steward disabled (COORD_MERGE_STEWARD_ENABLED=<value>)` and stop.
+  Any other value, including `1`/`true` and including garbage, is ENABLED — an off switch
+  that fails open is the correct direction here, because the failure it must never have is
+  silently declining to watch a wedged train.
+
+  ⚠️ **This inverts a real safety property, deliberately — know what was traded.** The old
+  default meant a steward launched by anything other than the runner's own launcher found
+  the flag unset and refused to act, so an accidental `/merge-train-steward` was inert. It
+  is now armed on invocation, in `--mode=autonomous` (the default), which is Tier-1
+  remediation + Tier-2 authoring. The operator's rationale is the same as served policy
+  `escalation-bar` `do-reversible-mechanical-work`: the cost of a stopped action exceeds
+  the cost of repairing a rare wrong one, and every mutation here is still gated by
+  `/vet-plan` + CI + candidate CI + the no-reap gate + per-PR review. If you want the old
+  inert-by-default behaviour for a session, pass `--mode=observe`; that is now the brake,
+  not the env var.
+
+  **Scope: this flag ONLY.** The sibling stewards keep ON-switch semantics and are
+  unchanged — `QONTINUI_CLEANUP_STEWARD_ENABLED` (which gates *destructive* reaping) and
+  `COORD_DEVOPS_STEWARD_ENABLED`. Do not generalise this inversion to them; the risk
+  profiles differ and only this one was operator-directed.
 - **Stopping the visible session** (Ctrl-C / closing the terminal / interrupting the
   `/loop`) halts it. On stop, run the **cleanup** in the try/finally sense: release any
   coord claims this run holds and leave no half-state (a partially-rebased worktree gets
@@ -112,29 +137,264 @@ The steward is armed by an env flag AND is instantly stoppable:
    the `2026-07-17-merge-train-long-ci-redesign` plan),
    `--once` (single pass, no continuous loop).
 
-   ⚠️ **The watch set is a SUPERSET of the merge-authority set — do not conflate them.** The
-   **merge-authority set** is the repos coord lands:
-   `qontinui-web,qontinui-runner,qontinui-coord,qontinui-schemas,qontinui,ui-bridge` (unchanged).
-   Only there do the land-related Tier-1 reflexes apply — recovery-merge, land-queue timing,
-   the coord drain gate, candidate-CI thresholds. Everything else in the watch set is
-   **watch-only**: the steward scans it for stuck and red PRs exactly as it does the rest, but
-   its remedy STOPS at making the PR landable and green (**re-run the failed run**, rebase a
-   stale merge ref, fix red CI, or close an already-landed empty diff) — the land itself is
-   someone else's mechanism. **This is a change of remedy, not a lowering of the stuck bar:**
-   non-draft + green + unlanded past the threshold is still a wedge, it is just a wedge in
-   *that repo's own* land mechanism rather than in coord's, so diagnose the mechanism instead
-   of waiting for a coord proposal that will never come.
-   `qontinui-claude-config` is watch-only today, and its mechanism is checked in —
-   `.github/workflows/auto-merge.yml`, whose own header says it "is NOT coord-managed" (coord's
-   authority covers the app repos with `strict_required_status_checks_policy` branches;
-   **this repo has none**). It merges with the default `GITHUB_TOKEN`, so its lands are
-   credited to `github-actions[bot]`, never to `app/qontinui-merge-orchestrator`.
-   ⚠️ It is **edge-triggered** — it fires
+   ⚠️ **DERIVE the watch set each pass — the hardcoded default above is a FALLBACK, not the
+   set.** A literal list is exactly what goes stale, and silently: measured 2026-09-01 against
+   `coord_query_train_activity` (**40** coord-authority repos), four repos holding live work sat
+   outside the default — `qontinui-devtools` (1 open PR, plus two stale gating REDs on `main`),
+   `qontinui-supervisor` (2 open), `qontinui-prm` (1 open), and `qontinui-dev-notes`
+   (**48 open non-draft — the largest backlog on the fleet**). So unless `--repos` was passed
+   explicitly, **build the watch set from `coord_query_train_activity`**: it returns one row per
+   coord-authority repo *including repos with no proposals at all*, which is precisely the
+   population a static list cannot contain and the reason a longer hardcoded list is not the fix.
+   Fall back to the default only when that read is unavailable, and **say which of the two you
+   used** — a pass run off the fallback has a known blind spot and should report it as one.
+   ⚠️ Its counts lag even where its row set is right: the same read reported **41** open for
+   `qontinui-dev-notes` against a measured **48**. Take the row set as authoritative for WHICH
+   repos to watch, and re-count per repo before acting on any number it gives.
+
+   ⚠️ **The merge-authority set is DERIVED each pass — and it is NOT the same question as
+   "who lands this repo". Keep the two apart; conflating them is what produced the defect
+   below.**
+
+   - **the merge-authority set, which this file also calls the coord-authority set — one
+     object, two spellings** — the repos coord's train covers. **This file already carries
+     the correct definition**, in item 3's *"Do NOT probe merge authority with a
+     `POST /agents/allocate` 409"* warning: `coord.canonical_repos` (tenant/global rows)
+     UNION `coord.tenant_repos` — **40 rows on 2026-09-16**, `qontinui-claude-config` among
+     them. What follows is that same definition, DERIVED rather than listed. There is not a
+     second one, and this file must never grow a third. **It is also the WATCH set**: both
+     come off the same read, so they are the same population and neither is "wider".
+   - **the lander** — WHO actually closes a PR here, which is a DIFFERENT question and the
+     only thing that selects the watch-only remedy below. **The procedure, stated once
+     because the steward acts on OPEN PRs that have no landing commit of their own:** read
+     the committer census over the repo's recent default-branch history —
+     `git log origin/main -100 --format='%cn'` — and classify each commit by the two shapes
+     the two-lander census below spells out. Coord is the PRIMARY lander iff coord-shaped
+     commits are the majority. That is a per-REPO verdict derived from per-COMMIT evidence;
+     the two phrasings elsewhere in this file mean this one procedure.
+
+   **What went wrong.** A six-repo literal
+   (`qontinui-web,qontinui-runner,qontinui-coord,qontinui-schemas,qontinui,ui-bridge`) stood
+   here as if it answered both, and everything else was called watch-only — *"coord holds no
+   merge authority"*, *"a coord proposal that will never come"*. Measured false 2026-09-16:
+   `gh pr list --state merged --json number,mergedBy` shows **`app/qontinui-merge-orchestrator`
+   — which IS coord**, the same App backing the "Qontinui merge gate" check on the six —
+   landing `qontinui-supervisor` (5/5), `qontinui-stack` (5/5), `qontinui-dev-notes` (8/8),
+   `qontinui-prm` (1/1) and `qontinui-devtools` (#7, #5; #4 down to #1 were `jspinak`, a transition).
+
+   ⚠️ **`mergedBy` UNDERCOUNTS coord, so a zero from it never establishes watch-only.** A coord
+   rebase-fast-forward land rewrites the sha, so GitHub often does not auto-close the PR — this
+   file says so itself under the two-lander census below — and such a land never appears in
+   `--state merged` with an orchestrator `mergedBy` at all. Measured on ccfg `origin/main`,
+   newest 100 commits: **83 `GitHub` / 13 `qontinui-coord` / 4 human**, and the `mergedBy` query
+   above saw **none of the 13**. So `mergedBy` is a one-way instrument — a hit proves coord
+   lands here, a miss proves nothing — and a repo coord lands EXCLUSIVELY by ff would read as
+   zero and be misclassified watch-only, which is this very defect with a different cause. **The
+   two-way instrument is the committer census**, `git log origin/main -100 --format='%cn'`,
+   read with the two committer shapes the census below spells out.
+
+   That changed the **REMEDY**, not a label: on those five a steward was sent hunting for a
+   land mechanism that does not exist and told to skip the coord-side diagnosis that actually
+   explains the hold — on that same pass supervisor#192 `action_required` with zero jobs,
+   prm#2 `escalate-path-matched`, and stack#80 waiting on a declared cross-repo dep edge
+   `upstream_of qontinui-coord#1836`. Finding `b8e2c2c7-35bb-4f24-be4e-6b3c25f92afe`.
+   **Do not fix it by widening the literal** — widening is the failure mode, not the remedy.
+
+   **Derive the coord-authority set on a CHAIN, and NAME the rung that answered.** Either rung
+   can time out: `coord_query_train_activity` timed out at 30 s twice in the 2026-09-16 pass
+   while `train_health` answered, and in the independent vet of this very change the reverse
+   happened. Try in order and report which one carried it.
+
+   ⚠️ **Before demoting a rung for timing out, retry it on the OTHER DOOR — a timeout may be
+   about the transport rather than the tool, and on 2026-09-16 it was not even stable within
+   one hour.** Three readings that day, same call, same arguments: over the runner loopback
+   proxy (`http://127.0.0.1:9876/coord-mcp`) one session saw **4 timeouts out of 4** at 30 s
+   while a direct `POST https://coord.qontinui.io/mcp` answered **HTTP 200 in 2.57 s**;
+   minutes later a second session got a full 40-row payload over **that same loopback proxy**,
+   well inside the budget. **So this is an observation, not a mechanism** — nothing here
+   measured WHERE the 30 s budget lives, and a paragraph claiming it did would be the
+   cause-for-a-measurement substitution this command polices elsewhere. Practically: retry on
+   the other door before falling through, and say which door carried it. The direct door needs
+   a device JWT — the credential chain is in item 2 of this step, not repeated here.
+   1. **`coord_query_train_activity`** — one row per coord-authority repo, each with an
+      `authority` object `{canonical, tenant}`; its own `coverage_note` states the row set as
+      `canonical_repos` UNION `tenant_repos`. Measured 2026-09-16: `repo_count: 40`, all five
+      corrected repos present. ⚠️ **`authority.canonical` is which TABLE the row came from,
+      not a capability tier**. It is wrong in BOTH directions: `qontinui` and `ui-bridge` read
+      `canonical: false` and have always been in the six, while `qontinui-supervisor` reads
+      `canonical: true` and was never in it. Never filter the set on it.
+   2. **`coord_query_train_health` → `ci_runner_inventory.registrar.armed_repos`** — note it
+      takes a REQUIRED `repo` argument, which bites precisely when rung 1 (the enumeration)
+      failed and you hold no repo: pass any repo you already know. 43 entries
+      on 2026-09-16, a strict SUPERSET of rung 1's rows (the extra three being
+      `portofino-pizzeria/backend`, `portofino-pizzeria/infra` and
+      `stefanbleck/Expenses-App`). ⚠️ It is the CI-runner registrar's roster rather than the
+      authority table, and it **reports its own freshness** in the same block — `coverage`,
+      `refresh.verdict` and `stale_repos`. On 2026-09-16 two reads seven minutes apart
+      disagreed on two of those three (`refresh.verdict` `unobserved` then `stale`;
+      `stale_repos` 43 then 26), which is exactly why no value from it is pinned here: **read
+      the freshness fields yourself and quote what YOU saw.** Take the roster as a WIDENING
+      signal and confirm per repo.
+   3. **The retired six-repo literal quoted under "What went wrong" — a declared FALLBACK
+      only, and note it is NOT the seven-repo `--repos` default in item 1; they differ by
+      exactly `qontinui-claude-config`.** A pass run off it has a known
+      blind spot and **must report it as one**.
+
+   ⚠️ **Neither rung is a complete enumeration, and rung 1 is credential-scoped.** Finding
+   `76f36279-fe65-4273-9c5d-23f1a828f997` measured `coord_query_train_activity` under a
+   `personal-jspinak` credential returning 40 rows that OMITTED `portofino-pizzeria/infra` and
+   `backend` — two repos coord had in fact ff-landed — with the practical rule that a
+   tenant-scoped steward enumerates via `gh repo list <owner>`, not via this read. A repo
+   absent from both rungs is UNKNOWN, never out of scope.
+
+   **Watch-only is a LANDER fact, established PER REPO — not the complement of a list, and
+   not "coord has no authority here".** A repo is watch-only when coord is not its PRIMARY
+   lander; `qontinui-claude-config` is the only measured instance today, and it is the case
+   this file has always got right. There the steward scans for stuck and red PRs exactly as
+   elsewhere, but the remedy STOPS at making the PR landable and green (**re-run the failed
+   run**, rebase a stale merge ref, fix red CI, or close an already-landed empty diff) —
+   closing it is the other mechanism's job. **This is a change of remedy, not a lowering of
+   the stuck bar:** non-draft + green + unlanded past the threshold is still a wedge, just a
+   wedge in *that repo's own* land mechanism.
+
+   ⚠️ **Watch-only does NOT mean coord is absent — and several rows further down in this file
+   were written as though it did.** ccfg is coord-authority, and on 2026-09-16
+   `coord_query_train_health` answered for it with a full payload:
+   `open_pr_backlog.histogram` over 18 open non-draft PRs, `candidate_ci_p90_secs: 78.8`, `last_land_at 2026-09-14T19:54:54Z`, 37
+   `coord.scheduler_ticks` rows and 14 `unproposed_branches`; `coord_pr_status` for ccfg#980
+   returned a fully populated card, not a thin one. Coord holds a card, a train and thresholds
+   even here.
+
+   **Do not trust a COUNT of the affected rows — this file has already been burned by one.**
+   Every passage corrected for this carries the literal marker **`WATCH-ONLY CORRECTION
+   2026-09-16`**. Before acting on ANY row that opens "on a watch-only repo …", check that it
+   carries that marker; a row that does not carries the pre-correction premise and must be
+   re-derived against the rule above. `grep -n 'watch-only' .claude/commands/merge-train-steward.md`
+   enumerates them in one command, which is the check to run rather than a number to read here.
+
+   **Honest limit on the correction above.** Recent-merge history is evidence about who HAS
+   landed, not a read of coord's authority table, and a repo with no recent merges is
+   invisible to that method. The five named are a **FLOOR**, not the complete correction —
+   the second reason to derive the set rather than paste a longer one.
+
+   `qontinui-claude-config` is watch-only today: coord is not its PRIMARY lander — the
+   committer census over the newest 100 commits of `origin/main` reads **83 `GitHub` / 13
+   `qontinui-coord` / 4 human**, so coord lands here but `auto-merge.yml` does the bulk — and
+   its checked-in mechanism is
+   `.github/workflows/auto-merge.yml`, whose own header says it "is NOT coord-managed" and
+   which merges with the default `GITHUB_TOKEN`, crediting those lands to
+   `github-actions[bot]`. (Coord ff-lands here too — the two-lander census below — so infer
+   the lander from the COMMIT, never from the repo.)
+   ⚠️ `auto-merge.yml` is **edge-triggered** — it fires
    only on a `lint-frontmatter` `workflow_run` *completing* with `conclusion == 'success'` and
    `event == 'pull_request'`, and nothing re-fires it on a schedule. A cancelled or failed lint
    run therefore strands the PR indefinitely, and only `rerun_failed_jobs` re-arms it: a fresh
    `gh workflow run --ref` dispatch produces `event == 'workflow_dispatch'`, fails that `if:`,
    and **cannot land the PR** no matter how green it goes.
+   Since 2026-09-02 a sibling workflow — `.github/workflows/lint-retry.yml` — performs that
+   re-run **automatically**, for a `pull_request` lint run. It does not change the trigger or
+   the bar: the retry must go green on its own merits before `auto-merge.yml` will look at it.
+   Since #916 (2026-09-13) the bound is **class-dependent** — `failure` gets one retry
+   (attempt 1 only); any other non-success conclusion (`cancelled`, `timed_out`, … — `skipped`
+   and an empty conclusion stay excluded) is retried while `run_attempt < 4` — and a decide step
+   (`scripts/lander-classify.sh retry`) stands the retry down when this attempt's failure
+   signature REPRODUCES the previous attempt's, at the ceiling, or when the decision could not
+   be read, **with a best-effort comment on the PR** in those three cases. It also stands down,
+   with NO comment, when the head is no longer an open PR's head (merged, superseded, branch
+   deleted) — so a missing comment on a merged or superseded head is expected, not a fault.
+   **So the manual re-run remedy above is now the SECOND-line remedy, not the first** — a ccfg
+   PR you find stranded behind a red lint has already had its automatic retry, which makes a
+   second failure evidence of a real failure rather than of a flake. And a `lint retry standing
+   down: … reproduced the previous attempt` comment means a re-run **cannot** help: a re-run
+   re-executes the workflow definition the run was created with, so the remedy is a new head
+   (rebase and push), never another re-run. Check `run_attempt` before spending one: an
+   attempt-1 red on a still-open head that was never retried and carries no stand-down comment
+   most likely means `lint-retry.yml` itself did not fire — read its runs for that head (the
+   comment is best-effort, so its absence alone is not proof) and chase THAT.
+
+   ⚠️ **And a GREEN lint with an open PR is a class `rerun_failed_jobs` cannot serve at all —
+   read the PR's file list before spending a re-arm on it.** `auto-merge.yml` merges with
+   `secrets.GITHUB_TOKEN`, and `workflows` is not a key its `permissions:` block can carry, so
+   GitHub refuses its `gh pr merge` with
+   `refusing to allow a GitHub App to create or update workflow `.github/workflows/<f>` without
+   `workflows` permission` — **but only when the squash would have to SYNTHESIZE a workflow blob
+   that no authorized push has introduced.** Measured 2026-09-06: `app/github-actions` landed 8
+   of 8 recent workflow-touching ccfg PRs (#788 #786 #777 #774 #772 #742 #726 #724, two of them
+   edits to `auto-merge.yml` itself), because the merged blob already existed on the head or on a
+   coord `merge-candidate/*` ref; the one refusal, #728, touched `lint-frontmatter.yml` after
+   `main` had also changed it. So the discriminator is **the PR touches a `.github/workflows/`
+   file that `main` has ALSO changed since the PR's merge-base** — a *stale* workflow-touching
+   PR, not a workflow-touching PR — and for that head the refusal is deterministic: re-arming the
+   edge (lint already green at its latest attempt) re-fires an auto-merge that refuses again. It
+   spent one of #728's three bounded attempts before its log was read. **Remedy: the
+   *Green-but-dirty* row's "Rebase it"** (any actor with workflow authority — the author or an
+   agent — can push the rebase; `auto-merge.yml` cannot, because update-branch under
+   GITHUB_TOKEN synthesizes the same blob), or coord's own lane, which lands the PR without a
+   rebase once EVERY check on the head is green — it did not take #728 because
+   `skill-bundle-parity` was red (coord card `block_reason_code: ci-not-green`). **It is not an
+   operator case**: finding `954275c5` refuted that escalation after it held #772 in draft while
+   green. Since plan `2026-09-04-ccfg-auto-merge-cannot-land-a-pr-that-touches-a-workflow-file`
+   landed, `auto-merge.yml` posts this class on the PR as a typed `auto-merge declined:` comment
+   naming the stale files and the rebase; before it, the reason lived only in the failed
+   `auto-merge` run's log, which is not attached to the PR as a check.
+
+   ⚠️ **`auto-merge.yml` is NOT the only thing landing this repo, and this file used to
+   say it was.** Measured 2026-09-02T05:46Z via
+   `git log origin/main --format='%cI %h committer=%cn %s'`: **two concurrent landers**,
+   interleaved inside one hour — `d1796d3` 05:42:16Z and `7875d44` 05:21:25Z with
+   `committer=GitHub`, against `f2b7367` 05:13:41Z and `fafe9b3` 05:14:56Z with
+   `committer=qontinui-coord <coord@qontinui.dev>`. coord states it itself on PR #615:
+   *"Landed on `main` by coord as `f2b73676c` (rebased fast-forward; PR head `ea46bfa69`
+   differs, so GitHub did not auto-close) — closing."* The retired claim — that lands here are
+   credited to `github-actions[bot]` **never** to `app/qontinui-merge-orchestrator` — was
+   simply false, and it misdirected two live steward sessions on 2026-09-02.
+
+   **So do not infer the lander from the REPO — infer it from the COMMIT.** That one
+   `git log` line separates the two shapes:
+   - `committer=GitHub` **with** a trailing `(#N)` ⇒ `auto-merge.yml`'s squash, landing as
+     `github-actions[bot]`; the squash rewrites the committer and stamps the PR number.
+   - `committer=qontinui-coord <coord@qontinui.dev>`, **no** `(#N)`, and the **original author
+     preserved** (`f2b7367` author `t`; `fafe9b3` author `jspinak`) ⇒ a coord
+     **rebase-fast-forward** land. The rebase changes the SHA, so GitHub often does not
+     auto-close the PR — a coord land can present as a stuck PR that has in fact already
+     shipped, which is the *already-landed empty-diff* class below, not a wedge.
+
+   ⚠️ **The two landers differ in a second way that nothing here used to say: only ONE of them
+   produces CI on `main`.** `auto-merge.yml` merges with `secrets.GITHUB_TOKEN`, and GitHub
+   creates no new workflow runs for events triggered by that token — so **every `committer=GitHub`
+   squash lands with zero `push`-event workflow runs at its sha**, while a `committer=qontinui-coord`
+   ff-land (a different credential) triggers them normally. Measured 2026-09-05 over the newest
+   100 commits of `origin/main`: 95 auto-merge squashes with **0** push runs; 4 coord ff-lands
+   and 1 human push with one each. Consequence for a steward reading this repo: `qontinui CI`
+   green on ccfg `main` means *"green as of whenever a coord ff-land or a human last pushed"*,
+   which at that land rate is roughly one commit in twenty — it does **not** mean the tip is
+   verified, and a broken ccfg `main` would read green. That is case **2s** in the red-main
+   remedies table below; the repo now carries a `main CI coverage` workflow that reports the gap
+   as a number. Plan: `2026-09-04-auto-merge-lands-trigger-no-main-ci`.
+
+   **Honest limit: whether coord landing this repo is NEW behaviour, or this doc was wrong
+   from the day it was written, is NOT established.** The evidence above is one hour of
+   `origin/main`, not a history. Say UNKNOWN rather than inventing either story.
+
+   **Consequence — a hypothesis, not a proven cause.** Two independent landers on one
+   protected `main` share no lease, and a collision surfaces as `mergeStateStatus: BLOCKED`,
+   which `gh pr merge` reports client-side as "the base branch policy prohibits the merge"
+   while `mergeable` still reads `MERGEABLE`. That is a **plausible mechanism for the BLOCKED
+   refusals seen here, not a demonstrated one** — a prior session asserted causation from
+   timing alone and was wrong; do not repeat that. It went unseen because `auto-merge.yml`
+   polled only `mergeable` (fixed in #619, landed as `7574c9a`, which now rechecks
+   `mergeStateStatus` between attempts). **One BLOCKED cause IS demonstrated, and it is not a
+   race:** on #909 (2026-09-12, twice) BLOCKED was the stale-workflow-blob refusal surfacing
+   at `mergeStateStatus` against a `main` tip 13 hours old. Since #916, `auto-merge.yml`
+   classifies a BLOCKED once from API data (`scripts/lander-classify.sh blocked`) before
+   spending its poll window — declining at once, on the PR, for a stale workflow blob or a
+   refusing branch rule — and its exhaustion decline now says whether `main`'s tip actually
+   moved. A decline reading *"main's tip did NOT move … UNEXPLAINED"* is not the race either;
+   read the classifier output it quotes before re-arming.
+
+   None of this loosens the watch-only **remedy** rule above: whichever mechanism lands this
+   repo, it is still not the steward's, so your remedy still STOPS at making the PR landable
+   and green.
 
    **Why it is in the watch set at all: a steward that excludes the repo holding its own
    tooling cannot see fixes to itself.** `qontinui-claude-config` holds this command,
@@ -170,6 +430,66 @@ The steward is armed by an env flag AND is instantly stoppable:
    base64-encoded SQL). Some operator REST levers (`/reevaluate`, merge-order) are **operator-SSO
    gated** and reject a device JWT (`401 operator context missing`) — those are Tier-3
    operator-resource actions, not steward-actionable.
+
+   > ⚠️ **Probe a second, independent instance before you name a cause for a dead door.**
+   > `/coord-revive` hands back a failure TYPE, and a type is a *diagnosis*: "the key is
+   > stale", "the port is dead", "coord is down". Each is a claim about a service you
+   > reached from one client, on one box, over one transport. Coord is multi-replica by
+   > construction — which is why liveness here is `<base>/health` sampled 4–8× looking for
+   > exactly one `is_leader:true` — so a second instance is free: sample again and read
+   > WHICH replica answered, then cross-check the public door with
+   > `curl -sS -o /dev/null -w '%{http_code}\n' https://coord.qontinui.io/health`. A `401`
+   > there still proves coord is **served**, which is exactly the claim a local "Command
+   > failed with no output" was about to be used to deny; a masked MCP tool is a fact
+   > about this session's transport and no evidence at all about the train. **This rung is
+   > unconditional** — no credential, no MCP, one `curl` — and it is cheaper than the
+   > `/coord-revive` cascade it precedes, so it runs first rather than instead.
+   >
+   > **Then ask what a peer already found:** `coord_recent_findings` for the
+   > `resource_keys` you are about to touch, or the `topic` when you know the subsystem
+   > (`coord-mcp`, `pr-merge`) before you know the files. `coord.findings` is
+   > pull-by-relevance — nothing pushes a peer's diagnosis at a steward, and a `/loop`
+   > steward re-derives the same wedge every iteration without it. Masked tool or dead
+   > transport: `GET /coord/agent-findings?resource_keys=…&topic=…&limit=…` (same
+   > `findings::recent` behind both doors). ⚠️ The two filters are **OR'd, not AND'd**
+   > — coord's `recent` matches *keys-overlap* **OR** *topic-equals* as one
+   > disjunction, not a conjunction (qontinui-coord
+   > `crates/coord/src/findings.rs`), so passing both **widens** the read.
+   >
+   > **Then ask what an ANSWERED QUESTION already established:** read the
+   > `diagnostic` corpus for the subsystem you are about to touch, exactly as you
+   > just read `coord_recent_findings`. Findings expire in ~14 days and are raw;
+   > diagnostics are durable, versioned, and carry a **Refutes** section naming a
+   > belief that has already been falsified — which is the one you are most likely
+   > to re-derive.
+   >
+   > ```bash
+   > # $HDR is a 0600 tempfile holding one line, `Authorization: Bearer <device JWT>`
+   > # — never the token on argv (served policy `security-and-autonomy`, credential hygiene)
+   > # topic vocabulary is coord.findings' own: merge-engine, pr-merge, coord-mcp, plan-corpus
+   > curl -sS -H @"$HDR" \
+   >   'https://api.qontinui.io/api/v1/plan-library?kind=diagnostic&q=<topic>&limit=20'
+   > ```
+   >
+   > Skim the **Refutes** sections first, then **Re-run** — a diagnostic's Measured
+   > block is a reading, not a fact, and re-running its named probe is cheaper than
+   > re-deriving its conclusion. ⚠️ `?q=` is full-text over title and body and does
+   > NOT match the slug; the exact door is `&work_unit_slug=<stem>`. A zero result is
+   > **UNKNOWN, not absent** — the corpus is young (3 rows at 2026-09-06T08:35Z) and
+   > nothing yet tells you it is empty rather than unwritten. Contract, bar and slug
+   > convention: `knowledge-base/qontinui-specific/diagnostic-artifacts.md`.
+   >
+   > **It gates the CAUSE, never the OBSERVATION.** "`coord_pr_status` returned 'Command
+   > failed with no output'" is a measurement and belongs in the ledger verbatim. "coord
+   > is down", "the train is stopped" are causes — and this steward *acts* on causes, which
+   > is why the distinction is operational rather than stylistic: a leaderless outage is a
+   > Tier-3 escalation and a hard stop on Tier-1/2 remediation, while a stale nonce is a
+   > `/coord-revive` and no escalation at all. **If the second instance cannot be reached
+   > either, that is UNKNOWN** — record UNKNOWN plus the two probes you ran, never the
+   > mechanism. Measured 2026-09-01 on this fleet: a session held a write door dead for
+   > ~5h45m on one local probe while it was live, with a correctly-keyed finding already
+   > six hours old (plan
+   > `2026-08-28-probe-first-belongs-in-the-diagnosing-commands`).
 3. **Rate-limit ledger.** Track `recovery_merges_this_hour = 0` on a rolling 60-minute window
    (timestamp each action; evict entries older than 60m before each check) — that cap is real
    and hard. Track `fix_prs` as a COUNT FOR THE LEDGER, not a ceiling: report how many fixes
@@ -203,16 +523,589 @@ The steward is armed by an env flag AND is instantly stoppable:
    eu-central-1 returns `ClusterNotFoundException` and reads like an outage. This is the
    landed-vs-serving distinction the honest-bookkeeping section depends on.
 
+   ⚠️ **The `aws` CLI is not present on every fleet member — DECLARE which read you
+   used.** Measured on the Linux box 2026-09-04 and again 2026-09-06: `command -v aws`
+   finds nothing, neither `~/.local/bin/aws` nor `/usr/local/bin/aws` exists, and both
+   commands above exit `127 command not found`. An absent `aws` is
+   **INOPERATIVE-ON-THIS-MACHINE, never a silently skipped item 9** — and never a
+   substitution made without saying so.
+
+   The declared fallback is coord's own unauthenticated health surface:
+
+   ```
+   curl -sS https://coord.qontinui.io/health | jq -c '{build_sha, built_at}'
+   ```
+
+   `build_sha` and `built_at` are **top-level**, while `is_leader` / `holder_id` sit
+   under `leader` — so `build_sha` is per-replica-image and NOT leader-gated, which is
+   why it survives a follower read where `/metrics` does not. Read it off the **same
+   4–8 samples** Step 0's liveness check already takes (see the leader probe above);
+   quote it only once it agrees across all of them. Measured 2026-09-06:
+   `5e151e6c13f236aeb6620a0a81274b2c6ed13c5a` @ `2026-09-05T20:25:39Z` on four
+   consecutive samples, every one served by a follower (`leader.is_leader: false`).
+
+   *Why `/health` and not `/coord/build-info`* — the endpoint the deploy workflow's own
+   provenance probe uses (`deploy-coord.yml:1536-1550`). It is operator-Bearer-gated:
+   measured 2026-09-06, it answers `401 {"error":"missing operator Bearer token"}`.
+   `/health` is the only unauthenticated door carrying a build sha.
+
+   ⚠️ **What the fallback cannot tell you — from the workflow's own source, not by
+   analogy.** `/health` is coord's **self-report**, answered by whichever replica the
+   ALB routes to. `deploy-coord.yml:1536-1550` makes its own build-info probe
+   *warning-only* for exactly this reason: *"during/just after the task flip a
+   still-draining old task (or a replica lag) can answer with the previous sha even
+   though the rollout took."* So the fallback confirms **which build is currently
+   answering** and can never confirm **that the intended task definition rolled** — the
+   `describe-services` → `describe-task-definition` chain resolves what the SERVICE is
+   pointed at, which survives a mid-flip read. Consequences: where the two disagree the
+   ECS read wins, and a single `/health` sample taken within minutes of a deploy is the
+   one reading you must not quote. Where `aws` is absent, `/health` IS the honest
+   answer — and the ledger says which read produced the number.
+
+## The per-pass CHECKLIST — every iteration, before anything else
+
+Steps 0-4 below say HOW to do the work. This says WHAT must be LOOKED AT, so a pass
+cannot quietly skip a surface. **Tick every line explicitly in the iteration ledger.**
+An unticked line is **UNKNOWN, never "fine"**, and a read that failed is named as the
+read that failed — absence is never health
+[policy: `verification-and-evidence` `silent-empty-is-unknown`].
+
+This list exists because a full overnight soak ran ~12 iterations, reported the fleet
+accurately on every surface it consulted, and was still blind to four repos with 23 open
+PRs — because nothing told it to look. Every item below is a surface some pass has
+actually missed.
+
+- [ ] **1. Enablement + kill-switch.** `COORD_MERGE_STEWARD_ENABLED` is an OFF switch —
+      confirm it is NOT set to `0`/`false`/`no`/`off` (unset = enabled); mode
+      (`autonomous` / `observe`) stated in the ledger.
+
+- [ ] **2. CARRY-OVER: were the LAST pass's findings actually ADDRESSED?**
+      For every deficiency the previous iteration named, state its CURRENT disposition —
+      not what you intended, what is true now:
+      **plan written → vetted → implemented → PR open → landed → SERVING**, or a
+      completed Tier-1 remediation, or a registered gate with a returned `gate_id`.
+      **Naming a deficiency is not addressing it, and neither is authoring a plan that
+      was never implemented.** A finding that reappears in three consecutive ledgers with
+      no plan behind it is itself the defect — escalate it as one. Carry the list forward
+      verbatim until each item reaches a terminal state; a deficiency that silently stops
+      being mentioned is a DROPPED item, which is the exact failure `/unattended` exists
+      to catch.
+
+- [ ] **3. THE TRAIN TAB — `https://qontinui.io/admin/coord/pipeline`.**
+      **This is not the same read as `/pr-merge/health`, and the difference is the whole
+      point of this line.** `GET /pr-merge/health` lists a repo only when it HAS a
+      proposal (`slots.repos[]`) or a ready PR (`ready_unmerged`). A repo with open
+      non-draft PRs and NO proposal at all appears in **neither**, so it is structurally
+      invisible to that read. The Train tab is built from
+      `buildRepoTrainRows(proposals, prs, health)` in
+      `qontinui-web/frontend/src/components/operations/trainActivity.ts` — note it takes
+      the **PR list** as an input, which is precisely why it can show what health cannot.
+
+      Read, per repo: the **activity kind** and dwell, and the **ranked pause reasons**.
+
+      ⚠️ **`kind: "idle"` means ONLY "no proposal in flight". It is NOT a health verdict.**
+      The reasons are what separate benign from wedged:
+      - idle **with zero open non-draft PRs** → benign (`no-candidates`, severity `info`).
+        Do not flag it; a detector that cries wolf here gets ignored.
+      - idle **WITH open non-draft PRs** → that is the signal. Ask why nothing is proposed.
+      Reason vocabulary to expect: `no-candidates`, `no-ci-runners`, `repo-cap-starved`,
+      `slots-saturated`, `main-red`, `suppressed-train`, `orchestrator-stalled`,
+      `leader-lease-stale`, `hydration-stale`, `dry-run-freeze`, `already_terminal`,
+      `removes-referenced-export`, `unrecognized-status`, `web_error`, `healthy`.
+      Note the fleet banner **`suppressed-train`** — "coord is deciding and then not
+      executing — the train is suppressed, not idle" — which fires when nothing has landed
+      for a long dwell while the predicate is still evaluating and PRs are ready. That
+      condition is invisible in the per-repo view.
+
+      **Until a served per-repo activity read exists, compute the census by hand** — it is
+      three cheap commands and it is the only thing that catches this class:
+      enumerate coord-authority repos, count **open non-draft** PRs per repo, and diff that
+      set against `slots.repos[]` plus `ready_unmerged` from `/pr-merge/health`. Any repo
+      with open non-draft PRs and no train presence is an idle-with-work repo: name it,
+      get its block reason, and dispose of it.
+
+      Measured 2026-08-28T08:32Z, the reason this item exists: only `qontinui-runner` and
+      `qontinui-coord` had any train activity, while `qontinui-dev-notes` (14),
+      `qontinui-web` (6), `qontinui-supervisor` (2) and `qontinui-schemas` (1) sat idle
+      holding **23 non-draft PRs between them**. Two of those repos were not in the default
+      `--repos` watch set at all — so **check the watch set against the repos coord
+      actually has authority over**, not against the default list.
+
+      (The route was RENAMED from `/admin/coord/fleet` to `/admin/coord/pipeline`; there is
+      a `route-rename.test.ts` beside the page. If a pointer anywhere still says `fleet`,
+      it is stale.)
+
+      ⚠️ **TRANSPORT REALITY — an agent session CANNOT perform the read this doc mandates.**
+      `GET /pr-merge/health` is TENANT-SCOPED and returns **HTTP 403
+      `{"error":"tenant_not_resolved"}`** to a device JWT and to an agent JWT alike (measured
+      2026-08-28; the gate is coord's `auth.rs`). It answers only for an **operator Cognito
+      bearer** minted from SSM — an OPERATOR credential, not one a session holds by default.
+      A steward that reports having read it should be able to say which credential carried it;
+      if the answer is "a device JWT", the read did not happen and the result is UNKNOWN.
+      The agent-reachable substitutes, in order:
+      - **`coord_query_train_activity`** — the per-repo activity + reason read built for exactly
+        this gap (coord#1682, plan `2026-08-28-coord-train-activity-retrieval-gap`). Prefer it
+        once it is SERVING; check that, not just that it landed.
+      - **`coord_query_train_health`** — reachable today, **but do not trust its idle arm.**
+        Measured 2026-08-28 against `qontinui-dev-notes`: it returned
+        `is_making_progress: true` with `why: "nothing to land — queue is empty"` while the
+        SAME payload carried **9 stranded PRs**, one conflicted for 7.6 days. It keyed the idle
+        verdict on `open_proposals == 0` alone and had no open-PR input at all. For
+        `qontinui-supervisor` and `qontinui-schemas` even `stranded_prs` was empty, so **no
+        field anywhere named their backlog**. Read `stranded_prs` yourself and cross-check
+        against `gh pr list`; a green `is_making_progress` on a repo with open PRs and no
+        proposals is exactly the false-healthy this checklist exists to catch.
+
+      ⚠️ **Do NOT probe merge authority with a `POST /agents/allocate` 409.** That checks
+      `coord.canonical_repos` ALONE (5 repos as of 2026-09-16), while merge authority is
+      `canonical_repos` UNION `tenant_repos` (40 as of the same date — both are live counts
+      off a mutable table, so re-read them rather than quoting these). A repo can 409 on allocate and still be a
+      full coord-authority repo with a complete train-health payload — `qontinui-claude-config`
+      does exactly that. The steward drew the wrong conclusion from this on 2026-08-28. Probe
+      with `train-health` itself instead, and note that among the nine repos examined the
+      "not a coord-authority repo" class was **empty** — so do not reach for it as an
+      explanation before establishing it.
+
+      ⚠️ **The console view has the same blind spot in a different shape.** `trainActivity.ts`
+      has NO reason code for "not a coord-authority repo", and for an unhydrated repo it
+      renders **no row at all** (the row set is seeded from the proposal/hydration maps). So an
+      absent row on the Train tab is UNKNOWN, never health — the same rule as everywhere else
+      here, applied to a UI.
+
+- [ ] **4. RED MAIN, every repo in the watch set.** Highest-severity signal; nothing else
+      in the scan detects it. Never report a repo green while any `RED(...)` or
+      `UNKNOWN@<tip>` line stands. Quote `excluded:` lines alongside a green verdict.
+      **Order the sweep, and stop it on a primary exhaustion.** The GitHub API budget is
+      per-ACCOUNT, so the repos read LAST are the ones that lose their verdict when it runs
+      out — and 2026-08-25 is what that costs: coord and runner were read back to back, the
+      account hit 5000/5000, and `qontinui-web` (21 open PRs, the most on the fleet) got no
+      verdict at all. So (a) **read the highest-open-PR repos first**, plus any repo whose
+      train is already held, so a shortfall costs the cheapest verdict rather than an
+      arbitrary one; (b) **on a `red_main` exit of `2` whose line names PRIMARY exhaustion,
+      STOP** — every remaining repo will fail identically, and GitHub warns that continuing to
+      call while limited risks the account. A SECONDARY throttle is the opposite: back off the
+      stated seconds, drop `RED_MAIN_PARALLEL`, continue. **A repo you never read is UNKNOWN
+      and must appear in the report as UNKNOWN, naming the reset instant from the throttle
+      line** — an omitted repo is the one way this item can read as OK while a red main sits
+      unwatched. Full reasoning at "Sweep the repos so the budget survives the sweep".
+
+- [ ] **5. LAND-vs-RED CONTRADICTION.** For every repo where item 4 reports a **gating**
+      RED, ask what that repo has actually landed. A gating RED asserts *"coord will not
+      enqueue for this repo"*; a train that keeps landing asserts the opposite. **Both
+      cannot be true, and nothing in this loop compared them until this line existed** —
+      which is exactly how a permanent false `RED(cancelled)` survived five iterations,
+      producing a frightening line and no consequence on every one of them. `advisory:`
+      lines are out of scope by construction: they never claimed to hold anything.
+
+      **The two land reads, and what each cannot see.**
+      - `coord_query_train_health` → `last_land_at` / `seconds_since_land`. ⚠️ That field is
+        `max(merge_proposals.merged_at) FILTER (WHERE status = 'merged')`
+        (`pr_merge/train_health.rs`, `proposal_health_facts`), so it sees **coord proposal
+        lands only** — a direct push, a hand merge, or a shadow-mode repo (which never
+        writes `merged_at` at all) leaves it NULL or frozen. A null or stale `last_land_at`
+        is **UNKNOWN, never "nothing landed"** [policy: `verification-and-evidence`
+        `silent-empty-is-unknown`], so this read can CONFIRM a contradiction and can never
+        clear one.
+      - **Did `main` move at all?** Compare the tip SHA against the one the previous pass
+        recorded, and — for a RED you are investigating — read `ahead_by` from the compare
+        call below. `red_main` already fetches `repos/<r>/commits/main` for the tip sha, so
+        the comparison is free. This read survives coord's sha-rewriting ff-land, which
+        `gh pr list --state merged` does not: that land closes the PR as `CLOSED` with
+        `mergedAt: null` and never appears there (`coord-ff-lands.md`). What it CANNOT
+        separate is a train land from a direct push — that is what the first read is for.
+
+        ⚠️ **Do NOT compute the tip's AGE from `.commit.committer.date`. On a coord-landed
+        repo that field is the CANDIDATE REBASE instant, not the land, and it under-states
+        the tip's recency by up to a full candidate-CI duration.** This bullet used to
+        prescribe exactly that read and call it *"land-shape independent"*; it is the
+        opposite — the field's meaning is decided by the land shape, and the two shapes on
+        this fleet disagree by tens of minutes to days:
+
+        | Land shape | `committer` | `committer.date` means |
+        |---|---|---|
+        | `auto-merge.yml` squash (ccfg) | `GitHub` | the LAND. Measured 2026-09-06 on the newest 5 ccfg commits: `committer.date == author.date` exactly, on every one |
+        | coord rebase-ff-land (every merge-authority repo) | `qontinui-coord` | the instant coord REBASED the candidate. The land happens after candidate CI — coord's own `candidate_ci_p90_secs` was **2567s (~43m)** at the time of measurement |
+
+        **Two measured consequences, both of which manufacture a FALSE staleness alarm:**
+
+        1. **A whole proposal shares ONE committer date**, so a multi-commit land gives the
+           tip the age of the oldest candidate build rather than of the land. Measured
+           2026-09-06 on `qontinui-coord`: `d0e1fe7d`, `14a68f17` and `d42ca974` all carry
+           `cd=12:46:04Z` while their author dates span `10:45:24Z`–`12:07:01Z`. Same shape
+           on `qontinui-runner` (`4d06204f` and `d3ed10be` both `cd=22:57:06Z`), where the
+           widest measured author→committer gap was **4 days** (`44fbea4e`: `ad` 2026-09-01
+           `21:47:56Z`, `cd` 2026-09-05 `22:57:06Z`).
+        2. **The committer date can PRECEDE the instant its own predecessor was still tip** —
+           which is the decisive proof that it is not a land clock. Measured 2026-09-06: this
+           steward's own `red_main` sweep read `a84b8f9e` as the coord tip at **13:05:54Z**;
+           its successor `d42ca974` carries `cd=12:46:04Z`, **19 minutes earlier**. In the
+           same window coord's `last_land_at` read `13:10:48Z` against that `12:46:04Z` tip
+           date — a ~25-minute gap between the tip's stamp and the land it belongs to.
+
+        So a steward computing "main has not moved in N minutes" from this field will read a
+        train that just landed as a stalled one. **The land clock on a coord repo is
+        `coord_query_train_health` → `last_land_at`** (with the null/frozen caveat the bullet
+        above already states); the *movement* question is answered by the SHA comparison and
+        by `ahead_by`, neither of which needs a timestamp at all.
+
+      **Compare against the RED's own sha, not against "now".** A land that PREDATES the red
+      proves nothing. The question is how far `main` has advanced *since the sha the RED is
+      reported at* — `gh api repos/<r>/compare/<red-sha>...main --jq '.status,.ahead_by'`,
+      one call, and only for a RED you are already investigating. ⚠️ Read `status` as well as
+      the count: compare is MERGE-BASE relative, so on an abandoned sha that is not an
+      ancestor of `main` (exactly the shape a superseded run sits on) `status` reads
+      `diverged` and `ahead_by` counts from the merge base, not from that sha. It is still
+      the right order-of-magnitude answer to *"has the train moved since?"*, but it is not a
+      commit distance from the red sha, and must not be reported as one.
+
+      ⚠️ **One land straight after a red appears is NORMAL — do not report it as a
+      contradiction.** coord's `main-red` block is an **ENQUEUE** gate and is not
+      re-consulted at land time; the optimism gate in `merge_scheduler.rs` says so in its own
+      refusal message (*"the ENQUEUE `main-red` block is NOT re-consulted at land; this is
+      the only land-time main-greenness read"*). Proposals already in flight when main went
+      red land past it by design. **The contradiction shape is a red that STANDS while lands
+      KEEP COMING** — across more than one pass, or with `ahead_by` climbing between passes.
+
+      **When it fires, one of the two is wrong. Investigate BEFORE reporting**, and name
+      which it was:
+      1. **The verdict class is wrong for that conclusion.** The measured instance:
+         `RED(cancelled)@42ea7611` reported as gating on `qontinui-runner` 2026-08-31 while
+         the repo landed PRs continuously. `cancelled`/`stale` are SUPERSEDED, not RED — see
+         the superseded note in the verdict vocabulary.
+      2. **This detector calls a workflow gating that coord's baseline does not — the
+         likeliest cause of the NEXT instance.** Its gating test is
+         `establishes_main_baseline` alone (the workflow has a `push` run on main). coord
+         applies two further filters this detector has no equivalent of:
+         `workflow_counts_for_main_red` (drops benign-supersession and one-shot-dynamic
+         workflows) and `failing_workflow_is_required` (a REQUIRED-context join fed by
+         `required_checks_cached`), both in `ci_baseline.rs`. So a failing **non-required
+         advisory** workflow on main is a gating RED here and green to coord, and the train
+         keeps running. ⚠️ That second filter is FAIL-CLOSED and only ever NARROWS the red
+         set on positive evidence: an unreadable or empty required set, or a
+         `failure_pattern.jobs[]` that is absent, empty or names no non-passing job, all
+         return `true` and keep the workflow counting. So the divergence exists only where
+         coord could actually read a non-empty required set AND name the failing jobs — do
+         not reach for this explanation before establishing that.
+      3. **`main` moved but the TRAIN did not** — a direct push, not a land. Read
+         `last_land_at` before calling it a landing train.
+      4. **The red is genuine and the lands predate it** — the comparison was made against
+         "now" instead of against the red's sha. Redo it.
+
+      It is a free consistency check over data the pass already holds, and it is what would
+      have caught the 2026-08-31 defect on the first iteration instead of the fifth.
+
+- [ ] **6. Per-PR twin cards** for every open non-draft PR in the watch set —
+      `coord_pr_status`, plus `changedFiles` for the empty-diff class. Read `confidence`
+      and `last_verified_at`; a stale card is stale, not absent.
+
+      ⚠️ **Report non-`none` `rebase_block`s SPLIT BY `rebase_block_disposition`, never
+      as one "blocked" bucket.** Three counts in the ledger — `coord_retries`,
+      `author_acts`, `terminal` — plus `unknown` named individually with its PR numbers.
+      A single bucket cannot be read: it mixes a population coord is actively re-cutting
+      by itself with one that will sit forever until somebody pushes or closes, and a
+      steward looking at the total cannot see that part of it is SELF-CLEARING. That is
+      how *"coord holds `rebase_block: rebase_ci_failed`, so it will not land"* reached an
+      operator-facing ledger about a PR coord re-proposed ~17 minutes later
+      (`qontinui-runner#1387`, 2026-09-06).
+
+      What each count obliges:
+      - **`coord_retries`** → **no steward action, and say so.** Coord re-enqueues these
+        unprompted. Do not rebase, do not force-push, do not close, do not open a
+        remediation plan for the block itself. It is a legitimate ledger line only as a
+        COUNT with a dwell — a `coord_retries` PR whose `rebase_checked_at` has not moved
+        across several passes is a *different* finding (the retry itself has stalled, or
+        `ContentConflictCap`'s 6h valve is throttling it) and is Tier 2, not an arm-2
+        close.
+      - **`author_acts`** → the green-but-dirty / stranded-conflict rows above own these.
+        ⚠️ **This is the fleet's biggest bucket and this split alone does not triage it.**
+        `RebaseBlockDisposition::of` sends every `conflicting_head` PR here — 81 of 174 open
+        non-draft PRs on 2026-09-17 — so `author_acts=<n>` is the same one number under a new
+        name, on an axis (WHO acts) that cannot separate a 90-minute conflict from a 28-day
+        strand. The **CONFLICT ledger line** below is mandatory for exactly this reason: it
+        carries the axis this split does not.
+      - **`terminal`** → arm 2's population (`already_landed` only; `empty_candidate` is
+        explicitly *not* closeable on coord's say-so).
+      - **`unknown`** → Tier 2 diagnosis, never a default disposition for a card that
+        simply came from an older coord build. A card carrying NO
+        `rebase_block_disposition` key at all is UNKNOWN — the same reading the
+        already-landed row's ARM 3 gives an absent `land_stamp`, because an absent
+        field satisfies every denylist.
+      Cross-check the split against `coord_query_train_health`'s `stranded_prs[].reason`,
+      which is the SAME token set from the same shared ladder
+      (`outbound_git::classify_conflict_cause`).
+
+- [ ] **7. Fleet metrics + economics.** `/metrics` scraped x10, **max per series** (a
+      follower renders every series as `0`). Counters need **two spaced samples** before
+      "flat" means anything. Cross-check `pr_state_stale_backlog` against
+      `/pr-merge/health`, which is the authoritative cluster-consistent twin.
+
+- [ ] **8. CI CAPACITY.** `online_ci_runners` and `coord_ci_runner_count{status=...}`
+      against GitHub's own runner list. The slot cap is dynamic, so an offline runner
+      silently lowers `effective_cap` and starves every repo at once — and that shows up
+      downstream as repos going **idle**, which is item 3.
+
+      ⚠️ **"a runner went offline" is a CAUSE — probe a second, independent instance
+      before you write it.** `online_ci_runners` falling is the observation; *which*
+      runner dropped, and whether any did, is settled on the other side of the
+      registration by GitHub's own list (`gh api /repos/{owner}/{repo}/actions/runners`,
+      or the org route) — which is why this item names that cross-check rather than the
+      metric alone. The metric by itself cannot carry the claim: a `/metrics` scrape that
+      lands on a FOLLOWER renders every series as `0`, so "zero online runners" is
+      indistinguishable from a total capacity outage until a second read says otherwise.
+      Where coord answers, run `coord_recent_findings` on the CI topic before authoring a
+      Tier-2 fix for a starvation a peer diagnosed an hour ago.
+
+- [ ] **9. LANDED IS NOT SERVING.** For every fix this session claims to have shipped,
+      verify the ECS task-definition image tag and test ancestry against it. A green
+      "Deploy coord" run is debounced and proves nothing. A defect whose fix has landed but
+      is not serving is **still live in production** and stays on the carry-over list at
+      item 2. **Where `aws` is absent, tick this line off the declared `/health`
+      fallback and SAY SO** (Step 0 item 4) — an absent `aws` is
+      INOPERATIVE-ON-THIS-MACHINE, never a skipped item, and a serving sha quoted with
+      no named source is the silent substitution this command polices everywhere else.
+      **A serving sha standing still is usually the DEBOUNCE, and it is bounded** — read
+      the newest `Deploy coord` run's JOBS, not its conclusion, before calling it an
+      anomaly (Guardrails, "A landed fix is NOT a serving fix").
+
+- [ ] **10. Gates and findings opened by this session** — every `gate_id` read BACK
+      (`has_continuation` and `will_dispatch` read together), every finding with a returned
+      `finding_id`. ⚠️ A gate continuation is written at REGISTRATION time and executed
+      LATER against a repository that has moved: re-read that any continuation you armed is
+      still the correct instruction, and make its first step a measurement rather than an
+      action.
+
+- [ ] **11. DARK CAPABILITIES WHOSE CONDITION IS ALREADY MET.** One read:
+      `coord_flag_states` (no arguments), then the filter
+      `effective_state == "off" && enabling_condition_met == true`, pre-counted for you
+      as `summary.off_but_enabling_condition_met`.
+
+      **Each such flag is a capability whose safeguards are all built and which nobody
+      has switched on** — served policy `engineering-priorities`
+      `capability-ships-enabled`: *"a capability nobody switched on is a capability the
+      product does not have."* Report the list, not the count alone; for each, name its
+      `dark_arm` (the recorded justification) and say whether that justification still
+      holds now that its condition is met. An arm that has been discharged is an
+      **arming candidate to surface with a recommendation**, never something this
+      session arms itself — arming stays an IaC edit plus an operator blast-radius call.
+
+      ⚠️ **Three ways to misread this line, all of them measured on 2026-09-06:**
+      - **`summary.off` is NOT this number and overstates it badly.** 34 flags read
+        `off`; 19 of those are numeric override knobs (`kind: "tunable"`) whose `off`
+        means *no override in effect*, which is a configured state and not a dark
+        feature. Filter on `kind == "capability"` before counting anything.
+      - **`enabling_condition_met: "unknown"` is not `false`.** It is the string
+        `unknown` and it means a conjunct could not be observed from coord's runtime.
+        Treat it as a blind spot to name in the ledger, never as "arming this is
+        pointless" [policy: `verification-and-evidence`
+        `unknown-must-not-render-as-a-default`].
+      - **This read evaluates against the SERVING build, not `origin/main`.** A
+        capability enabled on main and dark in the serving binary is a **deploy gap**,
+        not a dark capability — it is not one of the clause's arms and must not be
+        reported as one. Cross-check `coord_query_health` →
+        `surfaces[0].components.build` (`in_sync`, `serving_sha`) before you write the
+        row; on 2026-09-06 the serving build was 13 commits behind and
+        `Defaults::AUTO_FIX_RED_MAIN` was `true` on main and `false` in the binary
+        being queried. This is the same distinction item 9 draws for a fix, applied to
+        a flag.
+
+      ⚠️ **The agent principal does NOT reach this read either — so ATTEMPT it, and on the
+      refusal tick the item as UNKNOWN with the cascade EXHAUSTED.** This file used to say
+      `coord_flag_states` was off the `device` principal's allow-set but ON the **agent**
+      principal's, and sent you to the token from `POST /agents/allocate`. Measured false
+      2026-09-16: an agent credential used against `POST https://coord.qontinui.io/mcp`
+      answered verbatim — *"`coord_flag_states` exists but is NOT on this caller's MCP
+      allow-set (principal_kind=agent) — and no HTTP route is registered as serving the same
+      core"* — carrying `{"error":"tool_not_available_to_principal",
+      "principal_kind":"agent","tool_exists":true}`. **The second clause is what closes the
+      cascade**: there is no REST twin to fall back to, so the device refusal and the agent
+      refusal are the whole door set an agent session can reach.
+
+      ⚠️ **One residual, stated rather than papered over.** That measurement was taken with a
+      credential from the anonymous `POST https://coord.qontinui.io/agents/credential` mint,
+      **not** from the `POST /agents/allocate` token the retired sentence named. Both yield an
+      agent-principal JWT and coord refused on `principal_kind=agent` — a property of the
+      principal, not of the mint — so the refusal is expected to reproduce on the other door,
+      but that door was NOT exercised. If you have an `/agents/allocate` token to hand, spend
+      it here and record what it answers; until someone does, treat "no agent-holdable
+      principal reaches it" as strongly evidenced rather than exhaustively tested.
+
+      **Do not read that as a pinned value** [policy: `memory-and-notes`
+      `never-pin-a-mutable-policy-value`] — an allow-set is mutable, and the claim this
+      paragraph replaces is the worked example of what a pin costs. **Issue the call.** If
+      it answers, tick the item against the real list. If it refuses, tick it **UNKNOWN —
+      cascade exhausted**, quoting the refusal text and the `principal_kind` that produced
+      it. That IS a ticked line under this checklist's own preamble — *"a read that failed
+      is named as the read that failed"* — and it is what separates a NAMED blind spot from
+      silence. A `-32601` from the local `/coord-mcp` proxy reports the RUNNING runner
+      build's allowlist and is evidence about neither principal.
+
+      ⚠️ **SURFACE the boundary; do not absorb it.** A checklist line this command mandates
+      that no agent principal can satisfy is a coord-side gap — either `coord_flag_states`
+      belongs on the agent allow-set, or an HTTP route should serve the same core. Carry it
+      as a **Tier-2 deficiency** with the measured refusal attached. A steward pass does not
+      change coord's allow-set and does not arm anything.
+
+      The standing census this line samples against — 63 dark capabilities, 31 of them
+      carrying no justification the clause recognises, and 17 that are not in the flag
+      registry at all — is the `diagnostic` artifact
+      `2026-09-06-coord-dark-capability-census`. ⚠️ **It is a dated SNAPSHOT of a
+      per-serving-build quantity, never a substitute for the read** — its own third trap
+      (serving build vs `origin/main`) is what makes an old count unusable as a current one.
+      While the refusal above stands a steward cannot refresh it from any door either, so it
+      can never tick this item, and a disagreeing count read from it is UNKNOWN rather than
+      a correction. Where the read DOES answer, a count that disagrees with the census has
+      either moved (say so) or been read wrong (check the three traps above).
+
+- [ ] **12. THE AGENT ALERT QUEUE — `merge_train` domain.** Coord now serves alerts as
+      claimable agent work: `coord_alert_queue {domain: "merge_train"}`, or its HTTP twin
+      `GET /coord/alerts/queue?domain=merge_train` (plan
+      `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work` Phase 2).
+      Until that plan this command read no alerts at all, so a merge-train condition coord
+      had already detected — and paged — reached no steward. The protocol is stated once, in
+      `qontinui-claude-config/knowledge-base/qontinui-specific/coord-gates-and-access.md`
+      -> "The agent alert work queue — claim before you act". Here:
+      - **Claim before acting** (`coord_alert_claim {alert_id}`) — before a Tier-1 reflex
+        or a Tier-2 fix touches the condition a row names — and **act only when the
+        answer's `status` is `claimed`**. `claimed_by_other` (record `claimed_by` and
+        `claim_expires_at`), `alert_resolved`, `not_agent_work` and `not_found` all mean
+        leave it, and so does a `renewed: true` on a row not on this session's claimed
+        list — a peer sharing your holder label, whose lease you must never release. Full
+        table: the KB section named above, "The claim answer — act only on `status: claimed`".
+        Record the echoed `claimed_by`; **release** (`coord_alert_release`) when done or
+        handed off, or let the lease lapse. An `observe` pass claims nothing.
+      - **Claim mechanics** (KB -> "The claim answer — act only on `status: claimed`"): add
+        the alert id to this session's claimed list when the claim is SENT, not when it
+        answers, so a claim retried after a `5xx` that comes back `claimed, renewed: true`
+        reads as yours; a `claimed_by` of `device:<d>:session:<your own session>` is always
+        yours. Release over the door you claimed through; a `claimed_by_other` whose
+        `claimed_by` equals the label you recorded is your own lease under another label —
+        release again over that door, or let it lapse if that door is unavailable, never a
+        third door. `tool_not_available_to_principal` (with an `alternate_door`) means use
+        the HTTP twin it names; it is not a fallback to `/coord/alerts`.
+      - **A row never triggers a Tier-1 reflex by itself.** It names a condition coord
+        detected; the per-PR scan re-confirms the wedge class from its own reads before
+        any reflex fires.
+      - **Claiming never resolves** — coord closes the row when it re-observes the
+        condition clear, so tick an acted-on row as *"claimed, fix landed, awaiting
+        re-observation"*, never as closed.
+      - **An empty queue is not a healthy train.** It is empty only when `total_count`
+        reads `0` on page 1: `count` is the page length, `total_count` is `null`
+        (UNKNOWN) on a continuation page or a failed count, and a non-null `next_cursor`
+        means more pages [policy: `verification-and-evidence`
+        `silent-empty-is-unknown`]. The queue also shares `/coord/alerts`' per-principal
+        visibility.
+      - **Fall back only on the three answers the KB names**: coord refuses the tool as
+        unknown, the route answers `404`, or the body or tool error names
+        `schema_migration_pending` (KB -> "Before coord serves it — the fallback, and
+        what is NOT a fallback"). Then read `GET /coord/alerts` filtered by repeated
+        `?kind=` over the merge-train kinds this pass is weighing (`pr_merge_stuck`,
+        `coord_lost_land`, …), read `unknown_kinds` on page 1, and **tick the line as
+        carried by the fallback**. Nothing is claimable there, so act only on what the
+        per-PR scan confirms independently. Any other `5xx` is transient — retry (a retried claim is already on your claimed list — claim mechanics above),
+        do not fall back. A `-32601` from the local `/coord-mcp` proxy is the runner's
+        allowlist, not coord — try the HTTP twin first.
+
 ## Step 1 — Fleet scan (each iteration)
 
 Read coord's own honest view — no new observability:
 
 - ⚠️ **READ THE OPERATOR DASHBOARD FIRST — `GET <base>/pr-merge/health`. This is REQUIRED,
   every iteration, and it is the read this skill spent months not naming.** It is the Train
-  tab of `https://qontinui.io/admin/coord/fleet`, and it carries three things the per-repo
-  twin reads DO NOT: `ready_unmerged` (every PR coord considers ready but has not landed,
-  **with `latest_proposal_error` verbatim**), fleet-wide `slots` (occupancy vs cap, per-repo
-  at-cap flags), and `pr_state_stale_backlog`.
+  tab of `https://qontinui.io/admin/coord/pipeline`, and it carries three things the per-repo
+  twin reads DO NOT: `ready_unmerged` (every open PR that passes coord's DISPATCH filter
+  but has not landed — **including PRs coord is actively blocking** — each row carrying
+  coord's own persisted verdict and **`latest_proposal_error` verbatim**; contract below),
+  fleet-wide `slots` (occupancy vs cap, per-repo at-cap flags), and `pr_state_stale_backlog`.
+
+  ⚠️ **`ready_unmerged.count` / `max_age_seconds` are NOT "ready" figures — read the
+  predicate-accurate split beside them.** Membership is coord's dispatch filter
+  (`looks_ready`), which admits a PR whose CI aggregate is RED whenever its required checks
+  are satisfied. On 2026-08-26 six qontinui-web PRs coord had been blocking `ci-not-green`
+  for two days were published here as "ready" (plan
+  `2026-08-26-coord-pr-merge-health-ready-unmerged-over-reports`). Since coord #1758 the
+  object carries the honest split — read THESE, not `count`, for "how much is stuck-ready":
+  - `genuinely_ready_count` — rows whose persisted `predicate_eval` verdict PASSES.
+  - `blocked_count` — rows coord affirmatively blocks (it also fails closed on a verdict
+    value coord does not recognise). `by_block_reason` maps `verdict_block_reason_code` →
+    count over blocked rows; a blocked row with no code is bucketed under `"unknown"`.
+  - `unevaluated_count` — rows coord has **never evaluated**. This is **UNKNOWN: never
+    count it as ready and never count it as blocked.** Report it as its own number. A
+    fleet-wide evaluation outage shows up here and nowhere else; folding it into "ready"
+    re-creates the phantom-stuck-PR chase, folding it into "blocked" hides the outage.
+  - `unblocked_max_age_seconds` — the max age over genuinely-ready rows ONLY: the honest
+    stuck-PR signal. It is **`null`, not 0, when no row is genuinely ready** — render
+    `null` as "nothing to measure" ONLY when `genuinely_ready_count == 0`, never as
+    "0 s, nothing old". `null` beside `genuinely_ready_count > 0` means no ready row
+    carried an age: the age is UNKNOWN, not "nothing to measure" — say so.
+    `max_age_seconds` is over ALL rows, so a blocked PR can dominate it.
+
+  **Self-check your parse against both invariants every iteration:**
+  `genuinely_ready_count + blocked_count + unevaluated_count == count`, and
+  `sum(by_block_reason) == blocked_count`. A mismatch means your parse is wrong (or a
+  coord build predates the split — then all five keys are absent: say so, and treat
+  `count` as dispatch-filter membership, never as ready). Per row, `prs[]` carries
+  `readiness` — exactly one of `unevaluated` / `ready_no_proposal` /
+  `ready_proposal_open` / `blocked` — plus `verdict_result` / `verdict_block_reason_code`
+  / `verdict_as_of`, always serialized, `null` meaning never evaluated. **Render
+  `readiness` on every row you list**, so a blocked PR is never presented as stuck-ready.
+  `ready_proposal_open` does NOT assert an open proposal — only that a proposal row exists
+  at the current head, possibly `merged` / `conflict` / `cancelled` /
+  `shadow-landed`; read
+  `latest_proposal_status` beside it. Source of truth: coord `pr_merge/ops_routes.rs`
+  (`ready_unmerged_counters`, and the `get_health` doc comment). This split exists only
+  on `/pr-merge/health` — no agent-reachable tool carries it — and that route answers an
+  agent or device JWT `403 tenant_not_resolved` (checklist item 3's **TRANSPORT
+  REALITY** note above). So this contract governs the read WHEN an operator credential
+  carries it; a session holding only a device JWT has no split to report and says so.
+
+  ⚠️ **DATE THE PAYLOAD BEFORE YOU READ A SINGLE FIELD OF IT. Quote `generated_at` AND
+  its age in the ledger, every iteration.** Compute the age against YOUR OWN clock —
+  `now - generated_at` — and compare it to the payload's `snapshot_max_age_seconds`
+  budget (absent on a coord build predating that key: fall back to 600s and say you
+  did). **Any age beyond the budget makes the whole payload UNKNOWN, not fleet state:
+  discard it, re-read, and do not act on it.** This costs one subtraction and it is the
+  only thing standing between you and a confidently-wrong pass.
+
+  **Why this is REQUIRED and not hygiene.** Measured 2026-08-29T22:33:56Z: this read
+  returned HTTP 200 with a fully-populated, well-formed payload describing the fleet as
+  it stood **~48 hours earlier** — real PR numbers, real proposal statuses, real
+  verbatim error strings, and *nothing* marking it stale. It was caught only because
+  the PR numbers looked wrong against a census taken ten minutes before. This is a
+  strictly more dangerous shape than the two staleness traps already documented below:
+  the `/metrics` follower render returns all zeros, which is at least recognisable as
+  broken. This returns **plausible, richly-populated, wrong data**.
+
+  ⚠️ **Every other freshness-looking field in this payload is computed WITHIN the
+  payload itself and therefore CANNOT indicate staleness.** `leader.lease_fresh` and
+  `leader.heartbeat_age_seconds` are the trap: in the 2026-08-29 payload they read
+  `true` and `2.38` — self-consistently *fresh* — for a `holder_id` present in neither
+  live replica, on a `fenced_token` **41 terms behind**. Freshness there is measured
+  relative to the snapshot's own recorded instant, so it is a tautology inside a stale
+  payload rather than an assertion about the present. **`lease_fresh: true` is not
+  evidence the view is live, and reading it as such is how a two-day-old fleet gets
+  certified as healthy.** Read it against `leader.observed_at` (the DB instant the
+  comparison was made at) — and where that key is absent, `lease_fresh` tells you
+  nothing at all on its own.
+
+  The root cause of that incident is NOT a stale snapshot inside coord: `assemble_health`
+  is a live per-request derivation with no cache or memo in the path, so the bytes were
+  genuinely produced at their `generated_at` and REPLAYED two days later. That is why
+  the check belongs HERE, on the reader, and cannot be fully delegated to the server —
+  a replay copies any `stale: false` the server writes. Plan:
+  `2026-08-29-pr-merge-health-served-a-48h-stale-snapshot-as-live`.
+
+  ⚠️ **A replay is only visible from a second instance — probe one before you name the
+  cause.** The paragraph above names a mechanism, and it is known ONLY because a census
+  taken ten minutes earlier disagreed with the payload. Reproduce that rather than
+  inheriting it: read `<base>/pr-merge/health` a **second** time and compare
+  `generated_at` — two reads seconds apart carrying an IDENTICAL `generated_at` is a
+  replay, not a fleet that stood still — and sample `<base>/health` 4–8× so you know
+  which replica answered each read. Coord being multi-replica is what makes a **second,
+  independent instance** free here; there is no excuse for a single-read diagnosis. Only
+  after that may you write "the payload is stale", "the view is cached", or "the train is
+  stopped" — before it, report the fields and their age and nothing more. And where coord
+  answers at all, `coord_recent_findings` on the `pr-merge` topic first: a stale-payload
+  incident is exactly the finding a peer records and a steward re-derives.
 
   ⚠️ **`ready_unmerged` is an OBJECT, not an array — and misparsing it produces a
   confident FALSE "queue empty".** The shape is `{count, max_age_seconds, prs: [{repo,
@@ -245,8 +1138,10 @@ Read coord's own honest view — no new observability:
   local `:8000` proxy route the dashboard itself uses (`/api/v1/operations/pr-merge/health`)
   401s without an operator session, so it is not a shortcut.
 
-- **Per open PR**, across the `--repos` **watch set** (Step 0 — wider than the merge-authority
-  set, and deliberately so): **`coord_pr_status {repo, number}`** — the
+- **Per open PR**, across the `--repos` **watch set** (Step 0 — DERIVED from the same read
+  as the merge-authority set, so the two are the same population; the hardcoded `--repos`
+  default is seven of forty and is a fallback, never the set): **`coord_pr_status {repo,
+  number}`** — the
   deployed status card. Read `pr_state`, `head_sha`, `merge_state_status`, `mergeable`,
   **`confidence`** (`fresh|stale|unknown`), **`last_verified_at`**, `merged_at`,
   `merge_commit`, `blockers`, `dep_edges`. Enumerate open PRs with
@@ -255,10 +1150,21 @@ Read coord's own honest view — no new observability:
   classify it, do not assume it landed. An empty diff is equally consistent with an
   already-landed PR, an unhydrated or emptied branch, and a self-revert; only the Tier-1
   "Already-landed empty-diff PR" row's P ∧ N ∧ V ∧ A proof tells them apart.
-  ⚠️ On a **watch-only** repo the twin card may be thin or absent, since coord is not landing
-  there. That is UNKNOWN, not health: fall back to `gh` (`pr view`, `pr checks`) and judge the
-  PR on its own CI. A repo the twin says nothing about is exactly the repo that goes unwatched
-  for a week.
+  ⚠️ **WATCH-ONLY CORRECTION 2026-09-16.** This used to read *"on a watch-only repo the twin
+  card may be thin or absent, since coord is not landing there"*. **The reason is wrong and
+  so is the expectation**: watch-only is a LANDER fact (Step 0), coord still holds authority
+  there, and `coord_pr_status` for `qontinui-claude-config#980` came back fully populated.
+  A thin or absent card is possible on ANY repo and is a fact you READ, never one you predict
+  from the class. When it IS thin, that is UNKNOWN, not health: fall back to `gh` (`pr view`,
+  `pr checks`) and judge the PR on its own CI. A repo the twin says nothing about is exactly the repo that goes unwatched
+  for a week. ⚠️ **The fallback inherits the same rule one level down: a `gh pr checks` that
+  reports NO check rows is UNKNOWN too, not green.** "Nothing is failing" on a head with
+  nothing to fail is the zero-check vacuity, and reading it as a pass here launders an
+  unverified PR into "judged on its own CI". Use the same two-conjunct form as everywhere else
+  — **≥ 1 non-skipped check that PASSED, and no non-skipped check that has not passed** —
+  rather than enumerating the non-passing states, which is how `cancelled` slips through: one
+  pass plus one cancel satisfies a list that names only `queued` and `in_progress`, and a cancel
+  has not passed. Zero rows is a state to diagnose, not a verdict.
   ⚠️ **Dispatch note.** Older revisions of this doc keyed Tier 1 on
   `freshness_next_action` from `coord_pr_merge_verdict`. **Neither is deployed** (verified
   against the live 45-tool registry, 2026-07-23). Until a typed next-action is served, key
@@ -309,19 +1215,40 @@ Read coord's own honest view — no new observability:
   `/pr-merge/health` as the cluster-consistent view, so **`/pr-merge/health` is
   authoritative** and the gap is not a defect in either. (`/pr-merge/health` needs a
   tenant-resolving principal; a device JWT gets `tenant_not_resolved` 403.)
-  ⚠️ Every read in this bullet is coord-sourced, so on a **watch-only** repo it is empty BY
-  CONSTRUCTION — no candidates, no proposals, λ=0, no `suggested_stuck_threshold_secs`. That is
-  UNKNOWN in both directions: not a wedge, and not health. Judge a watch-only repo on its own CI
-  and PR ages, with a plain wall-clock threshold — `--threshold`'s "derive it from measured
-  candidate-CI duration" rule has no referent where no candidate CI exists.
+  ⚠️ **WATCH-ONLY CORRECTION 2026-09-16.** This bullet used to say every read here is
+  coord-sourced and therefore empty **BY CONSTRUCTION** on a **watch-only** repo — no
+  candidates, no proposals, λ=0, no `suggested_stuck_threshold_secs`. **That is false, and it
+  was false for the one repo watch-only actually names.** `coord_query_train_health` answered
+  for `qontinui-claude-config` with a full payload: `candidate_ci_p90_secs: 78.8`, `last_land_at 2026-09-14T19:54:54Z`, 37
+  `coord.scheduler_ticks` rows (inside `deferral_streak_basis`) and an
+  `open_pr_backlog.histogram` over 18 open non-draft PRs — note the spelling: `train_health`
+  has no `verdict_histogram`, that is `train_activity`'s row field. Watch-only is a LANDER fact
+  (Step 0); coord still holds authority, a train and thresholds there. **So READ these values
+  rather than assuming their absence**, and fall back to a plain wall-clock threshold only
+  where the payload actually comes back empty. An empty read is UNKNOWN in both directions —
+  not a wedge, not health — never a property of the class.
+
+- **The agent alert queue, `merge_train` domain** — `coord_alert_queue {domain:
+  "merge_train"}` / `GET /coord/alerts/queue?domain=merge_train`. Every row is a condition
+  coord already detected and wants an agent on, paged rows first. Claim before acting and
+  act only on `status: claimed`, release when done, never read an empty queue as a healthy
+  train, and fall back to `GET /coord/alerts?kind=` (saying so) only on the three answers
+  the KB names — all of it per checklist item 12. **A row never fires a Tier-1 reflex by
+  itself**: merge each row into the per-PR snapshot below, where the per-PR reads
+  re-confirm the class first, so a claimed row and the PR it names are dispositioned once.
 
 - **RED MAIN — check it FIRST, every repo, every iteration. It is the highest-severity fleet
   signal and NOTHING else in this scan detects it.** A red main HOLDS the merge train: coord
   refuses to land while the base branch's CI baseline is failing. Prefer `coord.ci_baselines`
   when you have SQL; the no-SQL equivalent is the per-workflow main-run read below.
-  (On a **watch-only** repo a red main holds no train — coord is not landing there — so it is
-  a normal red to fix, not a fleet-severity alarm. The detector is unchanged and repo-agnostic;
-  only the severity you attach to its verdict differs.)
+  (⚠️ **WATCH-ONLY CORRECTION 2026-09-16.** This used to read *"on a watch-only repo a red main
+  holds no train — coord is not landing there — so it is a normal red to fix, not a
+  fleet-severity alarm."* **Do not downgrade on that reasoning.** Watch-only is a LANDER fact
+  (Step 0), and coord's train runs on a watch-only repo too: ccfg carried 37
+  `coord.scheduler_ticks` rows and a land 40h old when this was measured. Downgrade only where
+  you have ESTABLISHED that no coord train is in play for the repo, and say how you
+  established it. The detector itself is unchanged and repo-agnostic; only the severity you
+  attach to its verdict differs.)
   ⚠️ **A verdict is only meaningful next to the SHA it came from, and next to the count of runs
   it was drawn from.** Three errors live here, and all three are invisible without that
   provenance:
@@ -412,7 +1339,11 @@ Read coord's own honest view — no new observability:
   (fix it, or retire the workflow), not something to scroll past. Equally, never collapse case
   3 into case 2 — that is the sha-fallback bug above.
 
-  **Two different remedies clear a red main, and picking the wrong one proves nothing.** The
+  **The red-main remedies table — two different remedies clear a red main, and picking the wrong
+  one proves nothing.** (That name is load-bearing: `/babysit-prs` Step 3 and
+  `.claude/agents/merge-specialist.md` both cite *"the red-main remedies table"* and *"row 1"* by
+  name, and until this heading existed the phrase appeared in this file only inside citations —
+  so grepping the cited name found no target. Keep the name if you move the table.) The
   `e154036b` note below says a fresh dispatch was the *wrong* move there; `qontinui-types-drift.yml`'s
   own header says a fresh dispatch is the *right* move for it. Both are correct, for different
   cases — the discriminator is **where the failing run sits**, not which tool you like:
@@ -421,6 +1352,30 @@ Read coord's own honest view — no new observability:
   |---|---|---|
   | A push run went red **at the tip** (case 1) on a flake or an infra kill — `RED(cancelled)`, **or** a `RED(failure)` that classifies Tier 1/2 | `rerun_failed_jobs` on that run | a GitHub re-run **preserves `event: push`**, reuses the run id and increments `run_attempt`, so it re-adjudicates the baseline at the current sha. This is what coord's own `auto_fix_red_main` does. |
   | A push run went red at an **older** sha and the workflow is **path-filtered**, so no later commit can re-trigger it (case 2b) | `gh workflow run <wf> --ref main` | a re-run would re-run *at the stale sha* and prove nothing about the tip. The dispatch is the only way to evaluate the workflow against the tip without a noop commit. |
+  | A push run went red at an **older** sha and the workflow is **NOT filtered at all** — the commits since it were landed by a mechanism whose pushes GitHub suppresses (case 2s, "suppressed") | `gh workflow run <wf> --ref main` for evidence, then **escalate the lander's credential** | the dispatch is the same remedy as 2b and buys the same evidence, but the *cause* is opposite and so is the follow-up: 2b's workflow is behaving correctly and needs nothing fixed, while 2s's repo is in a **CI blackout** that no dispatch can end. |
+
+  ⚠️ **2b and 2s render IDENTICALLY — `RED(...)@<older> (not triggered on tip)` — and reading
+  2s as 2b is the benign-direction error that hides a repo-wide blackout.** The discriminator is
+  the workflow's own `on:` block, which is readable and settles it: **2b has a `paths:` (or
+  `paths-ignore:`) key; 2s has none.** A workflow with an unfiltered `push: branches: [main]`
+  that has no run at the tip did not decline to match — it was *suppressed*, and something
+  landed those commits without producing a push event. Confirm with a committer census —
+  `git log origin/main -100 --format='%h|%cn'` cross-referenced against
+  `gh api "repos/<repo>/actions/workflows/<wf>/runs?branch=main&event=push"` — and the
+  suppressing lander names itself in the committer column.
+
+  The known instance is **`qontinui-claude-config`**, and it is structural rather than
+  incidental. `auto-merge.yml` there merges with `secrets.GITHUB_TOKEN`, and GitHub creates no
+  new workflow runs for events triggered by that token. Measured 2026-09-05 over the newest 100
+  commits of `origin/main`: **95 `committer=GitHub` auto-merge squashes, ZERO with a `push` run
+  at their sha**, while all 4 `committer=qontinui-coord` ff-lands and the 1 human push have one.
+  Both of that repo's main-push workflows were therefore 15 commits stale, with `qontinui CI`
+  reading GREEN at a sha 15 unverified commits below the tip. This is why the lander column of
+  the census above is not trivia: **`committer=GitHub` (auto-merge squash, trailing `(#N)`) is
+  the shape that suppresses; `committer=qontinui-coord` is the shape that does not.** Plan:
+  `2026-09-04-auto-merge-lands-trigger-no-main-ci`; the repo now carries a `main CI coverage`
+  workflow that measures the gap directly, and a red line from THAT workflow is this class
+  reporting itself rather than a check to re-run.
 
   ⚠️ **Row 1 is NOT reached by reading the run `conclusion`.** `cancelled` is the minority
   infra shape; most infra kills report `RED(failure)`, which at the RUN level is
@@ -508,11 +1463,54 @@ Read coord's own honest view — no new observability:
   **Verdict vocabulary is explicit because `conclusion` is not binary.** Real values seen on
   main across the fleet: `success`, `failure`, `cancelled`, `skipped`, `""`. `success` is GREEN;
   `skipped` is its own benign class `SKIPPED` (below); everything else non-empty is
-  `RED(<conclusion>)` so the reason travels with the alarm — `cancelled` in particular is the
-  infra-cancelled class that rolls up to a workflow failure and self-heals on a re-run
-  (`reference_coord_infra_cancelled_job_reds_main_holds_train`), and it
-  must not be silently upcast to GREEN. An empty conclusion on a *completed* run is
-  `UNKNOWN(blank conclusion)`, never blank output.
+  `RED(<conclusion>)` so the reason travels with the alarm. An empty conclusion on a *completed*
+  run is `UNKNOWN(blank conclusion)`, never blank output.
+
+  ⚠️ **`cancelled` and `stale` are SUPERSEDED — a THIRD class, neither GREEN nor
+  train-holding RED — and this is coord's rule, not a preference.**
+  `ci_baseline.rs` (`is_supersession_conclusion`, quoted): *"A `workflow_run` conclusion that
+  means 'superseded / never concluded', not a verdict on main's health. Such a run must not
+  overwrite the last CONCLUSIVE baseline (else a concurrency-cancel wedges the merge queue) …
+  `ingest_workflow_run` skips the write and the baseline keeps its last conclusive verdict —
+  green stays green (no wedge), and a real `failure` is never masked because it was never
+  overwritten."* So the run-selection above EXCLUDES them and falls through to the newest
+  conclusive run, which is what coord scores. They are still surfaced, as a
+  `+N superseded` annotation, never silently dropped.
+
+  Both directions are wrong: do NOT upcast them to GREEN (the older bug), and do NOT report
+  them as train-holding RED. Measured 2026-08-31: `qontinui-runner` reported a gating
+  `RED(cancelled)@42ea7611` while the repo was landing PRs continuously — a permanent false red
+  on an abandoned sha that nothing can ever supersede, which is the immortal-red shape the
+  `excluded:` logic exists to kill, arriving by another door. With the fix the same workflow
+  reads `GREEN@e6450727`, its last conclusive verdict.
+
+  **The reason it survived five iterations is that nothing compared the two facts in that
+  sentence.** A gating red produces a frightening line and no consequence, so nothing
+  contradicts it; the only tell is that the train kept landing. Per-pass checklist item 5 is
+  that comparison, and it is what should catch the next divergence of this class on the first
+  pass rather than the fifth.
+
+  ⚠️ `failure` / `timed_out` / `action_required` are REAL signals and stay RED — coord names
+  them so in the same comment. Do NOT widen the superseded set.
+
+  ⚠️ This is the RUN-level rule and does NOT change JOB-level triage: a `cancelled` *job*
+  inside an otherwise-red run is a different question, handled by the step-level Tier-1/2/3
+  classification. **But do not read the standing memory
+  `reference_coord_infra_cancelled_job_reds_main_holds_train` as current at EITHER level.** Its
+  title asserts that an infra-cancelled job reds main and holds the train. That is wrong at the
+  run level (`is_supersession_conclusion`, quoted above) and — since 2026-07-24 — wrong at the
+  job level too: `write_enriched_baseline` (`ci_baseline.rs`) now applies the job-level twin of
+  the same skip, dropping a `failure` rollup whenever `all_failing_jobs_cancelled` proves every
+  non-passing job in the enriched `failure_pattern.jobs` array was `cancelled`, and keeping the
+  prior conclusive baseline. coord's own comment there cites the 2026-07-19 incident that memory
+  was written from. What still reds main is what that predicate deliberately cannot prove: a
+  **MIXED** failing set (any genuine `failure`/`timed_out`/`action_required` job alongside the
+  cancelled ones), and an **UNENRICHED** run whose `jobs` array is empty or missing, which fails
+  the predicate closed so a degraded enrichment can never launder a real red. The memory's other
+  named defect is closed as well — `main_ci_status` now runs a required-context join
+  (`failing_workflow_is_required`, fed by `required_checks_cached`), so a non-required advisory
+  workflow failing on main no longer reds the train. Both landed in coord `f5d63aae`; verified
+  by content on `origin/main` 2026-09-01.
 
   ⚠️ **`cancelled` is NOT the only infrastructure class — most infra kills arrive as
   `failure`.** A CI job killed by a dying self-hosted runner reports `conclusion: failure`,
@@ -532,7 +1530,8 @@ Read coord's own honest view — no new observability:
   conflating the two is the same category error as calling it red, one direction over. Measured
   2026-08-04 on `qontinui-web` `Verify Frontend Deploy` (id `285385598`): **100 of its newest 100
   runs on `main` are `completed/skipped`** — treating that as `RED(skipped)` pins the repo
-  permanently red. `cancelled` is unaffected and stays RED.
+  permanently red. `cancelled` is a different class again — SUPERSEDED, not RED — see the
+  superseded note in the verdict vocabulary above.
   ```bash
   # Call once per repo, handing it the repo in the NAMED variable RM_REPO:
   #   RM_REPO=qontinui/qontinui-web red_main
@@ -546,19 +1545,302 @@ Read coord's own honest view — no new observability:
   # 29 queried / 29 failed / every line UNKNOWN on every repo. Named variables are not
   # substituted. (This comment deliberately spells no dollar-digit of its own — a literal one
   # here would be substituted too, garbling the warning.)
+  # ── GitHub API budget: read it from a REAL request's RESPONSE HEADERS ────────────────
+  # ⚠️ **NEVER from `gh api rate_limit`.** That endpoint is a well-formed, CONFIDENT WRONG
+  # ANSWER here. Measured 2026-08-25 on this account, 26 seconds apart, same token, both
+  # responses self-reporting `X-Ratelimit-Resource: core`:
+  #   GET /user       22:19:46Z -> 403, Limit 5000, Remaining    0, Used 5000, Reset 22:26:02Z
+  #   GET /rate_limit 22:20:12Z -> 200, Limit 5000, Remaining 4841, Used  159, Reset 22:23:34Z
+  # Different used, different remaining, and a DIFFERENT RESET INSTANT — so `rate_limit` is
+  # not merely *exempt from consumption*, it answers about a bucket that is not the one
+  # gating you. A steward that preflights on it is told 96.8% of the budget is intact while
+  # every real call is being refused. The only authority is the headers on a request that
+  # actually passed through the gate — which is why every tip read below uses `-i`.
+  # An ABSENT header is UNKNOWN: never 0, and never "fine". Every consumer treats an empty
+  # value as "cannot tell" and declines to gate on it, saying so out loud.
+  rm_bud() {
+    local f="${RM_BUD_FILE:-}"
+    RM_BUD_LIMIT=""; RM_BUD_REMAIN=""; RM_BUD_USED=""; RM_BUD_RESET=""; RM_BUD_RESRC=""; RM_BUD_RETRY=""
+    [ -s "$f" ] || return 0
+    RM_BUD_LIMIT=$(grep -i  '^x-ratelimit-limit:'     "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    RM_BUD_REMAIN=$(grep -i '^x-ratelimit-remaining:' "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    RM_BUD_USED=$(grep -i   '^x-ratelimit-used:'      "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    RM_BUD_RESET=$(grep -i  '^x-ratelimit-reset:'     "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    RM_BUD_RESRC=$(grep -i  '^x-ratelimit-resource:'  "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    RM_BUD_RETRY=$(grep -i  '^retry-after:'           "$f" | head -n 1 | cut -d: -f2 | tr -d ' \r')
+    return 0
+  }
+  # The server's own `message`, for the arms where we are NOT claiming to know the cause.
+  # `gh api -i` sends stderr to the void (the body carries the same text), so without this the
+  # non-throttle failure paths would print a candidate LIST and nothing observed — trading one
+  # confident-wrong-diagnosis for a vaguer one.
+  # ⚠️ It NEVER renders blank, for the same reason `rm_reset_at` does not. Every call site
+  # embeds it mid-sentence after "GitHub said:", so an empty return printed
+  # `GitHub said:  — candidates are …` — a sentence whose subject silently vanished, which
+  # reads as "GitHub said nothing" when the truth may be "nothing was captured to read". The
+  # two are different facts and each now names itself.
+  # ⚠️ Its FIRST branch is a BACKSTOP, not a live path, and labelling it is the whole point.
+  # Once `rm_throttle_report` went three-valued, an absent or empty capture returns 2 and is
+  # answered by the `tcls` 2 arm, which does not call this function at all — so **both** call
+  # sites below reach here only with a non-empty `RM_BUD_FILE`, guaranteed by the very test
+  # that produced the return of 1. The branch stays because this is a FUNCTION contract the
+  # next call site inherits, and the suite exercises it directly (cases A8/A8b). It is
+  # labelled rather than left to be rediscovered because an unlabelled unreachable branch is
+  # precisely what the withdrawn fourth defect was — and the next reader, finding it, would
+  # otherwise have to re-derive its reachability from two call sites and a return code.
+  rm_err_msg() {
+    local m=""
+    if [ ! -s "${RM_BUD_FILE:-}" ]; then
+      printf 'NOTHING — no response was captured, so the server was not quoted'
+      return 0
+    fi
+    m=$(sed -e '1,/^[[:space:]]*$/d' "$RM_BUD_FILE" | jq -r '.message // empty' 2>/dev/null) || m=""
+    m=${m%$(printf '\r')}   # CR strip, same class as query.tsv: this is quoted verbatim to the operator
+    if [ -n "$m" ]; then printf '%s' "$m"; else printf 'NOTHING — the captured response body carried no message field'; fi
+    return 0
+  }
+  # An operator needs an INSTANT to wait until, so this never renders blank and never says
+  # "soon": it degrades to the raw epoch, and to a named UNKNOWN when the header was absent.
+  rm_reset_at() {
+    local e="${RM_BUD_RESET:-}" t=""
+    if [ -z "$e" ]; then printf 'an UNKNOWN time (no X-Ratelimit-Reset header)'; return 0; fi
+    t=$(date -u -d "@$e" +%H:%M:%SZ 2>/dev/null) || t=""
+    [ -n "$t" ] || t=$(date -u -r "$e" +%H:%M:%SZ 2>/dev/null) || t=""
+    if [ -n "$t" ]; then printf '%s' "$t"; else printf 'epoch %s' "$e"; fi
+    return 0
+  }
+  # Classifies a saved response and prints ONE explicit line naming the throttle class, the
+  # measured budget, the remedy, and the instant to retry at — so a throttle never reaches an
+  # operator disguised as a bare UNKNOWN that reads like an auth problem.
+  #
+  # THREE-VALUED, and the third value is the whole point. Returns 0 IFF the response really
+  # was a rate-limit rejection; returns 1 when a response WAS captured and was not a throttle,
+  # so a non-throttle failure KEEPS ITS OWN DIAGNOSIS instead of being laundered into
+  # "throttled"; and returns 2 when NO response was captured at all, which is not evidence of
+  # anything.
+  # ⚠️ 1 and 2 used to be the same return, and that collapse re-created the exact defect this
+  # whole block was written to remove. `mktemp` failing sends the tip read down the
+  # uninstrumented plain-`gh` fallback, which saves no response — so this function had nothing
+  # to classify, said "not a throttle", and the caller printed
+  # `cause: NOT a rate-limit refusal` over a 403 it had never looked at. A confident negative
+  # derived from an absent measurement is the same class as the confident `main moved`
+  # derived from an absent sha: absence must never become a finding, in EITHER direction.
+  #
+  # ORDER MATTERS, and it is not the obvious one. The tempting discriminator — "remaining is
+  # still high, therefore SECONDARY" — is a heuristic GitHub's own documentation does NOT
+  # endorse: its handling ladder explicitly contemplates a secondary refusal WITH
+  # `x-ratelimit-remaining: 0` as well as without, so a high remaining is suggestive and a
+  # zero remaining proves nothing about the class on its own. The structural discriminator is
+  # `documentation_url`, which is what `google/go-github`'s CheckResponse branches on
+  # (secondary iff it ends `#abuse-rate-limits` or `secondary-rate-limits`; a primary refusal
+  # ends `#rate-limiting` — verified against a live 403 on this account, 2026-08-25). So the
+  # body is consulted FIRST and the headers only corroborate.
+  #   SECONDARY — burst/concurrency. Remedy: honour Retry-After, else wait >= 60s and back
+  #               off exponentially with a BOUNDED retry count; make requests more serially.
+  #   PRIMARY   — the hourly bucket is spent. Nothing but time helps, lower parallelism helps
+  #               NOTHING, and the budget is ACCOUNT-WIDE, so continuing to poke it starves
+  #               coord and every peer session. GitHub is explicit that "continuing to make
+  #               requests while you are rate limited may result in the banning of your
+  #               integration", which is why this arm says STOP rather than RETRY.
+  # Collapsing the two into one "rate limited" line is what makes an operator wait an hour for
+  # a 60-second problem, or retry-storm a bucket that will not refill for 45 minutes.
+  rm_throttle_report() {
+    local what="${RM_WHAT:-the request}"
+    [ -s "${RM_BUD_FILE:-}" ] || return 2
+    head -n 1 "$RM_BUD_FILE" | grep -qE ' (403|429)([^0-9]|$)' || return 1
+    grep -qiE 'rate limit|secondary-rate-limits|abuse-rate-limits' "$RM_BUD_FILE" || return 1
+    rm_bud
+    if grep -qiE 'secondary-rate-limits|abuse-rate-limits|exceeded a secondary rate limit' "$RM_BUD_FILE"; then
+      echo "  throttled: GitHub SECONDARY rate limit while reading $what (identified from the response body, not from the budget headers — the primary '${RM_BUD_RESRC:-unknown}' budget reads ${RM_BUD_REMAIN:-?}/${RM_BUD_LIMIT:-?} remaining, which does NOT settle the class either way). This is burst/concurrency: wait ${RM_BUD_RETRY:-60}s${RM_BUD_RETRY:+ (Retry-After)}, back off exponentially, cap the retries, and lower RED_MAIN_PARALLEL. Verdict withheld."
+    elif [ "${RM_BUD_REMAIN:-}" = "0" ]; then
+      echo "  throttled: GitHub PRIMARY rate limit EXHAUSTED on resource '${RM_BUD_RESRC:-unknown}' (${RM_BUD_USED:-?}/${RM_BUD_LIMIT:-?} used) while reading $what. This budget is ACCOUNT-WIDE and shared with coord, /babysit-prs, the runner and every peer session — no retry and no lower parallelism succeeds before it resets at $(rm_reset_at). STOP THE SWEEP: every remaining repo will fail identically, and continuing to poke a spent bucket risks the account. Verdict withheld."
+    elif [ -n "${RM_BUD_RETRY:-}" ]; then
+      echo "  throttled: GitHub refused the read of $what and sent Retry-After ${RM_BUD_RETRY}s without naming the class (primary '${RM_BUD_RESRC:-unknown}' reads ${RM_BUD_REMAIN:-?}/${RM_BUD_LIMIT:-?} remaining). Honour Retry-After — that instruction is class-independent. Verdict withheld."
+    else
+      echo "  throttled: GitHub refused the read of $what as rate-limited, but the response named no class and carried no usable budget headers (remaining='${RM_BUD_REMAIN:-}', resource='${RM_BUD_RESRC:-}') — PRIMARY vs SECONDARY is UNKNOWN, so neither wait is asserted here. Wait at least 60s before any retry, and cap them. Verdict withheld."
+    fi
+    return 0
+  }
   red_main() {
-  local r="${RM_REPO:-}" tip tip2 wf live win d qn qfail unadj adv nb nobase note id state name cls line probes gp gprun
-  local PAR="${RED_MAIN_PARALLEL:-12}" DEPTH="${RED_MAIN_DEPTH:-10}"
+  local r="${RM_REPO:-}" tip tip2 wf live win d qn qfail unadj adv nb nobase note id state name cls line probes gp gprun rc budnote need budneed tcls rm_prog cmps cmpskip cmpbud newerGp newerLast nsite nfrom nto nev nconc ncache nlab nnote
+  local PAR="${RED_MAIN_PARALLEL:-12}" DEPTH="${RED_MAIN_DEPTH:-10}" tnote=""
+  # Held back from the fan-out for OTHER consumers of the same account-wide budget — coord's
+  # merge train, peer sessions, /babysit-prs. Not a safety margin for this function.
+  local RESERVE="${RED_MAIN_BUDGET_RESERVE:-250}"
+  # Validated because it is interpolated into an arithmetic expansion below, where a
+  # non-integer is a hard shell error rather than a false compare — an operator typo in an
+  # env var must not take the fleet's highest-severity detector down. Fails to the default.
+  #
+  # ALL THREE TUNABLES ARE GUARDED HERE, and for one tick this guard covered only the third.
+  # `PAR` and `DEPTH` were declared two lines up and reached a process spawner and a URL with
+  # nothing checking them, which is the same unguarded-input shape as `RESERVE` arriving at an
+  # arithmetic expansion — but each fails DIFFERENTLY, so the argument above does not carry
+  # over and is not what justifies them:
+  #
+  # `PAR` reaches `xargs -P "$PAR"` twice. MEASURED, GNU findutils 4.10.0:
+  #   `xargs -P abc` → `invalid number "abc" for -P option`, exit 1, and ZERO children run.
+  #   The `|| true` that follows each fan-out (an errexit backstop, correct on its own terms)
+  #   then swallows that exit, so the ENTIRE fan-out is skipped and every workflow falls to
+  #   `UNKNOWN@none (per-workflow runs read FAILED for id N — verdict withheld)` — a positive
+  #   claim about a read that was never attempted. That is this fence's own defect class
+  #   (absence rendering as a finding), reachable from a typo, in the one input left unchecked.
+  #   `xargs -P 0` is the WORSE half because it succeeds: it is accepted and runs (measured),
+  #   and GNU documents -P 0 as "run as many processes as possible" — that second half is CITED
+  #   semantics, not something measured here — so the width goes UNBOUNDED, the opposite of the
+  #   remedy
+  #   every SECONDARY rate-limit arm in this file prescribes, arrived at by an operator typing
+  #   what they read as "off". So non-positive is rejected as well as non-numeric, which is
+  #   why this is a character-class test FOLLOWED BY a numeric one and not either alone: after
+  #   the first, `$PAR` is all digits and `-gt 0` is safe arithmetic on it, and it also catches
+  #   `00` and `000`, which the character class alone does not.
+  #   Pinned by `E11` (the class half), `E12`/`E12b` (the numeric half, including the `00` the
+  #   class waves through) and `E14` (the anti-vacuity control: a valid non-default width is
+  #   NOT rejected). ⚠️ Each of those pairs its header assertion with one read off a RECORDED
+  #   `xargs -P`, and the pairing is the point: the header prints `$PAR`, the variable this
+  #   guard has just written, so on its own it cannot tell a width that reached `xargs` from
+  #   one that only reached a `printf`. That distinction is load-bearing HERE rather than
+  #   pedantry: the `abc` half also announces itself through xargs's own `invalid number`, but
+  #   the `0` half is measured to error NOWHERE, so for `E12`/`E12b` the recorded `-P` is the
+  #   only non-header witness there is — MEASURED, a fence sanitising only what it prints
+  #   passed both arms outright.
+  #   ⚠️ "TWICE" IS THE FIRST WORD OF THIS PARAGRAPH AND FOR TWO INCREMENTS THE WITNESSES
+  #   COVERED ONE OF THE TWO. Every recording named above comes from the FETCH fan-out; the
+  #   gating probe below is the other `xargs -P "$PAR"`, and no arm executed it at all —
+  #   `SHIM_RUNS` was empty in all 28, so no workflow `.json` was written, `ambig.txt` stayed
+  #   empty and `probes` was 0 throughout. MEASURED: deleting the probe fan-out outright left
+  #   the whole suite green. `E16` is the arm that reaches it, and it needs TWO assertions no
+  #   single-site arm does, because both spawners append a bare width to ONE log: a COUNT (both
+  #   ran) and an all-lines width (neither was hardcoded). It runs at `-P 4` for that second
+  #   reason — at the default, a probe pinned to `12` is indistinguishable from a guarded one.
+  #   ⚠️ The second test rejects one more thing, and the message says the accepted SHAPE rather
+  #   than a diagnosis because of it: an all-digit value past the shell's integer range does not
+  #   compare as small, it ERRORS (MEASURED, bash 5.2: `[ 99999999999999999999999 -gt 0 ]` →
+  #   `integer expression expected`, rc 2), which `2>/dev/null` swallows and `||` routes to the
+  #   same fallback. Falling back is right; a message saying that value "is not at least 1"
+  #   would not be, so none is asserted — this fence does not print a derived cause it cannot
+  #   support, and that rule applies to its own guards.
+  #
+  # ⚠️ AND THAT REASONING SENT US BACK TO `RESERVE`, which had carried the character class ALONE
+  # since it shipped, so the class of value just described walked straight through it. It gets
+  # the numeric test too — spelled `-ge 0` rather than `-gt 0`, because zero IS a legal reserve
+  # here (discouraged and documented, not rejected) while a value this shell cannot compare is
+  # not a reserve at all.
+  # ⚠️ THAT IS ONLY HALF OF IT, and saying so here is the point: `-ge 0` closes the values the
+  # shell cannot COMPARE, and a value it can compare can still be one it cannot ADD. MEASURED,
+  # bash 5.2: `9223372036854775807` (INT64_MAX) is all digits, so the character class waves it
+  # through, and `[ 9223372036854775807 -ge 0 ]` is TRUE, so this arm waves it through as well —
+  # then `need + RESERVE` wraps to `-9223372036854775796`. The other half is therefore closed at
+  # the ONE arithmetic site that consumes it, the pre-flight gate below, where `need` exists to
+  # add. A guard that stopped here would have been an honest test of the wrong property.
+  #
+  # `DEPTH` is interpolated into `per_page=$RM_DEPTH` on every one of the `qn` fan-out URLs.
+  #   A value that is not a positive integer cannot be a page size, so the fan-out spends `qn`
+  #   calls of the ACCOUNT-WIDE budget the pre-flight gate has just approved on calls that
+  #   cannot answer — and the header below then prints `depth=<the typo>` as though that were
+  #   what was read. NOTHING is claimed here about what GitHub does with such a value: it is
+  #   not measured, and the guard does not need it, because the value is rejected on its own
+  #   shape. (For the same reason this does not cap DEPTH at any ceiling — an unmeasured
+  #   ceiling asserted as a clamp would be the same overclaim one direction over.)
+  #
+  # The rejection is NAMED rather than applied silently, and that is the one place these two
+  # differ from `RESERVE`, whose fallback is self-revealing (its decline message prints the
+  # reserve it actually used). A rejected `PAR` is invisible the moment the default works, and
+  # a rejected `DEPTH` is invisible behind a header printing the default — so the operator who
+  # set it, the only person who can fix it, would never learn it was ignored, and the tick
+  # would read as evidence about the fleet when it is evidence about the config. `RESERVE`
+  # joins the same NOTE for consistency: it had the guard but not the sentence.
+  #
+  # ⚠️ The `""` in each pattern is a CONTRACT BACKSTOP, not a live path, and it is labelled
+  # here rather than left for the next reader to re-derive — an unlabelled unreachable branch
+  # is exactly what `rm_err_msg` above had to correct. `${VAR:-default}` substitutes the
+  # default for an unset AND for an empty value, so all three variables are non-empty by the
+  # time they reach these tests; the empty pattern can only fire if a later edit drops a `:-`.
+  # It is kept for that, and because the sibling guard has carried it since it shipped — but
+  # no assertion claims it, since a fixture claiming it would pass with the pattern deleted.
+  # Each arm ASSIGNS THE DEFAULT FIRST and then interpolates it, so the sentence cannot drift
+  # from the value: written the other way the literal appears twice per tunable, and the next
+  # edit to a default leaves the NOTE confidently naming a number it did not use.
+  case "$RESERVE" in
+    (*[!0-9]*|"") RESERVE=250; tnote="${tnote}RED_MAIN_BUDGET_RESERVE='${RED_MAIN_BUDGET_RESERVE-}' is not a whole number, using ${RESERVE}; " ;;
+    (*) [ "$RESERVE" -ge 0 ] 2>/dev/null || { RESERVE=250; tnote="${tnote}RED_MAIN_BUDGET_RESERVE='${RED_MAIN_BUDGET_RESERVE-}' is not a reserve this shell can add — it must be a whole number the shell can compare, and an over-range one wraps NEGATIVE in the gate below and silently disables the reserve, using ${RESERVE}; "; } ;;
+  esac
+  case "$PAR" in
+    (*[!0-9]*|"") PAR=12; tnote="${tnote}RED_MAIN_PARALLEL='${RED_MAIN_PARALLEL-}' is not a whole number, using ${PAR}; " ;;
+    (*) [ "$PAR" -gt 0 ] 2>/dev/null || { PAR=12; tnote="${tnote}RED_MAIN_PARALLEL='${RED_MAIN_PARALLEL-}' is not a usable fan-out width — it must be a whole number of at least 1 that the shell can compare (0 and 00 are UNBOUNDED parallelism to xargs, not off; a value past the shell's integer range fails the comparison), using ${PAR}; "; } ;;
+  esac
+  case "$DEPTH" in
+    (*[!0-9]*|"") DEPTH=10; tnote="${tnote}RED_MAIN_DEPTH='${RED_MAIN_DEPTH-}' is not a whole number, using ${DEPTH}; " ;;
+    (*) [ "$DEPTH" -gt 0 ] 2>/dev/null || { DEPTH=10; tnote="${tnote}RED_MAIN_DEPTH='${RED_MAIN_DEPTH-}' is not a usable page size — it must be a whole number of at least 1 that the shell can compare, using ${DEPTH}; "; } ;;
+  esac
+  # `local` so each repo starts from a clean budget rather than inheriting the previous
+  # repo's numbers; `rm_bud` (dynamically scoped into these) also clears them on every call.
+  local RM_BUD_FILE="" RM_BUD_LIMIT="" RM_BUD_REMAIN="" RM_BUD_USED="" RM_BUD_RESET="" RM_BUD_RESRC="" RM_BUD_RETRY=""
   # Stated separately from the tip read below so an unset RM_REPO names its OWN cause. Folding
   # it into the tip check would surface a calling-convention mistake as "cannot resolve tip of
   # main (wrong default branch? auth?)" — a confident, wrong diagnosis. The `:-` default above
   # is what keeps this message REACHABLE under a `set -u` caller, which would otherwise abort on
   # the unset read one line earlier and print nothing at all.
   [ -n "$r" ] || { echo "UNKNOWN — red_main reads its repo from the named variable RM_REPO (call it as: RM_REPO=owner/repo red_main); RM_REPO was empty or unset, so NOTHING was read and no verdict is implied"; return 1; }
-  tip=$(gh api "repos/$r/commits/main" --jq .sha) || tip=""
+  # Emitted AFTER the RM_REPO guard so that a calling-convention mistake still renders as the
+  # single self-contained line above, and before the first read so it is present even on the
+  # ticks that decline this repo at the pre-flight gate and never reach the header.
+  # ⚠️ This sentence ends where it does deliberately. An earlier draft closed it with "and none
+  # of this changes a verdict", which THIS FILE contradicts twice: the depth section below calls
+  # the raw-window spend "the one place depth changes an outcome" and tells the operator to
+  # RAISE `RED_MAIN_DEPTH` for a deploy-event-heavy workflow, so a rejected 50 restoring 10 is
+  # exactly when a workflow renders `no-baseline` instead of a verdict; and the SECONDARY remedy
+  # is to LOWER `RED_MAIN_PARALLEL`, so a rejected low width restoring 12 can re-trigger the
+  # throttle that withholds every verdict on the repo. The guard is not itself a verdict
+  # decision, but its consequences are not none, and asserting they were would be an unmeasured
+  # positive claim in the file that exists to refuse them.
+  [ -z "$tnote" ] || echo "$r: NOTE: rejected tunable value(s) — ${tnote}defaults are in force for this tick. Nothing was silently accepted; the defaults may not be the width or depth you asked for, and the tunables section explains what each one changes."
+  # BUDGET-INSTRUMENTED. `-i` costs NO extra API call — the budget headers ride the response
+  # this function already had to make — and it is the only honest source of the remaining
+  # budget (see the rm_bud block above for why `gh api rate_limit` is not). It is also what
+  # makes a REFUSAL informative: gh prints the full status line and headers before it branches
+  # on the status code, so a 403 still yields its budget headers. The plain-gh fallback below
+  # only runs if mktemp fails, and it is deliberately unchanged behaviour, not a second path
+  # to maintain.
+  RM_BUD_FILE=$(mktemp) || RM_BUD_FILE=""
+  if [ -n "$RM_BUD_FILE" ]; then
+    gh api -i "repos/$r/commits/main" > "$RM_BUD_FILE" 2>/dev/null || true
+    rm_bud
+    tip=$(sed -e '1,/^[[:space:]]*$/d' "$RM_BUD_FILE" | jq -r '.sha // empty' 2>/dev/null) || tip=""
+  else
+    tip=$(gh api "repos/$r/commits/main" --jq .sha) || tip=""
+  fi
+  # CR strip — see the note on query.tsv, and `rm_bud` above, which already strips `\r` off
+  # every header value for the same reason. `$tip` is compared to `$tip2` (the mid-read
+  # re-read) and to every `head_sha`; it must be stripped at the SAME layer as they are, or
+  # the strip itself manufactures the inequality it was added to prevent.
+  tip=${tip%$(printf '\r')}
   # HARD PRECONDITION. An empty $tip makes every head_sha comparison fail, so cases 1
   # and 3 become UNREACHABLE and the repo silently degrades to all-stale verdicts.
-  [ -n "$tip" ] || { echo "$r: UNKNOWN — cannot resolve tip of 'main' (wrong default branch? auth?); verdict withheld"; return 1; }
+  # ⚠️ The cause is now DERIVED, never asserted. This message used to read
+  # "(wrong default branch? auth?)" — two guesses printed as if they were the finding, on a
+  # line that fires for any failure at all. When the real cause was an exhausted API budget
+  # it sent the operator to look at branch configuration and credentials, neither of which
+  # was wrong. Same class as everywhere else in this file: a suppressed error must never
+  # become a confident value, and that includes a confident *diagnosis*.
+  if [ -z "$tip" ]; then
+    echo "$r: UNKNOWN — cannot resolve tip of 'main'; verdict withheld"
+    # ⚠️ The `if` form is load-bearing, NOT style. `rm_throttle_report; tcls=$?` aborts the
+    # whole function under a `set -e` caller on exactly the two returns that matter (1 and 2),
+    # so the `cause:` line never prints, `rc` is never assigned, and the temp file leaks —
+    # while a real throttle (0) survives. That is failure biased toward the misdiagnosis-prone
+    # path, which is this block's whole subject. A command in an `if` condition is exempt from
+    # `set -e`; that is what makes the three-valued dispatch safe here.
+    if RM_WHAT="the tip of main" rm_throttle_report; then tcls=0; else tcls=$?; fi
+    case "$tcls" in
+      0) rc=2 ;;
+      2) echo "  cause: UNKNOWN — the throttle class could not be established because NO response was captured for this read (the saved response is absent or empty: mktemp may have failed, or gh may have produced no output at all). The cause is DERIVED, so neither is asserted. This is NOT a finding that it was not a throttle: from here a rate-limit refusal and a credentials failure are indistinguishable."
+         rc=1 ;;
+      *) echo "  cause: NOT a rate-limit refusal. GitHub said: $(rm_err_msg) — candidates are a non-'main' default branch, credentials, or the network. Diagnose this one; do not wait it out."
+         rc=1 ;;
+    esac
+    [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"
+    return "$rc"
+  fi
 
   # LIVE PRODUCERS — and now also the ENUMERATION source, so a workflow is judged even
   # when it has NO runs in any window. A workflow DELETED from the repo keeps its last run
@@ -606,7 +1888,7 @@ Read coord's own honest view — no new observability:
   note=""
   [ -n "$win" ] || note="  NOTE: deleted-workflow discovery read failed — an already-deleted workflow may be missing from the excluded: lines below; no verdict is affected while producer liveness is known"
 
-  d=$(mktemp -d) || { echo "$r: UNKNOWN — mktemp failed; verdict withheld"; return 1; }
+  d=$(mktemp -d) || { [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"; echo "$r: UNKNOWN — mktemp failed; verdict withheld"; return 1; }
 
   # Query set = live ids UNION ids seen in the discovery window. ONE enumeration, ONE read
   # path. `state` per id: live / dead / unknown (workflow list unusable). Grouping is by ID,
@@ -629,11 +1911,100 @@ Read coord's own honest view — no new observability:
                       else "dead" end) })
     | sort_by(.name | ascii_downcase)
     | .[] | "\(.id)\t\(.state)\t\(.name)"' > "$d/query.tsv" \
-    || { rm -rf "$d"; echo "$r: UNKNOWN — could not build the workflow query set; verdict withheld"; return 1; }
+    || { rm -rf "$d"; [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"; echo "$r: UNKNOWN — could not build the workflow query set; verdict withheld"; return 1; }
+  # ⚠️ CR STRIP — a CORRECTNESS step on Windows, not cosmetics, and the reason every jq
+  # value below is stripped too. jq opens stdout in TEXT mode on Windows, so each line it
+  # writes ends CRLF; the shell reads the file with IFS=TAB, which is not CR, so the LAST
+  # tab-separated field keeps it. Here that field is `name`, and `A<CR>` rendered as a line
+  # break mid-verdict on the `guard-roster-windows` leg. The same translation put
+  # `success<CR>` into the newer-* conclusion below — which is not `success`, so a GREEN run
+  # was labelled `newer-red`: a WRONG verdict word, not a spacing defect. This file already
+  # treats Windows as a first-class host (see the 32KB argv note below), and neither `gh`
+  # (Go, LF) nor Linux jq emits CR, so the strip is a no-op everywhere else. Applied AFTER
+  # the `||` handler so jq's own exit status still reaches it, and `|| :` so a strip that
+  # somehow fails cannot abort a `set -e` caller — worst case the CR survives and prints.
+  { tr -d '\r' < "$d/query.tsv" > "$d/query.lf" && mv -f "$d/query.lf" "$d/query.tsv"; } || :
 
   qn=$(wc -l < "$d/query.tsv" | tr -d ' \t')
   [ -n "$qn" ] && [ "$qn" -gt 0 ] 2>/dev/null \
-    || { rm -rf "$d"; echo "$r: UNKNOWN — no workflows to query (workflow list unusable AND no runs discovered); verdict withheld"; return 1; }
+    || { rm -rf "$d"; [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"; echo "$r: UNKNOWN — no workflows to query (workflow list unusable AND no runs discovered); verdict withheld"; return 1; }
+
+  # ── PRE-FLIGHT BUDGET GATE ────────────────────────────────────────────────────────────
+  # About to issue qn per-workflow calls, up to qn gating probes and one tip re-read against
+  # a budget that is ACCOUNT-WIDE, not this function's own: coord's merge train, /babysit-prs,
+  # the runner and every peer session draw from the same 5000/h. Spending the last of it buys
+  # a HALF-READ repo and strands every other consumer behind the same wall — which is exactly
+  # what happened on 2026-08-25: the sweep read qontinui-coord and qontinui-runner back to
+  # back, the account hit 5000/5000, and the third repo — qontinui-web, the busiest on the
+  # fleet with 21 open PRs — got no verdict at all.
+  # So a repo we cannot afford to read COMPLETELY is declined CHEAPLY and honestly, before
+  # spending anything, instead of half-read expensively. This is never a green: it prints
+  # UNKNOWN, withholds the verdict, and returns non-zero like every other abstention here.
+  # An UNKNOWN budget does NOT gate — but it does not silently assert affordability either;
+  # it says so, and every per-workflow path below still fails closed on a refused call.
+  #
+  # ⚠️ THE COST IS THE WORST CASE, and it must be, because "completely" is the whole claim.
+  # Three calls are already SPENT by the time we get here (the tip read, the workflow list,
+  # the discovery window), so what is left to buy is: qn fan-out calls, up to qn gating
+  # probes, and one tip re-read. `probes` is NOT KNOWABLE at this point — it is derived from
+  # the fan-out responses, which is precisely what we are deciding whether to buy — so its
+  # upper bound qn is the only honest figure, giving 2*qn + 1.
+  # This gate shipped budgeting `qn + 2` instead, i.e. it under-counted by up to qn - 1 calls
+  # (nearly HALF the repo on a probe-heavy one), so on the shortfall it exists to catch it
+  # approved a read it could not finish and half-read the repo anyway — the exact outcome it
+  # was written to prevent. The number is computed ONCE into `need` and both the test and the
+  # message read that variable: the shipped defect was an arithmetic and a sentence free to
+  # disagree, and they did.
+  # `need` is deliberately a CEILING, so a repo whose probes come in low is sometimes declined
+  # when it would just have fitted. That is the cheap error, and the same trade the RESERVE
+  # already makes; half-reading the repo and starving coord is the expensive one.
+  need=$((2 * qn + 1))
+  # ⚠️ THE ONLY ARITHMETIC `RESERVE` REACHES, and so the only place a reserve that PASSED the
+  # guard above can still do damage — the guard rejects a reserve this shell cannot compare;
+  # this rejects one it cannot add. MEASURED end to end through this fence with a fixture `gh`
+  # (`remaining` 10, `qn` 6, so `need` 13) and `RED_MAIN_BUDGET_RESERVE=9223372036854775807`:
+  # the sum wrapped NEGATIVE, `remaining -lt <negative>` was false, the gate declined NOTHING,
+  # and the fence read the repo on with the reserve effectively at ZERO — printing no decline
+  # line and no NOTE. That is exactly the silently-zeroed reserve this file calls the dangerous
+  # half, arriving past both halves of the guard, and it is why the reserve is checked in TWO
+  # places rather than one.
+  # The test is a DETECTION, not an assumption about limits: `RESERVE` is all digits by the time
+  # it gets here (the character class guarantees it) so it is non-negative, and `need` is at
+  # least 3, so a correct sum is always GREATER than `RESERVE` — a sum below it can only be a
+  # wrap. No ceiling is invented and none is asserted; an enormous but non-wrapping reserve is
+  # left alone, because "decline every repo" is a thing an operator may legitimately have asked
+  # for. Pinned by `E10c` — and the OTHER half of this line, that a valid reserve is actually
+  # ADDED, by `E15`. A rejection arm cannot show that half, and until `E15` existed nothing
+  # did: MEASURED, deleting `+ RESERVE` from this expression outright left ALL 143 of the
+  # suite's assertions GREEN, because every budget arm ran the reserve at 0 — the additive
+  # identity — and the only three carrying a non-zero one sat below `need` on its own, so
+  # they declined either way. The knob could have stopped working and the suite would have
+  # said nothing.
+  budneed=$((need + RESERVE))
+  if [ "$budneed" -lt "$RESERVE" ]; then
+    # ASSIGNED BEFORE IT IS INTERPOLATED, for the reason the guard block above
+    # states and this line used to break: written the other way the literal appears
+    # twice, and the next edit to the default leaves the NOTE confidently naming a
+    # number it did not use. This was the only site in the fence still spelling it
+    # the forbidden way, and it shipped in the same commit as the rule.
+    RESERVE=250
+    echo "$r: NOTE: rejected tunable value(s) — RED_MAIN_BUDGET_RESERVE='${RED_MAIN_BUDGET_RESERVE-}' cannot be added to this repo's cost without overflowing the shell's integer range, which would silently disable the reserve entirely; using ${RESERVE}. Nothing was silently accepted."
+    budneed=$((need + RESERVE))
+  fi
+  # This NOTE names its cause as "the tip read returned no X-Ratelimit-Remaining header", and
+  # that is ACCURATE on every path that reaches here — checked, not assumed. The other way to
+  # arrive with an empty RM_BUD_REMAIN is an uninstrumented tip read, i.e. `mktemp` having
+  # failed above; but `mktemp -d` is called before this point and fails under the same
+  # conditions, so that path returns earlier and never reaches this line. A second, derived
+  # branch was drafted here and then WITHDRAWN as unreachable: adding a cause the code cannot
+  # produce is the same defect as asserting one it cannot support, one direction over.
+  if [ -z "${RM_BUD_REMAIN:-}" ]; then
+    echo "$r: NOTE: GitHub API budget UNKNOWN this tick (the tip read returned no X-Ratelimit-Remaining header), so the pre-flight affordability gate did NOT run. A mid-sweep refusal is still reported explicitly and still withholds the verdict — it is never a green."
+  elif [ "$RM_BUD_REMAIN" -lt "$budneed" ] 2>/dev/null; then
+    rm -rf "$d"; [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"
+    echo "$r: UNKNOWN — GitHub API budget too low to read this repo COMPLETELY: ${RM_BUD_REMAIN} left on resource '${RM_BUD_RESRC:-core}', this repo needs up to ${need} more calls ($qn workflow reads, up to $qn gating probes, one tip re-read) plus the ${RESERVE}-call reserve held back for coord and peer sessions. Nothing further was read; verdict withheld, retry after $(rm_reset_at)."
+    return 2
+  fi
 
   # AUTHORITATIVE READ — one call per workflow, against that workflow's OWN runs index,
   # newest-first. This is the whole point of the rewrite: `gh run list` slices a shared,
@@ -670,9 +2041,26 @@ Read coord's own honest view — no new observability:
   # an empty `ids.txt`, so a zero-match read fans out over nothing and every workflow lands on
   # the read-FAILED path — an all-UNKNOWN repo returning non-zero, never a silent green.
   cut -f1 "$d/query.tsv" | grep -E '^[0-9]+$' > "$d/ids.txt" || true
-  # `|| true`: xargs exits 123 if any child failed, and a `set -e` caller would abort HERE,
-  # before the header prints — a tick that prints nothing, which must never happen. Child
-  # failures are already recorded as `.fail` marker files and surface per workflow below.
+  # `|| true`: a non-zero `xargs` would abort a `set -e` caller HERE, before the header prints
+  # — a tick that prints nothing, which must never happen. Child failures are already
+  # recorded as `.fail` marker files and surface per workflow below.
+  # ⚠️ Be exact about WHICH `xargs` exit that is, because this comment used to name the one
+  # that cannot happen. `xargs` returns 123 when a child exits 1-125 — and the helper generated
+  # one line above ends in `|| : > "...fail"`, so `sh` exits 0 whatever `gh` did. MEASURED with
+  # the real generated line and a failing `gh` shim: the helper exits 0, and `xargs` over two
+  # such children exits 0, never 123. (Control, same box: `xargs` over children that really do
+  # exit non-zero returns 123, so the instrument can see the code it did not find here.)
+  # So 123 is unreachable while that helper swallows its own failure, and this guard is a
+  # BACKSTOP for the exits that remain reachable rather than for the one it used to cite:
+  # a child killed by a signal (MEASURED 125 — an OOM kill of one `-P` child is the realistic
+  # instance; the FREQUENCY is not measured, only the exit) and an `env` that xargs cannot run
+  # (MEASURED 127 for a missing command; 126 is its found-but-unexecutable twin, not separately
+  # measured). Keep the guard; it is cheap and those paths are
+  # real. Do NOT rewrite it as a claim about failed children, and note that deleting the
+  # helper's `|| : > "...fail"` would put the 123 path back — the two are coupled.
+  # This is also exactly why `steward-red-main-throttle-fixtures-test.sh` declares this guard
+  # UNCOVERED instead of counting it: no fixture can redden it, so an arm claiming it would
+  # pass with the guard deleted.
   # `-I{}` consumes one id per invocation (implying the one-line-per-command behaviour the old
   # `-n1` gave) and `-P` still fans out. The replacement lands in an `env` ASSIGNMENT, never in
   # a shell string, so no id is ever parsed by a shell — `env` is exec'd directly, so a hostile
@@ -707,19 +2095,101 @@ Read coord's own honest view — no new observability:
   # `gating_unknown` and then UNKNOWN, degrading a minority of workflows in a way no footer
   # count makes obvious. The ids here are the already-validated integers from `ids.txt`.
   printf '%s\n' 'gh api "repos/$RM_REPO/actions/workflows/$RM_WF/runs?branch=main&event=push&per_page=1" > "$RM_DIR/$RM_WF.push.json" 2>/dev/null || : > "$RM_DIR/$RM_WF.pushfail"' > "$d/probe.sh"
+  # The `-eq 0` short-circuit is what stops `xargs` being handed an empty `ambig.txt`; the
+  # trailing `|| true` is the same errexit backstop as the fetch fan-out, and it carries the
+  # same correction. `probe.sh` above ALSO ends in `|| : > "...pushfail"`, so it too exits 0
+  # whatever `gh` did (MEASURED, with the real generated line and a failing `gh` shim: exit 0,
+  # and `xargs` over two such children exits 0). A failed probe therefore never reaches this
+  # guard either — it is reachable only by a signal-killed child (MEASURED 125) or an `env`
+  # xargs cannot run (MEASURED 127). Keep it for those; do not read it as covering probe
+  # failure, which is handled by the `.pushfail` marker and the `gating_unknown` route above.
+  # ⚠️ This guard stays uncovered, and the reason is now MEASURED rather than predicted. The
+  # suite used to list it as uncovered because `probes` was 0 in every arm — the WEAKER reason,
+  # which reads as "a runs fixture would reach it". `E16` is that runs fixture: `probes` is 1,
+  # this `xargs` runs, and the guard is STILL not reddened, because `probe.sh` exits 0 whatever
+  # `gh` did. The structural reason survived the arm that removed the weaker one. An arm built
+  # to assert THIS guard would still pass with it deleted.
+  # ⚠️ AND THE FAN-OUT ITSELF IS NOW WITNESSED, which it was not for two increments: `E16`
+  # asserts that this line spawned and did so at the guarded `$PAR`. That is a different claim
+  # from the guard above it, and it is the one the paragraph three up says matters most here —
+  # this site fails quieter than the fetch fan-out.
   [ "$probes" -eq 0 ] || xargs -P "$PAR" -I{} env RM_REPO="$r" RM_DIR="$d" RM_WF={} sh "$d/probe.sh" < "$d/ambig.txt" || true
 
   # Main can advance while we read; then the "tip" we label is stale and runs on the real
   # tip are invisible. This re-read sits AFTER the fan-out deliberately, so it brackets every
   # per-workflow read — re-reading before them would leave the reads unbracketed.
-  tip2=$(gh api "repos/$r/commits/main" --jq .sha) || tip2=""
-  [ "$tip" = "$tip2" ] || { rm -rf "$d"; echo "$r: UNKNOWN — main moved mid-read (${tip:0:8} -> ${tip2:0:8}); verdict withheld, re-read next tick"; return 1; }
+  # Budget-instrumented for the same reason as the first read, and additionally because THIS
+  # is the call the 2026-08-25 exhaustion actually landed on — so this is where the budget
+  # reported in the footer is measured from, after the whole fan-out has been paid for.
+  if [ -n "$RM_BUD_FILE" ]; then
+    gh api -i "repos/$r/commits/main" > "$RM_BUD_FILE" 2>/dev/null || true
+    rm_bud
+    tip2=$(sed -e '1,/^[[:space:]]*$/d' "$RM_BUD_FILE" | jq -r '.sha // empty' 2>/dev/null) || tip2=""
+  else
+    tip2=$(gh api "repos/$r/commits/main" --jq .sha) || tip2=""
+  fi
+  # CR strip, same class as query.tsv: `$tip2` is COMPARED to `$tip`, so a `<CR>` on the
+  # right-hand side reports a main move that never happened — the exact wrong-diagnosis
+  # failure the block below exists to prevent, arriving by a different door.
+  tip2=${tip2%$(printf '\r')}
+  # ⚠️ **AN EMPTY tip2 IS A FAILED RE-READ, NOT A MAIN MOVE.** Conflating the two shipped a
+  # confident wrong diagnosis for as long as this line existed: a failed read set tip2 empty,
+  # the equality test below could not distinguish that from a moved branch, and the operator
+  # was told main had moved. Measured 2026-08-25 22:12:35Z on qontinui-web — the account had
+  # spent its whole 5000/h core budget, this call 403'd, and the detector printed
+  # `UNKNOWN - main moved mid-read (bd80272c -> )`, sending the reader to look at a branch
+  # that had not moved at all. Fail-closed held (UNKNOWN, non-zero, no verdict) — the
+  # *reason* was invented. The tell was in the output the whole time: the arrow's right-hand
+  # side rendered BLANK, because there was no second sha to print. The empty case now names
+  # its own cause, and the move message is only ever reached with two real shas.
+  if [ -z "$tip2" ]; then
+    rm -rf "$d"
+    echo "$r: UNKNOWN — the tip re-read FAILED, so the fan-out could not be bracketed (this is NOT a main move: ${tip:0:8} -> <read failed>); verdict withheld"
+    # `if`, for the reason spelled out at the first tip read: a bare call plus `$?` is a
+    # `set -e` abort on rc 1 and rc 2.
+    if RM_WHAT="the tip re-read" rm_throttle_report; then tcls=0; else tcls=$?; fi
+    case "$tcls" in
+      0) rc=2 ;;
+      2) echo "  cause: UNKNOWN — the throttle class could not be established because NO response was captured for this read (the saved response is absent or empty). This is NOT a finding that it was not a throttle."
+         rc=1 ;;
+      *) echo "  cause: NOT a rate-limit refusal. GitHub said: $(rm_err_msg) — candidates are credentials or the network. Diagnose this one; do not wait it out."
+         rc=1 ;;
+    esac
+    [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"
+    return "$rc"
+  fi
+  [ "$tip" = "$tip2" ] || { rm -rf "$d"; [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"; echo "$r: UNKNOWN — main moved mid-read (${tip:0:8} -> ${tip2:0:8}); verdict withheld, re-read next tick"; return 1; }
+  # The budget VALUES survive in RM_BUD_* for the footer; only the response file is dropped.
+  [ -z "$RM_BUD_FILE" ] || rm -f "$RM_BUD_FILE"
 
   echo "== $r tip=${tip:0:8} — $qn workflow(s), per-workflow authoritative read (depth=$DEPTH, parallel=$PAR)"
   [ -z "$note" ] || echo "$note"
+  # This NOTE is a terminal verdict, so it owes the axes it was computed from.
+  # It is about GITHUB's workflow list and nothing else -- no coord door was
+  # consulted to produce it, and it says nothing about one. Adding the CONFLICT
+  # ledger section pushed this file over the cascade-surface threshold, which is
+  # what made the roster owed here (lint-reachability-axes check #58 arm B).
+  # axes: hosts=api.github.com prefixes=/repos credentials=gh-token unprobed=api.qontinui.io
   [ "$live" != "null" ] || echo "  NOTE: workflow list unavailable or truncated — producer liveness UNKNOWN for every line below, AND the workflow inventory itself fell back to the distrusted run window, so a workflow missing from that window is missing from this report entirely. A RED here may be a deleted workflow's immortal last run; a green repo verdict is NOT supported and this repo returns non-zero."
 
-  qfail=0; unadj=0; adv=0; nb=0; nobase=""
+  qfail=0; unadj=0; adv=0; nb=0; nobase=""; cmps=0; cmpskip=0
+  # ===== how many descent compares this repo may spend =======================================
+  # THE ANNOTATION YIELDS TO THE BUDGET, and this is D1's lesson applied to a call the gate
+  # above does not know about. `need` is `2 * qn + 1` -- the reads that MUST happen for a
+  # verdict -- and the newer-* compares sit on top of it. Folding them into `need` would raise
+  # the affordability bar by up to 50% for a cost MEASURED at 0-1 calls per repo (ccfg, live,
+  # 2026-09-06: exactly 1 for ten workflows), declining whole repos over an annotation; spending
+  # them unbudgeted is the shortfall D1 is about. So they are capped instead: whatever remains
+  # after the mandatory reads and the reserve, never more than `qn` (one per workflow is the
+  # pre-memoisation maximum), and NONE at all when the budget is UNKNOWN -- an annotation is
+  # never worth a call that cannot be accounted for. Skips are COUNTED and printed, so the
+  # omission is visible rather than silent.
+  cmpbud=0
+  if [ -n "${RM_BUD_REMAIN:-}" ]; then
+    cmpbud=$((RM_BUD_REMAIN - need - RESERVE)) || cmpbud=0
+    [ "$cmpbud" -ge 0 ] 2>/dev/null || cmpbud=0
+    [ "$cmpbud" -le "$qn" ] || cmpbud="$qn"
+  fi
   while IFS=$(printf '\t') read -r id state name; do
     [ -n "$id" ] || continue
     if [ -f "$d/$id.fail" ] || [ ! -s "$d/$id.json" ]; then
@@ -747,6 +2217,7 @@ Read coord's own honest view — no new observability:
     elif [ -s "$d/$id.push.json" ]; then
       gp=$(jq -r 'if (.total_count // -1) < 0 then "unknown"
                   elif .total_count > 0 then "gating" else "nongating" end' < "$d/$id.push.json" 2>/dev/null) || gp=unknown
+      gp=${gp%$(printf '\r')}   # see the CR-strip note on query.tsv: `gating<CR>` matches no case arm
       [ -n "$gp" ] || gp=unknown
       # PROJECT to the three fields the program below actually reads, never the whole run object.
       # This value is passed as --argjson on the jq COMMAND LINE, and on Windows the whole argv is
@@ -761,7 +2232,11 @@ Read coord's own honest view — no new observability:
       gprun=$(jq -c '((.workflow_runs // [])[0] // null) | if . == null then null else {status,conclusion,head_sha} end' < "$d/$id.push.json" 2>/dev/null) || gprun=null
       [ -n "$gprun" ] || gprun=null
     fi
-    line=$(jq -r --arg tip "$tip" --arg w "$name" --arg state "$state" --arg probe "$gp" --argjson gprun "$gprun" '
+    # The jq program is bound to a NAME rather than written inline, because it is now run
+    # TWICE per workflow -- once as the newer-* PREPASS, which emits an annotation request, and
+    # once to RENDER the line with the resolved note. Two inline copies is precisely the drift
+    # the annotation design forbids. It is a string assignment, not a call: no extra process.
+    rm_prog='
         # success | neutral | skipped are the three PASSING conclusions, matching coord
         # is_passing_conclusion (ci_baseline.rs). neutral and skipped keep their own labels
         # rather than being upcast to GREEN — they did not pass, they declined to run — but
@@ -773,6 +2248,9 @@ Read coord's own honest view — no new observability:
           elif (c // "") == "" then "UNKNOWN(blank conclusion)"
           else "RED(\(c))" end;
         def cls(c): if (c // "") == "" then "UNADJ" else "ADJ" end;
+        # The three PASSING conclusions again, as a predicate. Used ONLY to ask whether the
+        # newer-* evidence CONTRADICTS the line it would decorate -- never to form a verdict.
+        def passing(c): (["success","skipped","neutral"] | index(c // "")) != null;
         # NOTE: this jq program is inside a SINGLE-QUOTED shell string — no apostrophes below.
         # TWO decisions here, and they are deliberately separate. The URL cannot make either:
         # the runs endpoint accepts exactly ONE event= value, so both are client-side.
@@ -841,10 +2319,43 @@ Read coord's own honest view — no new observability:
       | " [read \($n)/\($tot) on main\(if $raw > $n then ", +\($raw - $n) non-baseline dropped" else "" end)]" as $depth
       | (if $state == "unknown" then " [producer liveness UNKNOWN]" else "" end) as $pq
       | [$R[] | select(.head_sha == $tip)] as $attip
-      | ([$attip[] | select(.status == "completed")] | sort_by(.created_at) | last) as $tipDone
+        # SUPERSEDED conclusions are NOT verdicts, and coord says so in code:
+        # ci_baseline.rs -- "a `workflow_run` conclusion that means superseded /
+        # never concluded, not a verdict on mains health. Such a run must not
+        # overwrite the last CONCLUSIVE baseline (else a concurrency-cancel
+        # wedges the merge queue) ... `ingest_workflow_run` skips the write and
+        # the baseline keeps its last conclusive verdict". `cancelled` is what
+        # GitHub stamps when a newer push cancels a still-running job; `stale`
+        # is the analogous marker. So they are EXCLUDED from the completed set
+        # here, and selection falls through to the newest CONCLUSIVE run --
+        # exactly what coord baseline does. Measured 2026-08-31: without this,
+        # qontinui-runner reported a gating `RED(cancelled)@42ea7611` while the
+        # repo was landing PRs continuously, which is a permanent false red on
+        # an abandoned sha that nothing can ever supersede.
+        # `failure`/`timed_out`/`action_required` are REAL and stay RED -- coord
+        # names them so in the same comment. Do NOT widen this set.
+      | ["cancelled","stale"] as $SUPERSEDED
+      | ([$attip[] | select(.status == "completed")
+                   | select((.conclusion // "") as $c | ($SUPERSEDED | index($c)) == null)]
+         | sort_by(.created_at) | last) as $tipDone
       | ([$attip[] | select(.status != "completed")] | length) as $inflight
+      | ([$attip[] | select(.status == "completed")
+                   | select((.conclusion // "") as $c | ($SUPERSEDED | index($c)) != null)]
+         | length) as $tipSuperseded
       | (if $inflight > 0 then " +\($inflight) in flight" else "" end) as $busy
-      | ([$R[]  | select(.status == "completed")] | sort_by(.created_at) | last) as $lastDone
+      | (if $tipSuperseded > 0 then " +\($tipSuperseded) superseded" else "" end) as $sup
+        # Superseded runs ANYWHERE in the judged set, not only at the tip. $tipSuperseded is
+        # at-tip only, so on the fallthrough line it is provably 0 and annotating with it
+        # would be dead code -- which is exactly how the MEASURED qontinui-runner case
+        # (cancelled off-tip, the conclusive verdict older still) dropped its annotation
+        # silently, contradicting the never-silently-dropped claim in this very file.
+      | ([$R[] | select(.status == "completed")
+                | select((.conclusion // "") as $c | ($SUPERSEDED | index($c)) != null)]
+         | length) as $allSuperseded
+      | (if $allSuperseded > 0 then " +\($allSuperseded) superseded" else "" end) as $supAll
+      | ([$R[]  | select(.status == "completed")
+                | select((.conclusion // "") as $c | ($SUPERSEDED | index($c)) == null)]
+         | sort_by(.created_at) | last) as $lastDone
         # OBSERVATION ONLY, never a verdict — the tip-run annotation. A completed NON-push
         # baseline run at the tip is read, admitted to $cand, then dropped from $R by the
         # push-only rule; the drop is CORRECT and stays, the SILENCE about it was the defect.
@@ -857,13 +2368,55 @@ Read coord's own honest view — no new observability:
          | sort_by(.created_at) | last) as $tipAlt
         # SYMMETRIC BY CONSTRUCTION: the label comes from the run conclusion, so tip-red prints as
         # loudly as tip-green. Lower-cased and bracketed so it cannot be mistaken for the verdict.
+        # A SUPERSEDED conclusion gets its own tip-superseded label rather than tip-red -- it
+        # carries no verdict at all, and calling it red here would contradict the run-level rule.
       | (if $tipAlt == null then "" else
            (($tipAlt.conclusion // "") as $tc
             | (if $tc == "success" then "tip-green"
+               elif ($SUPERSEDED | index($tc)) != null then "tip-superseded"
                elif ($tc == "") or ((["skipped","neutral"] | index($tc)) != null) then "tip-other"
                else "tip-red" end) as $tlab
             | " [\($tlab): \($tipAlt.event) \(if $tc == "" then "blank conclusion" else $tc end)@\($tip[0:8]) — observed, not adjudicating]")
          end) as $tipnote
+        # The three branch guards below are HOISTED rather than written inline in the chain,
+        # because $noteSite has to ask the same questions and a second copy would drift.
+      | (($mode == "gates_no_evidence") and (($state != "dead") or (($attip | length) > 0))) as $bGNE
+      | (($mode == "gating_unknown") and (($state != "dead") or (($attip | length) > 0))) as $bGU
+      | (($state == "dead") and (($attip | length) == 0)) as $bDead
+        # newer-* REQUEST. The evidence run: newest completed CONCLUSIVE non-push baseline run
+        # that is NOT at the tip -- the tip case is $tipnote and stays there. See the newer-run
+        # bullet in the notes for the descent rule, the contradiction gate and the cost.
+      | ([$cand[] | select((.event != "push") and (.status == "completed") and (.head_sha != $tip))
+                  | select((.conclusion // "") as $c | ($SUPERSEDED | index($c)) == null)]
+         | sort_by(.created_at) | last) as $newerAlt
+        # WHICH line would render, and with what sha/conclusion. Identical gates to the two
+        # $tipnote use sites, expressed once.
+      | (if $bGNE and ($gprun != null) and ($gprun.status == "completed")
+             and ((($gprun.conclusion // "") as $gc | ($SUPERSEDED | index($gc)) == null))
+             and (($gprun.conclusion // "") != "") and (($gprun.head_sha // "") != $tip)
+           then {site: "gp", sha: ($gprun.head_sha // ""), conc: ($gprun.conclusion // "")}
+         elif (($bGNE | not) and ($bGU | not) and ($n != 0) and ($bDead | not)
+               and ($tipDone == null) and ($inflight == 0) and ($lastDone != null)
+               and $gates and (($lastDone.conclusion // "") != ""))
+           then {site: "last", sha: ($lastDone.head_sha // ""), conc: ($lastDone.conclusion // "")}
+         else null end) as $noteSite
+        # CONTRADICTION ONLY. Evidence agreeing with the line changes nothing a reader acts on,
+        # and the compare call is the cost -- so no request is emitted for it.
+      | (if ($noteSite == null) or ($newerAlt == null) then null
+         else (($newerAlt.head_sha // "") as $es
+               | if ($es == "") or ($noteSite.sha == "") or ($es == $noteSite.sha)
+                    or (passing($newerAlt.conclusion) == passing($noteSite.conc))
+                 then null
+                 else {site: $noteSite.site, from: $noteSite.sha, to: $es,
+                       event: ($newerAlt.event // "?"), conc: ($newerAlt.conclusion // "")} end)
+         end) as $newerReq
+        # ONE program, two modes. The prepass emits the REQUEST and nothing else; the render
+        # pass takes the resolved notes back as $newerGp / $newerLast. Running the same program
+        # for both is what stops the request gates and the render gates drifting apart.
+      | if $prepass then
+          (if $newerReq == null then ""
+           else "\($newerReq.site)\t\($newerReq.from)\t\($newerReq.to)\t\($newerReq.event)\t\($newerReq.conc)" end)
+        else
         # $tot is the API total_count and is UNFILTERED, so it cannot distinguish "no baseline
         # run ever" from "no baseline run in this window". Both are NB: nothing to judge, never
         # act. They are LABELLED apart rather than merged, so the collapsed line still says which
@@ -891,20 +2444,28 @@ Read coord's own honest view — no new observability:
         # reported, never a verdict). The condition is the exact negation of the excluded: guard
         # below so the two cannot drift apart: a run AT THE TIP still proves a producer existed
         # at the tip and keeps its verdict.
-      | if ($mode == "gates_no_evidence") and (($state != "dead") or (($attip | length) > 0)) then
+        if $bGNE then
           # The tip-run note rides THIS line too, and that is not decoration. Every dispatch adds a
           # run to the DEPTH window and can evict the last in-window push run, flipping a workflow
           # from push_in_window to gates_no_evidence — so annotating only the case-2 branch would
           # make the annotation vanish precisely for the operator who applied the documented
           # dispatch remedy hardest. Gated on an ADJUDICATED probe verdict (non-blank conclusion)
           # that is NOT already at the tip, so it never decorates an UNKNOWN or a redundant line.
-          (if ($gprun != null) and ($gprun.status == "completed") then
-             "\(cls($gprun.conclusion))\t  \($w): \(verdict($gprun.conclusion))@\(($gprun.head_sha // "none")[0:8]) (newest push run on main, older than the \($raw0) examined; from gating probe)\(if (($gprun.conclusion // "") != "") and (($gprun.head_sha // "") != $tip) then $tipnote else "" end)\($pq)\($depth)"
+          (if ($gprun != null) and ($gprun.status == "completed")
+              and ((($gprun.conclusion // "") as $gc | ($SUPERSEDED | index($gc)) == null)) then
+             "\(cls($gprun.conclusion))\t  \($w): \(verdict($gprun.conclusion))@\(($gprun.head_sha // "none")[0:8]) (newest push run on main, older than the \($raw0) examined; from gating probe)\(if (($gprun.conclusion // "") != "") and (($gprun.head_sha // "") != $tip) then $tipnote else "" end)\($newerGp)\($pq)\($depth)"
+           elif ($gprun != null) and ($gprun.status == "completed") then
+             # SUPERSEDED probe run: per_page=1 gives no older run to fall through to, so there
+             # is nothing conclusive to report. It must NOT render as RED -- that is the defect
+             # this very commit closes, surviving on the probe path, and the probe reaches PAST
+             # window into frozen history, which is where an immortal false red lives longest.
+             # UNKNOWN is the honest verdict: no conclusive push run was observed.
+             "UNADJ\t  \($w): UNKNOWN@\(($gprun.head_sha // "none")[0:8]) (newest push run on main is \($gprun.conclusion // "?") — superseded, carries no verdict; from gating probe. Raise RED_MAIN_DEPTH to see a conclusive one)\($pq)\($depth)"
            elif ($gprun != null) then
              "UNADJ\t  \($w): UNKNOWN@\(($gprun.head_sha // "none")[0:8]) (newest push run on main is still \($gprun.status // "pending"); from gating probe)\($pq)\($depth)"
            else
              "UNADJ\t  \($w): UNKNOWN@none (gates main — push probe confirms push runs exist — but none in the \($raw0) examined and the probe returned no run; raise RED_MAIN_DEPTH)\($pq)\($depth)" end)
-        elif ($mode == "gating_unknown") and (($state != "dead") or (($attip | length) > 0)) then
+        elif $bGU then
           "UNADJ\t  \($w): UNKNOWN@none (cannot establish whether this workflow gates main — push probe failed or was inconclusive; verdict withheld)\($pq)\($depth) [gating UNKNOWN]"
         elif $n == 0 then
           (if $tot == 0 then "NB\t\($w)"
@@ -920,25 +2481,83 @@ Read coord's own honest view — no new observability:
         # at the tip, so cases 1 and 3 keep their verdict whatever the workflow list says —
         # otherwise a momentarily incomplete list drops a live at-tip RED. Blank conclusion
         # and absent head_sha are spelled out so neither side of the `@` can render blank.
-        elif ($state == "dead") and (($attip | length) == 0) then
+        elif $bDead then
           "ADJ\t  excluded:\($w) (no live producer — deleted from repo; "
-          + (if $lastDone == null then "no completed run on main"
-             else "last \(if ($lastDone.conclusion // "") == "" then "blank" else $lastDone.conclusion end)@\(($lastDone.head_sha // "none")[0:8])" end)
+          + (if $lastDone == null then (if $allSuperseded > 0 then "no CONCLUSIVE run on main (\($allSuperseded) superseded)" else "no completed run on main" end)
+             else "last conclusive \(if ($lastDone.conclusion // "") == "" then "blank" else $lastDone.conclusion end)@\(($lastDone.head_sha // "none")[0:8])" end)
           + ")\($depth)"
         # ADV routes every advisory line, whatever its conclusion: an advisory workflow never
         # gates, so it must not reach UNADJ (which would hold the repo unadjudicated) nor ADJ
         # (whose RED holds the train). It is still PRINTED in full — suppressing it is what hid
         # the atlas nightly failure for 12 days.
         elif $tipDone != null then
-          "\(if $gates then cls($tipDone.conclusion) else "ADV" end)\t  \($adv)\($w): \(verdict($tipDone.conclusion))@\($tip[0:8])\($busy)\($advwhy)\($pq)\($depth)"
-        elif ($attip | length) > 0 then
-          "\(if $gates then "UNADJ" else "ADV" end)\t  \($adv)\($w): UNKNOWN@\($tip[0:8]) (triggered on tip, \($inflight) in flight, no completed run)\($advwhy)\($pq)\($depth)"
+          "\(if $gates then cls($tipDone.conclusion) else "ADV" end)\t  \($adv)\($w): \(verdict($tipDone.conclusion))@\($tip[0:8])\($busy)\($sup)\($advwhy)\($pq)\($depth)"
+        # Gated on $inflight, NOT on ($attip | length): if every completed run at the tip is
+        # SUPERSEDED, $tipDone is null while $attip is non-empty, so keying on $attip swallows
+        # the fallthrough and renders a PERMANENT UNADJ -- text that says no completed run
+        # while a completed run exists. That re-creates the durable false signal this change
+        # exists to kill, one class over: an immortal false UNKNOWN instead of an immortal
+        # false RED. It is reachable by the dispatch remedy this file documents, since a
+        # dispatch on a workflow with cancel-in-progress concurrency cancels the tip push run.
+        # Falling through to $lastDone is what coord does -- keep the last CONCLUSIVE baseline.
+        elif $inflight > 0 then
+          "\(if $gates then "UNADJ" else "ADV" end)\t  \($adv)\($w): UNKNOWN@\($tip[0:8]) (triggered on tip, \($inflight) in flight, no completed run)\($sup)\($advwhy)\($pq)\($depth)"
         elif $lastDone != null then
-          "\(if $gates then cls($lastDone.conclusion) else "ADV" end)\t  \($adv)\($w): \(verdict($lastDone.conclusion))@\(($lastDone.head_sha // "none")[0:8]) (not triggered on tip)\(if $gates and (($lastDone.conclusion // "") != "") then $tipnote else "" end)\($advwhy)\($pq)\($depth)"
+          "\(if $gates then cls($lastDone.conclusion) else "ADV" end)\t  \($adv)\($w): \(verdict($lastDone.conclusion))@\(($lastDone.head_sha // "none")[0:8]) (\(if ($attip | length) > 0 then "tip run superseded" else "not triggered on tip" end))\($supAll)\(if $gates and (($lastDone.conclusion // "") != "") then $tipnote else "" end)\($newerLast)\($advwhy)\($pq)\($depth)"
         else
-          "\(if $gates then "UNADJ" else "ADV" end)\t  \($adv)\($w): UNKNOWN@none (no completed run on main in the \($n) examined)\($advwhy)\($pq)\($depth)"
-        end' < "$d/$id.json") \
+          "\(if $gates then "UNADJ" else "ADV" end)\t  \($adv)\($w): UNKNOWN@none (\(if $allSuperseded > 0 then "no CONCLUSIVE run on main in the \($n) examined (\($allSuperseded) superseded)" else "no completed run on main in the \($n) examined" end))\($advwhy)\($pq)\($depth)"
+        end end'
+    # ===== the newer-* annotation: resolve the request ========================================
+    # The prepass emits at most ONE tab-separated request per workflow, and only when the
+    # evidence CONTRADICTS the line. jq failing here costs the annotation and nothing else --
+    # the render pass below reports its own failure -- so it fails to an empty request file.
+    newerGp=""; newerLast=""
+    jq -r --arg tip "$tip" --arg w "$name" --arg state "$state" --arg probe "$gp" --argjson gprun "$gprun" \
+          --argjson prepass true --arg newerGp "" --arg newerLast "" "$rm_prog" \
+       < "$d/$id.json" > "$d/$id.newer" 2>/dev/null || : > "$d/$id.newer"
+    # The second CR carrier — see the strip on `query.tsv`. `nconc` is this file's last
+    # tab-separated field, and `success<CR>` misses the `success)` arm of the case below, so
+    # the CR does not mis-space the note, it RELABELS a green run red.
+    { tr -d '\r' < "$d/$id.newer" > "$d/$id.newer.lf" && mv -f "$d/$id.newer.lf" "$d/$id.newer"; } || :
+    while IFS=$(printf '\t') read -r nsite nfrom nto nev nconc; do
+      [ -n "$nsite" ] && [ -n "$nfrom" ] && [ -n "$nto" ] || continue
+      # DESCENT, not recency. `compare` is merge-base relative, so `ahead_by` is non-zero for a
+      # DIVERGED sha too; `status` is the only field that answers the ancestry question, and it
+      # is tested `= ahead` rather than `!= diverged` so that `behind` and `identical` are both
+      # refused. MEMOISED per (from, to) for the tick: workflows on one repo share stale shas.
+      # A FAILED call caches `call-failed`, which is not `ahead`, so it annotates nothing and
+      # is not retried -- an absent answer is never allowed to fall through into a descent.
+      ncache="$d/cmp.$nfrom.$nto"
+      if [ ! -f "$ncache" ]; then
+        if [ "$cmps" -ge "$cmpbud" ]; then cmpskip=$((cmpskip+1)); continue; fi
+        gh api "repos/$r/compare/$nfrom...$nto" --jq .status > "$ncache" 2>/dev/null \
+          || printf 'call-failed\n' > "$ncache"
+        cmps=$((cmps+1))
+      fi
+      [ "$(cat "$ncache" 2>/dev/null)" = "ahead" ] || continue
+      # SYMMETRIC, exactly as the tip-* note is: the label comes from the evidence run own
+      # conclusion, so newer-red prints as loudly as newer-green. The name states the POSITION
+      # of the run, never a verdict about the line it decorates.
+      case "$nconc" in
+        success)             nlab="newer-green" ;;
+        ""|skipped|neutral)  nlab="newer-other" ;;
+        *)                   nlab="newer-red" ;;
+      esac
+      [ -n "$nconc" ] || nconc="blank conclusion"
+      nnote=" [$nlab: $nev $nconc@${nto:0:8} — newer than this line sha, older than tip; observed, not adjudicating]"
+      case "$nsite" in
+        gp)   newerGp="$nnote" ;;
+        last) newerLast="$nnote" ;;
+      esac
+    done < "$d/$id.newer"
+    line=$(jq -r --arg tip "$tip" --arg w "$name" --arg state "$state" --arg probe "$gp" --argjson gprun "$gprun" \
+                 --argjson prepass false --arg newerGp "$newerGp" --arg newerLast "$newerLast" "$rm_prog" \
+              < "$d/$id.json") \
       || { qfail=$((qfail+1)); echo "  $name: UNKNOWN@none (jq failed on id $id — verdict withheld)$([ "$state" = unknown ] && printf ' [producer liveness UNKNOWN]')"; continue; }
+    # Same strip, command-substitution form: `$( )` eats the trailing newline and leaves the
+    # CR, so an un-stripped `line` ends every rendered verdict with one. `gprun` is exempt on
+    # purpose — it is spent as `--argjson`, where a trailing CR is legal JSON whitespace.
+    line=${line%$(printf '\r')}
     cls=${line%%$(printf '\t')*}; line=${line#*$(printf '\t')}
     case "$cls" in
       # A workflow with ZERO BASELINE runs on main has no verdict to hide, so it is accounted for
@@ -954,7 +2573,15 @@ Read coord's own honest view — no new observability:
   [ "$nb" -eq 0 ] || echo "  no-baseline ($nb — no baseline run on main to judge): ${nobase#, }"
 
   rm -rf "$d"
-  echo "  read: $qn workflow(s) queried, $qfail failed, $unadj unadjudicated, $adv advisory (non-gating), $probes gating probe(s), $((qn + probes + 4)) API calls issued"
+  # The measured budget rides the footer so its TREND is visible tick over tick — the whole
+  # point of instrumenting the tip reads. An UNKNOWN budget prints as UNKNOWN, never as blank
+  # and never omitted, so "no budget shown" can never be read as "budget fine".
+  if [ -n "${RM_BUD_REMAIN:-}" ]; then
+    budnote=", GitHub budget ${RM_BUD_REMAIN}/${RM_BUD_LIMIT:-?} left on '${RM_BUD_RESRC:-core}' after this repo (resets $(rm_reset_at))"
+  else
+    budnote=", GitHub budget UNKNOWN (no X-Ratelimit-Remaining header on the tip re-read)"
+  fi
+  echo "  read: $qn workflow(s) queried, $qfail failed, $unadj unadjudicated, $adv advisory (non-gating), $probes gating probe(s), $cmps descent compare(s)$([ "$cmpskip" -eq 0 ] || printf ' (+%s skipped, budget)' "$cmpskip"), $((qn + probes + cmps + 4)) API calls issued$budnote"
   # Non-zero whenever this repo is NOT fully adjudicated: any UNKNOWN line, any failed
   # per-workflow read, or a producer-liveness filter that did not run — matching the rule
   # below that a repo is never green while any line is UNKNOWN. Every withheld-verdict path
@@ -981,7 +2608,7 @@ Read coord's own honest view — no new observability:
     `--limit 100` is not a fix and never was: the corrupt read had 100 slots and spent them on
     two-week-old runs.
   - **Only `push` establishes a main baseline, and that is not this skill's opinion — it is coord's
-    shipped rule.** `qontinui-coord/src/ci_baseline.rs` defines
+    shipped rule.** `qontinui-coord/crates/coord/src/ci_baseline.rs` defines
     `fn establishes_main_baseline(event) -> bool { event == Some("push") }` with the comment:
     *"ONLY a `push` to `main` is per-commit main CI. Out-of-band runs — `workflow_dispatch`
     (manual diagnostics/runbook tools), `schedule` (maintenance), and `dynamic` (Dependabot) —
@@ -1014,7 +2641,10 @@ Read coord's own honest view — no new observability:
   - **The `e154036b` incident was a fresh `workflow_dispatch`, NOT a re-run — do not describe it
     as one.** Both runs are `run_attempt=1` (push `30878053349` `failure` 04:34:00Z; dispatch
     `30878692574` `success` 04:47:15Z), and **a GitHub re-run preserves `event: push`**, reusing
-    the run id and incrementing `run_attempt` — `ci_baseline.rs:1097` says the same. So
+    the run id and incrementing `run_attempt` — `crates/coord/src/ci_baseline.rs` says the same, in
+    its module doc (`git grep -n 'bumps .run_attempt' origin/main -- crates/coord/src/ci_baseline.rs`):
+    *"a re-run reuses its run id and only bumps `run_attempt`, and that re-run is the sanctioned
+    red-main remedy"*. So
     `?branch=main&event=push` never hid a re-run, and the "event filter hides the newer
     authoritative verdict" story is wrong. What actually happened is that the push run failed on a
     flaky `coord-db-tests` and someone fired a fresh dispatch instead of re-running it. By coord's
@@ -1086,11 +2716,87 @@ Read coord's own honest view — no new observability:
     interchangeable**, because a dispatch can run different jobs on different inputs (the three
     measured examples above). The annotation exists so a human can adjudicate that tradeoff with
     the facts in front of them. The tool refuses to adjudicate it for them.
+  - **The `newer-*` annotation — because the `tip-*` note above EVAPORATES on any unrelated push.**
+    Plan: `2026-09-06-stale-red-tip-green-annotation-evaporates-on-unrelated-push`. `$tipAlt`
+    requires `.head_sha == $tip`, so when `main` advances the corroborating evidence stops being
+    printed with **no change whatever in the condition it describes** — the line degrades from
+    *"RED, but proven green at the tip"* to a bare *"RED"*, and the next reader cannot tell it from
+    a live breakage. MEASURED on `qontinui-claude-config` `fleet-skill bundle parity`: the note was
+    present at tip `29162d71`, absent at tip `a519c67f` 16 minutes later, and the only intervening
+    commit touched a **command** file this workflow does not gate on.
+
+    ⚠️ **Do NOT "fix" this by widening `$tipAlt`.** Relaxing `.head_sha == $tip` to "the newest
+    completed non-push run at any sha" is the obvious one-liner and it re-creates the one-way
+    ratchet toward optimism rule 2 above forbids: a green run at an ANCIENT sha would then
+    decorate a fresh red. The tip scoping is correct on its own terms. What was missing is a
+    SECOND, honestly-labelled shape for the case the scoping cannot express.
+
+    So a line carrying an **adjudicated stale** verdict can now also carry
+    `[newer-green: schedule success@b2b2b2b2 — newer than this line sha, older than tip; observed, not adjudicating]`,
+    under the same five rules as the `tip-*` note (annotation only; symmetric — `newer-red` prints
+    as loudly, with `newer-other` for the benign non-passes; the event always named; completed
+    CONCLUSIVE runs only) plus **three of its own**:
+    1. **Admitted only on proven DESCENT.** `gh api repos/<r>/compare/<line-sha>...<evidence-sha>`
+       must read `status == "ahead"` — **exactly**. Not "newer by `created_at`": a timestamp says
+       nothing about branch topology and an abandoned or diverged sha must never corroborate.
+       Read `status`, not `ahead_by` — compare is merge-base relative, so a diverged sha reports a
+       non-zero `ahead_by` that is not descent. And test `== "ahead"`, never `!= "diverged"`:
+       `behind` and `identical` are the other two values and both must be refused. A FAILED call
+       caches `call-failed`, which is not `ahead`, so an absent answer can never fall through into
+       a descent — and it makes no claim in the other direction either.
+    2. **The call is issued only when the evidence CONTRADICTS the line**, and **memoised per
+       `(from-sha, to-sha)`** for the tick. Both are cost gates, not niceties: the population is
+       every adjudicated stale line, which this same file measures as roughly half a repo's
+       workflows at any moment. Without the contradiction gate `C` is the same order as `W`.
+       **And the annotation YIELDS to the budget.** The pre-flight gate budgets `2 * qn + 1` —
+       the reads a VERDICT needs — and these compares sit on top of it, so they are capped by
+       whatever remains after the mandatory reads and the reserve, never exceed `qn`, and are
+       **not issued at all when the budget is UNKNOWN**. Skips are counted and printed
+       (`0 descent compare(s) (+1 skipped, budget)`), because an annotation silently omitted is
+       indistinguishable from one that had nothing to say — which is the defect class this note
+       exists to close. Folding `C` into `need` instead would raise the affordability bar by up
+       to 50% and decline whole repos over a cost measured at 0–1 calls each.
+    3. **The gate is the SAME adjudicated-and-stale test `$tipnote` already uses — NOT "the line
+       carries a RED".** Restricting it to REDs looks like a cost saving and is an asymmetry: a
+       stale `GREEN@<older>` whose workflow has since produced a **failing** run at a descendant
+       sha would print nothing, while the mirror case still prints. Evidence that a condition has
+       BROKEN suppressed, evidence that it was FIXED shown — the same ratchet, arriving through
+       the cost gate instead of through `$tipAlt`. The label names the run's **position**, not the
+       verdict it decorates, which is why it is `newer-*` and not `post-red-*`.
+
+    **Severity, narrowed rather than inflated.** The decay is SELF-HEALING wherever the workflow
+    has an out-of-band cadence: the same ccfg line got its note back ~46 minutes later with no
+    intervention, because the workflow's ~1h `schedule` produced a fresh completed run AT the new
+    tip. So for a workflow WITH a cadence this is a legibility defect bounded by that interval —
+    real, because a steward iterating every 15 minutes reports the bare RED two or three times per
+    restoration, but not a blind spot. The population this is really for is a **path-filtered
+    workflow with NO out-of-band cadence at all**, where nothing will ever produce a fresh non-push
+    run at the new tip and the annotation, once dropped, never returns. ⚠️ That same self-healing
+    is what will make a hand-run verification of this look like a pass with the change reverted:
+    re-measure inside the window — after an unrelated push and BEFORE the next scheduled run
+    completes — or against a cadence-less workflow.
+
+    **Why not just re-fire the workflow.** `gh workflow run <wf> --ref main` produces a
+    `workflow_dispatch` run, which never adjudicates under the push-only baseline rule, so it buys
+    one iteration of tip-scoped legibility that decays again on the next unrelated push — for one
+    API call plus a CI run, forever.
+
+    **Implementation note, and it is load-bearing rather than incidental.** The annotation needs an
+    API call, and jq cannot make one — so the per-workflow jq program is bound to `rm_prog` and run
+    **twice**: once with `--argjson prepass true`, which emits the annotation REQUEST and nothing
+    else, and once to render the line with the resolved note in `$newerGp` / `$newerLast`. One
+    program, so the gates that emit a request and the gates that render a line cannot drift apart.
+    The three branch guards `$bGNE` / `$bGU` / `$bDead` are hoisted for the same reason. Fixtures:
+    `scripts/steward-red-main-throttle-fixtures-test.sh` arms `N1`–`N8`, covering all four
+    `compare` statuses, the failed call, the anti-vacuity control (a stale GREEN with a
+    contradicting red MUST annotate), the contradiction cost gate, and the memoisation.
   - **Candidate events are still narrowed first, and `branch=main` does NOT do it for you.**
     `deployment_status` and `dynamic` are never evidence: web's `Verify Frontend Deploy` is
     100/100 `deployment_status` (all `completed/skipped`), and `dynamic` on `qontinui/qontinui` is
     Dependabot `Graph Update` with 2 of 3 recent runs `failure`. Coord excludes `dynamic` at BOTH
-    ingest (`ci_baseline.rs:1074`) and read time after a live wedge — **qontinui-web 2026-06-05,
+    ingest (`is_dynamic_event`, called from the `workflow_run` ingest path —
+    `git grep -n 'fn is_dynamic_event' origin/main -- crates/coord/src/ci_baseline.rs`) and read time
+    (`is_one_shot_dynamic_workflow`) after a live wedge — **qontinui-web 2026-06-05,
     every green PR blocked until web #571 had to be admin-merged**. And `branch=main` matches
     `head_branch`, so it does not exclude a **fork PR opened from a branch named `main`**:
     `pytorch/pytorch` `Lint` (id `1316`) returns 92 `push` + 8 `pull_request` from forks, all
@@ -1182,12 +2888,68 @@ Read coord's own honest view — no new observability:
     genuine regression, because the vocabulary is derived from the run `conclusion` alone. Both
     stay RED here and both hold the train; the difference is only in the REMEDY, and it is
     settled at the step level — see “The `failure`-side discriminator is STEP-LEVEL”.
+  - **`gh api rate_limit` is a CONFIDENT WRONG ANSWER about the budget — the authority is the
+    response headers of a real request.** This is the load-bearing measurement behind the
+    budget instrumentation, and it reproduces in both the throttled and the healthy state.
+    Measured 2026-08-25 on this account, same token, both responses self-reporting
+    `X-Ratelimit-Resource: core`:
+
+    | | a real request | `GET /rate_limit` |
+    |---|---|---|
+    | throttled (22:19:46Z / 22:20:12Z) | 403, remaining **0**, used **5000**, reset 22:26:02Z | 200, remaining **4841**, used **159**, reset 22:23:34Z |
+    | recovered (~23:09Z, seconds apart) | remaining **4519**, used **481**, reset 23:26:20Z | remaining **4985**, used **15**, reset 23:23:50Z |
+
+    Different used, different remaining, and a **different reset instant** every time — in the
+    recovered sample `/rate_limit` under-reported consumption **32-fold** (15 vs 481). So it is
+    not merely *exempt from consumption*: **it answers about a bucket that is not the one
+    gating you**, and because it always reads near-pristine it can never warn. A steward that
+    preflights on it is told the budget is fine and walks into the wall — a non-empty,
+    well-formed value whose provenance cannot carry it, which is exactly the
+    unknown-must-not-render-as-a-default class this file polices everywhere else.
+    **The cause is NOT established** and this file does not assert one (a pooled or shared
+    credential resolving `/rate_limit` to a different identity is a candidate, not a finding);
+    what is established is the disagreement, three independent times. GitHub's own guidance
+    lands in the same place — *"When possible, you should use the rate limit response headers
+    instead of calling the API to check your rate limit"* — and adds two more reasons not to
+    poll it: it **does** count against the *secondary* limit, and **"there is not a way to
+    check the status of your secondary rate limit"** at all. Hence both tip reads use
+    `gh api -i`, which costs **no extra call** (the headers ride a response the function
+    already had to fetch) and, because `gh` prints the status line and headers before it
+    branches on the status code, is exactly what makes a **refusal** informative.
+  - **Lowering `RED_MAIN_PARALLEL` was the obvious fix for 2026-08-25 and it is the WRONG one
+    — deliberately rejected.** The refusal was a **primary** limit: `X-Ratelimit-Resource:
+    core`, `Used: 5000`, `Remaining: 0`, **no `Retry-After`**, and the primary-form message
+    body — and it struck `GET /user`, a plain non-Actions endpoint, so it was not an
+    Actions-specific limit either (Actions REST endpoints draw from `core`; the only
+    Actions-named bucket, `actions_runner_registration`, is for registering self-hosted
+    runners, and the documented per-repo Actions figure applies to `GITHUB_TOKEN` inside a
+    workflow, not to a user PAT). A primary bucket is **volume**-sensitive, not
+    rate-sensitive: the same fan-out at `-P 4` issues the same number of calls and exhausts
+    the same 5000, just slower. Confirmed by the incident itself — the 22:13:30Z retry at
+    `RED_MAIN_PARALLEL=4` failed on its **first** call. So parallelism stays at 12; the levers
+    that actually apply are the pre-flight budget gate and stopping the sweep. Parallelism
+    *is* the right lever for a **secondary** limit (GitHub's advice there is to make requests
+    serially, and its documented ceilings are concurrency- and per-minute-shaped: no more than
+    100 concurrent requests, no more than 900 points/minute to a single endpoint, where a
+    `GET` costs 1) — which is why the throttle line names the class before naming a remedy.
+  - **An empty second value is a FAILED READ, not a changed one.** The tip re-read used to
+    feed straight into `[ "$tip" = "$tip2" ]`, so a refused re-read (empty `tip2`) rendered as
+    `UNKNOWN — main moved mid-read (bd80272c -> )` — a confident wrong diagnosis that sent the
+    operator to look at a branch which had not moved. Fail-closed held throughout (UNKNOWN,
+    non-zero, verdict withheld), which is the only reason this cost an iteration rather than a
+    false green; the *reason* was invented, and the tell was in the output all along — the
+    arrow's right-hand side rendered **blank**. The empty case is now its own branch with its
+    own cause. Generalise it: this file already forbids a suppressed error becoming a
+    confident value, and a **confident diagnosis** is the same defect one level up. The same
+    correction applies to the first tip read, whose message asserted `(wrong default branch?
+    auth?)` — two guesses printed as a finding on a line that fires for every cause.
   - **`RED_MAIN_PARALLEL` (default 12) and `RED_MAIN_DEPTH` (default 10)** tune the fan-out width
     and how many runs per workflow are examined. Depth 10 is safe because the tip is the newest
     commit on `main`, so any at-tip runs are the newest rows in that workflow's own index —
     **depth can never hide an at-tip run**, it can only shorten the search for the newest
     *completed* one on the stale branch, and that case surfaces explicitly as
-    `UNKNOWN@none (no completed run on main in the N examined)` rather than as a green. The wider
+    `UNKNOWN@none (no completed run on main in the N examined)` rather than as a green — or, when the
+    only completed runs were superseded, `no CONCLUSIVE run on main in the N examined (M superseded)`. The wider
     baseline event set does not weaken that: `main` only moves forward, so any run created after
     the tip commit — `push`, `workflow_dispatch` or `schedule` alike — carries the tip as its
     `head_sha` and is still one of the newest rows. (Confirmed 2026-08-04 on web's `Backend CI`,
@@ -1198,6 +2960,90 @@ Read coord's own honest view — no new observability:
     `no-baseline` (labelled `[no baseline run in the N newest of <total>]`) instead of a verdict.
     Raise `RED_MAIN_DEPTH` if you need to see past a deploy-event-heavy workflow; the trade is a
     proportionally larger response per call, not more calls.
+    ⚠️ **Both are validated, and both were unvalidated for as long as they existed** — the guard
+    that `RED_MAIN_BUDGET_RESERVE` has always had covered only that one of the three. Each of
+    these two fails in its own way, and each failure below was reproduced against the SHIPPED
+    detector rather than reasoned about — with one boundary worth naming, since this section is
+    about not overclaiming: what was measured for `0` is that `xargs` accepts it and runs; that
+    `0` *means* unbounded is GNU's documented semantics for `-P`, cited, not measured here.
+    `RED_MAIN_PARALLEL=abc` makes `xargs -P` exit 1 with `invalid number "abc"` and run **zero
+    children**, which the fan-out's `|| true` errexit backstop then swallows — so the whole
+    fan-out is skipped and every workflow renders
+    `UNKNOWN@none (per-workflow runs read FAILED for id N)`, **a positive claim about a read
+    that was never attempted**, which is the one thing this detector may not print.
+    `RED_MAIN_PARALLEL=0` is worse because nothing errors at all: `xargs` accepts it and runs
+    (measured), and GNU documents `-P 0` as *run as many processes as possible* — so the
+    fan-out's width becomes **unbounded rather than off**, precisely the opposite of what the
+    SECONDARY rate-limit remedy above prescribes, reached by typing what reads as "off".
+    `RED_MAIN_DEPTH=abc` reaches `per_page=` on all `qn` fan-out URLs, spending an account-wide
+    budget the pre-flight gate has just approved on calls that cannot answer, under a header
+    printing `depth=abc` as though that were what was read.
+    So each is now rejected on **shape** — a whole number, at least 1 — and falls back to its
+    default. **The same pass closed the sibling hole it uncovered**, and closed it in two
+    places because it turned out to be two holes. `RESERVE` had carried the character class
+    alone, so it now carries a numeric test as well — spelled `-ge 0`, because zero is a legal
+    (documented, discouraged) reserve while a value the shell cannot compare is not a reserve at
+    all. But `9223372036854775807` passes **both**: it is all digits, and it compares fine. Its
+    damage is in the one **addition** the reserve reaches, `need + RESERVE`, which wraps
+    negative — so `remaining < negative` is false, the pre-flight gate declines nothing, and the
+    fence reads the repo on with the reserve effectively at zero, printing neither a decline nor
+    a NOTE. Measured through this fence. That half is caught at the **gate**, where `need`
+    exists to add, by detecting the wrap itself (a correct sum always exceeds a non-negative
+    `RESERVE`) rather than by inventing a ceiling — an enormous but non-wrapping reserve is left
+    alone, since "decline every repo" is something an operator may legitimately have asked for. Nothing is clamped to a ceiling: GitHub's own handling of an oversized `per_page`
+    is not measured here, and asserting a clamp on an unmeasured ceiling would be the same
+    overclaim in the other direction. **The rejection is printed**, naming the variable and the
+    value: unlike the reserve's, whose fallback is self-revealing in the decline message, these
+    two fall back invisibly behind a header showing the default, and a knob that ignores its
+    input in silence makes the tick read as evidence about the fleet when it is evidence about
+    the config. Pinned by `steward-red-main-throttle-fixtures-test.sh` cases `E11`–`E14`, of
+    which `E14` is the load-bearing one: valid non-default values must reach the header
+    unchanged, so a guard that rejected everything — turning a documented knob into a
+    decoration — cannot pass. `E13b` pins `DEPTH`'s numeric half specifically (neither
+    whole-guard mutation isolates it, because each reddens `E13` for a different reason), and
+    `E10c` pins the reserve's over-range door.
+  - **`RED_MAIN_BUDGET_RESERVE` (default 250)** is the third tunable, and it was undocumented
+    here for as long as it existed — a knob named in an operator-facing message
+    (*"plus the 250-call reserve"*) with nothing telling the reader it was theirs to turn. It
+    is the number of GitHub API calls the pre-flight gate holds back for OTHER consumers of
+    the same account-wide budget — coord's merge train, `/babysit-prs`, the runner, every peer
+    session — **not** a safety margin for this function, which budgets its own worst case
+    separately. A full fleet tick is ~113 calls across the watch set, so 250 is roughly two
+    ticks' headroom left for everyone else; at that setting the steward stops reading at ~5%
+    remaining, i.e. it goes blind slightly *earlier* than strictly necessary. That is the
+    deliberate direction: declining a repo it could just barely have finished is the cheap
+    error, half-reading it and starving coord is the expensive one. **Lower it only to buy one
+    more repo in a shortfall you are watching, and put it back** — a `0` makes this steward
+    the consumer that spends the fleet's last call. A non-integer value (an operator typo)
+    falls back to the default rather than reaching the arithmetic expansion below, where a
+    non-integer fails in **two different ways and neither is a clean error** (measured,
+    bash 5.2): `12abc` is a hard `value too great for base` error in every shell, aborting
+    the fleet's highest-severity detector mid-run; `not-a-number` tokenizes as three bare
+    *identifiers*, so under `set -u` it aborts as an unbound variable and **without `set -u`
+    it quietly evaluates to `0`** — silently disabling the reserve and handing coord and
+    every peer session a spent budget, with nothing printed. That last one is the dangerous
+    half and it depends on a shell option this fence does not control. The character-class test
+    closes those three, which is why it is not an attempt to parse a number — and a fourth,
+    an all-digit value the shell cannot **compare**, is closed by the `-ge 0` arm beside it
+    rather than by the class — and a fifth, one it can compare but cannot **add**, is closed at
+    the pre-flight gate instead. Both reasons are recorded at their sites.
+    Its fallback is now **named** as well, alongside the other two: it was correct from the day
+    it shipped and it was also silent, and the sentence that revealed it (*"plus the 250-call
+    reserve"*) only ever prints on the path that declines the repo.
+    ⚠️ **The RESERVE's three doors were each asserted where they REJECT and nowhere where
+    they ACCEPT** — `PAR` and `DEPTH` have had an accept-side witness since `E14` shipped, and the
+    reserve, which reaches the header nowhere, had none. That asymmetry is easy to miss precisely
+    because the rejection arms look like thorough coverage. Three fixtures close it, each measured
+    against a mutation rather than argued:
+    `E15` is the reserve's own `E14` — a budget that affords the read on `need` alone and not
+    once the reserve is added, so the reserve is the **only** thing that can decide the verdict
+    (before it, `+ RESERVE` could be deleted from the gate with all 143 assertions green).
+    `E10d` executes the `-ge 0` arm **itself**, which nothing did (`S7` now does too, under
+    `set -eu`): `E10a`/`E10b` stop at the
+    character class one test earlier, and `E10c`'s `INT64_MAX` **passes** this test and is
+    caught two hundred lines later at the gate — so the arm and its sentence were dead to the
+    suite on the day they shipped. `S7` drives `DEPTH`'s and `RESERVE`'s numeric arms under
+    `set -eu`, which `S6` reaches for `PAR` only.
   - **The class the shell routes on is OUT OF BAND.** `jq` emits `<class>\t<text>`
     (`ADJ` / `UNADJ` / `NB`), never a rendered line the shell has to re-parse. Classifying by
     matching the printed text would let a workflow *named* `no-baseline` route its own RED into
@@ -1210,6 +3056,15 @@ Read coord's own honest view — no new observability:
     path above. A **RED returns 0** — it is a definite verdict, and the RED line itself is the
     signal. So a caller must never wire `if RM_REPO=R red_main; then report_green` — exit 0 means "this
     repo was fully read", and the lines are what say whether it is green.
+    **`return 2` is a NARROWING of that non-zero, never a new success.** It means *not
+    adjudicated, because GitHub refused the read* — a rate-limit throttle, or a pre-flight
+    decline because the remaining budget could not cover the repo. Every existing caller that
+    treats non-zero as "not fully adjudicated" is correct unchanged; 2 exists so a caller that
+    *wants* to can tell "this repo is unreadable right now" from "this repo was read and has
+    UNKNOWN lines". **On a `2` whose line says PRIMARY exhaustion, STOP THE SWEEP** — the
+    budget is account-wide, so every remaining repo will fail identically, and GitHub warns
+    that continuing to call while limited can get the account banned. Report the unread repos
+    as UNKNOWN with the reset time; do not emit N identical UNKNOWNs by trying each one.
   - **The per-workflow `jq` program shares a HARD ~32KB argv budget with `--argjson gprun`, and
     overrunning it looks like a random regression somewhere else.** Both the program text and the
     probe run are passed on the jq command line; Windows caps the whole argv near 32768 bytes. A
@@ -1283,9 +3138,16 @@ Read coord's own honest view — no new observability:
     `[producer liveness UNKNOWN]` instead of silently reading its overflow workflows as deleted —
     over-exclusion is the failure mode that buries a real red, so it fails the other way. Fleet
     max today is web at 28.
-  - **Cost: `4 + W + P` API calls per repo.** `W` = workflows in the union set (tip, workflow
+  - **Cost: `4 + W + P + C` API calls per repo.** `W` = workflows in the union set (tip, workflow
     list, discovery window, tip re-read, then one per workflow); `P` = gating probes, which only
-    AMBIGUOUS workflows incur. The 2026-07-31 pre-probe census was web 32, runner 21, coord 14,
+    AMBIGUOUS workflows incur; `C` = **descent compares for the `newer-*` annotation**, which only
+    a line whose newest off-tip non-push run CONTRADICTS it incurs, memoised per `(from, to)` sha
+    pair for the tick. `C` is reported in the footer beside `P` rather than folded into it,
+    because the two are incurred by disjoint populations and a merged figure would hide which
+    one moved, and it is separately capped so it can never consume the budget the mandatory
+    reads need. It is expected to be **single digits fleet-wide and frequently 0** — the
+    contradiction gate is what keeps it there, and deleting that gate makes `C` the same order as
+    `W`, since roughly half a repo's workflows are adjudicated-and-stale at any moment. The 2026-07-31 pre-probe census was web 32, runner 21, coord 14,
     schemas 14, ui-bridge 14, qontinui 11 = 106 per fleet tick. Re-measured 2026-08-04 with the
     probe: **web 36 (P=4), runner 24 (P=3), coord 14 (P=0)** — coord pays nothing at all. Holding
     the three unmeasured repos at their old figures, that is **≥113 per fleet tick, ≥452/h against
@@ -1297,6 +3159,19 @@ Read coord's own honest view — no new observability:
     **14.4s / 44.2s / 47.5s**
     across three runs (P=1: 74.4s, P=6: 26.5s, P=20: 18.7s) — GitHub-side latency variance
     dominates, so treat the fan-out as tens of seconds per repo, not a fixed cost.
+    ⚠️ **The "≥9.0% of 5000/h" reading above is a SHARE, and a share is not headroom — do not
+    plan against it.** That percentage is this one function's own consumption on its own
+    census. The 5000/h is a **per-user budget shared by every tool, agent and session on the
+    account**: coord's merge train, `/babysit-prs`, every `gh pr`/`gh run` call any peer
+    session makes, and every other steward tick. `red_main` is one consumer among many and
+    cannot see the others' spend, so its own 9% says nothing about what is left.
+    **Measured 2026-08-25: the account hit `x-ratelimit-used: 5000` of 5000 — 100% — while
+    this census predicted 9%.** The number to reason about is therefore the **measured
+    remaining headroom at tick start**, which the tip read now reports in the footer, not any
+    share computed here. Both this figure and the `4 + W + P + C` formula stay because they are
+    still the right way to size *this* function; they were simply never a budget forecast.
+    ⚠️ The census figures above **predate `C`** and were never re-measured with it. `C` is
+    additive to every one of them, so read them as a floor for that reason as well.
   - **Why not a hybrid** (cheap windowed list as fast path, per-id verify only where the verdict
     would read stale)? Because the fast path can only skip a per-id call for a workflow that has
     a run **at the tip**, and measured across the fleet that is **18 of 82** workflows (web 7,
@@ -1326,6 +3201,26 @@ Read coord's own honest view — no new observability:
   had been red for 2.5h with PRs blocked; a land even occurred mid-red, which made the false
   verdict look confirmed. The operator had to point at the dashboard banner. **A "fleet healthy"
   claim without a per-repo red-main read is unsupported — do not make it.**
+
+  ⚠️ **Sweep the repos so the budget survives the sweep, and STOP the sweep on a primary
+  exhaustion.** The GitHub budget is per-account, not per-repo, so the repos read LAST are the
+  ones that go unadjudicated when it runs out — and the sweep order is arbitrary, so the repo
+  that loses its verdict is arbitrary too. Measured 2026-08-25: coord and runner were read
+  back to back, the account hit 5000/5000, and **`qontinui-web` — 21 open PRs, the most on the
+  fleet — got no red-main verdict at all**. Two consequences:
+  (a) **Read the repos that matter most first** — highest open-PR count, and any repo whose
+  train is already held — so a budget shortfall costs the cheapest verdict rather than a
+  random one. (b) **On a `red_main` exit of `2` whose line names PRIMARY exhaustion, stop.**
+  The budget is account-wide, so every remaining repo will fail identically; calling them
+  anyway buys N identical UNKNOWNs, starves coord and every peer session of the same budget,
+  and GitHub warns that continuing to call while limited risks the account. Report the unread
+  repos as UNKNOWN **naming the reset instant** from the throttle line, and read them next
+  tick. A SECONDARY throttle is the opposite case: back off the stated seconds, drop
+  `RED_MAIN_PARALLEL`, and continue — that one really is about burst, not budget.
+  **Neither is a green, and neither may be quietly omitted from the report:** a repo that was
+  never read is UNKNOWN, and an absent line must never read as OK — the same rule the detector
+  itself enforces per workflow, applied one level up at the sweep.
+
   Once red, classify before acting (see `reference_coord_infra_cancelled_job_reds_main_holds_train`):
   a **flake / infra-cancelled job** rolls up to workflow `failure` and self-heals on a CI RE-RUN
   (the unblock is a re-run, NOT a PR); a **genuine regression** needs a fix PR — but neither a
@@ -1349,9 +3244,26 @@ Read coord's own honest view — no new observability:
   OPTIONAL on GitHub's job object, and a bare `.steps[]` **aborts the whole jq program mid-stream**
   (`Cannot iterate over null`, exit 5) on exactly the **Tier 2** job this classification exists to
   catch — printing a partial list that reads like a complete one. That one is guarded executably:
-  `scripts/lint-command-frontmatter.py` **check #23** fails CI on the four static spellings of it
-  (`.steps[]`, `.steps | .[]`, `(.steps)[]`, `.["steps"][]`) under `.claude/`, `scripts/` and
-  `.agents/`. It bounds a hand-edit; it does not prove the property — a dynamically built path
+  `scripts/lint-command-frontmatter.py` **check #23** fails CI on the bracket-iteration spellings
+  of it under `.claude/`, `scripts/` and `.agents/` — twelve canonical ones (`.steps[]`,
+  `.steps | .[]`, `(.steps)[]`, `.["steps"][]`, `."steps"[]`, `.steps.[]`, `(.steps).[]`,
+  `.steps[ ]`, `.steps | .[ ]`, `.steps? []`, `.steps?[]`, `.steps?.[]`) plus their whitespace
+  variants. ⚠️ **The `?` ones are the trap worth knowing by hand: a `?` placed BEFORE the `[]` does
+  not save you** — it suppresses the field access and leaves the null to be iterated, so the filter
+  still exits 5 while *looking* null-safe. The `?` protects the iteration only when it lands AFTER
+  the brackets — `.steps[]?`, and equally `.steps[] ?` or `.steps | .[]?`, all of which the check
+  accepts alongside `(.steps // [])[]`.
+  ⚠️ **It guards `[]` iteration and nothing else, so a green CI run is NOT a proof this filter is
+  null-safe.** `steps` is just as null under `map`, `sort`, `keys`, `add`, `join`, `flatten`,
+  `group_by`, `to_entries`, `any`, `all`, `unique`, `sort_by` and `min_by` — all re-measured to
+  abort (jq 1.8.2), none guarded. (`first` and `last` were listed here on first shipping and are
+  **exit 0**: jq defines them as `.[0]` / `.[-1]`, and indexing a null yields null. `limit` and
+  `isempty` abort only in their real arities, where the array is iterated *inside* the call.)
+  The trap in *this* file is `map`: rewriting the projection above as
+  `steps: (.steps | map({name, conclusion}))` reads as a tidy-up, aborts identically on the
+  Tier-2 job, and CI stays green. Use `(.steps // [])` whenever you change how the array is
+  consumed, not only when you type brackets.
+  It bounds a hand-edit; it does not prove the property — a dynamically built path
   is invisible to it, `.github/workflows/` is outside its roots, and `per_page` and the projection
   have no spelling narrow enough to guard at all. Those stay a review concern. And `conclusion` is
   projected into the output because Tiers 1 and 2 below are keyed on `failure` while `cancelled`
@@ -1359,8 +3271,73 @@ Read coord's own honest view — no new observability:
   two you got.
 
   ⚠️ **Empty output is UNKNOWN, not “genuine failure”.** It means this run has no `failure` or
-  `cancelled` job at all — usually the wrong `run_id`, or a rollup whose red is somewhere else —
-  so go back and re-read the run's own conclusion before concluding anything about the code.
+  `cancelled` job at all — the wrong `run_id`, a rollup whose red is somewhere else, or the
+  **undispatched** run below — so go back and re-read the run's own conclusion before concluding
+  anything about the code.
+
+  ⚠️ **The third cause is the dangerous one, and the re-run reflex DESTROYS it: a run whose
+  jobs were NEVER DISPATCHED.** Predicate, all **three** together: the run is **`completed`** —
+  of ANY conclusion — and **every** job reads `status: queued` with `conclusion: null` and
+  **zero steps**. ⚠️ **The run-level conclusion is NOT one of the conjuncts.** It was until
+  2026-09-05, when this predicate read *“all four together: the run is `completed/failure`”*, and
+  that fourth conjunct made the class literally unrecognisable on a run that rolled up any other
+  way — which is how one sat undiagnosed for four steward ticks. The two conclusions MEASURED so
+  far are `failure` (`qontinui-web` runs `33817996523` / `33817996519`, 2026-09-04) and
+  **`startup_failure`** (`qontinui-coord` run `32984532063` on #1658's old head
+  `9d3c3f80fe23e201de556e7e67ab3e5c2aae56fe`, 2026-08-26 — its one job `Gitleaks Secret
+  Detection` read `queued`/`conclusion: null`/zero steps). Those are **instances, not the test**:
+  the next variant must be recognised by this predicate as written, without a third plan. That is
+  the same **allowlist-vs-denylist** lesson the arm-2 `rebase_block` row carries in the wedge-class
+  table below — key on the shape you can state, never on an enumeration of the values you have
+  happened to see — applied one predicate over.
+
+  **Why the rollup conclusion was never load-bearing:** the JOB shape carries the whole signal.
+  The tier table cannot see this class because all three tiers key on `conclusion == "failure"`
+  and these jobs have **no conclusion at all** — a consequence of the jobs never being
+  dispatched, and entirely independent of what the run rolled up to. So the filter above returns
+  empty while the run-level conclusion reads `failure`, or `startup_failure`, or anything else.
+  That combination reads as *“infra killed it, re-run it”* and it is the one case where that is
+  wrong.
+
+  **The executable twin — cite it, so prose and code cannot drift apart again.** coord already
+  ships this predicate in exactly job-shape-only form: `ci_baseline::all_failing_jobs_undispatched`
+  (`qontinui-coord` `crates/coord/src/ci_baseline.rs:949-979`), which tests `job_status ==
+  "queued"` (`:963`), `step_count == 0` (`:968`) and an absent-or-`"unknown"` conclusion
+  (`:973-976`), and reads **no run-level conclusion at all**.
+
+  **Do NOT re-run it. The re-run is one-way.** Measured 2026-09-04 on `qontinui-web`, twice, 45
+  minutes apart: runs `33817996523` (04:19Z) and `33817996519` (05:04Z) each went from
+  `completed/failure` — re-runnable — to permanently `queued` with `jobs=0` and `run_attempt`
+  still `1`; afterwards `POST .../cancel` answers `409` and `POST .../rerun` answers `403`, so
+  the run can never reach a conclusion again and its red is now immortal. Three sibling runs on
+  the same sha (`33817996512`, `33817996516`, `33817996522`) were deliberately left untouched and
+  were still `completed/failure`, still re-runnable, 2.5h later — that contrast is the evidence,
+  not the theory. Re-measured 06:47Z on `33817996512`: 6 of 6 jobs `queued`, `conclusion: null`,
+  zero steps, and the documented filter returns nothing.
+
+  ⚠️ **Whether a `startup_failure` run behaves the same under re-run is UNMEASURED — and it
+  must STAY that way.** Everything measured above was measured on `completed/failure` runs; the
+  only way to settle the other rollups is to manufacture a subject and risk making its red
+  immortal, and nobody should. So treat the one-way hazard as applying to the **whole undispatched
+  class regardless of rollup conclusion**. That is the conservative reading and it costs nothing,
+  because the remedy on every arm is the same one anyway — *wait for the head to move*.
+
+  **What to do instead:** classify it as UNDISPATCHED, leave the run alone, and treat the red as
+  clearing only when `main` next MOVES — a fresh push dispatches normally, and dispatch failure
+  is per-run rather than a capability outage (a diagnostic `workflow_dispatch` of an unrelated
+  workflow on the same repo completed `success` in ~30s while this class was live, which is what
+  rules the outage reading out). Say UNDISPATCHED in the ledger rather than “infra”, since the
+  remedies are opposite. ⚠️ **coord HAS this predicate — this line used to say *“coord has no
+  notion of this class either”*, and that is now FALSE.** `all_failing_jobs_undispatched` shipped
+  as coord `8f0eb501` and is wired into the main-baseline ingest at
+  `crates/coord/src/ci_baseline.rs:4009`. What is still missing is the WIRE, not the predicate:
+  that call site is conjoined on `conclusion == Some("failure")`, so a `startup_failure` run whose
+  jobs were all undispatched matches neither write-skip and coord still writes it as a conclusive
+  red baseline. The coord-side half is planned in
+  `2026-09-04-coord-undispatched-ci-run-reds-main-permanently` (its Phase 2 is
+  **qontinui-coord#1972, OPEN**); the `startup_failure` widening of that guard is being done by
+  `2026-09-04-undispatched-predicate-misses-startup-failure-and-coord-waits-forever` — the plan
+  that wrote this correction — which the sibling plan explicitly reserved for it by name.
 
   ⚠️ **A `cancelled` job the filter surfaces has NO row in the table below, and must not fall
   through it into “otherwise → genuine”.** The three tiers are all keyed on `conclusion ==
@@ -1423,13 +3400,18 @@ Read coord's own honest view — no new observability:
   that the PR's **required** checks were satisfied, since Tier 2 also admits an advisory-red rollup
   and a zero-CI repo. Coord's engine deliberately recomputes `head_ci_green`, "never inferred from
   tier ordering"; a steward must not make the inference the source itself declines.
-  ⚠️ **The recovery-waiver lane is INERT in prod — seeded ON and it never fires**, so never wait on
-  it: `is_recovery_candidate` needs `rebased_candidate_green`, whose only producer is
+  ⚠️ **The recovery-waiver lane still cannot be relied on — do not wait on it.**
+  `is_recovery_candidate` needs `rebased_candidate_green`, whose only producer is
   `pr_merge::engine::head_has_green_speculative_candidate` (a green `coord.speculative_chains` row,
-  fail-closed), and speculative candidate CI is OFF — `deploy/taskdef.json` sets
-  `COORD_SPECULATIVE_DISABLED="1"` against an inverted-sense read site (`!= Ok("0")`), so only the
-  literal `"0"` arms it. Coord says so itself: `fixer_arm_readiness::adjacent_breakages`, entry
-  `red_main_recovery_merge_lane_inert`.
+  fail-closed). Speculative candidate CI is ARMED in production since the arm PR of plan
+  `2026-07-25-coord-speculative-push-before-gate-churn` §8.4 step 6 (2026-09-03, qontinui-coord#1894): `COORD_SPECULATIVE_DISABLED` is now an
+  ordinary default-ON kill switch — `"1"` disables, unset arms, `deploy/taskdef.json` sets `"0"` —
+  so that producer CAN produce rows and the waiver is no longer inert BY THAT CAUSE. What remains
+  is the bootstrap gap plan `2026-08-20-coord-red-main-recovery-lane-is-inert` records: a
+  Tier-4-blocked PR never gets a proposal, so no chain is ever built for it. The
+  `fixer_arm_readiness::adjacent_breakages` entries `speculative_candidate_ci_disabled_in_prod` and
+  `red_main_recovery_merge_lane_inert` now derive their state from the live flag read rather than
+  asserting a prod value.
   ⚠️ **Yet a red main does NOT permanently deadlock its own fix, because main-red is checked ONLY
   in the predicate at ENQUEUE time and is never re-consulted at land.** The scheduler's land path
   carries no main-red gate — its one such read, `merge_scheduler::no_reap_land_precondition`,
@@ -1446,9 +3428,40 @@ Read coord's own honest view — no new observability:
   about whether a land is proceeding.
   Keep applying the label as human/agent signalling (coord's own fixer-dispatch prompt
   `next_step::build_red_main_fix_prompt` tells a spawned fix agent to apply it), but never "verify"
-  it as though it were the merge mechanism — and set it with `gh pr edit --add-label`, since
+  it as though it were the merge mechanism — and set it over the REST labels route,
+  `gh api -X POST repos/<owner>/<repo>/issues/<pr>/labels -f 'labels[]=coord:red-main-fix'`, since
   `pr_merge::labels_routes::validate_label` rejects it (that is the validator working, not another
-  broken lane).
+  broken lane) and `gh pr edit --add-label` cannot set it either — `gh pr edit` prefetches
+  `repository.pullRequest.projectCards` over GraphQL, GitHub refuses that under the Projects-classic
+  sunset, and it exits 1 **before** the label is applied (gh 2.46.0, reproduced 2026-09-04). Same
+  route and same reason as `.claude/skills/coord-pr-label/set-label.sh`.
+
+**The fixtures — run them, do not read them.** `bash scripts/steward-red-main-throttle-fixtures-test.sh`
+(this repo; its tracked `.sh` files are mode `100644`, so invoke through `bash`, never as a
+program). It extracts the `red_main` fence **out of this file**, located by the `red_main() {`
+marker rather than by line number or fence position, so it cannot go green over a copy that has
+drifted from what the harness injects — and a missing marker is a **harness failure (exit 2)**, not
+a green, because an empty extraction would make every arm below it pass vacuously. Hermetic:
+fixture HTTP responses under `mktemp -d` and a counting `gh` shim first on `PATH`; no network, no
+`gh` binary, no credentials, no fleet state.
+
+| Arms | What they hold |
+|---|---|
+| `A*` | `rm_throttle_report`'s classification, including the ordering that makes a 429 carrying `remaining: 0` read **SECONDARY**; and that `rm_err_msg` and `rm_reset_at` **never render blank** |
+| `E*` | `red_main` end to end: mostly over a refused read — both tip reads, the pre-flight gate at the boundary that separates the correct `2*qn + 1` from the `qn + 2` this gate shipped with, a garbage `RED_MAIN_BUDGET_RESERVE` — plus two healthy-tip arms (an instrumented 200 parses and hands a real sha forward; an UNKNOWN budget does not gate and does not render blank), and the **tunable guard** on all three of `RED_MAIN_PARALLEL` / `RED_MAIN_DEPTH` / `RED_MAIN_BUDGET_RESERVE` — including `E14`, the anti-vacuity control that fails if a valid non-default value is rejected; `E13b`, the witness that isolates `DEPTH`'s numeric half under `set -u` (`S7` is a second, under `set -eu`); and `E10c`, the reserve value that passes **both** halves of the guard and wraps in the gate's arithmetic; `E10d`, the uncomparable reserve that reaches the `-ge 0` test itself — the only arm that does so under `set -u`, `S7` being the one that does under `set -eu`; and `E15`, the pair pinning the reserve's **accepted** path — the only arms where a valid reserve is what decides the verdict. `E11`/`E12`/`E12b`/`E14` each pair their header assertion with the `-P` an `xargs` shim RECORDED: for the `0` and `00` halves, which are measured to error nowhere, that recording is the only non-header witness there is; and `E16`, the arm that reaches the fence's **second** `xargs -P "$PAR"` — the gating probe, which no arm executed until it, and which needs a fan-out COUNT and an all-invocations width because both spawners share one recorder |
+| `N*` | the **`newer-*` annotation**: the four values `compare` can return, tested `= ahead` so `behind` (`N3`) and `identical` (`N4`) are refused as firmly as `diverged` (`N2`) — a `!= diverged` implementation passes `N1`/`N2`/`N5` unchanged; the symmetry (`N6`, a stale GREEN whose newer evidence is RED, the only arm that reddens if the note is re-gated to lines already carrying a RED); the two cost properties (`N7`, contradiction-only, the only arm a fence calling unconditionally fails; `N8`, memoised per `(from, to)`); and the budget skip being REPORTED rather than silent (`N9`). `N10` is the **platform** arm: it runs the whole fence against a `jq` shim that emits CRLF, because jq's stdout is text-mode on Windows and the LAST tab-separated field of each jq-written TSV then reaches the shell with a `\r` — which does not mis-space the note, it makes `success` miss the `success)` label arm and prints `newer-red` over a green run. It shipped green on linux and red on `guard-roster-windows`, so a linux-only leg is not evidence for this class |
+| `S*` | the **shell-option contract** — the two instrumented tip reads, the two `if`-form dispatches, the zero-match guard on the workflow-id filter, and the tunable guard's `\|\| { … }` rejection arms — **all three of them**, across `S6` (`PAR`) and `S7` (`DEPTH` and `RESERVE`, whose arm returns rc **2** rather than 1) — driven under `set -eu` in a child shell. Six of the fence's **eight** errexit defences; the two `xargs` guards are declared uncovered there rather than counted. `S4` additionally asserts the fetch fan-out RAN — every other needle it carries is printed at or after the re-read, so all of them survive a fan-out that was skipped entirely, which is precisely what `E11` measures an unguarded `PAR` to cause — and `S1` the complement, that a refused tip read reaches **no** fan-out, so a repo whose tip could not be read costs no share of an account-wide budget. `S6` and `S7` follow the REPLACEMENT value — the one the guard substitutes for a rejected tunable — to the spawner and to the request under `set -eu`; every other needle they carry is something the guard itself printed, which is the shape a fence sanitising only its own output passes outright |
+
+⚠️ **Edit the fence and re-run it; the `S*` arms are why that is not a formality.** All three
+defects this suite found on its first run were in *shipped* code that four rounds of review had
+read as correct. The `set -e` hardness above was likewise restored by review alone, and **under
+`set -u` a reverted dispatch is byte-identical to the correct one** — same exit code, same text —
+so it is invisible to every other arm here. Under `set -eu` it loses the `cause:` line while `rc`
+stays `1`, and on the no-capture paths it returns **`2`** for a read that was merely unreadable —
+the exit this file defines as *"not adjudicated, because GitHub refused the read"*, answering the
+one question that exit exists to answer wrongly and silently. (It does **not** trip item 4's
+`STOP`, which is conditioned on a `2` *whose line names PRIMARY exhaustion*; the revert prints no
+line at all.)
 
 Build the per-PR + fleet snapshot. Then classify each signal against Tier 1; anything Tier 1
 cannot classify goes to Tier 2.
@@ -1457,25 +3470,252 @@ cannot classify goes to Tier 2.
 
 A rule table over the *remaining* wedge taxonomy (post-Phase-1/2). Each rule = detector →
 bounded, idempotent remediation (or escalate). **Reconcile this table with `/babysit-prs`
-Step 4d** (`babysit-prs.md:109-116`) — it is the same taxonomy keyed on the real
+Step 4d** (`.claude/commands/babysit-prs.md` → the step headed **"4d. Classify"**, whose
+table keys on `block_reason_code`; cite it by that name, **never by line number** — the two
+line-number pointers this paragraph and the *Stale read* row below used to carry both rotted
+the moment that file grew, and had come to land inside an unrelated step. Digits are omitted
+here deliberately, so this warning is not itself a hit for any future grep against that
+pattern) — it is the same taxonomy keyed on the real
 `block_reason_code` set; keep ONE source, don't let them drift. In `--mode=observe`, print
 the intended remediation and do nothing.
 
+⚠️ **The same rule now governs every citation into `qontinui-coord` in this file, and it had to
+be applied there the hard way.** This file used to point at `crates/coord/src/mcp/tools.rs`,
+`crates/coord/src/merge_scheduler.rs` and `crates/coord/src/ci_baseline.rs` by absolute line
+number. Re-verified against coord `origin/main` (`f8f84494`) on 2026-09-04, **eighteen of the
+nineteen had rotted** — `tools.rs` alone is a ~55,600-line file under continuous change, and a
+sibling worktree measured that week was 4,025 lines short of `main`, so a pointer into it decays
+within days. Only the `leader.rs` TTL pointer still resolved. **A rotted line number does not
+fail — it lands silently inside unrelated code and reads as a citation**: one of these had come
+to rest on a comment about `coord_skill`, another inside a different function entirely, and a
+reader who followed it found prose that neither confirmed nor denied the claim. Worse, the
+numbers were *hiding a claim that had gone false*: the `rebase_block` enum had grown a ninth
+member while this file still said eight, exactly the falsification its own next sentence
+predicted (see the **Already-landed empty-diff** row).
+
+**So: cite coord by SYMBOL, never by line number.** Every coord citation below names a token you
+can resolve for yourself from a coord checkout — the form is
+`git fetch origin main` then `git grep -n '<symbol>' origin/main -- <path>`, and the citations
+carry that command inline so the pointer re-resolves itself. A symbol that stops resolving is a
+LOUD failure that tells you the code moved; a line number that stops resolving is a silent one
+that tells you nothing. Structural facts that no single token names (the numbered `Phase`
+banners inside `recover_orphaned_proposals`, say) are cited by the enclosing function plus the
+banner text, on the same principle. If you add a coord citation to this file, add it in that
+form — and if a symbol grep returns a count that contradicts the prose (nine variants where the
+text says eight), **fix the prose, do not re-point the citation**: that mismatch is the only
+alarm this file gets, and it is worth more than the pointer. (No `file:NNNN` example appears in
+either of these two warnings, deliberately, so a grep for the pattern does not hit the warnings
+against it.)
+
 | Wedge class | Detector | Remediation (bounded, idempotent) |
 |---|---|---|
-| **Green-but-dirty** PR (behind main / needs rebase) | `mergeable_state=dirty`/`behind` or `freshness_next_action=rebase` + CI green. ⚠️ **A CLEAN `mergeStateStatus` does NOT rule out a coord rebase conflict — for one live PR class it asserts the OPPOSITE of the truth.** GitHub tests a **MERGE** (which trivially takes both sides); coord performs a **REBASE** (which replays commits). For a branch whose content already landed on `main` as a single squashed/verbatim commit, replaying its file-creating commit add/add-conflicts forever while the merge test stays clean. Measured on `qontinui-dev-notes#148` (2026-08-19): `gh pr view` reported `mergeable: MERGEABLE, mergeStateStatus: CLEAN` while coord held a **terminal `conflict`** on the same PR, stuck 30.8h. The decisive test is per-path **blob comparison** between the PR head and `origin/main` (`git rev-parse <head>:<path>` vs `git rev-parse origin/main:<path>`) — **`git cherry` also fails here**, because a squash landing destroys patch-id equivalence while preserving content equivalence: all 8 of #148's commits read `+` while the file was byte-identical at blob `32f17375`. A **second, independent** `git cherry` failure — the *merge-forward* shape, where the landed twins are pulled into the branch and so are excluded from cherry's comparison set — is measured in the **Already-landed empty-diff** row below. Neither is fixable: `git cherry` is not a land proof, in either direction. Anywhere below that triages on `mergeStateStatus`, read it as "GitHub's merge test passed", never as "coord can rebase this". | **CI-DURATION-AWARE — do NOT blind-rebase (that's the eager-churn trap).** (1) **Is it even yours to fix?** If the PR is merely *behind* main and coord's dry-rebase resolves it (no `could not apply`), LEAVE IT — coord auto-rebases the candidate at land; a manual rebase only resets CI to do coord's job. Only a TRUE textual conflict (`CONFLICTING` / `could not apply`, confirm via `git merge-tree`) needs hands. (2) **Gate the timing on the repo's candidate-CI p90** (from `coord_query_merge_economics`): **short-CI (p90 < ~30m) → resolve EAGERLY** (rebase in a worktree → re-verify → `--force-with-lease` → let coord land; re-resolution is cheap). **Long-CI (p90 ≥ ~30m; runner ~2h) → resolve JUST-IN-TIME, only when the PR is at/near the FRONT of the land queue** — a rebase resets a full ~2h CI and any sibling land re-dirties it, so resolving deep-in-queue = wasted CI (the churn tonight's audit measured: 82% of candidate CI wasted, 24/24 green). (3) **Overlapping cluster:** when several PRs conflict in the same files, STACK them (`coord:stacked-on=`) or land as a coord batch so they resolve ONCE, not N times. Never `gh pr merge` — coord is the merge authority once clean+green. Rebase mechanics = `/babysit-prs` Step 5 lever 3. |
-| **Already-landed empty-diff PR** (re-proposed forever) | `changedFiles=0` + non-draft, **or** `coord_pr_status` reports `merged_at`/`merge_commit` while `pr_state=open`. ⚠️ `mergeStateStatus` is a **dispatch hint here, not a gate** — an empty-diff PR reading `BLOCKED` or `UNKNOWN` still enters this row, because what authorises the close is the proof below, not GitHub's merge test. (Whether `CLEAN` genuinely holds on the ff-land shape is **UNSETTLED**: web#1033 read `BLOCKED`, but that read was taken *after* the close and a closed PR's `mergeStateStatus` is not a witness of its open-state value; a fleet sweep on 2026-08-24 found **no** open `changedFiles=0` PR in any of the seven repos, so there was nothing live to settle it against. Treat it as UNKNOWN, which is why it is not a gate.) | **Prove the merge is a NO-OP against the PR's REAL base, then close. Close iff P ∧ N ∧ V ∧ A; any read that errors is UNKNOWN → do not close, route to Tier 2.** ⚠️ **Ancestry is NOT a gate here — it is structurally unsatisfiable on the fleet's most common land shape.** A coord fast-forward land leaves the branch a *descendant* of `main`: it rebases the PR's commits onto a candidate, pushes the candidate tip straight to `main`, and the branch afterwards merges `main` back into itself. So `git merge-base --is-ancestor <head> origin/main` points the wrong way *by construction* and `git log origin/main..<head>` is non-empty *by construction* — not conservative, **unreachable**; no amount of waiting, re-fetching or re-polling will ever make them pass. Measured on `qontinui-web#1033` (2026-08-24): ancestry `exit=1`, `origin/main..head` = 6 commits, `changedFiles=0`, and the merge nonetheless a **proven no-op**. The claim this row used to carry — *"both shapes reach this row, and the three guards below hold for either"* — was **false**, and left open, the row *caused* the very re-cut-forever outcome it exists to prevent. Ancestry now counts as *evidence when it passes*, never as a gate. **P — preconditions, all mandatory.** (P1) Resolve the PR's **real** base — `gh pr view <n> --json baseRefName,headRefOid,isDraft,changedFiles,commits` — and compare against `origin/<baseRefName>`. ⚠️ **The hazard is the LOCAL CLONE, not the PR.** `baseRefName` is a bare branch name that the steward resolves as `origin/<name>` in whatever checkout it happens to be standing in, so a non-default base (or a stale sibling clone) proves a no-op against a same-named branch in the *wrong repo* — that is the D2 failure one level up. Check it where it lives: **`git remote get-url origin` must name the repo you are polling**, exit-status-checked, before any comparison. ⚠️ Do **not** reach for a `baseRepository` JSON field: **it does not exist** — measured 2026-08-25, asking gh for a `baseRepository` field returns `Unknown JSON field: "baseRepository"` and gh exits 1, which would abort this row's FIRST precondition on every PR and silently reproduce the very never-fires defect this rule replaced. The base-side field is `baseRefName` alone; `headRepository` / `headRepositoryOwner` / `isCrossRepository` are the repo-identity fields that do exist, and a PR's base repository is by construction the repo you passed to `-R`, so no PR field could ever disagree. `scripts/steward-empty-diff-fixtures-test.sh`'s **gate2** pins every `--json` field this row names against the real roster. (P2) `git fetch origin <baseRefName>`, **exit status checked** — a stale base is a measured false positive (fixture C5 reads `NOOP-PROVEN` against a stale base for a branch carrying a live deletion). (P3) `git fetch origin refs/pull/<n>/head:refs/tmp/pr<n>`, then `git cat-file -e` on **both** `origin/<baseRefName>^{commit}` and `<head>^{commit}`, both exit-status-checked — a hard prerequisite of N, not a courtesy: `git merge-tree` cannot distinguish an unreadable object from a conflict. (P4) Non-draft. (P6) **The payload must be IN THE TREE** — run the payload guard (inlined under **"The no-op probe"** below, as `scripts/merge-payload-guard.sh` in ccfg; use the **inlined** copy, since a relative path does not resolve from the polled repo's clone) and require exit `0`. N compares *trees*, so a PR whose payload is **not** a tree change is invisible to it and reads no-op while carrying work someone still intends to use. Two such shapes were **measured 2026-08-25, and P ∧ N ∧ V ∧ A all hold on both**: a **history-reconcile / back-merge** PR ("merge `release` into `main`" after the same content landed on `main` under a different sha) reads `commits=2, changedFiles=0, NOOP-PROVEN` — its payload is the **merge edge**, and closing it loses that edge, after which the next merge add/add-conflicts on byte-identical content (`rc=1 UU`), which is the wedge the Green-but-dirty row above documents; and a **marker PR** whose only commit is `git commit --allow-empty` (release marker, CI re-trigger) reads `commits=1, changedFiles=0, NOOP-PROVEN`. The guard refuses exactly two patterns and nothing else — *(a)* the head is a **merge commit whose first parent is already on the base**, and *(b)* **every** commit in `origin/<base>..<head>` is empty — both scoped to heads that are not already ancestors of the base. Measured non-refusals: web#1033 itself (`IN-TREE 6 tree-changing commits`), a single-commit rebase-landed PR (fixture C11), and the disclosed self-revert. A P6 refusal is **abort + escalate to Tier 2**, never a close. (P5) `git --version` ≥ 2.38, **checked in code, not asserted in prose** — an older git is **UNKNOWN → Tier 2**, and must never fall back to tree comparison (measured: that fallback decays within ~1h as `main` advances, and closes live work on any PR whose base is not the default branch). **N — the no-op proof.** `git merge-tree --write-tree origin/<baseRefName> <head>` exits **0** **and** its output equals `git rev-parse 'origin/<baseRefName>^{tree}'`. Both oids validated `^[0-9a-f]{40}` and non-empty **before** the equality test, which is never the first thing evaluated. Three exit codes, deliberately: `0` proven no-op, `1` proven **not** a no-op (conflict included), `2` **UNKNOWN** — and **`2` must never collapse into `1`**; only `0` may reach the close path. Runnable snippet + the exit-code and empty-string traps: **"The no-op probe"** immediately below this table. **V — anti-vacuity.** `gh pr view <n> --json commits` must return **≥ 1**. *Any* head that is an **ancestor** of the base makes N read no-op trivially — merging an ancestor into its descendant changes nothing — and that class holds both the legitimate sha-preserving ff-land **and** every unhydrated, emptied or stale-parked branch. **N cannot tell them apart.** V is what separates them *in the degenerate case*, and its discriminator is the commit count (#1033: `commits=6` with `changedFiles=0`; fixture C3's branch parked exactly at the base tip: `0`). ⚠️ **V is a test for "at least one commit object exists", NOT a hydration test — measured 2026-08-25, and the row used to overstate it.** An unhydrated branch carrying a single `--no-ff` merge-forward and no work at all reads `commits=1, changedFiles=0, NOOP-PROVEN` and sails straight through V (fixture C10); so does an empty-commit marker (C9). **P6 is what stops those**, not V. Keep V — it is still the only thing standing between this reflex and the `commits == 0` population, and it is exactly the conjunct a "simplifying" reviewer will delete — but do not credit it with more than the degenerate shape. **A — cross-source agreement.** GitHub's `changedFiles` must independently read `0`. It is redundant with N when everything is consistent, and that is the point: a different engine on different data. ⚠️ **Scope A's abort to the `changedFiles==0` population only.** GitHub *freezes* a landed PR's diff against its recorded base sha — measured 2026-08-24 on six merged web PRs (#1054/#1051/#1049/#1045/#1041/#1030): every one still reports `changedFiles` of 1..12 and `commits` of 1..3 **while its head IS an ancestor of `origin/main`**, i.e. while N reads no-op. N and `changedFiles` therefore disagree routinely and benignly, with nothing stale; an unscoped "any disagreement escalates" rule would fire on every landed PR on the fleet. **Within** the `changedFiles==0` population, a disagreement is an abort + escalate to Tier 2, never a close. **The close.** Re-read `headRefOid` immediately before `gh pr close` and abort if it moved since P1 — `gh pr close` has no compare-and-swap, and a force-push between the proof and the close is the one way this rule can close work that was live *at the moment of the close*. **NEVER `--delete-branch`**: that is a conjunct of the rule, not manners — it is what keeps a wrong close recoverable (every commit preserved, the PR reopenable) and it is what the asymmetry argument rests on. **The comment must state what was PROVEN, not what was assumed.** Cite base ref + base sha + base tree; head sha + the merged-tree oid from `merge-tree`; `changedFiles`; the commit count; and whatever land evidence was found — or, explicitly, *"none found — closed as a proven no-op, not as a land"*. The rule proves *"merging this PR into `<base>` changes nothing"*; it does **not** by itself prove *"this PR's work landed"*, and the honest generalisation is that **any PR whose payload is not in the tree** reads as a no-op. P6 refuses the two measured members of that class that carry real work when the graph permits (the trunk-side back-merge and the empty-commit marker). **Two survivors remain, and both are deliberately accepted** — do not restate this as "exactly one case", which is the mistake the pre-P6 rule made and which was measured false twice: *(i)* the **self-revert** (`add N.txt` then `git rm N.txt` reads no-op with `commits=2`) genuinely never landed and closes; *(ii)* the **release-side history-reconcile**, which is the same reconcile as the refused one with the merge's parents swapped and is therefore **graph-identical to web#1033 itself**, so no predicate can refuse it without refusing the case this row exists for (fixture C13 pins it). In both, the branch survives, `--delete-branch` is forbidden, and the honest-comment requirement is what tells the author why their PR closed — which is exactly why that requirement is load-bearing and not cosmetic. Never claim "already landed" blindly. **Land evidence is CITED, not REQUIRED** — under N ∧ V there is provably no content to lose, so it is not what authorises the close: collect `merge-base --is-ancestor` if it passes, per-commit `git patch-id --stable` twins reachable from the base, per-path blob comparison, `coord_explain_pr_close` / `close_cause` **keyed on the current head sha**. ⚠️ **Do NOT use `git cherry` here — measured false negative on this exact shape.** All four #1033 commits read `+` ("not upstream") while their `git patch-id --stable` values provably matched commits already on `main`. Cause: `git cherry <upstream> <head>` marks a commit `-` only if an equivalent patch turns up in **`<head>..<upstream>`** — commits on the upstream that are **not** reachable from the head. A merge-forward pulls `main` *into* the branch, so the landed twins become **ancestors of the head** and are excluded from that comparison set *by construction*; they can never be found there. ⚠️ Do not shorten this to "the set is empty": measured twice on #1033 — on 2026-08-24 with `main` still at the merge-base the set was indeed empty (all four `+` vacuously), and re-measured 2026-08-25 with `main` **6 commits ahead** the set was **non-empty** and all four *still* read `+`. Emptiness was an accident of timing; **twin-exclusion** is the durable mechanism, and it does not decay. This is **independent of** the squash-land limitation noted in the Green-but-dirty row above, and it fails in the dangerous direction: it *under-reports* landedness. Left open, coord re-cuts a candidate identical to main and re-runs full CI forever (observed on web#833/#836, 2026-07-23). Idempotent; not rate-limited. **Ledger it:** report `empty-diff candidates seen / closed / declined-with-reason` each cycle — this defect stayed invisible for weeks precisely because a Tier-1 row that *refuses* logs nothing and produces no wedge signal of its own. ⚠️ **NEVER close on the recorded `merge_commit`'s ancestry, and never on `changedFiles=0` alone.** `merged_at`/`merge_commit` come from `coord.repo_branches` keyed on `(repo, pr_number)` — a stamp about *a head that landed*, not about the head you are looking at — and coord's only invalidation fires on `pr_number IS DISTINCT FROM`, which by construction CANNOT fire when the same PR's head moves after a **partial ff-land**. Measured 2026-08-06 on runner#978: `merged_at=2026-08-05T18:49Z` + `merge_commit=be0d07fb` served against `pr_state=open`, where `be0d07fb` is genuinely an ancestor of main **and of the PR's own current head** — so an ancestry-keyed close PASSED while 2 commits (+277/-5) sat unlanded. That case is why the close is keyed on **N** (which reads NOT-NOOP there: merging those 2 commits changes the base) instead of on ancestry, and why **A** keeps `changedFiles=0` as an independent second engine. An unhydrated PR also reads `changedFiles=0` — that one is **V**'s job. (coord's own destructive sweep `phantom_open_candidates` already joins `rb.head_sha = mpr.head_sha` and is NOT affected — this reflex was the sole exposed consumer.) **Fixtures — run them, do not read them:** `bash scripts/steward-empty-diff-fixtures-test.sh` (qontinui-claude-config). Plan: `2026-08-24-steward-empty-diff-reflex-blind-to-ff-lands`. |
-| **Verified-green stuck** PR (train slow) | CLEAN + green + aged past the repo's *data-driven* `suggested_stuck_threshold_secs`, AND a **diagnosed coord defect** blocking autonomy | **Recovery-merge, NOT `--admin`.** `--admin` was observed failing 2026-07-04 ("required status checks expected") — a real observation, but the premise once recorded here to explain it ("bypass lists contain only `Integration:3825026`") is FALSE: measured 2026-07-29, the four `main-merge-gates` rulesets (runner, schemas, qontinui, ui-bridge) also carry `OrganizationAdmin` with `bypass_mode: always`; only coord/web/claude-config are App-only. Bypass lists differ per repo — re-read `bypass_actors` rather than restating a table. Whether `--admin` succeeds is untested by design; the steward's path is the deterministic one: rebase onto `origin/main`, required checks green on the up-to-date head, then plain `gh pr merge <n> --rebase`. **⚠️ Since PR #328 an agent CANNOT run that last command** — shared `.claude/settings.json` carries `deny: Bash(gh pr merge:*)`, which holds in every permission mode (`bypassPermissions` included), cannot be lifted by any local settings file or flag, and cannot be approved by a hook. So this row's recovery now ENDS at the hand-off: leave the audit trail (`/babysit-prs` Step 6 item 1), register a gate / escalate to the operator who holds the merge capability, and go to Tier 2 remediation. `--max-recovery-merges` is inert while the deny stands. Never route around it via `gh api .../pulls/N/merge` — `git-guard.sh` blocks that spelling too. |
-| **Conflicting PR gets NO new CI — coord parks it in `ci-pending` forever** | `/reevaluate` returns `block_reason_code: "ci-pending"` with **`input_freshness.ci_check_row_count: 0`**, and `GET repos/<r>/actions/runs?head_sha=<FULL 40>` returns `total_count: 0` — i.e. CI never fired even once. | **Check `mergeable` FIRST; this is not a separate defect.** A CONFLICTING PR gets **no new `pull_request` workflow runs at all** — GitHub cannot compute `refs/pull/N/merge`, so nothing is scheduled (not queued, not skipped). No runs ⇒ no check rows ⇒ coord waits for CI that can never arrive, and the PR shows **no FAILING checks**, so any sweep that counts only reds reads it as healthy. Measured 2026-08-24 across `qontinui-dev-notes`: 4 of 9 stuck PRs had `total_count: 0`. **Remedy: resolve the conflict — CI follows.** For a **MERGEABLE** PR whose CI simply never fired, `gh pr close <n> && gh pr reopen <n>` fires `reopened` and schedules it (no content change, no new commit, same head sha) — verified on dev-notes#153, green in ~20s, and it then let coord reach its real verdict (`[already-landed] — close this PR`). On a CONFLICTING PR the same close/reopen is a **no-op**: it succeeds and schedules nothing (verified on #203/#84/#78). Do NOT go hunting for disabled Actions or missing workflow files. ⚠️ Use the **FULL 40-char** sha on that query — a short sha returns a silent 200 with `total_count: 0` and fakes this exact symptom. |
+| **Green-but-dirty** PR (behind main / needs rebase) | `mergeable_state=dirty`/`behind` or `freshness_next_action=rebase` + CI green. ⚠️ **A CLEAN `mergeStateStatus` does NOT rule out a coord rebase conflict — for one live PR class it asserts the OPPOSITE of the truth.** GitHub tests a **MERGE** (which trivially takes both sides); coord performs a **REBASE** (which replays commits). For a branch whose content already landed on `main` as a single squashed/verbatim commit, replaying its file-creating commit add/add-conflicts forever while the merge test stays clean. Measured on `qontinui-dev-notes#148` (2026-08-19): `gh pr view` reported `mergeable: MERGEABLE, mergeStateStatus: CLEAN` while coord held a **terminal `conflict`** on the same PR, stuck 30.8h. The decisive test is per-path **blob comparison** between the PR head and `origin/main` (`git rev-parse <head>:<path>` vs `git rev-parse origin/main:<path>`) — **`git cherry` also fails here**, because a squash landing destroys patch-id equivalence while preserving content equivalence: all 8 of #148's commits read `+` while the file was byte-identical at blob `32f17375`. A **second, independent** `git cherry` failure — the *merge-forward* shape, where the landed twins are pulled into the branch and so are excluded from cherry's comparison set — is measured in the **Already-landed empty-diff** row below. Neither is fixable: `git cherry` is not a land proof, in either direction. Anywhere below that triages on `mergeStateStatus`, read it as "GitHub's merge test passed", never as "coord can rebase this". | **CI-DURATION-AWARE — do NOT blind-rebase (that's the eager-churn trap).** (1) **Is it even yours to fix?** If the PR is merely *behind* main and coord's dry-rebase resolves it (no `could not apply`), LEAVE IT — coord auto-rebases the candidate at land; a manual rebase only resets CI to do coord's job. Only a TRUE textual conflict (`CONFLICTING` / `could not apply`, confirm via `git merge-tree`) needs hands. **If this session does not own the branch, those hands are not yours** (`git-operations` `own-artifact-lifecycle`): run `/handoff-stuck-pr <owner/repo#N>` — plan `2026-09-06-fleet-scale-stuck-pr-conflict-handoff-protocol` — instead of resolving it, and let the author session or its coord-dispatched successor do it. ⚠️ **And one shape is neither a hard conflict nor coord's to resolve:** attempts climbing while coord's `last_error` text stays byte-identical is the merge-commit replay shape — see **Stranded conflicts that never converge** below. That one never converges on its own, so waiting is not a remedy. (2) **Gate the timing on the repo's candidate-CI p90** (from `coord_query_merge_economics`): **short-CI (p90 < ~30m) → resolve EAGERLY** (rebase in a worktree → re-verify (build + lint + format-check — see **Silent semantic conflicts** below; absence of `<<<<<<<` markers is NOT re-verified) → `--force-with-lease` (a push to the PR's branch: run `coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed" before and after it, re-testing the PRE-rebase head — a PR coord landed between polls, even one GitHub still shows OPEN, carries nothing, and the rebase then re-proposes landed commits) → let coord land; re-resolution is cheap). **Long-CI (p90 ≥ ~30m; runner ~2h) → resolve JUST-IN-TIME, only when the PR is at/near the FRONT of the land queue** — a rebase resets a full ~2h CI and any sibling land re-dirties it, so resolving deep-in-queue = wasted CI (the churn tonight's audit measured: 82% of candidate CI wasted, 24/24 green). (3) **Overlapping cluster:** when several PRs conflict in the same files, STACK them (`coord:stacked-on=`) or land as a coord batch so they resolve ONCE, not N times. Never `gh pr merge` — coord is the merge authority once clean+green. Rebase mechanics = `/babysit-prs` Step 6 item 2 (rebase in a worktree, `--force-with-lease`). |
+| **Already-landed empty-diff PR** (re-proposed forever) | **THREE ARMS — read all three; each later arm exists because the earlier ones cannot see a land shape the fleet actually produces.** **ARM 1 (`changedFiles==0`):** `changedFiles=0` + non-draft, **or** `coord_pr_status` reports `merged_at`/`merge_commit` while `pr_state=open`. ⚠️ **That second disjunct selects a population conjunct A can NEVER satisfy, and that population is ARM 3's.** `merged_at`/`merge_commit` served while `pr_state=open` is precisely the sha-rewriting land, and GitHub freezes such a PR's diff against its recorded base sha — so `changedFiles` stays NON-zero indefinitely and arm 1's proof can never complete. The disjunct **stays**: it still correctly admits the genuine `changedFiles==0` ff-land where A does hold (web#1033), and arm 3 is reached only when `changedFiles > 0`. When this disjunct admits a PR whose `changedFiles > 0`, do **not** decline it on A — fall through to arm 2's detector, then arm 3's. **ARM 2 (rebase-landed, FROZEN non-zero diff):** non-draft, **open**, `changedFiles > 0`, and **`coord_pr_status` serves EITHER member of a TWO-MEMBER ALLOWLIST — (i) `rebase_landable: false` together with `rebase_block == "already_landed"`, or (ii) `block_reason_code == "already-landed-by-content"`** (member (ii) added 2026-09-06; read the `block_reason_code` warning below before touching it). ⚠️ **Member (ii) does NOT come with `rebase_landable: false`, and requiring it there would make the member inert** — it is the merge PREDICATE's verdict, not the rebase classifier's. `BlockReason::AlreadyLandedByContent` (`git grep -n 'AlreadyLandedByContent' origin/main -- crates/coord/src/pr_merge/predicate.rs`) is raised by Guard 3 of `delivers_no_change_block` off `PrSnapshot::already_landed_proof_at_head`, whose own doc describes arm 2's population in coord's words: the proposal *"parks in `status='conflict'` and never reaches `merged`"* and *"this PR's `changedFiles` is NONZERO against its own base ref"*. Same proposal row as member (i), different code path, so the pair is one fact read twice — and **both members stay EQUALITIES**: the allowlist grew by one NAMED member, which is not the act of relaxing it into a denylist. `empty_candidate` still cannot satisfy either (Guard 3 keeps the detail only when `failure_class` classifies it `AlreadyLanded`), so C16's refusal is untouched. ⚠️ **Member (ii) has NO measured live card yet and NO fixture pin** — the suite's detector model reads `rebase_block` and `land_stamp` only and has no `block_reason_code` input at all, so nothing executable separates a correct member (ii) from a wrong one. That is a named follow-up, not coverage. Member (i) is the card's own expression of a terminally-failed proposal (the doc comment on `PrStatusCard`'s own `rebase_landable` field in `crates/coord/src/mcp/tools.rs` — `git grep -n 'pub rebase_landable' origin/main -- crates/coord/src/mcp/tools.rs` — reads *"`Some(false)` = **the LATEST PROPOSAL failed terminally** (see `rebase_block`)"*) whose cause is the already-landed marker. ⚠️ **Read "terminally" as scoped to the PROPOSAL, never to the PR — that is a THIRD independent reason `rebase_landable: false` alone is not this signal**, on top of the two present-tense arms named below. For `rebase_ci_failed` the proposal really did fail terminally and coord cut a fresh candidate ~17 minutes later unprompted (measured 2026-09-06 on `qontinui/qontinui-runner#1387`: card at ~03:02Z read `rebase_ci_failed` / `rebase_landable: false`, coord cut candidate `merge-candidate/01a074b8…` at 03:17:41Z with no human or agent action between). This steward printed *"coord holds `rebase_block: rebase_ci_failed`, so it will not land"* into an operator-facing ledger on exactly that misreading. **The card now answers it directly: `rebase_block_disposition`** (`git grep -n 'pub enum RebaseBlockDisposition' origin/main -- crates/coord/src/mcp/tools.rs`) — `coord_retries` | `author_acts` | `terminal` | `unknown`, `null` when `rebase_block` is `none`. Arm 2's population is `terminal` (`already_landed` and `empty_candidate` are its only two members, and only the first is admitted here); a `coord_retries` card is coord's own work in progress and is **never** an arm-2 close, whatever its `rebase_landable`. The disposition is a WHO-ACTS column, not a second detector: it does not widen or narrow either member of arm 2's allowlist, both of which stay EQUALITIES. ⚠️ **This conjunct used to read "coord holds the PR in its structured terminal `conflict` status", and that was wrong in two independent ways.** *Unobservable:* `conflict` is `coord.merge_proposals.status`, an INTERNAL column the card projects away — the `PrStatusCard` struct (`git grep -n 'pub struct PrStatusCard' origin/main -- crates/coord/src/mcp/tools.rs`) carries **no proposal-status field at all**, and `classify_rebase_block` CONSUMES the proposal status rather than storing it — it takes it as a bare `status: &str` parameter and returns only the triple `(rebase_landable, rebase_block, rebase_block_detail)` (`git grep -n 'fn classify_rebase_block' origin/main -- crates/coord/src/mcp/tools.rs`). A steward looking for a field equal to `"conflict"` finds none. *Too broad:* **six** classes are producible inside that single `"conflict"` arm — `merge_resolution_discarded`, `rebase_conflict`, `already_landed`, `empty_candidate`, `rebase_ci_failed`, `unknown` (the `"conflict"` arm of `classify_rebase_block`; resolve with the `git grep` above) — and only `already_landed` is arm 2's population. **This row used to say FIVE, omitting `merge_resolution_discarded`; that was measured false against coord `origin/main` on 2026-09-04.** Measured 2026-09-02: the detector as written matched nothing on four live arm-2 candidates, which were instead declined on conjunct **A** — arm 1's conjunct, structurally unsatisfiable here. ⚠️ **Each member of the test is an EQUALITY, i.e. the pair is an ALLOWLIST, and must stay one.** Member (i) is the `already_landed` equality argued here; member (ii) is the `already-landed-by-content` equality argued above, and the same reasoning governs both. `rebase_block` is a **nine**-member enum (`git grep -n 'pub enum RebaseBlock' origin/main -- crates/coord/src/mcp/tools.rs`): `none`, `base_not_default`, `conflicting_head`, `rebase_conflict`, `merge_resolution_discarded`, `rebase_ci_failed`, `already_landed`, `empty_candidate`, `unknown`. ⚠️ **This row said EIGHT until 2026-09-04, and predicted its own falsification in the next clause — coord duly added the ninth (`merge_resolution_discarded`) and the stale line number hid it.** That is the whole argument for the allowlist, now measured rather than reasoned: the ALLOWLIST survived a variant it had never heard of, and a denylist of "the classes to refuse" goes stale the moment coord adds a tenth, and two of the eight are traps a five-member mental model misses outright: `base_not_default` and `conflicting_head` are **present-tense** arms — Step 1 of `classify_rebase_block`, returning `RebaseBlock::BaseNotDefault` and `RebaseBlock::ConflictingHead` (`git grep -n 'RebaseBlock::BaseNotDefault' origin/main -- crates/coord/src/mcp/tools.rs`) **before** the proposal-derived ladder of Step 2, and outranking it, and **both also set `rebase_landable: Some(false)`** — so `rebase_landable: false` ALONE does **not** entail a terminal proposal and is not this signal. `already_landed` is by contrast reachable **only** from the `"conflict"` arm (`git grep -n 'RebaseBlock::AlreadyLanded' origin/main -- crates/coord/src/mcp/tools.rs` — exactly one CONSTRUCTION outside `#[cfg(test)]`, inside `classify_rebase_block`; the other non-test hit is a doc-comment reference to it, and the rest are that arm's own unit tests), so keying on it is strictly NARROWER than "terminal `conflict`", never broader. ⚠️ **`rebase_block: "empty_candidate"` is NOT admitted** — a sibling under that same terminal status whose own detail reads *"Do NOT close this PR on coord's say-so; a human must decide"* (the two `EMPTY_CANDIDATE_MARKER` detail strings in `crates/coord/src/merge_scheduler.rs` — `git grep -n 'EMPTY_CANDIDATE_MARKER' origin/main -- crates/coord/src/merge_scheduler.rs`; measured on `qontinui-coord#1664`, 2026-09-02). ⚠️ **TWO other fields on the same card are not this signal and will mislead you:** `blockers` (reads `["behind main"]` or `[]` across this population) and `merge_state_status` (GitHub's merge test — `BEHIND` or `CLEAN`); both were checked against the four live candidates on 2026-09-02 and neither carries the verdict. ⚠️ **That warning used to name a THIRD field — `block_reason_code` "(reads `none`)" — and the generalisation was FALSIFIED on 2026-09-06. The citation stays; the claim does not.** It did read `none` on those four candidates. On `qontinui-dev-notes#428` (`coord_pr_status`, `last_verified_at 2026-09-06T13:46:01.776242Z`, `confidence: fresh`) it read **`already-landed-at-head`**, so the field is a SECOND EXPRESSION of the already-landed fact rather than noise — and **which expression it is names the ARM**. `BlockReason::code` (`git grep -n 'fn code' origin/main -- crates/coord/src/pr_merge/predicate.rs`) carries three already-landed codes, one per guard of `delivers_no_change_block`, and they map one-to-one onto the three arms here: `empty-diff-already-landed` (Guard 1, `changedFiles` observed zero) → **arm 1**; `already-landed-by-content` (Guard 3, the parked-`conflict` proof, `changedFiles` nonzero) → **arm 2**, and it is member (ii) of the detector above; `already-landed-at-head` (Guard 2, `PrSnapshot::landed_at_current_head`) → **arm 3**. ⚠️ **Do NOT put `already-landed-at-head` in arm 2's allowlist.** Guard 2 is `gates::pr_has_merged_proposal_at_current_head` — a `merged` `coord.merge_proposals` row at the PR's EXACT current head — which is the SAME fact `land_stamp == "current_head"` reports through `merged_proposal_probe`'s `at_current_head`. Admitting it here pulls arm 3's whole population into arm 2 (arm 2's detector runs first) and onto a proof that requires B's VERDICT, which coord#1920 was measured to fail (`NOT-EQUIVALENT paths=5 identical=3`); and no fixture can catch that, because the suite's detector model has no `block_reason_code` input. The measured card: `pr_state: open`, `changedFiles: 3`, `commits: 1`, `merge_state_status: CLEAN`, `merged_at: 2026-09-06T13:45:57.832211Z`, `merge_commit: e31e7ed9994d64cc6cd5781b4c734c4cec539fe7`, `land_stamp: current_head`, `block_reason_code: already-landed-at-head`, `rebase_block: none`, `rebase_landable: true`, `blockers: []` — **arm 3's shape, on which arm 3's detector DOES fire; it is recorded as arm 3's third measured member below.** Arm 2's six conjuncts happened to pass on it as well (N `NOOP-PROVEN tree=c4d29d49f127e3301066402b1081f25d6e026478`, V `commits = 1`, P6 `IN-TREE 1`, B `EQUIVALENT paths=3 identical=3 base_existing=3`, A' `3 == 3`), **so this detector's miss cost a ROUTED close and never a wrong one — the failure direction was SILENCE**, which is the direction this row exists to police and the reason arm reach is ledgered rather than assumed. As before, **the structured enum only, never the `rebase_block_detail` TEXT** — and here the text is not merely unreliable but actively booby-trapped, since the `archived()` clause interpolates the raw proposal status into it (`git grep -n 'let archived = ' origin/main -- crates/coord/src/mcp/tools.rs`, whose two format strings both embed the status verbatim), so a substring search for `conflict` on the card hits exactly the two present-tense classes that must be refused. Fixtures C11 (admits), C15 / C16 (refuse the other eight) and C17 pin all of this; plan `2026-09-02-steward-arm2-detector-keyed-on-a-status-the-population-does-not-carry`. ⚠️ Arm 2's detector is a **COST FILTER and authorises nothing** — what authorises its close is P ∧ N ∧ V ∧ P6 ∧ B ∧ A' below. In particular, do **not** key it on coord's `[already-landed]` verdict TEXT: this same file records **"Believe coord's error TEXT last"** and two soaks in which the stored message named the wrong subsystem and sent the diagnosis hours astray. The text orders triage; the structured status is the filter. **ARM 3 (coord-landed, GitHub still OPEN — the population BETWEEN arms 1 and 2):** non-draft, **open**, `changedFiles > 0`, and `coord_pr_status` serves **`land_stamp == "current_head"`**. Evaluated **AFTER** arm 2's detector, so arm 2 keeps its population untouched; a PR matching both routes to **arm 2**, whose proof is the stronger one (fixture C22 pins that ordering, and an arm-3 branch inserted ABOVE arm 2's is exactly what it fails on). ⚠️ **The test is an EQUALITY on `current_head` — an ALLOWLIST over the five-member `LandStampScope` enum** (`git grep -n 'pub enum LandStampScope' origin/main -- crates/coord/src/mcp/tools.rs`; it carries `serde(rename_all = "snake_case")`, so the served values are `none`, `terminal`, `terminal_uncorroborated`, `current_head`, `superseded_head`) — and **never a denylist** such as `land_stamp != "superseded_head"`, for the same reason arm 2's `already_landed` equality must stay one. ⚠️ **That member count is COMMENTARY, not the contract — resolve it with the `git grep` above rather than trusting this line.** The `rebase_block` count one arm over read EIGHT for weeks after coord had already added a ninth, and the stale citation hid it; the EQUALITY is what survives a member this row has never heard of, which is exactly what happened there. ⚠️ **A card from an older coord that carries NO `land_stamp` field at all is UNKNOWN → Tier 2, never arm 3.** An absent field satisfies every denylist, so the denylist formulation would open this arm to the entire population it exists to exclude. Fixture C20 pins the absent field and C21 sweeps the four non-`current_head` values; together they are the direct analogue of C15/C16 for arm 2. ⚠️ **This is NOT the banned `merged_at`/`merge_commit` ancestry key, and that difference is the whole runner#978 lesson.** `LandStampScope::CurrentHead` has exactly ONE construction site outside `#[cfg(test)]` (`git grep -n 'LandStampScope::CurrentHead' origin/main -- crates/coord/src/mcp/tools.rs`), reachable only when the `at_current_head` field of `MergedProposalProbe` (`git grep -n 'struct MergedProposalProbe' origin/main -- crates/coord/src/mcp/tools.rs`) is `Some(true)`. `merged_proposal_probe` (`git grep -n 'fn merged_proposal_probe' origin/main -- crates/coord/src/mcp/tools.rs`) computes that from an `EXISTS` over `coord.merge_proposals` joined to `coord.merge_proposal_repos` with `p.status = 'merged'`, keyed on **its two bound parameters — the repo, and the PR's EXACT CURRENT head sha** (paraphrased on purpose: that query's own bind markers are dollar-digit sequences, which this file may not contain — see the gate under "The no-op probe"). Its own doc comment says the key is *"deliberately NOT on branch or pr_number"*, because a sha identifies a revision uniquely and the key *"survives the branch rename and the pr_number rebind that are exactly the events which break the other two keys."* So `current_head` asserts **coord's scheduler marked a proposal MERGED carrying THIS head** — a head-exact corroboration, not a reachability claim about some recorded commit. Those are different facts. ⚠️ **The fail-closed polarity is coord's, not the steward's.** If the probe cannot be evaluated (a PG error) `at_current_head` is `None`, which falls through to `SupersededHead`; `land_stamp_scope`'s doc block (`git grep -n 'fn land_stamp_scope' origin/main -- crates/coord/src/mcp/tools.rs`) states the intent directly — *"`None` fails to `SupersededHead`, not `CurrentHead`. The harmful direction on THIS surface is a false 'landed' on the PR the caller asked about, so we fail toward suppression."* — pinned by coord's own regression test `land_stamp_scope_corroboration_error_fails_to_superseded`. Arm 3 therefore inherits fail-closed behaviour without implementing it, and the ONE case it must still handle itself is the absent field above. ⚠️ **On this signal the steward was BEHIND COORD'S OWN TWIN, which is why arm 3 needs no coord change and is cheap.** `pr_status_blockers` (`git grep -n 'fn pr_status_blockers' origin/main -- crates/coord/src/mcp/tools.rs`) returns an EMPTY blocker list the moment `land_stamp` is `CurrentHead`, its comment calling that *"the legitimate phantom-open ff-land window … Treat it exactly like the terminal merged/closed arm above."* Coord already classifies this population as landed **by name** and already acts on that classification, while Tier 1 went on triaging with `changedFiles` and `rebase_block` — two fields that answer the question only by inference — and a purpose-built, head-exact field sat unread on the same card. The defect was never a missing signal; it was an **unconsumed** one. ⚠️ `mergeStateStatus` is a **dispatch hint here, not a gate** — an empty-diff PR reading `BLOCKED` or `UNKNOWN` still enters this row, because what authorises the close is the proof below, not GitHub's merge test. (Whether `CLEAN` genuinely holds on the ff-land shape is **UNSETTLED**: web#1033 read `BLOCKED`, but that read was taken *after* the close and a closed PR's `mergeStateStatus` is not a witness of its open-state value; a fleet sweep on 2026-08-24 found **no** open `changedFiles=0` PR in any of the seven repos, so there was nothing live to settle it against. Treat it as UNKNOWN, which is why it is not a gate.) | **Prove the merge is a NO-OP against the PR's REAL base, then close. Close iff P ∧ N ∧ V ∧ A; any read that errors is UNKNOWN → do not close, route to Tier 2.** ⚠️ **Ancestry is NOT a gate here — it is structurally unsatisfiable on the fleet's most common land shape.** A coord fast-forward land leaves the branch a *descendant* of `main`: it rebases the PR's commits onto a candidate, pushes the candidate tip straight to `main`, and the branch afterwards merges `main` back into itself. So `git merge-base --is-ancestor <head> origin/main` points the wrong way *by construction* and `git log origin/main..<head>` is non-empty *by construction* — not conservative, **unreachable**; no amount of waiting, re-fetching or re-polling will ever make them pass. Measured on `qontinui-web#1033` (2026-08-24): ancestry `exit=1`, `origin/main..head` = 6 commits, `changedFiles=0`, and the merge nonetheless a **proven no-op**. The claim this row used to carry — *"both shapes reach this row, and the three guards below hold for either"* — was **false**, and left open, the row *caused* the very re-cut-forever outcome it exists to prevent. Ancestry now counts as *evidence when it passes*, never as a gate. **P — preconditions, all mandatory.** (P1) Resolve the PR's **real** base — `gh pr view <n> --json baseRefName,headRefOid,isDraft,changedFiles,commits` — and compare against `origin/<baseRefName>`. ⚠️ **The hazard is the LOCAL CLONE, not the PR.** `baseRefName` is a bare branch name that the steward resolves as `origin/<name>` in whatever checkout it happens to be standing in, so a non-default base (or a stale sibling clone) proves a no-op against a same-named branch in the *wrong repo* — that is the D2 failure one level up. Check it where it lives: **`git remote get-url origin` must name the repo you are polling**, exit-status-checked, before any comparison. ⚠️ Do **not** reach for a `baseRepository` JSON field: **it does not exist** — measured 2026-08-25, asking gh for a `baseRepository` field returns `Unknown JSON field: "baseRepository"` and gh exits 1, which would abort this row's FIRST precondition on every PR and silently reproduce the very never-fires defect this rule replaced. The base-side field is `baseRefName` alone; `headRepository` / `headRepositoryOwner` / `isCrossRepository` are the repo-identity fields that do exist, and a PR's base repository is by construction the repo you passed to `-R`, so no PR field could ever disagree. `scripts/steward-empty-diff-fixtures-test.sh`'s **gate2** pins every `--json` field this row names against the real roster. (P2) `git fetch origin <baseRefName>`, **exit status checked** — a stale base is a measured false positive (fixture C5 reads `NOOP-PROVEN` against a stale base for a branch carrying a live deletion). (P3) `git fetch origin refs/pull/<n>/head:refs/tmp/pr<n>`, then `git cat-file -e` on **both** `origin/<baseRefName>^{commit}` and `<head>^{commit}`, both exit-status-checked — a hard prerequisite of N, not a courtesy: `git merge-tree` cannot distinguish an unreadable object from a conflict. (P4) Non-draft. (P6) **The payload must be IN THE TREE** — run the payload guard (inlined under **"The no-op probe"** below, as `scripts/merge-payload-guard.sh` in ccfg; use the **inlined** copy, since a relative path does not resolve from the polled repo's clone) and require exit `0`. N compares *trees*, so a PR whose payload is **not** a tree change is invisible to it and reads no-op while carrying work someone still intends to use. Two such shapes were **measured 2026-08-25, and P ∧ N ∧ V ∧ A all hold on both**: a **history-reconcile / back-merge** PR ("merge `release` into `main`" after the same content landed on `main` under a different sha) reads `commits=2, changedFiles=0, NOOP-PROVEN` — its payload is the **merge edge**, and closing it loses that edge, after which the next merge add/add-conflicts on byte-identical content (`rc=1 UU`), which is the wedge the Green-but-dirty row above documents; and a **marker PR** whose only commit is `git commit --allow-empty` (release marker, CI re-trigger) reads `commits=1, changedFiles=0, NOOP-PROVEN`. The guard refuses exactly two patterns and nothing else — *(a)* the head is a **merge commit whose first parent is already on the base**, and *(b)* **every** commit in `origin/<base>..<head>` is empty — both scoped to heads that are not already ancestors of the base. Measured non-refusals: web#1033 itself (`IN-TREE 6 tree-changing commits`), a single-commit rebase-landed PR (fixture C11), and the disclosed self-revert. A P6 refusal is **abort + escalate to Tier 2**, never a close. (P5) `git --version` ≥ 2.38, **checked in code, not asserted in prose** — an older git is **UNKNOWN → Tier 2**, and must never fall back to tree comparison (measured: that fallback decays within ~1h as `main` advances, and closes live work on any PR whose base is not the default branch). **N — the no-op proof.** `git merge-tree --write-tree origin/<baseRefName> <head>` exits **0** **and** its output equals `git rev-parse 'origin/<baseRefName>^{tree}'`. Both oids validated `^[0-9a-f]{40}` and non-empty **before** the equality test, which is never the first thing evaluated. Three exit codes, deliberately: `0` proven no-op, `1` proven **not** a no-op (conflict included), `2` **UNKNOWN** — and **`2` must never collapse into `1`**; only `0` may reach the close path. Runnable snippet + the exit-code and empty-string traps: **"The no-op probe"** immediately below this table. **V — anti-vacuity.** `gh pr view <n> --json commits` must return **≥ 1**. *Any* head that is an **ancestor** of the base makes N read no-op trivially — merging an ancestor into its descendant changes nothing — and that class holds both the legitimate sha-preserving ff-land **and** every unhydrated, emptied or stale-parked branch. **N cannot tell them apart.** V is what separates them *in the degenerate case*, and its discriminator is the commit count (#1033: `commits=6` with `changedFiles=0`; fixture C3's branch parked exactly at the base tip: `0`). ⚠️ **V is a test for "at least one commit object exists", NOT a hydration test — measured 2026-08-25, and the row used to overstate it.** An unhydrated branch carrying a single `--no-ff` merge-forward and no work at all reads `commits=1, changedFiles=0, NOOP-PROVEN` and sails straight through V (fixture C10); so does an empty-commit marker (C9). **P6 is what stops those**, not V. Keep V — it is still the only thing standing between this reflex and the `commits == 0` population, and it is exactly the conjunct a "simplifying" reviewer will delete — but do not credit it with more than the degenerate shape. **A — cross-source agreement.** GitHub's `changedFiles` must independently read `0`. It is redundant with N when everything is consistent, and that is the point: a different engine on different data. ⚠️ **Scope A's abort to the `changedFiles==0` population only.** GitHub *freezes* a landed PR's diff against its recorded base sha — measured 2026-08-24 on six merged web PRs (#1054/#1051/#1049/#1045/#1041/#1030): every one still reports `changedFiles` of 1..12 and `commits` of 1..3 **while its head IS an ancestor of `origin/main`**, i.e. while N reads no-op. N and `changedFiles` therefore disagree routinely and benignly, with nothing stale; an unscoped "any disagreement escalates" rule would fire on every landed PR on the fleet. **Within** the `changedFiles==0` population, a disagreement is an abort + escalate to Tier 2, never a close. **The close.** Re-read `headRefOid` immediately before `gh pr close` and abort if it moved since P1 — `gh pr close` has no compare-and-swap, and a force-push between the proof and the close is the one way this rule can close work that was live *at the moment of the close*. **NEVER `--delete-branch`**: that is a conjunct of the rule, not manners — it is what keeps a wrong close recoverable (every commit preserved, the PR reopenable) and it is what the asymmetry argument rests on. **The comment must state what was PROVEN, not what was assumed.** Cite base ref + base sha + base tree; head sha + the merged-tree oid from `merge-tree`; `changedFiles`; the commit count; and whatever land evidence was found — or, explicitly, *"none found — closed as a proven no-op, not as a land"*. The rule proves *"merging this PR into `<base>` changes nothing"*; it does **not** by itself prove *"this PR's work landed"*, and the honest generalisation is that **any PR whose payload is not in the tree** reads as a no-op. P6 refuses the two measured members of that class that carry real work when the graph permits (the trunk-side back-merge and the empty-commit marker). **Two survivors remain, and both are deliberately accepted** — do not restate this as "exactly one case", which is the mistake the pre-P6 rule made and which was measured false twice: *(i)* the **self-revert** (`add N.txt` then `git rm N.txt` reads no-op with `commits=2`) genuinely never landed and closes; *(ii)* the **release-side history-reconcile**, which is the same reconcile as the refused one with the merge's parents swapped and is therefore **graph-identical to web#1033 itself**, so no predicate can refuse it without refusing the case this row exists for (fixture C13 pins it). In both, the branch survives, `--delete-branch` is forbidden, and the honest-comment requirement is what tells the author why their PR closed — which is exactly why that requirement is load-bearing and not cosmetic. Never claim "already landed" blindly. **Land evidence is CITED, not REQUIRED — IN ARM 1** (⚠️ **arm 2 promotes one item of this list, per-path tree-entry comparison, to a REQUIRED conjunct — see B below.** The scoping is the reconciliation: in arm 1 conjunct A already supplies the cross-source engine, so the blob check is corroboration; in arm 2 A is unsatisfiable, so the same signal is made to carry weight it does not carry here. Two rules, one scope each — not a contradiction) — under N ∧ V there is provably no content to lose, so it is not what authorises the close: collect `merge-base --is-ancestor` if it passes, per-commit `git patch-id --stable` twins reachable from the base, per-path tree-entry comparison, `coord_explain_pr_close` / `close_cause` **keyed on the current head sha**. ⚠️ **Do NOT use `git cherry` here — measured false negative on this exact shape.** All four #1033 commits read `+` ("not upstream") while their `git patch-id --stable` values provably matched commits already on `main`. Cause: `git cherry <upstream> <head>` marks a commit `-` only if an equivalent patch turns up in **`<head>..<upstream>`** — commits on the upstream that are **not** reachable from the head. A merge-forward pulls `main` *into* the branch, so the landed twins become **ancestors of the head** and are excluded from that comparison set *by construction*; they can never be found there. ⚠️ Do not shorten this to "the set is empty": measured twice on #1033 — on 2026-08-24 with `main` still at the merge-base the set was indeed empty (all four `+` vacuously), and re-measured 2026-08-25 with `main` **6 commits ahead** the set was **non-empty** and all four *still* read `+`. Emptiness was an accident of timing; **twin-exclusion** is the durable mechanism, and it does not decay. This is **independent of** the squash-land limitation noted in the Green-but-dirty row above, and it fails in the dangerous direction: it *under-reports* landedness. Left open, coord re-cuts a candidate identical to main and re-runs full CI forever (observed on web#833/#836, 2026-07-23). Idempotent; not rate-limited. **Ledger it:** report `empty-diff candidates seen / closed / declined-with-reason` each cycle — this defect stayed invisible for weeks precisely because a Tier-1 row that *refuses* logs nothing and produces no wedge signal of its own. ⚠️ **NEVER close on the recorded `merge_commit`'s ancestry, and never on `changedFiles=0` alone.** `merged_at`/`merge_commit` come from `coord.repo_branches` keyed on `(repo, pr_number)` — a stamp about *a head that landed*, not about the head you are looking at — and coord's only invalidation fires on `pr_number IS DISTINCT FROM`, which by construction CANNOT fire when the same PR's head moves after a **partial ff-land**. Measured 2026-08-06 on runner#978: `merged_at=2026-08-05T18:49Z` + `merge_commit=be0d07fb` served against `pr_state=open`, where `be0d07fb` is genuinely an ancestor of main **and of the PR's own current head** — so an ancestry-keyed close PASSED while 2 commits (+277/-5) sat unlanded. That case is why the close is keyed on **N** (which reads NOT-NOOP there: merging those 2 commits changes the base) instead of on ancestry, and why **A** keeps `changedFiles=0` as an independent second engine. An unhydrated PR also reads `changedFiles=0` — that one is **V**'s job. (coord's own destructive sweep `phantom_open_candidates` already joins `rb.head_sha = mpr.head_sha` and is NOT affected — this reflex was the sole exposed consumer.) **ARM 2 — the rebase-landed frozen-diff close. Close iff P ∧ N ∧ V ∧ P6 ∧ B ∧ A'; any read that errors is UNKNOWN → do not close, route to Tier 2.** ⚠️ **Conjunct A is STRUCTURALLY UNSATISFIABLE here** — the same class of unreachability ancestry has on the ff-land shape, one conjunct over. GitHub freezes a PR's diff against its *recorded base sha*, so a PR whose content landed under a rewritten sha keeps reporting its pre-land file count **indefinitely**. This row already knew GitHub freezes landed diffs (the six merged web PRs cited under A) and used the fact only to scope A's abort — it never asked what happens when a frozen-diff PR is still **OPEN**, and the answer is that the reflex cannot see it at all. Measured on `qontinui-schemas#144` (2026-08-29; re-measured 2026-09-01 after `main` advanced six commits, verdicts unchanged): open 106h, coord `conflict` ~22h re-proposing `[already-landed] nothing to land`, `changedFiles=13 commits=1 mergeState=CLEAN`, ancestry `rc=1`, N `NOOP-PROVEN`, P6 `IN-TREE 1`, and all 13 of the PR's own files byte-identical to `origin/main`. Every signal except the frozen `changedFiles` said landed; that one dissenting signal is exactly what A is keyed on. Closed by hand on this evidence, branch deliberately preserved. **P, N, V, P6 — unchanged, but NOT boilerplate.** ⚠️ **P1's `git remote get-url origin` identity check and P2/P3's exit-status-checked fetches are LOAD-BEARING in arm 2**, because B compares against `origin/<baseRefName>` in whatever clone you are standing in and A is not there to catch a wrong or stale one. A stale base is already a measured false positive for N (fixture C5); it is the same false positive for B. **B — per-path tree-entry equivalence (mode, type and blob id), arm 2 only.** Run the inlined `merge-blob-equivalence` snippet (under "The no-op probe") and require exit `0`. It takes the path set from `git merge-base origin/<baseRefName> <head>` — **not** a two-dot diff from `origin/<baseRefName>`, which would also list every path the *base* changed and so refuse every PR on a moving base — and requires every path's tree ENTRY at the head (`git --literal-pathspecs ls-tree <head> -- <path>`: mode, type and blob id) to equal its entry at `origin/<baseRefName>`, the set to be **non-empty** (an empty set is arm 1's `changedFiles==0` population and the snippet routes it there as `NOT-ARM2`), and **at least one compared blob to exist in the base**, so an all-absent read from a wrong clone can never pass as "identical everywhere". ⚠️ **B is not a second SOURCE** — it is git again over the object store N already read — and it **decays toward REFUSAL** as `main` evolves the PR's paths, so a `NOT-EQUIVALENT` is *"arm 2 cannot prove this one"* and never *"the work did not land"*. Both points are argued in full beside the snippet. **A' — cross-source cardinality agreement, arm 2's replacement for A.** GitHub's `changedFiles` must be non-zero (the detector already requires it) **and equal the `paths=` count B printed**. A mismatch is abort + escalate to Tier 2, never a close — exactly how A's abort is scoped inside the `changedFiles==0` population. Measured on schemas#144: `changedFiles=13`, B `paths=13`. Re-measured 2026-09-01 after six `main` commits: still `13 == 13`. Weaker than A (a count, not a count against zero) and deliberately kept anyway: it is the only conjunct in arm 2 computed by a different engine on different data, and it is what makes the P1/P2/P3 promotion above a belt rather than the only strap. **The close is identical to arm 1's** — re-read `headRefOid` immediately before `gh pr close` and abort if it moved; **NEVER `--delete-branch`**; and the comment states what was PROVEN: base ref + base sha, head sha, N's merged-tree oid, B's `paths=`/`identical=`/`base_existing=` line, GitHub's `changedFiles`, the commit count, and — because arm 2 exists precisely where ancestry and `changedFiles` both read against it — an explicit note that **arm 1 does not apply and why**. **ARM 3 — the coord-landed, GitHub-still-open close. Close iff P ∧ (N ∨ (M ∧ A''')) ∧ V ∧ P6 ∧ L ∧ L' ∧ A''; any read that errors is UNKNOWN → do not close, route to Tier 2.** ⚠️ **This is the population BETWEEN arms 1 and 2 — admitted by arm 1's DETECTOR, unprovable by arm 1's PROOF, unadmitted by arm 2's DETECTOR, so NO ROW OWNED IT.** Conjunct A is structurally unsatisfiable here for exactly the reason it is in arm 2 (GitHub freezes a landed PR's diff against its recorded base sha, so this population reports its pre-land file count indefinitely), and that is true of **every** PR arm 1's `merged_at`-while-open disjunct admits, because that disjunct selects precisely the sha-rewriting land. Arm 2 cannot reach it either: arm 2's detector selects on *"coord is STUCK"* — `rebase_block == "already_landed"`, reachable only from a terminally-failed `"conflict"` proposal — and here coord **SUCCEEDED**, recorded the land, and has no failed proposal left to classify. Measured on `qontinui-coord#1920` (2026-09-04): `pr_state="open"`, `merged_at="2026-09-04T15:09:08Z"`, `merge_commit="f8f84494…"` which IS `main`'s own tip, `land_stamp="current_head"`, `rebase_block="none"`, `rebase_landable=true`; N `NOOP-PROVEN`, P6 `IN-TREE 2`, V `commits=2`, ancestry `rc=1` (uninformative, as always on this shape). It was closed **BY HAND** because no arm could classify it, and the `EMPTYDIFF` ledger had to record the close as having happened OUTSIDE the reflex. **A second live instance, `portofino-pizzeria/mobile#4` (measured 2026-09-05T20:42Z)**, also closed by hand as arm 3 before this arm shipped: `land_stamp=current_head`, `merge_commit=0447cdbf…` (GitHub's own compare of that sha against `main` reads `identical` — it IS main's tip), `merged_at=2026-09-05T17:02:09Z`, `rebase_block=none`, `rebase_landable=true`, `block_reason_code=already-landed-at-head`, `changedFiles=26`; N `NOOP-PROVEN`, P6 `IN-TREE 9`, V `commits=9`, ancestry `rc=1`. **A third, `qontinui-dev-notes#428` (measured 2026-09-06T13:46:01.776242Z, `confidence: fresh`)**, also closed by hand: `land_stamp=current_head`, `merge_commit=e31e7ed9994d64cc6cd5781b4c734c4cec539fe7` (on `origin/main`, `committer=qontinui-coord`, 2026-09-06T13:44:31Z), `merged_at=2026-09-06T13:45:57.832211Z`, `rebase_block=none`, `rebase_landable=true`, `block_reason_code=already-landed-at-head`, `changedFiles=3`; N `NOOP-PROVEN`, P6 `IN-TREE 1`, V `commits=1`, B `EQUIVALENT paths=3 identical=3 base_existing=3`. **All three members of this population carry `block_reason_code=already-landed-at-head`** — corroboration for arm 3's `land_stamp` equality, never a substitute for it, and never a member of arm 2's allowlist. **P, N, V, P6 — unchanged, and NOT boilerplate.** ⚠️ **P1's `git remote get-url origin` identity check and P2/P3's exit-status-checked fetches are LOAD-BEARING here for the same reason they are in arm 2** — L' compares against `origin/<baseRefName>` in whatever clone the steward is standing in, and A is not present to catch a wrong or stale one. N remains the proof that merging changes nothing — but in arm 3 it is only ONE disjunct of **(N ∨ M)**, because N decays once `main` rewrites the PR's own lines (see **M** below); V remains the only guard against the `commits == 0` population; P6 remains the only guard against the back-merge and empty-commit-marker shapes. **L — head-exact land corroboration, and THE authorising conjunct.** `coord_pr_status` must serve `land_stamp == "current_head"` as the structured-enum EQUALITY argued in the detector cell, **and** a `merge_commit` that is non-null and is 40 lowercase hex characters. L is what makes this arm sound; every other conjunct only narrows it. **L' — local reachability, the SECOND ENGINE, and NEVER a substitute for L.** In the polled repo's clone, both of these must hold, each **exit-status-checked**: `git cat-file -e <merge_commit>^{commit}`, then `git merge-base --is-ancestor <merge_commit> origin/<baseRefName>`. Three exit codes as everywhere on this path — `0` proven, `1` proven-refused, `2` UNKNOWN — and **`2` must never collapse into `1`**: an unreadable object or an unresolvable base is `2`, never `1` (`git merge-base --is-ancestor` returns 128 on a bad rev, as the payload guard already documents; discriminate BY EXIT CODE, never by "non-zero"). ⚠️ **L' IS the ancestry check this row bans, and it is admissible ONLY downstream of L.** On runner#978 the recorded `be0d07fb` genuinely **was** an ancestor of `main`, so **L' would have PASSED there** while 2 commits (+277/-5) sat unlanded — an arm keyed on L' alone is precisely the rule that closed live work. What refuses runner#978 is **L**, and independently **N**. *At the detector:* its head had moved past the stamp, so the probe's `at_current_head` reads `Some(false)`, `land_stamp_scope` falls to `SupersededHead`, and `merged_at`/`merge_commit` are **nulled out of the top-level card fields** and relocated to `superseded_land` (`git grep -n 'fn apply_land_stamp_scope' origin/main -- crates/coord/src/mcp/tools.rs`); coord's own regression test for that shape is named `land_stamp_scope_open_without_matching_proposal_is_superseded`, and the ADMITTING case is pinned by its neighbour `land_stamp_scope_open_with_proposal_at_current_head_serves_stamp`. *At the proof:* even with the detector wrong, **N reads NOT-NOOP on runner#978** — merging 2 unlanded commits that change +277/-5 changes the base tree. L' is present only because every arm owes one conjunct computed by a different engine on different data — arm 1 has A, arm 2 has A' — and L' is git's object store answering a question coord's Postgres already answered. **It narrows; it never admits.** Fixture C19 pins exactly that: the runner#978 shape, where L' PASSES and the DETECTOR is the only refusal. ⚠️ **L' is PROSE here, deliberately not a fourth inlined snippet.** The three inlined probes each own a script because each has a real surface that can drift — output strings the fixture suite matches IN FULL, an oid equality with an empty-string trap, an exit code that means two different things, a path-set derivation. L' has none of that: two commands whose exit statuses are conjoined, nothing parsed, no string compared — so a fourth `BEGIN`/`END` block would owe a fourth drift check protecting nothing (this file already prices a fourth inlining and declines it under "The no-op probe"). **Priced honestly, that is a small and real weakness** — prose can drift from what the steward actually runs, and no gate catches that — accepted because the fixture suite asserts the L' **PREDICATE** on C18, C19, C23a and C23b, so a wrong predicate fails the suite even though a reworded paragraph would not. **M — per-path tree-entry equivalence AT THE LAND COMMIT: arm 3's second no-op proof, and the disjunct that does not decay.** ⚠️ **N decays in arm 3, and this row did not know it.** N asks *"would replaying this head onto TODAY's `main` change nothing?"*. That is a replay-safety question. It is a landing question only until `main` evolves the PR's own lines. `main` can do three things after the land. *(1)* It can grow the PR's paths **away from its hunks**. The merge then takes `main`'s side and N stays `NOOP-PROVEN`. This is the 11-PR `qontinui-coord` population measured 2026-09-05, where "N does not decay" held. *(2)* It can rewrite **the very lines the PR introduced**. The two sides then collide in one hunk and N reads `NOT-NOOP merge conflicts`. *(3)* It can **revert** the PR. Replaying the head would re-apply it, so N reads `NOT-NOOP merged=…`. In cases 2 and 3 arm 3 declined forever, while coord served `block_reason_code=already-landed-at-head` on every tick. Measured 2026-09-13 on two PRs. `portofino-pizzeria/mobile#11` was a single squash (`merge_commit=e58e1954…`, `block_reason_repeat_count` 19). `#13` was a three-commit rebase train (`merge_commit=23b895a0…`, the train's tip, repeat count 45). On both, N read `NOT-NOOP merge conflicts`. B against `origin/main` read `NOT-EQUIVALENT paths=7 identical=6` and `NOT-EQUIVALENT paths=2 identical=0`. The SAME B snippet run against the recorded `merge_commit` read `EQUIVALENT paths=7 identical=7 base_existing=7` and `EQUIVALENT paths=2 identical=2 base_existing=2`. Both PRs were closed by hand on that evidence. **The rule.** Run the inlined `merge-blob-equivalence` snippet (under "The no-op probe") with `MT_BASE=<merge_commit>` and `MT_HEAD=<head>`. No fourth inlined script is added. With that input, the path set comes from `git merge-base <merge_commit> <head>`, which is the head's own fork-point set. Every path's tree ENTRY at the head (mode, type and blob id, never the blob id alone) must equal its entry at `merge_commit`. The set must be non-empty, and at least one blob must exist at `merge_commit`. **And `merge_commit` must sit on the base's FIRST-PARENT chain.** `git rev-list --first-parent origin/<baseRefName>` must exit `0`, and anything else reads `2`. The stamp, resolved to its full 40-hex with `git rev-parse --verify`, must then appear in that output as a whole line; if it is absent, this check reads `1`. A stamp that does not resolve reads `2`, not `1`. So does a shallow clone: unless `git rev-parse --is-shallow-repository` prints exactly `false`, this check reads `2`, because a truncated chain can omit a stamp that really is on it. L' alone does not establish this. An ancestor can reach the base through a merge whose resolution THREW ITS CONTENT AWAY (`-s ours`, or a bad conflict resolution). Its blobs then match the head while `main`'s tree never carried them (fixture C30). Rebase, squash, fast-forward and merge-commit lands all put the recorded commit on that chain AT LAND TIME (see *(g)* below for how a later fast-forward can move it off), and both measured stamps are on it today. This half is prose, not a fourth inlined snippet: it parses nothing but one whole-line match. The fixture suite pins its predicate (`mt_fp`, C30 and the P7 shallow check) the same way it pins L'. M is the three-valued AND of this check and the blob check: `1` if either proves a refusal, otherwise `2` if either could not tell, otherwise `0`. **M counts only once L and L' both read `0`.** Running it earlier is harmless, but a close never rests on M without them. M's authority is borrowed from them. L says coord marked a proposal MERGED carrying THIS head. L' says the stamped commit really is on the base. M adds git's own statement that the land commit carried this head's exact content on every path the head changed. **(N ∨ M) is a three-valued OR.** It reads `0` if either disjunct reads `0`. Otherwise it reads `2` if either reads `2`. Otherwise it reads `1`. **A `2` never collapses into `1`**, and only `0` reaches the close. **A''' — M's own `paths=` must also equal `changedFiles`** whenever M, not N, is the disjunct that proved the close. The two merge-bases coincided on both measured PRs. A mismatch means the stamp and the base see different fork points for this head, and that goes to Tier 2, never a close. The usual causes are a mis-recorded stamp, or a head that merged `main` forward through a commit the stamp does not contain (fixture C31). **What M admits that N refused, deliberately:** *(a)* overlapping later evolution, which is the target population. *(b)* A multi-commit rebase land stamped at the train's TIP. The tip's tree holds the cumulative result of every train commit, so blob equality there on every path means every path landed. *(c)* A **later revert**. The PR DID land, and undoing it was a later decision that a new PR owns. The close comment must show N's refusal beside M's line, so the revert stays visible. **What M still refuses (fail-safe):** *(a)* A non-tip `merge_commit`. Measured on `#13`'s intermediate train commits `e9ca38b` (`identical=0`) and `63b2459` (`identical=1`), and pinned as fixture C28. That includes a train whose LATER commits change only a mode. The non-tip stamp's content matches, and only its mode differs, so a blob-only M would have admitted it (fixture C33). The tip stamp of the same train still closes (fixture C34). *(b)* A land commit whose blob differs from the head on any single path, for example a conflict resolved differently from the head. *(c)* An all-deletions payload (`base_existing=0`, arm 2's accepted cost, C17). *(d)* A true merge commit with the head as a parent. The path set is empty, and the snippet prints its `NOT-ARM2 empty path set` routing line with rc `1`, which in arm 3 is simply a refusal. *(e)* A `merge_commit` absent from the clone, which reads `2` (fixture C29). *(f)* A stamp that reached the base only through a merge that discarded its content. Such a stamp is off the first-parent chain (fixture C30). *(g)* A genuine stamp that `main`'s first-parent chain later left behind. For example, a release branch merges `main` and `main` then fast-forwards to that release branch. This is a false refusal, disclosed rather than fixed: such a PR falls back to N, and where N also refuses, (N ∨ M) reads a proven `1`, so the PR is DECLINED and stays open. It is not routed to Tier 2, so the `declined` ledger line is the only place it shows up. Content that reached `main` through a DIFFERENT PR is not M's to judge at all: L refuses it at the detector. ⚠️ **The comparison is by tree ENTRY (mode + type + blob id), and that is measured, not a style choice.** M's first cut compared `git rev-parse <rev>:<path>` blob ids, which carry no mode. The independent vet of ccfg#943 closed a PR with that cut. The head ran `chmod +x run.sh` and edited a line of `g.txt`. The land kept `run.sh` at `100644`, and `main` then rewrote the `g.txt` line. N refused with a conflict, but blob-only M read `EQUIVALENT paths=2`, and first-parent, L', P6 and A''' all passed. So arm 3 CLOSED while `main` never carried the exec bit (fixture C32). A symlink swapped for a regular file with the same bytes is the same hole. It was NOT shared with arm 2, as this row once claimed. Arm 2 also requires N, and N compares tree oids, which include the mode; the hole was new to arm 3 because arm 3 can close on M alone. For the same reason, making B mode-aware changes no arm-2 verdict. ⚠️ **Do NOT drop N in favour of M.** M refuses a land whose conflict resolution differs from the head on some path, and N can still prove subsumption there. The disjunction keeps every close that worked before (C18, C23a) and adds only the population that N's decay drops (C27). **A'' — cross-source cardinality agreement, arm 3's replacement for A.** GitHub's `changedFiles` must be non-zero (the detector already requires it) **and equal the `paths=` count that B prints**. ⚠️ **Arm 3 runs B for its PATH COUNT ONLY and does NOT require B's verdict.** That has to be spelled out, because every reader arriving from arm 2 will assume B must exit `0` — and requiring it would refuse the very case this arm exists for. On coord#1920 a sibling PR (#1919) had landed `crates/coord/src/mcp/tools.rs` first, so `main` had evolved that path out from under B and B read `NOT-EQUIVALENT paths=5 identical=3 first-differing=crates/coord/src/mcp/tools.rs` — the documented decay this row already defines as *"arm 2 cannot prove this one"* and never *"the work did not land"*. **The cardinality agreed anyway:** `changedFiles=5` against B's `paths=5`. The second live instance settles it from the other side: on `portofino-pizzeria/mobile#4` B read **`EQUIVALENT paths=26 identical=26 base_existing=26`** against `changedFiles=26`. **The two measured members of this population DISAGREE on B's verdict and AGREE on its count** — which is the measurement that says A'' must take the count and not the verdict, and why an arm 3 requiring `B` to exit `0` would have been silently inert on half of what this population has already shown. A mismatch is **abort + escalate to Tier 2, never a close**; a `NOT-ARM2 empty path set` from B means `paths=0` against `changedFiles > 0` and fails A'' correctly. **The close is identical to arms 1 and 2** — re-read `headRefOid` immediately before `gh pr close` and abort if it moved; **NEVER `--delete-branch`**; and the comment states what was PROVEN: base ref + base sha, head sha, N's merged-tree oid, B's `paths=` line **with an explicit note that its verdict was NOT required and why**, GitHub's `changedFiles`, the commit count, the served `land_stamp` and `merge_commit`, **which disjunct proved the close** — N's merged-tree oid, or M's `EQUIVALENT` line with the `merge_commit` it ran against AND N's own refusal line, since an M-proved close is exactly the case where `main` has since rewritten or reverted the PR's lines — and an explicit note that **arms 1 and 2 do not apply and why**. ⚠️ **Do NOT "simplify" this later by widening arm 2 instead.** Admitting this population into arm 2 means growing its `already_landed` equality to include `none` — the DEFAULT `rebase_block` carried by essentially every healthy open PR on the fleet, and the exact value fixture C15 exists to pin as REFUSED. That does not stretch arm 2, it destroys the cost filter and hands every open PR to the proof conjuncts. ⚠️ **There is now a SECOND route to that same mistake, and it does not look like a denylist at all: adding `block_reason_code == "already-landed-at-head"` to arm 2's allowlist.** It reads as a disciplined one-member widening, and it captures this entire population, because Guard 2 and `land_stamp == "current_head"` are the same merged-proposal-at-this-head fact by two probes. Arm 2 is evaluated first, so the population would arrive at a proof requiring B's verdict — which coord#1920 fails. Refused in arm 2's own cell, with the measurement; today no fixture can catch it, because the suite's detector model has no `block_reason_code` input. The two populations also close on **different authorising proofs** (arm 2 requires B's verdict; arm 3 must not), and a single arm whose proof set varies by case makes the ledger's `closed=<n> (arm1=… arm2=… arm3=…)` rule unanswerable — that rule exists precisely so a reader can tell which proof was actually run. **Do NOT relax A for arm 1, do NOT add B to arm 1** (its path set is empty there by construction, so the conjunct would be vacuous — a vacuous conjunct that reads as a passing one is the silent-empty class), and do NOT key any arm's CLOSE on `merged_at`/`merge_commit` ancestry (runner#978 above) — ⚠️ **arm 3's L' IS that very check**, and it is admissible there ONLY as a second engine downstream of L, never as a substitute for it; see arm 3. **Ledger ALL THREE arms separately:** `arm1-candidates-seen / arm2-candidates-seen / arm3-candidates-seen / closed / declined-with-reason` each cycle. A repo showing coord `[already-landed]` verdicts alongside **zero** arm-2 candidates seen is a DETECTOR fault, not a clean repo — and the same rule holds one arm over: **zero arm-3 candidates seen in a repo where any open PR's card serves `land_stamp: "current_head"` is a DETECTOR FAULT too**. An undetected population cannot even be declined-with-reason, which is how arm 2's whole population stayed invisible while arm 1 was being hardened twice — and how arm 3's stayed invisible one arm further over. **Fixtures — run them, do not read them:** `bash scripts/steward-empty-diff-fixtures-test.sh` (qontinui-claude-config). Plans: `2026-08-24-steward-empty-diff-reflex-blind-to-ff-lands` (arm 1), `2026-08-29-steward-empty-diff-reflex-blind-to-rebase-landed-frozen-diff` (arm 2), `2026-09-04-steward-empty-diff-reflex-has-a-population-between-its-two-arms` (arm 3), `2026-09-13-steward-arm3-noop-proof-decays-when-main-evolves-landed-paths` (arm 3's M). |
+| **Verified-green stuck** PR (train slow) | CLEAN + green + aged past the repo's *data-driven* `suggested_stuck_threshold_secs`, AND a **diagnosed coord defect** blocking autonomy. ⚠️ **PRECONDITION — read `rebase_landable`, because every SUMMARY field lies about this class.** A PR based on a NON-DEFAULT branch is never proposed at all, so it is not in the train population and cannot be *stuck in* it. Measured on qontinui-runner#1560 at 2026-09-17T00:03Z: `block_reason_code: none`, `blockers: []`, `mergeable: true`, `merge_state_status: CLEAN`, all six checks `success`/`skipped`, `confidence: fresh`, `verdict_stale: false` — and SIMULTANEOUSLY `rebase_landable: false`, `rebase_block: base_not_default`, `rebase_block_disposition: author_acts`, `land_stamp: none`, with `block_reason_repeat_count: 6` recording coord reaching `none` six times over. `blockers: []` means *nothing blocks the proposal from being EVALUATED*; on a non-default base there is no proposal to evaluate. `rebase_block_detail` says it outright: *"coord fast-forward-lands only the repo default branch `main`, so it will never be proposed."* So a steward reading the summary fields babysits such a PR to green and then waits forever, with every field agreeing with it. **`rebase_landable` is the field that decides.** When it is `false` with `base_not_default` this row does NOT apply and neither does a wedge diagnosis: the disposition is `author_acts` — retarget the PR at `main` (for a stacked PR, once its parent lands), which no amount of coord-side remediation will do for you. This enum member already appears in the empty-diff reflex row above, as one of the present-tense arms sitting OUTSIDE arm 2's two-member allowlist — an allowlist by deliberate choice, per that row's own argument that a denylist goes stale the moment coord adds a tenth member. It was never connected to THIS row, which is how a structurally unproposable PR could read as a slow train. ⚠️ **`green` here means ≥ 1 non-skipped check that PASSED and no non-skipped check that has not passed — never a head with ZERO checks.** "No check is failing" is **vacuously true** on a head whose CI never fired, so an unqualified reading admits a PR that has been verified by nothing at all into a row whose remedy is an operator hand-off for a merge. This is the same predicate `/babysit-prs` Step 6 states as an explicit precondition and Step 2 as a stamping rule — the definition lives there; keep this row's reading identical to it. A zero-check head is **not** this row: discriminate the **never-fired** class (`ci_check_row_count: 0` **and** `actions/runs?head_sha=<FULL 40>` → `total_count: 0`) from the benign **`no-baseline`** one (every workflow path-filtered off this head — which shows EITHER as zero check rows OR as rows that all concluded `skipped`; both counters read non-zero in the second case, so the two-counter test alone does not sort it — full four-arm table in `/babysit-prs` Step 2's *THREE causes* warning) exactly as the *Conflicting PR gets NO new CI* row below does, and route it there rather than here. | **Recovery-merge, NOT `--admin`.** `--admin` was observed failing 2026-07-04 ("required status checks expected") — a real observation, but the premise once recorded here to explain it ("bypass lists contain only `Integration:3825026`") is FALSE: measured 2026-07-29, the four `main-merge-gates` rulesets (runner, schemas, qontinui, ui-bridge) also carry `OrganizationAdmin` with `bypass_mode: always`; only coord/web/claude-config are App-only. Bypass lists differ per repo — re-read `bypass_actors` rather than restating a table. Whether `--admin` succeeds is untested by design; the steward's path is the deterministic one: rebase onto `origin/main`, required checks green on the up-to-date head, then plain `gh pr merge <n> --rebase`. **⚠️ Since PR #328 an agent CANNOT run that last command** — shared `.claude/settings.json` carries `deny: Bash(gh pr merge:*)`, which holds in every permission mode (`bypassPermissions` included), cannot be lifted by any local settings file or flag, and cannot be approved by a hook. So this row's recovery now ENDS at the hand-off: leave the audit trail (`/babysit-prs` Step 6 item 1), register a gate / escalate to the operator who holds the merge capability, and go to Tier 2 remediation. `--max-recovery-merges` is inert while the deny stands. Never route around it via `gh api .../pulls/N/merge` — `git-guard.sh` mechanically blocks that spelling too (briefly unwired fleet-wide alongside its unrelated destructive git/rm/cargo arms in qontinui-claude-config PR #567, then re-wired the same day narrowed to only this merge-route check; the destructive arms stay removed). |
+| **Conflicting PR gets NO new CI — coord parks it in `ci-pending` forever** | `/reevaluate` returns `block_reason_code: "ci-pending"` with **`input_freshness.ci_check_row_count: 0`**, and `GET repos/<r>/actions/runs?head_sha=<FULL 40>` returns `total_count: 0` — i.e. CI never fired even once. | **Check `mergeable` FIRST; this is not a separate defect.** A CONFLICTING PR gets **no new `pull_request` workflow runs at all** — GitHub cannot compute `refs/pull/N/merge`, so nothing is scheduled (not queued, not skipped). No runs ⇒ no check rows ⇒ coord waits for CI that can never arrive, and the PR shows **no FAILING checks**, so any sweep that counts only reds reads it as healthy. Measured 2026-08-24 across `qontinui-dev-notes`: 4 of 9 stuck PRs had `total_count: 0`. **Remedy: resolve the conflict — CI follows.** For a **MERGEABLE** PR whose CI simply never fired, `gh pr close <n> && gh pr reopen <n>` fires `reopened` and schedules it (no content change, no new commit, same head sha) — verified on dev-notes#153, green in ~20s, and it then let coord reach its real verdict (`[already-landed] — close this PR`). On a CONFLICTING PR the same close/reopen is a **no-op**: it succeeds and schedules nothing (verified on #203/#84/#78). Do NOT go hunting for disabled Actions or missing workflow files. ⚠️ Use the **FULL 40-char** sha on that query — a short sha returns a silent 200 with `total_count: 0` and fakes this exact symptom. ⚠️ **`mergeable` is TERNARY, so those two arms are not a partition.** GitHub's GraphQL `MergeableState` enum is exactly `MERGEABLE \| CONFLICTING \| UNKNOWN` — checkable rather than remembered: `gh api graphql -f query='{ __type(name: "MergeableState") { enumValues { name } } }' --jq '.data.__type.enumValues[].name'`. `UNKNOWN` is the *not-yet-computed* state, and a two-armed split silently routes it into whichever arm is written first — here, the `MERGEABLE` arm, spending a close/reopen that schedules nothing and leaving the PR exactly as stuck. **Third arm: `UNKNOWN` → re-read it.** Poll `mergeable` again after a short delay and act only on a settled value; `UNKNOWN` is UNKNOWN, never a quiet synonym for `MERGEABLE`. How OFTEN this class reads `UNKNOWN` is **not measured** — the 9 dev-notes PRs recorded no `mergeable` values — so handle it because the enum has three members, not because it is expected. Also ⚠️ **a `MERGEABLE`/`CLEAN` read is GitHub's merge test passing, never "coord can rebase this"** — see the *Green-but-dirty* row's #148 measurement above; that caveat bears on a coord **rebase** hold, not on an absent workflow run, so it does not weaken the remedy here. |
+| **Runs EXIST but none of them can ever conclude — zero CONCLUSIVE runs** | `block_reason_code: "ci-pending"` with **`input_freshness.ci_check_row_count` > 0** (so this is **NOT** the never-fired class in the row above), **`mergeable: MERGEABLE`** (so it is **NOT** the CONFLICTING class either), and `GET repos/<r>/actions/runs?head_sha=<FULL 40>` returning **`total_count > 0` where EVERY run is non-conclusive** — each one `cancelled`, `startup_failure`, or a `completed` run carrying only never-dispatched jobs (the job shape defined in the UNDISPATCHED section above: every job `status: queued`, `conclusion: null`, zero steps). ⚠️ The **FULL 40-char** sha rule from the row above applies here unchanged. Since **`coord@f3942732`** (2026-09-05) the block reason carries a `detail` payload `{pending_checks, pending_required}`, built in one place — `ci_pending_from`, `qontinui-coord` `crates/coord/src/pr_merge/predicate.rs:2343-2356` — so the steward can now READ which check coord is waiting on directly off the block reason instead of deriving it (`pending_required: null` is UNKNOWN, `[]` means every pending check is advisory). That is how you confirm this row cheaply. ⚠️ It still does **not** say the check is UNCONCLUDABLE — that judgement is this row's whole job. ⚠️ **`gh pr checks` is blind to this by construction:** a required context that never reported is **absent, not red**, exactly as ccfg **#487** (MERGED 2026-08-30) already teaches in `/babysit-prs`, `/implement-plan` and `/vet-imp` — this row is that same observation one layer down, at the workflow run rather than at the check row, so read it there rather than as a second rule. | **The head must MOVE — and the two reflexes are both wrong, which is why this row names both.** ⚠️ **NOT a re-run.** That is the one-way hazard the UNDISPATCHED section measures: `POST .../rerun` on such a run leaves it permanently `queued` with `jobs=0`, after which `cancel` answers `409`, `rerun` answers `403`, and the red is immortal — and whether `startup_failure` behaves identically is deliberately UNMEASURED, so the class is treated as one. ⚠️ **NOT `gh pr close && gh pr reopen`.** That is the **MERGEABLE never-fired** remedy from the row above, and it schedules nothing useful here because runs ALREADY EXIST for this head; reopening does not re-dispatch a run that already failed to dispatch. **The remedy is a new head:** hand back to the author, or push a fresh commit — a new head gets a fresh dispatch. **Worked example, confirmed by observation:** `qontinui-coord#1658` sat **9.2 days** on `ci-pending` with **`block_reason_repeat_count: 620`** at head `9d3c3f80…` — one `completed/startup_failure` run whose only job `Gitleaks Secret Detection` was `queued`/`conclusion: null`/zero steps, plus one `completed/cancelled` run — and was **deliberately left alone**. On **2026-09-05T16:39:47Z its head moved to `20f63c3045522e5c99e94ed8a033bf4bdcdc44f1`**: both runs came back `completed/success`, the PR reached 9 check rows (8 success + 1 skipped), `mergeable: MERGEABLE`, `mergeStateStatus: CLEAN`, and the card read `Merge gate: passed / Scheduler: eligible`. So the prescribed remedy is **measured, not reasoned**, and NOT re-running was the correct call — no immortal red was created. Plan: `2026-09-04-undispatched-predicate-misses-startup-failure-and-coord-waits-forever`. |
 | **`cancel` bucket misread as a failure** (triage error, not a wedge) | a PR's non-passing check is in the **`cancel`** bucket, not `fail` | **`cancelled` is NOT `failed` — it reached NO verdict.** Treating it as a red hides PRs that are actually fixable. Measured 2026-08-22: runner#1062 and #1055 were skipped as "has failures beyond `security`", but those extras were `Clippy diff-scoped (advisory) → cancel` and `test (ubuntu-22.04) → cancel` (the latter cancelled after a **6h** run). Both were genuinely `security`-only, i.e. the stale-base class; after a rebase both went fully green — and #1055's previously-cancelled ubuntu job reached a real verdict in 51m. When triaging, filter on `.bucket == "fail"` and report `cancel` separately. This is the per-PR twin of the main-baseline `cancelled` handling above. |
-| **Stale read** (`freshness_next_action=refresh_github`) | `confidence ∈ {stale,unknown}` | Fire the concrete re-eval lever `POST <base>/pr-merge/prs/<owner>/<repo>/<pr>/reevaluate` (`babysit-prs.md:122` — cures stale snapshots), then wait one poll tick. Phase 2's freshness gate + Phase 1's post-land refresh do the re-read. Idempotent; not rate-limited. |
+| **Stale read** (`freshness_next_action=refresh_github`) | `confidence ∈ {stale,unknown}` | Fire the concrete re-eval lever `POST <base>/pr-merge/prs/<owner>/<repo>/<pr>/reevaluate` (`.claude/commands/babysit-prs.md` → Step 5, lever 1 **"Force re-evaluation"** — cures stale snapshots), then wait one poll tick. Phase 2's freshness gate + Phase 1's post-land refresh do the re-read. Idempotent; not rate-limited. |
 | **Orphaned-proposal residue** | `coord_proposals_resumed_after_failover_total` climbing without corresponding lands | Verify Phase-1 recovery ran (check the metric moves + lands resume); nudge re-eval on the affected PRs. If Phase-1 recovery regressed (metric climbs, no lands, no recovery), that's a **coord defect → Tier 2**. |
 | **Re-eval drift starvation** | `pr_merge_reconcile_reeval_total{reason="stale_eval_backstop"}` flat ACROSS TWO SAMPLES while a stale backlog > 0 | Raise the non-drift reserve knob (the `e86d2026` mitigation is a knob), or alert. ⚠️ **The series name matters:** there is NO `reconcile_reeval_stale_eval_backstop` — that bare name greps zero forever and the detector silently never fires (verified absent in production 2026-08-19T23:52Z; see Step 1). ⚠️ **"Flat" is only measurable across TWO samples.** This is a COUNTER: its absolute value says nothing about whether it is advancing, so a single nonzero scrape is not health and a single scrape is not "flat". Scrape twice, spaced, and compare — measured 2026-08-19, it read `203` on every leader-shaped scrape across ~7 minutes, which is a *finding* only because it was sampled repeatedly. And per Step 1, a follower scrape renders the whole family as `0`, so an apparent drop to zero is a WRONG-REPLICA read, not a reset — counters cannot go backwards without a restart. Backlog side: `pr_merge_reconciler_backlog_stale` (leader-only gauge; its HELP says it converges to 0 in steady state, sustained non-zero = the frozen-row backlog is not draining) and `pr_merge_pr_state_stale_backlog` (leader-only; **cluster-consistent twin is `GET /pr-merge/health` → `pr_state_stale_backlog`, which is authoritative**). NOTE: a flat backstop at **0 with no backlog is HEALTHY** — do not fire on it. |
 | **Phantom required context / aged prior** | the documented signatures (a required status context with no producer; a merge-state-unsettled dwell > 2× threshold on a fully-green head) | Arm the existing dark-launch flag / age-out per the shipped fixes; else escalate. |
 | **Phantom-kill / un-credited land** (long-CI repos) | main ADVANCED with the PR's content, but the PR is still `OPEN` and coord re-cut a NEW candidate **identical to the main tip** + re-ran full CI; churn-guard terminal error "candidate CI never converged" fired **seconds after** a successful land | ROOT-CAUSED + FIXED 2026-07-18 (`b0fab9c8`/coord#1095): `recover_same_term_stalls` reclaimed a `landing` row mid-push (dequeue-anchored `leased_at` + off-lease CI wait ⇒ every >1h-CI land raced the reclaim). If it RECURS, the fix isn't serving — verify the ECS image (see Honest-bookkeeping); do NOT re-propose a PR whose content is already on main. |
 | **`ci_timeout` < real CI livelock** | a GREEN candidate is re-cut ~seconds after its CI completes, forever; nothing lands on a repo whose CI > `COORD_MERGE_CI_TIMEOUT` (1800s default) | FIXED 2026-07-17 (`adb844d6`+`65a462bc`/coord#1070/#1078): `FallThrough`→`check_and_land`. Emergency lever if it recurs: raise `COORD_MERGE_CI_TIMEOUT` above the repo's CI wall-clock (fleet-wide; per-repo timers are the real fix — redesign P1). |
 | **Actions-saturation firehose** (NOT a coord defect) | runner train stalls with green PRs queued; `gh run list` is dominated by ONE branch pushing every ~few min; candidate CI is queued-not-started | **Check the COMMITTER of the looping commits** (`gh api repos/<r>/commits`): `github-actions[bot]` ⇒ a self-triggering auto-commit workflow (e.g. nondeterministic codegen re-detecting its own drift — clorinde `pub mod` HashMap order, fixed runner#769 `55b04022`), NOT a looping agent. Fix = deterministic codegen / per-branch CI concurrency-cancel. Escalate to the branch owner; do NOT "stop an agent" that isn't the cause. |
-| **Post-deploy proposal loss** (NOT a wedge) | coord went quiet on candidate-cutting right after a deploy / reconciler restart | ⚠️ **The "~80 min to rehydrate" figure was FOLKLORE — corrected 2026-07-20 by source trace.** No such constant exists in coord. **Scheduler recovery after a redeploy is ~17s** (leader TTL 15s, `leader.rs:55-57`, + a 2s tick, `merge_scheduler.rs:1843-1847`). What can cost ~88 min is a *single proposal* whose in-flight CI is DISCARDED by the Phase-2 requeue (`merge_scheduler.rs:8692-8704`) — and only for `dry-rebasing`, `landing`, batch members, `speculative-ci`, and base-moved `awaiting-ci` with no live CI. A plain `awaiting-ci` singleton on an unmoved base is ADOPTED and costs nothing (Phase 1, `:8455-8506`). ~88min is runner's candidate-CI suite length (`merge_scheduler.rs:1210`, `:1246`), not a recovery timer. **So: don't wait 80 minutes, and don't cite a system-wide recovery time — quote the per-proposal work at risk.** Correlate "idle since" with a task-def revision bump; WAIT, do not remediate. |
+| **Post-deploy proposal loss** (NOT a wedge) | coord went quiet on candidate-cutting right after a deploy / reconciler restart | ⚠️ **The "~80 min to rehydrate" figure was FOLKLORE — corrected 2026-07-20 by source trace.** No such constant exists in coord. **Scheduler recovery after a redeploy is ~17s** (leader TTL 15s — `DEFAULT_TTL_SECS`, `git grep -n 'DEFAULT_TTL_SECS' origin/main -- crates/coord/src/leader.rs` — plus a 2s tick — `COORD_MERGE_TICK_SECS`, `git grep -n 'COORD_MERGE_TICK_SECS' origin/main -- crates/coord/src/merge_scheduler.rs`, which defaults to 2). What can cost ~88 min is a *single proposal* whose in-flight CI is DISCARDED by the **Phase 2** requeue of `recover_orphaned_proposals` (`git grep -n 'fn recover_orphaned_proposals' origin/main -- crates/coord/src/merge_scheduler.rs`, then read its numbered `Phase` banners in order) — and only for `dry-rebasing`, `landing`, batch members, `speculative-ci`, and base-moved `awaiting-ci` with no live CI. A plain `awaiting-ci` singleton on an unmoved base is ADOPTED and costs nothing (**Phase 1** of that same sweep; `PROPOSALS_ADOPTED_AFTER_FAILOVER` is its counter). ~88min is runner's candidate-CI suite length (`git grep -n '88min' origin/main -- crates/coord/src/merge_scheduler.rs`, on the `candidate_ci_hard_cap` / `COORD_MERGE_CANDIDATE_CI_HARD_CAP_SECS` doc comments), not a recovery timer. **So: don't wait 80 minutes, and don't cite a system-wide recovery time — quote the per-proposal work at risk.** Correlate "idle since" with a task-def revision bump; WAIT, do not remediate. |
+
+### Stranded conflicts that never converge — the merge-commit replay shape (Green-but-dirty row)
+
+coord's dry-rebase replays the branch's **raw** commits onto the candidate. A conflict the author
+already resolved *inside* a `Merge branch 'main'` commit is **not carried by the commits being
+replayed** — a merge commit's resolution lives in the merge, not in its parents — so coord
+re-encounters that same conflict on every attempt, and each new `main` tip the author merges in
+adds one more. The attempt count therefore climbs **without ever converging**. Measured 2026-09-01
+clearing `qontinui-web`'s entire stranded population (6 PRs; one stranded **17.7 days across 13
+attempts**, another across 19): every one of the six carried between **2 and 21**
+`Merge branch 'main'` commits.
+
+- **The signature:** attempts rising while coord's `last_error` text stays *identical* is this
+  shape, not a hard conflict. A hard conflict's error text moves as `main` moves; this one does
+  not, because it is the same replayed commit failing the same way.
+- **The cheap probe:** `git rev-list --merges --count origin/main..<head>`. A non-zero count on a
+  long-stranded PR predicts it, at one command per PR — run it before spending any triage.
+- ⚠️ **That probe is NECESSARY, NOT SUFFICIENT — and the discriminator is free, because you already
+  hold it.** Measured 2026-09-05 on four `qontinui-web` PRs coord reported with `could not apply`:
+  all four passed the merge-count probe (#1132 3 merges of 5 commits, #1137 2 of 8, #1224 1 of 3,
+  #1223 1 of 2) and **only one was remediable**. Split them on GitHub's own `mergeable`:
+  - `could not apply` + **`CLEAN` / `MERGEABLE`** ⇒ the replay shape; the remedies below apply.
+  - `could not apply` + **`DIRTY` / `CONFLICTING`** ⇒ a **genuine content conflict with today's
+    `main`**. The replay shape may *also* be present, but it is not the blocker, and removing the
+    merge commits does not unstick the PR.
+  The reason is stated in the Green-but-dirty row above and simply was not carried across to here:
+  the replay shape leaves GitHub's **merge** test CLEAN *by construction*, because GitHub merges
+  (taking both sides) while coord rebases (replaying commits). So a `DIRTY` read is positive
+  evidence of a DIFFERENT blocker — the one case where `mergeStateStatus` is informative here.
+- **The decisive test, when the cheap one is ambiguous: `git merge origin/main` on the UNMODIFIED
+  head**, which still contains every merge commit and therefore every resolution the author made.
+  If *that* conflicts, the conflict is content `main` gained **after** the author's last merge, not
+  a resolution the rebase dropped. It conflicted for all three of the above, on file sets
+  byte-identical to the rebase's. **Consequence, and it is the load-bearing one: the tree-equality
+  proof is the entire safety argument for BOTH sub-shapes below, and here it cannot be
+  CONSTRUCTED** — there is no clean merge to compare a rewritten branch against. So the remedy is
+  not merely hard, it is *unprovable*, and an agent that rewrites the branch anyway has no argument
+  that it kept the author's resolutions. **Stop and report; do not adjudicate the content.**
+- ⚠️ **Two coord counters look like "attempts" and rank the population OPPOSITELY.**
+  `coord_query_train_health` → `stranded_prs[].attempts` read `20 / 1 / 1 / 1` for
+  #1132 / #1137 / #1224 / #1223, while `coord_pr_status` → `block_reason_repeat_count` read
+  `8 / 6 / 5 / 25` for the same four, at the same time. Both are correct — they count different
+  things (candidate attempts vs. re-observations of one block reason) — and neither field names its
+  own scope. **Quote the surface alongside the number**; a bare "attempts=20" is ambiguous, and it
+  was used to rank this work wrongly.
+- **Sub-shape (a) — a plain rebase succeeds. PREFER IT:** `git rebase origin/main` drops the merge
+  commits and replays only the real work, preserving authorship. Measured on **3 of the 6**, and
+  for all three the rebased tree was **byte-identical** to the tree `git merge origin/main`
+  produces — compare the two tree oids rather than assuming it, since that equality is what says
+  the rebase kept every resolution the merges held.
+- **Sub-shape (b) — a plain rebase CANNOT work**, because later commits exist solely to repair an
+  earlier merge's resolution: every intermediate state is one those fixups assume away, so the
+  rebase re-conflicts commit after commit no matter how many times it is retried. Remedy: take
+  the tree from a clean `git merge origin/main`, flatten the branch onto `origin/main` with that
+  tree, and **prove tree-equality against that merge** before pushing — the proof is the whole
+  safety argument, because a flatten discards the branch's history and nothing else re-checks it.
+  Preserve the original authorship (carry `--author` and the author date off the branch's own
+  commits); push with `--force-with-lease`.
+
+Either remedy produces a rewritten branch, so re-verify it exactly as the Green-but-dirty row
+requires — build + lint + format-check, plus the checks under **Silent semantic conflicts**
+below. A flatten changes more tree at once than a rebase does, which makes it the likelier place
+for one of those to hide. And either remedy ends in the same `--force-with-lease` push to the
+PR's branch as the Green-but-dirty row's, with the same carries-the-push check before and after
+it (`coord-ff-lands.md` → "Pushing to a branch whose PR may already have landed"), re-testing the PRE-rebase head.
+
+### Silent semantic conflicts — git's detector cannot see these (Green-but-dirty row)
+
+Git's three-way merge is line-based: two disjoint hunks that are each individually
+well-formed but jointly wrong produce **zero conflict markers**. "No `<<<<<<<` remains" is
+therefore not "re-verified" — re-verify means **build + lint + format-check**, run AFTER the
+rebase, per the Green-but-dirty row above. Nine subclasses, all measured across two soaks —
+subclasses 1-5 in the overnight soak of 2026-08-31/09-01 (full write-up: coord finding
+`4c4f637e-93cb-4fbc-ad1e-539050ce717c`); subclasses 6-9 in the taxonomy's extension to 9
+instances + 2 adjacent shapes (coord finding `f28442a9-a14f-428d-8d79-a1c216862e3c`); the
+cross-PR variant below is a separate finding, `69937d2c-f2fb-4e3b-b06b-18b31d1422ec`:
+
+1. **Signature drift, disjoint call sites** — coord#1664 `merge_scheduler.rs`: the branch added
+   a 4th param to `tenant_effective_cap`; main added 5 NEW callers of the old 3-arg signature.
+   Disjoint hunks, no markers — reached CI red (rust-ci, coord-db-tests, clippy-diff); plain
+   `cargo check` alone did not catch it (see the compile-target note below). <!-- lint-cargo-verification-form: ok the bare form is quoted here as the DEFECT, not prescribed — this line is the incident report -->
+2. **Adjacent-add duplication** — coord#1735 `agent_registry.rs`: adjacent adds on both sides
+   produced a duplicated `const` (compile error) and a duplicated test loop.
+3. **Rename shadowing** — ccfg#459 `scripts/analyze-hook-latency.py`: main renamed a loop
+   variable `matchers`→`declared`; the branch's code still read `matchers`, which post-rename
+   silently resolves to the OUTER dict. No compiler exists to catch this in Python.
+4. **Same-element duplicate attribute** — runner#1174 `CommandBar.tsx`: both sides added
+   `aria-label` to the same JSX element → TS17001, caught ONLY by `tsc --noEmit`.
+5. **Retirement drift, breaks a THIRD site** — runner#1175 `coord_auth_pin.rs`: main retired the
+   `session-owed` kind from a validation table after driving its emitters to 0; an in-flight PR
+   still emitted it. The breakage lands at the validation table — neither edit site — so grepping
+   symbol *definitions* on both sides misses it; grep for values the PR still **emits** that main
+   may have **retired**.
+6. **Identical counter bumps collapsing** — both sides bump the SAME census literal to the SAME
+   value; git takes it once where the intent was cumulative, so the merge is a silent
+   **collapse**, not a conflict — nothing marks it, and the count is now one short. Hit TWICE in
+   `crates/coord/src/alert_kind.rs`.
+7. **Forked dependency/revision GRAPH — the breakage is in a graph, not in any file either side
+   edited.** Two Alembic revisions chaining off one `down_revision` is a forked migration head:
+   no two commits touch the same line, so git never flags it; qontinui-web#1149 would have failed
+   the `alembic-heads-pr` required check had CI reached it in time. Measured again 2026-09-01 on
+   qontinui-web **#1071 and #989** — both pointed `down_revision` at `coordtouch_01`, by then
+   **three revisions stale** (`coordtouch_01 → grantorig_01 → coord_wusod_01 →
+   pmf_scope_cols_01`), and `count_alembic_heads.py` reported `HEAD_COUNT=2`. Neither side edits
+   the other's file, so there is **no textual conflict and no marker**, and it is invisible to
+   every check in this list: no compiler sees it, mypy does not, `tsc` does not, and a grep for
+   symbol *definitions* does not — the broken thing is the **revision graph**, which is neither
+   edit site. It is not cheap to leave: **4 of #989's 19 commits existed only to chase this
+   token**. **Generalise it beyond alembic:** any content-addressed or parent-pointer graph
+   (migration chains, a lockfile carrying a resolved-tree hash, a generated-code manifest) can
+   fork with zero textual conflict, for the same reason: the graph is not a file either side
+   touched. **Detection:** after any rebase touching `alembic/versions/`, run the repo's own
+   `count_alembic_heads.py` (or `alembic heads`) and require a **single** head; where the change
+   is non-trivial, confirm with `alembic upgrade head` against a clean database. ⚠️ **Repair by
+   HAND.** alembic is the sole author of `coord.*` schema and `alembic revision --autogenerate`
+   is never run directly — served policy `production-and-cost` `alembic-sole-authorship` — so a
+   fork is repaired by hand-editing `down_revision` **and** the `Revises:` docstring line, never
+   by regenerating, and in qontinui-web never by `alembic merge`, which that same gate
+   explicitly forbids.
+8. **A second copy of already-fixed stale text** — a PR's new hunk carries a SECOND COPY of text
+   `main` had already corrected elsewhere, silently reintroducing the bug it fixed. The
+   duplicate copy never touches the fixed one's lines, so nothing conflicts (qontinui-web#1200).
+9. **A brand-new file consuming a retired API** — `SessionsConsole.tsx`, added whole by the
+   branch, called `<RecordRow accent=…>` after `main` had replaced the `accent` prop with
+   `attention`. Caught ONLY by `tsc` (TS17001-adjacent, qontinui-web#1142). This one has **no
+   shared line, no shared hunk, and no file present on both sides** — the smallest surface any
+   subclass here presents, and it is still invisible to git.
+
+**Instance 9 forces a reframe, stated plainly: this was never really about conflicts.** A rebase
+produces an UNVERIFIED TREE, and only a build + typecheck + format-check + test run verifies it.
+"No `<<<<<<<` markers remain" is a fact about git's diff algorithm, not a fact about the code —
+subclass 9 shares no line, no hunk, and no file with the other side, and it is still wrong.
+
+**Re-verify, in increasing cost — run in this order, and treat none of the earlier steps as a
+substitute for the last:**
+
+1. Diff both sides against the TRUE merge-base (`git diff <merge-base> <main> -- <path>` and
+   `git diff <merge-base> <branch> -- <path>`), and read each commit's own diff — not just the
+   post-rebase tree. Surfaces subclasses 1, 3, and 5 before a compiler has to.
+2. Grep for duplicated definitions introduced on both sides over the same path (subclass 2),
+   AND grep for values the PR still emits that main may have retired (subclass 5) — a
+   definition-only grep is blind to the latter.
+3. Compile / typecheck / format-check — the load-bearing floor; 1 and 2 are pattern-matches and
+   can miss a variant shape.
+   - **Rust:** `cargo check --all-targets` (bare `cargo check` is **insufficient** — <!-- lint-cargo-verification-form: ok the bare form is quoted here as the DEFECT, not prescribed — this is the one file that STATES the rule, and it quotes the bad form to name it -->
+     coord#1664 passed it and still went red, because clippy and the DB tests must first
+     COMPILE THE TEST BINARY, which `--all-targets` forces and plain `cargo check` does not) + <!-- lint-cargo-verification-form: ok the bare form is quoted here as the DEFECT, not prescribed — prose about what --all-targets forces -->
+     `cargo clippy --all-targets` + `cargo fmt --check` (runner#1174 passed `cargo check`, <!-- lint-cargo-verification-form: ok the bare form is quoted here as the DEFECT, not prescribed — runner#1174 is cited as the counter-example -->
+     `cargo clippy`, AND `tsc --noEmit`, then failed `test (ubuntu-22.04)` and <!-- lint-cargo-verification-form: ok the bare form is quoted here as the DEFECT, not prescribed — same sentence, continued -->
+     `test (windows-latest)` on the single step "Format Rust code check" over one unwrapped
+     string literal — `cargo fmt --check` is separately load-bearing, not implied by the others).
+   - **Python:** the repo's own test suite / type-checker — no compiler exists, so subclass 3 is
+     invisible to anything less.
+   - **TypeScript:** `tsc --noEmit` — subclass 4 is invisible to `cargo`-shaped checks and to
+     eslint rules that don't cross a JSX attribute list.
+   - **Parent-pointer graphs (subclass 7):** no compiler reads these, so nothing above can
+     catch them. After any rebase touching `alembic/versions/`, run the repo's own
+     `count_alembic_heads.py` (or `alembic heads`) and require exactly one head; apply the same
+     discipline to any lockfile or manifest carrying a resolved-tree hash.
+
+⚠️ **The fleet's "never `cargo fmt`" rule is qontinui-COORD-ONLY — it does not generalize.** In
+qontinui-runner `cargo fmt` is REQUIRED and CI enforces it (`cargo fmt --check` is its own CI
+step, per runner#1174 above). Applying coord's rule to a runner PR silently reopens the exact
+gap this subsection closes.
+
+### Cross-PR silent conflicts — no pairwise rebase can see these
+
+Everything above assumes ONE branch rebased against ONE base. A distinct failure needs no
+rebase at all: three coord PRs (#1759, #1705, #1763) EACH pinned
+`FLAT_ALERT_KINDS.len() == 122` against a `main` that read 121, each adding exactly one new
+kind. Individually correct; jointly wrong — the second and third landers each falsify their OWN
+assertion the moment the first one lands, and no PR in the set was ever rebased against either
+of the others. The mechanism that makes it invisible: because all three write the SAME literal,
+git's three-way merge takes the numeric assert SILENTLY and conflicts only on the PROSE beside
+it — the visible conflict marker is a decoy pointing AWAY from the already-wrong number, not
+toward it. (coord finding `69937d2c-f2fb-4e3b-b06b-18b31d1422ec`.)
+
+**Rule:** before pinning any census literal, grep the OPEN PR SET for the same constant, not
+just `main` — a rebase against `main` alone cannot see a sibling PR that has not landed yet. And
+when a rebase conflicts on prose sitting next to a pinned number, treat the number itself as
+suspect even though git did not flag it — a decoy conflict on the prose is exactly what a
+jointly-wrong number under this mechanism looks like.
+
+**Two adjacent shapes, worth naming separately because neither is a rebase-detection gap:**
+
+- **The resolver's own tooling corrupts the result.** A naive split on `"======="` matched a
+  `// ====…====` comment header and duplicated a whole test module (runner#1252) — found only by
+  re-diffing the RESOLVED commit against BOTH parents, which should be its own distinct
+  verification step, not folded into "the rebase looked clean."
+- **A PR collides with itself.** One commit extracts code into a helper; a later commit,
+  authored PRE-extraction and carried into the PR unchanged, edits the now-deleted inline
+  version (coord#1705). No other branch or PR is involved — the self-inflicted conflict never
+  reaches git's detector because both commits sit on the same side of every rebase.
 
 ### The no-op probe — conjunct N of the "Already-landed empty-diff PR" row
 
@@ -1693,14 +3933,225 @@ echo "IN-TREE ${MT_LIVE} tree-changing commit(s) ahead of the base"; exit 0
 ```
 <!-- END merge-payload-guard -->
 
+**Conjunct B is inlined the same way — its VERDICT is required in ARM 2 only, and it is a THIRD
+engine, not a replacement for A.** Arm 3 runs the same snippet twice: against
+`origin/<baseRefName>` for its path COUNT only (A''), and against coord's recorded `merge_commit`
+as conjunct **M**. B reads each side with `git --literal-pathspecs ls-tree --full-tree` and forces
+`diff.relative=false`, so it gives the same answer from any subdirectory (fixture P8). A
+`GIT_GLOB_PATHSPECS`, `GIT_NOGLOB_PATHSPECS` or `GIT_ICASE_PATHSPECS` in the environment makes
+`--literal-pathspecs` fail with rc `128`, and B then reads UNKNOWN on every PR. That fails safe but
+silently, so unset those variables before running B. Arm 2 exists because a **rebase-landed** PR's GitHub diff is *frozen* against
+its recorded base sha, so `changedFiles` stays NON-zero forever and conjunct **A is structurally
+unsatisfiable** — the same shape of unreachability that ancestry has on the ff-land shape, one
+conjunct over. Measured on `qontinui-schemas#144` (2026-08-29, re-measured 2026-09-01 after `main`
+advanced six commits): `changedFiles=13 commits=1 state=OPEN`, ancestry `rc=1`, N `NOOP-PROVEN`,
+P6 `IN-TREE 1`, and every one of the PR's own 13 files byte-identical to `origin/main`.
+
+⚠️ **B is NOT a second SOURCE, and arm 2 must not be read as "A replaced".** A is *cross-source* —
+`changedFiles` is computed by GitHub, on GitHub's data, by code this fleet does not run — and its
+real job is the failure no amount of local git can see: a **stale or wrong local clone**. B is git
+again, over the **same object store N already read, in the same working copy**; a wrong clone makes
+N and B agree and both be wrong. So arm 2 carries its cross-source engine as **A'** (below), and
+**P1's `git remote get-url origin` identity check and P2/P3's exit-checked fetches are promoted from
+hygiene to load-bearing** there. Do not carry them over from arm 1 as unchanged boilerplate: in arm
+1 A covers for them, and in arm 2 nothing does.
+
+⚠️ **B decays toward REFUSAL, and a B refusal is NOT evidence that the work did not land.** Once
+`main` evolves any path the PR touched, B reads `NOT-EQUIVALENT` and arm 2 declines — the PR stays
+open, which is fail-safe. That direction is the whole reason B is safe to make a required conjunct
+where the `head^{tree} == origin/main^{tree}` predicate was measured and REJECTED: that one decayed
+toward *closing live work*, within an hour. B measured stable at +3 days and +6 `main` commits.
+Practical consequence: arm 2 catches the **recently** rebase-landed PR — the re-proposed-forever
+population it exists for — and a stale one `main` has evolved past falls out of arm 2 into Tier 2. That same decay is why arm 3
+carries **M**: pointed at the land commit instead of the moving base, the identical comparison no
+longer decays.
+
+Same input convention (`MT_BASE`/`MT_HEAD`), same three exit codes — `0` EQUIVALENT (proven), `1`
+NOT-EQUIVALENT **including the empty-path-set routing refusal** (an empty set IS the
+`changedFiles==0` population and belongs to arm 1), `2` UNKNOWN. Only `0` may reach the close path
+and `2` must never collapse into `1`.
+
+⚠️ **The `-z` output goes to a FILE, never to a command substitution — and that line is measured,
+not stylistic.** bash **discards NUL bytes in command substitution**: on schemas#144's real 13-path
+set, `MT_PATHS=$(git diff --name-only --no-renames -z ...)` warns *"ignored null byte in input"* and
+concatenates all thirteen paths into one meaningless string, which then reads absent on both sides,
+trips the `MT_EXIST` guard and refuses. Arm 2 would have **never fired, on any PR**, while every
+line of this prose still read correct — the shipped-implementation-does-not-match-the-prose class
+that P5 was written to stop. Reading from a file rather than a pipe also keeps the loop in the
+current shell so its counters survive.
+
+<!-- BEGIN merge-blob-equivalence (byte-identical to scripts/merge-blob-equivalence.sh) -->
+```bash
+set -u
+# Conjunct B of the Tier-1 "Already-landed empty-diff PR" row: are this PR's OWN
+# files already at the base's content, tree entry for tree entry (mode, type AND
+# blob id -- never the blob id alone)? Its VERDICT is required in
+# ARM 2. ARM 3 runs it twice: against the base for its paths= COUNT only (A''),
+# and with MT_BASE set to coord's recorded merge_commit as conjunct M -- the
+# no-op proof that does not decay when main later evolves the PR's own lines
+# (plan 2026-09-13-steward-arm3-noop-proof-decays-when-main-evolves-landed-paths).
+#
+# N (scripts/merge-noop-probe.sh) answers "merging this PR changes nothing".
+# B answers a different question over the same object store, and the row needs
+# both because arm 2 cannot use conjunct A: on a rebase-landed PR GitHub freezes
+# the diff against the recorded base sha, so changedFiles stays NON-zero and A is
+# unsatisfiable. See the row's "arm 2" block and plan
+# 2026-08-29-steward-empty-diff-reflex-blind-to-rebase-landed-frozen-diff.
+#
+# B is NOT a second SOURCE -- it is git again, in the same clone N read. The
+# cross-source engine for arm 2 is A' (GitHub's changedFiles == the paths= count
+# this script prints), and the clone-identity guarantee rests on P1's
+# `git remote get-url origin` check plus P2/P3's exit-checked fetches. Do not
+# read B as a replacement for A.
+#
+# Three exit codes, the same contract as N and P6:
+#   0  EQUIVALENT      -- proven: every path matches, set non-empty, base has content
+#   1  NOT-EQUIVALENT  -- proven refusal, INCLUDING "empty path set" (that is arm 1's
+#                         population, not arm 2's)
+#   2  UNKNOWN         -- nothing was proven in either direction; route to Tier 2
+# Only 0 may reach the close path, and 2 must NEVER collapse into 1.
+#
+# Inputs arrive as named env vars ONLY: MT_BASE (e.g. origin/main), MT_HEAD.
+# No positional parameters anywhere -- this file is inlined verbatim into a
+# slash-command body, where a dollar followed by a digit is a harness argument
+# placeholder (fixtures gate 1 greps the whole command file for one).
+
+# Missing inputs are UNKNOWN, not a verdict. `set -u` ALONE exits 1, and under
+# the contract above 1 means "proven NOT equivalent" -- the same
+# UNKNOWN-collapsed-into-a-proven-verdict defect P5 was written to stop.
+if [ -z "${MT_BASE:-}" ] || [ -z "${MT_HEAD:-}" ]; then
+  echo "UNKNOWN MT_BASE or MT_HEAD unset or empty"; exit 2
+fi
+
+# NO git-version gate here, and that is deliberate rather than forgotten: every
+# command below (merge-base, diff --name-only -z, ls-tree with
+# --literal-pathspecs, cat-file -e) long predates git 2.0. N carries P5 because `merge-tree
+# --write-tree` is 2.38+; nothing in B is. Add a gate here only if B ever grows a
+# dependency that actually has a floor. (--literal-pathspecs needs 1.8.5.) A
+# GIT_GLOB_PATHSPECS / GIT_NOGLOB_PATHSPECS / GIT_ICASE_PATHSPECS in the
+# environment makes --literal-pathspecs fail rc 128, so B reads UNKNOWN on every
+# PR -- fail-safe but silent; unset them before running B.
+
+git cat-file -e "${MT_BASE}^{commit}" || { echo "UNKNOWN base object absent"; exit 2; }
+git cat-file -e "${MT_HEAD}^{commit}" || { echo "UNKNOWN head object absent"; exit 2; }
+
+# The path set comes from the MERGE-BASE, never from MT_BASE directly. A two-dot
+# `git diff MT_BASE MT_HEAD` also lists every path the BASE changed that this head
+# never touched -- each differs by construction, so B would refuse every PR whose
+# base has moved at all. Merge-base yields the head's OWN path set, which is also
+# the set GitHub counts as changedFiles, and that is what makes A' comparable.
+MT_MB=$(git merge-base "${MT_BASE}" "${MT_HEAD}"); MT_MBRC=$?
+# rc 1 is "no merge base" (unrelated histories). Nothing was compared, so nothing
+# was proven -- UNKNOWN, never a refusal.
+[ "${MT_MBRC}" -eq 0 ] || { echo "UNKNOWN merge-base rc=${MT_MBRC}"; exit 2; }
+case "${MT_MB}" in ""|*[!0-9a-f]*) echo "UNKNOWN merge-base not hex"; exit 2;; esac
+
+# -z: NUL-delimited. A path containing a newline would otherwise split into two
+# entries, shrinking the set that has to match and passing a PR on fewer files
+# than it actually changes.
+#
+# It goes to a FILE, never to a command substitution. Measured 2026-09-01 on the
+# real 13-path schemas#144 set: `MT_PATHS=$(git diff ... -z ...)` makes bash warn
+# "ignored null byte in input" and STRIP every NUL, concatenating all 13 paths
+# into one meaningless string. B would then compare a single path absent on both
+# sides, hit the MT_EXIST guard and refuse -- so arm 2 would never fire, on any
+# PR, while every line of the prose still read correct. A redirect preserves the
+# NULs, and reading from a file (not a pipe) keeps the loop in THIS shell so the
+# counters below survive it.
+MT_PF=$(mktemp) || { echo "UNKNOWN cannot mktemp"; exit 2; }
+# -c diff.relative=false: with diff.relative=true (git 2.28+) a run from a
+# subdirectory would list only that subtree, with the prefix stripped (fixture P8).
+git -c diff.relative=false diff --name-only --no-renames -z "${MT_MB}" "${MT_HEAD}" > "${MT_PF}"; MT_DRC=$?
+if [ "${MT_DRC}" -ne 0 ]; then
+  rm -f "${MT_PF}"; echo "UNKNOWN diff rc=${MT_DRC}"; exit 2
+fi
+
+# ls-tree separates "<mode> <type> <oid>" from the path with a TAB; a listing
+# with a NEWLINE in it matched more than one entry.
+MT_TAB=$(printf '\t')
+MT_NL=$(printf '\nx'); MT_NL=${MT_NL%x}
+MT_N=0
+MT_SAME=0
+MT_EXIST=0
+MT_FIRSTDIFF=""
+while IFS= read -r -d '' MT_P; do
+  MT_N=$((MT_N + 1))
+  # Each side is read as its tree ENTRY -- "<mode> <type> <oid>" -- never as a
+  # bare blob id. A blob id carries no mode, so the old `rev-parse <rev>:<path>`
+  # compared a lost exec bit, or a symlink swapped for a regular file with the
+  # same bytes, as EQUAL. Arm 2 never paid for that (it also requires N, and
+  # merge-tree compares tree oids, which include the mode); arm 3 can close on M
+  # alone, and the independent vet of ccfg#943 closed a PR with main never
+  # carrying its chmod (fixture C32). --literal-pathspecs: a path containing `*`,
+  # `?` or `[` must match itself only. Both commits are proven readable, so a
+  # non-zero ls-tree is UNKNOWN; an EMPTY listing means the path is absent there.
+  # --full-tree: ls-tree resolves a pathspec against the CURRENT DIRECTORY, while
+  # diff --name-only prints repo-root paths. Without it, a run from a subdirectory
+  # compared the WRONG files and proved EQUIVALENT (fixture P8).
+  MT_HL=$(git --literal-pathspecs ls-tree --full-tree "${MT_HEAD}" -- "${MT_P}"); MT_HRC=$?
+  MT_BL=$(git --literal-pathspecs ls-tree --full-tree "${MT_BASE}" -- "${MT_P}"); MT_BRC=$?
+  if [ "${MT_HRC}" -ne 0 ] || [ "${MT_BRC}" -ne 0 ]; then
+    rm -f "${MT_PF}"; echo "UNKNOWN ls-tree rc=${MT_HRC}/${MT_BRC}"; exit 2
+  fi
+  case "${MT_HL}${MT_BL}" in
+    *"${MT_NL}"*) rm -f "${MT_PF}"; echo "UNKNOWN ls-tree listed more than one entry"; exit 2 ;;
+  esac
+  MT_HB=${MT_HL%%"${MT_TAB}"*}; [ -n "${MT_HB}" ] || MT_HB="absent"
+  MT_BB=${MT_BL%%"${MT_TAB}"*}; [ -n "${MT_BB}" ] || MT_BB="absent"
+  if [ "${MT_BB}" != "absent" ]; then MT_EXIST=$((MT_EXIST + 1)); fi
+  if [ "${MT_HB}" = "${MT_BB}" ]; then
+    # Both-absent lands here and is CORRECT at the path level: a deletion this PR
+    # made that the base has already taken is equivalent. What stops an all-absent
+    # read (a wrong or stale clone -- every path resolves to nothing) from passing
+    # is the SET-level MT_EXIST guard below, not this comparison.
+    MT_SAME=$((MT_SAME + 1))
+  elif [ -z "${MT_FIRSTDIFF}" ]; then
+    MT_FIRSTDIFF="${MT_P}"
+  fi
+done < "${MT_PF}"
+rm -f "${MT_PF}"
+
+# An EMPTY path set is not arm 2's population at all -- it is the changedFiles==0
+# population, which arm 1 owns under conjunct A. A proven routing refusal, not an
+# UNKNOWN.
+if [ "${MT_N}" -eq 0 ]; then
+  echo "NOT-ARM2 empty path set (changedFiles==0 population -- arm 1 owns it)"; exit 1
+fi
+
+if [ -n "${MT_FIRSTDIFF}" ]; then
+  echo "NOT-EQUIVALENT paths=${MT_N} identical=${MT_SAME} first-differing=${MT_FIRSTDIFF}"
+  exit 1
+fi
+
+# The silent-empty guard, and it is a SET-level test on purpose. Requiring at
+# least one path whose blob genuinely exists in the base is what stops "every
+# comparison read absent on both sides" -- the shape a wrong or stale clone
+# produces -- from reading as "identical everywhere". Accepted cost: a PR whose
+# entire payload is deletions that have all landed refuses here. That is
+# fail-safe (the PR stays open) and is the correct trade against a close that
+# proved nothing.
+if [ "${MT_EXIST}" -eq 0 ]; then
+  echo "NOT-EQUIVALENT paths=${MT_N} but no compared blob exists in the base"; exit 1
+fi
+
+echo "EQUIVALENT paths=${MT_N} identical=${MT_SAME} base_existing=${MT_EXIST}"
+exit 0
+```
+<!-- END merge-blob-equivalence -->
+
 **The fixtures — run them, do not read them.** `bash scripts/steward-empty-diff-fixtures-test.sh`
 (this repo; its tracked `.sh` files are mode `100644`, so invoke through `bash`, never as a
 program — a fresh CI checkout has no exec bit and `Permission denied` rc=126 reads as a
-behavioural failure). It builds three throwaway git repos, touches no network and no fleet state,
-and pins the thirteen git shapes that argue for each conjunct, plus three static gates over this
+behavioural failure). It builds throwaway git repos, touches no network and no fleet state,
+and pins the git shapes that argue for each conjunct, plus FOUR static gates over this
 file and the UNKNOWN cases. Each row asserts **N's full output string** (a prefix match cannot tell
-`NOT-NOOP merged=<oid>` from `NOT-NOOP merge conflicts`), **P6's exit code**, and the **commits-ahead
-count** — which is the empirical basis of the V argument and must be asserted, not merely printed:
+`NOT-NOOP merged=<oid>` from `NOT-NOOP merge conflicts`), **B's full output string** (same reason — a
+routing `NOT-ARM2` and a proven `NOT-EQUIVALENT` are different facts), **P6's exit code**, the
+**commits-ahead count** — which is the empirical basis of the V argument and must be asserted, not
+merely printed — and, since 2026-09-03, **which ARM the detector routes the case to**, from the
+fixture inputs `MT_CHANGED` (GitHub's `changedFiles`) and `MT_COORD` (coord's `rebase_block`).
+`MT_EXPECT_ARM=0` means *the detector refuses it before any probe is credited*, which is a different
+fact from *the probes refuse it* and was inexpressible while routing read `MT_CHANGED` alone:
 
 | Case | N | P6 | ahead | What it proves |
 |---|---|---|---|---|
@@ -1718,14 +4169,36 @@ count** — which is the empirical basis of the V argument and must be asserted,
 | C11 single-commit, rebase-landed | `NOOP-PROVEN` | pass | 1 | **must still close** — pins P6 against over-refusing |
 | C12 self-revert | `NOOP-PROVEN` | pass | 2 | accepted close of never-landed work (survivor 1 of 2) |
 | C13 the same reconcile as C8, authored on the **release** side | `NOOP-PROVEN` | pass | 2 | **accepted close**: swapping the merge's parents makes it graph-identical to C1, so no predicate separates them (survivor 2 of 2) |
-| gate0 drift | — | — | — | the snippet above is byte-identical to `scripts/merge-noop-probe.sh` |
+| C15 the C11 shape, `rebase_block` = each of the six non-`already_landed`, non-`empty_candidate` classes | `NOOP-PROVEN` | pass | 1 | **every proof conjunct passes** — the DETECTOR is the only refusal. Sweeps the enum so a five-member mental model cannot leave `none` / `base_not_default` / `conflicting_head` admitted |
+| C16 the C11 shape, `rebase_block` = `empty_candidate` | `NOOP-PROVEN` | pass | 1 | the `qontinui-coord#1664` **safety pin**: coord's own detail says a human must decide. Fails if anyone re-widens the conjunct to the parent `conflict` status |
+| C17 landed **all-deletions** branch (the `web#1185` shape) | `NOOP-PROVEN` | pass | 1 | admitted at the detector, then **B refuses** with `paths=1 but no compared blob exists in the base` — pins the `base_existing` guard that stops a wrong or stale clone reading "absent everywhere" as "identical everywhere" |
+| C18 the `coord#1920` shape — rebase-ff-landed by coord, left OPEN by GitHub, diff frozen non-zero | `NOOP-PROVEN` | pass | 1 | **arm 3 closes this**, and it is THE fixture the arm exists for: `land_stamp=current_head`, `changedFiles=5`, and B reads `NOT-EQUIVALENT paths=5 identical=3` because a sibling PR evolved two of the paths afterwards — A'' takes B's path **count** (5 = 5), never its verdict. Fails if the third ladder branch is deleted, or if anyone requires B to exit 0 inside arm 3 |
+| C19 the `runner#978` partial ff-land — coord landed an EARLIER head, the author kept pushing | `NOT-NOOP merged=…` | pass | 3 | **L' PASSES** (the stamped `merge_commit` genuinely is an ancestor of the base) and the PR still carries live unlanded work — coord re-scopes the stamp to `superseded_head`, so **L is the refusal** and the DETECTOR routes it to no arm before A'' is ever reached; N refuses independently. Fails for any arm 3 keyed on L' alone, or on the mere presence of `merged_at` / `merge_commit` |
+| C20 the C18 shape as served by an OLDER coord with no `land_stamp` field at all | `NOOP-PROVEN` | pass | 1 | the direct analogue of C15: an **absent field is UNKNOWN → Tier 2**, never arm 3. Fails if L is ever written as the denylist `land_stamp != "superseded_head"`, which an absent field satisfies |
+| C21 the C18 shape, `land_stamp` = each of the four non-`current_head` members of `LandStampScope` (`none`, `terminal`, `terminal_uncorroborated`, `superseded_head`) | `NOOP-PROVEN` | pass | 1 | **every proof conjunct passes** — the DETECTOR is the only refusal, the arm-3 counterpart of C15. Sweeps the enum so a five-member mental model cannot leave `terminal` / `terminal_uncorroborated` accidentally admitted |
+| C22 the C11 shape carrying BOTH signals — `rebase_block=already_landed` AND `land_stamp=current_head` | `NOOP-PROVEN` | pass | 1 | the **precedence** pin: routes to **arm 2**, where B reads `EQUIVALENT paths=1 identical=1 base_existing=1` and the close needs B's *verdict* — arm 2 is evaluated first, so the stronger proof owns the overlap. Fails if the arm-3 branch is inserted above arm 2's, which would silently downgrade arm 2's population to the weaker proof |
+| C23a the C18 shape, `merge_commit` = the fork point (exists AND is an ancestor of the base) | `NOOP-PROVEN` | pass | 1 | the **accept** control of the L' anti-vacuity bracket: L' reads `0` and the case closes under arm 3. L' is the one arm-3 conjunct the row keeps as prose, so this pair is its only executable pin — fails if L' is stubbed `exit 1`, which would make arm 3 inert while every other assertion still passed |
+| C23b the C18 shape, `merge_commit` = a commit that EXISTS in the clone but is NOT on the base | `NOOP-PROVEN` | pass | 1 | the **refuse** control: L' reads `1` — a *proven* refusal, never an UNKNOWN — and the case must NOT close even though the detector admits it and A'' agrees; **L' is the only stopper**. Fails if L' is stubbed `exit 0`. Pinned here rather than on C19 because L' *passes* on the runner#978 shape, so C19 cannot observe the refusing direction |
+| C27 landed as a two-commit rebase train stamped at its TIP, then a LATER commit on `main` rewrites the very line the PR introduced (the `portofino-pizzeria/mobile#11` / `#13` shape) | `NOT-NOOP merge conflicts` | pass | 1 | **arm 3 closes this through M**, and it is THE fixture M exists for. N refuses because `main` rewrote the PR's line, and B against the base reads `NOT-EQUIVALENT paths=2 identical=1`. B at the stamped `merge_commit` (the train's tip) reads `EQUIVALENT paths=2 identical=2 base_existing=2`, so (N ∨ M) reads `0` and A''' agrees (2 = 2). Fails if M is dropped from the OR, or if M is run against the base instead of the land commit |
+| C28 the C27 shape, `merge_commit` = the FIRST train commit (a non-tip, mis-recorded land) | `NOT-NOOP merge conflicts` | pass | 1 | the **refuse** control for M. M reads `NOT-EQUIVALENT paths=2 identical=1 first-differing=k2.txt`, so (N ∨ M) reads `1` and the PR must NOT close, even though the detector admits it and L' and A'' both pass. Fails if the OR is stubbed to `0` |
+| C29 the C27 shape, `merge_commit` = a well-formed sha ABSENT from the clone | `NOT-NOOP merge conflicts` | pass | 1 | the **UNKNOWN** control. L' reads `2` and M reads `UNKNOWN base object absent` (rc `2`), so (N ∨ M) must read `2`, not `1`: a `2` never collapses into `1`. Fails if the OR's UNKNOWN arm is dropped |
+| C30 the head's content reached `main` only through a side commit whose merge DISCARDED it (`-s ours`), and coord stamped that side commit | `NOT-NOOP merged=…` | pass | 1 | the **first-parent** pin. L' passes because the side commit IS an ancestor of the base. B at the stamp reads `EQUIVALENT paths=1 identical=1 base_existing=1`, but the stamp is off the base's first-parent chain, so M reads `1`, and so does (N ∨ M). `main`'s tree never carried the content. Fails if the first-parent check is dropped from M |
+| C31 the head merged `main` forward through a commit the stamp does not contain, so the stamp and the base see different fork points | `NOT-NOOP merge conflicts` | pass | 2 | the **A'''** pin. B's `paths=1` equals `changedFiles=1`, and M reads `EQUIVALENT paths=2`, so (N ∨ M) reads `0`. M's count disagrees with `changedFiles`, though, so the PR must NOT close. Fails if A''' is dropped from the computed close |
+| C32 the ccfg#943 vet's counter-example: the head runs `chmod +x run.sh` and edits `g.txt`, the land keeps `run.sh` at `100644`, and `main` later rewrites the `g.txt` line | `NOT-NOOP merge conflicts` | pass | 1 | the **mode** pin. M at the lossy land reads `NOT-EQUIVALENT paths=2 identical=1 first-differing=run.sh`, so (N ∨ M) reads `1` and the PR must NOT close, although first-parent, L', P6 and A''' all pass. Fails if B compares blob ids without the mode, which is exactly what closed it in the vet |
+| C33 the same head landed as a train, `g.txt` first and then ONLY the mode, with coord's stamp on the non-tip commit | `NOT-NOOP merge conflicts` | pass | 1 | the **mode-only non-tip** pin. The stamp's content matches, and only `run.sh`'s mode differs, so M reads `NOT-EQUIVALENT paths=2 identical=1 first-differing=run.sh` and refuses. A blob-only M admitted it. Fails for the same mutation as C32 |
+| C34 the C33 train, stamped at its tip | `NOT-NOOP merge conflicts` | pass | 1 | the **accept** control for C32/C33. M reads `EQUIVALENT paths=2 identical=2 base_existing=2` (mode and content both landed), so arm 3 closes through M. Fails if mode-awareness over-refuses a correct land |
+| gate0 drift | — | — | — | each of the three inlined snippets (`merge-noop-probe`, `merge-payload-guard`, `merge-blob-equivalence`) is byte-identical to its script |
 | gate1 dollar-digit | — | — | — | `0` in this file — **prose included**, which the CI linter's fence-scoped guard #18 does not cover |
 | gate2 gh fields | — | — | — | every `gh pr view --json` field this row names actually exists — this gate exists because `baseRepository` **does not**, and it aborted P1 on every PR |
+| gate3 EMPTYCAND spec | — | — | — | the `EMPTYCAND` ledger section exists and names every required token — the four counters (`unproven` above all, which has **no live exemplar**: `content-in-main` was 14 of 14 at authoring, so this gate is the only thing pinning it), the DETECTOR-FAULT rule, and `clearance_audience` / `"operator"`. Without that last one coord's `default_authority` resolves the gate to `AgentAny` — *the registrant included* — and the steward could clear its own human-decision gate |
+| gate3b no-close + handoff | — | — | — | the row states that **nothing in this line closes a PR** (the prose counterpart of C16's detector pin), and the structured exit handoff actually carries the `EMPTYCAND` line — a per-iteration line dropped from the handoff is invisible to the next steward |
 | P0 unset `MT_BASE`/`MT_HEAD` | `UNKNOWN` rc=2 | `UNKNOWN` rc=2 | — | bare `set -u` exits **1**, which this contract reads as a *proven* verdict |
+| P7 shallow clone | — | — | — | M's first-parent check reads `2` (UNKNOWN), never `1`, on a repository `git rev-parse --is-shallow-repository` reports as shallow, and reads `0` on the full copy of the same repository. A truncated first-parent chain can omit a stamp that really is on it, and reading `1` there would log a genuine land as a proven decline |
+| P8 B from a subdirectory | — | — | — | B reads `NOT-EQUIVALENT paths=2 identical=1 first-differing=f` (rc `1`) both from the repo root AND from `sub/`, in a repository that sets `diff.relative=true`. Without `ls-tree --full-tree`, a run from `sub/` compared the wrong files and proved `EQUIVALENT` (rc `0`), a false close. Without `-c diff.relative=false`, the path set shrank to the subtree |
 | P4 draft | — | — | — | the row's P1 field list actually requests `isDraft` |
 | P5 six malformed / pre-2.38 git versions | `UNKNOWN` rc=2 | — | — | UNKNOWN never collapses into a proven verdict |
 
-**Nine of the thirteen read `NOOP-PROVEN` — so the no-op proof alone is not the rule, and it is not
+**Most of the git-shape fixtures read `NOOP-PROVEN` — so the no-op proof alone is not the rule, and it is not
 close.** Each negative has a *different primary* stopper, and that is the entire argument for
 keeping the predicate conjunctive. C5 and C6' would each *also* be refused by **A** (GitHub computes
 `changedFiles` against the real, fresh base, so both read `1`), which makes P1 and P2
@@ -1740,32 +4213,98 @@ a live check of the `commits` field.**
 Tier 1 is **deterministic, auditable, fast** — the SRE reflexes, no LLM cost.
 
 **Watch-only repos (Step 0).** Every row above whose remediation ends in "coord lands it"
-applies to the **merge-authority set** only. On a watch-only repo the steward's remedy stops at
-**landable and green** (Step 0), and the land is someone else's mechanism. Still never
+applies wherever coord is the **LANDER**. On a watch-only repo the steward's remedy stops at
+**landable and green** (Step 0), and closing the PR is the other mechanism's job. Still never
 `gh pr merge`, and still never `--admin`.
 
-Three rows need their default INVERTED here rather than merely disapplied:
+⚠️ **WATCH-ONLY CORRECTION 2026-09-16 — establish watch-only PER REPO before applying any
+inversion below.** It is a lander fact, not the complement of a list, and the list this block
+was written against was measured WRONG for five repos coord does land (Step 0). **Applying an
+inversion to a repo coord lands is worse than not applying it at all** — the Green-but-dirty
+one turns into the eager-churn trap that row's own step (1) exists to prevent.
 
-- **Verified-green stuck.** The detector's `AND a diagnosed coord defect` conjunct is
-  **merge-authority-only** — by construction it can never hold where coord is not the lander,
+Three rows need their default INVERTED on a genuinely watch-only repo, rather than merely
+disapplied:
+
+- **Verified-green stuck.** The detector's `AND a diagnosed coord defect` conjunct applies
+  **wherever coord is the LANDER** — by construction it can never hold where coord is not,
   which would leave a watch-only repo with NO row that detects a stuck PR at all. The
   aged-past-threshold half stands alone: non-draft + green + unlanded past a plain wall-clock
   threshold IS the wedge. The remedy is not a recovery-merge (there is no coord defect to
   recover from) but **diagnosing that repo's own land mechanism** — for ccfg, `rerun_failed_jobs`
-  on the PR's `lint-frontmatter` run, which is the only thing that re-arms its edge-trigger.
+  on the PR's `lint-frontmatter` run, which is the only thing that re-arms its edge-trigger —
+  **gated on the lint NOT already being green at its latest attempt.** When it IS green and the
+  PR is still open, the edge already fired and the `auto-merge` run it fired declined; read that
+  run's log (or, since plan `2026-09-04-ccfg-auto-merge-cannot-land-a-pr-that-touches-a-workflow-file`,
+  the `auto-merge declined:` comment it posts on the PR) and the PR's file list before spending
+  an attempt. A PR touching a `.github/workflows/` file that `main` has also changed since the
+  merge-base is the `workflows`-refusal class named in the land-mechanism note under Step 0:
+  route it to the *Green-but-dirty* row's **Rebase it** — never to `rerun_failed_jobs`, which
+  re-arms a deterministic refusal, and never to an operator.
   Handle it HERE; do not let it fall through to Tier 2, which would spend a plan and a
-  `/vet-imp` run on something one re-run fixes.
+  `/vet-imp` run on something one re-run (or one rebase) fixes.
+
+  ⚠️ **Dropping the coord-defect conjunct makes `green` the only substantive one — so the
+  zero-check qualifier is LOAD-BEARING here, more than in the row itself.** Read `green` with
+  **both** conjuncts the row above states — ≥ 1 non-skipped check that PASSED **and no
+  non-skipped check that has not passed** — not the first alone. Keeping only the first admits a
+  head with one pass and one still-running check, which is the shortening this whole propagation
+  exists to stop, and on a watch-only repo nothing else is left to catch it.
+
+  ⚠️ **And `rerun_failed_jobs` presupposes a run exists.** On a head with **zero** check runs
+  there is nothing to re-run: the call has no target, and an agent that reaches for it here
+  gets an error it will read as a tooling fault rather than as the diagnosis. That head is a
+  different class with a different remedy — split it first, exactly as the *Conflicting PR gets
+  NO new CI* row does: **never-fired** (`ci_check_row_count: 0` **and** `total_count: 0` on the
+  FULL 40-char sha) → split on `mergeable`, and **on all THREE of its values, not two** —
+  `CONFLICTING` → resolve the conflict, CI follows; `MERGEABLE` → `gh pr close && gh pr reopen`
+  to schedule it; `UNKNOWN` → **re-read it** after a short delay and act only on a settled value,
+  never as a quiet synonym for `MERGEABLE`. (An `if CONFLICTING … else …` here is the same
+  two-armed misroute the row above refutes — the else-arm swallows `UNKNOWN` and spends a
+  close/reopen that schedules nothing.) **`no-baseline`** (every workflow path-filtered off this
+  head — zero check rows, **or** rows that all concluded `skipped`, which the two-counter test
+  does not distinguish; see `/babysit-prs` Step 2's *THREE causes* table) →
+  coord's `required-checks-missing` question, not a green-ness one. ccfg is not a hypothetical
+  witness for this: its `.github/workflows/auto-merge.yml` is edge-triggered on a
+  `lint-frontmatter` `workflow_run` *completing* (the land-mechanism note earlier in this file
+  spells out the trigger and why a fresh dispatch cannot substitute), so a ccfg PR that produced
+  **no such run at all** is precisely the head where the named remedy has nothing to act on.
+  That note already covers a lint run that was **cancelled or failed** — a run that never
+  existed is the third case, and it is the one `rerun_failed_jobs` cannot serve.
+
+  ⚠️ **And a THIRD arm that split does not have, on either surface: runs EXIST and none of them
+  can ever conclude.** `ci_check_row_count` **> 0** and `total_count` **> 0** on the FULL 40-char
+  sha, `mergeable: MERGEABLE`, yet **every** run is non-conclusive — `cancelled`,
+  `startup_failure`, or a `completed` run carrying only never-dispatched jobs (the job shape the
+  UNDISPATCHED section defines). That is neither **never-fired** (runs exist) nor **`no-baseline`**
+  (the workflows did fire), so neither arm of the split above reaches it — and **both of their
+  remedies are wrong here**: `rerun_failed_jobs` carries the one-way hazard that section measures,
+  and `gh pr close && gh pr reopen` schedules nothing when runs already exist for the head.
+  **The remedy is that the head must move** — hand back to the author, or push a fresh commit.
+  Full detector, the `{pending_checks, pending_required}` block-reason payload that confirms it
+  cheaply since `coord@f3942732`, and the `qontinui-coord#1658` worked example in which exactly
+  that remedy cleared a 9.2-day wedge: the *Runs EXIST but none of them can ever conclude* row in
+  the wedge-class table above.
 - **Green-but-dirty.** Step (1)'s "is it even yours to fix? … LEAVE IT — coord auto-rebases the
-  candidate at land" is **merge-authority-only**. Nothing auto-rebases on a watch-only repo, so
-  a merely-behind PR stays behind forever and LEAVE-IT is exactly the wrong default. Rebase it.
-  The CI-duration gating in step (2) is likewise moot where there is no candidate CI.
+  candidate at land" holds **wherever coord lands the repo**. Where it genuinely does not,
+  nothing auto-rebases, a merely-behind PR stays behind forever, and LEAVE-IT is the wrong
+  default: rebase it. ⚠️ **This is the inversion that costs most when misapplied, so establish
+  the lander first.** On the five repos the 2026-09-16 measurement corrected, coord DOES
+  auto-rebase, and rebasing there resets a full CI to do coord's job — the eager-churn trap
+  step (2) is gated against. The CI-duration gating in step (2) is moot only where there
+  genuinely is no candidate CI: read `candidate_ci_p90_secs` rather than assuming it absent
+  (ccfg reported **78.8 s** on 2026-09-16).
 - **Already-landed empty-diff.** This row **DOES apply**, and on a watch-only repo it is the
   more likely of the two — a stranded PR's content often lands out-of-band via a successor PR
   while the original sits open (ccfg #231, superseded by #255). Run its **P ∧ N ∧ V ∧ A no-op
   proof** against the PR's CURRENT head and its **real base** before touching anything else; a PR
   that needs closing must never be re-run and landed as a no-op. Out-of-band landing is precisely
-  the shape ancestry cannot see, so do **not** substitute an ancestry check for the proof — on a
-  watch-only repo there is no coord land record to fall back on either, and UNKNOWN is UNKNOWN.
+  the shape ancestry cannot see, so do **not** substitute an ancestry check for the proof.
+  ⚠️ **WATCH-ONLY CORRECTION 2026-09-16.** This used to add *"on a watch-only repo there is no
+  coord land record to fall back on either"*. **False** — watch-only is a LANDER fact (Step 0),
+  and coord ff-lands even here: 13 of ccfg `origin/main`'s newest 100 commits carry
+  `committer=qontinui-coord`. Look for the land record rather than assuming its absence; where
+  none is found, UNKNOWN is UNKNOWN.
 
 **Bounded-remediation discipline (inlined loop control).** Each Tier-1 remediation is a
 bounded attempt, not an open loop:
@@ -1825,9 +4364,22 @@ The pipeline, for each deficiency:
    Fix design + detection-gap / Recovery taken). `$QONTINUI_PLANS_DIR` is the directory
    plans live in, injected by the qontinui runner from its `paths.plans_dir` setting;
    **if it is unset** — a session launched outside the runner will not have it — ask the
-   user once where plans live, or fall back to `<workspace-root>/plans`. Never assume an
+   user once where plans live, or DISCOVER one: from the workspace root,
+   `ls -d plans */plans 2>/dev/null` and use the directory that actually exists. Never
+   fall back to a directory you have not confirmed is there; a named fallback fails
+   silently on every machine that does not have it. Never assume an
    absolute path from another machine. Pass the resolved absolute path to step 3, not the
    variable.
+
+   **Check for an existing plan on this defect first** — this step writes with no
+   existence check at all, and a steward that runs continuously is the likeliest
+   author of a twin. Discovery resolves against the plan corpus (`CLAUDE.md` → "Plan
+   corpus authority"): `GET <web-origin>/api/v1/plan-library?kind=plan&work_unit_slug=<stem>`
+   for a known stem, else page `?kind=plan&limit=200` and match `slug`/title —
+   **never `?q=<stem>`**, which matches title and body but not the slug. A
+   zero-result read is **UNKNOWN, not "no such plan"** — the corpus is a partial
+   mirror of disk by construction — so when it comes back UNKNOWN, reference the
+   uncertainty in the plan body rather than recording the defect as newly discovered.
 3. **Runs `Skill: vet-imp`** on that plan — `/vet-plan` audits it, then `/implement-plan`
    builds it worktree-isolated, runs CI, opens the PR. The vet pass + CI are the correctness
    gates; a bad fix fails them and never lands.
@@ -1899,11 +4451,22 @@ state; keep watching the rest of the fleet.
     `awaiting-ci` count). Land into a quiet queue; hold while proposals are mid-CI. Two coord
     fixes landing back-to-back into a drained queue are SAFER than one landing mid-flight —
     which is exactly what a per-hour cap cannot express.
-    ⚠️ **`open_proposals` OVER-COUNTS — filter before trusting the drain signal.** It includes
-    long-dead `shadow-landed` rows (19 of them aged ~40 days on 2026-07-23: coord 15, web 5),
-    which make a quiet queue look busy and can defer a coord fix indefinitely. Count only
-    genuinely in-flight statuses (`queued`, `awaiting-ci`, `dry-rebasing`, `landing`,
-    `speculative-ci`) and ignore `shadow-landed`. Cleaning up that residue is Tier-2 work.
+    ⚠️ **`open_proposals` / `open_proposal_list` ALREADY exclude terminal statuses — do NOT
+    re-filter them.** Both query sites bind coord's canonical `TERMINAL_PROPOSAL_STATUSES`
+    (`merged`, `cancelled`, `conflict`, `shadow-landed`) into a `status <> ALL(...)`
+    predicate (the test `terminal_set_counts_shadow_landed_as_terminal` pins the constant's
+    contents, not the binding); coord's
+    own module doc (`crates/coord/src/pr_merge/economics.rs`, "Terminal statuses are
+    ALREADY excluded — do NOT re-filter") names this guardrail as stale. Subtracting
+    terminal rows again double-filters and UNDER-reports — it makes a busy queue look
+    drained, which is the exact moment a coord fix must NOT land. Take the count as served.
+    *History:* this bullet used to say the opposite — "`open_proposals` OVER-COUNTS …
+    ignore `shadow-landed`" — and that was TRUE when written: on 2026-07-23 it included 19
+    long-dead `shadow-landed` rows (split recorded then as coord 15, web 5 — sums to
+    20, quoted as recorded), because the query then used a private
+    status list that omitted `shadow-landed`. It stopped being true when the query sites
+    were repointed at the canonical constant (plan
+    `2026-08-26-coord-pr-merge-health-ready-unmerged-over-reports`, Fix 2).
   - **Do NOT batch several fixes into one PR to reduce deploys.** It coarsens the revert unit
     (one bad fix contaminates the rest), degrades the review that is actually catching defects
     (11 real defects were found across two *small* single-purpose PRs on 2026-07-20, including
@@ -1933,7 +4496,10 @@ state; keep watching the rest of the fleet.
   defect** or **coord outage** justifies a recovery-merge, with evidence quoted on the PR
   first (`/babysit-prs` Step 6 preconditions; the audit trail is mandatory per
   recovery-merge).
-- **Honest bookkeeping — PR state is DOUBLY unreliable; CONTENT on `origin/main` is the only
+- **Honest bookkeeping** *(the honest-bookkeeping rule — cited by that name from
+  `.claude/commands/cleanup-steward.md` and `.claude/commands/unattended.md`; keep the name if
+  you move it, and note it is a BULLET, not a step or a heading, so a reader looking for a
+  "step" of that name finds nothing)** **— PR state is DOUBLY unreliable; CONTENT on `origin/main` is the only
   proof.** A coord ff/rebase-land leaves the PR `CLOSED, merged=false` (closed ≠ unmerged) —
   but ONLY when the rebase REWROTE the sha; on a TRUE fast-forward the pushed tip is
   byte-identical to the PR head, so GitHub marks it **`MERGED`** with `merge_commit_sha ==
@@ -1951,10 +4517,46 @@ state; keep watching the rest of the fleet.
   the new image is serving (this trap hid a landed fix TWICE in one soak). Confirm the serving
   sha via `aws ecs describe-task-definition` (image tag == git sha; `AWS_PAGER="" MSYS_NO_PATHCONV=1`,
   us-east-1, cluster `qontinui-staging`, service `coord`) and check the fix commit is its
-  ancestor. Force a real deploy with `gh workflow run deploy-coord.yml --ref main` (the
-  never-debounced `workflow_dispatch` lane), then re-verify the tag. `/coord/build-info` is
-  operator-Bearer-gated → useless from a device session. A wedge you "fixed" keeps firing until
-  the fix actually SERVES.
+  ancestor. `/coord/build-info` is operator-Bearer-gated → useless from a device session
+  (measured 2026-09-06: `401 missing operator Bearer token`). A wedge you "fixed" keeps
+  firing until the fix actually SERVES.
+
+  ⚠️ **`aws` is absent on some fleet members — the declared fallback is
+  `GET https://coord.qontinui.io/health` → `.build_sha` / `.built_at`**, unauthenticated
+  and CLI-free, read off the same 4–8 `/health` samples Step 0 already takes. **Say which
+  of the two reads you used.** It is coord's own self-report answered by whichever replica
+  the ALB routes to, so it establishes *which build is answering* and never *that the
+  intended task definition rolled*; where the two disagree the ECS read wins. An absent
+  `aws` is **INOPERATIVE-ON-THIS-MACHINE, never a skipped item 9**. Full statement, with
+  the sampling rule and the mid-flip caveat quoted from `deploy-coord.yml:1536-1550`:
+  Step 0 item 4 above.
+
+  ⚠️ **A serving sha that is not advancing is usually the DEBOUNCE, not a wedge — and it
+  is BOUNDED.** `deploy-coord.yml` skips a **push** deploy while the last run whose
+  `deploy` job itself concluded success finished less than `DEPLOY_MIN_SPACING_HOURS`
+  (default 4h, `:217-218`) ago; debounced skips and coalesce bow-outs conclude workflow
+  SUCCESS and never reset that clock (`:26-52`). The `schedule` lane
+  (`cron '17 */4 * * *'`, `:81-82`) is the catch-up, deploying iff main's HEAD differs
+  from the last run that actually rolled. The workflow states its own contract: **a
+  landed commit deploys within ~`DEPLOY_MIN_SPACING_HOURS` + one cron interval, ≤ ~8h
+  worst case** (`:44-45`). So before reporting a static serving sha as an anomaly: read
+  the newest `Deploy coord` run's **JOBS, not its conclusion** — a
+  `Deploy SKIPPED (spacing gate — no rollout)` job with `Build, push, and roll coord →
+  skipped` is the debounce working, and the answer is the next cron tick, not a
+  remediation. Compute and report the predicted release instant. **Only past that bound
+  is it a defect.** (Measured 2026-09-04: eleven consecutive steward ticks spent on a
+  4-commit gap that was inside the designed bound the whole time, with a scheduled
+  recovery already due.)
+
+  ⚠️ **Force a real deploy with `gh workflow run deploy-coord.yml --ref main` ONLY when a
+  diagnosed fix must serve NOW *and* the merge train is drained** — then re-verify the
+  tag. The `workflow_dispatch` lane is never debounced, and that is exactly the problem:
+  the drain step is gated
+  `if: ${{ (github.event_name == 'push' || github.event_name == 'schedule') && inputs.force_deploy != true }}`
+  (`deploy-coord.yml:1268`), so **the dispatch lane SKIPS the merge-train drain** — and a
+  coord restart orphans in-flight proposals, the top self-harm risk named in Step 0
+  item 4. Never force a deploy merely to advance a debounced sha; that is the debounce
+  working, and the cron catch-up is its recovery lane.
 
 ## Continuous operation
 
@@ -1968,6 +4570,64 @@ state; keep watching the rest of the fleet.
 - **`--once`** runs a single pass (assess → act → report → exit) — for a manual spot-check
   or CI dry-run.
 
+## Answering an operator question — the answer is a diagnostic artifact
+
+**TRIGGER: an operator asks this steward a question about fleet or product state
+whose answer required ≥2 measurements.** That answer is not a finding, not a
+plan, not a memory and not a policy document. Until 2026-09-06 it had no home and
+went into the chat transcript, where the next session re-derived it from scratch.
+It has one now: `agent.work_artifacts` with `kind = diagnostic`. **Write it.**
+
+Full body contract, write door, bar, slug convention and the two rules that make
+the store worth trusting: `knowledge-base/qontinui-specific/diagnostic-artifacts.md`.
+The short form:
+
+1. **Seven sections, in order** — Question (the operator's words, verbatim),
+   Measured (every claim with the TOOL that produced it and a UTC stamp; a claim
+   with no probe named is prefixed `ASSERTED:` and is not load-bearing), Re-run
+   (the commands that re-derive Measured — this is what turns the artifact from
+   history into an instrument), Mechanism (cited by SYMBOL, never by line number),
+   Refutes, Recommendation (ordered, each step with its OWNER and its OBSERVABLE),
+   UNKNOWN (never omitted).
+2. **The bar, all three or write nothing:** someone actually asked; ≥1 measurement
+   with a named probe; the conclusion would be non-obvious to a competent session
+   starting fresh. Restating what the code plainly says is noise, and noise
+   dilutes exactly the corpus a future session is meant to trust.
+3. **The write door.** Prefer `POST http://127.0.0.1:9876/plan-library/artifacts`;
+   where that answers 502 (the runner forwards to a web base this box does not
+   run) the live door is `POST https://api.qontinui.io/api/v1/plan-library` with a
+   device JWT carrying `user_id`. **Verify by read, never by the 201.** Say which
+   door you wrote through.
+4. **Slug** `probe-<topic>-<YYYY-MM-DD>-<short>`, `source_repo`
+   `qontinui-dev-notes/diagnostics`, `kind_is_heuristic: false`, and `intent_refs`
+   citing the served `success_metric/` or `domain_spec/` the answer bears on — so
+   its importance is INHERITED from a document the operator authored rather than
+   asserted by this steward.
+
+### A corrected claim gets a RETRACTION, not an in-place ⚠️ block
+
+This is the rule that lets this file shrink. When this steward corrects a
+belief — its own ledger line, a doc comment it quoted, a `domain_spec` line — the
+EVIDENCE goes into a `retraction-<topic>-<YYYY-MM-DD>-<short>` diagnostic in the
+same seven-section shape, with Question = *"what did we believe, and what
+falsified it?"*. Where the falsified claim is itself a plan-library artifact,
+also wire `POST …/plan-library/<retraction-id>/edges` with
+`{"relation": "refutes", "to_id": "<the falsified artifact>"}`. `supersedes` is
+close and WRONG — it means a newer version of the same thing, and using it makes
+a refutation indistinguishable from a revision. Where the falsified claim is a
+command file, a code comment or a transcript, the Refutes section carries the
+pointer in prose and the edge is **omitted rather than faked**.
+
+An in-place ⚠️ block here is still correct where this command's own BEHAVIOUR
+must change. What must stop is storing the evidence here: this file is injected
+into every steward session, so each correction is paid for in context on every
+tick, forever, and is unreadable to anyone not running the command. Worked
+instance, with no edge because its target was a transcript:
+`retraction-pr-merge-2026-09-06-rebase-ci-failed-is-not-terminal` — the it=179
+ledger line *"coord holds `rebase_block: rebase_ci_failed`, so it will not
+land"*, falsified by coord re-cutting a candidate 16m48s later with no human
+action.
+
 ## Report (each iteration, and on exit)
 
 Per iteration, emit a compact ledger: for each PR/signal touched — `repo#pr | class | next-action
@@ -1975,6 +4635,320 @@ Per iteration, emit a compact ledger: for each PR/signal touched — `repo#pr | 
 `fix_prs authored: N` per repo — a TALLY, not a ceiling) and any registered
 `gate_id`s. Also list **deficiencies found → what you did about them** (fixed / PR # / plan +
 gate_id / unchased-with-reason) — a found deficiency with no disposition is a silent drop.
+
+### The empty-diff ledger line — MANDATORY, and ALL THREE arms, every iteration
+
+The Tier-1 "Already-landed empty-diff PR" row has always asked to be ledgered. That instruction
+had **no executable backing and no fixed shape**, so it was satisfied by silence — and silence is
+precisely how the row's arm-2 population stayed invisible for weeks while arm 1 was hardened
+twice. A Tier-1 row that *refuses* produces no wedge signal of its own; the ledger line IS its
+only signal. Emit it every iteration, even when every number is zero:
+
+```
+EMPTYDIFF it=<N> <HH:MM:SSZ>  arm1-seen=<n> arm2-seen=<n> arm3-seen=<n> closed=<n> declined=<n>
+  declined: <repo#pr conjunct=<P1|P2|P3|P4|P5|P6|N|V|A|B|A'|L|L'|A''|M|A'''> verdict=<the tool's own line>
+```
+
+Rules that make it a signal rather than a formality:
+
+- **`arm1-seen`, `arm2-seen` and `arm3-seen` are counted SEPARATELY and none may be omitted.**
+  They are three disjoint populations selected by three different detectors, so one number cannot
+  stand for another, and a single merged count is exactly what hid arm 2 — then hid arm 3 one arm
+  further over.
+- **Zero arm-2 candidates in a repo where coord is emitting `[already-landed]` verdicts is a
+  DETECTOR FAULT, not a clean repo — say so in the ledger and route it to Tier 2.** An undetected
+  population cannot be declined-with-reason; it produces no line at all, which reads identical to
+  a healthy repo. This is the `silent-empty-is-unknown` class applied to a reflex.
+- **Arm 3's analogue of that rule, and it is not optional either: zero `arm3-seen` in a repo where
+  ANY open PR's `coord_pr_status` card serves `land_stamp: "current_head"` is a DETECTOR FAULT** —
+  say so in the ledger and route it to Tier 2. A second, **coord-independent** statement of the
+  same observable, for the repos that have no card to read: `origin/main` carrying commits whose
+  committer is `qontinui-coord` with **no `(#N)` suffix** while PRs sit open is the git-side
+  signature of this land shape. ⚠️ **WATCH-ONLY CORRECTION 2026-09-16:** this used to call it
+  "what a **watch-only** repo has *instead of* a coord card". It is an **additional**,
+  coord-independent signal, not a substitute — a watch-only repo still has a coord card
+  (Step 0), and this signature is worth reading on every repo.
+  Arm 3 was undetected for as long as it was precisely because an undetected population emits no
+  line at all — the frequency of this population is still unmeasured, and this counter is what
+  will actually answer that question.
+- **`declined` needs the REASON, and the reason is the conjunct that refused plus the tool's own
+  verdict string** — `NOT-NOOP merged=<oid> base=<oid>`, `NOT-EQUIVALENT paths=… first-differing=…`,
+  `NOT-ARM2 empty path set …`, `UNKNOWN …`. A bare count is not a reason, and an `UNKNOWN` decline
+  is a Tier-2 route, not a quiet skip.
+- **`closed` names the arm** (`closed=3 (arm1=1 arm2=1 arm3=1)`), because the three arms authorise
+  a close on different evidence — arm 1 on A, arm 2 on B's VERDICT plus A', arm 3 on L, L' and A''
+  (which takes B's path COUNT and explicitly not its verdict) plus N or M, counted separately as
+  `arm3=<n> (N=<n> M=<n>)` — and a reader has to be able to tell
+  which proof was actually run.
+- Every number comes from a command run in THIS iteration — the same freshness rule the rest of
+  the ledger is under.
+
+### The empty-CANDIDATE ledger line — MANDATORY, every iteration, and it closes NOTHING
+
+`EMPTYDIFF` above counts the populations the Tier-1 row **acts on**. This line counts the one it
+deliberately **refuses**, and the two must never be merged — see "Why this is its own line" below.
+
+coord terminates a proposal `empty_candidate` with the detail *"Do NOT close this PR on coord's
+say-so; a human must decide."* (two `EMPTY_CANDIDATE_MARKER` sites —
+`git grep -n 'EMPTY_CANDIDATE_MARKER' origin/main -- crates/coord/src/merge_scheduler.rs`). That
+disposition is CORRECT and stays: arm 2's detector allowlist is a pair of EQUALITIES
+(`rebase_block == already_landed`; `block_reason_code == already-landed-by-content`),
+neither of which an `empty_candidate` card satisfies; fixture C16 pins the refusal, and
+widening the allowlist to admit that class was already refuted. The defect is narrower and
+entirely on this side: **coord names an actor that nothing notifies.** The class is not on the
+Train tab (train activity, not terminated proposals), not in `ready_unmerged` (the proposal is
+terminal, not ready), and produces no `EMPTYDIFF` line because every arm's detector refuses it.
+Measured 2026-09-06: fourteen open non-draft PRs fleet-wide, eleven on `qontinui-coord` and three
+on `qontinui-web`, N proven and P6 in-tree on **14 of 14** — every one with its content already in
+`main` — a population that grew across five consecutive iterations and never shrank.
+
+Emit it every iteration, even when every number is zero:
+
+```
+EMPTYCAND it=<N> <HH:MM:SSZ>  seen=<n> content-in-main=<n> unproven=<n> surfaced=<n>
+  gates: <repo>=<gate_id|none> …
+  <repo#pr> age=<Nd> cf=<n> commits=<n> N=<verdict> P6=<verdict> gate=<gate_id|none>
+```
+
+Rules that make it a signal rather than a formality:
+
+- **`content-in-main` counts a member only where N is `NOOP-PROVEN` AND P6 is `IN-TREE` AND
+  V >= 1** — the three conjuncts that are sound for this population. `unproven` counts every other
+  outcome, **including every `UNKNOWN`**, which routes to Tier 2 as usual. The two must sum to
+  `seen`; a member that is neither is a counting bug, not a third category.
+- **B is REPORTED but never COUNTED here, and this is not laziness.** Measured across the eleven
+  `qontinui-coord` members, B refused 11 of 11 — including two PRs 8.5 hours old — because `main`
+  moves on these PRs' own paths, and on `qontinui-coord` those are the repo's hottest files
+  (`mcp/tools.rs` in 3 of 11, `pr_merge/engine.rs`, `fleet_health.rs` in 2, `auth.rs`,
+  `prompt_documents.rs`, `ci.yml`, `taskdef.json`). A `NOT-EQUIVALENT` here means *"arm 2 cannot
+  prove this one"*, never *"the work did not land"*. Counting it would report every member as
+  unproven and rebuild the exact silence this line exists to break.
+- **Zero `seen` in a repo where ANY open PR's `coord_pr_status` card serves
+  `rebase_block: "empty_candidate"` is a DETECTOR FAULT, not a clean repo — say so in the ledger
+  and route it to Tier 2.** This is the `silent-empty-is-unknown` class applied to a reflex, and it
+  is the same rule arm 2 and arm 3 each carry, for the same reason: an undetected population emits
+  no line at all, which reads identical to a healthy repo. A **coord-independent** statement of the
+  same observable, wherever no card can be read: an open non-draft PR whose coord
+  proposal comment carries the `[empty-candidate]` marker. (⚠️ **WATCH-ONLY CORRECTION
+  2026-09-16:** this used to say "for a watch-only repo with no card to read", which reads as
+  though watch-only implies no card. It does not — Step 0.)
+- **`surfaced` counts members named in a registered gate whose `gate_id` was RETURNED** — never a
+  gate you believe you registered. A registration with no returned id did not happen
+  [policy: gate-read-back].
+- Every number comes from a command run in THIS iteration — the same freshness rule the rest of
+  the ledger is under.
+
+**NOTHING IN THIS LINE CLOSES A PR.** The whole point of the class is that the disposition belongs
+to a human. Do not close, do not comment a recommendation to close, and do not widen any arm's
+detector to admit `empty_candidate`.
+
+#### Surfacing it — one `operator_approval` gate per repo, refreshed not duplicated
+
+For each repo holding members, register ONE gate whose prompt names every member with its N and P6
+verdicts and its age. One gate per repo, not one per PR: fourteen individually clearable gates is
+board noise for what is one recurring judgement per repo. **Not one gate fleet-wide either** — a
+fleet-wide gate can only clear when the population is empty in EVERY repo, so it never clears while
+any repo holds a member, and a gate that cannot clear is a known failure shape on this fleet. Per
+repo, it clears as that repo is dispositioned, and the count scales as O(repos).
+
+On a later iteration, **update the existing gate rather than registering a second** — a duplicate
+gate per iteration would be worse than the silence it replaces. The `gates:` sub-line is what makes
+that property readable: the same `gate_id` beside a repo across two iterations IS the assertion.
+
+Four registration facts, each of which has a way to fail silently:
+
+- **`clearance_audience` MUST be `"operator"`.** `gates_authority::default_authority` maps the
+  audience to the clearance authority, and `GatePredicate::is_human_decision`'s own doc comment
+  records that `"agent"` resolves to `ClearanceAuthority::AgentAny` — *"any agent in the tenant,
+  **the registrant included**"*. Registered under the agent audience, the steward could clear its
+  own human-decision gate, which nullifies the entire remedy and re-creates by another route the
+  thing coord's safety pin exists to prevent. **The steward never attests or clears one of these
+  gates.**
+- **Only two doors accept `operator_approval` from a session credential.** coord 403s
+  `operator_approval_requires_operator_auth` on BOTH work-unit / claim-anchored device-JWT HTTP
+  doors (`POST /coord/work-units/<slug>/register-gate` and `POST /coord/gates/register-agent`); the
+  asymmetry is intentional and fenced by a coord regression test. The doors that DO accept it are
+  MCP `coord_register_gate` and the operator/acting `POST /coord/gates/register`. Register through
+  **`/gate`**, which runs the whole cascade and returns the id.
+- **A returned `gate_id` is not yet a usable gate — read the verdict, and classify it.** The gate
+  is REGISTERED-BUT-NOT-USABLE when `initial_verdict_reason` says the predicate cannot be
+  evaluated, or when `initial_verdict` is a terminal state it can never clear from (`misconfigured` /
+  `failed`); then withdraw it and re-register on a predicate coord can evaluate. A non-empty
+  `warnings[]` is not that signal — read the warnings, do not count them. **Omit `gate_class` on
+  this gate**: it feeds coord's per-tenant `gate_clearance` matrix, which decides who may later
+  clear a gate, and none of the vocabulary classes fits a human PR decision — a class such as
+  `routine-review` could let a future tenant rule admit an agent clearer, which is exactly what
+  `clearance_audience: "operator"` above exists to prevent. Omitted, it resolves to the default
+  operator-only authority. Canonical: `_gate-registration` → "Registration warnings".
+- **Read it back, and record the id in FULL.** `coord_gate_inspect(gate_id)`, or by anchor over
+  `GET /coord/agent-gates` — `/coord/gates` is the operator tier and 403s a session credential,
+  which is evidence about the route and never about the gate.
+
+#### Why this is its own line and not a fourth `EMPTYDIFF` counter
+
+`EMPTYDIFF`'s counters all resolve to ONE disposition: its outcome fields are `closed=` and
+`declined=`, i.e. *close the PR*. This population must **never** be closed. Putting a `closed=`
+counter beside a population where closing is forbidden merges two opposite dispositions under one
+reading — the same conflation that makes a single coord verdict string useless when it covers two
+populations that want opposite actions. The separateness rule above already forbids merging three
+counters that are merely **disjoint**; these two are **opposed**, so it applies a fortiori.
+
+The neighbouring refused class, `base_not_default`, gets **no counter here** for the same reason
+and has its own remedy: it needs a DISCRIMINATOR (is the parent PR still open, or did it already
+land?), because a healthy stack and a stranded child produce the identical verdict and want
+opposite actions. Do not fold it into this line.
+
+### The CONFLICT ledger line — MANDATORY, every iteration, and it costs no GitHub budget
+
+`conflicting_head` is the **largest single wedge class on the fleet** and has been for six weeks —
+86 of 184 open non-draft PRs (47%) on 2026-09-06, 61 of 107 (57%) on 2026-09-12, **81 of 174 (47%)
+on 2026-09-17** — and it was declined in one number, every tick, with no per-PR disposition and no
+reason. Item **6 (Per-PR twin cards)** above now requires non-`none` `rebase_block`s be split by
+`rebase_block_disposition`, which is a real improvement on a different axis and **does nothing for
+this class**: `RebaseBlockDisposition::of` maps `ConflictingHead` → `AuthorActs`, so all 81 collapse
+into one `author_acts` count routed to prose. This line adds the axis that split does not carry —
+**how long the PR has been unable to merge at its current head.**
+
+Run the classifier every iteration, even when every number is zero:
+
+```bash
+# ONE fleet read. The credential goes in a header FILE, never on argv
+# (`security-and-autonomy` credential hygiene) -- a bearer on a command line is
+# readable from the process table by every other session on the box.
+hdr=$(mktemp); printf 'Authorization: Bearer %s\n' "$(cat ~/.qontinui/coord-device-jwt)" > "$hdr"; chmod 600 "$hdr"
+curl -sS -m 90 -H @"$hdr" "https://coord.qontinui.io/pr-merge/prs" \
+  | bash scripts/conflict-triage.sh --it <N> \
+      [--window-days 3] [--nudges-dir <dir>] [--handoffs <file>]
+rm -f "$hdr"
+```
+
+The payload also comes from `--file <path>` (process substitution works), which is what the
+fixtures use. **A non-zero exit is not a quiet skip:** `2` is UNKNOWN — no usable payload, or a row
+jq could not classify — and it must be ledgered as UNKNOWN, never as `seen=0`.
+
+```
+CONFLICT it=<N> <HH:MM:SSZ>  seen=<n> active=<n> stranded=<n> unreadable=<n> handed_off=<n|unknown>
+  stranded: <repo#pr conflict_age=<Nd> last_activity=<Nd> nudged=<y|n|unknown>>
+  unreadable: <repo#pr conflict_age=UNKNOWN …>
+```
+
+**Two classes and an UNKNOWN, not three.**
+
+| Class | Predicate | Disposition |
+|---|---|---|
+| **ACTIVE** | `conflict_age_secs < --window-days` (default **3d**) | **do not touch, and say why.** The conflict is younger than the window; the author may not have seen it. A contact here is the duplicate-nudge failure `pr_merge::stuck_author_nudge` calls *"the WORST failure mode"* |
+| **STRANDED** | `conflict_age_secs ≥` that window | **`/handoff-stuck-pr <owner/repo#N>`** — the Green-but-dirty row's own instruction. **Never a steward rebase of a branch it does not own** (`git-operations` `own-artifact-lifecycle`) |
+| **`unreadable`** | conflicting now, but the row carried **no `conflict_age_secs`** | its OWN column, UNKNOWN, Tier 2. **Never folded into ACTIVE** — that is the do-nothing class and a failed read would take it silently |
+
+Rules that make it a signal rather than a formality:
+
+- **`seen` must equal `active + stranded + unreadable`.** The classifier exits `2` when they do not
+  close; a member in none of the three is a counting bug, not a fourth category.
+- **The discriminator is `PrRow::conflict_age_secs`, NEVER `updatedAt`.** GitHub bumps `updatedAt`
+  on comments, labels, reviews and CI — coord's own bot writes included. Measured over the 81 on
+  2026-09-17: `updatedAt`-age minus last-commit-age had median **4.31d**, max **27.57d**, and
+  **64 of 81** carried an `updatedAt` inside a 3-day window while their last commit was outside it.
+  An `updatedAt`-keyed classifier parks 64 stranded PRs in a bucket labelled *"leave it alone,
+  someone is on it"* while looking like a careful safety rule. `conflict_age_secs` is head-scoped,
+  so it *"resets exactly when the author acts"* and cannot call an actively-pushing branch stranded;
+  its no-evidence fallback (`repo_branches.last_refreshed_at`) UNDER-reports, delaying a handoff
+  rather than inventing one. Pinned by fixture **K4**, and the mechanism by gate **G3**.
+- **Zero GitHub API calls.** One `GET /pr-merge/prs` returns the whole fleet with `mergeable`,
+  `merge_state_status`, `conflict_age_secs` and `last_activity_secs`. The rejected alternative —
+  one `pulls/<n>/commits` walk per conflicting PR per tick — was 81 metered calls against the same
+  account-wide budget as `red_main`, and needed a cap, a memoisation and a skip-count. **There is
+  nothing to cap here; do not add one.**
+  ⚠️ **Use the FLEET route. Do not reach for the per-repo sibling
+  `GET /pr-merge/repo/<owner%2Fname>/prs` as a scoped pass** — measured 2026-09-17 with a device
+  JWT, it answered **`404 {"error": "no PRs visible for repo qontinui/qontinui-coord"}`** for a
+  repo the fleet route was serving **39** conflicting PRs on at that moment. The route resolved the
+  repo and still said "no PRs visible", so its 404 is a scoping artefact, **not** an empty repo, and
+  a steward that read it as one would report the fleet's biggest backlog as clean. The classifier
+  fails closed on it (`rc=2 UNKNOWN`, its `.prs`-array guard), which is the correct outcome and
+  exactly what that guard is for.
+- **⚠️ There is NO `REPLAY` class, and adding one is a regression.** `conflicting_head` is raised
+  off `live.conflicting_now` (`mergeable IS FALSE OR merge_state_status = 'dirty'`) — GitHub's
+  **merge** test failing. The merge-commit replay shape leaves that test **CLEAN by construction**,
+  which **Stranded conflicts that never converge** above already measured (2026-09-05, four
+  `qontinui-web` PRs): *"`could not apply` + DIRTY ⇒ a genuine content conflict with today's `main`
+  … removing the merge commits does not unstick the PR."* A merge-commit count inside this
+  population is a coincidence; routing on it sends ~11% of the class to a remedy that cannot help
+  it. Pinned by fixture **K9**.
+- **⚠️ STRANDED IS NOT PROOF THAT WORK REMAINS, and the ledger must not imply it does.** A **fully
+  landed** PR can be carded `conflicting_head` — measured live on `qontinui-coord#1742` and
+  `#1810` (2026-09-06): every commit patch-identical to one on `main`, `git rebase origin/main`
+  skipping all of them, and coord's own newest proposal reading `[empty-candidate]` while the card
+  said `conflicting_head`. **No arm of the already-landed empty-diff reflex sees that shape** —
+  arm 1 needs `changedFiles == 0`, which GitHub freezes non-zero on a landed PR forever; arm 2 is
+  an equality allowlist on `already_landed` / `already-landed-by-content`; arm 3 is keyed on
+  `land_stamp`. Eight such PRs were closed by hand in one day. **This classifier deliberately has
+  no already-landed arm** — the land question belongs to that reflex, not to a strand clock — so
+  before handing a STRANDED row to its author, check that reflex's arms, and **never assert to an
+  author that work remains**. Say *"this has not merged in N days"*, not *"you have work to do"*.
+  ⚠️ **That check is per HANDOFF, not per tick.** It runs on the row you are about to hand over —
+  bounded by the handoff rate, which the p90 just-in-time rule below already keeps small — **never
+  across the whole stranded set**. Reading it as "probe all 61 every iteration" would put an
+  unbounded git cost on a ledger line whose whole argument is that it costs nothing.
+  ⚠️ This is **not** a claim that landed PRs are piling up here: a per-commit patch-id sweep of all
+  59 then-open `qontinui-coord` PRs on 2026-09-06, calibrated against those eight, found **zero**
+  had landed. The population at any moment may be entirely legitimate. The honest claim is that the
+  blind spot admits **no automatic disposition when the case arises**, which it did eight times in
+  one day.
+- **If you ever build a land check here, use per-commit `git patch-id --stable`, never one
+  aggregate over the whole branch diff** — coord replays commits individually, so the aggregate
+  false-negatives on every multi-commit PR. And a percentage-of-lines-present heuristic lies **high**
+  in two measured ways: a stacked PR inherits its parent's land (one read 90.1% while its own commit
+  had 0 of 13 lines on `main` — measure against the **declared base**), and a merge-resolution commit
+  imports `main`'s content as "added" (one read 94.9% while its substantive commit had 17 of 18 new
+  symbols absent).
+- **⚠️ `handed_off` is PER-RUN, and there is no fleet-durable store behind it — say so rather than
+  reading it as a fleet fact.** The `--handoffs` file is the steward's OWN running record: append
+  `<owner/repo>#<n>` as each `/handoff-stuck-pr` returns exit 0, and pass it back on the next tick,
+  so the actionable set visibly shrinks within a run instead of re-reporting the same 61 forever.
+  **On the first tick of a run it reads `unknown`, and that is correct, not a placeholder.** What it
+  cannot do is survive the run: `/handoff-stuck-pr` anchors its gate on the AUTHOR'S SESSION claim
+  (`claim_terminal`, `claim_kind: session`) and explicitly **never** on a `repo_branch`, so no coord
+  read answers *"which PRs have been handed off"* by key — only the gate HINT carries a `PR:` line.
+  A later run therefore starts from `unknown` again. That is a known limitation of the gate's
+  anchoring, not of this ledger, and it is why the column is `unknown` rather than `0`.
+- **`handed_off` is `unknown` when nothing was supplied to compute it from, never `0`** — and
+  `nudged` is `unknown` on a missing, unparseable or `{"error": …}` nudge body. `GET
+  /pr-merge/<repo>/stuck-nudges` answered **404 `no stuck-nudge ledger`** for both `qontinui-coord`
+  and `qontinui-runner` on 2026-09-17, and `pr_merge::stuck_author_nudge` is DARK by default
+  (`COORD_PR_STUCK_AUTHOR_NUDGE_ENABLED`) — so coord is **not** currently contacting these authors
+  and the two-actors-one-branch collision is **latent, not live**. ⚠️ A 404 there is UNKNOWN about
+  whether the sweep is armed, never proof that it is off; the flag is an env var and can be flipped
+  without this file changing. Read the ledger before contacting an author anyway — it is one cheap
+  call and the failure it prevents is the worst one this population has.
+- **A failed read and an empty fleet must never look the same.** The classifier exits `2` on a body
+  with no `.prs` array — a 401/404/500 parses as JSON too, and `.prs // []` would render every one
+  of them as *"no conflicting PRs"* (`verification-and-evidence` `silent-empty-is-unknown`).
+  Pinned by fixtures **E1**/**E3**.
+- **Work the STRANDED set in the Green-but-dirty row's order, not top-down**: short-CI repos
+  (candidate-CI p90 < ~30m, from `coord_query_merge_economics`) first; long-CI repos only at or near
+  the front of the land queue. A handoff mints no new head, so it triggers no CI — but the work it
+  hands over does, and that row measured 82% of candidate CI wasted by resolving deep in the queue.
+- **Honour `/handoff-stuck-pr`'s typed exits.** `3` no author session, `4` author already closed,
+  `5` gate registered but the message unaddressed. A `3` or a `5` is a ledger line and a Tier-2
+  route, **not a retry**, and the row stays STRANDED — which is a correct outcome, not a failure.
+- **The per-PR waste this measures is unbounded, and that is the better scale argument.**
+  `block_reason_repeat_count` on 2026-09-06: `coord#1664` **212** since 09-04, `#1715` **251**,
+  `#1599` **179**, `#1763` **168**, `#1795` **166**, `#1716` **156**. Coord re-deciding the same PR
+  every few minutes for days with no path to a terminal state. A population count says how many;
+  this says how much, per PR, growing without bound until something dispositions them.
+- Every number comes from a command run in THIS iteration — the same freshness rule the rest of the
+  ledger is under.
+
+**The fixtures — run them, do not read them.** `bash scripts/steward-conflict-triage-fixtures-test.sh`
+executes `scripts/conflict-triage.sh` against synthetic `/pr-merge/prs` payloads: no network, and
+nothing modelled as an unobservable INPUT, because a payload is exactly what a fixture can be. Its
+three gates are drift checks on THIS section — **G1** that the section names the classifier by path,
+**G2** that this template carries every column the classifier emits, **G3** that the classifier never
+reads `updatedAt`. The load-bearing fixture is **K4**: a row whose `updatedAt` is inside the window
+while its `conflict_age_secs` is far outside it, which MUST classify STRANDED. It is the live shape
+on 64 of 81 PRs, it is the mistake this plan's own first draft made, and it is the **only** arm that
+fails a classifier which returns ACTIVE for everything.
+
 On exit (stop / `--once` / cap), emit the structured handoff — assembled **mechanically from the
 ledger, not re-derived**, so whoever picks this up sees exactly what was attempted and the one
 decision that is blocked:
@@ -1986,6 +4960,8 @@ decision that is blocked:
 - Termination reason: <stop | --once | cap | blocked>
 - Registered gates: <gate_id(s), or "none">
 - Per-wedge ledger: <repo#pr | class | next-action | action-taken | outcome, one line each>
+- Empty-diff ledger: <the EMPTYDIFF line from the final iteration, all three arms>
+- Empty-candidate ledger: <the EMPTYCAND line from the final iteration, plus its `gates:` sub-line>
 - Tier-3 escalations: <the specific decision needed, WITH your recommendation>
 - Deferred fix-lands: <each, with its reason — deploy-batch defer / rate-limit defer>
 ```
@@ -2137,6 +5113,43 @@ These are the lessons that cost the most time; the 2026-07-17/18 set below still
     pre-PR `code-reviewer` pass is mandatory (it is), either spawn it from the MAIN session
     against the worktree diff, or treat a self-review as a **gap to report**, not as the
     review having happened.
+  - **Brief every worktree-holding or PR-opening subagent with the checkpoint contract,
+    and read its checkpoint on EVERY notification — `failed` AND `completed` — before
+    deciding anything.** A provider limit (`429`, "You've reached your Fable limit") destroys
+    a subagent's transcript and hands you a `failed` notification with no state; a
+    subagent that ended on a progress note hands you a `completed` one that is not a
+    report. The checkpoint (`scripts/agent-checkpoint.sh write --label <label>`, rewritten
+    after each material step) is the only thing that survives either, and it is what you
+    pass back verbatim on re-spawn instead of doing repo archaeology. The label is a
+    FILENAME on every platform, so derive it from the wedge or PR fingerprint rather than
+    using the fingerprint itself — `qontinui-web#12` is a label, `qontinui/qontinui-web#12`
+    is not. When the kill message states a reset time, do not re-spawn into the limit:
+    register a coord `time_elapsed` gate for it via `/gate` (converted against the zone the
+    message names, never the box's) and `annotate --key resume_gate_id` on the checkpoint so
+    a second kill does not double-book; the parser that automates the conversion is the
+    plan's Phase 2 and is not landed at the time of writing. Fields and exit codes:
+    `knowledge-base/qontinui-specific/agent-checkpoints.md`.
+  - **Allocate every worktree through coord — never a raw `git worktree add`.** An
+    unregistered worktree has no `coord.agent_worktrees` row, and a cleanup pass REAPED one
+    mid-rebase on this fleet, costing ~50 minutes — recovered only because the resolved commits
+    still lived in the shared `.git/objects` store; a raw worktree gets that same object-store
+    safety net, but registers nowhere, so nothing else protects it and nothing attributes the
+    reap to the session that owned it. Allocate with the fleet's one command,
+    `bash <workspace-root>/qontinui-claude-config/scripts/allocate-worktree.sh --repo <repo> --intent "<text>"`
+    (it POSTs the literal, anonymous `https://coord.qontinui.io/agents/allocate` — no credential,
+    no `$COORD_HTTP_URL` — and materialises the result; a raw call sends this):
+    ```json
+    {"device_id": "<this box's id from ~/.qontinui/machine.json>",
+     "repos": [{"repo": "<owner/name>", "worktree_path": "<relative-slug>"}],
+     "purpose": "<text>"}
+    ```
+    Three round-trips through typed 422s were spent recovering this shape: `repos` is an ARRAY
+    of `AllocateRepoSpec` STRUCTS — never `repo`, never bare strings; the returned
+    `worktree_path` is RELATIVE to the workspace root; and the reserved branch the response also
+    carries is for NEW work only — a steward rebasing an existing PR still pushes to that PR's
+    OWN branch and wants only the registered path, not the branch. **Standing mitigation:**
+    commit the resolution BEFORE any long verification run, so a reap costs a re-run, never the
+    work itself. (coord finding `74f887ae-194f-4432-9516-ff1ba5cefbef`.)
 - **Adversarially verify YOUR OWN fix — a landed fix that "should work" is a hypothesis, not a
   result.** In this soak a fix (the FallThrough re-cut backstop) LANDED green and introduced a NEW
   failure mode that re-cut green candidates; it was caught ONLY because a fresh `debugging-specialist`
@@ -2214,7 +5227,12 @@ These are the lessons that cost the most time; the 2026-07-17/18 set below still
   settings file, CLI flag or `PreToolUse` hook can override. A steward that reaches a
   recovery-merge hands the PR to the operator (audit comment + gate/escalation) and
   moves on; it does not attempt the merge, and it does not reach for
-  `gh api .../pulls/N/merge`, which `git-guard.sh` blocks as the same act. (The four `main-merge-gates` rulesets DO list
+  `gh api .../pulls/N/merge`, which `git-guard.sh` blocks as the same act
+  — that hook was briefly unwired fleet-wide (qontinui-claude-config PR #567)
+  along with its unrelated destructive git/rm/cargo arms (those stay removed,
+  at the repo owner's explicit request), then re-wired the same day narrowed
+  to ONLY this merge-route check, so this is mechanically enforced again.
+  (The four `main-merge-gates` rulesets DO list
   `OrganizationAdmin` as a bypass actor — measured 2026-07-29 — so never tell a caller
   "no one but coord can merge this"; say the steward does not merge it. Per-repo bypass
   detail: `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`.)
@@ -2244,3 +5262,27 @@ These are the lessons that cost the most time; the 2026-07-17/18 set below still
   goal: the steward should never again learn a merge fact GitHub/SQL knows but coord's twin won't
   say. (Reference target: the `2026-07-17-merge-train-long-ci-redesign` plan
   §"standing metric".)
+
+## A back-merge on a candidate branch is a diagnosis, not a stall
+
+⚠️ **Pointer only — deliberately NOT an inlined snippet.** This file inlines
+three probes byte-identically with `<!-- BEGIN … -->` markers, and each
+inlining is gated by its own drift check inside
+`scripts/steward-empty-diff-fixtures-test.sh`. A fourth inlined copy would owe
+a fourth drift check, which is a real cost with no payoff here — the steward is
+not this probe's primary consumer.
+
+coord lands by **rebase**, and a rebase **discards merge commits**. When a
+candidate branch carries a back-merge (`git rev-list --merges
+origin/main..HEAD` non-empty), any conflict resolution inside it is not in what
+lands — either the replay re-conflicts and the PR parks while GitHub still
+reports it CLEAN, or it re-merges silently and the pre-merge text ships with no
+error at all.
+
+Prove it rather than guessing:
+`bash qontinui-claude-config/scripts/rebase-oracle-check.sh` (rc 0
+`EQUIVALENT`/`NO-MERGES`, rc 1 `DIVERGENT-CONFLICT`/`DIVERGENT-SILENT`, rc 2
+UNKNOWN). Full detail, the two faces and the remedy:
+`knowledge-base/qontinui-specific/coord-merge-train.md` → "Why a back-merge is
+not a fix". The authoring-time warn arm that fires when such a merge is
+CREATED is in `knowledge-base/qontinui-specific/guard-hooks.md`.

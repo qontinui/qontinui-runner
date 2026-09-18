@@ -7,7 +7,7 @@ Run a structured, category-by-category test of all UI Bridge functionality acros
 | Application | Base URL |
 |-------------|----------|
 | **Web frontend** | `https://qontinui.io/api/ui-bridge` |
-| **Runner UI** | `http://localhost:9876/ui-bridge` |
+| **Runner UI** | `http://127.0.0.1:9876/ui-bridge` |
 
 ### Injected target (bare pre-auth page) — optional
 
@@ -93,7 +93,7 @@ Each category specifies a **Page Setup** step. Always execute the navigation FIR
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}" https://qontinui.io/api/ui-bridge/control/snapshot
-curl -s -o /dev/null -w "%{http_code}" http://localhost:9876/ui-bridge/control/snapshot
+curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:9876/ui-bridge/control/snapshot
 ```
 
 If either returns non-200, the app is completely down. Note it, skip that app entirely, and recommend the user start it.
@@ -117,7 +117,7 @@ This is where the UI Bridge tests itself — use its own endpoints to find and f
 **Diagnosis checklist:**
 
 1. **Console errors** — `GET $BASE/control/console-errors` — look for TypeError, import errors, missing module errors
-2. **Dev logs** — Read `.dev-logs/frontend.err.log`, `.dev-logs/frontend.log`, and the newest `qontinui-runner.log.*` (the runner's daily-rolled tracing sink) for startup errors. Glob for the sink in **both** `.dev-logs/` and `<LOCALAPPDATA>/qontinui-runner/dev-logs/` — the runner usually writes to the latter; `GET http://localhost:9876/log-sources/runner-log-sink` returns the exact dir
+2. **Dev logs** — Read `.dev-logs/frontend.err.log`, `.dev-logs/frontend.log`, and the newest `qontinui-runner.log.*` (the runner's daily-rolled tracing sink) for startup errors. Glob for the sink in **both** `.dev-logs/` and `<LOCALAPPDATA>/qontinui-runner/dev-logs/` — the runner usually writes to the latter; `GET http://127.0.0.1:9876/log-sources/runner-log-sink` returns the exact dir
 3. **Health endpoint** — `GET $BASE/health` — check SSE/WebSocket connection status, tab count, responsive flag
 4. **AI snapshot** — `GET $BASE/ai/snapshot` (if available) — may provide semantic page state even when elements are empty
 
@@ -807,7 +807,7 @@ After navigating, take a snapshot and search for elements with `type: "select"`,
 
 **How to test:**
 
-1. **Snapshot both apps** — `GET https://qontinui.io/api/ui-bridge/control/snapshot` and `GET http://localhost:9876/ui-bridge/control/snapshot` — capture both
+1. **Snapshot both apps** — `GET https://qontinui.io/api/ui-bridge/control/snapshot` and `GET http://127.0.0.1:9876/ui-bridge/control/snapshot` — capture both
 2. **Compare element types** — Count elements by type in each app — note which element types appear in both vs only in one
 3. **Compare capabilities** — Compare health/capabilities responses from both apps — document feature parity
 4. **Compare AI snapshots** — `GET $BASE/ai/snapshot` on both apps — compare semantic structure and grouping

@@ -257,8 +257,8 @@ npm run type-check
 
 # Rust: Run checks
 cd $PWD/qontinui-runner
-cargo check
-cargo clippy
+cargo check --all-targets
+cargo clippy --all-targets
 ```
 
 ---

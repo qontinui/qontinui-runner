@@ -83,12 +83,27 @@ session was already terminated this is a no-op; surface any error verbatim.
 
 ### 5. Spawn the replacement (skip if `--no-replay`)
 
-`POST /sessions/spawn` with body:
+First pick the account, as served policy `production-and-cost`
+`spawn-routing-reads-account-budget` requires (Phase 4 of plan
+`2026-09-03-provider-limit-kills-destroy-subagent-context-and-nothing-resumes`):
+`bash <workspace-root>/qontinui-claude-config/scripts/account-budget.sh pick --model <the model the spawn will run>`.
+`PICK <id> …` (exit 0) names the account to pass below. `UNKNOWN_ONLY` (exit 4)
+means no account is known-healthy but none is known-exhausted either — place
+the spawn in one of the listed ids and say so. `ALL_EXHAUSTED
+earliest_reset=<iso>` (exit 3): do not spawn into a limit and do not narrow
+the work — schedule the replay against that reset with
+`scripts/rate-limit-reset.sh schedule`, passing `--hint` (the resumed agent's
+only context is what you put there; shape and cap: `/vet-imp-sweep` Step 6), and
+report the `gate_id`. `NO_ACCOUNTS` (exit 2) means the roster resolved to
+nothing — a configuration fault to report, not a reason to spawn unrouted.
+
+Then `POST /sessions/spawn` with body:
 
 ```json
 {
   "role": "worker",
   "tab_id": "<the same tab_id the failed worker occupied>",
+  "account": "<the id PICK named>",
   "initial_message": "<failure-context block>"
 }
 ```

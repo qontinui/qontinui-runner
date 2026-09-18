@@ -9,7 +9,7 @@ Three applications have the UI Bridge SDK installed:
 | Application | Base URL | Description |
 |-------------|----------|-------------|
 | **Web frontend** (Next.js) | `https://qontinui.io/api/ui-bridge` | qontinui-web frontend, direct HTTP |
-| **Runner UI** (Tauri) | `http://localhost:9876/ui-bridge` | Runner's React frontend, proxied via Tauri IPC |
+| **Runner UI** (Tauri) | `http://127.0.0.1:9876/ui-bridge` | Runner's React frontend, proxied via Tauri IPC |
 | **Mobile app** (React Native) | `http://localhost:8087/ui-bridge` | qontinui-mobile, via `ui-bridge-native` SDK (port 8087) |
 
 All expose the same endpoints — the only difference is the base URL and access method.
@@ -22,7 +22,7 @@ All expose the same endpoints — the only difference is the base URL and access
 BASE="https://qontinui.io/api/ui-bridge"
 
 # Runner UI:
-BASE="http://localhost:9876/ui-bridge"
+BASE="http://127.0.0.1:9876/ui-bridge"
 
 # Mobile app (requires adb port forwarding for emulator):
 #   adb forward tcp:8087 tcp:8087
@@ -116,11 +116,11 @@ You can also use these endpoints directly — they work without the SDK:
 
 ```bash
 # Native window capture — works even when SDK/React is completely dead (Runner only)
-curl -s "http://localhost:9876/ui-bridge/control/annotated-screenshot?runner=true"
+curl -s "http://127.0.0.1:9876/ui-bridge/control/annotated-screenshot?runner=true"
 # Returns: {"success":true,"data":{"screenshot":"<base64 PNG>","width":...,"height":...}}
 
 # Health endpoint includes diagnosticScreenshot when ready:false for >30s
-curl -s http://localhost:9876/ui-bridge/health
+curl -s http://127.0.0.1:9876/ui-bridge/health
 # Check data.diagnosticScreenshot.screenshot if present
 ```
 
@@ -209,26 +209,26 @@ This is a powerful escape hatch for interacting with elements that the standard 
 
 ### Terminal HTTP API (Runner only)
 
-The Runner exposes a terminal management API at `http://localhost:9876` (separate from the UI Bridge endpoints).
+The Runner exposes a terminal management API at `http://127.0.0.1:9876` (separate from the UI Bridge endpoints).
 
 ```bash
 # List terminal sessions
-curl -s http://localhost:9876/terminals
+curl -s http://127.0.0.1:9876/terminals
 
 # Create terminal
-curl -s -X POST http://localhost:9876/terminals -H "Content-Type: application/json" -d '{"title": "My Terminal"}'
+curl -s -X POST http://127.0.0.1:9876/terminals -H "Content-Type: application/json" -d '{"title": "My Terminal"}'
 
 # Write to terminal (data is base64-encoded)
-curl -s -X POST http://localhost:9876/terminals/{id}/write -H "Content-Type: application/json" -d '{"data": "base64..."}'
+curl -s -X POST http://127.0.0.1:9876/terminals/{id}/write -H "Content-Type: application/json" -d '{"data": "base64..."}'
 
 # Read terminal buffer
-curl -s http://localhost:9876/terminals/{id}/buffer
+curl -s http://127.0.0.1:9876/terminals/{id}/buffer
 
 # Resize terminal
-curl -s -X POST http://localhost:9876/terminals/{id}/resize -H "Content-Type: application/json" -d '{"cols": 120, "rows": 40}'
+curl -s -X POST http://127.0.0.1:9876/terminals/{id}/resize -H "Content-Type: application/json" -d '{"cols": 120, "rows": 40}'
 
 # Close terminal
-curl -s -X DELETE http://localhost:9876/terminals/{id}
+curl -s -X DELETE http://127.0.0.1:9876/terminals/{id}
 ```
 
 ### Navigation (web frontend only)
@@ -386,7 +386,7 @@ Then snapshot/interact exactly as in Snapshot/Interact Mode. The injected runtim
 - A direct `curl` to `/api/v1/...` returns `401 {"error":"UNAUTHORIZED"}` (the web fastapi-users gate).
 - The relay (`GET /api/ui-bridge/sdk/status`, `…/control/snapshot`) returns `401 {"code":"UNAUTHENTICATED","message":"UI Bridge relay requires a valid session token"}` — prod runs with `UI_BRIDGE_REQUIRE_AUTH=1`. **A relay 401 is NOT "SDK not connected" — it's "no bearer."** Don't conclude verification is impossible; authenticate.
 
-**Path A — Cognito login harness (the default, fully autonomous).** The **`ui-bridge-login-web`** package bin (`@qontinui/ui-bridge-wrapper` ≥ 0.4.0; ui-bridge PR #86) drives the entire OAuth redirect chain (app `/login` → Cognito hosted UI → `/auth/callback` → authed landing) in one headless Chromium tab via the injected transport, then confirms on the authed DOM. It is a **published bin** — it resolves the engine bundle from its own module tree, so it runs from ANY directory (no more "cd to the ui-bridge repo root"; the old untracked `scripts/login-web.cjs` was never committed and is gone). Origin plan: the `2026-06-05-ui-bridge-authed-web-drive-harness` plan.
+**Path A — Cognito login harness (the default, fully autonomous).** The **`ui-bridge-login-web`** package bin (`@qontinui/ui-bridge-wrapper` ≥ 0.4.0 for the bin to *exist*; ui-bridge PR #86 — but see the **version floor** note under "Multi-step verification" below before you replay a `--storage-state-out` artifact, which needs a strictly higher floor on two packages) drives the entire OAuth redirect chain (app `/login` → Cognito hosted UI → `/auth/callback` → authed landing) in one headless Chromium tab via the injected transport, then confirms on the authed DOM. It is a **published bin** — it resolves the engine bundle from its own module tree, so it runs from ANY directory (no more "cd to the ui-bridge repo root"; the old untracked `scripts/login-web.cjs` was never committed and is gone). Origin plan: the `2026-06-05-ui-bridge-authed-web-drive-harness` plan.
 
 ```bash
 export MSYS_NO_PATHCONV=1        # REQUIRED: Git Bash mangles leading-/ SSM names → ParameterNotFound
@@ -416,6 +416,7 @@ Prefer a `?next=<urlencoded-path>` `--url` so the authed landing is **determinis
   INJECT="npx -y -p @qontinui/ui-bridge-wrapper -p @qontinui/ui-bridge -p @qontinui/ui-bridge-headless -p playwright ui-bridge-inject"
   $INJECT --url https://qontinui.io/digital-twin --storage-state auth.json --exec 'getControlSnapshot {}'
   ```
+  > **⚠️ VERSION FLOOR — replay needs a higher floor than capture, on TWO packages.** A storage state historically carried `__uiBridge_tabId` in sessionStorage, so replaying it re-registered the injected tab under the **operator's live tab id**. Floor **both** `@qontinui/ui-bridge-wrapper` ≥ **0.7.0** (the capture-side strip; the first *released* carrier — 0.6.1 was never published) **and** `@qontinui/ui-bridge-headless` ≥ **0.4.0** (the restore-side scrub, which is where the defense for artifacts *already captured* lives). The wrapper's peer range is `>=0.3.0 <1` on headless, so it does **not** force 0.4.0. The `npx -p` line above names headless as its own top-level package with no version, so today it resolves `latest` = 0.4.0 and is fine — a version pin, a lockfile or a warm npx cache is what can hold it at 0.3.0, which replays `--storage-state` without scrubbing. Below either floor, pass an explicit `--tab-id` or strip the key from the JSON by hand. Full derivation: `knowledge-base/qontinui-specific/ui-bridge.md` → "Tab-identity safety on storage-state replay".
   Only when neither flags nor the artifact fit should you write a small custom driver against the injected transport's `ctx.page` (Playwright) — model it on `src/login-web-cli.ts`'s `drive` step.
 
 **Path B — device-JWT relay drive (server-side, when an authed tab is registered to the relay).** `_auth.ts` accepts a **coord device-JWT** as `Authorization: Bearer <jwt>` (verified via `/api/v1/devices/me`) in addition to a Cognito operator bearer — so the relay's `/control/*` endpoints can be driven **server-side**, against a tab already registered to that device's paired operator. Attach `-H "Authorization: Bearer <bearer>"` to the relay calls. For an **operator bearer**, the Path-A `--storage-state-out` artifact above already captures it (sessionStorage `auth_bearer_access_token`) — so the bootstrap is now non-interactive via the login bin. Standalone non-interactive minting of a fresh **device-JWT** from the runner's on-disk encrypted store (outside the runner process) is **not** built; the runner's own `device_jwt_refresher` mints them in-process. See the gap/assessment in the `2026-06-17-standalone-device-jwt-mint-assessment` plan.
@@ -451,6 +452,48 @@ If the user says "explore" or wants a walkthrough of available UI:
 - **After navigation or clicks that change the view**, wait 2 seconds then re-discover and re-snapshot
 - **If the app is not responding**, check if the service is running. Suggest `.\dev-start.ps1 -Frontend` or `-Runner` as appropriate.
 - **Report errors clearly** — if an endpoint returns an error, explain what it means and suggest a fix
+
+### Probe before you name a cause
+
+A snapshot that comes back empty, a `discover` that 404s, a bridge port that refuses the
+connection — those are **observations**, and they go into the report exactly as measured.
+*"the frontend isn't running"*, *"the UI Bridge isn't served"*, *"this runner build
+predates the endpoint"* are **causes**, and none of them may be written — nor turned into
+the `dev-start.ps1` suggestion the rule above offers — until you have asked a
+**second, independent instance** of the same door.
+
+For a runner target the second instance is a **temp runner from the supervisor**, never
+the primary on `:9876`, which you may not restart (CLAUDE.md → "Runner lifecycle"). Spawn
+one with `POST http://127.0.0.1:9875/runners/spawn-test` and drive the `ui_bridge_url` it
+returns:
+
+```bash
+curl -fsS --max-time 20 http://127.0.0.1:9875/runners   # every runner the supervisor knows
+curl -fsS --max-time 25 http://127.0.0.1:$PORT/health   # the temp runner's own build
+```
+
+For a `qontinui-web` target it is the deployed instance rather than localhost:
+`curl -sS -o /dev/null -w '%{http_code}\n' https://qontinui.io/`. **This rung is
+unconditional** — no coord, no MCP tool, no credential — and a `401` or a `403` still
+proves the route is *served*, which is exactly the claim a local connection refusal was
+about to be used to deny. A temp runner that serves the route the primary does not settles
+the question against the running BINARY rather than the code, and that is a different
+remedy entirely.
+
+**Where coord is reachable, ask what is already known:** `coord_recent_findings` for the
+`resource_keys` you are about to touch, or the `topic` when you know the subsystem before
+you know the files. `coord.findings` is pull-by-relevance — nothing pushes a peer's
+diagnosis at you. If the tool is masked or its transport is dead, read the twin: `GET
+/coord/agent-findings?resource_keys=…&topic=…&limit=…`. ⚠️ The two filters are **OR'd,
+not AND'd** (`f.resource_keys && $2 OR ($3 IS NOT NULL AND f.topic = $3)`, qontinui-coord
+`crates/coord/src/findings.rs`), so passing both **widens** the read instead of narrowing
+it.
+
+**If the second instance cannot be reached either, that is UNKNOWN** — not confirmation of
+the local mechanism. Say UNKNOWN and name both probes you ran. Measured 2026-09-01: a
+session declared a door dead for ~5h45m on a single local probe while it was live, and the
+correct, well-keyed finding had been sitting in `coord.findings` for six hours (plan
+`2026-08-28-probe-first-belongs-in-the-diagnosing-commands`).
 
 ## Example Output Format
 
