@@ -4237,11 +4237,19 @@ impl TerminalSession {
     /// backward or forward step of at least the grace period (an NTP
     /// correction, a VM resume, a manual clock set) therefore moves the window
     /// without the pane having been idle for it, and can promote a pane to
-    /// `Eligible`. Harmless while Phase 1 is a dry run — nothing acts on the
-    /// verdict — but it must be settled before anything closes a pane on it.
-    /// A monotonic clock is the fix; it is not made here because the observed
-    /// `since` is also reported over `/restart-readiness` as an absolute epoch
-    /// millis, so the two would have to change together.
+    /// `Eligible`. This was harmless while Phase 1 only reported the verdict;
+    /// **it is not any more** — the Phase 4 wind-down executor closes panes on
+    /// it.
+    ///
+    /// It is SETTLED, but not here and not by a monotonic clock. A monotonic
+    /// window cannot be built at this seam: the same verdict also folds coord's
+    /// `finished_at`, which arrives as a wall-clock instant over the wire, and
+    /// the `since` this produces is reported over `/restart-readiness` as
+    /// absolute epoch millis. Instead `session::wind_down_executor`'s
+    /// `ClockJumpGuard` measures the wall clock against the monotonic one on
+    /// every tick and quarantines wind-down for a full grace period whenever
+    /// they disagree — so a stepped window is refused rather than acted on. See
+    /// that module's "Hazard 1" section.
     pub fn observe_grid_idle(&self) -> qontinui_runner_lib::wind_down::GridIdle {
         use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
 

@@ -258,6 +258,49 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
     }
 }
 
+/// Re-derive ONE session's wind-down verdict from a brand-new pass.
+///
+/// The Phase 4 executor closes up to four panes per tick and each close can
+/// wait a full `EXIT_DEADLINE`, so the verdict that authorised the LAST close
+/// in a batch can be minutes old by the time `/exit` is typed into its pane —
+/// and in those minutes an operator can have returned to that session, worked
+/// in it, and left it momentarily quiet again. `exit_prompt_ready` cannot tell
+/// that state from idleness; only a re-observed grace window can. This is the
+/// door for that re-check.
+///
+/// It re-runs [`fresh_pass`] rather than re-observing the pane alone,
+/// deliberately: the verdict folds FIVE inputs and a pane observation refreshes
+/// only two of them. A cheaper partial re-check would leave `has_live_children`
+/// and coord's work axis frozen at the tick's start, which is the very
+/// staleness this exists to remove. The cost is one census plus one bulk
+/// work-status read per close, paid only while the device is drained.
+///
+/// `None` means the session is no longer a top-level terminal-hosted `claude`
+/// this pass can see at all — which is not eligibility either.
+pub async fn recheck(
+    app: &tauri::AppHandle,
+    grace: Duration,
+    claude_session_id: &str,
+    terminal_id: &str,
+) -> Option<WindDownView> {
+    let fresh = fresh_pass(app, grace).await;
+    // The pane must still host this session: a terminal id that has been
+    // rebound to another session since the tick's first pass is not the pane
+    // whose verdict we are re-checking.
+    if fresh.observed.terminal_for(claude_session_id) != Some(terminal_id) {
+        return None;
+    }
+    fresh
+        .pass?
+        .report
+        .terminal_hosted
+        .iter()
+        .find(|proc| {
+            !proc.nested_under_claude && proc.session_id.as_deref() == Some(claude_session_id)
+        })
+        .and_then(|proc| proc.wind_down.clone())
+}
+
 /// What one terminal pane showed wind-down.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalObservation {

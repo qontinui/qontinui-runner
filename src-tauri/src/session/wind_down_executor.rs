@@ -16,8 +16,11 @@
 //!   lifecycle record, and each close is logged with the session id, the
 //!   record's origin and the eligibility inputs the verdict was reached on.
 //! * **Looping agents** — the idle-past-grace tab → `graceful_exit` (D6). The
-//!   loop DEFINITION is untouched, so undrain brings the agent back as a
-//!   `FirstSpawn` on the supervisor's next tick; nothing here re-registers it.
+//!   loop DEFINITION is untouched, so the supervisor brings the agent back by
+//!   itself once the drain lifts; nothing here re-registers it. The spawn it
+//!   makes is a `DeathRespawn`, not a `FirstSpawn` — `looping_agent::policy`
+//!   picks `FirstSpawn` only while `ever_spawned` is false, which no tab this
+//!   module could have closed satisfies — and it is backoff-gated.
 //! * **Stewards** — idle-past-grace → `graceful_exit`, and the kind goes into
 //!   the persisted `stopped_by_drain` set ([`StoppedByDrain`]).
 //!
@@ -40,6 +43,33 @@
 //! uses — is not called from here, so no `io.kill` can land on a live `claude`
 //! (D5). [`tests::the_executor_never_reaches_a_kill_path`] pins that by
 //! scanning this file's own source.
+//!
+//! ## A bare shell left by a refused close (review S-1, related lead)
+//!
+//! `CloseRefused` and `CloseOutcomeUnknown` are reached only AFTER `claude` is
+//! gone, so they leave a pane holding a bare shell, still registered with the
+//! `TerminalManager`. Two consumers read that pane as ALIVE, and they are worth
+//! knowing about because neither is this module's to fix:
+//!
+//! * **Stewards** — `find_running_steward` filters on the SHELL's `is_alive`,
+//!   so `GET /steward/{kind}/status` reports `running: true` for a steward that
+//!   has stopped, and a later start is refused 409. Handled HERE, by recording
+//!   `stopped_by_drain` on "`claude` left" rather than on "the tab closed"; the
+//!   undrain restart then answers the 409 and the operator sees the truth.
+//! * **Looping agents** — `looping_agent_supervisor::resolve_live_session`
+//!   derives `Liveness` from whether the terminal id is still REGISTERED with
+//!   the manager, never from whether a `claude` lives in it, so `tab_alive` is
+//!   true for that bare shell. `looping_agent::policy::decide` therefore skips
+//!   its `DeathRespawn` arm and takes the live-tab arm: on the next idle tick
+//!   past grace it emits `Nudge`, which types a journal prompt into a shell
+//!   that will never answer, and increments `cycles_since_relaunch` doing it.
+//!   A `Relaunch` (context-low, or the K-cycle budget) self-heals, because it
+//!   closes the tab before respawning — so the agent recovers at the next
+//!   relaunch cadence rather than staying wedged forever. **Not fixed here:**
+//!   the honest fix is in that supervisor's own liveness resolution, which is
+//!   outside this plan, and the failure is bounded and observable (the
+//!   lifecycle record carries `close_refused` / `close_unknown`). Recorded as a
+//!   follow-up rather than patched from a neighbouring module.
 //!
 //! ## Hazard 1: the grace window is WALL-CLOCK
 //!
@@ -83,6 +113,7 @@ use crate::session::session_lifecycle_store::{
     SessionLifecycleStore, WIND_DOWN_CLOSED, WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN,
     WIND_DOWN_EXIT_STUCK, WIND_DOWN_NOT_ATTEMPTED,
 };
+use crate::session::tracking_health::LiveClaudeProcess;
 use crate::session::wind_down_observer;
 use crate::terminal::graceful_exit::GracefulExitOutcome;
 use crate::terminal::TerminalManager;
@@ -196,15 +227,21 @@ impl ClockJumpGuard {
     /// count as agreeing — a parameter so the boundary is testable at values
     /// other than the shipped [`CLOCK_SKEW_TOLERANCE`].
     ///
-    /// The FIRST call establishes the reference and is trustworthy. That is
-    /// sound only because the guard lives for the PROCESS
-    /// ([`clock_guard`]), not for one run of the loop: the windows a tick reads
-    /// are carried on long-lived per-`TerminalSession` trackers and on coord's
-    /// wall-clock `finished_at`, so they can be much older than the tick — but
-    /// they cannot be older than this process, which created every
-    /// `TerminalSession` it can see. A per-run guard would have made this false
-    /// and, worse, would have dropped a live quarantine on every supervised
-    /// respawn.
+    /// The FIRST call establishes the reference and is trustworthy, for two
+    /// separate reasons — one per clock the window is built from:
+    ///
+    /// * the grid-idle window is carried on a per-`TerminalSession`
+    ///   `GridIdleTracker`, and this process created every `TerminalSession` it
+    ///   can see, so that window cannot predate the process;
+    /// * coord's `finished_at` DOES routinely predate the process, arriving
+    ///   over the wire — but it only ever `.max()`es `since_ms` in
+    ///   `wind_down::eligibility`, so it can move a session towards `NotYet`
+    ///   and never towards `Eligible`. A stale one cannot authorise a close.
+    ///
+    /// Both of those need the guard to live for the PROCESS ([`clock_guard`]),
+    /// not for one run of the loop: a per-run guard would drop a live
+    /// quarantine on every supervised respawn and then read the next tick as a
+    /// trustworthy first call.
     pub fn check(
         &mut self,
         mono: Instant,
@@ -314,13 +351,13 @@ impl StoppedByDrain {
         self.kinds.insert(kind.to_string())
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.kinds.is_empty()
+    /// Forget a kind. Returns `true` when it was there to forget.
+    pub fn remove(&mut self, kind: &str) -> bool {
+        self.kinds.remove(kind)
     }
 
-    /// Take everything recorded, leaving the set empty.
-    pub fn drain_all(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.kinds).into_iter().collect()
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
     }
 
     pub fn kinds(&self) -> impl Iterator<Item = &str> {
@@ -400,16 +437,28 @@ async fn tick_once(state: &mut ExecutorState) {
             state.was_drained = true;
         }
     }
+    // S-3: the clock is compared on EVERY tick, not only on drained ones. The
+    // tolerance is an ABSOLUTE 5 ms-scale bound, not a rate, so a reference left
+    // behind by the last drained tick — days old on a runner that is rarely
+    // drained — turns ordinary NTP slew, or an hour of laptop suspend (Linux
+    // `Instant` is CLOCK_MONOTONIC and does not advance across it), into a
+    // "jump" and quarantines wind-down for a full grace period at exactly the
+    // moment a drain wants the runner to reach idle. Comparing every tick keeps
+    // the interval at ~`TICK`, where 5 s of disagreement really is a step.
+    // The verdict is only CONSULTED in the wind-down arm.
+    let grace = wind_down::grace_from_env();
+    let clock = check_clock(grace);
+
     match decide_tick(&drain, state.was_drained, Utc::now()) {
         TickAction::Nothing => {}
         TickAction::Undrain => {
-            state.was_drained = false;
-            undrain(&app).await;
+            // `undrain` reports what it could not restart, so a kind the drain
+            // re-armed under is still owed and is retried on a later undrain.
+            state.was_drained = undrain(&app).await;
         }
         TickAction::WindDown => {
             state.was_drained = true;
-            let grace = wind_down::grace_from_env();
-            match check_clock(grace) {
+            match clock {
                 ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
                 // Hazard 1. Fail closed: no close is attempted on an idle
                 // window measured across a clock step.
@@ -426,6 +475,114 @@ async fn tick_once(state: &mut ExecutorState) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The two pure halves of a pass (extracted so they can be tested directly —
+// the invariants they carry are the ones this module, not Phase 1, owns)
+// ---------------------------------------------------------------------------
+
+/// PURE: which `(claude_session_id, terminal_id)` pairs a pass may close.
+///
+/// Three filters, each load-bearing:
+/// * the verdict must be exactly `Eligible` — `NotYet`, `Ineligible` and
+///   `Unknown` are all refusals, and a process with NO verdict at all (a nested
+///   subagent) is not a candidate either;
+/// * the process must resolve to a pane, because `graceful_exit` targets a pane;
+/// * ONE candidate per pane, since two top-level `claude` processes attributed
+///   to the same terminal would spend two of the tick's budget slots on one
+///   close and the second would fail on a pane that is already gone.
+pub fn select_candidates(
+    processes: &[LiveClaudeProcess],
+    observed: &wind_down_observer::ObservedInputs,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for proc in processes {
+        if !proc
+            .wind_down
+            .as_ref()
+            .is_some_and(wind_down::WindDownView::is_eligible)
+        {
+            continue;
+        }
+        let Some(session_id) = proc.session_id.clone() else {
+            continue;
+        };
+        let Some(terminal_id) = observed.terminal_for(&session_id).map(str::to_string) else {
+            continue;
+        };
+        if out.iter().any(|(_, tid)| tid == &terminal_id) {
+            continue;
+        }
+        out.push((session_id, terminal_id));
+    }
+    out
+}
+
+/// PURE: the word an outcome is recorded on the lifecycle record as, or `None`
+/// when the executor cannot honestly claim anything happened to the session.
+pub fn outcome_word(outcome: &GracefulExitOutcome) -> Option<&'static str> {
+    match outcome {
+        GracefulExitOutcome::Exited { .. } => Some(WIND_DOWN_CLOSED),
+        GracefulExitOutcome::ExitStuck { .. } => Some(WIND_DOWN_EXIT_STUCK),
+        GracefulExitOutcome::CloseRefused { .. } => Some(WIND_DOWN_CLOSE_REFUSED),
+        GracefulExitOutcome::CloseOutcomeUnknown { .. } => Some(WIND_DOWN_CLOSE_UNKNOWN),
+        // `Refused` and `WriteFailed` are NOT non-events: `/exit` may already
+        // have been typed into the pane, and where the refusal's Ctrl-U
+        // recovery fired it cleared the whole input line. An unattended closer
+        // that touched an operator's pane and recorded nothing would be the
+        // worst of both. Recorded.
+        GracefulExitOutcome::Refused { .. } | GracefulExitOutcome::WriteFailed { .. } => {
+            Some(WIND_DOWN_NOT_ATTEMPTED)
+        }
+        // These two return before anything is typed, so nothing happened to the
+        // session and nothing is claimed.
+        GracefulExitOutcome::NoLiveClaude | GracefulExitOutcome::ProbeUnavailable { .. } => None,
+    }
+}
+
+/// PURE: did `claude` leave the pane? See the `stopped_by_drain` comment in
+/// [`wind_down_once`] for why this, and not "the tab closed", is the predicate
+/// a steward restart is owed on.
+pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
+    matches!(
+        outcome,
+        GracefulExitOutcome::Exited { .. }
+            | GracefulExitOutcome::CloseRefused { .. }
+            | GracefulExitOutcome::CloseOutcomeUnknown { .. }
+    )
+}
+
+/// Add `kind` to the persisted stopped-by-drain set. Off the runtime worker
+/// (N-2): the store is small but `std::fs` is blocking, and this runs inside
+/// the executor's async tick.
+async fn record_stopped_by_drain(kind: String) {
+    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        let path = stopped_by_drain_path();
+        let mut set = StoppedByDrain::load(&path);
+        if set.insert(&kind) {
+            set.save(&path);
+            info!(steward = %kind, "wind_down_executor: recorded stopped_by_drain");
+        }
+    })
+    .await;
+}
+
+/// Read the persisted set off the runtime worker (N-2).
+async fn load_stopped_by_drain() -> StoppedByDrain {
+    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
+        StoppedByDrain::load(&stopped_by_drain_path())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Persist the set off the runtime worker (N-2).
+async fn save_stopped_by_drain(set: StoppedByDrain) {
+    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+        set.save(&stopped_by_drain_path());
+    })
+    .await;
 }
 
 /// One wind-down pass: observe, then close what is eligible.
@@ -458,30 +615,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
             .and_then(|r| r.origin.clone())
     };
 
-    let candidates: Vec<(String, String)> = pass
-        .report
-        .terminal_hosted
-        .iter()
-        .filter(|proc| {
-            proc.wind_down
-                .as_ref()
-                .is_some_and(wind_down::WindDownView::is_eligible)
-        })
-        .filter_map(|proc| {
-            let session_id = proc.session_id.clone()?;
-            let terminal_id = fresh.observed.terminal_for(&session_id)?.to_string();
-            Some((session_id, terminal_id))
-        })
-        // ONE candidate per PANE. `graceful_exit` targets a pane, not a pid, so
-        // two top-level `claude` processes attributed to the same terminal
-        // would spend two of the tick's budget slots on one close and the
-        // second would fail on a pane that is already gone.
-        .fold(Vec::new(), |mut acc: Vec<(String, String)>, entry| {
-            if !acc.iter().any(|(_, tid)| tid == &entry.1) {
-                acc.push(entry);
-            }
-            acc
-        });
+    let candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
 
     if candidates.is_empty() {
         return;
@@ -492,18 +626,58 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         "wind_down_executor: the device is drained — closing eligible sessions"
     );
 
-    for (session_id, terminal_id) in candidates.into_iter().take(MAX_CLOSES_PER_TICK) {
-        // Re-read the drain BEFORE each close, not once per tick. Each
-        // `graceful_exit` can wait a full `EXIT_DEADLINE`, so a batch can run
-        // for minutes — long enough for coord to lift the drain underneath it,
-        // and "only while Drained" would then be false for every close after
-        // the first. `was_drained` is not touched here: the tick's own
-        // bookkeeping owns it, and the undrain runs on the next tick.
+    for (index, (session_id, terminal_id)) in
+        candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
+    {
+        // ── Both per-close preconditions are re-established here ────────────
+        //
+        // A batch is up to `MAX_CLOSES_PER_TICK` closes, each of which can wait
+        // a full `EXIT_DEADLINE`, so the last one can start minutes after the
+        // pass that authorised it. BOTH things that authorise a close can have
+        // changed in those minutes, and both are re-read.
+        //
+        // (a) The DRAIN. "Only while Drained" would otherwise be false for
+        //     every close after the first.
         if decide_tick(&crate::coord_drain_state::current(), false, Utc::now())
             != TickAction::WindDown
         {
             info!("wind_down_executor: the drain lifted mid-batch — stopping this pass");
             return;
+        }
+        // (b) The ELIGIBILITY of THIS session. The scenario this closes: four
+        //     sessions are eligible, D is last; while A, B and C are being
+        //     closed the operator returns to D, types a prompt, `claude` works
+        //     for 90 s, answers, and D is back at an empty prompt. D's grid
+        //     generation moved and its grace clock restarted, so a re-observed
+        //     verdict is `NotYet` for another full grace period — but the
+        //     frozen one still says `Eligible`, `exit_prompt_ready` passes
+        //     (the pane genuinely IS at an empty prompt), and the session is
+        //     closed out from under them. `drive`'s own preamble catches a pane
+        //     that is BUSY at close time; it cannot catch one that was busy
+        //     twenty seconds ago and is momentarily quiet, which is precisely
+        //     the state a grace period exists to distinguish from idleness.
+        //     Without this, two of this module's four advertised invariants —
+        //     "a `working` sideband resets the grace clock" and "an unfinished
+        //     idle terminal session is never closed" — would hold only of a
+        //     value read before the batch began.
+        //
+        //     Skipped for the FIRST candidate alone, whose verdict is the pass
+        //     that just ran, milliseconds old, with nothing having elapsed
+        //     since. Every later one pays a re-check.
+        if index > 0 {
+            match wind_down_observer::recheck(app, grace, &session_id, &terminal_id).await {
+                Some(view) if view.is_eligible() => {}
+                other => {
+                    info!(
+                        session_id = %session_id,
+                        terminal_id = %terminal_id,
+                        verdict = other.as_ref().map_or("gone", |v| v.eligibility),
+                        reason = other.as_ref().and_then(|v| v.reason).unwrap_or("-"),
+                        "wind_down_executor: no longer eligible when its turn came — not closed"
+                    );
+                    continue;
+                }
+            }
         }
         let kind = fresh.observed.kind_for(&terminal_id);
         let observation = fresh.observed.observation_for(&terminal_id);
@@ -529,25 +703,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
                 continue;
             }
         };
-        let recorded = match &outcome {
-            GracefulExitOutcome::Exited { .. } => Some(WIND_DOWN_CLOSED),
-            GracefulExitOutcome::ExitStuck { .. } => Some(WIND_DOWN_EXIT_STUCK),
-            GracefulExitOutcome::CloseRefused { .. } => Some(WIND_DOWN_CLOSE_REFUSED),
-            GracefulExitOutcome::CloseOutcomeUnknown { .. } => Some(WIND_DOWN_CLOSE_UNKNOWN),
-            // `Refused` and `WriteFailed` are NOT non-events: `/exit` may
-            // already have been typed into the pane, and where the refusal's
-            // Ctrl-U recovery fired it cleared the whole input line. An
-            // unattended closer that touched an operator's pane and recorded
-            // nothing would be the worst of both. Recorded.
-            GracefulExitOutcome::Refused { .. } | GracefulExitOutcome::WriteFailed { .. } => {
-                Some(WIND_DOWN_NOT_ATTEMPTED)
-            }
-            // `NoLiveClaude` and `ProbeUnavailable` return before anything is
-            // typed, so nothing happened to the session and nothing is claimed.
-            GracefulExitOutcome::NoLiveClaude | GracefulExitOutcome::ProbeUnavailable { .. } => {
-                None
-            }
-        };
+        let recorded = outcome_word(&outcome);
         match (recorded, &store) {
             (Some(word), Some(store)) => {
                 store.set_wind_down_outcome(&session_id, word, Utc::now().timestamp_millis())
@@ -558,26 +714,52 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         }
         if matches!(outcome, GracefulExitOutcome::Exited { .. }) {
             info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
-            // D6: a steward that the drain stopped is owed a restart on
-            // undrain, and only a CLOSED one is actually stopped.
-            if kind == SessionKind::Steward {
-                if let Some(kind) = steward_kind {
-                    let path = stopped_by_drain_path();
-                    let mut set = StoppedByDrain::load(&path);
-                    if set.insert(&kind) {
-                        set.save(&path);
-                        info!(steward = %kind, "wind_down_executor: recorded stopped_by_drain");
-                    }
-                }
-            }
         } else {
             warn!(session_id = %session_id, terminal_id = %terminal_id, ?outcome, "wind_down_executor: not closed");
+        }
+        // D6: a steward the drain STOPPED is owed a restart on undrain. The
+        // predicate is "`claude` left", NOT "the tab closed" — `drive` reaches
+        // its close callback only after `GONE_PROBES_REQUIRED` consecutive gone
+        // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
+        // steward's `claude` is already gone and only the bare shell survives.
+        // Recording just `Exited` left those as zombies: `find_running_steward`
+        // filters on the SHELL's liveness and so reports `running: true`, the
+        // kind is not in the set, undrain does not restart it, a later start is
+        // refused 409, and the next tick cannot retry because a pane with no
+        // live `claude` never appears in `terminal_hosted` again. Over-recording
+        // is cheap — the set is idempotent and `restart_after_drain` answers a
+        // benign 409 with `NotNeeded` — and under-recording is permanent.
+        if kind == SessionKind::Steward && claude_left(&outcome) {
+            if let Some(kind) = steward_kind {
+                record_stopped_by_drain(kind).await;
+            }
         }
     }
 }
 
-/// The undrain half: restart exactly the stewards the drain stopped, then clear
-/// the set.
+/// The undrain half: restart exactly the stewards the drain stopped, and remove
+/// each kind from the persisted set only once ITS OWN restart has reached a
+/// terminal outcome.
+///
+/// Returns whether anything is STILL OWED, which the caller folds back into
+/// `was_drained` so a kind left behind is retried on a later undrain rather
+/// than silently dropped.
+///
+/// ## Why per-kind, and not "drain the set, then restart"
+///
+/// Draining it up front loses stewards two ways, and both are ordinary:
+///
+/// * the drain RE-ARMS between the undrain decision and a restart. The restart
+///   is deferred by the gate (a 409 carrying a `DeferClass` code), the kind is
+///   already out of the set, and nothing puts it back — the wind-down tick
+///   cannot, because there is no tab left to close. The steward is gone until a
+///   human notices. Here the kind stays in the set.
+/// * the process DIES between the save and the restarts, losing every kind at
+///   once. Here at most the one in flight is at risk.
+///
+/// A hard error (not a deferral) still removes the kind: that is a steward an
+/// operator has to look at, and retrying it every 30 s forever — which is what
+/// `was_drained` staying true would do — buries the message it needs to send.
 ///
 /// The other two undrain obligations need no code here, and saying so is the
 /// point of this comment rather than an omission:
@@ -590,37 +772,62 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
 ///   them.
 /// * **the looping supervisor** resumes by itself: its drain rewrite
 ///   (`looping_agent_supervisor::drain_rewrite`) stops turning `Spawn` into
-///   `None` the moment the gate allows, and a closed tab makes the next tick's
-///   decision a `FirstSpawn`.
-async fn undrain(app: &tauri::AppHandle) {
-    let path = stopped_by_drain_path();
-    let mut set = StoppedByDrain::load(&path);
+///   `None` the moment the gate allows, and a tab this module closed is no
+///   longer registered with the `TerminalManager`, so `resolve_live_session`
+///   reports `Liveness::Dead` and `policy::decide` takes its self-heal arm. The
+///   spawn is a `DeathRespawn` (`ever_spawned` is true for any tab wind-down
+///   could have closed) and is backoff-gated, not cadence-gated.
+async fn undrain(app: &tauri::AppHandle) -> bool {
+    let mut set = load_stopped_by_drain().await;
     if set.is_empty() {
         info!("wind_down_executor: the drain lifted — nothing was stopped by it");
-        return;
+        return false;
     }
-    let kinds = set.drain_all();
+    let kinds: Vec<String> = set.kinds().map(str::to_string).collect();
     info!(
         ?kinds,
         "wind_down_executor: the drain lifted — restarting the stewards it stopped"
     );
-    // Cleared BEFORE the restarts, and persisted first: a restart that fails is
-    // reported and left to the operator, whereas a set that survived a failure
-    // would retry the same steward on every tick forever.
-    set.save(&path);
     for kind in kinds {
-        match crate::mcp::steward::restart_after_drain(app.clone(), &kind).await {
+        // Restarted on the roster's DEFAULTS: the mode and interval a stopped
+        // steward was launched with are not persisted (the metadata store is
+        // in-memory and the close removed the row), so reconstructing them
+        // would be invention. An operator who launched a non-default mode over
+        // the API relaunches it the same way.
+        let outcome = crate::mcp::steward::restart_after_drain(app.clone(), &kind).await;
+        let settled = match &outcome {
             Ok(crate::mcp::steward::RestartOutcome::Started) => {
-                info!(steward = %kind, "wind_down_executor: restarted")
+                info!(steward = %kind, "wind_down_executor: restarted");
+                true
             }
             Ok(crate::mcp::steward::RestartOutcome::NotNeeded(why)) => {
-                info!(steward = %kind, "wind_down_executor: no restart needed — {why}")
+                info!(steward = %kind, "wind_down_executor: no restart needed — {why}");
+                true
+            }
+            // The one arm that is NOT settled: the drain re-armed, so this kind
+            // is still owed and stays in the set for a later undrain.
+            Ok(crate::mcp::steward::RestartOutcome::Deferred(why)) => {
+                info!(steward = %kind, "wind_down_executor: restart deferred by the drain, still owed — {why}");
+                false
             }
             Err(e) => {
-                warn!(steward = %kind, error = %e, "wind_down_executor: could not restart the steward the drain stopped — it needs an operator")
+                warn!(steward = %kind, error = %e, "wind_down_executor: could not restart the steward the drain stopped — it needs an operator");
+                true
             }
+        };
+        if settled && set.remove(&kind) {
+            // Persisted per kind, so a crash costs at most the one in flight.
+            save_stopped_by_drain(set.clone()).await;
         }
     }
+    let still_owed = !set.is_empty();
+    if still_owed {
+        info!(
+            owed = ?set.kinds().collect::<Vec<_>>(),
+            "wind_down_executor: stewards still owed a restart — retried on a later undrain"
+        );
+    }
+    still_owed
 }
 
 #[cfg(test)]
@@ -676,8 +883,11 @@ mod tests {
             "io.kill",
             "close_with_deadline",
             "TerminalManager::close",
-            "manager.close(",
-            ".close(&terminal_id)",
+            // RECEIVER-AGNOSTIC. Naming `manager.close(` alone was the hole:
+            // renaming the binding to `mgr` walked straight past it. This
+            // module legitimately calls `.close(` on nothing at all, so the
+            // bare method name is the right thing to forbid.
+            ".close(",
             "taskkill",
         ] {
             assert!(
@@ -690,6 +900,13 @@ mod tests {
             body.contains("graceful_exit(") && body.contains("EXIT_DEADLINE"),
             "the one permitted close call is gone from the module's EXECUTABLE \
              lines — this test is now vacuous"
+        );
+        // ...and the strip itself must not have eaten the module: a filter bug
+        // that returned nothing would pass every forbidden-literal check.
+        assert!(
+            body.len() > 2_000,
+            "the comment strip left {} bytes — the scan is vacuous",
+            body.len()
         );
     }
 
@@ -938,12 +1155,303 @@ mod tests {
         );
     }
 
+    /// S-2: a kind leaves the set ONE AT A TIME, after its own restart settled.
+    /// The all-or-nothing `drain_all` this replaced lost every kind to a crash
+    /// between the save and the restarts, and lost a deferred one permanently.
     #[test]
-    fn draining_the_set_empties_it() {
+    fn a_kind_leaves_the_set_one_at_a_time() {
         let mut set = StoppedByDrain::default();
         set.insert("dev-ops");
-        assert_eq!(set.drain_all(), vec!["dev-ops".to_string()]);
+        set.insert("merge-train");
+        assert!(set.remove("dev-ops"));
+        assert!(!set.remove("dev-ops"), "removing twice is a no-op");
+        assert_eq!(set.kinds().collect::<Vec<_>>(), vec!["merge-train"]);
+        assert!(!set.is_empty(), "the undeferred kind is still owed");
+        assert!(set.remove("merge-train"));
         assert!(set.is_empty());
+    }
+
+    // ── S-4: the two pure halves of a pass, tested directly ─────────────
+    //
+    // Invariants 2 and 3 below are Phase-1 properties re-asserted at the seam:
+    // no mutation confined to THIS module can make either fail. These are the
+    // ones this module owns, and each of them fails on a mutation that would
+    // otherwise close a session it must not.
+
+    fn candidate_proc(
+        pid: u32,
+        session_id: Option<&str>,
+        verdict: Option<&str>,
+        nested: bool,
+    ) -> LiveClaudeProcess {
+        LiveClaudeProcess {
+            pid,
+            parent_pid: None,
+            image: Some("claude".to_string()),
+            age_s: Some(60),
+            cwd: None,
+            has_live_children: Some(false),
+            nested_under_claude: nested,
+            session_id: session_id.map(str::to_string),
+            session_status: Some("finished".to_string()),
+            blocks_restart: false,
+            wind_down: verdict.map(|eligibility| wind_down::WindDownView {
+                eligibility: match eligibility {
+                    "eligible" => "eligible",
+                    "not_yet" => "not_yet",
+                    "ineligible" => "ineligible",
+                    _ => "unknown",
+                },
+                since: None,
+                until: None,
+                reason: None,
+                kind: SessionKind::Terminal,
+            }),
+        }
+    }
+
+    fn observed_with(pairs: &[(&str, &str)]) -> wind_down_observer::ObservedInputs {
+        wind_down_observer::ObservedInputs {
+            terminal_by_session: pairs
+                .iter()
+                .map(|(s, t)| (s.to_string(), t.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Only an `Eligible` verdict is a candidate — the mutation that deletes
+    /// the filter, and the one that weakens it to "has a verdict at all", both
+    /// close sessions the grace period is still protecting.
+    #[test]
+    fn only_an_eligible_verdict_is_a_candidate() {
+        let observed = observed_with(&[
+            ("s-ok", "t1"),
+            ("s-not-yet", "t2"),
+            ("s-inel", "t3"),
+            ("s-unk", "t4"),
+        ]);
+        let processes = vec![
+            candidate_proc(1, Some("s-ok"), Some("eligible"), false),
+            candidate_proc(2, Some("s-not-yet"), Some("not_yet"), false),
+            candidate_proc(3, Some("s-inel"), Some("ineligible"), false),
+            candidate_proc(4, Some("s-unk"), Some("unknown"), false),
+        ];
+        assert_eq!(
+            select_candidates(&processes, &observed),
+            vec![("s-ok".to_string(), "t1".to_string())]
+        );
+    }
+
+    /// A process with NO verdict is not a candidate either — that is how a
+    /// nested subagent (and anything the observer could not judge) is excluded.
+    /// `.is_some()` in place of `.is_eligible()` fails here.
+    #[test]
+    fn a_process_with_no_verdict_is_never_a_candidate() {
+        let observed = observed_with(&[("s-nested", "t1")]);
+        let processes = vec![candidate_proc(1, Some("s-nested"), None, true)];
+        assert!(select_candidates(&processes, &observed).is_empty());
+    }
+
+    /// An eligible process the pass cannot resolve to a pane is skipped rather
+    /// than closed against a guessed terminal.
+    #[test]
+    fn an_eligible_process_with_no_pane_is_skipped() {
+        let processes = vec![
+            candidate_proc(1, Some("s-unmapped"), Some("eligible"), false),
+            candidate_proc(2, None, Some("eligible"), false),
+        ];
+        assert!(select_candidates(&processes, &observed_with(&[])).is_empty());
+    }
+
+    /// ONE candidate per PANE: two top-level `claude` processes attributed to
+    /// the same terminal must not spend two of the tick's budget slots on one
+    /// close, the second of which lands on a pane that is already gone.
+    #[test]
+    fn two_processes_on_one_pane_yield_one_candidate() {
+        let observed = observed_with(&[("s-a", "t1"), ("s-b", "t1"), ("s-c", "t2")]);
+        let processes = vec![
+            candidate_proc(1, Some("s-a"), Some("eligible"), false),
+            candidate_proc(2, Some("s-b"), Some("eligible"), false),
+            candidate_proc(3, Some("s-c"), Some("eligible"), false),
+        ];
+        let got = select_candidates(&processes, &observed);
+        assert_eq!(
+            got,
+            vec![
+                ("s-a".to_string(), "t1".to_string()),
+                ("s-c".to_string(), "t2".to_string())
+            ],
+            "the first process on a pane wins and the second is dropped"
+        );
+    }
+
+    /// Every outcome maps to the word that is TRUE of it, and the two that
+    /// happen before anything is typed claim nothing at all.
+    #[test]
+    fn every_outcome_maps_to_the_word_that_is_true_of_it() {
+        use crate::session::session_lifecycle_store::{
+            WIND_DOWN_CLOSED, WIND_DOWN_CLOSE_REFUSED, WIND_DOWN_CLOSE_UNKNOWN,
+            WIND_DOWN_EXIT_STUCK, WIND_DOWN_NOT_ATTEMPTED,
+        };
+        let pids = vec![42];
+        let cases: Vec<(GracefulExitOutcome, Option<&str>, bool)> = vec![
+            (
+                GracefulExitOutcome::Exited {
+                    waited_ms: 1,
+                    claude_pids: pids.clone(),
+                },
+                Some(WIND_DOWN_CLOSED),
+                true,
+            ),
+            (
+                GracefulExitOutcome::ExitStuck {
+                    waited_ms: 1,
+                    claude_pids: pids.clone(),
+                    last_probe_unreadable: false,
+                },
+                Some(WIND_DOWN_EXIT_STUCK),
+                // `claude` is STILL RUNNING: nothing was stopped, so nothing is
+                // owed a restart.
+                false,
+            ),
+            (
+                GracefulExitOutcome::CloseRefused {
+                    waited_ms: 1,
+                    claude_pids: pids.clone(),
+                    reason: "r".into(),
+                },
+                Some(WIND_DOWN_CLOSE_REFUSED),
+                true,
+            ),
+            (
+                GracefulExitOutcome::CloseOutcomeUnknown {
+                    waited_ms: 1,
+                    claude_pids: pids.clone(),
+                    detail: "d".into(),
+                },
+                Some(WIND_DOWN_CLOSE_UNKNOWN),
+                true,
+            ),
+            (
+                GracefulExitOutcome::Refused {
+                    reason: "r".into(),
+                    claude_pids: pids.clone(),
+                },
+                Some(WIND_DOWN_NOT_ATTEMPTED),
+                false,
+            ),
+            (
+                GracefulExitOutcome::WriteFailed {
+                    error: "e".into(),
+                    claude_pids: pids.clone(),
+                },
+                Some(WIND_DOWN_NOT_ATTEMPTED),
+                false,
+            ),
+            (GracefulExitOutcome::NoLiveClaude, None, false),
+            (
+                GracefulExitOutcome::ProbeUnavailable { detail: "d".into() },
+                None,
+                false,
+            ),
+        ];
+        for (outcome, word, left) in cases {
+            assert_eq!(outcome_word(&outcome), word, "word for {outcome:?}");
+            assert_eq!(claude_left(&outcome), left, "claude_left for {outcome:?}");
+        }
+    }
+
+    /// S-1: the predicate a steward restart is owed on is "`claude` left", not
+    /// "the tab closed". `CloseRefused` and `CloseOutcomeUnknown` are reached
+    /// only AFTER the gone probes, so the steward really is stopped even though
+    /// its bare shell survives.
+    #[test]
+    fn a_refused_close_still_counts_as_the_steward_having_stopped() {
+        assert!(claude_left(&GracefulExitOutcome::CloseRefused {
+            waited_ms: 1,
+            claude_pids: vec![42],
+            reason: "a claude reappeared".into(),
+        }));
+        assert!(claude_left(&GracefulExitOutcome::CloseOutcomeUnknown {
+            waited_ms: 1,
+            claude_pids: vec![42],
+            detail: "the close task died".into(),
+        }));
+        assert!(
+            !claude_left(&GracefulExitOutcome::ExitStuck {
+                waited_ms: 1,
+                claude_pids: vec![42],
+                last_probe_unreadable: false,
+            }),
+            "an exit-stuck steward is still running and is owed nothing"
+        );
+    }
+
+    /// The lifecycle write this module makes. Absent record = no-op; present
+    /// record takes the word and the instant; a later write supersedes.
+    #[test]
+    fn the_wind_down_outcome_is_recorded_on_the_record_it_names() {
+        use crate::session::session_lifecycle_store::SessionLifecycleStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SessionLifecycleStore::open(&dir.path().join("terminal-sessions.json")).unwrap();
+        // An absent record is a no-op, not an error and not a new row.
+        store.set_wind_down_outcome("missing", WIND_DOWN_CLOSED, 10);
+        assert!(store.get("missing").is_none());
+
+        store.record_open(
+            crate::session::session_lifecycle_store::TerminalSessionRecord {
+                claude_session_id: "s1".to_string(),
+                config_dir: None,
+                working_dir: None,
+                page_id: "default".to_string(),
+                zone_index: 0,
+                title: None,
+                terminal_id: "t1".to_string(),
+                opened_at: 1,
+                last_seen_at: 2,
+                state: "open".to_string(),
+                closed_at: None,
+                close_reason: None,
+                provider: "claude".to_string(),
+                origin: None,
+                restore_pending_at: None,
+                confirmed_at: None,
+                handle: None,
+                account_label: None,
+                account_wrapper: None,
+                session_name: None,
+                name_source: None,
+                tenant_id: None,
+                task_run_id: None,
+                bypass_permissions: None,
+                restored_from_boot_at: None,
+                restore_tier: None,
+                finished_at: None,
+                wind_down_outcome: None,
+                wind_down_at: None,
+                finish_reason: None,
+                finish_synced: false,
+            },
+        );
+        assert!(store.get("s1").unwrap().wind_down_outcome.is_none());
+
+        store.set_wind_down_outcome("s1", WIND_DOWN_EXIT_STUCK, 111);
+        let after = store.get("s1").unwrap();
+        assert_eq!(
+            after.wind_down_outcome.as_deref(),
+            Some(WIND_DOWN_EXIT_STUCK)
+        );
+        assert_eq!(after.wind_down_at, Some(111));
+        // Orthogonal to `state`: an exit-stuck session is still open.
+        assert_eq!(after.state, "open");
+
+        store.set_wind_down_outcome("s1", WIND_DOWN_CLOSED, 222);
+        let later = store.get("s1").unwrap();
+        assert_eq!(later.wind_down_outcome.as_deref(), Some(WIND_DOWN_CLOSED));
+        assert_eq!(later.wind_down_at, Some(222));
     }
 
     // ── Invariants 2 and 3, over the pure verdict this executor acts on ──
