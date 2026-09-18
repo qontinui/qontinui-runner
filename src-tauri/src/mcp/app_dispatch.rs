@@ -490,7 +490,7 @@ mod tests {
     async fn websocket_path_round_trips() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
         registry
             .upsert(
                 sample_app("wapp", "http://unused"),
@@ -517,12 +517,16 @@ mod tests {
         assert_eq!(v["payload"]["q"], 1);
 
         relay
-            .resolve(super::super::command_relay::CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({"ok": true})),
-                error: None,
-            })
+            .resolve(
+                Some(conn_id),
+                true,
+                super::super::command_relay::CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                },
+            )
             .await;
 
         let out = handle.await.unwrap().unwrap();
@@ -577,7 +581,7 @@ mod tests {
     async fn dispatch_active_routes_websocket_via_relay() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
         registry
             .upsert(
                 sample_app("wapp", "ws-app://wapp"),
@@ -606,12 +610,16 @@ mod tests {
         assert_eq!(v["payload"]["q"], 1);
 
         relay
-            .resolve(super::super::command_relay::CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({"ok": true})),
-                error: None,
-            })
+            .resolve(
+                Some(conn_id),
+                true,
+                super::super::command_relay::CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({"ok": true})),
+                    error: None,
+                },
+            )
             .await;
 
         let out = handle.await.unwrap().unwrap();

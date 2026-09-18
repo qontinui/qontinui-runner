@@ -151,6 +151,15 @@ pub struct RegisterAppResponse {
     #[serde(flatten)]
     pub app: DiscoveredApp,
     pub transport: crate::mcp::app_registry::AppTransport,
+    /// Agent-visible provenance, served with NO gate (plan
+    /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`): the
+    /// header origin the runner VERIFIED this registrant at, and the requester
+    /// class it was admitted under. `null` for an operator-trust registrant,
+    /// which sends no `Origin`. An agent can see what it is driving without
+    /// being blocked by the binding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_origin: Option<String>,
+    pub principal_class: &'static str,
 }
 
 // ============================================================================
@@ -621,16 +630,29 @@ async fn ios_forward(
 /// Also accepts the legacy manual `{url, port, basePath}` shape when `baseUrl`
 /// is absent, so existing callers keep working.
 ///
-/// `_principal` (the origin guard's classification of the caller) is carried
-/// for the principal binding of plan
-/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`; not consulted
-/// yet.
+/// Bound to the caller's principal (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`): R-opaque
+/// refuses a browser with no usable `Origin`, R4 refuses a body `origin` /
+/// `baseUrl` that disagrees with the header and a browser-declared WebSocket
+/// transport, and R1/R5 refuse a claim on an id another principal holds.
 pub(crate) async fn register_app(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
     Json(req): Json<RegisterAppRequest>,
 ) -> Result<Json<ApiResponse<RegisterAppResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     use crate::mcp::app_registry::AppTransport;
+    use crate::mcp::relay_binding::{BindingMode, Principal, Refusal};
+
+    const ROUTE: &str = "POST /ui-bridge/apps/register";
+    let binding = state.binding.clone();
+    let mode = binding.config.binding;
+    let principal = binding
+        .principal(requester.as_ref().map(|e| &e.0), None, ROUTE)
+        .map_err(Refusal::into_http)?;
+    let browser_origin = match &principal {
+        Principal::Browser { origin, .. } if mode != BindingMode::Off => Some(origin.clone()),
+        _ => None,
+    };
 
     // Parse the declared transport (defaults to HTTP when absent). Unknown
     // values are rejected so wrappers get a clear signal rather than being
@@ -648,6 +670,24 @@ pub(crate) async fn register_app(
             ));
         }
     };
+
+    // R4's transport arm: only the WS handler creates WebSocket entries, so a
+    // browser page phoning home may not declare one. `useCommandRelay` always
+    // sends `transport:"http"`.
+    if browser_origin.is_some()
+        && (transport == AppTransport::Websocket || req.websocket_conn_id.is_some())
+    {
+        binding
+            .meter(
+                mode,
+                &principal,
+                ROUTE,
+                Refusal::origin_mismatch(
+                    "A browser registration may not declare a WebSocket transport or a websocketConnId; only the /ui-bridge/ws handler creates those entries",
+                ),
+            )
+            .map_err(Refusal::into_http)?;
+    }
 
     // Derive a canonical (origin, port, base_path) triple from either the
     // preferred `base_url` or the legacy `url` + `port` + `base_path` shape.
@@ -711,6 +751,33 @@ pub(crate) async fn register_app(
         }
     };
 
+    // R4's origin arm: a browser's self-declared `origin` and the origin of
+    // the `baseUrl` / `url` the runner would POST to must both be the origin
+    // the request was actually sent from. `origin_url` is already the
+    // canonical `scheme://host:port` derived above.
+    if let Some(header) = &browser_origin {
+        for (label, declared) in [
+            ("origin", req.origin.as_deref()),
+            ("baseUrl", Some(origin_url.as_str())),
+        ] {
+            let Some(raw) = declared.map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let matches = crate::mcp::origin_guard::NormOrigin::parse(raw)
+                .is_some_and(|d| d.same_principal(header));
+            if !matches {
+                let message = if label == "origin" {
+                    "The declared `origin` is not the origin this request was sent from"
+                } else {
+                    "The declared `baseUrl` / `url` is not on the origin this request was sent from"
+                };
+                binding
+                    .meter(mode, &principal, ROUTE, Refusal::origin_mismatch(message))
+                    .map_err(Refusal::into_http)?;
+            }
+        }
+    }
+
     let app = DiscoveredApp {
         app_id: req.app_id.clone(),
         app_name: req.app_name,
@@ -726,25 +793,39 @@ pub(crate) async fn register_app(
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
 
+    // R1/R5: the check and the write under ONE registry lock.
     state
         .app_registry
-        .upsert(
+        .claim(
+            &binding,
+            &principal,
+            ROUTE,
             app.clone(),
             req.origin,
             transport,
             req.websocket_conn_id,
             keep_alive_ms,
         )
-        .await;
+        .await
+        .map_err(Refusal::into_http)?;
 
     debug!(
-        "[app-registry] registered appId={} origin={} port={} basePath={} transport={:?} keepAliveMs={:?}",
-        app.app_id, app.url, app.port, app.base_path, transport, keep_alive_ms
+        "[app-registry] registered appId={} url={} port={} basePath={} transport={:?} keepAliveMs={:?} class={} verifiedOrigin={:?}",
+        app.app_id,
+        app.url,
+        app.port,
+        app.base_path,
+        transport,
+        keep_alive_ms,
+        principal.class_str(),
+        principal.verified_origin(),
     );
 
     Ok(Json(ApiResponse::success(RegisterAppResponse {
         app,
         transport,
+        verified_origin: principal.verified_origin(),
+        principal_class: principal.class_str(),
     })))
 }
 
@@ -760,8 +841,10 @@ pub(crate) async fn list_registered_apps(
         .await
         .into_iter()
         .map(|e| RegisterAppResponse {
-            app: e.app,
             transport: e.transport,
+            verified_origin: e.verified_origin(),
+            principal_class: e.principal_class(),
+            app: e.app,
         })
         .collect();
     Json(ApiResponse::success(apps))
@@ -769,13 +852,29 @@ pub(crate) async fn list_registered_apps(
 
 /// Explicit deregistration — useful on `beforeunload` when the SDK can still
 /// send a beacon. Returns `true` if an entry was removed.
+///
+/// R2: only the holder's own principal, or an operator-trust caller, may
+/// remove an entry; anyone else gets `UIB_REGISTRATION_HELD`. A browser
+/// principal's released id is then tombstoned for `BINDING_TOMBSTONE_MS`, so
+/// a page polling `/ui-bridge/apps/registered` cannot win the reload race.
 pub(crate) async fn deregister_app(
     State(state): State<RelayState>,
-    _principal: Option<Extension<RequesterPrincipal>>,
+    requester: Option<Extension<RequesterPrincipal>>,
     Path(app_id): Path<String>,
-) -> Json<ApiResponse<bool>> {
-    let removed = state.app_registry.remove(&app_id).await;
-    Json(ApiResponse::success(removed))
+) -> Result<Json<ApiResponse<bool>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use crate::mcp::relay_binding::Refusal;
+
+    const ROUTE: &str = "DELETE /ui-bridge/apps/register/{app_id}";
+    let binding = state.binding.clone();
+    let principal = binding
+        .principal(requester.as_ref().map(|e| &e.0), None, ROUTE)
+        .map_err(Refusal::into_http)?;
+    let removed = state
+        .app_registry
+        .release(&binding, &app_id, &principal, None, ROUTE)
+        .await
+        .map_err(Refusal::into_http)?;
+    Ok(Json(ApiResponse::success(removed)))
 }
 
 // ============================================================================
@@ -897,6 +996,8 @@ pub(crate) async fn wait_for_app_inner(
                 .map(|e| RegisterAppResponse {
                     app: e.app.clone(),
                     transport: e.transport,
+                    verified_origin: e.verified_origin(),
+                    principal_class: e.principal_class(),
                 })
         };
 
@@ -1431,7 +1532,7 @@ mod tests {
 
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("wapp").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("wapp").await;
         registry
             .upsert(
                 sample_app("wapp"),
@@ -1469,12 +1570,16 @@ mod tests {
         assert_eq!(v["payload"], serde_json::json!({"x": 1}));
 
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(serde_json::json!({"ok": true})),
-                error: None,
-            })
+            .resolve(
+                Some(conn_id),
+                true,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(serde_json::json!({"ok": true})),
+                    error: None,
+                },
+            )
             .await;
 
         let (status, body) = handle.await.unwrap();
