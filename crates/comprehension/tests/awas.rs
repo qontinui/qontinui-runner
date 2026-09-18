@@ -18,9 +18,12 @@ use qontinui_comprehension::mapping::degraded_evidence_classes;
 use qontinui_comprehension::worker::{assemble_spec, assemble_spec_with_seed};
 
 use qontinui_types::completeness_eval::{enumerate_nodes, evaluate_completeness, CoverageEvidence};
+use qontinui_types::endpoint_for::endpoint_for;
 use qontinui_types::functional_spec::{FunctionalSpec, SpecProvenance};
+use qontinui_types::priorities_profile::Profile;
 
 const MANIFEST: &str = include_str!("fixtures/comprehension/connect-runner.awas-manifest.json");
+const PROFILE: &str = include_str!("fixtures/comprehension/connect-runner.profile.json");
 const DISCOVERY: &str = include_str!("fixtures/comprehension/connect-runner.discovery.json");
 const INFERRED: &str =
     include_str!("fixtures/comprehension/connect-runner.inferred-overconfident.json");
@@ -131,7 +134,12 @@ fn seed_emits_declared_operation_inputs_effect_and_auth() {
     let prov = op.provenance.as_deref().unwrap();
     assert!(
         prov.contains("/api/runners/pair") && prov.contains("POST"),
-        "provenance carries the declared endpoint for endpoint_for's override path: {prov}"
+        "provenance RECORDS the declared route — frozen v0 has no field for it, \
+         so this string is the only place it survives: {prov}"
+    );
+    assert!(
+        prov.contains("[declared-route; v0 derives its own]"),
+        "the record is marked as unhonoured, not left to look authoritative: {prov}"
     );
     assert_eq!(op.inputs.len(), 2);
     for input in &op.inputs {
@@ -364,4 +372,118 @@ fn seeded_spec_round_trips_to_full_coverage() {
     assert!(verdict.gaps.is_empty(), "no gaps: {:?}", verdict.gaps);
     assert!((verdict.assumed_fill_rate - 1.0).abs() < 1e-9);
     assert!(verdict.coverage_is_consistent());
+}
+
+/// The one thing AWAS knows that the explorer cannot — the route — is the one
+/// thing frozen v0 cannot carry. This test EXISTS TO FAIL when that changes:
+/// when `Operation` gains the `observed_endpoint` field `endpoint_for`'s module
+/// doc reserves, populate it in `awas_seed` and delete this test.
+#[test]
+fn the_declared_route_is_recorded_but_v0_derives_its_own() {
+    let profile: Profile =
+        serde_json::from_str(PROFILE).expect("connect-runner profile fixture parses");
+    let spec = comprehend_with_seed(inferred());
+    let pair = op(&spec, "pairConfirm");
+
+    let declared = "/api/runners/pair";
+    assert!(
+        pair.provenance.as_deref().unwrap().contains(declared),
+        "the manifest's declared route is recorded"
+    );
+
+    let derived = endpoint_for(pair, &profile);
+    assert_eq!(derived.method, "POST");
+    assert_eq!(
+        derived.path, "/api/v1/devices/pair-confirm",
+        "v0 derives from verb/name/entity and never reads `provenance`"
+    );
+    assert_ne!(
+        derived.path, declared,
+        "the divergence is REAL on the shipped fixture — recorded, not silently \
+         implied to be handled (awas_seed module docs)"
+    );
+}
+
+/// A manifest is remote, unauthenticated input, and `AwasDeclared` is the one
+/// class the clamp will not touch — so an action id that spells a dotted ref
+/// must not be able to pin a node the manifest never declared.
+#[test]
+fn a_manifest_cannot_forge_a_ref_in_the_pinned_namespace() {
+    let hostile: AwasManifest = serde_json::from_str(
+        r#"{
+          "schemaVersion": "1.0",
+          "baseUrl": "https://evil.example",
+          "actions": [
+            {"id": "listDevices.inputs.q.validation", "method": "GET", "endpoint": "/api/v1/devices"},
+            {"id": "", "method": "GET", "endpoint": "/api/v1/devices"},
+            {"id": "ok", "method": "GET", "endpoint": "/api/v1/devices"},
+            {"id": "ok", "method": "POST", "endpoint": "/api/v1/other"}
+          ],
+          "auth": {"type": "api_key", "scopes": [{"name": "bad.scope"}, {"name": "good"}]}
+        }"#,
+    )
+    .expect("hostile manifest parses");
+
+    let (seed, classes) = awas_to_spec_seed(&hostile);
+
+    let names: Vec<&str> = seed.operations.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["ok"],
+        "dotted, empty and duplicate ids are all skipped, not collapsed"
+    );
+    assert!(
+        !classes.contains_key("operations.listDevices.inputs.q.validation"),
+        "a forged ref never reaches the pinned class map: {classes:?}"
+    );
+    assert!(!classes.contains_key("operations."), "empty id skipped");
+
+    let roles: Vec<&str> = seed
+        .auth
+        .as_ref()
+        .unwrap()
+        .roles
+        .iter()
+        .map(|r| r.name.as_str())
+        .collect();
+    assert_eq!(roles, vec!["good"], "a dotted scope name is skipped too");
+    assert!(!classes.contains_key("auth.roles.bad.scope"));
+
+    // The surviving action keeps its own pinned ref.
+    assert_eq!(
+        classes.get("operations.ok"),
+        Some(&EvidenceClass::AwasDeclared)
+    );
+}
+
+/// `Operation.entity` names an entity `endpoint_for` derives a route from, so
+/// the spec must contain it even when no schema gave it fields.
+#[test]
+fn an_entity_named_by_an_operation_is_always_present_in_the_spec() {
+    let schemaless: AwasManifest = serde_json::from_str(
+        r#"{
+          "schemaVersion": "1.0",
+          "baseUrl": "https://app.example",
+          "actions": [
+            {"id": "pairRunner", "method": "GET", "endpoint": "/api/v1/runners/pair"}
+          ]
+        }"#,
+    )
+    .expect("schemaless manifest parses");
+
+    let (seed, classes) = awas_to_spec_seed(&schemaless);
+    let named = seed.operations[0]
+        .entity
+        .as_deref()
+        .expect("entity derived from the endpoint");
+    assert_eq!(named, "Runner");
+    assert!(
+        seed.entities.iter().any(|e| e.name == named),
+        "no dangling entity reference: {:?}",
+        seed.entities
+    );
+    assert_eq!(
+        classes.get("entities.Runner"),
+        Some(&EvidenceClass::AwasDeclared)
+    );
 }

@@ -23,8 +23,44 @@
 //! — it sharpens the `assumption` text, never the provenance class. So the seed
 //! emits every effect at `Assumed` and classes it `Silent`, exactly as the
 //! degraded path does, and the clamp would force it regardless.
+//!
+//! ## The declared route is recorded, NOT honoured (frozen-v0 limitation)
+//!
+//! A manifest states its own endpoint — `POST /api/runners/pair` — and that is
+//! the hardest routing evidence this crate ever sees. **Frozen v0 cannot carry
+//! it.** `Operation` has no endpoint field, and `endpoint_for` reads only
+//! `verb`, `name` and `entity`; its own module doc says the structured override
+//! "lands when the contract gains an `observed_endpoint` field … until then the
+//! deterministic rule is authoritative". So for the connect-runner fixture the
+//! seed records `POST /api/runners/pair` in `provenance` while `endpoint_for`
+//! derives `POST /api/v1/devices/pair-confirm`, and **the declared route loses**.
+//!
+//! This is stated here, pinned by the golden test
+//! `the_declared_route_is_recorded_but_v0_derives_its_own` in `tests/awas.rs`,
+//! and flagged in the operation's own `provenance` string, rather than being
+//! implied to work. The seed does not pretend otherwise: an earlier draft of
+//! this module claimed the provenance string *was* the `endpoint_for` override
+//! path, which is false against the frozen crate. When `observed_endpoint`
+//! lands on `Operation`, populate it here and that test will fail, which is the
+//! point of it.
+//!
+//! One related lossy edge, for the same frozen-vocabulary reason: `PATCH` maps
+//! to the verb `update`, which `endpoint_for` regenerates as `PUT`. A declared
+//! partial update comes back as a full replace. The real method is kept in the
+//! operation's `provenance` so the fact is recoverable.
+//!
+//! ## Manifest strings are untrusted input to a PINNED namespace
+//!
+//! Every evidence-class key is a dotted `enumerate_nodes` ref, the namespace has
+//! no escaping, and `AwasDeclared` is the one class the clamp refuses to touch.
+//! A remote manifest that named an action `listDevices.inputs.q.validation`
+//! would therefore pin a node it never declared, and an LLM over-claim on that
+//! node would survive the honesty clamp. Every manifest-controlled string that
+//! reaches a ref is screened by [`is_ref_safe`] first, and an action with an
+//! empty or duplicate `id` is skipped rather than silently collapsed into its
+//! namesake.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -154,8 +190,9 @@ pub struct AwasScope {
 /// - action → `Operation{name: id, verb: <from method>, entity: <schema title
 ///   or derived from the endpoint>, inputs: <from parameters>, effect: Assumed,
 ///   confidence: Observed, provenance: "awas:<endpoint> <METHOD> — <intent>"}`.
-///   The observed endpoint rides in `provenance` — the `endpoint_for` override
-///   path the oracle test pins.
+///   The declared endpoint rides in `provenance` as a RECORD; frozen v0 has no
+///   field for it and `endpoint_for` derives its own route regardless (module
+///   docs, "The declared route is recorded, NOT honoured").
 /// - parameter → `OperationInput{field, required, validation: rule
 ///   "enum:a|b|c" | "type:<type>", provenance carrying the `location`}`.
 ///   Nothing dropped, nothing invented on the frozen struct.
@@ -173,13 +210,34 @@ pub fn awas_to_spec_seed(
     let mut entities: Vec<Entity> = Vec::new();
     let mut operations: Vec<Operation> = Vec::new();
 
+    let mut seen_ids: BTreeSet<&str> = BTreeSet::new();
     for action in &manifest.actions {
+        if !is_ref_safe(&action.id) {
+            tracing::warn!(
+                action_id = %action.id,
+                "awas: skipping an action whose id is empty or carries a `.` — it would \
+                 forge an evidence ref in the pinned AwasDeclared namespace"
+            );
+            continue;
+        }
+        if !seen_ids.insert(action.id.as_str()) {
+            tracing::warn!(
+                action_id = %action.id,
+                "awas: skipping a duplicate action id — collapsing it would silently \
+                 discard one action's endpoint, inputs and effect"
+            );
+            continue;
+        }
         let method = action.method.trim().to_ascii_uppercase();
         let entity_name = entity_for_action(action);
 
+        // Deduped by `name`: two parameters of one name would emit
+        // `operations.<id>.inputs.<name>.validation` twice.
+        let mut seen_params: BTreeSet<&str> = BTreeSet::new();
         let inputs: Vec<OperationInput> = action
             .parameters
             .iter()
+            .filter(|p| is_ref_safe(&p.name) && seen_params.insert(p.name.as_str()))
             .map(|p| parameter_to_input(action, p))
             .collect();
 
@@ -215,14 +273,30 @@ pub fn awas_to_spec_seed(
                 credibility: None,
             }),
             confidence: SpecProvenance::Observed,
+            // `declared-route` is a marker, not decoration: frozen v0 carries no
+            // endpoint field, so this string is the ONLY record that the site
+            // stated a route, and `endpoint_for` will derive a different one.
+            // Module docs, "The declared route is recorded, NOT honoured".
             provenance: Some(format!(
-                "awas:{} {} — {}",
+                "awas:{} {} — {} [declared-route; v0 derives its own]",
                 action.endpoint, method, action.intent
             )),
             credibility: None,
         });
 
         if let Some(entity_name) = &entity_name {
+            // `Operation.entity` names this entity, and `endpoint_for` derives a
+            // route from it, so the spec must CONTAIN it even when no schema
+            // gave it fields — otherwise the operation carries a dangling
+            // reference. The endpoint declared it; a fieldless entity is the
+            // honest record of that.
+            merge_seed_entity(
+                &mut entities,
+                &mut classes,
+                entity_name,
+                vec![],
+                &format!("awas:{}", action.id),
+            );
             for (schema, label) in [
                 (&action.input_schema, "input_schema"),
                 (&action.output_schema, "output_schema"),
@@ -243,25 +317,31 @@ pub fn awas_to_spec_seed(
         }
     }
 
-    let auth = manifest.auth.as_ref().map(|a| {
+    // `auth: None` seeds NO auth node — the explorer path owns it at
+    // `AuthShellInfer`. Written as an `if let` rather than an `Option::map`
+    // because the body mutates `classes`, which a projection should not hide.
+    let mut auth = None;
+    if let Some(a) = &manifest.auth {
         classes.insert("auth".into(), EvidenceClass::AwasDeclared);
-        let roles = a
-            .scopes
-            .iter()
-            .map(|s| {
-                classes.insert(
-                    format!("auth.roles.{}", s.name),
-                    EvidenceClass::AwasDeclared,
-                );
-                AuthRole {
-                    name: s.name.clone(),
-                    confidence: SpecProvenance::Observed,
-                    provenance: Some("awas:auth.scopes".into()),
-                    credibility: None,
-                }
-            })
-            .collect();
-        AuthModel {
+        let mut roles = Vec::with_capacity(a.scopes.len());
+        let mut seen_scopes: BTreeSet<&str> = BTreeSet::new();
+        for s in &a.scopes {
+            if !is_ref_safe(&s.name) || !seen_scopes.insert(s.name.as_str()) {
+                tracing::warn!(scope = %s.name, "awas: skipping an unusable auth scope name");
+                continue;
+            }
+            classes.insert(
+                format!("auth.roles.{}", s.name),
+                EvidenceClass::AwasDeclared,
+            );
+            roles.push(AuthRole {
+                name: s.name.clone(),
+                confidence: SpecProvenance::Observed,
+                provenance: Some("awas:auth.scopes".into()),
+                credibility: None,
+            });
+        }
+        auth = Some(AuthModel {
             model: if a.auth_type.trim().is_empty() {
                 "none".into()
             } else {
@@ -271,8 +351,8 @@ pub fn awas_to_spec_seed(
             roles,
             provenance: Some("awas:auth".into()),
             credibility: None,
-        }
-    });
+        });
+    }
 
     let spec = FunctionalSpec {
         spec_version: "0".into(),
@@ -290,9 +370,26 @@ pub fn awas_to_spec_seed(
     (spec, classes)
 }
 
+/// A string is usable inside a dotted `enumerate_nodes` ref: non-empty after
+/// trimming, no `.` (the ref separator), and no whitespace or control
+/// characters. Screening every manifest-controlled ref component here is what
+/// stops a remote manifest forging a node in the pinned `AwasDeclared`
+/// namespace — see the module docs.
+pub fn is_ref_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.trim() == s
+        && !s.contains('.')
+        && !s.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
 /// `GET`→`read`, `POST`→`create`, `PUT`/`PATCH`→`update`, `DELETE`→`delete`;
 /// anything else is the lower-cased method (the `endpoint_for` rule treats an
 /// unknown verb as `custom`→`POST`).
+///
+/// `PATCH` and `PUT` collapse because the frozen verb vocabulary has one
+/// `update`: `endpoint_for` regenerates both as `PUT`, so a declared partial
+/// update round-trips as a full replace. The real method stays in the
+/// operation's `provenance`.
 fn verb_for_method(method_upper: &str) -> String {
     match method_upper {
         "GET" => "read".into(),
@@ -313,7 +410,10 @@ fn entity_for_action(action: &AwasAction) -> Option<String> {
     {
         if let Some(title) = schema.get("title").and_then(|t| t.as_str()) {
             let title = title.trim();
-            if !title.is_empty() {
+            // The title becomes `entities.<title>` — screen it like any other
+            // manifest-controlled ref component, and fall through to the
+            // endpoint when it is unusable rather than dropping the entity.
+            if is_ref_safe(title) {
                 return Some(title.to_string());
             }
         }
@@ -322,15 +422,58 @@ fn entity_for_action(action: &AwasAction) -> Option<String> {
 }
 
 /// `/api/v1/runners/pair` → `Runner`.
+///
+/// Singularisation is deliberately small, not a pluralisation library: it
+/// handles `-ies`→`-y`, `-sses`/`-shes`/`-ches`/`-xes`→ drop `-es`, a trailing
+/// `-s` that is not `-ss`, and leaves everything else alone. It exists to
+/// round-trip the shapes `endpoint_for::table_name` re-pluralises; anything
+/// exotic stays as declared rather than being mangled (`/status` stays
+/// `Status`, not `Statu`).
 fn entity_from_endpoint(endpoint: &str) -> Option<String> {
-    let path = endpoint.split(['?', '#']).next().unwrap_or_default();
+    let path = endpoint.split(['?', '#']).next().unwrap_or(endpoint);
     let segment = path
         .split('/')
         .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("api") && !is_version_token(s))?;
-    let singular = segment.strip_suffix('s').unwrap_or(segment);
+    let singular = singularise(segment);
+    if !is_ref_safe(&singular) {
+        return None;
+    }
     let mut chars = singular.chars();
     let first = chars.next()?;
     Some(first.to_uppercase().chain(chars).collect())
+}
+
+fn singularise(segment: &str) -> String {
+    // `to_ascii_lowercase` is byte-length preserving, so a suffix length found
+    // on `lower` is a valid byte count on `segment`; `trim_bytes` still refuses
+    // a cut that is not a char boundary, so this cannot panic on any input.
+    let lower = segment.to_ascii_lowercase();
+    let trim_bytes = |n: usize| -> String {
+        let keep = segment.len().saturating_sub(n);
+        match segment.get(..keep) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => segment.to_string(),
+        }
+    };
+
+    // Not plurals at all: `status`, `address`, `analysis`, `chaos`.
+    if ["us", "ss", "is", "os"].iter().any(|t| lower.ends_with(t)) {
+        return segment.to_string();
+    }
+    if lower.len() > 3 && lower.ends_with("ies") {
+        return format!("{}y", trim_bytes(3));
+    }
+    // `-sses` / `-shes` / `-ches` / `-xes` / `-zes` drop the `es`.
+    if ["sses", "shes", "ches", "xes", "zes"]
+        .iter()
+        .any(|t| lower.ends_with(t))
+    {
+        return trim_bytes(2);
+    }
+    if lower.ends_with('s') {
+        return trim_bytes(1);
+    }
+    segment.to_string()
 }
 
 /// `v1`, `V2`, `v10` … — a version segment, not an entity.
@@ -368,14 +511,25 @@ fn parameter_to_input(action: &AwasAction, p: &AwasParameter) -> OperationInput 
 }
 
 /// Read a JSON Schema's `properties` into entity fields (each property's `type`,
-/// or `string`; `enum` values when present). Key order is serde_json's object
-/// order — sorted, hence deterministic.
+/// or `string`; `enum` values when present).
+///
+/// Sorted by property name EXPLICITLY. `serde_json::Map` iterates in sorted
+/// order only while the additive `preserve_order` feature is off anywhere in the
+/// workspace graph; any crate enabling it would flip `Map` to insertion order
+/// and silently reorder every seeded entity's fields, breaking a fixture oracle
+/// far from the cause. Sorting here makes the ordering this function's property
+/// rather than a feature-resolution accident.
+///
+/// A property name that is not [`is_ref_safe`] is skipped — it would become
+/// `entities.<entity>.fields.<name>` in the pinned namespace.
 fn schema_fields(schema: &serde_json::Value, provenance: &str) -> Vec<EntityField> {
     let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
         return vec![];
     };
-    props
-        .iter()
+    let mut entries: Vec<_> = props.iter().filter(|(name, _)| is_ref_safe(name)).collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    entries
+        .into_iter()
         .map(|(name, prop)| {
             let values: Vec<String> = prop
                 .get("enum")
@@ -457,6 +611,28 @@ mod tests {
         assert_eq!(
             entity_from_endpoint("/devices?x=1").as_deref(),
             Some("Device")
+        );
+        // The shapes a naive `strip_suffix('s')` mangles.
+        assert_eq!(
+            entity_from_endpoint("/api/v1/status").as_deref(),
+            Some("Status")
+        );
+        assert_eq!(
+            entity_from_endpoint("/api/v1/addresses").as_deref(),
+            Some("Address")
+        );
+        assert_eq!(
+            entity_from_endpoint("/api/v1/policies").as_deref(),
+            Some("Policy")
+        );
+        assert_eq!(
+            entity_from_endpoint("/api/v1/batches").as_deref(),
+            Some("Batch")
+        );
+        // Not a plural, left exactly as declared.
+        assert_eq!(
+            entity_from_endpoint("/api/v1/analysis").as_deref(),
+            Some("Analysis")
         );
         assert_eq!(entity_from_endpoint("/api/v2").as_deref(), None);
         assert_eq!(entity_from_endpoint("").as_deref(), None);

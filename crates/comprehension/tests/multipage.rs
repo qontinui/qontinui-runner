@@ -82,7 +82,20 @@ fn comprehend_site() -> FunctionalSpec {
         3,
         "the LLM stand-in names Device once per page"
     );
-    let _ = snapshot; // the merged snapshot is the LLM's prompt context (runtime-deferred)
+    // The merged snapshot is the LLM's prompt context — feeding it to a live
+    // model is the runtime-deferred leg. What IS assertable here, and what the
+    // aggregation exists to guarantee, is that the context carries every page's
+    // elements under collision-free ids.
+    assert_eq!(
+        snapshot.elements.len(),
+        pages()
+            .iter()
+            .map(|p| p.snapshot.elements.len())
+            .sum::<usize>(),
+        "no element is lost on the way into the prompt context"
+    );
+    let element_ids: BTreeSet<&str> = snapshot.elements.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(element_ids.len(), snapshot.elements.len());
     assemble_spec(
         inferred,
         &discovery,
@@ -142,6 +155,9 @@ fn aggregated_observation_namespaces_ids_and_unions_states() {
             "pairing-confirm-authorization-copy"
         ]
     );
+    // Transitions ARE namespaced (states are not): upstream ids are positional
+    // when the source carries none, so a raw-id union would delete a page's
+    // transitions outright. See `aggregate_pages`' docs.
     let t_ids: Vec<&str> = discovery
         .transitions
         .iter()
@@ -149,8 +165,24 @@ fn aggregated_observation_namespaces_ids_and_unions_states() {
         .collect();
     assert_eq!(
         t_ids,
-        vec!["open-device", "repair-device", "show-pairing-error"]
+        vec![
+            "https://app.qontinui.io/devices::open-device",
+            "https://app.qontinui.io/devices/dev-7f3a::repair-device",
+            "https://app.qontinui.io/connect-runner::show-pairing-error"
+        ]
     );
+    // Their endpoints still point at the un-namespaced state ids the union
+    // above produced, so the graph stays connected.
+    let state_id_set: BTreeSet<&str> = discovery.states.iter().map(|s| s.id.as_str()).collect();
+    for t in &discovery.transitions {
+        for id in t.from_state_ids.iter().chain(t.to_state_ids.iter()) {
+            assert!(
+                state_id_set.contains(id.as_str()),
+                "transition {} points at an unknown state {id}",
+                t.id
+            );
+        }
+    }
 }
 
 #[test]
@@ -267,7 +299,18 @@ fn ui_states_and_navigation_are_the_distinct_ids_across_pages() {
     let nav: Vec<&str> = spec.navigation.iter().map(|t| t.id.as_str()).collect();
     assert_eq!(
         nav,
-        vec!["open-device", "repair-device", "show-pairing-error"]
+        vec![
+            "https://app.qontinui.io/devices::open-device",
+            "https://app.qontinui.io/devices/dev-7f3a::repair-device",
+            "https://app.qontinui.io/connect-runner::show-pairing-error"
+        ]
+    );
+    let distinct_nav: BTreeSet<&str> = nav.iter().copied().collect();
+    assert_eq!(
+        distinct_nav.len(),
+        nav.len(),
+        "navigation.* refs are unique — the assembly tail does not dedupe them, \
+         so aggregate_pages must"
     );
 }
 
