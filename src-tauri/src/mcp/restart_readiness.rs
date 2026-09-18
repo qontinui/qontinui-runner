@@ -135,7 +135,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -1402,7 +1402,7 @@ mod tests {
                 image: Some("claude.exe".to_string()),
                 age_s: Some(90),
                 cwd: None,
-                has_live_children: false,
+                has_live_children: Some(false),
                 nested_under_claude: false,
                 session_id: None,
                 session_status: None,
@@ -1811,8 +1811,9 @@ mod tests {
             first.cwd.as_deref(),
             Some("/w/01a07bad-a553/qontinui-coord")
         );
-        assert!(
+        assert_eq!(
             first.has_live_children,
+            Some(true),
             "pid 10 has a `cargo` child — the HINT, not a verdict"
         );
         assert!(!first.nested_under_claude);
@@ -2540,7 +2541,7 @@ mod tests {
             image: Some("claude".to_string()),
             age_s: Some(3_600),
             cwd: None,
-            has_live_children: children,
+            has_live_children: Some(children),
             nested_under_claude: nested,
             session_id: session_id.map(str::to_string),
             session_status: status.map(str::to_string),

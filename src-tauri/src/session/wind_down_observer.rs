@@ -31,7 +31,10 @@
 //!   serve it, in which case the declaration does not bound the idle window;
 //! - **sideband** — the pane's runner-local last OSC 9999 state;
 //! - **grid** — the pane's tracked idle observation;
-//! - **children** — `has_live_children` from the pass's own snapshot;
+//! - **children** — `has_live_children` from the pass's own snapshot, passed
+//!   through as the `Option` it already is: `None` (the snapshot never
+//!   enumerated that pid) must reach `eligibility` as `ChildrenUnknown` rather
+//!   than being flattened into a confident "no children";
 //! - **kind** — steward registry, then looping-agent registry, else terminal.
 
 use std::collections::{HashMap, HashSet};
@@ -198,8 +201,12 @@ pub fn wind_down_for_process(
         work_status,
         sideband: observation.sideband,
         grid: observation.grid,
-        // The pass read this from a snapshot it successfully took.
-        has_live_children: Some(process.has_live_children),
+        // Passed through, NOT re-wrapped in `Some`. A snapshot that never
+        // enumerated this pid carries `None` here, and that has to survive as
+        // far as `eligibility`, which turns it into `ChildrenUnknown`. Wrapping
+        // it — which this line used to do — made an uncomputable input render
+        // as a confident "no children" and left `ChildrenUnknown` unreachable.
+        has_live_children: process.has_live_children,
         finished_at_ms,
         grace,
     };
@@ -284,7 +291,7 @@ mod tests {
             image: Some("claude".to_string()),
             age_s: Some(60),
             cwd: None,
-            has_live_children: false,
+            has_live_children: Some(false),
             nested_under_claude: false,
             session_id: session_id.map(str::to_string),
             session_status: status.map(str::to_string),
