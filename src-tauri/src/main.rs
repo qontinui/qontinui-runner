@@ -1233,6 +1233,214 @@ mod headless_manifest_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The application tokio runtime (plan
+// `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`).
+// ---------------------------------------------------------------------------
+
+/// The application runtime, installed into Tauri's global slot at the top of
+/// [`main`] so Tauri never builds its own.
+///
+/// Process-lived by construction. `tauri::async_runtime::set`'s own doc says
+/// *"you cannot drop the underlying `TokioRuntime`"*, and a `OnceLock` that
+/// lives for the program gives exactly that with no `Box::leak` and no
+/// `'static` transmute. It is filled ONLY after `set` has succeeded, so a
+/// runtime we could not install is dropped rather than left running 16 idle
+/// workers nobody can reach.
+static APP_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// The cap on the application runtime's worker count.
+///
+/// ## What it is capping
+///
+/// `tauri::async_runtime::default_runtime()` (tauri 2.11.1) builds the app's
+/// global runtime as `tokio::runtime::Runtime::new()`, which takes EVERY tokio
+/// default: one worker per CPU, and the thread name `tokio-rt-worker`. Tokio's
+/// BLOCKING POOL takes the same name (`runtime/blocking/pool.rs` names each
+/// thread from the builder's `thread_name`), and this binary has ~400
+/// `spawn_blocking` / `spawn_blocking_tracked` call sites feeding it.
+///
+/// Measured on the 48-core Linux dev box 2026-09-18, ~96.6 h uptime: **277 of
+/// 424 threads** were `tokio-rt-worker`, against **22** session-attributable
+/// ones. Clustering them by `starttime` gives one cluster of 50 at boot and
+/// ~227 created later and never retired.
+///
+/// **How much of that is THIS runtime is not yet known, and this constant does
+/// not claim it.** The boot cluster is consistent with 48 default workers, but
+/// the runner builds ~10 other current-thread runtimes in shipped code
+/// (`pg-boot-rt`, `online-learn-rt`, `fleet-hb-rt`, `cognito-rt`, `pg-stop-rt`,
+/// `envagent-rt`, `agentcmd-rt`, `pair-rt` — all named in the same change) and
+/// each carries its OWN blocking pool that tokio also names `tokio-rt-worker`.
+/// Naming every one of them is what turns the attribution from an argument into
+/// a measurement: after this change, a thread still called `tokio-rt-worker` is
+/// a runtime this repo did not build.
+///
+/// ## Why 16, and why not 2-4
+///
+/// This is not an auxiliary runtime. `fleet-pub-rt` (1 worker) and `mcp-api-rt`
+/// ([`mcp_api::API_RUNTIME_WORKER_THREADS`] = 4) each serve one subsystem and
+/// are sized for it. This one serves every Tauri IPC command and every
+/// `tauri::async_runtime::spawn` in the process — and `serve_on_dedicated_runtime`
+/// exists precisely BECAUSE this runtime has a history of being wedged by a
+/// blocking handler. Capping it at 2-4 would make that wedge cheaper to reach,
+/// which is the opposite of the intent.
+///
+/// 16 is chosen so that:
+/// - every fleet box with 16 or fewer cores is UNCHANGED — this is a cap, not a
+///   resize, and it is not a behaviour change for them;
+/// - the worker count stops scaling with `num_cpus`, which is the actual defect;
+/// - one blocked worker still leaves 15 driving the runtime.
+const APP_RUNTIME_WORKER_THREADS_MAX: usize = 16;
+
+/// The env override for [`APP_RUNTIME_WORKER_THREADS_MAX`].
+const APP_RUNTIME_WORKER_THREADS_ENV: &str = "QONTINUI_APP_RUNTIME_WORKER_THREADS";
+
+/// How many workers the application runtime gets on THIS machine.
+///
+/// `min(available_parallelism, 16)`, or the env override when it names a usable
+/// number. A value that does not parse, or `0`, is IGNORED with a warning
+/// rather than silently becoming a runtime nobody can schedule on — a zero
+/// worker count is not a stricter setting, it is a dead process.
+fn app_runtime_worker_threads() -> usize {
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(APP_RUNTIME_WORKER_THREADS_MAX);
+    let raw = std::env::var(APP_RUNTIME_WORKER_THREADS_ENV).ok();
+    resolve_app_runtime_workers(cpus, raw.as_deref())
+}
+
+/// The arithmetic of [`app_runtime_worker_threads`], PURE, so it can be tested
+/// without an env var and without a particular CPU count.
+///
+/// The env read and the `available_parallelism` call are the only impure parts
+/// and they stay in the caller — the same split `resource_guard` uses to keep
+/// `merge_thread_ceilings` testable.
+fn resolve_app_runtime_workers(cpus: usize, override_raw: Option<&str>) -> usize {
+    // `available_parallelism` cannot return 0, but a future caller could pass
+    // one; a zero-worker runtime is not a stricter setting, it is a process
+    // nothing can be scheduled on.
+    let derived = cpus.clamp(1, APP_RUNTIME_WORKER_THREADS_MAX);
+    match override_raw {
+        None => derived,
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "app runtime: {APP_RUNTIME_WORKER_THREADS_ENV}={raw:?} is not a positive \
+                     integer — ignoring it and using {derived} workers."
+                );
+                derived
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod app_runtime_tests {
+    use super::*;
+
+    /// The cap is a CAP: a box with fewer cores than the ceiling is unchanged,
+    /// which is what makes this not a behaviour change for most of the fleet.
+    #[test]
+    fn a_small_box_is_unchanged_and_a_big_one_is_capped() {
+        assert_eq!(resolve_app_runtime_workers(1, None), 1);
+        assert_eq!(resolve_app_runtime_workers(4, None), 4);
+        assert_eq!(
+            resolve_app_runtime_workers(APP_RUNTIME_WORKER_THREADS_MAX, None),
+            APP_RUNTIME_WORKER_THREADS_MAX
+        );
+        assert_eq!(
+            resolve_app_runtime_workers(48, None),
+            APP_RUNTIME_WORKER_THREADS_MAX,
+            "the 48-core box that idled at 424 threads must stop scaling with num_cpus"
+        );
+        assert_eq!(
+            resolve_app_runtime_workers(256, None),
+            APP_RUNTIME_WORKER_THREADS_MAX
+        );
+    }
+
+    /// An explicit override wins in BOTH directions — this is an operator
+    /// escape hatch, not a second cap.
+    #[test]
+    fn an_explicit_override_wins_in_both_directions() {
+        assert_eq!(resolve_app_runtime_workers(48, Some("2")), 2);
+        assert_eq!(resolve_app_runtime_workers(4, Some("64")), 64);
+        assert_eq!(resolve_app_runtime_workers(48, Some("  8  ")), 8);
+    }
+
+    /// A malformed or zero override is IGNORED, never honoured. A zero-worker
+    /// runtime is not a stricter setting; it is a process nothing runs on, and
+    /// silently accepting one would turn a typo into a dead runner.
+    #[test]
+    fn a_useless_override_is_ignored_rather_than_honoured() {
+        for raw in ["0", "", "   ", "-1", "sixteen", "4.5", "1e3"] {
+            assert_eq!(
+                resolve_app_runtime_workers(48, Some(raw)),
+                APP_RUNTIME_WORKER_THREADS_MAX,
+                "override {raw:?} must fall back to the derived count, not be honoured"
+            );
+        }
+    }
+
+    /// A zero CPU count can never come from `available_parallelism`, but the
+    /// pure function must still never author a zero-worker runtime.
+    #[test]
+    fn zero_cpus_never_produces_a_zero_worker_runtime() {
+        assert_eq!(resolve_app_runtime_workers(0, None), 1);
+    }
+}
+
+/// Install the application runtime into Tauri's global slot.
+///
+/// Called as the FIRST thing [`main`] does, because `tauri::async_runtime::set`
+/// PANICS when the slot is already filled and the slot is filled lazily by the
+/// first `tauri::async_runtime::{spawn, block_on, handle}` anywhere in the
+/// process.
+///
+/// Fail-open in both directions, the same posture
+/// [`mcp_api::serve_on_dedicated_runtime`] takes for the same reason — a
+/// degraded runtime is strictly better than no runner:
+/// - a runtime we cannot BUILD leaves Tauri to build its own (today's behaviour);
+/// - a slot that is already TAKEN is caught rather than fatal, and the runtime
+///   we built is dropped so it does not leave workers behind.
+fn install_app_runtime() {
+    let workers = app_runtime_worker_threads();
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .thread_name("app-rt")
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!(
+                "app runtime: could not build the pinned application runtime ({e}). Tauri will \
+                 build its own with one worker per CPU; the thread lane will read high on a \
+                 high-core box."
+            );
+            return;
+        }
+    };
+
+    let handle = rt.handle().clone();
+    let installed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        tauri::async_runtime::set(handle);
+    }))
+    .is_ok();
+
+    if installed {
+        // Held for the life of the process; `set` took only a Handle.
+        let _ = APP_RUNTIME.set(rt);
+    } else {
+        eprintln!(
+            "app runtime: Tauri's async runtime was already initialized before \
+             install_app_runtime() ran — the pinned runtime was NOT installed. Dropping it."
+        );
+        drop(rt);
+    }
+}
+
 fn main() {
     // The capability manifest (`--capability-manifest[ --json]`,
     // `--capability-manifest-doc`). Same posture as the `env …` CLI below and
@@ -1287,6 +1495,22 @@ fn main() {
     // Per-monitor DPI awareness must be set before any screen capture
     // (Windows: PROCESS_PER_MONITOR_DPI_AWARE_V2). No-op on macOS/Linux.
     screen::ensure_dpi_awareness();
+
+    // Install the PINNED, NAMED application runtime into Tauri's global slot
+    // before anything can fill it lazily. Left to itself, `tauri::async_runtime`
+    // builds `tokio::runtime::Runtime::new()` — one worker per CPU, every
+    // thread called `tokio-rt-worker`, and the blocking pool named the same.
+    // See [`install_app_runtime`] and plan
+    // `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`.
+    //
+    // Placed HERE rather than at the top of `main` deliberately. Everything
+    // above either returns without touching a runtime or `process::exit`s
+    // (`try_headless_manifest`, `profile_cli::try_run_cli`), so installing
+    // earlier would build a 16-worker runtime for `--capability-manifest` and
+    // `qontinui-runner env …` and then throw it away. This is the last point
+    // before `run_app`, and `run_app` is where the first
+    // `tauri::async_runtime::*` call in this process can occur.
+    install_app_runtime();
 
     let result = std::panic::catch_unwind(run_app);
 
@@ -1427,6 +1651,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let profile = qontinui_runner_lib::profiles::load();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .thread_name("pg-boot-rt")
             .build()
             .expect("Failed to create tokio runtime for PG initialization");
 
@@ -1460,6 +1685,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         let ol_pg = pg_db.clone();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .thread_name("online-learn-rt")
             .build()
             .expect("Failed to create tokio runtime for online learning init");
         rt.block_on(online_learning::initialize(&ol_pg));
@@ -1553,6 +1779,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         .spawn(|| {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
+                .thread_name("fleet-hb-rt")
                 .build()
             {
                 Ok(rt) => rt,
