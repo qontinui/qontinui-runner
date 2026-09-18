@@ -802,6 +802,20 @@ pub(crate) async fn register_app(
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
 
+    // The LIVE WebSocket routing slot for this id, read before the registry
+    // lock and handed to `claim`. Without it this door displaces a live WS
+    // holder with no handshake at all — and it is the door that decides the
+    // dispatch target, since `AppDispatcher` reads the REGISTRY.
+    let slot_holder = if mode == BindingMode::Off {
+        None
+    } else {
+        state
+            .ws_connection_manager
+            .holder_for_app(&req.app_id)
+            .await
+            .map(|(_, p)| p)
+    };
+
     // R1/R5: the check and the write under ONE registry lock. `claimed`
     // carries the EFFECTIVE keep-alive, which R5 may have capped.
     let claimed = state
@@ -810,6 +824,7 @@ pub(crate) async fn register_app(
             &binding,
             &principal,
             ROUTE,
+            slot_holder.as_ref(),
             app.clone(),
             req.origin,
             transport,
