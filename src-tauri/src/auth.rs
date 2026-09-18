@@ -4170,8 +4170,14 @@ mod bearer_selection_tests {
     /// reaches the count. (`commands::auth`'s door test
     /// `a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant`
     /// reaches the same wiring INDIRECTLY, through the door; this is the test
-    /// that names it, and the only one that also covers
-    /// [`HeldDeviceTenants::read_with`].) A rewiring in the other direction —
+    /// that names it.) [`HeldDeviceTenants::read_with`] is exercised elsewhere —
+    /// directly by `held_tenants_count_the_legacy_slot_only_for_the_tenant_it_names`
+    /// and indirectly by every door test through its `held()` helper — but this
+    /// is the only test where read_with's [`measured_device_binding_count`] term
+    /// DECIDES the answer: everywhere else the token carries a claim, so
+    /// `legacy_token_serves_tenant` settles before the count is consulted, and
+    /// the door test's named-tenant branch reads `held.slots` rather than
+    /// `held.legacy_slot`. A rewiring in the other direction —
     /// `MeasuredBindingCount::Measured(device_binding_count())` — compiles, and
     /// the malformed file then reads as ONE binding, which accepts a claimless
     /// token whose owner is unknowable and presents it as `t`'s credential.
