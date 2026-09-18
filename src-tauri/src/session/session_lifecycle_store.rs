@@ -701,10 +701,22 @@ pub struct TerminalSessionRecord {
     /// the sessions this feature exists to preserve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
-    /// What the drained-runner wind-down executor did to this session:
-    /// [`WIND_DOWN_CLOSED`], [`WIND_DOWN_EXIT_STUCK`] or
-    /// [`WIND_DOWN_CLOSE_REFUSED`] (plan
-    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 4).
+    /// What the drained-runner wind-down executor did to this session (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 4). One of the
+    /// FIVE `WIND_DOWN_*` words, and they say different things:
+    ///
+    /// * [`WIND_DOWN_CLOSED`] — `claude` left and the pane was closed;
+    /// * [`WIND_DOWN_EXIT_STUCK`] — `claude` outlived the deadline, nothing was
+    ///   killed, the session is STILL RUNNING;
+    /// * [`WIND_DOWN_CLOSE_REFUSED`] — `claude` left, but the pane could not be
+    ///   proven clear at the close, so the tab was left open;
+    /// * [`WIND_DOWN_CLOSE_UNKNOWN`] — `claude` left and the close was
+    ///   attempted, and what it achieved is NOT known. This one asserts nothing
+    ///   about the pane either way and must not be read as either of the two
+    ///   above;
+    /// * [`WIND_DOWN_NOT_ATTEMPTED`] — `/exit` was never submitted (the pane was
+    ///   not in a safe state, or the write failed). Nothing was closed, but the
+    ///   pane MAY have been written to.
     ///
     /// It is the OUTCOME axis of an automatic close, and it is orthogonal to
     /// both `state` and `finished_at`: a session can be `closed` for a dozen

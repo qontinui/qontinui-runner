@@ -887,6 +887,11 @@ pub async fn wait_until_allowed(origin: SpawnOrigin) {
 // ---------------------------------------------------------------------------
 
 /// Minimum spacing between two HELD work items starting after a drain lifts.
+///
+/// The wave is paced, not capped, so the LAST of N held tasks waits about
+/// `N * RELEASE_SPACING`: a drain that accumulated 1000 of them releases over
+/// roughly 25 minutes. That is the intended behaviour and not a hang — every
+/// task is queued, none is dropped, and each one logs its own release.
 pub const RELEASE_SPACING: Duration = Duration::from_millis(1_500);
 
 /// Upper bound on the random jitter added to each release slot, so a release
@@ -904,8 +909,13 @@ fn release_slot() -> &'static Mutex<Option<tokio::time::Instant>> {
 /// PURE: the slot a release claims, given the previously claimed one.
 ///
 /// `now` when nothing is queued ahead; otherwise `spacing + jitter` past the
-/// last claimed slot. Monotone by construction — a later caller never gets an
-/// earlier slot — so the release order is the arrival order.
+/// last claimed slot. Monotone by construction: a caller that claims LATER
+/// never gets an earlier slot.
+///
+/// That orders releases by CLAIM order, which is mutex-acquisition order after
+/// `tx.send_replace` wakes every waiter at once — scheduler order, not the
+/// order the tasks arrived at the hold, which can be hours apart. Pacing is the
+/// property this buys; fairness is not, and nothing downstream needs it.
 pub fn next_release_slot(
     now: tokio::time::Instant,
     last: Option<tokio::time::Instant>,

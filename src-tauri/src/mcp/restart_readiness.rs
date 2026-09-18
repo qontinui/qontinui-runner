@@ -791,7 +791,10 @@ pub fn build_verdict(
 }
 
 /// `windDownCandidates` for a resolved terminal plane: top-level processes
-/// whose dry-run wind-down verdict is `eligible`.
+/// whose wind-down verdict is `eligible`. Computed whether or not the runner is
+/// drained, and THIS endpoint closes none of them — but since Phase 4 the
+/// wind-down executor acts on the same verdict while drained, so this is a
+/// count of candidates, not of sessions that will certainly be closed.
 pub fn wind_down_candidates_in(plane: &TerminalPlane) -> usize {
     plane
         .processes
@@ -905,8 +908,11 @@ pub async fn restart_readiness_handler(
     // an empty map, every process blocks, and the verdict is bit-for-bit the
     // pre-work-axis one — with the degradation stated in the response.
     //
-    // Wind-down here is a DRY RUN: the verdicts are reported and nothing acts
-    // on them in this handler.
+    // This HANDLER acts on nothing: it reports the verdicts and closes no
+    // session. That is a property of the endpoint, not of the verdict — since
+    // Phase 4 the wind-down executor reads the same one and does act on it,
+    // while drained. Do not restore the old "DRY RUN" wording: it described the
+    // verdict, and stopped being true of it.
     let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
     let wind_down_observer::FreshPass {
         pass,
@@ -2478,7 +2484,7 @@ mod tests {
         assert!(BOUNDARY.contains("ambiguous"));
     }
 
-    // ---- wind-down (DRY-RUN) --------------------------------------------
+    // ---- wind-down (reported here; ACTED ON by the executor) -------------
 
     use crate::session::wind_down_observer::{
         apply_wind_down, terminal_ids_by_session, TerminalObservation,
