@@ -2295,20 +2295,43 @@ pub(crate) fn default_binding_tenant_in(base: &std::path::Path) -> BindingTenant
 /// Kept as a local minimal reader for the same reason [`default_binding_tenant`]
 /// is: `auth` compiles into BOTH the lib and bin crates while `pair` is
 /// lib-only.
+///
+/// It reads [`binding_count_from_value`], NOT the stricter
+/// [`measured_binding_count_from_value`]: the two parsers diverge on a
+/// `bindings` array holding an entry that is not an object with a string
+/// `tenant_id`, and moving this call site onto the strict one would turn a
+/// 2-binding device into a 1-binding device — the D2 degrade rule would then
+/// present the DEFAULT binding's credential where it used to send nothing, the
+/// silent wrong-tenant write this module refuses. The strict parser is the
+/// claimless-legacy-token input and nothing else.
 pub(crate) fn device_binding_count() -> usize {
-    match measured_device_binding_count() {
-        MeasuredBindingCount::Measured(n) => n,
-        MeasuredBindingCount::Unknown => 1,
+    match read_paired_user_value() {
+        Some(value) => binding_count_from_value(&value),
+        None => 1,
     }
+}
+
+/// `paired_user.json` as JSON, or `None` when there is no storage dir, no file,
+/// or the file does not parse. The one file read both binding-count parsers
+/// share; each classifies the absence its own way.
+fn read_paired_user_value() -> Option<serde_json::Value> {
+    let base = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))?;
+    let bytes = std::fs::read(base.join("paired_user.json")).ok()?;
+    serde_json::from_slice::<serde_json::Value>(&bytes).ok()
 }
 
 /// The device's binding count as MEASURED from `paired_user.json`, with an
 /// unreadable state kept distinct from a count.
 ///
-/// [`device_binding_count`] (the D2 degrade rule's input) collapses
-/// [`MeasuredBindingCount::Unknown`] to one on purpose; the claimless-legacy
-/// token rule ([`legacy_token_serves_tenant`]) must not, because there "one"
-/// is permission to present a token of unstated ownership.
+/// This is the claimless-legacy-token rule's input and nothing else
+/// ([`legacy_token_serves_tenant`]); the D2 degrade rule and the plan adapter's
+/// gate read [`device_binding_count`], which parses the same file LOOSELY and
+/// reads every unreadable state as one. That rule may not treat Unknown as one,
+/// because there "one" is permission to present a token of unstated ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MeasuredBindingCount {
     /// A well-formed file stated this many bindings.
@@ -2321,21 +2344,10 @@ pub(crate) enum MeasuredBindingCount {
 /// Read `paired_user.json` and measure its binding count; every failure to read
 /// or parse is [`MeasuredBindingCount::Unknown`].
 pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
-    let Some(base) = std::env::var("QONTINUI_SECURE_STORAGE_DIR")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|d| d.join("com.qontinui.runner")))
-    else {
-        return MeasuredBindingCount::Unknown;
-    };
-    let Ok(bytes) = std::fs::read(base.join("paired_user.json")) else {
-        return MeasuredBindingCount::Unknown;
-    };
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-        return MeasuredBindingCount::Unknown;
-    };
-    measured_binding_count_from_value(&value)
+    match read_paired_user_value() {
+        Some(value) => measured_binding_count_from_value(&value),
+        None => MeasuredBindingCount::Unknown,
+    }
 }
 
 /// The parse half of [`measured_device_binding_count`].
@@ -2375,9 +2387,12 @@ pub(crate) fn measured_binding_count_from_value(value: &serde_json::Value) -> Me
 /// shape rather than reporting zero — `effective_bindings` does the same, and
 /// an empty array is an unpaired or half-written file, not a statement that the
 /// device holds no tenant. This count is deliberately LOOSER than
-/// [`measured_binding_count_from_value`]: it counts array entries without
-/// validating them, and every other shape is one — the D2 degrade rule's
-/// failure direction, unchanged.
+/// [`measured_binding_count_from_value`], and it is what [`device_binding_count`]
+/// — the D2 degrade rule and the plan adapter's gate — actually calls: it counts
+/// array entries without validating them, and every other shape is one, which is
+/// the failure direction those two rules chose. A malformed 2-entry array
+/// therefore still counts as TWO here and degrades, while the strict parser
+/// calls it Unknown and refuses a claimless token.
 pub(crate) fn binding_count_from_value(value: &serde_json::Value) -> usize {
     if let Some(arr) = value.get("bindings").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
@@ -4004,7 +4019,8 @@ mod bearer_selection_tests {
             assert_eq!(
                 binding_count_from_value(&v),
                 1,
-                "D2 still reads one: {what}"
+                "D2's own parser - the one device_binding_count calls - still \
+                 reads one: {what}"
             );
             assert_eq!(
                 select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
@@ -4013,23 +4029,41 @@ mod bearer_selection_tests {
             );
         }
         // Nit (b): an array entry that is not a valid binding (an object with a
-        // string `tenant_id`) makes the whole count Unknown.
-        for (v, what) in [
+        // string `tenant_id`) makes the STRICT count Unknown - and D2's own
+        // parser still counts the entries, which is where the two readings
+        // diverge. A malformed 2-entry array is TWO bindings to the degrade
+        // rule (so it degrades) and Unknown to the claimless rule (so it
+        // refuses); collapsing it to one would present the default binding's
+        // credential on a device that states two.
+        for (v, what, d2) in [
             (
                 serde_json::json!({"bindings": [7]}),
                 "a non-object binding entry",
+                1usize,
             ),
             (
                 serde_json::json!({"bindings": [{}]}),
                 "a binding entry with no tenant_id",
+                1,
             ),
             (
                 serde_json::json!({"bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]}),
                 "one valid entry beside a numeric tenant_id",
+                2,
+            ),
+            (
+                serde_json::json!({"bindings": [7, 8]}),
+                "two non-object binding entries",
+                2,
             ),
         ] {
             let measured = measured_binding_count_from_value(&v);
             assert_eq!(measured, MeasuredBindingCount::Unknown, "{what}: {v}");
+            assert_eq!(
+                binding_count_from_value(&v),
+                d2,
+                "{what}: D2 counts the entries it was given"
+            );
             assert_eq!(
                 select_device_bearer_with(&mgr, Some(&a), Some(a), measured),
                 None,
@@ -4092,6 +4126,28 @@ mod bearer_selection_tests {
         assert_eq!(
             measured_device_binding_count(),
             MeasuredBindingCount::Measured(1)
+        );
+        assert_eq!(device_binding_count(), 1);
+        // THE WIRING, pinned: the two readers of this one file must stay on
+        // their own parsers. A malformed 2-entry array is TWO bindings to
+        // device_binding_count (D2's degrade rule and the plan adapter's gate)
+        // and Unknown to the claimless-token rule. Reading D2 through the
+        // strict parser would make this device single-bound and hand out the
+        // default binding's credential.
+        std::fs::write(
+            &path,
+            br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, {"tenant_id": 7}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            device_binding_count(),
+            2,
+            "D2 counts the entries of a malformed array"
+        );
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown,
+            "the claimless rule refuses to read a count from it"
         );
     }
 
@@ -4777,7 +4833,44 @@ mod bearer_selection_tests {
         assert_eq!(reads, 1, "Unresolved must consult the count exactly once");
     }
 
-    // ---- binding count: the input the degrade rule keys on ----------------
+    /// Re-re-review: the D2 degrade rule reads [`binding_count_from_value`], so
+    /// a MALFORMED two-entry `bindings` array is still two bindings and an
+    /// Unresolved-scope call still degrades to no bearer. Reading it through the
+    /// strict parser would make it one binding and present the DEFAULT binding's
+    /// device JWT - a silent wrong-tenant write where there used to be an
+    /// unauthenticated, warned request.
+    #[test]
+    fn a_malformed_two_entry_bindings_array_still_degrades_the_unresolved_arm() {
+        let mgr = create_test_auth_manager("scope_lazy_malformed_two_entries");
+        let a = tenant(0xC4);
+        let default_jwt = live_jwt("default");
+        mgr.store_tokens(&default_jwt, "").unwrap();
+        let v: serde_json::Value = serde_json::json!({
+            "default_tenant_id": a.to_string(),
+            "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]
+        });
+        assert_eq!(binding_count_from_value(&v), 2);
+        assert_eq!(
+            measured_binding_count_from_value(&v),
+            MeasuredBindingCount::Unknown
+        );
+        assert_eq!(
+            select_scoped_bearer_lazy(&mgr, TenantScope::Unresolved, Some(a), || {
+                binding_count_from_value(&v)
+            }),
+            None,
+            "a device stating two bindings must not present the default one's token"
+        );
+        // ...and the single-binding reading is what WOULD have presented it.
+        assert_eq!(
+            select_scoped_bearer_lazy(&mgr, TenantScope::Unresolved, Some(a), || 1).as_deref(),
+            Some(default_jwt.as_str()),
+            "the strict parser's Unknown->one reading would hand out the default binding's token"
+        );
+    }
+
+    // ---- binding count: D2's own parser (binding_count_from_value), the
+    // one device_binding_count calls -------------------------------------
 
     /// The v2 `bindings` array is the count when present and non-empty.
     #[test]
