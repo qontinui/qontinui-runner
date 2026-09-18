@@ -777,6 +777,20 @@ pub struct SessionLifecycleStore {
     /// entirely inside the snapshot it truncates or entirely after it.
     wal: Mutex<WalWriter>,
     map: Mutex<HashMap<String, TerminalSessionRecord>>,
+    /// Terminal ids whose session has MOVED to another terminal while the
+    /// old PTY was still alive — the account-migration order is spawn the
+    /// replacement first, then close the source, so for a moment two PTYs
+    /// carry one session. [`Self::record_open`] re-keys the row onto the new
+    /// terminal; the old PTY's later exit-close names `(session id, old
+    /// terminal)`, which no open row owns any more, and would otherwise read
+    /// as a MIS-BOUND close (`NotFound`, a `warn!`) on the fleet's most
+    /// routine interruption. [`Self::mark_terminal_superseded`] records the
+    /// hand-off and [`Self::record_close_checked`] answers that close with
+    /// [`CloseOutcome::TerminalSuperseded`] — no mutation, no observer, no nonce
+    /// release, because the session lives on. Process-local by design: a
+    /// superseded PTY cannot outlive the runner that spawned it, so there is
+    /// nothing to persist. Consumed on first match.
+    superseded_terminals: Mutex<HashSet<String>>,
     /// Optional write-only sink for the append-only snapshot HISTORY
     /// ([`crate::session::snapshot_history`], Phase 4 of the session-restore
     /// shim-fix plan). When attached, every layout-meaningful mutation
@@ -872,6 +886,7 @@ impl SessionLifecycleStore {
             wal_path,
             wal: Mutex::new(WalWriter::default()),
             map: Mutex::new(map),
+            superseded_terminals: Mutex::new(HashSet::new()),
             snapshot_history: OnceLock::new(),
             restore_emitter: OnceLock::new(),
             transcript_probe: OnceLock::new(),
@@ -1344,7 +1359,7 @@ impl SessionLifecycleStore {
     /// Thin wrapper over [`Self::record_close_checked`] with no terminal
     /// expectation — byte-identical behaviour to the pre-`CloseOutcome` close.
     /// Kept for the internal closers that legitimately have no live terminal in
-    /// hand (`poll-dead`, `never-started`, `no-terminal`, `migrated`): those
+    /// hand (`poll-dead`, `never-started`, `no-terminal`): those
     /// records' terminals are gone by definition, which is the entire meaning of
     /// their close reasons.
     ///
@@ -1357,6 +1372,52 @@ impl SessionLifecycleStore {
     /// and when a sibling open session still shares the workdir.
     pub fn record_close(&self, claude_session_id: &str, reason: &str) {
         let _ = self.record_close_checked(claude_session_id, None, reason);
+    }
+
+    /// Record that `old_terminal_id`'s session now lives on `new_terminal_id`
+    /// and the old PTY is about to be closed. The next close naming
+    /// `old_terminal_id` is answered with [`CloseOutcome::TerminalSuperseded`] instead
+    /// of being resolved against the map (where it would land as a
+    /// mis-bound `NotFound`). Call it AFTER the replacement's
+    /// [`Self::record_open`] and BEFORE tearing the old PTY down — the
+    /// account migration's step 4.
+    pub fn mark_terminal_superseded(&self, old_terminal_id: &str, new_terminal_id: &str) {
+        let old = old_terminal_id.trim();
+        if old.is_empty() {
+            return;
+        }
+        match self.superseded_terminals.lock() {
+            Ok(mut set) => {
+                set.insert(old.to_string());
+                debug!(
+                    old_terminal_id = %old,
+                    new_terminal_id = %new_terminal_id,
+                    "session_lifecycle_store: terminal superseded — its session moved to a new PTY"
+                );
+            }
+            Err(e) => warn!(
+                error = %e,
+                "session_lifecycle_store: lock poisoned on mark_terminal_superseded"
+            ),
+        }
+    }
+
+    /// Withdraw a [`Self::mark_terminal_superseded`] that will never be
+    /// consumed — the old PTY turned out to be gone already, so its exit-close
+    /// either arrived before the mark or never will. Keeps the register equal
+    /// to "closes still expected". Harmless to call for an id never marked.
+    pub fn unmark_terminal_superseded(&self, old_terminal_id: &str) {
+        if let Ok(mut set) = self.superseded_terminals.lock() {
+            set.remove(old_terminal_id.trim());
+        }
+    }
+
+    #[cfg(test)]
+    fn superseded_terminal_count(&self) -> usize {
+        self.superseded_terminals
+            .lock()
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     /// Close the record the caller's TERMINAL actually owns, not merely the one
@@ -1377,6 +1438,11 @@ impl SessionLifecycleStore {
     ///
     /// ## Semantics
     ///
+    /// * `Some(t)` and `t` is in the superseded-terminal register
+    ///   ([`Self::mark_terminal_superseded`]) — the session moved to another
+    ///   PTY and this is the old pane leaving. Consume the entry and answer
+    ///   [`CloseOutcome::TerminalSuperseded`] before anything below runs:
+    ///   nothing mutated, no observer, no nonce release.
     /// * `expect_terminal_id == None` — today's behaviour exactly: close the
     ///   record at `claude_session_id` if it is open.
     /// * `Some(t)` and the record at `claude_session_id` is open ON `t` —
@@ -1408,6 +1474,45 @@ impl SessionLifecycleStore {
         reason: &str,
     ) -> CloseOutcome {
         let now = Utc::now().timestamp_millis();
+        // An empty / whitespace terminal id is "no expectation": empty ids
+        // are uncorrelatable and already excluded from every terminal-keyed
+        // resolver in this file.
+        let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
+
+        // A close naming a terminal whose session already MOVED to a new PTY
+        // (account migration: spawn the replacement, then close the source) is
+        // the old pane leaving, not a session ending. Answered BEFORE the map
+        // is locked — the register never reads the map, and keeping the two
+        // locks un-nested means there is no lock order to get wrong — and
+        // before the map resolver, which would otherwise see a session id
+        // keyed to a different terminal and report a mis-bound `NotFound`.
+        // Consumed on first match so a genuinely stale close of the same id
+        // later still surfaces.
+        if let Some(t) = expect {
+            let superseded = match self.superseded_terminals.lock() {
+                Ok(mut set) => set.remove(t),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "session_lifecycle_store: lock poisoned on the superseded-terminal register — treating the close as not superseded"
+                    );
+                    false
+                }
+            };
+            if superseded {
+                debug!(
+                    claude_session_id = %claude_session_id,
+                    terminal_id = %t,
+                    reason = %reason,
+                    "session-close: terminal was superseded by a migration respawn — the session lives on, no-op"
+                );
+                return CloseOutcome::TerminalSuperseded {
+                    requested: claude_session_id.to_string(),
+                    terminal_id: t.to_string(),
+                };
+            }
+        }
+
         let (outcome, closed_id, closed, closed_workdir, workdir_still_in_use) = {
             let mut m = match self.map.lock() {
                 Ok(m) => m,
@@ -1415,15 +1520,10 @@ impl SessionLifecycleStore {
                     warn!(error = %e, "session_lifecycle_store: lock poisoned on record_close");
                     return CloseOutcome::NotFound {
                         requested: claude_session_id.to_string(),
-                        terminal_id: expect_terminal_id.map(str::to_string),
+                        terminal_id: expect.map(str::to_string),
                     };
                 }
             };
-
-            // An empty / whitespace terminal id is "no expectation": empty ids
-            // are uncorrelatable and already excluded from every terminal-keyed
-            // resolver in this file.
-            let expect = expect_terminal_id.map(str::trim).filter(|t| !t.is_empty());
 
             let (target, outcome) = resolve_close_target(&m, claude_session_id, expect);
 
@@ -1509,12 +1609,9 @@ impl SessionLifecycleStore {
         }
 
         // Credential hygiene: drop the coord-mcp device nonce bound to this
-        // workdir once no OPEN record still uses it. Runs after the observer
-        // notify above so a real close is always reported to coord, even when
-        // the migration early-return below keeps the nonce alive.
-        if reason == crate::terminal::account_migration::CLOSE_REASON_MIGRATED {
-            return outcome; // the session lives on under a new record — keep its nonce
-        }
+        // workdir once no OPEN record still uses it. An account migration
+        // never reaches here — its row is never closed, only re-keyed — so
+        // the nonce the resumed pane still uses is never released under it.
         if let Some(wd) = closed_workdir {
             if !workdir_still_in_use {
                 crate::coord_mcp::release_workdir_on_session_close(&wd);
@@ -2970,6 +3067,20 @@ pub enum CloseOutcome {
     /// provider-less shell. Nothing mutated; not a failure.
     #[serde(rename_all = "camelCase")]
     AlreadyClosed { claude_session_id: String },
+    /// The named terminal's session had already MOVED to another PTY (an
+    /// account-migration respawn) before this close arrived; the old pane is
+    /// leaving, the session is not. Benign no-op — nothing mutated, no
+    /// observer, the workdir nonce kept. See
+    /// [`SessionLifecycleStore::mark_terminal_superseded`].
+    ///
+    /// Distinct from the `close_reason: "superseded"` that [`SessionLifecycleStore::record_open`]
+    /// writes when another session binds a ROW's terminal — that closes a row;
+    /// this retires a terminal and closes nothing.
+    #[serde(rename_all = "camelCase")]
+    TerminalSuperseded {
+        requested: String,
+        terminal_id: String,
+    },
     /// Neither the requested `claude_session_id` nor the caller's terminal
     /// resolves to an open record. Nothing mutated, no observer fired.
     #[serde(rename_all = "camelCase")]
@@ -5391,9 +5502,107 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 0, "no observer on NotFound");
     }
 
+    /// The account-migration hand-off: the respawn re-keys the session's row
+    /// onto the NEW terminal while the old PTY is still alive, then the old
+    /// PTY is closed. Its exit-close names `(session, old terminal)`, which no
+    /// open row owns — without the register that is a mis-bound `NotFound`
+    /// (a `warn!`) on every migration. With it: `Superseded`, nothing mutated,
+    /// no observer (coord must not see a `Closed` for a live session), and
+    /// the entry is consumed so a genuinely stale close of the same id later
+    /// still surfaces as `NotFound`.
+    #[test]
+    fn record_close_checked_answers_a_superseded_terminal_without_touching_the_live_row() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        let fired = std::sync::Arc::new(AtomicUsize::new(0));
+        {
+            let fired = fired.clone();
+            store.attach_close_observer(move |_| {
+                fired.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        // The session opens on the old terminal, then the respawn re-keys the
+        // SAME row onto the new one (what `record_pinned_session_open` does).
+        store.record_open(auth_on("moving", "term-old"));
+        store.record_open(auth_on("moving", "term-new"));
+        assert_eq!(store.get("moving").unwrap().terminal_id, "term-new");
+
+        store.mark_terminal_superseded("term-old", "term-new");
+        let outcome = store.record_close_checked("moving", Some("term-old"), "pty-exit");
+
+        assert_eq!(
+            outcome,
+            CloseOutcome::TerminalSuperseded {
+                requested: "moving".to_string(),
+                terminal_id: "term-old".to_string(),
+            }
+        );
+        let live = store.get("moving").unwrap();
+        assert_eq!(live.state, "open", "the live row must not be closed");
+        assert_eq!(live.terminal_id, "term-new");
+        assert!(live.close_reason.is_none());
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            0,
+            "no coord Closed for a live session"
+        );
+
+        // Consumed: the same close again is the ordinary mis-bound answer.
+        assert_eq!(
+            store.record_close_checked("moving", Some("term-old"), "pty-exit"),
+            CloseOutcome::NotFound {
+                requested: "moving".to_string(),
+                terminal_id: Some("term-old".to_string()),
+            }
+        );
+        // And the new terminal's own close still works as a real close.
+        assert_eq!(
+            store.record_close_checked("moving", Some("term-new"), "explicit"),
+            CloseOutcome::Closed {
+                claude_session_id: "moving".to_string()
+            }
+        );
+        assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    /// The register is keyed by terminal id alone: a superseded entry must not
+    /// intercept a close that names a DIFFERENT terminal; a blank id is never
+    /// registered; and `unmark` withdraws an entry that will never be consumed
+    /// (the old PTY was already gone when the migration went to close it).
+    #[test]
+    fn superseded_register_matches_only_the_named_terminal() {
+        let dir = tempdir().unwrap();
+        let store = SessionLifecycleStore::open(dir.path().join("s.json")).unwrap();
+        store.record_open(auth_on("a", "term-a"));
+        store.mark_terminal_superseded("term-elsewhere", "term-x");
+        store.mark_terminal_superseded("   ", "term-x");
+        assert_eq!(
+            store.superseded_terminal_count(),
+            1,
+            "a blank id is never registered"
+        );
+
+        assert_eq!(
+            store.record_close_checked("a", Some("term-a"), "explicit"),
+            CloseOutcome::Closed {
+                claude_session_id: "a".to_string()
+            }
+        );
+        assert_eq!(
+            store.superseded_terminal_count(),
+            1,
+            "a different terminal's close consumes nothing"
+        );
+
+        store.unmark_terminal_superseded("term-elsewhere");
+        store.unmark_terminal_superseded("never-marked");
+        assert_eq!(store.superseded_terminal_count(), 0);
+    }
+
     /// `expect_terminal_id == None` is byte-identical to the historical
     /// csid-only close on the same fixture — the internal closers
-    /// (`poll-dead`, `never-started`, `no-terminal`, `migrated`) keep their
+    /// (`poll-dead`, `never-started`, `no-terminal`) keep their
     /// semantics exactly.
     #[test]
     fn record_close_checked_without_a_terminal_matches_legacy_record_close() {
