@@ -1023,7 +1023,16 @@ async fn spawn_looping_agent_terminal(
     // continuations); the playbook itself goes in the visible initial prompt
     // so it lives in scrollback and is re-sent verbatim on every fresh
     // relaunch.
-    let claude_bin = crate::agent_runtime::claude_bin_path();
+    //
+    // The ABSOLUTE binary, as the gate-continuation twin in `agent_runtime`
+    // resolves it: this argv is the PTY child's program (direct
+    // `CreateProcessW`, no `cmd.exe /c`), and a bare `claude` PATH-searched in
+    // the child's env — identity-shim dir prepended — lands on the
+    // extensionless shim script and fails with os error 193. Same defect that
+    // lost three account-migration respawns on 2026-09-18.
+    let claude_bin = spawn_blocking_tracked(crate::agent_runtime::resolve_claude_bin)
+        .await
+        .unwrap_or_else(|_| crate::agent_runtime::claude_bin_path());
     let pinned_session_id = uuid::Uuid::new_v4().to_string();
 
     // Account selection (fail-loud): never spawn a `claude` that dies
