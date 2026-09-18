@@ -17681,10 +17681,42 @@ mod ui_bridge_binding_health_tests {
         )
         .expect("read mcp_api.rs");
         // Strip the test modules: their fixtures legitimately build their own.
-        let production = src
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file has a non-test prefix");
+        //
+        // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
+        // FIRST occurrence, which in this file is about 62% of the way in, so
+        // a second construction added after that line was invisible and the
+        // test passed by placement luck. Every `#[cfg(test)]` in this file
+        // sits at column 0 on its own line and gates an item that closes with
+        // a column-0 `}`, so skip exactly those spans and keep the rest.
+        let mut production = String::new();
+        let mut skipping = false;
+        let mut scanned = 0usize;
+        for line in src.lines() {
+            if !skipping && line == "#[cfg(test)]" {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if line == "}" {
+                    skipping = false;
+                }
+                continue;
+            }
+            production.push_str(line);
+            production.push('\n');
+            scanned += 1;
+        }
+        assert!(
+            !skipping,
+            "a #[cfg(test)] span never closed at column 0 — the scan is unreliable"
+        );
+        // Guard the guard: if the span-skipping ever swallows the file, the
+        // count below would trivially be 0 and this test would pass blind.
+        assert!(
+            scanned * 2 > src.lines().count(),
+            "scanned only {scanned} of {} lines; the test-span skip is over-eager",
+            src.lines().count()
+        );
         let built = production.matches("RelayBinding::new(").count();
         assert_eq!(
             built, 1,

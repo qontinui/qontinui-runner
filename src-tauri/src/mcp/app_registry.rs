@@ -20,8 +20,8 @@ use tokio::sync::RwLock;
 
 use super::app_discovery::DiscoveredApp;
 use super::relay_binding::{
-    app_tombstone_key, BindingMode, Principal, Refusal, RelayBinding, RULE_R1, RULE_R2, RULE_R5,
-    RULE_R5_KEEP_ALIVE,
+    app_tombstone_key, BindingMode, Principal, Refusal, RelayBinding, BINDING_TOMBSTONE_MS,
+    RULE_R1, RULE_R1_SLOT, RULE_R2, RULE_R5, RULE_R5_KEEP_ALIVE,
 };
 
 /// Entries older than this (in ms) are considered stale and evicted.
@@ -131,6 +131,7 @@ impl AppRegistry {
         binding: &RelayBinding,
         principal: &Principal,
         route: &'static str,
+        slot_holder: Option<&Principal>,
         app: DiscoveredApp,
         declared_origin: Option<String>,
         transport: AppTransport,
@@ -144,6 +145,22 @@ impl AppRegistry {
 
         let mut keep_alive_ms = keep_alive_ms;
         if mode != BindingMode::Off {
+            // R1 against the LIVE WebSocket routing slot. It lives INSIDE this
+            // lock, so BOTH registrant doors inherit it. The HTTP register
+            // door is the easier route to the same takeover and the one that
+            // actually decides the dispatch target — `AppDispatcher` reads the
+            // REGISTRY, so an attacker pointing it at its own `baseUrl` wins
+            // even while the victim's socket is still open.
+            if let Some(slot) = slot_holder {
+                if !principal.may_displace(slot) {
+                    binding.meter(
+                        mode,
+                        principal,
+                        route,
+                        Refusal::registration_held(RULE_R1_SLOT),
+                    )?;
+                }
+            }
             match w.get(&app.app_id) {
                 // R1: a live holder is displaced only by itself or operator trust.
                 Some(existing) if existing.is_live(now) => {
@@ -156,9 +173,31 @@ impl AppRegistry {
                         )?;
                     }
                 }
-                // R5: no live entry, but the id may still be tombstoned for
-                // the principal that just released it (the reload race).
-                _ => {
+                // R5, held ON THE ROW. A row past its TTL but not yet swept
+                // used to fall straight through to the tombstone map — which
+                // is EMPTY until the sweeper runs, and `SWEEP_INTERVAL_MS` is
+                // 15 s while `list_live` drops the row from
+                // `/ui-bridge/apps/registered` at the TTL, which is exactly
+                // the attacker's signal. Polling at 1 Hz won roughly 14 times
+                // in 15. So the reservation is a property of the ROW, running
+                // from the row's own expiry; the sweep tombstone only covers
+                // the window after the row is truly gone.
+                Some(existing) => {
+                    let reserved_until = existing.last_seen_ms
+                        + existing.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
+                        + BINDING_TOMBSTONE_MS;
+                    if now <= reserved_until && !principal.may_displace(&existing.principal) {
+                        binding.meter(
+                            mode,
+                            principal,
+                            route,
+                            Refusal::registration_held(RULE_R5),
+                        )?;
+                    }
+                }
+                // No row at all: the sweeper has been here, so the
+                // reservation (if any) is in the tombstone map.
+                None => {
                     if let Some(prev) = binding.tombstone_holder(&key) {
                         if !principal.may_displace(&prev) {
                             binding.meter(
@@ -266,24 +305,36 @@ impl AppRegistry {
     /// must not keep the holder's registration alive. `None` skips that check
     /// — the kill-switch-`off` path.
     ///
-    /// The guard applies ONLY to a `Websocket` entry. For an `Http` entry
-    /// there is no conn to compare against, so holding the guard against it
-    /// would make every `touch` return `false` and let the row age out under
-    /// a live socket — which is reachable whenever a same-origin phone-home
-    /// re-registers an id a WebSocket holds (`websocket_conn_id` becomes
-    /// `None`). R1 already guarantees only the holder principal or operator
-    /// trust could have taken that id.
+    /// The conn guard applies only to a `Websocket` entry: an `Http` row has
+    /// no conn to compare against, so holding the guard against it would make
+    /// every `touch` return `false` and let the row age out under a live
+    /// socket (reachable whenever a same-origin phone-home re-registers an id
+    /// a WebSocket holds, which sets `websocket_conn_id: None`).
+    ///
+    /// For that `Http` case the socket's own `principal` decides instead.
+    /// "R1 already vetted whoever took the id" is NOT sufficient, and was
+    /// wrong across a tombstone lapse: an attacker that first-claimed an
+    /// unheld id over WebSocket (an accepted non-goal) and keeps its socket
+    /// open would otherwise refresh the VICTIM's row on every inbound frame
+    /// once the victim re-registered that id over HTTP.
     ///
     /// Returns `true` if an entry was refreshed.
-    pub async fn touch(&self, app_id: &str, conn_guard: Option<u64>) -> bool {
+    pub async fn touch(
+        &self,
+        app_id: &str,
+        conn_guard: Option<u64>,
+        principal: &Principal,
+    ) -> bool {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
         if let Some(entry) = w.get_mut(app_id) {
-            if entry.transport == AppTransport::Websocket {
-                if let Some(conn_id) = conn_guard {
+            if let Some(conn_id) = conn_guard {
+                if entry.transport == AppTransport::Websocket {
                     if entry.websocket_conn_id != Some(conn_id) {
                         return false;
                     }
+                } else if !principal.may_displace(&entry.principal) {
+                    return false;
                 }
             }
             entry.last_seen_ms = now;
@@ -332,16 +383,31 @@ impl AppRegistry {
     pub async fn sweep(&self, binding: &RelayBinding) -> usize {
         let now = chrono::Utc::now().timestamp_millis();
         let tombstone = binding.config.binding != BindingMode::Off;
+        let mut evicted: Vec<(String, Principal, i64)> = Vec::new();
         let mut w = self.inner.write().await;
         let before = w.len();
         w.retain(|app_id, e| {
-            let live = now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS);
+            let ttl = e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS);
+            let live = now - e.last_seen_ms <= ttl;
             if !live && tombstone {
-                binding.tombstone(app_tombstone_key(app_id), &e.principal);
+                // From the row's OWN expiry, never from this sweep instant,
+                // so the reservation's length does not vary with sweeper lag.
+                evicted.push((
+                    app_tombstone_key(app_id),
+                    e.principal.clone(),
+                    e.last_seen_ms + ttl + BINDING_TOMBSTONE_MS,
+                ));
             }
             live
         });
-        before - w.len()
+        let count = before - w.len();
+        // Off the registry write lock: a burst of simultaneous expiries would
+        // otherwise hold it for one bounded-map pass per evicted row.
+        drop(w);
+        for (key, principal, expires_at_ms) in evicted {
+            binding.tombstone_until(key, &principal, expires_at_ms);
+        }
+        count
     }
 
     /// Test-only shorthand for the pre-binding `upsert`: an operator-trust
@@ -368,6 +434,7 @@ impl AppRegistry {
             &binding,
             &principal,
             "test",
+            None,
             app,
             declared_origin,
             transport,
@@ -561,10 +628,13 @@ mod tests {
             "precondition: backdated entry should not be live"
         );
 
-        let refreshed = reg.touch("a1", Some(1)).await;
+        let agent = Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        };
+        let refreshed = reg.touch("a1", Some(1), &agent).await;
         assert!(refreshed, "touch must return true for the owning conn");
         assert!(
-            !reg.touch("a1", Some(2)).await,
+            !reg.touch("a1", Some(2), &agent).await,
             "R2: a displaced conn's touch must NOT refresh the holder"
         );
 
@@ -585,7 +655,14 @@ mod tests {
     async fn touch_returns_false_for_unknown_app() {
         let reg = AppRegistry::new();
         assert!(
-            !reg.touch("nope", None).await,
+            !reg.touch(
+                "nope",
+                None,
+                &Principal::OperatorTrust {
+                    class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+                }
+            )
+            .await,
             "touch on empty registry must return false"
         );
         // Sanity: registry is still empty (touch doesn't create entries).

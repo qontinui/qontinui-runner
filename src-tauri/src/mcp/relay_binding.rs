@@ -75,6 +75,14 @@ pub const RULE_R5: &str = "R5";
 /// registration is admitted — but Phase 4 reads these counters to decide
 /// graduation, so it has to be visible in BOTH modes.
 pub const RULE_R5_KEEP_ALIVE: &str = "R5-keepAlive";
+/// R5's ceiling arm: a reservation evicted because the tombstone map hit its
+/// global ceiling. Never silent — an operator must be able to see that
+/// reservations are being displaced, which is the shape of a flooding attack.
+pub const RULE_R5_EVICTED: &str = "R5-tombstoneEvicted";
+/// R1 as decided by the LIVE WebSocket routing slot rather than the registry
+/// row. Counted separately so it cannot crowd the row-based R1 out of the
+/// 20-slot `/health` ring that Phase 4's graduation is read from.
+pub const RULE_R1_SLOT: &str = "R1-slot";
 pub const RULE_OPAQUE: &str = "R-opaque";
 
 /// How long a browser principal's released `appId` / `tabId` stays reserved
@@ -84,7 +92,7 @@ pub const BINDING_TOMBSTONE_MS: i64 = 60_000;
 
 /// Ceiling on the whole tombstone map, so a page spraying fresh ids cannot
 /// grow it without bound.
-const MAX_TOMBSTONES: usize = 1024;
+pub(crate) const MAX_TOMBSTONES: usize = 1024;
 
 /// Ceiling on ONE principal's tombstones, which is what actually makes R5
 /// hold: a global ceiling alone is adversarially evictable. Every tombstone
@@ -94,7 +102,7 @@ const MAX_TOMBSTONES: usize = 1024;
 /// an accepted non-goal, so each succeeds) would evict the victim's reload
 /// reservation and hand itself the reload race back. Bounding per principal
 /// means one principal only ever evicts its OWN.
-const MAX_TOMBSTONES_PER_PRINCIPAL: usize = 64;
+pub(crate) const MAX_TOMBSTONES_PER_PRINCIPAL: usize = 64;
 
 /// How many `(rule, class, route)` tuples `/health` reports.
 const MAX_RECENT_TUPLES: usize = 20;
@@ -570,38 +578,89 @@ impl RelayBinding {
     /// many principals and this one holds none, the write is DROPPED rather
     /// than evicting somebody else's.
     pub fn tombstone(&self, key: String, holder: &Principal) {
+        self.tombstone_until(
+            key,
+            holder,
+            chrono::Utc::now().timestamp_millis() + BINDING_TOMBSTONE_MS,
+        );
+    }
+
+    /// Reserve `key` for `holder` until an EXPLICIT instant.
+    ///
+    /// The sweeper needs this: a reservation written when the sweeper happens
+    /// to run must still run from the moment the registration actually ENDED,
+    /// not from the sweep instant, or its length varies silently with sweeper
+    /// lag (up to `SWEEP_INTERVAL_MS`). A reservation whose instant has
+    /// already passed is not written at all.
+    ///
+    /// Operator-trust releases are NOT tombstoned: an agent's id is free the
+    /// moment it lets go.
+    ///
+    /// The map is bounded per principal first and globally second. At the
+    /// global ceiling it evicts the soonest-to-expire of the LARGEST bucket,
+    /// which is fair by construction — a victim holding one reservation is
+    /// never selected while a flooder holds 64 — and it NEVER drops the
+    /// incoming write. Dropping was the previous behaviour and it was
+    /// attacker-forceable: the bucket key is `class:origin`, and one domain
+    /// yields unlimited origins (`s0..s15.evil.example` × 64 = 1024), so an
+    /// attacker could fill the map from 16 principals and then silently
+    /// PREVENT a chosen victim's reservation instead of evicting it — the same
+    /// outcome at the same cost.
+    pub fn tombstone_until(&self, key: String, holder: &Principal, expires_at_ms: i64) {
         if holder.is_operator_trust() {
             return;
         }
         let now = chrono::Utc::now().timestamp_millis();
+        if expires_at_ms <= now {
+            return;
+        }
         let bucket = holder.log_key();
         let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, t| t.expires_at_ms > now);
 
-        let soonest_of_mine = |map: &HashMap<String, Tombstone>| {
-            map.iter()
-                .filter(|(_, t)| t.holder.log_key() == bucket)
-                .min_by_key(|(_, t)| t.expires_at_ms)
-                .map(|(k, _)| k.clone())
-        };
-        let mine = map
-            .iter()
-            .filter(|(k, t)| t.holder.log_key() == bucket && **k != key)
-            .count();
-
-        if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
-            if let Some(k) = soonest_of_mine(&map) {
-                map.remove(&k);
-            }
-        } else if map.len() >= MAX_TOMBSTONES && !map.contains_key(&key) {
-            match soonest_of_mine(&map) {
-                Some(k) => {
-                    map.remove(&k);
+        // ONE pass for every decision below: per-bucket counts, and each
+        // bucket's soonest-to-expire key. `sweep` can call this once per
+        // evicted row, so the previous three-or-four scans per call mattered.
+        let replacing = map.contains_key(&key);
+        if !replacing {
+            let mut counts: HashMap<String, (usize, String, i64)> = HashMap::new();
+            for (k, t) in map.iter() {
+                let b = t.holder.log_key();
+                match counts.get_mut(&b) {
+                    Some(e) => {
+                        e.0 += 1;
+                        if t.expires_at_ms < e.2 {
+                            e.1 = k.clone();
+                            e.2 = t.expires_at_ms;
+                        }
+                    }
+                    None => {
+                        counts.insert(b, (1, k.clone(), t.expires_at_ms));
+                    }
                 }
-                // Nothing of ours to reclaim, and evicting another
-                // principal's reservation is exactly the attack this bound
-                // exists to stop. Drop this write instead.
-                None => return,
+            }
+            let mine = counts.get(&bucket).map(|e| e.0).unwrap_or(0);
+            if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
+                if let Some((_, victim, _)) = counts.get(&bucket) {
+                    map.remove(victim);
+                }
+            } else if map.len() >= MAX_TOMBSTONES {
+                // Largest bucket wins the eviction: a flooder pays for its own
+                // flood, and a principal holding 0-1 never does.
+                if let Some((b, (n, victim, _))) = counts.iter().max_by_key(|(_, e)| e.0) {
+                    self.counters.record(RULE_R5_EVICTED, true);
+                    if self.first_sighting(holder, RULE_R5_EVICTED) {
+                        tracing::warn!(
+                            evicted_bucket = %b,
+                            evicted_bucket_size = n,
+                            map_len = map.len(),
+                            ceiling = MAX_TOMBSTONES,
+                            "ui-bridge binding (R5): the tombstone map hit its global ceiling; evicted the largest bucket's soonest reservation (logged once per principal+rule; counted on /health uiBridgeBinding)"
+                        );
+                    }
+                    let victim = victim.clone();
+                    map.remove(&victim);
+                }
             }
         }
 
@@ -609,7 +668,7 @@ impl RelayBinding {
             key,
             Tombstone {
                 holder: holder.clone(),
-                expires_at_ms: now + BINDING_TOMBSTONE_MS,
+                expires_at_ms,
             },
         );
     }

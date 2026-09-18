@@ -880,15 +880,33 @@ async fn expiry_tombstones_the_holder_so_a_missed_heartbeat_is_not_a_lockout() {
     assert_eq!(status, 200, "{body}");
 
     // The tab is backgrounded / crashed / throttled: no DELETE, no
-    // phone-home, and the entry ages past its TTL and is swept.
+    // phone-home, and the entry ages past its TTL.
+    //
+    // NO `sweep()` HERE, deliberately. The sweeper runs every 15 s while
+    // `list_live` drops the row from `/ui-bridge/apps/registered` the instant
+    // it expires — which is the attacker's signal — so in production the
+    // attacker arrives in the skew, before any sweep. Calling `sweep()` on the
+    // next line (which the first version of this test did) collapses that
+    // window to zero and tests an ordering production never has.
     assert!(
         s.relay
             .app_registry
             .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
             .await
     );
-    assert_eq!(s.relay.app_registry.sweep(&s.relay.binding).await, 1);
-    assert!(s.relay.app_registry.get("app").await.is_none());
+    assert!(
+        s.relay.app_registry.get("app").await.is_some(),
+        "precondition: the row is expired but NOT yet swept — the real window"
+    );
+    assert!(
+        s.relay
+            .app_registry
+            .list_live()
+            .await
+            .iter()
+            .all(|e| e.app.app_id != "app"),
+        "precondition: and it has already vanished from /ui-bridge/apps/registered"
+    );
 
     // The attacker polling /ui-bridge/apps/registered must not get the id.
     let (status, body) = s
@@ -1002,11 +1020,147 @@ async fn ws_touch_keeps_refreshing_a_row_an_http_phone_home_took_over() {
             .test_age_entry("shared", REGISTRATION_TTL_MS - 1_000)
             .await
     );
+    let good_principal = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
     assert!(
-        s.relay.app_registry.touch("shared", Some(conn_id)).await,
-        "the conn guard is meaningless for an HTTP entry and must not block the refresh"
+        s.relay
+            .app_registry
+            .touch("shared", Some(conn_id), &good_principal)
+            .await,
+        "the conn guard is meaningless for an HTTP entry, and the holder's own          principal must not be blocked from refreshing it"
     );
     assert_eq!(s.relay.app_registry.sweep(&s.relay.binding).await, 0);
+}
+
+/// H2 / R1-slot on the HTTP door: `POST /ui-bridge/apps/register` must not
+/// displace a live WebSocket holder either.
+///
+/// This is the EASIER route to the same takeover — no handshake — and the one
+/// that decides where agent commands go, because `AppDispatcher::dispatch`
+/// reads the REGISTRY: an attacker that gets an `Http` row with its own
+/// `baseUrl` receives every subsequent agent command and payload, even while
+/// the victim's socket is still open. The check therefore lives inside
+/// `AppRegistry::claim`, which both doors go through, rather than on the WS
+/// handshake path alone.
+#[tokio::test]
+async fn an_http_register_cannot_displace_a_live_ws_holder_the_registry_forgot() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let holder_conn = ack["connId"].as_u64().unwrap();
+
+    // The row is gone and no reservation survives it, so the live routing
+    // slot is the only thing that still knows who holds this id.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    assert!(s.relay.app_registry.get("app").await.is_none());
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Redirect", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "an HTTP register took the dispatch target from a live WS holder: {body}"
+    );
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+    assert!(
+        s.relay.app_registry.get("app").await.is_none(),
+        "the refused claim must have written nothing"
+    );
+    assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
+}
+
+/// H3: the tombstone map's global ceiling must not let an attacker PREVENT a
+/// chosen victim's reservation either.
+///
+/// The per-principal bound alone only stopped *eviction by one principal*. The
+/// bucket key is `class:origin` and one domain yields unlimited origins, so
+/// 16 sub-origins x 64 filled the map, and the victim's own write then found
+/// `mine == 0`, a full map, and was silently DROPPED — the same outcome at the
+/// same cost. The ceiling now evicts the soonest-to-expire of the LARGEST
+/// bucket, which a victim holding one reservation is never in.
+#[test]
+fn a_multi_origin_flood_cannot_prevent_a_victims_reservation() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let evil_at = |n: usize| Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(&format!("https://s{n}.evil.example")).unwrap(),
+    };
+    // Fill from enough distinct origins to reach the GLOBAL ceiling without
+    // any single one reaching the per-principal bound.
+    let origins = (MAX_TOMBSTONES / MAX_TOMBSTONES_PER_PRINCIPAL) + 4;
+    for o in 0..origins {
+        for i in 0..MAX_TOMBSTONES_PER_PRINCIPAL {
+            binding.tombstone(app_tombstone_key(&format!("squat-{o}-{i}")), &evil_at(o));
+        }
+    }
+    let total = binding.health_json()["tombstones"].as_u64().unwrap() as usize;
+    assert!(total <= MAX_TOMBSTONES, "the map is still bounded: {total}");
+
+    // Now the victim reloads. Its reservation must be WRITTEN, not dropped.
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    let victim = app_tombstone_key("victim-app");
+    binding.tombstone(victim.clone(), &good);
+    assert_eq!(
+        binding.tombstone_holder(&victim),
+        Some(good),
+        "a multi-origin flood silently PREVENTED the victim's reservation"
+    );
+    // And the eviction is observable, not silent.
+    assert!(
+        binding.health_json()["rules"]["R5-tombstoneEvicted"]["refused"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "the ceiling arm must be counted on /health: {}",
+        binding.health_json()
+    );
+}
+
+/// M1: an attacker holding an open socket on an id it first-claimed must not
+/// refresh the VICTIM's row once the victim re-registers that id over HTTP.
+/// First-claim squatting of an unheld id is an accepted non-goal; keeping the
+/// squatted row alive against its real owner is not.
+#[tokio::test]
+async fn a_foreign_socket_cannot_refresh_an_http_row_it_does_not_hold() {
+    let s = spawn(BindingConfig::default()).await;
+    // EVIL squats the unheld id over WS and keeps the socket open.
+    let (_evil, ack) = s.ws_register(Some(EVIL), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let evil_conn = ack["connId"].as_u64().unwrap();
+
+    // The squat lapses and GOOD takes the id over HTTP.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Owner", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "keepAliveSecs": 30 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    let evil_principal = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(EVIL).unwrap(),
+    };
+    assert!(
+        !s.relay
+            .app_registry
+            .touch("app", Some(evil_conn), &evil_principal)
+            .await,
+        "a foreign socket refreshed an HTTP row it does not hold"
+    );
 }
 
 /// R7.
