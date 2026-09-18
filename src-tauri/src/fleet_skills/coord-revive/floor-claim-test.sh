@@ -444,8 +444,13 @@ else
     mc_expect_red "map UNKNOWN-under-load to exit 1, so it reads as DEAD" \
       "$SCRIPT" 's/verdict="UNKNOWN"; FLOOR_EXIT=5/verdict="UNKNOWN"; FLOOR_EXIT=1/' \
       -- bash "$0"
+    # The arm is REPLACED by a no-op rather than deleted: deleting it leaves an
+    # `if ... then` whose body is only comments, so the mutated copy does not
+    # parse and reddens every assertion for a reason that has nothing to do with
+    # the envelope (scripts/lib/mutation-control.sh's parse gate now reports
+    # that as vacuous rather than counting it as a kill).
     mc_expect_red "drop the envelope arm, so an empty control read stays live=1" \
-      "$SCRIPT" '/^        live=0; tail=" envelope=UNKNOWN(key not confirmed)"$/d' \
+      "$SCRIPT" 's/^        live=0; tail=" envelope=UNKNOWN(key not confirmed)"$/        :/' \
       -- bash "$0"
     mc_trailer "$((PASS + FAIL))"
   else
