@@ -605,6 +605,35 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
     )
 }
 
+/// PURE: did this exit attempt POSITIVELY OBSERVE a `claude` in the pane?
+///
+/// B4-1's evidence. The steward registry needs to know a pane was once
+/// occupied, and until now the only thing that could tell it was a process
+/// probe driven by an HTTP request — which an unattended runner never
+/// receives, so the fact went unrecorded on exactly the boxes this plan is
+/// about.
+///
+/// This reads the evidence the exit already gathered rather than re-deriving
+/// it: six of the eight outcomes carry `claude_pids`, and a NON-EMPTY list is
+/// the pids `drive` actually saw. `NoLiveClaude` (looked, found none) and
+/// `ProbeUnavailable` (could not look) carry none, and both correctly answer
+/// false — the second because "could not look" is never evidence.
+///
+/// An exhaustive `match` rather than `matches!` deliberately: a new outcome
+/// variant must be classified here by the compiler, not silently default to
+/// "no claude was ever here", which is the answer that loses a steward.
+pub fn claude_was_observed(outcome: &GracefulExitOutcome) -> bool {
+    match outcome {
+        GracefulExitOutcome::Exited { claude_pids, .. }
+        | GracefulExitOutcome::ExitStuck { claude_pids, .. }
+        | GracefulExitOutcome::Refused { claude_pids, .. }
+        | GracefulExitOutcome::WriteFailed { claude_pids, .. }
+        | GracefulExitOutcome::CloseRefused { claude_pids, .. }
+        | GracefulExitOutcome::CloseOutcomeUnknown { claude_pids, .. } => !claude_pids.is_empty(),
+        GracefulExitOutcome::NoLiveClaude | GracefulExitOutcome::ProbeUnavailable { .. } => false,
+    }
+}
+
 /// Add `kind` to the persisted stopped-by-drain set. Off the runtime worker
 /// (N-2): the store is small but `std::fs` is blocking, and this runs inside
 /// the executor's async tick.
@@ -704,8 +733,15 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
 /// batch is assertable — see [`close_batch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CandidateOutcome {
-    /// Handed to [`CloseEffects::wind_down_one`].
-    Closed,
+    /// A graceful exit RAN. Whether it closed the pane is
+    /// [`GracefulExitOutcome`]'s to say — `ExitStuck` and `CloseRefused` are
+    /// both ordinary — so this deliberately does not claim one. It used to be
+    /// spelled `Closed`, which was a lie on both of those and on the arm
+    /// below.
+    Attempted,
+    /// `graceful_exit` could not even start (the pane was gone from the
+    /// manager, say). Nothing was typed.
+    ExitNotStarted,
     /// Re-observation no longer admitted it (B1). Nothing was typed at it.
     NoLongerEligible,
     /// The drain lifted before its turn. This candidate and every later one
@@ -729,15 +765,30 @@ pub(crate) trait CloseEffects {
     /// gone, or could not be observed — both fail closed.
     async fn recheck(&self, session_id: &str, terminal_id: &str)
         -> Option<wind_down::WindDownView>;
-    /// Drive the graceful exit and everything that follows it: the lifecycle
-    /// record, the log line, and D6's steward recording.
+    /// Ask the pane to leave. `Err` when the exit could not START at all.
     ///
     /// Deliberately NOT named `close`: the kill-path tripwire forbids the bare
     /// token `.close(` anywhere in this module's executable lines, receiver-
     /// agnostic, and a trait method spelled that way would have put one there
     /// — which is the tripwire working, not a false positive. This module
     /// never closes a pane; it asks for a graceful exit and the exit closes it.
-    async fn wind_down_one(&self, session_id: &str, terminal_id: &str);
+    async fn wind_down_one(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<GracefulExitOutcome, String>;
+    /// What kind of session this pane holds, and — for a steward — which kind
+    /// of steward. Reads, not effects, but they come from the pass and the
+    /// steward registry, so a test double supplies them.
+    fn session_kind(&self, terminal_id: &str) -> SessionKind;
+    fn steward_kind(&self, terminal_id: &str) -> Option<String>;
+    /// Stamp the outcome on the session's lifecycle record.
+    fn record_outcome(&self, session_id: &str, outcome: &GracefulExitOutcome);
+    /// Latch [`crate::mcp::steward::StewardMeta::claude_seen`] — B4-1's
+    /// backend-owned writer.
+    fn record_claude_seen(&self, terminal_id: &str);
+    /// D6: this steward kind is owed a restart on undrain.
+    async fn record_stopped_by_drain(&self, kind: &str);
 }
 
 /// Close up to [`MAX_CLOSES_PER_TICK`] candidates, re-establishing BOTH
@@ -797,8 +848,44 @@ pub(crate) async fn close_batch<E: CloseEffects + Sync>(
             outcomes.push(CandidateOutcome::NoLongerEligible);
             continue;
         }
-        effects.wind_down_one(&session_id, &terminal_id).await;
-        outcomes.push(CandidateOutcome::Closed);
+        let outcome = match effects.wind_down_one(&session_id, &terminal_id).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "wind_down_executor: graceful exit could not start");
+                outcomes.push(CandidateOutcome::ExitNotStarted);
+                continue;
+            }
+        };
+        effects.record_outcome(&session_id, &outcome);
+
+        // B4-1: POSITIVE PROOF that a `claude` lived in this pane, taken at the
+        // exact moment the husk is created. Six of the eight outcomes carry the
+        // pids they saw, and `claude_was_observed` reads THAT rather than
+        // re-deriving it — so the latch the steward registry needs is written
+        // by this executor, which runs on a timer the runner owns, and not by
+        // an HTTP probe that an unattended box never receives.
+        if claude_was_observed(&outcome) {
+            effects.record_claude_seen(&terminal_id);
+        }
+
+        // D6: a steward the drain STOPPED is owed a restart on undrain. The
+        // predicate is "`claude` left", NOT "the tab closed" — `drive` reaches
+        // its close callback only after `GONE_PROBES_REQUIRED` consecutive gone
+        // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
+        // steward's `claude` is already gone and only the bare shell survives.
+        // Recording just `Exited` left those as zombies: the pane reported
+        // `running: true`, the kind was not in the set, undrain did not restart
+        // it, a later start was refused 409, and the next tick could not retry
+        // because a pane with no live `claude` never appears in
+        // `terminal_hosted` again. Over-recording is cheap — the set is
+        // idempotent and `restart_after_drain` answers a benign 409 with
+        // `NotNeeded` — and under-recording is permanent.
+        if effects.session_kind(&terminal_id) == SessionKind::Steward && claude_left(&outcome) {
+            if let Some(kind) = effects.steward_kind(&terminal_id) {
+                effects.record_stopped_by_drain(&kind).await;
+            }
+        }
+        outcomes.push(CandidateOutcome::Attempted);
     }
     outcomes
 }
@@ -827,10 +914,13 @@ impl CloseEffects for LiveCloseEffects<'_> {
         wind_down_observer::recheck(self.app, self.grace, session_id, terminal_id).await
     }
 
-    async fn wind_down_one(&self, session_id: &str, terminal_id: &str) {
+    async fn wind_down_one(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Result<GracefulExitOutcome, String> {
         let kind = self.fresh.observed.kind_for(terminal_id);
         let observation = self.fresh.observed.observation_for(terminal_id);
-        let steward_kind = crate::mcp::steward::steward_kind_for_terminal(terminal_id);
         let origin = self
             .fresh
             .pass
@@ -846,7 +936,7 @@ impl CloseEffects for LiveCloseEffects<'_> {
             terminal_id = %terminal_id,
             ?kind,
             origin = origin.as_deref().unwrap_or("-"),
-            steward_kind = steward_kind.as_deref().unwrap_or("-"),
+            steward_kind = self.steward_kind(terminal_id).as_deref().unwrap_or("-"),
             sideband = ?observation.sideband,
             grid = ?observation.grid,
             judged_at_ms = self.fresh.observed.now_ms,
@@ -855,14 +945,28 @@ impl CloseEffects for LiveCloseEffects<'_> {
         );
 
         // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-        let outcome = match self.manager.graceful_exit(terminal_id, EXIT_DEADLINE).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "wind_down_executor: graceful exit could not start");
-                return;
-            }
-        };
-        match (outcome_word(&outcome), &self.store) {
+        let outcome = self
+            .manager
+            .graceful_exit(terminal_id, EXIT_DEADLINE)
+            .await?;
+        if matches!(outcome, GracefulExitOutcome::Exited { .. }) {
+            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
+        } else {
+            warn!(session_id = %session_id, terminal_id = %terminal_id, ?outcome, "wind_down_executor: not closed");
+        }
+        Ok(outcome)
+    }
+
+    fn session_kind(&self, terminal_id: &str) -> SessionKind {
+        self.fresh.observed.kind_for(terminal_id)
+    }
+
+    fn steward_kind(&self, terminal_id: &str) -> Option<String> {
+        crate::mcp::steward::steward_kind_for_terminal(terminal_id)
+    }
+
+    fn record_outcome(&self, session_id: &str, outcome: &GracefulExitOutcome) {
+        match (outcome_word(outcome), &self.store) {
             (Some(word), Some(store)) => {
                 store.set_wind_down_outcome(session_id, word, Utc::now().timestamp_millis())
             }
@@ -870,28 +974,14 @@ impl CloseEffects for LiveCloseEffects<'_> {
                 debug!(session_id = %session_id, ?outcome, "wind_down_executor: nothing recorded for this outcome")
             }
         }
-        if matches!(outcome, GracefulExitOutcome::Exited { .. }) {
-            info!(session_id = %session_id, terminal_id = %terminal_id, ?kind, "wind_down_executor: closed");
-        } else {
-            warn!(session_id = %session_id, terminal_id = %terminal_id, ?outcome, "wind_down_executor: not closed");
-        }
-        // D6: a steward the drain STOPPED is owed a restart on undrain. The
-        // predicate is "`claude` left", NOT "the tab closed" — `drive` reaches
-        // its close callback only after `GONE_PROBES_REQUIRED` consecutive gone
-        // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
-        // steward's `claude` is already gone and only the bare shell survives.
-        // Recording just `Exited` left those as zombies: `find_running_steward`
-        // reported `running: true`, the kind was not in the set, undrain did not
-        // restart it, a later start was refused 409, and the next tick could not
-        // retry because a pane with no live `claude` never appears in
-        // `terminal_hosted` again. Over-recording is cheap — the set is
-        // idempotent and `restart_after_drain` answers a benign 409 with
-        // `NotNeeded` — and under-recording is permanent.
-        if kind == SessionKind::Steward && claude_left(&outcome) {
-            if let Some(kind) = steward_kind {
-                record_stopped_by_drain(kind).await;
-            }
-        }
+    }
+
+    fn record_claude_seen(&self, terminal_id: &str) {
+        crate::mcp::steward::record_claude_seen(terminal_id);
+    }
+
+    async fn record_stopped_by_drain(&self, kind: &str) {
+        record_stopped_by_drain(kind.to_string()).await;
     }
 }
 
@@ -1463,10 +1553,12 @@ mod tests {
 
     // ── The close batch, at its call site ──────────────────────────────────
     //
-    // S3-2: the two tests above pin `recheck_is_owed` and `recheck_admits`
-    // themselves, and both stay green if the block that CALLS them is deleted
-    // outright. These drive [`close_batch`] with a recording double, so the
-    // WIRING is what is asserted.
+    // S3-2: the pure helpers `recheck_is_owed` / `recheck_admits` stay green if
+    // the block that CALLS them is deleted outright. S4-2: so did the D6
+    // steward recording, while the seam sat above it. These drive
+    // [`close_batch`] with a recording double whose seam is BELOW
+    // `graceful_exit`, so the wiring — the order, the skips, and the two
+    // records — is what is asserted.
 
     /// A [`CloseEffects`] that records every call and answers from a script.
     struct RecordingEffects {
@@ -1475,6 +1567,11 @@ mod tests {
         drained: Vec<bool>,
         /// What `recheck` answers, by terminal id. Absent = `None` (gone).
         verdicts: HashMap<String, wind_down::WindDownView>,
+        /// What `wind_down_one` answers, by terminal id. Absent = `Exited`
+        /// with one pid — the ordinary case.
+        outcomes: HashMap<String, Result<GracefulExitOutcome, String>>,
+        /// Which terminals hold a steward, and of which kind.
+        stewards: HashMap<String, String>,
         calls: std::sync::Mutex<Vec<String>>,
         drained_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1484,6 +1581,8 @@ mod tests {
             Self {
                 drained: vec![true],
                 verdicts: HashMap::new(),
+                outcomes: HashMap::new(),
+                stewards: HashMap::new(),
                 calls: std::sync::Mutex::new(Vec::new()),
                 drained_calls: std::sync::atomic::AtomicUsize::new(0),
             }
@@ -1502,8 +1601,25 @@ mod tests {
             self.drained = script.to_vec();
             self
         }
+        fn steward(mut self, terminal_id: &str, kind: &str) -> Self {
+            self.stewards
+                .insert(terminal_id.to_string(), kind.to_string());
+            self
+        }
+        fn outcome(mut self, terminal_id: &str, outcome: GracefulExitOutcome) -> Self {
+            self.outcomes.insert(terminal_id.to_string(), Ok(outcome));
+            self
+        }
+        fn exit_fails(mut self, terminal_id: &str) -> Self {
+            self.outcomes
+                .insert(terminal_id.to_string(), Err("no such pane".to_string()));
+            self
+        }
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
         }
     }
 
@@ -1514,6 +1630,13 @@ mod tests {
             until: None,
             reason: None,
             kind: SessionKind::Terminal,
+        }
+    }
+
+    fn exited() -> GracefulExitOutcome {
+        GracefulExitOutcome::Exited {
+            waited_ms: 10,
+            claude_pids: vec![42],
         }
     }
 
@@ -1530,17 +1653,39 @@ mod tests {
             _session_id: &str,
             terminal_id: &str,
         ) -> Option<wind_down::WindDownView> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("recheck:{terminal_id}"));
+            self.log(format!("recheck:{terminal_id}"));
             self.verdicts.get(terminal_id).cloned()
         }
-        async fn wind_down_one(&self, _session_id: &str, terminal_id: &str) {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("close:{terminal_id}"));
+        async fn wind_down_one(
+            &self,
+            _session_id: &str,
+            terminal_id: &str,
+        ) -> Result<GracefulExitOutcome, String> {
+            self.log(format!("exit:{terminal_id}"));
+            match self.outcomes.get(terminal_id) {
+                Some(Ok(outcome)) => Ok(outcome.clone()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Ok(exited()),
+            }
+        }
+        fn session_kind(&self, terminal_id: &str) -> SessionKind {
+            if self.stewards.contains_key(terminal_id) {
+                SessionKind::Steward
+            } else {
+                SessionKind::Terminal
+            }
+        }
+        fn steward_kind(&self, terminal_id: &str) -> Option<String> {
+            self.stewards.get(terminal_id).cloned()
+        }
+        fn record_outcome(&self, session_id: &str, _outcome: &GracefulExitOutcome) {
+            self.log(format!("record_outcome:{session_id}"));
+        }
+        fn record_claude_seen(&self, terminal_id: &str) {
+            self.log(format!("claude_seen:{terminal_id}"));
+        }
+        async fn record_stopped_by_drain(&self, kind: &str) {
+            self.log(format!("stopped_by_drain:{kind}"));
         }
     }
 
@@ -1561,19 +1706,24 @@ mod tests {
         let effects = RecordingEffects::new().eligible("t2").eligible("t3");
         let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
 
+        let order: Vec<String> = effects
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("recheck:") || c.starts_with("exit:"))
+            .collect();
         assert_eq!(
-            effects.calls(),
+            order,
             vec![
                 // No `recheck:t1` — index 0 is exempt, and only index 0.
-                "close:t1",
+                "exit:t1",
                 "recheck:t2",
-                "close:t2",
+                "exit:t2",
                 "recheck:t3",
-                "close:t3",
+                "exit:t3",
             ],
             "every candidate after the first must be re-observed BEFORE it is closed"
         );
-        assert_eq!(outcomes, vec![CandidateOutcome::Closed; 3]);
+        assert_eq!(outcomes, vec![CandidateOutcome::Attempted; 3]);
     }
 
     /// The scenario B1 exists for: the operator came back to D while A was
@@ -1584,17 +1734,16 @@ mod tests {
         let effects = RecordingEffects::new().not_yet("t2").eligible("t3");
         let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
 
-        assert_eq!(
-            effects.calls(),
-            vec!["close:t1", "recheck:t2", "recheck:t3", "close:t3"],
+        assert!(
+            !effects.calls().contains(&"exit:t2".to_string()),
             "t2 was re-observed and must NOT have been closed"
         );
         assert_eq!(
             outcomes,
             vec![
-                CandidateOutcome::Closed,
+                CandidateOutcome::Attempted,
                 CandidateOutcome::NoLongerEligible,
-                CandidateOutcome::Closed
+                CandidateOutcome::Attempted
             ]
         );
     }
@@ -1603,14 +1752,16 @@ mod tests {
     /// `None` must never be read as "nothing changed".
     #[tokio::test]
     async fn a_candidate_the_recheck_cannot_find_is_not_closed() {
-        // No verdict scripted for t2 at all.
         let effects = RecordingEffects::new();
         let outcomes = close_batch(batch(&["t1", "t2"]), &effects).await;
 
-        assert_eq!(effects.calls(), vec!["close:t1", "recheck:t2"]);
+        assert!(!effects.calls().contains(&"exit:t2".to_string()));
         assert_eq!(
             outcomes,
-            vec![CandidateOutcome::Closed, CandidateOutcome::NoLongerEligible]
+            vec![
+                CandidateOutcome::Attempted,
+                CandidateOutcome::NoLongerEligible
+            ]
         );
     }
 
@@ -1625,14 +1776,13 @@ mod tests {
             .eligible("t3");
         let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
 
-        assert_eq!(
-            effects.calls(),
-            vec!["close:t1"],
+        assert!(
+            !effects.calls().iter().any(|c| c.ends_with(":t2")),
             "t2 must not even be re-observed once the drain has lifted"
         );
         assert_eq!(
             outcomes,
-            vec![CandidateOutcome::Closed, CandidateOutcome::DrainLifted]
+            vec![CandidateOutcome::Attempted, CandidateOutcome::DrainLifted]
         );
     }
 
@@ -1654,10 +1804,157 @@ mod tests {
             effects
                 .calls()
                 .iter()
-                .filter(|c| c.starts_with("close:"))
+                .filter(|c| c.starts_with("exit:"))
                 .count(),
             MAX_CLOSES_PER_TICK
         );
+    }
+
+    /// S4-2: D6, at the call site. A steward whose `claude` left is recorded as
+    /// owed a restart — and a plain terminal session is NOT.
+    ///
+    /// The seam used to sit above this, so deleting the whole
+    /// `if kind == Steward && claude_left(..)` block left every batch test
+    /// green. It does not now.
+    #[tokio::test]
+    async fn a_steward_whose_claude_left_is_recorded_as_owed_a_restart() {
+        let effects = RecordingEffects::new()
+            .steward("t1", "merge-train")
+            .eligible("t2");
+        close_batch(batch(&["t1", "t2"]), &effects).await;
+
+        let calls = effects.calls();
+        assert!(
+            calls.contains(&"stopped_by_drain:merge-train".to_string()),
+            "the steward kind must be owed a restart on undrain: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("stopped_by_drain:"))
+                .count(),
+            1,
+            "t2 is an ordinary terminal session and owes nothing: {calls:?}"
+        );
+    }
+
+    /// D6's predicate is "`claude` left", not "the tab closed". A refused close
+    /// is reached only AFTER `claude` is gone, so it owes the restart too —
+    /// recording only `Exited` is what left those stewards down.
+    #[tokio::test]
+    async fn a_steward_whose_close_was_refused_still_owes_a_restart() {
+        let effects = RecordingEffects::new().steward("t1", "dev-ops").outcome(
+            "t1",
+            GracefulExitOutcome::CloseRefused {
+                waited_ms: 10,
+                claude_pids: vec![7],
+                reason: "pane not provably clear".to_string(),
+            },
+        );
+        close_batch(batch(&["t1"]), &effects).await;
+
+        assert!(effects
+            .calls()
+            .contains(&"stopped_by_drain:dev-ops".to_string()));
+    }
+
+    /// B4-1 AT THE CALL SITE. The latch the steward registry depends on is
+    /// written by THIS executor, from evidence the exit already gathered — not
+    /// by an HTTP probe an unattended runner never receives.
+    ///
+    /// This is the test that fails if the `record_claude_seen` call is deleted,
+    /// and the scenario it stands for is the whole plan's: a drained runner
+    /// nobody is watching.
+    #[tokio::test]
+    async fn an_exit_that_saw_a_claude_latches_it_on_the_steward_registry() {
+        let effects = RecordingEffects::new().steward("t1", "merge-train");
+        close_batch(batch(&["t1"]), &effects).await;
+
+        assert!(
+            effects.calls().contains(&"claude_seen:t1".to_string()),
+            "a graceful exit carrying claude_pids is proof the pane was occupied"
+        );
+    }
+
+    /// ...and an exit that saw NOTHING must not latch it. `NoLiveClaude` is
+    /// "looked, found none"; latching on it would mark a pane occupied that
+    /// never was, which is how a pane that is merely starting gets reaped.
+    #[tokio::test]
+    async fn an_exit_that_saw_no_claude_latches_nothing() {
+        let effects = RecordingEffects::new()
+            .steward("t1", "merge-train")
+            .outcome("t1", GracefulExitOutcome::NoLiveClaude);
+        close_batch(batch(&["t1"]), &effects).await;
+
+        let calls = effects.calls();
+        assert!(
+            !calls.iter().any(|c| c.starts_with("claude_seen:")),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c.starts_with("stopped_by_drain:")),
+            "and nothing left, so nothing is owed: {calls:?}"
+        );
+    }
+
+    /// S4-3: an exit that could not START is not an attempt at anything. The
+    /// enum used to call this `Closed`.
+    #[tokio::test]
+    async fn an_exit_that_could_not_start_is_not_reported_as_attempted() {
+        let effects = RecordingEffects::new().exit_fails("t1").eligible("t2");
+        let outcomes = close_batch(batch(&["t1", "t2"]), &effects).await;
+
+        assert_eq!(
+            outcomes,
+            vec![
+                CandidateOutcome::ExitNotStarted,
+                CandidateOutcome::Attempted
+            ]
+        );
+        let calls = effects.calls();
+        assert!(
+            !calls.contains(&"record_outcome:s-t1".to_string()),
+            "nothing happened to that session, so nothing is stamped on it: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"claude_seen:t1".to_string()),
+            "an exit that never started gathered no evidence to latch: {calls:?}"
+        );
+        // Scoped to t1 deliberately: t2's exit DID run and DID see a claude, so
+        // it latches. An `any(starts_with("claude_seen:"))` here would be
+        // asserting that the batch stops after a failed exit, which is a
+        // different (and wrong) claim.
+        assert!(calls.contains(&"claude_seen:t2".to_string()));
+    }
+
+    /// `claude_was_observed` reads the pids the exit actually saw, so a variant
+    /// that carries an EMPTY list is not evidence either.
+    #[test]
+    fn only_an_outcome_carrying_pids_is_evidence_a_claude_was_there() {
+        assert!(claude_was_observed(&exited()));
+        assert!(!claude_was_observed(&GracefulExitOutcome::NoLiveClaude));
+        assert!(
+            !claude_was_observed(&GracefulExitOutcome::ProbeUnavailable {
+                detail: "unreadable".to_string()
+            }),
+            "could not look is never evidence"
+        );
+        assert!(
+            !claude_was_observed(&GracefulExitOutcome::Exited {
+                waited_ms: 1,
+                claude_pids: vec![],
+            }),
+            "an empty pid list proves nothing, whatever the variant"
+        );
+        // `ExitStuck` means claude is STILL there — the strongest evidence of
+        // all, and one `claude_left` deliberately excludes.
+        let stuck = GracefulExitOutcome::ExitStuck {
+            waited_ms: 1,
+            claude_pids: vec![9],
+            last_probe_unreadable: false,
+        };
+        assert!(claude_was_observed(&stuck));
+        assert!(!claude_left(&stuck));
     }
 
     /// N-4: the nested check is the function's own, not a collaborator's.
