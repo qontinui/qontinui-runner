@@ -35,8 +35,9 @@
 //! `blob` is the git blob id of the body bytes with the key excluded. For a
 //! builtin it equals `git hash-object` of the VENDORED file this build
 //! embedded — and of the canonical file only while the two are in byte parity.
-//! `git -C qontinui-claude-config cat-file -e <blob>` separates a stale copy
-//! (the blob is an older canonical version) from a fork (it is in no version).
+//! After a fetch, `git -C qontinui-claude-config log --all --find-object=<blob>
+//! -- .claude/commands/<name>.md` separates a stale copy (the blob is an older
+//! canonical version) from a fork (no version of that file ever held it).
 //! A provisioned file is checkable on its own — no sibling checkout, no runner —
 //! by [`provenance_consistent`], or from a shell: when line 3 is `---` (a
 //! prepended block) `tail -n +4 <file> | git hash-object --stdin`, otherwise
