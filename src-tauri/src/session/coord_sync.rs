@@ -73,7 +73,7 @@
 //! frontend doesn't need a schema update for Phase 3.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -579,6 +579,26 @@ fn write_failure_outcome(status: StatusCode, message: String) -> PushOutcome {
         CoordWriteClass::Permanent => PushOutcome::PermanentFailure(message),
         CoordWriteClass::Spoolable => PushOutcome::Transport(message),
     }
+}
+
+/// `coord-transport-rung` rows the drain Ack-DROPPED on a 404 (coord does not
+/// know the lane's session id) since this process booted. Module-level, not
+/// function-local, so `GET /health` `transportRung.drainDropped` can read it
+/// (plan 2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-a-
+/// serving-emitter, Phase 1): a drop that leaves no counter is
+/// indistinguishable from a fleet where nobody calls coord.
+pub(crate) static TRANSPORT_RUNG_DROPPED_404: AtomicU64 = AtomicU64::new(0);
+/// The 405 twin: rows dropped because the serving coord has no session-events
+/// ingest route. The push arm's throttled `warn!` reads this same counter, so
+/// hoisting it out of the function changed nothing about the log cadence.
+pub(crate) static TRANSPORT_RUNG_DROPPED_405: AtomicU64 = AtomicU64::new(0);
+
+/// `(dropped_404, dropped_405)` for `GET /health` `transportRung.drainDropped`.
+pub(crate) fn transport_rung_drain_dropped() -> (u64, u64) {
+    (
+        TRANSPORT_RUNG_DROPPED_404.load(Ordering::Relaxed),
+        TRANSPORT_RUNG_DROPPED_405.load(Ordering::Relaxed),
+    )
 }
 
 /// Kinds drained under the BEST-EFFORT posture: a transport failure skips the
@@ -1170,10 +1190,13 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                     //     id — a wrong lane, or a GC'd `coord.sessions` row).
                     //     Per-occurrence detail is what makes it diagnosable,
                     //     so it is NOT throttled.
+                    //
+                    // Both are counted at module level
+                    // (`TRANSPORT_RUNG_DROPPED_404` / `_405`) so `GET /health`
+                    // `transportRung.drainDropped` carries the totals a log
+                    // grep used to be the only way to reach.
                     if status == StatusCode::METHOD_NOT_ALLOWED {
-                        static DROPPED_405: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let n = DROPPED_405.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let n = TRANSPORT_RUNG_DROPPED_405.fetch_add(1, Ordering::Relaxed) + 1;
                         if n == 1 || n % 1000 == 0 {
                             tracing::warn!(
                                 dropped_total = n,
@@ -1186,6 +1209,7 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                         }
                         return PushOutcome::Acked;
                     }
+                    TRANSPORT_RUNG_DROPPED_404.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(
                         session = %rec.session_id,
                         seq = rec.seq,
@@ -2188,6 +2212,10 @@ mod tests {
         /// When true, every PATCH returns 404 (simulates a GC'd / missing
         /// coord row — drives the R2 resume 404-fallback path).
         patch_returns_404: bool,
+        /// When set, `POST /sessions/:id/events` answers this status instead
+        /// of 201 (still recording the body) — drives the mirror-drop arms
+        /// (404 unknown session id, 405 no ingest route).
+        events_status: Option<u16>,
     }
 
     impl CoordRecorder {
@@ -2296,8 +2324,13 @@ mod tests {
                     |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
                      AxumPath(id): AxumPath<Uuid>,
                      Json(body): Json<JsonValue>| async move {
-                        state.lock().await.events.push((id, body.clone()));
-                        (AxumStatus::CREATED, Json(json!({"id": id}))).into_response()
+                        let mut g = state.lock().await;
+                        g.events.push((id, body.clone()));
+                        let status = g
+                            .events_status
+                            .and_then(|s| AxumStatus::from_u16(s).ok())
+                            .unwrap_or(AxumStatus::CREATED);
+                        (status, Json(json!({"id": id}))).into_response()
                     },
                 ),
             )
@@ -2655,6 +2688,132 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    /// The two drop counters are process-wide and each test below asserts
+    /// the OTHER one did not move, so the two serialise on one lock — the
+    /// same shared-static remedy as `series_lock` in `mcp_api`'s tests.
+    fn drop_counter_lock() -> &'static TokMutex<()> {
+        static LOCK: OnceLock<TokMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TokMutex::new(()))
+    }
+
+    /// Drain one `coord-transport-rung` row into a fake coord answering
+    /// `status` on the events route; returns how much the given drop counter
+    /// moved, plus the `/health` accessor's `(404, 405)` tuple read while the
+    /// guard is still held. The row must end ACKed (the arm drops, it does
+    /// not retry), and the SIBLING counter must not move.
+    async fn drain_rung_row_dropped_with(
+        status: u16,
+        counter: &'static AtomicU64,
+        sibling: &'static AtomicU64,
+    ) -> (u64, (u64, u64)) {
+        let _guard = drop_counter_lock().lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.events_status = Some(status);
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+
+        let obs = crate::session::coord_transport_rung::RungObservation::from_declaration(
+            None,
+            None,
+            None,
+            None,
+            crate::session::coord_transport_rung::OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            crate::session::coord_transport_rung::OPERATION_READ,
+            None,
+        );
+        let before = counter.load(Ordering::Relaxed);
+        let sibling_before = sibling.load(Ordering::Relaxed);
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::CoordTransportRung,
+                obs.payload(),
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+
+        wait_until(Duration::from_secs(5), || {
+            let r = rec.try_lock();
+            r.map(|g| !g.events.is_empty()).unwrap_or(false)
+        })
+        .await;
+        // Ack-dropped, never retried: the outbox empties.
+        wait_until(Duration::from_secs(3), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        assert!(
+            outbox.pending().unwrap().is_empty(),
+            "a {status} on the events route is an Ack-drop, not a retry"
+        );
+        assert_eq!(
+            rec.lock().await.events.len(),
+            1,
+            "exactly one POST — the drop must not be retried"
+        );
+        assert_eq!(
+            sibling.load(Ordering::Relaxed),
+            sibling_before,
+            "the {status} drop must not move the sibling counter"
+        );
+        (
+            counter.load(Ordering::Relaxed) - before,
+            transport_rung_drain_dropped(),
+        )
+    }
+
+    /// Phase 1 of plan 2026-09-18-runner-transport-rung-rows-never-reach-coord-
+    /// despite-a-serving-emitter: a 404 Ack-drop is COUNTED at module level so
+    /// `GET /health` can read it. Before this the arm only logged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_counts_a_404_transport_rung_drop() {
+        let before = TRANSPORT_RUNG_DROPPED_404.load(Ordering::Relaxed);
+        let (moved, (d404, _)) = drain_rung_row_dropped_with(
+            404,
+            &TRANSPORT_RUNG_DROPPED_404,
+            &TRANSPORT_RUNG_DROPPED_405,
+        )
+        .await;
+        assert_eq!(
+            moved, 1,
+            "one 404-dropped row moves `drainDropped.404` by one"
+        );
+        assert!(
+            d404 >= before + 1,
+            "the /health accessor reads the hoisted 404 counter"
+        );
+    }
+
+    /// The hoisted 405 counter: it used to be a function-local `static` the
+    /// throttled `warn!` alone could read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_counts_a_405_transport_rung_drop() {
+        let before = TRANSPORT_RUNG_DROPPED_405.load(Ordering::Relaxed);
+        let (moved, (_, d405)) = drain_rung_row_dropped_with(
+            405,
+            &TRANSPORT_RUNG_DROPPED_405,
+            &TRANSPORT_RUNG_DROPPED_404,
+        )
+        .await;
+        assert_eq!(
+            moved, 1,
+            "one 405-dropped row moves `drainDropped.405` by one"
+        );
+        assert!(
+            d405 >= before + 1,
+            "the /health accessor reads the hoisted 405 counter"
+        );
     }
 
     /// Restore-registry mirror (plan 2026-07-09 §3.4, Phase 4) — a

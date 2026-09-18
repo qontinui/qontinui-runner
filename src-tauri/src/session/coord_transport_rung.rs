@@ -50,6 +50,7 @@
 //! and return. A proxied coord call must never become an error because its
 //! observation could not be recorded.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value as JsonValue};
@@ -548,6 +549,13 @@ impl RungEmitter {
             SessionEventKind::CoordTransportRung,
             obs.payload(),
         ) {
+            // Arm (c) of a dropped observation (plan
+            // 2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-
+            // a-serving-emitter, Phase 1): counted so `GET /health`
+            // `transportRung.outboxWriteFailed` says how many observations
+            // were handed to the emitter and never reached the outbox — the
+            // `debug!` alone is silent at the default filter.
+            OUTBOX_WRITE_FAILED.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(
                 session = %lane_session_id,
                 transport = obs.transport,
@@ -555,6 +563,17 @@ impl RungEmitter {
             );
         }
     }
+}
+
+/// Observations handed to [`RungEmitter::emit`] whose outbox append failed,
+/// since this process booted. Process-wide, not per-emitter: [`install`] keeps
+/// one emitter per process, and `/health` reads one number.
+static OUTBOX_WRITE_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// How many observations [`RungEmitter::emit`] dropped on an outbox write
+/// error, for `GET /health` `transportRung.outboxWriteFailed`.
+pub fn outbox_write_failed_total() -> u64 {
+    OUTBOX_WRITE_FAILED.load(Ordering::Relaxed)
 }
 
 static GLOBAL: OnceLock<Arc<RungEmitter>> = OnceLock::new();
@@ -784,5 +803,48 @@ mod tests {
         assert_eq!(pending[0].payload["reporter_step"], json!("2"));
         assert_eq!(pending[0].payload["attempted"], json!(["native_mcp"]));
         assert_eq!(pending[0].payload["operation"], json!("read"));
+    }
+
+    /// Arm (c): an outbox append that fails is COUNTED, not only `debug!`-ed.
+    /// `OutboxWriter::record` reopens the file per write, so deleting the
+    /// directory underneath an opened outbox is exactly the write error a
+    /// vanished dev-logs dir produces in production.
+    #[test]
+    fn outbox_write_error_increments_outbox_write_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = RungEmitter::new(outbox, Uuid::new_v4());
+        let obs = RungObservation::from_declaration(
+            None,
+            None,
+            None,
+            None,
+            OUTCOME_OK,
+            "https://coord.qontinui.io/mcp",
+            OPERATION_READ,
+            None,
+        );
+        // A successful emit must NOT move the counter.
+        let before = outbox_write_failed_total();
+        emitter.emit(Uuid::new_v4(), &obs);
+        assert_eq!(
+            outbox_write_failed_total(),
+            before,
+            "a successful append is not a write failure"
+        );
+
+        // Pull the directory out from under the outbox; the next append fails.
+        let path = dir.path().to_path_buf();
+        drop(dir);
+        assert!(!path.exists(), "tempdir must be gone for the write to fail");
+        let before = outbox_write_failed_total();
+        emitter.emit(Uuid::new_v4(), &obs);
+        assert_eq!(
+            outbox_write_failed_total(),
+            before + 1,
+            "an outbox write error must increment `outboxWriteFailed`"
+        );
     }
 }

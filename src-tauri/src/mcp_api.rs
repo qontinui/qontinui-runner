@@ -1397,6 +1397,27 @@ async fn health(
         // `no_lifecycle_record` verdict can be told apart from a
         // wrong-granularity one.
         "selfId": self_id_health_snapshot(),
+        // The three arms plan 2026-09-18-runner-transport-rung-rows-never-
+        // reach-coord-despite-a-serving-emitter §1 names, on which a
+        // `coord-transport-rung` observation is DROPPED between the proxy
+        // door and coord — (a) lane miss, (b) drain 404/405 Ack-drop, (c)
+        // emitter outbox write error — counted since boot (Phase 1). Two
+        // drop arms are deliberately NOT counted here: any OTHER 4xx from
+        // `POST /sessions/:id/events` (falls to `write_failure_outcome` →
+        // PermanentFailure, logged at `error!` in `coord_sync`), and outbox
+        // cap eviction (`OutboxWriter::dropped_unacked`, kind-agnostic and
+        // not on /health). `emitted` is observations HANDED to the
+        // emitter; `laneMiss` partitions the calls that never got a
+        // `coord.sessions` lane by the FIRST gate they failed (one key per
+        // `EventLaneMiss` variant, present even at zero — an absent key is
+        // UNKNOWN, a zero is a number); `drainDropped` is what the outbox
+        // drain Ack-dropped on a 404 (coord does not know the lane) or a 405
+        // (no ingest route); `outboxWriteFailed` is the emitter's own append
+        // failing; `emitterInstalled: false` explains an all-zero block on a
+        // host whose session subsystem never came up. A `coord_only` fleet
+        // with a serving emitter used to be diagnosable only by log grep on
+        // the emitting box.
+        "transportRung": transport_rung_health_snapshot(),
         // Where the coord-mcp rotation-forensics JSONL actually is (plan
         // 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 3).
         // It resolves through `paths::get_dev_logs_dir` — settings override,
@@ -2859,8 +2880,9 @@ fn resolve_event_lane_session_id(
 /// the FIRST gate the call failed, so the dropped-observation log line says
 /// which leg missed instead of collapsing every drop into one unfielded
 /// `debug!` (the shape Finding 2 flagged: "40 rows out of 4000 calls" has to be
-/// diagnosable from the logs alone, since the typed `/health` counter is
-/// deliberately deferred to a follow-up).
+/// diagnosable from the logs alone). Each variant is also one series under
+/// `GET /health` `transportRung.laneMiss` ([`record_event_lane_miss`]), the
+/// counter that line used to say was deferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventLaneMiss {
     /// The proxy call carried no nonce at all (the unauthenticated door).
@@ -2916,6 +2938,158 @@ impl EventLaneMiss {
             | Self::AiSessionUnregistered => "ai_plane",
         }
     }
+
+    /// This miss's counter slot, as an EXHAUSTIVE match — the same guard
+    /// [`SelfIdOutcome::index`] documents: a variant without a slot is a build
+    /// error, never a miscount into another series.
+    const fn index(self) -> usize {
+        match self {
+            Self::NoNonce => 0,
+            Self::NoTerminalManager => 1,
+            Self::TerminalGone => 2,
+            Self::TerminalHasNoCoordSession => 3,
+            Self::NoWorkdir => 4,
+            Self::AiPlaneStateMissing => 5,
+            Self::NoTaskRun => 6,
+            Self::AiSessionUnregistered => 7,
+        }
+    }
+
+    /// Every miss, in counter-slot order — `ALL[i].index() == i`, asserted in
+    /// the tests so the two orderings cannot drift.
+    const ALL: [Self; 8] = [
+        Self::NoNonce,
+        Self::NoTerminalManager,
+        Self::TerminalGone,
+        Self::TerminalHasNoCoordSession,
+        Self::NoWorkdir,
+        Self::AiPlaneStateMissing,
+        Self::NoTaskRun,
+        Self::AiSessionUnregistered,
+    ];
+}
+
+/// One counter slot per [`EventLaneMiss`] variant — the array width every
+/// lane-miss counter set below is declared with, tied to `ALL` so the three
+/// cannot drift apart.
+const LANE_MISS_SLOTS: usize = EventLaneMiss::ALL.len();
+
+// `ALL[i].index() == i`, checked at compile time: a reordered `ALL` or a
+// renumbered `index()` is a build error, never a series rendering another
+// variant's count.
+const _: () = {
+    let mut i = 0;
+    while i < EventLaneMiss::ALL.len() {
+        assert!(
+            EventLaneMiss::ALL[i].index() == i,
+            "EventLaneMiss::ALL order drifted from index()"
+        );
+        i += 1;
+    }
+};
+
+/// Per-reason lane-miss counters, indexed by [`EventLaneMiss::index`] (the
+/// declaration order of [`EventLaneMiss::ALL`]) — the [`self_id_counters`]
+/// shape, one instance per counter family.
+fn transport_rung_lane_miss_counters() -> &'static [std::sync::atomic::AtomicU64; LANE_MISS_SLOTS] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; LANE_MISS_SLOTS]> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(Default::default)
+}
+
+/// Observations HANDED to the rung emitter by [`record_coord_transport_rung`]
+/// since boot — the numerator every drop counter is read against.
+fn transport_rung_emitted_counter() -> &'static std::sync::atomic::AtomicU64 {
+    static COUNTER: std::sync::OnceLock<std::sync::atomic::AtomicU64> = std::sync::OnceLock::new();
+    COUNTER.get_or_init(Default::default)
+}
+
+/// Count one dropped observation under its reason, and say so — ONCE per
+/// reason at `warn!`, then every 1000th with the running total, which is the
+/// cadence the drain's 405 arm already uses (`coord_sync::TRANSPORT_RUNG_DROPPED_405`)
+/// and for the same reason: two of these reasons are structurally capable of
+/// dropping EVERY call from a session for its whole life, so a per-call
+/// `warn!` would bury the other warnings in `.dev-logs`, while a `debug!`
+/// alone is invisible at the default filter — which is how a serving emitter
+/// went 48 h without a single row and nobody could see why. The occurrences
+/// in between keep the per-call `debug!` so a raised filter still correlates
+/// one drop with one binding.
+///
+/// The nonce is a credential, so only a PREFIX ever reaches a log
+/// ([`nonce_log_prefix`]). The terminal id is re-read here rather than threaded
+/// through the miss, because misses are the rare path and a stale read only
+/// affects a log field.
+fn record_event_lane_miss(miss: EventLaneMiss, door: &str, nonce: Option<&str>) {
+    debug_assert!(miss.index() < LANE_MISS_SLOTS);
+    let n = transport_rung_lane_miss_counters()[miss.index()].fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n % 1000 == 0 {
+        tracing::warn!(
+            dropped_total = n,
+            door = %door,
+            leg = %miss.leg(),
+            reason = %miss.as_str(),
+            terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
+            nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
+            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+             observation not recorded; first-rung reachability under-counts \
+             (GET /health transportRung.laneMiss carries the totals)"
+        );
+    } else {
+        tracing::debug!(
+            dropped_total = n,
+            door = %door,
+            leg = %miss.leg(),
+            reason = %miss.as_str(),
+            terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
+            nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
+            "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
+             observation not recorded"
+        );
+    }
+}
+
+/// The `transportRung` block of `GET /health`, rendered from the live
+/// counters. The shape is [`transport_rung_snapshot_from`]'s; this only reads
+/// the process-wide sources.
+pub(crate) fn transport_rung_health_snapshot() -> serde_json::Value {
+    let (dropped_404, dropped_405) = crate::session::coord_sync::transport_rung_drain_dropped();
+    transport_rung_snapshot_from(
+        transport_rung_lane_miss_counters(),
+        transport_rung_emitted_counter().load(Ordering::Relaxed),
+        dropped_404,
+        dropped_405,
+        crate::session::coord_transport_rung::outbox_write_failed_total(),
+        crate::session::coord_transport_rung::global().is_some(),
+    )
+}
+
+/// Render one `transportRung` block from explicit inputs, so the tests can
+/// prove "every variant present, at zero" against a fresh counter set rather
+/// than against whatever the process has already counted.
+fn transport_rung_snapshot_from(
+    lane_miss: &[std::sync::atomic::AtomicU64; LANE_MISS_SLOTS],
+    emitted: u64,
+    dropped_404: u64,
+    dropped_405: u64,
+    outbox_write_failed: u64,
+    emitter_installed: bool,
+) -> serde_json::Value {
+    let mut misses = serde_json::Map::new();
+    for miss in EventLaneMiss::ALL {
+        // Keyed on `index()`, not the iteration position — the same
+        // compiler-checked mapping `record_event_lane_miss` writes through.
+        misses.insert(
+            miss.as_str().to_string(),
+            serde_json::json!(lane_miss[miss.index()].load(Ordering::Relaxed)),
+        );
+    }
+    serde_json::json!({
+        "emitted": emitted,
+        "laneMiss": misses,
+        "drainDropped": { "404": dropped_404, "405": dropped_405 },
+        "outboxWriteFailed": outbox_write_failed,
+        "emitterInstalled": emitter_installed,
+    })
 }
 
 /// The three genuinely different things leg 1 of the EVENT-LANE resolver can
@@ -2981,7 +3155,8 @@ fn nonce_log_prefix(nonce: &str) -> String {
 /// Mirrors [`record_self_id_outcome`]'s call-site posture exactly: a
 /// per-request recorder, called unconditionally on the proxy path, that can
 /// never fail the request it observes. Every miss — no lane session id, no
-/// installed emitter, an outbox write error — logs at `debug` and returns.
+/// installed emitter, an outbox write error — is counted under `GET /health`
+/// `transportRung` ([`transport_rung_health_snapshot`]), logged, and returns.
 ///
 /// ## The untagged arm is VISIBLE, never skipped
 ///
@@ -3017,27 +3192,31 @@ fn record_coord_transport_rung(
         Ok(lane) => lane,
         Err(miss) => {
             // A dropped observation has to be IDENTIFIABLE, or "the runner
-            // emitted 40 rows out of 4000 calls" is undiagnosable — this line
-            // used to carry no fields at all. Fields only: the typed
-            // `LaneOutcome` counter on `/health` is deliberately deferred to a
-            // follow-up.
-            //
-            // The nonce is a credential, so only a PREFIX ever reaches a log
-            // ([`nonce_log_prefix`]). The terminal id is re-read here rather
-            // than threaded through the miss, because misses are the rare path
-            // and a stale read only affects a log field.
-            tracing::debug!(
-                door = %door,
-                leg = %miss.leg(),
-                reason = %miss.as_str(),
-                terminal_id = ?nonce.and_then(crate::coord_mcp::terminal_id_for_nonce),
-                nonce_prefix = %nonce.map(nonce_log_prefix).unwrap_or_default(),
-                "coord-mcp proxy: no coord.sessions lane for this caller — transport-rung \
-                 observation not recorded"
-            );
+            // emitted 40 rows out of 4000 calls" is undiagnosable — this arm
+            // used to carry an unfielded `debug!` and nothing else. Now it
+            // is counted per reason under `GET /health`
+            // `transportRung.laneMiss` and warned once per reason.
+            record_event_lane_miss(miss, door, nonce);
             return;
         }
     };
+    hand_off_transport_rung(emitter, lane, headers, body, door, caller_session_id);
+}
+
+/// The lane-resolved half of [`record_coord_transport_rung`]: build the
+/// observation, hand it to the emitter, count the hand-off. Split out so the
+/// `emitted` counter is provable against a real emitter without an `ApiState`
+/// (the lane resolver is the only part that needs Tauri state).
+fn hand_off_transport_rung(
+    emitter: Arc<crate::session::coord_transport_rung::RungEmitter>,
+    lane: uuid::Uuid,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+    door: &str,
+    caller_session_id: Option<uuid::Uuid>,
+) {
+    use crate::session::coord_transport_rung as rung;
+
     let hdr = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let obs = rung::RungObservation::from_declaration(
         hdr(rung::TRANSPORT_HEADER),
@@ -3060,6 +3239,13 @@ fn record_coord_transport_rung(
     // the proxied call must not wait on its own observation, and a runtime
     // shutting down before the task runs loses one telemetry row, which is the
     // correct trade against delaying a live coord call.
+    //
+    // Counted BEFORE the hand-off, not on the blocking pool: this is
+    // "observations HANDED to the emitter", and bumping it first means a
+    // snapshot can never read `outboxWriteFailed > emitted`. An append that
+    // then fails is arm (c), counted by the emitter itself as
+    // `outboxWriteFailed`.
+    transport_rung_emitted_counter().fetch_add(1, Ordering::Relaxed);
     tokio::task::spawn_blocking(move || emitter.emit(lane, &obs));
 }
 
@@ -11198,6 +11384,238 @@ mod window_getter_single_flight_tests {
 /// the `forward_claims_get` seam against a local mock coord with a synthetic
 /// bearer — covering live-bearer injection, verbatim query forwarding, and
 /// verbatim status+body passthrough including non-200 upstream verdicts.
+/// Phase 1 of plan
+/// `2026-09-18-runner-transport-rung-rows-never-reach-coord-despite-a-serving-emitter`:
+/// every arm on which a transport-rung observation can be dropped is counted
+/// where `GET /health` can read it. Each test here goes red when its
+/// increment is removed (mutation-proved at authoring).
+#[cfg(test)]
+mod transport_rung_counter_tests {
+    use super::{
+        hand_off_transport_rung, record_event_lane_miss, transport_rung_emitted_counter,
+        transport_rung_health_snapshot, transport_rung_lane_miss_counters,
+        transport_rung_snapshot_from, EventLaneMiss, LANE_MISS_SLOTS,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// The lane-miss counters are process-wide and the per-variant tests each
+    /// assert that NO OTHER series moved, so they serialise on one lock —
+    /// same defect class and same remedy as `series_lock` in the memory-search
+    /// tests below.
+    fn series_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn lane_miss_series() -> Vec<(&'static str, u64)> {
+        let snap = transport_rung_health_snapshot();
+        let obj = snap["laneMiss"]
+            .as_object()
+            .expect("laneMiss must be an object");
+        EventLaneMiss::ALL
+            .iter()
+            .map(|m| (m.as_str(), obj[m.as_str()].as_u64().expect("u64 series")))
+            .collect()
+    }
+
+    /// One miss of `miss` moves exactly its own `/health` series by one.
+    fn assert_only_this_series_moves(miss: EventLaneMiss) {
+        let _guard = series_lock();
+        let before = lane_miss_series();
+        record_event_lane_miss(
+            miss,
+            "https://coord.qontinui.io/mcp",
+            Some("nonce-abcdef-1234"),
+        );
+        let after = lane_miss_series();
+        for ((label, b), (_, a)) in before.iter().zip(after.iter()) {
+            let expected = if *label == miss.as_str() { b + 1 } else { *b };
+            assert_eq!(
+                *a,
+                expected,
+                "recording `{}` left `{label}` at {a}, expected {expected}",
+                miss.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn lane_miss_no_nonce_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::NoNonce);
+    }
+
+    #[test]
+    fn lane_miss_no_terminal_manager_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::NoTerminalManager);
+    }
+
+    #[test]
+    fn lane_miss_terminal_gone_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::TerminalGone);
+    }
+
+    #[test]
+    fn lane_miss_terminal_has_no_coord_session_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::TerminalHasNoCoordSession);
+    }
+
+    #[test]
+    fn lane_miss_no_workdir_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::NoWorkdir);
+    }
+
+    #[test]
+    fn lane_miss_ai_plane_state_missing_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::AiPlaneStateMissing);
+    }
+
+    #[test]
+    fn lane_miss_no_task_run_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::NoTaskRun);
+    }
+
+    #[test]
+    fn lane_miss_ai_session_unregistered_moves_only_its_series() {
+        assert_only_this_series_moves(EventLaneMiss::AiSessionUnregistered);
+    }
+
+    /// `ALL[i].index() == i`, and every label is distinct — the two orderings
+    /// (and the `/health` keys) cannot drift.
+    #[test]
+    fn every_lane_miss_has_its_own_slot_and_label() {
+        for (i, miss) in EventLaneMiss::ALL.iter().enumerate() {
+            assert_eq!(
+                miss.index(),
+                i,
+                "`{}` is ALL[{i}] but indexes to {}",
+                miss.as_str(),
+                miss.index()
+            );
+        }
+        let mut labels: Vec<&str> = EventLaneMiss::ALL.iter().map(|m| m.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            EventLaneMiss::ALL.len(),
+            "duplicate lane-miss label"
+        );
+        assert_eq!(
+            transport_rung_lane_miss_counters().len(),
+            EventLaneMiss::ALL.len()
+        );
+    }
+
+    /// A fresh counter set renders EVERY variant key at zero, plus the four
+    /// sibling fields — an absent key is UNKNOWN, a zero is a number.
+    #[test]
+    fn snapshot_renders_every_variant_at_zero_on_a_fresh_counter_set() {
+        let fresh: [std::sync::atomic::AtomicU64; LANE_MISS_SLOTS] = Default::default();
+        let snap = transport_rung_snapshot_from(&fresh, 0, 0, 0, 0, false);
+        let misses = snap["laneMiss"]
+            .as_object()
+            .expect("laneMiss must be an object");
+        assert_eq!(
+            misses.len(),
+            EventLaneMiss::ALL.len(),
+            "one key per EventLaneMiss variant, no more: {misses:?}"
+        );
+        for miss in EventLaneMiss::ALL {
+            assert_eq!(
+                misses.get(miss.as_str()).and_then(|v| v.as_u64()),
+                Some(0),
+                "GET /health transportRung.laneMiss is missing `{}` (or it is not zero)",
+                miss.as_str()
+            );
+        }
+        assert_eq!(snap["emitted"], serde_json::json!(0));
+        assert_eq!(snap["drainDropped"]["404"], serde_json::json!(0));
+        assert_eq!(snap["drainDropped"]["405"], serde_json::json!(0));
+        assert_eq!(snap["outboxWriteFailed"], serde_json::json!(0));
+        assert_eq!(snap["emitterInstalled"], serde_json::json!(false));
+
+        // And the live renderer has the same shape (values are whatever the
+        // process has counted so far, so only the keys are asserted).
+        let live = transport_rung_health_snapshot();
+        for key in [
+            "emitted",
+            "laneMiss",
+            "drainDropped",
+            "outboxWriteFailed",
+            "emitterInstalled",
+        ] {
+            assert!(
+                live.get(key).is_some(),
+                "GET /health transportRung is missing `{key}`"
+            );
+        }
+        assert!(live["emitterInstalled"].is_boolean());
+        assert!(live["drainDropped"]["404"].is_u64());
+        assert!(live["drainDropped"]["405"].is_u64());
+    }
+
+    /// A successful hand-off to a real emitter increments `emitted` by one —
+    /// and the observation really reaches the outbox, so this is the hand-off
+    /// counted, not a bare counter bump.
+    #[tokio::test]
+    async fn successful_emit_increments_emitted() {
+        use crate::session::coord_transport_rung::{RungEmitter, TRANSPORT_HEADER};
+        use crate::session::local_store::OutboxWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = std::sync::Arc::new(
+            OutboxWriter::open(dir.path().join("session-outbox.jsonl")).expect("outbox opens"),
+        );
+        let emitter = std::sync::Arc::new(RungEmitter::new(outbox.clone(), uuid::Uuid::new_v4()));
+        let lane = uuid::Uuid::new_v4();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(TRANSPORT_HEADER, "loopback_proxy".parse().unwrap());
+
+        let before = transport_rung_emitted_counter().load(Ordering::Relaxed);
+        hand_off_transport_rung(
+            emitter,
+            lane,
+            &headers,
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"coord_inbox","arguments":{}}}"#,
+            "https://coord.qontinui.io/mcp",
+            None,
+        );
+        assert_eq!(
+            transport_rung_emitted_counter().load(Ordering::Relaxed),
+            before + 1,
+            "one hand-off moves `emitted` by one"
+        );
+        assert_eq!(
+            transport_rung_health_snapshot()["emitted"].as_u64(),
+            Some(before + 1),
+            "GET /health transportRung.emitted reads the same counter"
+        );
+
+        // The detached blocking task lands the row; bounded wait.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let pending = outbox.pending().expect("pending readable");
+            if !pending.is_empty() {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].session_id, lane);
+                assert_eq!(pending[0].event_kind, "coord-transport-rung");
+                assert_eq!(
+                    pending[0].payload["transport"],
+                    serde_json::json!("loopback_proxy")
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the handed-off observation never reached the outbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod self_id_chain_tests {
     use super::{
