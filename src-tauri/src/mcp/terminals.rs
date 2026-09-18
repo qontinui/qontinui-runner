@@ -221,9 +221,35 @@ pub async fn list_terminals_handler(
 /// `POST /terminals`' answer to a refused spawn tenant: a 400 naming the
 /// refusal, since a malformed or unpaired tenant is the caller's to fix. The
 /// refusal itself is the shared [`crate::commands::terminal::admit_spawn_tenant`].
+///
+/// The envelope carries an explicit `code` derived from the refusal's
+/// `terminal:<reason>:` prefix (`terminal:tenant_not_paired` →
+/// `TENANT_NOT_PAIRED`). Without one, the 400 was stamped with the
+/// status-derived `INVALID_JSON`, so a client branching on `code` read a
+/// correctly refused unpaired tenant as a malformed body.
 fn spawn_tenant_bad_request(refusal: String) -> (StatusCode, Json<ApiResponse<()>>) {
     warn!("HTTP: rejecting terminal create — {refusal}");
-    (StatusCode::BAD_REQUEST, Json(api_error(refusal)))
+    let code = spawn_tenant_refusal_code(&refusal);
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiResponse::error_with_code(refusal, code)),
+    )
+}
+
+/// `terminal:<reason>: …` → `<REASON>`; anything else → `SPAWN_TENANT_REFUSED`.
+fn spawn_tenant_refusal_code(refusal: &str) -> String {
+    refusal
+        .strip_prefix("terminal:")
+        .and_then(|rest| rest.split(':').next())
+        .map(str::trim)
+        .filter(|reason| {
+            !reason.is_empty()
+                && reason
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| "SPAWN_TENANT_REFUSED".to_string())
 }
 
 /// Create a new terminal session.
@@ -1063,15 +1089,55 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let text = serde_json::to_string(&body).unwrap();
         assert!(text.contains("terminal:tenant_not_paired"), "{text}");
+        assert_eq!(body.code.as_deref(), Some("TENANT_NOT_PAIRED"), "{text}");
         assert!(
             text.contains("qontinui_profile device pair --tenant-id"),
             "{text}"
         );
 
-        let (status, _) = admit(Some("not-a-uuid")).unwrap_err();
+        let (status, Json(body)) = admit(Some("not-a-uuid")).unwrap_err();
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.code.as_deref(), Some("TENANT_INVALID"));
         assert_eq!(admit(Some(&a.to_string())).ok(), Some(Some(a)));
         assert_eq!(admit(None).ok(), Some(None));
+    }
+
+    /// Every refusal `admit_spawn_tenant` can emit maps to its own typed
+    /// code, never the generic fallback — so a reworded refusal that stops
+    /// parsing fails here instead of silently degrading to
+    /// `SPAWN_TENANT_REFUSED`.
+    #[test]
+    fn every_spawn_tenant_refusal_gets_its_own_code() {
+        use crate::coord_mcp::{DeclaredWorkdirKey, SpawnTenantRefusal};
+        let tenant = uuid::Uuid::from_u128(0xB2);
+        let refusals = [
+            SpawnTenantRefusal::NotPaired { tenant },
+            SpawnTenantRefusal::CredentialStoreUnreadable {
+                tenant,
+                error: "C:\\store: locked".into(),
+            },
+            SpawnTenantRefusal::WorkdirDeclaresOtherTenant {
+                tenant,
+                declared_file: std::path::PathBuf::from("C:\\ws\\.mcp.json"),
+                declared: DeclaredWorkdirKey::NoNonce,
+            },
+        ];
+        for refusal in refusals {
+            let expected = refusal
+                .code()
+                .trim_start_matches("terminal:")
+                .to_ascii_uppercase();
+            assert_eq!(spawn_tenant_refusal_code(&refusal.to_string()), expected);
+        }
+        let invalid = crate::commands::terminal::admit_spawn_tenant(Some("x")).unwrap_err();
+        assert_eq!(spawn_tenant_refusal_code(&invalid), "TENANT_INVALID");
+
+        for unparseable in ["garbage", "terminal::x", "terminal:Bad-Reason: x"] {
+            assert_eq!(
+                spawn_tenant_refusal_code(unparseable),
+                "SPAWN_TENANT_REFUSED"
+            );
+        }
     }
 
     #[test]
