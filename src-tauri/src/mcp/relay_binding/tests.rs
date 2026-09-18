@@ -549,16 +549,14 @@ fn enforce_all() -> BindingConfig {
 // Acceptance tests — SECURE behaviour, red until their phase
 // ===========================================================================
 
-/// Vector 1. Phase 1 un-ignores this minus the `active_url` assertion, which
+/// Vector 1. Un-ignored in Phase 1, minus the `active_url` assertion, which
 /// is R6 and lands in Phase 3.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn hijack_live_ws_connection_refused() {
     let s = spawn(BindingConfig::default()).await;
     let (mut good, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered", "holder ack: {ack}");
     let holder_conn = ack["connId"].as_u64().unwrap();
-    let active_before = s.active_url().await;
 
     // An agent dispatch the holder answers slowly.
     let dispatch = s.app_dispatch("app");
@@ -581,7 +579,10 @@ async fn hijack_live_ws_connection_refused() {
     assert_eq!(body["data"]["from"], "holder");
 
     assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
-    assert_eq!(s.active_url().await, active_before, "active_url moved (R6)");
+    // The `active_url` assertion is R6 and lands in Phase 3, which re-adds it
+    // here with `active_binding: Enforce` in this test's own BindingConfig.
+    // Under the Phase 1 default (`shadow`) a registration still becomes
+    // active, so asserting it now would pin the WRONG behaviour.
     let entry = s.registered("app").await.expect("holder entry");
     assert_eq!(entry["verifiedOrigin"], GOOD);
 }
@@ -723,7 +724,6 @@ mod forged_command_completion_refused {
     }
 
     #[tokio::test]
-    #[ignore = "red until Phase 1/2/3 — finding 8f142485"]
     async fn ws_other_connection() {
         let s = spawn(BindingConfig::default()).await;
         let (mut holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -754,7 +754,6 @@ mod forged_command_completion_refused {
 
 /// Vector 5.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn http_register_cannot_redirect_or_flip_transport() {
     let s = spawn(BindingConfig::default()).await;
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -795,7 +794,6 @@ async fn http_register_cannot_redirect_or_flip_transport() {
 
 /// R2.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn displaced_or_foreign_teardown_cannot_delete_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -821,7 +819,6 @@ async fn displaced_or_foreign_teardown_cannot_delete_holder() {
 
 /// R5.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn reload_race_tombstone() {
     let s = spawn(BindingConfig::default()).await;
     let (holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -882,7 +879,6 @@ async fn sdk_switch_refused_to_foreign() {
 
 /// R1 is checked and written under one lock.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn concurrent_claims_single_winner() {
     let s = Arc::new(spawn(BindingConfig::default()).await);
     let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
@@ -915,7 +911,6 @@ async fn concurrent_claims_single_winner() {
 
 /// R2's liveness arm.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn displaced_conn_touch_does_not_refresh_holder() {
     let s = spawn(BindingConfig::default()).await;
     let (mut displaced, _) = s.ws_register(Some(GOOD), "app").await;
@@ -939,7 +934,6 @@ async fn displaced_conn_touch_does_not_refresh_holder() {
 
 /// R4's transport arm.
 #[tokio::test]
-#[ignore = "red until Phase 1/2/3 — finding 8f142485"]
 async fn browser_http_register_cannot_declare_websocket() {
     let s = spawn(BindingConfig::default()).await;
     let (status, body) = s
@@ -1478,6 +1472,101 @@ fn binding_config_from_values_parses() {
     assert_eq!(c.active_binding, BindingMode::Enforce);
     let junk = BindingConfig::from_values(Some("yes"), Some(""));
     assert_eq!(junk, BindingConfig::default());
+}
+
+/// `Principal::same` is the ONE comparison every rule runs, and three of its
+/// arms are not reachable from the end-to-end tests above: the `Opaque`
+/// no-principal arm, the tab-key digest arm (Phase 2 consults it), and a
+/// loopback alias on a DIFFERENT port or scheme, which must NOT fold.
+#[test]
+fn principal_same_folds_loopback_aliases_and_nothing_else() {
+    let b = |o: &str| Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(o).expect("a parseable origin"),
+    };
+    let operator = Principal::OperatorTrust {
+        class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+    };
+
+    // The scheme's default port is made explicit on both sides.
+    assert!(b("https://a.example").same(&b("https://a.example:443")));
+    assert!(!b("https://a.example").same(&b("https://b.example")));
+    assert!(!b("https://a.example").same(&b("http://a.example")));
+
+    // Loopback aliases fold at the SAME scheme and port, and only there.
+    for other in ["http://127.0.0.1:9875", "http://[::1]:9875"] {
+        assert!(
+            b("http://localhost:9875").same(&b(other)),
+            "loopback alias {other} must be one principal"
+        );
+    }
+    assert!(!b("http://localhost:9875").same(&b("http://localhost:3001")));
+    assert!(!b("http://localhost:9875").same(&b("https://localhost:9875")));
+
+    // Operator trust is one principal, and is not any browser.
+    assert!(operator.same(&Principal::OperatorTrust {
+        class: crate::mcp::origin_guard::OriginClass::FirstParty,
+    }));
+    assert!(!operator.same(&b("https://a.example")));
+    // …but it may displace anything, which is the R1/R2 exemption.
+    assert!(operator.may_displace(&b("https://a.example")));
+    assert!(!b("https://a.example").may_displace(&operator));
+
+    // A key binds by digest alone, whatever the origin.
+    let k1 = Principal::TabKey {
+        digest: key_digest("K"),
+    };
+    assert!(k1.same(&Principal::TabKey {
+        digest: key_digest("K")
+    }));
+    assert!(!k1.same(&Principal::TabKey {
+        digest: key_digest("other")
+    }));
+    assert!(!k1.same(&b("https://a.example")));
+
+    // An opaque request has NO principal: it matches nothing, not even
+    // another opaque one. Two attacker pages with no origin must not share a
+    // claim.
+    let opaque = Principal::Opaque {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+    };
+    assert!(!opaque.same(&opaque));
+    assert!(!opaque.may_displace(&b("https://a.example")));
+}
+
+/// The R5 tombstone map: reserved for its holder, cleared on re-claim, never
+/// written for operator trust, and swept by the registry's existing tick.
+#[test]
+fn tombstones_reserve_for_the_holder_and_sweep() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    let key = app_tombstone_key("app");
+
+    assert!(binding.tombstone_holder(&key).is_none());
+    binding.tombstone(key.clone(), &good);
+    assert_eq!(binding.tombstone_holder(&key), Some(good.clone()));
+    assert_eq!(binding.health_json()["tombstones"], 1);
+
+    binding.clear_tombstone(&key);
+    assert!(binding.tombstone_holder(&key).is_none());
+
+    // Operator trust never tombstones: an agent's id is free the moment it
+    // lets go, which is what `agent_flow_unchanged`'s DELETE relies on.
+    binding.tombstone(
+        key.clone(),
+        &Principal::OperatorTrust {
+            class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+        },
+    );
+    assert!(binding.tombstone_holder(&key).is_none());
+
+    // The sweep drops expired entries and keeps live ones.
+    binding.tombstone(key.clone(), &good);
+    assert_eq!(binding.sweep_tombstones(), 0, "a live tombstone stays");
+    assert!(binding.tombstone_holder(&key).is_some());
 }
 
 #[test]
