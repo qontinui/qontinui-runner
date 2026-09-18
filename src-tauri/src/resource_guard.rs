@@ -152,6 +152,7 @@
 //! the quantity that collapsed to 7.25 GB during the incident.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter};
@@ -279,6 +280,170 @@ pub(crate) const SESSION_FLOOR_MAX_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 /// below the shipped warn ceiling. A machine clamped all the way down to it
 /// still starts sessions: 151 is not above 200.
 pub(crate) const THREAD_CEILING_MIN: usize = 200;
+
+/// The idle thread count the shipped 256 / 400 ceilings were chosen against.
+///
+/// [`THREAD_CEILING_MIN`]'s doc records the measurement: **150-151 threads with
+/// no session running**, sampled 2026-08-30 on the Linux dev box. The HIGHER of
+/// that pair is pinned here on purpose — it yields the SMALLER headroom
+/// (`256 - 151 = 105`, `400 - 151 = 249`) and therefore the stricter guard, and
+/// pinning one number is what makes [`machine_thread_shift`] exactly zero on
+/// the machine the constants were authored for.
+///
+/// Do not "fix" this to 150. The pair was a range; picking either end is a
+/// choice, and this is the conservative one.
+pub(crate) const CALIBRATION_BASELINE: usize = 151;
+
+/// The largest at-rest thread floor [`machine_thread_shift`] will re-base onto.
+///
+/// Anchored, not guessed: **512 is tokio's per-runtime `max_blocking_threads`
+/// default** — the same number
+/// [`qontinui_runner_lib::wedge_diagnostics::BlockingBodies::per_runtime_pool_capacity_default`]
+/// publishes, and the number [`THREAD_CEILING_MIN`]'s own doc anchors the 400
+/// critical ceiling to. One runtime saturating its blocking pool is the largest
+/// at-rest floor that is a HEALTHY process rather than a leak.
+///
+/// Past it the shift stops growing, so the effective ceilings cap at
+/// `512 + 105 = 617` warn and `512 + 249 = 761` critical. That bound is the
+/// whole answer to "does a slow leak eventually disable this lane?" — it does
+/// not: a process whose at-rest floor exceeds 512 has a leak the guard will not
+/// accommodate, and refusing work is then correct, because the next thing to
+/// fail is thread creation itself.
+pub(crate) const AT_REST_BASELINE_MAX: usize = 512;
+
+/// OS threads attributable to one live terminal session.
+///
+/// **3, from the control's own documentation**, not from the thread-name census.
+/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc derives
+/// "roughly 3 OS threads per continuation session" from the 2026-08-29 wedge's
+/// own arithmetic (540 threads at ~130 sessions over a 150-151 idle baseline).
+/// The 2026-09-18 census finds only 2 NAMED per-session threads
+/// (`terminal-waiter`, `terminal-reader`) but also shows per-session
+/// `pipe-drain` and `transcript-scan`, so 2 is a floor and 3 is the measured
+/// figure.
+///
+/// The direction of the error matters more than its size, and this is the safe
+/// direction: this constant is SUBTRACTED from a live reading to estimate the
+/// at-rest floor, so over-subtracting lowers the baseline, lowers the ceiling
+/// and biases the guard toward STRICTNESS. Under-subtracting would let session
+/// load leak into the baseline and loosen the ceiling as the box fills — the
+/// guard getting weaker exactly when it is needed.
+pub(crate) const THREADS_PER_SESSION: usize = 3;
+
+/// The lowest at-rest thread floor observed since this process started, or
+/// `None` before the first usable sample.
+///
+/// `usize::MAX` is the "nothing recorded yet" sentinel because it is the
+/// identity for the `min` this cell accumulates; [`at_rest_thread_baseline`]
+/// maps it back to `None` so no caller can mistake it for a reading.
+static AT_REST_BASELINE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Record one `(total threads, live sessions)` observation and fold it into the
+/// at-rest floor.
+///
+/// Called from [`crate::fleet::resource_sample`], which already takes BOTH
+/// readings two lines apart on its own 30 s publish tick — so this adds no
+/// sensor, no timer and no new call into the terminal registry.
+///
+/// ## Why a low-water mark rather than a boot snapshot
+///
+/// A boot-only baseline does not survive this process. Measured 2026-09-18 on
+/// the 48-core box: the runner started near 190 threads and sat at 424 after
+/// ~96 h, because ~227 blocking-pool threads accumulate and are never retired.
+/// A ceiling derived from the boot figure would have re-latched within days —
+/// the same defect with a longer fuse. A running minimum tracks the floor the
+/// process actually has, on a box that never reaches zero sessions.
+///
+/// ## Why EITHER `None` records nothing
+///
+/// `thread_count` is `None` on an unreadable sensor;
+/// `active_terminal_sessions` is `None` when the `TerminalManager` mutex is
+/// poisoned, when there is no Tauri runtime, and when there is no managed state
+/// at all. Substituting `0` for the session count would INFLATE the estimated
+/// floor, inflate the ceiling and loosen the guard precisely when the registry
+/// is broken — an UNKNOWN rendering as a permissive default, which is the shape
+/// served policy `unknown-must-not-render-as-a-default` forbids. An unusable
+/// tick contributes nothing and the previous floor stands.
+pub(crate) fn record_at_rest_sample(total_threads: Option<usize>, live_sessions: Option<usize>) {
+    if let Some(at_rest) = at_rest_estimate(total_threads, live_sessions) {
+        AT_REST_BASELINE.fetch_min(at_rest, Ordering::Relaxed);
+    }
+}
+
+/// The at-rest floor one `(total threads, live sessions)` observation implies,
+/// or `None` when the observation cannot support one. PURE.
+///
+/// Split out from [`record_at_rest_sample`] so the UNKNOWN arms are settleable
+/// in a test without writing to a process-global cell that every other test in
+/// this binary would then share — the same purity split
+/// [`merge_thread_ceilings_reporting`] keeps from
+/// [`effective_thread_ceilings`].
+pub(crate) fn at_rest_estimate(
+    total_threads: Option<usize>,
+    live_sessions: Option<usize>,
+) -> Option<usize> {
+    let (Some(total), Some(sessions)) = (total_threads, live_sessions) else {
+        return None;
+    };
+    Some(total.saturating_sub(sessions.saturating_mul(THREADS_PER_SESSION)))
+}
+
+/// The measured at-rest thread floor, or `None` when nothing usable has been
+/// sampled yet.
+pub(crate) fn at_rest_thread_baseline() -> Option<usize> {
+    match AT_REST_BASELINE.load(Ordering::Relaxed) {
+        usize::MAX => None,
+        n => Some(n),
+    }
+}
+
+/// How far to re-base this machine's thread ladder, in threads. PURE.
+///
+/// ## Why the ladder moves at all
+///
+/// A thread ceiling is a HEADROOM figure wearing an absolute number's clothes.
+/// 256 and 400 mean "105 and 249 threads of room above a runner that idles at
+/// 151" — that is how [`THREAD_CEILING_MIN`]'s doc derives them and how
+/// [`crate::agent_runtime::DEFAULT_CONTINUATION_SESSION_CAP`]'s doc converts
+/// them to ~35 and ~83 sessions. Enforced as absolutes on a machine whose idle
+/// floor is 400, they are not a stricter guard: they are a LATCH. Every
+/// continuation is deferred, the deferral frees ~3 threads against a floor of
+/// ~400, and so the deferral cannot clear the condition that caused it.
+/// Measured 2026-09-06..09-18: 616 thread-pressure-deferred continuations,
+/// 11,744 deferral events, 178 never consumed.
+///
+/// ## Why EVERY term is shifted, and why that is not "loosening"
+///
+/// The shift is applied to the FOLDED ceiling, i.e. after `min(local,
+/// hardcoded, fleet)` and after the [`THREAD_CEILING_MIN`] clamp, so it moves
+/// all three terms by the same amount. Nothing gains on anything else:
+///
+/// - a fleet row still cannot walk this machine past the hardcoded default —
+///   the property `no_combination_of_terms_can_make_the_machine_unspawnable`
+///   defends, now stated against `defaults() + shift` rather than against a
+///   number that only meant anything on one machine;
+/// - the operator's knob still works in BOTH directions, with no change to
+///   [`SessionGuardSettings`]'s type and no change to what the settings panel
+///   sends. Set 300 on a box shifted by 251 and the ceiling is 551; set 600 and
+///   it is 851. The ladder moved; the knob did not;
+/// - [`THREAD_CEILING_MIN`]'s guarantee is preserved and strengthened, because
+///   "a ceiling below the runner's own at-rest thread count is a machine that
+///   can never spawn again" now holds against the MEASURED floor instead of
+///   against a constant guessed at one.
+///
+/// ## The two UNKNOWN arms
+///
+/// No baseline yet, and a baseline at or below [`CALIBRATION_BASELINE`], both
+/// give a shift of ZERO — today's 256 / 400, byte for byte. UNKNOWN degrades to
+/// the shipped constants; it never degrades to a permissive default.
+pub(crate) fn machine_thread_shift(baseline: Option<usize>) -> usize {
+    baseline
+        .map(|b| {
+            b.min(AT_REST_BASELINE_MAX)
+                .saturating_sub(CALIBRATION_BASELINE)
+        })
+        .unwrap_or(0)
+}
 
 /// What a lane measures, and therefore which direction is bad.
 ///
@@ -693,8 +858,9 @@ pub(crate) fn merge_floors_reporting(
 pub(crate) fn merge_thread_ceilings(
     local: &SessionGuardSettings,
     fleet: SessionFloors,
+    machine_shift: usize,
 ) -> SessionGuardSettings {
-    merge_thread_ceilings_reporting(local, fleet).0
+    merge_thread_ceilings_reporting(local, fleet, machine_shift).0
 }
 
 /// [`merge_thread_ceilings`], plus the ladder coercion it had to apply — still
@@ -702,18 +868,25 @@ pub(crate) fn merge_thread_ceilings(
 pub(crate) fn merge_thread_ceilings_reporting(
     local: &SessionGuardSettings,
     fleet: SessionFloors,
+    machine_shift: usize,
 ) -> (SessionGuardSettings, Option<LadderCoercion>) {
     let hardcoded = SessionGuardSettings::default();
+    // The shift is added AFTER the fold and after the clamp, so it moves every
+    // term by the same amount and no source gains on any other. See
+    // [`machine_thread_shift`] for why the ladder is re-based rather than
+    // re-derived, and why that is not loosening.
     let warn = tighten_ceiling(
         local.warn_thread_count,
         hardcoded.warn_thread_count,
         fleet.warn_thread_count.map(|n| n as usize),
-    );
+    )
+    .saturating_add(machine_shift);
     let requested_critical = tighten_ceiling(
         local.critical_thread_count,
         hardcoded.critical_thread_count,
         fleet.critical_thread_count.map(|n| n as usize),
-    );
+    )
+    .saturating_add(machine_shift);
     let (critical, coercion) = coerce_ceiling_ladder(warn, requested_critical);
     (
         SessionGuardSettings {
@@ -927,6 +1100,10 @@ pub(crate) fn effective_thread_ceilings(local: &SessionGuardSettings) -> Session
     let (ceilings, coercion) = merge_thread_ceilings_reporting(
         local,
         crate::mcp::fleet_policy_poller::fleet_session_floors(lane),
+        // The SECOND impure read this seam owns, and it belongs here for the
+        // same reason the fleet cache does: `merge_thread_ceilings_reporting`
+        // is pure and must stay settleable in a test.
+        machine_thread_shift(at_rest_thread_baseline()),
     );
     note_ladder_coercion(lane, coercion);
     ceilings
@@ -2022,7 +2199,7 @@ mod tests {
         assert_eq!(evaluate("host", Some(0), &merged), SpawnGate::Proceed);
 
         // Same for the thread lane, whose fleet term is likewise limits-only.
-        let merged = merge_thread_ceilings(&off, fleet_threads(Some(10), Some(20)));
+        let merged = merge_thread_ceilings(&off, fleet_threads(Some(10), Some(20)), 0);
         assert!(!merged.enabled);
         assert_eq!(evaluate_threads(Some(9_999), &merged), SpawnGate::Proceed);
     }
@@ -2075,7 +2252,7 @@ mod tests {
     fn an_absent_fleet_ceiling_contributes_nothing() {
         assert_eq!(tighten_ceiling(400, 400, None), 400);
         assert_eq!(
-            merge_thread_ceilings(&defaults(), SessionFloors::default()),
+            merge_thread_ceilings(&defaults(), SessionFloors::default(), 0),
             defaults(),
             "the dormant fleet term must leave a default machine exactly as it was"
         );
@@ -2088,45 +2265,266 @@ mod tests {
     /// runner is already over at rest — that is not a stricter guard, it is a
     /// machine that can never start a session again, on eight unattended seams
     /// with nobody to press "Start anyway".
+
+    // ------------------------------------------------------------------
+    // The latch, and the safety valve. Plan
+    // `2026-09-18-the-runner-thread-pressure-guard-is-a-latch-not-back-pressure`.
+    // ------------------------------------------------------------------
+
+    /// The effective ceilings for a machine whose at-rest floor is `baseline`.
+    fn ceilings_for(baseline: Option<usize>) -> SessionGuardSettings {
+        merge_thread_ceilings(
+            &defaults(),
+            SessionFloors::default(),
+            machine_thread_shift(baseline),
+        )
+    }
+
+    /// **ARM A — the latch. This is the test that fails on `origin/main`.**
+    ///
+    /// A 48-core runner measured 2026-09-18 (device `eb2155ed`): 424 OS
+    /// threads, ZERO sessions running, an at-rest floor of ~402. Against the
+    /// absolute 400 this returns `Critical(424 over 400)` and
+    /// `agent_runtime::evaluate_continuation_guard` defers every gate
+    /// continuation — 616 of them over 12 days, 11,744 deferral events, 178
+    /// never consumed.
+    ///
+    /// It is a LATCH rather than back-pressure because the deferral frees
+    /// `THREADS_PER_SESSION` threads against a floor of ~402: the act the guard
+    /// takes cannot move the quantity the guard read. With no sessions running
+    /// there is not even that.
+    #[test]
+    fn a_high_core_runner_at_rest_does_not_defer() {
+        let merged = ceilings_for(Some(402));
+        assert_eq!(
+            evaluate_threads(Some(424), &merged),
+            SpawnGate::Proceed,
+            "a runner sitting at its own at-rest floor with zero sessions must \
+             not be refused: {merged:?}"
+        );
+    }
+
+    /// **ARM B — the safety valve.** A latch is being fixed, not a guard
+    /// removed. Genuine load on the same machine still refuses.
+    #[test]
+    fn a_genuinely_loaded_high_core_runner_still_defers() {
+        let merged = ceilings_for(Some(402));
+        match evaluate_threads(Some(700), &merged) {
+            SpawnGate::Critical(o) => assert_eq!(o.observed, 700),
+            other => panic!("expected Critical far above the re-based ceiling, got {other:?}"),
+        }
+        // ARM B' — and the WARN band still exists between the two, which is the
+        // band the continuation guard actually defers on.
+        match evaluate_threads(Some(520), &merged) {
+            SpawnGate::Warn(o) => assert_eq!(o.observed, 520),
+            other => panic!("expected Warn inside the re-based warn band, got {other:?}"),
+        }
+    }
+
+    /// **ARM C — the machine the constants were calibrated on is EXACTLY
+    /// unchanged**, not approximately. `shift` is zero at and below
+    /// [`CALIBRATION_BASELINE`], so this is the shipped 256 / 400 byte for
+    /// byte — which is what makes the re-basing safe to ship to a fleet whose
+    /// other boxes were never mis-bounded.
+    #[test]
+    fn the_calibrated_box_is_byte_identical() {
+        for baseline in [
+            None,
+            Some(0),
+            Some(120),
+            Some(150),
+            Some(CALIBRATION_BASELINE),
+        ] {
+            let merged = ceilings_for(baseline);
+            assert_eq!(
+                merged.warn_thread_count,
+                defaults().warn_thread_count,
+                "baseline {baseline:?} must not move the warn ceiling"
+            );
+            assert_eq!(
+                merged.critical_thread_count,
+                defaults().critical_thread_count,
+                "baseline {baseline:?} must not move the critical ceiling"
+            );
+            assert_eq!(
+                evaluate_threads(Some(300), &merged),
+                SpawnGate::Warn(thread_observation(300, 256))
+            );
+        }
+    }
+
+    /// **ARM D — no baseline is UNKNOWN, and UNKNOWN keeps the shipped
+    /// constants.** It must never render as a permissive default: a machine
+    /// that cannot measure its own floor gets the guard it has today, not a
+    /// weaker one.
+    #[test]
+    fn an_unknown_baseline_keeps_the_shipped_ceilings() {
+        assert_eq!(machine_thread_shift(None), 0);
+        let merged = ceilings_for(None);
+        match evaluate_threads(Some(424), &merged) {
+            SpawnGate::Critical(o) => assert_eq!(o.limit, 400),
+            other => panic!("UNKNOWN must fall back to the shipped 400, got {other:?}"),
+        }
+    }
+
+    /// **ARM E — the bound holds, so a leak cannot disable the lane.**
+    ///
+    /// The baseline is capped at [`AT_REST_BASELINE_MAX`] (tokio's per-runtime
+    /// blocking-pool default), so the ceilings cap too. Without this the
+    /// low-water mark would chase a monotone leak upward forever and the lane
+    /// would go inert on exactly the boxes that need it.
+    #[test]
+    fn a_runaway_baseline_cannot_disable_the_lane() {
+        let capped = machine_thread_shift(Some(AT_REST_BASELINE_MAX));
+        for baseline in [AT_REST_BASELINE_MAX + 1, 10_000, usize::MAX] {
+            assert_eq!(
+                machine_thread_shift(Some(baseline)),
+                capped,
+                "the shift must stop growing past AT_REST_BASELINE_MAX"
+            );
+        }
+        let merged = ceilings_for(Some(usize::MAX));
+        assert_eq!(
+            merged.warn_thread_count,
+            AT_REST_BASELINE_MAX + (defaults().warn_thread_count - CALIBRATION_BASELINE)
+        );
+        assert_eq!(
+            merged.critical_thread_count,
+            AT_REST_BASELINE_MAX + (defaults().critical_thread_count - CALIBRATION_BASELINE)
+        );
+        match evaluate_threads(Some(1_000), &merged) {
+            SpawnGate::Critical(o) => assert_eq!(o.observed, 1_000),
+            other => panic!("a leaking process must still be refused, got {other:?}"),
+        }
+    }
+
+    /// The at-rest tracker keeps the LOWEST floor it has seen, subtracts the
+    /// session load at the instant of each reading, and records NOTHING when
+    /// either half is UNKNOWN.
+    ///
+    /// Pure arithmetic only — the process-global cell is deliberately not
+    /// touched here, because a static shared with every other test in this
+    /// binary cannot be asserted on without ordering assumptions.
+    #[test]
+    fn the_at_rest_estimate_subtracts_session_load_and_never_invents_one() {
+        // 424 threads with 11 live sessions is the 2026-09-18 reading.
+        assert_eq!(at_rest_estimate(Some(424), Some(11)), Some(391));
+        // Over-subtracting is the SAFE direction: it lowers the estimated
+        // floor, which lowers the ceiling, which makes the guard stricter. 2 is
+        // the census floor (`terminal-waiter` + `terminal-reader`); 3 is what
+        // `DEFAULT_CONTINUATION_SESSION_CAP`'s doc measures.
+        assert_eq!(THREADS_PER_SESSION, 3);
+        assert!(
+            at_rest_estimate(Some(424), Some(11)).unwrap() < 424usize.saturating_sub(11 * 2),
+            "3 must estimate a LOWER floor than the census's 2, or the bias \
+             points at looseness"
+        );
+
+        // EITHER half UNKNOWN produces no sample at all. A `0` substituted for
+        // the session count would raise the estimated floor, raise the ceiling
+        // and loosen the guard exactly when the terminal registry is broken.
+        assert_eq!(at_rest_estimate(None, Some(1)), None);
+        assert_eq!(at_rest_estimate(Some(400), None), None);
+        assert_eq!(at_rest_estimate(None, None), None);
+        assert_eq!(
+            at_rest_estimate(Some(400), Some(0)),
+            Some(400),
+            "zero sessions is a READING, not an absence — it must still sample"
+        );
+
+        // A nonsensical reading saturates to 0 rather than wrapping to a huge
+        // floor, which would loosen the ceiling to its cap.
+        assert_eq!(at_rest_estimate(Some(1), Some(1000)), Some(0));
+        assert_eq!(at_rest_estimate(Some(10), Some(usize::MAX)), Some(0));
+    }
+
+    /// The calibration constants are the ones the shipped defaults were
+    /// actually derived from — pinned so a future edit to either default has to
+    /// come here and restate the relationship rather than silently changing
+    /// what a ceiling MEANS.
+    #[test]
+    fn the_calibration_baseline_reproduces_the_shipped_headrooms() {
+        assert_eq!(defaults().warn_thread_count - CALIBRATION_BASELINE, 105);
+        assert_eq!(defaults().critical_thread_count - CALIBRATION_BASELINE, 249);
+        assert!(
+            CALIBRATION_BASELINE > crate::health_monitor::THREAD_WARNING_THRESHOLD,
+            "the calibration baseline is a MEASURED idle count, not a threshold"
+        );
+        assert_eq!(
+            AT_REST_BASELINE_MAX, 512,
+            "tokio's per-runtime max_blocking_threads default — the anchor, not a round number"
+        );
+    }
+
     #[test]
     fn no_combination_of_terms_can_make_the_machine_unspawnable() {
         let ceilings = [0usize, 1, 64, 151, THREAD_CEILING_MIN, 256, 400, usize::MAX];
         let fleets = [None, Some(0), Some(1), Some(64), Some(300), Some(u32::MAX)];
-        for lw in ceilings {
-            for lc in ceilings {
-                for fw in fleets {
-                    for fc in fleets {
-                        let merged = merge_thread_ceilings(
-                            &SessionGuardSettings {
-                                warn_thread_count: lw,
-                                critical_thread_count: lc,
-                                ..defaults()
-                            },
-                            fleet_threads(fw, fc),
-                        );
-                        assert!(
-                            merged.critical_thread_count >= THREAD_CEILING_MIN,
-                            "unspawnable: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        assert!(
-                            merged.critical_thread_count >= merged.warn_thread_count,
-                            "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        assert!(
-                            merged.warn_thread_count <= defaults().warn_thread_count,
-                            "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
-                        );
-                        // The MEASURED at-rest count (150-151 on 2026-08-30)
-                        // still proceeds under EVERY composable configuration.
-                        // This is the property the clamp exists to buy, and the
-                        // reading it has to be measured against — the stale
-                        // 100-130 band in `health_monitor`'s doc would have let
-                        // a clamp of 150 pass this test and wedge the box.
-                        assert_eq!(
-                            evaluate_threads(Some(151), &merged),
-                            SpawnGate::Proceed,
-                            "an idle runner must never be refused: {merged:?}"
-                        );
+        // Every shift a real machine can produce: none (unknown or a box at or
+        // below the calibration baseline), this fleet's 48-core box, and the
+        // capped maximum.
+        let shifts = [
+            0,
+            machine_thread_shift(Some(402)),
+            machine_thread_shift(Some(usize::MAX)),
+        ];
+        for shift in shifts {
+            for lw in ceilings {
+                for lc in ceilings {
+                    for fw in fleets {
+                        for fc in fleets {
+                            let merged = merge_thread_ceilings(
+                                &SessionGuardSettings {
+                                    warn_thread_count: lw,
+                                    critical_thread_count: lc,
+                                    ..defaults()
+                                },
+                                fleet_threads(fw, fc),
+                                shift,
+                            );
+                            assert!(
+                                merged.critical_thread_count >= THREAD_CEILING_MIN,
+                                "unspawnable: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                            );
+                            assert!(
+                                merged.critical_thread_count >= merged.warn_thread_count,
+                                "inverted: local({lw},{lc}) fleet({fw:?},{fc:?}) {merged:?}"
+                            );
+                            // NOT loosened — stated against the RE-BASED ladder.
+                            //
+                            // This assertion used to read `<= defaults()
+                            // .warn_thread_count` with the same failure label, and
+                            // that spelling only ever meant what it says on a
+                            // machine whose at-rest floor is the one the defaults
+                            // were calibrated against (151). On a box that idles at
+                            // 400 it did not defend the guard: it WAS the latch,
+                            // because it pinned the ceiling below a reading the
+                            // process carries with zero sessions running.
+                            //
+                            // The property being defended is unchanged and is
+                            // restated here in the units that survive re-basing: no
+                            // combination of LOCAL and FLEET terms may loosen past
+                            // the hardcoded default for this machine. `shift` is
+                            // not a term either party can author — it is a
+                            // measurement of the box ([`machine_thread_shift`]) —
+                            // so a bad fleet row still cannot walk the ceiling up.
+                            assert!(
+                                merged.warn_thread_count <= defaults().warn_thread_count + shift,
+                                "loosened: local({lw},{lc}) fleet({fw:?},{fc:?}) \
+                             shift({shift}) {merged:?}"
+                            );
+                            // The MEASURED at-rest count (150-151 on 2026-08-30)
+                            // still proceeds under EVERY composable configuration.
+                            // This is the property the clamp exists to buy, and the
+                            // reading it has to be measured against — the stale
+                            // 100-130 band in `health_monitor`'s doc would have let
+                            // a clamp of 150 pass this test and wedge the box.
+                            assert_eq!(
+                                evaluate_threads(Some(151), &merged),
+                                SpawnGate::Proceed,
+                                "an idle runner must never be refused: {merged:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -2177,7 +2575,7 @@ mod tests {
     #[test]
     fn a_fleet_critical_ceiling_with_a_null_warn_column_cannot_invert_the_ladder() {
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&defaults(), fleet_threads(None, Some(120)));
+            merge_thread_ceilings_reporting(&defaults(), fleet_threads(None, Some(120)), 0);
 
         // The warn ceiling is NOT lowered to meet the critical one: that would
         // enforce a ceiling nobody stated, below the measured at-rest band,
@@ -2213,7 +2611,7 @@ mod tests {
             ..defaults()
         };
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&owner, fleet_threads(None, Some(210)));
+            merge_thread_ceilings_reporting(&owner, fleet_threads(None, Some(210)), 0);
 
         // The warn ceiling is NOT dragged down to 210: that would enforce a
         // limit neither party stated, tightening past both inputs.
@@ -2240,7 +2638,7 @@ mod tests {
             ..defaults()
         };
         let (merged, coercion) =
-            merge_thread_ceilings_reporting(&inverted, SessionFloors::default());
+            merge_thread_ceilings_reporting(&inverted, SessionFloors::default(), 0);
         assert_eq!(merged.warn_thread_count, 240, "warn is never dragged down");
         assert_eq!(
             merged.critical_thread_count, 240,
@@ -2265,7 +2663,8 @@ mod tests {
             critical_thread_count: 240,
             ..defaults()
         };
-        let (merged, coercion) = merge_thread_ceilings_reporting(&equal, SessionFloors::default());
+        let (merged, coercion) =
+            merge_thread_ceilings_reporting(&equal, SessionFloors::default(), 0);
         assert_eq!(merged, equal);
         assert_eq!(coercion, None);
     }
@@ -2279,7 +2678,7 @@ mod tests {
         let reading = Some(320);
 
         // Local ceilings alone: 320 is between 150 and 400, so it warns.
-        let local_only = merge_thread_ceilings(&local, SessionFloors::default());
+        let local_only = merge_thread_ceilings(&local, SessionFloors::default(), 0);
         assert!(matches!(
             evaluate_threads(reading, &local_only),
             SpawnGate::Warn(_)
@@ -2287,7 +2686,7 @@ mod tests {
 
         // The tenant declares a 300-thread critical ceiling; the same reading
         // is now a refusal.
-        let merged = merge_thread_ceilings(&local, fleet_threads(None, Some(300)));
+        let merged = merge_thread_ceilings(&local, fleet_threads(None, Some(300)), 0);
         assert_eq!(
             evaluate_threads(reading, &merged),
             SpawnGate::Critical(thread_observation(320, 300))
@@ -2314,7 +2713,7 @@ mod tests {
         assert_eq!(floors.warn_thread_count, 200);
         assert_eq!(floors.critical_thread_count, 300);
 
-        let ceilings = merge_thread_ceilings(&local, fleet_threads(None, Some(250)));
+        let ceilings = merge_thread_ceilings(&local, fleet_threads(None, Some(250)), 0);
         assert_eq!(ceilings.critical_thread_count, 250);
         // The owner tightened their warn ceiling to 200 and it survives: 200 is
         // below the hardcoded 256 (so the `min` keeps it) and at the clamp (so
@@ -2431,7 +2830,7 @@ mod tests {
     /// band; `admit_spawn` refuses only past the critical ceiling.
     #[test]
     fn the_warn_band_is_the_band_phase_one_defers_in() {
-        let guard = merge_thread_ceilings(&defaults(), SessionFloors::default());
+        let guard = merge_thread_ceilings(&defaults(), SessionFloors::default(), 0);
 
         // A continuation-deferring reading: over the warn ceiling, under the
         // critical one. `admit_spawn` would still let a human's terminal start.
