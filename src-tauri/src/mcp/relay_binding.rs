@@ -70,6 +70,11 @@ pub const RULE_R2: &str = "R2";
 pub const RULE_R3: &str = "R3";
 pub const RULE_R4: &str = "R4";
 pub const RULE_R5: &str = "R5";
+/// R5's second arm, counted separately: a browser principal's `keepAliveSecs`
+/// capped back to `REGISTRATION_TTL_MS`. It is not a refusal — the
+/// registration is admitted — but Phase 4 reads these counters to decide
+/// graduation, so it has to be visible in BOTH modes.
+pub const RULE_R5_KEEP_ALIVE: &str = "R5-keepAlive";
 pub const RULE_OPAQUE: &str = "R-opaque";
 
 /// How long a browser principal's released `appId` / `tabId` stays reserved
@@ -77,9 +82,19 @@ pub const RULE_OPAQUE: &str = "R-opaque";
 /// polling `/ui-bridge/apps/registered` must not get the id first.
 pub const BINDING_TOMBSTONE_MS: i64 = 60_000;
 
-/// Ceiling on the tombstone map, so a page spraying fresh ids cannot grow it
-/// without bound. Expired entries go first, then the soonest to expire.
+/// Ceiling on the whole tombstone map, so a page spraying fresh ids cannot
+/// grow it without bound.
 const MAX_TOMBSTONES: usize = 1024;
+
+/// Ceiling on ONE principal's tombstones, which is what actually makes R5
+/// hold: a global ceiling alone is adversarially evictable. Every tombstone
+/// has the same 60 s lifetime, so "evict the soonest to expire" is always
+/// "evict the OLDEST", which is always the victim's — an attacker who
+/// registers and DELETEs `MAX_TOMBSTONES` fresh ids (first-claim squatting is
+/// an accepted non-goal, so each succeeds) would evict the victim's reload
+/// reservation and hand itself the reload race back. Bounding per principal
+/// means one principal only ever evicts its OWN.
+const MAX_TOMBSTONES_PER_PRINCIPAL: usize = 64;
 
 /// How many `(rule, class, route)` tuples `/health` reports.
 const MAX_RECENT_TUPLES: usize = 20;
@@ -533,9 +548,13 @@ impl RelayBinding {
     fn first_sighting(&self, principal: &Principal, rule: &'static str) -> bool {
         let mut logged = self.logged.lock().unwrap_or_else(|e| e.into_inner());
         if logged.len() >= MAX_LOGGED_SIGHTINGS {
-            // Bounded: past the ceiling every sighting logs rather than
-            // growing the set. Noisy beats unbounded.
-            return true;
+            // CLEAR rather than disable. Returning `true` past the ceiling
+            // would turn a once-per-pair WARN into an unbounded flood on
+            // exactly the shadow path an operator reads to decide Phase 4's
+            // graduation. Clearing keeps the set bounded AND keeps the
+            // once-per-pair property, at the cost of re-logging each pair
+            // once per epoch.
+            logged.clear();
         }
         logged.insert(format!("{}|{}", principal.log_key(), rule))
     }
@@ -544,24 +563,48 @@ impl RelayBinding {
 
     /// Reserve `key` for `holder` for [`BINDING_TOMBSTONE_MS`]. Operator-trust
     /// releases are NOT tombstoned: an agent's id is free the moment it lets go.
+    ///
+    /// The map is bounded PER PRINCIPAL first and globally second, so a
+    /// principal can only ever evict its own reservations — see
+    /// [`MAX_TOMBSTONES_PER_PRINCIPAL`]. When the global ceiling is reached by
+    /// many principals and this one holds none, the write is DROPPED rather
+    /// than evicting somebody else's.
     pub fn tombstone(&self, key: String, holder: &Principal) {
         if holder.is_operator_trust() {
             return;
         }
         let now = chrono::Utc::now().timestamp_millis();
+        let bucket = holder.log_key();
         let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, t| t.expires_at_ms > now);
-        if map.len() >= MAX_TOMBSTONES {
-            // Drop the one closest to expiry so a spray of fresh ids cannot
-            // grow the map without bound.
-            if let Some(soonest) = map
-                .iter()
+
+        let soonest_of_mine = |map: &HashMap<String, Tombstone>| {
+            map.iter()
+                .filter(|(_, t)| t.holder.log_key() == bucket)
                 .min_by_key(|(_, t)| t.expires_at_ms)
                 .map(|(k, _)| k.clone())
-            {
-                map.remove(&soonest);
+        };
+        let mine = map
+            .iter()
+            .filter(|(k, t)| t.holder.log_key() == bucket && **k != key)
+            .count();
+
+        if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
+            if let Some(k) = soonest_of_mine(&map) {
+                map.remove(&k);
+            }
+        } else if map.len() >= MAX_TOMBSTONES && !map.contains_key(&key) {
+            match soonest_of_mine(&map) {
+                Some(k) => {
+                    map.remove(&k);
+                }
+                // Nothing of ours to reclaim, and evicting another
+                // principal's reservation is exactly the attack this bound
+                // exists to stop. Drop this write instead.
+                None => return,
             }
         }
+
         map.insert(
             key,
             Tombstone {
@@ -584,6 +627,18 @@ impl RelayBinding {
     pub fn clear_tombstone(&self, key: &str) {
         let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
         map.remove(key);
+    }
+
+    /// Test-only seam: backdate every tombstone past its expiry, so a test
+    /// can exercise [`Self::sweep_tombstones`]'s real arm without sleeping
+    /// 60 s.
+    #[cfg(test)]
+    pub fn test_expire_tombstones(&self) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
+        for t in map.values_mut() {
+            t.expires_at_ms = now - 1;
+        }
     }
 
     /// Drop every expired tombstone. Driven by `app_registry::spawn_sweeper`'s

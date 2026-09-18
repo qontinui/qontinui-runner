@@ -154,12 +154,21 @@ pub struct RegisterAppResponse {
     /// Agent-visible provenance, served with NO gate (plan
     /// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`): the
     /// header origin the runner VERIFIED this registrant at, and the requester
-    /// class it was admitted under. `null` for an operator-trust registrant,
-    /// which sends no `Origin`. An agent can see what it is driving without
-    /// being blocked by the binding.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// class it was admitted under. An agent can see what it is driving
+    /// without being blocked by the binding.
+    ///
+    /// ALWAYS serialized, deliberately not `skip_serializing_if`: `null` has
+    /// to mean "an operator-trust registrant, which sends no `Origin`" and
+    /// ABSENT has to mean "this runner predates the binding". Phase 2b's
+    /// `waitForUiBridgeRegistration` falls back to `tabs[0]` on exactly that
+    /// second case, and an omitted field would collapse the two.
     pub verified_origin: Option<String>,
     pub principal_class: &'static str,
+    /// The EFFECTIVE per-entry TTL the runner stored, in ms — R5 caps a
+    /// browser principal's `keepAliveSecs` at `REGISTRATION_TTL_MS`, and
+    /// without this echo a page that asked for an hour gets a 200 and no hint
+    /// its entry dies in 30 s. `null` means the global default.
+    pub keep_alive_ms: Option<i64>,
 }
 
 // ============================================================================
@@ -793,8 +802,9 @@ pub(crate) async fn register_app(
         discovered_at: chrono::Utc::now().timestamp_millis(),
     };
 
-    // R1/R5: the check and the write under ONE registry lock.
-    state
+    // R1/R5: the check and the write under ONE registry lock. `claimed`
+    // carries the EFFECTIVE keep-alive, which R5 may have capped.
+    let claimed = state
         .app_registry
         .claim(
             &binding,
@@ -816,7 +826,7 @@ pub(crate) async fn register_app(
         app.port,
         app.base_path,
         transport,
-        keep_alive_ms,
+        claimed.keep_alive_ms,
         principal.class_str(),
         principal.verified_origin(),
     );
@@ -826,6 +836,7 @@ pub(crate) async fn register_app(
         transport,
         verified_origin: principal.verified_origin(),
         principal_class: principal.class_str(),
+        keep_alive_ms: claimed.keep_alive_ms,
     })))
 }
 
@@ -844,6 +855,7 @@ pub(crate) async fn list_registered_apps(
             transport: e.transport,
             verified_origin: e.verified_origin(),
             principal_class: e.principal_class(),
+            keep_alive_ms: e.keep_alive_ms,
             app: e.app,
         })
         .collect();
@@ -998,6 +1010,7 @@ pub(crate) async fn wait_for_app_inner(
                     transport: e.transport,
                     verified_origin: e.verified_origin(),
                     principal_class: e.principal_class(),
+                    keep_alive_ms: e.keep_alive_ms,
                 })
         };
 
@@ -1571,8 +1584,8 @@ mod tests {
 
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 CommandResponse {
                     command_id,
                     success: true,

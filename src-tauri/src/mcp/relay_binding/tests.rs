@@ -37,6 +37,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use super::*;
+use crate::mcp::app_registry::REGISTRATION_TTL_MS;
 use crate::mcp::origin_guard::{self, NormOrigin, OriginGuard};
 
 const GOOD: &str = "https://good.example";
@@ -100,10 +101,12 @@ async fn spawn_with_policy(policy: Option<&str>, config: BindingConfig) -> Serve
 /// The relay routes at their production patterns, over `RelayState`.
 ///
 /// `/test-health` is the HARNESS's own counter read — deliberately NOT spelled
-/// `/health`, because the production `/health` handler serves no
-/// `uiBridgeBinding` block yet. Wiring `RelayBinding::health_json` into it, and
-/// asserting the counters against the REAL handler, is Phase 1's job; until
-/// then nothing here is evidence that an operator can see a counter.
+/// `/health`, because the production handler needs an `ApiState` (and so a
+/// `tauri::AppHandle`) no test can build. Phase 1 DID wire
+/// `RelayBinding::health_json` into the production `/health`; what pins that
+/// is `mcp_api::ui_bridge_binding_health_tests`, which asserts the block's
+/// render through `health_json` and its wiring against the handler's own
+/// source. Nothing HERE is evidence an operator can see a counter.
 fn relay_router(relay: RelayState) -> Router {
     use crate::mcp::app_discovery::{
         deregister_app, dispatch_to_app, list_registered_apps, register_app,
@@ -441,8 +444,9 @@ impl Server {
         self.relay.sdk_connection.lock().await.active_url.clone()
     }
 
-    /// A rule's counters, read from the HARNESS stub — see `relay_router`:
-    /// the production `/health` does not serve this block until Phase 1.
+    /// A rule's counters, read from the HARNESS stub — see `relay_router`.
+    /// The production `/health` serves the same block from the ONE shared
+    /// `RelayBinding`; `mcp_api::ui_bridge_binding_health_tests` pins that.
     async fn rule(&self, rule: &str) -> Value {
         let (_, body) = self.get("/test-health", agent()).await;
         body["uiBridgeBinding"]["rules"][rule].clone()
@@ -557,6 +561,7 @@ async fn hijack_live_ws_connection_refused() {
     let (mut good, ack) = s.ws_register(Some(GOOD), "app").await;
     assert_eq!(ack["type"], "registered", "holder ack: {ack}");
     let holder_conn = ack["connId"].as_u64().unwrap();
+    let active_before = s.active_url().await;
 
     // An agent dispatch the holder answers slowly.
     let dispatch = s.app_dispatch("app");
@@ -579,10 +584,14 @@ async fn hijack_live_ws_connection_refused() {
     assert_eq!(body["data"]["from"], "holder");
 
     assert_eq!(conn_for(&s, "app").await, Some(holder_conn));
-    // The `active_url` assertion is R6 and lands in Phase 3, which re-adds it
-    // here with `active_binding: Enforce` in this test's own BindingConfig.
-    // Under the Phase 1 default (`shadow`) a registration still becomes
-    // active, so asserting it now would pin the WRONG behaviour.
+    // This is NOT the R6 shadow caveat: R6 is about a DIFFERENT appId
+    // becoming active (`new_app_id_does_not_steal_active_connection`), and
+    // this attacker registers the SAME id, which R1 refuses inside
+    // `registry.claim` — BEFORE `install_ws_sdk_connection` runs. So the
+    // assertion pins a real Phase 1 property: a refused claim touches no
+    // state, and the SDK install is ordered AFTER the claim. It is the only
+    // test that would catch someone hoisting the install above the claim.
+    assert_eq!(s.active_url().await, active_before, "active_url moved (R1)");
     let entry = s.registered("app").await.expect("holder entry");
     assert_eq!(entry["verifiedOrigin"], GOOD);
 }
@@ -845,6 +854,159 @@ async fn reload_race_tombstone() {
         reply["type"], "registered",
         "the same principal re-registers: {reply}"
     );
+}
+
+/// Finding 1 / R5: a registration that ends by EXPIRY is tombstoned too.
+///
+/// `beforeunload` is not the only way a browser registration ends — a tab
+/// crash, an OOM kill, a sleep, or Chrome throttling a backgrounded tab's
+/// 10 s phone-home past the 30 s TTL all end it by expiry instead. If the
+/// sweeper evicted untombstoned, R1 would turn that into a PERMANENT lockout:
+/// an attacker claims the swept id and renews it every 10 s, and the
+/// returning tab is refused forever — strictly worse than main, where it
+/// simply re-took its slot. That is the "one more way to be locked out" cost
+/// the plan's ranking used to REJECT option A.
+#[tokio::test]
+async fn expiry_tombstones_the_holder_so_a_missed_heartbeat_is_not_a_lockout() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The tab is backgrounded / crashed / throttled: no DELETE, no
+    // phone-home, and the entry ages past its TTL and is swept.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+    assert_eq!(s.relay.app_registry.sweep(&s.relay.binding).await, 1);
+    assert!(s.relay.app_registry.get("app").await.is_none());
+
+    // The attacker polling /ui-bridge/apps/registered must not get the id.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(
+        status, 409,
+        "a swept id was claimable by a foreign page: {body}"
+    );
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+    // …and the victim coming back to the foreground is admitted, exactly as
+    // it would have been on main.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "the returning holder was locked out: {body}");
+    assert_eq!(
+        s.registered("app").await.expect("entry")["verifiedOrigin"],
+        GOOD
+    );
+}
+
+/// Finding 2 / R1: the LIVE routing slot is a holder signal in its own right.
+///
+/// A wrapper whose send task is parked inside `sink.send().await` never
+/// reaches the `heartbeat.tick()` arm that calls `touch`, so its registry row
+/// ages out and is swept while the socket is wide open. R5 then reserves the
+/// id for 60 s — but the socket can be parked for much longer than that, and
+/// once the tombstone lapses NOTHING but the routing slot knows the holder is
+/// still there. `register_with_id` would displace it.
+///
+/// The row is dropped through a seam rather than aged: a WebSocket client
+/// auto-pongs the 20 s ping and every inbound frame refreshes `last_seen_ms`,
+/// so ageing races that refresh and the test would silently fall back to
+/// exercising plain R1 against a still-live row. (It did — the first version
+/// of this test survived deleting the very check it names.)
+#[tokio::test]
+async fn a_live_ws_holder_is_not_displaceable_once_its_registry_row_is_gone() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_holder, ack) = s.ws_register(Some(GOOD), "app").await;
+    assert_eq!(ack["type"], "registered");
+    let holder_conn = ack["connId"].as_u64().unwrap();
+
+    // The row is gone and its R5 reservation has lapsed, so the live routing
+    // slot is the ONLY thing left that knows who holds this id.
+    assert!(s.relay.app_registry.test_drop_row("app").await);
+    assert!(
+        s.relay.app_registry.get("app").await.is_none(),
+        "precondition: no registry row"
+    );
+    assert!(
+        s.relay
+            .binding
+            .tombstone_holder(&crate::mcp::relay_binding::app_tombstone_key("app"))
+            .is_none(),
+        "precondition: no live tombstone"
+    );
+
+    let (_evil, reply) = s.ws_register(Some(EVIL), "app").await;
+    assert_eq!(
+        ack_refusal_code(&reply),
+        Some("UIB_REGISTRATION_HELD"),
+        "a foreign socket displaced a LIVE holder the registry had forgotten: {reply}"
+    );
+    assert_eq!(
+        conn_for(&s, "app").await,
+        Some(holder_conn),
+        "the routing slot moved"
+    );
+}
+
+/// Finding 2's second path: an HTTP phone-home for an id a WebSocket holds
+/// flips the row to `Http` / `websocket_conn_id: None`. The socket's `touch`
+/// must keep working after that, or the row ages out under a live socket.
+#[tokio::test]
+async fn ws_touch_keeps_refreshing_a_row_an_http_phone_home_took_over() {
+    let s = spawn(BindingConfig::default()).await;
+    let (_ws, ack) = s.ws_register(Some(GOOD), "shared").await;
+    assert_eq!(ack["type"], "registered");
+    let conn_id = ack["connId"].as_u64().unwrap();
+
+    // Same principal, so R1 admits it; the row is now an HTTP entry.
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "shared", "appName": "Same origin", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        s.relay.app_registry.get("shared").await.unwrap().transport,
+        crate::mcp::app_registry::AppTransport::Http
+    );
+
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("shared", REGISTRATION_TTL_MS - 1_000)
+            .await
+    );
+    assert!(
+        s.relay.app_registry.touch("shared", Some(conn_id)).await,
+        "the conn guard is meaningless for an HTTP entry and must not block the refresh"
+    );
+    assert_eq!(s.relay.app_registry.sweep(&s.relay.binding).await, 0);
 }
 
 /// R7.
@@ -1563,10 +1725,52 @@ fn tombstones_reserve_for_the_holder_and_sweep() {
     );
     assert!(binding.tombstone_holder(&key).is_none());
 
-    // The sweep drops expired entries and keeps live ones.
+    // The sweep drops EXPIRED entries and keeps live ones. Without a seam
+    // this test would only ever have asserted the trivial arm — its name said
+    // "and sweep" while nothing ever expired.
     binding.tombstone(key.clone(), &good);
     assert_eq!(binding.sweep_tombstones(), 0, "a live tombstone stays");
     assert!(binding.tombstone_holder(&key).is_some());
+    binding.test_expire_tombstones();
+    assert_eq!(binding.sweep_tombstones(), 1, "an expired tombstone goes");
+    assert!(binding.tombstone_holder(&key).is_none());
+    assert_eq!(binding.health_json()["tombstones"], 0);
+}
+
+/// Finding 3: the tombstone map is bounded PER PRINCIPAL, so flooding it from
+/// one origin cannot evict another origin's reservation.
+///
+/// Every tombstone has the same 60 s lifetime, so a purely global "evict the
+/// soonest to expire" bound always evicts the OLDEST — which is always the
+/// victim's, because the attacker's are newer by construction. First-claim
+/// squatting of unheld ids is an accepted non-goal, so an attacker really can
+/// register and DELETE as many fresh ids as it likes.
+#[test]
+fn a_tombstone_flood_from_one_principal_cannot_evict_anothers() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    let evil = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(EVIL).unwrap(),
+    };
+    let victim = app_tombstone_key("victim-app");
+    binding.tombstone(victim.clone(), &good);
+
+    // Far past both ceilings.
+    for i in 0..(MAX_TOMBSTONES * 2) {
+        binding.tombstone(app_tombstone_key(&format!("squat-{i}")), &evil);
+    }
+
+    assert_eq!(
+        binding.tombstone_holder(&victim),
+        Some(good),
+        "the victim's reservation was evicted by another principal's flood"
+    );
+    let total = binding.health_json()["tombstones"].as_u64().unwrap() as usize;
+    assert!(total <= MAX_TOMBSTONES, "the map is still bounded: {total}");
 }
 
 #[test]

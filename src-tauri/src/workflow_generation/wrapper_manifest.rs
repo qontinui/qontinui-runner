@@ -482,8 +482,8 @@ mod tests {
         let cmd_id = v["commandId"].as_str().unwrap().to_string();
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 CommandResponse {
                     command_id: cmd_id,
                     success: true,

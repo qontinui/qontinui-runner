@@ -518,8 +518,8 @@ mod tests {
 
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 super::super::command_relay::CommandResponse {
                     command_id,
                     success: true,
@@ -611,8 +611,8 @@ mod tests {
 
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 super::super::command_relay::CommandResponse {
                     command_id,
                     success: true,
