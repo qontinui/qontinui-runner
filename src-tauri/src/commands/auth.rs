@@ -2349,6 +2349,10 @@ mod device_token_door_tests {
         };
         let err = coord_device_token_for(&am, Some(a), &unreadable, false).unwrap_err();
         assert!(err.contains("slot store io"), "{err}");
+        assert!(
+            !err.contains(&claimless),
+            "a refusal must not carry the token it refused to hand out"
+        );
     }
 
     #[test]
