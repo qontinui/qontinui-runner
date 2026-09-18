@@ -366,10 +366,18 @@ pub struct RestartReadiness {
     pub session_status_source: SessionStatusSource,
     /// How many top-level terminal-hosted processes are wind-down `eligible`
     /// right now — the count of `windDown.eligibility == "eligible"` across
-    /// `terminal_sessions.processes`. **DRY-RUN** (plan
-    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 1): nothing acts on
-    /// it, and it is computed whether or not the runner is drained. `null` when
-    /// the terminal plane could not be determined — never `0`.
+    /// `terminal_sessions.processes` (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`).
+    ///
+    /// ⚠ **NOT a dry run since Phase 4**, and this is the WIRE contract, so an
+    /// external consumer reads it here. THIS ENDPOINT closes nothing and the
+    /// count is computed whether or not the runner is drained — but the
+    /// wind-down executor acts on the same verdict while the device IS drained.
+    /// It is therefore a count of CANDIDATES, not a prediction: the executor
+    /// applies further gates of its own (the drain, a wall-clock-jump
+    /// quarantine, a per-tick budget, and a re-check immediately before each
+    /// close). `null` when the terminal plane could not be determined — never
+    /// `0`.
     #[serde(rename = "windDownCandidates")]
     pub wind_down_candidates: Option<usize>,
     pub boundary: &'static str,

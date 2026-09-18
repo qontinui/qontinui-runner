@@ -51,11 +51,18 @@
 //! `TerminalManager`. Two consumers read that pane as ALIVE, and they are worth
 //! knowing about because neither is this module's to fix:
 //!
-//! * **Stewards** — `find_running_steward` filters on the SHELL's `is_alive`,
-//!   so `GET /steward/{kind}/status` reports `running: true` for a steward that
-//!   has stopped, and a later start is refused 409. Handled HERE, by recording
-//!   `stopped_by_drain` on "`claude` left" rather than on "the tab closed"; the
-//!   undrain restart then answers the 409 and the operator sees the truth.
+//! * **Stewards** — fixed, but NOT here alone, and the first attempt to fix it
+//!   here alone did nothing. Recording `stopped_by_drain` on "`claude` left"
+//!   rather than "the tab closed" is necessary and was not sufficient: the
+//!   undrain restart still hit `find_running_steward`, which keyed on the
+//!   SHELL's `is_alive`, still answered `running: true` for the emptied pane,
+//!   and returned a 409 carrying no `DeferClass` code — so the kind read as the
+//!   benign "already running" family, was settled out of the set, and the
+//!   steward stayed down with a log line claiming no restart was needed. The
+//!   real fix is `mcp::steward::steward_pane_is_running`, which asks whether a
+//!   `claude` lives in the pane. Both halves are required: without the
+//!   recording the kind is never owed, without the liveness change the restart
+//!   is refused.
 //! * **Looping agents** — `looping_agent_supervisor::resolve_live_session`
 //!   derives `Liveness` from whether the terminal id is still REGISTERED with
 //!   the manager, never from whether a `claude` lives in it, so `tab_alive` is
@@ -448,6 +455,22 @@ async fn tick_once(state: &mut ExecutorState) {
     // The verdict is only CONSULTED in the wind-down arm.
     let grace = wind_down::grace_from_env();
     let clock = check_clock(grace);
+    // Logged HERE, at DETECTION, not where the verdict is consulted. S-3's
+    // whole premise is that suspend and NTP slew are ordinary, so the jump is
+    // usually detected on a `Nothing` or `Undrain` tick — and a log buried in
+    // the wind-down arm would arm a full grace period of quarantine with
+    // nothing at info level saying why. An operator would then watch a drained
+    // runner refuse to wind down and have no thread to pull.
+    if let ClockVerdict::Jumped { skew_ms } = clock {
+        warn!(
+            skew_ms,
+            quarantine_s = grace.as_secs(),
+            drain = crate::coord_drain_state::current().label(),
+            "wind_down_executor: the wall clock stepped against the monotonic clock — \
+             every idle window in play is untrustworthy, so wind-down is quarantined \
+             for a full grace period"
+        );
+    }
 
     match decide_tick(&drain, state.was_drained, Utc::now()) {
         TickAction::Nothing => {}
@@ -461,14 +484,9 @@ async fn tick_once(state: &mut ExecutorState) {
             match clock {
                 ClockVerdict::Trustworthy => wind_down_once(&app, grace).await,
                 // Hazard 1. Fail closed: no close is attempted on an idle
-                // window measured across a clock step.
-                ClockVerdict::Jumped { skew_ms } => warn!(
-                    skew_ms,
-                    quarantine_s = grace.as_secs(),
-                    "wind_down_executor: the wall clock stepped against the monotonic clock — \
-                     every idle window in play is untrustworthy, so wind-down is quarantined \
-                     for a full grace period"
-                ),
+                // window measured across a clock step. Already logged at
+                // detection, above.
+                ClockVerdict::Jumped { .. } => {}
                 ClockVerdict::Quarantined => debug!(
                     "wind_down_executor: still within the post-clock-jump quarantine — no closes"
                 ),
@@ -498,6 +516,13 @@ pub fn select_candidates(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for proc in processes {
+        // A nested subagent is never a candidate. The observer already leaves
+        // its verdict `None`, so this is belt and braces — but the function
+        // ADVERTISES the property, and a doc that only a collaborator enforces
+        // is the defect class this module keeps finding.
+        if proc.nested_under_claude {
+            continue;
+        }
         if !proc
             .wind_down
             .as_ref()
@@ -541,6 +566,33 @@ pub fn outcome_word(outcome: &GracefulExitOutcome) -> Option<&'static str> {
     }
 }
 
+/// PURE: must this candidate's verdict be re-established before it is closed?
+///
+/// Only the FIRST candidate is exempt: its verdict comes from the pass that
+/// just ran, milliseconds old, with nothing having elapsed since. Every later
+/// one can be minutes stale (see the call site).
+pub fn recheck_is_owed(index: usize) -> bool {
+    index > 0
+}
+
+/// PURE: may this candidate be closed, given what the re-check found?
+///
+/// `view` is `None` both when no re-check was owed and when one ran and found
+/// the session gone — which the caller distinguishes, and which this does not
+/// need to: it is FAIL-CLOSED for every index that owes a re-check. Only an
+/// index that owes none, or a re-check that came back `Eligible`, admits.
+///
+/// Extracted and tested as a function because the mutations that matter are
+/// invisible otherwise: deleting the re-check, or weakening its condition to
+/// an index no batch reaches, is green across the whole suite and walks past
+/// the kill-path tripwire, which forbids literals and pins nothing positive.
+pub fn recheck_admits(index: usize, view: Option<&wind_down::WindDownView>) -> bool {
+    if !recheck_is_owed(index) {
+        return true;
+    }
+    view.is_some_and(wind_down::WindDownView::is_eligible)
+}
+
 /// PURE: did `claude` leave the pane? See the `stopped_by_drain` comment in
 /// [`wind_down_once`] for why this, and not "the tab closed", is the predicate
 /// a steward restart is owed on.
@@ -557,7 +609,12 @@ pub fn claude_left(outcome: &GracefulExitOutcome) -> bool {
 /// (N-2): the store is small but `std::fs` is blocking, and this runs inside
 /// the executor's async tick.
 async fn record_stopped_by_drain(kind: String) {
-    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+    // The `JoinError` is REPORTED, not discarded. This module's own doctrine is
+    // that under-recording a stopped steward is permanent, so a panic in the
+    // task that does the recording is the loudest thing that can happen here —
+    // `let _ =` would convert it into silence.
+    let named = kind.clone();
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         let path = stopped_by_drain_path();
         let mut set = StoppedByDrain::load(&path);
         if set.insert(&kind) {
@@ -565,24 +622,39 @@ async fn record_stopped_by_drain(kind: String) {
             info!(steward = %kind, "wind_down_executor: recorded stopped_by_drain");
         }
     })
-    .await;
+    .await
+    {
+        warn!(steward = %named, error = %e, "wind_down_executor: recording stopped_by_drain DIED — this steward may not be restarted on undrain");
+    }
 }
 
 /// Read the persisted set off the runtime worker (N-2).
 async fn load_stopped_by_drain() -> StoppedByDrain {
-    qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
+    match qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(|| {
         StoppedByDrain::load(&stopped_by_drain_path())
     })
     .await
-    .unwrap_or_default()
+    {
+        Ok(set) => set,
+        Err(e) => {
+            // An empty set is the same answer an absent file gives, so the
+            // undrain simply restarts nothing — but SAY so, because here it
+            // means "could not look", not "nothing was stopped".
+            warn!(error = %e, "wind_down_executor: reading the stopped-by-drain set DIED — treating it as empty for this tick");
+            StoppedByDrain::default()
+        }
+    }
 }
 
 /// Persist the set off the runtime worker (N-2).
 async fn save_stopped_by_drain(set: StoppedByDrain) {
-    let _ = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
+    if let Err(e) = qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked(move || {
         set.save(&stopped_by_drain_path());
     })
-    .await;
+    .await
+    {
+        warn!(error = %e, "wind_down_executor: persisting the stopped-by-drain set DIED — a kind may be restarted twice, or not at all, after a restart");
+    }
 }
 
 /// One wind-down pass: observe, then close what is eligible.
@@ -664,20 +736,21 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         //     Skipped for the FIRST candidate alone, whose verdict is the pass
         //     that just ran, milliseconds old, with nothing having elapsed
         //     since. Every later one pays a re-check.
-        if index > 0 {
-            match wind_down_observer::recheck(app, grace, &session_id, &terminal_id).await {
-                Some(view) if view.is_eligible() => {}
-                other => {
-                    info!(
-                        session_id = %session_id,
-                        terminal_id = %terminal_id,
-                        verdict = other.as_ref().map_or("gone", |v| v.eligibility),
-                        reason = other.as_ref().and_then(|v| v.reason).unwrap_or("-"),
-                        "wind_down_executor: no longer eligible when its turn came — not closed"
-                    );
-                    continue;
-                }
-            }
+        let rechecked = if recheck_is_owed(index) {
+            Some(wind_down_observer::recheck(app, grace, &session_id, &terminal_id).await)
+        } else {
+            None
+        };
+        if !recheck_admits(index, rechecked.as_ref().and_then(Option::as_ref)) {
+            let view = rechecked.as_ref().and_then(Option::as_ref);
+            info!(
+                session_id = %session_id,
+                terminal_id = %terminal_id,
+                verdict = view.map_or("gone", |v| v.eligibility),
+                reason = view.and_then(|v| v.reason).unwrap_or("-"),
+                "wind_down_executor: no longer eligible when its turn came — not closed"
+            );
+            continue;
         }
         let kind = fresh.observed.kind_for(&terminal_id);
         let observation = fresh.observed.observation_for(&terminal_id);
@@ -1241,6 +1314,69 @@ mod tests {
             select_candidates(&processes, &observed),
             vec![("s-ok".to_string(), "t1".to_string())]
         );
+    }
+
+    /// S-A: the per-close re-check, as a property rather than a code shape.
+    /// Deleting the re-check or weakening it to an index no batch reaches is
+    /// what this catches — both are green across every other test.
+    #[test]
+    fn only_the_first_candidate_skips_the_recheck_and_every_other_fails_closed() {
+        let eligible = wind_down::WindDownView {
+            eligibility: "eligible",
+            since: Some(1),
+            until: None,
+            reason: None,
+            kind: SessionKind::Terminal,
+        };
+        let not_yet = wind_down::WindDownView {
+            eligibility: "not_yet",
+            since: Some(1),
+            until: Some(2),
+            reason: None,
+            kind: SessionKind::Terminal,
+        };
+
+        // Index 0 owes nothing: its verdict is the pass that just ran.
+        assert!(!recheck_is_owed(0));
+        assert!(recheck_admits(0, None));
+
+        // Every later index owes one, and NOTHING but a fresh `Eligible`
+        // admits — not a stale verdict, not a missing one.
+        for index in 1..8 {
+            assert!(recheck_is_owed(index), "index {index} must owe a re-check");
+            assert!(
+                !recheck_admits(index, None),
+                "index {index}: a session the re-check could not find must not be closed"
+            );
+            assert!(
+                !recheck_admits(index, Some(&not_yet)),
+                "index {index}: a session whose grace clock restarted must not be closed"
+            );
+            assert!(recheck_admits(index, Some(&eligible)), "index {index}");
+        }
+    }
+
+    /// The mutation the reviewer named: weakening the condition to an index no
+    /// batch reaches must not silently restore per-tick behaviour.
+    #[test]
+    fn every_index_a_batch_can_reach_owes_a_recheck_except_the_first() {
+        let owed: Vec<bool> = (0..MAX_CLOSES_PER_TICK).map(recheck_is_owed).collect();
+        assert_eq!(
+            owed,
+            vec![false, true, true, true],
+            "with MAX_CLOSES_PER_TICK = {MAX_CLOSES_PER_TICK}, exactly the first \
+             candidate may skip the re-check"
+        );
+    }
+
+    /// N-4: the nested check is the function's own, not a collaborator's.
+    #[test]
+    fn a_nested_subagent_is_not_a_candidate_even_with_an_eligible_verdict() {
+        let observed = observed_with(&[("s-nested", "t1")]);
+        // An eligible verdict AND nested — the observer would not produce this,
+        // which is exactly why the function must refuse it itself.
+        let processes = vec![candidate_proc(1, Some("s-nested"), Some("eligible"), true)];
+        assert!(select_candidates(&processes, &observed).is_empty());
     }
 
     /// A process with NO verdict is not a candidate either — that is how a
