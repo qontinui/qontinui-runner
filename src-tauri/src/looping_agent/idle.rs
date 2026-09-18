@@ -70,8 +70,12 @@ pub fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
         }
     }
 
-    // (3) prompt marker visible — remember its row for (4).
-    let Some(prompt_row) = lines.iter().position(|l| l.contains(PROMPT_MARKER)) else {
+    // (3) prompt marker visible — remember its row for (4). The input box is
+    // the BOTTOM-MOST `❯` row: a starship-style shell prompt leaves `❯ claude`
+    // in the inline viewport at session start and a select menu renders
+    // `❯ 1. Yes` above the box, while nothing Claude Code draws below the box
+    // carries the glyph (mirrors `mcp::session_message_poller::snapshot_verdict`).
+    let Some(prompt_row) = lines.iter().rposition(|l| l.contains(PROMPT_MARKER)) else {
         // No visible input prompt ⇒ can't confirm ready-for-input ⇒ not idle.
         return false;
     };
@@ -192,6 +196,20 @@ mod tests {
         // A just-spawned tab (blank grid) must read NOT idle — conservative.
         assert!(!snapshot_looks_idle(&lines(&["", "", ""]), 0));
         assert!(!snapshot_looks_idle(&[], 0));
+    }
+
+    #[test]
+    fn prompt_row_is_the_bottom_most_marker_row() {
+        // A starship-style shell prompt leaves `❯ claude` in the inline
+        // viewport at session start, above Claude Code's own input box. The
+        // box is the bottom-most `❯` row, so the cursor sitting on the box
+        // (row 3) is idle — judging the FIRST `❯` row would put the cursor
+        // "below the prompt" trivially, and a cursor on the shell line (row
+        // 1) would wrongly read as idle.
+        let grid = lines(&["~/repo on main", "❯ claude", "Welcome", "❯ "]);
+        assert!(snapshot_looks_idle(&grid, 3));
+        // Cursor on the stale shell line, above the real box ⇒ not idle.
+        assert!(!snapshot_looks_idle(&grid, 1));
     }
 
     // ── snapshot_context_low ─────────────────────────────────────────────
