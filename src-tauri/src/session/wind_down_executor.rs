@@ -662,7 +662,7 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
     use tauri::Manager;
 
     let fresh = wind_down_observer::fresh_pass(app, grace).await;
-    let Some(pass) = fresh.pass else {
+    let Some(pass) = fresh.pass.as_ref() else {
         debug!(
             unknowns = ?fresh.unknowns,
             "wind_down_executor: no census this tick — nothing is eligible, nothing closed"
@@ -679,14 +679,6 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         .try_state::<Arc<SessionLifecycleStore>>()
         .map(|s| s.inner().clone());
 
-    // The record per session, for the `origin` the close is logged with.
-    let record_origin = |session_id: &str| -> Option<String> {
-        pass.open_records
-            .iter()
-            .find(|r| r.claude_session_id == session_id)
-            .and_then(|r| r.origin.clone())
-    };
-
     let candidates = select_candidates(&pass.report.terminal_hosted, &fresh.observed);
 
     if candidates.is_empty() {
@@ -698,88 +690,181 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         "wind_down_executor: the device is drained — closing eligible sessions"
     );
 
+    let effects = LiveCloseEffects {
+        app,
+        grace,
+        manager,
+        store,
+        fresh: &fresh,
+    };
+    close_batch(candidates, &effects).await;
+}
+
+/// What one candidate's turn came to. Returned rather than only logged so a
+/// batch is assertable — see [`close_batch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateOutcome {
+    /// Handed to [`CloseEffects::wind_down_one`].
+    Closed,
+    /// Re-observation no longer admitted it (B1). Nothing was typed at it.
+    NoLongerEligible,
+    /// The drain lifted before its turn. This candidate and every later one
+    /// were abandoned, so this is always the LAST element.
+    DrainLifted,
+}
+
+/// Everything [`close_batch`] does to the world, behind a trait.
+///
+/// The two per-candidate preconditions are **sequencing**, not computation, and
+/// sequencing is exactly what the pure helpers around it cannot pin: with
+/// `recheck_is_owed` and `recheck_admits` tested in isolation, deleting the
+/// block that CALLS them stayed green across the whole suite. Injecting the
+/// three effects is what makes "index 0 is not re-checked, index 1 is, and a
+/// `NotYet` answer skips the close" an assertion instead of a comment.
+#[async_trait::async_trait]
+pub(crate) trait CloseEffects {
+    /// (a) Is the device still drained?
+    fn still_drained(&self) -> bool;
+    /// (b) Re-observe ONE candidate. `None` when the session or its pane is
+    /// gone, or could not be observed — both fail closed.
+    async fn recheck(&self, session_id: &str, terminal_id: &str)
+        -> Option<wind_down::WindDownView>;
+    /// Drive the graceful exit and everything that follows it: the lifecycle
+    /// record, the log line, and D6's steward recording.
+    ///
+    /// Deliberately NOT named `close`: the kill-path tripwire forbids the bare
+    /// token `.close(` anywhere in this module's executable lines, receiver-
+    /// agnostic, and a trait method spelled that way would have put one there
+    /// — which is the tripwire working, not a false positive. This module
+    /// never closes a pane; it asks for a graceful exit and the exit closes it.
+    async fn wind_down_one(&self, session_id: &str, terminal_id: &str);
+}
+
+/// Close up to [`MAX_CLOSES_PER_TICK`] candidates, re-establishing BOTH
+/// preconditions before each one.
+///
+/// A batch is up to `MAX_CLOSES_PER_TICK` closes, each of which can wait a full
+/// [`EXIT_DEADLINE`], so the last one can start minutes after the pass that
+/// authorised it. Both things that authorise a close can have changed in those
+/// minutes, and both are re-read:
+///
+/// * **The DRAIN.** "Only while `Drained`" would otherwise be false for every
+///   close after the first.
+/// * **The ELIGIBILITY of THIS session.** The scenario: four sessions are
+///   eligible, D is last; while A, B and C are being closed the operator
+///   returns to D, types a prompt, `claude` works for 90 s, answers, and D is
+///   back at an empty prompt. D's grid generation moved and its grace clock
+///   restarted, so a re-observed verdict is `NotYet` for another full grace
+///   period — but the frozen one still says `Eligible`, `exit_prompt_ready`
+///   passes (the pane genuinely IS at an empty prompt), and the session is
+///   closed out from under them. `drive`'s own preamble catches a pane that is
+///   BUSY at close time; it cannot catch one that was busy twenty seconds ago
+///   and is momentarily quiet, which is precisely the state a grace period
+///   exists to distinguish from idleness. Without this, two of this module's
+///   four advertised invariants — "a `working` sideband resets the grace clock"
+///   and "an unfinished idle terminal session is never closed" — would hold
+///   only of a value read before the batch began.
+///
+///   Skipped for the FIRST candidate alone, whose verdict is the pass that just
+///   ran, milliseconds old, with nothing having elapsed since. Every later one
+///   pays a re-check.
+pub(crate) async fn close_batch<E: CloseEffects + Sync>(
+    candidates: Vec<(String, String)>,
+    effects: &E,
+) -> Vec<CandidateOutcome> {
+    let mut outcomes = Vec::new();
     for (index, (session_id, terminal_id)) in
         candidates.into_iter().take(MAX_CLOSES_PER_TICK).enumerate()
     {
-        // ── Both per-close preconditions are re-established here ────────────
-        //
-        // A batch is up to `MAX_CLOSES_PER_TICK` closes, each of which can wait
-        // a full `EXIT_DEADLINE`, so the last one can start minutes after the
-        // pass that authorised it. BOTH things that authorise a close can have
-        // changed in those minutes, and both are re-read.
-        //
-        // (a) The DRAIN. "Only while Drained" would otherwise be false for
-        //     every close after the first.
-        if decide_tick(&crate::coord_drain_state::current(), false, Utc::now())
-            != TickAction::WindDown
-        {
+        if !effects.still_drained() {
             info!("wind_down_executor: the drain lifted mid-batch — stopping this pass");
-            return;
+            outcomes.push(CandidateOutcome::DrainLifted);
+            return outcomes;
         }
-        // (b) The ELIGIBILITY of THIS session. The scenario this closes: four
-        //     sessions are eligible, D is last; while A, B and C are being
-        //     closed the operator returns to D, types a prompt, `claude` works
-        //     for 90 s, answers, and D is back at an empty prompt. D's grid
-        //     generation moved and its grace clock restarted, so a re-observed
-        //     verdict is `NotYet` for another full grace period — but the
-        //     frozen one still says `Eligible`, `exit_prompt_ready` passes
-        //     (the pane genuinely IS at an empty prompt), and the session is
-        //     closed out from under them. `drive`'s own preamble catches a pane
-        //     that is BUSY at close time; it cannot catch one that was busy
-        //     twenty seconds ago and is momentarily quiet, which is precisely
-        //     the state a grace period exists to distinguish from idleness.
-        //     Without this, two of this module's four advertised invariants —
-        //     "a `working` sideband resets the grace clock" and "an unfinished
-        //     idle terminal session is never closed" — would hold only of a
-        //     value read before the batch began.
-        //
-        //     Skipped for the FIRST candidate alone, whose verdict is the pass
-        //     that just ran, milliseconds old, with nothing having elapsed
-        //     since. Every later one pays a re-check.
         let rechecked = if recheck_is_owed(index) {
-            Some(wind_down_observer::recheck(app, grace, &session_id, &terminal_id).await)
+            effects.recheck(&session_id, &terminal_id).await
         } else {
             None
         };
-        if !recheck_admits(index, rechecked.as_ref().and_then(Option::as_ref)) {
-            let view = rechecked.as_ref().and_then(Option::as_ref);
+        if !recheck_admits(index, rechecked.as_ref()) {
             info!(
                 session_id = %session_id,
                 terminal_id = %terminal_id,
-                verdict = view.map_or("gone", |v| v.eligibility),
-                reason = view.and_then(|v| v.reason).unwrap_or("-"),
+                verdict = rechecked.as_ref().map_or("gone", |v| v.eligibility),
+                reason = rechecked.as_ref().and_then(|v| v.reason).unwrap_or("-"),
                 "wind_down_executor: no longer eligible when its turn came — not closed"
             );
+            outcomes.push(CandidateOutcome::NoLongerEligible);
             continue;
         }
-        let kind = fresh.observed.kind_for(&terminal_id);
-        let observation = fresh.observed.observation_for(&terminal_id);
-        let steward_kind = crate::mcp::steward::steward_kind_for_terminal(&terminal_id);
+        effects.wind_down_one(&session_id, &terminal_id).await;
+        outcomes.push(CandidateOutcome::Closed);
+    }
+    outcomes
+}
+
+/// The shipped [`CloseEffects`] — the real drain state, the real observer, and
+/// `TerminalManager::graceful_exit`.
+struct LiveCloseEffects<'a> {
+    app: &'a tauri::AppHandle,
+    grace: Duration,
+    manager: Arc<TerminalManager>,
+    store: Option<Arc<SessionLifecycleStore>>,
+    fresh: &'a wind_down_observer::FreshPass,
+}
+
+#[async_trait::async_trait]
+impl CloseEffects for LiveCloseEffects<'_> {
+    fn still_drained(&self) -> bool {
+        decide_tick(&crate::coord_drain_state::current(), false, Utc::now()) == TickAction::WindDown
+    }
+
+    async fn recheck(
+        &self,
+        session_id: &str,
+        terminal_id: &str,
+    ) -> Option<wind_down::WindDownView> {
+        wind_down_observer::recheck(self.app, self.grace, session_id, terminal_id).await
+    }
+
+    async fn wind_down_one(&self, session_id: &str, terminal_id: &str) {
+        let kind = self.fresh.observed.kind_for(terminal_id);
+        let observation = self.fresh.observed.observation_for(terminal_id);
+        let steward_kind = crate::mcp::steward::steward_kind_for_terminal(terminal_id);
+        let origin = self
+            .fresh
+            .pass
+            .as_ref()
+            .and_then(|pass| {
+                pass.open_records
+                    .iter()
+                    .find(|r| r.claude_session_id == session_id)
+            })
+            .and_then(|r| r.origin.clone());
         info!(
             session_id = %session_id,
             terminal_id = %terminal_id,
             ?kind,
-            origin = record_origin(&session_id).as_deref().unwrap_or("-"),
+            origin = origin.as_deref().unwrap_or("-"),
             steward_kind = steward_kind.as_deref().unwrap_or("-"),
             sideband = ?observation.sideband,
             grid = ?observation.grid,
-            judged_at_ms = fresh.observed.now_ms,
-            grace_s = grace.as_secs(),
+            judged_at_ms = self.fresh.observed.now_ms,
+            grace_s = self.grace.as_secs(),
             "wind_down_executor: graceful /exit — eligible past grace"
         );
 
         // The ONE way this module reaches a pane. Never `TerminalManager::close`.
-        let outcome = match manager.graceful_exit(&terminal_id, EXIT_DEADLINE).await {
+        let outcome = match self.manager.graceful_exit(terminal_id, EXIT_DEADLINE).await {
             Ok(outcome) => outcome,
             Err(e) => {
                 warn!(session_id = %session_id, terminal_id = %terminal_id, error = %e, "wind_down_executor: graceful exit could not start");
-                continue;
+                return;
             }
         };
-        let recorded = outcome_word(&outcome);
-        match (recorded, &store) {
+        match (outcome_word(&outcome), &self.store) {
             (Some(word), Some(store)) => {
-                store.set_wind_down_outcome(&session_id, word, Utc::now().timestamp_millis())
+                store.set_wind_down_outcome(session_id, word, Utc::now().timestamp_millis())
             }
             _ => {
                 debug!(session_id = %session_id, ?outcome, "wind_down_executor: nothing recorded for this outcome")
@@ -796,12 +881,12 @@ async fn wind_down_once(app: &tauri::AppHandle, grace: Duration) {
         // probes, so `CloseRefused` and `CloseOutcomeUnknown` both mean the
         // steward's `claude` is already gone and only the bare shell survives.
         // Recording just `Exited` left those as zombies: `find_running_steward`
-        // filters on the SHELL's liveness and so reports `running: true`, the
-        // kind is not in the set, undrain does not restart it, a later start is
-        // refused 409, and the next tick cannot retry because a pane with no
-        // live `claude` never appears in `terminal_hosted` again. Over-recording
-        // is cheap — the set is idempotent and `restart_after_drain` answers a
-        // benign 409 with `NotNeeded` — and under-recording is permanent.
+        // reported `running: true`, the kind was not in the set, undrain did not
+        // restart it, a later start was refused 409, and the next tick could not
+        // retry because a pane with no live `claude` never appears in
+        // `terminal_hosted` again. Over-recording is cheap — the set is
+        // idempotent and `restart_after_drain` answers a benign 409 with
+        // `NotNeeded` — and under-recording is permanent.
         if kind == SessionKind::Steward && claude_left(&outcome) {
             if let Some(kind) = steward_kind {
                 record_stopped_by_drain(kind).await;
@@ -906,6 +991,7 @@ async fn undrain(app: &tauri::AppHandle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn drained() -> CoordDrainState {
         CoordDrainState::Drained {
@@ -1361,11 +1447,216 @@ mod tests {
     #[test]
     fn every_index_a_batch_can_reach_owes_a_recheck_except_the_first() {
         let owed: Vec<bool> = (0..MAX_CLOSES_PER_TICK).map(recheck_is_owed).collect();
+        // Built from the constant, not written out: a hardcoded vector fails on
+        // any change to `MAX_CLOSES_PER_TICK`, including a correct one, while
+        // pinning nothing this does not.
+        let expected: Vec<bool> = std::iter::once(false)
+            .chain(std::iter::repeat(true))
+            .take(MAX_CLOSES_PER_TICK)
+            .collect();
         assert_eq!(
-            owed,
-            vec![false, true, true, true],
+            owed, expected,
             "with MAX_CLOSES_PER_TICK = {MAX_CLOSES_PER_TICK}, exactly the first \
              candidate may skip the re-check"
+        );
+    }
+
+    // ── The close batch, at its call site ──────────────────────────────────
+    //
+    // S3-2: the two tests above pin `recheck_is_owed` and `recheck_admits`
+    // themselves, and both stay green if the block that CALLS them is deleted
+    // outright. These drive [`close_batch`] with a recording double, so the
+    // WIRING is what is asserted.
+
+    /// A [`CloseEffects`] that records every call and answers from a script.
+    struct RecordingEffects {
+        /// `still_drained` answers by index of call: `drained[n]`, then the
+        /// last value forever.
+        drained: Vec<bool>,
+        /// What `recheck` answers, by terminal id. Absent = `None` (gone).
+        verdicts: HashMap<String, wind_down::WindDownView>,
+        calls: std::sync::Mutex<Vec<String>>,
+        drained_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingEffects {
+        fn new() -> Self {
+            Self {
+                drained: vec![true],
+                verdicts: HashMap::new(),
+                calls: std::sync::Mutex::new(Vec::new()),
+                drained_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn eligible(mut self, terminal_id: &str) -> Self {
+            self.verdicts
+                .insert(terminal_id.to_string(), view("eligible"));
+            self
+        }
+        fn not_yet(mut self, terminal_id: &str) -> Self {
+            self.verdicts
+                .insert(terminal_id.to_string(), view("not_yet"));
+            self
+        }
+        fn drained(mut self, script: &[bool]) -> Self {
+            self.drained = script.to_vec();
+            self
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn view(eligibility: &'static str) -> wind_down::WindDownView {
+        wind_down::WindDownView {
+            eligibility,
+            since: Some(1),
+            until: None,
+            reason: None,
+            kind: SessionKind::Terminal,
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CloseEffects for RecordingEffects {
+        fn still_drained(&self) -> bool {
+            let n = self
+                .drained_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *self.drained.get(n).unwrap_or(self.drained.last().unwrap())
+        }
+        async fn recheck(
+            &self,
+            _session_id: &str,
+            terminal_id: &str,
+        ) -> Option<wind_down::WindDownView> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("recheck:{terminal_id}"));
+            self.verdicts.get(terminal_id).cloned()
+        }
+        async fn wind_down_one(&self, _session_id: &str, terminal_id: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("close:{terminal_id}"));
+        }
+    }
+
+    fn batch(ids: &[&str]) -> Vec<(String, String)> {
+        ids.iter()
+            .map(|t| (format!("s-{t}"), (*t).to_string()))
+            .collect()
+    }
+
+    /// B1 AT THE CALL SITE. The first candidate is closed on the pass's own
+    /// verdict; every later one is re-observed FIRST, and the close happens
+    /// only if that answer admits it.
+    ///
+    /// Deleting the re-check block from [`close_batch`] fails here on the call
+    /// ORDER, which no pure-helper test can see.
+    #[tokio::test]
+    async fn the_first_candidate_is_closed_unrechecked_and_the_rest_are_rechecked_first() {
+        let effects = RecordingEffects::new().eligible("t2").eligible("t3");
+        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+
+        assert_eq!(
+            effects.calls(),
+            vec![
+                // No `recheck:t1` — index 0 is exempt, and only index 0.
+                "close:t1",
+                "recheck:t2",
+                "close:t2",
+                "recheck:t3",
+                "close:t3",
+            ],
+            "every candidate after the first must be re-observed BEFORE it is closed"
+        );
+        assert_eq!(outcomes, vec![CandidateOutcome::Closed; 3]);
+    }
+
+    /// The scenario B1 exists for: the operator came back to D while A was
+    /// being closed. A re-check that answers `NotYet` must skip the close and
+    /// keep going — not close it, and not abandon the batch.
+    #[tokio::test]
+    async fn a_candidate_whose_grace_clock_restarted_is_skipped_not_closed() {
+        let effects = RecordingEffects::new().not_yet("t2").eligible("t3");
+        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+
+        assert_eq!(
+            effects.calls(),
+            vec!["close:t1", "recheck:t2", "recheck:t3", "close:t3"],
+            "t2 was re-observed and must NOT have been closed"
+        );
+        assert_eq!(
+            outcomes,
+            vec![
+                CandidateOutcome::Closed,
+                CandidateOutcome::NoLongerEligible,
+                CandidateOutcome::Closed
+            ]
+        );
+    }
+
+    /// FAIL CLOSED. A re-check that cannot find the session answers `None`, and
+    /// `None` must never be read as "nothing changed".
+    #[tokio::test]
+    async fn a_candidate_the_recheck_cannot_find_is_not_closed() {
+        // No verdict scripted for t2 at all.
+        let effects = RecordingEffects::new();
+        let outcomes = close_batch(batch(&["t1", "t2"]), &effects).await;
+
+        assert_eq!(effects.calls(), vec!["close:t1", "recheck:t2"]);
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Closed, CandidateOutcome::NoLongerEligible]
+        );
+    }
+
+    /// "Only while `Drained`" is a per-CLOSE property, not a per-tick one: a
+    /// batch can run for minutes. The drain lifting mid-batch abandons every
+    /// remaining candidate.
+    #[tokio::test]
+    async fn the_drain_lifting_mid_batch_stops_the_pass() {
+        let effects = RecordingEffects::new()
+            .drained(&[true, false])
+            .eligible("t2")
+            .eligible("t3");
+        let outcomes = close_batch(batch(&["t1", "t2", "t3"]), &effects).await;
+
+        assert_eq!(
+            effects.calls(),
+            vec!["close:t1"],
+            "t2 must not even be re-observed once the drain has lifted"
+        );
+        assert_eq!(
+            outcomes,
+            vec![CandidateOutcome::Closed, CandidateOutcome::DrainLifted]
+        );
+    }
+
+    /// S5 (thundering herd): the per-tick budget is applied by the batch, so a
+    /// census with fifty eligible sessions closes four and leaves the rest to
+    /// the next tick.
+    #[tokio::test]
+    async fn the_batch_never_exceeds_the_per_tick_budget() {
+        let ids: Vec<String> = (0..12).map(|i| format!("t{i}")).collect();
+        let mut effects = RecordingEffects::new();
+        for id in &ids {
+            effects = effects.eligible(id);
+        }
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let outcomes = close_batch(batch(&refs), &effects).await;
+
+        assert_eq!(outcomes.len(), MAX_CLOSES_PER_TICK);
+        assert_eq!(
+            effects
+                .calls()
+                .iter()
+                .filter(|c| c.starts_with("close:"))
+                .count(),
+            MAX_CLOSES_PER_TICK
         );
     }
 
