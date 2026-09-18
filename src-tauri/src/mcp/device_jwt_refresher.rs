@@ -8777,11 +8777,18 @@ mod tenant_slot_refresh_tests {
     }
 
     /// WIRING, pinned at the source like the re-pair scan above: every
-    /// production `store_tokens(` write in this file (the three legacy mints)
-    /// is paired with a `retire_rejection_streaks_after_legacy_mint(` call, so
-    /// a fourth mint path cannot be added without spending the evidence, and
-    /// deleting a call while keeping the write fails here. Comment lines are
-    /// cut first, so a commented-out call does not count.
+    /// production `store_tokens_expecting(` write in this file (the three
+    /// legacy mints) is paired with a `retire_rejection_streaks_after_legacy_mint(`
+    /// call, so a fourth mint path cannot be added without spending the
+    /// evidence, and deleting a call while keeping the write fails here.
+    /// Comment lines are cut first, so a commented-out call does not count.
+    ///
+    /// Matches `store_tokens_expecting(`, not the bare `store_tokens(`: plan
+    /// `2026-09-17-device-jwt-refresh-drops-the-requested-tenant-and-coord-mints-the-home-tenant`
+    /// D2 routed all three refresher-owned mints through the tenant-guarded
+    /// seam (`AuthManager::store_tokens_expecting`) instead of calling
+    /// `store_tokens` directly — a STRICTER invariant than before, not a
+    /// weaker one, and this scan must track wherever that seam moves to next.
     #[test]
     fn every_legacy_mint_in_this_file_retires_the_stale_rejection_streaks() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -8796,7 +8803,7 @@ mod tenant_slot_refresh_tests {
             .map(|line| line.find("//").map_or(line, |i| &line[..i]))
             .collect::<Vec<_>>()
             .join("\n");
-        let writes = production.matches(".store_tokens(").count();
+        let writes = production.matches(".store_tokens_expecting(").count();
         let retirements = production
             .matches("retire_rejection_streaks_after_legacy_mint(")
             .count()
