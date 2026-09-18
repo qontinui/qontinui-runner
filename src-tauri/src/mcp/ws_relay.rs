@@ -44,7 +44,7 @@ use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
 use super::origin_guard::{NormOrigin, RequesterPrincipal};
-use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState};
+use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R1};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
 
@@ -139,6 +139,13 @@ pub enum WsOutboundError {
 struct ConnectionEntry {
     app_id: String,
     outbound: mpsc::Sender<String>,
+    /// WHO opened this socket. The registry row is the usual holder signal,
+    /// but it can go stale under a LIVE socket (a parked send task never
+    /// reaches its `touch`; an HTTP phone-home flips the row's transport), and
+    /// `register_with_id` displaces the routing slot the moment a claim is
+    /// admitted. So R1 is also asked against this, which cannot go stale
+    /// while the socket is open.
+    principal: Principal,
 }
 
 /// Tracks every active `/ui-bridge/ws` connection.
@@ -190,14 +197,31 @@ impl WsConnectionManager {
         &self,
         app_id: String,
         conn_id: u64,
+        principal: Principal,
         outbound: mpsc::Sender<String>,
     ) -> Option<u64> {
         let mut inner = self.inner.lock().await;
         let displaced = inner.by_app.insert(app_id.clone(), conn_id);
-        inner
-            .by_conn
-            .insert(conn_id, ConnectionEntry { app_id, outbound });
+        inner.by_conn.insert(
+            conn_id,
+            ConnectionEntry {
+                app_id,
+                outbound,
+                principal,
+            },
+        );
         displaced
+    }
+
+    /// The LIVE routing slot for `app_id`: its `conn_id` and the principal
+    /// that opened it. This is the authoritative holder signal for a
+    /// WebSocket registrant — unlike the registry row it cannot age out under
+    /// an open socket.
+    pub async fn holder_for_app(&self, app_id: &str) -> Option<(u64, Principal)> {
+        let inner = self.inner.lock().await;
+        let conn_id = *inner.by_app.get(app_id)?;
+        let entry = inner.by_conn.get(&conn_id)?;
+        Some((conn_id, entry.principal.clone()))
     }
 
     /// Remove a connection by id. Only clears the `by_app` entry if it still
@@ -240,7 +264,16 @@ impl WsConnectionManager {
     pub async fn test_register(&self, app_id: &str) -> (u64, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel(16);
         let conn_id = self.allocate_conn_id();
-        let _displaced = self.register_with_id(app_id.to_string(), conn_id, tx).await;
+        let _displaced = self
+            .register_with_id(
+                app_id.to_string(),
+                conn_id,
+                Principal::OperatorTrust {
+                    class: crate::mcp::origin_guard::OriginClass::NonBrowser,
+                },
+                tx,
+            )
+            .await;
         (conn_id, rx)
     }
 }
@@ -394,6 +427,35 @@ async fn drive_connection(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
     let conn_id = ws_manager.allocate_conn_id();
 
+    // 2a. R1 against the LIVE routing slot, which `register_with_id` is about
+    //     to displace. The registry row alone is not enough: it can go stale
+    //     under an open socket — a send task parked inside `sink.send().await`
+    //     never reaches the `heartbeat.tick()` arm that calls `touch`, and a
+    //     same-origin HTTP phone-home for the same id flips the row to
+    //     `Http`/`websocket_conn_id: None`. Either way the row ages out while
+    //     the socket is alive, and without this check a foreign principal
+    //     could then take the slot out from under it.
+    //
+    //     The registry `claim` below remains the ATOMIC gate (check and write
+    //     under one lock); this is a strictly ADDITIONAL refusal in front of
+    //     it, so it can only narrow what is admitted, never widen it.
+    if mode != BindingMode::Off {
+        if let Some((holder_conn, holder_principal)) =
+            ws_manager.holder_for_app(&register.app_id).await
+        {
+            if holder_conn != conn_id && !principal.may_displace(&holder_principal) {
+                if let Err(refusal) = binding.meter(
+                    mode,
+                    &principal,
+                    WS_ROUTE,
+                    Refusal::registration_held(RULE_R1),
+                ) {
+                    return refuse_handshake(sink, &register.app_id, refusal).await;
+                }
+            }
+        }
+    }
+
     // 3. Mirror into the app registry so discovery / list endpoints see it.
     let discovered = DiscoveredApp {
         app_id: register.app_id.clone(),
@@ -429,7 +491,12 @@ async fn drive_connection(
     }
 
     let displaced = ws_manager
-        .register_with_id(register.app_id.clone(), conn_id, outbound_tx)
+        .register_with_id(
+            register.app_id.clone(),
+            conn_id,
+            principal.clone(),
+            outbound_tx,
+        )
         .await;
 
     if let Some(prev) = displaced {
@@ -721,8 +788,8 @@ async fn handle_inbound_text(
         }) => {
             let outcome = relay
                 .resolve(
-                    (mode != BindingMode::Off).then_some(conn_id),
-                    mode == BindingMode::Enforce,
+                    conn_id,
+                    mode,
                     CommandResponse {
                         command_id: command_id.clone(),
                         success: success.unwrap_or_else(|| error.is_none()),

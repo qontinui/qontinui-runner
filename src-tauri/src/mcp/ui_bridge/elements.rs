@@ -5370,8 +5370,8 @@ mod ws_dispatch_selection_tests {
         // Resolve as the wrapper would.
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 CommandResponse {
                     command_id,
                     success: true,
@@ -5432,8 +5432,8 @@ mod ws_dispatch_selection_tests {
         let command_id = v["commandId"].as_str().unwrap().to_string();
         relay
             .resolve(
-                Some(conn_id),
-                true,
+                conn_id,
+                crate::mcp::relay_binding::BindingMode::Enforce,
                 CommandResponse {
                     command_id,
                     success: true,
@@ -5584,8 +5584,8 @@ mod ws_dispatch_selection_tests {
             async move {
                 relay_h
                     .resolve(
-                        Some(conn),
-                        true,
+                        conn,
+                        crate::mcp::relay_binding::BindingMode::Enforce,
                         CommandResponse {
                             command_id: cmd,
                             success: true,

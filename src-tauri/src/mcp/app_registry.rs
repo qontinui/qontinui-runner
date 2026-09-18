@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 use super::app_discovery::DiscoveredApp;
 use super::relay_binding::{
     app_tombstone_key, BindingMode, Principal, Refusal, RelayBinding, RULE_R1, RULE_R2, RULE_R5,
+    RULE_R5_KEEP_ALIVE,
 };
 
 /// Entries older than this (in ms) are considered stale and evicted.
@@ -89,6 +90,14 @@ impl RegisteredApp {
     }
 }
 
+/// What [`AppRegistry::claim`] actually wrote. Today only the EFFECTIVE
+/// `keep_alive_ms`, which R5 may have capped below what the registrant asked
+/// for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Claimed {
+    pub keep_alive_ms: Option<i64>,
+}
+
 pub struct AppRegistry {
     inner: RwLock<HashMap<String, RegisteredApp>>,
 }
@@ -112,6 +121,10 @@ impl AppRegistry {
     /// The `transport` + `websocket_conn_id` pair must be consistent:
     /// `Websocket` requires `Some(conn_id)`, `Http` requires `None`. The
     /// caller (register handler / WS relay) is responsible for that invariant.
+    ///
+    /// Returns what was actually written, so the caller can tell the
+    /// registrant its EFFECTIVE `keep_alive_ms` rather than letting a browser
+    /// that asked for an hour discover in 30 s that its entry is gone.
     #[allow(clippy::too_many_arguments)]
     pub async fn claim(
         &self,
@@ -123,7 +136,7 @@ impl AppRegistry {
         transport: AppTransport,
         websocket_conn_id: Option<u64>,
         keep_alive_ms: Option<i64>,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Claimed, Refusal> {
         let mode = binding.config.binding;
         let now = chrono::Utc::now().timestamp_millis();
         let key = app_tombstone_key(&app.app_id);
@@ -159,10 +172,28 @@ impl AppRegistry {
                 }
             }
             // R5's second arm: a browser principal may not park an entry past
-            // the heartbeat window. Applied only under `enforce` — in `shadow`
-            // no rule may change behaviour.
-            if mode == BindingMode::Enforce && !principal.is_operator_trust() {
-                keep_alive_ms = keep_alive_ms.map(|ms| ms.min(REGISTRATION_TTL_MS));
+            // the heartbeat window. COUNTED in both modes so Phase 4 can see
+            // whether it would bite; APPLIED only under `enforce`, because in
+            // `shadow` no rule may change behaviour.
+            if !principal.is_operator_trust() {
+                if let Some(asked) = keep_alive_ms {
+                    if asked > REGISTRATION_TTL_MS {
+                        binding
+                            .counters
+                            .record(RULE_R5_KEEP_ALIVE, mode == BindingMode::Enforce);
+                        if mode == BindingMode::Enforce {
+                            tracing::warn!(
+                                class = principal.class_str(),
+                                app_id = %app.app_id,
+                                asked_ms = asked,
+                                capped_ms = REGISTRATION_TTL_MS,
+                                route = route,
+                                "ui-bridge binding (R5): capped a browser principal's keepAliveSecs to the registration TTL; the effective value is echoed as keepAliveMs"
+                            );
+                            keep_alive_ms = Some(REGISTRATION_TTL_MS);
+                        }
+                    }
+                }
             }
         }
 
@@ -179,7 +210,7 @@ impl AppRegistry {
                 keep_alive_ms,
             },
         );
-        Ok(())
+        Ok(Claimed { keep_alive_ms })
     }
 
     /// Release `app_id` (R2).
@@ -235,14 +266,24 @@ impl AppRegistry {
     /// must not keep the holder's registration alive. `None` skips that check
     /// — the kill-switch-`off` path.
     ///
+    /// The guard applies ONLY to a `Websocket` entry. For an `Http` entry
+    /// there is no conn to compare against, so holding the guard against it
+    /// would make every `touch` return `false` and let the row age out under
+    /// a live socket — which is reachable whenever a same-origin phone-home
+    /// re-registers an id a WebSocket holds (`websocket_conn_id` becomes
+    /// `None`). R1 already guarantees only the holder principal or operator
+    /// trust could have taken that id.
+    ///
     /// Returns `true` if an entry was refreshed.
     pub async fn touch(&self, app_id: &str, conn_guard: Option<u64>) -> bool {
         let now = chrono::Utc::now().timestamp_millis();
         let mut w = self.inner.write().await;
         if let Some(entry) = w.get_mut(app_id) {
-            if let Some(conn_id) = conn_guard {
-                if entry.websocket_conn_id != Some(conn_id) {
-                    return false;
+            if entry.transport == AppTransport::Websocket {
+                if let Some(conn_id) = conn_guard {
+                    if entry.websocket_conn_id != Some(conn_id) {
+                        return false;
+                    }
                 }
             }
             entry.last_seen_ms = now;
@@ -274,11 +315,32 @@ impl AppRegistry {
     /// Evict entries older than each entry's TTL (per-entry `keep_alive_ms`
     /// if set, else `REGISTRATION_TTL_MS`). Returns the number of evicted
     /// entries.
-    pub async fn sweep(&self) -> usize {
+    ///
+    /// EXPIRY IS A WAY A REGISTRATION ENDS, so every eviction tombstones its
+    /// holder exactly as [`Self::release`] does (R5). Without this, R1 turns
+    /// a missed heartbeat into a PERMANENT lockout: `beforeunload` does not
+    /// run on a tab crash, an OOM kill, a sleep, or when Chrome throttles a
+    /// backgrounded tab's 10 s phone-home past the 30 s TTL — the row is
+    /// swept, an attacker polling `/ui-bridge/apps/registered` claims the id
+    /// and renews it every 10 s, and the returning tab is refused forever,
+    /// where on main it would simply have re-taken its slot. That is the
+    /// "one more way to be locked out" cost the plan's own ranking used to
+    /// REJECT option A, so this phase must not introduce it.
+    ///
+    /// `binding.tombstone` already no-ops for operator trust, so an agent's
+    /// expired synthetic entry frees its id immediately.
+    pub async fn sweep(&self, binding: &RelayBinding) -> usize {
         let now = chrono::Utc::now().timestamp_millis();
+        let tombstone = binding.config.binding != BindingMode::Off;
         let mut w = self.inner.write().await;
         let before = w.len();
-        w.retain(|_, e| now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS));
+        w.retain(|app_id, e| {
+            let live = now - e.last_seen_ms <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS);
+            if !live && tombstone {
+                binding.tombstone(app_tombstone_key(app_id), &e.principal);
+            }
+            live
+        });
         before - w.len()
     }
 
@@ -328,6 +390,18 @@ impl AppRegistry {
             .expect("an operator-trust release is always admitted")
     }
 
+    /// Test-only: drop a row WITHOUT tombstoning it, so a test can isolate a
+    /// rule that must hold on the LIVE routing slot alone. Ageing a row cannot
+    /// do this deterministically: a WebSocket holder's client auto-pongs the
+    /// 20 s ping, and every inbound frame refreshes `last_seen_ms`, so a test
+    /// that ages the row races that refresh and ends up exercising plain R1
+    /// against a still-live row instead.
+    #[cfg(test)]
+    pub async fn test_drop_row(&self, app_id: &str) -> bool {
+        let mut w = self.inner.write().await;
+        w.remove(app_id).is_some()
+    }
+
     /// Test-only helper that subtracts `delta_ms` from an entry's
     /// `last_seen_ms` to simulate the passage of time. Returns `true` if the
     /// entry exists. Used by integration tests in sibling modules
@@ -354,7 +428,7 @@ pub fn spawn_sweeper(registry: Arc<AppRegistry>, binding: Arc<RelayBinding>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            let evicted = registry.sweep().await;
+            let evicted = registry.sweep(&binding).await;
             if evicted > 0 {
                 tracing::debug!("[app-registry] evicted {} stale app(s)", evicted);
             }
@@ -373,6 +447,12 @@ pub fn spawn_sweeper(registry: Arc<AppRegistry>, binding: Arc<RelayBinding>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A default binding for the registry's own fixtures. The binding RULES
+    /// are exercised in `relay_binding/tests.rs`, over a real socket.
+    fn binding() -> Arc<RelayBinding> {
+        RelayBinding::new(crate::mcp::relay_binding::BindingConfig::default())
+    }
+
     fn sample_app(app_id: &str) -> DiscoveredApp {
         DiscoveredApp {
             app_id: app_id.to_string(),
@@ -543,7 +623,7 @@ mod tests {
         assert_eq!(live[0].keep_alive_ms, Some(300_000));
 
         // Sweep must NOT evict the entry either.
-        let evicted = reg.sweep().await;
+        let evicted = reg.sweep(&binding()).await;
         assert_eq!(evicted, 0, "sweep must respect per-entry keep_alive_ms");
         assert!(reg.get("long-lived").await.is_some());
     }
@@ -571,7 +651,7 @@ mod tests {
             reg.list_live().await.is_empty(),
             "entry past its own keep_alive_ms must be filtered"
         );
-        let evicted = reg.sweep().await;
+        let evicted = reg.sweep(&binding()).await;
         assert_eq!(evicted, 1, "sweep must evict per-entry-stale entries");
     }
 

@@ -17664,4 +17664,38 @@ mod ui_bridge_binding_health_tests {
             "`/health` must still be served by `health`"
         );
     }
+
+    /// The wiring assertion above proves the LINE is present. It does not
+    /// prove `state.relay_binding` is the SAME instance the relays mutate — a
+    /// refactor that constructed a second `RelayBinding` would leave both
+    /// tests green while `/health` reported zeros forever, which is exactly
+    /// the surface Phase 4 graduates R6, R8 and R9-unkeyed from.
+    ///
+    /// `ApiState` owns a `tauri::AppHandle` no test can build, so this is
+    /// pinned where it is decided: production constructs the binding EXACTLY
+    /// once, and `RelayState`'s `FromRef` only ever clones that `Arc`.
+    #[test]
+    fn production_constructs_exactly_one_relay_binding() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        // Strip the test modules: their fixtures legitimately build their own.
+        let production = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the file has a non-test prefix");
+        let built = production.matches("RelayBinding::new(").count();
+        assert_eq!(
+            built, 1,
+            "production must construct ONE RelayBinding (found {built}); every \
+             reader — the relays through RelayState's FromRef, and /health — \
+             has to share that one Arc, or the counters an operator reads are \
+             not the counters the rules increment"
+        );
+        assert!(
+            production.contains("relay_binding: crate::mcp::relay_binding::RelayBinding::new("),
+            "the one instance must be the field on ApiState"
+        );
+    }
 }
