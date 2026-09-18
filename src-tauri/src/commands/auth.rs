@@ -2070,11 +2070,29 @@ mod device_token_door_tests {
         )
     }
 
+    /// Never the real OS keychain: `AuthManager::new()` keys it on the fixed
+    /// real `SERVICE_NAME`, and `store_tokens` writes that entry unless
+    /// `QONTINUI_DISABLE_KEYCHAIN` is set — so on a paired Windows box these
+    /// tests would overwrite the runner's own keychain backup, the documented
+    /// recovery when the `.enc` store will not decrypt. On Linux the keyring
+    /// call fails and is swallowed as `debug!`, which is why it stays invisible
+    /// until Windows. `isolated_ambient` captures the key but sets neither it
+    /// nor a removal, so the guard belongs here; it is safe inside the fixture,
+    /// which holds `env_lock` and has already captured the key for restore.
+    ///
+    /// Every `AuthManager` in this module comes from here, so the ordering
+    /// (guard BEFORE the first `store_tokens`) is enforced rather than
+    /// remembered.
+    fn hermetic_auth_manager() -> AuthManager {
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        AuthManager::new()
+    }
+
     /// A runner paired for A (the default binding, in the legacy slot and — by
     /// the mirror — its own slot) and for B.
     fn two_slot_runner() -> (AuthManager, uuid::Uuid, uuid::Uuid) {
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         am.store_tokens(&jwt_for(a), "").unwrap();
         am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
         assert_eq!(am.try_list_tenant_device_jwt_tenants().unwrap().len(), 2);
@@ -2161,7 +2179,7 @@ mod device_token_door_tests {
     #[test]
     fn a_single_slot_runner_is_unchanged() {
         let _amb = crate::test_env::isolated_ambient();
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         assert_eq!(
             coord_device_token_for(&am, None, &held(&am, None), false),
             Ok(None)
@@ -2182,7 +2200,7 @@ mod device_token_door_tests {
     fn a_legacy_only_default_plus_one_slot_is_two_tenants_and_refuses() {
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         am.store_tokens(&jwt_for(a), "").unwrap();
         am.clear_tenant_device_jwt(&a).unwrap(); // the mirror's copy gone: legacy only
         am.store_tenant_device_jwt(&b, &jwt_for(b)).unwrap();
@@ -2211,7 +2229,7 @@ mod device_token_door_tests {
     fn a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant() {
         let _amb = crate::test_env::isolated_ambient();
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         // The legacy slot holds B's token while the binding file says A.
         am.store_tokens(&jwt_for(b), "").unwrap();
         am.clear_tenant_device_jwt(&b).unwrap();
@@ -2294,14 +2312,8 @@ mod device_token_door_tests {
     #[test]
     fn a_claim_mismatch_on_an_unreadable_store_is_the_unreadable_error() {
         let _amb = crate::test_env::isolated_ambient();
-        // AuthManager::new() keys the OS keychain on the fixed real
-        // SERVICE_NAME and store_tokens writes it unless this is set, so on a
-        // paired Windows box these tests would overwrite the runner's own
-        // keychain backup. isolated_ambient captures the key but does not set
-        // it. Safe here: the fixture holds env_lock and captured it already.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let (a, b) = (tenant(0xA1), tenant(0xB2));
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         am.store_tokens(&jwt_for(b), "").unwrap();
         am.clear_tenant_device_jwt(&b).unwrap();
         let held = crate::auth::HeldDeviceTenants {
@@ -2321,10 +2333,8 @@ mod device_token_door_tests {
     #[test]
     fn a_claimless_token_is_not_handed_out_beside_an_unreadable_slot_store() {
         let _amb = crate::test_env::isolated_ambient();
-        // See the note above: never the real OS keychain from a test.
-        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = tenant(0xA1);
-        let am = AuthManager::new();
+        let am = hermetic_auth_manager();
         let exp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
