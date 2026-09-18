@@ -734,7 +734,8 @@ const PROMPT_MARKER: char = '❯';
 /// placeholder (`Try "fix lint errors"`, `Try "how do I…"`). The opening
 /// quote is part of the prefix on purpose: the installed bundle renders the
 /// hint as the template string `Try "${te[(x>>>8)%te.length]}"` — measured
-/// 2026-09-08 in `@anthropic-ai/claude-code` 2.1.263 (`bin/claude.exe`, the
+/// 2026-09-08 in `@anthropic-ai/claude-code` 2.1.263 and again 2026-09-18 in 2.1.276
+/// (`bin/claude.exe`, the
 /// node v24.19.0 nvm install, `grep -a`), which always emits the quote — so
 /// a bare `Try ` would class an operator's half-typed `Try running the tests`
 /// as empty. This is an OBSERVED RENDERING of the Claude Code TUI, not a
@@ -763,11 +764,13 @@ fn prompt_rest_is_empty(rest: &str) -> bool {
 /// Decide whether a single rendered grid snapshot looks IDLE / ready for input
 /// — the predicate the worker PTYs have always used ([`snapshot_verdict`]
 /// with `require_empty_prompt = false`).
+#[cfg(test)]
 fn snapshot_looks_idle(lines: &[String], cursor_row: u16) -> bool {
     snapshot_verdict(lines, cursor_row, false).is_ok()
 }
 
 /// [`snapshot_verdict`] as a bool, for the typed-terminal arm's tests.
+#[cfg(test)]
 fn snapshot_looks_idle_for(lines: &[String], cursor_row: u16, require_empty_prompt: bool) -> bool {
     snapshot_verdict(lines, cursor_row, require_empty_prompt).is_ok()
 }
