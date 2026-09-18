@@ -101,9 +101,12 @@ mkdir -p "$FAKE_HOME/.qontinui/runner"
 # record (scripts/coord-provision-nonce.sh, #993): a schema-2 record whose .port
 # is the stub's port names the per-port key file. write_stub_breadcrumb runs
 # once each stub has reported its port.
+# The secret is PER PORT, and each stub accepts only its own: a helper that
+# reused one origin's key for the next would be refused rather than silently
+# served (#993's central property; the reviewer's caching mutant).
 write_stub_breadcrumb() {
   local port="$1" key="$FAKE_HOME/.qontinui/runner-loopback-key-$1"
-  printf 'stub-loopback-key\n' > "$key"
+  printf 'stub-loopback-key-%s\n' "$port" > "$key"
   printf '{\n  "schema": 2,\n  "port": %s,\n  "pid": 4242,\n  "started_at_ms": 1789000000000,\n  "primary": false,\n  "loopback_key_path": "%s"\n}\n' \
     "$port" "$key" > "$FAKE_HOME/.qontinui/runner/api-port-$port.json"
 }
@@ -210,7 +213,7 @@ class H(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         if self.path == "/coord-mcp/provision-session":
-            if self.headers.get("X-Qontinui-Loopback-Key") != "stub-loopback-key":
+            if self.headers.get("X-Qontinui-Loopback-Key") != "stub-loopback-key-%d" % self.server.server_address[1]:
                 self._send(403, {"success": False, "code": "COORD_MCP_PROVISION_NO_HANDSHAKE", "error": "no handshake"})
                 return
             nm = mode("nonce_runner", "absent")
