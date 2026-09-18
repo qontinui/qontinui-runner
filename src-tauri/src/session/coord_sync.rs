@@ -594,6 +594,7 @@ fn is_best_effort_kind(kind: &str) -> bool {
     kind == SessionEventKind::HelperTaskCreated.as_str()
         || kind == SessionEventKind::GateRegistration.as_str()
         || kind == SessionEventKind::FindingPosted.as_str()
+        || kind == SessionEventKind::AgentNotification.as_str()
 }
 
 /// How many per-session push chains run at once (plan
@@ -999,6 +1000,14 @@ async fn push_record(inner: &Arc<CoordSyncInner>, rec: &OutboxRecord) -> PushOut
                 .send()
                 .await
         }
+        "agent_notification" => {
+            // Sensitive-action notification (plan
+            // 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work,
+            // Phase 9). POST /coord/agent-notifications with the payload
+            // forwarded verbatim — it IS the body. Its own function because a
+            // 400 naming the `undo` field earns exactly one retry without it.
+            return agent_notification_push(inner, rec, scope, base).await;
+        }
         "commit_report" => {
             // Commit ↔ session lineage push-report (plan
             // 2026-06-07-coord-commit-session-lineage.md, Population path 2).
@@ -1380,6 +1389,130 @@ async fn finding_outcome(rec: &OutboxRecord, resp: reqwest::Response) -> PushOut
         return PushOutcome::Acked;
     }
     let detail = resp.text().await.unwrap_or_default();
+    write_failure_outcome(status, format!("{status}: {detail}"))
+}
+
+/// Push one `agent_notification` row to `POST /coord/agent-notifications`.
+///
+/// ## The `undo` fallback (plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`)
+///
+/// The runner sends `undo` — the prior sha of a force-updated ref — because
+/// that plan's Phase 4 adds it to coord's `AgentNotificationBody`. That coord
+/// change ships in a PARALLEL pull request, and until it deploys coord's body
+/// is `deny_unknown_fields` WITHOUT `undo`: the whole notification is a 400.
+/// A 400 is a permanent failure to the drain, so without a fallback every
+/// force-push notification would be dropped for the entire window between the
+/// two deploys — losing the record of an action that already happened, which
+/// is the failure this plan exists to prevent.
+///
+/// So: on a 400 whose body names an unknown `undo` field, retry ONCE with
+/// `undo` removed. Only that exact refusal earns the retry; any other 400
+/// (unknown action, empty artifact, a field too long) is a body the queue
+/// cannot fix and is dropped as before. Once coord serves `undo`, the first
+/// POST succeeds and the retry never runs, so this arm needs no removal to be
+/// correct — it can be deleted once every coord this runner can talk to
+/// carries the field.
+async fn agent_notification_push(
+    inner: &Arc<CoordSyncInner>,
+    rec: &OutboxRecord,
+    scope: TenantScope,
+    base: &str,
+) -> PushOutcome {
+    let url = format!("{base}/coord/agent-notifications");
+    let post = |body: &JsonValue| {
+        crate::auth::attach_device_auth_for(inner.http.post(&url).json(body), scope).send()
+    };
+
+    let resp = match post(&rec.payload).await {
+        Ok(r) => r,
+        Err(e) => return PushOutcome::Transport(format!("{e}")),
+    };
+    let status = resp.status();
+    if status.is_success() {
+        return agent_notification_acked(rec, resp).await;
+    }
+    let detail = resp.text().await.unwrap_or_default();
+    if status == StatusCode::BAD_REQUEST
+        && rec.payload.get("undo").is_some()
+        && rejects_unknown_undo_field(&detail)
+    {
+        tracing::info!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            "coord_sync: coord predates the notification `undo` field — retrying once without it"
+        );
+        let mut stripped = rec.payload.clone();
+        if let Some(obj) = stripped.as_object_mut() {
+            obj.remove("undo");
+        }
+        let resp = match post(&stripped).await {
+            Ok(r) => r,
+            Err(e) => return PushOutcome::Transport(format!("{e}")),
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return agent_notification_acked(rec, resp).await;
+        }
+        let detail = resp.text().await.unwrap_or_default();
+        return agent_notification_failure(rec, status, detail);
+    }
+    agent_notification_failure(rec, status, detail)
+}
+
+/// Whether a coord 400 body is the deserializer refusing an unknown `undo`
+/// field. Coord answers `{"error":"invalid_body","detail":"… unknown field
+/// `undo`, expected one of …"}`; the check reads `detail` when the body is
+/// JSON and the raw text otherwise.
+fn rejects_unknown_undo_field(body: &str) -> bool {
+    let detail = serde_json::from_str::<JsonValue>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("detail")
+                .and_then(JsonValue::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    detail.contains("unknown field `undo`")
+}
+
+/// A 2xx from the notifications door. Logs the line coord will show the
+/// operator (`summary`), so the runner log carries what was actually said.
+async fn agent_notification_acked(rec: &OutboxRecord, resp: reqwest::Response) -> PushOutcome {
+    let summary = resp.json::<JsonValue>().await.ok().and_then(|b| {
+        b.get("summary")
+            .and_then(JsonValue::as_str)
+            .map(str::to_string)
+    });
+    tracing::info!(
+        session = %rec.session_id,
+        seq = rec.seq,
+        summary = summary.as_deref().unwrap_or("<no summary in response>"),
+        "coord_sync: agent notification recorded"
+    );
+    PushOutcome::Acked
+}
+
+/// A refused notification. A 429 is coord's per-tenant fatigue bound: the
+/// window reopens, so it is retried within the best-effort budget rather than
+/// dropped on first sight like other 4xx. Everything else follows the shared
+/// classifier (4xx permanent, 5xx transient).
+fn agent_notification_failure(
+    rec: &OutboxRecord,
+    status: StatusCode,
+    detail: String,
+) -> PushOutcome {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return PushOutcome::Transport(format!("{status}: {detail}"));
+    }
+    if status.is_client_error() {
+        tracing::warn!(
+            session = %rec.session_id,
+            seq = rec.seq,
+            status = %status,
+            detail = %detail,
+            "coord_sync: coord refused an agent notification — the action it reports already              happened, so this line is its only remaining trace"
+        );
+    }
     write_failure_outcome(status, format!("{status}: {detail}"))
 }
 
@@ -2047,6 +2180,7 @@ mod tests {
             SessionEventKind::FindingPosted,
             SessionEventKind::Finished,
             SessionEventKind::CoordTransportRung,
+            SessionEventKind::AgentNotification,
         ] {
             let arm = format!("\"{}\" =>", kind.as_str());
             assert!(
@@ -2177,6 +2311,14 @@ mod tests {
         /// degradation: 200 with `{"posted": false}` (the `coord_findings`
         /// migration is not applied).
         findings_degraded: bool,
+        /// Bodies accepted by `POST /coord/agent-notifications`.
+        notifications: Vec<JsonValue>,
+        /// Every `POST /coord/agent-notifications` attempt, accepted or not.
+        notification_attempts: usize,
+        /// When true, `POST /coord/agent-notifications` refuses a body carrying
+        /// `undo` exactly as a coord predating the field does: 400
+        /// `invalid_body` naming the unknown field.
+        notifications_reject_undo: bool,
         /// When true, the next POST returns 409 + a synthetic row.
         next_post_conflict: bool,
         /// When >0, the next N POSTs return 500.
@@ -2364,6 +2506,49 @@ mod tests {
                         }
                         g.findings.push(body.clone());
                         (AxumStatus::CREATED, Json(json!({"posted": true}))).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/coord/agent-notifications",
+                post(
+                    |AxumState(state): AxumState<Arc<TokMutex<CoordRecorder>>>,
+                     Json(body): Json<JsonValue>| async move {
+                        let mut g = state.lock().await;
+                        g.notification_attempts += 1;
+                        if g.notifications_reject_undo && body.get("undo").is_some() {
+                            // Byte-shape of coord's own deserializer refusal
+                            // (`notifications::post_agent_notification`).
+                            return (
+                                AxumStatus::BAD_REQUEST,
+                                Json(json!({
+                                    "error": "invalid_body",
+                                    "detail": "Failed to deserialize the JSON body into the \
+                                               target type: unknown field `undo`, expected one \
+                                               of `action`, `artifact`, `reversible`, `checks`, \
+                                               `repo`, `pr_number`, `actor`",
+                                    "message": "`kind` is not a parameter of this door",
+                                })),
+                            )
+                                .into_response();
+                        }
+                        if body.get("action").and_then(JsonValue::as_str) == Some("bogus") {
+                            return (
+                                AxumStatus::BAD_REQUEST,
+                                Json(json!({"error": "unknown_action"})),
+                            )
+                                .into_response();
+                        }
+                        g.notifications.push(body.clone());
+                        (
+                            AxumStatus::OK,
+                            Json(json!({
+                                "notification_id": "22222222-2222-2222-2222-222222222222",
+                                "kind": "agent_took_sensitive_action",
+                                "summary": "agent force-pushed feat/x",
+                            })),
+                        )
+                            .into_response()
                     },
                 ),
             )
@@ -3775,6 +3960,130 @@ mod tests {
             outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
         })
         .await;
+    }
+
+    // ── agent_notification (plan
+    // 2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work,
+    // Phase 9) ──────────────────────────────────────────────────────────────
+
+    fn force_push_notification() -> JsonValue {
+        json!({
+            "action": "force_push",
+            "artifact": "feat/x",
+            "reversible": "restore",
+            "repo": "qontinui/qontinui-runner",
+            "undo": "1a2b3c4",
+        })
+    }
+
+    /// Record one `agent_notification` row, drain it against the fake coord,
+    /// and wait until the outbox is empty (acked or dropped).
+    async fn drain_one_notification(
+        payload: JsonValue,
+        reject_undo: bool,
+    ) -> Arc<TokMutex<CoordRecorder>> {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = build_outbox(dir.path());
+        let (base, rec) = spawn_fake_coord().await;
+        rec.lock().await.notifications_reject_undo = reject_undo;
+        let coord = CoordSync::new_for_test(
+            outbox.clone(),
+            base,
+            Duration::from_millis(50),
+            Duration::from_secs(10),
+        );
+        let _registry = build_registry(coord.clone());
+        outbox
+            .record(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                SessionEventKind::AgentNotification,
+                payload,
+            )
+            .unwrap();
+        let _drain = coord.start_drain_task();
+        wait_until(Duration::from_secs(5), || {
+            outbox.pending().map(|p| p.is_empty()).unwrap_or(false)
+        })
+        .await;
+        rec
+    }
+
+    /// The row drains to `POST /coord/agent-notifications` with the payload
+    /// forwarded VERBATIM — `undo` included — against a coord that serves it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_pushes_agent_notification_verbatim() {
+        let payload = force_push_notification();
+        let rec = drain_one_notification(payload.clone(), false).await;
+        let g = rec.lock().await;
+        assert_eq!(g.notification_attempts, 1, "one POST, no retry");
+        assert_eq!(g.notifications, vec![payload], "body forwarded verbatim");
+    }
+
+    /// A coord predating the `undo` field 400s on it; the drain retries ONCE
+    /// without `undo`, so the notification still lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_retries_agent_notification_without_undo_on_an_old_coord() {
+        let payload = force_push_notification();
+        let rec = drain_one_notification(payload.clone(), true).await;
+        let g = rec.lock().await;
+        assert_eq!(g.notification_attempts, 2, "the refusal, then one retry");
+        let mut expected = payload;
+        expected.as_object_mut().unwrap().remove("undo");
+        assert_eq!(
+            g.notifications,
+            vec![expected],
+            "the retry carries every field but `undo`"
+        );
+    }
+
+    /// Any OTHER 400 is a body the queue cannot fix: no retry, and the row is
+    /// dropped rather than wedging the lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_does_not_retry_an_agent_notification_refused_for_another_reason() {
+        let mut payload = force_push_notification();
+        payload["action"] = json!("bogus");
+        let rec = drain_one_notification(payload, false).await;
+        let g = rec.lock().await;
+        assert!(g.notifications.is_empty(), "nothing stored");
+        assert_eq!(
+            g.notification_attempts, 1,
+            "a non-undo 400 is never retried"
+        );
+    }
+
+    /// The undo retry happens at most ONCE per push: a retried body refused
+    /// for another reason is dropped, not retried again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_undo_retry_fires_once_then_the_row_drops() {
+        let mut payload = force_push_notification();
+        payload["action"] = json!("bogus");
+        let rec = drain_one_notification(payload, true).await;
+        let g = rec.lock().await;
+        assert!(g.notifications.is_empty(), "nothing stored");
+        assert_eq!(
+            g.notification_attempts, 2,
+            "the undo refusal, one retry without undo, then the drop"
+        );
+    }
+
+    #[test]
+    fn unknown_undo_refusal_is_recognised_only_for_undo() {
+        assert!(rejects_unknown_undo_field(
+            r#"{"error":"invalid_body","detail":"Failed to deserialize the JSON body into the target type: unknown field `undo`, expected one of `action`"}"#
+        ));
+        assert!(rejects_unknown_undo_field(
+            "Failed to deserialize: unknown field `undo`, expected one of"
+        ));
+        assert!(!rejects_unknown_undo_field(
+            r#"{"error":"invalid_body","detail":"unknown field `kind`, expected one of `action`"}"#
+        ));
+        assert!(!rejects_unknown_undo_field(r#"{"error":"unknown_action"}"#));
+        // A newer coord's accepted-fields MESSAGE may name `undo` without it
+        // being the refusal — only `detail`'s unknown-field text counts.
+        assert!(!rejects_unknown_undo_field(
+            r#"{"error":"invalid_body","detail":"missing field `artifact`","message":"accepted: action, artifact, unknown field `undo`"}"#
+        ));
     }
 
     /// A `finding_posted` row drains to `POST /coord/agent-findings` with the

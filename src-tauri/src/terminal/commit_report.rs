@@ -33,13 +33,22 @@
 //! but we still suppress no-op work: a process-global cache remembers the last
 //! HEAD SHA reported per `(repo, branch)`. A subsequent push that hasn't moved
 //! HEAD enqueues nothing.
+//!
+//! ## Sensitive agent actions (Phase 9)
+//!
+//! The same tail also classifies the Bash commands that act OUTSIDE coord —
+//! force-pushes, ref deletions, `gh release create|delete`, `npm publish`,
+//! `cargo publish` — and, once their `tool_result` shows they succeeded,
+//! notifies coord (`POST /coord/agent-notifications`). See the "Sensitive
+//! agent actions" section below (plan
+//! `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use once_cell::sync::Lazy;
 use tracing::{debug, warn};
@@ -549,6 +558,1317 @@ pub fn dispatch_stats() -> (u64, u64) {
     (PUSH_DISPATCHER.accepted(), PUSH_DISPATCHER.dropped())
 }
 
+// ── Sensitive agent actions (Phase 9) ─────────────────────────────────────────
+//
+// Plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`
+// Phase 9 — "actions agents take outside coord still notify".
+//
+// Coord emits `agent_took_sensitive_action` for the sensitive steps that pass
+// THROUGH it (its own force-pushes, force-merges, dial loosenings…). An agent
+// that runs `git push --force`, `git push --delete`, `gh release create`,
+// `npm publish` or `cargo publish` in its own shell goes straight to GitHub or
+// a registry, and coord never sees it. This section is the runner's half of
+// the notify-after-action contract for exactly those commands:
+//
+// 1. **Classify** the Bash `tool_use` command ([`classify_sensitive_command`]),
+//    with the same first-word-of-a-segment rule [`command_is_git_push`] uses,
+//    so `echo "git push --force"` is text, not a push.
+// 2. **Hold** the classification in a bounded pending map keyed on the
+//    `tool_use_id` ([`SensitiveActionTracker`]). The transcript parser is
+//    stateless per record and the `tool_result` arrives in a LATER `user`
+//    record, so something has to remember the command in between. The map is
+//    owned by the transcript watcher's per-session tail loop, capped at
+//    [`PENDING_ACTION_CAPACITY`] entries and expires entries after
+//    [`PENDING_ACTION_TTL`].
+// 3. **Emit only on success**: when the paired `tool_result` is not
+//    `is_error` (and its output shows no failure marker), the action HAPPENED
+//    and the notification records a fact rather than an attempt.
+// 4. **POST** through the same session outbox → `CoordSync` drain → device-JWT
+//    path the commit report uses, to `POST /coord/agent-notifications` (the
+//    HTTP twin of `coord_notify_sensitive_action`). The drain arm lives in
+//    `session::coord_sync` (`agent_notification`).
+
+/// Default-ON env gate for the sensitive-action notifier, same shape as
+/// [`report_enabled`]. Any of `0` / `false` / `off` (case-insensitive) in
+/// `QONTINUI_AGENT_ACTION_NOTIFY` disables it; anything else leaves it ON.
+pub fn action_notify_enabled() -> bool {
+    match std::env::var("QONTINUI_AGENT_ACTION_NOTIFY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// At most this many unresolved sensitive `tool_use`s are remembered per
+/// transcript. A session has at most a handful in flight; 256 only binds for a
+/// transcript whose results never arrive (a killed CLI), and then the oldest
+/// entry is evicted rather than the map growing.
+pub const PENDING_ACTION_CAPACITY: usize = 256;
+
+/// A pending `tool_use` whose `tool_result` has not arrived after this long is
+/// dropped: the command was interrupted, the session died, or the result line
+/// was never written. Ten minutes comfortably covers a slow `cargo publish`
+/// (which verifies by building) without holding a dead entry forever.
+pub const PENDING_ACTION_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How many emitted `tool_use_id`s a tracker remembers, so a transcript that is
+/// truncated and re-read from offset 0 does not notify the same action twice.
+const EMITTED_MEMORY: usize = 1024;
+
+/// Longest `artifact` / `undo` string sent. Coord caps posted fields at 2000
+/// chars; the runner stays well under so a pathological ref name cannot turn
+/// the notification into a 400 (which would LOSE it).
+const MAX_NOTIFICATION_FIELD_CHARS: usize = 500;
+
+/// Coord's `detail.action` discriminator, restricted to the three verbs a
+/// shell command can be classified as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SensitiveAction {
+    /// A ref was force-updated, discarding commits reachable before.
+    ForcePush,
+    /// A remote ref (or a GitHub release) was deleted.
+    Delete,
+    /// An artifact was published outward — a GitHub release, an npm version,
+    /// a crate version.
+    Publish,
+}
+
+impl SensitiveAction {
+    /// Coord's wire string (`AgentAction::as_str`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SensitiveAction::ForcePush => "force_push",
+            SensitiveAction::Delete => "delete",
+            SensitiveAction::Publish => "publish",
+        }
+    }
+}
+
+/// Coord's `detail.reversible` wire strings (`Reversibility::as_str`).
+pub mod reversibility {
+    /// Cannot be undone — the prior state is gone.
+    pub const NO: &str = "no";
+    /// Undone by moving forward (re-create, re-publish).
+    pub const ROLL_FORWARD: &str = "roll-forward";
+    /// Undone by restoring the prior state from something that still holds it.
+    pub const RESTORE: &str = "restore";
+}
+
+/// `git push` with a force and/or delete component, parsed from the command.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitPushIntent {
+    /// First positional argument — a remote name or a URL. `None` means
+    /// git's default remote.
+    pub remote: Option<String>,
+    /// `Some(refs)` when the push force-updates: the DESTINATION refs named by
+    /// `+refspec`s or covered by a `--force`/`-f`/`--force-with-lease` flag.
+    /// `Some(vec![])` means "forced, refs unnamed" (the current branch under
+    /// `push.default`).
+    pub force: Option<Vec<String>>,
+    /// `Some(refs)` when the push deletes: `--delete`/`-d` refs, or `:ref`
+    /// refspecs. `Some(vec![])` means "deletes, refs unnamed".
+    pub delete: Option<Vec<String>>,
+}
+
+/// One classified sensitive command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SensitiveCommand {
+    /// `git push` that force-updates and/or deletes a ref.
+    GitPush(GitPushIntent),
+    /// `gh release create` (non-draft) or `gh release delete`.
+    GhRelease {
+        /// `true` for `delete`, `false` for `create`.
+        delete: bool,
+        /// The release tag (first positional), when given.
+        tag: Option<String>,
+        /// `-R/--repo owner/repo`, when given.
+        repo: Option<String>,
+        /// `gh release delete --cleanup-tag` also deletes the git tag.
+        cleanup_tag: bool,
+    },
+    /// `npm publish` (not `--dry-run`).
+    NpmPublish {
+        /// Positional `<folder|tarball>`, when given.
+        spec: Option<String>,
+    },
+    /// `cargo publish` (not `--dry-run`).
+    CargoPublish {
+        /// `-p/--package`, when given.
+        package: Option<String>,
+    },
+}
+
+// ── Shell tokenizing ─────────────────────────────────────────────────────────
+
+/// Split a shell command into segments of words — the quote-aware form of the
+/// split [`command_is_git_push`] does.
+///
+/// The RULE is the same one that detector applies: a command is only what
+/// starts a segment (`;`, `&`, `&&`, `|`, `||`, newline, `(`, `)`), so
+/// `echo git push --force` is an `echo`. The difference is that quoting is
+/// honoured — a separator inside quotes does not start a segment and quotes
+/// are stripped from words — because the commands this classifier looks for
+/// are routinely written inside commit messages, PR bodies and `echo`s, where
+/// the unquoted split would find a `git push --force` that never ran. For the
+/// same reason heredoc bodies are skipped, and `#` comments are dropped.
+/// Redirections stay attached to their word (`2>&1` is one word, not a
+/// segment break).
+pub(crate) fn shell_segments(command: &str) -> Vec<Vec<String>> {
+    struct Lexer {
+        segments: Vec<Vec<String>>,
+        words: Vec<String>,
+        cur: String,
+        in_word: bool,
+    }
+    impl Lexer {
+        fn end_word(&mut self) {
+            if self.in_word {
+                self.words.push(std::mem::take(&mut self.cur));
+                self.in_word = false;
+            }
+        }
+        fn end_segment(&mut self) {
+            self.end_word();
+            if !self.words.is_empty() {
+                self.segments.push(std::mem::take(&mut self.words));
+            }
+        }
+    }
+
+    let chars: Vec<char> = command.chars().collect();
+    let n = chars.len();
+    let mut lx = Lexer {
+        segments: Vec::new(),
+        words: Vec::new(),
+        cur: String::new(),
+        in_word: false,
+    };
+    // Heredoc delimiters opened on the current line: (delimiter, strip_tabs).
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let c = chars[i];
+        match c {
+            '\'' => {
+                lx.in_word = true;
+                i += 1;
+                while i < n && chars[i] != '\'' {
+                    lx.cur.push(chars[i]);
+                    i += 1;
+                }
+                i += 1; // closing quote (or end)
+            }
+            '"' => {
+                lx.in_word = true;
+                i += 1;
+                while i < n && chars[i] != '"' {
+                    if chars[i] == '\\'
+                        && i + 1 < n
+                        && matches!(chars[i + 1], '"' | '\\' | '$' | '`')
+                    {
+                        lx.cur.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                    lx.cur.push(chars[i]);
+                    i += 1;
+                }
+                i += 1;
+            }
+            '\\' => {
+                if i + 1 < n {
+                    if chars[i + 1] != '\n' {
+                        lx.cur.push(chars[i + 1]);
+                        lx.in_word = true;
+                    }
+                    i += 2; // backslash-newline is a line continuation
+                } else {
+                    i += 1;
+                }
+            }
+            ' ' | '\t' | '\r' => {
+                lx.end_word();
+                i += 1;
+            }
+            '\n' => {
+                lx.end_segment();
+                i += 1;
+                // Skip the bodies of any heredocs opened on the line just ended.
+                for (delim, strip_tabs) in std::mem::take(&mut heredocs) {
+                    loop {
+                        if i >= n {
+                            break;
+                        }
+                        let start = i;
+                        while i < n && chars[i] != '\n' {
+                            i += 1;
+                        }
+                        let line: String = chars[start..i].iter().collect();
+                        i += 1; // the newline
+                        let line = line.trim_end_matches('\r');
+                        let line = if strip_tabs {
+                            line.trim_start_matches('\t')
+                        } else {
+                            line
+                        };
+                        if line == delim {
+                            break;
+                        }
+                    }
+                }
+            }
+            ';' | '|' | '(' | ')' => {
+                lx.end_segment();
+                i += 1;
+            }
+            '&' => {
+                let redirect_target =
+                    lx.in_word && (lx.cur.ends_with('>') || lx.cur.ends_with('<'));
+                let redirect_both = i + 1 < n && chars[i + 1] == '>';
+                if redirect_target || redirect_both {
+                    // `2>&1` / `&>file` — part of a redirection word.
+                    lx.cur.push('&');
+                    lx.in_word = true;
+                } else {
+                    lx.end_segment();
+                }
+                i += 1;
+            }
+            '#' if !lx.in_word => {
+                while i < n && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '<' if i + 1 < n && chars[i + 1] == '<' && !(i + 2 < n && chars[i + 2] == '<') => {
+                // Heredoc operator `<<DELIM` / `<<-DELIM` / `<<'DELIM'`.
+                lx.end_word();
+                i += 2;
+                let mut strip_tabs = false;
+                if i < n && chars[i] == '-' {
+                    strip_tabs = true;
+                    i += 1;
+                }
+                while i < n && (chars[i] == ' ' || chars[i] == '\t') {
+                    i += 1;
+                }
+                let mut delim = String::new();
+                while i < n && !matches!(chars[i], ' ' | '\t' | '\n' | ';' | '&' | '|' | ')') {
+                    if !matches!(chars[i], '\'' | '"') {
+                        delim.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                if !delim.is_empty() {
+                    heredocs.push((delim, strip_tabs));
+                }
+            }
+            _ => {
+                lx.cur.push(c);
+                lx.in_word = true;
+                i += 1;
+            }
+        }
+    }
+    lx.end_segment();
+    lx.segments
+}
+
+/// `NAME=value` — a leading environment assignment, skipped when finding a
+/// segment's program (the same tolerance [`command_is_git_push`] has).
+fn is_env_assignment(word: &str) -> bool {
+    match word.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// Whether `word` names the program `name`, tolerating a path prefix and a
+/// Windows `.exe` / `.cmd` suffix (`/usr/bin/git`, `git.exe`, `npm.cmd`).
+fn program_is(word: &str, name: &str) -> bool {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let base = base
+        .strip_suffix(".exe")
+        .or_else(|| base.strip_suffix(".cmd"))
+        .unwrap_or(base);
+    base == name
+}
+
+/// A redirection word: `>f`, `2>&1`, `&>f`, `<f`, `>>f`.
+fn is_redirection(word: &str) -> bool {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    rest.starts_with('>') || rest.starts_with('<') || word.starts_with("&>")
+}
+
+/// A redirection OPERATOR with its target in the next word (`>` then `file`).
+fn redirection_takes_next(word: &str) -> bool {
+    is_redirection(word) && (word.ends_with('>') || word.ends_with('<'))
+}
+
+/// The words of a segment after its leading env assignments.
+fn command_words(segment: &[String]) -> &[String] {
+    let start = segment
+        .iter()
+        .position(|w| !is_env_assignment(w))
+        .unwrap_or(segment.len());
+    &segment[start..]
+}
+
+/// Iterate a command's arguments with redirections removed.
+fn args_without_redirections(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut j = 0;
+    while j < args.len() {
+        let w = args[j].as_str();
+        if is_redirection(w) {
+            j += if redirection_takes_next(w) { 2 } else { 1 };
+            continue;
+        }
+        out.push(w);
+        j += 1;
+    }
+    out
+}
+
+// ── Classification ───────────────────────────────────────────────────────────
+
+/// Classify every sensitive command in a shell command string.
+///
+/// Returns one entry per segment that is one of the five shapes: a `git push`
+/// that force-updates (`--force`, `-f`, `--force-with-lease[=…]`, `--mirror`,
+/// or a `+refspec`) and/or deletes (`--delete`, `-d`, `:ref`); a non-draft
+/// `gh release create` or a `gh release delete`; `npm publish`; and
+/// `cargo publish`. A `--dry-run` of any of them publishes nothing and is not
+/// classified, and neither is a plain push.
+pub fn classify_sensitive_command(command: &str) -> Vec<SensitiveCommand> {
+    shell_segments(command)
+        .iter()
+        .filter_map(|seg| classify_segment(command_words(seg)))
+        .collect()
+}
+
+fn classify_segment(words: &[String]) -> Option<SensitiveCommand> {
+    let program = words.first()?;
+    let rest = &words[1..];
+    if program_is(program, "git") {
+        classify_git(rest)
+    } else if program_is(program, "gh") {
+        classify_gh(rest)
+    } else if program_is(program, "npm") {
+        classify_npm(rest)
+    } else if program_is(program, "cargo") {
+        classify_cargo(rest)
+    } else {
+        None
+    }
+}
+
+fn classify_git(args: &[String]) -> Option<SensitiveCommand> {
+    let args = args_without_redirections(args);
+    // Global options before the subcommand, some of which take a value.
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if matches!(a, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    if args.get(i) != Some(&"push") {
+        return None;
+    }
+    parse_git_push_args(&args[i + 1..]).map(SensitiveCommand::GitPush)
+}
+
+/// Parse the arguments after `push`. `None` for a dry-run or a push that
+/// neither forces nor deletes.
+fn parse_git_push_args(args: &[&str]) -> Option<GitPushIntent> {
+    let mut remote: Option<String> = None;
+    let mut refspecs: Vec<String> = Vec::new();
+    let mut force_flag = false;
+    let mut delete_flag = false;
+    let mut only_positional = false;
+    let mut j = 0;
+    while j < args.len() {
+        let a = args[j];
+        if !only_positional && a.starts_with('-') && a.len() > 1 {
+            match a {
+                "--" => only_positional = true,
+                "--force" | "--force-with-lease" | "--mirror" => force_flag = true,
+                "--delete" => delete_flag = true,
+                "--dry-run" => return None,
+                "-o" | "--push-option" | "--repo" | "--receive-pack" | "--exec" => j += 1,
+                s if s.starts_with("--force-with-lease=") => force_flag = true,
+                s if s.starts_with("--") => {}
+                s => {
+                    // A short-flag cluster: `-f`, `-uf`, `-d`, `-n`.
+                    let flags = &s[1..];
+                    if flags.contains('n') {
+                        return None; // -n is --dry-run
+                    }
+                    if flags.contains('f') {
+                        force_flag = true;
+                    }
+                    if flags.contains('d') {
+                        delete_flag = true;
+                    }
+                    if flags.ends_with('o') {
+                        j += 1; // `-o <option>`
+                    }
+                }
+            }
+            j += 1;
+            continue;
+        }
+        if remote.is_none() {
+            remote = Some(a.to_string());
+        } else {
+            refspecs.push(a.to_string());
+        }
+        j += 1;
+    }
+
+    let mut forced: Vec<String> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    let mut unforced_named = 0usize;
+    for spec in &refspecs {
+        let (plus, body) = match spec.strip_prefix('+') {
+            Some(b) => (true, b),
+            None => (false, spec.as_str()),
+        };
+        if delete_flag {
+            deleted.push(body.trim_start_matches(':').to_string());
+            continue;
+        }
+        if let Some(dst) = body.strip_prefix(':') {
+            deleted.push(dst.to_string());
+            continue;
+        }
+        let dst = body.rsplit_once(':').map(|(_, d)| d).unwrap_or(body);
+        if plus || force_flag {
+            forced.push(dst.to_string());
+        } else {
+            unforced_named += 1;
+        }
+    }
+
+    // A force flag with no non-delete refspec forces the unnamed default
+    // (the current branch). A force flag beside ONLY `:ref` deletions forces
+    // nothing — there is no ref for it to apply to.
+    let force = if !forced.is_empty() {
+        Some(forced)
+    } else if force_flag && !delete_flag && deleted.is_empty() && unforced_named == 0 {
+        Some(Vec::new())
+    } else {
+        None
+    };
+    let delete = if !deleted.is_empty() || delete_flag {
+        Some(deleted)
+    } else {
+        None
+    };
+    if force.is_none() && delete.is_none() {
+        return None;
+    }
+    Some(GitPushIntent {
+        remote,
+        force,
+        delete,
+    })
+}
+
+fn classify_gh(args: &[String]) -> Option<SensitiveCommand> {
+    let args = args_without_redirections(args);
+    if args.first() != Some(&"release") {
+        return None;
+    }
+    let delete = match args.get(1) {
+        Some(&"create") => false,
+        Some(&"delete") => true,
+        _ => return None,
+    };
+    let mut tag: Option<String> = None;
+    let mut repo: Option<String> = None;
+    let mut cleanup_tag = false;
+    let mut j = 2;
+    while j < args.len() {
+        let a = args[j];
+        if a.starts_with('-') && a.len() > 1 {
+            match a {
+                "-R" | "--repo" => {
+                    repo = args.get(j + 1).map(|s| s.to_string());
+                    j += 2;
+                    continue;
+                }
+                s if s.starts_with("--repo=") => repo = Some(s["--repo=".len()..].to_string()),
+                // A draft release is not published — nobody outside the repo
+                // can see it until it is edited to non-draft.
+                "-d" | "--draft" if !delete => return None,
+                s if s.starts_with("--draft=") && s != "--draft=false" && !delete => return None,
+                "--cleanup-tag" => cleanup_tag = true,
+                // Value-taking flags of `gh release create`.
+                "-t"
+                | "--title"
+                | "-n"
+                | "--notes"
+                | "-F"
+                | "--notes-file"
+                | "--target"
+                | "--discussion-category"
+                | "--notes-start-tag"
+                | "--notes-from-tag" => {
+                    j += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            j += 1;
+            continue;
+        }
+        if tag.is_none() {
+            tag = Some(a.to_string());
+        }
+        j += 1;
+    }
+    Some(SensitiveCommand::GhRelease {
+        delete,
+        tag,
+        repo,
+        cleanup_tag,
+    })
+}
+
+fn classify_npm(args: &[String]) -> Option<SensitiveCommand> {
+    let args = args_without_redirections(args);
+    // The subcommand is the first non-flag word.
+    let sub = args.iter().position(|a| !a.starts_with('-'))?;
+    if args[sub] != "publish" {
+        return None;
+    }
+    let mut spec: Option<String> = None;
+    let mut j = sub + 1;
+    while j < args.len() {
+        let a = args[j];
+        if a.starts_with('-') && a.len() > 1 {
+            match a {
+                "--dry-run" => return None,
+                s if s.starts_with("--dry-run=") && s != "--dry-run=false" => return None,
+                "--tag" | "--access" | "--otp" | "--registry" | "-w" | "--workspace" => {
+                    j += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            j += 1;
+            continue;
+        }
+        if spec.is_none() {
+            spec = Some(a.to_string());
+        }
+        j += 1;
+    }
+    Some(SensitiveCommand::NpmPublish { spec })
+}
+
+fn classify_cargo(args: &[String]) -> Option<SensitiveCommand> {
+    let args = args_without_redirections(args);
+    // `cargo +nightly publish` — skip a toolchain selector and global flags.
+    let sub = args
+        .iter()
+        .position(|a| !a.starts_with('-') && !a.starts_with('+'))?;
+    if args[sub] != "publish" {
+        return None;
+    }
+    let mut package: Option<String> = None;
+    let mut j = sub + 1;
+    while j < args.len() {
+        let a = args[j];
+        match a {
+            "--dry-run" | "-n" => return None,
+            "-p" | "--package" => {
+                package = args.get(j + 1).map(|s| s.to_string());
+                j += 2;
+                continue;
+            }
+            s if s.starts_with("--package=") => package = Some(s["--package=".len()..].to_string()),
+            "--registry" | "--index" | "--token" | "--manifest-path" | "--target"
+            | "--target-dir" | "-j" | "--jobs" | "-F" | "--features" | "--config" | "-Z" => {
+                j += 2;
+                continue;
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    Some(SensitiveCommand::CargoPublish { package })
+}
+
+// ── Result interpretation ────────────────────────────────────────────────────
+
+/// A sensitive action that HAPPENED — the paired `tool_result` succeeded.
+/// Everything needed for the `POST /coord/agent-notifications` body, except a
+/// repo that still has to be read from git (see [`Self::repo_from_remote`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedAction {
+    pub action: SensitiveAction,
+    /// What was acted on: a ref, a release tag, a package version.
+    pub artifact: String,
+    /// One of [`reversibility`]'s wire strings.
+    pub reversible: &'static str,
+    /// The concrete revert handle — the prior sha of a force-updated ref, when
+    /// the push output names it.
+    pub undo: Option<String>,
+    /// `owner/repo`, when the command or its output named it.
+    pub repo: Option<String>,
+    /// When `repo` is unknown and the action IS repo-scoped: the git remote
+    /// (name or URL) whose URL names the repo. `Some("origin")` for the
+    /// default. `None` when the action is not repo-scoped (a registry publish)
+    /// or the repo is already known.
+    pub repo_from_remote: Option<String>,
+    /// Where to run `git remote get-url` for [`Self::repo_from_remote`].
+    pub working_dir: String,
+}
+
+fn cap_field(s: &str) -> String {
+    if s.chars().count() <= MAX_NOTIFICATION_FIELD_CHARS {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX_NOTIFICATION_FIELD_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+impl DetectedAction {
+    /// The `POST /coord/agent-notifications` body (coord's
+    /// `AgentNotificationBody`). Optional fields are OMITTED rather than sent
+    /// as `null`: coord's body is `deny_unknown_fields`, and `undo` in
+    /// particular is unknown to a coord that predates the plan's Phase 4.
+    pub fn body(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "action": self.action.as_str(),
+            "artifact": cap_field(&self.artifact),
+            "reversible": self.reversible,
+        });
+        if let Some(repo) = &self.repo {
+            body["repo"] = serde_json::Value::String(repo.clone());
+        }
+        if let Some(undo) = &self.undo {
+            body["undo"] = serde_json::Value::String(cap_field(undo));
+        }
+        body
+    }
+}
+
+/// What a `git push`'s own output says happened.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PushOutput {
+    /// `(destination ref, prior sha)` per ` + old...new src -> dst (forced update)`.
+    forced: Vec<(String, String)>,
+    /// Ref per ` - [deleted]  ref`.
+    deleted: Vec<String>,
+    /// Any other ref-table line (`[new branch]`, a fast-forward `a..b x -> x`).
+    other_ref_lines: usize,
+    /// `Everything up-to-date`.
+    up_to_date: bool,
+    /// A rejection or fatal error.
+    failed: bool,
+    /// `owner/repo` from the `To <url>` line.
+    repo: Option<String>,
+}
+
+fn parse_push_output(output: &str) -> PushOutput {
+    let mut out = PushOutput::default();
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(url) = line.strip_prefix("To ") {
+            if out.repo.is_none() {
+                out.repo = parse_repo_full_name(url.trim());
+            }
+            continue;
+        }
+        if line.starts_with("! [")
+            || line.starts_with("error: failed to push")
+            || line.starts_with("fatal:")
+        {
+            out.failed = true;
+            continue;
+        }
+        if line == "Everything up-to-date" {
+            out.up_to_date = true;
+            continue;
+        }
+        if line.contains("(forced update)") {
+            let toks: Vec<&str> = line.split_whitespace().collect();
+            // ["+", "old...new", "src", "->", "dst", "(forced", "update)"]
+            let prior = toks
+                .iter()
+                .find(|t| t.contains("..."))
+                .and_then(|t| t.split("...").next())
+                .unwrap_or("")
+                .to_string();
+            let dst = toks
+                .iter()
+                .position(|t| *t == "->")
+                .and_then(|p| toks.get(p + 1))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if !dst.is_empty() {
+                out.forced.push((dst, prior));
+            }
+            continue;
+        }
+        if line.starts_with("- [deleted]") {
+            if let Some(r) = line.split_whitespace().last() {
+                out.deleted.push(r.to_string());
+            }
+            continue;
+        }
+        if line.starts_with("* [new") || line.contains(" -> ") {
+            out.other_ref_lines += 1;
+        }
+    }
+    out
+}
+
+/// Case-insensitive "any line starts with one of `prefixes`".
+fn any_line_starts_with(output: &str, prefixes: &[&str]) -> bool {
+    output.lines().any(|l| {
+        let l = l.trim_start().to_ascii_lowercase();
+        prefixes.iter().any(|p| l.starts_with(p))
+    })
+}
+
+/// Turn one classified command plus its SUCCESSFUL tool output into the
+/// actions that happened. The output is read for positive evidence first (the
+/// `(forced update)` / `[deleted]` ref-table lines name the refs and prior
+/// shas exactly); when the output says nothing either way — `-q`, redirected
+/// to a file — the command's own declaration is reported, marked
+/// irreversible-unless-known, rather than dropped.
+pub fn interpret_success(
+    cmd: &SensitiveCommand,
+    output: &str,
+    working_dir: &str,
+) -> Vec<DetectedAction> {
+    match cmd {
+        SensitiveCommand::GitPush(intent) => interpret_git_push(intent, output, working_dir),
+        SensitiveCommand::GhRelease {
+            delete,
+            tag,
+            repo,
+            cleanup_tag,
+        } => {
+            if output.contains("HTTP 4")
+                || output.contains("HTTP 5")
+                || output.to_ascii_lowercase().contains("release not found")
+            {
+                return Vec::new();
+            }
+            let tag_txt = tag.clone().unwrap_or_else(|| "(unnamed tag)".to_string());
+            let repo = repo.clone().or_else(|| {
+                // `gh release create` prints the release URL:
+                // https://github.com/<owner>/<repo>/releases/tag/<tag>
+                output
+                    .split_whitespace()
+                    .find_map(|w| w.split_once("/releases/").map(|(base, _)| base))
+                    .and_then(parse_repo_full_name)
+            });
+            let repo_from_remote = if repo.is_none() {
+                Some("origin".to_string())
+            } else {
+                None
+            };
+            let (action, artifact, reversible) = if *delete {
+                let artifact = if *cleanup_tag {
+                    format!("release {tag_txt} and its tag")
+                } else {
+                    format!("release {tag_txt}")
+                };
+                // Deviation from a flat "delete → restore": a deleted GitHub
+                // release keeps nothing to restore it FROM — its notes and
+                // uploaded assets are gone. It is recreated, which is coord's
+                // `roll-forward`, not `restore`.
+                (
+                    SensitiveAction::Delete,
+                    artifact,
+                    reversibility::ROLL_FORWARD,
+                )
+            } else {
+                (
+                    SensitiveAction::Publish,
+                    format!("release {tag_txt}"),
+                    reversibility::NO,
+                )
+            };
+            vec![DetectedAction {
+                action,
+                artifact,
+                reversible,
+                undo: None,
+                repo,
+                repo_from_remote,
+                working_dir: working_dir.to_string(),
+            }]
+        }
+        SensitiveCommand::NpmPublish { spec } => {
+            if any_line_starts_with(output, &["npm err!", "npm error"]) {
+                return Vec::new();
+            }
+            // npm prints `+ <name>@<version>` on success.
+            let published = output.lines().find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("+ ")
+                    .filter(|rest| rest.contains('@'))
+                    .map(|rest| rest.trim().to_string())
+            });
+            let artifact = published.unwrap_or_else(|| match spec {
+                Some(s) => format!("npm package {s}"),
+                None => format!("npm package in {working_dir}"),
+            });
+            vec![registry_publish(artifact, working_dir)]
+        }
+        SensitiveCommand::CargoPublish { package } => {
+            if any_line_starts_with(output, &["error:", "error["]) {
+                return Vec::new();
+            }
+            // cargo prints `Published <name> v<version> at registry …` (or,
+            // older, `Uploading <name> v<version> (<path>)`).
+            let published = output.lines().find_map(|l| {
+                let l = l.trim();
+                let rest = l
+                    .strip_prefix("Published ")
+                    .or_else(|| l.strip_prefix("Uploading "))?;
+                let mut it = rest.split_whitespace();
+                let name = it.next()?;
+                let version = it.next()?;
+                Some(format!("crate {name} {version}"))
+            });
+            let artifact = published.unwrap_or_else(|| match package {
+                Some(p) => format!("crate {p}"),
+                None => format!("crate in {working_dir}"),
+            });
+            vec![registry_publish(artifact, working_dir)]
+        }
+    }
+}
+
+fn registry_publish(artifact: String, working_dir: &str) -> DetectedAction {
+    DetectedAction {
+        action: SensitiveAction::Publish,
+        artifact,
+        // A registry version cannot be un-published into reuse: npm forbids
+        // re-publishing a version number, crates.io only yanks.
+        reversible: reversibility::NO,
+        undo: None,
+        repo: None,
+        repo_from_remote: None,
+        working_dir: working_dir.to_string(),
+    }
+}
+
+fn interpret_git_push(
+    intent: &GitPushIntent,
+    output: &str,
+    working_dir: &str,
+) -> Vec<DetectedAction> {
+    let parsed = parse_push_output(output);
+    let remote = intent
+        .remote
+        .clone()
+        .unwrap_or_else(|| "origin".to_string());
+    // A remote given as a URL names the repo directly.
+    let repo = parsed
+        .repo
+        .clone()
+        .or_else(|| intent.remote.as_deref().and_then(url_repo));
+    let repo_from_remote = if repo.is_none() {
+        Some(remote.clone())
+    } else {
+        None
+    };
+    let base = |action, artifact: String, reversible, undo| DetectedAction {
+        action,
+        artifact,
+        reversible,
+        undo,
+        repo: repo.clone(),
+        repo_from_remote: repo_from_remote.clone(),
+        working_dir: working_dir.to_string(),
+    };
+    // The output said SOMETHING about the refs — trust it over the command.
+    let output_spoke = !parsed.forced.is_empty()
+        || !parsed.deleted.is_empty()
+        || parsed.other_ref_lines > 0
+        || parsed.up_to_date
+        || parsed.failed;
+
+    let mut out = Vec::new();
+    if let Some(declared) = &intent.force {
+        if !parsed.forced.is_empty() {
+            for (dst, prior) in &parsed.forced {
+                let (reversible, undo) = if prior.is_empty() {
+                    (reversibility::NO, None)
+                } else {
+                    (reversibility::RESTORE, Some(prior.clone()))
+                };
+                out.push(base(
+                    SensitiveAction::ForcePush,
+                    dst.clone(),
+                    reversible,
+                    undo,
+                ));
+            }
+        } else if !output_spoke {
+            // Output silent (`-q`, redirected): report what the command
+            // declared. No prior sha is known, so it is not restorable from
+            // anything this notification can name.
+            let artifact = if declared.is_empty() {
+                format!("the current branch on {remote}")
+            } else {
+                declared.join(", ")
+            };
+            out.push(base(
+                SensitiveAction::ForcePush,
+                artifact,
+                reversibility::NO,
+                None,
+            ));
+        }
+        // Otherwise the output shows only fast-forwards / up-to-date / a
+        // rejection: the force discarded nothing, so there is nothing to
+        // report.
+    }
+    if let Some(declared) = &intent.delete {
+        if !parsed.deleted.is_empty() {
+            for r in &parsed.deleted {
+                out.push(base(
+                    SensitiveAction::Delete,
+                    r.clone(),
+                    reversibility::RESTORE,
+                    None,
+                ));
+            }
+        } else if !output_spoke {
+            let artifact = if declared.is_empty() {
+                format!("ref(s) on {remote}")
+            } else {
+                declared.join(", ")
+            };
+            out.push(base(
+                SensitiveAction::Delete,
+                artifact,
+                reversibility::RESTORE,
+                None,
+            ));
+        }
+    }
+    out
+}
+
+/// `owner/repo` when `remote` is a URL rather than a remote name.
+fn url_repo(remote: &str) -> Option<String> {
+    if remote.contains("://") || remote.contains('@') || remote.ends_with(".git") {
+        parse_repo_full_name(remote)
+    } else {
+        None
+    }
+}
+
+/// Resolve `owner/repo` from a git remote in `working_dir`. A remote given as
+/// a URL is parsed directly; a name is read with `git remote get-url`.
+/// Impure (runs git) — call on the dispatcher worker, never the tail loop.
+pub fn resolve_remote_repo(working_dir: &str, remote: &str) -> Option<String> {
+    if let Some(r) = url_repo(remote) {
+        return Some(r);
+    }
+    if working_dir.trim().is_empty() {
+        return None;
+    }
+    let url = git(&PathBuf::from(working_dir), &["remote", "get-url", remote])?;
+    parse_repo_full_name(&url)
+}
+
+// ── The pending map ──────────────────────────────────────────────────────────
+
+struct PendingAction {
+    commands: Vec<SensitiveCommand>,
+    working_dir: String,
+    observed_at: Instant,
+}
+
+/// Per-transcript memory of sensitive `tool_use`s awaiting their `tool_result`.
+///
+/// Owned by one transcript tail loop (`transcript_watcher::tail_session`), so
+/// it needs no lock and dies with the tail. Bounded two ways: at most
+/// [`PENDING_ACTION_CAPACITY`] entries (the oldest is evicted to admit a new
+/// one), and entries older than [`PENDING_ACTION_TTL`] are dropped before any
+/// lookup — so a result that arrives after the TTL is NOT emitted. Both drops
+/// are counted.
+pub struct SensitiveActionTracker {
+    pending: HashMap<String, PendingAction>,
+    emitted: std::collections::VecDeque<String>,
+    expired: u64,
+    evicted: u64,
+}
+
+impl Default for SensitiveActionTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SensitiveActionTracker {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            emitted: std::collections::VecDeque::new(),
+            expired: 0,
+            evicted: 0,
+        }
+    }
+
+    /// Entries awaiting a result.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Entries dropped by the TTL.
+    pub fn expired(&self) -> u64 {
+        self.expired
+    }
+
+    /// Entries evicted by the capacity bound.
+    pub fn evicted(&self) -> u64 {
+        self.evicted
+    }
+
+    fn sweep(&mut self, now: Instant) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, p| now.saturating_duration_since(p.observed_at) < PENDING_ACTION_TTL);
+        let dropped = (before - self.pending.len()) as u64;
+        if dropped > 0 {
+            self.expired += dropped;
+            debug!(
+                dropped,
+                expired_total = self.expired,
+                "commit_report: sensitive tool_use(s) expired with no tool_result — not notified"
+            );
+        }
+    }
+
+    fn insert(&mut self, id: String, entry: PendingAction) {
+        if !self.pending.contains_key(&id) && self.pending.len() >= PENDING_ACTION_CAPACITY {
+            if let Some(oldest) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, p)| p.observed_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.pending.remove(&oldest);
+                self.evicted += 1;
+                warn!(
+                    capacity = PENDING_ACTION_CAPACITY,
+                    evicted_total = self.evicted,
+                    "commit_report: sensitive-action pending map full — evicted the oldest entry"
+                );
+            }
+        }
+        self.pending.insert(id, entry);
+    }
+
+    fn remember_emitted(&mut self, id: &str) -> bool {
+        if self.emitted.iter().any(|e| e == id) {
+            return false;
+        }
+        if self.emitted.len() >= EMITTED_MEMORY {
+            self.emitted.pop_front();
+        }
+        self.emitted.push_back(id.to_string());
+        true
+    }
+
+    /// Feed one transcript line. Returns the actions whose SUCCESSFUL result
+    /// this line carried. Pure apart from `now` — never runs git or I/O.
+    pub fn observe_line(&mut self, line: &str, now: Instant) -> Vec<DetectedAction> {
+        // Cheap pre-filters: this runs on every transcript line, and almost no
+        // line is a Bash tool_use or a result we are waiting for.
+        let maybe_use = line.contains("\"tool_use\"") && line.contains("\"Bash\"");
+        let maybe_result = !self.pending.is_empty() && line.contains("\"tool_result\"");
+        if !maybe_use && !maybe_result {
+            return Vec::new();
+        }
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return Vec::new();
+        };
+        self.sweep(now);
+        match record.get("type").and_then(|t| t.as_str()) {
+            Some("assistant") => {
+                self.observe_tool_uses(&record, now);
+                Vec::new()
+            }
+            Some("user") => self.observe_tool_results(&record),
+            _ => Vec::new(),
+        }
+    }
+
+    fn observe_tool_uses(&mut self, record: &serde_json::Value, now: Instant) {
+        let transcript_cwd = record.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        let Some(content) = record
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return;
+        };
+        for block in content {
+            if block.get("type").and_then(|t| t.as_str()) != Some("tool_use")
+                || block.get("name").and_then(|n| n.as_str()) != Some("Bash")
+            {
+                continue;
+            }
+            let (Some(id), Some(command)) = (
+                block.get("id").and_then(|i| i.as_str()),
+                block
+                    .get("input")
+                    .and_then(|i| i.get("command"))
+                    .and_then(|c| c.as_str()),
+            ) else {
+                continue;
+            };
+            let commands = classify_sensitive_command(command);
+            if commands.is_empty() {
+                continue;
+            }
+            self.insert(
+                id.to_string(),
+                PendingAction {
+                    commands,
+                    working_dir: resolve_working_dir(command, transcript_cwd),
+                    observed_at: now,
+                },
+            );
+        }
+    }
+
+    fn observe_tool_results(&mut self, record: &serde_json::Value) -> Vec<DetectedAction> {
+        let Some(content) = record
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return Vec::new();
+        };
+        let results: Vec<&serde_json::Value> = content
+            .iter()
+            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+            .collect();
+        let mut out = Vec::new();
+        for block in &results {
+            let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str()) else {
+                continue;
+            };
+            let Some(pending) = self.pending.remove(id) else {
+                continue;
+            };
+            if block.get("is_error").and_then(|e| e.as_bool()) == Some(true) {
+                debug!(
+                    tool_use_id = id,
+                    "commit_report: sensitive command failed (is_error) — not notified"
+                );
+                continue;
+            }
+            // The Claude Code record also carries the raw stdout/stderr under
+            // `toolUseResult` — git writes its ref table to STDERR — and flags
+            // an interrupted command there. It describes the record's single
+            // result, so only read it when there is exactly one.
+            let side = if results.len() == 1 {
+                record.get("toolUseResult")
+            } else {
+                None
+            };
+            if side
+                .and_then(|s| s.get("interrupted"))
+                .and_then(|i| i.as_bool())
+                == Some(true)
+            {
+                continue;
+            }
+            let mut output = tool_result_text(block);
+            if let Some(side) = side {
+                for key in ["stdout", "stderr"] {
+                    if let Some(s) = side.get(key).and_then(|v| v.as_str()) {
+                        output.push('\n');
+                        output.push_str(s);
+                    }
+                }
+            }
+            if !self.remember_emitted(id) {
+                continue; // a re-read transcript — already notified
+            }
+            for cmd in &pending.commands {
+                out.extend(interpret_success(cmd, &output, &pending.working_dir));
+            }
+        }
+        out
+    }
+}
+
+/// The text of a `tool_result` block: a string, or an array of `{type:"text"}`.
+fn tool_result_text(block: &serde_json::Value) -> String {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Hand one detected action to the bounded git worker, which resolves a
+/// still-unknown repo from the git remote and enqueues the notification on
+/// the session outbox. Non-blocking, same queue and drop posture as
+/// [`dispatch_push_observation`].
+pub fn dispatch_detected_action(
+    action: DetectedAction,
+    lane: uuid::Uuid,
+    registrar: Arc<crate::claude_session::coord_register::AiCoordRegistrar>,
+) -> bool {
+    PUSH_DISPATCHER.try_dispatch(move || {
+        let mut action = action;
+        if action.repo.is_none() {
+            if let Some(remote) = action.repo_from_remote.as_deref() {
+                action.repo = resolve_remote_repo(&action.working_dir, remote);
+            }
+        }
+        registrar.report_agent_notification(lane, action.body());
+    })
+}
+
+/// The outbox seq lane for a transcript's notifications: deterministic per
+/// transcript session so its notifications drain in order, and distinct from
+/// any coord session id (coord never reads it).
+pub fn agent_notification_lane(transcript_session_id: &str) -> uuid::Uuid {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("agent-notification:{transcript_session_id}").as_bytes(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +2114,586 @@ mod tests {
             return; // ambient override — nothing to pin
         }
         assert_eq!(git_timeout(), Duration::from_secs(GIT_TIMEOUT_DEFAULT_SECS));
+    }
+}
+
+/// Phase 9 of plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`:
+/// the sensitive-action classifier, the result interpreter, and the pending
+/// map, driven by fixture transcripts.
+#[cfg(test)]
+mod sensitive_action_tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── Classifier: positive shapes ──────────────────────────────────────
+
+    fn git_push(cmd: &str) -> GitPushIntent {
+        let got = classify_sensitive_command(cmd);
+        assert_eq!(got.len(), 1, "{cmd:?} should classify once, got {got:?}");
+        match &got[0] {
+            SensitiveCommand::GitPush(i) => i.clone(),
+            other => panic!("{cmd:?} classified as {other:?}, not a git push"),
+        }
+    }
+
+    #[test]
+    fn force_push_flag_shapes() {
+        for cmd in [
+            "git push --force",
+            "git push -f",
+            "git push --force-with-lease",
+            "git push --mirror origin",
+            "cd \"C:/repo\" && git push --force 2>&1 | tail -5",
+            "git -C /some/dir push -f",
+            "FOO=bar git push --force",
+            "/usr/bin/git push --force",
+            "git.exe push -f",
+        ] {
+            let i = git_push(cmd);
+            assert_eq!(i.force, Some(vec![]), "{cmd:?}: forced, refs unnamed");
+            assert_eq!(i.delete, None, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn force_push_named_refs() {
+        let i = git_push("git push -f origin feat/x");
+        assert_eq!(i.remote.as_deref(), Some("origin"));
+        assert_eq!(i.force, Some(vec!["feat/x".to_string()]));
+
+        let i = git_push("git push --force-with-lease=main:abc123 origin main");
+        assert_eq!(i.force, Some(vec!["main".to_string()]));
+
+        let i = git_push("git push -uf origin feat/y");
+        assert_eq!(i.force, Some(vec!["feat/y".to_string()]));
+
+        // A `+refspec` forces only that ref; its destination is reported.
+        let i = git_push("git push origin +HEAD:refs/heads/feat/z main");
+        assert_eq!(i.force, Some(vec!["refs/heads/feat/z".to_string()]));
+
+        let i = git_push("git push origin +main");
+        assert_eq!(i.force, Some(vec!["main".to_string()]));
+    }
+
+    #[test]
+    fn ref_deletion_shapes() {
+        let i = git_push("git push --delete origin old-a old-b");
+        assert_eq!(
+            i.delete,
+            Some(vec!["old-a".to_string(), "old-b".to_string()])
+        );
+        assert_eq!(i.force, None);
+
+        let i = git_push("git push -d origin old");
+        assert_eq!(i.delete, Some(vec!["old".to_string()]));
+
+        let i = git_push("git push origin :old");
+        assert_eq!(i.delete, Some(vec!["old".to_string()]));
+        assert_eq!(i.force, None);
+
+        // A force flag beside ONLY a deletion forces nothing.
+        let i = git_push("git push -f origin :old");
+        assert_eq!(i.force, None);
+        assert_eq!(i.delete, Some(vec!["old".to_string()]));
+    }
+
+    #[test]
+    fn gh_release_shapes() {
+        let got = classify_sensitive_command(
+            "gh release create v1.2.3 --title \"v1.2.3\" --notes \"fixes; see git push --force\"",
+        );
+        assert_eq!(
+            got,
+            vec![SensitiveCommand::GhRelease {
+                delete: false,
+                tag: Some("v1.2.3".to_string()),
+                repo: None,
+                cleanup_tag: false,
+            }],
+            "the quoted notes are ONE argument — no phantom git push, no wrong tag"
+        );
+
+        let got = classify_sensitive_command("gh release delete v1.0.0 -y --cleanup-tag -R o/r");
+        assert_eq!(
+            got,
+            vec![SensitiveCommand::GhRelease {
+                delete: true,
+                tag: Some("v1.0.0".to_string()),
+                repo: Some("o/r".to_string()),
+                cleanup_tag: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn registry_publish_shapes() {
+        assert_eq!(
+            classify_sensitive_command("npm publish"),
+            vec![SensitiveCommand::NpmPublish { spec: None }]
+        );
+        assert_eq!(
+            classify_sensitive_command("cd packages/ui && npm publish --access public"),
+            vec![SensitiveCommand::NpmPublish { spec: None }]
+        );
+        assert_eq!(
+            classify_sensitive_command("cargo publish"),
+            vec![SensitiveCommand::CargoPublish { package: None }]
+        );
+        assert_eq!(
+            classify_sensitive_command("cargo +stable publish -p qontinui-schemas"),
+            vec![SensitiveCommand::CargoPublish {
+                package: Some("qontinui-schemas".to_string())
+            }]
+        );
+    }
+
+    // ── Classifier: negative shapes ──────────────────────────────────────
+
+    #[test]
+    fn plain_and_dry_run_pushes_are_not_sensitive() {
+        for cmd in [
+            "git push",
+            "git push -u origin feat/x",
+            "git push origin HEAD",
+            "git push --force --dry-run",
+            "git push -n -f origin x",
+            "git push -fn origin x",
+            "git push --force-if-includes origin x",
+        ] {
+            assert!(
+                classify_sensitive_command(cmd).is_empty(),
+                "{cmd:?} must not classify"
+            );
+        }
+    }
+
+    /// The same first-word-of-a-segment rule [`command_is_git_push`] applies:
+    /// a push MENTIONED as text is not a push. Both detectors agree on every
+    /// shape here.
+    #[test]
+    fn mentioned_commands_are_text_not_actions() {
+        for cmd in [
+            "echo \"git push --force-with-lease\"",
+            "echo git push --force",
+            "printf '%s' 'npm publish'",
+            "git commit -m \"revert the git push --force\"",
+            "# git push --force\ngit status",
+        ] {
+            assert!(
+                classify_sensitive_command(cmd).is_empty(),
+                "{cmd:?} must not classify"
+            );
+        }
+        // The git-push detector agrees on the unquoted echo.
+        assert!(!command_is_git_push("echo git push --force"));
+        // And both see the real push behind `&&`.
+        assert!(command_is_git_push("cd x && git push -f"));
+        assert_eq!(classify_sensitive_command("cd x && git push -f").len(), 1);
+    }
+
+    #[test]
+    fn heredoc_bodies_are_not_commands() {
+        let cmd =
+            "git commit -F - <<'EOF'\nfix: undo it\ngit push --force\nnpm publish\nEOF\ngit log -1";
+        assert!(classify_sensitive_command(cmd).is_empty());
+        // A real command AFTER the heredoc still classifies.
+        let cmd = "cat <<EOF > notes.txt\ngit push --force\nEOF\ngit push -f origin x";
+        assert_eq!(classify_sensitive_command(cmd).len(), 1);
+    }
+
+    #[test]
+    fn non_publish_subcommands_are_not_sensitive() {
+        for cmd in [
+            "npm run publish",
+            "npm publish --dry-run",
+            "cargo publish --dry-run",
+            "cargo publish -n",
+            "cargo build --release",
+            "gh release create v1 --draft",
+            "gh release view v1",
+            "gh pr create --title x",
+            "git log --grep=force",
+        ] {
+            assert!(
+                classify_sensitive_command(cmd).is_empty(),
+                "{cmd:?} must not classify"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_segments_keeps_redirections_attached() {
+        assert_eq!(
+            shell_segments("git push -f 2>&1 | tail -3"),
+            vec![vec!["git", "push", "-f", "2>&1"], vec!["tail", "-3"],]
+                .into_iter()
+                .map(|v| v.into_iter().map(String::from).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Result interpretation ────────────────────────────────────────────
+
+    #[test]
+    fn forced_update_names_ref_prior_sha_and_repo() {
+        let intent = git_push("git push --force-with-lease origin feat/x");
+        let out = "To github.com:qontinui/qontinui-runner.git\n + 1a2b3c4...5d6e7f8 feat/x -> feat/x (forced update)\n";
+        let got = interpret_success(&SensitiveCommand::GitPush(intent), out, "C:/r");
+        assert_eq!(got.len(), 1);
+        let a = &got[0];
+        assert_eq!(a.action, SensitiveAction::ForcePush);
+        assert_eq!(a.artifact, "feat/x");
+        assert_eq!(a.reversible, reversibility::RESTORE);
+        assert_eq!(a.undo.as_deref(), Some("1a2b3c4"));
+        assert_eq!(a.repo.as_deref(), Some("qontinui/qontinui-runner"));
+        assert_eq!(a.repo_from_remote, None, "the output named the repo");
+    }
+
+    #[test]
+    fn a_force_that_only_fast_forwarded_discarded_nothing() {
+        let intent = git_push("git push -f origin main");
+        for out in [
+            "To github.com:o/r.git\n   1a2b3c4..5d6e7f8  main -> main\n",
+            "Everything up-to-date\n",
+        ] {
+            let got = interpret_success(&SensitiveCommand::GitPush(intent.clone()), out, "");
+            assert!(got.is_empty(), "{out:?} discarded nothing: {got:?}");
+        }
+    }
+
+    #[test]
+    fn silent_output_reports_the_declared_force_without_undo() {
+        let intent = git_push("git push -q --force");
+        let got = interpret_success(&SensitiveCommand::GitPush(intent), "", "C:/r");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].artifact, "the current branch on origin");
+        assert_eq!(
+            got[0].reversible,
+            reversibility::NO,
+            "no prior sha is known"
+        );
+        assert_eq!(got[0].undo, None);
+        assert_eq!(got[0].repo, None);
+        assert_eq!(got[0].repo_from_remote.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn deleted_refs_are_read_from_the_output() {
+        let intent = git_push("git push origin --delete old-a");
+        let out = "To https://github.com/o/r.git\n - [deleted]         old-a\n";
+        let got = interpret_success(&SensitiveCommand::GitPush(intent), out, "");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, SensitiveAction::Delete);
+        assert_eq!(got[0].artifact, "old-a");
+        assert_eq!(got[0].reversible, reversibility::RESTORE);
+        assert_eq!(got[0].repo.as_deref(), Some("o/r"));
+    }
+
+    #[test]
+    fn a_rejected_push_piped_to_tail_reports_nothing() {
+        // `| tail` makes the exit status 0, so is_error is false — the output
+        // is the only evidence that nothing happened.
+        let intent = git_push("git push -f origin main 2>&1 | tail -3");
+        let out = " ! [rejected]        main -> main (stale info)\nerror: failed to push some refs to 'github.com:o/r.git'\n";
+        let got = interpret_success(&SensitiveCommand::GitPush(intent), out, "");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn gh_release_create_reads_repo_from_the_release_url() {
+        let cmd = classify_sensitive_command("gh release create v2.0.0 --generate-notes");
+        let got = interpret_success(
+            &cmd[0],
+            "https://github.com/qontinui/qontinui-web/releases/tag/v2.0.0\n",
+            "",
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, SensitiveAction::Publish);
+        assert_eq!(got[0].artifact, "release v2.0.0");
+        assert_eq!(got[0].reversible, reversibility::NO);
+        assert_eq!(got[0].repo.as_deref(), Some("qontinui/qontinui-web"));
+    }
+
+    #[test]
+    fn gh_release_delete_is_roll_forward() {
+        let cmd = classify_sensitive_command("gh release delete v1 --yes -R o/r");
+        let got = interpret_success(&cmd[0], "", "");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, SensitiveAction::Delete);
+        assert_eq!(got[0].reversible, reversibility::ROLL_FORWARD);
+        assert_eq!(got[0].repo.as_deref(), Some("o/r"));
+    }
+
+    #[test]
+    fn registry_publishes_read_the_version_from_the_output() {
+        let npm = interpret_success(
+            &SensitiveCommand::NpmPublish { spec: None },
+            "npm notice Publishing to https://registry.npmjs.org/\n+ @qontinui/ui-bridge@0.27.0\n",
+            "C:/r",
+        );
+        assert_eq!(npm.len(), 1);
+        assert_eq!(npm[0].artifact, "@qontinui/ui-bridge@0.27.0");
+        assert_eq!(npm[0].reversible, reversibility::NO);
+        assert_eq!(
+            npm[0].repo_from_remote, None,
+            "a registry publish is not repo-scoped"
+        );
+
+        let cargo = interpret_success(
+            &SensitiveCommand::CargoPublish { package: None },
+            "   Uploading qontinui-schemas v0.4.1 (C:/r)\n   Published qontinui-schemas v0.4.1 at registry `crates-io`\n",
+            "C:/r",
+        );
+        assert_eq!(cargo[0].artifact, "crate qontinui-schemas v0.4.1");
+
+        let failed = interpret_success(
+            &SensitiveCommand::NpmPublish { spec: None },
+            "npm error code E403\n",
+            "C:/r",
+        );
+        assert!(failed.is_empty());
+    }
+
+    #[test]
+    fn body_omits_absent_optionals_and_carries_undo_when_known() {
+        let a = DetectedAction {
+            action: SensitiveAction::ForcePush,
+            artifact: "feat/x".into(),
+            reversible: reversibility::RESTORE,
+            undo: Some("1a2b3c4".into()),
+            repo: Some("o/r".into()),
+            repo_from_remote: None,
+            working_dir: String::new(),
+        };
+        assert_eq!(
+            a.body(),
+            json!({
+                "action": "force_push",
+                "artifact": "feat/x",
+                "reversible": "restore",
+                "repo": "o/r",
+                "undo": "1a2b3c4",
+            })
+        );
+        let b = DetectedAction {
+            undo: None,
+            repo: None,
+            ..a
+        };
+        let body = b.body();
+        assert!(body.get("undo").is_none(), "never `undo: null`");
+        assert!(body.get("repo").is_none());
+    }
+
+    // ── Fixture transcripts through the pending map ──────────────────────
+
+    fn tool_use_line(id: &str, command: &str) -> String {
+        json!({
+            "type": "assistant",
+            "cwd": "C:/work/qontinui-runner",
+            "message": {"content": [
+                {"type": "text", "text": "pushing"},
+                {"type": "tool_use", "id": id, "name": "Bash", "input": {"command": command}},
+            ]},
+        })
+        .to_string()
+    }
+
+    fn tool_result_line(id: &str, is_error: bool, content: &str) -> String {
+        json!({
+            "type": "user",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content},
+            ]},
+            "toolUseResult": {"stdout": "", "stderr": "", "interrupted": false},
+        })
+        .to_string()
+    }
+
+    const FORCED_OUTPUT: &str = "To github.com:qontinui/qontinui-runner.git\n + 1a2b3c4...5d6e7f8 feat/x -> feat/x (forced update)";
+
+    #[test]
+    fn fixture_successful_force_push_emits() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        assert!(t
+            .observe_line(
+                &tool_use_line("toolu_1", "git push --force-with-lease origin feat/x"),
+                t0
+            )
+            .is_empty());
+        assert_eq!(t.pending_len(), 1, "the tool_use is parked");
+
+        let got = t.observe_line(
+            &tool_result_line("toolu_1", false, FORCED_OUTPUT),
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].action, SensitiveAction::ForcePush);
+        assert_eq!(got[0].undo.as_deref(), Some("1a2b3c4"));
+        assert_eq!(got[0].working_dir, "C:/work/qontinui-runner");
+        assert_eq!(got[0].body()["repo"], json!("qontinui/qontinui-runner"));
+        assert_eq!(t.pending_len(), 0, "the result resolves the entry");
+    }
+
+    #[test]
+    fn fixture_failed_force_push_does_not_emit() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_2", "git push -f origin main"), t0);
+        let got = t.observe_line(
+            &tool_result_line(
+                "toolu_2",
+                true,
+                "Exit code 1\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs",
+            ),
+            t0,
+        );
+        assert!(got.is_empty(), "is_error means it did not happen");
+        assert_eq!(
+            t.pending_len(),
+            0,
+            "the failed entry is released, not leaked"
+        );
+    }
+
+    #[test]
+    fn fixture_plain_push_does_not_emit() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_3", "git push -u origin feat/x"), t0);
+        assert_eq!(t.pending_len(), 0, "a plain push is never parked");
+        let got = t.observe_line(
+            &tool_result_line(
+                "toolu_3",
+                false,
+                "To github.com:o/r.git\n * [new branch] feat/x -> feat/x",
+            ),
+            t0,
+        );
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn fixture_result_that_never_arrives_expires_without_emitting() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_4", "git push --force"), t0);
+        assert_eq!(t.pending_len(), 1);
+
+        // Any later line past the TTL sweeps it — here an unrelated Bash use.
+        t.observe_line(
+            &tool_use_line("toolu_other", "git status"),
+            t0 + PENDING_ACTION_TTL + Duration::from_secs(1),
+        );
+        assert_eq!(t.pending_len(), 0, "expired");
+        assert_eq!(t.expired(), 1);
+
+        // A result that straggles in after expiry is NOT emitted.
+        let got = t.observe_line(
+            &tool_result_line("toolu_4", false, FORCED_OUTPUT),
+            t0 + PENDING_ACTION_TTL + Duration::from_secs(2),
+        );
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn a_result_inside_the_ttl_still_emits() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_5", "git push --force"), t0);
+        let got = t.observe_line(
+            &tool_result_line("toolu_5", false, FORCED_OUTPUT),
+            t0 + PENDING_ACTION_TTL - Duration::from_secs(1),
+        );
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn the_pending_map_is_bounded() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        let offered = PENDING_ACTION_CAPACITY + 44;
+        for n in 0..offered {
+            t.observe_line(
+                &tool_use_line(&format!("toolu_{n}"), "git push --force"),
+                t0 + Duration::from_millis(n as u64),
+            );
+        }
+        assert_eq!(t.pending_len(), PENDING_ACTION_CAPACITY);
+        assert_eq!(t.evicted(), 44);
+        // The OLDEST were evicted: the first id is gone, the last is held.
+        assert!(t
+            .observe_line(&tool_result_line("toolu_0", false, FORCED_OUTPUT), t0)
+            .is_empty());
+        assert_eq!(
+            t.observe_line(
+                &tool_result_line(&format!("toolu_{}", offered - 1), false, FORCED_OUTPUT),
+                t0,
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_reread_transcript_does_not_notify_twice() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        let use_line = tool_use_line("toolu_6", "git push --force");
+        let result = tool_result_line("toolu_6", false, FORCED_OUTPUT);
+        t.observe_line(&use_line, t0);
+        assert_eq!(t.observe_line(&result, t0).len(), 1);
+        // Truncation → the tail re-reads from offset 0.
+        t.observe_line(&use_line, t0);
+        assert!(t.observe_line(&result, t0).is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_command_does_not_emit() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_7", "cargo publish"), t0);
+        let line = json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_7", "is_error": false, "content": ""},
+            ]},
+            "toolUseResult": {"stdout": "", "stderr": "", "interrupted": true},
+        })
+        .to_string();
+        assert!(t.observe_line(&line, t0).is_empty());
+    }
+
+    #[test]
+    fn the_ref_table_is_read_from_stderr_when_content_omits_it() {
+        let mut t = SensitiveActionTracker::new();
+        let t0 = Instant::now();
+        t.observe_line(&tool_use_line("toolu_8", "git push -f origin feat/x"), t0);
+        let line = json!({
+            "type": "user",
+            "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "toolu_8", "is_error": false,
+                 "content": [{"type": "text", "text": ""}]},
+            ]},
+            "toolUseResult": {"stdout": "", "stderr": FORCED_OUTPUT, "interrupted": false},
+        })
+        .to_string();
+        let got = t.observe_line(&line, t0);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].undo.as_deref(), Some("1a2b3c4"));
+    }
+
+    #[test]
+    fn notification_lane_is_deterministic_per_transcript() {
+        let a = agent_notification_lane("0f6c1c4e-0000-4000-8000-000000000001");
+        assert_eq!(
+            a,
+            agent_notification_lane("0f6c1c4e-0000-4000-8000-000000000001")
+        );
+        assert_ne!(
+            a,
+            agent_notification_lane("0f6c1c4e-0000-4000-8000-000000000002")
+        );
     }
 }
