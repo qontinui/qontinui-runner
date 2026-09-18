@@ -18,8 +18,10 @@
 //! `qontinui-claude-config`'s favour when this runner de-forked its copies
 //! (`dd1630ea0`); every later change arrives as a re-vendor commit carrying the
 //! canonical bytes. Edit the canonical file, then re-vendor — an edit made only
-//! here is a fork, and the byte-parity arm of `qontinui-claude-config`'s
-//! command lint is what polices the copy against its canonical file.
+//! here is a fork. The byte comparison that will police the copy against its
+//! canonical file is a planned arm of `qontinui-claude-config`'s command lint
+//! (plan `2026-09-13-a-served-command-body-carries-no-provenance-and-its-parity-gate-compares-tokens`,
+//! Phases 1–3); until it gates, check #15b compares tokens, not bytes.
 //!
 //! ## Every written body states its provenance
 //!
@@ -30,10 +32,17 @@
 //! qontinui-provenance: source=<builtin|served|disk_cache> canonical=qontinui-claude-config:.claude/commands/<name>.md blob=<sha1> runner_build=<RUNNER_BUILD_ID>
 //! ```
 //!
-//! `blob` is the git blob id of the body bytes with the key excluded, so for an
-//! unmodified builtin it equals `git hash-object` of the canonical file, and a
-//! provisioned file is checkable on its own — no sibling checkout, no runner —
-//! by [`provenance_consistent`]. The key is a write-time transform only: the
+//! `blob` is the git blob id of the body bytes with the key excluded. For a
+//! builtin it equals `git hash-object` of the VENDORED file this build
+//! embedded — and of the canonical file only while the two are in byte parity.
+//! `git -C qontinui-claude-config cat-file -e <blob>` separates a stale copy
+//! (the blob is an older canonical version) from a fork (it is in no version).
+//! A provisioned file is checkable on its own — no sibling checkout, no runner —
+//! by [`provenance_consistent`], or from a shell: when line 3 is `---` (a
+//! prepended block) `tail -n +4 <file> | git hash-object --stdin`, otherwise
+//! (the key was inserted into existing frontmatter) `sed 2d <file> | git
+//! hash-object --stdin`; with no git at all, the sha1 of
+//! `blob <byte-length>\0<body>`. The key is a write-time transform only: the
 //! embedded consts and the files beside this module never carry it.
 //!
 //! Adding a command is adding a `.md` file next to them plus one line in
@@ -612,8 +621,8 @@ fn split_first_line(text: &str) -> (&str, &str) {
 /// `body` with ONE generated `qontinui-provenance:` key placed at line 2, in
 /// YAML frontmatter.
 ///
-/// Placement, because Claude Code parses frontmatter only when it starts at
-/// line 1 — nothing is ever put above an existing `---`:
+/// Placement, because YAML frontmatter is recognised only when it starts at
+/// line 1 (the convention Claude Code's command loader follows) — nothing is ever put above an existing `---`:
 /// - a body that opens a NON-EMPTY frontmatter block (`---\n` or `---\r\n`
 ///   followed by anything but a closing `---`) gets the key inserted as the
 ///   first line inside it, with the opener's own line ending;
@@ -624,7 +633,8 @@ fn split_first_line(text: &str) -> (&str, &str) {
 ///   [`strip_provenance`] could not tell the two apart.
 ///
 /// `blob` is computed over `body` BEFORE the key is added, so it equals
-/// `git hash-object` of the canonical file whenever the body is unmodified.
+/// `git hash-object` of the vendored file for an unmodified builtin (and of the
+/// canonical file only while the two are in byte parity).
 pub(crate) fn with_provenance(name: &str, body: &str, source: CommandSource) -> String {
     let key = format!(
         "{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \
@@ -1399,7 +1409,7 @@ mod tests {
                      spawned session and on a device with no qontinui-claude-config \
                      checkout it is the ONLY copy, so a mechanic missing here is a \
                      mechanic the fleet does not have; add it in \
-                     src-tauri/src/fleet_commands/{name}.md"
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
             }
         }
@@ -1453,7 +1463,7 @@ mod tests {
                      but never states the discriminator that tells a usable gate from an \
                      unusable one. The rule: {NOT_USABLE_TEST}. Every registration path \
                      needs it, not just the file as a whole; add the Warnings-honesty \
-                     bullet to this path in src-tauri/src/fleet_commands/{name}.md"
+                     bullet to this path in qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
                 // The SECOND arm of the narrowed rule. Keyed on the terminal
                 // states rather than on an `initial_verdict` token, which would
@@ -1467,7 +1477,7 @@ mod tests {
                      the terminal-`initial_verdict` arm, so it teaches a session to treat a \
                      gate born `misconfigured` / `failed` as live and wait on something that \
                      can never clear. The rule: {NOT_USABLE_TEST}. Add the missing arm in \
-                     src-tauri/src/fleet_commands/{name}.md"
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
             }
         }
@@ -1543,7 +1553,7 @@ mod tests {
                 !norm.contains(RETIRED_HEADING),
                 "bundled agent command {name} revives the RETIRED gate-warnings heading \
                  (\"a `gate_id` with WARNINGS is not a registered gate\"). The rule is now: \
-                 {NOT_USABLE_TEST}. Fix src-tauri/src/fleet_commands/{name}.md"
+                 {NOT_USABLE_TEST}. Fix qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
             );
 
             let chars: Vec<char> = norm.chars().collect();
@@ -1577,8 +1587,8 @@ mod tests {
     /// NOT bare `qontinui-dev-notes`, which legitimately appears as a repo name.
     ///
     /// This guard is independent of where the bodies come from, and it got MORE
-    /// load-bearing once these files became the canonical, user-facing
-    /// defaults: whatever is here ships to every fleet device.
+    /// load-bearing once these files became the user-facing embedded
+    /// defaults: whatever is vendored here ships to every fleet device.
     #[test]
     fn staged_fleet_commands_have_no_plan_path_hardcodes() {
         const FORBIDDEN: &[&str] = &[
@@ -1592,7 +1602,7 @@ mod tests {
                     !contents.contains(pat),
                     "bundled agent command {name} contains forbidden plan-path hardcode \
                      {pat:?} — an operator-local absolute path must never ship to a fleet \
-                     device; rewrite it in src-tauri/src/fleet_commands/{name}.md"
+                     device; fix it in qontinui-claude-config .claude/commands/{name}.md and re-vendor"
                 );
             }
         }
@@ -1835,7 +1845,7 @@ mod tests {
                     "bundled agent command {name} contains forbidden operator-local absolute \
                      path {pat:?} — a path rooted on one operator's machine is a dead pointer \
                      on every other fleet device; rewrite it in \
-                     src-tauri/src/fleet_commands/{name}.md"
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
             }
         }
@@ -1933,7 +1943,7 @@ mod tests {
                      guard (it names {DELIVERY_READ}) but never mentions {token:?} — \
                      {why}. Without it this command's copy of the guard fails OPEN, and \
                      the failure is silent: the prose still reads complete. Add it in \
-                     src-tauri/src/fleet_commands/{name}.md"
+                     qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
             }
         }
@@ -2091,7 +2101,7 @@ mod tests {
                      {why}. A copy missing it fails OPEN on the one response shape that \
                      reads as a clean observation, and on a device with no \
                      qontinui-claude-config checkout this file is the ONLY copy; add it \
-                     in src-tauri/src/fleet_commands/{name}.md"
+                     in qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
                 );
             }
         }
@@ -2136,7 +2146,7 @@ mod tests {
                  exact omission is what let a vet pass overwrite a plan whose work had \
                  already landed and then re-implement it; restore the \"`IN PROGRESS` is \
                  CONDITIONALLY overwritable\" disposition in \
-                 src-tauri/src/fleet_commands/{name}.md"
+                 qontinui-claude-config .claude/commands/{name}.md (then re-vendor)"
             );
         }
         assert!(
