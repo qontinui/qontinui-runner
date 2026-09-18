@@ -174,6 +174,7 @@ pub(super) async fn fetch_pending(
     http: &reqwest::Client,
     coord_url: &str,
     device_id: Uuid,
+    timeout: Duration,
 ) -> Result<AttachListResponse, HandoffError> {
     let url = format!(
         "{}/sessions/attach-requests?device_id={}",
@@ -181,7 +182,7 @@ pub(super) async fn fetch_pending(
         device_id
     );
     let resp = crate::coord_http::coord_get(http, &url)
-        .timeout(Duration::from_secs(10))
+        .timeout(timeout)
         .send()
         .await
         .map_err(|e| HandoffError::Http(format!("GET {url}: {e}")))?;
@@ -201,8 +202,13 @@ pub(super) async fn fetch_pending(
 /// The catch-up: GET the pending list and record every row. Best-effort,
 /// same posture as the handoff and respawn catch-ups — one WARN line on a
 /// 401/403 (pre-pairing window), debug otherwise.
-pub(super) async fn run_catchup(http: &reqwest::Client, coord_url: &str, device_id: Uuid) {
-    match fetch_pending(http, coord_url, device_id).await {
+pub(super) async fn run_catchup(
+    http: &reqwest::Client,
+    coord_url: &str,
+    device_id: Uuid,
+    timeout: Duration,
+) {
+    match fetch_pending(http, coord_url, device_id, timeout).await {
         Ok(list) => {
             if list.storage.as_deref() == Some("absent") {
                 tracing::debug!(
@@ -236,12 +242,31 @@ pub(super) async fn run_catchup(http: &reqwest::Client, coord_url: &str, device_
     }
 }
 
+/// The background catch-up's HTTP budget. Generous because nothing is waiting
+/// on it — it runs on the 60 s poll and on the coord-WS / relay `connected`
+/// acks.
+pub const CATCHUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Run the catch-up once against the registry's coord — the door the backend
 /// relay calls on its `connected` ack.
 pub async fn catch_up_now(registry: &Arc<SessionRegistry>) {
+    catch_up_now_within(registry, CATCHUP_TIMEOUT).await;
+}
+
+/// [`catch_up_now`] with an explicit HTTP timeout.
+///
+/// The on-demand re-read — the one `handle_terminal_attach` awaits on the
+/// backend relay's SERIAL read loop when an attach names a jti this device
+/// does not know — passes
+/// [`crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT`] here instead of the
+/// background [`CATCHUP_TIMEOUT`]. That call freezes terminal input, terminal
+/// output and every other relay frame on the socket for as long as it runs, so
+/// its bound is a LIVENESS budget for the whole device and not a patience
+/// budget for one grant — the same reasoning as the create twin.
+pub async fn catch_up_now_within(registry: &Arc<SessionRegistry>, timeout: Duration) {
     let http = registry.coord_sync().http_client();
     let coord_url = registry.coord_sync().coord_url().to_string();
-    run_catchup(&http, &coord_url, registry.machine_id()).await;
+    run_catchup(&http, &coord_url, registry.machine_id(), timeout).await;
 }
 
 /// The 60 s catch-up loop. Returns the handle so the caller can hold it for

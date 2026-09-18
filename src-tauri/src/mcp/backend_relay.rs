@@ -2275,7 +2275,7 @@ async fn handle_relay_command(
         // to the client first because the backend refuses a
         // `remote_terminal_attach` that way, correlated by `request_id`.
         // --------------------------------------------------------------
-        "terminal_attach" => handle_terminal_attach(api_state, data),
+        "terminal_attach" => handle_terminal_attach(api_state, data).await,
         "terminal_detach" => handle_terminal_detach(data),
         // A source's `set_paused` toggle, applied to this target's per-grant
         // `EmissionGate` (Phase 5). Both spellings route here on purpose: the
@@ -3916,30 +3916,19 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
             // round-trip and is refused exactly as before. The first gate
             // refused at the LOOKUP, before any consume, so re-gating is
             // idempotent.
-            let worth_a_reread = frame
-                .get("code")
-                .and_then(|c| c.as_str())
-                .is_some_and(crate::mcp::remote_terminal::refusal_warrants_a_coord_reread);
-            let jti = frame
-                .get("grant_jti")
-                .and_then(|j| j.as_str())
-                .unwrap_or_default()
-                .to_string();
             // THROTTLED, because this `await` runs on the relay's SERIAL read
             // loop: an unthrottled re-read stalls terminal input, output and
             // every other frame for up to the coord timeout, once per forged
-            // jti. `claim_create_reread` allows one per jti and one per
+            // jti. `claim_grant_reread` allows one per jti and one per
             // cooldown window; everything else is refused from memory at no
             // cost. It RECORDS the attempt, so call it once.
-            if !worth_a_reread
-                || jti.is_empty()
-                || !crate::mcp::remote_terminal::claim_create_reread(
-                    &jti,
-                    crate::mcp::remote_terminal::now_epoch_secs(),
-                )
-            {
+            let Some(jti) = crate::mcp::remote_terminal::reread_decision(
+                &frame,
+                crate::mcp::remote_terminal::GrantFamily::Create,
+                crate::mcp::remote_terminal::now_epoch_secs(),
+            ) else {
                 return Some(frame);
-            }
+            };
             match api_state
                 .app_handle
                 .try_state::<Arc<crate::session::SessionRegistry>>()
@@ -3956,16 +3945,16 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                     // read loop, so it is the whole device's liveness budget.
                     crate::session::create::catch_up_now_within(
                         &registry,
-                        crate::mcp::remote_terminal::CREATE_REREAD_TIMEOUT,
+                        crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT,
                     )
                     .await;
-                    // Re-stamp the cooldown on COMPLETION. `claim_create_reread`
+                    // Re-stamp the cooldown on COMPLETION. `claim_grant_reread`
                     // stamped it when the re-read started, which bounds how
                     // often one begins and not how much of the read loop it
                     // occupies — a round-trip as long as the cooldown left the
                     // next unknown jti free to claim immediately, so the stalls
                     // ran back to back.
-                    crate::mcp::remote_terminal::finish_create_reread(
+                    crate::mcp::remote_terminal::finish_grant_reread(
                         crate::mcp::remote_terminal::now_epoch_secs(),
                     );
                 }
@@ -3976,7 +3965,10 @@ async fn handle_terminal_create(api_state: &Arc<ApiState>, data: &Value) -> Opti
                     // Coord knew it: the re-read raced the directive and won,
                     // so drop the "already asked" memory rather than holding a
                     // slot for a jti that turned out to be real.
-                    crate::mcp::remote_terminal::clear_create_reread(&jti);
+                    crate::mcp::remote_terminal::clear_grant_reread(
+                        crate::mcp::remote_terminal::GrantFamily::Create,
+                        &jti,
+                    );
                     admitted
                 }
                 // Coord does not know it either. Return the SECOND refusal:
@@ -4263,7 +4255,7 @@ fn resolve_local_terminal(
 /// `handle_terminal_buffer` computes it. The terminal's `terminal_output`
 /// frames then flow through `handle_outbound`, which forwards them for a
 /// terminal with a bound grant even with no web subscriber.
-fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
+async fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Value> {
     use crate::mcp::remote_terminal::{admit_terminal_attach, grants, now_epoch_secs, remote_echo};
     let request_id = data.get("request_id");
     let terminal_manager: Option<Arc<crate::terminal::TerminalManager>> = api_state
@@ -4280,15 +4272,90 @@ fn handle_terminal_attach(api_state: &Arc<ApiState>, data: &Value) -> Option<Val
 
     // Parse → lookup (source device cross-checked) → resolve → bind, all in
     // the pure seam so each refusal is unit-tested; `Err` is the frame.
-    let (block, grant, terminal_id, session) = match admit_terminal_attach(
-        grants(),
-        crate::settings::get_remote_attach_preference,
-        data,
-        now_epoch_secs(),
-        |session_id| resolve_local_terminal(tm.as_ref(), session_id),
-    ) {
+    let gate = || {
+        admit_terminal_attach(
+            grants(),
+            crate::settings::get_remote_attach_preference,
+            data,
+            now_epoch_secs(),
+            |session_id| resolve_local_terminal(tm.as_ref(), session_id),
+        )
+    };
+    let (block, grant, terminal_id, session) = match gate() {
         Ok(admitted) => admitted,
-        Err(frame) => return Some(frame),
+        Err(frame) => {
+            // The ONE refusal worth a second look, and only this one — the
+            // exact mitigation `handle_terminal_create` already carries.
+            //
+            // Coord publishes the attach directive before it answers the
+            // source's mint, but the directive rides NATS while the frame
+            // rides the source's HTTP round-trip and the relay socket — two
+            // paths with no ordering between them. So a LEGITIMATE attach can
+            // arrive microseconds before the grant that authorises it, and the
+            // 60 s catch-up poll made that permanent rather than a flake:
+            // every retry mints a FRESH jti, so the grant the poll eventually
+            // records is never the one the next frame presents.
+            //
+            // Ask coord directly, once, and re-gate. This does not weaken the
+            // check — the answer still comes from COORD and never from the
+            // relay — it only removes the race. The first gate refused at the
+            // LOOKUP, before any consume, so re-gating is idempotent.
+            // THROTTLED on the same budget the create re-read uses, because it
+            // is the same resource being spent: this `await` runs on the
+            // relay's SERIAL read loop, so an unthrottled re-read stalls
+            // terminal input, output and every other frame once per forged
+            // jti. It RECORDS the attempt, so call it once.
+            let Some(jti) = crate::mcp::remote_terminal::reread_decision(
+                &frame,
+                crate::mcp::remote_terminal::GrantFamily::Attach,
+                crate::mcp::remote_terminal::now_epoch_secs(),
+            ) else {
+                return Some(frame);
+            };
+            match api_state
+                .app_handle
+                .try_state::<Arc<crate::session::SessionRegistry>>()
+            {
+                Some(registry) => {
+                    let registry = registry.inner().clone();
+                    tracing::debug!(
+                        grant_jti = %jti,
+                        "remote attach: jti unknown to this device — asking coord directly \
+                         before refusing (the directive may not have landed yet)"
+                    );
+                    // BOUNDED to the shared liveness budget, not the catch-up's
+                    // ten seconds: this holds the whole device's read loop.
+                    crate::session::attach::catch_up_now_within(
+                        &registry,
+                        crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT,
+                    )
+                    .await;
+                    // Re-stamp the cooldown on COMPLETION — stamping only at
+                    // the start bounds how often a re-read BEGINS, not how much
+                    // of the read loop it occupies, so back-to-back stalls slip
+                    // through.
+                    crate::mcp::remote_terminal::finish_grant_reread(
+                        crate::mcp::remote_terminal::now_epoch_secs(),
+                    );
+                }
+                None => return Some(frame),
+            }
+            match gate() {
+                Ok(admitted) => {
+                    // Coord knew it: the re-read won the race, so drop the
+                    // "already asked" memory rather than holding a slot for a
+                    // jti that turned out to be real.
+                    crate::mcp::remote_terminal::clear_grant_reread(
+                        crate::mcp::remote_terminal::GrantFamily::Attach,
+                        &jti,
+                    );
+                    admitted
+                }
+                // Coord does not know it either. Return the SECOND refusal: it
+                // was decided against a freshly read list.
+                Err(frame) => return Some(frame),
+            }
+        }
     };
 
     // A fresh binding starts with an open gate: a stale pause from an earlier
