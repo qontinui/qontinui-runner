@@ -46,8 +46,8 @@
 //! |---|---|---|
 //! | (i) [`FaultClass::Unreachable`] | coord did not answer, or answered non-2xx | 3 consecutive probes |
 //! | (ii) [`FaultClass::WorkerDead`] | a leader-gated worker rolls up `dead` | first observation, per worker |
-//! | (iii) [`FaultClass::NoLeader`] | a leader-gated worker reports `no_leader_tick` — NO live replica is running it | 3 consecutive probes |
-//! | (iv) [`FaultClass::LivenessUnknown`] | coord answered and this runner could not read a ledger out of it | 3 consecutive probes |
+//! | (iii) [`FaultClass::NoLeader`] | coord reports leader-gated workers with no live replica running them (`counts.not_leader_here`, whether or not their rows survived the cap) | 3 probes |
+//! | (iv) [`FaultClass::LivenessUnknown`] | this runner has had no USABLE observation of coord | 3 consecutive probes |
 //!
 //! (ii) carries no cadence requirement because `dead` is already a debounced
 //! verdict: coord's ledger only reaches it after >10 tick intervals of
@@ -57,13 +57,25 @@
 //! (iv) is not a fault in coord. It is a fault in this runner's VIEW of
 //! coord, and it gets a surface for exactly the reason the other three do:
 //! a watcher that has gone blind must SAY SO on the surface it would have
-//! used, or its silence is indistinguishable from a clean fleet. Four ways it
-//! becomes permanent rather than transient — a rotated or expired device
-//! credential (or a WAF 401), coord's own `workers:no_observation`, a
-//! response-shape change this build cannot parse, and a flaky load balancer
-//! alternating `Unreachable`/`Unusable` so that NEITHER streak ever reaches
-//! its cadence — are all states in which coord liveness is unobserved
-//! indefinitely while the runner looks healthy.
+//! used, or its silence is indistinguishable from a clean fleet.
+//!
+//! **(iv)'s counter is the one thing here that no other arm resets**
+//! ([`ObserverState::unobserved_streak`]). That is deliberate and it is the
+//! whole point of the class: the states this exists to catch are the ones in
+//! which no SINGLE predicate ever holds long enough to fire, while coord is
+//! nonetheless unobserved throughout. A rotated or expired device credential
+//! (or a WAF 401), coord's own `workers:no_observation`, and a response-shape
+//! change this build cannot parse each pin `Unusable`; a load balancer with
+//! one target serving a 200 maintenance page and one refusing connections
+//! ALTERNATES `Unusable` and `Unreachable`, and each arm legitimately
+//! contradicts the other's streak — so before this counter existed, neither
+//! (i) nor (iv) could ever reach `CADENCES_TO_FIRE` and a wholly-down coord
+//! produced no card, no incident line and no finding, indefinitely. A counter
+//! that only a SETTLING read clears cannot be starved that way.
+//!
+//! It is suppressed while (i) has already fired, because "coord has not
+//! answered on N consecutive probes" is a strictly stronger statement about
+//! the same episode and a second card beside it is noise, not a second fact.
 //!
 //! # What an UNKNOWN must never become
 //!
@@ -90,10 +102,26 @@
 //! WORST-first, and `not_leader_here` shares the bottom severity with
 //! `alive`. So the cap discards leaderless rows FIRST and dead rows LAST,
 //! which inverts the naive risk model: predicate (iii), the one this module
-//! exists for, is the one the cap silences. An empty `leaderless` list on a
-//! TRUNCATED read is therefore UNKNOWN, never health, and
-//! [`ObserverState`] neither advances nor clears (iii) on such a cycle —
-//! exactly what it already does for an [`ProbeOutcome::Unusable`].
+//! exists for, is the one the cap silences.
+//!
+//! The answer is to stop reading (iii) off the LIST at all. `counts` is over
+//! the full worker set and is never capped, and every worker inside
+//! `counts.not_leader_here` is leader-gated and non-nominal BY CONSTRUCTION
+//! (the proof is on [`LedgerRead::counts_not_leader_here`]) — so that count
+//! IS predicate (iii)'s population, and the list only ever supplies NAMES.
+//! [`ObserverState::observe_leaderless`] therefore advances on the count and
+//! reports with whatever names survived, saying so when they did not. A count
+//! coord affirms is an observation, not an UNKNOWN: "coord says twelve
+//! leader-gated workers have no leader and I cannot name them" is an outage
+//! report, not a blind spot.
+//!
+//! What remains of the truncation story for (ii): `counts.dead` genuinely
+//! spans the follower plane as well, so a surplus there is ordinary and only
+//! [`LedgerRead::dead_is_underread`] — a surplus ON A TRUNCATED LIST — is
+//! evidence of a blind spot. The two predicates are NOT analogues, and the
+//! asymmetry between [`LedgerRead::dead_is_underread`] and
+//! [`LedgerRead::leaderless_is_underread`] is load-bearing rather than an
+//! oversight.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,10 +155,17 @@ pub const PROBE_PERIOD_SECS: u64 = 60;
 /// overlap even without the in-flight latch.
 const PROBE_TIMEOUT_SECS: u64 = 20;
 
-/// How often an `Unusable` streak re-warns, in probes. The first one always
+/// How often an UNOBSERVED streak re-warns, in probes. The first one always
 /// warns; after that roughly hourly, so a runner whose credential has gone
 /// dark says so without burying the log.
-const UNUSABLE_REWARN_EVERY: u32 = 60;
+///
+/// It counts the streak that NOTHING but a settling read clears, which is the
+/// only counter on which "roughly hourly" is true. Counted off the old
+/// per-arm `Unusable` streak it was a promise the code could not keep: an
+/// alternating door reset that streak to 1 on every other probe, so `== 1`
+/// matched forever and the warn fired every ~2 minutes for as long as the
+/// flap lasted.
+const UNOBSERVED_REWARN_EVERY: u32 = 60;
 
 /// The coord tool this observer calls. Swapped in for the doctor's
 /// `tools/list` — same door, a question with an answer in it.
@@ -159,15 +194,17 @@ pub enum FaultClass {
     /// (iii) no replica reports itself leader, so nothing is running the
     /// leader-gated plane.
     NoLeader,
-    /// (iv) coord ANSWERED and this runner could not read a worker ledger out
-    /// of its answer, for [`CADENCES_TO_FIRE`] probes running.
+    /// (iv) this runner has had no USABLE observation of coord for
+    /// [`CADENCES_TO_FIRE`] probes running — it did not answer, answered
+    /// unreadably, or answered readably while leaving a predicate unsettled.
     ///
     /// Not a statement about coord's health — a statement that this runner
     /// has no statement. It is a class rather than a log line because the
     /// states that produce it (a dead credential, a shape change, coord's own
-    /// `workers:no_observation`) are typically PERMANENT until someone acts,
-    /// and an observer that is permanently blind while the runner looks
-    /// healthy is the exact defect this whole plan is about.
+    /// `workers:no_observation`, a door alternating between two failure
+    /// modes) are typically PERMANENT until someone acts, and an observer
+    /// that is permanently blind while the runner looks healthy is the exact
+    /// defect this whole plan is about.
     LivenessUnknown,
 }
 
@@ -229,16 +266,18 @@ impl FaultClass {
             }
             FaultClass::LivenessUnknown => {
                 "This is NOT a verdict on coord — it is this runner reporting that it \
-                 has no verdict. coord answered every probe and none of the answers \
-                 carried a readable worker ledger, so predicates (ii) and (iii) have \
+                 has no verdict. No probe in the window produced a usable observation, \
+                 so predicates (ii) and (iii) have \
                  been unobserved from here for as long as the message says. The usual \
                  causes, in order: an expired or rotated device credential (run \
                  `coord doctor` — a 401/403 is reported here, never as `coord is \
                  down`); the `coord_query_workers` tool masked for this principal; \
                  coord's own `workers:no_observation` verdict, which means its ledger \
-                 has no rows to read; or a response shape this runner build cannot \
-                 parse, which wants a runner upgrade. The details block carries the \
-                 last reason verbatim."
+                 has no rows to read; a response shape this runner build cannot \
+                 parse, which wants a runner upgrade; or a door alternating between \
+                 two failure modes, which is coord being wholly unavailable behind a \
+                 load balancer whose targets fail differently. The details block \
+                 carries the last reason verbatim."
             }
         }
     }
@@ -271,21 +310,36 @@ pub struct LedgerRead {
     /// discrimination — predicate (ii)'s population.
     pub dead_leader_gated: Vec<WorkerVerdict>,
     /// Leader-gated workers no live replica is running (`reason:
-    /// no_leader_tick`) — predicate (iii)'s population.
+    /// no_leader_tick`) — the NAMES for predicate (iii). Its population is
+    /// [`Self::counts_not_leader_here`], because this list is capped and that
+    /// count is not.
     pub leaderless: Vec<WorkerVerdict>,
     /// `components.counts.dead`, verbatim, for the report body.
     pub counts_dead: u64,
     /// `components.counts.not_leader_here`, verbatim — predicate (iii)'s
-    /// count over the FULL worker set, which is what makes a truncated list
-    /// readable as UNKNOWN rather than as health.
+    /// POPULATION, over the FULL worker set and never capped.
     ///
-    /// It is an exact analogue of [`Self::counts_dead`] because coord makes
-    /// it one: a rollup status of `not_leader_here` is non-nominal BY
-    /// CONSTRUCTION (`qontinui-coord` `worker_ledger::rollup`'s
-    /// `(nominal, reason)` match — every `NotLeaderHere` gets
-    /// `(false, Some("no_leader_tick"))`), so every worker this counts is
-    /// also a worker the `non_nominal_workers` list would have carried had it
-    /// not been capped.
+    /// **It is NOT an analogue of [`Self::counts_dead`], and the difference
+    /// is the whole of predicate (iii).** `counts.dead` spans the follower
+    /// plane, so a surplus over the leader-gated rows this module classifies
+    /// is ordinary. `counts.not_leader_here` cannot: in `qontinui-coord`,
+    ///
+    /// * `WorkerLiveness::NotLeaderHere` is reachable only from
+    ///   `last_outcome == FollowerSkip` (`worker_ledger.rs`);
+    /// * a `FollowerSkip` row is written only under
+    ///   `if spec.leader_gated && !state.leader.is_leader()`;
+    /// * the rollup sets `leader_gated = group.iter().any(|r| r.leader_gated)`,
+    ///   and every `NotLeaderHere` rollup is non-nominal —
+    ///   `(false, Some("no_leader_tick"))`.
+    ///
+    /// So **every worker inside this count is leader-gated and non-nominal**,
+    /// and on an untruncated read `leaderless.len()` equals it EXACTLY. A
+    /// surplus is never ordinary here: it is always rows the 40-row cap took,
+    /// or rows this build failed to classify. Either way coord has
+    /// affirmatively said there are leaderless workers, which is an
+    /// observation of (iii) rather than an UNKNOWN about it — so
+    /// [`ObserverState::observe_leaderless`] advances on this number and
+    /// treats [`Self::leaderless`] as a source of names only.
     pub counts_not_leader_here: u64,
     /// Leader-gated `dead` rows EXCLUDED because coord could prove the verdict
     /// came from a replica a deploy had already replaced. Reported in the body
@@ -322,12 +376,17 @@ pub struct LedgerRead {
     /// `leaderless: []` — the fault this module exists to catch, rendered as
     /// health.
     ///
-    /// Carried rather than ignored so that BOTH under-reads
-    /// ([`Self::dead_is_underread`], [`Self::leaderless_is_underread`]) read
+    /// Carried rather than ignored so that [`Self::dead_is_underread`] reads
     /// as UNKNOWN instead of as a clean fleet (served policy
-    /// `verification-and-evidence` `unknown-must-not-render-as-a-default`).
-    /// Latent today — 19 workers against a cap of 40 — which is exactly when
-    /// it is cheap to get right.
+    /// `verification-and-evidence` `unknown-must-not-render-as-a-default`),
+    /// and so a (iii) report can say its names were capped away rather than
+    /// print an empty list.
+    ///
+    /// Whether the cap is REACHABLE on a given fleet is a runtime property of
+    /// that fleet's worker population, not a fact this file can assert: it is
+    /// one row of a live table away from changing, and no dated measurement
+    /// of it is cited here. Predicate (iii) no longer depends on the answer —
+    /// it reads [`Self::counts_not_leader_here`], which the cap never touches.
     pub list_truncated: bool,
 }
 
@@ -353,28 +412,62 @@ impl LedgerRead {
         self.list_truncated && self.dead_unaccounted() > 0
     }
 
-    /// `counts.not_leader_here` this read could not name — the exact analogue
-    /// of [`Self::dead_unaccounted`] for predicate (iii).
+    /// `counts.not_leader_here` this read could not NAME.
     ///
-    /// Saturating, and not an error on its own: [`Self::leaderless`] is the
-    /// LEADER-GATED subset while the count is over every worker, so a surplus
-    /// is ordinary on an untruncated list.
+    /// Saturating. Unlike [`Self::dead_unaccounted`] this is never ordinary:
+    /// every worker the count covers is leader-gated and non-nominal by
+    /// coord's own construction (the proof is on
+    /// [`Self::counts_not_leader_here`]), so on a whole, parseable read it is
+    /// exactly zero.
     pub fn leaderless_unaccounted(&self) -> u64 {
         self.counts_not_leader_here
             .saturating_sub(self.leaderless.len() as u64)
     }
 
-    /// True when coord counted leaderless workers this runner could not see,
-    /// BECAUSE the list was truncated — the analogue of
-    /// [`Self::dead_is_underread`], and the one that actually fires in
-    /// practice, because the cap discards severity-0 rows first (see
-    /// [`Self::list_truncated`]).
+    /// True when coord counted leaderless workers this runner could not name.
     ///
-    /// When this holds, an EMPTY [`Self::leaderless`] is UNKNOWN rather than
-    /// health, and [`ObserverState::observe`] must neither advance nor clear
-    /// predicate (iii) on that cycle.
+    /// **Deliberately NOT conditioned on [`Self::list_truncated`], and that
+    /// asymmetry with [`Self::dead_is_underread`] is the point.** The
+    /// conjunct used to be there, justified by a claim that a surplus was
+    /// ordinary on an untruncated list; that claim was false (see
+    /// [`Self::counts_not_leader_here`]) and it opened a silent false
+    /// negative with no truncation in it at all. If coord renames a row key
+    /// or changes `leader_gated`'s type, every row falls through
+    /// `classify_ledger`'s `_` arm and is dropped: `counts.not_leader_here`
+    /// reads 12, the list carries 12 rows, `non_nominal_workers_truncated` is
+    /// `false`, `leaderless` is empty — and a truncation-gated predicate
+    /// reported a clean fleet for a coord with no leader.
+    ///
+    /// Reduced to the count alone it says "coord counts leaderless workers
+    /// and I named none of them", which cannot false-positive: an untruncated
+    /// read that classified every row makes it exactly `false`.
+    ///
+    /// It is a REPORTING signal, not a gate. Predicate (iii) advances on
+    /// [`Self::counts_not_leader_here`] either way; this is what lets the
+    /// report say the names were unavailable instead of printing nothing.
     pub fn leaderless_is_underread(&self) -> bool {
-        self.list_truncated && self.leaderless_unaccounted() > 0
+        self.leaderless_unaccounted() > 0
+    }
+
+    /// Why this read left a predicate UNOBSERVED, or `None` when it settled
+    /// both — the input [`ObserverState::unobserved_streak`] folds for a
+    /// `Read`.
+    ///
+    /// Only (ii) can reach here. (iii) is settled either way by
+    /// [`Self::counts_not_leader_here`]: a zero is a leader, a non-zero is
+    /// predicate (iii) itself. (ii) is unobserved only when the truncated
+    /// list named NONE of the dead workers coord counted — a read that named
+    /// one has already put a `WorkerDead` card up and the operator is looking.
+    pub fn unobserved_reason(&self) -> Option<String> {
+        if self.dead_leader_gated.is_empty() && self.dead_is_underread() {
+            return Some(format!(
+                "coord answered and its `non_nominal_workers` list was TRUNCATED, naming none of \
+                 the {} dead worker(s) `counts.dead` reports — predicate (ii) was not observed \
+                 on this cycle",
+                self.counts_dead
+            ));
+        }
+        None
     }
 }
 
@@ -518,13 +611,31 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
         }
     };
 
+    // The flag gets the SAME arm as the two counts above, for the same reason
+    // the comment there gives. Defaulting it to `false` reintroduced exactly
+    // the harm that comment names: `dead_is_underread` reads `false` on every
+    // cycle, and the one under-read predicate that still consults the flag
+    // reports a clean fleet forever, with no warning anywhere. An absent or
+    // wrong-typed flag is a shape this build cannot read, which is
+    // `Unusable` — and three of those reach predicate (iv).
+    let list_truncated = match tool.pointer("/components/non_nominal_workers_truncated") {
+        Some(JsonValue::Bool(b)) => *b,
+        other => {
+            return ProbeOutcome::Unusable {
+                reason: format!(
+                    "coord answered but `components.non_nominal_workers_truncated` is {} rather \
+                     than a bool — this runner build cannot read this response shape, and an \
+                     absent truncation flag is UNKNOWN, not `false`",
+                    other.map(kind_of).unwrap_or("absent")
+                ),
+            }
+        }
+    };
+
     let mut read = LedgerRead {
         counts_dead,
         counts_not_leader_here,
-        list_truncated: tool
-            .pointer("/components/non_nominal_workers_truncated")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false),
+        list_truncated,
         ..LedgerRead::default()
     };
     for row in &listed {
@@ -656,16 +767,30 @@ pub struct ObserverState {
     leaderless_streak: u32,
     /// EVERY probe folded since the (iii) episode opened, not only the ones
     /// that advanced the streak. The streak deliberately survives cycles that
-    /// observe nothing (an [`ProbeOutcome::Unusable`], an
-    /// [`ProbeOutcome::Unreachable`], a truncated read whose leaderless rows
-    /// were capped away), so `streak` and "consecutive probes" are NOT the
-    /// same number and the summary must not claim they are.
+    /// observe nothing about (iii) — an [`ProbeOutcome::Unusable`] or an
+    /// [`ProbeOutcome::Unreachable`] — so `streak` and "consecutive probes"
+    /// are NOT the same number and the summary must not claim they are. (A
+    /// truncated read is no longer one of those cycles: it carries
+    /// `counts.not_leader_here`, which settles (iii) either way.)
     leaderless_probes: u32,
     leaderless_notified: bool,
     leaderless_since: Option<Instant>,
-    unusable_streak: u32,
-    unusable_notified: bool,
-    unusable_since: Option<Instant>,
+    /// Predicate (iv)'s counter: consecutive probes that produced NO usable
+    /// observation of coord — it did not answer, it answered unreadably, or
+    /// it answered readably and left (ii) unsettled.
+    ///
+    /// **Nothing but a settling read clears it**, which is the property the
+    /// class is named for and the reason it is a separate counter rather than
+    /// a rename of the old per-arm `Unusable` streak. The per-arm streaks
+    /// correctly contradict each other — an `Unreachable` really does refute
+    /// "coord answered unreadably", and an `Unusable` really does refute
+    /// "coord did not answer" — so an alternating door pinned both at 1 and
+    /// NEITHER predicate could ever reach its cadence. This counter asks the
+    /// question neither arm can: *has this runner had a usable observation of
+    /// coord in the last N probes?*
+    unobserved_streak: u32,
+    unobserved_notified: bool,
+    unobserved_since: Option<Instant>,
     /// Workers already reported dead in the current episode. A worker that
     /// recovers is dropped, so a second death is reported again.
     dead_notified: BTreeSet<String>,
@@ -694,17 +819,20 @@ impl ObserverState {
         if self.leaderless_since.is_some() {
             self.leaderless_probes = self.leaderless_probes.saturating_add(1);
         }
-        match outcome {
+        let mut out = match outcome {
             ProbeOutcome::Unreachable { reason } => self.observe_unreachable(reason, now),
-            ProbeOutcome::Unusable { reason } => self.observe_unusable(reason, now),
+            ProbeOutcome::Unusable { reason } => self.observe_unusable(reason),
             ProbeOutcome::Read(read) => {
                 self.clear_unreachable();
-                self.clear_unusable();
                 let mut out = self.observe_dead(read);
                 out.extend(self.observe_leaderless(read, now));
                 out
             }
-        }
+        };
+        // LAST, and over the outcome as a whole rather than inside any arm:
+        // predicate (iv) is the one that must survive every OTHER arm's reset.
+        out.extend(self.observe_unobserved(outcome, now));
+        out
     }
 
     fn clear_unreachable(&mut self) {
@@ -713,10 +841,10 @@ impl ObserverState {
         self.unreachable_since = None;
     }
 
-    fn clear_unusable(&mut self) {
-        self.unusable_streak = 0;
-        self.unusable_notified = false;
-        self.unusable_since = None;
+    fn clear_unobserved(&mut self) {
+        self.unobserved_streak = 0;
+        self.unobserved_notified = false;
+        self.unobserved_since = None;
     }
 
     fn clear_leaderless(&mut self) {
@@ -727,11 +855,6 @@ impl ObserverState {
     }
 
     fn observe_unreachable(&mut self, reason: &str, now: Instant) -> Vec<Report> {
-        // An `Unreachable` CONTRADICTS the UNKNOWN streak — this probe did not
-        // reach a coord that could answer unreadably. Left un-cleared, a load
-        // balancer alternating the two arms inflated `unusable_streak` without
-        // either predicate ever describing what was happening.
-        self.clear_unusable();
         self.unreachable_streak = self.unreachable_streak.saturating_add(1);
         self.unreachable_since.get_or_insert(now);
         if self.unreachable_streak < CADENCES_TO_FIRE || self.unreachable_notified {
@@ -751,42 +874,71 @@ impl ObserverState {
         }]
     }
 
-    /// Predicate (iv). coord SPOKE, so (i) is settled in the negative and
-    /// (ii)/(iii) are left exactly where they were — an absent observation is
-    /// not a contradicting one. What is NOT left alone is the operator: held
-    /// for [`CADENCES_TO_FIRE`] probes this becomes a reported class, because
-    /// every way it becomes permanent leaves coord liveness unobserved while
-    /// the runner looks healthy.
-    fn observe_unusable(&mut self, reason: &str, now: Instant) -> Vec<Report> {
+    /// coord SPOKE, so predicate (i) is settled in the negative and (ii)/(iii)
+    /// are left exactly where they were — an absent observation is not a
+    /// contradicting one.
+    ///
+    /// It reports nothing itself. Predicate (iv) is owned entirely by
+    /// [`Self::observe_unobserved`], which folds this outcome along with every
+    /// other unusable one; splitting the firing across both would have raised
+    /// two `LivenessUnknown` cards for a single blind episode.
+    fn observe_unusable(&mut self, _reason: &str) -> Vec<Report> {
         self.clear_unreachable();
-        self.unusable_streak = self.unusable_streak.saturating_add(1);
-        self.unusable_since.get_or_insert(now);
-        if self.unusable_streak == 1 || self.unusable_streak.is_multiple_of(UNUSABLE_REWARN_EVERY) {
+        Vec::new()
+    }
+
+    /// Predicate (iv), folded over the outcome as a WHOLE.
+    ///
+    /// The honest question no per-arm streak can ask: *has this runner had a
+    /// usable observation of coord in the last [`CADENCES_TO_FIRE`] probes?*
+    /// An `Unreachable`, an `Unusable`, and a `Read` that left a predicate
+    /// unsettled all answer no, and only a settling `Read` clears it.
+    fn observe_unobserved(&mut self, outcome: &ProbeOutcome, now: Instant) -> Vec<Report> {
+        let Some(reason) = unobserved_reason_of(outcome) else {
+            self.clear_unobserved();
+            return Vec::new();
+        };
+        self.unobserved_streak = self.unobserved_streak.saturating_add(1);
+        self.unobserved_since.get_or_insert(now);
+        if self.unobserved_streak == 1
+            || self
+                .unobserved_streak
+                .is_multiple_of(UNOBSERVED_REWARN_EVERY)
+        {
             warn!(
-                probes = self.unusable_streak,
+                probes = self.unobserved_streak,
                 reason = %reason,
-                "coord outside observer: coord answered but this runner could not read \
-                 its worker ledger — coord liveness is UNKNOWN here, not healthy"
+                "coord outside observer: no usable observation of coord on this probe — \
+                 coord liveness is UNKNOWN here, not healthy"
             );
         }
-        if self.unusable_streak < CADENCES_TO_FIRE || self.unusable_notified {
+        if self.unobserved_streak < CADENCES_TO_FIRE || self.unobserved_notified {
             return Vec::new();
         }
-        self.unusable_notified = true;
+        // Predicate (i) has already put a card in front of the operator naming
+        // this same episode, and "coord has not answered on N consecutive
+        // probes" is strictly stronger than "I have no verdict". A second card
+        // beside it is noise, not a second fact. Not latched: if the door later
+        // flaps to an `Unusable`, (i) is cleared and this becomes the only
+        // honest thing left to say.
+        if self.unreachable_notified {
+            return Vec::new();
+        }
+        self.unobserved_notified = true;
         vec![Report {
             class: FaultClass::LivenessUnknown,
             summary: format!(
-                "coord answered but this runner could not read its worker ledger on {} \
-                 consecutive probes, over a measured {}s — coord liveness is UNOBSERVED from \
-                 here, which is not the same as healthy. Last reason: {reason}",
-                self.unusable_streak,
-                elapsed_secs(self.unusable_since, now),
+                "this runner has had NO usable observation of coord on {} consecutive probes, \
+                 over a measured {}s — coord liveness is UNOBSERVED from here, which is not the \
+                 same as healthy. Last reason: {reason}",
+                self.unobserved_streak,
+                elapsed_secs(self.unobserved_since, now),
             ),
-            raw: reason.to_string(),
-            // Never. The one credential this runner has is the credential that
-            // just failed to read a ledger, so a finding POST is the same call
-            // with the same outcome — and the module's contract is to write
-            // only to a coord that just ANSWERED a read.
+            raw: reason,
+            // Never. Whatever kept this runner from observing coord — no
+            // answer, a refused credential, an unreadable shape — applies
+            // identically to a finding POST, and the module's contract is to
+            // write only to a coord that just ANSWERED a read.
             post_finding: false,
         }]
     }
@@ -842,25 +994,30 @@ impl ObserverState {
     }
 
     fn observe_leaderless(&mut self, read: &LedgerRead, now: Instant) -> Vec<Report> {
-        if read.leaderless.is_empty() {
-            // An empty list is only EVIDENCE of a leader when the list was
-            // whole. coord's 40-row cap discards severity-0 rows first and
-            // `not_leader_here` IS severity 0 (see
-            // `LedgerRead::list_truncated`), so the very failure this
-            // predicate exists for — coord loses its leader, every
-            // leader-gated worker flips at once, the population blows past
-            // the cap — presents as `leaderless: []`. Treating that as health
-            // reset the streak and cleared the latch; with the boundary
-            // flapping around 40 it reset the streak every other sample, so
-            // `CADENCES_TO_FIRE` was never reached at all: a permanent false
-            // negative out of flapping input.
-            //
-            // So this cycle is UNKNOWN. Leave the streak, the probe count and
-            // the latch exactly where they are — the same arm
-            // `observe_unusable` already takes, for the same reason.
-            if read.leaderless_is_underread() {
-                return Vec::new();
-            }
+        // (iii)'s population is the COUNT, never the list. `counts` is over
+        // the full worker set and the 40-row cap never touches it, while every
+        // worker inside `counts.not_leader_here` is leader-gated and
+        // non-nominal by coord's own construction (the proof is on
+        // `LedgerRead::counts_not_leader_here`). So a non-zero count IS
+        // predicate (iii), names or no names, and the list supplies only the
+        // names.
+        //
+        // `.max()` rather than the count alone so a coord that somehow lists
+        // more leaderless rows than it counts still fires: the report must
+        // never be weaker than either half of the evidence.
+        //
+        // This is also why a capped cycle is no longer an UNKNOWN that holds
+        // the streak in place. The shape that used to be invisible — coord
+        // loses its leader, every leader-gated worker flips at once, the
+        // non-nominal population blows past the cap, `leaderless: []` — now
+        // ADVANCES on the count and pages after the cadence, saying that the
+        // names were unavailable. And a leaderless episode capped away from
+        // its very ONSET, which held the streak at zero forever and produced
+        // nothing but a per-probe `warn!`, now reaches the operator.
+        let population = read
+            .counts_not_leader_here
+            .max(read.leaderless.len() as u64);
+        if population == 0 {
             self.clear_leaderless();
             return Vec::new();
         }
@@ -876,20 +1033,49 @@ impl ObserverState {
         }
         self.leaderless_notified = true;
         let names: Vec<&str> = read.leaderless.iter().map(|w| w.name.as_str()).collect();
+        // The names are the part the cap eats, so they are reported as a
+        // separate fact from the population — never by silently shrinking it,
+        // and never as an empty list masquerading as "none".
+        let named = if names.is_empty() {
+            format!(
+                "coord named NONE of them in its `non_nominal_workers` list \
+                 (truncated: {}), so this report carries the count without the names — read \
+                 `coord_query_workers` with a `name` for the per-replica rows",
+                read.list_truncated
+            )
+        } else if read.leaderless_is_underread() {
+            format!(
+                "{} — and {} more coord counted but did not name (truncated: {})",
+                names.join(", "),
+                read.leaderless_unaccounted(),
+                read.list_truncated
+            )
+        } else {
+            names.join(", ")
+        };
         vec![Report {
             class: FaultClass::NoLeader,
             summary: format!(
-                "no coord replica reports itself leader: {} leader-gated worker(s) have read \
-                 `no_leader_tick` on {} of the last {} probes, over a measured {}s — {}",
-                names.len(),
+                "no coord replica reports itself leader: {population} leader-gated worker(s) \
+                 have read `no_leader_tick` on {} of the last {} probes, over a measured {}s — {}",
                 self.leaderless_streak,
                 self.leaderless_probes.max(self.leaderless_streak),
                 elapsed_secs(self.leaderless_since, now),
-                names.join(", ")
+                named
             ),
             raw: render_read(read),
             post_finding: true,
         }]
+    }
+}
+
+/// Why one probe outcome counts as UNOBSERVED, or `None` when it settled the
+/// predicates — predicate (iv)'s single input, over all three arms.
+fn unobserved_reason_of(outcome: &ProbeOutcome) -> Option<String> {
+    match outcome {
+        ProbeOutcome::Unreachable { reason } => Some(format!("coord did not answer: {reason}")),
+        ProbeOutcome::Unusable { reason } => Some(reason.clone()),
+        ProbeOutcome::Read(read) => read.unobserved_reason(),
     }
 }
 
@@ -1144,10 +1330,35 @@ async fn post_finding(
         crate::auth::attach_device_auth_for(client.post(&url).json(&body), scope_for(door.pin));
     match rb.send().await {
         Ok(resp) if resp.status().is_success() => {
-            info!(
-                class = report.class.breadcrumb_reason(),
-                "coord outside observer: observation posted to coord as a finding"
-            );
+            // A 2xx is not storage. With the `coord_findings` migration
+            // unapplied coord answers **200** with `{"posted": false,
+            // "reason": …}` rather than an error — the graceful degradation
+            // `session::coord_sync::finding_outcome` documents and handles in
+            // this same repo. Logging success on any 2xx made this observer
+            // claim a finding a later session will never find. Not retried:
+            // a retry cannot apply a migration.
+            let status = resp.status();
+            match resp.json::<JsonValue>().await {
+                Ok(body) if body.get("posted").and_then(JsonValue::as_bool) == Some(false) => {
+                    warn!(
+                        class = report.class.breadcrumb_reason(),
+                        reason = ?body.get("reason").and_then(JsonValue::as_str),
+                        "coord outside observer: coord accepted the observation but did NOT \
+                         store it (coord.findings not provisioned) — the finding is LOST"
+                    );
+                }
+                Ok(_) => info!(
+                    class = report.class.breadcrumb_reason(),
+                    "coord outside observer: observation posted to coord as a finding"
+                ),
+                Err(e) => warn!(
+                    class = report.class.breadcrumb_reason(),
+                    status = %status,
+                    error = %e,
+                    "coord outside observer: coord answered 2xx with a body this runner could \
+                     not read — storage is NOT confirmed"
+                ),
+            }
         }
         Ok(resp) => warn!(
             status = %resp.status(),
@@ -1280,19 +1491,23 @@ impl CoordOutsideObserver {
                      for the per-replica rows."
                 );
             }
-            // The one that actually fires in practice: the cap discards
-            // severity-0 rows FIRST, and `not_leader_here` is severity 0.
+            // (iii) is NOT unsettled by this — it advances on the count — but
+            // the missing names are worth a line, and they are the only thing
+            // a per-name follow-up read can recover. Two causes, neither of
+            // which this runner can tell apart from here: coord's cap (which
+            // drops `not_leader_here` BEFORE `dead`), or rows this build could
+            // not classify.
             if read.leaderless_is_underread() {
                 warn!(
                     counts_not_leader_here = read.counts_not_leader_here,
                     unaccounted = read.leaderless_unaccounted(),
                     named = read.leaderless.len(),
-                    "coord outside observer: coord's non_nominal_workers list was TRUNCATED and \
-                     counts.not_leader_here exceeds what this read could name — predicate (iii) \
-                     is UNKNOWN on this cycle, not clear, and the leaderless streak was held \
-                     rather than reset. The cap drops `not_leader_here` BEFORE `dead`, so this \
-                     is the blind spot a lost coord leader hides in. Call coord_query_workers \
-                     with a `name` for the per-replica rows."
+                    truncated = read.list_truncated,
+                    "coord outside observer: coord counts more leaderless leader-gated workers \
+                     than this read could NAME — predicate (iii) still advances on the count, \
+                     but the names are unavailable. Either coord's 40-row cap took them or this \
+                     build could not classify the rows. Call coord_query_workers with a `name` \
+                     for the per-replica rows."
                 );
             }
         }
@@ -1694,10 +1909,19 @@ mod tests {
         };
         state.observe(&down);
         state.observe(&down);
-        assert!(state.observe(&unusable).is_empty());
+        // Predicate (i)'s streak is reset here — but three probes running have
+        // now produced no usable observation, which is predicate (iv) and no
+        // longer silence (D3).
+        let reports = state.observe(&unusable);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].class, FaultClass::LivenessUnknown);
+        // (i) itself needs three CONSECUTIVE non-answers, and the count
+        // restarted.
         assert!(state.observe(&down).is_empty());
         assert!(state.observe(&down).is_empty());
-        assert_eq!(state.observe(&down).len(), 1);
+        let reports = state.observe(&down);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].class, FaultClass::Unreachable);
     }
 
     // ── the truncation blind spot ───────────────────────────────────────
@@ -1762,6 +1986,39 @@ mod tests {
         );
     }
 
+    /// The remaining under-read that is genuinely an UNKNOWN rather than an
+    /// observation: coord's cap named NONE of the dead workers it counted, so
+    /// predicate (ii) was not observed on that cycle. Held for the cadence it
+    /// reaches predicate (iv) — a `Read` outcome that nonetheless advances the
+    /// unobserved streak.
+    #[test]
+    fn a_truncated_read_that_named_no_dead_worker_reaches_predicate_four() {
+        let body = truncated_ledger_body(3, json!([dead_row("some.follower.loop", false, false)]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(read.dead_leader_gated.is_empty());
+        assert!(read.dead_is_underread());
+        assert!(
+            read.unobserved_reason().is_some(),
+            "a read that named none of the dead workers coord counted settled nothing"
+        );
+
+        let outcome = ProbeOutcome::Read(read);
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            fired.extend(state.observe(&outcome));
+        }
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].class, FaultClass::LivenessUnknown);
+        assert!(
+            fired[0].summary.contains("predicate (ii) was not observed"),
+            "{}",
+            fired[0].summary
+        );
+    }
+
     #[test]
     fn a_body_without_counts_is_unusable() {
         let body = json!({"instance": "workers", "components": {"something_else": 1}});
@@ -1801,6 +2058,116 @@ mod tests {
         );
     }
 
+    /// D1. The shape the truncation-gated predicate could not see AT ALL, and
+    /// the reason attestation was refused: **no truncation is involved**.
+    ///
+    /// coord renames a row key or emits `leader_gated` as a string. Every row
+    /// is then dropped unclassified — through `classify_ledger`'s `_` arm, or
+    /// through the leader-gated filter above it — so
+    /// `leaderless` is empty while `counts.not_leader_here` says 12 and
+    /// `non_nominal_workers_truncated` says `false`. With the old
+    /// `list_truncated &&` conjunct that read `leaderless_is_underread() ==
+    /// false`, so the observer cleared the streak and the latch and reported a
+    /// CLEAN FLEET for a coord with no leader — no truncation, no warning
+    /// anywhere, and outcome `Read` so predicate (iv) never engaged either.
+    #[test]
+    fn an_untruncated_read_that_named_no_leaderless_row_is_under_read_and_still_fires() {
+        // Two ways one renamed or retyped key drops every row, both silent:
+        // a `status` coord spells differently falls through `classify_ledger`'s
+        // `_` arm (and its `reason` fallback with it), and a `leader_gated`
+        // emitted as a string is dropped by the leader-gated filter above it.
+        let status_renamed = |name: &str| {
+            let mut row = no_leader_row(name);
+            row["status"] = json!("NotLeaderHere");
+            row["reason"] = json!("noLeaderTick");
+            row
+        };
+        let retyped_gate = |name: &str| {
+            let mut row = no_leader_row(name);
+            row["leader_gated"] = json!("true");
+            row
+        };
+        let mut body = ledger_body(
+            0,
+            json!([
+                status_renamed("merge_dispatch"),
+                status_renamed("gate_sweep"),
+                retyped_gate("alert_pageout_worker"),
+            ]),
+        );
+        body["components"]["counts"]["not_leader_here"] = json!(12);
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read — the body parses; it is the ROWS that do not");
+        };
+
+        assert!(!read.list_truncated, "no truncation is involved");
+        assert!(
+            read.leaderless.is_empty(),
+            "every row was dropped, unclassified"
+        );
+        assert_eq!(read.counts_not_leader_here, 12);
+        assert_eq!(read.leaderless_unaccounted(), 12);
+        assert!(
+            read.leaderless_is_underread(),
+            "coord counted leaderless workers and this read named NONE — an under-read, \
+             whatever the truncation flag says"
+        );
+
+        // …and it is not merely flagged: predicate (iii) advances on the
+        // count and pages, rather than clearing the streak as health.
+        let mut state = ObserverState::default();
+        let outcome = ProbeOutcome::Read(read);
+        assert!(state.observe(&outcome).is_empty(), "probe 1");
+        assert!(state.observe(&outcome).is_empty(), "probe 2");
+        let reports = state.observe(&outcome);
+        assert_eq!(
+            reports.len(),
+            1,
+            "a coord with no leader must page: {reports:?}"
+        );
+        assert_eq!(reports[0].class, FaultClass::NoLeader);
+        assert!(
+            reports[0].summary.contains("12 leader-gated worker(s)"),
+            "the count is the population: {}",
+            reports[0].summary
+        );
+        assert!(
+            reports[0].summary.contains("named NONE of them"),
+            "and the report says the names were unavailable rather than printing none: {}",
+            reports[0].summary
+        );
+    }
+
+    /// D1's asymmetry, pinned so nobody "fixes" it into a second analogue:
+    /// `counts.dead` genuinely spans the follower plane, so a surplus there is
+    /// ordinary on a whole list and `dead_is_underread` MUST stay conditioned
+    /// on truncation.
+    #[test]
+    fn the_two_under_read_predicates_are_not_analogues() {
+        let body = ledger_body(5, json!([dead_row("follower.loop", false, false)]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(!read.list_truncated);
+        assert_eq!(read.dead_unaccounted(), 5);
+        assert!(
+            !read.dead_is_underread(),
+            "an untruncated `counts.dead` surplus is the follower plane, not a blind spot"
+        );
+
+        let mut body = ledger_body(0, json!([]));
+        body["components"]["counts"]["not_leader_here"] = json!(5);
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(!read.list_truncated);
+        assert!(
+            read.leaderless_is_underread(),
+            "the SAME untruncated surplus on `not_leader_here` is always a blind spot: every \
+             worker that count covers is leader-gated and non-nominal by construction"
+        );
+    }
+
     #[test]
     fn an_untruncated_empty_leaderless_list_is_still_a_clean_read() {
         // The other half of the same predicate: with the list whole, an empty
@@ -1826,7 +2193,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_leaderless_cycle_neither_advances_nor_resets_the_streak() {
+    fn a_truncated_leaderless_cycle_advances_the_streak_on_the_count() {
         let dark = ledger_body(0, json!([no_leader_row("alert_pageout_worker")]));
         // The surviving rows are follower-plane, so predicate (ii) is silent
         // and this test is about (iii) alone.
@@ -1835,17 +2202,90 @@ mod tests {
         let mut state = ObserverState::default();
         assert!(state.observe(&classify_ledger(&dark)).is_empty(), "probe 1");
         assert!(state.observe(&classify_ledger(&dark)).is_empty(), "probe 2");
-        // THIS is the cycle that used to read as a clean fleet: it reset the
-        // streak to 0 and cleared the latch on an empty list it had no right
-        // to trust. It must do neither.
+        // This cycle once read as a clean fleet (streak to 0, latch cleared),
+        // then as an UNKNOWN that merely HELD the streak. Both were weaker
+        // than the evidence: coord affirmatively counts 7 leaderless
+        // leader-gated workers here. It is (iii), and it advances.
+        let reports = state.observe(&classify_ledger(&capped));
+        assert_eq!(
+            reports.len(),
+            1,
+            "a count coord affirms is an observation, not an UNKNOWN: {reports:?}"
+        );
+        assert_eq!(reports[0].class, FaultClass::NoLeader);
+        assert!(
+            reports[0].summary.contains("7 leader-gated worker(s)"),
+            "the population is the COUNT, not the surviving rows: {}",
+            reports[0].summary
+        );
+    }
+
+    /// D4. The onset case — every leaderless row capped away from the FIRST
+    /// probe. The streak could never leave zero, so this paged nothing at all,
+    /// forever, against the module's own doctrine that a watcher which has
+    /// gone blind must say so on the surface it would have used.
+    #[test]
+    fn a_leaderless_episode_capped_away_from_its_onset_still_pages() {
+        let capped =
+            truncated_leaderless_body(38, json!([dead_row("some.follower.loop", false, false)]));
+        let mut state = ObserverState::default();
         assert!(
             state.observe(&classify_ledger(&capped)).is_empty(),
-            "an UNKNOWN cycle reports nothing itself…"
+            "probe 1"
         );
-        assert_eq!(
-            state.observe(&classify_ledger(&dark)).len(),
-            1,
-            "…and the streak it HELD reaches the cadence on the next real observation"
+        assert!(
+            state.observe(&classify_ledger(&capped)).is_empty(),
+            "probe 2"
+        );
+        let reports = state.observe(&classify_ledger(&capped));
+        assert_eq!(reports.len(), 1, "probe 3 reaches the cadence: {reports:?}");
+        assert_eq!(reports[0].class, FaultClass::NoLeader);
+        assert!(
+            reports[0].post_finding,
+            "coord ANSWERED this cycle, so the observation is carried back"
+        );
+        assert!(
+            reports[0].summary.contains("named NONE of them"),
+            "it reports the count and says the names are unavailable: {}",
+            reports[0].summary
+        );
+        assert!(
+            reports[0].summary.contains("38 leader-gated worker(s)"),
+            "{}",
+            reports[0].summary
+        );
+        // One episode, one card.
+        for _ in 0..5 {
+            assert!(state.observe(&classify_ledger(&capped)).is_empty());
+        }
+        // …and a coord that regains its leader re-arms it.
+        assert!(state
+            .observe(&classify_ledger(&ledger_body(0, json!([]))))
+            .is_empty());
+        for _ in 0..2 {
+            assert!(state.observe(&classify_ledger(&capped)).is_empty());
+        }
+        assert_eq!(state.observe(&classify_ledger(&capped)).len(), 1);
+    }
+
+    /// A partially-capped report names what it has AND says how much it does
+    /// not — never a silently shrunken population.
+    #[test]
+    fn a_partially_named_leaderless_report_says_how_many_it_could_not_name() {
+        let mut body = truncated_leaderless_body(9, json!([no_leader_row("merge_dispatch")]));
+        body["components"]["counts"]["not_leader_here"] = json!(9);
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            fired.extend(state.observe(&classify_ledger(&body)));
+        }
+        assert_eq!(fired.len(), 1);
+        let summary = &fired[0].summary;
+        assert!(summary.contains("9 leader-gated worker(s)"), "{summary}");
+        assert!(summary.contains("merge_dispatch"), "{summary}");
+        assert!(
+            summary.contains("8 more coord counted but did not name"),
+            "{summary}"
         );
     }
 
@@ -1929,6 +2369,54 @@ mod tests {
                 "an absent `counts.{key}` is UNKNOWN, not zero"
             );
         }
+    }
+
+    /// D2. The truncation flag itself defaulted to `false` twenty-five lines
+    /// below a comment refusing to default its two neighbours — and naming
+    /// this exact harm, in the words *"`list_truncated` reading `false`"*. A
+    /// renamed or retyped flag left `dead_is_underread` reading `false` on
+    /// every cycle: a permanently clean fleet with no warning anywhere.
+    #[test]
+    fn an_absent_or_wrong_typed_truncation_flag_is_unusable_not_false() {
+        let mut absent = ledger_body(0, json!([]));
+        absent["components"]
+            .as_object_mut()
+            .unwrap()
+            .remove("non_nominal_workers_truncated");
+        match classify_ledger(&absent) {
+            ProbeOutcome::Unusable { reason } => {
+                assert!(reason.contains("absent"), "{reason}");
+                assert!(reason.contains("UNKNOWN, not `false`"), "{reason}");
+            }
+            other => panic!("an absent truncation flag is UNKNOWN, not `false`: {other:?}"),
+        }
+
+        for wrong in [json!("true"), json!(1), json!(null), json!(["true"])] {
+            let mut body = ledger_body(0, json!([]));
+            body["components"]["non_nominal_workers_truncated"] = wrong.clone();
+            assert!(
+                matches!(classify_ledger(&body), ProbeOutcome::Unusable { .. }),
+                "a {wrong} truncation flag is UNKNOWN, not `false`"
+            );
+        }
+    }
+
+    /// …and, like its two neighbours, it reaches predicate (iv) after three
+    /// cadences rather than dying in the log.
+    #[test]
+    fn a_missing_truncation_flag_reaches_predicate_four() {
+        let mut body = ledger_body(0, json!([]));
+        body["components"]
+            .as_object_mut()
+            .unwrap()
+            .remove("non_nominal_workers_truncated");
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            fired.extend(state.observe(&classify_ledger(&body)));
+        }
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].class, FaultClass::LivenessUnknown);
     }
 
     // ── F5: a flapping exclusion is not a recovery ──────────────────────
@@ -2028,12 +2516,21 @@ mod tests {
         assert_eq!(fired[0].class.error_code(), "COORD_LIVENESS_UNKNOWN");
     }
 
-    // ── F8: an Unreachable contradicts the UNKNOWN streak ───────────────
+    // ── D3: an alternating door is coord being DOWN, and must page ──────
 
+    /// F8 was right in isolation and wrong in composition. An `Unreachable`
+    /// really does contradict "coord answered unreadably" and an `Unusable`
+    /// really does contradict "coord did not answer" — so a door alternating
+    /// between them pinned BOTH per-arm streaks at 1 and neither predicate
+    /// could ever reach `CADENCES_TO_FIRE`. The test that stood here asserted
+    /// that silence as correct.
+    ///
+    /// The real shape: a load balancer with one target serving a 200
+    /// maintenance page (→ `Unusable`) and one refusing connections (→
+    /// `Unreachable`). coord wholly down, and the observer produced no card,
+    /// no incident line and no finding, indefinitely.
     #[test]
-    fn alternating_unreachable_and_unusable_inflates_neither_streak() {
-        // A flaky load balancer. Neither predicate may creep to its cadence
-        // on evidence the other arm contradicted.
+    fn an_alternating_door_reaches_the_cadence_as_liveness_unknown() {
         let mut state = ObserverState::default();
         let unusable = ProbeOutcome::Unusable {
             reason: "a shape this build cannot parse".into(),
@@ -2041,14 +2538,71 @@ mod tests {
         let down = ProbeOutcome::Unreachable {
             reason: "connection refused".into(),
         };
-        for _ in 0..10 {
-            assert!(state.observe(&unusable).is_empty());
+
+        // The per-arm streaks still contradict each other, so NEITHER (i) nor
+        // a per-arm (iv) fires — correctly.
+        assert!(state.observe(&unusable).is_empty(), "probe 1");
+        assert!(state.observe(&down).is_empty(), "probe 2");
+        // …but three probes have now produced no usable observation of coord,
+        // and THAT is the honest predicate.
+        let reports = state.observe(&unusable);
+        assert_eq!(
+            reports.len(),
+            1,
+            "a wholly-down coord behind a flapping door must not be silence: {reports:?}"
+        );
+        assert_eq!(reports[0].class, FaultClass::LivenessUnknown);
+        assert!(
+            reports[0].summary.contains("NO usable observation"),
+            "{}",
+            reports[0].summary
+        );
+        assert!(
+            reports[0].summary.contains("3 consecutive probes"),
+            "the counter nothing resets: {}",
+            reports[0].summary
+        );
+        assert!(
+            !reports[0].post_finding,
+            "there is no coord to post to — that is the whole condition"
+        );
+
+        // One episode, one card, however long the flap lasts.
+        for _ in 0..20 {
             assert!(state.observe(&down).is_empty());
+            assert!(state.observe(&unusable).is_empty());
         }
-        // …and each still fires on its own uninterrupted evidence.
+        // A settling read is the ONLY thing that clears it — and re-arms it.
+        assert!(state
+            .observe(&classify_ledger(&ledger_body(0, json!([]))))
+            .is_empty());
+        assert!(state.observe(&down).is_empty());
         assert!(state.observe(&unusable).is_empty());
-        assert!(state.observe(&unusable).is_empty());
-        assert_eq!(state.observe(&unusable).len(), 1);
+        assert_eq!(
+            state.observe(&down).len(),
+            1,
+            "a second blind episode pages again"
+        );
+    }
+
+    /// Predicate (i) still owns a coord that is simply not answering, and
+    /// (iv) must not double-card the same episode.
+    #[test]
+    fn a_plain_unreachable_outage_raises_one_card_not_two() {
+        let mut state = ObserverState::default();
+        let down = ProbeOutcome::Unreachable {
+            reason: "connection refused".into(),
+        };
+        let mut fired = Vec::new();
+        for _ in 0..10 {
+            fired.extend(state.observe(&down));
+        }
+        assert_eq!(fired.len(), 1, "one card: {fired:?}");
+        assert_eq!(
+            fired[0].class,
+            FaultClass::Unreachable,
+            "`coord has not answered on N consecutive probes` is the stronger statement"
+        );
     }
 
     // ── F6: elapsed is measured, and the count is the real one ──────────
