@@ -3878,18 +3878,24 @@ mod bearer_selection_tests {
 
     /// W3, the symmetric twin of W1: [`select_device_bearer`] (and
     /// [`HeldDeviceTenants::read_with`] beside it) call
-    /// [`measured_device_binding_count`], and every other test drives them
-    /// through the injected-count doors or stores a token carrying a claim, so
-    /// `legacy_token_serves_tenant` settles on the claim and never reaches the
-    /// count. A rewiring in the other direction —
+    /// [`measured_device_binding_count`], and every other test IN THIS MODULE
+    /// drives them through the injected-count doors or stores a token carrying
+    /// a claim, so `legacy_token_serves_tenant` settles on the claim and never
+    /// reaches the count. (`commands::auth`'s door test
+    /// `a_named_tenant_never_gets_a_legacy_token_that_names_another_tenant`
+    /// reaches the same wiring INDIRECTLY, through the door; this is the test
+    /// that names it, and the only one that also covers
+    /// [`HeldDeviceTenants::read_with`].) A rewiring in the other direction —
     /// `MeasuredBindingCount::Measured(device_binding_count())` — compiles, and
     /// the malformed file then reads as ONE binding, which accepts a claimless
     /// token whose owner is unknowable and presents it as `t`'s credential.
     ///
-    /// The file here holds ONE malformed entry on purpose: that is the shape
-    /// where the two parsers actually disagree about admission (loose = 1,
-    /// strict = Unknown). A malformed TWO-entry file counts as two either way,
-    /// so it would not see the rewiring at all.
+    /// The file here holds ONE malformed entry on purpose, and it is W1's exact
+    /// mirror: a shape the loose parser counts (1) and the strict one refuses to
+    /// count at all (`Unknown`), which is where admission diverges. A malformed
+    /// TWO-entry file is refused under BOTH readings — loose 2, strict
+    /// `Unknown`, neither of them `Measured(1)` — so it would not see the
+    /// rewiring at all.
     #[test]
     fn select_device_bearer_refuses_a_claimless_token_on_an_unmeasurable_binding_file() {
         let amb = crate::test_env::isolated_ambient();
