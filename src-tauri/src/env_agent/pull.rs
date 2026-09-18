@@ -690,6 +690,7 @@ pub async fn pull_and_plan() -> Result<ApplyPlan, String> {
 pub fn pull_and_plan_blocking() -> Result<ApplyPlan, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .thread_name("envagent-rt")
         .build()
         .map_err(|e| format!("tokio runtime build failed: {e}"))?;
     rt.block_on(pull_and_plan())

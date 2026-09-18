@@ -491,6 +491,7 @@ pub async fn capture_and_push() -> Result<(), String> {
 pub fn capture_and_push_blocking() -> Result<(), String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .thread_name("envagent-rt")
         .build()
         .map_err(|e| format!("tokio runtime build failed: {e}"))?;
     rt.block_on(capture_and_push())
@@ -502,6 +503,7 @@ pub fn capture_and_push_blocking() -> Result<(), String> {
 pub fn build_envelope_blocking() -> Result<ConfigEnvelope, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .thread_name("envagent-rt")
         .build()
         .map_err(|e| format!("tokio runtime build failed: {e}"))?;
     Ok(rt.block_on(build_envelope()))

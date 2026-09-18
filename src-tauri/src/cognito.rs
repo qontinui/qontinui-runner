@@ -267,6 +267,7 @@ pub fn pkce_login(identity_provider: Option<&str>) -> Result<CognitoLoginResult,
     let _server_handle = std::thread::spawn(move || -> Result<(), String> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .thread_name("cognito-rt")
             .build()
             .map_err(|e| format!("runtime build failed: {e}"))?;
         rt.block_on(async move {

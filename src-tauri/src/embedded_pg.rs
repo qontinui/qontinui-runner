@@ -1108,6 +1108,7 @@ pub fn stop_on_exit() {
     };
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
+        .thread_name("pg-stop-rt")
         .build()
     {
         Ok(rt) => rt.block_on(stop(handle)),
