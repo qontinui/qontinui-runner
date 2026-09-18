@@ -136,9 +136,42 @@
 //! `non_nominal_workers_truncated` stays `false`. `unclassified` catches both
 //! retypes and renames, it is a property of this build's own reading rather
 //! than of a coord field that could itself be renamed next, and it rides
-//! [`LedgerRead::unobserved_reason`] into predicate (iv). With it in place
-//! both halves of (ii) are covered: the count governs firing, the classifier
-//! governs observability.
+//! [`LedgerRead::unobserved_reason`] into predicate (iv).
+//!
+//! **What that covers, and the half it does NOT.** `unclassified` covers rows
+//! that are PRESENT and UNREADABLE. It cannot cover rows that are ABSENT
+//! while `non_nominal_workers_truncated` reads `false`, because there is no
+//! row to fail. An executed counterexample: coord emits `counts.dead = 12`,
+//! `non_nominal_workers: []`, `non_nominal_workers_truncated: false` —
+//! `classification_is_underread()` is `false` (no rows, so nothing
+//! unclassified), `dead_is_underread()` is `false` (the flag is `false`),
+//! `dead_unaccounted()` is 12, `unobserved_reason()` is `None`, and 500
+//! probes raise no card while twelve workers are dead. That is the F1 defect
+//! class verbatim in a third response shape, and **the gap is OPEN**: a
+//! silently SHORT list beside a `false` truncation flag is covered by neither
+//! defense in this module.
+//!
+//! Two things bound it and neither closes it. It is **not a regression** —
+//! the behaviour is identical at `197d6811`, before `unclassified` existed.
+//! And it is **not reachable against coord as it stands**: `Dead` implies
+//! `nominal: false`, and `non_nominal_workers` and
+//! `non_nominal_workers_truncated` are computed from the same `non_nominal`
+//! vector in the same function, so the list and the flag cannot disagree
+//! today. It becomes reachable the moment anyone adds a filter to the listed
+//! rows — authorization scoping, a dedupe, a `name.is_some()` guard —
+//! without touching the flag's formula.
+//!
+//! The field that would close it is **`counts.non_nominal`**, compared
+//! against [`LedgerRead::listed_rows`] on an untruncated read. That is the
+//! defense [`LedgerRead::unclassified`]'s own doc declines in favour of the
+//! classifier, and the two are **complementary, not competing**:
+//! `unclassified` catches a whole list this build cannot READ, a
+//! `listed_rows` shortfall catches a list coord did not SEND, and neither
+//! shape is a subset of the other. This module ships the first and
+//! deliberately not the second, for the shape-dependency reason recorded
+//! there. So, stated exactly: the count governs firing, the classifier
+//! governs the observability of rows that ARRIVED, and the observability of
+//! rows that never arrived is unclosed — named here rather than assumed away.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -207,6 +240,20 @@ const DEAD_STATUS: &str = "dead";
 /// line between "deliberately not my class" and "I could not tell what this
 /// row was", and widening it silently is how predicate (ii) goes blind again.
 const KNOWN_ROLLUP_STATUSES: [&str; 4] = ["alive", "stale", DEAD_STATUS, "not_leader_here"];
+
+/// How many `unclassified` labels a SUMMARY may carry.
+///
+/// [`LedgerRead::unobserved_reason`] becomes `Report.summary`, and that one
+/// string is both the `wedge-incidents.log` line and `UserFacingError.message`
+/// — the operator card's HEADLINE, not its collapsed details. Unbounded, a
+/// `join("; ")` over coord's own 40-row cap with ordinary worker names
+/// measures at ~3.5 KB in one log line and one headline, and this runner does
+/// not enforce coord's cap, so nothing else bounds it. Every other list in
+/// this module renders into the body instead.
+///
+/// Nothing is lost by the bound: [`render_read`] already carries the FULL
+/// list on the same card as `rows_this_build_could_not_classify`.
+const UNCLASSIFIED_IN_SUMMARY: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Fault classes
@@ -425,6 +472,15 @@ pub struct LedgerRead {
     /// module depend on one more coord field whose absence it must then treat
     /// as UNKNOWN — a second shape dependency on the response this defense
     /// exists to be robust against.
+    ///
+    /// **Chosen over, not instead of.** The two defenses are complementary:
+    /// this one catches a list that ARRIVED and could not be read, and the
+    /// `listed.len()` vs `counts.non_nominal` one catches a list that arrived
+    /// SHORT with coord's truncation flag reading `false`. This module covers
+    /// the first shape only, and the module doc's "What that covers, and the
+    /// half it does NOT" records the second as an open gap — unreachable
+    /// against coord as it stands, and reachable the moment anyone filters
+    /// the listed rows without touching the flag's formula.
     pub unclassified: Vec<String>,
     /// How many rows `non_nominal_workers` carried, for a report that can say
     /// "N of M" rather than "N".
@@ -584,6 +640,19 @@ impl LedgerRead {
         !self.unclassified.is_empty()
     }
 
+    /// The unclassified labels, bounded for a headline — see
+    /// [`UNCLASSIFIED_IN_SUMMARY`]. The remainder is COUNTED rather than
+    /// dropped, so the summary never understates the blind spot, and
+    /// [`render_read`] carries every label in full on the same card.
+    fn unclassified_summary(&self) -> String {
+        let shown = self.unclassified.len().min(UNCLASSIFIED_IN_SUMMARY);
+        let head = self.unclassified[..shown].join("; ");
+        match self.unclassified.len() - shown {
+            0 => head,
+            more => format!("{head}; and {more} more"),
+        }
+    }
+
     /// Why this read left a predicate UNOBSERVED, or `None` when it settled
     /// both — the input [`ObserverState::unobserved_streak`] folds for a
     /// `Read`.
@@ -612,7 +681,7 @@ impl LedgerRead {
                  rows, so it was not observed on this cycle",
                 self.unclassified.len(),
                 self.listed_rows,
-                self.unclassified.join("; "),
+                self.unclassified_summary(),
             ));
         }
         if self.dead_leader_gated.is_empty() && self.dead_is_underread() {
@@ -869,7 +938,13 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
                     // dropping it into the same silence `alive`/`stale` get.
                     read.unclassified.push(format!(
                         "`{}`: status `{}` is outside this build's vocabulary",
-                        verdict.name,
+                        // `row_name`, not `verdict.name`: the same bound the
+                        // `leader_gated` arm 50 lines above already applies.
+                        // `worker_verdict` copies `name` VERBATIM, so a
+                        // 5000-char name rendered 5057 bytes here against
+                        // that arm's 142 — into a label that reaches a
+                        // headline.
+                        row_name(row),
                         truncate(other, 40),
                     ));
                 }
@@ -1721,6 +1796,26 @@ impl CoordOutsideObserver {
                      for the per-replica rows."
                 );
             }
+            // (ii)'s OTHER blind shape, and the only one of the three with no
+            // count behind it: rows this build could not PLACE. Warned beside
+            // its two siblings for the reason the comment above them gives,
+            // and for one more that is specific to it — on the path where
+            // `observed_nothing_else()` is false because this same read named
+            // a dead worker, `unobserved_reason()` returns `None` and no
+            // report carries the blind spot, so without this line the
+            // classifier's failure is recorded NOWHERE.
+            if read.classification_is_underread() {
+                warn!(
+                    unclassified = read.unclassified.len(),
+                    listed_rows = read.listed_rows,
+                    truncated = read.list_truncated,
+                    detail = %read.unclassified_summary(),
+                    "coord outside observer: this runner build could not classify every row in \
+                     coord's non_nominal_workers list — predicate (ii) reads its population off \
+                     those rows, so it is UNKNOWN for the rows that did not classify, not clear. \
+                     A renamed `status` or a retyped `leader_gated` wants a runner upgrade."
+                );
+            }
         }
         let coord_answered = !matches!(outcome, ProbeOutcome::Unreachable { .. });
         let reports = {
@@ -2544,17 +2639,34 @@ mod tests {
     /// under-read for the rest.
     #[test]
     fn a_truncated_list_is_still_under_read_for_the_dead_rows_it_did_not_name() {
+        // The third row is the one that pins F2's `status == dead` conjunct:
+        // a follower-plane row that is NOT dead. `dead_follower_plane` must
+        // not move for it. Without that conjunct the subtraction would eat
+        // every follower-plane row whatever its status, and a truncated list
+        // whose surviving follower rows are `stale` while the DEAD ones were
+        // capped away would read as fully accounted for — silent, forever.
+        let mut stale_follower = dead_row("follower.stale", false, false);
+        stale_follower["status"] = json!("stale");
+        stale_follower["live_status"] = json!("stale");
+        stale_follower["reason"] = json!("stale");
+
         let body = truncated_ledger_body(
             4,
             json!([
                 dead_row("follower.one", false, false),
                 dead_row("a.sweep", true, false),
+                stale_follower,
             ]),
         );
         let ProbeOutcome::Read(read) = classify_ledger(&body) else {
             panic!("expected a Read");
         };
-        // 4 counted − 1 leader-gated named − 1 follower-plane read = 2 unseen.
+        assert_eq!(
+            read.dead_follower_plane, 1,
+            "only the DEAD follower-plane row is subtractable; a `stale` one was never counted \
+             by `counts.dead` and subtracting it would hide a capped-away dead worker"
+        );
+        // 4 counted − 1 leader-gated named − 1 dead follower-plane read = 2 unseen.
         assert_eq!(read.dead_unaccounted(), 2);
         assert!(read.dead_is_underread());
     }
