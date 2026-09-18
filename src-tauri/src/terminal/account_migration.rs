@@ -483,33 +483,31 @@ pub(crate) fn spawn_resumed_pane(
     let launch_cfg =
         crate::claude_session::launch_spec::LaunchConfig::from_settings(Some(spec.config_dir));
     let prompt_carrier = crate::session::spawn_prompt::resolve_system_prompt_carrier(None);
-    let command = crate::claude_session::launch_spec::render_argv(
-        &crate::claude_session::launch_spec::LaunchSpec {
-            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
-            resume_id: Some(spec.claude_session_id.to_string()),
-            model,
-            // The hook carrier, spelled out because this respawn execs the
-            // resolved `claude_bin_path()` DIRECTLY — the identity shim, which
-            // is what appends `--settings` for a PATH-resolved `claude`, is not
-            // in this chain. Without it the migrated session runs with no
-            // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
-            // when the policy injection matters most: the session carries its
-            // old context but not the policies as they now stand
-            // ([`crate::mcp::policy_context`]). Empty on a materialize failure
-            // ⇒ no flag, which is the pre-existing behaviour.
-            //
-            // Plus the policy body at spawn (plan
-            // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
-            // this respawn has no briefing, so it carries a BODY-ONLY composed
-            // file when the tenant's cache exists, and nothing otherwise.
-            extra_required: resume_respawn_extra_required(
-                crate::session::claude_hook::direct_spawn_settings_args(),
-                prompt_carrier.as_ref(),
-            ),
-            ..Default::default()
-        },
+    let command = resume_respawn_argv(
+        // The ABSOLUTE binary — see `resume_respawn_argv` for why the bare
+        // `claude_bin_path()` cannot be the PTY child's program on Windows.
+        &crate::agent_runtime::resolve_claude_bin(),
+        spec.claude_session_id,
+        model,
         &launch_cfg,
-        &crate::agent_runtime::claude_bin_path(),
+        // The hook carrier, spelled out because this respawn execs the
+        // resolved `resolve_claude_bin()` DIRECTLY — the identity shim,
+        // which is what appends `--settings` for a PATH-resolved `claude`,
+        // is not in this chain. Without it the migrated session runs with no
+        // `SessionStart` hook, and `SessionStart` on a `--resume` is exactly
+        // when the policy injection matters most: the session carries its
+        // old context but not the policies as they now stand
+        // ([`crate::mcp::policy_context`]). Empty on a materialize failure
+        // ⇒ no flag, which is the pre-existing behaviour.
+        //
+        // Plus the policy body at spawn (plan
+        // `2026-09-15-runner-policy-injection-off-sessionstart-hook-channel`):
+        // this respawn has no briefing, so it carries a BODY-ONLY composed
+        // file when the tenant's cache exists, and nothing otherwise.
+        resume_respawn_extra_required(
+            crate::session::claude_hook::direct_spawn_settings_args(),
+            prompt_carrier.as_ref(),
+        ),
     );
     let capture_hint = crate::commands::terminal::SessionCaptureHint {
         config_dir: Some(spec.config_dir.to_string()),
@@ -550,6 +548,59 @@ pub(crate) fn spawn_resumed_pane(
         capture_hint,
         Some(spec.page_id),
         spec.resource_override,
+    )
+}
+
+/// The full PTY-child argv of the `--resume` respawn. With no operator launch
+/// template it is `[<claude_bin>, --permission-mode bypassPermissions,
+/// [--model m], --resume <sid>, <extra_required…>]`; template flags land
+/// between `--resume` and the tail (`compose_flags` step 4). Pure — the head
+/// is whatever the caller passes — so the argv is assertable without a PTY
+/// and without reading process-global env.
+///
+/// `claude_bin` MUST be the ABSOLUTE binary
+/// ([`crate::agent_runtime::resolve_claude_bin`]), never the bare
+/// `claude_bin_path()`. This argv becomes the PTY child's program
+/// (`Some([program, args…])` → portable-pty `CommandBuilder::new(program)` →
+/// Windows `CreateProcessW`), and a bare `claude` is searched against the
+/// CHILD's PATH — where the always-on identity-shim dir is prepended — and
+/// lands on the EXTENSIONLESS shim script, which `CreateProcessW` refuses with
+/// `%1 is not a valid Win32 application (os error 193)`. Measured 2026-09-18:
+/// three usage-limit migrations each closed the source terminal
+/// ([`migrate_session`] step 2) and then failed at the respawn, so the pane
+/// vanished with nothing in its place (two more of the same shape the day
+/// before). Same resolver the condition-check / gate-continuation PTY spawns
+/// use.
+///
+/// Consequence worth knowing off Windows, where the extensionless shim was
+/// launchable and this respawn used to go THROUGH it: the shim's `--resume`
+/// branch also appended `--mcp-config $QONTINUI_MCP_CONFIG` and fired its
+/// beacon. Execing the absolute binary drops both, exactly as the
+/// gate-continuation direct spawn already does; `--settings` is covered by
+/// `extra_required`, and a cwd that declares coord-mcp (every allocated
+/// worktree) needs no injection.
+///
+/// `resolve_claude_bin` does blocking filesystem stats. Its callers here —
+/// [`spawn_resumed_pane`] via [`migrate_session`] and the respawn receiver —
+/// run on async tasks that already block on transcript copy, terminal close
+/// and the PTY spawn itself, so a PATH walk widens nothing.
+fn resume_respawn_argv(
+    claude_bin: &str,
+    claude_session_id: &str,
+    model: Option<String>,
+    launch_cfg: &crate::claude_session::launch_spec::LaunchConfig,
+    extra_required: Vec<String>,
+) -> Vec<String> {
+    crate::claude_session::launch_spec::render_argv(
+        &crate::claude_session::launch_spec::LaunchSpec {
+            permission: crate::claude_session::launch_spec::PermissionMode::BypassPermissions,
+            resume_id: Some(claude_session_id.to_string()),
+            model,
+            extra_required,
+            ..Default::default()
+        },
+        launch_cfg,
+        claude_bin,
     )
 }
 
@@ -823,6 +874,55 @@ mod tests {
         let bare = resume_respawn_extra_required(settings.clone(), None);
         assert_eq!(bare, settings, "no cached body ⇒ exactly today's tail");
         assert!(!bare.iter().any(|a| a == APPEND_SYSTEM_PROMPT_FLAG));
+    }
+
+    /// The 2026-09-18 regression: the respawn argv's head was the bare
+    /// `claude_bin_path()`, which the PTY spawn resolved against the child's
+    /// PATH to the extensionless identity-shim script and `CreateProcessW`
+    /// refused (os error 193) — after the source pane had already been closed.
+    /// The head must be exactly the binary the caller resolved, verbatim, with
+    /// the flags the migration has always carried behind it. The head is passed
+    /// in rather than read from the resolver so this reads no process-global
+    /// env (`PATH`, `QONTINUI_CLAUDE_BIN`) that other tests in this binary
+    /// mutate; the one-line wiring in `spawn_resumed_pane` is the
+    /// `resolve_claude_bin()` call itself.
+    #[test]
+    fn resume_respawn_argv_head_is_the_binary_the_caller_resolved() {
+        let bin = if cfg!(windows) {
+            r"C:\fake\bin\claude.exe"
+        } else {
+            "/fake/bin/claude"
+        };
+        let argv = resume_respawn_argv(
+            bin,
+            "7b4a9fb4-5526-4ab0-b89e-f13b6316874a",
+            Some("claude-opus-5".to_string()),
+            &crate::claude_session::launch_spec::LaunchConfig::default(),
+            vec!["--settings".to_string(), "hooks.json".to_string()],
+        );
+        assert_eq!(
+            argv[0], bin,
+            "head must be the resolved binary verbatim: {argv:?}"
+        );
+        assert_ne!(argv[0], "claude", "the bare name is the os-error-193 shape");
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-mode", "bypassPermissions"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--model", "claude-opus-5"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--resume", "7b4a9fb4-5526-4ab0-b89e-f13b6316874a"]),
+            "{argv:?}"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["--settings", "hooks.json"]),
+            "extra_required tail must survive: {argv:?}"
+        );
     }
 
     #[test]
