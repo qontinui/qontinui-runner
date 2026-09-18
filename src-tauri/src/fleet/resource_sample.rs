@@ -263,10 +263,21 @@ pub(crate) struct ResourceSample {
     /// widening — do not pattern-match the type off the neighbouring `BIGINT`
     /// saturation fields.
     ///
-    /// coord grades this warn at 256 / critical at 400, the same two numbers as
-    /// this runner's shipped [`crate::settings::SessionGuardSettings`]
-    /// `warn_thread_count` / `critical_thread_count`, so the dashboard's
-    /// verdict and the local spawn gate's cannot drift into two opinions.
+    /// **The ceilings this is judged against now travel WITH it** —
+    /// [`Self::thread_warn_ceiling`] and [`Self::thread_critical_ceiling`] —
+    /// and a consumer must grade against those rather than against a constant.
+    ///
+    /// This doc used to say coord "grades this warn at 256 / critical at 400,
+    /// the same two numbers as this runner's shipped
+    /// [`crate::settings::SessionGuardSettings`] … so the dashboard's verdict
+    /// and the local spawn gate's cannot drift into two opinions." That was
+    /// true only while the ceilings were absolute constants. They are now
+    /// re-based onto each machine's measured at-rest thread floor
+    /// ([`crate::resource_guard::machine_thread_shift`]), so a
+    /// 48-core box enforces a different pair from a 4-core one and a hardcoded
+    /// 256/400 on the reader's side IS the drift that sentence promised could
+    /// not happen. Publishing the pair beside the reading is what keeps the
+    /// promise; hardcoding it is what breaks it.
     ///
     /// `None` when [`crate::health_monitor::thread_count_reading`] cannot read
     /// the sensor — UNKNOWN, never 0, for the reason [`Saturation`]'s "NULL,
@@ -296,6 +307,24 @@ pub(crate) struct ResourceSample {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) active_terminal_sessions: Option<i32>,
+    /// The warn ceiling [`Self::thread_count`] is actually judged against on
+    /// THIS machine, after the local / hardcoded / fleet fold and after the
+    /// machine re-basing.
+    ///
+    /// Published so a consumer never has to assume a number. Grading a reading
+    /// against a constant the enforcing process does not use is how a dashboard
+    /// and a spawn gate come to hold two opinions — see [`Self::thread_count`].
+    ///
+    /// **Host lane only**, same placement argument as the two fields above: the
+    /// thread count is a property of the runner PROCESS. `None` on every other
+    /// lane, and `None` here means UNKNOWN — never "no ceiling".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_warn_ceiling: Option<i32>,
+    /// The critical ceiling [`Self::thread_count`] is actually judged against
+    /// on THIS machine. The sibling of [`Self::thread_warn_ceiling`], and the
+    /// one a `Critical` verdict quotes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) thread_critical_ceiling: Option<i32>,
     /// Per-lane breakdown of THIS runner process's in-flight tracked blocking
     /// bodies — [`qontinui_runner_lib::wedge_diagnostics::tracked_blocking_by_thread`],
     /// keyed by the thread that spawned each body. Bounded to
@@ -563,6 +592,8 @@ impl ResourceSample {
             ci_jobs_running: None,
             thread_count: None,
             active_terminal_sessions: None,
+            thread_warn_ceiling: None,
+            thread_critical_ceiling: None,
             blocking_lanes: None,
             threads_max: None,
             threads_used: None,
@@ -850,6 +881,25 @@ fn collect_host_lane() -> ResourceSample {
     s.thread_count =
         crate::health_monitor::thread_count_reading().map(|n| n.min(i32::MAX as usize) as i32);
     s.active_terminal_sessions = live_terminal_session_count();
+
+    // Fold this tick into the at-rest thread floor the guard re-bases its
+    // ceilings onto. Both readings were just taken, on the same tick, two lines
+    // apart — which is exactly why the baseline lives off THIS loop and needs
+    // no sensor, timer or registry reach of its own. Either one UNKNOWN records
+    // nothing; see `record_at_rest_sample`.
+    crate::resource_guard::record_at_rest_sample(
+        s.thread_count.and_then(|n| usize::try_from(n).ok()),
+        s.active_terminal_sessions
+            .and_then(|n| usize::try_from(n).ok()),
+    );
+
+    // The ceilings that reading is actually judged against on this machine, so
+    // no consumer has to assume 256/400 — they are no longer constants.
+    let ceilings = crate::resource_guard::effective_thread_ceilings(
+        &crate::settings::get_session_guard_settings(),
+    );
+    s.thread_warn_ceiling = Some(ceilings.warn_thread_count.min(i32::MAX as usize) as i32);
+    s.thread_critical_ceiling = Some(ceilings.critical_thread_count.min(i32::MAX as usize) as i32);
     s.blocking_lanes = Some(
         tracked_blocking_by_thread()
             .into_iter()
