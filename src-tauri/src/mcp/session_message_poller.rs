@@ -563,14 +563,14 @@ impl SurfacingTracker {
             repeat,
             enabled,
         ) {
-                // Stamp BEFORE the (fail-open) POST attempt: at most one
-                // attempt per window even if the POST errors — never a retry
-                // storm.
-                entry.last_posted = Some(now);
-                Some(entry.first_seen_wall)
-            } else {
-                None
-            };
+            // Stamp BEFORE the (fail-open) POST attempt: at most one
+            // attempt per window even if the POST errors — never a retry
+            // storm.
+            entry.last_posted = Some(now);
+            Some(entry.first_seen_wall)
+        } else {
+            None
+        };
         BlockedVerdict {
             log_now,
             surface_since,
@@ -2067,7 +2067,9 @@ mod tests {
     fn surfacing_disabled_flag_never_fires() {
         let first_seen = Instant::now();
         let now = first_seen + REPEAT * 3;
-        assert!(!should_surface(first_seen, None, now, THRESH, REPEAT, false));
+        assert!(!should_surface(
+            first_seen, None, now, THRESH, REPEAT, false
+        ));
     }
 
     #[test]
@@ -2093,7 +2095,9 @@ mod tests {
         // counts poll ticks.
         let first_seen = Instant::now();
         let first_fire = first_seen + THRESH;
-        assert!(should_surface(first_seen, None, first_fire, THRESH, REPEAT, true));
+        assert!(should_surface(
+            first_seen, None, first_fire, THRESH, REPEAT, true
+        ));
         // Another threshold window later: still inside the repeat window.
         let now = first_fire + THRESH;
         assert!(!should_surface(
@@ -2435,7 +2439,10 @@ mod tests {
         let t0 = Instant::now();
         let v0 = t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         assert!(v0.log_now, "the first sighting must log immediately");
-        assert!(v0.surface_since.is_none(), "…but not POST below the threshold");
+        assert!(
+            v0.surface_since.is_none(),
+            "…but not POST below the threshold"
+        );
         // The next poll tick, inside the window: quiet.
         let v1 = t.note_blocked(
             "m1",
@@ -2465,7 +2472,10 @@ mod tests {
             REPEAT,
             true,
         );
-        assert!(v3.log_now, "a full window since the last line must log again");
+        assert!(
+            v3.log_now,
+            "a full window since the last line must log again"
+        );
         assert!(v3.surface_since.is_some());
         // The log keeps its 60 s cadence while the POST waits for the repeat
         // window: two threshold windows later it logs again but does not POST.
@@ -2612,12 +2622,7 @@ mod tests {
     #[test]
     fn health_snapshot_has_exactly_the_documented_keys_and_bumps_are_visible() {
         let keys = |v: &serde_json::Value| -> Vec<String> {
-            let mut k: Vec<String> = v
-                .as_object()
-                .expect("object")
-                .keys()
-                .cloned()
-                .collect();
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
             k.sort();
             k
         };
@@ -2686,15 +2691,23 @@ mod tests {
         assert!(prompt_rest_is_empty("                          │"));
         // The Claude Code hint placeholder ⇒ empty (observed rendering,
         // `Try "${…}"` — the opening quote is always rendered).
-        assert!(prompt_rest_is_empty(" Try \"fix lint errors\"            │"));
+        assert!(prompt_rest_is_empty(
+            " Try \"fix lint errors\"            │"
+        ));
         assert!(prompt_rest_is_empty("Try \"how do I log an error?\""));
         // Anything the operator typed ⇒ NOT empty — including a prompt that
         // happens to begin with the word `Try` but not the quoted hint.
         assert!(!prompt_rest_is_empty(" hello"));
-        assert!(!prompt_rest_is_empty(" Try running the tests             │"));
+        assert!(!prompt_rest_is_empty(
+            " Try running the tests             │"
+        ));
         assert!(!prompt_rest_is_empty(" Try"));
-        assert!(!prompt_rest_is_empty(" try lowercase is not the placeholder │"));
-        assert!(!prompt_rest_is_empty(" /vet-imp 2026-09-07-…               │"));
+        assert!(!prompt_rest_is_empty(
+            " try lowercase is not the placeholder │"
+        ));
+        assert!(!prompt_rest_is_empty(
+            " /vet-imp 2026-09-07-…               │"
+        ));
     }
 
     #[test]
@@ -2728,10 +2741,7 @@ mod tests {
         assert_eq!(snapshot_verdict(&select_menu_above, 3, true), Ok(()));
         // And the bottom-most row is the one JUDGED: text there still defers,
         // even with an empty-looking `❯` row above it.
-        let typing_below = lines(&[
-            "❯ ",
-            "│ ❯ hello                                    │",
-        ]);
+        let typing_below = lines(&["❯ ", "│ ❯ hello                                    │"]);
         assert_eq!(
             snapshot_verdict(&typing_below, 1, true),
             Err(GateMiss::PromptNotEmpty)
@@ -2751,7 +2761,10 @@ mod tests {
         let busy = lines(&["✻ Thinking… (esc to interrupt)", "│ ❯          │"]);
         assert_eq!(snapshot_verdict(&busy, 1, true), Err(GateMiss::NotIdle));
         let no_prompt = lines(&["still streaming output"]);
-        assert_eq!(snapshot_verdict(&no_prompt, 0, true), Err(GateMiss::NotIdle));
+        assert_eq!(
+            snapshot_verdict(&no_prompt, 0, true),
+            Err(GateMiss::NotIdle)
+        );
         let half_typed = lines(&["│ ❯ hello    │"]);
         assert_eq!(
             snapshot_verdict(&half_typed, 0, true),
@@ -2799,7 +2812,12 @@ mod tests {
     fn gate_miss_details_name_the_prompt_case() {
         // The once-per-window log line names "prompt not empty" as the
         // specific behind the coarse `pty_never_idle` reason.
-        assert!(GateMiss::PromptNotEmpty.detail().contains("prompt row not empty"));
-        assert_ne!(GateMiss::PromptNotEmpty.detail(), GateMiss::NotIdle.detail());
+        assert!(GateMiss::PromptNotEmpty
+            .detail()
+            .contains("prompt row not empty"));
+        assert_ne!(
+            GateMiss::PromptNotEmpty.detail(),
+            GateMiss::NotIdle.detail()
+        );
     }
 }
