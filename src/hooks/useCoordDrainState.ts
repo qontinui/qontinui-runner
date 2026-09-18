@@ -40,8 +40,13 @@ export interface CoordDrainSnapshot {
   deferredCount: number;
   /**
    * `true` once the backend's `MAX_DEFERRED_KEYS` cap was hit, which makes
-   * `deferredCount` a FLOOR rather than a total. Optional: a runner predating
-   * the field sends nothing, and an absent value is not a `false`.
+   * `deferredCount` a FLOOR rather than a total.
+   *
+   * Optional because a runner predating the field sends nothing. The banner
+   * renders an absent value AS `false` (`?? false`), and that is deliberate
+   * rather than a collapse of unknown into no: a build with no such field also
+   * has no such cap, so its count really is a total. The default is only ever
+   * read on a runner where the question does not arise.
    */
   deferredCapped?: boolean;
   deferredByOrigin: Record<string, number>;

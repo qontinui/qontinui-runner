@@ -608,16 +608,30 @@ pub(crate) async fn restart_after_drain(
     .await
     {
         Ok(_) => Ok(RestartOutcome::Started),
-        // A 409 is the BENIGN family and must not be reported as a failure
-        // needing an operator: the kind is already running (an operator
-        // restarted it by hand during the drain, or a start is in flight), or
-        // the drain re-armed between the undrain decision and this call, in
-        // which case the deferral is the correct answer and the next drain will
-        // record the kind again.
+        // 409 covers TWO families, and collapsing them loses a steward.
+        //
+        // * A DRAIN DEFERRAL — the drain re-armed between the undrain decision
+        //   and this call. Nothing started, and nothing else will re-record the
+        //   kind: there is no tab left to close, so the wind-down tick can never
+        //   put it back in the stopped-by-drain set. The caller must keep it
+        //   owed. `code` is exactly what says so — `api_refusal` stamps
+        //   `DeferClass`'s `device_drained` / `drain_unreadable`.
+        // * ANYTHING ELSE — already running (an operator restarted it by hand
+        //   during the drain), or a start already in flight. Benign; nothing is
+        //   owed and nothing needs an operator.
         Err((StatusCode::CONFLICT, Json(err))) => {
-            Ok(RestartOutcome::NotNeeded(err.error.unwrap_or_else(|| {
-                "already running or deferred".to_string()
-            })))
+            let deferred = err.code.as_deref().is_some_and(|code| {
+                code == crate::coord_drain_state::DeferClass::Drained.code()
+                    || code == crate::coord_drain_state::DeferClass::Unknown.code()
+            });
+            let reason = err
+                .error
+                .unwrap_or_else(|| "already running or deferred".to_string());
+            Ok(if deferred {
+                RestartOutcome::Deferred(reason)
+            } else {
+                RestartOutcome::NotNeeded(reason)
+            })
         }
         Err((status, Json(err))) => Err(format!(
             "{}: {}",
@@ -636,6 +650,10 @@ pub(crate) enum RestartOutcome {
     /// Nothing was started, and nothing is wrong: the reason is carried so the
     /// caller can log WHICH benign case it was.
     NotNeeded(String),
+    /// The coord device drain deferred the restart — it re-armed between the
+    /// undrain decision and this call. Nothing was started and the kind is
+    /// STILL OWED: no tab is left to close, so nothing else will re-record it.
+    Deferred(String),
 }
 
 /// The shared start path behind the HTTP route and the Tauri command. `origin`
