@@ -819,6 +819,18 @@ fn boot_embedded_pg(rt: &tokio::runtime::Runtime) -> Arc<crate::database::pg::Pg
     }
 }
 
+/// The `paths.plans_dir` door the `harness` capture section reads through
+/// (`env_agent::collectors::publish_plans_dir`). Re-reads the setting on every
+/// call — the same per-call contract as the adapter's `PathReader`, the
+/// session launcher and the plan-library door — and resolves it through the
+/// adapter's own `resolve_plans_dir`, so "blank counts as unset" holds here
+/// exactly as it does on the scan. A `fn` pointer rather than a closure
+/// because the door type is `fn() -> Option<String>`.
+fn runner_plans_dir_setting() -> Option<String> {
+    let paths = crate::config_facade::get_setting::<crate::settings::PathSettings>();
+    qontinui_runner_lib::plan_workunit_adapter::resolve_plans_dir(paths.plans_dir)
+}
+
 /// Parse a boolean env lever the way the rest of the boot path does.
 fn env_flag(name: &str) -> bool {
     std::env::var(name)
@@ -1722,6 +1734,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // appear afterwards, however the operator fixed the setting.
                 qontinui_runner_lib::env_agent::collectors::publish_workspace_root(
                     crate::workspace_paths::runner_workspace_root,
+                );
+                // Same bridge again for `paths.plans_dir`, which the `harness`
+                // collector renders root-relative. The setting lives behind
+                // this crate's settings facade; the door re-reads it per call
+                // and runs it through the adapter's own resolver so the
+                // capture and the scan agree on what "unset" means.
+                qontinui_runner_lib::env_agent::collectors::publish_plans_dir(
+                    runner_plans_dir_setting,
                 );
                 qontinui_runner_lib::env_agent::spawn_env_capture();
                 // Phase 3 — dispatched self-enroll: subscribe to coord's

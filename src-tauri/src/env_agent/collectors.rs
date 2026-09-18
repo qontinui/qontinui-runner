@@ -3363,6 +3363,522 @@ fn collect_claude_accounts_from(
     Some(section)
 }
 
+// ============================================================================
+// harness section — the fleet's agent harness, as far as the filesystem shows
+// ============================================================================
+//
+// Plan `2026-09-13-a-new-machine-cannot-discover-apply-or-verify-the-fleet-harness-config`
+// Phase 3. A new machine configures itself through two unrelated layers, and
+// only the product one (`versions` / `services` / `repos` …) was visible
+// centrally. This section makes the OTHER layer — the `qontinui-claude-config`
+// harness: the three workspace-root links, the installers' renders, the
+// runner's `paths.plans_dir` and the plan-corpus invariant — a capture, so
+// "every other fleet machine is UNKNOWN" becomes a drift query.
+//
+// **Report-only, by design (plan D3).** No apply module reads this section:
+// replacing a real `<root>/plans` directory is destructive, and the
+// consolidation plan required a blast-radius gate and a fold-in for exactly
+// that act. Remediation stays a deliberate session.
+//
+// **File-observable state only — this NEVER shells out.** The capture loop runs
+// every 60–900 s; the installers' `--check` arms take seconds each and need
+// bash, so calling them here would park a blocking-pool worker on every tick
+// for a reading the doctor already gives. The deep check is
+// `qontinui-claude-config/scripts/capability-doctor.sh` (the plan's Phase 2);
+// what this section publishes is the render each installer leaves on disk,
+// which is what `--check` itself compares against.
+//
+// **`plans_dir_relative` is root-RELATIVE, never the absolute path.** An
+// absolute path differs on every box by construction (`C:\qontinui-root` vs
+// `/home/…`), so publishing it would read as drift fleet-wide and pin the
+// rollup at `warning` forever — the "drift signal rots" failure
+// `devenv_drift.py` records for `repos`. The relative rendering is identical
+// on every compliant box (`qontinui-dev-notes/plans`), so two machines with
+// different roots compare `in_sync` on it. The absolute value stays readable
+// locally through the Phase 2 doctor and the Paths settings page.
+
+/// The bin crate's `paths.plans_dir` door, published as a FUNCTION for the
+/// same reason [`WorkspaceRootFn`] is: the setting is operator-editable and
+/// re-read per call by every other consumer (the adapter's `PathReader`, the
+/// session launcher, the plan-library door), so a capture must see the same
+/// value they do on its next tick, never a boot-time snapshot.
+///
+/// The door is expected to run the setting through
+/// `plan_workunit_adapter::resolve_plans_dir` (blank counts as unset) so this
+/// section and the scan can never disagree about what "unset" means.
+pub type PlansDirFn = fn() -> Option<String>;
+
+static PLANS_DIR_DOOR: std::sync::OnceLock<PlansDirFn> = std::sync::OnceLock::new();
+
+/// Publish the runner's `paths.plans_dir` reader so [`collect_harness`] can
+/// render it. Called by the binary at boot next to
+/// [`publish_workspace_root`]. Idempotent — a second call is ignored.
+///
+/// The setting lives behind the bin-crate settings facade, which this lib
+/// crate provably cannot reach; until the door is published the section
+/// reports the key as [`PLANS_DIR_UNREAD`] rather than guessing `unset`.
+pub fn publish_plans_dir(door: PlansDirFn) {
+    let _ = PLANS_DIR_DOOR.set(door);
+}
+
+/// The harness repo's checkout directory name under the workspace root.
+const HARNESS_CONFIG_REPO_DIR: &str = "qontinui-claude-config";
+
+/// The repo whose `plans/` directory is the fleet's ONE plan corpus
+/// (`CLAUDE.md` → "Plan corpus authority"; operator instruction 2026-09-07).
+const HARNESS_PLANS_REPO_DIR: &str = "qontinui-dev-notes";
+
+/// `plans_dir_relative` when `paths.plans_dir` is absent or blank — the
+/// markdown-plan tier is OFF on that box.
+const PLANS_DIR_UNSET: &str = "unset";
+/// `plans_dir_relative` when the setting is absolute and not under the
+/// workspace root.
+const PLANS_DIR_OUTSIDE: &str = "outside-workspace";
+/// `plans_dir_relative` when this process has no door to the setting at all
+/// (the standalone `qontinui_profile env capture` CLI, which has no settings
+/// store). A statement of UNKNOWN, deliberately distinct from `unset`: the
+/// runner-published capture is the ordinary one, and a one-shot CLI capture
+/// that read `unset` here would assert a reading it never took.
+const PLANS_DIR_UNREAD: &str = "unread";
+
+/// What the settings door answered, or that there was no door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlansDirReading {
+    /// The door answered (already run through `resolve_plans_dir`, so `None`
+    /// is "unset or blank").
+    Read(Option<String>),
+    /// No door published in this process.
+    Unread,
+}
+
+/// One workspace-root entry's on-disk shape, read once by [`path_shape`] and
+/// classified by the PURE [`link_state`] / [`invariant_class`] so every arm is
+/// unit-testable over shapes a test box may not be able to create (a symlink
+/// needs Developer Mode or elevation on Windows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathShape {
+    /// Nothing at that path.
+    Missing,
+    /// A symlink or junction. `resolved` is the FOLLOWED, canonical target
+    /// (`None` when dangling); `raw_target` is the literal link text.
+    Link {
+        resolved: Option<PathBuf>,
+        raw_target: PathBuf,
+    },
+    /// A regular directory.
+    Dir,
+    /// A regular file, with its contents when they were readable.
+    File { contents: Option<String> },
+    /// Stat'd, but as something none of the above (or the stat itself
+    /// errored with something other than not-found).
+    Unreadable,
+}
+
+/// Read `path`'s [`PathShape`] without following it. `symlink_metadata` on
+/// purpose: a junction or symlink must be seen as itself. On Windows std's
+/// `FileType::is_symlink` is true for both an NTFS symlink and a junction
+/// (`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT` both carry the
+/// name-surrogate bit), and `read_link` reads either — which is what lets a
+/// no-elevation `mklink /J .claude …` (the README's Windows arm) read
+/// `present` exactly like the `ln -s` form.
+fn path_shape(path: &Path) -> PathShape {
+    let md = match std::fs::symlink_metadata(path) {
+        Ok(md) => md,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PathShape::Missing,
+        Err(_) => return PathShape::Unreadable,
+    };
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        let raw_target = std::fs::read_link(path).unwrap_or_default();
+        // `canonicalize` FOLLOWS the link; a dangling one errors.
+        let resolved = std::fs::canonicalize(path).ok();
+        return PathShape::Link {
+            resolved,
+            raw_target,
+        };
+    }
+    if ft.is_dir() {
+        return PathShape::Dir;
+    }
+    if ft.is_file() {
+        return PathShape::File {
+            contents: std::fs::read_to_string(path).ok(),
+        };
+    }
+    PathShape::Unreadable
+}
+
+/// Whether two paths name the same place: canonical equality when both resolve,
+/// else a lexical comparison of the normalized renderings (so a link whose
+/// target is not on disk yet still compares against where it SHOULD point).
+/// Case-insensitive on Windows, where the filesystem is.
+fn same_place(a: &Path, b: &Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        return ca == cb;
+    }
+    let (na, nb) = (normalize_lexical(a), normalize_lexical(b));
+    if cfg!(windows) {
+        na.eq_ignore_ascii_case(&nb)
+    } else {
+        na == nb
+    }
+}
+
+/// Forward-slash rendering with the Windows verbatim prefix and any trailing
+/// separator stripped, for lexical comparison and for the published relative
+/// path.
+fn normalize_lexical(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.strip_prefix("//?/").unwrap_or(&s).to_string();
+    s.trim_end_matches('/').to_string()
+}
+
+/// Where a link's literal target points, as an absolute path: an absolute
+/// target as-is, a relative one against the link's own parent (which is how
+/// the OS resolves it).
+fn link_target_absolute(link: &Path, raw_target: &Path) -> PathBuf {
+    if raw_target.is_absolute() {
+        raw_target.to_path_buf()
+    } else {
+        link.parent()
+            .map(|p| p.join(raw_target))
+            .unwrap_or_else(|| raw_target.to_path_buf())
+    }
+}
+
+/// Classify one harness link. **Pure over [`PathShape`] — unit-tested.**
+///
+/// - `present`: a link (symlink or junction) resolving to `expected`, or a
+///   plain file whose contents `plain_file_ok` accepts — the README's two
+///   non-link forms (`@qontinui-claude-config/CLAUDE.md`, and the
+///   `dev-start.ps1` forwarding shim a box without elevation carries).
+/// - `absent`: nothing at the path.
+/// - `foreign`: something is there but it is not the harness's — a link
+///   elsewhere, a dangling link, a real directory, a file with other contents.
+/// - `unknown`: the path could not be stat'd or read; not asserted either way.
+fn link_state(
+    link: &Path,
+    shape: &PathShape,
+    expected: &Path,
+    plain_file_ok: fn(&str) -> bool,
+) -> &'static str {
+    match shape {
+        PathShape::Missing => "absent",
+        PathShape::Unreadable => "unknown",
+        PathShape::Dir => "foreign",
+        PathShape::File { contents: None } => "unknown",
+        PathShape::File {
+            contents: Some(text),
+        } => {
+            if plain_file_ok(text) {
+                "present"
+            } else {
+                "foreign"
+            }
+        }
+        PathShape::Link {
+            resolved,
+            raw_target,
+        } => {
+            let target = match resolved {
+                Some(r) => r.clone(),
+                None => link_target_absolute(link, raw_target),
+            };
+            if same_place(&target, expected) {
+                "present"
+            } else {
+                "foreign"
+            }
+        }
+    }
+}
+
+/// A plain-file `CLAUDE.md` is the harness's when its ONLY non-blank line is
+/// the Claude Code include of the served one.
+fn claude_md_plain_ok(text: &str) -> bool {
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    matches!(
+        (lines.next(), lines.next()),
+        (Some("@qontinui-claude-config/CLAUDE.md"), None)
+    )
+}
+
+/// A plain-file `dev-start.ps1` is the harness's when it forwards to the
+/// tracked script (either separator spelling).
+fn dev_start_plain_ok(text: &str) -> bool {
+    text.contains("qontinui-claude-config\\scripts\\dev-start.ps1")
+        || text.contains("qontinui-claude-config/scripts/dev-start.ps1")
+}
+
+/// `.claude` has no plain-file form: the umbrella link is load-bearing (the
+/// guard hooks find `cargo-guard.sh` by traversing through it).
+fn never_plain_ok(_: &str) -> bool {
+    false
+}
+
+/// Classify the plan-corpus invariant (consolidation plan Design decision 2:
+/// "at most one writable plan corpus per machine"). **Pure — unit-tested.**
+///
+/// - `(a)`: no `<root>/plans` at all.
+/// - `(b)`: `<root>/plans` is a link resolving to the tracked corpus.
+/// - `(c)`: `<root>/plans` is a second writable corpus — a real directory, or
+///   a link to somewhere OTHER than the tracked corpus. Report only (D3).
+/// - `unknown`: the path is there but the probe could not settle it (dangling
+///   link, a plain file, an unreadable entry).
+fn invariant_class(shape: &PathShape, tracked: &Path) -> &'static str {
+    match shape {
+        PathShape::Missing => "(a)",
+        PathShape::Dir => "(c)",
+        PathShape::Link {
+            resolved: Some(r), ..
+        } => {
+            if same_place(r, tracked) {
+                "(b)"
+            } else {
+                "(c)"
+            }
+        }
+        // Dangling: nothing writable behind it, but not (a) either — say so
+        // rather than pick. The raw target is deliberately not consulted: a
+        // link whose target does not exist cannot be a corpus.
+        PathShape::Link { resolved: None, .. } => "unknown",
+        PathShape::File { .. } | PathShape::Unreadable => "unknown",
+    }
+}
+
+/// Render `paths.plans_dir` relative to the workspace root. **Pure —
+/// unit-tested.** See the section header for why the absolute path is never
+/// published.
+fn plans_dir_relative(root: &Path, reading: &PlansDirReading) -> String {
+    let configured = match reading {
+        PlansDirReading::Unread => return PLANS_DIR_UNREAD.to_string(),
+        PlansDirReading::Read(None) => return PLANS_DIR_UNSET.to_string(),
+        PlansDirReading::Read(Some(p)) => Path::new(p),
+    };
+    if !configured.is_absolute() {
+        // Already a relative rendering; publish it normalized. The setting is
+        // documented as absolute, so this arm is defensive rather than a
+        // supported spelling.
+        let rel = normalize_lexical(configured);
+        return rel.trim_start_matches("./").to_string();
+    }
+    // Canonical when both sides resolve (so `D:` vs `C:` subst aliases and
+    // case differences do not fake an `outside-workspace`), lexical otherwise
+    // (a configured directory that does not exist yet is still comparable).
+    let (root_n, cfg_n) = match (
+        std::fs::canonicalize(root),
+        std::fs::canonicalize(configured),
+    ) {
+        (Ok(r), Ok(c)) => (normalize_lexical(&r), normalize_lexical(&c)),
+        _ => (normalize_lexical(root), normalize_lexical(configured)),
+    };
+    let prefix = format!("{root_n}/");
+    let same = |a: &str, b: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    let under = cfg_n
+        .get(..prefix.len())
+        .map(|head| same(head, &prefix))
+        .unwrap_or(false);
+    if under {
+        cfg_n[prefix.len()..].to_string()
+    } else if same(&cfg_n, &root_n) {
+        // The root itself as the plans dir: the relative rendering would be
+        // empty, which reads as unset. Name it.
+        ".".to_string()
+    } else {
+        PLANS_DIR_OUTSIDE.to_string()
+    }
+}
+
+/// `present` / `absent` for a plain existence probe.
+fn presence(exists: bool) -> &'static str {
+    if exists {
+        "present"
+    } else {
+        "absent"
+    }
+}
+
+/// The guard installer's render: `<config repo>/.claude/settings.json` with a
+/// non-empty `hooks` object. What `install-guard-hooks.sh --check` verifies is
+/// that render against its manifest; existence of the render is the
+/// file-observable half.
+fn guard_hooks_installed(config_repo: &Path) -> bool {
+    let path = config_repo.join(".claude").join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    v.get("hooks")
+        .and_then(Value::as_object)
+        .map(|h| !h.is_empty())
+        .unwrap_or(false)
+}
+
+/// The agent-skills installer's render: at least one skill directory under
+/// `<config repo>/.agents/skills`.
+fn agent_skills_installed(config_repo: &Path) -> bool {
+    std::fs::read_dir(config_repo.join(".agents").join("skills"))
+        .map(|rd| {
+            rd.flatten()
+                .any(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+/// The accounts installer's render: the runner's machine-global roster
+/// (`<config dir>/com.qontinui.runner/claude-accounts.json` — the same file
+/// [`collect_claude_accounts_from`] reads, through the same probe) naming at
+/// least one per-account config dir that exists on disk. The `.claude-<id>`
+/// dirs themselves live under the installer's accounts root (not under the
+/// runner's config dir), which is why the roster is the anchor rather than a
+/// directory enumeration.
+fn claude_accounts_installed(config_root: Option<&Path>) -> bool {
+    let Some(config_root) = config_root else {
+        return false;
+    };
+    let roster = config_root
+        .join("com.qontinui.runner")
+        .join("claude-accounts.json");
+    let Ok(text) = std::fs::read_to_string(&roster) else {
+        return false;
+    };
+    let Ok(probe) = serde_json::from_str::<AccountsFileProbe>(&text) else {
+        return false;
+    };
+    probe
+        .claude_config_dirs
+        .iter()
+        .any(|d| !d.trim().is_empty() && Path::new(d).is_dir())
+}
+
+/// One workspace-root link to judge: the section key, the entry name under
+/// the root, where the README says it points, and which plain-file contents
+/// (if any) count as the harness's.
+type HarnessLinkSpec = (&'static str, &'static str, PathBuf, fn(&str) -> bool);
+
+/// Collect the `harness` section: the fleet harness's file-observable state
+/// under the workspace root. See the section header.
+///
+/// Returns `None` only when the workspace root does not resolve — no
+/// observation, no section, exactly as [`collect_repos`]. A resolved root
+/// under which nothing is installed still returns `Some` (every key `absent`,
+/// the invariant `(a)`): that is a real, comparable observation — "this box
+/// has no harness" — and the one this section exists to make visible.
+pub fn collect_harness() -> Option<Section> {
+    let resolved = workspace_root();
+    if let Some(rejected) = resolved.rejected {
+        warn!(
+            "env_agent: harness capture — {} — continuing with the next resolution rung",
+            rejected.describe()
+        );
+    }
+    let root = resolved.into_root()?;
+    let plans_dir = match PLANS_DIR_DOOR.get() {
+        Some(door) => PlansDirReading::Read(door()),
+        None => PlansDirReading::Unread,
+    };
+    let config_root = dirs::config_dir();
+    Some(collect_harness_under(
+        &root,
+        &plans_dir,
+        config_root.as_deref(),
+    ))
+}
+
+/// Injectable core of [`collect_harness`]: `root` is the workspace root,
+/// `plans_dir` the settings door's answer, `config_root` the platform config
+/// dir the accounts roster lives under. Every value is a `Value::String`.
+fn collect_harness_under(
+    root: &Path,
+    plans_dir: &PlansDirReading,
+    config_root: Option<&Path>,
+) -> Section {
+    let config_repo = root.join(HARNESS_CONFIG_REPO_DIR);
+    let mut section = Section::new();
+
+    // The three workspace-root links, each judged against where the README
+    // says it points.
+    let links: [HarnessLinkSpec; 3] = [
+        (
+            "link_claude_dir",
+            ".claude",
+            config_repo.join(".claude"),
+            never_plain_ok,
+        ),
+        (
+            "link_claude_md",
+            "CLAUDE.md",
+            config_repo.join("CLAUDE.md"),
+            claude_md_plain_ok,
+        ),
+        (
+            "link_dev_start",
+            "dev-start.ps1",
+            config_repo.join("scripts").join("dev-start.ps1"),
+            dev_start_plain_ok,
+        ),
+    ];
+    for (key, name, expected, plain_ok) in links {
+        let link = root.join(name);
+        let shape = path_shape(&link);
+        put(&mut section, key, link_state(&link, &shape, &expected, plain_ok));
+    }
+
+    // The harness repo itself — a `.git` dir (canonical checkout) or file
+    // (linked worktree) both count as "cloned".
+    let git_marker = config_repo.join(".git");
+    put(&mut section, "config_repo", presence(git_marker.exists()));
+
+    // Installer renders — file-observable state only, never `--check`.
+    put(
+        &mut section,
+        "installer_guard_hooks",
+        presence(guard_hooks_installed(&config_repo)),
+    );
+    put(
+        &mut section,
+        "installer_agent_skills",
+        presence(agent_skills_installed(&config_repo)),
+    );
+    put(
+        &mut section,
+        "installer_claude_accounts",
+        presence(claude_accounts_installed(config_root)),
+    );
+    put(
+        &mut section,
+        "installer_git_hooks",
+        presence(git_marker.join("hooks").join("prepare-commit-msg").is_file()),
+    );
+
+    // The runner's plans dir, root-relative.
+    put(
+        &mut section,
+        "plans_dir_relative",
+        plans_dir_relative(root, plans_dir),
+    );
+
+    // The plan-corpus invariant.
+    let plans_link = root.join("plans");
+    let tracked = root.join(HARNESS_PLANS_REPO_DIR).join("plans");
+    let shape = path_shape(&plans_link);
+    put(
+        &mut section,
+        "invariant_class",
+        invariant_class(&shape, &tracked),
+    );
+
+    section
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3521,8 +4037,8 @@ mod tests {
                 .unwrap();
         }
         let wt_path = root.join("qontinui-runner-wt-something");
-        let mut opts = git2::WorktreeAddOptions::new();
-        r.worktree("wt-something", &wt_path, Some(&mut opts))
+        let opts = git2::WorktreeAddOptions::new();
+        r.worktree("wt-something", &wt_path, Some(&opts))
             .unwrap();
         // Guard the guard: if this ever stops being a worktree, the exclusion
         // test below is vacuous and must fail loudly rather than quietly pass.
@@ -4357,8 +4873,7 @@ dependencies = [
         // 256 KiB — four times the 64 KiB pipe capacity, so the old shape
         // deadlocks rather than merely coming close.
         let line = "x".repeat(255);
-        let body: String = std::iter::repeat(line.as_str())
-            .take(1024)
+        let body: String = std::iter::repeat_n(line.as_str(), 1024)
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&payload, &body).unwrap();
@@ -5766,5 +6281,452 @@ dependencies = [
         assert_eq!(account_name("/home/user/.claude-work"), "work");
         assert_eq!(account_name("/home/user/plain"), "plain");
         assert_eq!(account_name("C:\\Users\\x\\.claude-hotmail\\"), "hotmail");
+    }
+
+    // ------------------------------------------------------------------
+    // harness section
+    // ------------------------------------------------------------------
+
+    /// A throwaway workspace root for the harness tests. NOT under
+    /// `tempfile::tempdir()`'s guard because links created inside it are
+    /// removed by `remove_dir_all` just fine; the explicit name makes a leaked
+    /// one findable.
+    fn harness_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "qontinui_harness_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Create a link at `link` → `target` the way the README does: a symlink
+    /// where the box allows one, else (Windows, directories only) a junction —
+    /// the no-elevation arm. Returns false when neither could be made, so a
+    /// test can SAY it skipped rather than pass vacuously.
+    fn make_link(link: &Path, target: &Path, is_dir: bool) -> bool {
+        #[cfg(unix)]
+        {
+            let _ = is_dir;
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            let made = if is_dir {
+                std::os::windows::fs::symlink_dir(target, link).is_ok()
+            } else {
+                std::os::windows::fs::symlink_file(target, link).is_ok()
+            };
+            if made {
+                return true;
+            }
+            if !is_dir {
+                return false;
+            }
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+    }
+
+    /// A compliant harness under `root`: the config repo with its `.git`, the
+    /// three links, the guard-hooks render, one agent skill, the git hook, the
+    /// tracked plan corpus. Returns false when the box cannot create links.
+    fn compliant_harness(root: &Path) -> bool {
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        std::fs::create_dir_all(cfg.join(".git").join("hooks")).unwrap();
+        std::fs::write(cfg.join(".git").join("hooks").join("prepare-commit-msg"), "#!/bin/sh\n")
+            .unwrap();
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        std::fs::write(
+            cfg.join(".claude").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[]}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(cfg.join("CLAUDE.md"), "# guidelines\n").unwrap();
+        std::fs::create_dir_all(cfg.join("scripts")).unwrap();
+        std::fs::write(cfg.join("scripts").join("dev-start.ps1"), "param()\n").unwrap();
+        std::fs::create_dir_all(cfg.join(".agents").join("skills").join("coord")).unwrap();
+        std::fs::create_dir_all(root.join(HARNESS_PLANS_REPO_DIR).join("plans")).unwrap();
+
+        make_link(&root.join(".claude"), &cfg.join(".claude"), true)
+            && make_link(&root.join("CLAUDE.md"), &cfg.join("CLAUDE.md"), false)
+            && make_link(
+                &root.join("dev-start.ps1"),
+                &cfg.join("scripts").join("dev-start.ps1"),
+                false,
+            )
+    }
+
+    fn harness_value<'a>(section: &'a Section, key: &str) -> &'a str {
+        section
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{key} missing or not a string: {section:?}"))
+    }
+
+    /// The compliant shape reads `present` everywhere, `(a)` for the
+    /// invariant, and the tracked corpus as a root-relative forward-slash
+    /// path — the exact reading two compliant boxes with different roots must
+    /// agree on. Every value is a string (envelope contract).
+    #[test]
+    fn harness_compliant_root_reads_present_and_root_relative() {
+        let root = harness_root("compliant");
+        if !compliant_harness(&root) {
+            eprintln!("skipping: this box cannot create symlinks or junctions");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let plans = root
+            .join(HARNESS_PLANS_REPO_DIR)
+            .join("plans")
+            .display()
+            .to_string();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(Some(plans)), None);
+
+        for (k, v) in &section {
+            assert!(v.is_string(), "envelope contract: {k} must be a string, got {v:?}");
+        }
+        assert_eq!(harness_value(&section, "link_claude_dir"), "present");
+        assert_eq!(harness_value(&section, "link_claude_md"), "present");
+        assert_eq!(harness_value(&section, "link_dev_start"), "present");
+        assert_eq!(harness_value(&section, "config_repo"), "present");
+        assert_eq!(harness_value(&section, "installer_guard_hooks"), "present");
+        assert_eq!(harness_value(&section, "installer_agent_skills"), "present");
+        assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
+        // No config root handed in → the roster cannot be read → absent.
+        assert_eq!(harness_value(&section, "installer_claude_accounts"), "absent");
+        assert_eq!(
+            harness_value(&section, "plans_dir_relative"),
+            "qontinui-dev-notes/plans"
+        );
+        assert_eq!(harness_value(&section, "invariant_class"), "(a)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A bare root — nothing installed — is still a stated observation: every
+    /// key `absent`, the invariant `(a)`, the tier `unset`. Never a dropped
+    /// section.
+    #[test]
+    fn harness_bare_root_reads_absent_everywhere() {
+        let root = harness_root("bare");
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        for key in [
+            "link_claude_dir",
+            "link_claude_md",
+            "link_dev_start",
+            "config_repo",
+            "installer_guard_hooks",
+            "installer_agent_skills",
+            "installer_claude_accounts",
+            "installer_git_hooks",
+        ] {
+            assert_eq!(harness_value(&section, key), "absent", "{key}");
+        }
+        assert_eq!(harness_value(&section, "plans_dir_relative"), "unset");
+        assert_eq!(harness_value(&section, "invariant_class"), "(a)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Clause (b): `<root>/plans` is a link to the tracked corpus.
+    /// Clause (c): it is a real directory — a second writable corpus, which the
+    /// section REPORTS and never touches (D3): the directory must survive the
+    /// capture untouched.
+    #[test]
+    fn harness_invariant_class_b_and_c() {
+        let root = harness_root("invariant");
+        let tracked = root.join(HARNESS_PLANS_REPO_DIR).join("plans");
+        std::fs::create_dir_all(&tracked).unwrap();
+
+        if make_link(&root.join("plans"), &tracked, true) {
+            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+            assert_eq!(harness_value(&section, "invariant_class"), "(b)");
+            // Remove the link only (never the target). On Windows a directory
+            // symlink/junction is removed as a directory.
+            #[cfg(windows)]
+            std::fs::remove_dir(root.join("plans")).unwrap();
+            #[cfg(unix)]
+            std::fs::remove_file(root.join("plans")).unwrap();
+        } else {
+            eprintln!("skipping (b): this box cannot create symlinks or junctions");
+        }
+
+        std::fs::create_dir_all(root.join("plans")).unwrap();
+        std::fs::write(root.join("plans").join("stray.md"), "# a second corpus\n").unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        assert_eq!(harness_value(&section, "invariant_class"), "(c)");
+        assert!(
+            root.join("plans").join("stray.md").is_file(),
+            "report-only: the second corpus must be left exactly where it was"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link that exists but resolves elsewhere is `foreign`, not `present`:
+    /// the harness a session would actually load from is a different tree.
+    #[test]
+    fn harness_link_pointing_elsewhere_is_foreign() {
+        let root = harness_root("foreign");
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        let elsewhere = root.join("some-other-checkout").join(".claude");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        if !make_link(&root.join(".claude"), &elsewhere, true) {
+            eprintln!("skipping: this box cannot create symlinks or junctions");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The two plain-file forms the README sanctions read `present`; a real
+    /// `.claude` directory (a copy, which goes stale) reads `foreign`, and so
+    /// does a `CLAUDE.md` with its own contents.
+    #[test]
+    fn harness_plain_file_forms() {
+        let root = harness_root("plain");
+        std::fs::write(root.join("CLAUDE.md"), "\n@qontinui-claude-config/CLAUDE.md\n\n").unwrap();
+        std::fs::write(
+            root.join("dev-start.ps1"),
+            "# forwarder\n& \"$PSScriptRoot\\qontinui-claude-config\\scripts\\dev-start.ps1\" @args\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        assert_eq!(harness_value(&section, "link_claude_md"), "present");
+        assert_eq!(harness_value(&section, "link_dev_start"), "present");
+        assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
+
+        std::fs::write(root.join("CLAUDE.md"), "# my own guidelines\n").unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        assert_eq!(harness_value(&section, "link_claude_md"), "foreign");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Pure classification over shapes this box may not be able to create.
+    #[test]
+    fn harness_link_state_is_pure_over_shapes() {
+        let root = Path::new(if cfg!(windows) {
+            "C:\\ws"
+        } else {
+            "/ws"
+        });
+        let link = root.join(".claude");
+        let expected = root.join(HARNESS_CONFIG_REPO_DIR).join(".claude");
+        assert_eq!(
+            link_state(&link, &PathShape::Missing, &expected, never_plain_ok),
+            "absent"
+        );
+        assert_eq!(
+            link_state(&link, &PathShape::Dir, &expected, never_plain_ok),
+            "foreign"
+        );
+        assert_eq!(
+            link_state(&link, &PathShape::Unreadable, &expected, never_plain_ok),
+            "unknown"
+        );
+        // A dangling link whose LITERAL target is the right relative path —
+        // the config repo is not cloned yet — still judges by where it points.
+        let dangling_right = PathShape::Link {
+            resolved: None,
+            raw_target: PathBuf::from(HARNESS_CONFIG_REPO_DIR).join(".claude"),
+        };
+        assert_eq!(
+            link_state(&link, &dangling_right, &expected, never_plain_ok),
+            "present"
+        );
+        let resolved_elsewhere = PathShape::Link {
+            resolved: Some(root.join("other").join(".claude")),
+            raw_target: PathBuf::from("other/.claude"),
+        };
+        assert_eq!(
+            link_state(&link, &resolved_elsewhere, &expected, never_plain_ok),
+            "foreign"
+        );
+        // Plain-file acceptance is the caller's predicate, not the shape's.
+        let file = PathShape::File {
+            contents: Some("@qontinui-claude-config/CLAUDE.md\n".into()),
+        };
+        assert_eq!(
+            link_state(&link, &file, &expected, claude_md_plain_ok),
+            "present"
+        );
+        assert_eq!(
+            link_state(&link, &file, &expected, never_plain_ok),
+            "foreign"
+        );
+        assert_eq!(
+            link_state(
+                &link,
+                &PathShape::File { contents: None },
+                &expected,
+                never_plain_ok
+            ),
+            "unknown"
+        );
+    }
+
+    /// Pure invariant classification, including the two arms a filesystem
+    /// test cannot easily stage (a dangling link; a link to a foreign corpus).
+    #[test]
+    fn harness_invariant_class_is_pure_over_shapes() {
+        let root = Path::new(if cfg!(windows) {
+            "C:\\ws"
+        } else {
+            "/ws"
+        });
+        let tracked = root.join(HARNESS_PLANS_REPO_DIR).join("plans");
+        assert_eq!(invariant_class(&PathShape::Missing, &tracked), "(a)");
+        assert_eq!(invariant_class(&PathShape::Dir, &tracked), "(c)");
+        assert_eq!(
+            invariant_class(
+                &PathShape::Link {
+                    resolved: Some(tracked.clone()),
+                    raw_target: tracked.clone(),
+                },
+                &tracked
+            ),
+            "(b)"
+        );
+        assert_eq!(
+            invariant_class(
+                &PathShape::Link {
+                    resolved: Some(root.join("elsewhere").join("plans")),
+                    raw_target: PathBuf::from("elsewhere/plans"),
+                },
+                &tracked
+            ),
+            "(c)",
+            "a link to a foreign corpus is a second writable corpus"
+        );
+        assert_eq!(
+            invariant_class(
+                &PathShape::Link {
+                    resolved: None,
+                    raw_target: tracked.clone(),
+                },
+                &tracked
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            invariant_class(&PathShape::File { contents: None }, &tracked),
+            "unknown"
+        );
+        assert_eq!(invariant_class(&PathShape::Unreadable, &tracked), "unknown");
+    }
+
+    /// `plans_dir_relative`: unset / inside / outside / unread — and never the
+    /// absolute path, which would differ on every box by construction.
+    #[test]
+    fn harness_plans_dir_relative_arms() {
+        let root = harness_root("plansdir");
+        assert_eq!(
+            plans_dir_relative(&root, &PlansDirReading::Read(None)),
+            "unset"
+        );
+        assert_eq!(
+            plans_dir_relative(&root, &PlansDirReading::Unread),
+            "unread"
+        );
+
+        // Inside, existing: canonical comparison, forward slashes, no root.
+        let inside = root.join(HARNESS_PLANS_REPO_DIR).join("plans");
+        std::fs::create_dir_all(&inside).unwrap();
+        let rendered = plans_dir_relative(
+            &root,
+            &PlansDirReading::Read(Some(inside.display().to_string())),
+        );
+        assert_eq!(rendered, "qontinui-dev-notes/plans");
+        assert!(
+            !rendered.contains(&normalize_lexical(&root)),
+            "the absolute root must never be published: {rendered}"
+        );
+
+        // Inside, NOT existing yet: lexical comparison still renders it.
+        let planned = root.join("qontinui-dev-notes").join("plans-next");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(planned.display().to_string()))
+            ),
+            "qontinui-dev-notes/plans-next"
+        );
+
+        // Outside: a sibling of the root, existing or not.
+        let outside = root.parent().unwrap().join("somewhere-else").join("plans");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(outside.display().to_string()))
+            ),
+            "outside-workspace"
+        );
+        // A prefix that is not a path-component boundary is outside too.
+        let lookalike = PathBuf::from(format!("{}-other", root.display())).join("plans");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(lookalike.display().to_string()))
+            ),
+            "outside-workspace"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The accounts installer's render is judged through the roster the runner
+    /// itself reads, and only counts when a listed config dir is really there.
+    #[test]
+    fn harness_claude_accounts_installed_reads_the_roster() {
+        let cfg_root = harness_root("roster");
+        assert!(!claude_accounts_installed(Some(&cfg_root)));
+        assert!(!claude_accounts_installed(None));
+        let runner_dir = cfg_root.join("com.qontinui.runner");
+        std::fs::create_dir_all(&runner_dir).unwrap();
+        let acct = cfg_root.join(".claude-gmail");
+        let roster = runner_dir.join("claude-accounts.json");
+        std::fs::write(
+            &roster,
+            format!(
+                r#"{{"claude_config_dirs":["{}"]}}"#,
+                acct.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        assert!(
+            !claude_accounts_installed(Some(&cfg_root)),
+            "a roster naming a dir that does not exist is not an install"
+        );
+        std::fs::create_dir_all(&acct).unwrap();
+        assert!(claude_accounts_installed(Some(&cfg_root)));
+        let _ = std::fs::remove_dir_all(&cfg_root);
+    }
+
+    /// Guard-hooks render: an empty `hooks` object is NOT an install (the
+    /// uninstall arm leaves exactly that behind).
+    #[test]
+    fn harness_guard_hooks_render_needs_a_non_empty_hooks_object() {
+        let root = harness_root("guard");
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        let settings = cfg.join(".claude").join("settings.json");
+        std::fs::write(&settings, r#"{"hooks":{}}"#).unwrap();
+        assert!(!guard_hooks_installed(&cfg));
+        std::fs::write(&settings, r#"{"permissions":{}}"#).unwrap();
+        assert!(!guard_hooks_installed(&cfg));
+        std::fs::write(&settings, r#"{"hooks":{"Stop":[]}}"#).unwrap();
+        assert!(guard_hooks_installed(&cfg));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

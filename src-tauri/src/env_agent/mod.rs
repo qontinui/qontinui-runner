@@ -28,7 +28,8 @@
 //!     "versions":     { "<key>": "<string>" },
 //!     "env_contract": { "<VAR_NAME>": "present" },
 //!     "claude_accounts": { "<key>": "<string>" },
-//!     "repos":        { "repo_<owner>_<name>": "<canonical clone url>" }
+//!     "repos":        { "repo_<owner>_<name>": "<canonical clone url>" },
+//!     "harness":      { "<key>": "<string>" }
 //!   },
 //!   "unknown_keys": { "versions": ["rustc"] }
 //! }
@@ -337,6 +338,14 @@ pub async fn build_envelope() -> ConfigEnvelope {
     // "this box has none of them" stays a stated observation rather than a
     // dropped section.
     add_section(&mut sections, "repos", collectors::collect_repos());
+    // The fleet harness (`qontinui-claude-config`: the workspace-root links,
+    // the installers' renders, the root-relative `paths.plans_dir`, the
+    // plan-corpus invariant class). Same contract as `repos`: None only when
+    // the workspace root does not resolve; a resolved root with nothing
+    // installed is a stated observation. Report-only — no apply module reads
+    // it, by design (plan `2026-09-13-a-new-machine-cannot-discover-apply-or-
+    // verify-the-fleet-harness-config` D3).
+    add_section(&mut sections, "harness", collectors::collect_harness());
 
     ConfigEnvelope {
         schema_version: SCHEMA_VERSION,
