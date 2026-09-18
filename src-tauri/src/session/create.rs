@@ -411,7 +411,7 @@ pub async fn catch_up_now(registry: &Arc<SessionRegistry>) {
 /// The on-demand re-read — the one `handle_terminal_create` awaits on the
 /// backend relay's SERIAL read loop when a create names a jti this device does
 /// not know — passes
-/// [`crate::mcp::remote_terminal::CREATE_REREAD_TIMEOUT`] here instead of the
+/// [`crate::mcp::remote_terminal::GRANT_REREAD_TIMEOUT`] here instead of the
 /// background [`CATCHUP_TIMEOUT`]. That call freezes terminal input, terminal
 /// output and every other relay frame on the socket for as long as it runs, so
 /// its bound is a LIVENESS budget for the whole device and not a patience
@@ -609,10 +609,10 @@ mod tests {
     /// back to back however the cooldown is stamped.
     #[test]
     fn the_on_demand_reread_is_bounded_far_tighter_than_the_background_catch_up() {
-        use crate::mcp::remote_terminal::{CREATE_REREAD_COOLDOWN_SECS, CREATE_REREAD_TIMEOUT};
-        assert!(CREATE_REREAD_TIMEOUT < CATCHUP_TIMEOUT);
+        use crate::mcp::remote_terminal::{GRANT_REREAD_COOLDOWN_SECS, GRANT_REREAD_TIMEOUT};
+        assert!(GRANT_REREAD_TIMEOUT < CATCHUP_TIMEOUT);
         assert!(
-            CREATE_REREAD_TIMEOUT < Duration::from_secs(CREATE_REREAD_COOLDOWN_SECS),
+            GRANT_REREAD_TIMEOUT < Duration::from_secs(GRANT_REREAD_COOLDOWN_SECS),
             "a re-read that can run for a whole cooldown window makes the throttle a \
              frequency bound on STARTS rather than a gap between stalls"
         );

@@ -1637,28 +1637,28 @@ where
     }))
 }
 
-/// Is this create refusal worth ONE coord re-read before it is returned?
+/// Is this refusal worth ONE coord re-read before it is returned?
 ///
-/// Exactly one is: [`CreateRefusal::GrantUnknown`]. Coord publishes the
-/// `create_request` directive before it answers the source's mint, but the
-/// directive rides NATS while the frame rides the source's HTTP round-trip and
-/// the relay socket — two paths with no ordering between them, so a LEGITIMATE
-/// create can arrive microseconds before the directive that authorises it. A
-/// single on-demand `GET /sessions/create-requests` removes that race; the 60 s
-/// catch-up poll alone would turn it into a minute-long flake.
+/// Exactly one code per grant family is: the unknown-jti one —
+/// [`CreateRefusal::GrantUnknown`] and [`AttachRefusal::GrantUnknown`]. Those
+/// are the only refusals a freshly read coord list can overturn, because they
+/// are the only ones that mean "this device has not heard of it yet" rather
+/// than "coord and this device agree it is not allowed".
 ///
-/// **Every other refusal is final**, and that is the point of spelling this as
-/// a predicate rather than as an `if` in the handler:
-///
-/// * `Disabled` — the device's own dial; coord has nothing to add.
-/// * `GrantRequired` — the block is not a create block at all.
-/// * `GrantExpired` — coord's list cannot un-expire it.
-/// * the two allowlist refusals — decided entirely from local config.
-///
-/// Re-reading on any of those would be a coord round-trip per refused frame,
-/// which is a denial-of-service lever pointed at coord.
+/// **Every other refusal is final** and must stay final, in both families —
+/// `Disabled`, `GrantRequired`, `GrantExpired`, `NoTargetDirectory`, the two
+/// allowlist refusals, `SessionNotLocal` and `TerminalMismatch`. Widening this
+/// points a coord-round-trip-per-refused-frame lever at coord; narrowing it to
+/// none reinstates the directive/frame race as a permanent failure.
 pub fn refusal_warrants_a_coord_reread(code: &str) -> bool {
-    code == CreateRefusal::GrantUnknown.code()
+    // BOTH grant families race the same way: coord publishes the directive
+    // before it answers the source's mint, the directive rides NATS and the
+    // frame rides the source's HTTP round-trip plus the relay socket, and
+    // nothing orders the two. An attach that loses that race used to wait for
+    // the 60 s catch-up poll, which made it unwinnable in practice — every
+    // retry mints a FRESH jti, so the grant the target learns is never the one
+    // the next frame presents.
+    code == CreateRefusal::GrantUnknown.code() || code == AttachRefusal::GrantUnknown.code()
 }
 
 /// Minimum gap between two on-demand coord re-reads, whatever jti asked.
@@ -1675,14 +1675,39 @@ pub fn refusal_warrants_a_coord_reread(code: &str) -> bool {
 /// legitimate create that loses the race is served by the first re-read; a
 /// flood gets at most one coord round-trip per window and is otherwise refused
 /// from memory at no cost.
-pub const CREATE_REREAD_COOLDOWN_SECS: u64 = 3;
+///
+/// **SHARED between the create and attach paths on purpose, and that is a real
+/// trade.** One read loop is one resource, so two independent cooldowns would
+/// bound neither the stall a device actually suffers. The cost, stated rather
+/// than left for the next reader to discover: ordinary attach churn can
+/// consume the slot a create needed, so a legitimate create that loses the
+/// directive race may be denied its re-read and fall back to the 60 s poll —
+/// and vice versa. The per-jti brake is NOT shared (see [`GrantFamily`]);
+/// only this clock is.
+pub const GRANT_REREAD_COOLDOWN_SECS: u64 = 3;
 
-/// Per-jti + global throttle for the on-demand re-read. `(last_reread_at,
-/// jtis already re-read and still unknown)`.
-static CREATE_REREAD_STATE: OnceLock<Mutex<(u64, HashMap<String, u64>)>> = OnceLock::new();
+/// Which coord feed a re-read would consult. The per-jti memory is keyed on
+/// this as well as the jti, because the two feeds are different lists and an
+/// answer from one is NOT evidence about the other: coord's
+/// `/sessions/create-requests` not knowing a jti says nothing about whether
+/// `/sessions/attach-requests` knows it. Sharing one key let a create-labelled
+/// frame — which `admit_terminal_create` can legitimately produce for an
+/// attach jti during the race window — record "already asked" and silently
+/// disable the attach re-read for that jti for the next hour, defeating
+/// exactly the case this mechanism exists to serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GrantFamily {
+    Create,
+    Attach,
+}
 
-fn create_reread_state() -> &'static Mutex<(u64, HashMap<String, u64>)> {
-    CREATE_REREAD_STATE.get_or_init(|| Mutex::new((0, HashMap::new())))
+/// Per-(family, jti) + global throttle for the on-demand re-read.
+/// `(last_reread_at, grants already re-read and still unknown)`.
+static GRANT_REREAD_STATE: OnceLock<Mutex<(u64, HashMap<(GrantFamily, String), u64>)>> =
+    OnceLock::new();
+
+fn grant_reread_state() -> &'static Mutex<(u64, HashMap<(GrantFamily, String), u64>)> {
+    GRANT_REREAD_STATE.get_or_init(|| Mutex::new((0, HashMap::new())))
 }
 
 /// Should this unknown-jti refusal buy a coord re-read *right now*?
@@ -1693,7 +1718,7 @@ fn create_reread_state() -> &'static Mutex<(u64, HashMap<String, u64>)> {
 ///   know, is never asked about again while it could still be live. Retrying it
 ///   cannot produce a different answer for the same reason the first read
 ///   didn't.
-/// * **once per [`CREATE_REREAD_COOLDOWN_SECS`]** — a flood of DISTINCT jtis
+/// * **once per [`GRANT_REREAD_COOLDOWN_SECS`]** — a flood of DISTINCT jtis
 ///   would otherwise slip past the per-jti brake, which is exactly the shape an
 ///   attacker would choose.
 ///
@@ -1701,46 +1726,75 @@ fn create_reread_state() -> &'static Mutex<(u64, HashMap<String, u64>)> {
 /// called once per decision. `grant_expires_hint` bounds how long the per-jti
 /// memory is kept; a create grant lives 15 minutes, so an hour is a generous
 /// upper bound for a jti nobody can name an expiry for.
-pub fn claim_create_reread(grant_jti: &str, now: u64) -> bool {
+pub fn claim_grant_reread(family: GrantFamily, grant_jti: &str, now: u64) -> bool {
     const UNKNOWN_JTI_MEMORY_SECS: u64 = 3600;
-    let Ok(mut state) = create_reread_state().lock() else {
+    let Ok(mut state) = grant_reread_state().lock() else {
         // A poisoned throttle must not become an unthrottled door.
         return false;
     };
     let (last, asked) = &mut *state;
     asked.retain(|_, at| now.saturating_sub(*at) < UNKNOWN_JTI_MEMORY_SECS);
-    if asked.contains_key(grant_jti) {
+    let key = (family, grant_jti.to_string());
+    if asked.contains_key(&key) {
         return false;
     }
-    if now.saturating_sub(*last) < CREATE_REREAD_COOLDOWN_SECS {
+    if now.saturating_sub(*last) < GRANT_REREAD_COOLDOWN_SECS {
         return false;
     }
     *last = now;
-    asked.insert(grant_jti.to_string(), now);
+    asked.insert(key, now);
     true
 }
 
 /// Forget that `grant_jti` was re-read — called when the re-read FOUND it, so
 /// the memory holds only jtis coord genuinely did not know. Without this a
 /// legitimate grant that lost the race would occupy a slot for an hour.
-pub fn clear_create_reread(grant_jti: &str) {
-    if let Ok(mut state) = create_reread_state().lock() {
-        state.1.remove(grant_jti);
+pub fn clear_grant_reread(family: GrantFamily, grant_jti: &str) {
+    if let Ok(mut state) = grant_reread_state().lock() {
+        state.1.remove(&(family, grant_jti.to_string()));
     }
+}
+
+/// The whole re-read decision for one refusal frame, in one place so the two
+/// relay handlers cannot drift apart.
+///
+/// Returns the jti to ask coord about, already TRIMMED, or `None` when the
+/// refusal is final, carries no usable jti, or the throttle refuses it.
+/// Calling this RECORDS the attempt.
+///
+/// The jti is trimmed because `refusal_frame` echoes the wire value
+/// UNTRIMMED while `parse_remote_block` trims: without this a `"   "` jti is
+/// non-empty and buys a coord round-trip for a block that names no grant at
+/// all, and whitespace-padding one real jti mints unbounded distinct throttle
+/// keys that all collapse to the same table lookup — evading the per-jti brake
+/// and leaving only the global cooldown.
+pub fn reread_decision(frame: &Value, family: GrantFamily, now: u64) -> Option<String> {
+    let worth_it = frame
+        .get("code")
+        .and_then(|c| c.as_str())
+        .is_some_and(refusal_warrants_a_coord_reread);
+    if !worth_it {
+        return None;
+    }
+    let jti = frame.get("grant_jti").and_then(|j| j.as_str())?.trim();
+    if jti.is_empty() || !claim_grant_reread(family, jti, now) {
+        return None;
+    }
+    Some(jti.to_string())
 }
 
 /// Re-stamp the cooldown clock when a re-read FINISHES. Call it once, after
 /// the coord round-trip, on every arm.
 ///
-/// [`claim_create_reread`] stamps the clock at CLAIM time, which bounds how
+/// [`claim_grant_reread`] stamps the clock at CLAIM time, which bounds how
 /// often a re-read starts and not how much of the relay's serial read loop it
 /// occupies: a round-trip that takes as long as the cooldown ends with
 /// `now - last >= COOLDOWN` already true, so the next unknown jti claims
 /// immediately and the stalls run back to back (review finding 5). Stamping
 /// again here makes the cooldown a gap BETWEEN stalls, which is what it was
 /// described as.
-pub fn finish_create_reread(now: u64) {
-    if let Ok(mut state) = create_reread_state().lock() {
+pub fn finish_grant_reread(now: u64) {
+    if let Ok(mut state) = grant_reread_state().lock() {
         state.0 = now;
     }
 }
@@ -1748,11 +1802,17 @@ pub fn finish_create_reread(now: u64) {
 /// How long the ON-DEMAND re-read may hold the relay's serial read loop.
 ///
 /// Not the 10 s the catch-up GET otherwise allows. What this re-read races is
-/// the gap between coord publishing the `create_request` directive and the
-/// relay's frame arriving — milliseconds — so a second is already generous for
-/// the legitimate case, while the 10 s timeout was a ten-second freeze of every
-/// terminal on the socket for each forged jti that won the throttle.
-pub const CREATE_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
+/// the gap between coord publishing the directive — `create_request` or its
+/// attach twin — and the relay's frame arriving: milliseconds. So a second is
+/// already generous for the legitimate case, while the 10 s timeout was a
+/// ten-second freeze of every terminal on the socket for each forged jti that
+/// won the throttle.
+///
+/// The bound covers `send()` onward. `coord_get`'s auth attach resolves a
+/// token first, which can touch the on-disk store or the OS keychain
+/// synchronously and is NOT inside this timeout — pre-existing, but two frame
+/// types can now reach it rather than one.
+pub const GRANT_REREAD_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The PTY-write side of `terminal_input`, abstracted so the gate can be
 /// tested against a recorder that proves a refused frame never reaches it.
@@ -4323,7 +4383,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod create_gate_tests {
+mod grant_gate_tests {
     //! D2 — **the TARGET chooses the working directory.**
     //!
     //! These are the pin on the hole review round 1 found and closed:
@@ -4992,14 +5052,40 @@ mod create_gate_tests {
         }
     }
 
-    /// EXACTLY ONE refusal buys a coord re-read. Widening this would point a
-    /// coord round-trip-per-refused-frame lever at coord; narrowing it to none
-    /// would reinstate the directive/frame race as a 60 s flake.
+    /// EXACTLY ONE refusal PER GRANT FAMILY buys a coord re-read — the
+    /// unknown-jti one, and only it. Widening this would point a coord
+    /// round-trip-per-refused-frame lever at coord; narrowing it to none would
+    /// reinstate the directive/frame race as a 60 s flake.
+    ///
+    /// **The attach arm is asserted here deliberately.** It was missing for
+    /// the whole of the feature's first life: `handle_terminal_create` carried
+    /// the re-read and `handle_terminal_attach` did not, so a legitimate
+    /// attach that lost the race was refused `attach_grant_unknown` and had to
+    /// wait for the 60 s catch-up poll. That made it PERMANENT rather than
+    /// flaky, because every retry mints a fresh jti and the grant the poll
+    /// records is never the one the next frame presents (measured on
+    /// merytshost 2026-09-18; coord finding a5f08a4d). Deleting either
+    /// assertion below reinstates that.
     #[test]
     fn only_an_unknown_grant_warrants_a_coord_reread() {
         assert!(refusal_warrants_a_coord_reread(
             CreateRefusal::GrantUnknown.code()
         ));
+        assert!(
+            refusal_warrants_a_coord_reread(AttachRefusal::GrantUnknown.code()),
+            "the attach path races the directive exactly as create does"
+        );
+        for final_attach_refusal in [
+            AttachRefusal::GrantExpired,
+            AttachRefusal::TerminalMismatch,
+            AttachRefusal::Disabled,
+            AttachRefusal::SessionNotLocal,
+        ] {
+            assert!(
+                !refusal_warrants_a_coord_reread(final_attach_refusal.code()),
+                "{final_attach_refusal:?} is final — coord has nothing to add"
+            );
+        }
         for final_refusal in [
             CreateRefusal::Disabled,
             CreateRefusal::GrantRequired,
@@ -5019,6 +5105,24 @@ mod create_gate_tests {
         assert!(!refusal_warrants_a_coord_reread(""));
     }
 
+
+
+    /// A final refusal never reaches the throttle at all, whatever jti it
+    /// carries — the cheap refusals an attacker can provoke must cost nothing.
+    #[test]
+    fn a_final_refusal_never_reaches_coord() {
+        let base = 9_700_000u64;
+        for final_code in [
+            AttachRefusal::Disabled.code(),
+            AttachRefusal::SessionNotLocal.code(),
+            AttachRefusal::TerminalMismatch.code(),
+            AttachRefusal::GrantExpired.code(),
+        ] {
+            let frame = serde_json::json!({ "code": final_code, "grant_jti": "final-probe" });
+            assert_eq!(reread_decision(&frame, GrantFamily::Attach, base), None);
+        }
+    }
+
     /// **The re-read is throttled on two independent axes**, because it is
     /// `await`ed on the relay's SERIAL read loop: every one stalls terminal
     /// input, output and every other frame for up to the coord timeout. A
@@ -5035,15 +5139,15 @@ mod create_gate_tests {
 
         // One per window: the first distinct jti in a window wins, the next
         // does not, and the window reopens after the cooldown.
-        assert!(claim_create_reread(&format!("{tag}-a"), base));
+        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-a"), base));
         assert!(
-            !claim_create_reread(&format!("{tag}-b"), base),
+            !claim_grant_reread(GrantFamily::Create, &format!("{tag}-b"), base),
             "a DIFFERENT jti inside the cooldown must not slip past — a flood of distinct jtis \
              is the shape an attacker would choose"
         );
-        assert!(claim_create_reread(
+        assert!(claim_grant_reread(GrantFamily::Create, 
             &format!("{tag}-b"),
-            base + CREATE_REREAD_COOLDOWN_SECS
+            base + GRANT_REREAD_COOLDOWN_SECS
         ));
 
         // Once per jti: `-a` is remembered as asked-and-unknown, so it buys no
@@ -5054,19 +5158,19 @@ mod create_gate_tests {
         // names is long expired, so re-asking about it is harmless and the
         // global cooldown still caps the rate.)
         assert!(
-            !claim_create_reread(&format!("{tag}-a"), base + 900),
+            !claim_grant_reread(GrantFamily::Create, &format!("{tag}-a"), base + 900),
             "a jti coord already said it did not know must not be asked again while the grant \
              it names could still be live"
         );
 
         // …unless the re-read FOUND it, which clears the memory: a legitimate
         // grant that lost the directive race must not hold a slot for an hour.
-        clear_create_reread(&format!("{tag}-a"));
-        assert!(claim_create_reread(&format!("{tag}-a"), base + 900));
+        clear_grant_reread(GrantFamily::Create, &format!("{tag}-a"));
+        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-a"), base + 900));
 
         // The cooldown is sized against the directive race (milliseconds), not
         // against the grant's 900 s life.
-        assert!(CREATE_REREAD_COOLDOWN_SECS > 0 && CREATE_REREAD_COOLDOWN_SECS < 60);
+        assert!(GRANT_REREAD_COOLDOWN_SECS > 0 && GRANT_REREAD_COOLDOWN_SECS < 60);
 
         // --- and the cooldown must bound the STALL, not merely how often one
         // --- STARTS (review finding 5). In the SAME test, not a second one:
@@ -5074,32 +5178,109 @@ mod create_gate_tests {
         // --- parallel threads, so a separate test asserting on it races this
         // --- one — which is exactly how this pair first went red.
         //
-        // `claim_create_reread` stamps the clock at CLAIM time, and the re-read
+        // `claim_grant_reread` stamps the clock at CLAIM time, and the re-read
         // is awaited inline on the relay's serial read loop. A round-trip that
         // takes as long as the cooldown therefore ends with
         // `now - last >= COOLDOWN` already true, and the next unknown jti
         // claims immediately: the stalls run BACK TO BACK and every terminal on
-        // the socket freezes for the duration. `finish_create_reread` re-stamps
+        // the socket freezes for the duration. `finish_grant_reread` re-stamps
         // on COMPLETION, which is what makes the cooldown a gap BETWEEN stalls.
         //
         // Fails against a build without that call: the second claim succeeds
         // there, because `finished - stall` is exactly one cooldown.
         let stall = base + 100_000;
-        assert!(claim_create_reread(&format!("{tag}-stall-a"), stall));
-        let finished = stall + CREATE_REREAD_COOLDOWN_SECS;
-        finish_create_reread(finished);
+        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-stall-a"), stall));
+        let finished = stall + GRANT_REREAD_COOLDOWN_SECS;
+        finish_grant_reread(finished);
         assert!(
-            !claim_create_reread(&format!("{tag}-stall-b"), finished),
+            !claim_grant_reread(GrantFamily::Create, &format!("{tag}-stall-b"), finished),
             "a second stall must not begin the instant the first one ends"
         );
         assert!(
-            claim_create_reread(
+            claim_grant_reread(GrantFamily::Create, 
                 &format!("{tag}-stall-b"),
-                finished + CREATE_REREAD_COOLDOWN_SECS
+                finished + GRANT_REREAD_COOLDOWN_SECS
             ),
             "…and the window reopens a cooldown AFTER the previous one finished"
         );
-    }
+    
+        // ---- folded in deliberately: everything below mutates the SAME
+        // process-global throttle, and cargo test runs test fns in parallel.
+        // As separate #[test] fns these stamped the global cooldown clock at
+        // timestamps far ahead of this function's `base`, so whichever ran
+        // first made the other's opening claim fail. Timestamps below are
+        // strictly increasing from here on, and derived from `stall` -- the
+        // LAST timestamp the section above stamps -- rather than from `base`,
+        // because the global cooldown compares against whatever was stamped
+        // last and `saturating_sub` floors a backwards step to 0, which reads
+        // as "still inside the cooldown" and refuses the claim.
+
+        // The per-jti memory is keyed on the FEED as well as the jti. Coord's
+        // create list not knowing a jti is no evidence about its attach list,
+        // and `admit_terminal_create` can legitimately produce
+        // `remote_create_grant_unknown` for an ATTACH jti during the race
+        // window. Sharing one key let a create refusal record "already asked"
+        // and disable the attach re-read for that jti for an hour.
+        let fam = stall + 100_000;
+        let shared_jti = "family-key-probe-jti";
+        assert!(claim_grant_reread(GrantFamily::Create, shared_jti, fam));
+        assert!(
+            claim_grant_reread(
+                GrantFamily::Attach,
+                shared_jti,
+                fam + GRANT_REREAD_COOLDOWN_SECS
+            ),
+            "an answer from the create feed says nothing about the attach feed"
+        );
+        assert!(
+            !claim_grant_reread(
+                GrantFamily::Attach,
+                shared_jti,
+                fam + GRANT_REREAD_COOLDOWN_SECS * 4
+            ),
+            "the per-jti brake still holds WITHIN a family"
+        );
+
+        // `refusal_frame` echoes the jti UNTRIMMED while `parse_remote_block`
+        // trims, so the decision seam trims before deciding: otherwise a block
+        // naming no grant buys a coord round-trip and a 1 s stall of the
+        // serial read loop, and padding one real jti mints unbounded distinct
+        // throttle keys that all collapse to the same table lookup.
+        let trim = fam + 20_000;
+        let blank = serde_json::json!({
+            "code": AttachRefusal::GrantUnknown.code(),
+            "grant_jti": "   ",
+        });
+        assert_eq!(
+            reread_decision(&blank, GrantFamily::Attach, trim),
+            None,
+            "a block with no usable jti must not reach coord"
+        );
+
+        let pad_jti = "pad-probe-jti";
+        let padded = serde_json::json!({
+            "code": AttachRefusal::GrantUnknown.code(),
+            "grant_jti": format!("  {pad_jti}  "),
+        });
+        assert_eq!(
+            reread_decision(&padded, GrantFamily::Attach, trim + GRANT_REREAD_COOLDOWN_SECS),
+            Some(pad_jti.to_string()),
+            "the TRIMMED jti is what coord is asked about"
+        );
+        let repadded = serde_json::json!({
+            "code": AttachRefusal::GrantUnknown.code(),
+            "grant_jti": format!(" {pad_jti}"),
+        });
+        assert_eq!(
+            reread_decision(
+                &repadded,
+                GrantFamily::Attach,
+                trim + GRANT_REREAD_COOLDOWN_SECS * 4
+            ),
+            None,
+            "re-padding the same jti must not mint a fresh throttle key"
+        );
+}
 
     /// An unauthorised caller must not learn this device's directory and repo
     /// allowlists. The grant lookup therefore runs BEFORE the two resolutions,

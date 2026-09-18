@@ -667,7 +667,10 @@ async fn run_all_catchups(
             // `2026-08-31-remote-session-tabs-in-runner-terminal`, Phase 3c),
             // into the table the backend relay's terminal handlers enforce
             // against.
-            CatchupKind::Attach => super::attach::run_catchup(http, coord_url, device_id).await,
+            CatchupKind::Attach => {
+                super::attach::run_catchup(http, coord_url, device_id, super::attach::CATCHUP_TIMEOUT)
+                    .await
+            }
             // The remote-CREATE grants beside them (plan
             // `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase
             // 3b). Without this the target has no source for the grants coord
