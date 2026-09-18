@@ -4162,15 +4162,91 @@ mod bearer_selection_tests {
         );
     }
 
+    /// W3, the symmetric twin of W1: [`select_device_bearer`] (and
+    /// [`HeldDeviceTenants::read_with`] beside it) call
+    /// [`measured_device_binding_count`], and every other test drives them
+    /// through the injected-count doors or stores a token carrying a claim, so
+    /// `legacy_token_serves_tenant` settles on the claim and never reaches the
+    /// count. A rewiring in the other direction —
+    /// `MeasuredBindingCount::Measured(device_binding_count())` — compiles, and
+    /// the malformed file then reads as ONE binding, which accepts a claimless
+    /// token whose owner is unknowable and presents it as `t`'s credential.
+    ///
+    /// The file here holds ONE malformed entry on purpose: that is the shape
+    /// where the two parsers actually disagree about admission (loose = 1,
+    /// strict = Unknown). A malformed TWO-entry file counts as two either way,
+    /// so it would not see the rewiring at all.
+    #[test]
+    fn select_device_bearer_refuses_a_claimless_token_on_an_unmeasurable_binding_file() {
+        let amb = crate::test_env::isolated_ambient();
+        // See the note in the W1 test above: never the real OS keychain.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
+        let a = tenant(0xC6);
+        let mgr = AuthManager::new();
+        let claimless = live_jwt("claimless");
+        mgr.store_tokens(&claimless, "").unwrap();
+        mgr.clear_tenant_device_jwt(&a).unwrap();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": 7}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(device_binding_count(), 1, "the LOOSE count reads one here");
+        assert_eq!(
+            measured_device_binding_count(),
+            MeasuredBindingCount::Unknown,
+            "...and the strict one refuses to state a count at all"
+        );
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)),
+            None,
+            "a claimless legacy token must not be served on a file whose binding \
+             count cannot be measured"
+        );
+        assert_eq!(
+            HeldDeviceTenants::read_with(&mgr, BindingTenantRead::Bound(a)).holds(a),
+            Ok(false),
+            "and the held set agrees through the same reader"
+        );
+        // The counterfactual: a WELL-FORMED single-binding file is what serves
+        // that same token, so the refusal above is the count and nothing else.
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            select_device_bearer(&mgr, Some(&a), Some(a)).as_deref(),
+            Some(claimless.as_str())
+        );
+    }
+
     /// W1: [`device_bearer_scoped`] is the PRODUCTION site that hands
     /// [`device_binding_count`] to [`select_scoped_bearer_lazy`], and nothing
     /// else observes that connection — every other test injects its own
-    /// closure. On a device whose file states two bindings (malformed, so the
-    /// strict parser would call it one) an Unresolved-scope call must present
+    /// closure. The file states two bindings in the malformed shape where the
+    /// two parsers diverge — the strict one calls it Unknown, which a rewiring
+    /// would collapse to ONE — so an Unresolved-scope call must present
     /// nothing, while a Device-scope call still presents the legacy slot.
     #[test]
     fn device_bearer_scoped_degrades_on_a_devices_own_two_binding_file() {
         let amb = crate::test_env::isolated_ambient();
+        // NEVER the real OS credential store. AuthManager::new() keys the
+        // keychain on the fixed real SERVICE_NAME, and store_tokens writes it
+        // unless this is set; isolated_ambient captures the variable but does
+        // not set it, so on a paired Windows box this test would overwrite the
+        // runner's own keychain backup — the documented recovery when the .enc
+        // store will not decrypt. Safe here: the fixture holds env_lock and has
+        // already captured this key for restore.
+        std::env::set_var("QONTINUI_DISABLE_KEYCHAIN", "1");
         let a = tenant(0xC5);
         let am = AuthManager::new();
         let jwt = live_jwt("default-binding");
