@@ -675,7 +675,7 @@ impl AiCoordRegistrar {
                 action, artifact
             ),
             Err(e) => warn!(
-                "ai_coord_register: outbox AgentNotification write failed for {} {}                  (best-effort — the action already happened): {}",
+                "ai_coord_register: outbox AgentNotification write failed for {} {} (best-effort; the action already happened): {}",
                 action, artifact, e
             ),
         }

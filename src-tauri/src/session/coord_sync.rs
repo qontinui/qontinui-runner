@@ -1588,7 +1588,7 @@ fn agent_notification_failure(
             seq = rec.seq,
             status = %status,
             detail = %detail,
-            "coord_sync: coord refused an agent notification — the action it reports already              happened, so this line is its only remaining trace"
+            "coord_sync: coord refused an agent notification; the action it reports already happened, so this line is its only remaining trace"
         );
     }
     write_failure_outcome(status, format!("{status}: {detail}"))
