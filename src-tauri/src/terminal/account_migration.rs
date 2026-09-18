@@ -32,10 +32,13 @@
 //!    windows).
 //! 4. **Migrate** — copy the session transcript
 //!    (`<src>/projects/<slug>/<sid>.jsonl` → same slug under the target dir;
-//!    the source file is never touched), close the old pane
-//!    (`close_reason: "account-migrated"`), and respawn
+//!    the source file is never touched), respawn
 //!    `claude --permission-mode bypassPermissions --resume <sid>` in a fresh
-//!    PTY pinned to the target account, on the same grid page/zone.
+//!    PTY pinned to the target account, on the same grid page/zone, and only
+//!    THEN close the old pane. The respawn re-keys the session's lifecycle
+//!    row onto the new PTY; the old pane's exit is answered as
+//!    `TerminalSuperseded` and closes nothing. A failed respawn leaves the
+//!    old pane in place.
 //!
 //! Guards: per-session migration cap (no ping-pong when every account is
 //! dry), settings kill-switch
@@ -53,11 +56,6 @@ use tauri::Emitter;
 use tracing::{info, warn};
 
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
-
-/// Close reason recorded on the old pane's lifecycle row. Deliberately NOT
-/// `pty-exit`/`poll-dead`: the boot-restore path must not resurrect the old
-/// pane — its replacement is already running under the new account.
-pub const CLOSE_REASON_MIGRATED: &str = "account-migrated";
 
 /// Max migrations per Claude session within [`MIGRATION_CAP_WINDOW_MS`].
 /// A second hop is legitimate (the target can run dry too); an unbounded
@@ -566,10 +564,10 @@ pub(crate) fn spawn_resumed_pane(
 /// CHILD's PATH — where the always-on identity-shim dir is prepended — and
 /// lands on the EXTENSIONLESS shim script, which `CreateProcessW` refuses with
 /// `%1 is not a valid Win32 application (os error 193)`. Measured 2026-09-18:
-/// three usage-limit migrations each closed the source terminal
-/// ([`migrate_session`] step 2) and then failed at the respawn, so the pane
-/// vanished with nothing in its place (two more of the same shape the day
-/// before). Same resolver the condition-check / gate-continuation PTY spawns
+/// three usage-limit migrations each closed the source terminal (the
+/// pre-reorder [`migrate_session`] closed BEFORE it respawned) and then failed
+/// at the respawn, so the pane vanished with nothing in its place (two more of
+/// the same shape the day before). Same resolver the condition-check / gate-continuation PTY spawns
 /// use.
 ///
 /// Consequence worth knowing off Windows, where the extensionless shim was
@@ -618,8 +616,17 @@ fn resume_respawn_extra_required(
     out
 }
 
-/// Perform the migration mechanics: transcript copy → close old pane →
-/// respawn under the target account → re-record lifecycle row → emit event.
+/// Perform the migration mechanics: transcript copy → trust for the
+/// destination → respawn under the target account (which re-keys the
+/// lifecycle row onto the new PTY) → close the old pane → emit event.
+///
+/// **The old pane closes only after the respawn has succeeded.** Any failure
+/// before that — transcript, trust, the spawn itself — returns with the old
+/// pane untouched, still sitting at its usage-limit prompt, and the caller
+/// emits `skipped`. Until 2026-09-18 the order was close-then-respawn, so a
+/// respawn failure (three that day, from a resolver defect) was a vanished
+/// window with nothing in its place. For a moment two PTYs now carry one
+/// session; the old one is idle at a limit prompt and consumes nothing.
 ///
 /// Shared by the automatic path ([`handle_usage_limit_hint`], which has
 /// already confirmed exhaustion) and the manual Tauri command
@@ -661,18 +668,18 @@ pub fn migrate_session(
         &record.claude_session_id,
     )?;
 
-    // 1b. Workspace trust for the DESTINATION account, decided BEFORE anything
-    // is torn down. The respawn below reaches `TerminalManager::create` on its
-    // pinned arm, which derives trust for `dst` through the trust gate and
-    // refuses when it cannot; refusing THERE would be after step 2 has closed
-    // the old pane — a refusal that destroys the session it was meant to
-    // protect, the inversion the resource override on this path exists to
-    // avoid. So the same decision is taken here first: a refusal aborts the
-    // migration with the old pane intact (the caller emits `skipped`), and a
-    // grant means the seam's own check short-circuits on `AlreadyTrusted`.
-    // The destination is not pre-trusted by the source's spawn any more (that
-    // spawn mints for its own account only), so this is the usual case, not an
-    // edge: trust the session had under `src` is not the same key under `dst`.
+    // 1b. Workspace trust for the DESTINATION account, decided up front. The
+    // respawn below reaches `TerminalManager::create` on its pinned arm, which
+    // derives trust for `dst` through the trust gate and refuses when it
+    // cannot. Since 2026-09-18 the old pane is closed only AFTER the respawn
+    // succeeds, so a refusal inside the spawn no longer destroys anything —
+    // but deciding it here still gives the operator a typed, named refusal
+    // (the caller emits `skipped` with it) instead of a generic spawn failure,
+    // and a grant means the seam's own check short-circuits on
+    // `AlreadyTrusted`. The destination is not pre-trusted by the source's
+    // spawn (that spawn mints for its own account only), so this is the usual
+    // case, not an edge: trust the session had under `src` is not the same key
+    // under `dst`.
     let trust = crate::claude_session::trust_gate::pre_accept_for_account_sync(
         &working_dir,
         Some(dst_config_dir),
@@ -680,39 +687,28 @@ pub fn migrate_session(
     );
     if let Some(refusal) = trust.decision.refusal() {
         return Err(format!(
-            "workspace trust for the destination account could not be derived — the old pane              is left in place: {refusal}"
+            "workspace trust for the destination account could not be derived — the old pane is left in place: {refusal}"
         ));
     }
 
-    // 2. Close the old pane. Record the migration close-reason BEFORE the
-    // PTY teardown so the exit hook's later `pty-exit` close is a no-op
-    // (record_close ignores already-closed rows) and boot-restore never
-    // resurrects the stranded pane.
-    //
-    // A migration close is NOT an exit, so lift any gate-continuation
-    // registration off the old terminal FIRST. Left in place, the PTY teardown
-    // below would drive the exit hook and post `work_unreported` for a session
-    // that is merely moving accounts — a false negative on the fleet's most
-    // routine interruption, and an IRREVERSIBLE one: coord admits exactly one
-    // `spawned → work_*` transition, so the resumed session could never correct
-    // it. Re-pinned onto the new terminal after the respawn (and back onto the
-    // old id if the respawn fails, so the reaper can report honestly).
+    // 2. Lift any gate-continuation registration off the old terminal
+    // BEFORE the respawn: the new PTY is spawned with the carried gate identity
+    // and the registration is re-pinned onto it on success. On failure it goes
+    // straight back onto the old terminal, which is still alive — so the
+    // liveness reaper never sees a registration on a dead pane and never posts
+    // a false `work_unreported` for a session that merely failed to move.
+    // (Coord admits exactly one `spawned → work_*` transition, so that false
+    // negative would be irreversible.)
     let carried_continuation =
         crate::agent_runtime::take_continuation_registration(&record.terminal_id);
-    store.record_close(&record.claude_session_id, CLOSE_REASON_MIGRATED);
-    if let Err(e) = terminal_manager.close(&record.terminal_id) {
-        // Old pane may already be gone (user closed it after exhaustion) —
-        // not fatal, the respawn is what matters.
-        info!(
-            terminal_id = %record.terminal_id,
-            error = %e,
-            "old terminal close failed (continuing with respawn)"
-        );
-    }
 
     // 3. Respawn under the target account, through the SHARED resume seam
     // ([`spawn_resumed_pane`]) — the same code path the respawn receiver
-    // (`crate::session::respawn`) uses, so the two never drift.
+    // (`crate::session::respawn`) uses, so the two never drift. The pinned-id
+    // capture hint inside `create_terminal_session_backend` re-keys the SAME
+    // lifecycle row (`--resume <id>`) onto the new terminal/account
+    // synchronously, preserving page/zone; the old PTY is still running at
+    // this point and no longer owns a row.
     let title = record.title.clone().unwrap_or_else(|| {
         format!(
             "Resumed {}",
@@ -758,16 +754,17 @@ pub fn migrate_session(
             coord_lineage: None,
             // OVERRIDE — the one call site that passes `true`, and the only one
             // that should. An account migration is not the creation of a new
-            // session: the operator's session already existed, this function has
-            // ALREADY torn down its old PTY, and this respawn is the second half
-            // of a move that is mid-flight. Refusing here would not protect a
-            // live session — it would destroy one, which inverts the whole point
-            // of the guard (plan §Part D step 5: never touch an already-running
-            // session; this gate fires only when something NEW is created). The
-            // migration is also commit-neutral by construction: one `claude`
-            // goes away, one comes back. A RESPAWN, by contrast, creates
-            // something genuinely new (its source is already closed) and passes
-            // `false`.
+            // session: the operator's session already exists, and this respawn
+            // is the first half of a move whose second half (step 4) closes the
+            // old PTY the moment this one is up. Refusing here would not
+            // protect a live session — it would strand one at a usage-limit
+            // prompt, which inverts the whole point of the guard (plan §Part D
+            // step 5: never touch an already-running session; this gate fires
+            // only when something NEW is created). The migration is
+            // commit-neutral by construction: one `claude` comes up, one goes
+            // away a moment later, and the one going away is idle at a limit
+            // prompt. A RESPAWN, by contrast, creates something genuinely new
+            // (its source is already closed) and passes `false`.
             resource_override: true,
             gate_identity: carried_gate_identity,
         },
@@ -786,10 +783,10 @@ pub fn migrate_session(
             terminal_id
         }
         Err(e) => {
-            // The respawn failed and the old PTY is already gone. Put the
-            // registration back on the dead terminal id: the liveness reaper
-            // will then post the honest `work_unreported`, which is exactly
-            // what happened.
+            // The respawn failed and the old PTY is UNTOUCHED — the session is
+            // exactly where it was, at its usage-limit prompt. Put the
+            // registration back on it so the eventual real exit reports
+            // honestly. The caller emits `skipped` with this error.
             if let Some(carried) = carried_continuation {
                 crate::agent_runtime::restore_continuation_registration(
                     record.terminal_id.clone(),
@@ -800,11 +797,30 @@ pub fn migrate_session(
         }
     };
 
-    // The lifecycle row was re-opened synchronously by the pinned-id capture
-    // hint inside `create_terminal_session_backend` (`--resume <id>` keys the
-    // SAME row: new terminal/account, preserved page/zone, origin "pinned").
+    // 4. The replacement is up: close the old pane. Its lifecycle row already
+    // belongs to the new terminal (step 3), so the exit hook's later
+    // `(session id, old terminal)` close must not be resolved against the map
+    // — it would read as a mis-bound `NotFound`. Mark the hand-off first so the
+    // store answers that close with `TerminalSuperseded`: no mutation, no coord
+    // `Closed`, and the workdir nonce the resumed pane still uses is kept.
+    // There is no close-reason to record because the row is never closed —
+    // which is also what keeps boot-restore from ever offering the old pane.
+    store.mark_terminal_superseded(&record.terminal_id, &new_terminal_id);
+    if let Err(e) = terminal_manager.close(&record.terminal_id) {
+        // Old pane was already gone (user closed it after exhaustion) — not
+        // fatal, the replacement is what matters. Its exit-close then either
+        // arrived before the mark or never will, so withdraw the mark rather
+        // than leave an entry nothing consumes.
+        store.unmark_terminal_superseded(&record.terminal_id);
+        info!(
+            terminal_id = %record.terminal_id,
+            new_terminal_id = %new_terminal_id,
+            error = %e,
+            "old terminal close failed after a successful respawn"
+        );
+    }
 
-    // 4. Optionally nudge the resumed session to pick the task back up once
+    // 5. Optionally nudge the resumed session to pick the task back up once
     // the CLI paints its idle prompt — a bare `--resume` restores context but
     // then sits at the input box with nobody typing.
     if crate::settings::get_ai_settings()

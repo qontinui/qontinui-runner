@@ -1417,12 +1417,13 @@ pub fn terminal_session_clear_restore_pending(
 /// foreign, and without the terminal id the store has no way to tell a correct
 /// close from one that lands on a different session's record. Omit it only for
 /// the closers whose terminal is gone by definition (`poll-dead`,
-/// `never-started`, `no-terminal`, `migrated`).
+/// `never-started`, `no-terminal`).
 ///
 /// The typed [`CloseOutcome`] is returned in `data` — never rendered into
 /// `message` — and an unresolvable close reports `success: false`. A repeat
 /// close of this terminal's own record (`alreadyClosed`) is a no-op, not a
-/// failure.
+/// failure, and so is a close naming a terminal whose session already moved to
+/// a new PTY (`terminalSuperseded` — the account-migration hand-off).
 #[tauri::command]
 pub fn terminal_session_record_close(
     store: tauri::State<'_, Arc<SessionLifecycleStore>>,
@@ -1788,8 +1789,9 @@ pub async fn terminal_claude_session_list_live() -> Result<CommandResponse, Stri
 }
 
 /// Manually migrate a Claude terminal session to a different configured
-/// account: copy its transcript into the target account's project dir, close
-/// the old pane, and respawn `claude --resume` under the target account (see
+/// account: copy its transcript into the target account's project dir, respawn
+/// `claude --resume` under the target account, and only then close the old
+/// pane (see
 /// `terminal::account_migration` — this is the operator-clicked form of the
 /// automatic token-exhaustion migration; the click IS the confirmation, so
 /// no usage probe gates it).
@@ -2731,6 +2733,10 @@ mod tests {
             },
             CloseOutcome::AlreadyClosed {
                 claude_session_id: "s".to_string(),
+            },
+            CloseOutcome::TerminalSuperseded {
+                requested: "s".to_string(),
+                terminal_id: "t-old".to_string(),
             },
         ] {
             assert!(

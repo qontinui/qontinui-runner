@@ -3823,8 +3823,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 // restart re-presents the SAME handle on restore-rebind.
                 ai_coord_registrar.attach_lifecycle_store(lifecycle_store.clone());
                 // Fabric Phase 3 (review W2) — when a terminal-session record
-                // flips closed (operator close, poll-dead, no-terminal,
-                // account migration), close the matching coord session row so
+                // flips closed (operator close, poll-dead, no-terminal — NOT an
+                // account migration, which re-keys the row onto the new PTY
+                // and never closes it), close the matching coord session row so
                 // sniffed registrations don't accrue as never-closing
                 // coord.sessions rows. Weak, not Arc: the registrar already
                 // holds this store for the handle hook, and a strong closure
