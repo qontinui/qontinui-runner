@@ -189,6 +189,14 @@ pub async fn ui_bridge_get_elements_handler(
                 Vec::new()
             };
 
+            // Same projection as `get_snapshot` (`createSnapshotAsync`), so
+            // advertise custom actions in `actions` exactly as the snapshot
+            // handler does — otherwise `/control/elements` and
+            // `/control/snapshot` disagree about one element's actions.
+            for el in elements_array.iter_mut() {
+                fold_custom_actions_into_element(el);
+            }
+
             // Apply Tier 1.2 filters: case-insensitive substring match on
             // title, aria-label, or label/id text fields.
             if filter_title.is_some() || filter_aria_label.is_some() || filter_text.is_some() {
@@ -297,6 +305,8 @@ pub async fn ui_bridge_get_element_handler(
     // preserve the same success/failure envelope as before (including the
     // `success: false` detection for IPC-layer errors).
     let filtered_result = result.map(|mut data| {
+        // Before the field filter, so `?fields=actions` carries them too.
+        advertise_custom_actions_in_element_response(&mut data);
         if let Some(csv) = fields_csv {
             // Frontend wraps the element either at top level or under
             // `data.element`. Filter both possible shapes in place so
@@ -850,10 +860,16 @@ fn fold_custom_actions_into_element(elem: &mut serde_json::Value) {
     obj.insert("actions".to_string(), serde_json::Value::Array(actions));
 }
 
-/// Walk a discover/snapshot IPC payload and fold every element's
+/// Walk a discover/snapshot/find IPC payload and fold every element's
 /// `customActions` into its advertised `actions` array (see
-/// [`fold_custom_actions_into_element`]). Handles the three element-array
-/// layouts the SDK emits — identical to `count_elements_in_discover_payload`:
+/// [`fold_custom_actions_into_element`]). Every read route that returns
+/// elements applies the fold — `discover`, `snapshot`, `find`, `elements`
+/// (per element) and `element/{id}` (via
+/// [`advertise_custom_actions_in_element_response`]) — so no two of them
+/// disagree about one element's `actions`;
+/// `every_element_read_handler_advertises_custom_actions` pins that. Handles
+/// the three element-array layouts the SDK emits — identical to
+/// `count_elements_in_discover_payload`:
 ///   - a bare top-level array,
 ///   - `{ elements: [...] }` (discover + snapshot),
 ///   - `{ data: { elements: [...] } }`.
@@ -879,6 +895,18 @@ fn advertise_custom_actions_in_payload(data: &mut serde_json::Value) {
         .and_then(|v| v.as_array_mut())
     {
         fold_array(arr);
+    }
+}
+
+/// Single-element counterpart of [`advertise_custom_actions_in_payload`], for
+/// the `get_element` IPC response: the frontend returns the element either
+/// bare or wrapped as `{ element: {...} }`, so fold whichever it is. A failure
+/// envelope (`{ success: false, error }`) carries no `customActions` and is
+/// left unchanged.
+fn advertise_custom_actions_in_element_response(data: &mut serde_json::Value) {
+    match data.get_mut("element") {
+        Some(el) if el.is_object() => fold_custom_actions_into_element(el),
+        _ => fold_custom_actions_into_element(data),
     }
 }
 
@@ -3705,7 +3733,15 @@ pub async fn ui_bridge_find_handler(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("UI Bridge API: Find elements");
 
-    wrap_ipc_result(ui_bridge_request_sync(&state, "find", request).await)
+    // The frontend's `find` arm calls the same `bridge.discover()` as the
+    // `discover` arm, so its payload gets the same custom-action fold.
+    let result = ui_bridge_request_sync(&state, "find", request)
+        .await
+        .map(|mut data| {
+            advertise_custom_actions_in_payload(&mut data);
+            data
+        });
+    wrap_ipc_result(result)
 }
 
 // =========================================================================
@@ -5830,10 +5866,10 @@ mod action_not_supported_tests {
     //! handler uses — if the body template changes there, this test must
     //! change in lockstep, which is exactly the regression guard we want.
     use super::{
-        advertise_custom_actions_in_payload, api_error_detailed, as_action_failure,
-        classify_transport_error, extract_custom_actions, extract_supported_actions,
-        fold_custom_actions_into_element, is_action_advertised, recovery_is_genuine, ActionResult,
-        Json, StatusCode, UiBridgeError,
+        advertise_custom_actions_in_element_response, advertise_custom_actions_in_payload,
+        api_error_detailed, as_action_failure, classify_transport_error, extract_custom_actions,
+        extract_supported_actions, fold_custom_actions_into_element, is_action_advertised,
+        recovery_is_genuine, ActionResult, Json, StatusCode, UiBridgeError,
     };
     use crate::mcp::types::ApiResponse;
     use crate::mcp::ui_bridge::recovery_executor::{RecoveryOutcome, RecoveryVia};
@@ -6192,6 +6228,69 @@ mod action_not_supported_tests {
         let once = payload.clone();
         advertise_custom_actions_in_payload(&mut payload);
         assert_eq!(payload, once);
+    }
+
+    /// `get_element` returns the element bare or as `{ element: {...} }`;
+    /// both fold, and a failure envelope is left alone.
+    #[test]
+    fn advertise_custom_actions_in_element_response_folds_bare_and_wrapped() {
+        let element = json!({
+            "id": "terminal-pane-term-1",
+            "actions": ["focus"],
+            "customActions": [{ "id": "sendKeys", "effect": "write" }],
+        });
+
+        let mut bare = element.clone();
+        advertise_custom_actions_in_element_response(&mut bare);
+        assert_eq!(bare["actions"], json!(["focus", "sendKeys"]));
+
+        let mut wrapped = json!({ "element": element });
+        advertise_custom_actions_in_element_response(&mut wrapped);
+        assert_eq!(wrapped["element"]["actions"], json!(["focus", "sendKeys"]));
+        assert!(
+            wrapped.get("actions").is_none(),
+            "the wrapper itself must not grow an `actions` key"
+        );
+
+        let failure = json!({ "success": false, "error": "" });
+        let mut unchanged = failure.clone();
+        advertise_custom_actions_in_element_response(&mut unchanged);
+        assert_eq!(unchanged, failure);
+    }
+
+    /// Every read route that returns elements must advertise custom actions in
+    /// `actions`. Since `@qontinui/ui-bridge` 0.27.0 `discover`/`find` emit
+    /// `customActions`, so a route that skips the fold now reports a different
+    /// `actions` list for the same element than its siblings do — `find` and
+    /// `discover` call the same `bridge.discover()`, and `elements` and
+    /// `snapshot` read the same `createSnapshotAsync()`. The handlers need an
+    /// `ApiState`, so this scrapes their bodies, like `sdk_contract_pins`.
+    #[test]
+    fn every_element_read_handler_advertises_custom_actions() {
+        let src = include_str!("elements.rs").replace("\r\n", "\n");
+        for handler in [
+            "ui_bridge_get_elements_handler",
+            "ui_bridge_get_element_handler",
+            "ui_bridge_discover_handler",
+            "ui_bridge_get_snapshot_handler",
+            "ui_bridge_find_handler",
+        ] {
+            let start = src
+                .find(&format!("pub async fn {handler}("))
+                .unwrap_or_else(|| panic!("{handler} not found in elements.rs"));
+            let rest = &src[start + 1..];
+            // A handler ends at its first column-0 closing brace.
+            let body = &rest[..rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{handler} has no column-0 closing brace"))];
+            assert!(
+                body.contains("advertise_custom_actions_in_payload(")
+                    || body.contains("advertise_custom_actions_in_element_response(")
+                    || body.contains("fold_custom_actions_into_element("),
+                "{handler} returns elements but does not fold `customActions` into \
+                 `actions`, so it disagrees with the other element read routes"
+            );
+        }
     }
 
     /// A recovery counts only when it chose a command AND the original action
