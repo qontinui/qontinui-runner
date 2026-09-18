@@ -4175,6 +4175,17 @@ impl TerminalSession {
     /// only across observations with an unchanged generation, which is what
     /// stands in for a quiescence debounce. A poisoned tracker is
     /// `GridIdle::Unknown`, never a fresh window.
+    ///
+    /// ⚠ The timestamp is `Utc::now()` — **WALL CLOCK, not a monotonic
+    /// instant**, so the idle window it feeds measures elapsed wall time. A
+    /// backward or forward step of at least the grace period (an NTP
+    /// correction, a VM resume, a manual clock set) therefore moves the window
+    /// without the pane having been idle for it, and can promote a pane to
+    /// `Eligible`. Harmless while Phase 1 is a dry run — nothing acts on the
+    /// verdict — but it must be settled before anything closes a pane on it.
+    /// A monotonic clock is the fix; it is not made here because the observed
+    /// `since` is also reported over `/restart-readiness` as an absolute epoch
+    /// millis, so the two would have to change together.
     pub fn observe_grid_idle(&self) -> qontinui_runner_lib::wind_down::GridIdle {
         use qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle;
 
@@ -4368,7 +4379,9 @@ impl TerminalSession {
             None => warn!(
                 terminal_id = %self.id,
                 "Could not acquire the writer lock within the shutdown budget — skipping \
-                 the stdin EOF flush (the PTY child is already killed)"
+                 the stdin EOF flush (the PTY child has been killed, UNLESS this close \
+                 was entered with kill_child = false — the graceful-exit path, where the \
+                 child exited on its own `/exit`)"
             ),
         }
 
@@ -5334,8 +5347,15 @@ mod tests {
         assert_eq!(pane.io.kills(), 0);
     }
 
+    /// Through the REAL session seam: a `/exit` that never echoes is refused,
+    /// nothing is submitted, and nothing is killed or closed.
+    ///
+    /// This pane never echoes, so its input line never shows our text — and
+    /// Ctrl-U clears the whole line, so the recovery deliberately does NOT
+    /// fire here. The bytes written are exactly `/exit`: no `0x15`, and above
+    /// all no `\r`.
     #[tokio::test(start_paused = true)]
-    async fn graceful_exit_clears_and_refuses_when_exit_does_not_echo() {
+    async fn graceful_exit_refuses_and_submits_nothing_when_exit_does_not_echo() {
         use crate::terminal::graceful_exit::GracefulExitOutcome;
 
         let pane = prompt_pane(EMPTY_PROMPT, false);
@@ -5348,11 +5368,14 @@ mod tests {
                 move || async move { closer.close_after_graceful_exit() },
             )
             .await;
-        assert!(
-            matches!(&outcome, GracefulExitOutcome::Refused { reason, .. } if reason.contains("did not echo")),
-            "{outcome:?}"
-        );
-        assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\x15");
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("did not echo"), "{reason}");
+                assert!(reason.contains("LEFT AS IS"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit");
         assert_eq!(pane.io.kills(), 0);
         assert!(pane.session.is_alive());
     }

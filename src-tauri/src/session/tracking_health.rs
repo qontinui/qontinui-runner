@@ -257,14 +257,23 @@ pub struct LiveClaudeProcess {
     /// process's cwd is not exposed by `Win32_Process`) and for any pid whose
     /// `/proc/<pid>/cwd` could not be read.
     pub cwd: Option<String>,
-    /// **HINT, NOT A VERDICT.** True iff this pid has at least one child in
-    /// the same snapshot. A `claude` mid-tool-call has children (a `cargo`, a
-    /// `git`); a `claude` between turns has none and is NOT therefore idle,
-    /// abandoned, or safe to kill. Read it as "there is visibly a child
-    /// process attached right now", never as "this session is busy" — and
-    /// never let it weaken the restart verdict, which counts every live
-    /// process regardless.
-    pub has_live_children: bool,
+    /// **HINT, NOT A VERDICT.** `Some(true)` iff this pid has at least one
+    /// child in the same snapshot. A `claude` mid-tool-call has children (a
+    /// `cargo`, a `git`); a `claude` between turns has none and is NOT
+    /// therefore idle, abandoned, or safe to kill. Read it as "there is
+    /// visibly a child process attached right now", never as "this session is
+    /// busy" — and never let it weaken the restart verdict, which counts every
+    /// live process regardless.
+    ///
+    /// `None` means the snapshot could not compute it: the pass did not
+    /// enumerate this pid at all (a `/proc` read that failed or raced the
+    /// process). It does NOT mean "no children" — that is `Some(false)`, and
+    /// conflating the two is what this `Option` exists to prevent. The
+    /// distinction is load-bearing downstream: `wind_down::eligibility` turns
+    /// `None` into `UnknownReason::ChildrenUnknown` and refuses to call a pane
+    /// eligible, per `verification-and-evidence`
+    /// `unknown-must-not-render-as-a-default`. Serialized as JSON `null`.
+    pub has_live_children: Option<bool>,
     /// True iff this process's parent is ITSELF a counted `claude` in the same
     /// live set — i.e. it is a nested subagent rather than a top-level agent
     /// session. Load-bearing for honest prose: `live_claude_total` is a count
@@ -688,11 +697,20 @@ pub fn evaluate(
             image: snapshot.names.get(&pid).cloned(),
             age_s: age_s_from_creation(snapshot.creation_times.get(&pid).copied(), now_ms),
             cwd: cwd_by_pid.get(&pid).cloned(),
-            has_live_children: snapshot
-                .parent_map
-                .get(&pid)
-                .map(|kids| !kids.is_empty())
-                .unwrap_or(false),
+            // Absence from `parent_map` is ambiguous on its own: a childless
+            // process has no entry, and so does a process the snapshot never
+            // saw. `creation_times` disambiguates — the Unix and Windows
+            // builders both insert one entry per pid they successfully
+            // enumerate, so a pid present there was seen and its missing
+            // `parent_map` entry genuinely means "no children", while a pid
+            // absent there was not seen at all and its children are
+            // UNCOMPUTABLE rather than absent.
+            has_live_children: snapshot.creation_times.contains_key(&pid).then(|| {
+                snapshot
+                    .parent_map
+                    .get(&pid)
+                    .is_some_and(|kids| !kids.is_empty())
+            }),
             nested_under_claude,
             session_status: status.map(|s| s.as_wire()),
             session_id,
@@ -1004,7 +1022,7 @@ mod tests {
             image: Some("claude".to_string()),
             age_s: None,
             cwd: None,
-            has_live_children: false,
+            has_live_children: Some(false),
             nested_under_claude: false,
             session_id: None,
             session_status: None,
@@ -1384,7 +1402,7 @@ mod tests {
         let with_children: Vec<u32> = report
             .headless_exempt
             .iter()
-            .filter(|p| p.has_live_children)
+            .filter(|p| p.has_live_children == Some(true))
             .map(|p| p.pid)
             .collect();
         assert_eq!(with_children, vec![10, 11]);
@@ -1544,14 +1562,81 @@ mod tests {
             a.cwd.as_deref(),
             Some("/home/x/qontinui-worktrees/01a07bad/qontinui-coord")
         );
-        assert!(a.has_live_children, "pid 99 is attached to it");
+        assert_eq!(a.has_live_children, Some(true), "pid 99 is attached to it");
         assert!(!a.nested_under_claude);
 
         let b = &report.headless_exempt[1];
         assert_eq!(b.pid, 11);
         assert_eq!(b.age_s, None, "an unknown creation time is null, not 0");
         assert_eq!(b.cwd, None, "an unresolvable cwd is null, not a guess");
-        assert!(!b.has_live_children);
+        assert_eq!(
+            b.has_live_children,
+            Some(false),
+            "the snapshot saw pid 11 and it has no children — not UNKNOWN"
+        );
+    }
+
+    /// A pid the snapshot never enumerated reports `has_live_children: None`,
+    /// not `Some(false)`.
+    ///
+    /// The two states are NOT interchangeable and the difference is the whole
+    /// point of the `Option`: `Some(false)` says "looked, found no children",
+    /// `None` says "could not look". Downstream,
+    /// `wind_down::eligibility` turns `None` into `ChildrenUnknown` and
+    /// refuses to call the pane eligible, while `Some(false)` is one of the
+    /// conditions FOR eligibility — so flattening `None` into `Some(false)`
+    /// promotes an uncomputable input to a permissive default, which is what
+    /// `verification-and-evidence` `unknown-must-not-render-as-a-default`
+    /// forbids. Before this, `LiveClaudeProcess` carried a bare `bool` built
+    /// with `unwrap_or(false)`, so `ChildrenUnknown` was unreachable.
+    #[test]
+    fn a_pid_the_snapshot_never_saw_has_unknown_children_not_no_children() {
+        let now_s = chrono::Utc::now().timestamp();
+        let now_ms = now_s * 1000;
+        // 10 is a child of 1 per the parent_map, but NO creation_times entry —
+        // the shape a /proc walk leaves when it races the process or cannot
+        // read its stat. 11 is fully enumerated and childless.
+        let snap = snap_with(
+            &[(1, &[10, 11])],
+            &[(11, now_s)],
+            &[(10, "claude"), (11, "claude")],
+        );
+        let agent_runtime: HashSet<u32> = [10u32, 11].into_iter().collect();
+
+        let report = evaluate(
+            &snap,
+            1,
+            &[],
+            &HashMap::new(),
+            &agent_runtime,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            now_ms,
+            now_ms,
+        );
+
+        let unseen = report
+            .headless_exempt
+            .iter()
+            .find(|p| p.pid == 10)
+            .expect("pid 10 is in the report");
+        assert_eq!(
+            unseen.has_live_children, None,
+            "the snapshot never enumerated pid 10 — its children are \
+             UNCOMPUTABLE, and null is the only honest answer"
+        );
+
+        let seen = report
+            .headless_exempt
+            .iter()
+            .find(|p| p.pid == 11)
+            .expect("pid 11 is in the report");
+        assert_eq!(
+            seen.has_live_children,
+            Some(false),
+            "pid 11 WAS enumerated and has no children — a real negative"
+        );
     }
 
     /// A clock-skewed process (created in the "future") reports `age_s: None`

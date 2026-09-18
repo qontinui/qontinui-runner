@@ -207,6 +207,15 @@ pub const CREDENTIAL_DOORS: &[&str] = &[
     "/sessions/{id}/message",
     "/terminals",
     "/terminals/*",
+    // `debug_assertions` builds only — which is every supervisor-built runner,
+    // so this is not a developer-laptop-only route. It drives a process in the
+    // sense this list means: it types `/exit` into a live agent's pane and
+    // then closes it. The `/terminals/*` entry above does NOT cover it (the
+    // first segment is `__debug`), so without its own entry
+    // `is_credential_door` is false for it and, under the default
+    // `EnforceDoors`, a Foreign origin reaches it while the identically
+    // capable `POST /terminals/{id}/write` is refused.
+    "POST /__debug/terminals/{id}/graceful-exit",
     "/shell-commands/*",
     "/processes/*",
     "/instances/spawn",

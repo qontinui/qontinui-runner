@@ -354,13 +354,23 @@ impl WindDownView {
 /// Continuity tracker behind [`GridIdle::Idle`]'s `since_ms`, one per
 /// terminal.
 ///
-/// An idle observation can only EXTEND the previous idle window when nothing
-/// could have happened in between: the previous observation was idle, and the
-/// terminal's grid generation counter (bumped on every grid mutation) has not
-/// moved since, neither before this observation's first read nor during its
-/// debounce. Otherwise a session that worked between two observations minutes
-/// apart would read as continuously idle, so the window restarts at this
-/// observation.
+/// An idle observation can only EXTEND the previous idle window when the
+/// previous observation was idle AND the terminal's grid generation counter
+/// has not moved since — neither before this observation's first read nor
+/// across the read itself. Otherwise a session that worked between two
+/// observations minutes apart would read as continuously idle, so the window
+/// restarts at this observation.
+///
+/// **An unmoved counter is strong evidence, not a proof that nothing
+/// happened.** `terminal::scan_gate` — the source of this counter — states the
+/// limit explicitly: the property it guarantees is NOT "if it has not moved,
+/// no byte reached the parser", because the bump lands *after* the grid
+/// mutation and *after* the grid lock is released. A byte that reached the
+/// parser in that window is drawn but not yet counted, so an observation
+/// landing there can extend a window across one missed mutation. Bounded to
+/// that one mutation, and harmless while Phase 1 only reports — but this doc
+/// must not claim the stronger property, because Phase 4 will act on the
+/// window it produces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GridIdleTracker {
     last: Option<TrackedObservation>,

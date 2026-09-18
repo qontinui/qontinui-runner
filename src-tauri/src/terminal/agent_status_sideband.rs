@@ -56,6 +56,24 @@ use uuid::Uuid;
 /// coord-side rejection we would then have to interpret.
 const MAX_FIELD_CHARS: usize = 128;
 
+/// Largest raw payload [`parse_sideband`] will hand to `serde_json`.
+///
+/// Deliberately the same number as [`crate::terminal::grid::
+/// MAX_AGENT_STATUS_SIDEBAND_BYTES`], and deliberately NOT a reference to it:
+/// this is defence in depth, not the primary bound. The grid drops an
+/// over-long OSC 9999 payload whole before `dispatch` ever sees it, so on the
+/// production path this check never fires.
+///
+/// It exists because `parse_sideband` is `pub` and its cost is now paid by
+/// EVERY pane on the PTY reader thread. The wind-down work moved
+/// `record_observed_state` ahead of both the coord-mirror check and the rate
+/// limiter — correctly, since eligibility must read the latest reported state
+/// whether or not coord can be told — which means a pane with no coord mirror
+/// now parses too, and the limiter no longer stands between untrusted PTY
+/// bytes and the parser. A parser reached from a reader thread should bound
+/// its own input rather than inherit a bound from one caller.
+const MAX_PAYLOAD_BYTES: usize = 8192;
+
 /// Minimum spacing between two sideband enqueues for one session.
 ///
 /// A terminal can emit OSC sequences at PTY speed, and every accepted payload
@@ -156,11 +174,19 @@ fn bounded_digest(obj: &JsonValue) -> Option<String> {
 
 /// Parse one raw sideband payload into a bounded [`AgentStatus`].
 ///
-/// `None` — silently — for: not JSON, JSON that is not an object, and an
-/// object from which no field survived validation. Never panics, for any
-/// input. An individual bad FIELD is dropped without dropping its siblings;
-/// the whole payload is dropped only when nothing usable remains.
+/// `None` — silently — for: a payload over [`MAX_PAYLOAD_BYTES`], not JSON,
+/// JSON that is not an object, and an object from which no field survived
+/// validation. Never panics, for any input. An individual bad FIELD is dropped
+/// without dropping its siblings; the whole payload is dropped only when
+/// nothing usable remains.
 pub fn parse_sideband(raw: &str) -> Option<AgentStatus> {
+    // Before `from_str`, so the parser's cost is bounded by this function
+    // rather than by whichever caller reached it. Dropped whole, never
+    // truncated: a truncated JSON document is not a smaller JSON document, and
+    // half a payload is not a weaker claim than a whole one.
+    if raw.len() > MAX_PAYLOAD_BYTES {
+        return None;
+    }
     let value: JsonValue = serde_json::from_str(raw).ok()?;
     if !value.is_object() {
         return None;
@@ -497,6 +523,32 @@ mod tests {
             .expect("sibling field survives");
         assert_eq!(parsed.state, None);
         assert_eq!(parsed.tool_name.as_deref(), Some("Bash"));
+    }
+
+    /// An over-length payload is dropped whole BEFORE `serde_json` sees it.
+    ///
+    /// The grid drops these first in production, so this pins the parser's own
+    /// bound — the one that holds for any caller, including the PTY reader
+    /// thread path that no longer has the rate limiter in front of it.
+    #[test]
+    fn an_over_length_payload_is_dropped_before_the_json_parser() {
+        // Valid JSON with a valid state, so the ONLY reason to drop it is size.
+        let filler = "t".repeat(MAX_PAYLOAD_BYTES);
+        let raw = format!(r#"{{"state":"working","tool_name":"{filler}"}}"#);
+        assert!(raw.len() > MAX_PAYLOAD_BYTES);
+        assert!(
+            parse_sideband(&raw).is_none(),
+            "over the cap is dropped whole, not truncated into a smaller claim"
+        );
+
+        // The same payload under the cap parses, so the cap is what rejected
+        // it above and not the shape.
+        let short = format!(r#"{{"state":"working","tool_name":"{}"}}"#, "t".repeat(16));
+        assert!(short.len() <= MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            parse_sideband(&short).and_then(|s| s.state).as_deref(),
+            Some("working")
+        );
     }
 
     #[test]

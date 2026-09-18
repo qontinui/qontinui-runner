@@ -200,22 +200,38 @@ pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
         );
     }
 
-    // Dialog markers from the input box's top edge (when one sits just above
-    // the prompt) to the bottom of the screen. Rows above the box are
-    // transcript, where numbered lists are ordinary output. With no box edge
-    // there is no transcript boundary to trust, so the scan reaches
-    // DIALOG_SCAN_ROWS above the cursor instead — a dialog renders right above
-    // wherever the cursor is parked.
+    // TWO scan regions, because the two signals do not have the same
+    // false-positive profile.
+    //
+    // `marker_first` — always at least DIALOG_SCAN_ROWS above the cursor, and
+    // the input box's top edge too when that sits higher. Taking the box edge
+    // ALONE was the bug: the edge is found within two rows of the cursor,
+    // which is the normal input-box rendering, so the scan began one or two
+    // rows above the cursor and everything above it — dialog included — went
+    // unscanned. That made the guard's reach a property of a two-row layout
+    // heuristic rather than of the dialog markers, so a TUI layout change
+    // could silently delete the check.
+    //
+    // `option_first` — the box region only. A numbered line ABOVE the box is
+    // ordinary transcript ("1. First, run the tests" in an agent's own
+    // output), so scanning for numbered options up there would refuse constantly.
+    // The DIALOG_MARKERS phrases do not have that problem: they are specific
+    // enough to mean a dialog wherever they appear near the cursor.
+    //
+    // Erring toward refusing is correct here either way: a false positive is a
+    // `Refused`, which leaves the pane untouched, while a false negative types
+    // `\r` into a live agent's terminal.
     let cursor_row = usize::from(screen.cursor_row);
-    let first = (cursor_row.saturating_sub(2)..cursor_row)
+    let box_edge = (cursor_row.saturating_sub(2)..cursor_row)
         .rev()
-        .find(|&r| screen.lines.get(r).is_some_and(|l| is_box_edge(l)))
-        .unwrap_or_else(|| cursor_row.saturating_sub(DIALOG_SCAN_ROWS));
-    for (r, text) in screen.lines.iter().enumerate().skip(first) {
+        .find(|&r| screen.lines.get(r).is_some_and(|l| is_box_edge(l)));
+    let option_first = box_edge.unwrap_or_else(|| cursor_row.saturating_sub(DIALOG_SCAN_ROWS));
+    let marker_first = option_first.min(cursor_row.saturating_sub(DIALOG_SCAN_ROWS));
+    for (r, text) in screen.lines.iter().enumerate().skip(marker_first) {
         if r == cursor_row {
             continue;
         }
-        if is_numbered_option(text) {
+        if r >= option_first && is_numbered_option(text) {
             return Err(format!(
                 "a numbered choice is showing on row {r} — a dialog"
             ));
@@ -236,6 +252,26 @@ pub fn exit_echoed(screen: &ScreenText) -> bool {
     };
     let typed = std::str::from_utf8(EXIT_TEXT).unwrap_or_default();
     line.input == typed && usize::from(screen.cursor_col) == input_start(&line) + typed.len()
+}
+
+/// Does the input line hold ONLY (a prefix of) the `/exit` we just wrote?
+///
+/// This gates the Ctrl-U recovery. Ctrl-U clears the WHOLE input line, not
+/// just our bytes, so firing it blindly when the echo failed to arrive can
+/// destroy something the operator typed into the pane during the echo window —
+/// the pane is live, and that window is whole seconds long.
+///
+/// `true` only when what is on the line is a prefix of `/exit` (our own text,
+/// possibly partially rendered). Anything else — the operator's own draft, or
+/// our text with theirs appended — is NOT ours to clear, and the caller leaves
+/// the line alone and says so instead. An empty line has nothing to clear, so
+/// it is false too: the recovery is pointless there.
+pub fn input_is_only_our_exit_text(screen: &ScreenText) -> bool {
+    let Some(line) = prompt_line(screen) else {
+        return false;
+    };
+    let typed = std::str::from_utf8(EXIT_TEXT).unwrap_or_default();
+    !line.input.is_empty() && typed.starts_with(line.input.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +393,17 @@ pub enum GracefulExitOutcome {
         last_probe_unreadable: bool,
     },
     /// The pane was not in a state where `/exit` is safe to type. Nothing was
-    /// submitted and nothing closed; `/exit` may have been typed and cleared.
+    /// submitted (no `\r`) and nothing was closed.
+    ///
+    /// The pane may still have been WRITTEN TO, and `reason` says exactly what
+    /// happened: when the readiness check refused, nothing was typed at all;
+    /// when `/exit` was typed but never echoed, the recovery either cleared
+    /// the line with Ctrl-U or deliberately left it alone. That Ctrl-U clears
+    /// the WHOLE input line, so where it fired it also removed anything the
+    /// operator had typed into the pane during the echo window — which is why
+    /// it now fires only while the line holds nothing but our own `/exit`
+    /// ([`input_is_only_our_exit_text`]), and `reason` states which of the two
+    /// it did.
     Refused {
         reason: String,
         claude_pids: Vec<u32>,
@@ -444,9 +490,20 @@ where
     let echo_started = tokio::time::Instant::now();
     while !exit_echoed(&screen()) {
         if echo_started.elapsed() >= timing.echo_timeout {
-            let cleared = match write(CLEAR_INPUT_LINE) {
-                Ok(()) => "the line was cleared".to_string(),
-                Err(e) => format!("clearing the line failed: {e}"),
+            // Ctrl-U clears the WHOLE line. Only do it when the line still
+            // holds nothing but our own (possibly partial) `/exit` — never
+            // when the operator has typed into the pane during the echo
+            // window, where clearing would destroy their text.
+            let cleared = if input_is_only_our_exit_text(&screen()) {
+                match write(CLEAR_INPUT_LINE) {
+                    Ok(()) => "the partially-typed /exit was cleared".to_string(),
+                    Err(e) => format!("clearing the line failed: {e}"),
+                }
+            } else {
+                "the line was LEFT AS IS — it no longer holds only our /exit, so \
+                 clearing it could have destroyed text typed in the pane; any \
+                 leftover /exit characters are still on the input line"
+                    .to_string()
             };
             return GracefulExitOutcome::Refused {
                 reason: format!(
@@ -640,6 +697,46 @@ mod tests {
         let mut s = empty_prompt();
         s.lines[0] = "1. First, run the tests".to_string();
         assert_eq!(exit_prompt_ready(&s), Ok(()));
+    }
+
+    /// A dialog marker ABOVE the input box's top edge is still caught.
+    ///
+    /// The box edge renders one or two rows above the cursor, so keying the
+    /// scan's start on it alone truncated the scan to almost nothing and left
+    /// anything higher unread. The marker scan now always reaches
+    /// `DIALOG_SCAN_ROWS` above the cursor as well, so the guard depends on the
+    /// dialog markers rather than on a two-row layout assumption.
+    #[test]
+    fn a_dialog_marker_above_the_box_edge_is_still_caught() {
+        let mut s = empty_prompt();
+        // row 1 is the box edge, row 2 the prompt/cursor — so row 0 is above
+        // the edge and was previously never scanned.
+        s.lines[0] = " Do you want to proceed?".to_string();
+        let why = exit_prompt_ready(&s).unwrap_err();
+        assert!(why.contains("dialog marker"), "{why}");
+        assert!(why.contains("row 0"), "{why}");
+    }
+
+    /// The Ctrl-U recovery only fires while the line holds our own text.
+    #[test]
+    fn only_our_own_exit_text_may_be_cleared() {
+        // Fully echoed, and partially echoed — both ours.
+        assert!(input_is_only_our_exit_text(&echoed_prompt()));
+        let mut partial = echoed_prompt();
+        partial.lines[3] = "❯\u{a0}/exi".to_string();
+        assert!(input_is_only_our_exit_text(&partial));
+
+        // The operator's own draft is NOT ours to clear.
+        assert!(!input_is_only_our_exit_text(&draft_prompt()));
+
+        // Our text with theirs appended is not ours either — Ctrl-U would take
+        // both.
+        let mut mixed = echoed_prompt();
+        mixed.lines[3] = "❯\u{a0}/exit and then some".to_string();
+        assert!(!input_is_only_our_exit_text(&mixed));
+
+        // An empty prompt has nothing of ours to clear.
+        assert!(!input_is_only_our_exit_text(&empty_prompt()));
     }
 
     #[test]
@@ -1008,8 +1105,15 @@ mod tests {
         }
     }
 
+    /// A missing echo never submits — and does NOT blind-clear a line that is
+    /// not showing our text.
+    ///
+    /// The pane here never echoes, so the input line still shows its
+    /// placeholder. Ctrl-U clears the WHOLE line, so firing it on a line we
+    /// cannot see our own text on risks destroying whatever the operator typed
+    /// during the echo window. `\r` is never written either way.
     #[tokio::test(start_paused = true)]
-    async fn a_missing_echo_clears_the_line_and_never_submits() {
+    async fn a_missing_echo_never_submits_and_leaves_a_foreign_line_alone() {
         let log: Log = Arc::default();
         let pane = FakePane::new(empty_prompt(), false);
         let outcome = drive(
@@ -1020,11 +1124,70 @@ mod tests {
             timing(),
         )
         .await;
-        assert!(
-            matches!(&outcome, GracefulExitOutcome::Refused { reason, .. } if reason.contains("did not echo")),
-            "{outcome:?}"
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("did not echo"), "{reason}");
+                assert!(reason.contains("LEFT AS IS"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(
+            pane.typed.lock().unwrap().as_slice(),
+            b"/exit",
+            "no Ctrl-U (0x15) and above all no \\r"
         );
-        assert_eq!(pane.typed.lock().unwrap().as_slice(), b"/exit\x15");
+        assert!(!entries(&log).iter().any(|e| e == "close"));
+    }
+
+    /// When the line IS showing our own partially-typed `/exit`, the Ctrl-U
+    /// recovery still fires — the narrowing removed the blind clear, not the
+    /// clear.
+    #[tokio::test(start_paused = true)]
+    async fn a_partially_echoed_exit_is_cleared() {
+        let log: Log = Arc::default();
+        let typed: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let write = {
+            let typed = Arc::clone(&typed);
+            move |bytes: &[u8]| {
+                typed.lock().unwrap().extend_from_slice(bytes);
+                Ok(())
+            }
+        };
+        // Empty until we type (so the readiness check passes), then a PARTIAL
+        // `/exi` — ours, but never completing, so the echo check never passes.
+        let screen = {
+            let typed = Arc::clone(&typed);
+            move || {
+                if typed.lock().unwrap().is_empty() {
+                    empty_prompt()
+                } else {
+                    let mut partial = echoed_prompt();
+                    partial.lines[3] = "❯\u{a0}/exi".to_string();
+                    partial.cursor_col = 6;
+                    partial
+                }
+            }
+        };
+        let outcome = drive(
+            write,
+            screen,
+            scripted_probe(vec![readable(&[CLAUDE], 0, &[])], log.clone()),
+            recording_close(log.clone()),
+            timing(),
+        )
+        .await;
+        match &outcome {
+            GracefulExitOutcome::Refused { reason, .. } => {
+                assert!(reason.contains("did not echo"), "{reason}");
+                assert!(reason.contains("cleared"), "{reason}");
+            }
+            other => panic!("expected Refused, got {other:?}"),
+        }
+        assert_eq!(
+            typed.lock().unwrap().as_slice(),
+            b"/exit\x15",
+            "our own partial text is cleared with Ctrl-U, and still no \\r"
+        );
         assert!(!entries(&log).iter().any(|e| e == "close"));
     }
 

@@ -1385,14 +1385,6 @@ fn every_credential_door_covers_a_registered_route() {
 /// test modules. Anything shaped like a door and on no list fails
 /// `every_door_shaped_route_is_classified`.
 const REVIEWED_NOT_DOOR: &[(&str, &str)] = &[
-    // Door-shaped only because the path says "terminals". `debug_assertions`
-    // builds only, and it drives the SAME graceful-exit the wind-down runs:
-    // type `/exit` at an idle prompt, then close the pane. It issues no
-    // credential, and it composes nothing its own siblings do not already
-    // offer — `POST /terminals/{id}/write` (terminals.rs:990) and
-    // `DELETE /terminals/{id}` (terminals.rs:1010), neither of which is a
-    // credential door either.
-    ("POST", "/__debug/terminals/{id}/graceful-exit"),
     ("GET", "/agent-tokens/health"),
     ("GET", "/agent-worktrees/reclaimable"),
     ("GET", "/agent-worktrees/wip-orphans"),
