@@ -1,0 +1,50 @@
+{
+  "schemaVersion": "1.0",
+  "appName": "Qontinui Connect Runner",
+  "description": "Pairs a runner device with the operator's Qontinui account.",
+  "baseUrl": "https://app.qontinui.io",
+  "conformanceLevel": "L1",
+  "actions": [
+    {
+      "id": "pairConfirm",
+      "name": "Confirm runner pairing",
+      "method": "POST",
+      "endpoint": "/api/runners/pair",
+      "intent": "Confirm pairing of a runner device",
+      "side_effect": true,
+      "parameters": [
+        {
+          "name": "deviceName",
+          "location": "body",
+          "type": "string",
+          "required": true,
+          "description": "Human-readable name of the device being paired"
+        },
+        {
+          "name": "deviceId",
+          "location": "body",
+          "type": "string",
+          "required": true,
+          "description": "Opaque device identifier issued by the runner"
+        }
+      ],
+      "input_schema": {
+        "type": "object",
+        "title": "Device",
+        "properties": {
+          "deviceName": { "type": "string" },
+          "deviceId": { "type": "string" }
+        },
+        "required": ["deviceName", "deviceId"]
+      },
+      "required_scopes": ["runner:pair"]
+    }
+  ],
+  "auth": {
+    "type": "api_key",
+    "header_name": "X-API-Key",
+    "scopes": [
+      { "name": "runner:pair", "description": "Pair a runner device with this account" }
+    ]
+  }
+}

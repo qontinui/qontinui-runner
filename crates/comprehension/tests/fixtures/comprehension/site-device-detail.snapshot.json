@@ -1,0 +1,38 @@
+{
+  "page": "https://app.qontinui.io/devices/dev-7f3a",
+  "elements": [
+    {
+      "id": "device-detail-heading",
+      "role": "heading",
+      "tagName": "h1",
+      "accessibleName": "Device name",
+      "text": "jspinak-workstation",
+      "actions": []
+    },
+    {
+      "id": "device-detail-id",
+      "role": "text",
+      "tagName": "code",
+      "accessibleName": "Device ID",
+      "text": "dev-7f3a",
+      "actions": []
+    },
+    {
+      "id": "device-detail-last-seen",
+      "role": "text",
+      "tagName": "time",
+      "accessibleName": "Last seen",
+      "text": "2026-06-14T09:12:00Z",
+      "actions": []
+    },
+    {
+      "id": "device-detail-pair-again",
+      "role": "button",
+      "tagName": "button",
+      "accessibleName": "Re-pair",
+      "text": "Re-pair",
+      "actions": ["click"]
+    }
+  ],
+  "forms": []
+}

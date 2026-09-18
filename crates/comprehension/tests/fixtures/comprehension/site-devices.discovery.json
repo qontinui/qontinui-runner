@@ -1,0 +1,38 @@
+{
+  "states": [
+    {
+      "id": "devices-list",
+      "name": "Devices List",
+      "description": "Lists every paired device with its name and online status.",
+      "isInitial": true,
+      "observableChecks": [
+        {
+          "id": "devices-list-heading",
+          "description": "The Devices heading is rendered.",
+          "category": "element-presence",
+          "severity": "critical",
+          "criteria": { "role": "heading", "text": "Devices" },
+          "label": "Devices heading"
+        },
+        {
+          "id": "devices-list-status-cell",
+          "description": "Each device row shows an online/offline status.",
+          "category": "text-content",
+          "severity": "warning",
+          "criteria": { "text_contains": "online" },
+          "label": "device status text"
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "id": "open-device",
+      "name": "Open Device",
+      "fromStateIds": ["devices-list"],
+      "toStateIds": ["device-detail"],
+      "trigger": { "role": "link", "textContains": "Open" },
+      "actionType": "click"
+    }
+  ]
+}

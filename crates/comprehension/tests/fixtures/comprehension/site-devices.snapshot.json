@@ -1,0 +1,38 @@
+{
+  "page": "https://app.qontinui.io/devices",
+  "elements": [
+    {
+      "id": "devices-heading",
+      "role": "heading",
+      "tagName": "h1",
+      "accessibleName": "Devices",
+      "text": "Devices",
+      "actions": []
+    },
+    {
+      "id": "device-row-0-name",
+      "role": "cell",
+      "tagName": "td",
+      "accessibleName": "Device name",
+      "text": "jspinak-workstation",
+      "actions": []
+    },
+    {
+      "id": "device-row-0-status",
+      "role": "cell",
+      "tagName": "td",
+      "accessibleName": "Status",
+      "text": "online",
+      "actions": []
+    },
+    {
+      "id": "device-row-0-open",
+      "role": "link",
+      "tagName": "a",
+      "accessibleName": "Open device",
+      "text": "Open",
+      "actions": ["click"]
+    }
+  ],
+  "forms": []
+}

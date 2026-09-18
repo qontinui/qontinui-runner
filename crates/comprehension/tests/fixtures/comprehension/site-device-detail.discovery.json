@@ -1,0 +1,62 @@
+{
+  "states": [
+    {
+      "id": "device-detail",
+      "name": "Device Detail",
+      "description": "Shows one device's name, id and last-seen timestamp.",
+      "isInitial": false,
+      "observableChecks": [
+        {
+          "id": "device-detail-id-code",
+          "description": "The device id is rendered as a code element.",
+          "category": "element-presence",
+          "severity": "critical",
+          "criteria": { "text_contains": "dev-" },
+          "label": "device id"
+        },
+        {
+          "id": "device-detail-last-seen-time",
+          "description": "The last-seen timestamp is rendered.",
+          "category": "text-content",
+          "severity": "warning",
+          "criteria": { "text_contains": "2026-" },
+          "label": "last seen timestamp"
+        }
+      ]
+    },
+    {
+      "id": "pairing-confirm",
+      "name": "Pairing Confirmation",
+      "description": "Re-listed from the Re-pair button: the same clustered state connect-runner discovers.",
+      "isInitial": false,
+      "observableChecks": [
+        {
+          "id": "pairing-confirm-connect-button",
+          "description": "The Connect button that confirms pairing is present.",
+          "category": "element-presence",
+          "severity": "critical",
+          "criteria": { "role": "button", "text": "Connect" },
+          "label": "Connect button"
+        },
+        {
+          "id": "pairing-confirm-repair-origin",
+          "description": "The confirmation names the device being re-paired.",
+          "category": "text-content",
+          "severity": "warning",
+          "criteria": { "text_contains": "jspinak-workstation" },
+          "label": "re-pair device name"
+        }
+      ]
+    }
+  ],
+  "transitions": [
+    {
+      "id": "repair-device",
+      "name": "Re-pair Device",
+      "fromStateIds": ["device-detail"],
+      "toStateIds": ["pairing-confirm"],
+      "trigger": { "role": "button", "textContains": "Re-pair" },
+      "actionType": "click"
+    }
+  ]
+}

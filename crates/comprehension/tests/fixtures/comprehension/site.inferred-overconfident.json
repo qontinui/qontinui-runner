@@ -1,0 +1,91 @@
+{
+  "specVersion": "0",
+  "target": { "sourceUrl": "https://app.qontinui.io" },
+  "entities": [
+    {
+      "name": "Device",
+      "fields": [
+        { "name": "deviceName", "type": "string", "confidence": "observed", "provenance": "devices list renders the name cell" },
+        { "name": "status", "type": "enum", "values": ["online", "offline"], "confidence": "observed", "provenance": "devices list renders an online/offline status cell" },
+        { "name": "lastSeen", "type": "date", "confidence": "inferred", "provenance": "the list sorts by recency, so a last-seen timestamp probably exists", "credibility": 0.5 }
+      ],
+      "confidence": "observed",
+      "provenance": "the devices list renders one row per Device"
+    },
+    {
+      "name": "Device",
+      "fields": [
+        { "name": "deviceName", "type": "string", "confidence": "observed", "provenance": "detail heading renders the device name" },
+        { "name": "deviceId", "type": "string", "confidence": "observed", "provenance": "detail page renders the id as code" },
+        { "name": "lastSeen", "type": "date", "confidence": "observed", "provenance": "detail page renders a last-seen <time>" },
+        { "name": "owner", "type": "reference", "confidence": "observed", "provenance": "the detail URL sits under the operator's account, so the device is owned", "credibility": 0.9 }
+      ],
+      "confidence": "observed",
+      "provenance": "the detail page renders a single Device"
+    },
+    {
+      "name": "Device",
+      "fields": [
+        { "name": "deviceName", "type": "string", "confidence": "observed", "provenance": "device name rendered in the pairing confirmation box" },
+        { "name": "deviceId", "type": "string", "confidence": "observed", "provenance": "deviceId read from the query string and echoed in the request" },
+        { "name": "state", "type": "string", "confidence": "observed", "provenance": "opaque CSRF/state token round-tripped to pair-confirm", "credibility": 0.95 },
+        { "name": "callback", "type": "string", "confidence": "observed", "provenance": "callback URL displayed + used for post-pairing redirect", "credibility": 0.95 }
+      ],
+      "confidence": "observed",
+      "provenance": "the page renders and submits a single Device pairing record"
+    }
+  ],
+  "operations": [
+    {
+      "name": "listDevices",
+      "verb": "read",
+      "entity": "Device",
+      "confidence": "observed",
+      "provenance": "the devices page GETs /api/v1/devices on load"
+    },
+    {
+      "name": "pairConfirm",
+      "verb": "create",
+      "entity": "Device",
+      "inputs": [],
+      "effect": {
+        "confidence": "observed",
+        "assumption": "re-pairs the device (REST 201)",
+        "credibility": 0.4
+      },
+      "confidence": "inferred",
+      "provenance": "the Re-pair button probably re-runs pairing",
+      "credibility": 0.4
+    },
+    {
+      "name": "pairConfirm",
+      "verb": "create",
+      "entity": "Device",
+      "inputs": [
+        {
+          "field": "callback",
+          "required": true,
+          "validation": {
+            "rule": "https allowlisted host",
+            "confidence": "observed",
+            "provenance": "client rejects non-https / non-allowlisted callback before POST"
+          }
+        }
+      ],
+      "effect": {
+        "confidence": "observed",
+        "assumption": "persists pairing + returns device token (REST 201)",
+        "credibility": 0.99
+      },
+      "confidence": "observed",
+      "provenance": "Connect button POSTs /api/v1/devices/pair-confirm"
+    }
+  ],
+  "auth": {
+    "model": "session",
+    "confidence": "observed",
+    "roles": [],
+    "provenance": "every page sits behind the authenticated app shell",
+    "credibility": 0.95
+  }
+}

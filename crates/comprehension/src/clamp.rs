@@ -78,8 +78,9 @@ impl EvidenceClass {
     }
 }
 
-/// Rank for ceiling comparison: a higher value = more confident.
-fn rank(p: SpecProvenance) -> u8 {
+/// Rank for ceiling comparison: a higher value = more confident. Shared with
+/// `aggregate::merge_entities`, which picks the higher-evidence copy by it.
+pub(crate) fn rank(p: SpecProvenance) -> u8 {
     match p {
         SpecProvenance::Assumed => 0,
         SpecProvenance::Inferred => 1,
