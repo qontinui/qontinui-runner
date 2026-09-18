@@ -122,8 +122,8 @@ jobs:
       # dangerous failure is a FALSE GREEN -- `unknown` on both legs counted as
       # agreement would make this job report 0 defects while observing nothing.
       #
-      # `powershell -File`, NOT `pwsh`: PS 5.1 is the interpreter every step
-      # below actually uses, and its PSCustomObject `.Count` behaviour is the
+      # `powershell -File`, NOT `pwsh`: PS 5.1 is the interpreter every script
+      # step below actually uses, and its PSCustomObject `.Count` behaviour is the
       # bug class these assertions exist to catch. Passing under pwsh 7 would
       # green-light a regression that still breaks the real thing.
       - name: Parity comparator unit tests (PS 5.1)
@@ -312,36 +312,74 @@ jobs:
       # decided in this repo. Nothing here hardcodes it: the locator in
       # scripts/lib/installed-runner.ps1 probes %LOCALAPPDATA%, %ProgramFiles%
       # and %ProgramFiles(x86)% in order and THROWS naming every path it tried.
+      #
+      # BOUNDED. Run 35318462832 (2026-09-18, the first nightly on the #1564
+      # workflow) got through the build and the checksum in 30 minutes, then
+      # sat on `"./$SETUP_EXE" /S || true` under git bash for TWO HOURS until
+      # the job's 150-minute budget cancelled it — steps 17-21 skipped, the
+      # count UNKNOWN. What the cancel sweep found alive was the INSTALLER
+      # itself (`Qontinui.Runner_1.0.11_x64-setup`, one pid), no launched app,
+      # and "Installed after" never printed: the installer never finished, and
+      # a bash foreground wait has no bound. `Start-Process` + `WaitForExit(ms)`
+      # bounds the wait, the timed-out installer is killed (a hung NSIS holds
+      # its install-dir handles and its single-instance mutex through both
+      # parity legs otherwise, and if it inherited this step's stdout it would
+      # hold the step open past pwsh's own exit), `timeout-minutes` bounds the
+      # step, and the still-alive process listing with its window title is the
+      # diagnostic for WHY it hung. The step itself never fails: a missing exe
+      # is the locator's to refuse, downstream, naming every path it probed.
+      # (`Start-Process` also gives the installer its own handles, so a process
+      # it launches cannot hold this step open either — covered, not the
+      # measured cause.)
       - name: Install the published build silently
+        timeout-minutes: 15
         run: |
-          set -euo pipefail
-          echo "Installing $SETUP_EXE"
-          "./$SETUP_EXE" /S || true
-
-          # cygpath, not the raw variable: %LOCALAPPDATA% arrives as a Windows
-          # path with backslashes, and only the POSIX form is safe to build a
-          # test path out of in git bash.
-          local_app=$(cygpath -u "${LOCALAPPDATA:-}" 2>/dev/null || true)
-          prog_files=$(cygpath -u "${ProgramFiles:-}" 2>/dev/null || true)
+          $p = $null
+          try {
+            $setup = (Resolve-Path -LiteralPath $env:SETUP_EXE).Path
+            Write-Host "Installing $setup"
+            $p = Start-Process -FilePath $setup -ArgumentList '/S' -PassThru
+          } catch {
+            Write-Host "::warning::Could not launch installer '$($env:SETUP_EXE)': $($_.Exception.Message) -- continuing to the exe probe; the locator downstream fails typed."
+          }
+          if ($p -and $p.WaitForExit(600000)) {
+            if ($p.ExitCode -ne 0) {
+              Write-Host "::warning::Installer exited with code $($p.ExitCode) (NSIS: 1 = aborted, 2 = script aborted)."
+            } else {
+              Write-Host "Installer exited with code 0."
+            }
+          } elseif ($p) {
+            $p.Refresh()
+            Write-Host "::warning::Installer (pid $($p.Id)) still running after 600s; main window: '$($p.MainWindowTitle)'. Killing it and continuing to the exe probe."
+            Get-Process -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProcessName -match 'Qontinui|setup' } |
+              ForEach-Object { Write-Host ("alive: pid {0} {1} window='{2}'" -f $_.Id, $_.ProcessName, $_.MainWindowTitle) }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          }
 
           # NSIS /S can return before the files are fully written, so poll for
-          # the exe rather than sleeping a fixed amount.
-          for i in $(seq 1 60); do
-            if { [ -n "$local_app" ] && [ -f "$local_app/Qontinui Runner/Qontinui Runner.exe" ]; } \
-               || { [ -n "$prog_files" ] && [ -f "$prog_files/Qontinui Runner/Qontinui Runner.exe" ]; }; then
-              echo "Installed after ${i}s."
-              break
-            fi
-            sleep 1
-          done
+          # the exe rather than sleeping a fixed amount. A base that is unset
+          # (a service-account runner with no profile) contributes no candidate
+          # rather than a Join-Path binding error.
+          $candidates = foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+            if ($base) { Join-Path $base 'Qontinui Runner\Qontinui Runner.exe' }
+          }
+          $installed = $false
+          for ($i = 1; $i -le 60; $i++) {
+            foreach ($c in $candidates) {
+              if (Test-Path -LiteralPath $c) { Write-Host "Installed after ${i}s: $c"; $installed = $true; break }
+            }
+            if ($installed) { break }
+            Start-Sleep -Seconds 1
+          }
 
           # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
           # what actually finds the exe, and it throws naming every path probed
           # rather than falling back to anything.
-          for base in "$local_app" "$prog_files"; do
-            [ -n "$base" ] && find "$base" -maxdepth 2 -iname 'Qontinui Runner*' 2>/dev/null || true
-          done
-        shell: bash
+          foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
+            if ($base) { Get-ChildItem -LiteralPath $base -Depth 1 -Filter 'Qontinui Runner*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }
+          }
+        shell: pwsh
 
       # The Tauri NSIS installer can launch the app when it finishes. A running
       # instance would take the port and could make the single-instance path
