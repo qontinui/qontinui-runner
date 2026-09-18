@@ -3508,7 +3508,7 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// credential, so it cannot forge a coord-internal notification.
 ///
 /// Until plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`
-/// Phase 4 this line named `coord_post_notification` — a tool coord NEVER had.
+/// Phase 4 this line named `coord_post_notification` — a name never served on main.
 /// Coord's tool was `coord_notify_irreversible_action`, so the entry allowed
 /// nothing and the real tool answered `-32601` from every runner-proxied session:
 /// the self-report door was unreachable while this list read as if it were open.
@@ -13194,7 +13194,7 @@ mod coord_mcp_body_gate_tests {
             // only costs the operator the notification that
             // `escalation-bar` `do-reversible-mechanical-work` makes the
             // compensating control for the gate it removed. (It stood here as
-            // `coord_post_notification` — a name coord never served — until
+            // `coord_post_notification` — a name never served on main — until
             // plan 2026-09-18-notifications-are-agent-actions-and-alerts-are-
             // agent-work Phase 4.)
             "coord_notify_sensitive_action",

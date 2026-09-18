@@ -104,6 +104,9 @@ pub fn start_transcript_watcher(
         "transcript_watcher: starting with {} workspace path(s)",
         workspace_paths.len()
     );
+    // Phase 9 (plan 2026-09-18-notifications-are-agent-actions-and-alerts-are-
+    // agent-work): record the notifier gate's value once per process.
+    super::commit_report::log_action_notify_gate();
 
     // Spawn the orchestrator on the tokio runtime. It owns the channel, the
     // watcher, and the per-session task map.
