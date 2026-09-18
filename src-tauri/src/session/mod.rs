@@ -344,6 +344,22 @@ pub enum SessionEventKind {
     /// one without the other.
     #[serde(rename = "coord-transport-rung")]
     CoordTransportRung,
+    /// A sensitive action an agent took OUTSIDE coord — a force-push, a ref
+    /// deletion, a GitHub release, an npm/crate publish — detected from the
+    /// session transcript once its `tool_result` succeeded (plan
+    /// `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`,
+    /// Phase 9; producer [`crate::terminal::commit_report::SensitiveActionTracker`]).
+    ///
+    /// Drained to `POST /coord/agent-notifications` — the HTTP twin of
+    /// `coord_notify_sensitive_action` — with the payload forwarded VERBATIM
+    /// as the body: `{action, artifact, reversible, repo?, undo?}`. Coord's
+    /// body is `deny_unknown_fields`, so the payload must hold nothing else
+    /// (no `tenant_id`; the lane's tenant resolves from the registry or the
+    /// default slot). A coord that predates the `undo` field answers 400
+    /// naming it; the drain then retries ONCE without `undo`.
+    ///
+    /// Best-effort, same posture as [`Self::FindingPosted`].
+    AgentNotification,
 }
 
 impl SessionEventKind {
@@ -366,6 +382,7 @@ impl SessionEventKind {
             SessionEventKind::FindingPosted => "finding_posted",
             SessionEventKind::Finished => "finished",
             SessionEventKind::CoordTransportRung => "coord-transport-rung",
+            SessionEventKind::AgentNotification => "agent_notification",
         }
     }
 }
