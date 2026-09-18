@@ -2353,6 +2353,14 @@ mod device_token_door_tests {
             !err.contains(&claimless),
             "a refusal must not carry the token it refused to hand out"
         );
+        // S1: the TENANT-LESS arm interpolates the same HeldTenantsUnknown,
+        // whose Unreadable(e) carries a store error string. Same rule there.
+        let err = coord_device_token_for(&am, None, &unreadable, false).unwrap_err();
+        assert!(err.contains("slot store io"), "{err}");
+        assert!(
+            !err.contains(&claimless),
+            "the tenant-less refusal must not carry the token either"
+        );
     }
 
     #[test]

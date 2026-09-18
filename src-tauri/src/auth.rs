@@ -2237,6 +2237,11 @@ pub(crate) enum MeasuredBindingCount {
 
 /// Read `paired_user.json` and measure its binding count; every failure to read
 /// or parse is [`MeasuredBindingCount::Unknown`].
+///
+/// Its ONE call site family is the claimless-legacy-token rule
+/// ([`legacy_token_serves_tenant`], through [`select_device_bearer`] and
+/// [`HeldDeviceTenants`]). The D2 degrade rule and the plan adapter's gate read
+/// [`device_binding_count`] instead.
 pub(crate) fn measured_device_binding_count() -> MeasuredBindingCount {
     match read_paired_user_value() {
         Some(value) => measured_binding_count_from_value(&value),
@@ -3842,14 +3847,20 @@ mod bearer_selection_tests {
             MeasuredBindingCount::Measured(1)
         );
         assert_eq!(device_binding_count(), 1);
-        // THE WIRING, pinned: the two readers of this one file must stay on
-        // their own parsers. A malformed 2-entry array is TWO bindings to
-        // device_binding_count (D2's degrade rule and the plan adapter's gate)
-        // and Unknown to the claimless-token rule. Reading D2 through the
-        // strict parser would make this device single-bound and hand out the
-        // default binding's credential.
+    }
+
+    /// THE WIRING, pinned against the FILE: the two readers of `paired_user.json`
+    /// must stay on their own parsers. A malformed 2-entry array is TWO bindings
+    /// to [`device_binding_count`] (the D2 degrade rule and the plan adapter's
+    /// gate) and Unknown to the claimless-token rule. Reading D2 through the
+    /// strict parser makes this device single-bound and hands out the default
+    /// binding's credential — the silent wrong-tenant write. Its own test, so a
+    /// failure here names the wiring rather than the reader.
+    #[test]
+    fn the_two_binding_count_readers_stay_on_their_own_parsers() {
+        let amb = crate::test_env::isolated_ambient();
         std::fs::write(
-            &path,
+            amb.dir().join("paired_user.json"),
             br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, {"tenant_id": 7}]}"#,
         )
         .unwrap();
@@ -3862,6 +3873,39 @@ mod bearer_selection_tests {
             measured_device_binding_count(),
             MeasuredBindingCount::Unknown,
             "the claimless rule refuses to read a count from it"
+        );
+    }
+
+    /// W1: [`device_bearer_scoped`] is the PRODUCTION site that hands
+    /// [`device_binding_count`] to [`select_scoped_bearer_lazy`], and nothing
+    /// else observes that connection — every other test injects its own
+    /// closure. On a device whose file states two bindings (malformed, so the
+    /// strict parser would call it one) an Unresolved-scope call must present
+    /// nothing, while a Device-scope call still presents the legacy slot.
+    #[test]
+    fn device_bearer_scoped_degrades_on_a_devices_own_two_binding_file() {
+        let amb = crate::test_env::isolated_ambient();
+        let a = tenant(0xC5);
+        let am = AuthManager::new();
+        let jwt = live_jwt("default-binding");
+        am.store_tokens(&jwt, "").unwrap();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            serde_json::json!({
+                "default_tenant_id": a.to_string(),
+                "bindings": [{"tenant_id": a.to_string()}, {"tenant_id": 7}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            device_bearer_scoped(TenantScope::Unresolved),
+            None,
+            "an Unresolved write on a two-binding device must send no bearer"
+        );
+        assert!(
+            device_bearer_scoped(TenantScope::Device).is_some(),
+            "a Device-scoped call still presents the legacy slot"
         );
     }
 
