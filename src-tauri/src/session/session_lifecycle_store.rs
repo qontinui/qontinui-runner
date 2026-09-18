@@ -205,6 +205,28 @@ fn normalize_origin(origin: Option<String>) -> Option<String> {
     })
 }
 
+/// [`TerminalSessionRecord::wind_down_outcome`] — the graceful exit landed and
+/// the pane was closed.
+pub const WIND_DOWN_CLOSED: &str = "closed";
+/// [`TerminalSessionRecord::wind_down_outcome`] — `claude` outlived the
+/// graceful-exit deadline. Nothing was killed; the session is STILL RUNNING.
+pub const WIND_DOWN_EXIT_STUCK: &str = "exit_stuck";
+/// [`TerminalSessionRecord::wind_down_outcome`] — `claude` left, but the pane
+/// could not be proven clear at the moment of the close, so the tab was left
+/// open (see `terminal::graceful_exit::CloseTabResult`).
+pub const WIND_DOWN_CLOSE_REFUSED: &str = "close_refused";
+/// [`TerminalSessionRecord::wind_down_outcome`] — the close was attempted and
+/// what it achieved is NOT known. Distinct from
+/// [`WIND_DOWN_CLOSE_REFUSED`], which is the positive statement that the pane
+/// was left untouched.
+pub const WIND_DOWN_CLOSE_UNKNOWN: &str = "close_unknown";
+/// [`TerminalSessionRecord::wind_down_outcome`] — the pane was not in a state
+/// where `/exit` was safe to submit, or the write failed. Nothing was closed,
+/// but the pane MAY have been written to (see
+/// `terminal::graceful_exit::GracefulExitOutcome::Refused`), which is why this
+/// is recorded rather than treated as a non-event.
+pub const WIND_DOWN_NOT_ATTEMPTED: &str = "exit_not_submitted";
+
 /// Restore tier: the session was brought back with `claude --resume` and the
 /// provider handshake landed — the transcript continues.
 pub const RESTORE_TIER_RESUMED: &str = "resumed";
@@ -679,6 +701,25 @@ pub struct TerminalSessionRecord {
     /// the sessions this feature exists to preserve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<i64>,
+    /// What the drained-runner wind-down executor did to this session:
+    /// [`WIND_DOWN_CLOSED`], [`WIND_DOWN_EXIT_STUCK`] or
+    /// [`WIND_DOWN_CLOSE_REFUSED`] (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, Phase 4).
+    ///
+    /// It is the OUTCOME axis of an automatic close, and it is orthogonal to
+    /// both `state` and `finished_at`: a session can be `closed` for a dozen
+    /// other reasons, and an `exit_stuck` one is still `open` and still
+    /// running. `None` = wind-down never acted on this record, which is a
+    /// different statement from "it tried and failed" and must not be collapsed
+    /// into it.
+    ///
+    /// Sticky, like every field around it. `#[serde(default)]`: every record
+    /// already on disk predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind_down_outcome: Option<String>,
+    /// Unix millis when [`Self::wind_down_outcome`] was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wind_down_at: Option<i64>,
     /// Free-text reason recorded alongside [`Self::finished_at`] (e.g.
     /// `"unattended: 6 units, all landed"`). Sticky; searchable in the
     /// Previous-sessions view.
@@ -1950,6 +1991,37 @@ impl SessionLifecycleStore {
                 rec.clone()
             }
             _ => return,
+        };
+        self.persist(
+            m,
+            &[LifecycleDelta::Upsert {
+                rec: Box::new(changed),
+            }],
+        );
+    }
+
+    /// Record what the wind-down executor did to this session — one of the
+    /// `WIND_DOWN_*` words above. No-op when the record is absent.
+    ///
+    /// Written whether or not the record is still `open`: the `closed` outcome
+    /// is recorded on a record the close itself has usually just flipped, and
+    /// the two statements are orthogonal (see
+    /// [`TerminalSessionRecord::wind_down_outcome`]).
+    pub fn set_wind_down_outcome(&self, claude_session_id: &str, outcome: &str, at_ms: i64) {
+        let mut m = match self.map.lock() {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "session_lifecycle_store: lock poisoned on set_wind_down_outcome");
+                return;
+            }
+        };
+        let changed = match m.get_mut(claude_session_id) {
+            Some(rec) => {
+                rec.wind_down_outcome = Some(outcome.to_string());
+                rec.wind_down_at = Some(at_ms);
+                rec.clone()
+            }
+            None => return,
         };
         self.persist(
             m,
@@ -3913,6 +3985,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }
@@ -7477,6 +7551,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }

@@ -187,6 +187,20 @@ pub(crate) fn steward_terminal_ids() -> std::collections::HashSet<String> {
         .unwrap_or_default()
 }
 
+/// The steward KIND a terminal hosts, when this runner started one there.
+///
+/// The wind-down executor needs this to record a `stopped_by_drain` kind: the
+/// census knows a pane is a steward (its terminal id is in
+/// [`steward_terminal_ids`]) but not WHICH one, and the undrain restart is
+/// per-kind. A poisoned store answers `None` — the close still happens, the
+/// restart is then owed to an operator, which is the honest degradation.
+pub(crate) fn steward_kind_for_terminal(terminal_id: &str) -> Option<String> {
+    steward_meta_store()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(terminal_id).map(|meta| meta.kind.clone()))
+}
+
 /// Kinds whose `start` is currently in flight.
 ///
 /// The single-instance guard cannot be enforced by the metadata store alone:
@@ -561,6 +575,69 @@ pub async fn steward_start(
     }
 }
 
+/// Restart a steward the drained-runner wind-down stopped (plan
+/// `2026-09-13-drained-runner-never-reaches-idle`, Phase 4 / D6).
+///
+/// Its own defaults are used, exactly as `POST /steward/{kind}/start` with an
+/// empty body would: the runner does not persist the mode and interval a
+/// stopped steward was launched with — the metadata store is in-memory and the
+/// close removed the row — so reconstructing them would be invention. *"undrain
+/// returns the runner to what it was running"* is satisfied at the roster's
+/// granularity, and an operator who launched a non-default mode over the API
+/// relaunches it the same way.
+///
+/// Carries [`SpawnOrigin::Steward`] — the AUTONOMOUS origin — deliberately: the
+/// restart is the runner's own act, not an operator's, so it passes the same
+/// gate every other autonomous steward start passes. A drain that re-armed
+/// between the undrain decision and this call therefore defers it rather than
+/// spawning into a drained device, and the kind is already out of the
+/// stopped-by-drain set, so nothing retries forever.
+pub(crate) async fn restart_after_drain(
+    app_handle: tauri::AppHandle,
+    kind: &str,
+) -> Result<RestartOutcome, String> {
+    match start_steward(
+        app_handle,
+        kind.to_string(),
+        StewardStartRequest {
+            mode: None,
+            interval: None,
+        },
+        crate::coord_drain_state::SpawnOrigin::Steward,
+    )
+    .await
+    {
+        Ok(_) => Ok(RestartOutcome::Started),
+        // A 409 is the BENIGN family and must not be reported as a failure
+        // needing an operator: the kind is already running (an operator
+        // restarted it by hand during the drain, or a start is in flight), or
+        // the drain re-armed between the undrain decision and this call, in
+        // which case the deferral is the correct answer and the next drain will
+        // record the kind again.
+        Err((StatusCode::CONFLICT, Json(err))) => {
+            Ok(RestartOutcome::NotNeeded(err.error.unwrap_or_else(|| {
+                "already running or deferred".to_string()
+            })))
+        }
+        Err((status, Json(err))) => Err(format!(
+            "{}: {}",
+            status.as_u16(),
+            err.error
+                .unwrap_or_else(|| "steward restart refused".to_string())
+        )),
+    }
+}
+
+/// What [`restart_after_drain`] achieved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestartOutcome {
+    /// A fresh steward session was started.
+    Started,
+    /// Nothing was started, and nothing is wrong: the reason is carried so the
+    /// caller can log WHICH benign case it was.
+    NotNeeded(String),
+}
+
 /// The shared start path behind the HTTP route and the Tauri command. `origin`
 /// decides how the coord device drain applies: `Steward` (autonomous) is
 /// deferred while the drain holds, `OperatorTerminal` is not.
@@ -776,13 +853,47 @@ async fn start_steward(
     }
 }
 
-/// `POST /steward/{kind}/stop` — stop this steward's tracked terminal
-/// session. Reuses the existing `TerminalManager::close` kill path
-/// (`terminal/manager.rs:221`, same as `close_terminal_handler`,
-/// `mcp/terminals.rs:387`).
+/// Query for `POST /steward/{kind}/stop`.
+#[derive(Debug, Default, Deserialize)]
+pub struct StewardStopQuery {
+    /// `boundary` for the GRACEFUL variant (plan
+    /// `2026-09-13-drained-runner-never-reaches-idle`, D6). Anything else — or
+    /// absent — keeps the shipped kill.
+    pub at: Option<String>,
+}
+
+/// The `at=` value that selects the graceful stop.
+pub const STOP_AT_BOUNDARY: &str = "boundary";
+
+/// PURE: does this `at=` select the graceful variant? Exact match, so a
+/// mistyped value takes the DOCUMENTED default (the kill) rather than silently
+/// becoming the other one.
+pub fn stops_at_boundary(at: Option<&str>) -> bool {
+    at.map(str::trim) == Some(STOP_AT_BOUNDARY)
+}
+
+/// `POST /steward/{kind}/stop` — stop this steward's tracked terminal session.
+///
+/// Two variants, selected by `?at=`:
+///
+/// * **default** — the shipped `TerminalManager::close` kill path
+///   (`terminal/manager.rs:221`, same as `close_terminal_handler`,
+///   `mcp/terminals.rs:387`). Immediate, and it kills the `claude` in the pane.
+/// * **`?at=boundary`** — `TerminalManager::graceful_exit`: types `/exit` at
+///   the steward's idle window (its `/loop` iteration boundary), waits for
+///   `claude` to leave, and only then closes the tab. Never kills a live
+///   `claude` (D5), so it can answer `exit_stuck` and leave the steward
+///   RUNNING — the response says which, and the caller must read it rather
+///   than assume a 200 means stopped.
+///
+/// This is the same graceful path the wind-down executor uses; the difference
+/// is only that this one is asked for, so it does not wait for the idle window
+/// to have lasted a grace period — `graceful_exit` refuses on its own if the
+/// pane is not at an empty prompt.
 pub async fn steward_stop_handler(
     State(state): State<Arc<ApiState>>,
     Path(kind): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<StewardStopQuery>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let spec = steward_spec(&kind).ok_or_else(|| unknown_kind_error(&kind))?;
     let terminal_manager = get_terminal_manager(&state);
@@ -796,6 +907,49 @@ pub async fn steward_stop_handler(
 
     let manager = terminal_manager.clone();
     let terminal_id = info.id.clone();
+
+    if stops_at_boundary(query.at.as_deref()) {
+        info!(
+            "HTTP: Stopping {} at its iteration boundary (terminal {})",
+            spec.skill, terminal_id
+        );
+        let outcome = manager
+            .graceful_exit(
+                &terminal_id,
+                crate::terminal::graceful_exit::DEFAULT_DEADLINE,
+            )
+            .await
+            .map_err(|e| {
+                error!("HTTP: Failed to stop {} gracefully: {}", spec.skill, e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to stop {}: {}", spec.skill, e))),
+                )
+            })?;
+        let stopped = matches!(
+            outcome,
+            crate::terminal::graceful_exit::GracefulExitOutcome::Exited { .. }
+        );
+        // Only a real exit retires the metadata row. A steward left running
+        // must stay reachable by `status` and `stop`.
+        if stopped {
+            if let Ok(mut guard) = steward_meta_store().lock() {
+                guard.remove(&info.id);
+            }
+        } else {
+            warn!(
+                "HTTP: {} was NOT stopped at its boundary — left running: {:?}",
+                spec.skill, outcome
+            );
+        }
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "stopped": stopped,
+            "kind": spec.kind,
+            "session_id": info.id,
+            "at": STOP_AT_BOUNDARY,
+            "outcome": outcome,
+        }))));
+    }
 
     info!("HTTP: Stopping {} (terminal {})", spec.skill, terminal_id);
 
@@ -866,6 +1020,26 @@ mod tests {
             field,
             seen
         );
+    }
+
+    /// `?at=boundary` selects the GRACEFUL stop; everything else keeps the
+    /// shipped kill. Exact match, so a typo takes the documented default
+    /// rather than silently becoming the other variant.
+    #[test]
+    fn only_an_exact_at_boundary_selects_the_graceful_stop() {
+        assert!(stops_at_boundary(Some("boundary")));
+        assert!(stops_at_boundary(Some("  boundary  ")));
+        assert!(!stops_at_boundary(None));
+        for other in [
+            "",
+            "Boundary",
+            "boundry",
+            "iteration-boundary",
+            "kill",
+            "now",
+        ] {
+            assert!(!stops_at_boundary(Some(other)), "{other:?}");
+        }
     }
 
     #[test]

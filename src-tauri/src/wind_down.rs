@@ -6,10 +6,15 @@
 //!
 //! [`eligibility`] folds five observations about ONE live `claude` session into
 //! a four-way verdict ([`Eligibility`]). It performs no I/O, reads no clock
-//! (`now_ms` is an argument) and acts on nothing: in Phase 1 the verdict is
-//! reported read-only on `GET /restart-readiness` and nothing closes a session
-//! on its strength. The closing primitive (`TerminalSession::graceful_exit`)
-//! exists beside it but is not wired to it.
+//! (`now_ms` is an argument) and acts on nothing itself.
+//!
+//! Two callers read the verdict, and they are not the same:
+//! `GET /restart-readiness` REPORTS it, whatever the drain state; the Phase 4
+//! wind-down executor (`session::wind_down_executor`) ACTS on it, and only
+//! while coord holds this device drained. Since that phase landed, an
+//! [`Eligibility::Eligible`] on a drained runner is a session that will be
+//! graceful-`/exit`ed — so read the rules below as the authorisation they are,
+//! not as a report.
 //!
 //! ## The rules (D4, D6)
 //!
@@ -200,8 +205,8 @@ impl UnknownReason {
     }
 }
 
-/// The verdict. Only [`Eligibility::Eligible`] could ever authorise a close,
-/// and in Phase 1 nothing acts on it at all.
+/// The verdict. Only [`Eligibility::Eligible`] authorises a close, and since
+/// Phase 4 the wind-down executor acts on exactly that — while drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Eligibility {
     /// Every condition has held since `since_ms`, for at least the grace
@@ -368,9 +373,12 @@ impl WindDownView {
 /// mutation and *after* the grid lock is released. A byte that reached the
 /// parser in that window is drawn but not yet counted, so an observation
 /// landing there can extend a window across one missed mutation. Bounded to
-/// that one mutation, and harmless while Phase 1 only reports — but this doc
-/// must not claim the stronger property, because Phase 4 will act on the
-/// window it produces.
+/// that one mutation — and Phase 4 now ACTS on this window, so what keeps the
+/// residue safe is no longer "nothing acts on it" but the conditions stacked
+/// beside it: a terminal session must additionally be declared `finished`, the
+/// sideband must not say `working`, no child process may be attached, and all
+/// of it must hold for the grace period. One missed mutation cannot satisfy
+/// those; this doc still must not claim the stronger property.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GridIdleTracker {
     last: Option<TrackedObservation>,

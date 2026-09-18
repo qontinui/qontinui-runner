@@ -1238,6 +1238,8 @@ pub fn terminal_session_record_open(
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     };
@@ -2518,6 +2520,8 @@ async fn poll_and_record_session<F>(
                 restored_from_boot_at: None,
                 restore_tier: None,
                 finished_at: None,
+                wind_down_outcome: None,
+                wind_down_at: None,
                 finish_reason: None,
                 finish_synced: false,
             };
@@ -2607,6 +2611,8 @@ pub(crate) fn record_pinned_session_open(
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     });
@@ -2800,6 +2806,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }
