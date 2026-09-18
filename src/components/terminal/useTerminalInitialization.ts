@@ -922,7 +922,17 @@ export function useTerminalInitialization({
   const [drainResumeEpoch, setDrainResumeEpoch] = useState(0);
   useEffect(
     () =>
-      subscribeCoordDrainState(autonomousResumeDetector(() => setDrainResumeEpoch((n) => n + 1))),
+      subscribeCoordDrainState(
+        autonomousResumeDetector(
+          () => setDrainResumeEpoch((n) => n + 1),
+          // Seed the edge detector from OUR OWN deferral record rather than
+          // from whichever snapshot happens to arrive first (review N1): this
+          // effect runs after the deferred restore returned, so the first
+          // snapshot can already read `allowed`, and a stream-seeded detector
+          // would never see the rising edge that re-runs the restore.
+          () => drainDeferredPages.current.size > 0,
+        ),
+      ),
     [],
   );
 

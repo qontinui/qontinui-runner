@@ -38,6 +38,12 @@ export interface CoordDrainSnapshot {
   cause: string | null;
   /** Distinct autonomous work items deferred since the drain began. */
   deferredCount: number;
+  /**
+   * `true` once the backend's `MAX_DEFERRED_KEYS` cap was hit, which makes
+   * `deferredCount` a FLOOR rather than a total. Optional: a runner predating
+   * the field sends nothing, and an absent value is not a `false`.
+   */
+  deferredCapped?: boolean;
   deferredByOrigin: Record<string, number>;
   lastReadAt: string;
   /** True while the boot read is still in flight and nothing has been read. */
@@ -104,11 +110,31 @@ export function subscribeCoordDrainState(fn: (s: CoordDrainSnapshot) => void): (
  * Call `onResume` each time autonomous spawns become allowed after they were
  * not (a drain lifting, or an unknown state being read). Pure edge detector
  * over a snapshot stream, exported for tests.
+ *
+ * ## Why the seed comes from the DEFERRAL, not the stream (review N1)
+ *
+ * `last` starts at `null` and used to be seeded by whichever snapshot arrived
+ * first. That misses the edge whenever the drain lifts between the deferral and
+ * the first snapshot this detector sees — which is the ordinary case, because
+ * the subscription is set up in an effect that runs after the deferred call
+ * returned. The first snapshot then reads `allowed: true`, `last` was never
+ * `false`, no resume fires, and the deferred restore waits for a drain cycle
+ * that may never come again.
+ *
+ * `hasDeferredWork` is the caller's own record that something WAS deferred, and
+ * it is the honest seed: work parked by the drain is by definition work that
+ * saw `allowed: false`, whatever the stream later shows. When it reports
+ * `true` and `last` is still unseeded, `last` is seeded `false`, so the first
+ * allowing snapshot is a rising edge.
  */
-export function autonomousResumeDetector(onResume: () => void): (s: CoordDrainSnapshot) => void {
+export function autonomousResumeDetector(
+  onResume: () => void,
+  hasDeferredWork: () => boolean = () => false,
+): (s: CoordDrainSnapshot) => void {
   let last: boolean | null = null;
   return (s) => {
     const allowed = s.autonomousSpawnsAllowed;
+    if (last === null && hasDeferredWork()) last = false;
     if (last === false && allowed) onResume();
     last = allowed;
   };

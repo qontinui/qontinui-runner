@@ -6,7 +6,12 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { drainBannerModel, deferredLabel, UNKNOWN_HEADING } from "./RunnerDrainBanner";
+import {
+  drainBannerModel,
+  deferredLabel,
+  RESTORE_NOTE,
+  UNKNOWN_HEADING,
+} from "./RunnerDrainBanner";
 import {
   autonomousResumeDetector,
   isCoordDrainSnapshot,
@@ -79,6 +84,31 @@ describe("deferredLabel", () => {
   it("is null for nothing deferred", () => {
     expect(deferredLabel(0)).toBeNull();
   });
+
+  it("says the count is a floor once the backend cap was hit", () => {
+    expect(deferredLabel(512, false)).toBe("512 deferred work items");
+    expect(deferredLabel(512, true)).toBe("512+ deferred work items");
+    // The singular only applies to a real one, never to a floor of one.
+    expect(deferredLabel(1, false)).toBe("1 deferred work item");
+    expect(deferredLabel(1, true)).toBe("1+ deferred work items");
+  });
+});
+
+describe("the withheld-restore note (review N3)", () => {
+  it("is carried by both deferring states and by neither allowing one", () => {
+    expect(
+      drainBannerModel(snap({ state: "drained", autonomousSpawnsAllowed: false }))?.restoreNote,
+    ).toBe(RESTORE_NOTE);
+    expect(
+      drainBannerModel(snap({ state: "unknown", autonomousSpawnsAllowed: false }))?.restoreNote,
+    ).toBe(RESTORE_NOTE);
+    expect(drainBannerModel(snap({ state: "clear" }))).toBeNull();
+  });
+
+  it("says the tabs come back rather than leaving a blank grid unexplained", () => {
+    expect(RESTORE_NOTE).toMatch(/not restored while this holds/);
+    expect(RESTORE_NOTE).toMatch(/nothing is lost/);
+  });
 });
 
 describe("isCoordDrainSnapshot", () => {
@@ -92,6 +122,37 @@ describe("isCoordDrainSnapshot", () => {
 });
 
 describe("autonomousResumeDetector", () => {
+  it("seeds from the deferral, so an edge that happened before the first snapshot still fires", () => {
+    // Review N1: the drain lifted between the deferred call and this
+    // subscription, so the stream only ever shows `allowed`. Seeded from the
+    // stream alone, `last` would be `true` on the first snapshot and the
+    // deferred restore would never re-run.
+    let fired = 0;
+    const feed = autonomousResumeDetector(
+      () => {
+        fired += 1;
+      },
+      () => true,
+    );
+    feed(snap({ state: "clear" }));
+    expect(fired).toBe(1);
+    feed(snap({ state: "clear" }));
+    // Only the edge fires, not every allowing snapshot.
+    expect(fired).toBe(1);
+  });
+
+  it("does not fire on the first snapshot when nothing was deferred", () => {
+    let fired = 0;
+    const feed = autonomousResumeDetector(
+      () => {
+        fired += 1;
+      },
+      () => false,
+    );
+    feed(snap({ state: "clear" }));
+    expect(fired).toBe(0);
+  });
+
   it("fires only on a transition from paused to allowed", () => {
     let fired = 0;
     const feed = autonomousResumeDetector(() => {

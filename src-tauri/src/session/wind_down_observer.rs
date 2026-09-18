@@ -41,6 +41,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::mcp::session_work_status::StatusFetch;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{LiveClaudeProcess, SessionWorkStatus, TrackingHealthPass};
 use crate::terminal::agent_status_sideband::ObservedAgentState;
@@ -49,6 +50,47 @@ use qontinui_runner_lib::wind_down::{
     self, EligibilityInputs, GridIdle, SessionKind, Sideband, SidebandState, WindDownView,
     WorkStatus,
 };
+
+/// What one [`observe_and_apply`] pass looked at, kept so a caller that ACTS on
+/// a verdict (the Phase 4 wind-down executor) can log the inputs the verdict
+/// was reached on, and resolve a process's pane and kind. Readiness ignores it.
+#[derive(Debug, Clone, Default)]
+pub struct ObservedInputs {
+    /// `claude_session_id` → `terminal_id`.
+    pub terminal_by_session: HashMap<String, String>,
+    /// `terminal_id` → what its pane showed.
+    pub by_terminal: HashMap<String, TerminalObservation>,
+    pub steward_terminal_ids: HashSet<String>,
+    pub looping_terminal_ids: HashSet<String>,
+    /// The instant every verdict in the pass was judged at.
+    pub now_ms: i64,
+}
+
+impl ObservedInputs {
+    /// The pane hosting `claude_session_id`, when the pass resolved one.
+    pub fn terminal_for(&self, claude_session_id: &str) -> Option<&str> {
+        self.terminal_by_session
+            .get(claude_session_id)
+            .map(String::as_str)
+    }
+
+    /// What that pane showed, or [`TerminalObservation::UNOBSERVABLE`].
+    pub fn observation_for(&self, terminal_id: &str) -> TerminalObservation {
+        self.by_terminal
+            .get(terminal_id)
+            .copied()
+            .unwrap_or(TerminalObservation::UNOBSERVABLE)
+    }
+
+    /// The session kind the pass resolved for that pane.
+    pub fn kind_for(&self, terminal_id: &str) -> SessionKind {
+        session_kind_for(
+            terminal_id,
+            &self.steward_terminal_ids,
+            &self.looping_terminal_ids,
+        )
+    }
+}
 
 /// Observe every top-level terminal-hosted process in `pass` and attach its
 /// wind-down verdict (`LiveClaudeProcess::wind_down`). Nested subagents get
@@ -59,7 +101,7 @@ pub fn observe_and_apply(
     pass: &mut TrackingHealthPass,
     finished_at_by_session: &HashMap<String, i64>,
     grace: Duration,
-) {
+) -> ObservedInputs {
     use tauri::Manager;
 
     let terminal_by_session = terminal_ids_by_session(&pass.open_records);
@@ -74,6 +116,14 @@ pub fn observe_and_apply(
     let manager = app
         .try_state::<Arc<TerminalManager>>()
         .map(|s| s.inner().clone());
+    // Registry reads FIRST, pane observations second, and the clock last — so
+    // `now_ms` is still read after the observations it judges (see this
+    // function's doc comment). Hoisting these two above the observations, as
+    // this code briefly did, pushed `now_ms` later than the observations by the
+    // cost of two registry reads, which can only make an idle window look
+    // longer than it was — the one direction that must never drift.
+    let steward_terminal_ids = crate::mcp::steward::steward_terminal_ids();
+    let looping_terminal_ids = looping_terminal_ids(app);
     let observations = observe_terminals(manager.as_deref(), wanted);
     let now_ms = chrono::Utc::now().timestamp_millis();
     apply_wind_down(
@@ -81,11 +131,131 @@ pub fn observe_and_apply(
         &terminal_by_session,
         &observations,
         finished_at_by_session,
-        &crate::mcp::steward::steward_terminal_ids(),
-        &looping_terminal_ids(app),
+        &steward_terminal_ids,
+        &looping_terminal_ids,
         grace,
         now_ms,
     );
+    ObservedInputs {
+        terminal_by_session,
+        by_terminal: observations,
+        steward_terminal_ids,
+        looping_terminal_ids,
+        now_ms,
+    }
+}
+
+/// One freshly computed, freshly observed census pass — everything both
+/// wind-down callers need, gathered once.
+///
+/// Built by [`fresh_pass`], which is the ONE place the sequence
+/// "read the open ids → fetch the coord work axis in bulk → `tracking_health::
+/// compute` with that FRESH map → [`observe_and_apply`]" lives. `GET
+/// /restart-readiness` and the Phase 4 wind-down tick both go through it, so
+/// the two can never drift into two differently-built censuses (the "second
+/// census" the plan forbids).
+pub struct FreshPass {
+    /// `None` when the terminal plane could not be determined at all; the
+    /// reason is then in `unknowns`.
+    pub pass: Option<TrackingHealthPass>,
+    pub status_fetch: StatusFetch,
+    pub observed: ObservedInputs,
+    /// Human-readable reasons the pass is incomplete, in the order they were
+    /// discovered. `/restart-readiness` renders these verbatim.
+    pub unknowns: Vec<String>,
+}
+
+/// Compute + observe one fresh pass. See [`FreshPass`].
+pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
+    use tauri::Manager;
+
+    let mut unknowns: Vec<String> = Vec::new();
+
+    // `compute` reads `store.open_records()` itself, so it cannot be handed a
+    // status map unless the ids are known first. A record that APPEARS between
+    // this read and `compute`'s own gets no status and therefore blocks —
+    // fail-closed by construction.
+    let open_ids: Option<Vec<String>> = app
+        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        .map(|store| {
+            store
+                .open_records()
+                .into_iter()
+                .map(|r| r.claude_session_id)
+                .collect()
+        });
+    let status_fetch: StatusFetch = match &open_ids {
+        Some(ids) => crate::mcp::session_work_status::fetch(ids).await,
+        // An unresolvable store is NOT "there was nothing to ask about" — it is
+        // an axis that could not be consulted at all.
+        None => StatusFetch::store_unavailable(),
+    };
+
+    let mut pass = 'terminal: {
+        let Some(tm) = app.try_state::<Arc<TerminalManager>>() else {
+            unknowns.push(
+                "the terminal-session plane could not be determined: TerminalManager did not resolve"
+                    .to_string(),
+            );
+            break 'terminal None;
+        };
+        let Some(store) =
+            app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+        else {
+            unknowns.push(
+                "the terminal-session plane could not be determined: SessionLifecycleStore did not resolve"
+                    .to_string(),
+            );
+            break 'terminal None;
+        };
+        let Some(sm) = app.try_state::<Arc<crate::claude_session::SessionManager>>() else {
+            unknowns.push(
+                "the terminal-session plane could not be determined: SessionManager did not resolve, so the exempt AI plane cannot be subtracted"
+                    .to_string(),
+            );
+            break 'terminal None;
+        };
+        // NEVER `now()` here — that reference feeds the PID-reuse guard and
+        // substituting it falsely flips live idle sessions to tracked-dead.
+        let Some(boot_ms) = crate::session::tracking_health::primary_boot_unix_millis() else {
+            unknowns.push(
+                "the terminal-session plane could not be determined: the PID-reuse guard's primary-boot reference is not initialized yet (the runner is still starting)"
+                    .to_string(),
+            );
+            break 'terminal None;
+        };
+
+        match crate::session::tracking_health::compute(
+            tm.inner(),
+            store.inner(),
+            sm.inner(),
+            boot_ms,
+            &status_fetch.by_session_id,
+        )
+        .await
+        {
+            Some(pass) => Some(pass),
+            None => {
+                unknowns.push(
+                    "the terminal-session plane could not be determined: the process table is unreadable (snapshot_process_table_public returned an empty parent_map), so live `claude` processes cannot be enumerated"
+                        .to_string(),
+                );
+                None
+            }
+        }
+    };
+
+    let observed = match pass.as_mut() {
+        Some(p) => observe_and_apply(app, p, &status_fetch.finished_at_by_session_id, grace),
+        None => ObservedInputs::default(),
+    };
+
+    FreshPass {
+        pass,
+        status_fetch,
+        observed,
+        unknowns,
+    }
 }
 
 /// What one terminal pane showed wind-down.
