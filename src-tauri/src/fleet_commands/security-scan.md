@@ -169,6 +169,7 @@ Create a table of vulnerable dependencies:
 ### Phase 6: Generate Security Report
 
 ````markdown
+tree: root=<checkout-name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
 # Security Scan Report: {project}
 Date: {date}
 

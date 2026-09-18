@@ -45,6 +45,39 @@ the whole variable is unset the row is `<n/a>`, not `<none>` — with no context
 there is no briefing to have provenance for, and `<none>` would assert a runner
 build this card never saw.
 
+**Line 3, where present, is the COORD-CREDENTIAL line** —
+`[coord-credential: <posture> since <RFC3339>]`, with `<posture>` one of
+`expiring`, `expired`, `absent`, `unrefreshable` or `dark`
+(`terminal/mod.rs`, `coord_credential_briefing_line()`; plan
+`2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`).
+It is a statement about **the runner's own coord device JWT**, not about this
+session's `.mcp.json`, not about its proxy nonce, and not about coord — all
+three can be perfect while this line reads `expired`, and that combination is
+the whole reason the line exists. When it is present, every `coord_*` call this
+session makes through the runner's forwarder comes back
+`401 {"code":"runner_credential_<posture>"}` and the runner drops the matching
+`RUNNER_CREDENTIAL_<POSTURE>` reason into `.coord-mcp-status` beside a
+perfectly valid `.mcp.json`; the doors that still answer are the ones carrying
+their own credential (`/coord-revive`'s L4 and L5), a re-provision fixes
+nothing, and a new session fixes nothing either because every session on the box
+shares that runner.
+
+**Its ABSENCE is three-way and must never be printed as health.** The runner
+emits no line 3 when the posture is `live`, when no refresher pass has concluded
+yet (UNKNOWN — a posture printed here would be invented), and on any build
+predating the line. This card cannot separate those from the variable alone, so
+it reports the absence as exactly that ambiguity — the same reading an absent
+`.coord-mcp-status` breadcrumb gets. `expiring` DOES print, unlike the
+breadcrumb and the local 401, which fire only when the credential cannot answer
+at all.
+
+`GET :9876/health`'s `coordCredential` is what separates the three, and it never
+answers `null`: `mcp_api.rs` unwraps a `None` posture into
+`{"posture":"unknown","state":"unknown","reason":…}`, so the runner's own
+UNKNOWN arrives as the **value** `unknown` rather than as a missing object. An
+absent `coordCredential` key therefore means a build predating the field, and
+nothing else.
+
 Three things this card exists to stop you concluding:
 
 1. **A `:9876` probe is not an identity test.** It answers "is the runner API up
@@ -121,7 +154,7 @@ PLANS_DIR="$(printenv QONTINUI_PLANS_DIR 2>/dev/null)"
 # runner that has one, is the provenance line. The briefing body itself is not
 # printed. Parse with parameter expansion - no awk field references, which the
 # harness would rewrite (lint check #18).
-SPAWN_VER=""; SPAWN_SHA=""; BRIEFING=""; CLAUSE=""
+SPAWN_VER=""; SPAWN_SHA=""; BRIEFING=""; CLAUSE=""; CREDENTIAL=""
 if [ -n "$CTX" ]; then
   MARKER="$(printf '%s\n' "$CTX" | head -n 1)"
   case "$MARKER" in
@@ -158,6 +191,15 @@ if [ -n "$CTX" ]; then
   case "$LINE2" in
     *"[clause: "*) CLAUSE="${LINE2#*\[clause: }"; CLAUSE="${CLAUSE%%]*}" ;;
   esac
+  # LINE 3 IS OPTIONAL AND PREFIX-MATCHED, never positional. The runner emits it
+  # only when there is something to say, so on every healthy spawn - and on any
+  # build predating it - line 3 is the FIRST LINE OF THE BRIEFING BODY instead.
+  # Taking `sed -n '3p'` as the credential row would print briefing prose as a
+  # posture; the `[coord-credential: ` guard is what makes the absence readable.
+  LINE3="$(printf '%s\n' "$CTX" | sed -n '3p')"
+  case "$LINE3" in
+    "[coord-credential: "*) CREDENTIAL="${LINE3#\[coord-credential: }"; CREDENTIAL="${CREDENTIAL%%]*}" ;;
+  esac
 fi
 
 # Three states for the briefing row, not two. With NO context at all there is no
@@ -178,12 +220,23 @@ elif [ -n "$CLAUSE" ]; then CLAUSE_ROW="$CLAUSE"
 elif [ -n "$BRIEFING" ]; then CLAUSE_ROW="<absent - plan-capture dial is off>"
 else CLAUSE_ROW="<n/a - runner predates briefing provenance>"; fi
 
+# THE ABSENCE IS THE POINT, so it is spelled out rather than left blank. A
+# present line names a runner whose coord credential cannot answer; an absent one
+# is `live` OR UNKNOWN (no refresher pass has concluded) OR a build that predates
+# the line, and this card cannot tell those apart from the variable alone.
+# Printing `live` or `ok` here would be the exact fabrication the plan behind
+# this row exists to end.
+if [ -z "$CTX" ]; then CREDENTIAL_ROW="<n/a - no runner context>"
+elif [ -n "$CREDENTIAL" ]; then CREDENTIAL_ROW="$CREDENTIAL  <-- the RUNNER's coord credential cannot answer; your .mcp.json and nonce are FINE. Use /coord-revive's L4/L5 bearer doors; a re-provision, a new session and a runner restart all fix nothing"
+else CREDENTIAL_ROW="<absent - live, UNKNOWN (no refresher pass concluded), or a build predating the line. NOT evidence of health: confirm with GET http://127.0.0.1:9876/health .coordCredential>"; fi
+
 if [ -n "$CTX" ]; then INSIDE="YES"; else INSIDE="NO (or a headless spawn - see note 3)"; fi
 printf 'inside runner : %s\n' "$INSIDE"
 printf 'runner id     : %s\n' "${RUNNER_ID:-<unset>}"
 printf 'context       : version %s sha %s\n' "${SPAWN_VER:-<unparsed>}" "${SPAWN_SHA:-<unparsed>}"
 printf 'briefing      : %s\n' "$BRIEFING_ROW"
 printf 'clause        : %s\n' "$CLAUSE_ROW"
+printf 'coord cred    : %s\n' "$CREDENTIAL_ROW"
 printf 'tier          : %s\n' "${TIER:-<unset>}"
 printf 'terminal id   : %s\n' "${TERMINAL_ID:-<unset>}"
 printf 'worktree mode : %s\n' "${WT_MODE:-<unset>}"
@@ -495,6 +548,64 @@ esac
 [ "$LIVE_SHA" = "unknown" ] && LIVE_SHA=""
 [ "$SPAWN_SHA" = "unknown" ] && SPAWN_SHA=""
 
+# THE LIVE HALF OF THE CREDENTIAL ROW, from the body already fetched - no second
+# request. The IDENTITY block reports what the runner said at SPAWN; this reports
+# what it says NOW, and they differ in both directions (a credential that expired
+# after spawn, or one that has since healed).
+#
+# DO NOT ASSUME A KEY ORDER INSIDE THE OBJECT. `CoordCredentialStatus::to_json`
+# builds it with `serde_json::json!`, and serde_json is pinned at 1.0.149 with
+# NO `indexmap` dependency, so `preserve_order` is off and its `Map` is a
+# `BTreeMap`: the keys serialize SORTED, and `posture` is nowhere near the
+# front. A pattern anchored on `{"posture":` reads NOTHING from a real body, and
+# the first cut of this block did exactly that; it looked like it worked only
+# because the UNKNOWN body carries just posture/reason/state, which sorts
+# `posture` first.
+#
+# DELIBERATELY NO KEY LIST HERE. One stood in this comment for a day and was
+# already stale: `attributable` landed in `CoordCredentialStatus` and, sorting
+# ahead of `canAnswer`, moved `posture` from ninth of thirteen to tenth of
+# fourteen. A transcribed roster of a sibling repo's field names is the drift
+# class this fleet keeps paying for, and no checker reaches this one -- so what
+# is written down is the PROPERTY the reader depends on, which does not move:
+# the object's fields are all SCALARS (string, bool, integer or null), so the
+# first `}` after the key IS the object's close and bounds the read, and within
+# that bound the FIRST `"posture":"` is the value regardless of how many keys
+# precede it or what they are called. A new scalar key cannot break this;
+# measured against the fourteen-key body on 2026-09-16.
+LIVE_CRED=""
+CRED_PRESENT=""
+case "$LIVE_BUILD" in
+  *'"coordCredential":'*)
+    CRED_PRESENT=1
+    CRED_SEG="${LIVE_BUILD#*\"coordCredential\":}"
+    CRED_SEG="${CRED_SEG%%\}*}"
+    case "$CRED_SEG" in
+      *'"posture":"'*)
+        LIVE_CRED="${CRED_SEG#*\"posture\":\"}"
+        LIVE_CRED="${LIVE_CRED%%\"*}"
+        ;;
+    esac
+    ;;
+esac
+# THREE absences, and each names only what it can. `posture: "unknown"` is a
+# VALUE here, not an absence: the runner never serves `coordCredential: null` --
+# `mcp_api.rs` unwraps a `None` posture into {"posture":"unknown","state":
+# "unknown","reason":...}, so UNKNOWN arrives through the row above and prints
+# as `unknown`.
+if [ -z "$LIVE_BUILD" ]; then
+  printf 'coord cred (now)   UNKNOWN - /health did not answer; nothing here observed the credential\n'
+elif [ -n "$LIVE_CRED" ]; then
+  printf 'coord cred (now)   %s\n' "$LIVE_CRED"
+elif [ -n "$CRED_PRESENT" ]; then
+  # The key IS present - the case above established it - so "the build predates
+  # the field" is the ONE explanation ruled out on this path, and printing it
+  # would be the fabrication this row exists to prevent.
+  printf 'coord cred (now)   UNKNOWN - coordCredential is present but this reader could not parse a posture out of it (shape changed, or the body was truncated)\n'
+else
+  printf 'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)\n'
+fi
+
 if [ -z "$SPAWN_SHA" ] || [ -z "$LIVE_SHA" ]; then
   printf 'build cross-check  UNKNOWN (spawn=%s live=%s)\n' "${SPAWN_SHA:-?}" "${LIVE_SHA:-?}"
 elif [ "$SPAWN_SHA" = "$LIVE_SHA" ]; then
@@ -624,6 +735,28 @@ foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor';
   }
 }
 'live coord proxy   not swept (Step 3 has no PowerShell twin - not a verdict)'
+
+# The live credential row, from the body already fetched - the pwsh twin of the
+# bash block above, with the same three absences and the same refusal to assume
+# a key order. `[^}]*` is the regex spelling of that bash block's "bound the read
+# to the object": serde_json serializes this object's keys SORTED (BTreeMap --
+# 1.0.149, no `indexmap`, so `preserve_order` is off), so `posture` arrives deep
+# inside the object and an anchor on `\{\s*"posture"` matches nothing on a real
+# body. The bound holds for the reason the bash comment gives -- every field is
+# a scalar, so no nested `}` can end it early -- and NOT because of any
+# particular key list, which is why neither comment carries one.
+$liveCred = ''
+$credPresent = "$runnerBody" -cmatch '"coordCredential"\s*:'
+if ("$runnerBody" -cmatch '"coordCredential"\s*:\s*\{[^}]*"posture"\s*:\s*"([^"]*)"') { $liveCred = $Matches[1] }
+if (-not "$runnerBody") {
+  'coord cred (now)   UNKNOWN - /health did not answer; nothing here observed the credential'
+} elseif ($liveCred) {
+  "coord cred (now)   $liveCred"
+} elseif ($credPresent) {
+  'coord cred (now)   UNKNOWN - coordCredential is present but this reader could not parse a posture out of it (shape changed, or the body was truncated)'
+} else {
+  'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)'
+}
 
 # Step 4, from the /health body already fetched above - no second request.
 # `data.gitSha`, NOT the top-level `buildId`: see the long note in Step 4 for

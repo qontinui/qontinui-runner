@@ -118,7 +118,7 @@ tail -500 "$BASE/.dev-logs/frontend.log" 2>/dev/null | grep -iE "error|exception
 # Runner errors — the runner's own tracing sink is daily-rolled
 # (`qontinui-runner.log.<YYYY-MM-DD>`), so resolve the newest file. It usually
 # lives in the runner's app-data dev-logs dir, not the workspace .dev-logs/, so
-# glob both. Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# glob both. Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$BASE"/.dev-logs/qontinui-runner.log.* \
   "$RDL"/qontinui-runner.log.* 2>/dev/null | head -1)

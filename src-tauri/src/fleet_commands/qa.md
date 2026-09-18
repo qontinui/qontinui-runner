@@ -102,7 +102,7 @@ grep -i error "$BASE/.dev-logs/frontend.log" | tail -50
 # qontinui-runner's own tracing sink (auth, relay, backend-URL, executor).
 # Daily-rolled — read the newest, and glob the runner's app-data dev-logs dir as
 # well as the workspace one: everything the runner writes usually lands there.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 # (`runner-tauri.log` is retired as a runner log — it is only stdout capture.)
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$BASE"/.dev-logs/qontinui-runner.log.* \

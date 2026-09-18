@@ -12,7 +12,16 @@ Review a just-completed implementation plan. Find unfinished features, check for
 1. **Find the plan context** — look for:
    - An active plan in the current conversation (most common)
    - Recent git commits on the current branch that represent the implementation
-   - PLAN*.md or TODO*.md files in the working directory or qontinui-dev-notes
+   - **The plan corpus**, which is the authoritative surface for discovery
+     (`CLAUDE.md` → "Plan corpus authority"): a `Plan: <stem>` marker on the PR or
+     in a commit gives you the stem, and the exact door is
+     `GET <web-origin>/api/v1/plan-library?kind=plan&work_unit_slug=<stem>`.
+     **Never probe by stem with `?q=`** — it matches title and body, not the slug.
+     A zero-result read is **UNKNOWN, not "no such plan"** — that layer is a
+     partial mirror of disk by construction — so fall through to the sources
+     below rather than concluding the plan does not exist.
+   - `$QONTINUI_PLANS_DIR/*.md`, or PLAN*.md / TODO*.md files in the working
+     directory or qontinui-dev-notes
 
 2. **Determine scope** — identify which repos/directories were touched:
    ```bash
@@ -41,12 +50,12 @@ For each item in the plan, verify it was actually implemented:
 1. **Type checking** — run appropriate checkers:
    - Python: `poetry run mypy --package <pkg>` or `ruff check .`
    - TypeScript: `npm run type-check` or `npx tsc --noEmit`
-   - Rust: `cargo check` / `cargo clippy`
+   - Rust: `cargo check --all-targets` / `cargo clippy --all-targets`
 
 2. **Lint** — run linters on changed files:
    - Python: `poetry run ruff check .`
    - TypeScript: `npm run lint`
-   - Rust: `cargo clippy`
+   - Rust: `cargo clippy --all-targets`
 
 3. **Logical review** — read through the changed code looking for:
    - Off-by-one errors, missing error handling at boundaries
@@ -80,7 +89,7 @@ For each item in the plan, verify it was actually implemented:
 1. **Re-run all checkers** on affected code to confirm zero errors:
    - Python: `poetry run ruff check . && poetry run mypy --package <pkg>`
    - TypeScript: `npm run type-check && npm run lint`
-   - Rust: `cargo check && cargo clippy`
+   - Rust: `cargo check --all-targets && cargo clippy --all-targets`
 
 2. **Report what was done:**
 

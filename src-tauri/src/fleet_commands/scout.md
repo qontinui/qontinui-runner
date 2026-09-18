@@ -147,6 +147,7 @@ Some projects may span categories. Choose the primary category and note secondar
 Present findings in a structured format, grouped by category:
 
 ```
+tree: root=<checkout-name> head=<sha> dirty=<digest|clean|unknown> dirty_files=<n|UNKNOWN> measured=<ISO-8601-UTC>
 ## Scout Report — YYYY-MM-DD
 
 ### Runner

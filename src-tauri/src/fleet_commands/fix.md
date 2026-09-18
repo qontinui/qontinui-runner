@@ -32,7 +32,7 @@ tail -500 "$BASE/.dev-logs/frontend.log" 2>/dev/null | grep -iE "error|exception
 # The runner's own tracing sink is `qontinui-runner.log.<YYYY-MM-DD>` — daily-rolled
 # with 14-file retention, so resolve the NEWEST match. It usually lives in the
 # runner's app-data dev-logs dir rather than the workspace .dev-logs/, so glob
-# both. Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# both. Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 # (`runner-tauri.log` is retired as a runner log — it is only stdout capture.)
 # Runtime error patterns: [ERROR], [WARNING], Traceback, AttributeError
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
@@ -79,7 +79,7 @@ ls -la "$BASE/.dev-logs/last-loaded-config."* 2>/dev/null
 **There are TWO dev-logs directories.** `$RDL` below is the runner's own,
 `<LOCALAPPDATA>/qontinui-runner/dev-logs/` — everything the runner writes lands
 there, not in the workspace `.dev-logs/`, unless `paths.dev_logs_dir` is
-overridden. Resolve it with `GET http://localhost:9876/log-sources/runner-log-sink`
+overridden. Resolve it with `GET http://127.0.0.1:9876/log-sources/runner-log-sink`
 rather than hardcoding either path.
 
 **Log file locations:**
@@ -174,7 +174,7 @@ SKIP_WEB_SERVER=1 npx playwright test <test-file> --project=chromium
 If the fix modified a component source file (`.tsx`, `.jsx`, `.vue`, `.svelte`) and the edit changed any `aria-label`, `role`, element `textContent`, or `data-*` attribute, emit an invalidation call so stale state-machine observations are cleared. Prefer the `spec_id` filter — `fingerprint_pattern` matches fingerprint hashes, not semantic content. Over-invalidation is recoverable within 24 h via `/undo`.
 
 ```bash
-curl -sS -X POST http://localhost:9876/co-occurrence/invalidate \
+curl -sS -X POST http://127.0.0.1:9876/co-occurrence/invalidate \
   -H 'Content-Type: application/json' \
   -d '{"spec_id": "<spec-id>", "reason": "fix: source edit to <component>", "invalidated_by": "agent:fix"}'
 ```

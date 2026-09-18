@@ -58,7 +58,7 @@ Run:
 ### 4. Run tests
 
 If the touched files include Rust under `qontinui-runner/src-tauri/`:
-- `Bash: cd qontinui-runner/src-tauri && cargo check` (fast)
+- `Bash: cd qontinui-runner/src-tauri && cargo check --all-targets` (fast; the bare form compiles no #[cfg(test)] code at all)
 - `Bash: cd qontinui-runner/src-tauri && cargo test --quiet -- --test-threads=4`
   on the modules likely affected (use `--test <name>` filters when claims are
   narrow).

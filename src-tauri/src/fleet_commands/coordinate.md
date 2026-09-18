@@ -159,7 +159,13 @@ You may also be woken by inbound user messages in this session's tab. Treat
 those as commands to override the loop:
 - "stop" / "pause" → stop the loop until further notice.
 - "review task <id>" → spawn `/auto-review <id>` (i.e., trigger via
-  `POST /sessions/spawn` with role `auto-review`).
+  `POST /sessions/spawn` with role `auto-review`, and with `account` set to
+  the id `scripts/account-budget.sh pick --model <the model the spawn will run>`
+  names (`PICK`; on `UNKNOWN_ONLY` place it in a listed id and say so; on
+  `NO_ACCOUNTS` report the roster fault) — served policy
+  `production-and-cost` `spawn-routing-reads-account-budget`; on
+  `ALL_EXHAUSTED` schedule it against the stated reset instead of spawning
+  into a limit).
 - "explain decision X" → look up `coordinator_decisions.id = X`, render its
   `reasoning` field.
 

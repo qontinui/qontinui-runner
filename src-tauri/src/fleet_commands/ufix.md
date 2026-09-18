@@ -103,7 +103,7 @@ The UI Bridge is an **SDK-based system** — any React app with the `@qontinui/u
 
 | Application | Base URL | Description |
 |-------------|----------|-------------|
-| **Runner UI** (Tauri) | `http://localhost:9876/ui-bridge/control/*` | Runner's own React frontend, proxied via Tauri IPC |
+| **Runner UI** (Tauri) | `http://127.0.0.1:9876/ui-bridge/control/*` | Runner's own React frontend, proxied via Tauri IPC |
 | **Web frontend** (Next.js) | `https://qontinui.io/api/ui-bridge/control/*` | qontinui-web frontend, direct HTTP |
 
 Both expose the **same endpoints** — the only difference is the base URL.
@@ -114,7 +114,7 @@ All examples use `$BASE` — set it based on which app you're targeting:
 
 ```bash
 # For Runner UI bugs:
-BASE="http://localhost:9876/ui-bridge"
+BASE="http://127.0.0.1:9876/ui-bridge"
 
 # For Web frontend bugs:
 BASE="https://qontinui.io/api/ui-bridge"
@@ -186,7 +186,7 @@ curl -s -X POST $BASE/control/page/refresh
 ### Step 1: Understand the Bug and Determine Target
 
 Read the bug report carefully. Determine which application is affected:
-- **Runner UI** (Tauri webview) → Base: `http://localhost:9876/ui-bridge`
+- **Runner UI** (Tauri webview) → Base: `http://127.0.0.1:9876/ui-bridge`
 - **Web frontend** (Next.js on port 3001) → Base: `https://qontinui.io/api/ui-bridge`
 - **Backend API** (FastAPI on port 8000) → Use logs and direct HTTP calls
 
@@ -217,11 +217,11 @@ The snapshot endpoint automatically falls back to a native window capture — ch
 
 ```bash
 # Native window capture — works even when SDK/React is completely dead (Runner only)
-curl -s "http://localhost:9876/ui-bridge/control/annotated-screenshot?runner=true"
+curl -s "http://127.0.0.1:9876/ui-bridge/control/annotated-screenshot?runner=true"
 # Returns: {"success":true,"data":{"screenshot":"<base64 PNG>","width":...,"height":...}}
 
 # Health endpoint also includes a diagnosticScreenshot when ready:false for >30s
-curl -s http://localhost:9876/ui-bridge/health
+curl -s http://127.0.0.1:9876/ui-bridge/health
 # Look for data.diagnosticScreenshot.screenshot (base64 PNG)
 ```
 
@@ -253,7 +253,7 @@ tail -500 "$BASE_LOGS/.dev-logs/frontend.log" 2>/dev/null | grep -iE "error|exce
 # The runner's own tracing sink is daily-rolled (`qontinui-runner.log.<date>`),
 # so resolve the NEWEST match — and glob the runner's app-data dev-logs dir as
 # well as the workspace one, which is where it usually writes.
-# Exact dir: GET http://localhost:9876/log-sources/runner-log-sink
+# Exact dir: GET http://127.0.0.1:9876/log-sources/runner-log-sink
 # (`runner-tauri.log` is retired as a runner log — it is only stdout capture.)
 RDL="$LOCALAPPDATA/qontinui-runner/dev-logs"
 RUNNER_LOG=$(ls -t "$BASE_LOGS"/.dev-logs/qontinui-runner.log.* \
@@ -370,7 +370,7 @@ If the fix involved CSS, styles, colors, contrast, or visual changes, run a desi
 # First, check if the SDK is connected
 curl -s $BASE/control/page/evaluate -H 'Content-Type: application/json' -d '{"expression": "true"}'
 # Or check SDK status directly:
-curl -s http://localhost:9876/ui-bridge/sdk/status
+curl -s http://127.0.0.1:9876/ui-bridge/sdk/status
 ```
 
 **If SDK is connected**, run `runDesignAudit` to check for contrast issues, select option visibility, and accessibility problems:
@@ -466,7 +466,7 @@ carve-out (security / coord-deploy / surprising finding).
 If the fix modified a component source file (`.tsx`, `.jsx`, `.vue`, `.svelte`) and the edit changed any `aria-label`, `role`, element `textContent`, or `data-*` attribute, emit an invalidation call so stale state-machine observations are cleared. Prefer the `spec_id` filter — `fingerprint_pattern` matches fingerprint hashes, not semantic content. Over-invalidation is recoverable within 24 h via `/undo`.
 
 ```bash
-curl -sS -X POST http://localhost:9876/co-occurrence/invalidate \
+curl -sS -X POST http://127.0.0.1:9876/co-occurrence/invalidate \
   -H 'Content-Type: application/json' \
   -d '{"spec_id": "<spec-id>", "reason": "ufix: source edit to <component>", "invalidated_by": "agent:ufix"}'
 ```
@@ -485,7 +485,7 @@ If UI Bridge commands time out or return errors, the browser tab may be frozen:
 curl -s https://qontinui.io/api/ui-bridge/health | jq '{healthy, heartbeatAgeMs}'
 
 # Check health (runner proxy for SDK app)
-curl -s http://localhost:9876/ui-bridge/sdk/status | jq '.data.healthy'
+curl -s http://127.0.0.1:9876/ui-bridge/sdk/status | jq '.data.healthy'
 ```
 
 If `healthy: false`:
