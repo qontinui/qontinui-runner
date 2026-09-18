@@ -9,13 +9,32 @@
 //! into the session cwd, so the commands resolve regardless of what (if
 //! anything) is in the device's home dir.
 //!
-//! ## The `.md` files in `fleet_commands/` are the CANONICAL sources
+//! ## The `.md` files in `fleet_commands/` are VENDORED copies
 //!
-//! They are not staged copies of anything. They are ordinary files in this
-//! public repository: edit them in place, review the change through a normal
-//! pull request, and git history is the tamper record. There is no upstream to
-//! re-sync from and no hash to re-pin — a diff in `git log` is the complete
-//! account of how a shipped command body came to say what it says.
+//! The canonical source of every bundled command is
+//! `qontinui-claude-config/.claude/commands/<name>.md`. The files here are
+//! vendored copies of those, embedded so the binary carries a working command
+//! set with no network and no sibling checkout. The direction was settled in
+//! `qontinui-claude-config`'s favour when this runner de-forked its copies
+//! (`dd1630ea0`); every later change arrives as a re-vendor commit carrying the
+//! canonical bytes. Edit the canonical file, then re-vendor — an edit made only
+//! here is a fork, and the byte-parity arm of `qontinui-claude-config`'s
+//! command lint is what polices the copy against its canonical file.
+//!
+//! ## Every written body states its provenance
+//!
+//! A body is written with ONE generated key at line 2 of its YAML frontmatter
+//! (see [`with_provenance`]):
+//!
+//! ```text
+//! qontinui-provenance: source=<builtin|served|disk_cache> canonical=qontinui-claude-config:.claude/commands/<name>.md blob=<sha1> runner_build=<RUNNER_BUILD_ID>
+//! ```
+//!
+//! `blob` is the git blob id of the body bytes with the key excluded, so for an
+//! unmodified builtin it equals `git hash-object` of the canonical file, and a
+//! provisioned file is checkable on its own — no sibling checkout, no runner —
+//! by [`provenance_consistent`]. The key is a write-time transform only: the
+//! embedded consts and the files beside this module never carry it.
 //!
 //! Adding a command is adding a `.md` file next to them plus one line in
 //! [`FLEET_COMMANDS`]. Nothing in this module or its consumers may assume the
@@ -38,21 +57,22 @@ use std::path::Path;
 
 use tracing::{info, warn};
 
-use crate::agent_commands::AgentCommandRegistry;
+use crate::agent_commands::{AgentCommandRegistry, CommandSource};
 use crate::capability_manifest::{self, CapabilityObservation, ProvisionReport};
 
-/// `/vet-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/vet-plan.md` in this repository — edit it
-/// there.
+/// `/vet-plan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/vet-plan.md` (canonical) — edit it
+/// there, then re-vendor.
 const VET_PLAN: &str = include_str!("fleet_commands/vet-plan.md");
 
-/// `/implement-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/implement-plan.md` in this repository — edit
-/// it there.
+/// `/implement-plan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/implement-plan.md` (canonical) — edit it
+/// there, then re-vendor.
 const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 
-/// `/policy` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/policy.md` in this repository — edit it there.
+/// `/policy` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/policy.md` (canonical) — edit it
+/// there, then re-vendor.
 ///
 /// One of the five COORD DOORS added to the bundle: the read door for the
 /// fleet policy documents. Bundled rather than left to the account layer
@@ -61,368 +81,369 @@ const IMPLEMENT_PLAN: &str = include_str!("fleet_commands/implement-plan.md");
 /// report why it is stuck.
 const POLICY: &str = include_str!("fleet_commands/policy.md");
 
-/// `/gate` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/gate.md` in this repository — edit it there.
+/// `/gate` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/gate.md` (canonical) — edit it
+/// there, then re-vendor.
 ///
 /// The transport-agnostic gate register/attest/withdraw door. Same reasoning
 /// as [`POLICY`]: registering a gate is how a blocked agent makes its blocker
 /// observable, so it must not itself depend on a healthy transport.
 const GATE: &str = include_str!("fleet_commands/gate.md");
 
-/// `/whereami` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/whereami.md` in this repository — edit it
-/// there.
+/// `/whereami` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/whereami.md` (canonical) — edit it
+/// there, then re-vendor.
 ///
 /// Reports session IDENTITY from `$QONTINUI_RUNNER_CONTEXT` (never a port
 /// probe). Bundled because it answers "what am I running inside" — a question
 /// whose answer must not depend on the thing being diagnosed.
 const WHEREAMI: &str = include_str!("fleet_commands/whereami.md");
 
-/// `/blocked` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/blocked.md` in this repository — edit it
-/// there.
+/// `/blocked` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/blocked.md` (canonical) — edit it
+/// there, then re-vendor.
 ///
 /// The session-close emit-on-block protocol. This is the LAST thing a stuck
 /// session runs, so it is the one command least able to rely on a fetch having
 /// succeeded earlier.
 const BLOCKED: &str = include_str!("fleet_commands/blocked.md");
 
-/// `/gate-sweep` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/gate-sweep.md` in this repository — edit it
-/// there.
+/// `/gate-sweep` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/gate-sweep.md` (canonical) — edit it
+/// there, then re-vendor.
 ///
 /// Reports open/closed gates. Bundled alongside [`GATE`] and [`BLOCKED`] so the
 /// register/report pair is never half-present.
 const GATE_SWEEP: &str = include_str!("fleet_commands/gate-sweep.md");
 
-/// `/add-tests` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/add-tests.md` in this repository — edit it
-/// there.
+/// `/add-tests` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/add-tests.md` (canonical) — edit it
+/// there, then re-vendor.
 const ADD_TESTS: &str = include_str!("fleet_commands/add-tests.md");
 
-/// `/add-types` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/add-types.md` in this repository — edit it
-/// there.
+/// `/add-types` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/add-types.md` (canonical) — edit it
+/// there, then re-vendor.
 const ADD_TYPES: &str = include_str!("fleet_commands/add-types.md");
 
-/// `/analyze-automation` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/analyze-automation.md` in this repository — edit it
-/// there.
+/// `/analyze-automation` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/analyze-automation.md` (canonical) — edit it
+/// there, then re-vendor.
 const ANALYZE_AUTOMATION: &str = include_str!("fleet_commands/analyze-automation.md");
 
-/// `/analyze-subagent` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/analyze-subagent.md` in this repository — edit it
-/// there.
+/// `/analyze-subagent` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/analyze-subagent.md` (canonical) — edit it
+/// there, then re-vendor.
 const ANALYZE_SUBAGENT: &str = include_str!("fleet_commands/analyze-subagent.md");
 
-/// `/ask-operator` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/ask-operator.md` in this repository — edit it
-/// there.
+/// `/ask-operator` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/ask-operator.md` (canonical) — edit it
+/// there, then re-vendor.
 const ASK_OPERATOR: &str = include_str!("fleet_commands/ask-operator.md");
 
-/// `/audit` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/audit.md` in this repository — edit it
-/// there.
+/// `/audit` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/audit.md` (canonical) — edit it
+/// there, then re-vendor.
 const AUDIT: &str = include_str!("fleet_commands/audit.md");
 
-/// `/auto-fix` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/auto-fix.md` in this repository — edit it
-/// there.
+/// `/auto-fix` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/auto-fix.md` (canonical) — edit it
+/// there, then re-vendor.
 const AUTO_FIX: &str = include_str!("fleet_commands/auto-fix.md");
 
-/// `/auto-improve` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/auto-improve.md` in this repository — edit it
-/// there.
+/// `/auto-improve` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/auto-improve.md` (canonical) — edit it
+/// there, then re-vendor.
 const AUTO_IMPROVE: &str = include_str!("fleet_commands/auto-improve.md");
 
-/// `/auto-review` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/auto-review.md` in this repository — edit it
-/// there.
+/// `/auto-review` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/auto-review.md` (canonical) — edit it
+/// there, then re-vendor.
 const AUTO_REVIEW: &str = include_str!("fleet_commands/auto-review.md");
 
-/// `/babysit-prs` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/babysit-prs.md` in this repository — edit it
-/// there.
+/// `/babysit-prs` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/babysit-prs.md` (canonical) — edit it
+/// there, then re-vendor.
 const BABYSIT_PRS: &str = include_str!("fleet_commands/babysit-prs.md");
 
-/// `/clean-commit` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/clean-commit.md` in this repository — edit it
-/// there.
+/// `/clean-commit` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/clean-commit.md` (canonical) — edit it
+/// there, then re-vendor.
 const CLEAN_COMMIT: &str = include_str!("fleet_commands/clean-commit.md");
 
-/// `/clean` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/clean.md` in this repository — edit it
-/// there.
+/// `/clean` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/clean.md` (canonical) — edit it
+/// there, then re-vendor.
 const CLEAN: &str = include_str!("fleet_commands/clean.md");
 
-/// `/code-analyze` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/code-analyze.md` in this repository — edit it
-/// there.
+/// `/code-analyze` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/code-analyze.md` (canonical) — edit it
+/// there, then re-vendor.
 const CODE_ANALYZE: &str = include_str!("fleet_commands/code-analyze.md");
 
-/// `/code-fix` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/code-fix.md` in this repository — edit it
-/// there.
+/// `/code-fix` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/code-fix.md` (canonical) — edit it
+/// there, then re-vendor.
 const CODE_FIX: &str = include_str!("fleet_commands/code-fix.md");
 
-/// `/coordinate` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/coordinate.md` in this repository — edit it
-/// there.
+/// `/coordinate` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/coordinate.md` (canonical) — edit it
+/// there, then re-vendor.
 const COORDINATE: &str = include_str!("fleet_commands/coordinate.md");
 
-/// `/create-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/create-plan.md` in this repository — edit it
-/// there.
+/// `/create-plan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/create-plan.md` (canonical) — edit it
+/// there, then re-vendor.
 const CREATE_PLAN: &str = include_str!("fleet_commands/create-plan.md");
 
-/// `/create-tutorial` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/create-tutorial.md` in this repository — edit it
-/// there.
+/// `/create-tutorial` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/create-tutorial.md` (canonical) — edit it
+/// there, then re-vendor.
 const CREATE_TUTORIAL: &str = include_str!("fleet_commands/create-tutorial.md");
 
-/// `/debug-loop` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/debug-loop.md` in this repository — edit it
-/// there.
+/// `/debug-loop` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/debug-loop.md` (canonical) — edit it
+/// there, then re-vendor.
 const DEBUG_LOOP: &str = include_str!("fleet_commands/debug-loop.md");
 
-/// `/debug` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/debug.md` in this repository — edit it
-/// there.
+/// `/debug` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/debug.md` (canonical) — edit it
+/// there, then re-vendor.
 const DEBUG: &str = include_str!("fleet_commands/debug.md");
 
-/// `/find-debt` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/find-debt.md` in this repository — edit it
-/// there.
+/// `/find-debt` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/find-debt.md` (canonical) — edit it
+/// there, then re-vendor.
 const FIND_DEBT: &str = include_str!("fleet_commands/find-debt.md");
 
-/// `/find-misplaced` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/find-misplaced.md` in this repository — edit it
-/// there.
+/// `/find-misplaced` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/find-misplaced.md` (canonical) — edit it
+/// there, then re-vendor.
 const FIND_MISPLACED: &str = include_str!("fleet_commands/find-misplaced.md");
 
-/// `/fix` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/fix.md` in this repository — edit it
-/// there.
+/// `/fix` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/fix.md` (canonical) — edit it
+/// there, then re-vendor.
 const FIX: &str = include_str!("fleet_commands/fix.md");
 
-/// `/implement-phase` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/implement-phase.md` in this repository — edit it
-/// there.
+/// `/implement-phase` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/implement-phase.md` (canonical) — edit it
+/// there, then re-vendor.
 const IMPLEMENT_PHASE: &str = include_str!("fleet_commands/implement-phase.md");
 
-/// `/improve-all` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/improve-all.md` in this repository — edit it
-/// there.
+/// `/improve-all` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/improve-all.md` (canonical) — edit it
+/// there, then re-vendor.
 const IMPROVE_ALL: &str = include_str!("fleet_commands/improve-all.md");
 
-/// `/manual-test-coord-loop` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/manual-test-coord-loop.md` in this repository — edit it
-/// there.
+/// `/manual-test-coord-loop` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/manual-test-coord-loop.md` (canonical) — edit it
+/// there, then re-vendor.
 const MANUAL_TEST_COORD_LOOP: &str = include_str!("fleet_commands/manual-test-coord-loop.md");
 
-/// `/manual-test-coord` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/manual-test-coord.md` in this repository — edit it
-/// there.
+/// `/manual-test-coord` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/manual-test-coord.md` (canonical) — edit it
+/// there, then re-vendor.
 const MANUAL_TEST_COORD: &str = include_str!("fleet_commands/manual-test-coord.md");
 
-/// `/manual-test-loop` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/manual-test-loop.md` in this repository — edit it
-/// there.
+/// `/manual-test-loop` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/manual-test-loop.md` (canonical) — edit it
+/// there, then re-vendor.
 const MANUAL_TEST_LOOP: &str = include_str!("fleet_commands/manual-test-loop.md");
 
-/// `/manual-test` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/manual-test.md` in this repository — edit it
-/// there.
+/// `/manual-test` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/manual-test.md` (canonical) — edit it
+/// there, then re-vendor.
 const MANUAL_TEST: &str = include_str!("fleet_commands/manual-test.md");
 
-/// `/merge-train-steward` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/merge-train-steward.md` in this repository — edit it
-/// there.
+/// `/merge-train-steward` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/merge-train-steward.md` (canonical) — edit it
+/// there, then re-vendor.
 const MERGE_TRAIN_STEWARD: &str = include_str!("fleet_commands/merge-train-steward.md");
 
-/// `/mobile-dev` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/mobile-dev.md` in this repository — edit it
-/// there.
+/// `/mobile-dev` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/mobile-dev.md` (canonical) — edit it
+/// there, then re-vendor.
 const MOBILE_DEV: &str = include_str!("fleet_commands/mobile-dev.md");
 
-/// `/mobile-verify` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/mobile-verify.md` in this repository — edit it
-/// there.
+/// `/mobile-verify` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/mobile-verify.md` (canonical) — edit it
+/// there, then re-vendor.
 const MOBILE_VERIFY: &str = include_str!("fleet_commands/mobile-verify.md");
 
-/// `/mtc` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/mtc.md` in this repository — edit it
-/// there.
+/// `/mtc` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/mtc.md` (canonical) — edit it
+/// there, then re-vendor.
 const MTC: &str = include_str!("fleet_commands/mtc.md");
 
-/// `/name` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/name.md` in this repository — edit it
-/// there.
+/// `/name` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/name.md` (canonical) — edit it
+/// there, then re-vendor.
 const NAME: &str = include_str!("fleet_commands/name.md");
 
-/// `/next-steps` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/next-steps.md` in this repository — edit it
-/// there.
+/// `/next-steps` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/next-steps.md` (canonical) — edit it
+/// there, then re-vendor.
 const NEXT_STEPS: &str = include_str!("fleet_commands/next-steps.md");
 
-/// `/organize-notes` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/organize-notes.md` in this repository — edit it
-/// there.
+/// `/organize-notes` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/organize-notes.md` (canonical) — edit it
+/// there, then re-vendor.
 const ORGANIZE_NOTES: &str = include_str!("fleet_commands/organize-notes.md");
 
-/// `/publish-runner` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/publish-runner.md` in this repository — edit it
-/// there.
+/// `/publish-runner` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/publish-runner.md` (canonical) — edit it
+/// there, then re-vendor.
 const PUBLISH_RUNNER: &str = include_str!("fleet_commands/publish-runner.md");
 
-/// `/pull-all` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/pull-all.md` in this repository — edit it
-/// there.
+/// `/pull-all` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/pull-all.md` (canonical) — edit it
+/// there, then re-vendor.
 const PULL_ALL: &str = include_str!("fleet_commands/pull-all.md");
 
-/// `/pull-scoped` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/pull-scoped.md` in this repository — edit it
-/// there.
+/// `/pull-scoped` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/pull-scoped.md` (canonical) — edit it
+/// there, then re-vendor.
 const PULL_SCOPED: &str = include_str!("fleet_commands/pull-scoped.md");
 
-/// `/pvi` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/pvi.md` in this repository — edit it
-/// there.
+/// `/pvi` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/pvi.md` (canonical) — edit it
+/// there, then re-vendor.
 const PVI: &str = include_str!("fleet_commands/pvi.md");
 
-/// `/qa` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/qa.md` in this repository — edit it
-/// there.
+/// `/qa` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/qa.md` (canonical) — edit it
+/// there, then re-vendor.
 const QA: &str = include_str!("fleet_commands/qa.md");
 
-/// `/recursive-automation` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/recursive-automation.md` in this repository — edit it
-/// there.
+/// `/recursive-automation` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/recursive-automation.md` (canonical) — edit it
+/// there, then re-vendor.
 const RECURSIVE_AUTOMATION: &str = include_str!("fleet_commands/recursive-automation.md");
 
-/// `/refactor-srp` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/refactor-srp.md` in this repository — edit it
-/// there.
+/// `/refactor-srp` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/refactor-srp.md` (canonical) — edit it
+/// there, then re-vendor.
 const REFACTOR_SRP: &str = include_str!("fleet_commands/refactor-srp.md");
 
-/// `/reflect-ui-bridge` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/reflect-ui-bridge.md` in this repository — edit it
-/// there.
+/// `/reflect-ui-bridge` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/reflect-ui-bridge.md` (canonical) — edit it
+/// there, then re-vendor.
 const REFLECT_UI_BRIDGE: &str = include_str!("fleet_commands/reflect-ui-bridge.md");
 
-/// `/research-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/research-plan.md` in this repository — edit it
-/// there.
+/// `/research-plan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/research-plan.md` (canonical) — edit it
+/// there, then re-vendor.
 const RESEARCH_PLAN: &str = include_str!("fleet_commands/research-plan.md");
 
-/// `/resume-foreign` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/resume-foreign.md` in this repository — edit it
-/// there.
+/// `/resume-foreign` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/resume-foreign.md` (canonical) — edit it
+/// there, then re-vendor.
 const RESUME_FOREIGN: &str = include_str!("fleet_commands/resume-foreign.md");
 
-/// `/review-before-code` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/review-before-code.md` in this repository — edit it
-/// there.
+/// `/review-before-code` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/review-before-code.md` (canonical) — edit it
+/// there, then re-vendor.
 const REVIEW_BEFORE_CODE: &str = include_str!("fleet_commands/review-before-code.md");
 
-/// `/review-commit` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/review-commit.md` in this repository — edit it
-/// there.
+/// `/review-commit` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/review-commit.md` (canonical) — edit it
+/// there, then re-vendor.
 const REVIEW_COMMIT: &str = include_str!("fleet_commands/review-commit.md");
 
-/// `/review-logs` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/review-logs.md` in this repository — edit it
-/// there.
+/// `/review-logs` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/review-logs.md` (canonical) — edit it
+/// there, then re-vendor.
 const REVIEW_LOGS: &str = include_str!("fleet_commands/review-logs.md");
 
-/// `/review-plan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/review-plan.md` in this repository — edit it
-/// there.
+/// `/review-plan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/review-plan.md` (canonical) — edit it
+/// there, then re-vendor.
 const REVIEW_PLAN: &str = include_str!("fleet_commands/review-plan.md");
 
-/// `/review-plan-next-steps` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/review-plan-next-steps.md` in this repository — edit it
-/// there.
+/// `/review-plan-next-steps` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/review-plan-next-steps.md` (canonical) — edit it
+/// there, then re-vendor.
 const REVIEW_PLAN_NEXT_STEPS: &str = include_str!("fleet_commands/review-plan-next-steps.md");
 
-/// `/rewind-session` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/rewind-session.md` in this repository — edit it
-/// there.
+/// `/rewind-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/rewind-session.md` (canonical) — edit it
+/// there, then re-vendor.
 const REWIND_SESSION: &str = include_str!("fleet_commands/rewind-session.md");
 
-/// `/run-automation` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/run-automation.md` in this repository — edit it
-/// there.
+/// `/run-automation` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/run-automation.md` (canonical) — edit it
+/// there, then re-vendor.
 const RUN_AUTOMATION: &str = include_str!("fleet_commands/run-automation.md");
 
-/// `/scout` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/scout.md` in this repository — edit it
-/// there.
+/// `/scout` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/scout.md` (canonical) — edit it
+/// there, then re-vendor.
 const SCOUT: &str = include_str!("fleet_commands/scout.md");
 
-/// `/security-scan` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/security-scan.md` in this repository — edit it
-/// there.
+/// `/security-scan` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/security-scan.md` (canonical) — edit it
+/// there, then re-vendor.
 const SECURITY_SCAN: &str = include_str!("fleet_commands/security-scan.md");
 
-/// `/summarize-session` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/summarize-session.md` in this repository — edit it
-/// there.
+/// `/summarize-session` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/summarize-session.md` (canonical) — edit it
+/// there, then re-vendor.
 const SUMMARIZE_SESSION: &str = include_str!("fleet_commands/summarize-session.md");
 
-/// `/symbol-claims-warn` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/symbol-claims-warn.md` in this repository — edit it
-/// there.
+/// `/symbol-claims-warn` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/symbol-claims-warn.md` (canonical) — edit it
+/// there, then re-vendor.
 const SYMBOL_CLAIMS_WARN: &str = include_str!("fleet_commands/symbol-claims-warn.md");
 
-/// `/test-ui-bridge` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/test-ui-bridge.md` in this repository — edit it
-/// there.
+/// `/test-ui-bridge` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/test-ui-bridge.md` (canonical) — edit it
+/// there, then re-vendor.
 const TEST_UI_BRIDGE: &str = include_str!("fleet_commands/test-ui-bridge.md");
 
-/// `/ufix` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/ufix.md` in this repository — edit it
-/// there.
+/// `/ufix` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/ufix.md` (canonical) — edit it
+/// there, then re-vendor.
 const UFIX: &str = include_str!("fleet_commands/ufix.md");
 
-/// `/ui-bridge` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/ui-bridge.md` in this repository — edit it
-/// there.
+/// `/ui-bridge` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/ui-bridge.md` (canonical) — edit it
+/// there, then re-vendor.
 const UI_BRIDGE: &str = include_str!("fleet_commands/ui-bridge.md");
 
-/// `/unattended` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/unattended.md` in this repository — edit it
-/// there.
+/// `/unattended` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/unattended.md` (canonical) — edit it
+/// there, then re-vendor.
 const UNATTENDED: &str = include_str!("fleet_commands/unattended.md");
 
-/// `/update-spec` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/update-spec.md` in this repository — edit it
-/// there.
+/// `/update-spec` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/update-spec.md` (canonical) — edit it
+/// there, then re-vendor.
 const UPDATE_SPEC: &str = include_str!("fleet_commands/update-spec.md");
 
-/// `/validate` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/validate.md` in this repository — edit it
-/// there.
+/// `/validate` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/validate.md` (canonical) — edit it
+/// there, then re-vendor.
 const VALIDATE: &str = include_str!("fleet_commands/validate.md");
 
-/// `/verify-plan-status` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/verify-plan-status.md` in this repository — edit it
-/// there.
+/// `/verify-plan-status` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/verify-plan-status.md` (canonical) — edit it
+/// there, then re-vendor.
 const VERIFY_PLAN_STATUS: &str = include_str!("fleet_commands/verify-plan-status.md");
 
-/// `/verify-web` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/verify-web.md` in this repository — edit it
-/// there.
+/// `/verify-web` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/verify-web.md` (canonical) — edit it
+/// there, then re-vendor.
 const VERIFY_WEB: &str = include_str!("fleet_commands/verify-web.md");
 
-/// `/vet-imp` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/vet-imp.md` in this repository — edit it
-/// there.
+/// `/vet-imp` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/vet-imp.md` (canonical) — edit it
+/// there, then re-vendor.
 const VET_IMP: &str = include_str!("fleet_commands/vet-imp.md");
 
-/// `/workflow-runs` procedure, bundled into the binary. Canonical source:
-/// `src-tauri/src/fleet_commands/workflow-runs.md` in this repository — edit it
-/// there.
+/// `/workflow-runs` procedure, bundled into the binary. Vendored from
+/// qontinui-claude-config `.claude/commands/workflow-runs.md` (canonical) — edit it
+/// there, then re-vendor.
 const WORKFLOW_RUNS: &str = include_str!("fleet_commands/workflow-runs.md");
 
 /// The embedded default commands, as `(name, body)`. `name` is the slash
@@ -504,6 +525,169 @@ pub(crate) const FLEET_COMMANDS: &[(&str, &str)] = &[
     ("workflow-runs", WORKFLOW_RUNS),
 ];
 
+/// The YAML frontmatter key [`with_provenance`] writes at line 2 of every
+/// provisioned command file.
+pub(crate) const PROVENANCE_KEY: &str = "qontinui-provenance:";
+
+/// The build identity stamped into `runner_build=` — the same compile-time
+/// value `/health` reports as `buildId`.
+const RUNNER_BUILD: &str = env!("RUNNER_BUILD_ID");
+
+/// The parsed fields of one `qontinui-provenance:` line.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProvenanceLine {
+    /// `builtin` / `served` / `disk_cache` — [`CommandSource::as_str`].
+    pub source: String,
+    /// `qontinui-claude-config:.claude/commands/<name>.md`.
+    pub canonical: String,
+    /// Lowercase 40-hex git blob id of the body, provenance excluded.
+    pub blob: String,
+    /// The `RUNNER_BUILD_ID` of the binary that wrote the file.
+    pub runner_build: String,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl ProvenanceLine {
+    /// Parse the text after [`PROVENANCE_KEY`]. `None` unless all four fields
+    /// are present.
+    fn parse(value: &str) -> Option<Self> {
+        let (mut source, mut canonical, mut blob, mut runner_build) = (None, None, None, None);
+        for token in value.split_whitespace() {
+            let (k, v) = token.split_once('=')?;
+            let slot = match k {
+                "source" => &mut source,
+                "canonical" => &mut canonical,
+                "blob" => &mut blob,
+                "runner_build" => &mut runner_build,
+                _ => continue,
+            };
+            *slot = Some(v.to_string());
+        }
+        Some(Self {
+            source: source?,
+            canonical: canonical?,
+            blob: blob?,
+            runner_build: runner_build?,
+        })
+    }
+}
+
+/// Why [`provenance_consistent`] refused a file.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProvenanceError {
+    /// No well-formed `qontinui-provenance:` line at line 2 of a frontmatter
+    /// block — the file carries no claim to check.
+    Missing,
+    /// The body no longer hashes to the blob the line recorded: it was edited
+    /// after it was written, or the line was copied onto another body.
+    BlobMismatch { recorded: String, actual: String },
+}
+
+/// Git blob id (`git hash-object`) of `bytes`, lowercase 40-hex.
+fn git_blob_id(bytes: &[u8]) -> String {
+    // Hashing an in-memory buffer cannot fail for the Blob type; the fallback
+    // keeps this total rather than panicking inside a fail-soft provisioner.
+    git2::Oid::hash_object(git2::ObjectType::Blob, bytes)
+        .map(|oid| oid.to_string())
+        .unwrap_or_default()
+}
+
+/// The content of a line with its terminator (`\n` or `\r\n`) removed.
+fn line_content(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .unwrap_or(line)
+}
+
+/// `text` split into its first line (terminator included) and the remainder.
+fn split_first_line(text: &str) -> (&str, &str) {
+    match text.find('\n') {
+        Some(i) => text.split_at(i + 1),
+        None => (text, ""),
+    }
+}
+
+/// `body` with ONE generated `qontinui-provenance:` key placed at line 2, in
+/// YAML frontmatter.
+///
+/// Placement, because Claude Code parses frontmatter only when it starts at
+/// line 1 — nothing is ever put above an existing `---`:
+/// - a body that opens a NON-EMPTY frontmatter block (`---\n` or `---\r\n`
+///   followed by anything but a closing `---`) gets the key inserted as the
+///   first line inside it, with the opener's own line ending;
+/// - every other body gets a new `---\n<key>\n---\n` block prepended and is
+///   otherwise unchanged. That includes a body opening an EMPTY block
+///   (`---\n---\n`): inserting into it would produce bytes identical to a
+///   prepended block over the empty block's remainder, and
+///   [`strip_provenance`] could not tell the two apart.
+///
+/// `blob` is computed over `body` BEFORE the key is added, so it equals
+/// `git hash-object` of the canonical file whenever the body is unmodified.
+pub(crate) fn with_provenance(name: &str, body: &str, source: CommandSource) -> String {
+    let key = format!(
+        "{PROVENANCE_KEY} source={} canonical=qontinui-claude-config:.claude/commands/{name}.md \
+         blob={} runner_build={RUNNER_BUILD}",
+        source.as_str(),
+        git_blob_id(body.as_bytes()),
+    );
+    let (first, rest) = split_first_line(body);
+    let opens_block = first == "---\n" || first == "---\r\n";
+    let (second, _) = split_first_line(rest);
+    if opens_block && line_content(second) != "---" {
+        let eol = if first.ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        format!("{first}{key}{eol}{rest}")
+    } else {
+        format!("---\n{key}\n---\n{body}")
+    }
+}
+
+/// Undo [`with_provenance`]: remove exactly the one `qontinui-provenance:` line
+/// at line 2 — and the frontmatter block around it when that block is then
+/// empty (the one `with_provenance` created) — returning the parsed line and
+/// the original body, byte-for-byte. `None` when line 2 is not a well-formed
+/// provenance line inside a frontmatter opener.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn strip_provenance(text: &str) -> Option<(ProvenanceLine, String)> {
+    let (first, rest) = split_first_line(text);
+    if first != "---\n" && first != "---\r\n" {
+        return None;
+    }
+    let (key_line, after_key) = split_first_line(rest);
+    let value = line_content(key_line).strip_prefix(PROVENANCE_KEY)?;
+    let parsed = ProvenanceLine::parse(value)?;
+    let (third, after_third) = split_first_line(after_key);
+    let body = if line_content(third) == "---" {
+        // The block holds nothing but the key: `with_provenance` created it.
+        after_third.to_string()
+    } else {
+        format!("{first}{after_key}")
+    };
+    Some((parsed, body))
+}
+
+/// Check a provisioned command file against its own provenance line: strip the
+/// line, re-hash what remains, and compare with the recorded `blob`. Needs
+/// nothing but the file — no sibling checkout, no runner.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn provenance_consistent(text: &str) -> Result<ProvenanceLine, ProvenanceError> {
+    let (line, body) = strip_provenance(text).ok_or(ProvenanceError::Missing)?;
+    let actual = git_blob_id(body.as_bytes());
+    if actual == line.blob {
+        Ok(line)
+    } else {
+        Err(ProvenanceError::BlobMismatch {
+            recorded: line.blob,
+            actual,
+        })
+    }
+}
+
 /// Provision the resolved agent commands into `<workdir>/.claude/commands/` so
 /// a `claude` session spawned with `workdir` as its cwd can resolve them as
 /// PROJECT-scoped slash commands — even on a device with no
@@ -572,6 +756,9 @@ pub(crate) fn provision_fleet_commands_for_session(workdir: &str) {
 /// unit test can drive it against a tempdir and assert the result — mirroring
 /// how `provision_agent_definitions` factored out its `_from_root` core.
 ///
+/// Each body is written through [`with_provenance`], so the file on disk is
+/// the resolved body plus one `qontinui-provenance:` frontmatter line.
+///
 /// Idempotent (a second pass over the same dir overwrites rather than errors),
 /// with ONE exception: a destination that already exists AND is tracked in the
 /// enclosing git repository is skipped, logged at `info!`, and counted in
@@ -627,7 +814,10 @@ fn provision_fleet_commands_into(
             out.skip(file_name, capability_manifest::SkipReason::GitTracked);
             continue;
         }
-        std::fs::write(&dst, &command.body)?;
+        std::fs::write(
+            &dst,
+            with_provenance(&command.name, &command.body, command.source),
+        )?;
         out.record_written();
     }
     // Nothing landed at all, so no rung answered for this session — a stated
@@ -664,10 +854,13 @@ mod tests {
             assert!(path.exists(), "{name}.md should exist");
             let on_disk = std::fs::read_to_string(&path).expect("read command");
             assert!(!on_disk.is_empty(), "{name}.md should be non-empty");
+            let (line, stripped) =
+                strip_provenance(&on_disk).expect("every written body carries provenance");
             assert_eq!(
-                &on_disk, body,
-                "{name}.md must be written byte-identically to the embedded default"
+                &stripped, body,
+                "{name}.md minus its provenance line must be byte-identical to the embedded default"
             );
+            assert_eq!(line.source, "builtin");
         }
 
         // Substrings verified present near the top of each bundled file
@@ -738,6 +931,7 @@ mod tests {
             "an override replaces a default; it does not add a file"
         );
         let on_disk = std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).unwrap();
+        let (_, on_disk) = strip_provenance(&on_disk).expect("provenance line");
         assert_eq!(on_disk, "# my own procedure\n");
         assert_ne!(on_disk, default_body);
     }
@@ -893,10 +1087,250 @@ mod tests {
         );
         assert_eq!(out.written, FLEET_COMMANDS.len());
         assert_eq!(
-            &std::fs::read_to_string(&dst).unwrap(),
+            &strip_provenance(&std::fs::read_to_string(&dst).unwrap())
+                .expect("provenance line")
+                .1,
             body,
             "an untracked destination is overwritten exactly as before"
         );
+    }
+
+    /// A provisioned command file, read back.
+    fn provision_one(registry: &AgentCommandRegistry, name: &str) -> String {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let commands_dir = tmp.path().join(".claude").join("commands");
+        provision_fleet_commands_into(&commands_dir, registry).expect("provision");
+        std::fs::read_to_string(commands_dir.join(format!("{name}.md"))).expect("read command")
+    }
+
+    fn embedded(name: &str) -> &'static str {
+        FLEET_COMMANDS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, b)| *b)
+            .unwrap_or_else(|| panic!("{name} is not bundled"))
+    }
+
+    fn override_registry(name: &str, body: &str, source: CommandSource) -> AgentCommandRegistry {
+        let mut registry = AgentCommandRegistry::new();
+        registry.set_overrides(
+            vec![qontinui_types::agent_commands::AgentCommand {
+                id: "id-1".to_string(),
+                organization_id: Some("org-1".to_string()),
+                created_by_user_id: None,
+                name: name.to_string(),
+                body: body.to_string(),
+                checksum: None,
+                is_shared: false,
+                current_version: 1,
+                created_at: "2026-08-04T00:00:00Z".to_string(),
+                updated_at: "2026-08-04T00:00:00Z".to_string(),
+            }],
+            source,
+        );
+        registry
+    }
+
+    /// A body with no frontmatter gets a NEW block whose only line is the
+    /// provenance key, and everything after the block is the body unchanged.
+    #[test]
+    fn a_plain_body_gets_a_new_frontmatter_block_holding_only_the_key() {
+        let original = embedded("vet-plan");
+        assert!(
+            !original.starts_with("---"),
+            "fixture must be frontmatter-free"
+        );
+        let on_disk = provision_one(&AgentCommandRegistry::new(), "vet-plan");
+
+        let lines: Vec<&str> = on_disk.splitn(4, '\n').collect();
+        assert_eq!(lines[0], "---");
+        assert!(
+            lines[1].starts_with(&format!("{PROVENANCE_KEY} source=builtin ")),
+            "line 2 must be the provenance key, got {:?}",
+            lines[1]
+        );
+        assert!(lines[1].contains("canonical=qontinui-claude-config:.claude/commands/vet-plan.md "));
+        assert!(lines[1].ends_with(&format!(" runner_build={RUNNER_BUILD}")));
+        assert_eq!(lines[2], "---");
+        assert_eq!(
+            lines[3], original,
+            "the rest of the file is the body, unchanged"
+        );
+    }
+
+    /// A body that already opens frontmatter keeps it parseable: `---` still at
+    /// line 1, the key first inside the block, every original key after it and
+    /// the closing `---` intact.
+    #[test]
+    fn a_frontmatter_body_keeps_its_keys_with_the_provenance_line_first() {
+        let original = embedded("policy");
+        assert!(
+            original.starts_with("---\n"),
+            "fixture must open frontmatter"
+        );
+        let on_disk = provision_one(&AgentCommandRegistry::new(), "policy");
+
+        let mut lines = on_disk.lines();
+        assert_eq!(lines.next(), Some("---"));
+        assert!(lines.next().unwrap().starts_with(PROVENANCE_KEY));
+        // Everything from the original's line 2 onward follows verbatim.
+        let original_tail = original.split_once('\n').unwrap().1;
+        let written_tail = on_disk
+            .split_once('\n')
+            .unwrap()
+            .1
+            .split_once('\n')
+            .unwrap()
+            .1;
+        assert_eq!(written_tail, original_tail);
+        // The original block's keys are still inside one frontmatter block.
+        let block: Vec<&str> = on_disk
+            .lines()
+            .skip(1)
+            .take_while(|l| *l != "---")
+            .collect();
+        assert!(block.iter().any(|l| l.starts_with("description:")));
+        assert_eq!(
+            on_disk.lines().filter(|l| *l == "---").count(),
+            original.lines().filter(|l| *l == "---").count(),
+            "no fence added or lost"
+        );
+    }
+
+    /// `blob` is the git blob id of the body WITHOUT the key — for a builtin,
+    /// the `git hash-object` of the vendored file itself.
+    #[test]
+    fn the_recorded_blob_is_the_git_blob_id_of_the_original_body() {
+        // Known answer: `printf 'hello\n' | git hash-object --stdin`.
+        assert_eq!(
+            git_blob_id(b"hello\n"),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
+        for name in ["vet-plan", "policy"] {
+            let on_disk = provision_one(&AgentCommandRegistry::new(), name);
+            let (line, _) = strip_provenance(&on_disk).expect("provenance line");
+            let expected =
+                git2::Oid::hash_object(git2::ObjectType::Blob, embedded(name).as_bytes())
+                    .unwrap()
+                    .to_string();
+            assert_eq!(line.blob, expected);
+            assert_eq!(line.blob.len(), 40);
+            assert!(line
+                .blob
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+            // The vendored file on disk, read independently of `include_str!`.
+            let vendored = std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join("fleet_commands")
+                    .join(format!("{name}.md")),
+            )
+            .expect("read vendored file");
+            assert_eq!(line.blob, git_blob_id(&vendored));
+        }
+    }
+
+    /// `strip_provenance` is the exact inverse of `with_provenance` for every
+    /// shape — including CRLF frontmatter and the empty-block edge case whose
+    /// insertion would be ambiguous.
+    #[test]
+    fn strip_provenance_round_trips_every_shape() {
+        let mut shapes: Vec<String> = vec![
+            "# plain\nbody\n".to_string(),
+            "---\ndescription: x\n---\n# body\n".to_string(),
+            "---\r\ndescription: x\r\nname: y\r\n---\r\n# body\r\n".to_string(),
+            "---\n---\n# empty block\n".to_string(),
+            "---\r\n---\r\n# empty CRLF block\n".to_string(),
+            "---\n".to_string(),
+            "---".to_string(),
+            String::new(),
+            "no trailing newline".to_string(),
+        ];
+        shapes.extend(FLEET_COMMANDS.iter().map(|(_, b)| b.to_string()));
+        for body in &shapes {
+            for source in [
+                CommandSource::Builtin,
+                CommandSource::Served,
+                CommandSource::DiskCache,
+            ] {
+                let written = with_provenance("x", body, source);
+                assert!(
+                    written.starts_with("---"),
+                    "frontmatter must start at line 1"
+                );
+                let (line, stripped) = strip_provenance(&written)
+                    .unwrap_or_else(|| panic!("no provenance found in {written:?}"));
+                assert_eq!(&stripped, body, "round trip of {body:?}");
+                assert_eq!(line.source, source.as_str());
+                assert_eq!(provenance_consistent(&written), Ok(line));
+            }
+        }
+        // CRLF frontmatter keeps its own line endings on the inserted line.
+        let crlf = with_provenance("x", "---\r\na: 1\r\n---\r\n", CommandSource::Builtin);
+        assert!(crlf
+            .split_once("\r\n")
+            .unwrap()
+            .1
+            .starts_with(PROVENANCE_KEY));
+        assert!(!crlf.contains("\n---\n"), "no LF-only fence introduced");
+        // A file with no provenance line is not mistaken for one.
+        assert_eq!(strip_provenance("---\ndescription: x\n---\n"), None);
+        assert_eq!(strip_provenance("# plain\n"), None);
+    }
+
+    /// The honest negative, detectable inside ONE file: change a single byte of
+    /// a provisioned body and the recorded blob no longer matches.
+    #[test]
+    fn a_tampered_body_is_detected_from_the_file_alone() {
+        for name in ["vet-plan", "policy"] {
+            let on_disk = provision_one(&AgentCommandRegistry::new(), name);
+            assert!(
+                provenance_consistent(&on_disk).is_ok(),
+                "untampered is consistent"
+            );
+
+            // Flip one byte of the body, well past the frontmatter.
+            let mut bytes = on_disk.clone().into_bytes();
+            let i = bytes
+                .iter()
+                .rposition(|b| b.is_ascii_alphanumeric())
+                .expect("body has an ascii letter");
+            bytes[i] = if bytes[i] == b'x' { b'y' } else { b'x' };
+            let tampered = String::from_utf8(bytes).expect("ascii flip stays utf-8");
+            match provenance_consistent(&tampered) {
+                Err(ProvenanceError::BlobMismatch { recorded, actual }) => {
+                    assert_ne!(recorded, actual)
+                }
+                other => panic!("{name}: a one-byte tamper must be a mismatch, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            provenance_consistent("# no provenance\n"),
+            Err(ProvenanceError::Missing)
+        );
+    }
+
+    /// `source=` names the layer that actually supplied the body.
+    #[test]
+    fn an_override_is_stamped_with_its_own_source() {
+        let (name, _) = FLEET_COMMANDS[0];
+        for source in [CommandSource::Served, CommandSource::DiskCache] {
+            let registry = override_registry(name, "# my own procedure\n", source);
+            let on_disk = provision_one(&registry, name);
+            let (line, body) = strip_provenance(&on_disk).expect("provenance line");
+            assert_eq!(line.source, source.as_str());
+            assert_eq!(body, "# my own procedure\n");
+            assert_eq!(line.blob, git_blob_id(b"# my own procedure\n"));
+            assert_eq!(
+                line.canonical,
+                format!("qontinui-claude-config:.claude/commands/{name}.md")
+            );
+            // Commands the override did not touch still say builtin.
+            let (other, _) = FLEET_COMMANDS[1];
+            let (other_line, _) = strip_provenance(&provision_one(&registry, other)).unwrap();
+            assert_eq!(other_line.source, "builtin");
+        }
     }
 
     /// The gate-registration mechanics every bundled command that teaches
