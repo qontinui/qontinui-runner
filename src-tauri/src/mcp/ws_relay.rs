@@ -44,7 +44,7 @@ use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
 use super::origin_guard::{NormOrigin, RequesterPrincipal};
-use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState, RULE_R1};
+use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
 
@@ -427,34 +427,23 @@ async fn drive_connection(
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
     let conn_id = ws_manager.allocate_conn_id();
 
-    // 2a. R1 against the LIVE routing slot, which `register_with_id` is about
-    //     to displace. The registry row alone is not enough: it can go stale
+    // 2a. The LIVE routing slot, which `register_with_id` is about to
+    //     displace. The registry row alone is not enough: it can go stale
     //     under an open socket — a send task parked inside `sink.send().await`
-    //     never reaches the `heartbeat.tick()` arm that calls `touch`, and a
-    //     same-origin HTTP phone-home for the same id flips the row to
-    //     `Http`/`websocket_conn_id: None`. Either way the row ages out while
-    //     the socket is alive, and without this check a foreign principal
-    //     could then take the slot out from under it.
-    //
-    //     The registry `claim` below remains the ATOMIC gate (check and write
-    //     under one lock); this is a strictly ADDITIONAL refusal in front of
-    //     it, so it can only narrow what is admitted, never widen it.
-    if mode != BindingMode::Off {
-        if let Some((holder_conn, holder_principal)) =
-            ws_manager.holder_for_app(&register.app_id).await
-        {
-            if holder_conn != conn_id && !principal.may_displace(&holder_principal) {
-                if let Err(refusal) = binding.meter(
-                    mode,
-                    &principal,
-                    WS_ROUTE,
-                    Refusal::registration_held(RULE_R1),
-                ) {
-                    return refuse_handshake(sink, &register.app_id, refusal).await;
-                }
-            }
-        }
-    }
+    //     never reaches the `heartbeat.tick()` arm that calls `touch`. It is
+    //     read here (the connection manager has its own lock) and handed to
+    //     `claim`, so the check happens INSIDE the one atomic gate that BOTH
+    //     registrant doors go through — the HTTP register door reaches the
+    //     same takeover with no handshake at all. Our own conn is not in the
+    //     manager yet, so any holder found is a prior one.
+    let slot_holder = if mode == BindingMode::Off {
+        None
+    } else {
+        ws_manager
+            .holder_for_app(&register.app_id)
+            .await
+            .map(|(_, p)| p)
+    };
 
     // 3. Mirror into the app registry so discovery / list endpoints see it.
     let discovered = DiscoveredApp {
@@ -479,6 +468,7 @@ async fn drive_connection(
             &binding,
             &principal,
             WS_ROUTE,
+            slot_holder.as_ref(),
             discovered,
             register.origin.clone(),
             AppTransport::Websocket,
@@ -553,6 +543,7 @@ async fn drive_connection(
     let conn_guard = (mode != BindingMode::Off).then_some(conn_id);
     let send_app_id = register.app_id.clone();
     let send_registry = registry.clone();
+    let send_principal = principal.clone();
     let send_task = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -578,7 +569,9 @@ async fn drive_connection(
                     // every frame; this branch covers the case where the
                     // wrapper is quiet and we're the only thing keeping the
                     // socket warm.
-                    let _ = send_registry.touch(&send_app_id, conn_guard).await;
+                    let _ = send_registry
+                        .touch(&send_app_id, conn_guard, &send_principal)
+                        .await;
                 }
             }
         }
@@ -623,7 +616,9 @@ async fn drive_connection(
             // this app past REGISTRATION_TTL_MS. We skip refresh on Close so
             // a closing tab doesn't briefly look fresh during teardown.
             if !matches!(msg, Message::Close(_)) {
-                let _ = recv_registry.touch(&recv_app_id, conn_guard).await;
+                let _ = recv_registry
+                    .touch(&recv_app_id, conn_guard, &recv_principal)
+                    .await;
             }
 
             match msg {
