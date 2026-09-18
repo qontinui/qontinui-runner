@@ -1378,8 +1378,8 @@ impl NormOrigin {
     ///
     /// The type is `pub` because it rides on [`RequesterPrincipal`]; it is
     /// compared with `PartialEq` (scheme + host + port, the scheme's default
-    /// port made explicit) and carries no accessors until a rule needs one —
-    /// Phase 1's `Principal::same` and `verified_origin` are where that lands.
+    /// port made explicit). The three accessors below are the ones
+    /// `relay_binding::Principal` needs.
     pub(crate) fn parse(raw: &str) -> Option<Self> {
         let raw = raw.trim().trim_end_matches('/');
         if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
@@ -1392,6 +1392,41 @@ impl NormOrigin {
             host,
             port: u.port_or_known_default(),
         })
+    }
+
+    /// `scheme://host[:port]`, with the scheme's default port elided — the
+    /// spelling served as `verifiedOrigin` and compared in log lines. A
+    /// header `https://a.example` and a body `https://a.example:443` both
+    /// render `https://a.example`.
+    pub fn as_origin_string(&self) -> String {
+        let default_port = url::Url::parse(&format!("{}://{}", self.scheme, self.host))
+            .ok()
+            .and_then(|d| d.port_or_known_default());
+        match self.port {
+            Some(p) if Some(p) != default_port => format!("{}://{}:{}", self.scheme, self.host, p),
+            _ => format!("{}://{}", self.scheme, self.host),
+        }
+    }
+
+    /// One of the three spellings of the loopback interface a browser can put
+    /// in an `Origin`. `url` keeps an IPv6 host bracketed, so `[::1]` is the
+    /// host string for `http://[::1]:9875`.
+    pub fn is_loopback_host(&self) -> bool {
+        matches!(self.host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+    }
+
+    /// Principal equality: exact, or the SAME scheme and port under two
+    /// spellings of loopback. Without the second arm the supervisor dashboard
+    /// opened as `localhost:9875` in one tab and `127.0.0.1:9875` in another
+    /// would lock each other out of its one fixed `appId`.
+    pub fn same_principal(&self, other: &Self) -> bool {
+        if self == other {
+            return true;
+        }
+        self.scheme == other.scheme
+            && self.port == other.port
+            && self.is_loopback_host()
+            && other.is_loopback_host()
     }
 }
 

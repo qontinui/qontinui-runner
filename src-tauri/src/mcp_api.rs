@@ -1529,6 +1529,13 @@ async fn health(
         // Foreign requester, since they name the other sites that reached this
         // runner.
         "originGuard": crate::mcp::origin_guard::health_json(requester.map(|e| e.0.class)),
+        // UI Bridge relay principal binding (plan 2026-09-17-ui-bridge-relay-
+        // registration-is-unauthenticated): both kill-switch modes, the
+        // per-rule wouldRefuse/refused counts and the last 20 (rule, class,
+        // route) tuples. Phase 4 decides the graduation of R6, R8 and
+        // R9-unkeyed from exactly these counters, so they are served here
+        // rather than only to the test harness. The tuples carry no origin.
+        "uiBridgeBinding": state.relay_binding.health_json(),
         "storage": {
             "apiPort": api_port,
             "namespaceSuffix": storage_namespace_suffix,
@@ -8640,8 +8647,12 @@ pub fn create_router(
     // `State<'_, Arc<ApiState>>` can resolve it.
     app_handle.manage(api_state.clone());
 
-    // Spawn the background sweeper that evicts stale phone-home registrations.
-    crate::mcp::app_registry::spawn_sweeper(api_state.app_registry.clone());
+    // Spawn the background sweeper that evicts stale phone-home registrations
+    // (and, on the same tick, expired relay-binding tombstones).
+    crate::mcp::app_registry::spawn_sweeper(
+        api_state.app_registry.clone(),
+        api_state.relay_binding.clone(),
+    );
 
     // Set up UI Bridge response listener
     // This listens for "ui-bridge-response" events from the React frontend
@@ -17573,6 +17584,81 @@ mod supervised_workers_health_tests {
             "async fn health must emit `supervised_workers` from supervised_workers_json()"
         );
         // And the route is still the one the block is documented on.
+        assert!(
+            src.contains(".route(\"/health\", get(health))"),
+            "`/health` must still be served by `health`"
+        );
+    }
+}
+
+/// `/health` `uiBridgeBinding` (plan
+/// `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`, Phase 1).
+///
+/// Phase 4 graduates R6, R8 and R9-unkeyed from exactly these counters, so an
+/// OPERATOR has to be able to read them — `relay_binding/tests.rs` serves its
+/// own `/test-health` stub, which proves nothing about the real handler.
+/// `ApiState` owns a `tauri::AppHandle` no test can build, so the RENDER is
+/// asserted through `RelayBinding::health_json` and the WIRING against the
+/// handler's own source, the same split the `supervised_workers` block above
+/// uses for the same reason.
+#[cfg(test)]
+mod ui_bridge_binding_health_tests {
+    use crate::mcp::relay_binding::{BindingConfig, BindingMode, RelayBinding};
+
+    #[test]
+    fn the_block_renders_both_modes_the_env_names_and_per_rule_counts() {
+        let binding = RelayBinding::new(BindingConfig {
+            binding: BindingMode::Enforce,
+            active_binding: BindingMode::Shadow,
+        });
+        binding.counters.record("R1", true);
+        binding.counters.record("R6", false);
+
+        let v = binding.health_json();
+        assert_eq!(v["binding"], "enforce");
+        assert_eq!(v["activeBinding"], "shadow");
+        assert_eq!(v["bindingEnv"], "QONTINUI_RUNNER_UIBRIDGE_BINDING");
+        assert_eq!(
+            v["activeBindingEnv"],
+            "QONTINUI_RUNNER_UIBRIDGE_ACTIVE_BINDING"
+        );
+        assert_eq!(v["rules"]["R1"]["refused"], 1, "{v}");
+        assert_eq!(v["rules"]["R6"]["wouldRefuse"], 1, "{v}");
+        assert!(
+            v["recent"].is_array(),
+            "the (rule, class, route) tuples: {v}"
+        );
+        assert!(v["tombstoneMs"].is_i64(), "{v}");
+    }
+
+    #[test]
+    fn the_health_handler_emits_the_ui_bridge_binding_block() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp_api.rs"),
+        )
+        .expect("read mcp_api.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.starts_with("async fn health("))
+            .expect("the /health handler is `async fn health(`");
+        let end = lines[start..]
+            .iter()
+            .position(|l| *l == "}")
+            .map(|i| start + i)
+            .expect("the handler closes at column 0");
+        let region = lines[start..=end]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            region.contains("\"uiBridgeBinding\": state.relay_binding.health_json()"),
+            "async fn health must emit `uiBridgeBinding` from the ONE shared \
+             RelayBinding on ApiState — the relay_binding test harness's \
+             /test-health stub is not this surface"
+        );
         assert!(
             src.contains(".route(\"/health\", get(health))"),
             "`/health` must still be served by `health`"
