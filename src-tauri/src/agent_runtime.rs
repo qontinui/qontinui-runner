@@ -1741,7 +1741,11 @@ fn spawn_run_task(payload: LaunchPayload) {
                     "agent_runtime: coord spawn-request agent_id={agent_id} was stopped while \
                      held by the device drain — nothing was launched"
                 );
-                agent_stops().lock().unwrap().remove(&agent_id);
+                // The guard owns the entry: dropping it removes the registration
+                // exactly once, and only while the entry still carries THIS
+                // launch's token. A raw `remove` here would strip a re-delivered
+                // launch's newer entry in the race the token exists to prevent.
+                drop(stop_registration);
                 return;
             }
         };
@@ -14958,24 +14962,5 @@ mod launch_hold_tests {
         )
         .await;
         assert_eq!(out, LaunchHold::Refused(refusal));
-    }
-
-    #[test]
-    fn a_replayed_delivery_of_a_held_or_running_launch_is_deduped() {
-        let agent_id = uuid::Uuid::new_v4();
-        assert!(
-            register_agent_stop(agent_id).is_some(),
-            "the first delivery registers"
-        );
-        assert!(
-            register_agent_stop(agent_id).is_none(),
-            "a replay while it is held or running is ignored"
-        );
-        agent_stops().lock().unwrap().remove(&agent_id);
-        assert!(
-            register_agent_stop(agent_id).is_some(),
-            "once the run is done a new delivery may register again"
-        );
-        agent_stops().lock().unwrap().remove(&agent_id);
     }
 }

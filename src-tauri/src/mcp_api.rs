@@ -13051,6 +13051,12 @@ mod memory_search_enrichment_tests {
     /// asserts a DELTA rather than an absolute.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_skip_lands_in_its_own_series_and_not_in_enriched() {
+        // Same serialisation as the other two counter-delta tests in this
+        // module: these assertions are a BEFORE/AFTER read of process-global
+        // atomics, so a sibling test incrementing `enriched` between the two
+        // reads fails this one. Without it the suite carries a latent race —
+        // observed failing here with left: 1, right: 0.
+        let _serialised = series_lock();
         let read = |k: &str| {
             memory_enrich_health_snapshot()
                 .get(k)
