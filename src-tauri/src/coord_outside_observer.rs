@@ -116,12 +116,29 @@
 //! report, not a blind spot.
 //!
 //! What remains of the truncation story for (ii): `counts.dead` genuinely
-//! spans the follower plane as well, so a surplus there is ordinary and only
-//! [`LedgerRead::dead_is_underread`] — a surplus ON A TRUNCATED LIST — is
-//! evidence of a blind spot. The two predicates are NOT analogues, and the
-//! asymmetry between [`LedgerRead::dead_is_underread`] and
+//! spans the follower plane as well, so a surplus there cannot be read as
+//! (ii) FIRING, and only [`LedgerRead::dead_is_underread`] — a surplus ON A
+//! TRUNCATED LIST, after the follower-plane rows this read classified are
+//! subtracted — is evidence of a truncation blind spot. That asymmetry with
 //! [`LedgerRead::leaderless_is_underread`] is load-bearing rather than an
 //! oversight.
+//!
+//! **It settles truncation only, and an earlier revision of this paragraph
+//! wrongly read as settling (ii)'s OBSERVABILITY too.** It does not: "a
+//! surplus on `counts.dead` is ordinary" says why that count cannot DRIVE
+//! (ii), and says nothing about whether (ii) was observed. So (ii) needs its
+//! own observability defense, and [`LedgerRead::unclassified`] is it — the
+//! rows this build could not place in ANY bucket. Predicate (ii)'s population
+//! is read off the list and only off the list, so a list this build cannot
+//! READ leaves (ii) unobserved however the counts fall, with no truncation in
+//! it at all: retype `leader_gated` to the string `"true"`, or rename
+//! `status`, and every row falls out of the classifier while
+//! `non_nominal_workers_truncated` stays `false`. `unclassified` catches both
+//! retypes and renames, it is a property of this build's own reading rather
+//! than of a coord field that could itself be renamed next, and it rides
+//! [`LedgerRead::unobserved_reason`] into predicate (iv). With it in place
+//! both halves of (ii) are covered: the count governs firing, the classifier
+//! governs observability.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -178,6 +195,18 @@ const FINDING_TOPIC: &str = "coord-merge-train";
 /// (pre-migration, or a replica that has never observed a row). Never a clean
 /// fleet — see the module doc.
 const NO_OBSERVATION_SUBCLASS: &str = "workers:no_observation";
+
+/// coord's rollup status for a worker whose loop task is gone.
+const DEAD_STATUS: &str = "dead";
+
+/// Every rollup status `qontinui-coord`'s `WorkerLiveness::as_str` can emit.
+///
+/// A listed row carrying one of these was READ, whether or not this module
+/// holds a predicate over it. Anything else is a shape this build cannot
+/// read, and lands in [`LedgerRead::unclassified`] — so this constant is the
+/// line between "deliberately not my class" and "I could not tell what this
+/// row was", and widening it silently is how predicate (ii) goes blind again.
+const KNOWN_ROLLUP_STATUSES: [&str; 4] = ["alive", "stale", DEAD_STATUS, "not_leader_here"];
 
 // ---------------------------------------------------------------------------
 // Fault classes
@@ -322,7 +351,12 @@ pub struct LedgerRead {
     /// **It is NOT an analogue of [`Self::counts_dead`], and the difference
     /// is the whole of predicate (iii).** `counts.dead` spans the follower
     /// plane, so a surplus over the leader-gated rows this module classifies
-    /// is ordinary. `counts.not_leader_here` cannot: in `qontinui-coord`,
+    /// does not on its own say a dead worker went unseen, and that count
+    /// therefore cannot DRIVE predicate (ii) the way this one drives (iii).
+    /// It says nothing about whether (ii) was OBSERVED — that half is
+    /// [`Self::unclassified`]'s, and conflating the two is how (ii) stayed
+    /// blind to a `leader_gated` retype long after (iii) was fixed.
+    /// `counts.not_leader_here` needs neither defense: in `qontinui-coord`,
     ///
     /// * `WorkerLiveness::NotLeaderHere` is reachable only from
     ///   `last_outcome == FollowerSkip` (`worker_ledger.rs`);
@@ -345,6 +379,56 @@ pub struct LedgerRead {
     /// came from a replica a deploy had already replaced. Reported in the body
     /// so an excluded row is visible rather than silently dropped.
     pub rolled_off_excluded: Vec<String>,
+    /// `dead` rows this read SAW, classified, and deliberately dropped as
+    /// follower-plane (`leader_gated: false`) — not this observer's class,
+    /// and visible to coord's own pager.
+    ///
+    /// Carried for exactly one reason: [`Self::dead_unaccounted`] subtracts
+    /// it. Without that subtraction a dead follower row is counted by
+    /// `counts.dead` and named by NOTHING this runner tracks, so on any fleet
+    /// whose non-nominal population passes the 40-row cap the surplus is
+    /// permanently non-zero, [`Self::dead_is_underread`] is permanently true,
+    /// and [`Self::unobserved_reason`] reports "the list named none of the N
+    /// dead workers" about a list that named every one of them. Routed into
+    /// [`ObserverState::unobserved_streak`], which only a SETTLING read
+    /// clears, that is a permanent false `LivenessUnknown` card plus an
+    /// hourly `warn!` — on the one surface whose entire meaning is *"I have
+    /// no verdict"*. A row that was read and judged is not an unread one,
+    /// which is the same rule [`Self::rolled_off_excluded`] is subtracted
+    /// under.
+    pub dead_follower_plane: u64,
+    /// Rows in `non_nominal_workers` this build could not place in ANY
+    /// bucket, labelled with what made them unreadable — predicate (ii)'s
+    /// observability defense, and the F1 half the truncation story never
+    /// covered.
+    ///
+    /// A row is unclassified when `leader_gated` is absent or is not a bool
+    /// at all (a `false` is READ and deliberately dropped, and lands in
+    /// [`Self::dead_follower_plane`] instead), or when its `status` is
+    /// outside [`KNOWN_ROLLUP_STATUSES`] and it carries no `no_leader_tick`
+    /// reason to rescue it. Both arms are shape faults in THIS build's
+    /// reading, never a judgement about the fleet:
+    ///
+    /// * a `stale` or `alive` leader-gated row is CLASSIFIED — this module
+    ///   deliberately holds no predicate over it, so counting it here would
+    ///   false-positive on every ordinary fleet;
+    /// * a `leader_gated` retyped to the string `"true"`, and a renamed
+    ///   `status`, are the two shapes that used to drop every row silently
+    ///   while `non_nominal_workers_truncated` read `false` — a truncation-
+    ///   gated under-read predicate cannot see either.
+    ///
+    /// Chosen over the other sufficient defense (compare `listed.len()`
+    /// against `counts.non_nominal` on an untruncated read) because that one
+    /// catches the retype and MISSES the rename outright: a renamed `status`
+    /// leaves the list complete, so `listed.len() == counts.non_nominal`
+    /// exactly while nothing in it classifies. It also would have made this
+    /// module depend on one more coord field whose absence it must then treat
+    /// as UNKNOWN — a second shape dependency on the response this defense
+    /// exists to be robust against.
+    pub unclassified: Vec<String>,
+    /// How many rows `non_nominal_workers` carried, for a report that can say
+    /// "N of M" rather than "N".
+    pub listed_rows: u64,
     /// coord's own `components.non_nominal_workers_truncated`.
     ///
     /// The list is capped at `QUERY_WORKERS_MAX_LISTED` (40) by
@@ -399,15 +483,28 @@ impl LedgerRead {
     /// the rolled-off discrimination, so a non-zero value is ordinary on an
     /// untruncated list. It is only evidence of a BLIND SPOT when
     /// [`Self::list_truncated`] is also true.
+    ///
+    /// **Every row this read had an OPINION about is subtracted, not only the
+    /// ones it kept.** All three subtrahends are rows coord counted and this
+    /// runner READ: the ones it judged dead-and-leader-gated, the ones it
+    /// excluded as a deploy-roll artifact, and the ones it dropped as
+    /// follower-plane. Leaving that last class in was a real defect, not a
+    /// conservative margin — see [`Self::dead_follower_plane`] for the
+    /// permanent false page it produced.
     pub fn dead_unaccounted(&self) -> u64 {
         self.counts_dead
             .saturating_sub(self.dead_leader_gated.len() as u64)
             .saturating_sub(self.rolled_off_excluded.len() as u64)
+            .saturating_sub(self.dead_follower_plane)
     }
 
     /// True when coord counted dead workers this runner could not see,
-    /// BECAUSE the list was truncated. The one shape that would otherwise
-    /// render a real outage as silence.
+    /// BECAUSE the list was truncated.
+    ///
+    /// This is (ii)'s TRUNCATION defense and only that. The other way (ii)
+    /// goes blind — a list this build cannot classify, whole and untruncated
+    /// — is [`Self::classification_is_underread`]; both feed
+    /// [`Self::unobserved_reason`], and neither covers the other's shape.
     pub fn dead_is_underread(&self) -> bool {
         self.list_truncated && self.dead_unaccounted() > 0
     }
@@ -426,8 +523,7 @@ impl LedgerRead {
 
     /// True when coord counted leaderless workers this runner could not name.
     ///
-    /// **Deliberately NOT conditioned on [`Self::list_truncated`], and that
-    /// asymmetry with [`Self::dead_is_underread`] is the point.** The
+    /// **Deliberately NOT conditioned on [`Self::list_truncated`].** The
     /// conjunct used to be there, justified by a claim that a surplus was
     /// ordinary on an untruncated list; that claim was false (see
     /// [`Self::counts_not_leader_here`]) and it opened a silent false
@@ -445,8 +541,47 @@ impl LedgerRead {
     /// It is a REPORTING signal, not a gate. Predicate (iii) advances on
     /// [`Self::counts_not_leader_here`] either way; this is what lets the
     /// report say the names were unavailable instead of printing nothing.
+    ///
+    /// The asymmetry with [`Self::dead_is_underread`] survives, but read it
+    /// narrowly: `dead_is_underread` is the TRUNCATION half of (ii) and is
+    /// gated on truncation because that is the only shape it claims to
+    /// cover. The retype/rename shape this doc names above is (ii)'s too, and
+    /// [`Self::classification_is_underread`] carries it — ungated, exactly
+    /// like this predicate, and for the same reason.
     pub fn leaderless_is_underread(&self) -> bool {
         self.leaderless_unaccounted() > 0
+    }
+
+    /// True when this read established NO predicate of its own: it named no
+    /// dead leader-gated worker, and coord's leaderless population is zero
+    /// however it is counted.
+    ///
+    /// It gates the classification arm of [`Self::unobserved_reason`] for the
+    /// reason [`ObserverState::observe_unobserved`] suppresses itself under a
+    /// fired predicate (i): *"I have no verdict"* is FALSE beside a verdict,
+    /// and a `LivenessUnknown` card raised next to a `NoLeader` one would say
+    /// coord was unobserved on a cycle whose own report quotes what coord
+    /// said. The unreadable rows still travel — [`render_read`] puts them on
+    /// that card's body as `rows_this_build_could_not_classify` — so the
+    /// blind spot is disclosed where the operator is already looking rather
+    /// than suppressed.
+    fn observed_nothing_else(&self) -> bool {
+        self.dead_leader_gated.is_empty()
+            && self.counts_not_leader_here == 0
+            && self.leaderless.is_empty()
+    }
+
+    /// True when this build failed to place at least one listed row in any
+    /// bucket — predicate (ii)'s observability defense.
+    ///
+    /// Unlike [`Self::dead_is_underread`] it is not gated on truncation and
+    /// does not consult a single count, because the shape it exists for has
+    /// neither: a `leader_gated` coord emits as the string `"true"`, or a
+    /// renamed `status`, drops every row through the classifier while the
+    /// list is WHOLE and coord's truncation flag reads `false`. See
+    /// [`Self::unclassified`].
+    pub fn classification_is_underread(&self) -> bool {
+        !self.unclassified.is_empty()
     }
 
     /// Why this read left a predicate UNOBSERVED, or `None` when it settled
@@ -455,16 +590,38 @@ impl LedgerRead {
     ///
     /// Only (ii) can reach here. (iii) is settled either way by
     /// [`Self::counts_not_leader_here`]: a zero is a leader, a non-zero is
-    /// predicate (iii) itself. (ii) is unobserved only when the truncated
-    /// list named NONE of the dead workers coord counted — a read that named
-    /// one has already put a `WorkerDead` card up and the operator is looking.
+    /// predicate (iii) itself. (ii) is unobserved on two shapes, and they are
+    /// independent:
+    ///
+    /// 1. **the classifier failed** — at least one listed row was unreadable,
+    ///    so (ii)'s population was never fully assembled. Gated on nothing
+    ///    about truncation, because the shapes it catches (a `leader_gated`
+    ///    retype, a `status` rename) leave the list whole and coord's flag
+    ///    `false`; gated only on [`Self::observed_nothing_else`], so it never
+    ///    contradicts a verdict this same read produced;
+    /// 2. **the cap ate them all** — the truncated list named NONE of the
+    ///    dead workers coord counted, after the rows this read DID classify
+    ///    (kept, excluded, or dropped as follower-plane) are subtracted. A
+    ///    read that named one has already put a `WorkerDead` card up and the
+    ///    operator is looking.
     pub fn unobserved_reason(&self) -> Option<String> {
+        if self.classification_is_underread() && self.observed_nothing_else() {
+            return Some(format!(
+                "coord answered and this runner could not classify {} of the {} row(s) in its \
+                 `non_nominal_workers` list ({}) — predicate (ii)'s population is read off those \
+                 rows, so it was not observed on this cycle",
+                self.unclassified.len(),
+                self.listed_rows,
+                self.unclassified.join("; "),
+            ));
+        }
         if self.dead_leader_gated.is_empty() && self.dead_is_underread() {
             return Some(format!(
                 "coord answered and its `non_nominal_workers` list was TRUNCATED, naming none of \
-                 the {} dead worker(s) `counts.dead` reports — predicate (ii) was not observed \
-                 on this cycle",
-                self.counts_dead
+                 the {} dead worker(s) `counts.dead` reports that this read did not otherwise \
+                 account for ({} counted in all) — predicate (ii) was not observed on this cycle",
+                self.dead_unaccounted(),
+                self.counts_dead,
             ));
         }
         None
@@ -636,13 +793,39 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
         counts_dead,
         counts_not_leader_here,
         list_truncated,
+        listed_rows: listed.len() as u64,
         ..LedgerRead::default()
     };
     for row in &listed {
         // Leader-gated only. A follower-plane worker's death is not the class
         // this observer exists for, and coord's own pager can see it.
-        if row.get("leader_gated").and_then(JsonValue::as_bool) != Some(true) {
-            continue;
+        //
+        // Three arms rather than `and_then(as_bool) != Some(true)`, because
+        // that spelling collapsed two different facts into one `continue`: a
+        // row READ and deliberately dropped (`false`), and a row this build
+        // could not read at all (absent, or a bool retyped to a string). The
+        // collapse is what let a `leader_gated: "true"` drop every row in
+        // silence on an UNTRUNCATED list — see `LedgerRead::unclassified`.
+        match row.get("leader_gated") {
+            Some(JsonValue::Bool(true)) => {}
+            Some(JsonValue::Bool(false)) => {
+                // Read, judged, out of scope — and REMEMBERED, because
+                // `counts.dead` spans this plane and `dead_unaccounted()`
+                // must subtract what this read accounted for. See
+                // `LedgerRead::dead_follower_plane`.
+                if row.get("status").and_then(JsonValue::as_str) == Some(DEAD_STATUS) {
+                    read.dead_follower_plane = read.dead_follower_plane.saturating_add(1);
+                }
+                continue;
+            }
+            other => {
+                read.unclassified.push(format!(
+                    "`{}`: `leader_gated` is {} rather than a bool",
+                    row_name(row),
+                    other.map(kind_of).unwrap_or("absent"),
+                ));
+                continue;
+            }
         }
         let verdict = worker_verdict(row);
         // Cloned rather than matched in place: the arms MOVE `verdict`, and a
@@ -675,10 +858,26 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
             // live replica reports `alive`. `reason` is the primary key
             // because it is the field coord sets for precisely this state.
             "not_leader_here" => read.leaderless.push(verdict),
-            _ => {
+            other => {
                 if verdict.reason.as_deref() == Some("no_leader_tick") {
                     read.leaderless.push(verdict);
+                } else if !KNOWN_ROLLUP_STATUSES.contains(&other) {
+                    // A status outside coord's own vocabulary: renamed key,
+                    // renamed value, or a variant this build predates. Either
+                    // way this row was NOT placed, and predicate (ii) reads
+                    // its population off these rows — so say so rather than
+                    // dropping it into the same silence `alive`/`stale` get.
+                    read.unclassified.push(format!(
+                        "`{}`: status `{}` is outside this build's vocabulary",
+                        verdict.name,
+                        truncate(other, 40),
+                    ));
                 }
+                // `alive` and `stale` land here and are CLASSIFIED: this
+                // module holds no predicate over them (the `stale` gap is
+                // coord's own pager's, and it sees it while a leader is
+                // live), so counting them as unreadable would page on every
+                // ordinary fleet.
             }
         }
     }
@@ -695,6 +894,15 @@ fn kind_of(v: &JsonValue) -> &'static str {
         JsonValue::Array(_) => "array",
         JsonValue::Object(_) => "object",
     }
+}
+
+/// A row's `name` for a diagnostic label, without building a whole
+/// [`WorkerVerdict`] out of a row that did not classify.
+fn row_name(row: &JsonValue) -> String {
+    row.get("name")
+        .and_then(JsonValue::as_str)
+        .map(|n| truncate(n, 80))
+        .unwrap_or_else(|| "(unnamed)".to_string())
 }
 
 fn worker_verdict(row: &JsonValue) -> WorkerVerdict {
@@ -1098,7 +1306,10 @@ fn render_read(read: &LedgerRead) -> String {
         "dead_leader_gated": read.dead_leader_gated.iter().map(worker_json).collect::<Vec<_>>(),
         "leaderless": read.leaderless.iter().map(worker_json).collect::<Vec<_>>(),
         "excluded_as_rolled_off_replica": read.rolled_off_excluded,
+        "dead_dropped_as_follower_plane": read.dead_follower_plane,
         "non_nominal_workers_truncated": read.list_truncated,
+        "listed_rows": read.listed_rows,
+        "rows_this_build_could_not_classify": read.unclassified,
         "dead_unaccounted_for_in_the_list": read.dead_unaccounted(),
         "not_leader_here_unaccounted_for_in_the_list": read.leaderless_unaccounted(),
     }))
@@ -1965,7 +2176,13 @@ mod tests {
             panic!("expected a Read");
         };
         assert!(!read.list_truncated);
-        assert_eq!(read.dead_unaccounted(), 5);
+        // 4, not 5: this constant CHANGED deliberately. One of coord's five
+        // dead workers is the follower-plane row in this very list — read,
+        // classified and dropped as out of scope — so `dead_unaccounted()`
+        // now subtracts it along with the kept and excluded rows. The old 5
+        // counted a row the observer had in its hand as one it never saw.
+        assert_eq!(read.dead_follower_plane, 1);
+        assert_eq!(read.dead_unaccounted(), 4);
         assert!(
             !read.dead_is_underread(),
             "an untruncated list was fully read, whatever the counts say"
@@ -2138,10 +2355,216 @@ mod tests {
         );
     }
 
+    /// **F1 — the D1 shape on predicate (ii)'s side of the house.** The
+    /// mirror of
+    /// `an_untruncated_read_that_named_no_leaderless_row_is_under_read_and_still_fires`,
+    /// and the defect that shape's fix deliberately left open: (iii) was made
+    /// immune by reading `counts.not_leader_here`, and (ii) — which has no
+    /// count it can read, because `counts.dead` spans the follower plane —
+    /// was left on the LIST with only a truncation-gated defense.
+    ///
+    /// So the same retype sinks it. coord emits `leader_gated` as the string
+    /// `"true"` (or renames `status`); every row drops out of
+    /// `classify_ledger`; `counts.dead` says 12; the list is WHOLE and
+    /// `non_nominal_workers_truncated` is `false`. Before
+    /// `LedgerRead::unclassified`, `dead_is_underread()`'s `list_truncated &&`
+    /// conjunct read `false`, `unobserved_reason()` returned `None`, and the
+    /// (iv) counter was CLEARED every cycle — no card, no incident line, no
+    /// finding, indefinitely, on a runner that could not read a single row.
+    #[test]
+    fn an_untruncated_read_that_classified_no_row_is_under_read_and_reaches_predicate_four() {
+        // Both silent retypes, on DEAD rows this time: a `leader_gated`
+        // emitted as a string is dropped by the leader-gated filter, and a
+        // `status` coord spells differently falls through the match below it.
+        let retyped_gate = |name: &str| {
+            let mut row = dead_row(name, true, false);
+            row["leader_gated"] = json!("true");
+            row
+        };
+        let status_renamed = |name: &str| {
+            let mut row = dead_row(name, true, false);
+            row["status"] = json!("Dead");
+            row["reason"] = json!("deadLoop");
+            row
+        };
+        let body = ledger_body(
+            12,
+            json!([
+                retyped_gate("merge_dispatch"),
+                retyped_gate("gate_sweep"),
+                status_renamed("alert_pageout_worker"),
+            ]),
+        );
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read — the body parses; it is the ROWS that do not");
+        };
+
+        assert!(!read.list_truncated, "no truncation is involved");
+        assert!(
+            read.dead_leader_gated.is_empty() && read.rolled_off_excluded.is_empty(),
+            "every row was dropped, unclassified"
+        );
+        assert_eq!(
+            read.dead_follower_plane, 0,
+            "a retyped gate is NOT a read `false` — it must not be accounted for as one"
+        );
+        assert_eq!(read.counts_dead, 12);
+        assert!(
+            !read.dead_is_underread(),
+            "the truncation-gated predicate still cannot see this — which is the point"
+        );
+        assert!(
+            read.classification_is_underread(),
+            "a list this build could not classify leaves (ii) unobserved, truncation or not"
+        );
+        let reason = read
+            .unobserved_reason()
+            .expect("an unreadable list settles nothing about (ii)");
+        assert!(
+            reason.contains("could not classify 3 of the 3 row(s)"),
+            "{reason}"
+        );
+        assert_eq!(
+            read.unclassified.len(),
+            3,
+            "all three rows are unreadable, and named: {:?}",
+            read.unclassified
+        );
+
+        // …and it is not merely flagged: it rides the counter that nothing
+        // but a settling read clears, and reaches predicate (iv).
+        let outcome = ProbeOutcome::Read(read);
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            fired.extend(state.observe(&outcome));
+        }
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].class, FaultClass::LivenessUnknown);
+        assert!(
+            fired[0].summary.contains("could not classify"),
+            "{}",
+            fired[0].summary
+        );
+    }
+
+    /// The other half of F1's fix, so it cannot be "hardened" into a predicate
+    /// that pages on every ordinary fleet: a leader-gated `stale` or `alive`
+    /// row is CLASSIFIED. This module deliberately holds no predicate over
+    /// either (the `stale` class is coord's own pager's, and it sees it while
+    /// a leader is live), and counting a deliberate non-interest as an
+    /// unreadable row would make `LivenessUnknown` permanent everywhere.
+    #[test]
+    fn a_status_this_module_ignores_is_classified_not_unreadable() {
+        let mut stale = no_leader_row("some.sweep");
+        stale["status"] = json!("stale");
+        stale["live_status"] = json!("stale");
+        stale["reason"] = json!("stale");
+        let mut alive = no_leader_row("other.sweep");
+        alive["status"] = json!("alive");
+        alive["live_status"] = json!("alive");
+        alive["reason"] = json!(null);
+
+        let body = ledger_body(0, json!([stale, alive]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(
+            read.unclassified.is_empty(),
+            "a known status this module ignores was READ: {:?}",
+            read.unclassified
+        );
+        assert!(!read.classification_is_underread());
+        assert_eq!(read.unobserved_reason(), None);
+    }
+
+    /// **F2 — a PERMANENT false page on a fleet this observer fully
+    /// observed.** `dead_unaccounted()` subtracted the rows it kept and the
+    /// rows it excluded, but not the dead rows it READ and dropped as
+    /// follower-plane. Any fleet with more than 40 non-nominal workers (41
+    /// stale rows will do — no dead row is needed to trip the cap) plus one
+    /// dead follower-plane worker therefore produced a permanent
+    /// `dead_is_underread()`, an hourly `warn!`, and — routed into a counter
+    /// only a settling read clears — a `LivenessUnknown` card that never
+    /// comes down, saying the list named none of the dead workers coord
+    /// counted about a list that named every one of them.
+    #[test]
+    fn a_truncated_list_that_named_every_dead_worker_is_not_under_read() {
+        // coord counts 2 dead; both are in the list, both follower-plane,
+        // both read and correctly judged out of scope. The list is truncated
+        // because 41 OTHER non-nominal rows tripped the cap — which is a fact
+        // about `stale` rows, not about anything predicate (ii) cares for.
+        let body = truncated_ledger_body(
+            2,
+            json!([
+                dead_row("follower.one", false, false),
+                dead_row("follower.two", false, false),
+            ]),
+        );
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(read.list_truncated);
+        assert_eq!(read.counts_dead, 2);
+        assert_eq!(
+            read.dead_follower_plane, 2,
+            "both dead rows were READ and classified"
+        );
+        assert_eq!(
+            read.dead_unaccounted(),
+            0,
+            "a row this read judged is not a row it missed"
+        );
+        assert!(
+            !read.dead_is_underread(),
+            "predicate (ii) WAS observed on this cycle: the list named both dead workers"
+        );
+        assert_eq!(
+            read.unobserved_reason(),
+            None,
+            "nothing about this read is UNKNOWN"
+        );
+
+        // 200 probes of it, because the defect's whole character is that it
+        // never clears: the counter it fed is reset only by a settling read.
+        let outcome = ProbeOutcome::Read(read);
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..200 {
+            fired.extend(state.observe(&outcome));
+        }
+        assert!(
+            fired.is_empty(),
+            "a fully-observed fleet must raise no card, ever: {fired:?}"
+        );
+    }
+
+    /// F2's fix must not blunt the truncation predicate it corrects: a
+    /// truncated list that named SOME of the dead workers is still an
+    /// under-read for the rest.
+    #[test]
+    fn a_truncated_list_is_still_under_read_for_the_dead_rows_it_did_not_name() {
+        let body = truncated_ledger_body(
+            4,
+            json!([
+                dead_row("follower.one", false, false),
+                dead_row("a.sweep", true, false),
+            ]),
+        );
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        // 4 counted − 1 leader-gated named − 1 follower-plane read = 2 unseen.
+        assert_eq!(read.dead_unaccounted(), 2);
+        assert!(read.dead_is_underread());
+    }
+
     /// D1's asymmetry, pinned so nobody "fixes" it into a second analogue:
-    /// `counts.dead` genuinely spans the follower plane, so a surplus there is
-    /// ordinary on a whole list and `dead_is_underread` MUST stay conditioned
-    /// on truncation.
+    /// `counts.dead` genuinely spans the follower plane, so a surplus there
+    /// cannot DRIVE predicate (ii) and `dead_is_underread` MUST stay
+    /// conditioned on truncation. (ii)'s OBSERVABILITY is a separate
+    /// question, answered by `classification_is_underread` — see F1's test
+    /// above.
     #[test]
     fn the_two_under_read_predicates_are_not_analogues() {
         let body = ledger_body(5, json!([dead_row("follower.loop", false, false)]));
@@ -2149,7 +2572,11 @@ mod tests {
             panic!("expected a Read");
         };
         assert!(!read.list_truncated);
-        assert_eq!(read.dead_unaccounted(), 5);
+        // 4, not 5 — the same deliberate correction as
+        // `an_untruncated_list_is_never_under_read_however_the_counts_fall`:
+        // the one follower-plane row in this list was SEEN, so it is
+        // accounted for rather than counted as missing.
+        assert_eq!(read.dead_unaccounted(), 4);
         assert!(
             !read.dead_is_underread(),
             "an untruncated `counts.dead` surplus is the follower plane, not a blind spot"
