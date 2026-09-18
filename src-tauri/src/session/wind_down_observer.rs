@@ -272,8 +272,15 @@ pub async fn fresh_pass(app: &tauri::AppHandle, grace: Duration) -> FreshPass {
 /// deliberately: the verdict folds FIVE inputs and a pane observation refreshes
 /// only two of them. A cheaper partial re-check would leave `has_live_children`
 /// and coord's work axis frozen at the tick's start, which is the very
-/// staleness this exists to remove. The cost is one census plus one bulk
-/// work-status read per close, paid only while the device is drained.
+/// staleness this exists to remove.
+///
+/// **What it costs, in full.** One process-table census, plus one bulk
+/// work-status read — and that read is a coord HTTP call whose credential
+/// resolution can block on the platform keychain. At `MAX_CLOSES_PER_TICK` of
+/// four, with the first candidate exempt, that is up to three per tick, paid
+/// only while the device is drained. It buys the difference between closing a
+/// session on a verdict and closing one on a verdict that was true four
+/// minutes ago.
 ///
 /// `None` means the session is no longer a top-level terminal-hosted `claude`
 /// this pass can see at all — which is not eligibility either.
