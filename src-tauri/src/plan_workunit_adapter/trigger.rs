@@ -5395,6 +5395,28 @@ mod tests {
     use anyhow::Result;
     use std::sync::Mutex;
 
+    /// W2: [`read_device_binding_count`] fills `local` from
+    /// `auth::device_binding_count`, and nothing else observes WHICH auth
+    /// function that is — `work_unit_write_posture` is tested as a pure
+    /// function and `LoopState` injects the reading. A malformed 2-entry
+    /// `bindings` array is the shape where the two auth parsers diverge: the
+    /// strict one calls it Unknown, which collapses to ONE and would turn this
+    /// device's withheld posture into a write in another tenant's name.
+    #[test]
+    fn read_device_binding_count_reads_the_devices_own_loose_count() {
+        let amb = crate::test_env::isolated_ambient();
+        std::fs::write(
+            amb.dir().join("paired_user.json"),
+            br#"{"bindings": [{"tenant_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}, {"tenant_id": 7}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_device_binding_count().local,
+            2,
+            "the adapter gate must see the two bindings this file states"
+        );
+    }
+
     // ---- scan-source divergence detector (plan 2026-09-10-…-not-a-ref, P1) ----
 
     /// A [`GitRefReader`] built from canned answers, so every arm of
