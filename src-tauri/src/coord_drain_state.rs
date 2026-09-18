@@ -854,18 +854,86 @@ pub enum HeartbeatOutcome {
     NotEnrolled { why: &'static str },
 }
 
-/// Why this runner is not a coord device, or `Ok(coord_base)`.
-fn enrollment() -> Result<String, &'static str> {
-    let device = crate::fleet::load_device_file().ok_or("~/.qontinui/machine.json is missing")?;
-    if uuid::Uuid::parse_str(&device.device_id).is_err() {
-        return Err("machine.json device_id is not a UUID");
+/// What the local files say about this runner's coord enrollment.
+///
+/// THREE answers, not two, and the third is the whole point. `NotEnrolled`
+/// ALLOWS autonomous spawns — it is the "this box has no coord, nothing can
+/// drain it" arm — so anything that cannot be established must NOT land there.
+/// Both local reads return `Option` and swallow the difference between *absent*
+/// and *unreadable*: `machine.json` under a momentary lock (a concurrent
+/// `qontinui_profile device init`, an AV scan, a half-written file) read as
+/// "missing", and so did an unreadable `settings.json`, whose own
+/// `UnknownTierProdDefault` arm exists to say "we could not read your tier".
+/// Either one made [`fold`] see `allows_autonomous_spawns()`, clear `deferred`,
+/// and wake every held spawn at once on a device coord still holds DRAINED.
+///
+/// So an indeterminate local read is `Indeterminate`, which the callers fold as
+/// a MISS — trending to `Unknown`, which defers. Absent stays `NotEnrolled`.
+/// The network direction already had this right: every non-2xx and transport
+/// error is an `Err` from [`read_me_drain`] and folds as a miss.
+enum Enrollment {
+    /// A coord device, with this base.
+    Enrolled(String),
+    /// Positively NOT a coord device: the file is genuinely absent, or names no
+    /// device, or no coord is configured. Autonomous spawns run.
+    NotEnrolled(&'static str),
+    /// Could not be established. Fails CLOSED — folded as a miss, not as
+    /// `NotEnrolled`.
+    Indeterminate(String),
+}
+
+/// Why this runner is not a coord device, the base if it is, or that the local
+/// files could not answer. See [`Enrollment`].
+fn enrollment() -> Enrollment {
+    use qontinui_runner_lib::ambient::MachineJsonError;
+
+    let machine = match qontinui_runner_lib::ambient::try_read_machine_json() {
+        Ok(machine) => machine,
+        // The one arm that is genuinely "no device file": ENOENT.
+        Err(e) if e.is_missing() => {
+            return Enrollment::NotEnrolled("~/.qontinui/machine.json is missing")
+        }
+        // No home dir at all: there is no device identity to have, and no
+        // amount of retrying produces one.
+        Err(MachineJsonError::NoHomeDir) => {
+            return Enrollment::NotEnrolled("no home directory, so there is no machine.json")
+        }
+        // A permission error, a mid-write truncation, invalid JSON: the file
+        // may well name a drained device. Fail closed.
+        Err(e) => {
+            return Enrollment::Indeterminate(format!(
+                "~/.qontinui/machine.json could not be read: {e}"
+            ))
+        }
+    };
+    let Some(device_id) = machine.device_id.as_deref() else {
+        return Enrollment::NotEnrolled("machine.json names no device_id");
+    };
+    if uuid::Uuid::parse_str(device_id).is_err() {
+        // STATED but garbage — a device that is probably enrolled behind a
+        // corrupt file, which is not the same claim as "not a coord device".
+        return Enrollment::Indeterminate(
+            "machine.json device_id is stated but is not a UUID".to_string(),
+        );
     }
     // A tenant binding is NOT required: a device with `machine.json` and a coord
     // URL is a coord device coord can drain, and `me/drain` answers on the
     // device JWT alone. Treating an unpaired device as not-enrolled would let
     // it spawn autonomously while coord holds it drained.
-    qontinui_runner_lib::profiles::connected_coord_base()
-        .ok_or("the active profile has no coord_url")
+    if let Some(base) = qontinui_runner_lib::profiles::connected_coord_base() {
+        return Enrollment::Enrolled(base);
+    }
+    // `connected_coord_base` said "isolated". That is only NotEnrolled when the
+    // tier was actually READ; the `UnknownTierProdDefault` arm means
+    // settings.json was UNREADABLE and prod was a guess, which is indeterminate.
+    match qontinui_runner_lib::profiles::coord_base_policy().1 {
+        qontinui_runner_lib::profiles::CoordBaseSource::UnknownTierProdDefault => {
+            Enrollment::Indeterminate(
+                "settings.json could not be read, so the coord base is unknown".to_string(),
+            )
+        }
+        _ => Enrollment::NotEnrolled("the active profile has no coord_url"),
+    }
 }
 
 /// `GET {base}/coord/devices/me/drain` → an observation, or the failure cause.
@@ -903,7 +971,7 @@ pub async fn note_heartbeat(outcome: HeartbeatOutcome) {
             }
         }
         HeartbeatOutcome::NotSent { why } => match enrollment() {
-            Ok(base) => match read_me_drain(&base).await {
+            Enrollment::Enrolled(base) => match read_me_drain(&base).await {
                 Ok(obs) => {
                     fold(|tr, now| tr.observe(obs, now));
                 }
@@ -911,8 +979,11 @@ pub async fn note_heartbeat(outcome: HeartbeatOutcome) {
                     fold(|tr, now| tr.miss(&format!("{why}; me/drain: {e}"), now));
                 }
             },
-            Err(why) => {
-                fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
+            Enrollment::NotEnrolled(not) => {
+                fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why: not }, now));
+            }
+            Enrollment::Indeterminate(cause) => {
+                fold(|tr, now| tr.miss(&format!("{why}; {cause}"), now));
             }
         },
         HeartbeatOutcome::NotEnrolled { why } => {
@@ -929,7 +1000,9 @@ pub fn note_heartbeat_failure(cause: &str) {
 /// On a transition into `drained`: read `me/drain` for the operator's reason.
 /// A failed read leaves the drained state as the heartbeat reported it.
 async fn refresh_reason() {
-    let Ok(base) = enrollment() else { return };
+    let Enrollment::Enrolled(base) = enrollment() else {
+        return;
+    };
     match read_me_drain(&base).await {
         Ok(obs @ (DrainObservation::Drained { .. } | DrainObservation::Clear)) => {
             fold(|tr, now| tr.observe(obs, now));
@@ -949,7 +1022,7 @@ pub async fn boot_read() {
         return;
     }
     match enrollment() {
-        Ok(base) => match read_me_drain(&base).await {
+        Enrollment::Enrolled(base) => match read_me_drain(&base).await {
             Ok(obs) => {
                 fold(|tr, now| tr.observe(obs, now));
             }
@@ -957,7 +1030,10 @@ pub async fn boot_read() {
                 fold(|tr, now| tr.miss(&format!("boot read: {e}"), now));
             }
         },
-        Err(why) => {
+        Enrollment::Indeterminate(cause) => {
+            fold(|tr, now| tr.miss(&format!("boot read: {cause}"), now));
+        }
+        Enrollment::NotEnrolled(why) => {
             fold(|tr, now| tr.observe(DrainObservation::NotEnrolled { why }, now));
         }
     }
@@ -1273,6 +1349,50 @@ mod tests {
         let mut tr = DrainTracker::new(t0());
         tr.observe(DrainObservation::NotEnrolled { why: "no coord" }, t0());
         assert!(tr.state().allows_autonomous_spawns());
+    }
+
+    /// …which is exactly why an UNREADABLE local file must not reach that arm.
+    /// The review found the two local reads swallowing the difference between
+    /// *absent* and *unreadable*, so a momentary lock on `machine.json` (a
+    /// concurrent `qontinui_profile device init`, an AV scan, a half-written
+    /// file) released every held spawn on a device coord still held DRAINED.
+    ///
+    /// This pins the fold each arm gets, which is the part that decides it: an
+    /// indeterminate read is a MISS (trending to `Unknown`, which defers), never
+    /// an observation of `NotEnrolled`.
+    #[test]
+    fn an_indeterminate_local_read_defers_while_an_absent_one_allows() {
+        // Absent: positively not a coord device — spawns run.
+        let mut absent = DrainTracker::new(t0());
+        absent.observe(
+            DrainObservation::NotEnrolled {
+                why: "~/.qontinui/machine.json is missing",
+            },
+            t0(),
+        );
+        assert!(
+            absent.state().allows_autonomous_spawns(),
+            "a box with no machine.json has no coord that could drain it"
+        );
+
+        // Indeterminate, folded as a miss: after the miss budget the state is
+        // Unknown, which DEFERS. The drained device stays deferred.
+        let mut unreadable = DrainTracker::new(t0());
+        for _ in 0..3 {
+            unreadable.miss(
+                "~/.qontinui/machine.json could not be read: permission denied",
+                t0(),
+            );
+        }
+        assert!(
+            matches!(unreadable.state(), CoordDrainState::Unknown { .. }),
+            "an unreadable machine.json must trend to Unknown, got {:?}",
+            unreadable.state()
+        );
+        assert!(
+            !unreadable.state().allows_autonomous_spawns(),
+            "an unreadable local file must FAIL CLOSED — it may well name a drained device"
+        );
     }
 
     #[test]

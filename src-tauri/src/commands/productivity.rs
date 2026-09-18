@@ -1146,6 +1146,25 @@ pub async fn spawn_worker_session(
     // Part D — see `launch_coordinator_session`.
     resource_override: Option<bool>,
 ) -> Result<LaunchResult, String> {
+    // Coord's device drain (plan `2026-09-13-drained-runner-never-reaches-idle`,
+    // D3). This command is NOT operator-only despite being a `#[tauri::command]`:
+    // it sits on the UI Bridge invoke allowlist (`ui_bridge_invoke.rs`), whose own
+    // entry names "coord soak smokes" among its callers, and an automation reaching
+    // a door is exactly what the `operator` carve-out does not cover. So it is
+    // classified `autonomous` in `runner_spawn_sites.txt` and gated like its
+    // siblings — otherwise `POST /ui-bridge/invoke/spawn_worker_session` would
+    // start a `claude` PTY on a device coord has drained, while `/terminals`,
+    // `/prompts/run` and the workflow doors all answer 409 for the same caller.
+    if let crate::coord_drain_state::DrainGate::Defer { reason, .. } =
+        crate::coord_drain_state::drain_gate_for_work(
+            crate::coord_drain_state::SpawnOrigin::Unknown,
+            "spawn_worker_session",
+        )
+    {
+        tracing::warn!("spawn_worker_session refused — {reason}");
+        return Err(reason);
+    }
+
     let app_state = require_app_state(&app_handle)?;
 
     let primary_repo_path = resolve_runner_repo_path()

@@ -8,11 +8,37 @@
 //! drain every HTTP caller is autonomous (`unknown`) and is refused with 409.
 //!
 //! These Tauri commands are the same doors called in-process with an OPERATOR
-//! origin. Tauri commands are reachable only from this runner's own webview:
-//! they are NOT on the UI Bridge invoke allowlist (`ui_bridge_invoke.rs`) and
-//! not on the `/tauri/invoke` proxy, so an automation cannot borrow them. Each
-//! returns the door's HTTP status and JSON body unchanged, so the frontend
-//! handles a twin's answer exactly as it handled the route's.
+//! origin. Each returns the door's HTTP status and JSON body unchanged, so the
+//! frontend handles a twin's answer exactly as it handled the route's.
+//!
+//! ## What actually keeps an automation off a twin — and what does not
+//!
+//! Being a `#[tauri::command]` is NOT the boundary. This comment used to claim
+//! Tauri commands "are reachable only from this runner's own webview", and that
+//! was false in two ways worth stating precisely, because the same reasoning
+//! guards every future twin:
+//!
+//! 1. **The UI Bridge invoke allowlist is a real borrow route.**
+//!    `ui_bridge_invoke.rs` proxies allowlisted command names over
+//!    `POST /ui-bridge/invoke/<name>`, reachable by curl or any local process.
+//!    A `#[tauri::command]` on that allowlist is reachable by automation, full
+//!    stop. `spawn_worker_session` sat there classified `operator` while
+//!    starting `claude` PTYs with `--dangerously-skip-permissions`. So the twins
+//!    here stay OFF that allowlist, and
+//!    `the_twins_are_not_reachable_through_the_ui_bridge_allowlist` now derives
+//!    its subject list from the roster instead of a hardcoded eight.
+//! 2. **A third route exists: `POST /ui-bridge/sdk/control/page-evaluate`.**
+//!    It evaluates a caller-supplied expression inside this runner's own webview
+//!    realm — the very realm the claim above rests on. Its
+//!    `PAGE_EVALUATE_STRUCTURAL_PATTERNS` filter blocks `eval`, `new Function`,
+//!    `import` and `document.cookie`, but NOT `invoke`, so an expression can
+//!    call a Tauri command the allowlist never names.
+//!
+//! The honest bound on (2), recorded rather than hand-waved: on a bundled,
+//! CSP-enforcing build the route is dead — `script-src 'self'` without
+//! `unsafe-eval` refuses every expression it would evaluate. So (2) is a
+//! DEV-BUILD bypass. (1) is not: it needs no eval and works on any build, which
+//! is why it was the blocking finding and (2) is a documented boundary.
 
 use std::sync::Arc;
 
@@ -251,6 +277,27 @@ mod tests {
 
     #[test]
     fn the_twins_are_not_reachable_through_the_ui_bridge_allowlist() {
+        // Derived from the ROSTER, not from a hardcoded list. The list this
+        // replaced named eight twins and could not have caught a ninth — which
+        // is not hypothetical: `spawn_worker_session` was classified `operator`
+        // while sitting on the allowlist the whole time, and no control here
+        // said so. Anything the roster calls `operator` is claiming "an
+        // automation cannot borrow this", and that claim is checked here.
+        let borrowable: Vec<String> = crate::runner_spawn_sites::operator_rows()
+            .into_iter()
+            .filter(|(_, func)| crate::ui_bridge_invoke::is_allowlisted(func))
+            .map(|(file, func)| format!("{file}:{func}"))
+            .collect();
+        assert!(
+            borrowable.is_empty(),
+            "these rows are `operator` in runner_spawn_sites.txt yet reachable over \
+             POST /ui-bridge/invoke — an automation can borrow them and spawn on a \
+             drained device: {borrowable:#?}"
+        );
+
+        // The twins this module owns are covered by the sweep above only if they
+        // are in the roster at all, so assert them by name too — a twin that is
+        // missing from the roster would otherwise be silently unchecked.
         for name in [
             "operator_run_prompt",
             "operator_run_unified_workflow",

@@ -100,9 +100,7 @@ impl SchedulerService {
         path: &str,
         body: serde_json::Value,
     ) -> Result<(u16, serde_json::Value), String> {
-        let origin = LAUNCH_ORIGIN
-            .try_with(|o| *o)
-            .unwrap_or(crate::coord_drain_state::SpawnOrigin::Scheduler);
+        let origin = launch_origin();
         if !origin.is_autonomous() {
             let reply =
                 crate::commands::operator_doors::call_door_in_process(path, body, origin).await?;
@@ -2308,6 +2306,25 @@ pub async fn run_task_now(
     Ok(())
 }
 
+/// The origin this launch is running under: the operator origin when
+/// [`LAUNCH_ORIGIN`] is in scope, else `Scheduler`.
+///
+/// Extracted from `post_self` so the PROPAGATION is testable. The chain holds
+/// today only because every hop between the operator entry point and the door
+/// either awaits inline or re-enters the scope explicitly
+/// (`tokio::spawn(LAUNCH_ORIGIN.scope(origin, ..))` in `run_task_now`). A bare
+/// `tokio::spawn` inserted anywhere on that path for "don't block the tick"
+/// silently downgrades the operator to `Scheduler`, and the visible symptom is
+/// the operator's Run-now button starting to answer 409 while the device is
+/// drained — the dead-button outcome D3 exists to prevent. There is no compiler
+/// error for that, so `launch_origin_survives_a_scoped_spawn_and_is_lost_by_a_bare_one`
+/// is the thing that says it.
+fn launch_origin() -> crate::coord_drain_state::SpawnOrigin {
+    LAUNCH_ORIGIN
+        .try_with(|o| *o)
+        .unwrap_or(crate::coord_drain_state::SpawnOrigin::Scheduler)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -2380,6 +2397,63 @@ fn run_prompt_session_id(response: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn launch_origin_survives_a_scoped_spawn_and_is_lost_by_a_bare_one() {
+        use crate::coord_drain_state::SpawnOrigin;
+
+        // 1. No scope at all: a scheduler tick. Autonomous, so the door's own gate
+        //    judges it — the behaviour the drain relies on.
+        assert_eq!(launch_origin(), SpawnOrigin::Scheduler);
+
+        // 2. In scope, awaited INLINE — the shape every hop between the operator
+        //    entry point and `post_self` uses today.
+        let inline = LAUNCH_ORIGIN
+            .scope(SpawnOrigin::OperatorTerminal, async { launch_origin() })
+            .await;
+        assert_eq!(
+            inline,
+            SpawnOrigin::OperatorTerminal,
+            "an inline await must carry the operator origin to the door"
+        );
+
+        // 3. Across a spawn that RE-ENTERS the scope — what `run_task_now` does, and
+        //    the reason the operator's Run-now button still works while drained.
+        let scoped = tokio::spawn(
+            LAUNCH_ORIGIN.scope(SpawnOrigin::OperatorTerminal, async { launch_origin() }),
+        )
+        .await
+        .expect("scoped spawn");
+        assert_eq!(
+            scoped,
+            SpawnOrigin::OperatorTerminal,
+            "tokio::spawn(LAUNCH_ORIGIN.scope(origin, ..)) must preserve the operator origin"
+        );
+
+        // 4. THE REGRESSION, pinned: a BARE `tokio::spawn` inside the scope does not
+        //    inherit the task-local, so the operator silently becomes `Scheduler` —
+        //    autonomous — and the Run-now button starts answering 409 while the
+        //    device is drained. Nothing in the type system says this; this does.
+        let bare = LAUNCH_ORIGIN
+            .scope(SpawnOrigin::OperatorTerminal, async {
+                tokio::spawn(async { launch_origin() })
+                    .await
+                    .expect("bare spawn")
+            })
+            .await;
+        assert_eq!(
+            bare,
+            SpawnOrigin::Scheduler,
+            "a bare tokio::spawn LOSES the task-local — if this ever reads OperatorTerminal \
+             the propagation changed and the comment on `launch_origin` needs rewriting; if a \
+             hop on the operator path ever adopts this shape, the operator is silently \
+             downgraded to autonomous"
+        );
+        assert!(
+            bare.is_autonomous() && !scoped.is_autonomous(),
+            "the downgrade is exactly a move from operator to autonomous"
+        );
+    }
 
     use crate::test_env::{env_lock, EnvVarRestore};
 

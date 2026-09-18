@@ -22,6 +22,24 @@
 //!   spawn primitives require — is a recorded follow-up.
 //! * A block comment is recognised when `/*` opens a line; a `/*` in the middle
 //!   of a code line is not tracked.
+//! * The scan sees a spawn PRIMITIVE, so a path that reaches `claude` by some
+//!   other construction is invisible until its shape is added to
+//!   `primitive_res`. `Command::new("claude")` was exactly that until review
+//!   round 2 added it.
+//! * `autonomous_sites_bypassing_the_gate` reads the SITE fn's own body, so it
+//!   cannot see which `SpawnOrigin` a CALLER passes to an origin-parameterised
+//!   door. Every door added by this plan has that shape (`run_prompt`,
+//!   `run_unified_workflow`, `resume_task_run`, …): the door reads clean here
+//!   while its operator twin supplies `OperatorTerminal`. What keeps that sound
+//!   is a separate control — the twins must not be reachable by an automation,
+//!   which `every_operator_site_is_a_tauri_command` now asserts against the UI
+//!   Bridge allowlist rather than by inspecting origins.
+//! * Only `helper` rows propagate to their callers. An `operator` or `exempt`
+//!   wrapper around an already-gated door gets no row of its own, so a wrapper
+//!   that widened its door's reach would not be flagged here.
+//! * A green scan is therefore NOT the claim "every autonomous spawn path is
+//!   gated". It is "every path this scan RECOGNISES is declared, and every
+//!   declared autonomous one branches on a gate call in its own body".
 //! * "Branches on the gate result" is judged per statement: a gate call is BARE
 //!   only when its statement is nothing but the (path-qualified) call, optionally
 //!   `.await`-ed, ending in `;` — or `let _ = …;`. Anything that consumes the
@@ -173,25 +191,70 @@ fn fn_decl_re() -> Regex {
 /// The spawn primitives. Multi-line: a receiver on one line and `.create(` on
 /// the next is still a call.
 fn primitive_res() -> Vec<Regex> {
-    [
+    primitive_families()
+        .into_iter()
+        .flat_map(|(_, res)| res)
+        .collect()
+}
+
+/// The spawn primitives grouped by the FAMILY they detect, because that is the
+/// granularity the vacuity floor has to work at.
+///
+/// Within a family the entries are alternative SPELLINGS of one thing — the
+/// four `TerminalManager::create` receiver shapes, say — and an alternative
+/// matching nothing is normal: it is there for a spelling this tree does not
+/// currently use. A whole family matching nothing is not normal; it means the
+/// scan has gone blind to a class of spawn while the other families keep a lump
+/// total up and the guard still reads green.
+fn primitive_families() -> Vec<(&'static str, Vec<Regex>)> {
+    let fam = |name: &'static str, pats: &[&str]| {
+        (
+            name,
+            pats.iter()
+                .map(|p| Regex::new(p).expect("primitive regex"))
+                .collect::<Vec<_>>(),
+        )
+    };
+    vec![
         // TerminalManager::create, by receiver shape (see the module's limits).
-        r"\b[A-Za-z_]*terminal_manager[A-Za-z0-9_]*\s*\.\s*create\s*\(",
-        r"\b(?:tm|mgr|manager|create_manager)\s*\.\s*create\s*\(",
-        r"\bget_terminal_manager\s*\([^)]*\)\s*\.\s*create\s*\(",
-        r"TerminalManager\s*>+\s*\(\s*\)\s*(?:\.\s*inner\s*\(\s*\)\s*)?\.\s*create\s*\(",
-        r"\bcreate_tracked_terminal_session_backend\s*\(",
+        fam(
+            "TerminalManager::create",
+            &[
+                r"\b[A-Za-z_]*terminal_manager[A-Za-z0-9_]*\s*\.\s*create\s*\(",
+                r"\b(?:tm|mgr|manager|create_manager)\s*\.\s*create\s*\(",
+                r"\bget_terminal_manager\s*\([^)]*\)\s*\.\s*create\s*\(",
+                r"TerminalManager\s*>+\s*\(\s*\)\s*(?:\.\s*inner\s*\(\s*\)\s*)?\.\s*create\s*\(",
+            ],
+        ),
+        fam(
+            "create_tracked_terminal_session_backend",
+            &[r"\bcreate_tracked_terminal_session_backend\s*\("],
+        ),
         // AI-session and `claude` launches.
-        r"\bClaudeSession::spawn\s*\(",
-        r"\brun_claude_session_with_retry\s*\(",
-        r"\bspawn_claude_child\s*\(",
-        r#""spawn-independent-claude\.py""#,
+        fam(
+            "claude launch",
+            &[
+                r"\bClaudeSession::spawn\s*\(",
+                r"\brun_claude_session_with_retry\s*\(",
+                r"\bspawn_claude_child\s*\(",
+                r#""spawn-independent-claude\.py""#,
+                // A DIRECT `claude` process build — `tokio::process::Command::new("claude")`
+                // or the std twin. Added by review round 2: this was a blind spot, and
+                // `orchestration_loop/fix_agent.rs` sat in it. Nothing was wrong there
+                // (it carries a `DrainAdmission::Exempt`), but the roster would have
+                // stayed green if it had not.
+                r#"Command::new\s*\(\s*"claude"\s*\)"#,
+            ],
+        ),
         // Workflow runs.
-        r"\bspawn_workflow_with_panic_guard\s*\(",
-        r"\bspawn_sequence_with_panic_guard\s*\(",
+        fam(
+            "workflow run",
+            &[
+                r"\bspawn_workflow_with_panic_guard\s*\(",
+                r"\bspawn_sequence_with_panic_guard\s*\(",
+            ],
+        ),
     ]
-    .iter()
-    .map(|p| Regex::new(p).expect("primitive regex"))
-    .collect()
 }
 
 /// A literal call token (`foo(`, `.start_inner(`) as a regex that tolerates
@@ -441,6 +504,37 @@ fn operator_sites_not_tauri_commands(sources: &Sources, rows: &Rows) -> Vec<Stri
         .collect()
 }
 
+/// The roster's `operator` rows as `(file, fn)`, for controls that live in the
+/// module they guard rather than here. `#[cfg(test)]` like the rest of this
+/// module, so it compiles into no shipped binary.
+pub(crate) fn operator_rows() -> Vec<(String, String)> {
+    load_rows()
+        .into_iter()
+        .filter(|(_, r)| r.class == "operator")
+        .map(|((file, func), _)| (file, func))
+        .collect()
+}
+
+/// The property that actually makes `operator` SAFE: an automation cannot
+/// borrow the door. Being a `#[tauri::command]` is necessary and nowhere near
+/// sufficient — `spawn_worker_session` was a `#[tauri::command]`, passed
+/// [`operator_sites_not_tauri_commands`] for months, and was reachable the whole
+/// time over `POST /ui-bridge/invoke/spawn_worker_session`, which starts a
+/// `claude` PTY with `--dangerously-skip-permissions`. The UI Bridge invoke
+/// allowlist is the borrow route, so every `operator` row must be absent from it.
+///
+/// Derived from the ROSTER rather than a hardcoded name list, because a list of
+/// eight cannot catch the ninth: `launch_coordinator_session` is one allowlist
+/// entry away from exactly the same hole, and this returns it the moment that
+/// entry is added.
+fn operator_sites_reachable_by_an_automation(rows: &Rows) -> Vec<String> {
+    rows.iter()
+        .filter(|(_, r)| r.class == "operator")
+        .filter(|((_, func), _)| crate::ui_bridge_invoke::is_allowlisted(func))
+        .map(|((file, func), _)| format!("{file}:{func}"))
+        .collect()
+}
+
 fn parse_sites(text: &str) -> Rows {
     let mut out = BTreeMap::new();
     for (n, raw) in text.lines().enumerate() {
@@ -506,6 +600,22 @@ fn every_spawn_site_is_listed_and_no_row_is_a_ghost() {
     let sources = load_sources();
     let rows = load_rows();
     let found = scan_sites(&sources, &rows);
+    // Per-PRIMITIVE coverage, not one lump total. A single floor degrades
+    // quietly: a regex that stops matching a whole family (a receiver rename, a
+    // moved primitive) keeps the total up on the other families and the scan
+    // still reads green while it has gone blind to a whole class.
+    let sources_for_count = &sources;
+    let blind: Vec<&str> = primitive_families()
+        .into_iter()
+        .filter(|(_, res)| scan_calls(sources_for_count, res).is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        blind.is_empty(),
+        "these spawn primitives matched NOTHING — the regex has gone blind to a whole \
+         family, and the other families keep the total up so a lump floor would not \
+         have said so: {blind:?}"
+    );
     assert!(
         found.len() >= 20,
         "found only {} spawn sites — scan broken?",
@@ -529,7 +639,7 @@ fn every_spawn_site_is_listed_and_no_row_is_a_ghost() {
 fn every_autonomous_site_passes_the_drain_gate() {
     let rows = load_rows();
     assert!(
-        rows.values().filter(|r| r.class == "autonomous").count() >= 10,
+        rows.values().filter(|r| r.class == "autonomous").count() >= 25,
         "too few autonomous rows — the guard would be vacuous"
     );
     let violations = autonomous_sites_bypassing_the_gate(&load_sources(), &rows);
@@ -541,12 +651,66 @@ fn every_autonomous_site_passes_the_drain_gate() {
 
 #[test]
 fn every_operator_site_is_a_tauri_command() {
-    let violations = operator_sites_not_tauri_commands(&load_sources(), &load_rows());
+    let rows = load_rows();
+    let violations = operator_sites_not_tauri_commands(&load_sources(), &rows);
     assert!(
         violations.is_empty(),
         "`operator` is reserved for the runner UI's own Tauri commands (D3) — an HTTP or \
          relay door is autonomous: {violations:#?}"
     );
+
+    // …and the property that being a Tauri command does NOT give you. Asserted
+    // here, beside the weaker one, so an `operator` row cannot be defended by
+    // the necessary condition alone.
+    let borrowable = operator_sites_reachable_by_an_automation(&rows);
+    assert!(
+        borrowable.is_empty(),
+        "an `operator` row is on the UI Bridge invoke allowlist, so an automation can \
+         borrow it and spawn on a drained device — either gate it and reclassify it \
+         `autonomous`, or take it off the allowlist: {borrowable:#?}"
+    );
+}
+
+/// The mutation twin for the control above: a row that IS allowlisted must be
+/// returned, or the check is vacuous. `spawn_worker_session` is the real case
+/// the review found, so it is the fixture — it is `autonomous` now, and this
+/// asserts what the check WOULD have said while it was `operator`.
+#[test]
+fn an_allowlisted_operator_row_is_caught() {
+    assert!(
+        crate::ui_bridge_invoke::is_allowlisted("spawn_worker_session"),
+        "fixture: spawn_worker_session must stay allowlisted — real callers need it"
+    );
+    let mut rows: Rows = BTreeMap::new();
+    rows.insert(
+        (
+            "commands/productivity.rs".to_string(),
+            "spawn_worker_session".to_string(),
+        ),
+        Row {
+            class: "operator".to_string(),
+            detail: "-".to_string(),
+        },
+    );
+    assert_eq!(
+        operator_sites_reachable_by_an_automation(&rows),
+        vec!["commands/productivity.rs:spawn_worker_session".to_string()],
+        "an allowlisted `operator` row must be reported"
+    );
+
+    // And a row that is NOT allowlisted passes, so the check is not "always red".
+    let mut clean: Rows = BTreeMap::new();
+    clean.insert(
+        (
+            "commands/productivity.rs".to_string(),
+            "launch_coordinator_session".to_string(),
+        ),
+        Row {
+            class: "operator".to_string(),
+            detail: "-".to_string(),
+        },
+    );
+    assert!(operator_sites_reachable_by_an_automation(&clean).is_empty());
 }
 
 /// Mutation check: delete the gate call from the steward start path and the

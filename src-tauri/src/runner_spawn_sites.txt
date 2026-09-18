@@ -50,12 +50,13 @@ commands/ai_session.rs | create_ai_session | operator | -
 commands/ai_session.rs | resume_ai_sessions | autonomous | resume_ai_sessions
 commands/config.rs | get_workspace_paths_impl | exempt | only resolves the spawn script's path for display; launches nothing
 commands/productivity.rs | launch_coordinator_session | operator | -
-commands/productivity.rs | spawn_worker_session | operator | -
+commands/productivity.rs | spawn_worker_session | autonomous | spawn_worker_session
 commands/session.rs | session_start | operator | -
 commands/terminal.rs | create_terminal_session_backend | helper | create_terminal_session_backend(
 commands/terminal.rs | create_tracked_terminal_session_backend | helper | create_tracked_terminal_session_backend(
 commands/terminal.rs | terminal_create | operator | -
 commands/terminal.rs | terminal_migrate_session_account | operator | -
+config_report_cmd.rs | seam_reports | exempt | builds the fix-agent command ONLY to report its environment (the seam table); never spawns it
 fixer/trigger.rs | launch_fixer | autonomous | launch_fixer
 follow_up/trigger.rs | launch_follow_up | autonomous | launch_follow_up
 looping_agent_supervisor.rs | spawn_looping_agent_terminal | autonomous | spawn_looping_agent_terminal
@@ -75,6 +76,8 @@ mcp/unified_workflows.rs | run_composed_workflow | autonomous | run_composed_wor
 mcp/unified_workflows.rs | run_unified_workflow | autonomous | run_unified_workflow
 meta_optimizer/trigger.rs | launch_optimizer_internal | autonomous | launch_optimizer_internal
 orchestration_loop/ai_session_executor.rs | dispatch_subtask | autonomous | dispatch_subtask
+orchestration_loop/fix_agent.rs | build_fix_agent_command | helper | build_fix_agent_command(
+orchestration_loop/fix_agent.rs | run_fix_agent | exempt | the fix step of an orchestration loop ALREADY running — carries DrainAdmission::Exempt; the loop's own fan-out is the new work the drain defers
 reflection/trigger.rs | launch_project_reflection | autonomous | launch_project_reflection
 reflection/trigger.rs | launch_reflection | autonomous | launch_reflection
 reflection/trigger.rs | launch_ui_bridge_reflection | autonomous | launch_ui_bridge_reflection
