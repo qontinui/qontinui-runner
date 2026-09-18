@@ -43,8 +43,8 @@ use tracing::{debug, info, warn};
 use super::app_discovery::DiscoveredApp;
 use super::app_registry::{AppRegistry, AppTransport};
 use super::command_relay::{CommandRelay, CommandResponse};
-use super::origin_guard::RequesterPrincipal;
-use super::relay_binding::RelayState;
+use super::origin_guard::{NormOrigin, RequesterPrincipal};
+use super::relay_binding::{BindingMode, Principal, Refusal, RelayBinding, RelayState};
 use super::sdk_client::{SdkAppInfo, SdkConnection, SdkConnectionManager};
 use super::types::ApiState;
 
@@ -178,16 +178,26 @@ impl WsConnectionManager {
         self.next_conn_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Register a newly-connected WebSocket. Returns the `conn_id`.
-    /// Displaces any prior connection for the same `app_id` (last-tab-wins).
-    async fn register(&self, app_id: String, outbound: mpsc::Sender<String>) -> (u64, Option<u64>) {
-        let conn_id = self.allocate_conn_id();
+    /// Register a newly-connected WebSocket under a conn_id the caller already
+    /// allocated. Displaces any prior connection for the same `app_id`
+    /// (last-tab-wins) and returns the displaced id.
+    ///
+    /// The id is allocated separately because the binding claims the `appId`
+    /// in `AppRegistry` FIRST (it needs the id to record) and only registers
+    /// the routing slot once the claim is admitted — so a refused registration
+    /// never moves routing (R1).
+    async fn register_with_id(
+        &self,
+        app_id: String,
+        conn_id: u64,
+        outbound: mpsc::Sender<String>,
+    ) -> Option<u64> {
         let mut inner = self.inner.lock().await;
         let displaced = inner.by_app.insert(app_id.clone(), conn_id);
         inner
             .by_conn
             .insert(conn_id, ConnectionEntry { app_id, outbound });
-        (conn_id, displaced)
+        displaced
     }
 
     /// Remove a connection by id. Only clears the `by_app` entry if it still
@@ -229,7 +239,8 @@ impl WsConnectionManager {
     #[cfg(test)]
     pub async fn test_register(&self, app_id: &str) -> (u64, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel(16);
-        let (conn_id, _displaced) = self.register(app_id.to_string(), tx).await;
+        let conn_id = self.allocate_conn_id();
+        let _displaced = self.register_with_id(app_id.to_string(), conn_id, tx).await;
         (conn_id, rx)
     }
 }
@@ -323,17 +334,22 @@ pub async fn ws_upgrade_handler(
     ws.on_upgrade(move |socket| drive_connection(socket, state, principal))
 }
 
+/// The route label the binding rules record in the `/health` tuples.
+const WS_ROUTE: &str = "GET /ui-bridge/ws";
+
 /// Split the socket, wait for the register frame, then run the send/recv
 /// tasks until either side closes. Always cleans up registry + connection
 /// manager state on exit.
 async fn drive_connection(
     socket: WebSocket,
     state: RelayState,
-    _principal: Option<RequesterPrincipal>,
+    requester: Option<RequesterPrincipal>,
 ) {
     let ws_manager = state.ws_connection_manager.clone();
     let relay = state.ws_command_relay.clone();
     let registry = state.app_registry.clone();
+    let binding = state.binding.clone();
+    let mode = binding.config.binding;
 
     let (mut sink, mut stream) = socket.split();
 
@@ -358,10 +374,62 @@ async fn drive_connection(
         }
     }
 
-    // 2. Allocate the connection + register with the manager.
+    // 1b. WHO is registering (plan `2026-09-17-ui-bridge-relay-registration-
+    //     is-unauthenticated`). R-opaque refuses a browser-class upgrade with
+    //     no parseable, non-`null` Origin; R4 refuses a body `origin` /
+    //     `pageUrl` that disagrees with the header the page cannot forge.
+    //     Both refuse BEFORE any state is touched.
+    let principal = match binding.principal(requester.as_ref(), None, WS_ROUTE) {
+        Ok(p) => p,
+        Err(refusal) => return refuse_handshake(sink, &register.app_id, refusal).await,
+    };
+    if let Err(refusal) = check_register_frame_origin(&binding, &principal, &register, mode) {
+        return refuse_handshake(sink, &register.app_id, refusal).await;
+    }
+
+    // 2. Allocate the connection id, CLAIM the appId under it (R1/R5, checked
+    //    and written under one registry lock), and only then take the routing
+    //    slot. A refused claim moves nothing: no routing slot, no displaced
+    //    in-flight commands, no registry entry, no SDK connection.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(OUTBOUND_BUFFER);
-    let (conn_id, displaced) = ws_manager
-        .register(register.app_id.clone(), outbound_tx)
+    let conn_id = ws_manager.allocate_conn_id();
+
+    // 3. Mirror into the app registry so discovery / list endpoints see it.
+    let discovered = DiscoveredApp {
+        app_id: register.app_id.clone(),
+        app_name: register.app_name.clone(),
+        app_type: register.app_type.clone(),
+        framework: register.framework.clone(),
+        url: register
+            .page_url
+            .clone()
+            .unwrap_or_else(|| "ws://runner/ui-bridge/ws".to_string()),
+        port: 0,
+        base_path: String::new(),
+        version: register.version.clone(),
+        capabilities: register.capabilities.clone().unwrap_or_default(),
+        element_count: None,
+        component_count: None,
+        discovered_at: chrono::Utc::now().timestamp_millis(),
+    };
+    if let Err(refusal) = registry
+        .claim(
+            &binding,
+            &principal,
+            WS_ROUTE,
+            discovered,
+            register.origin.clone(),
+            AppTransport::Websocket,
+            Some(conn_id),
+            None,
+        )
+        .await
+    {
+        return refuse_handshake(sink, &register.app_id, refusal).await;
+    }
+
+    let displaced = ws_manager
+        .register_with_id(register.app_id.clone(), conn_id, outbound_tx)
         .await;
 
     if let Some(prev) = displaced {
@@ -385,34 +453,6 @@ async fn drive_connection(
             );
         }
     }
-
-    // 3. Mirror into the app registry so discovery / list endpoints see it.
-    let discovered = DiscoveredApp {
-        app_id: register.app_id.clone(),
-        app_name: register.app_name.clone(),
-        app_type: register.app_type.clone(),
-        framework: register.framework.clone(),
-        url: register
-            .page_url
-            .clone()
-            .unwrap_or_else(|| "ws://runner/ui-bridge/ws".to_string()),
-        port: 0,
-        base_path: String::new(),
-        version: register.version.clone(),
-        capabilities: register.capabilities.clone().unwrap_or_default(),
-        element_count: None,
-        component_count: None,
-        discovered_at: chrono::Utc::now().timestamp_millis(),
-    };
-    registry
-        .upsert(
-            discovered,
-            register.origin.clone(),
-            AppTransport::Websocket,
-            Some(conn_id),
-            None,
-        )
-        .await;
 
     // 3b. Mirror into sdk_connection so try_ws_dispatch can look up app_id.
     //     Without this, WS-only wrappers can never be reached via the
@@ -439,6 +479,11 @@ async fn drive_connection(
 
     // 5. Fan out: one task drains outbound_rx → sink with periodic pings,
     //    the current task reads inbound frames.
+    //
+    // `conn_guard` is what makes the liveness refresh and the teardown
+    // conn-scoped (R2). Under the kill switch it is `None`, which restores
+    // today's unguarded `touch` / `remove`.
+    let conn_guard = (mode != BindingMode::Off).then_some(conn_id);
     let send_app_id = register.app_id.clone();
     let send_registry = registry.clone();
     let send_task = tokio::spawn(async move {
@@ -466,7 +511,7 @@ async fn drive_connection(
                     // every frame; this branch covers the case where the
                     // wrapper is quiet and we're the only thing keeping the
                     // socket warm.
-                    let _ = send_registry.touch(&send_app_id).await;
+                    let _ = send_registry.touch(&send_app_id, conn_guard).await;
                 }
             }
         }
@@ -476,6 +521,8 @@ async fn drive_connection(
     let recv_app_id = register.app_id.clone();
     let recv_relay = relay.clone();
     let recv_registry = registry.clone();
+    let recv_binding = binding.clone();
+    let recv_principal = principal.clone();
     // The recv loop runs for the lifetime of the WebSocket. Per-frame
     // liveness is enforced by the inner `tokio::time::timeout` on each
     // `stream.next()` call below — if no frame (data, pong, ping) arrives
@@ -509,12 +556,21 @@ async fn drive_connection(
             // this app past REGISTRATION_TTL_MS. We skip refresh on Close so
             // a closing tab doesn't briefly look fresh during teardown.
             if !matches!(msg, Message::Close(_)) {
-                let _ = recv_registry.touch(&recv_app_id).await;
+                let _ = recv_registry.touch(&recv_app_id, conn_guard).await;
             }
 
             match msg {
                 Message::Text(text) => {
-                    handle_inbound_text(&recv_app_id, &recv_relay, text.as_str()).await;
+                    handle_inbound_text(
+                        &recv_app_id,
+                        conn_id,
+                        mode,
+                        &recv_principal,
+                        &recv_binding,
+                        &recv_relay,
+                        text.as_str(),
+                    )
+                    .await;
                 }
                 Message::Binary(_) => {
                     debug!("[ws-relay] ignoring binary frame from '{}'", recv_app_id);
@@ -532,8 +588,13 @@ async fn drive_connection(
     //    their awaiters don't have to wait for the 30s default timeout. We
     //    key on conn_id (not app_id) so a sibling tab that displaced this
     //    conn but is still healthy keeps its in-flight commands.
+    //    The registry release is conn-guarded and principal-guarded (R2): a
+    //    connection that was displaced no longer owns the entry, so its
+    //    teardown takes nothing with it.
     ws_manager.remove(conn_id).await;
-    registry.remove(&register.app_id).await;
+    let _ = registry
+        .release(&binding, &register.app_id, &principal, conn_guard, WS_ROUTE)
+        .await;
     uninstall_ws_sdk_connection(&state.sdk_connection, &synthetic_url, prior_active).await;
     relay.reject_by_conn(conn_id, "wrapper disconnected").await;
     send_task.abort();
@@ -541,6 +602,64 @@ async fn drive_connection(
         "[ws-relay] app '{}' disconnected (conn_id={})",
         register.app_id, conn_id
     );
+}
+
+/// Send `{type:"ack", ok:false, error:{…}}` and close, having touched no
+/// state. `LiveSessionTransport.handleMessage` maps that shape onto a
+/// `WrapperTransportError` carrying the code, so no client change is needed.
+async fn refuse_handshake(
+    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+    app_id: &str,
+    refusal: Refusal,
+) {
+    warn!(
+        app_id = app_id,
+        code = refusal.code,
+        rule = refusal.rule,
+        "[ws-relay] refused a register frame: {}",
+        refusal.message
+    );
+    if let Ok(frame) = serde_json::to_string(&refusal.ws_ack()) {
+        let _ = sink.send(Message::Text(frame.into())).await;
+    }
+    let _ = sink.send(Message::Close(None)).await;
+}
+
+/// R4 over the WebSocket handshake: a BROWSER principal's self-declared
+/// `origin` / `pageUrl` must name the same origin as the `Origin` header it
+/// cannot forge. Operator trust declares whatever it likes — it already holds
+/// every door — and an opaque or keyed principal has no header origin to
+/// compare against.
+fn check_register_frame_origin(
+    binding: &RelayBinding,
+    principal: &Principal,
+    register: &RegisterFrame,
+    mode: BindingMode,
+) -> Result<(), Refusal> {
+    if mode == BindingMode::Off {
+        return Ok(());
+    }
+    let Principal::Browser { origin: header, .. } = principal else {
+        return Ok(());
+    };
+    for (label, declared) in [
+        ("origin", register.origin.as_deref()),
+        ("pageUrl", register.page_url.as_deref()),
+    ] {
+        let Some(raw) = declared.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let matches = NormOrigin::parse(raw).is_some_and(|d| d.same_principal(header));
+        if !matches {
+            let message = if label == "origin" {
+                "The register frame's `origin` is not the origin this socket was opened from"
+            } else {
+                "The register frame's `pageUrl` is not on the origin this socket was opened from"
+            };
+            binding.meter(mode, principal, WS_ROUTE, Refusal::origin_mismatch(message))?;
+        }
+    }
+    Ok(())
 }
 
 /// Read exactly one text frame and parse it as a `RegisterFrame`. Anything
@@ -578,7 +697,20 @@ async fn read_register_frame(
     Ok(frame)
 }
 
-async fn handle_inbound_text(app_id: &str, relay: &Arc<CommandRelay>, text: &str) {
+/// R3's WebSocket arm. `conn_id` is the socket the frame arrived on:
+/// `enforce` completes a command only from the connection it was routed to,
+/// `shadow` completes it as today and counts, and `off` does not check at all.
+/// A refusal over a WebSocket is logged, counted and dropped — there is no
+/// per-command response frame to carry a typed payload.
+async fn handle_inbound_text(
+    app_id: &str,
+    conn_id: u64,
+    mode: BindingMode,
+    principal: &Principal,
+    binding: &Arc<RelayBinding>,
+    relay: &Arc<CommandRelay>,
+    text: &str,
+) {
     let parsed: Result<InboundFrame, _> = serde_json::from_str(text);
     match parsed {
         Ok(InboundFrame::Response {
@@ -587,15 +719,23 @@ async fn handle_inbound_text(app_id: &str, relay: &Arc<CommandRelay>, text: &str
             result,
             error,
         }) => {
-            let matched = relay
-                .resolve(CommandResponse {
-                    command_id: command_id.clone(),
-                    success: success.unwrap_or_else(|| error.is_none()),
-                    result,
-                    error,
-                })
+            let outcome = relay
+                .resolve(
+                    (mode != BindingMode::Off).then_some(conn_id),
+                    mode == BindingMode::Enforce,
+                    CommandResponse {
+                        command_id: command_id.clone(),
+                        success: success.unwrap_or_else(|| error.is_none()),
+                        result,
+                        error,
+                    },
+                )
                 .await;
-            if !matched {
+            if outcome.not_yours {
+                // Counted on `/health` under R3 — `meter` returns the refusal
+                // in `enforce`, and there is no frame to send it in.
+                let _ = binding.meter(mode, principal, WS_ROUTE, Refusal::command_not_yours());
+            } else if !outcome.matched {
                 debug!(
                     "[ws-relay] orphan response from '{}' for command_id={}",
                     app_id, command_id

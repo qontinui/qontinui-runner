@@ -5376,7 +5376,7 @@ mod ws_dispatch_selection_tests {
     async fn ws_dispatch_for_app_routes_websocket_traffic() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("test-wrapper").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("test-wrapper").await;
         registry
             .upsert(
                 sample_app("test-wrapper"),
@@ -5419,12 +5419,16 @@ mod ws_dispatch_selection_tests {
 
         // Resolve as the wrapper would.
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({ "output": "hi" })),
-                error: None,
-            })
+            .resolve(
+                Some(conn_id),
+                true,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({ "output": "hi" })),
+                    error: None,
+                },
+            )
             .await;
 
         let outcome = dispatch_fut.await.unwrap();
@@ -5445,7 +5449,7 @@ mod ws_dispatch_selection_tests {
     async fn id_collision_ws_wins_for_action_endpoint_only() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_conn_id, mut outbound_rx) = ws.test_register("terminal").await;
+        let (conn_id, mut outbound_rx) = ws.test_register("terminal").await;
         registry
             .upsert(
                 sample_app("terminal"),
@@ -5477,12 +5481,16 @@ mod ws_dispatch_selection_tests {
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
         let command_id = v["commandId"].as_str().unwrap().to_string();
         relay
-            .resolve(CommandResponse {
-                command_id,
-                success: true,
-                result: Some(json!({ "ran": true })),
-                error: None,
-            })
+            .resolve(
+                Some(conn_id),
+                true,
+                CommandResponse {
+                    command_id,
+                    success: true,
+                    result: Some(json!({ "ran": true })),
+                    error: None,
+                },
+            )
             .await;
         match action_fut.await.unwrap() {
             Some(Ok(value)) => assert_eq!(value, json!({ "ran": true })),
@@ -5564,8 +5572,8 @@ mod ws_dispatch_selection_tests {
     async fn ws_collect_components_merges_live_wrappers() {
         let registry = AppRegistry::new();
         let ws = WsConnectionManager::new();
-        let (_a_conn, mut a_rx) = ws.test_register("alpha").await;
-        let (_b_conn, mut b_rx) = ws.test_register("beta").await;
+        let (a_conn, mut a_rx) = ws.test_register("alpha").await;
+        let (b_conn, mut b_rx) = ws.test_register("beta").await;
         registry
             .upsert(
                 sample_app("alpha"),
@@ -5614,6 +5622,7 @@ mod ws_dispatch_selection_tests {
         let resolve_one = |frame: String, app_id: &str| {
             let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
             let cmd = v["commandId"].as_str().unwrap().to_string();
+            let conn = if app_id == "alpha" { a_conn } else { b_conn };
             let result = if app_id == "alpha" {
                 // Bare array shape from the frame's payload context.
                 json!([{ "id": "alpha-1" }, { "id": "alpha-2" }])
@@ -5624,12 +5633,16 @@ mod ws_dispatch_selection_tests {
             let relay_h = relay_for_resolve.clone();
             async move {
                 relay_h
-                    .resolve(CommandResponse {
-                        command_id: cmd,
-                        success: true,
-                        result: Some(result),
-                        error: None,
-                    })
+                    .resolve(
+                        Some(conn),
+                        true,
+                        CommandResponse {
+                            command_id: cmd,
+                            success: true,
+                            result: Some(result),
+                            error: None,
+                        },
+                    )
                     .await;
             }
         };
