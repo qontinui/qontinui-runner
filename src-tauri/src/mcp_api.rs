@@ -11422,6 +11422,8 @@ mod self_id_chain_tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }

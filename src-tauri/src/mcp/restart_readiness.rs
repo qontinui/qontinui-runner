@@ -125,7 +125,7 @@ use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
 
-use crate::mcp::session_work_status::{self, SessionStatusSource, StatusFetch};
+use crate::mcp::session_work_status::{self, SessionStatusSource};
 use crate::mcp::types::ApiState;
 use crate::session::session_lifecycle_store::TerminalSessionRecord;
 use crate::session::tracking_health::{self, LiveClaudeProcess, TrackingHealthReport};
@@ -135,7 +135,7 @@ use qontinui_runner_lib::wind_down::{self, WindDownView};
 /// What the subtree cross-reference structurally cannot see. Emitted verbatim
 /// on every response so a reader is never invited to infer omniscience from a
 /// confident-looking count.
-pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a DRY-RUN wind-down eligibility report — nothing closes a session on them, they are computed whether or not the runner is drained, and a grid-idle window is only as old as the first `/restart-readiness` observation that saw the pane idle with no grid change since";
+pub const BOUNDARY: &str = "counts `claude` PROCESSES in this runner's inclusive process subtree — each process, so a nested subagent counts alongside the agent that spawned it (`nested_under_claude` marks those, and `root_count` excludes them); a session doing non-`claude` work, or a child that escaped the subtree, is not represented; `cwd` is read from `/proc/<pid>/cwd` and is null on Windows and for any pid whose link could not be resolved; `has_live_children` is a hint that a child process is attached right now, never a verdict that a session is busy or idle, and is null when the snapshot never enumerated that pid — null means UNCOMPUTABLE, never \"no children\"; `session_status` is the coord WORK axis (`coord.sessions.session_status`), read fresh per request from `GET /coord/sessions/work-status` — a session marked `finished` is DISCOUNTED from `blocking` but its `claude` PROCESS IS STILL RUNNING, still holds memory, and will still be killed by a restart, so `finished` means \"no work worth protecting\", NEVER \"not running\"; every other status, an unreadable coord, an absent row, an unset axis, an unrecognised value, an ambiguous process->session mapping and every non-terminal-hosted process all count as BLOCKING; a NESTED subagent `claude` is never discounted by its ancestor's declaration (nobody declared IT finished), and a live `claude` whose own lifecycle record has no live terminal at all is invisible to this join and is attributed to whichever live terminal's subtree contains it, or to none; `windDown` (on each top-level terminal-hosted process) and `windDownCandidates` are a wind-down eligibility report — THIS ENDPOINT closes nothing, but since Phase 4 the wind-down executor acts on the same verdict WHILE COORD HOLDS THIS DEVICE DRAINED, so an `eligible` here is a session the runner will graceful-`/exit` on its next 30 s tick if the drain is on; they are computed whether or not the runner is drained, the executor's own extra gates (the drain itself, a wall-clock-jump quarantine, and a per-tick close budget) are NOT reflected here, so `eligible` is a candidacy and never a prediction; and a grid-idle window is only as old as the first observation that saw the pane idle with no grid change since";
 
 /// `drain.covers` — the constant, honest scope of `POST /drain`.
 pub const DRAIN_COVERS: &str = "ai_sessions only";
@@ -893,111 +893,29 @@ pub async fn restart_readiness_handler(
         None => None,
     };
 
-    // ── The coord WORK axis, read ONCE in bulk before the census ─────────
+    // ── ONE fresh, observed census pass ──────────────────────────────────
     //
-    // `compute` reads `store.open_records()` itself, so it cannot be handed a
-    // status map unless the ids are known first. This does that cheap
-    // in-memory read up front. A record that APPEARS between this read and
-    // `compute`'s own gets no status and therefore blocks — fail-closed by
-    // construction. Do not "fix" that with a lock: the endpoint's correct
-    // answer for a session it learned about a millisecond ago is "blocking".
+    // `wind_down_observer::fresh_pass` owns the whole sequence: the bulk coord
+    // WORK-axis read, `tracking_health::compute` against that FRESH map (never
+    // the background census's empty one), and the wind-down observation. The
+    // Phase 4 wind-down tick calls the same function, so the two can never
+    // build two differently-shaped censuses (D1).
     //
     // The fetch NEVER fails (see `session_work_status`): a coord outage yields
     // an empty map, every process blocks, and the verdict is bit-for-bit the
     // pre-work-axis one — with the degradation stated in the response.
-    let open_ids: Option<Vec<String>> = app
-        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-        .map(|store| {
-            store
-                .open_records()
-                .into_iter()
-                .map(|r| r.claude_session_id)
-                .collect()
-        });
-    let status_fetch: StatusFetch = match &open_ids {
-        Some(ids) => session_work_status::fetch(ids).await,
-        // An unresolvable store is NOT "there was nothing to ask about" — it
-        // is an axis that could not be consulted at all. Report it as
-        // degraded rather than letting `session_status_source` assert a clean
-        // read of something never read. (The terminal plane independently
-        // pushes an `unknowns` entry for the same cause, so the verdict is
-        // already UNSAFE; this keeps the provenance block honest too.)
-        None => StatusFetch::store_unavailable(),
-    };
-    let status_source = SessionStatusSource::from(&status_fetch);
-
-    // ── Terminal + headless planes: ONE fresh tracking_health pass (D5),
-    //    never latest(). The pass partitions the live `claude` set, so all
-    //    three census-derived planes and the totals come from a single
-    //    `compute` — there is no second census here (D1).
-    let mut pass = 'terminal: {
-        let Some(tm) = app.try_state::<Arc<crate::terminal::TerminalManager>>() else {
-            unknowns.push(
-                "the terminal-session plane could not be determined: TerminalManager did not resolve"
-                    .to_string(),
-            );
-            break 'terminal None;
-        };
-        let Some(store) =
-            app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
-        else {
-            unknowns.push(
-                "the terminal-session plane could not be determined: SessionLifecycleStore did not resolve"
-                    .to_string(),
-            );
-            break 'terminal None;
-        };
-        let Some(sm) = app.try_state::<Arc<crate::claude_session::SessionManager>>() else {
-            unknowns.push(
-                "the terminal-session plane could not be determined: SessionManager did not resolve, so the exempt AI plane cannot be subtracted"
-                    .to_string(),
-            );
-            break 'terminal None;
-        };
-        // NEVER `now()` here — that reference feeds the PID-reuse guard and
-        // substituting it falsely flips live idle sessions to tracked-dead.
-        let Some(boot_ms) = tracking_health::primary_boot_unix_millis() else {
-            unknowns.push(
-                "the terminal-session plane could not be determined: the PID-reuse guard's primary-boot reference is not initialized yet (the runner is still starting)"
-                    .to_string(),
-            );
-            break 'terminal None;
-        };
-
-        match tracking_health::compute(
-            tm.inner(),
-            store.inner(),
-            sm.inner(),
-            boot_ms,
-            &status_fetch.by_session_id,
-        )
-        .await
-        {
-            Some(pass) => Some(pass),
-            None => {
-                unknowns.push(
-                    "the terminal-session plane could not be determined: the process table is unreadable (snapshot_process_table_public returned an empty parent_map), so live `claude` processes cannot be enumerated"
-                        .to_string(),
-                );
-                None
-            }
-        }
-    };
-
-    // ── Wind-down eligibility: DRY-RUN, reported only ─────────────────────
     //
-    // The ONE observation entry point (`session::wind_down_observer`), which
-    // Phase 4's wind-down tick also calls. It reads THIS request's fresh
-    // work-status map, already resolved onto each process by `compute` —
-    // never the background census's empty one. Nothing acts on the result.
-    if let Some(p) = pass.as_mut() {
-        wind_down_observer::observe_and_apply(
-            app,
-            p,
-            &status_fetch.finished_at_by_session_id,
-            wind_down::grace_from_env(),
-        );
-    }
+    // Wind-down here is a DRY RUN: the verdicts are reported and nothing acts
+    // on them in this handler.
+    let fresh = wind_down_observer::fresh_pass(app, wind_down::grace_from_env()).await;
+    let wind_down_observer::FreshPass {
+        pass,
+        status_fetch,
+        observed: _,
+        unknowns: pass_unknowns,
+    } = fresh;
+    unknowns.extend(pass_unknowns);
+    let status_source = SessionStatusSource::from(&status_fetch);
 
     let terminal = pass
         .as_ref()
@@ -1099,6 +1017,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }
@@ -2751,8 +2671,18 @@ mod tests {
     }
 
     #[test]
-    fn boundary_states_wind_down_is_a_dry_run() {
-        assert!(BOUNDARY.contains("DRY-RUN"));
+    /// Phase 4 made the verdict ACTIONABLE, so the boundary must no longer
+    /// call it a dry run — but it must still say that THIS endpoint closes
+    /// nothing, and that an `eligible` is a candidacy rather than a prediction.
+    fn boundary_states_what_wind_down_is_and_is_not() {
+        assert!(
+            !BOUNDARY.contains("DRY-RUN"),
+            "the wind-down executor acts on this verdict while drained — the \
+             boundary must not still call it a dry run"
+        );
+        assert!(BOUNDARY.contains("THIS ENDPOINT closes nothing"));
+        assert!(BOUNDARY.contains("WHILE COORD HOLDS THIS DEVICE DRAINED"));
+        assert!(BOUNDARY.contains("a candidacy and never a prediction"));
         assert!(BOUNDARY.contains("windDownCandidates"));
         assert!(BOUNDARY.contains("whether or not the runner is drained"));
     }

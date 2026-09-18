@@ -378,6 +378,8 @@ fn bind_record(
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     }
@@ -1359,6 +1361,8 @@ fn disk_only_record(t: &crate::terminal::transcript::RecentTranscript) -> Termin
         restored_from_boot_at: None,
         restore_tier: None,
         finished_at: None,
+        wind_down_outcome: None,
+        wind_down_at: None,
         finish_reason: None,
         finish_synced: false,
     }
@@ -1801,6 +1805,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         }
@@ -2213,6 +2219,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         };
@@ -2378,6 +2386,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         });
@@ -2463,6 +2473,8 @@ mod tests {
             restored_from_boot_at: None,
             restore_tier: None,
             finished_at: None,
+            wind_down_outcome: None,
+            wind_down_at: None,
             finish_reason: None,
             finish_synced: false,
         });
