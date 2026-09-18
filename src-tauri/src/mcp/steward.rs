@@ -34,8 +34,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tauri::Manager;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::mcp::types::{api_error, ApiResponse, ApiState};
 use crate::terminal::types::TerminalInfo;
@@ -174,19 +175,39 @@ struct StewardMeta {
     /// a DETACHED task after a 300 ms sleep, and `claude` then has to start —
     /// realistically 1-3 s, longer on a loaded box. The pane has a real root
     /// pid from PTY spawn, so throughout that window the probe correctly
-    /// answers `Some(false)`. Without this latch the roster reported
-    /// `running: false` for a steward that had just started, the
-    /// single-instance guard (which is `steward_status().running` once
-    /// `StartClaim` drops) stood open for the whole window, and the UI — which
-    /// polls `/stewards` every 2 s and re-enables Start whenever `running` is
-    /// false — invited a second click. Two `merge-train` stewards driving the
+    /// answers `Some(false)`. Without this latch the single-instance guard
+    /// (which is `steward_status().running` once `StartClaim` drops) stood
+    /// open for that whole window, and two `merge-train` stewards driving the
     /// merge train at once is the exact outcome the fail direction exists to
-    /// prevent, and the first version of this predicate shipped it
-    /// deterministically at every start.
+    /// prevent.
     ///
-    /// Latched (never cleared) the first time a probe sees a `claude`. A
-    /// restart of the runner drops the whole store with the PTYs, so there is
-    /// nothing stale to inherit.
+    /// ## Who sets it, and why that list is the whole point
+    ///
+    /// A latch needs an EVENT. The first version of this field had none it
+    /// owned: it was set only from [`tracked_panes`], which is reachable only
+    /// from HTTP handlers — `GET /stewards`, `GET /steward/{kind}/status`, the
+    /// start guard, the stop handler. There is no in-process poller, and the
+    /// only prober in the tree is a React component mounted behind a
+    /// collapsible sidebar. An UNATTENDED runner — the scenario this whole
+    /// plan exists for — therefore probes ZERO times, the latch never sets,
+    /// and a pane that ran `claude` for hours reads as "still starting"
+    /// forever: not reapable, permanently `running: true`, every future start
+    /// refused. That is round 2's bug restored in full, and it was reached by
+    /// asserting the probe rather than emitting it.
+    ///
+    /// So it now has a writer the backend owns: the wind-down executor calls
+    /// [`record_claude_seen`] whenever a `graceful_exit` outcome carries
+    /// `claude_pids`, which is POSITIVE PROOF a `claude` was in that pane —
+    /// evidence already in hand at the exact moment the husk is created.
+    /// [`tracked_panes`] still sets it opportunistically; it is no longer the
+    /// only path.
+    ///
+    /// The remaining route — a pane where `claude` NEVER starts, so no
+    /// evidence exists to latch on — is closed by time instead, not by this
+    /// field: see [`STARTUP_GRACE`].
+    ///
+    /// Latched (never cleared). A restart of the runner drops the whole store
+    /// with the PTYs, so there is nothing stale to inherit.
     claude_seen: bool,
 }
 
@@ -303,6 +324,66 @@ fn tracked_ids_for_kind(
         .collect()
 }
 
+/// How long a steward pane may sit alive with NO `claude` in it before that
+/// stops meaning "it has not arrived yet" and starts meaning "it never
+/// arrived".
+///
+/// The launch is a detached task with a 300 ms sleep followed by a program
+/// start — 1-3 s in practice, more on a loaded box (this runner's own
+/// `/health` has been sampled at 10 s there). Two minutes is far past any of
+/// that and still bounded, which is the property that matters: it is the only
+/// thing that resolves a pane whose `claude` never started at all, and that
+/// pane has no evidence to latch on by construction. The precedent is in this
+/// module's own history — a `claude` PowerShell function with a `$PROFILE`
+/// syntax error shadowed the CLI, so the command was typed and nothing ever
+/// appeared in the process table.
+///
+/// Without this bound such a pane is permanently "still starting": it counts
+/// as running, so every future start of the kind is refused, and the only
+/// recovery is a `stop` then `start` that no autonomous path performs —
+/// `restart_after_drain` has none. "A refused start an operator can see and
+/// retry" is the stated cost of a false "running", and a retry does not clear
+/// this one.
+pub(crate) const STARTUP_GRACE: Duration = Duration::from_secs(120);
+
+/// What ONE look at a tracked pane established. Everything the two predicates
+/// below judge, and nothing else, so they stay pure and exhaustively testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneEvidence {
+    /// Is the pane's SHELL alive? (`TerminalInfo::is_alive`.)
+    pub is_alive: bool,
+    /// Does a `claude` live in its subtree right now? `None` = the process
+    /// table could not be read, or the pane has no local pid.
+    pub hosts_claude: Option<bool>,
+    /// Has one EVER been seen here? See [`StewardMeta::claude_seen`].
+    pub claude_seen: bool,
+    /// How long the pane has existed, from `TerminalInfo::created_at`.
+    pub age: Duration,
+    /// Direct children of the pane's own root process. `None` = unreadable.
+    /// This is NOT `ClaudeProbe`'s `top_level_children`, which counts children
+    /// of the first `claude` and is therefore always 0 on a pane with none.
+    pub shell_children: Option<usize>,
+}
+
+impl PaneEvidence {
+    /// Has the startup window closed? A pane younger than [`STARTUP_GRACE`] is
+    /// given the benefit of the doubt; one older is not.
+    ///
+    /// Age is wall-clock (`created_at` is a unix timestamp), so a clock that
+    /// jumps BACKWARD saturates this to "not expired" — the safe direction,
+    /// and self-correcting as soon as the clock is sane again.
+    fn startup_window_closed(&self) -> bool {
+        self.age >= STARTUP_GRACE
+    }
+
+    /// Is the pane provably empty of `claude` AND past the point where that
+    /// could still mean "starting"? The shared core of both predicates below,
+    /// which is why they cannot disagree.
+    fn is_provably_vacant(&self) -> bool {
+        self.hosts_claude == Some(false) && (self.claude_seen || self.startup_window_closed())
+    }
+}
+
 /// PURE: is this pane still running the steward?
 ///
 /// ## Why the shell's liveness is not the question
@@ -313,71 +394,74 @@ fn tracked_ids_for_kind(
 /// after `claude` is proven gone, so a `CloseRefused` (ordinary — a single
 /// `ClaudeProbe::Unreadable` on a contended box produces one) leaves a pane
 /// that is REGISTERED and whose SHELL is alive, with no `claude` in it. Keyed
-/// on `info.is_alive` alone, that pane answered `running: true` forever: the
+/// on `is_alive` alone, that pane answered `running: true` forever: the
 /// undrain restart hit the single-instance guard, took a 409 (whose body
 /// carries no `DeferClass` code, so it read as the benign "already running"
-/// family), dropped the kind from the stopped-by-drain set, and logged
-/// "no restart needed — already running". For a merge-train steward that is
-/// PRs silently ceasing to land.
+/// family), dropped the kind from the stopped-by-drain set, and logged "no
+/// restart needed — already running".
 ///
-/// `hosts_claude` is the pane's own process answer: `Some(true)` a `claude`
-/// lives there, `Some(false)` none right now, `None` the process table could
-/// not be read. `claude_seen` is [`StewardMeta::claude_seen`] — whether one was
-/// EVER seen here.
+/// ## Why the process table alone is not the answer either
 ///
-/// **`Some(false)` is ambiguous on its own**, and that is what `claude_seen`
-/// resolves: before the latch it means "not started yet", after it "left". A
-/// steward is running until a `claude` has been seen and then is not.
+/// `hosts_claude == Some(false)` is a single instantaneous observation, and it
+/// is produced by THREE different pane states: one that has not started yet,
+/// one whose `claude` has left, and one where `claude` never started at all.
+/// Reading it as any one of them is wrong two thirds of the time. The other
+/// two fields are what separate them — [`StewardMeta::claude_seen`] (evidence
+/// it was once occupied) and [`STARTUP_GRACE`] (time enough that "not yet" has
+/// stopped being credible) — and BOTH are needed, because each closes a route
+/// the other cannot reach.
 ///
-/// **Fail direction: a pane counts as running unless we can prove it was
-/// occupied and is now empty.** `None` keeps the old answer, and so does a
-/// `Some(false)` on a pane that has never been occupied.
+/// **Fail direction: a pane counts as running unless it is provably vacant.**
+/// `None` keeps the old answer, and so does a `Some(false)` inside the startup
+/// window on a pane that has never been occupied.
 ///
 /// The asymmetry is deliberate. A false "running" costs a refused start an
-/// operator can see and retry. A false "not running" costs two stewards of one
-/// kind, and — measured against the code rather than asserted — that is
-/// recoverable but not free: `stop` kills whichever `list()` yields first,
-/// `close` drops it from the manager map, `prune_stale_meta` drops its row, and
-/// the NEXT `status` then finds the survivor, so a second `stop` ends it. Two
-/// stop calls, not zero. Temporarily invisible, not permanently ungovernable —
-/// an earlier version of this comment claimed the latter, and the overstatement
-/// is worth correcting because it is exactly the cost model that should have
-/// caught the start-window hole above.
-pub(crate) fn steward_pane_is_running(
-    is_alive: bool,
-    hosts_claude: Option<bool>,
-    claude_seen: bool,
-) -> bool {
-    if !is_alive {
-        return false;
-    }
-    match hosts_claude {
-        Some(true) => true,
-        // The only arm that says "not running", and only once we know the pane
-        // was occupied at some point.
-        Some(false) => !claude_seen,
-        None => true,
-    }
+/// operator can see and retry — PROVIDED the state it comes from can still be
+/// left, which is exactly what `STARTUP_GRACE` guarantees and why an unbounded
+/// "still starting" was not acceptable. A false "not running" costs two
+/// stewards of one kind, and — measured against the code rather than asserted
+/// — that is recoverable but not free: `stop` kills whichever `list()` yields
+/// first, `close` drops it from the manager map, `prune_stale_meta` drops its
+/// row, and the NEXT `status` then finds the survivor, so a second `stop` ends
+/// it. Two stop calls, not zero. Temporarily invisible, not permanently
+/// ungovernable — an earlier version of this comment claimed the latter, and
+/// the overstatement is worth correcting because it is exactly the cost model
+/// that should have caught the start-window hole above.
+pub(crate) fn steward_pane_is_running(ev: &PaneEvidence) -> bool {
+    ev.is_alive && !ev.is_provably_vacant()
 }
 
-/// PURE: is this pane a tracked steward that has been EMPTIED — occupied once,
-/// provably empty now, and so neither the running steward nor something that
-/// will become one?
+/// PURE: is this pane a tracked steward that has been EMPTIED — provably
+/// vacant, and holding nothing else that a close would destroy?
 ///
 /// These are what a refused graceful close leaves behind (`CloseRefused` /
 /// `CloseOutcomeUnknown` are reached only after `claude` is gone, and neither
-/// closes the tab). Before the liveness fix above they were mistaken for the
-/// running steward, which broke the undrain restart; now that they are not, the
-/// undrain starts a SECOND pane and the emptied one would be retained forever —
+/// closes the tab), plus the pane whose `claude` never started. Once the
+/// liveness predicate above stopped mistaking them for the running steward,
+/// the undrain starts a SECOND pane and the husk would be retained forever —
 /// live shell so `prune_stale_meta` never evicts it, no top-level `claude` so
 /// the wind-down census never sees it again, and nothing else closes it. One
 /// leaked pane per drain/undrain cycle. See [`reap_emptied_panes`].
-pub(crate) fn steward_pane_is_emptied(
-    is_alive: bool,
-    hosts_claude: Option<bool>,
-    claude_seen: bool,
-) -> bool {
-    is_alive && hosts_claude == Some(false) && claude_seen
+///
+/// ## `shell_children == Some(0)` is a SAFETY clause, not thrift
+///
+/// Vacancy proves only that no `claude` is in the subtree. The husk is a bare
+/// interactive shell in a visible tab, and an operator who typed `cargo build`
+/// or a long `git` operation into it would have it closed underneath them with
+/// no confirmation. So the reap additionally requires the shell to have no
+/// children of its own — `snapshot.parent_map.get(&root_pid)`, which is the
+/// shell's OWN children and not `ClaudeProbe::top_level_children` (that counts
+/// children of the first `claude`, so on a pane with none it is always 0 and
+/// would prove nothing here).
+///
+/// `None` — an unreadable table — does NOT reap. "Could not look" is never
+/// evidence that a pane is empty.
+///
+/// A husk an operator has adopted is therefore never reaped, and that is the
+/// intended outcome: it is their pane now. It is also no longer the steward,
+/// so a fresh one can start beside it.
+pub(crate) fn steward_pane_is_emptied(ev: &PaneEvidence) -> bool {
+    ev.is_alive && ev.is_provably_vacant() && ev.shell_children == Some(0)
 }
 
 /// Does a `claude` live in the pane rooted at `root_pid`, as one already-taken
@@ -399,18 +483,24 @@ pub(crate) fn pane_hosts_claude(
 /// One tracked pane of a kind, with everything the two predicates above need.
 struct TrackedPane {
     info: TerminalInfo,
-    hosts_claude: Option<bool>,
-    claude_seen: bool,
+    evidence: PaneEvidence,
 }
 
 /// The tracked panes of one kind, judged against an already-taken snapshot —
 /// **and the `claude_seen` latch advanced where this look supplies the
 /// evidence.**
 ///
-/// The latch is set here rather than at start because start has nothing to
-/// latch on: the pane is empty then, by construction. Every path that asks
-/// whether a steward is running goes through this function, and the roster is
-/// polled every 2 s, so the first probe after `claude` appears carries it.
+/// The latch is advanced here rather than at start because start has nothing
+/// to latch on: the pane is empty then, by construction.
+///
+/// **This is an OPPORTUNISTIC writer, not the one the latch relies on.** It
+/// runs only when something calls an HTTP handler — `GET /stewards`, `GET
+/// /steward/{kind}/status`, the start guard, the stop handler — and there is
+/// no in-process poller behind any of them. On an unattended runner it may
+/// never run at all, which is exactly how the first version of the latch
+/// failed. The writer that is always reached is
+/// [`record_claude_seen`], called by the wind-down executor from an exit
+/// outcome carrying `claude_pids`; see [`StewardMeta::claude_seen`].
 ///
 /// A poisoned store yields no latch, so every pane reads as `claude_seen:
 /// false` — running, and never reaped. That is the safe direction for both
@@ -419,6 +509,7 @@ fn tracked_panes(
     terminal_manager: &TerminalManager,
     kind: &str,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    now_ms: u64,
 ) -> Vec<TrackedPane> {
     let tracked_ids = steward_meta_store()
         .lock()
@@ -427,19 +518,20 @@ fn tracked_panes(
     if tracked_ids.is_empty() {
         return Vec::new();
     }
-    let observed: Vec<(TerminalInfo, Option<bool>)> = terminal_manager
+    let observed: Vec<(TerminalInfo, Option<bool>, Option<usize>)> = terminal_manager
         .list()
         .into_iter()
         .filter(|info| tracked_ids.contains(&info.id))
         .map(|info| {
             let hosts = pane_hosts_claude(snapshot, info.pid);
-            (info, hosts)
+            let children = pane_child_count(snapshot, info.pid);
+            (info, hosts, children)
         })
         .collect();
 
     let mut latched: HashMap<String, bool> = HashMap::new();
     if let Ok(mut guard) = steward_meta_store().lock() {
-        for (info, hosts) in &observed {
+        for (info, hosts, _) in &observed {
             if let Some(meta) = guard.get_mut(&info.id) {
                 if *hosts == Some(true) {
                     meta.claude_seen = true;
@@ -451,15 +543,79 @@ fn tracked_panes(
 
     observed
         .into_iter()
-        .map(|(info, hosts_claude)| {
-            let claude_seen = latched.get(&info.id).copied().unwrap_or(false);
-            TrackedPane {
-                info,
+        .map(|(info, hosts_claude, shell_children)| {
+            let evidence = PaneEvidence {
+                is_alive: info.is_alive,
                 hosts_claude,
-                claude_seen,
-            }
+                claude_seen: latched.get(&info.id).copied().unwrap_or(false),
+                age: Duration::from_millis(now_ms.saturating_sub(info.created_at)),
+                shell_children,
+            };
+            TrackedPane { info, evidence }
         })
         .collect()
+}
+
+/// Wall-clock now, in unix millis — the same base `TerminalInfo::created_at`
+/// is stamped from, so the two subtract to a pane's age.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How many direct children does the pane's own root process have? `None` when
+/// the question cannot be answered — a remote pane with no local pid, or an
+/// unreadable table.
+///
+/// The shell's OWN children, which is what [`steward_pane_is_emptied`] needs
+/// and what `ClaudeProbe::top_level_children` is not.
+pub(crate) fn pane_child_count(
+    snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
+    root_pid: Option<u32>,
+) -> Option<usize> {
+    let root = root_pid?;
+    if snapshot.parent_map.is_empty() {
+        return None;
+    }
+    Some(snapshot.parent_map.get(&root).map_or(0, Vec::len))
+}
+
+/// Record that a `claude` was POSITIVELY OBSERVED in this pane — the latch
+/// writer the backend owns.
+///
+/// Called by the wind-down executor from an outcome carrying `claude_pids`,
+/// which is proof rather than inference. See [`StewardMeta::claude_seen`] for
+/// why a writer reachable without an HTTP request is the whole point.
+///
+/// Returns whether a tracked row was updated; `false` means this terminal is
+/// not a steward, which is the ordinary case for every other pane.
+pub(crate) fn record_claude_seen(terminal_id: &str) -> bool {
+    match steward_meta_store().lock() {
+        Ok(mut guard) => match guard.get_mut(terminal_id) {
+            Some(meta) => {
+                let first = !meta.claude_seen;
+                meta.claude_seen = true;
+                if first {
+                    debug!(
+                        terminal_id,
+                        kind = %meta.kind,
+                        "steward: latched claude_seen from a graceful-exit outcome"
+                    );
+                }
+                true
+            }
+            None => false,
+        },
+        Err(e) => {
+            warn!(
+                terminal_id,
+                "steward: could not latch claude_seen — metadata store poisoned: {e}"
+            );
+            false
+        }
+    }
 }
 
 /// [`find_running_steward`] against an already-taken process snapshot.
@@ -474,11 +630,9 @@ fn find_running_steward_in(
     kind: &str,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
 ) -> Option<TerminalInfo> {
-    tracked_panes(terminal_manager, kind, snapshot)
+    tracked_panes(terminal_manager, kind, snapshot, now_ms())
         .into_iter()
-        .find(|pane| {
-            steward_pane_is_running(pane.info.is_alive, pane.hosts_claude, pane.claude_seen)
-        })
+        .find(|pane| steward_pane_is_running(&pane.evidence))
         .map(|pane| pane.info)
 }
 
@@ -486,25 +640,45 @@ fn find_running_steward_in(
 /// [`steward_pane_is_emptied`] for what leaves them behind and why nothing
 /// else ever removes them.
 ///
-/// **Closing is safe precisely because of the predicate**: the snapshot proves
-/// there is no `claude` in the subtree, so this cannot kill a live agent
-/// session, which is the act D5 and served policy `production-and-cost`
-/// `runner-lifecycle` forbid. It is a bare shell being closed.
+/// **Closing is safe precisely because of the predicate**, and the predicate
+/// now carries two clauses rather than one. The snapshot proves there is no
+/// `claude` in the subtree, so this cannot kill a live agent session — the act
+/// D5 and served policy `production-and-cost` `runner-lifecycle` forbid. It
+/// also proves the shell has no children of its own, so this cannot kill an
+/// operator's `cargo build` either. An earlier version of this sentence read
+/// "It is a bare shell being closed", which the vacancy clause alone does not
+/// establish: it proves no `claude`, not nothing at all.
 ///
 /// Returns how many it closed. Called from [`start_steward`] BEFORE the
 /// single-instance guard, which is the moment the leak would otherwise
 /// double: the undrain restart is about to open a second pane for a kind
 /// whose first one is an empty husk.
+///
+/// ## The residual this call site leaves, and why it stays here
+///
+/// Reaping on `start` sweeps the ordinary cycle completely, because `undrain`
+/// restarts each stopped kind through `start_steward`: drain → `CloseRefused`
+/// → undrain → reap, with the husk gone before its replacement opens. What it
+/// does NOT cover is a husk whose kind is never started again — a runner that
+/// drains and then exits without ever undraining. That residual is **one husk
+/// per kind per drain, bounded, and it dies with the process**.
+///
+/// An unconditional sweep on the wind-down tick would buy that narrow case at
+/// the price of running this predicate — and therefore taking a process-table
+/// snapshot — on every tick forever. That is the same trade declined for the
+/// roster's own snapshot (see [`snapshot_for_kind`]: uncached, but skipped
+/// entirely when nothing is tracked), and taking it here while declining it
+/// there would be inconsistent. The tick is also the wrong edge: it is gated
+/// on `Drained`, and the husk only becomes a leak on the UNDRAIN edge, which
+/// is exactly where this call site sits.
 async fn reap_emptied_panes(
     terminal_manager: &Arc<TerminalManager>,
     kind: &str,
     snapshot: &crate::process_capture::process_tree::ProcessSnapshot,
 ) -> usize {
-    let emptied: Vec<String> = tracked_panes(terminal_manager, kind, snapshot)
+    let emptied: Vec<String> = tracked_panes(terminal_manager, kind, snapshot, now_ms())
         .into_iter()
-        .filter(|pane| {
-            steward_pane_is_emptied(pane.info.is_alive, pane.hosts_claude, pane.claude_seen)
-        })
+        .filter(|pane| steward_pane_is_emptied(&pane.evidence))
         .map(|pane| pane.info.id)
         .collect();
 
@@ -1041,7 +1215,13 @@ async fn start_steward(
     // deliberately: it must see the state AFTER these closes, and it is the
     // one read where a stale answer re-opens the double-start window.
     let reaper_snapshot = snapshot_for_kind(spec.kind).await;
-    reap_emptied_panes(&terminal_manager, spec.kind, &reaper_snapshot).await;
+    let reaped = reap_emptied_panes(&terminal_manager, spec.kind, &reaper_snapshot).await;
+    if reaped > 0 {
+        info!(
+            "HTTP: reaped {} emptied {} pane(s) before starting",
+            reaped, spec.skill
+        );
+    }
 
     // Single-instance guard, PER KIND: refuse if `GET /steward/{kind}/status`
     // would report running: true. A merge-train steward must not block a
@@ -1388,99 +1568,206 @@ mod tests {
         );
     }
 
+    /// A pane with the given evidence, defaulted to the ordinary running
+    /// steward so each test states only what it is about.
+    fn ev() -> PaneEvidence {
+        PaneEvidence {
+            is_alive: true,
+            hosts_claude: Some(true),
+            claude_seen: true,
+            age: Duration::from_secs(3600),
+            shell_children: Some(0),
+        }
+    }
+
     /// B-1: a steward is a `claude`, not a shell. The pane wind-down emptied
     /// has a LIVE shell and no `claude`, and keying on the shell made it answer
     /// `running: true` forever — which swallowed the undrain restart as a
     /// benign "already running" 409 and left the steward down.
     #[test]
     fn a_pane_whose_claude_left_is_not_a_running_steward() {
-        // The regression, stated as the predicate sees it. `claude_seen` is
-        // what makes this pane "left" rather than "not arrived yet".
-        assert!(
-            !steward_pane_is_running(true, Some(false), true),
-            "a live shell that HAD a claude and no longer does is a bare prompt, \
-             not a running steward"
-        );
+        assert!(!steward_pane_is_running(&PaneEvidence {
+            hosts_claude: Some(false),
+            claude_seen: true,
+            ..ev()
+        }));
         // ...and the ordinary running case still is.
-        assert!(steward_pane_is_running(true, Some(true), true));
-        assert!(steward_pane_is_running(true, Some(true), false));
+        assert!(steward_pane_is_running(&ev()));
         // A dead pane is not running whatever the process table says.
-        for seen in [true, false] {
-            assert!(!steward_pane_is_running(false, Some(true), seen));
-            assert!(!steward_pane_is_running(false, Some(false), seen));
-            assert!(!steward_pane_is_running(false, None, seen));
+        for hosts in [Some(true), Some(false), None] {
+            assert!(!steward_pane_is_running(&PaneEvidence {
+                is_alive: false,
+                hosts_claude: hosts,
+                ..ev()
+            }));
         }
     }
 
     /// B3-1: the START WINDOW. Between `TerminalManager::create` returning and
     /// `claude` appearing — a detached task, a 300 ms sleep, then a program
-    /// start, so 1-3 s and longer on a loaded box — the pane is alive, has a
-    /// real root pid, and provably hosts no `claude`. That is byte-for-byte the
-    /// same observation as an emptied pane.
+    /// start — the pane is alive, has a real root pid, and provably hosts no
+    /// `claude`. That is the same observation as an emptied pane.
     ///
     /// Reading it as "not running" is not a cosmetic wrong answer: the roster
-    /// is the single-instance guard, so for that whole window `start` would
-    /// have admitted a SECOND steward of the kind, and the UI re-enables its
-    /// Start button on exactly that field. Two merge-train stewards driving
-    /// the merge train is the outcome the fail direction exists to prevent, and
-    /// the first version of this predicate produced it at every single start.
+    /// IS the single-instance guard, so for that whole window `start` would
+    /// admit a SECOND steward of the kind.
     #[test]
     fn a_steward_that_has_not_arrived_yet_is_still_running() {
         assert!(
-            steward_pane_is_running(true, Some(false), false),
-            "an empty pane that has NEVER hosted a claude is starting, not stopped"
+            steward_pane_is_running(&PaneEvidence {
+                hosts_claude: Some(false),
+                claude_seen: false,
+                age: Duration::from_secs(2),
+                ..ev()
+            }),
+            "an empty pane that has NEVER hosted a claude, inside the startup \
+             window, is starting — not stopped"
         );
-        // And the latch is the only difference between the two readings.
-        assert!(!steward_pane_is_running(true, Some(false), true));
+    }
+
+    /// B4-1, the other half. "Still starting" must be BOUNDED. A pane whose
+    /// `claude` never started at all has no evidence to latch on — the
+    /// precedent is a shell function shadowing the CLI — so without a time
+    /// bound it stays "running" forever, every future start of the kind is
+    /// refused, and no autonomous path can clear it: `restart_after_drain`
+    /// only ever calls `start`, and a retry is exactly what does not help.
+    #[test]
+    fn a_claude_that_never_arrived_stops_counting_as_starting() {
+        let never_started = PaneEvidence {
+            hosts_claude: Some(false),
+            claude_seen: false,
+            age: STARTUP_GRACE,
+            ..ev()
+        };
+        assert!(
+            !steward_pane_is_running(&never_started),
+            "past STARTUP_GRACE an empty pane is a failed start, not a pending one"
+        );
+        // And it is reapable, so the next start of the kind can succeed
+        // without an operator ever touching it.
+        assert!(steward_pane_is_emptied(&never_started));
+
+        // The boundary is the constant itself, not a hardcoded duration.
+        let one_tick_earlier = PaneEvidence {
+            age: STARTUP_GRACE - Duration::from_millis(1),
+            ..never_started
+        };
+        assert!(steward_pane_is_running(&one_tick_earlier));
+        assert!(!steward_pane_is_emptied(&one_tick_earlier));
     }
 
     /// FAIL DIRECTION. An unanswerable process table must keep the old
     /// answer, because a false "not running" admits a second steward of the
-    /// kind. Recoverable — `stop` takes the one `list()` yields first, pruning
-    /// then exposes the survivor to the NEXT `status`, so two stop calls end
-    /// it — but two is not zero, and for a merge-train steward the interval
-    /// between them is spent with two of them driving the train.
+    /// kind. Recoverable — two stop calls, not zero — but two is not zero.
     #[test]
     fn an_unreadable_process_table_keeps_the_pane_running() {
         for seen in [true, false] {
-            assert!(
-                steward_pane_is_running(true, None, seen),
-                "a pane counts as running unless it is PROVEN to have emptied"
-            );
+            for age in [Duration::ZERO, STARTUP_GRACE * 10] {
+                let e = PaneEvidence {
+                    hosts_claude: None,
+                    claude_seen: seen,
+                    age,
+                    ..ev()
+                };
+                assert!(
+                    steward_pane_is_running(&e),
+                    "a pane counts as running unless it is PROVEN vacant"
+                );
+                assert!(
+                    !steward_pane_is_emptied(&e),
+                    "and is never reaped on a guess"
+                );
+            }
         }
     }
 
-    /// The reaper's predicate is strictly narrower than "not running": it fires
-    /// only on the one state that leaks, and never on an unreadable table or a
-    /// pane that has yet to start.
+    /// S4-1: vacancy proves no `claude`. It does NOT prove the pane is empty
+    /// — the husk is an interactive shell in a visible tab, and an operator
+    /// may have typed a build into it. The reap must not close that.
     #[test]
-    fn only_a_pane_that_was_occupied_and_is_now_empty_is_reaped() {
-        assert!(steward_pane_is_emptied(true, Some(false), true));
+    fn a_husk_an_operator_is_using_is_never_reaped() {
+        let adopted = PaneEvidence {
+            hosts_claude: Some(false),
+            claude_seen: true,
+            shell_children: Some(1),
+            ..ev()
+        };
+        assert!(
+            !steward_pane_is_emptied(&adopted),
+            "a shell with a child of its own is somebody's work, not a husk"
+        );
+        // It is still not the steward, so a fresh one can start beside it.
+        assert!(!steward_pane_is_running(&adopted));
+
+        // An unreadable child count is not evidence of emptiness either.
+        assert!(!steward_pane_is_emptied(&PaneEvidence {
+            shell_children: None,
+            ..adopted
+        }));
+    }
+
+    /// The reaper's predicate fires only on states that genuinely leak, and
+    /// never on one where closing could destroy something.
+    #[test]
+    fn only_a_vacant_childless_pane_is_reaped() {
+        assert!(steward_pane_is_emptied(&PaneEvidence {
+            hosts_claude: Some(false),
+            claude_seen: true,
+            ..ev()
+        }));
 
         // Never on a starting pane — closing one of those races the launch.
-        assert!(!steward_pane_is_emptied(true, Some(false), false));
+        assert!(!steward_pane_is_emptied(&PaneEvidence {
+            hosts_claude: Some(false),
+            claude_seen: false,
+            age: Duration::from_secs(1),
+            ..ev()
+        }));
         // Never on an occupied pane. This is the load-bearing one: the reaper
         // CLOSES, and closing a pane that hosts a live `claude` is the act D5
         // and `runner-lifecycle` forbid.
-        assert!(!steward_pane_is_emptied(true, Some(true), true));
-        // Never on an unreadable table — "could not look" is not evidence.
-        assert!(!steward_pane_is_emptied(true, None, true));
+        assert!(!steward_pane_is_emptied(&ev()));
         // A dead pane needs no reaping; `prune_stale_meta` already has it.
-        assert!(!steward_pane_is_emptied(false, Some(false), true));
+        assert!(!steward_pane_is_emptied(&PaneEvidence {
+            is_alive: false,
+            hosts_claude: Some(false),
+            ..ev()
+        }));
     }
 
     /// The two predicates never both hold: nothing is reaped while it counts
-    /// as the running steward, whatever the inputs.
+    /// as the running steward.
+    ///
+    /// N4-1: this is exhaustive over the predicates' whole input domain, so
+    /// for the PURE functions it is a proof rather than a sample. It says
+    /// nothing about the call site, which makes two observations at different
+    /// instants — `reap_emptied_panes` and the single-instance guard each take
+    /// their own snapshot, deliberately (see `start_steward`). Exclusivity of
+    /// the predicates does not extend to exclusivity across two looks.
     #[test]
     fn a_reaped_pane_is_never_a_running_one() {
-        for alive in [true, false] {
-            for hosts in [Some(true), Some(false), None] {
-                for seen in [true, false] {
-                    assert!(
-                        !(steward_pane_is_running(alive, hosts, seen)
-                            && steward_pane_is_emptied(alive, hosts, seen)),
-                        "alive={alive} hosts={hosts:?} seen={seen}"
-                    );
+        for is_alive in [true, false] {
+            for hosts_claude in [Some(true), Some(false), None] {
+                for claude_seen in [true, false] {
+                    for age in [
+                        Duration::ZERO,
+                        STARTUP_GRACE - Duration::from_millis(1),
+                        STARTUP_GRACE,
+                    ] {
+                        for shell_children in [Some(0), Some(2), None] {
+                            let e = PaneEvidence {
+                                is_alive,
+                                hosts_claude,
+                                claude_seen,
+                                age,
+                                shell_children,
+                            };
+                            assert!(
+                                !(steward_pane_is_running(&e) && steward_pane_is_emptied(&e)),
+                                "{e:?}"
+                            );
+                        }
+                    }
                 }
             }
         }
