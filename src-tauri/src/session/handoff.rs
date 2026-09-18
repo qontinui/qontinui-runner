@@ -683,8 +683,6 @@ async fn run_all_catchups(
                 .await
             }
         }
-            }
-        }
     }
 }
 
