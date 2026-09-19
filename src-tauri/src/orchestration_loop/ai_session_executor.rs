@@ -386,7 +386,9 @@ pub async fn dispatch_subtask(
     let session_mgr = app_handle
         .try_state::<Arc<SessionManager>>()
         .ok_or_else(|| {
-            DispatchError::Failed("dispatch_subtask: SessionManager state not available".to_string())
+            DispatchError::Failed(
+                "dispatch_subtask: SessionManager state not available".to_string(),
+            )
         })?
         .inner()
         .clone();
