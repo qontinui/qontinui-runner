@@ -729,7 +729,19 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                     // `last_actor` GET and a `current_status` GET on EVERY
                     // cycle until coord happens to derive the word itself
                     // (forever, if its predicate never holds). Falling through
-                    // pays one refused transition, once.
+                    // pays one refused transition per pair per PROCESS (the
+                    // retirement store does not survive a runner start).
+                    //
+                    // Two known imperfections, both bounded and neither able to
+                    // overwrite anything: (1) coord checks the CAS `from_status`
+                    // guard BEFORE the derived-status check, so when the
+                    // conflict read below is UNREADABLE (guard kept) and the
+                    // owner has moved the unit, the answer is a 409, not the
+                    // permanent 422 — the pair is not retired and the attempt
+                    // repeats until a read succeeds, which then drops the
+                    // guard; (2) an owner that moved the unit makes the
+                    // conflict check below log `file wins (loud override)`
+                    // once for a write coord is about to refuse.
                 } else {
                     tracing::info!(
                         slug = %u.slug,
