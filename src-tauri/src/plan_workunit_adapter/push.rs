@@ -720,6 +720,16 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                 let converged = matches!(&remote, RemoteStatus::Known(Some(s)) if s == &u.status);
                 if converged {
                     action = PushAction::RefreshOnly;
+                } else if is_coord_derived_status(&u.status) {
+                    // NOT deferred: a transition onto a coord-DERIVED status is
+                    // one no identity can make, so sending it cannot overwrite
+                    // what the owner set — coord refuses it with `terminality:
+                    // "permanent"`, and `reconcile_once` retires the pair. The
+                    // deferral protects nothing here and would cost this unit a
+                    // `last_actor` GET and a `current_status` GET on EVERY
+                    // cycle until coord happens to derive the word itself
+                    // (forever, if its predicate never holds). Falling through
+                    // pays one refused transition, once.
                 } else {
                     tracing::info!(
                         slug = %u.slug,
@@ -927,6 +937,14 @@ pub async fn push_work_unit_with_status_write<S: WorkUnitSink + ?Sized>(
                     RemoteStatus::Known(Some(remote_status)) => Some(remote_status.clone()),
                     _ => None,
                 }
+            } else if matches!(remote, RemoteStatus::Known(None)) {
+                // The conflict check READ the unit as provably absent (deleted
+                // out of band), and this status-less upsert re-creates it.
+                // coord stores a created row's missing status as `''`
+                // (`COALESCE($3, '')`), so that — not the file's word — is
+                // what coord now holds. Recording it makes the next cycle a
+                // real `Transition { "" -> file }` that restores the status.
+                Some(String::new())
             } else {
                 Some(u.status.clone())
             };
@@ -2193,6 +2211,36 @@ mod tests {
         );
     }
 
+    /// A refresh whose conflict check READ the unit as provably absent
+    /// re-creates it status-less, so coord then holds `''` — and that, not the
+    /// file's word, is what the push may report as applied. Reporting the
+    /// file's word would leave the memory claiming a status coord does not
+    /// hold, and the next cycle would never restore it.
+    ///
+    /// Neuter check: drop the `RemoteStatus::Known(None)` arm and this fails.
+    #[tokio::test]
+    async fn a_refresh_of_a_vanished_unit_reports_the_empty_status_it_recreated() {
+        let sink = FakeSink {
+            remote: None,
+            ..Default::default()
+        };
+        let out = push_work_unit(&sink, &unit("s", "vetted"), Some("vetted"))
+            .await
+            .unwrap();
+        assert_eq!(out.kind, PushOutcomeKind::Refreshed);
+        assert!(!out.conflict, "an absent row is not a divergence");
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            1,
+            "the check did read it"
+        );
+        assert_eq!(
+            out.applied_status.as_deref(),
+            Some(""),
+            "coord re-created the row with an empty status"
+        );
+    }
+
     /// A `current_status` `Err` in the CONFLICT CHECK must not be consumed as
     /// "no divergence". It still does not SET `conflict` — we observed no
     /// divergence and must not claim one — but it takes the UNKNOWN arm (which
@@ -2241,7 +2289,9 @@ mod tests {
             last_actor: Some("device:d:agent:a".to_string()),
             ..Default::default()
         };
-        let out = push_work_unit(&sink, &unit("s", "shipped"), Some("vetted"))
+        // A SETTABLE target: a transition onto a coord-derived word is not
+        // deferred at all (no identity can set it, so it overwrites nothing).
+        let out = push_work_unit(&sink, &unit("s", "in_progress"), Some("vetted"))
             .await
             .unwrap();
         assert!(
