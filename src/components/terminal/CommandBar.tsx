@@ -65,6 +65,7 @@ import {
   resolve,
   subscribe,
 } from "./commands";
+import { noMatchEnterIsInert, tier3Eligible } from "./tier3EnterGate";
 
 /**
  * How many argument slots the winning tier actually CAPTURED.
@@ -162,21 +163,6 @@ export const COMMAND_BAR_INPUT_ACTIONS: StandardAction[] = [
 // enough to let the operator finish typing a phrase, short enough that
 // they don't feel a lag after they stop.
 const TIER3_DEBOUNCE_MS = 600;
-// Minimum normalized-query length that's "meaningful enough" to spend a
-// subprocess call on. Below this, Tier-1 fuzzy carries the response.
-const TIER3_MIN_CHARS = 3;
-
-/**
- * Whether Tier 3 would be asked about `query` at all: long enough, and not
- * already resolved exactly by Tier 1 or matched by a Tier-2 pattern. One
- * predicate for the debounced fire and for the no-match Enter branch, so the
- * two cannot disagree about which lines are still awaiting an answer.
- */
-function tier3Eligible(query: string, recents: Parameters<typeof resolve>[1]): boolean {
-  if (query.trim().length < TIER3_MIN_CHARS) return false;
-  if (resolve(query, recents).some((m) => m.exact)) return false;
-  return !matchPattern(query);
-}
 
 const PLACEHOLDER_EXAMPLES = [
   "/spawn-ai 3 best",
@@ -417,8 +403,11 @@ export function CommandBar() {
   useEffect(() => {
     // Clear any previous result whenever the query changes — operator
     // is mid-typing or starting over, the prior Tier-3 hit no longer
-    // applies.
+    // applies. `tier3SettledFor` too: "settled" belongs to one RUN, not to a
+    // string — a line recalled from history, or edited away and back, is
+    // awaiting a fresh answer and must not read as already judged.
     setTier3Match(null);
+    setTier3SettledFor(null);
 
     // Skip below the length floor, and when Tier-1 / Tier-2 already nailed
     // it — Tier-3 would burn a subprocess on a query that's already resolved.
@@ -662,7 +651,16 @@ export function CommandBar() {
         // the debounce window or the subprocess call, "no match" is a verdict
         // from two of three tiers, and the AI match can land under the error a
         // moment later. Enter stays inert there, as it always was.
-        if (interpreting || (tier3Eligible(query, recents) && tier3SettledFor !== query)) return;
+        if (
+          noMatchEnterIsInert({
+            query,
+            interpreting,
+            eligible: tier3Eligible(query, recents),
+            settledFor: tier3SettledFor,
+          })
+        ) {
+          return;
+        }
         persistHistory(query);
         setHistoryIdx(-1);
         setStatus({
