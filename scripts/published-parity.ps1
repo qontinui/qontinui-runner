@@ -582,11 +582,11 @@ if ($SummaryOut) {
     $md.Add("### Published-build capability parity")
     $md.Add("")
     if ($result.SchemaRefusal) {
-        $md.Add("**Refused — schema version mismatch.** $($result.SchemaRefusalReason)")
+        $md.Add("**Refused -- schema version mismatch.** $($result.SchemaRefusalReason)")
         $md.Add("")
         $md.Add("No defect count is reported. A row diff across two manifest formats is meaningless, and ``0`` would be a claim this run did not earn.")
     } else {
-        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) — out of **$($result.ComparableCount) comparable** rows.")
+        $md.Add("**parity_defects = $($result.ParityDefectCount)** (rung_differs $($result.RungDifferCount) + only_in_dev $($result.OnlyInDevCount)) -- out of **$($result.ComparableCount) comparable** rows.")
         $md.Add("")
         $md.Add("**$($result.UnobservedCount) rows were unobserved** on at least one leg, so no comparison was possible for them. ``unknown`` is the absence of a reading, never agreement -- read ``parity_defects`` as a floor over the comparable set, not a verdict on the roster.")
         $md.Add("")
@@ -607,7 +607,7 @@ if ($SummaryOut) {
             $md.Add("| ``$($r.Id)`` | $devCell | $pubCell | $disp |")
         }
         $md.Add("")
-        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " — the allowlist is empty; nothing was excused." } else { ":" }))
+        $md.Add("Allowlisted expected differences: **$(@($result.Allowlist).Count)** entries" + $(if (@($result.Allowlist).Count -eq 0) { " -- the allowlist is empty; nothing was excused." } else { ":" }))
         foreach ($e in @($result.Allowlist)) {
             $md.Add("- ``$($e.Id)`` (dev ``$($e.DevRung)`` / published ``$($e.PublishedRung)``): $($e.Reason)")
         }

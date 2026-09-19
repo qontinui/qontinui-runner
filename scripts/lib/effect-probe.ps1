@@ -10,7 +10,7 @@
 # Probe 2b's job is to go RED when the `effect` annotation is stripped between
 # the SDK and the runner's IPC consumers. Everything that touches a live runner
 # (spawn, activate-tab, poll, HTTP) can only be exercised on a box with a
-# supervisor and a Windows-gated CI lane — which means the probe's *decision*
+# supervisor and a Windows-gated CI lane -- which means the probe's *decision*
 # would otherwise never be observed failing on any developer machine. A check
 # nobody has watched fail has not been shown to check anything.
 #
@@ -26,9 +26,9 @@
 
 .PARAMETER Surfaces
     One entry per surface to check, each a hashtable/PSCustomObject with:
-      Name    — how the surface is named in a failure message
+      Name    -- how the surface is named in a failure message
                 (e.g. 'components-list', 'component-detail')
-      Actions — the surface's `actions` array, already ConvertFrom-Json'd.
+      Actions -- the surface's `actions` array, already ConvertFrom-Json'd.
     Both `/control/components` and `/control/component/:id` are checked because
     they are SEPARATE `serializeComponent` call sites (useControlEvents.ts
     `get_components` vs `get_component`); a regression can hit one alone.
@@ -37,7 +37,7 @@
     Hashtable of actionId -> expected effect string.
 
 .OUTPUTS
-    [string[]] — one line per problem. Always an array, possibly empty.
+    [string[]] -- one line per problem. Always an array, possibly empty.
 #>
 function Get-EffectProbeProblems {
     [CmdletBinding()]
