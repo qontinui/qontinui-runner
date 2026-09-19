@@ -601,7 +601,7 @@ function Get-FreePort {
 function Start-DirectRunner {
     param([string]$ExePath, [int]$Port)
 
-    # -LiteralPath, not -Path: the published exe is "Qontinui Runner.exe" and
+    # -LiteralPath, not -Path: the published exe is "qontinui-runner.exe" and
     # lives under "...\Qontinui Runner\". A space is harmless to -Path, but the
     # install dir is user-controlled and a wildcard metacharacter ([ ] ? *) in
     # it would silently make -Path glob instead of address one file.
