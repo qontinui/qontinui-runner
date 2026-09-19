@@ -171,6 +171,11 @@ pub struct AllocatedWorktree {
     pub status: String,
     #[serde(default)]
     pub push_ref: Option<String>,
+    /// D3 — coord's verdict on how fresh `parent_sha` is, flattened onto the
+    /// row. Every field defaults, so a payload from an older coord reads
+    /// `Unknown` / `None` — never `Fresh`.
+    #[serde(flatten)]
+    pub parent_sha_provenance: crate::agent_worktree::ParentShaProvenance,
 }
 
 /// How a gate continuation should be surfaced to the operator.
@@ -7214,15 +7219,20 @@ fn payload_to_allocate_result(
         worktrees: payload
             .worktrees
             .iter()
-            .map(|w| MaterializedWorktree {
-                repo: w.repo.clone(),
-                branch: w.branch.clone(),
-                parent_sha: w.parent_sha.clone(),
-                worktree_path: std::path::PathBuf::from(&w.worktree_path),
-                push_ref: w
-                    .push_ref
-                    .clone()
-                    .unwrap_or_else(|| crate::agent_worktree::remote_agent_ref(&w.branch)),
+            .map(|w| {
+                // D3 — a pure mapping; the not-fresh WARN for this row fired in
+                // `materialize_worktrees`, before the first act on the sha.
+                MaterializedWorktree {
+                    repo: w.repo.clone(),
+                    branch: w.branch.clone(),
+                    parent_sha: w.parent_sha.clone(),
+                    worktree_path: std::path::PathBuf::from(&w.worktree_path),
+                    push_ref: w
+                        .push_ref
+                        .clone()
+                        .unwrap_or_else(|| crate::agent_worktree::remote_agent_ref(&w.branch)),
+                    parent_sha_provenance: w.parent_sha_provenance.clone(),
+                }
             })
             .collect(),
         token: credential.token.clone(),
@@ -7784,6 +7794,14 @@ async fn run_agent_subprocess(
 async fn materialize_worktrees(payload: &LaunchPayload) -> anyhow::Result<()> {
     let root = qontinui_root_dir()
         .ok_or_else(|| anyhow::anyhow!("no qontinui-root directory configured"))?;
+    // D3/D6 — the first act on a coord-delivered row is the `git worktree add`
+    // below, so say here, once per row and before it, when coord did not
+    // vouch for the sha. The sha is then used exactly as served (D6: no
+    // client-side fast-forward — `fs_observer` diffs against it).
+    for wt in &payload.worktrees {
+        wt.parent_sha_provenance
+            .warn_if_not_fresh(&wt.repo, &wt.parent_sha);
+    }
     for wt in &payload.worktrees {
         let repo_root = root.join(local_repo_name(&wt.repo));
         if !repo_root.exists() {
@@ -9089,6 +9107,128 @@ mod tests {
     use crate::test_env::env_lock;
 
     // =======================================================================
+    // D3 — the four `parent_sha_*` freshness fields on a coord-delivered
+    // `LaunchPayload` worktree row (plan
+    // `2026-09-13-coord-allocate-serves-a-stale-mirror-sha-as-a-fresh-parent`
+    // Phase 4). A row that says nothing reads `Unknown`, never `Fresh`.
+    // =======================================================================
+
+    #[test]
+    fn allocated_worktree_without_freshness_fields_reads_unknown() {
+        use crate::agent_worktree::ParentShaFreshness;
+        let row: AllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"/wt/qontinui-runner","status":"allocated",
+                "push_ref":"refs/agent/m-a"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            row.parent_sha_provenance.parent_sha_freshness,
+            ParentShaFreshness::Unknown
+        );
+        assert_eq!(row.parent_sha_provenance.parent_sha_age_secs, None);
+        assert_eq!(row.parent_sha_provenance.parent_sha_observed_at, None);
+        assert_eq!(row.parent_sha_provenance.parent_sha_basis, None);
+    }
+
+    #[test]
+    fn allocated_worktree_round_trips_a_stale_verdict() {
+        use crate::agent_worktree::ParentShaFreshness;
+        let row: AllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"/wt/qontinui-runner","status":"allocated",
+                "parent_sha_freshness":"stale","parent_sha_age_secs":1234,
+                "parent_sha_basis":"fetch_failed",
+                "parent_sha_observed_at":"2026-09-13T03:47:11Z"}"#,
+        )
+        .unwrap();
+        let p = &row.parent_sha_provenance;
+        assert_eq!(p.parent_sha_freshness, ParentShaFreshness::Stale);
+        assert_eq!(p.parent_sha_age_secs, Some(1234));
+        assert_eq!(p.parent_sha_basis.as_deref(), Some("fetch_failed"));
+        assert_eq!(
+            p.parent_sha_observed_at.as_deref(),
+            Some("2026-09-13T03:47:11Z")
+        );
+    }
+
+    #[test]
+    fn allocated_worktree_explicit_nulls_read_unmeasured() {
+        use crate::agent_worktree::ParentShaFreshness;
+        // What a NEW coord emits for an unmeasured row: keys present, values null.
+        let row: AllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"/wt/qontinui-runner","status":"allocated",
+                "parent_sha_freshness":"unknown","parent_sha_age_secs":null,
+                "parent_sha_basis":null,"parent_sha_observed_at":null}"#,
+        )
+        .unwrap();
+        let p = &row.parent_sha_provenance;
+        assert_eq!(p.parent_sha_freshness, ParentShaFreshness::Unknown);
+        assert_eq!(p.parent_sha_age_secs, None);
+        assert_eq!(p.parent_sha_basis, None);
+        assert_eq!(p.parent_sha_observed_at, None);
+    }
+
+    #[test]
+    fn allocated_worktree_unrecognised_freshness_reads_unknown() {
+        use crate::agent_worktree::ParentShaFreshness;
+        let row: AllocatedWorktree = serde_json::from_str(
+            r#"{"repo":"qontinui-runner","branch":"agent/m-a","parent_sha":"abc123",
+                "worktree_path":"/wt/qontinui-runner","status":"allocated",
+                "parent_sha_freshness":"extremely_fresh"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            row.parent_sha_provenance.parent_sha_freshness,
+            ParentShaFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn payload_to_allocate_result_carries_freshness_onto_the_result() {
+        use crate::agent_worktree::ParentShaFreshness;
+        let body = serde_json::json!({
+            "agent_id": uuid::Uuid::nil(),
+            "target_device_id": uuid::Uuid::nil(),
+            "worktrees": [{
+                "repo": "qontinui-runner",
+                "branch": "agent/m-a",
+                "parent_sha": "abc123",
+                "worktree_path": "/wt/qontinui-runner",
+                "status": "allocated",
+                "parent_sha_freshness": "stale",
+                "parent_sha_age_secs": 1234,
+                "parent_sha_basis": "fetch_failed",
+                "parent_sha_observed_at": "2026-09-13T03:47:11Z"
+            }],
+            "jwt": "tok",
+            "jwt_exp": 0,
+            "initial_prompt": "go",
+            "claim_token": "agent:00000000-0000-0000-0000-000000000000"
+        });
+        let payload: LaunchPayload = serde_json::from_value(body).unwrap();
+        let credential = AgentCredential {
+            token: "tok".to_string(),
+            exp: 0,
+            jti: uuid::Uuid::nil(),
+        };
+        let result = payload_to_allocate_result(&payload, &credential);
+        let wt = &result.worktrees[0];
+        assert_eq!(wt.parent_sha, "abc123");
+        let p = &wt.parent_sha_provenance;
+        assert_eq!(p.parent_sha_freshness, ParentShaFreshness::Stale);
+        assert_eq!(p.parent_sha_age_secs, Some(1234));
+        assert_eq!(p.parent_sha_basis.as_deref(), Some("fetch_failed"));
+        assert_eq!(
+            p.parent_sha_observed_at.as_deref(),
+            Some("2026-09-13T03:47:11Z")
+        );
+        // The push_ref fallback still applies beside the new fields.
+        assert_eq!(wt.push_ref, "refs/agent/m-a");
+    }
+
+    // =======================================================================
     // Condition-check spawn-failure reporting (plan
     // `2026-09-09-continuation-dispatch-fails-silently-three-times-in-four`
     // Phase 1).
@@ -10155,6 +10295,7 @@ mod tests {
                 worktree_path: "/tmp/wt".to_string(),
                 status: "allocated".to_string(),
                 push_ref: Some("refs/agent/abc-def".to_string()),
+                parent_sha_provenance: Default::default(),
             }],
             jwt: "tok".to_string(),
             jwt_exp: 0,
