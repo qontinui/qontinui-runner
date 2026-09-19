@@ -1138,6 +1138,7 @@ const GATED_CONSTRUCTORS: &[&str] = &[
 /// about whether any CALLER is gated.
 const EXPECTED_GATED_SITES: &[(&str, usize)] = &[
     ("agent_worktree/census.rs", 1),
+    ("agent_worktree/mod.rs", 1),
     ("session/coord_sync.rs", 2),
     ("session/handoff.rs", 1),
     ("session/mod.rs", 1),
@@ -1176,6 +1177,13 @@ const EXPECTED_UNGATED_SITES: &[(&str, usize, &str)] = &[
         "the operator NAMES the tenant on argv, so the CLI asserts it rather \
          than inferring it, and coord derives the row from the verified \
          principal either way.",
+    ),
+    (
+        "commands/session_info.rs",
+        1,
+        "a match PATTERN, not a construction: `project_tenancy` reads a session's \
+         scope into the read-only tenancy report. Nothing it builds reaches a \
+         wire body.",
     ),
     (
         "mcp/device_jwt_refresher.rs",
@@ -1308,11 +1316,12 @@ fn every_ungated_tenant_scope_construction_is_a_reviewed_exception() {
 
     let total: usize = found.values().sum();
     assert_eq!(
-        total, 15,
-        "expected 15 ungated `TenantScope` constructions in production code — 5 in auth.rs \
-         (the type's own module) and 10 reviewed exceptions, every one of them a route whose \
-         body carries no tenant, a caller-named read, the credential-health publish, or a \
-         gate's own internals. Found {total}. It goes DOWN when a site adopts a gated \
+        total, 16,
+        "expected 16 ungated `TenantScope` constructions in production code — 5 in auth.rs \
+         (the type's own module) and 11 reviewed exceptions, every one of them a route whose \
+         body carries no tenant, a caller-named read, the credential-health publish, a \
+         gate's own internals, or a match pattern in the read-only tenancy report. Found \
+         {total}. It goes DOWN when a site adopts a gated \
          constructor, and UP only when a new ungated resolution ships, which is the event \
          this number exists to make visible."
     );
