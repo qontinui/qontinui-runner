@@ -229,8 +229,8 @@ jobs:
       # directory — `coverage-diff.test.mjs` and `perf-harness-lib.test.mjs`
       # predate this step and have not been verified against this job's exact
       # environment; wiring them in is a separate, separately-verified change.
-      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest)
-        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs
+      - name: Run CI-tooling unit tests (ci-flake-analyze, ci-test-results-ingest, ci-expiry-phase-summary)
+        run: node --test scripts/__tests__/ci-flake-analyze.test.mjs scripts/__tests__/ci-test-results-ingest.test.mjs scripts/__tests__/ci-expiry-phase-summary.test.mjs
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
@@ -630,24 +630,44 @@ jobs:
           echo "device_id=$DEVICE_ID active_tenant_id=$TENANT_ID"
         shell: bash
 
-      - name: Run Rust tests
-        # Accessibility integration tests that require a real desktop session are
-        # skipped in CI. Only pure unit tests (no system dependencies) run here.
-        #
-        # Step has a hard 90-minute timeout. Empirical durations from
-        # main-branch runs on 2026-05-11/12 (10-run sample): Ubuntu p50
-        # ~43 min, Windows p50 ~70 min, macOS p50 ~58 min / p90 ~70 min /
-        # max(success) ~72 min. The earlier 75-min cap sat at p90+5 min;
-        # PR #104 and PR #105 (both content-trivial — terminal-sessions
-        # endpoint additions / JSON spec) blew it three times in 36 h
-        # with `Run Rust tests` landing at 75.2 / 75.4 / 75.5 min.
-        # Variance is dominated by GitHub-hosted macOS runner load +
-        # cache state (cold-cache runs land at 65-72 min, warm-cache at
-        # 30-40 min). 90 min = p90 + 20 min headroom covers the slow
-        # tail without hiding genuine regressions. The original cap
-        # rationale ("fail fast on swap-thrash hangs") is preserved —
-        # JOBS=1 below prevents the 80+ min swap-thrash scenario from
-        # PR #84, so the cap is just bounding normal variance now.
+      # ── BUILD half of the old single `Run Rust tests` step ─────────────
+      #
+      # The split is plan 2026-09-17-the-windows-test-gate-is-a-90-minute-build-
+      # wearing-a-test-shaped-bound, Phase 1. WHY: `cargo test` compiles AND
+      # executes, so one `timeout-minutes` bounded (dependency compile +
+      # workspace codegen + test-binary link + test execution) under a name and
+      # a rationale that talked almost entirely about TESTS. Measured on the
+      # windows leg, 2026-09-17: the suite itself reports `finished in 117.72s`
+      # while the step's median is ~50 min — roughly 92% of what the bound
+      # bounded was `rustc`. On run 35043646051 attempt 1 the step expired at
+      # exactly 90 min TWO MINUTES AFTER the suite had already reported
+      # `1354 passed; 0 failed`, so a required check went red on a PR whose
+      # tests passed. A bound sized against the wrong quantity cannot be tuned
+      # correctly and cannot attribute its own expiry; split, each bound is
+      # named for what it actually bounds.
+      #
+      # THE BOUNDS ARE NOT A TUNING CHANGE. 90 stays on the build half — the
+      # whole measured distribution already fits under it (44 windows samples
+      # after 2026-09-08: p50 50, p90 63, max(success) 82) and the plan ranks
+      # raising a bound LAST, after Phases 1-3 have moved the distribution
+      # (its Phase 5). What is new is only that the run half is bounded
+      # SEPARATELY and SMALL, which is the thing the old composite could not
+      # express.
+      #
+      # Accessibility integration tests that require a real desktop session are
+      # skipped in CI. Only pure unit tests (no system dependencies) run here.
+      #
+      # Historical rationale for the 90, preserved because it is still the
+      # build half's rationale: empirical durations from main-branch runs on
+      # 2026-05-11/12 (10-run sample) were Ubuntu p50 ~43 min, Windows p50
+      # ~70 min, macOS p50 ~58 min / p90 ~70 min / max(success) ~72 min. The
+      # earlier 75-min cap sat at p90+5 min; PR #104 and PR #105 (both
+      # content-trivial) blew it three times in 36 h at 75.2 / 75.4 / 75.5 min.
+      # Variance is dominated by hosted-runner load + cache state. 90 min =
+      # p90 + 20 min headroom covers the slow tail without hiding genuine
+      # regressions.
+      - name: Build Rust tests
+        id: build_rust_tests
         timeout-minutes: 90
         env:
           # `auth::tests::test_device_id_*` and `test_token_storage` exercise
@@ -687,7 +707,13 @@ jobs:
           #     ~38 min of the 50-min step (run 28948290993: last dep
           #     compile 14:31, `Finished` 15:09). If 0xc000001d /
           #     rustc-LLVM OOM recurs here, revert to JOBS=1 AND keep the
-          #     24 GB pagefile.
+          #     32 GB pagefile.
+          #     (Corrected 2026-09-19: this ladder said "24 GB" — the size the
+          #     pagefile step carried when the JOBS=2 restoration was written.
+          #     `Configure pagefile` above now sets 32GB/32GB, so the ladder
+          #     named a configuration nobody has measured. The OOM EVIDENCE
+          #     above is still correctly dated to a 16 GB pagefile; it is only
+          #     the trailing "keep" size that had gone stale.)
           #   - Ubuntu OOM-killer is harsher: even with a 12 GB swapfile,
           #     JOBS=2 still trips the runner-agent shutdown. Drop Ubuntu
           #     to JOBS=1 for a single-threaded compile.
@@ -721,14 +747,142 @@ jobs:
           fi
           cd src-tauri
           # `set -o pipefail`: without it, `cargo test | tee` reports TEE's exit
-          # code (always 0), silently turning every red into green. The tee is
-          # for the "Report test results to coord" step below, which parses
-          # this SAME output instead of running the suite a second time — see
-          # plan 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train,
-          # Phase 1 (redesigned).
+          # code (always 0), silently turning every red into green. Load-bearing
+          # on BOTH halves of the split, so it is repeated on the run step too.
+          #
+          # This log is the BUILD log and is deliberately NOT
+          # `cargo-test-output.log`. `hasCargoTestOutput`
+          # (scripts/ci-flake-analyze.mjs, consumed by `parseTestOutcomes`,
+          # consumed by scripts/ci-test-results-ingest.mjs) recognises a log
+          # ONLY by run-phase lines — `test result:`, `running N tests`,
+          # `test … ... ok|FAILED|ignored`. A `--no-run` log carries none of
+          # them, so it parses as `unparsed` and the ingest correctly sends
+          # nothing. Keeping the two logs distinct is what makes the split
+          # transparent to the ingest; the expiry summariser below reads both.
+          set -o pipefail
+          cargo test --no-run --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-build.log"
+        shell: bash
+
+      # ── RUN half ────────────────────────────────────────────
+      #
+      # Executes the binaries the step above already built, so its clock is a
+      # TEST clock and is bounded like one. Measured execution on the windows
+      # leg is ~2 min (`finished in 117.72s`, run 35043646051); 15 min is ~7.5x
+      # that, which leaves generous room for the hang classes the old comment
+      # legitimately worried about while no longer hiding them behind 88 idle
+      # minutes of compile budget:
+      #
+      #   * per-test heartbeat stalls (the swap-thrash class from PR #84), and
+      #   * the macOS keychain hang — macOS is currently out of the matrix, but
+      #     QONTINUI_DISABLE_KEYCHAIN below is what actually neutralises it and
+      #     stays set, so re-adding macos-latest does not silently re-arm it.
+      #
+      # `cargo test` (not a direct binary invocation) is deliberate: it
+      # re-resolves the workspace, which is seconds against the tree the build
+      # step just made fresh, and it keeps the log the coord ingest parses
+      # byte-identical to what a single unsplit step produced.
+      #
+      # WHY 20 AND NOT 2. `cargo test --no-run` compiles the test TARGETS but
+      # not the DOCTESTS — rustdoc compiles and runs those at test time — so
+      # this step is not purely execution and its bound cannot be sized off the
+      # `finished in 117.72s` figure alone. On the run this plan was written
+      # from, everything outside the one 80.0-minute `rustc` window fitted in
+      # ~7 min, doctests included. 20 min is ~3x that whole tail and ~10x the
+      # measured harness execution, and it is still 4.5x smaller than the bound
+      # it came out of — which is the property that matters: an expiry HERE now
+      # means a hang, not a compile.
+      #
+      # `CARGO_BUILD_JOBS` is carried across for the same reason: doctest
+      # compilation happens in THIS step, so dropping the throttle here would
+      # silently retune it to cargo's default on exactly the platform the
+      # throttle exists for. Phase 3 step 2 retunes both together, after the
+      # sampler below has produced a peak.
+      - name: Run Rust tests
+        id: run_rust_tests
+        timeout-minutes: 20
+        env:
+          QONTINUI_DISABLE_KEYCHAIN: "1"
+          CARGO_BUILD_JOBS: ${{ matrix.platform == 'windows-latest' && '2' || '1' }}
+        run: |
+          cd src-tauri
+          # `set -o pipefail` — see the build step. The tee is for the "Report
+          # test results to coord" step below, which parses this SAME output
+          # instead of running the suite a second time (plan
+          # 2026-08-30-runner-ci-has-no-flake-detection-so-one-flaky-test-freezes-the-train,
+          # Phase 1 redesigned). `cargo-test-output.log` is written HERE and
+          # nowhere else: the ingest's whole recognition gate is run-phase
+          # lines, so the run step owning this filename is a contract, not a
+          # convention. src-tauri/tests/ci_rust_test_steps_split.rs pins it.
           set -o pipefail
           cargo test --verbose 2>&1 | tee "$GITHUB_WORKSPACE/cargo-test-output.log"
         shell: bash
+
+      # Phase 2 of the same plan: make an expiry name its own phase.
+      #
+      # `The action 'Run Rust tests' has timed out after 90 minutes` was
+      # compatible with a slow build, a hung test and a wedged runner — three
+      # conditions wanting three different responses — and #1545 had every fact
+      # needed to tell them apart sitting in its log while no reader produced
+      # them; a steward reconstructed them by hand. The split above answers
+      # "which phase" structurally (WHICH step's clock expired); this step says
+      # it in the job summary, names the crate that was in flight, and says
+      # UNKNOWN when it cannot tell.
+      #
+      # Modelled on this repo's shipped in-band marker contract
+      # (.github/workflows/frontend-coverage-producer.yml +
+      # scripts/tests/test_ci_timeout_marker.py), but deliberately NOT a carrier
+      # of it and deliberately not named like one: that contract explains a
+      # JOB-level expiry, which GitHub concludes `cancelled` and which is
+      # indistinguishable from a `cancel-in-progress` supersede. This is a
+      # STEP-level expiry, which concludes `failure` and prints a literal
+      # `##[error]The action '<name>' has timed out after N minutes`. Different
+      # mechanism, same shape — so the roster in that Python file is
+      # deliberately left alone. Folding the two together would make one roster
+      # row assert two things and leave its lockstep check meaningless.
+      #
+      # `continue-on-error` with NO step-level `timeout-minutes`: pairing those
+      # two cancels the whole JOB on trip rather than the step (the mechanism
+      # that broke the reverted nextest shadow — see the ingest script header).
+      - name: Explain which Rust test phase the bound expired in
+        if: failure()
+        continue-on-error: true
+        shell: bash
+        run: |
+          node scripts/ci-expiry-phase-summary.mjs \
+            --build-log "$GITHUB_WORKSPACE/cargo-test-build.log" \
+            --run-log "$GITHUB_WORKSPACE/cargo-test-output.log" \
+            --build-outcome "${{ steps.build_rust_tests.outcome }}" \
+            --run-outcome "${{ steps.run_rust_tests.outcome }}"
+
+      # Phase 3 step 1 of the same plan: MEASURE the quantity
+      # `CARGO_BUILD_JOBS` is tuned against, before retuning it.
+      #
+      # The pre-`cargo test` diagnostic in the build step samples memory BEFORE
+      # the compile that would exhaust it, so the peak the throttle exists to
+      # avoid has never been measured anywhere. `if: always()` so an EXPIRED
+      # step still reports — the expired runs are the ones whose peak matters
+      # most, and a sampler that only ran on success would measure exactly the
+      # population that did not need measuring.
+      #
+      # Deliberately measurement-only. The retune (windows CARGO_BUILD_JOBS
+      # from 2 toward cargo's default) is Phase 3 step 2 and waits on a soak
+      # window of these readings; tuning first against an unmeasured quantity
+      # is how the current value went stale.
+      - name: Windows memory peak after the Rust test steps
+        if: always() && runner.os == 'Windows'
+        continue-on-error: true
+        shell: bash
+        run: |
+          {
+            echo "### Windows memory after the Rust test steps"
+            echo
+            echo '```'
+            powershell -NoProfile -Command "Get-CimInstance Win32_PageFileUsage | Select-Object Name,AllocatedBaseSize,CurrentUsage,PeakUsage | Format-List; Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize,TotalVirtualMemorySize,FreeVirtualMemory | Format-List"
+            echo '```'
+            echo
+            echo "build step outcome: ${{ steps.build_rust_tests.outcome }} - run step outcome: ${{ steps.run_rust_tests.outcome }}"
+            echo "PeakUsage is the pagefile high-water mark for this boot, so it covers the compile that just ran. Compare it against AllocatedBaseSize (the 32 GB the pagefile step configures) before changing CARGO_BUILD_JOBS."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Best-effort, non-gating: pushes this job's per-test outcomes into
       # coord.test_results so coord's already-shipped `flakiness_priors` has a
@@ -750,6 +904,25 @@ jobs:
       # Phase 0 found (10 of its 12 same-SHA disagreements were windows-only,
       # and coord's own `test_id` derivation elsewhere carries no platform
       # component).
+      #
+      # `--gating-outcome` is Phase 4a of plan
+      # 2026-09-17-the-windows-test-gate-is-a-90-minute-build-wearing-a-test-
+      # shaped-bound. On run 35043646051 attempt 1 this step ran to completion
+      # AFTER the gating step's 90-minute expiry and recorded 7112 rows of a
+      # fully passing suite against a job GitHub calls `failure`, so anything
+      # scoring "did this head's tests pass" from coord.test_results alone got a
+      # green answer for a red required check. The flag does NOT change the
+      # payload — verified at source, coord's `ResultIngestRequest` has no field
+      # that could carry a gating outcome and no `deny_unknown_fields`, so an
+      # added key is silently dropped — it makes the disagreement LOUD, in an
+      # `::error` annotation and in the job summary. The durable stamp is a
+      # three-repo change tracked as that plan's Phase 4b.
+      #
+      # The split above narrows what is left for it to catch: a BUILD expiry now
+      # produces no run-phase lines at all, so `parseTestOutcomes` returns
+      # `unparsed` and this step correctly sends nothing. What survives is the
+      # narrow case — the RUN step expiring after some binaries reported and
+      # before others finished, which is #1545's own tail.
       - name: Report test results to coord (best-effort)
         if: always()
         continue-on-error: true
@@ -781,7 +954,8 @@ jobs:
             --log "$GITHUB_WORKSPACE/cargo-test-output.log" \
             --repo "${{ github.repository }}" \
             --head-sha "${{ github.event.pull_request.head.sha || github.sha }}" \
-            --shard "${{ matrix.platform }}"
+            --shard "${{ matrix.platform }}" \
+            --gating-outcome "${{ steps.run_rust_tests.outcome }}"
 
       # Undo `Poison ambient state` so the poison covers the test step and
       # nothing after it. `$GITHUB_ENV` cannot unset, only assign — but every
