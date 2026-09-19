@@ -671,9 +671,9 @@ jobs:
       # minutes before the kill is ONE BINARY OF 29, not the suite. The largest
       # binary — 9905 tests — started at 02:58:22 and was still emitting `ok`
       # lines at 03:00:25 when the clock killed it, so it never produced a
-      # `test result:` line at all. The run was ~62% complete (7112 ingested
-      # rows against a suite of 11,486). Nothing about that run says the tests
-      # passed.
+      # `test result:` line at all. The run was ~62% complete — the ingest
+      # recorded 7112 rows against a suite its own `test result:` lines count
+      # at 11,486. Nothing about that run says the tests passed.
       #
       # THE SPLIT WOULD HAVE SAVED IT, and that is the measurement that
       # justifies this change: on the same attempt the build phase finished at
@@ -1028,6 +1028,19 @@ jobs:
       # this change probed `GET /api/v1/plan-library/<edge id>` — the ARTIFACT
       # route — got a 404 and reported the ids as unresolvable, so the door is
       # named here to stop the next reader repeating it.
+      #
+      # ⚠️ THAT FEED IS PAGINATED AND UNFILTERED, so the bare URL above is not
+      # enough and a second review caught the same class of miss one level
+      # down. Measured 2026-09-19: `limit 50`, `total 134`,
+      # `ordering: oldest_first`, and these two rows sit at index 130-131 — so
+      # page 1 is a well-formed 200 carrying neither. Worse, the route ignores
+      # no unknown parameter: `?from_id=…`, `?artifact_id=…` and `?slug=…` each
+      # return **zero items** rather than the unfiltered page, so a guessed
+      # filter reads as "the follow-up does not exist". Page it and match
+      # client-side:
+      #   GET /api/v1/plan-library/followups?offset=100
+      # then select on `from_id == ae8b3f39-…`. Read `total` and keep paging;
+      # the index will drift as other plans record follow-ups.
       #
       # The flag does NOT change the payload — verified at source, coord's
       # `ResultIngestRequest` has no field that could carry a gating outcome and

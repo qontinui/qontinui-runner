@@ -78,6 +78,13 @@
  * the ARTIFACT route and correctly 404s — a review of this change probed it
  * and reported the id unresolvable, so the door is named here.
  *
+ * ⚠️ And the feed is PAGINATED AND UNFILTERED: measured 2026-09-19 it serves
+ * `limit 50` of `total 134` oldest-first, this row sits at index 131, and an
+ * unknown query parameter (`?from_id=…`, `?slug=…`) returns ZERO items rather
+ * than the unfiltered page — so a guessed filter reads as "no such follow-up".
+ * Use `?offset=100` (and keep paging against `total`), then match `from_id`
+ * client-side.
+ *
  * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
  * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
  * gating outcome to land: `ResultIngestRequest` carries no such field and no
