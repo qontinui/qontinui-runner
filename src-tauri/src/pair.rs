@@ -988,13 +988,25 @@ pub(crate) fn reconcile_paired_bindings_with(
     // Flagging a tenant the selector serves would send an operator to re-pair
     // something that works; NOT flagging one whose slot expired is the defect
     // this predicate was unified to end.
-    let default_slot = crate::auth::read_legacy_slot(mgr).state();
+    let default_slot_read = crate::auth::read_legacy_slot(mgr);
+    let default_slot = default_slot_read.state();
+    // ...and whether that token is the DEFAULT binding's credential at all: a
+    // usable legacy token whose claim names another tenant (or an unclaimed one
+    // on a device that cannot state a single binding) is not this binding's,
+    // and the selector refuses it. Computed once — it does not vary by `t`,
+    // since the fallback arm is only ever the default tenant's.
+    let default_slot_serves = crate::auth::legacy_slot_serves_default_tenant(
+        mgr,
+        &default_slot_read,
+        old_default.as_ref(),
+    );
     for t in coord_set {
         let has_entry = kept_tenants.contains(t);
         let cred = crate::auth::credential_state(
             crate::auth::read_tenant_slot(mgr, t).state(),
             old_default.as_ref() == Some(t),
             default_slot,
+            default_slot_serves,
         );
         // `can_act() != Some(true)` and not `== Some(false)`: an UNREADABLE
         // store established nothing, and an unflagged unknown would read as
