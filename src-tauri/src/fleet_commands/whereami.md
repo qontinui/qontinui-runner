@@ -626,13 +626,117 @@ far the running build is behind `origin/main`. A runner can be many commits
 behind and still AGREE here, because AGREE means "the binary that spawned me is
 the binary I am talking to", not "the binary is current".
 
+## Step 5 — TENANCY: which tenant each half of this session acts as
+
+A session has **three** tenants, decided by three different mechanisms, and they
+can disagree (plan
+`2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P0; served
+by a runner build carrying qontinui-runner PR #1558):
+
+| Half | What decides it | Field in the runner's census |
+|---|---|---|
+| **row** | the tenant the spawn picker / `--tenant` stamped on the session | `tenancy.row.tenantId` |
+| **data plane** | the tenant the runner's own work-scoped coord writes present | `tenancy.dataPlane` |
+| **credential** | the tenant this session's coord-mcp key actually selects — where its memory, prompt-document and gate writes land | `tenancy.credential` |
+
+A session labelled B whose credential resolves to A writes to A and gets a
+`201` for it; this card is where that is visible. Read it from the runner's own
+census, `GET /control/sessions/info`, for the entry whose `identity.terminalId`
+is `$QONTINUI_TERMINAL_ID`, and print what it says **verbatim**, reasons
+included — never pick one tenant as "the" tenant.
+
+`divergence` is the comparison verdict: `diverged`, `agree`, or `unknown` (a
+tenant-less session whose spawn-time device default was not recorded — after a
+runner restart on a build that does not persist it — cannot be compared, and
+`unknown` is NOT agreement). Which fields answer depends on the runner BUILD:
+
+- a build carrying the runner P2/P3 change (same plan) serves `divergence`,
+  `row.spawnDeviceDefaultStatus` and `row.spawnDeviceDefaultReason`;
+- a build carrying qontinui-runner PR #1558 (P0/P1) but not that change serves
+  the `tenancy` block with only the boolean `diverged`, whose `false` also covers
+  "could not compare" — so the card reports
+  `unknown (runner predates the divergence field)`, never `agree`;
+- a build with neither serves **no `tenancy` block at all**: the whole tenancy
+  row is UNKNOWN (absent field), never agreement.
+
+This is a REACHABILITY-class read (it needs the runner up right now) about an
+IDENTITY-class fact, so it prints under its own header, after both blocks.
+
+```bash
+# Re-derived - shell state does not survive between Bash tool calls (Step 2).
+API_PORT="$(printenv QONTINUI_RUNNER_API_PORT 2>/dev/null)"
+TERM_ID="$(printenv QONTINUI_TERMINAL_ID 2>/dev/null)"
+echo '=== TENANCY (read from the runner now) ==='
+if [ -z "$TERM_ID" ]; then
+  echo 'tenancy        UNKNOWN - $QONTINUI_TERMINAL_ID is unset, so the census cannot name this session (not a runner-spawned terminal, or a headless spawn)'
+  exit 0
+fi
+BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
+# Native curl.exe / python.exe open the path themselves, so hand them the
+# Windows spelling where cygpath exists (MSYS_NO_PATHCONV - see Step 3).
+BODYP="$BODY"
+command -v cygpath >/dev/null 2>&1 && BODYP="$(cygpath -w "$BODY")"
+CODE="$(curl -s --connect-timeout 3 -m 20 -o "$BODYP" -w '%{http_code}' "http://127.0.0.1:${API_PORT:-9876}/control/sessions/info" 2>/dev/null)"
+RC=$?
+if [ "$RC" = "7" ]; then echo 'tenancy        UNKNOWN - runner DOWN (connection refused)'; exit 0; fi
+if [ "$RC" != "0" ] || [ "$CODE" != "200" ]; then
+  echo "tenancy        UNKNOWN - census did not answer 200 (curl exit $RC, HTTP ${CODE:-none}); not evidence of anything"
+  exit 0
+fi
+if command -v jq >/dev/null 2>&1; then
+  jq -r --arg term "$TERM_ID" '
+    def v(x): if x == null then "<null>" else (x | tostring) end;
+    if (.data | type) != "object" then "tenancy        UNKNOWN - census envelope has no data object"
+    elif .data.status != "ok" then "tenancy        UNKNOWN - census unavailable: \(v(.data.reason))"
+    else ([.data.sessions[]? | select(.identity.terminalId? == $term)] | first) as $s
+    | if $s == null then "tenancy        UNKNOWN - terminal \($term) is not in the census (not an OPEN session on this runner)"
+      elif ($s.tenancy | type) != "object" then "tenancy        UNKNOWN - no tenancy block (runner build predates it; absent field, NOT agreement)"
+      else $s.tenancy as $t
+      | "row            tenant \(v($t.row.tenantId))  spawn-default \(v($t.row.spawnDeviceDefaultTenantId)) [\(v($t.row.spawnDeviceDefaultStatus)) \(v($t.row.spawnDeviceDefaultReason))]  current-default \(v($t.row.currentDeviceDefaultTenantId)) (context only)",
+        "data plane     \(v($t.dataPlane.status))  tenant \(v($t.dataPlane.tenantId))  reason \(v($t.dataPlane.reason))",
+        "credential     \(v($t.credential.status))  tenant \(v($t.credential.tenantId))  slot \(v($t.credential.slot))  reason \(v($t.credential.reason))",
+        "slot posture   \(v($t.credential.posture.status))  value \(v($t.credential.posture.value))  canAnswer \(v($t.credential.posture.canAnswer))  reason \(v($t.credential.posture.reason))",
+        (if ($t | has("divergence")) then "divergence     \($t.divergence)"
+         else "divergence     unknown (runner predates the divergence field; its diverged=\(v($t.diverged)) cannot say \"could not compare\")" end)
+      end
+    end' < "$BODY"  # envelope-ok: a predicate search over the census; every absent key prints <null> or a named UNKNOWN line, never an inferred tenant
+else
+  PY="$(command -v python3 || command -v python)"
+  if [ -z "$PY" ]; then echo 'tenancy        UNKNOWN - neither jq nor python can read the census (LOCAL fault, not a verdict)'; exit 0; fi
+  TERM_ID="$TERM_ID" "$PY" -c 'import json,os,sys
+d=json.load(open(sys.argv[1]))  # envelope-ok: every absent key below prints a named UNKNOWN line or <null>, never an inferred tenant
+v=lambda x: "<null>" if x is None else str(x)
+data=d.get("data") if isinstance(d,dict) else None
+if not isinstance(data,dict): print("tenancy        UNKNOWN - census envelope has no data object"); sys.exit(0)
+if data.get("status")!="ok": print("tenancy        UNKNOWN - census unavailable: %s" % v(data.get("reason"))); sys.exit(0)
+rows=[r for r in (data.get("sessions") or []) if isinstance(r,dict) and (r.get("identity") or {}).get("terminalId")==os.environ["TERM_ID"]]
+if not rows: print("tenancy        UNKNOWN - terminal %s is not in the census" % os.environ["TERM_ID"]); sys.exit(0)
+t=rows[0].get("tenancy")
+if not isinstance(t,dict): print("tenancy        UNKNOWN - no tenancy block (runner build predates it; absent field, NOT agreement)"); sys.exit(0)
+g=lambda o,k: (o or {}).get(k)
+row,dp,cr=t.get("row"),t.get("dataPlane"),t.get("credential")
+po=g(cr,"posture")
+print("row            tenant %s  spawn-default %s [%s %s]  current-default %s (context only)" % (v(g(row,"tenantId")),v(g(row,"spawnDeviceDefaultTenantId")),v(g(row,"spawnDeviceDefaultStatus")),v(g(row,"spawnDeviceDefaultReason")),v(g(row,"currentDeviceDefaultTenantId"))))
+print("data plane     %s  tenant %s  reason %s" % (v(g(dp,"status")),v(g(dp,"tenantId")),v(g(dp,"reason"))))
+print("credential     %s  tenant %s  slot %s  reason %s" % (v(g(cr,"status")),v(g(cr,"tenantId")),v(g(cr,"slot")),v(g(cr,"reason"))))
+print("slot posture   %s  value %s  canAnswer %s  reason %s" % (v(g(po,"status")),v(g(po,"value")),v(g(po,"canAnswer")),v(g(po,"reason"))))
+print("divergence     %s" % (t["divergence"] if "divergence" in t else "unknown (runner predates the divergence field; its diverged=%s cannot say \"could not compare\")" % v(t.get("diverged"))))' "$BODYP"  # envelope-ok: the same predicate search as the jq arm
+fi
+```
+
+Read the rows, do not summarise them away: a `credential` tenant that differs
+from the `row` tenant is the wrong-tenant-write condition itself, and
+`current-default` is context only — after an operator switches the device
+default every running session legitimately differs from it. An `unknown`
+anywhere names its reason; carry the reason into the one-sentence summary.
+
 ## Fallback when bash hangs
 
 msys `bash` has been observed hanging on this box where PowerShell works — switch
 rather than retrying. This one block carries the **whole** card: Step 1's IDENTITY
 rows, Step 2's port probes and Step 4's build cross-check.
 
-**What it does NOT carry is Step 3's proxy sweep** — that sweep needs a JSON
+**What it does NOT carry is Step 3's proxy sweep, nor Step 5's tenancy read** — that sweep needs a JSON
 reader, a private header file and a per-candidate POST, and there is no
 PowerShell twin of it here. Print the proxy row as `not swept`, exactly as Step 3
 itself instructs when you skip it. An unswept row is not a dead one, and a
@@ -735,6 +839,7 @@ foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor';
   }
 }
 'live coord proxy   not swept (Step 3 has no PowerShell twin - not a verdict)'
+'tenancy            not read (Step 5 has no PowerShell twin - UNKNOWN, not agreement)'
 
 # The live credential row, from the body already fetched - the pwsh twin of the
 # bash block above, with the same three absences and the same refusal to assume
@@ -796,7 +901,8 @@ Two limitations of this block, stated rather than left to be inferred:
 
 ## Output shape
 
-Print exactly two labelled blocks, in this order, with the fixed half first:
+Print the two labelled blocks, in this order, with the fixed half first, then
+the TENANCY block from Step 5:
 
 ```
 === IDENTITY (fixed for this session) ===
@@ -816,7 +922,17 @@ runner  :9876       up (HTTP 200)
 supervisor :9875    DOWN (connection refused)
 live coord proxy    <path/to/.mcp.json>  (nonce#<fp>) | not swept
 build cross-check   AGREE | DISAGREE | UNKNOWN
+
+=== TENANCY (read from the runner now) ===
+row            tenant <uuid|<null>>  spawn-default <uuid|<null>> [<recorded|unknown> <reason>]  current-default <uuid> (context only)
+data plane     <owned|device|unresolved|unknown>  tenant <uuid|<null>>  reason <reason|<null>>
+credential     <resolved|unknown>  tenant <uuid|<null>>  slot <tenant|default|<null>>  reason <reason|<null>>
+slot posture   <observed|unknown>  value <live|expiring|expired|...>  canAnswer <bool>  reason <reason|<null>>
+divergence     diverged | agree | unknown[ (why)]
 ```
+
+or a single `tenancy  UNKNOWN - <reason>` line when the census cannot be read,
+the terminal is not in it, or the runner predates the block.
 
 Then one sentence naming anything that came back UNKNOWN and why it is not a
 "no". Do not merge the blocks, and do not let a reachability result rewrite an

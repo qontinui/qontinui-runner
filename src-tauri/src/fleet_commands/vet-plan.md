@@ -2198,20 +2198,21 @@ even on the path that does not attest.
 > the running build has no manifest surface and your manifest was **not stored**.
 > Report it in §6 as *built but not stored*, and do not report the vet as failed.
 >
-> **That is the case today.** As of 2026-09-01 neither the manifest surface
-> (Phase 3) nor the evidence arm (Phase 7) is on `qontinui-coord`'s `origin/main`
-> — `TransitionRequest` there still declares no `vet_evidence` field — so a coord
-> deployed from main **silently drops** the field and returns success anyway:
-> `TransitionRequest` carries no `#[serde(deny_unknown_fields)]`. The
-> `coord_work_unit_transition` MCP tool schema
-> (`crates/coord/src/mcp/tools.rs`) declares `"additionalProperties": false`, so
-> that door fails **loudly** instead — a schema-validating client rejects the
-> call outright. If the MCP call is rejected on the field, drop `vet_evidence`,
+> **State of the surface.** The manifest door (Phase 3) is on
+> `qontinui-coord`'s `origin/main` as of `qontinui-coord#2207`: both HTTP doors
+> (`POST /coord/work-units/:slug/transition` and the upsert) and both MCP tools
+> (`coord_work_unit_transition`, `coord_work_unit_upsert`) accept
+> `vet_evidence`, store it in the same transaction as the status write, and
+> refuse an unparseable entry naming its index. `GET
+> /coord/agent-work-units/<slug>` echoes the CANONICAL stored form back under
+> `vet_evidence` — read it to verify what coord kept. A coord deployed from an
+> older build may still lack the surface: an older HTTP door **silently drops**
+> the field (no `deny_unknown_fields`), and an older MCP schema rejects it
+> loudly. If the MCP call is rejected on the field, drop `vet_evidence`,
 > re-send, and report *built but not stored*.
 >
 > **Key off the receipt, not off a deploy date.** The presence of that object is
-> the only honest test of whether the running coord kept your manifest, and it
-> stays correct without edits when Phase 3 and Phase 7 do merge. **Until a
+> the only honest test of whether the running coord kept your manifest. **Until a
 > receipt or a read comes back carrying your entries, "submitted" is UNKNOWN, not
 > stored.**
 
@@ -2227,22 +2228,16 @@ arms it.
 
 **Step C — the fallback, and it is NOT the normal path.**
 
-Reach for this only when Step B actually refused. Once coord's evidence arm is
-armed, a `→ vetted` carrying a manifest that meets the §2a floor is admitted
-**regardless of who sends it** — equal actor keys included, and either identity
-unresolvable included — because identity stops being the input the decision is
-made on. So there are exactly **two** reasons you are standing here:
-
-1. **Your manifest did not meet the floor** — it carried no mechanically-resolvable
-   anchor, or it was absent. Below the floor the decision is byte-for-byte the
-   old one: `self_attestation_forbidden` / `owner_unresolved` /
-   `attester_unresolved` all behave exactly as they always did.
-2. **The evidence arm is not armed** — `COORD_WORKUNIT_EVIDENCE_ATTEST_MODE` is
-   anything other than `live` (it defaults to off), or the running coord has no
-   evidence arm at all.
-
-Those are different facts with different owners: (1) is an instruction to the
-next vetter, (2) is an instruction to the operator. **Say which one you hit.**
+Reach for this only when Step B actually refused. **A manifest does not change
+the authorization verdict** — coord has no evidence-admission arm. Plan
+`2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one, but
+`qontinui-coord#2207` deliberately did not carry it: `main`'s
+`IndependenceDeclaration` is the attestation control, and two admission paths on
+one gate is a design nobody has made. So you are standing here for the ordinary
+identity reason — `self_attestation_forbidden` / `owner_unresolved` /
+`attester_unresolved` — whatever your manifest contained. Say which one, and do
+not attribute the fallback to the manifest or to an unarmed flag: there is no
+`COORD_WORKUNIT_EVIDENCE_ATTEST_MODE` to arm.
 
 ```
 POST $COORD_HTTP_URL/coord/work-units/<plan stem>/transition
@@ -2261,14 +2256,15 @@ is always present when a receipt is, because "which arm" has no sensible default
 
 | `admitted_on` | What actually happened |
 |---|---|
-| `evidence` | your manifest met the floor and admitted the transition on its own. Identity was recorded, not consulted |
 | `identity` | the ordinary actor-key comparison passed — you were a different actor from the owner. **Your manifest did not carry this**, even if you sent one |
 | `graduation` | a graduated actor self-attested; the flywheel's track record carried it, not your evidence |
 | `no_transition` | the write stored a manifest without changing any status, so no authz question was asked at all |
 
-Reporting `evidence` when the response said `identity` is exactly the
-overstatement this plan exists to remove — a self-vet that *would* have been
-refused and a peer vet that was never in doubt are otherwise indistinguishable.
+There is no `evidence` value: coord has no evidence arm, so a manifest never
+carries a transition. Reporting that your manifest admitted the `→ vetted` is
+exactly the overstatement this plan exists to remove — a self-vet that *would*
+have been refused and a peer vet that was never in doubt are otherwise
+indistinguishable.
 
 Send `from_status` as a CAS guard so a peer attestation that landed between your
 read and this write cannot be clobbered. Use the value Step A established —
@@ -2401,29 +2397,21 @@ a unit parked in a status coord does not recognize, owned by the one actor barre
 from fixing it. That is a trap, not a graceful degradation — do not report it as
 a clean fallback.
 
-> **The evidence arm is what stops you entering that trap — when it is armed.**
-> A `→ vetted` admitted on `evidence` never reaches Step C, so the ownership
-> stamp above is never applied and the unit lands on the real `vetted` status
-> that derives `ready`. The trap is entered only on the fallback, i.e. only in
-> the two cases Step C enumerates: the floor was not met, or the arm is not
-> armed. It is a consequence of falling back, not a cost of the manifest.
->
-> **State of the arm, as observed 2026-09-01 — do not assume it is live.** The
-> implementation exists (`crates/coord/src/work_unit_vet_evidence.rs`, and the
-> `VetEvidence` input on `authorize_target_transition`), but it is **not on
-> `qontinui-coord`'s `origin/main`**, and `COORD_WORKUNIT_EVIDENCE_ATTEST_MODE`
-> defaults to off even once it merges — only the literal value `live`
-> (case-insensitive) arms it. So the fallback is still what fires today. Do not
-> tell the operator the manifest changed the verdict unless `admitted_on` came
-> back `evidence`; that field is the only thing entitled to settle it.
+> **No evidence arm keeps you out of that trap.** Plan
+> `2026-09-01-vet-evidence-manifest-and-decay` Phase 7 designed one — a manifest
+> meeting a floor would admit `→ vetted` regardless of identity — but it is
+> **not on `qontinui-coord`'s `origin/main`**, and `qontinui-coord#2207` left it
+> out on purpose (see Step C). So the fallback fires whenever identity refuses.
+> Never tell the operator the manifest changed the verdict; `admitted_on` is the
+> only thing entitled to settle which arm carried you, and it has no `evidence`
+> value.
 
-**Two properties of the evidence arm worth knowing before you lean on it.** It is
-strictly a **widening** — every identity cell that passes without a manifest also
-passes with one — so submitting a manifest can never cause a refusal that would
-not otherwise have happened, and there is no reason to withhold one. And it
-deliberately does **not** reach derived statuses: a manifest never makes `ready`
-or `shipped` directly settable, because those are coord-computed and there is
-nothing there to attest.
+**Submitting a manifest can never cause a refusal** that would not otherwise
+have happened, so there is no reason to withhold one. What it DOES do once
+stored: coord re-resolves it on a timer, and a vet observed to have decayed
+(`vet_state` `moved`/`gone`) withholds the derived `ready` once the derive worker
+is armed. A manifest never makes `ready` or `shipped` directly settable, because
+those are coord-computed and there is nothing there to attest.
 
 **The read-only harness door does not carry this.** `.agents/skills/coord` — the
 Agent Skill for harnesses with no MCP client — is a **read-only** wrapper over
@@ -2704,7 +2692,7 @@ Brief — under 150 words. State:
   origin/main <short-sha>` — and **quote the sha**, not just the date. It is
   what lets the next reader tell a citation that has gone stale from one that
   was always wrong, without re-resolving every row
-- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`evidence` / `identity` / `graduation` / `no_transition`). **Read both; do not infer either.** No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, say **which** of Step C's two reasons applied — the floor was not met (an instruction to the next vetter), or the evidence arm is not armed (an instruction to the operator). A bare "fell back" conflates them
+- **The evidence manifest** (§2a): quote `stored` from the transition's `vet_evidence` receipt — the count coord **kept**, never the count you sent — and `admitted_on`, the arm that actually carried the transition (`identity` / `graduation` / `no_transition`). **Read both; do not infer either.** No receipt at all means the running coord has no manifest surface: say *built but not stored*. If you fell back to `vetted_unattested`, name the identity refusal that sent you there (`self_attestation_forbidden` / `owner_unresolved` / `attester_unresolved`) — never the manifest, which admits nothing
 - Open questions you **resolved using the Decision policy**, with the deciding priority in parentheses (e.g. "picked registry-backed lookup (scalability)")
 - Anything you flagged for the user that you did NOT auto-fix — limit this to product/scope/stakeholder calls the Decision policy can't decide; engineering trade-offs should already be resolved in the plan
 
