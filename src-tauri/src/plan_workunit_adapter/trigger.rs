@@ -2537,9 +2537,11 @@ pub struct WorkUnitBackfillSummary {
     /// Transitions the agent-owner deferral suppressed
     /// ([`PushOutcomeKind::Deferred`]).
     pub deferred: u64,
-    /// Units whose read or push errored. The pass continues past each one.
+    /// Units whose read or push errored, excluding a permanent refusal of the
+    /// status transition (see `refused_permanently`). The pass continues past
+    /// each one.
     pub failed: u64,
-    /// Units whose STATUS coord refused with `terminality: "permanent"` — in
+    /// Units whose status TRANSITION coord refused with `terminality: "permanent"` — in
     /// practice a file stamped with a coord-DERIVED word (`shipped`/`ready`)
     /// that coord does not yet hold. Not a failure: the unit's metadata upsert
     /// runs before the refused status write, and no retry of the identical
@@ -2624,7 +2626,16 @@ pub async fn backfill_work_units_once<S: WorkUnitSink + ?Sized>(
                 }
             },
             Err(e) => {
-                if denial_of(&e).is_some_and(|d| d.verdict.is_permanently_denied()) {
+                // Only a permanent refusal of the TRANSITION qualifies: the
+                // `Transition` arm's status-less upsert must have succeeded
+                // before the transition was sent, which is what makes
+                // "metadata was refreshed" true. A permanent refusal of the
+                // upsert itself, or of a read, means nothing landed — that is
+                // a failure, whatever its terminality.
+                let transition_refused_permanently = denial_of(&e)
+                    .is_some_and(|d| d.verdict.is_permanently_denied())
+                    && super::push::coord_write_error(&e).is_some_and(|w| w.op == "transition");
+                if transition_refused_permanently {
                     summary.refused_permanently += 1;
                     tracing::info!(
                         slug = %u.slug,
@@ -9370,6 +9381,27 @@ mod tests {
             Some("ready"),
             "coord's own status is untouched"
         );
+        // The claim the counter rests on: `a`'s status-less metadata upsert
+        // LANDED before the refused transition.
+        assert!(
+            sink.upserts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.slug == "a" && b.status.is_none()),
+            "the refused unit's metadata must have been refreshed"
+        );
+
+        // Negative case: a permanent refusal of the UPSERT means nothing
+        // landed, so it stays a failure.
+        let upsert_refused = FakeSink {
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(SYNTHETIC_PERMANENT.to_string()),
+            ..Default::default()
+        };
+        let s = backfill_work_units_once(&[unit("c", "vetted")], &upsert_refused).await;
+        assert_eq!(s.failed, 1, "a refused upsert landed nothing: a failure");
+        assert_eq!(s.refused_permanently, 0);
     }
 
     /// Idempotence must not rest on the backend echoing the status it was
