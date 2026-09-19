@@ -16,6 +16,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import {
   classifyExpiry,
   describeLog,
@@ -23,6 +29,8 @@ import {
   renderSummary,
   tallyTestResults,
 } from "../ci-expiry-phase-summary.mjs";
+
+const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "ci-expiry-phase-summary.mjs");
 
 // ---------------------------------------------------------------------------
 // Fixtures — the three real shapes, written as the tee'd file actually looks.
@@ -109,13 +117,20 @@ test("describeLog distinguishes UNREADABLE from empty-but-read", () => {
 // The arms — one per phase, plus the two that must abstain
 // ---------------------------------------------------------------------------
 
-function classify(buildText, runText, buildOutcome, runOutcome) {
-  return classifyExpiry({
+/// Build the `classifyExpiry` input from two raw log bodies. Split out from
+/// `classify` so a mutation proof can feed the SAME input to the real
+/// classifier and to a mutant.
+function describeAll(buildText, runText, buildOutcome, runOutcome) {
+  return {
     buildLog: describeLog(buildText),
     runLog: describeLog(runText),
     buildOutcome,
     runOutcome,
-  });
+  };
+}
+
+function classify(buildText, runText, buildOutcome, runOutcome) {
+  return classifyExpiry(describeAll(buildText, runText, buildOutcome, runOutcome));
 }
 
 test("a build expiry names the BUILD phase and the crate in flight", () => {
@@ -192,29 +207,134 @@ test("both steps green means this job failed somewhere else, and says so", () =>
 });
 
 // ---------------------------------------------------------------------------
-// MUTATION PROOF — the plan requires each regression test be shown to FAIL
-// against a deliberately broken variant. These re-implement the two mutations
-// the plan names and assert they would be caught.
+// MUTATION PROOFS — each one runs the REAL classifier against a MUTATED input
+// or a mutated wrapper and asserts the suite's own assertion would catch it.
+//
+// The two tests that stood here until 2026-09-19 were tautologies: they built a
+// local stub, asserted the stub did what it was written to do, and then
+// re-asserted something an earlier test already covered. A mutation proof that
+// never runs the real implementation proves nothing and inflates the test
+// count. These replace them.
 // ---------------------------------------------------------------------------
 
-test("MUTATION: a hard-coded phase fails the differing-fixture assertion", () => {
-  const hardCoded = () => ({ phase: "build", title: "Rust test phase: BUILD", lines: ["static"] });
-  const a = renderSummary(hardCoded());
-  const b = renderSummary(hardCoded());
-  // The real implementation distinguishes these two fixtures; a hard-coded one
-  // cannot, which is exactly what the assertion above would catch.
-  assert.equal(a, b);
-  assert.notEqual(
-    renderSummary(classify(BUILD_EXPIRED_LOG, "", "failure", "skipped")),
-    renderSummary(classify(BUILD_COMPILE_ERROR_LOG, "", "failure", "skipped")),
-  );
+/// The mutation: "hard-code the phase". Modelled as a wrapper that discards the
+/// inputs and always answers BUILD-expired — then the suite's own
+/// differing-fixture assertion is RE-RUN against it and must fail.
+function hardCodedClassifier() {
+  return { phase: "build", title: "Rust test phase: BUILD", lines: ["expired mid-compile"] };
+}
+
+/// The mutation: "collapse UNKNOWN into the compile-expiry arm".
+function unknownCollapsingClassifier(input) {
+  const real = classifyExpiry(input);
+  return {
+    ...real,
+    lines: real.lines.map((l) =>
+      l.includes("UNKNOWN") ? "the step's `timeout-minutes` expiring mid-compile" : l,
+    ),
+  };
+}
+
+/// Run one assertion and report whether it threw. This is what lets a mutation
+/// proof assert "the suite CATCHES this", rather than asserting a stub.
+function caught(fn) {
+  try {
+    fn();
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+test("MUTATION hard-coded phase: the differing-fixture assertion catches it", () => {
+  const assertion = (classifier) => {
+    assert.notEqual(
+      renderSummary(classifier(describeAll(BUILD_EXPIRED_LOG, "", "failure", "skipped"))),
+      renderSummary(classifier(describeAll(BUILD_COMPILE_ERROR_LOG, "", "failure", "skipped"))),
+    );
+  };
+  // The real implementation passes it…
+  assert.equal(caught(() => assertion(classifyExpiry)), false);
+  // …and the mutant is caught by that same assertion.
+  assert.equal(caught(() => assertion(hardCodedClassifier)), true);
 });
 
-test("MUTATION: collapsing UNKNOWN into 'expired mid-compile' would be caught", () => {
-  // A summariser that treated an unrecognisable run log as a compile expiry
-  // would emit the build arm's text on the truncated run fixture. Assert the
-  // real one does not.
-  const text = renderSummary(classify(BUILD_EXPIRED_LOG, RUN_TRUNCATED_LOG, "success", "failure"));
-  assert.doesNotMatch(text, /timeout-minutes` expiring mid-compile/);
-  assert.match(text, /\*\*UNKNOWN\*\*/);
+test("MUTATION UNKNOWN-collapse: the truncated-run assertion catches it", () => {
+  const assertion = (classifier) => {
+    const text = renderSummary(
+      classifier(describeAll(BUILD_EXPIRED_LOG, RUN_TRUNCATED_LOG, "success", "failure")),
+    );
+    assert.match(text, /\*\*UNKNOWN\*\*/);
+    assert.doesNotMatch(text, /timeout-minutes` expiring mid-compile/);
+  };
+  assert.equal(caught(() => assertion(classifyExpiry)), false);
+  assert.equal(caught(() => assertion(unknownCollapsingClassifier)), true);
+});
+
+// ---------------------------------------------------------------------------
+// The two abstention arms a review found the first cut got wrong.
+// ---------------------------------------------------------------------------
+
+test("a READABLE build log with no rustc invocation at all ABSTAINS", () => {
+  // Empty is at least as consistent with the step dying before cargo ran (a
+  // failed `cd`, a missing cargo, a full disk, an immediate kill) as with a
+  // mid-compile expiry. The first cut called it "a SLOW BUILD, not a broken
+  // one" with full confidence.
+  const v = classify("", "", "failure", "skipped");
+  const text = renderSummary(v);
+  assert.match(text, /no rustc invocation at all, so \*\*UNKNOWN\*\*/);
+  assert.doesNotMatch(text, /Treat this as a SLOW BUILD/);
+});
+
+test("an UNREADABLE run log is not reported as 'no test ever executed'", () => {
+  // `recognisedAsRun: false` covers BOTH "read, no test output" and "could not
+  // be read"; describeLog's own contract says never to collapse them.
+  const v = classify(BUILD_EXPIRED_LOG, null, "failure", "skipped");
+  const text = renderSummary(v);
+  assert.match(text, /run log could not be read, so whether anything executed is \*\*UNKNOWN\*\*/);
+  assert.doesNotMatch(text, /No test ever executed/);
+});
+
+test("a READ-but-silent run log still says no test executed", () => {
+  const v = classify(BUILD_EXPIRED_LOG, "", "failure", "skipped");
+  assert.match(renderSummary(v), /No test ever executed/);
+});
+
+// ---------------------------------------------------------------------------
+// The $GITHUB_STEP_SUMMARY append path, which no test covered.
+// ---------------------------------------------------------------------------
+
+test("the CLI appends its block to $GITHUB_STEP_SUMMARY and still exits 0", () => {
+  const dir = mkdtempSync(join(tmpdir(), "expiry-summary-"));
+  const summary = join(dir, "summary.md");
+  writeFileSync(summary, "PRE-EXISTING\n", "utf8");
+  const buildLog = join(dir, "build.log");
+  writeFileSync(buildLog, BUILD_EXPIRED_LOG, "utf8");
+
+  const r = spawnSync(
+    process.execPath,
+    [CLI, "--build-log", buildLog, "--run-log", join(dir, "absent.log"),
+     "--build-outcome", "failure", "--run-outcome", "skipped"],
+    { env: { ...process.env, GITHUB_STEP_SUMMARY: summary }, encoding: "utf8" },
+  );
+
+  assert.equal(r.status, 0, "the summariser must always exit 0");
+  const written = readFileSync(summary, "utf8");
+  assert.match(written, /^PRE-EXISTING$/m, "it must APPEND, never truncate");
+  assert.match(written, /Rust test phase: BUILD/);
+  assert.match(r.stdout, /Rust test phase: BUILD/, "and always print to stdout too");
+});
+
+test("an UNWRITABLE $GITHUB_STEP_SUMMARY degrades to a warning, never a failure", () => {
+  const r = spawnSync(
+    process.execPath,
+    [CLI, "--build-outcome", "failure", "--run-outcome", "skipped"],
+    {
+      env: { ...process.env, GITHUB_STEP_SUMMARY: "/nonexistent-dir/summary.md" },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /::warning title=ci-expiry-phase-summary::/);
+  assert.match(r.stdout, /Rust test phase: BUILD/);
 });

@@ -59,8 +59,8 @@ fn repo_root() -> PathBuf {
 
 fn ci_workflow() -> serde_yaml::Value {
     let path = repo_root().join(".github").join("workflows").join("ci.yml");
-    let text = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
 }
 
@@ -164,6 +164,28 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
         "`{BUILD}` must come before `{RUN}`"
     );
 
+    // The `id:`s are pinned HERE and not merely referenced elsewhere. Three
+    // later steps read `${{ steps.<id>.outcome }}`; a renamed or deleted `id`
+    // makes every one of those expressions expand to the EMPTY STRING in CI —
+    // silently, since a GitHub expression referencing an unknown step is not an
+    // error. The substring assertion on the ingest's `run:` body below would
+    // still pass, because it never looks at these steps. This was the one
+    // assertion in this file that would have passed against a broken workflow.
+    assert_eq!(
+        build.get("id").and_then(|v| v.as_str()),
+        Some("build_rust_tests"),
+        "`{BUILD}` must keep `id: build_rust_tests` — the expiry summariser and \
+         the memory sampler both read `steps.build_rust_tests.outcome`, and an \
+         unknown step id expands to the empty string rather than erroring"
+    );
+    assert_eq!(
+        run.get("id").and_then(|v| v.as_str()),
+        Some("run_rust_tests"),
+        "`{RUN}` must keep `id: run_rust_tests` — the expiry summariser, the \
+         memory sampler and the coord ingest's `--gating-outcome` all read \
+         `steps.run_rust_tests.outcome`"
+    );
+
     let build_bound = timeout_minutes(build, BUILD);
     let run_bound = timeout_minutes(run, RUN);
 
@@ -173,9 +195,11 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
     assert!(
         run_bound < build_bound,
         "the run bound ({run_bound}) must be strictly smaller than the build \
-         bound ({build_bound}): ~92% of the old composite step was `rustc`, and \
-         the point of the split is that the test clock is sized against the \
-         measured ~2 min of test execution rather than against a compile."
+         bound ({build_bound}). This assertion pins the ORDERING only — the \
+         numbers are Phase 5's to re-size. What the ordering encodes is that one \
+         of these is a compile clock and the other is a test clock: measured on \
+         run 35043646051 attempt 2, the build phase is ~37 min and the whole run \
+         phase is 5m26s."
     );
 
     let build_run = command_lines(build, BUILD);
@@ -195,11 +219,19 @@ fn rust_tests_are_built_and_run_in_separate_bounded_steps() {
     // (always 0) is the step's, silently turning every red green. The step's
     // own comment has recorded this since before the split; it is load-bearing
     // on BOTH halves now.
+    // `shell: bash` already runs as `bash --noprofile --norc -eo pipefail {0}`,
+    // so this is defence in depth rather than the mechanism — the claim that
+    // "without it every red goes green" is NOT true of these steps as spelled.
+    // What it guards is the shell being respelled later (`shell: sh`, an
+    // explicit `bash {0}`, a `bash -c` wrapper), after which `cargo test | tee`
+    // really would report tee's always-zero exit code.
     for (name, body) in [(BUILD, &build_run), (RUN, &run_run)] {
         assert!(
             body.contains("set -o pipefail"),
             "step `{name}` pipes cargo into `tee` and must `set -o pipefail` \
-             first, or tee's always-zero exit code becomes the step's verdict"
+             first. GitHub's own `shell: bash` invocation already sets it, so \
+             this is defence in depth against the shell being respelled — but \
+             it is cheap and the failure it prevents is every red reading green"
         );
     }
 }
@@ -281,7 +313,10 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
 
     // Neither diagnostic may become a second way to fail the job.
     for (name, step) in [
-        ("Explain which Rust test phase the bound expired in", explain),
+        (
+            "Explain which Rust test phase the bound expired in",
+            explain,
+        ),
         ("Windows memory peak after the Rust test steps", sampler),
     ] {
         assert_eq!(
@@ -299,25 +334,70 @@ fn an_expiry_is_explained_and_the_memory_peak_is_sampled() {
 }
 
 #[test]
-fn the_windows_build_jobs_throttle_is_still_expressed_per_platform() {
-    // Phase 3 step 2 will move this value once a soak window of peaks exists.
-    // What must not happen in the meantime is the expression being flattened to
-    // a single literal, which would silently retune the ubuntu leg too.
+fn both_halves_keep_the_two_env_entries_the_split_argues_for() {
+    // Phase 3 step 2 will move the `CARGO_BUILD_JOBS` value once a soak window
+    // of peaks exists. What must not happen in the meantime is the expression
+    // being flattened to a single literal (which silently retunes the ubuntu
+    // leg too) or either entry being dropped from a half.
+    //
+    // BOTH halves, deliberately. An earlier version of this test read the build
+    // step only, while `ci.yml` spent a paragraph on why each entry belongs on
+    // the RUN step as well — `CARGO_BUILD_JOBS` because rustdoc compiles the
+    // doctests there, `QONTINUI_DISABLE_KEYCHAIN` because that is where tests
+    // actually execute and the keychain hang is a runtime hang. Both were
+    // deletable from the run step with every test green.
     let doc = ci_workflow();
     let steps = job_steps(&doc, "test");
-    let build = find_step(&steps, BUILD);
 
-    let jobs = build
-        .get("env")
-        .and_then(|e| e.get("CARGO_BUILD_JOBS"))
+    for name in [BUILD, RUN] {
+        let step = find_step(&steps, name);
+        let env = step
+            .get("env")
+            .unwrap_or_else(|| panic!("step `{name}` must carry an `env:` mapping"));
+
+        let jobs = env
+            .get("CARGO_BUILD_JOBS")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("step `{name}` must carry a `CARGO_BUILD_JOBS` env entry"));
+        assert!(
+            jobs.contains("matrix.platform") && jobs.contains("windows-latest"),
+            "step `{name}`'s `CARGO_BUILD_JOBS` must stay a per-platform \
+             expression, got `{jobs}` — the windows and ubuntu legs are \
+             throttled for different reasons (pagefile commit headroom vs the \
+             OOM killer) and a single literal retunes both at once"
+        );
+
+        assert_eq!(
+            env.get("QONTINUI_DISABLE_KEYCHAIN")
+                .and_then(|v| v.as_str()),
+            Some("1"),
+            "step `{name}` must keep `QONTINUI_DISABLE_KEYCHAIN: \"1\"`. It \
+             short-circuits `keychain_enabled()` in src-tauri/src/auth.rs; \
+             without it the macOS keychain blocks indefinitely on a runner with \
+             no desktop session and eats the whole bound. macOS is out of the \
+             matrix today, which is exactly why dropping this would go unnoticed \
+             until it is re-added."
+        );
+    }
+}
+
+#[test]
+fn the_memory_sampler_is_gated_to_the_windows_leg() {
+    // Without the platform gate the step runs on ubuntu, `powershell` is not
+    // found, `bash -e` aborts the group, and `continue-on-error: true` swallows
+    // it — a diagnostic that reports nothing and says nothing about reporting
+    // nothing. Asserted separately from the `always()` check so a failure names
+    // which half broke.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+    let sampler = find_step(&steps, "Windows memory peak after the Rust test steps");
+    let cond = sampler
+        .get("if")
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| panic!("`{BUILD}` must carry a `CARGO_BUILD_JOBS` env entry"));
+        .unwrap_or_else(|| panic!("the memory sampler must carry an `if:` condition"));
 
     assert!(
-        jobs.contains("matrix.platform") && jobs.contains("windows-latest"),
-        "`CARGO_BUILD_JOBS` must stay a per-platform expression, got `{jobs}` — \
-         the windows and ubuntu legs are throttled for different reasons \
-         (pagefile commit headroom vs the OOM killer) and a single literal \
-         retunes both at once"
+        cond.contains("windows-latest"),
+        "the memory sampler's `if:` must gate on the windows leg, got `{cond}`"
     );
 }

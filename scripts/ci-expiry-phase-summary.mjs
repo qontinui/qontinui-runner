@@ -11,10 +11,18 @@
  * `The action 'Run Rust tests' has timed out after 90 minutes` — a sentence
  * equally compatible with a slow build, a hung test and a wedged runner, which
  * want three different responses. On run `35043646051` attempt 1 every fact
- * needed to tell them apart was sitting in the job log (a single 80.0-minute
- * silent window whose both edges were `Running rustc` lines, and a
- * `test result: ok. 1354 passed` two minutes before the kill) and no reader
- * produced any of it; a steward reconstructed it by hand.
+ * needed to tell them apart was sitting in the job log — a single 80.0-minute
+ * silent window whose both edges were `Running rustc` lines, and then a suite
+ * killed MID-RUN — and no reader produced any of it; a steward reconstructed
+ * it by hand.
+ *
+ * Be precise about that incident, because the obvious reading is wrong and an
+ * earlier version of this header carried it. The `test result: ok. 1354
+ * passed` line two minutes before the kill is ONE BINARY OF 29, not the suite:
+ * the largest binary (9905 tests) started at 02:58:22, was still emitting `ok`
+ * lines at 03:00:25, and never reported at all. The run was ~63% complete.
+ * That is exactly the state this script must describe honestly rather than
+ * summarising as a pass — see the all-`ok`-and-still-failed arm below.
  *
  * The split answers "which phase" STRUCTURALLY — whichever step's clock
  * expired. This script says it where a human reads it, names the crate that was
@@ -196,6 +204,21 @@ export function classifyExpiry({ buildLog, runLog, buildOutcome, runOutcome }) {
       lines.push(
         "The build log could not be read, so compile-error-vs-expiry is **UNKNOWN**.",
       );
+    } else if (buildLog.crate === null) {
+      // ABSTAIN. A readable log that never reached a single rustc invocation
+      // is at least as consistent with the step dying before cargo emitted
+      // anything — `cd src-tauri` failing, cargo missing, the disk full, an
+      // immediate runner kill — as with a mid-compile expiry. The
+      // no-`error:`-line arm below would call that a SLOW BUILD with full
+      // confidence, which is precisely the class this file promises to abstain
+      // on. `lineCount` is here and not merely computed because it is the
+      // difference between "empty" and "said things, none of them rustc".
+      lines.push(
+        `The build log is readable (${buildLog.lineCount} line(s)) but contains no rustc ` +
+          "invocation at all, so **UNKNOWN**: an expiry before the first compile and a " +
+          "step that died before cargo ran are indistinguishable from here. Read the job " +
+          "log's own step result rather than inferring one.",
+      );
     } else if (buildLog.oom) {
       lines.push(
         "The log carries an rustc/LLVM out-of-memory signature. That is the condition " +
@@ -214,11 +237,22 @@ export function classifyExpiry({ buildLog, runLog, buildOutcome, runOutcome }) {
           "into the job log, never into the tee'd file. Treat this as a SLOW BUILD, not a broken one.",
       );
     }
-    lines.push(
-      runLog.recognisedAsRun
-        ? "The run log nevertheless carries recognisable test output — read it before assuming nothing ran."
-        : "No test ever executed: the run step never got the binaries.",
-    );
+    // Three states, not two. `recognisedAsRun: false` is true BOTH when the log
+    // was read and had no test output AND when it could not be read at all, and
+    // `describeLog`'s own contract says those must never be collapsed — which
+    // is exactly what this line used to do, asserting "no test ever executed"
+    // one bullet below "the build log could not be read".
+    if (!runLog.readable) {
+      lines.push(
+        "The run log could not be read, so whether anything executed is **UNKNOWN**.",
+      );
+    } else if (runLog.recognisedAsRun) {
+      lines.push(
+        "The run log nevertheless carries recognisable test output — read it before assuming nothing ran.",
+      );
+    } else {
+      lines.push("No test ever executed: the run step never got the binaries.");
+    }
     return { phase: "build", title: "Rust test phase: BUILD", lines };
   }
 
