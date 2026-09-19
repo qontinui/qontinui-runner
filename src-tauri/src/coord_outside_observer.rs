@@ -1233,7 +1233,13 @@ impl ObserverState {
                 self.unobserved_streak,
                 elapsed_secs(self.unobserved_since, now),
             ),
-            raw: reason,
+            // A `Read` that left (ii) unobserved still HAS a read, and the
+            // card's details are where every other class puts it — without it
+            // the operator is told the counts disagree and not shown them.
+            raw: match outcome {
+                ProbeOutcome::Read(read) => format!("{reason}\n\n{}", render_read(read)),
+                _ => reason,
+            },
             // Never. Whatever kept this runner from observing coord — no
             // answer, a refused credential, an unreadable shape — applies
             // identically to a finding POST, and the module's contract is to
