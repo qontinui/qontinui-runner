@@ -17685,38 +17685,50 @@ mod ui_bridge_binding_health_tests {
         // `split("#[cfg(test)]").next()` was WRONG here — it stops at the
         // FIRST occurrence, which in this file is about 62% of the way in, so
         // a second construction added after that line was invisible and the
-        // test passed by placement luck. Every `#[cfg(test)]` in this file
-        // sits at column 0 on its own line and gates an item that closes with
-        // a column-0 `}`, so skip exactly those spans and keep the rest.
+        // test passed by placement luck.
+        //
+        // Skip only a column-0 `#[cfg(test)]` that gates a `mod` — that is the
+        // shape whose body closes with a column-0 `}`. A `#[cfg(test)]` on a
+        // bare `fn` or `use` would otherwise make this swallow production code
+        // up to the next column-0 brace, so it is asserted, not assumed.
+        let lines: Vec<&str> = src.lines().collect();
         let mut production = String::new();
-        let mut skipping = false;
-        let mut scanned = 0usize;
-        for line in src.lines() {
-            if !skipping && line == "#[cfg(test)]" {
-                skipping = true;
-                continue;
-            }
-            if skipping {
-                if line == "}" {
-                    skipping = false;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let next = lines.get(i + 1).copied().unwrap_or("");
+                assert!(
+                    next.starts_with("mod "),
+                    "column-0 #[cfg(test)] at line {} gates `{next}`, not a `mod` — \
+                     this scan would swallow production code up to the next \
+                     column-0 brace",
+                    i + 1
+                );
+                i += 1;
+                while i < lines.len() && lines[i] != "}" {
+                    i += 1;
                 }
+                i += 1;
                 continue;
             }
-            production.push_str(line);
+            production.push_str(lines[i]);
             production.push('\n');
-            scanned += 1;
+            i += 1;
         }
-        assert!(
-            !skipping,
-            "a #[cfg(test)] span never closed at column 0 — the scan is unreliable"
-        );
-        // Guard the guard: if the span-skipping ever swallows the file, the
-        // count below would trivially be 0 and this test would pass blind.
-        assert!(
-            scanned * 2 > src.lines().count(),
-            "scanned only {scanned} of {} lines; the test-span skip is over-eager",
-            src.lines().count()
-        );
+        // Anchor on known production symbols rather than a line-count ratio:
+        // the ratio flips to a spurious failure the day the test modules
+        // exceed half the file, which is a property of test volume, not of
+        // what this is guarding.
+        for anchor in [
+            "async fn health(",
+            ".route(\"/health\", get(health))",
+            "let api_state = Arc::new(ApiState {",
+        ] {
+            assert!(
+                production.contains(anchor),
+                "the test-span skip removed production code: `{anchor}` is gone"
+            );
+        }
         let built = production.matches("RelayBinding::new(").count();
         assert_eq!(
             built, 1,

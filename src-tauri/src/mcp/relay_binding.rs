@@ -32,6 +32,7 @@
 //! [`RequesterPrincipal`]: crate::mcp::origin_guard::RequesterPrincipal
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::FromRef;
@@ -75,13 +76,12 @@ pub const RULE_R5: &str = "R5";
 /// registration is admitted — but Phase 4 reads these counters to decide
 /// graduation, so it has to be visible in BOTH modes.
 pub const RULE_R5_KEEP_ALIVE: &str = "R5-keepAlive";
-/// R5's ceiling arm: a reservation evicted because the tombstone map hit its
-/// global ceiling. Never silent — an operator must be able to see that
-/// reservations are being displaced, which is the shape of a flooding attack.
-pub const RULE_R5_EVICTED: &str = "R5-tombstoneEvicted";
 /// R1 as decided by the LIVE WebSocket routing slot rather than the registry
-/// row. Counted separately so it cannot crowd the row-based R1 out of the
-/// 20-slot `/health` ring that Phase 4's graduation is read from.
+/// row. Counted under its own id because Phase 4 needs to know WHICH gate
+/// fired: a refusal here means the registry row had already gone while the
+/// socket was still open, which is a different operational story from a
+/// refusal against a live row, and the two would be indistinguishable under
+/// one counter. (It does not reduce ring pressure — both ids share the ring.)
 pub const RULE_R1_SLOT: &str = "R1-slot";
 pub const RULE_OPAQUE: &str = "R-opaque";
 
@@ -294,6 +294,30 @@ impl Principal {
         self.is_operator_trust() || self.same(holder)
     }
 
+    /// The key a tombstone's fair-share bucket is counted under.
+    ///
+    /// The VERIFIED HEADER ORIGIN, never [`Self::log_key`]: a bucket is a
+    /// quota, so it has to cost something to mint. An origin costs DNS and a
+    /// certificate. `log_key` becomes `tabkey:<digest>` for a keyed tab in
+    /// Phase 2, which is 32 random bytes minted client-side — unlimited
+    /// buckets for free, which would turn any fair-share rule into its
+    /// opposite. Everything without a verified origin therefore shares ONE
+    /// bucket and, between them, one share.
+    pub fn tombstone_bucket(&self) -> String {
+        match self {
+            Self::Browser { origin, .. } => origin.as_origin_string(),
+            // Operator trust never tombstones; a keyed or opaque principal has
+            // no origin the runner verified, so they pool.
+            _ => "<unverified>".to_string(),
+        }
+    }
+
+    /// A stable key for the "log once per principal+rule" set.
+    #[cfg(test)]
+    pub fn log_key_for_test(&self) -> String {
+        self.log_key()
+    }
+
     /// A stable key for the "log once per principal+rule" set.
     fn log_key(&self) -> String {
         match self {
@@ -473,6 +497,16 @@ pub struct RelayBinding {
     recent: Mutex<VecDeque<(&'static str, &'static str, &'static str)>>,
     /// "principal+rule already logged" — one WARN per pair, not per request.
     logged: Mutex<HashSet<String>>,
+    /// Tombstone reservations displaced by the global ceiling. An operational
+    /// event, kept OUT of `rules` — see `tombstone_until`.
+    tombstone_evictions: AtomicU64,
+    /// Evicted keys already WARNed about, so a flood is one line per displaced
+    /// reservation rather than one per request.
+    evicted_logged: Mutex<HashSet<String>>,
+    /// Writes refused because the map was full and NOTHING was above its fair
+    /// share. Distinct from an eviction: nobody lost a reservation, the
+    /// arrival did not get one.
+    tombstone_drops: AtomicU64,
 }
 
 impl RelayBinding {
@@ -483,6 +517,9 @@ impl RelayBinding {
             tombstones: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             logged: Mutex::new(HashSet::new()),
+            tombstone_evictions: AtomicU64::new(0),
+            evicted_logged: Mutex::new(HashSet::new()),
+            tombstone_drops: AtomicU64::new(0),
         })
     }
 
@@ -545,6 +582,17 @@ impl RelayBinding {
         }
     }
 
+    fn first_eviction_sighting(&self, evicted_key: &str) -> bool {
+        let mut seen = self
+            .evicted_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= MAX_LOGGED_SIGHTINGS {
+            seen.clear();
+        }
+        seen.insert(evicted_key.to_string())
+    }
+
     fn push_recent(&self, rule: &'static str, class: &'static str, route: &'static str) {
         let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
         if recent.len() >= MAX_RECENT_TUPLES {
@@ -569,14 +617,8 @@ impl RelayBinding {
 
     // -- Tombstones (R5) -------------------------------------------------
 
-    /// Reserve `key` for `holder` for [`BINDING_TOMBSTONE_MS`]. Operator-trust
-    /// releases are NOT tombstoned: an agent's id is free the moment it lets go.
-    ///
-    /// The map is bounded PER PRINCIPAL first and globally second, so a
-    /// principal can only ever evict its own reservations — see
-    /// [`MAX_TOMBSTONES_PER_PRINCIPAL`]. When the global ceiling is reached by
-    /// many principals and this one holds none, the write is DROPPED rather
-    /// than evicting somebody else's.
+    /// Reserve `key` for `holder` for [`BINDING_TOMBSTONE_MS`] from now.
+    /// See [`Self::tombstone_until`] for the carve-outs and the ceiling.
     pub fn tombstone(&self, key: String, holder: &Principal) {
         self.tombstone_until(
             key,
@@ -587,25 +629,38 @@ impl RelayBinding {
 
     /// Reserve `key` for `holder` until an EXPLICIT instant.
     ///
-    /// The sweeper needs this: a reservation written when the sweeper happens
-    /// to run must still run from the moment the registration actually ENDED,
-    /// not from the sweep instant, or its length varies silently with sweeper
-    /// lag (up to `SWEEP_INTERVAL_MS`). A reservation whose instant has
-    /// already passed is not written at all.
-    ///
     /// Operator-trust releases are NOT tombstoned: an agent's id is free the
-    /// moment it lets go.
+    /// moment it lets go. A reservation whose instant has already passed is
+    /// not written at all.
     ///
-    /// The map is bounded per principal first and globally second. At the
-    /// global ceiling it evicts the soonest-to-expire of the LARGEST bucket,
-    /// which is fair by construction — a victim holding one reservation is
-    /// never selected while a flooder holds 64 — and it NEVER drops the
-    /// incoming write. Dropping was the previous behaviour and it was
-    /// attacker-forceable: the bucket key is `class:origin`, and one domain
-    /// yields unlimited origins (`s0..s15.evil.example` × 64 = 1024), so an
-    /// attacker could fill the map from 16 principals and then silently
-    /// PREVENT a chosen victim's reservation instead of evicting it — the same
-    /// outcome at the same cost.
+    /// Only the EXPLICIT-release path reaches here. Expiry is handled by the
+    /// registry retaining the row through its reservation window, so this map
+    /// no longer has to cover it.
+    ///
+    /// # The ceiling
+    ///
+    /// Bounded per bucket ([`MAX_TOMBSTONES_PER_PRINCIPAL`]) and then
+    /// globally ([`MAX_TOMBSTONES`]). A bucket is a VERIFIED ORIGIN
+    /// ([`Principal::tombstone_bucket`]).
+    ///
+    /// At the global ceiling the victim is chosen by FAIR-SHARE EXCESS:
+    /// `share = MAX / buckets`, and only a bucket strictly above its share is
+    /// eligible, picked by largest excess and tie-broken by bucket key so the
+    /// choice never depends on `HashMap` iteration order. Two earlier rules
+    /// were measured wrong and are recorded here so they are not re-invented:
+    /// "evict the globally soonest" always picked the victim, because every
+    /// reservation has the same lifetime so soonest == oldest == the one
+    /// written before the flood; and "evict the largest bucket" is
+    /// attacker-chosen too — 1023 origins holding one each tie at one and the
+    /// winner fell out of hash order, while a victim that legitimately holds
+    /// the largest bucket (a multi-app origin) was evicted every single time.
+    ///
+    /// When NOTHING exceeds its share the incoming principal evicts its OWN
+    /// soonest — self-eviction, never victim-eviction. Only if it holds none
+    /// either does the globally soonest go, and in that state the map is
+    /// saturated by `MAX` distinct verified origins each at its share, the
+    /// incoming write is the newest, and the eviction lands on whoever wrote
+    /// longest ago.
     pub fn tombstone_until(&self, key: String, holder: &Principal, expires_at_ms: i64) {
         if holder.is_operator_trust() {
             return;
@@ -614,22 +669,21 @@ impl RelayBinding {
         if expires_at_ms <= now {
             return;
         }
-        let bucket = holder.log_key();
+        let bucket = holder.tombstone_bucket();
         let mut map = self.tombstones.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, t| t.expires_at_ms > now);
 
-        // ONE pass for every decision below: per-bucket counts, and each
-        // bucket's soonest-to-expire key. `sweep` can call this once per
-        // evicted row, so the previous three-or-four scans per call mattered.
-        let replacing = map.contains_key(&key);
-        if !replacing {
-            let mut counts: HashMap<String, (usize, String, i64)> = HashMap::new();
+        if !map.contains_key(&key) {
+            // ONE pass for every decision below: per-bucket count and each
+            // bucket's soonest-to-expire key, tie-broken by key so a bucket's
+            // representative is deterministic too.
+            let mut counts: BTreeMap<String, (usize, String, i64)> = BTreeMap::new();
             for (k, t) in map.iter() {
-                let b = t.holder.log_key();
+                let b = t.holder.tombstone_bucket();
                 match counts.get_mut(&b) {
                     Some(e) => {
                         e.0 += 1;
-                        if t.expires_at_ms < e.2 {
+                        if (t.expires_at_ms, k.as_str()) < (e.2, e.1.as_str()) {
                             e.1 = k.clone();
                             e.2 = t.expires_at_ms;
                         }
@@ -640,26 +694,64 @@ impl RelayBinding {
                 }
             }
             let mine = counts.get(&bucket).map(|e| e.0).unwrap_or(0);
-            if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
-                if let Some((_, victim, _)) = counts.get(&bucket) {
-                    map.remove(victim);
-                }
-            } else if map.len() >= MAX_TOMBSTONES {
-                // Largest bucket wins the eviction: a flooder pays for its own
-                // flood, and a principal holding 0-1 never does.
-                if let Some((b, (n, victim, _))) = counts.iter().max_by_key(|(_, e)| e.0) {
-                    self.counters.record(RULE_R5_EVICTED, true);
-                    if self.first_sighting(holder, RULE_R5_EVICTED) {
+
+            // Who pays for this write, in order:
+            //
+            //   1. me, if my own bucket is already at its per-bucket cap;
+            //   2. me, if my bucket is at or above its FAIR SHARE — the
+            //      incoming write is the one causing the overflow, so a
+            //      principal that already has its share pays for wanting more
+            //      before anyone under their share does;
+            //   3. the bucket furthest ABOVE its fair share, tie-broken by
+            //      bucket key (`counts` is a BTreeMap, so this is key order
+            //      and never hash order);
+            //   4. nobody — the write is DROPPED.
+            //
+            // Step 4 is reachable only when every bucket is at or under its
+            // share, which at a full map means ~`MAX_TOMBSTONES` distinct
+            // VERIFIED origins. Dropping there is symmetric: it falls on
+            // whoever arrives next, with no attacker control over who that is.
+            // That is the opposite of the earlier dropped-write arm, which an
+            // attacker could force against a CHOSEN victim from 16 origins.
+            let share = MAX_TOMBSTONES / (counts.len() + usize::from(mine == 0)).max(1);
+            let my_soonest = counts.get(&bucket).map(|e| e.1.clone());
+            let victim = if mine >= MAX_TOMBSTONES_PER_PRINCIPAL {
+                my_soonest
+            } else if map.len() < MAX_TOMBSTONES {
+                None
+            } else if mine > 0 && mine >= share {
+                my_soonest
+            } else {
+                counts
+                    .iter()
+                    .filter(|(_, e)| e.0 > share)
+                    .max_by_key(|(_, e)| e.0 - share)
+                    .map(|(_, e)| e.1.clone())
+            };
+
+            // Step 4: nothing was chosen and the map is full — do not insert.
+            if victim.is_none() && map.len() >= MAX_TOMBSTONES {
+                self.tombstone_drops.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            if let Some(v) = victim {
+                if map.remove(&v).is_some() {
+                    // An operational EVENT, not a rule verdict: counted on its
+                    // own `/health` field rather than under `rules`, where a
+                    // shadow box would otherwise report "refusals" beside
+                    // `binding: "shadow"` in the exact signal Phase 4 reads.
+                    self.tombstone_evictions.fetch_add(1, Ordering::Relaxed);
+                    // Deduped on the EVICTED bucket, not the incoming
+                    // principal: under a flood the incoming principal differs
+                    // every request, which made this one line per request.
+                    if self.first_eviction_sighting(&v) {
                         tracing::warn!(
-                            evicted_bucket = %b,
-                            evicted_bucket_size = n,
-                            map_len = map.len(),
                             ceiling = MAX_TOMBSTONES,
-                            "ui-bridge binding (R5): the tombstone map hit its global ceiling; evicted the largest bucket's soonest reservation (logged once per principal+rule; counted on /health uiBridgeBinding)"
+                            buckets = counts.len(),
+                            "ui-bridge binding (R5): the tombstone map hit its global ceiling and displaced a reservation (logged once per evicted reservation; counted on /health uiBridgeBinding.tombstoneEvictions)"
                         );
                     }
-                    let victim = victim.clone();
-                    map.remove(&victim);
                 }
             }
         }
@@ -728,6 +820,11 @@ impl RelayBinding {
             "bindingEnv": ENV_BINDING,
             "activeBindingEnv": ENV_ACTIVE_BINDING,
             "tombstoneMs": BINDING_TOMBSTONE_MS,
+            // An operational event, deliberately NOT under `rules`: a shadow
+            // box must not report anything that reads as a refusal in the
+            // signal Phase 4's graduation is decided from.
+            "tombstoneEvictions": self.tombstone_evictions.load(Ordering::Relaxed),
+            "tombstoneDrops": self.tombstone_drops.load(Ordering::Relaxed),
             "tombstones": self
                 .tombstones
                 .lock()

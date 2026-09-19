@@ -124,9 +124,12 @@ impl AppDispatcher {
         http_path: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, DispatchError> {
+        // `get_live`, not `get`: the registry retains an expired row for its
+        // reservation window so the id stays held for its owner, and routing
+        // must not follow a row that stopped heartbeating.
         let entry = self
             .registry
-            .get(app_id)
+            .get_live(app_id)
             .await
             .ok_or_else(|| DispatchError::NotRegistered(app_id.to_string()))?;
 
@@ -381,7 +384,7 @@ impl AppDispatcher {
         // 2. WS-transport apps short-circuit through the relay — same code
         //    path as `dispatch`, but reached via the active-connection probe
         //    rather than a caller-supplied `app_id`.
-        if let Some(entry) = self.registry.get(&app_id).await {
+        if let Some(entry) = self.registry.get_live(&app_id).await {
             if matches!(entry.transport, AppTransport::Websocket) {
                 debug!(
                     "[app-dispatch] {} via websocket (active) → app='{}' conn_id={:?}",

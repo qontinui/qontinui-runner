@@ -85,7 +85,7 @@ impl RegisteredApp {
     /// Within its TTL (per-entry `keep_alive_ms`, else the global default) —
     /// exactly the predicate `list_live` and `sweep` use, so the registry
     /// never refuses a claim on an entry it does not serve.
-    fn is_live(&self, now: i64) -> bool {
+    pub(crate) fn is_live(&self, now: i64) -> bool {
         now - self.last_seen_ms <= self.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
     }
 }
@@ -186,7 +186,19 @@ impl AppRegistry {
                     let reserved_until = existing.last_seen_ms
                         + existing.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS)
                         + BINDING_TOMBSTONE_MS;
-                    if now <= reserved_until && !principal.may_displace(&existing.principal) {
+                    // The operator-trust carve-out, mirroring
+                    // `tombstone_until`: an agent's id is free the moment its
+                    // registration ends, expiry included. Without this an
+                    // agent that registered with `keepAliveSecs: 3600` and
+                    // stopped heartbeating would lock a legitimate browser
+                    // page out of that id for 60 s past a one-hour TTL — and
+                    // only when the sweeper had not yet run, which is the very
+                    // timing dependence this arm exists to delete, sign
+                    // flipped.
+                    if now <= reserved_until
+                        && !existing.principal.is_operator_trust()
+                        && !principal.may_displace(&existing.principal)
+                    {
                         binding.meter(
                             mode,
                             principal,
@@ -344,11 +356,27 @@ impl AppRegistry {
         }
     }
 
-    /// Look up an entry by app_id (regardless of freshness). Returns a clone
-    /// so callers can inspect the transport without holding the lock.
+    /// Look up an entry by app_id REGARDLESS of freshness. Since `sweep`
+    /// retains a row through its reservation window, this can return a row
+    /// whose TTL has passed — use [`Self::get_live`] for anything that routes.
     pub async fn get(&self, app_id: &str) -> Option<RegisteredApp> {
         let r = self.inner.read().await;
         r.get(app_id).cloned()
+    }
+
+    /// Look up an entry only while it is FRESH, i.e. the same predicate
+    /// `list_live` and `/ui-bridge/apps/registered` use.
+    ///
+    /// Routing reads this rather than [`Self::get`]. The registry now keeps an
+    /// expired row for `BINDING_TOMBSTONE_MS` past its TTL so the id stays
+    /// reserved for its holder; without this split that retention would also
+    /// extend the window in which a dispatch targets an app that stopped
+    /// heartbeating, from the old sweeper-tick skew to the full reservation.
+    /// Reservation and reachability are different questions.
+    pub async fn get_live(&self, app_id: &str) -> Option<RegisteredApp> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let r = self.inner.read().await;
+        r.get(app_id).filter(|e| e.is_live(now)).cloned()
     }
 
     /// Returns entries that haven't been stale-evicted (last_seen_ms within
@@ -363,51 +391,40 @@ impl AppRegistry {
             .collect()
     }
 
-    /// Evict entries older than each entry's TTL (per-entry `keep_alive_ms`
-    /// if set, else `REGISTRATION_TTL_MS`). Returns the number of evicted
-    /// entries.
+    /// Drop entries whose RESERVATION has lapsed — `last_seen_ms + ttl +
+    /// BINDING_TOMBSTONE_MS`, not the bare TTL. Returns the number dropped.
     ///
-    /// EXPIRY IS A WAY A REGISTRATION ENDS, so every eviction tombstones its
-    /// holder exactly as [`Self::release`] does (R5). Without this, R1 turns
-    /// a missed heartbeat into a PERMANENT lockout: `beforeunload` does not
-    /// run on a tab crash, an OOM kill, a sleep, or when Chrome throttles a
-    /// backgrounded tab's 10 s phone-home past the 30 s TTL — the row is
-    /// swept, an attacker polling `/ui-bridge/apps/registered` claims the id
-    /// and renews it every 10 s, and the returning tab is refused forever,
-    /// where on main it would simply have re-taken its slot. That is the
-    /// "one more way to be locked out" cost the plan's own ranking used to
-    /// REJECT option A, so this phase must not introduce it.
+    /// Retaining the row through its reservation window is what makes R5 hold
+    /// without any dependence on when the sweeper happens to run. The row
+    /// itself IS the reservation, so:
     ///
-    /// `binding.tombstone` already no-ops for operator trust, so an agent's
-    /// expired synthetic entry frees its id immediately.
-    pub async fn sweep(&self, binding: &RelayBinding) -> usize {
+    /// - there is no window between the TTL and the next 15 s tick in which
+    ///   the id looks unheld (the attacker used to win that window ~14 times
+    ///   in 15 by polling at 1 Hz, because `list_live` drops the row from
+    ///   `/ui-bridge/apps/registered` at the TTL — the attacker's signal —
+    ///   while nothing yet reserved it);
+    /// - the sweeper writes no tombstones at all, so there is no
+    ///   collect-then-write ordering for a queued writer to slip into;
+    /// - the reservation's length cannot vary with sweeper lag, because
+    ///   nothing about it is computed at sweep time.
+    ///
+    /// The tombstone map is therefore only the EXPLICIT-release path
+    /// (`DELETE`, WebSocket teardown), where the row is deliberately removed
+    /// before its reservation has run out.
+    ///
+    /// Readers are unaffected: `list_live` filters on the TTL and is what
+    /// serves `/ui-bridge/apps/registered`, and the routing paths use
+    /// [`Self::get_live`]. A retained-but-expired row is visible only to
+    /// [`Self::get`] and to `claim`'s reservation arm.
+    pub async fn sweep(&self, _binding: &RelayBinding) -> usize {
         let now = chrono::Utc::now().timestamp_millis();
-        let tombstone = binding.config.binding != BindingMode::Off;
-        let mut evicted: Vec<(String, Principal, i64)> = Vec::new();
         let mut w = self.inner.write().await;
         let before = w.len();
-        w.retain(|app_id, e| {
-            let ttl = e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS);
-            let live = now - e.last_seen_ms <= ttl;
-            if !live && tombstone {
-                // From the row's OWN expiry, never from this sweep instant,
-                // so the reservation's length does not vary with sweeper lag.
-                evicted.push((
-                    app_tombstone_key(app_id),
-                    e.principal.clone(),
-                    e.last_seen_ms + ttl + BINDING_TOMBSTONE_MS,
-                ));
-            }
-            live
+        w.retain(|_, e| {
+            now - e.last_seen_ms
+                <= e.keep_alive_ms.unwrap_or(REGISTRATION_TTL_MS) + BINDING_TOMBSTONE_MS
         });
-        let count = before - w.len();
-        // Off the registry write lock: a burst of simultaneous expiries would
-        // otherwise hold it for one bounded-map pass per evicted row.
-        drop(w);
-        for (key, principal, expires_at_ms) in evicted {
-            binding.tombstone_until(key, &principal, expires_at_ms);
-        }
-        count
+        before - w.len()
     }
 
     /// Test-only shorthand for the pre-binding `upsert`: an operator-trust
@@ -728,8 +745,34 @@ mod tests {
             reg.list_live().await.is_empty(),
             "entry past its own keep_alive_ms must be filtered"
         );
-        let evicted = reg.sweep(&binding()).await;
-        assert_eq!(evicted, 1, "sweep must evict per-entry-stale entries");
+        // FRESHNESS and PRESENCE are now different questions. `list_live`
+        // still filters at the entry's own keep-alive (asserted above, and it
+        // is what `/ui-bridge/apps/registered` serves), but `sweep` retains
+        // the row for BINDING_TOMBSTONE_MS beyond it, because the row IS the
+        // R5 reservation — plan
+        // `2026-09-17-ui-bridge-relay-registration-is-unauthenticated`. This
+        // test asserted the old contract, where the two coincided.
+        assert_eq!(
+            reg.sweep(&binding()).await,
+            0,
+            "a row inside its reservation window is retained, not swept"
+        );
+        assert!(
+            reg.get("brief").await.is_some(),
+            "…and it is still there to answer `who holds this id`"
+        );
+
+        // Past the reservation too: now it goes.
+        {
+            let mut w = reg.inner.write().await;
+            w.get_mut("brief").unwrap().last_seen_ms -= BINDING_TOMBSTONE_MS;
+        }
+        assert_eq!(
+            reg.sweep(&binding()).await,
+            1,
+            "sweep must evict once the reservation has lapsed too"
+        );
+        assert!(reg.get("brief").await.is_none());
     }
 
     #[tokio::test]

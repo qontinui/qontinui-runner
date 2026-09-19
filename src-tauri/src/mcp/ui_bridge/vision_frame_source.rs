@@ -234,7 +234,7 @@ pub async fn resolve_frame_provider(
     }
 
     // 2. Registered app → its base url.
-    if let Some(entry) = state.app_registry.get(id).await {
+    if let Some(entry) = state.app_registry.get_live(id).await {
         return Ok(Box::new(DeviceScreenshotSource {
             base_url: entry.app.url.clone(),
         }));
