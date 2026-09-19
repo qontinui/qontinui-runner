@@ -574,9 +574,44 @@ it — WAIT, do not race it).
 | Class | Codes / signals | Action |
 |---|---|---|
 | **Transient — wait** | `ci-pending` (**only once you have PROVEN CI actually fired — see the note under this table**), `below-green-dwell`, `merge-state-unsettled` (young), in-flight proposal in `/merge/queue` | Nothing. Reset no clocks; check again next poll. |
-| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red`, `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI) or, for `escalate-path-matched`, surface to the operator via `/ask-operator` — that gate exists to force human review of secrets/migrations/infra; bypassing it defeats its purpose. ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2 kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
+| **Legitimate hold — fix the cause, NEVER bypass** | `ci-not-green`, `main-red`, `main-status-unknown`, `not-open`, `required-checks-missing`, `behind-main-or-unstable` (DIRTY), `auto-merge-disabled`, `dry-run-mode`, `escalate-path-matched`, `has-cross-repo-dependency` via `stacked-on` with parent still open | Fix in-session (rebase, fix CI). For `escalate-path-matched`, read what coord is actually waiting on and fix THAT — see the note under this table; never route around it (no recovery merge, no override you arrange yourself). ⚠️ For `ci-not-green` **and `main-red` alike, run Step 3's step-level classifier on the failed job FIRST**: a Tier-1/2 kill is not a cause to fix, it is a re-run — of main's own run in the `main-red` case — and it will **never** self-heal on its own. A `main-red` hold is a legitimate hold either way, but the remedy is not the same one. |
 | **Coord defect — recover + remediate** | `has-cross-repo-dependency` where the labeled PR is the UPSTREAM of the edge (`coord:upstream-of=` deadlock — engine parent-resolution inverted); `unlandable_cycle` spinning (cycles > ~5) with all members green; `merge-state-unsettled` dwell > 2× threshold on a fully-green head (phantom required-context wedge, coord#638); latest hydration `head_sha` ≠ current head for > 1h (stale ingest); predicate `result: pass` with no landing and no queue entry for > 1h; `has-blocking-label` on a live PR (retired code — should be extinct) | Step 5 → 6. |
 | **Coord down** | no leader across 4–8 health samples, **and** `bash .claude/skills/coord-revive/coord-revive.sh --floor-claim` printed a `FLOOR-CLAIM:` block reading `verdict=FLOOR` — paste it into the report. `verdict=UNKNOWN` (exit 5: sampled under this box's own load) is NOT this class; wait for the builds to finish and sample again | Step 6 directly — which for an agent ends in the operator hand-off, not a merge (#328). |
+
+**`escalate-path-matched` is a hold with a named pending gate — read it before
+deciding who acts.** `coord_pr_merge_verdict {repo, pr_number}` returns an
+`escalate` block for exactly this code — `category`, `disposition`,
+`pending_gate` and a precise `reason` — and `pending_gate` decides the next
+step. It is never bypassed, whatever it says: no recovery merge (Step 6 does
+not apply to this code), no override arranged by the agent.
+
+| `pending_gate` | What coord is waiting on | Action | Exit state |
+|---|---|---|---|
+| `migration_classifier` | the migration failed coord's additive-safety classifier (`qontinui-coord` `crates/coord/src/pr_merge/migration_classifier.rs`); `reason` names the op | Fix the named op in the migration and push — `auto_if_provably_safe` then lands it with no human. If the op is fine and the CLASSIFIER is wrong, fix the classifier in qontinui-coord (plan → `/vet-imp`) and file a finding; the PR waits on that fix | `fixed-and-waiting` (migration fixed) or `blocked-legitimate` (classifier fix in flight) |
+| `reversal_gate` | the repo's `Migration Reversal Gate` check at the head is absent or not green | Fix that check | `fixed-and-waiting` |
+| `migration_disposition` | coord could not EVALUATE the migration (fetch failure, no GitHub App client, file missing at head) — not a check | Fix the cause `reason` names; if transient, re-evaluate (`coord_reevaluate`) | `fixed-and-waiting` |
+| `secret_scan` | the secret scan must pass, and THEN an operator override is still required | Get the scan green, then ask the operator — secrets is closed-list item 1 | `operator-escalated` |
+| `awaiting_operator_override` | every other category (`infra`, `dependencies`, `other`) and dispositions `block_hard` / `block_soft` | Ask the operator to review and override or reject — closed-list item 2 (the `strategy_admin` override is a resource no agent can obtain) | `operator-escalated` |
+
+**The override is a human decision by design, not a mechanical act.**
+`coord_attest_escalate_override` requires the `strategy_admin` scope precisely
+so that no device or agent token can self-clear its own escalation
+(`crates/coord/src/mcp/tools.rs`, the override tool's authorization comment).
+Where the table says ask, the ask is the review decision itself — "review this
+change, then override or reject" — never a request to press a button, and
+never a reason to build an agent-clearable path around it.
+
+**When an ask is owed is served policy, not this file** — read it fresh
+(`/policy`) rather than from a copy here: [policy: `escalation-bar`
+`escalation-closed-list`] (whose anti-triggers include "high blast radius
+alone, when a verification gate exists") and, for migrations, [policy:
+`production-and-cost` `pipeline-deploys-are-not-adhoc-mutation`]. Ask through
+`/ask-operator`, with a recommendation, naming the closed-list item.
+
+This note replaced an unconditional "surface to the operator via
+`/ask-operator`". On 2026-09-18 that sent an additive migration PR
+(qontinui-web#1393) to the operator when coord's `pending_gate` was
+`migration_classifier` — a rejection the author could fix (finding `bff69ae4`).
 
 ⚠️ **`ci-pending` is transient only if CI actually FIRED. When it never fired
 it is PERMANENT, and waiting on it is an unbounded wait on a state that cannot
@@ -869,10 +904,21 @@ Then:
    `qontinui-claude-config/knowledge-base/qontinui-specific/coord-merge-train.md`.
    Whether `--admin` actually succeeds anywhere is untested by design, so it is
    not a path to reach for. **Own the branch first** (`git-operations`
-   `own-artifact-lifecycle`): if this session does not, run
+   `own-artifact-lifecycle`): if this session does not, **re-read served
+   policy `git-operations` NOW** (`/policy get policy git-operations`) —
+   the clause that decides what a non-owner may do,
+   `abandoned-pr-branch-is-adoptable-by-route-around`, was authored on
+   2026-09-08 and a session working from a five-day-old read proposed the
+   exact anti-pattern it names (plan
+   `2026-09-10-the-fixer-contract-authority-context-and-provenance-on-a-pr-you-did-not-author`,
+   §2a). Then branch on what it says: a **live** owner gets
    `/handoff-stuck-pr <owner/repo#N>` (plan
-   `2026-09-06-fleet-scale-stuck-pr-conflict-handoff-protocol`) and let the
-   author session or its coord-dispatched successor do it. The working
+   `2026-09-06-fleet-scale-stuck-pr-conflict-handoff-protocol`) and does the
+   rebase itself or through its coord-dispatched successor; an **absent**
+   owner (`/handoff-stuck-pr` exit 3, or exit 4 with no successor) is NOT
+   handed off — the clause names that shape an escalation dressed as a
+   hand-off (read its wording from the served document, not from here) — it
+   is **adopted by route-around**, per "Adopting a foreign branch" below. The working
    recovery: run `landed-since.sh check` (Step 4a.5), then rebase the branch onto current `origin/main` (in a worktree,
    `--force-with-lease` push — a push to the PR's branch, so Step 3's
    carries-the-push check runs before and after it, re-testing the PRE-rebase
@@ -882,6 +928,39 @@ Then:
    `gh pr merge <n> --rebase`. Strict rulesets (qontinui-web) need
    the up-to-date head; non-strict ones (qontinui-coord) merge as soon as the
    required checks are green on the current head.
+   **Adopting a foreign branch (route-around) — the only shape it may take.**
+   The clause's bound is the original branch: never rebase it, never
+   force-push it, never push to it at all. Take its content onto a fresh
+   branch off current `origin/main` (cherry-pick or re-apply in a worktree —
+   once qontinui-claude-config#901 lands, the trailer hook records you as
+   `Rebased-By:` and never as the author; until then a replay stamps YOUR
+   `Session-Id:` onto the author's commits, which is the corruption that PR
+   closes, so check its state before trusting the trailers you produced),
+   open a NEW PR from that branch, and leave the
+   original PR to be superseded. Every adoption discloses, in the new PR's
+   body, all four of these lines — they are what coord#2034 wrote in prose on
+   2026-09-08 and what `scripts/adoption-disclosure-check.sh` checks:
+
+   ```
+   Adoption-Supersedes: <owner/repo#N> at <original head sha, 40 hex>
+   Adoption-Ownership-Evidence: <what proved the owner absent — the /handoff-stuck-pr exit code and its DOOR/RESOLVER lines, or the PARKED probe>
+   Adoption-Original-Untouched: <the original branch's sha as it stands now, 40 hex — verified AFTER your work, never before>
+   Adoption-Credit: <who authored the content — the Session-Id/Claude-Session trailers or `unknown`>
+   ```
+
+   Run `bash <workspace-root>/qontinui-claude-config/scripts/adoption-disclosure-check.sh --body-file <the body>`
+   before `gh pr create`; it exits 1 naming the missing line. And **verify
+   the `Untouched` sha against the ORIGINAL branch's provenance, not against
+   your own** — coord#2034 certified a branch as untouched at a sha that was
+   the previous adopter's rebase commit, a correct check on an already
+   rewritten record (the plan's §2c). Trailerless commits you re-applied need
+   a `Session-Id-Inherited: <sha> <origin|unknown>` line per commit in the
+   same body — the inherited arm of the Session-Id trailer gate, where the
+   target repo runs one (`qontinui-dev-notes`'s
+   `.github/workflows/require-session-id-trailer.yml` documents the grammar;
+   read the target repo's own workflow rather than assuming); do not
+   rebase-to-stamp them.
+
 3. **Verify coord ingested the land** — within a few minutes the PR's
    `pr_state` should read `merged` (coord's phantom-open sweep and land-cause
    precedence handle the rest). If a dependent PR still carries a
@@ -921,7 +1000,11 @@ an admin-merge happened — produces a plan so the defect class dies:
 
 - **Never bypass a legitimate hold.** `escalate-path-matched` and red CI are
   the system working. The command's value is telling these apart from
-  defects, with evidence.
+  defects, with evidence. For `escalate-path-matched`, "never bypass" is not
+  "always escalate": act on the `pending_gate` coord names (4d's
+  `escalate-path-matched` table) — most arms are agent work, and the override
+  arms are an operator review decision, never something an agent routes
+  around.
 - **Evidence before action.** No admin-merge — and no hand-off asking the
   operator to perform one — without a quoted `block_reason_code` diagnosis on
   the PR. "It's been a while" is not a diagnosis. The bar does not drop just
