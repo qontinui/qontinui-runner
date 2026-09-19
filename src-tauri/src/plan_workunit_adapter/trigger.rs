@@ -43,8 +43,8 @@
 
 use super::parser::{parse_work_unit, slug_from_filename, ParsedWorkUnit, PlanConvention};
 use super::push::{
-    push_archive_metadata, push_work_unit, push_work_unit_with_remote, PushOutcomeKind,
-    SetDepsOutcome, WorkUnitSink,
+    push_archive_metadata, push_work_unit, push_work_unit_with_remote,
+    push_work_unit_with_status_write, PushOutcomeKind, SetDepsOutcome, StatusWrite, WorkUnitSink,
 };
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
 use std::collections::{HashMap, HashSet};
@@ -87,11 +87,27 @@ pub struct AdapterMetrics {
     /// Total `metadata.archive_path` stamps written by the archive scan
     /// (counter). Metadata-only — never a status transition (D4).
     pub archive_stamped_total: AtomicU64,
-    /// Slugs coord refused with a `403` and this process has therefore retired
-    /// (counter, monotonic — one increment per refused slug, not per cycle).
-    /// A non-zero value here with a flat `errors_total` is the healthy shape:
-    /// the adapter noticed a permission verdict and stopped re-asking.
+    /// Slugs coord refused with a `403` **naming no clearing condition**, and
+    /// this process has therefore retired PRINCIPAL-wide (counter, monotonic —
+    /// one increment per refused slug, not per cycle). A non-zero value here
+    /// with a flat `errors_total` is the healthy shape: the adapter noticed a
+    /// permission verdict and stopped re-asking.
+    ///
+    /// **This counter is one operator action only: *fix the principal's
+    /// permission*.** It deliberately does NOT include the
+    /// `terminality: permanent` retirements — those say *fix the plan file's
+    /// status stamp*, which shares nothing with a missing grant, and are
+    /// counted in [`AdapterMetrics::retired_permanent_total`].
     pub forbidden_total: AtomicU64,
+    /// `(slug, status)` pairs coord answered `terminality: permanent` for, and
+    /// this process has therefore retired for that PAIR (counter, monotonic —
+    /// one increment per retired pair, not per cycle).
+    ///
+    /// The operator action is *edit the plan file's status stamp* — typically a
+    /// coord-DERIVED word (`shipped`/`ready`) that coord computes and nobody
+    /// may set. It self-clears: the next cycle whose parsed status differs is
+    /// pushed normally, with no restart.
+    pub retired_permanent_total: AtomicU64,
     /// Scan roots in effect after the loop's last path resolution (gauge):
     /// the distinct configured directories among `plans_dir`,
     /// `plans_archive_dir` and `prompts_dir`. `0` while the tier is off.
@@ -164,6 +180,7 @@ pub struct MetricsSnapshot {
     pub deps_errors_total: u64,
     pub archive_stamped_total: u64,
     pub forbidden_total: u64,
+    pub retired_permanent_total: u64,
     pub scan_roots: u64,
     pub path_resolutions_total: u64,
     pub active_plans_dir: Option<String>,
@@ -193,6 +210,7 @@ impl AdapterMetrics {
             deps_errors_total: self.deps_errors_total.load(Ordering::Relaxed),
             archive_stamped_total: self.archive_stamped_total.load(Ordering::Relaxed),
             forbidden_total: self.forbidden_total.load(Ordering::Relaxed),
+            retired_permanent_total: self.retired_permanent_total.load(Ordering::Relaxed),
             scan_roots: self.scan_roots.load(Ordering::Relaxed),
             path_resolutions_total: self.path_resolutions_total.load(Ordering::Relaxed),
             active_plans_dir: self
@@ -1636,16 +1654,31 @@ pub struct ReconcileSummary {
     /// is reserved for the unit upsert/transition path — a dep-edge failure is
     /// non-fatal and additive).
     pub deps_errors: u64,
-    /// Units skipped or retired this cycle because coord answered `403`
-    /// ([`super::push::ForbiddenByCoord`]). Deliberately NOT folded into
-    /// `errors`: `errors` means "retryable, and we will retry", which is the
-    /// one thing a permission verdict is not.
+    /// Units skipped or retired this cycle because coord answered `403` and
+    /// named no clearing condition — a PERMISSION verdict, whose remedy is to
+    /// fix the principal's grant. Deliberately NOT folded into `errors`:
+    /// `errors` means "retryable, and we will retry", which is the one thing a
+    /// permission verdict is not — and deliberately not folded together with
+    /// `retired_permanent` either, which is a different operator action.
     pub forbidden: u64,
+    /// Units whose STATUS WRITE was withheld this cycle because coord answered
+    /// `terminality: permanent` for the status the file asks to apply — a
+    /// PLAN-FILE verdict, whose remedy is to edit the stamp. Scoped to the
+    /// `(slug, status)` pair, so it stops counting a unit the moment its file
+    /// changes. The unit's status-less metadata upsert still runs.
+    pub retired_permanent: u64,
     /// Dep-edge pushes skipped or retired this cycle because coord answered
     /// `403` on `POST /coord/work-units/:slug/deps` specifically. Not folded
     /// into `deps_errors` for the same reason `forbidden` is kept out of
     /// `errors` — and not folded into `forbidden`, since a deps refusal does
     /// not imply the unit's own upsert/transition route is refused too.
+    ///
+    /// Only the principal class (a `403` naming no clearing condition) retires
+    /// this route. A `terminality: permanent` on a dep-edge set is left in the
+    /// retry arm deliberately: the key it would have to be retired on is the
+    /// attempted DEP SET, not a status, and coord is not known to emit one
+    /// here — a retirement keyed too broadly is the defect this file closed on
+    /// the unit route.
     pub deps_forbidden: u64,
     /// Units whose `last_applied` was seeded from coord's current status this
     /// cycle (no in-process memory of them).
@@ -1705,25 +1738,32 @@ fn relative_source_path(root: Option<&str>, path: &Path) -> String {
 /// The parsed shape is identical on both arms — same slug, same
 /// `source_path` — so moving the source does not churn a single coord row.
 /// `read_plans_for_cycle_arms_agree` pins that by construction.
+///
+/// `Ok` carries a [`PlanDirScan`], whose `complete` flag says whether EVERY
+/// plan the source listed was read. Both arms can come back short without
+/// failing — the tree walk skips an unreadable or unstattable file, the ref
+/// walk skips a blob that will not read or is not UTF-8 — and a short `Ok`
+/// must not be read as the absence of what it skipped.
 pub fn read_plans_for_cycle(
     dir: &Path,
     conv: &PlanConvention,
     git: &dyn GitRefReader,
-) -> Result<Vec<ParsedWorkUnit>, String> {
+) -> Result<PlanDirScan, String> {
     use super::ref_scan::{read_ref_dir, resolve_scan_source, ScanSource};
     match resolve_scan_source(git, dir) {
-        ScanSource::WorkTree => Ok(read_plan_dir(dir, conv)),
+        ScanSource::WorkTree => Ok(scan_plan_dir(dir, conv)),
         ScanSource::Unavailable { reason } => Err(reason),
         ScanSource::Ref {
             repo_root,
             ref_name,
             rel_dir,
         } => match read_ref_dir(git, &repo_root, &ref_name, &rel_dir) {
-            Ok(files) => {
+            Ok(read) => {
                 // Resolved ONCE per scan, as in `read_plan_dir`: it walks the
                 // ancestor chain for a `.git` and every entry shares the answer.
                 let source_root = super::body_push::derive_source_repo(dir);
-                Ok(files
+                let units = read
+                    .files
                     .into_iter()
                     .map(|f| {
                         // The path a unit RECORDS is the one the tree scan
@@ -1734,7 +1774,11 @@ pub fn read_plans_for_cycle(
                         let slug = slug_from_filename(&path.to_string_lossy());
                         parse_work_unit(&slug, &source_path, &f.body, conv)
                     })
-                    .collect())
+                    .collect();
+                Ok(PlanDirScan {
+                    units,
+                    complete: read.complete,
+                })
             }
             Err(e) => Err(format!(
                 "could not read `{ref_name}:{rel_dir}` in {}: {e}",
@@ -1744,32 +1788,128 @@ pub fn read_plans_for_cycle(
     }
 }
 
+/// What one plans-dir scan produced — the parsed units, and whether the scan
+/// was **complete**.
+///
+/// The flag exists because an empty (or short) `units` is otherwise
+/// indistinguishable between *"the directory holds nothing"* and *"the
+/// directory could not be read"* — the `silent-empty-is-unknown` shape. Every
+/// consumer that reasons about ABSENCE (today: the disappeared-slug detector,
+/// [`newly_disappeared_slugs`]) must gate on `complete`; a consumer that only
+/// reasons about what it FOUND (the reconcile, the archive stamp) may ignore it,
+/// because a short scan pushes less rather than concluding more.
+///
+/// Produced by BOTH scan sources: [`scan_plan_dir`] for a working tree, and
+/// [`read_plans_for_cycle`]'s ref arm, whose per-blob skip
+/// ([`super::ref_scan::read_ref_dir`]) is the same partial-read shape.
+#[derive(Debug)]
+pub struct PlanDirScan {
+    pub units: Vec<ParsedWorkUnit>,
+    /// `true` **iff** every plan the source listed was resolved and read. On
+    /// the tree arm: the directory listing succeeded, every entry it yielded
+    /// was resolved, and every `*.md` among them was STATTED and read. On the
+    /// ref arm: every `*.md` blob the listing named was read as UTF-8. Any
+    /// single failure makes it `false` — the PARTIAL read is the nastier
+    /// shape, because the vector still looks plausible.
+    pub complete: bool,
+}
+
+/// What one `*.md` directory entry turned out to be, once its metadata was
+/// resolved.
+///
+/// This exists as a named classification — rather than the [`Path::is_file`]
+/// one-liner it replaced — because that call is
+/// `fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)`: it FOLDS the IO
+/// error into `false`, so an entry whose `stat` refuses is indistinguishable
+/// from a directory named `x.md` and was dropped with no log line while
+/// [`PlanDirScan::complete`] stayed `true`.
+///
+/// The shape is not hypothetical. A POSIX plans dir at mode `0o644` (read, no
+/// execute — a botched `chmod -R a-x`, a tarball with odd modes, a restrictive
+/// Windows ACL) lists every name from `read_dir`, which needs only `r`, and
+/// then fails EACCES on every `stat`, which needs `x`. EIO/ESTALE on a network
+/// or 9p mount reaches the same arm.
+#[derive(Debug)]
+enum PlanEntry {
+    /// A regular file: read it.
+    Read,
+    /// Resolved, and genuinely not a plan — a DIRECTORY named `*.md`. Skipping
+    /// it is the guard's legitimate purpose and costs the scan nothing.
+    NotAPlan,
+    /// The listing yielded the name and `stat` refused it. A GAP, not a skip.
+    Unstattable(std::io::Error),
+}
+
+/// Classify one entry from its metadata result. Pure, so the `Err` arm is
+/// testable on every platform — including a box where no unprivileged process
+/// can manufacture a real `stat` failure.
+fn classify_plan_entry(meta: std::io::Result<std::fs::Metadata>) -> PlanEntry {
+    match meta {
+        Ok(m) if m.is_file() => PlanEntry::Read,
+        Ok(_) => PlanEntry::NotAPlan,
+        Err(e) => PlanEntry::Unstattable(e),
+    }
+}
+
 /// Read + parse every `*.md` in `dir` (non-recursive — the plans dir is flat,
-/// matching coord's `walk_root`). IO errors on individual files are logged and
-/// skipped; a missing dir yields an empty vec.
+/// matching coord's `walk_root`), reporting whether the walk was COMPLETE.
+/// IO errors on individual files — a refused `stat` as well as a refused read
+/// — are logged and skipped; a missing dir yields an empty vec. All of those
+/// clear [`PlanDirScan::complete`]. A DIRECTORY named `*.md` is the one entry
+/// skipped WITHOUT clearing it: it is resolved, and it is genuinely not a
+/// plan.
 ///
 /// The absolute path is still what is OPENED and what is logged on an IO
 /// error; only the path RECORDED on the parsed unit is made relative — see
 /// [`relative_source_path`].
-pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
+pub fn scan_plan_dir(dir: &Path, conv: &PlanConvention) -> PlanDirScan {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(dir = %dir.display(), error = %e, "plan adapter: cannot read plans dir");
-            return Vec::new();
+            return PlanDirScan {
+                units: Vec::new(),
+                complete: false,
+            };
         }
     };
     // Resolved ONCE per scan, not per file: it walks the ancestor chain
     // looking for `.git`, and every entry in this directory shares the answer.
     let source_root = super::body_push::derive_source_repo(dir);
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // A per-ENTRY failure: the listing started, but this name could
+                // not be resolved. `flatten()` used to drop it silently, which
+                // is exactly how a short read passed for an empty directory.
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "plan adapter: cannot read a plans-dir entry; scan is PARTIAL"
+                );
+                complete = false;
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        if !path.is_file() {
-            continue;
+        match classify_plan_entry(path.metadata()) {
+            PlanEntry::Read => {}
+            PlanEntry::NotAPlan => continue,
+            PlanEntry::Unstattable(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "plan adapter: cannot stat a plans-dir entry; scan is PARTIAL"
+                );
+                complete = false;
+                continue;
+            }
         }
         let path_str = path.to_string_lossy().to_string();
         let source_path = relative_source_path(source_root.as_deref(), &path);
@@ -1780,10 +1920,165 @@ pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
             }
             Err(e) => {
                 tracing::warn!(path = %path_str, error = %e, "plan adapter: cannot read plan file");
+                complete = false;
             }
         }
     }
-    out
+    PlanDirScan {
+        units: out,
+        complete,
+    }
+}
+
+/// [`scan_plan_dir`], for a caller that only reasons about what was FOUND.
+///
+/// **Never call this from a consumer that reasons about ABSENCE** — the
+/// discarded `complete` flag is the only thing separating "nothing is there"
+/// from "nothing could be read".
+pub fn read_plan_dir(dir: &Path, conv: &PlanConvention) -> Vec<ParsedWorkUnit> {
+    scan_plan_dir(dir, conv).units
+}
+
+/// Why a push was retired for the life of this process — **and how broadly**.
+///
+/// The two are not one condition wearing two hats, which is why they are not
+/// one counter either: *"the principal lacks permission — fix the grant"* and
+/// *"this plan file carries a status coord derives — fix the stamp"* share
+/// nothing an operator can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetirementReason {
+    /// coord answered `403` and named no clearing condition. A permission
+    /// verdict is a property of the PRINCIPAL and the slug, not of any
+    /// particular status, so this retires **every** status for that slug.
+    ForbiddenPrincipal,
+    /// coord answered `terminality: permanent` for one attempted status. coord
+    /// scopes that word to the `(slug, status)` pair:
+    /// [`crate::http_disposition::DenialTerminality::Permanent`] is documented
+    /// *"permanently unsatisfiable for this (slug, status)"* — so this retires
+    /// **that pair's status write only**.
+    PermanentForStatus,
+}
+
+/// The process-lifetime retirement store: which pushes this process has stopped
+/// attempting, and on whose authority.
+///
+/// **The key is the scope coord actually asserted, never broader.** A plan file
+/// is an INPUT to the request coord refused, so the moment its parsed status
+/// changes the request is no longer identical and the permanence coord asserted
+/// no longer covers it. Keying a `permanent` denial on the slug alone would
+/// mean the ordinary path (a plan stamped `vetted`, then edited to the corpus's
+/// normal terminal word `shipped`) retired the slug FOREVER on its first
+/// cycle, silently dropping every later edit — with no recovery short of a
+/// runner restart, which served policy `production-and-cost`
+/// `runner-lifecycle` forbids.
+///
+/// So a `permanent` retirement is keyed on the PAIR and self-clears when the
+/// file changes; only the 403/principal class is slug-wide.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetiredSlugs {
+    /// Slugs coord answered `403` for, with no terminality naming a clearing
+    /// condition. Every status is retired.
+    principal: HashSet<String>,
+    /// Attempted statuses coord answered `permanent` for, keyed by slug.
+    permanent: HashMap<String, HashSet<String>>,
+}
+
+impl RetiredSlugs {
+    /// The reason this `(slug, attempted status)` push is retired, or `None` if
+    /// it is still to be attempted.
+    pub fn retirement_for(&self, slug: &str, attempted_status: &str) -> Option<RetirementReason> {
+        if self.principal.contains(slug) {
+            return Some(RetirementReason::ForbiddenPrincipal);
+        }
+        if self
+            .permanent
+            .get(slug)
+            .is_some_and(|statuses| statuses.contains(attempted_status))
+        {
+            return Some(RetirementReason::PermanentForStatus);
+        }
+        None
+    }
+
+    /// Retire every status for `slug` (a `403`). `true` when this is new, so
+    /// the caller counts and WARNs exactly once per slug per process.
+    pub fn retire_principal(&mut self, slug: &str) -> bool {
+        self.principal.insert(slug.to_string())
+    }
+
+    /// Retire the `(slug, status)` pair (a `terminality: permanent` denial).
+    /// `true` when this pair is new.
+    pub fn retire_status(&mut self, slug: &str, attempted_status: &str) -> bool {
+        self.permanent
+            .entry(slug.to_string())
+            .or_default()
+            .insert(attempted_status.to_string())
+    }
+
+    /// No retirement of either class is recorded.
+    pub fn is_empty(&self) -> bool {
+        self.principal.is_empty() && self.permanent.is_empty()
+    }
+}
+
+/// One coord refusal, normalised across the TWO error shapes this adapter's
+/// sink produces — the READ routes' [`super::push::ForbiddenByCoord`] and the
+/// WRITE routes' [`super::push::CoordWriteError`] — so the retirement decision
+/// is made ONCE rather than once per shape.
+struct CoordDenial {
+    /// The route that refused, as the log has always spelled it.
+    route: String,
+    /// coord's response body, verbatim.
+    detail: String,
+    /// The HTTP status coord answered with (`403` by construction for the read
+    /// shape, which exists only for that status).
+    status: Option<u16>,
+    /// The shared classifier's reading of it — disposition, coord's denial code
+    /// and its `terminality` hint.
+    verdict: crate::http_disposition::Verdict,
+}
+
+impl CoordDenial {
+    /// True when this denial retires the PRINCIPAL for the slug — every status,
+    /// for the life of the process.
+    ///
+    /// **Only a `403` that names no clearing condition.** Every `403` coord
+    /// emits on the work-unit write routes carries a NON-permanent terminality
+    /// (`self_attestation_forbidden` and `attester_unresolved` are
+    /// `actor_dependent`, `owner_unresolved` is `state_dependent`), and coord
+    /// names concrete events that clear each of them with the caller changing
+    /// nothing. Retiring on those would suppress a denial a later cycle could
+    /// legitimately clear — see [`crate::http_disposition::DenialTerminality`].
+    ///
+    /// An ABSENT or unrecognised hint still retires: that is a coord predating
+    /// the hint, whose `403`s reproduced the log-flood this retirement closed,
+    /// and UNKNOWN here must not silently re-open it.
+    fn retires_the_principal(&self) -> bool {
+        self.status == Some(403) && self.verdict.terminality.is_none()
+    }
+}
+
+/// Recover the [`CoordDenial`] behind a push failure, whichever shape carries
+/// it. `None` for a transport blip or a parse error — neither is a verdict.
+fn denial_of(err: &anyhow::Error) -> Option<CoordDenial> {
+    if let Some(f) = err.downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>() {
+        return Some(CoordDenial {
+            route: f.route.to_string(),
+            detail: f.detail.clone(),
+            status: Some(403),
+            // The read shape keeps coord's body verbatim, so its terminality —
+            // when a coord sends one on a read route — is readable here too,
+            // through the same one classifier.
+            verdict: crate::http_disposition::classify(Some(403), &f.detail),
+        });
+    }
+    let w = super::push::coord_write_error(err)?;
+    Some(CoordDenial {
+        route: w.op.to_string(),
+        detail: w.body.clone(),
+        status: w.status,
+        verdict: w.verdict(),
+    })
 }
 
 /// Push every parsed unit through the edge-trigger + conflict logic, updating
@@ -1793,7 +2088,7 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
     parsed_units: &[ParsedWorkUnit],
     last_applied: &mut HashMap<String, String>,
     last_deps: &mut HashMap<String, Vec<String>>,
-    forbidden: &mut HashSet<String>,
+    forbidden: &mut RetiredSlugs,
     forbidden_deps: &mut HashSet<String>,
     sink: &S,
     metrics: &AdapterMetrics,
@@ -1803,14 +2098,47 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         ..Default::default()
     };
     for u in parsed_units {
-        // A slug coord has already refused (403) is retired for the life of the
-        // process: the request would be byte-identical, so the verdict would be
-        // too. Skipping here — rather than merely muting the log — is what makes
-        // this a fix and not a mute: it also stops the HTTP call.
-        if forbidden.contains(&u.slug) {
-            summary.forbidden += 1;
-            continue;
-        }
+        // A push coord has already refused is not re-issued: the request would
+        // be byte-identical, so the verdict would be too. Stopping here — rather
+        // than merely muting the log — is what makes this a fix and not a mute:
+        // it also stops the HTTP call.
+        //
+        // **How much is stopped depends on WHAT coord scoped its refusal to**,
+        // and the two classes are not interchangeable:
+        //
+        // - `ForbiddenPrincipal` (a `403` naming no clearing condition): a
+        //   verdict about the principal, so EVERY request for this slug would
+        //   be refused — the status-less metadata upsert included. Skip the
+        //   unit whole.
+        //
+        // - `PermanentForStatus` (a `terminality: "permanent"` denial): a
+        //   verdict about the `(slug, status)` PAIR of a STATUS WRITE. The
+        //   status-less metadata upsert the same cycle would emit is a
+        //   different request, and coord accepts it — it is exactly what the
+        //   derived-status filter already degrades an upsert to. So the push
+        //   still runs, in the metadata-only shape
+        //   ([`super::push::StatusWrite::RetiredPermanently`]): no status write,
+        //   no transition, no `current_status` GET, no `last_actor` GET — but
+        //   `title`, `phases`, `source_path` and `depends_on` keep reaching
+        //   coord. `continue`ing here instead would freeze a unit's provenance
+        //   for the life of the process the first time its stamp reached
+        //   `shipped`.
+        //
+        // The lookup takes the PARSED STATUS as well as the slug, because that
+        // is the scope coord's permanence covers ([`RetiredSlugs`]): a file
+        // edited off the refused word is a DIFFERENT request and is attempted
+        // again, with no restart and no operator action beyond the edit.
+        let status_write = match forbidden.retirement_for(&u.slug, &u.status) {
+            Some(RetirementReason::ForbiddenPrincipal) => {
+                summary.forbidden += 1;
+                continue;
+            }
+            Some(RetirementReason::PermanentForStatus) => {
+                summary.retired_permanent += 1;
+                StatusWrite::RetiredPermanently
+            }
+            None => StatusWrite::Allowed,
+        };
         // `last_applied` is per-PROCESS memory, rebuilt empty by `run_loop` on
         // every runner start. Without seeding, the first cycle after a start
         // sees `None` for EVERY slug — including slugs coord already has rows
@@ -1848,7 +2176,14 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
         // — a failed read abstains and never reaches the push, which is exactly
         // the contract `push_work_unit_with_remote` documents.
         let mut seed_read: Option<Option<String>> = None;
-        if prev.is_none() {
+        // A retired pair is NOT seeded. The push is forced to the metadata-only
+        // shape whatever `prev` says, it puts no status on the wire, and it
+        // reports nothing applied — so a seed read here would buy nothing and
+        // would be re-paid EVERY cycle (the memory it would prime is never
+        // written for a retired pair). The seed's whole purpose — stopping an
+        // `UpsertWithStatus` from overwriting coord's status — cannot arise on
+        // a push that sends no status.
+        if prev.is_none() && status_write == StatusWrite::Allowed {
             match sink.current_status(&u.slug).await {
                 // Coord already has this unit. Treat its status as what we last
                 // applied so the edge-trigger compares against reality.
@@ -1881,7 +2216,9 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
             }
         }
         let known_remote = seed_read.as_ref().map(|s| s.as_deref());
-        match push_work_unit_with_remote(sink, u, prev.as_deref(), known_remote).await {
+        match push_work_unit_with_status_write(sink, u, prev.as_deref(), known_remote, status_write)
+            .await
+        {
             Ok(outcome) => {
                 if outcome.conflict {
                     summary.conflicts += 1;
@@ -1897,7 +2234,22 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                     metrics.deferrals_total.fetch_add(1, Ordering::Relaxed);
                 }
                 // Record what we just applied so the next cycle is edge-triggered
-                // — but ONLY when something was actually applied. A deferral
+                // — but ONLY what was actually applied, which the push reports
+                // as `applied_status`: the value that went ON THE WIRE, or one
+                // read back off coord in the same push. Three shapes apply
+                // NOTHING and must record nothing.
+                //
+                // A status the derived-status filter WITHDREW from the upsert
+                // (`shipped`, `ready`) is one of them, and the upsert still
+                // SUCCEEDS — so recording `u.status` here would write a memory
+                // of a word coord was never sent. That would arm the conflict
+                // check (a `current_status` GET per slug per cycle) and then
+                // make it announce `file wins (loud override)` every cycle
+                // forever, for a race this writer had withdrawn from. A
+                // permanently-retired pair's metadata-only push is another. See
+                // [`super::push::PushOutcome::applied_status`].
+                //
+                // A deferral is the third. It
                 // wrote NOTHING, so recording it as applied would be a lie with
                 // two consequences: the next cycle would answer `RefreshOnly`
                 // and stop re-checking (so a PERSISTENT deferral would be
@@ -1911,8 +2263,8 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // re-evaluated every cycle, so `deferred` reads as a live gauge
                 // of "units an agent currently owns and the file disagrees
                 // with".
-                if !deferred {
-                    last_applied.insert(u.slug.clone(), u.status.clone());
+                if let Some(applied) = &outcome.applied_status {
+                    last_applied.insert(u.slug.clone(), applied.clone());
                 }
 
                 // After the unit's upsert/transition succeeded, ALSO push its
@@ -1962,15 +2314,37 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                             // this route: a 403 here is settled and retired, an
                             // ordinary failure is retried every cycle (best-effort,
                             // as before — it still does not fail the reconcile).
-                            if let Some(f) = e.downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>()
-                            {
+                            //
+                            // It goes through the SAME `denial_of` normaliser,
+                            // and that is the fix rather than a tidy-up: this
+                            // arm used to downcast to `ForbiddenByCoord` alone,
+                            // a shape `HttpWorkUnitSink::set_deps` **cannot
+                            // produce** — it builds a `CoordWriteError` for
+                            // every non-2xx, and only `classify_failure` (the
+                            // two READ routes) builds the other one. So in
+                            // production a `403` landed in `deps_errors` and
+                            // the identical replace-set was re-issued every
+                            // cycle forever.
+                            //
+                            // This arm and the unit arm below deliberately
+                            // disagree about which terminalities are settled:
+                            // coord's work-unit write routes emit a
+                            // `terminality` hint, `POST /coord/work-units/:slug/deps`
+                            // emits none, so here the `403`-with-no-terminality
+                            // test is the only signal there is. If coord ever
+                            // answers this route `terminality: "permanent"` on
+                            // a non-403 status, this arm falls through to
+                            // `deps_errors` and retries every cycle — wire the
+                            // `is_permanently_denied()` test in here (scoped
+                            // to the deps route's own retirement set) that day.
+                            if let Some(d) = denial_of(&e).filter(|d| d.retires_the_principal()) {
                                 forbidden_deps.insert(u.slug.clone());
                                 summary.deps_forbidden += 1;
                                 metrics.deps_forbidden_total.fetch_add(1, Ordering::Relaxed);
                                 tracing::warn!(
                                     slug = %u.slug,
-                                    route = %f.route,
-                                    detail = %f.detail,
+                                    route = %d.route,
+                                    detail = %d.detail,
                                     "plan adapter: coord refused this unit's dep-edge set (403); \
                                      retiring the edge push for the life of this process (the \
                                      unit's own upsert/transition route is unaffected). Restart \
@@ -2001,49 +2375,118 @@ pub async fn reconcile_once<S: WorkUnitSink + ?Sized>(
                 // `CoordWriteError` (which is strictly richer — it keeps coord's
                 // machine-readable denial code). Routing only one of them here
                 // would leave half the retry storm running.
-                let write = super::push::coord_write_error(&e);
-                let verdict = write.map(|w| w.verdict());
-                let settled_403 = e
-                    .downcast_ref::<crate::plan_workunit_adapter::push::ForbiddenByCoord>()
-                    .map(|f| (f.route.to_string(), f.detail.clone()))
-                    .or_else(|| {
-                        write
-                            .filter(|w| w.status == Some(403))
-                            .map(|w| (w.op.to_string(), w.body.clone()))
-                    });
-                if let Some((route, detail)) = settled_403 {
-                    forbidden.insert(u.slug.clone());
+                let denial = denial_of(&e);
+                let verdict = denial.as_ref().map(|d| &d.verdict);
+                // `permanent` FIRST: it is the narrowest retirement (the
+                // `(slug, status)` pair), and a denial carrying it is settled
+                // whatever its status code.
+                if let Some(d) = denial
+                    .as_ref()
+                    .filter(|d| d.verdict.is_permanently_denied())
+                {
+                    // coord SAID this can never succeed. `terminality:
+                    // "permanent"` is the one value in its closed three-element
+                    // vocabulary that is unconditionally terminal — nothing
+                    // invalidates it — so the pair is retired: one WARN per
+                    // pair per process, and no status write on any later cycle
+                    // while the file still parses to that status.
+                    //
+                    // `actor_dependent`, `state_dependent`, an absent hint (an
+                    // older coord) and a word this build does not recognise all
+                    // fall through — UNKNOWN retries, which is the pre-change
+                    // behaviour.
+                    //
+                    // **The key is `u.status` — the status the FILE parsed to —
+                    // regardless of whether the request that failed actually
+                    // carried it.** Today that is exact, because every push
+                    // shape that can produce a `permanent` denial does carry it
+                    // (`UpsertWithStatus`'s `status` field, a `Transition`'s
+                    // `to_status`); coord's `permanent` on a work-unit write is
+                    // `status_is_derived`, which only a status-carrying body can
+                    // trigger. If coord ever denied a status-LESS upsert
+                    // permanently, this would retire a pair whose status was
+                    // never sent — carry the sent status out of the push and
+                    // key on that instead, that day.
+                    if forbidden.retire_status(&u.slug, &u.status) {
+                        metrics
+                            .retired_permanent_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            slug = %u.slug,
+                            route = %d.route,
+                            detail = %d.detail,
+                            denial = ?verdict.and_then(|v| v.denial.as_ref().map(|t| t.as_code())),
+                            terminality = "permanent",
+                            attempted_status = %u.status,
+                            retirement_scope = "slug+status",
+                            "plan adapter: coord refused this work unit permanently for the \
+                             status it was asked to apply; retiring that (slug, status) pair's \
+                             STATUS WRITE — coord states no change of actor or state can make \
+                             an identical request succeed. The unit's status-less metadata \
+                             upsert keeps running. REMEDIATION: edit the plan file's status \
+                             stamp (a coord-DERIVED word such as `shipped`/`ready` is computed \
+                             by coord and settable by nobody). The next parsed status that \
+                             differs is pushed on the very next cycle — no restart, and none \
+                             is possible (served policy `production-and-cost` \
+                             `runner-lifecycle`)."
+                        );
+                    }
+                    // ONE count per unit per cycle. A unit whose pair was
+                    // ALREADY retired was counted by the pre-check above and
+                    // then pushed in the metadata-only shape; if that
+                    // status-less upsert is itself denied `permanent`, counting
+                    // it again would make `retired_permanent` exceed `scanned`.
+                    if status_write == StatusWrite::Allowed {
+                        summary.retired_permanent += 1;
+                    }
+                } else if let Some(d) = denial.as_ref().filter(|d| d.retires_the_principal()) {
+                    if forbidden.retire_principal(&u.slug) {
+                        metrics.forbidden_total.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            slug = %u.slug,
+                            route = %d.route,
+                            detail = %d.detail,
+                            denial = ?verdict.and_then(|v| v.denial.as_ref().map(|t| t.as_code())),
+                            retirement_scope = "slug",
+                            "plan adapter: coord refused this work unit (403); retiring the \
+                             slug for the life of this process — an identical retry \
+                             cannot change the verdict. Restart the runner after \
+                             fixing the principal's permission."
+                        );
+                    }
                     summary.forbidden += 1;
-                    metrics.forbidden_total.fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(
-                        slug = %u.slug,
-                        route = %route,
-                        detail = %detail,
-                        denial = ?verdict.as_ref().and_then(|v| v.denial.as_ref().map(|d| d.as_code())),
-                        "plan adapter: coord refused this work unit (403); retiring the \
-                         slug for the life of this process — an identical retry \
-                         cannot change the verdict. Restart the runner after \
-                         fixing the principal's permission."
-                    );
                 } else {
                     summary.errors += 1;
                     metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+                    // **This arm has no rate limit: one WARN per slug per
+                    // cycle, for as long as the denial stands.** That is
+                    // correct by doctrine — a denial whose `terminality` names
+                    // a clearing condition (or names none on a non-403) is NOT
+                    // settled, so it must keep being retried and must keep
+                    // being visible. If a population of `actor_dependent`
+                    // denials (a separation-of-duties flip) ever floods here,
+                    // the fix is a per-slug log DAMPER — never a retirement,
+                    // which would suppress a denial a later cycle could
+                    // legitimately clear.
+                    //
                     // The status coord answered with used to be formatted into
                     // the error string and thrown away here, so a `422`
                     // structural refusal and a `502` transport blip read
                     // identically in the log and to any code downstream.
                     // `CoordWriteError` now carries it, and the ONE shared
                     // classifier turns it into a verdict — `disposition` (retry
-                    // or not) plus coord's own `denial` code when it named one.
-                    // Nothing acts on the verdict yet (the keyed terminal store
-                    // is a later phase); this makes the distinction VISIBLE,
-                    // which is what 33 hours of byte-identical cycle summaries
-                    // never were.
+                    // or not) plus coord's own `denial` code and `terminality`
+                    // when it named them. This is the arm those do NOT retire:
+                    // an UNKNOWN or out-of-band-clearing verdict, which retries.
+                    // Logging all three makes the distinction VISIBLE, which is
+                    // what 33 hours of byte-identical cycle summaries never
+                    // were.
                     tracing::warn!(
                         slug = %u.slug,
                         error = %format!("{e:#}"),
-                        disposition = ?verdict.as_ref().map(|v| v.disposition),
-                        denial = ?verdict.as_ref().and_then(|v| v.denial.as_ref().map(|d| d.as_code())),
+                        disposition = ?verdict.map(|v| v.disposition),
+                        denial = ?verdict.and_then(|v| v.denial.as_ref().map(|d| d.as_code())),
+                        terminality = ?verdict.and_then(|v| v.terminality),
                         "plan adapter: push failed"
                     );
                 }
@@ -2227,24 +2670,40 @@ pub async fn reconcile_archive_once<S: WorkUnitSink + ?Sized>(
     summary
 }
 
-/// Pure disappeared-slug detection (D4). A slug we have previously applied
+/// Pure disappeared-slug detection (D4). A slug we have previously SEEN
 /// (present in `known`) that is now absent from BOTH the active scan
 /// (`active_slugs`) and the archive scan (`archive_slugs`), and has not already
 /// been warned about (`warned`), is "disappeared": the plan file left the
 /// active dir without landing in the archive. Returns those newly-disappeared
 /// slugs and records them in `warned` so each is surfaced **once per process**.
 ///
+/// **`known` is the set of slugs the active scan has SEEN, never the set whose
+/// status was APPLIED.** Those two look interchangeable and are not: the
+/// apply-memory (`last_applied`) records only what went on the wire, so it
+/// never holds a unit whose status this adapter withdrew (`shipped`, `ready`),
+/// nor one the agent-owner deferral suppressed, nor one whose `(slug, status)`
+/// pair coord permanently denied. Keyed on the apply-memory, the detector
+/// would go blind to **exactly the plans most likely to be moved or deleted**
+/// — a `shipped` plan being consolidated is the whole case it exists for.
+///
 /// The caller only *warns* on the result — the work unit is left untouched.
 /// Terminal state is owned by coord's derive engine; the adapter must never
 /// push `shipped`/`archived` to fill the gap (a second-writer race).
+///
+/// **The caller MUST establish that both scans were COMPLETE before calling
+/// this** ([`PlanDirScan::complete`]). This function is pure set arithmetic: it
+/// cannot tell a directory that holds nothing from one that could not be read,
+/// and on the second it reports the entire corpus disappeared AND poisons
+/// `warned`, which is warn-once per process — permanent blindness from one
+/// transient IO fault. See the guard in `LoopState::tick`.
 pub fn newly_disappeared_slugs(
-    known: &HashMap<String, String>,
+    known: &HashSet<String>,
     active_slugs: &HashSet<String>,
     archive_slugs: &HashSet<String>,
     warned: &mut HashSet<String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    for slug in known.keys() {
+    for slug in known {
         if !active_slugs.contains(slug) && !archive_slugs.contains(slug) && !warned.contains(slug) {
             warned.insert(slug.clone());
             out.push(slug.clone());
@@ -2310,10 +2769,26 @@ struct LoopState {
     resolved: Option<ResolvedDirs>,
     last_applied: HashMap<String, String>,
     last_deps: HashMap<String, Vec<String>>,
+    /// Every slug the ACTIVE scan has parsed since the current plans dir was
+    /// resolved — the disappeared-slug detector's `known` set.
+    ///
+    /// Deliberately NOT `last_applied.keys()`. That map holds only units whose
+    /// status actually went on the wire, which silently excludes the three
+    /// populations the detector most needs to cover: a coord-derived stamp
+    /// (`shipped`/`ready`) the write-side filter withdrew, a unit the
+    /// agent-owner deferral suppressed, and a `(slug, status)` pair coord
+    /// permanently denied. See [`newly_disappeared_slugs`].
+    seen_slugs: HashSet<String>,
     warned_disappeared: HashSet<String>,
-    /// Slugs coord answered `403` for. Owned by the loop (there is exactly one
-    /// per process), so "retired" means "for this process's lifetime".
-    forbidden: HashSet<String>,
+    /// Pushes coord has refused for good — a `403` on the principal (every
+    /// status for that slug) or a `terminality: permanent` on one
+    /// `(slug, status)` pair's status write. Owned by the loop (there is
+    /// exactly one per process), so "retired" means "for this process's
+    /// lifetime" — which is why the permanent class is keyed on the pair: a
+    /// plan file edited off the refused word re-arms itself, and a runner
+    /// restart (the only thing that would clear a slug-wide retirement) is
+    /// forbidden by served policy `production-and-cost` `runner-lifecycle`.
+    forbidden: RetiredSlugs,
     /// Same, scoped to the dep-edge route alone: coord evaluates the unit's own
     /// upsert/transition route and the edge-table route as separate authorization
     /// checks, so a deps-only 403 must not retire the whole unit. See
@@ -2373,9 +2848,10 @@ impl LoopState {
             resolved: None,
             last_applied: HashMap::new(),
             last_deps: HashMap::new(),
+            seen_slugs: HashSet::new(),
             warned_disappeared: HashSet::new(),
             last_scan_unavailable: None,
-            forbidden: HashSet::new(),
+            forbidden: RetiredSlugs::default(),
             forbidden_deps: HashSet::new(),
             bulk_seeded: false,
             #[cfg(test)]
@@ -2497,6 +2973,7 @@ impl LoopState {
         // where its file lives.
         self.last_applied.clear();
         self.last_deps.clear();
+        self.seen_slugs.clear();
         self.warned_disappeared.clear();
         // `last_applied` is empty again, so the corpus is cold again: re-arm the
         // bulk seed rather than leave the per-slug fallback to pay one
@@ -2545,10 +3022,10 @@ impl LoopState {
     /// Either way the per-slug seed still runs; nothing about correctness
     /// depends on this method succeeding.
     ///
-    /// Only slugs ACTUALLY IN the scanned dir are primed. Priming every unit
-    /// coord knows would feed `newly_disappeared_slugs` a set full of
-    /// coord-native units that were never plan-backed, and warn that each of
-    /// them had "disappeared from the active dir".
+    /// Only slugs ACTUALLY IN the scanned dir are primed. The memory is this
+    /// corpus's edge-trigger state; a coord-native unit that was never
+    /// plan-backed has no business in it. (The disappeared-slug detector no
+    /// longer reads this map at all — it keys on [`LoopState::seen_slugs`].)
     async fn bulk_seed<S: WorkUnitSink + ?Sized>(
         &mut self,
         units: &[ParsedWorkUnit],
@@ -2741,11 +3218,10 @@ impl LoopState {
         // because the memory is empty. `forbidden` / `forbidden_deps` stay (a
         // 403 is coord's verdict on the slug regardless of posture),
         // `last_deps` stays (the edge replace-set is idempotent) and
-        // `warned_disappeared` stays (those verdicts stand). Forfeited, as on
-        // a corpus switch: the "disappeared from the active dir" warn for a
-        // slug whose file vanished WHILE withheld — `newly_disappeared_slugs`
-        // walks `last_applied`'s keys, and that slug is no longer among them.
-        // Informational only; coord's row is untouched either way.
+        // `warned_disappeared` stays (those verdicts stand), and so does
+        // `seen_slugs` — the detector's known set is what was SCANNED, not the
+        // apply-memory cleared here, so a slug whose file vanished while writes
+        // were withheld is still surfaced on the resumed cycle.
         if posture == WorkUnitWritePosture::Write
             && matches!(self.last_write_posture, Some(p) if p != WorkUnitWritePosture::Write)
         {
@@ -2777,7 +3253,7 @@ impl LoopState {
         // the scan duration. That is the mechanism behind a 20s keepalive firing
         // 264s late and an 8s backoff taking 25.5 minutes. See `off_runtime.rs`
         // for why a `tokio::time::timeout` cannot rescue this on its own.
-        let units = {
+        let active_scan = {
             let scan_dir = dir.clone();
             let conv = self.conv.clone();
             // The loop's OWN git reader, not a hardcoded `ProcessGit`: the
@@ -2853,6 +3329,8 @@ impl LoopState {
         };
         // Read something, so the next unavailability is news again.
         self.last_scan_unavailable = None;
+        let active_scan_complete = active_scan.complete;
+        let units = active_scan.units;
         self.bulk_seed(&units, sink, metrics).await;
         let summary = reconcile_once(
             &units,
@@ -2875,6 +3353,7 @@ impl LoopState {
             deps_skipped_unmigrated = summary.deps_skipped_unmigrated,
             deps_errors = summary.deps_errors,
             forbidden = summary.forbidden,
+            retired_permanent = summary.retired_permanent,
             deps_forbidden = summary.deps_forbidden,
             seeded = summary.seeded,
             seed_errors = summary.seed_errors,
@@ -2886,22 +3365,37 @@ impl LoopState {
         // the archive slug set is empty — a slug that vanishes from the active
         // dir with no archive configured is still surfaced as disappeared.
         // Same reasoning as the active scan above: off the single worker.
-        let archived = match archive_dir {
+        let archive_scan = match archive_dir {
             Some(a) => {
                 let conv = self.conv.clone();
-                match tokio::task::spawn_blocking(move || read_plan_dir(&a, &conv)).await {
+                match tokio::task::spawn_blocking(move || scan_plan_dir(&a, &conv)).await {
                     Ok(u) => u,
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "plan adapter: archive-dir scan task failed; skipping this cycle"
+                            "plan adapter: archive-dir scan task failed; this cycle scanned \
+                             NOTHING from the archive"
                         );
-                        Vec::new()
+                        // NOT "skipping this cycle" — the cycle continues. An
+                        // empty-and-INCOMPLETE scan must not let any consumer
+                        // read the emptiness as absence.
+                        PlanDirScan {
+                            units: Vec::new(),
+                            complete: false,
+                        }
                     }
                 }
             }
-            None => Vec::new(),
+            // No archive dir configured: there is nothing to read, so the empty
+            // set is the WHOLE truth about the archive — a complete scan of
+            // nothing, not a failed scan.
+            None => PlanDirScan {
+                units: Vec::new(),
+                complete: true,
+            },
         };
+        let archive_scan_complete = archive_scan.complete;
+        let archived = archive_scan.units;
         if !archived.is_empty() {
             let asum = reconcile_archive_once(&archived, sink, metrics).await;
             tracing::info!(
@@ -2918,17 +3412,48 @@ impl LoopState {
 
         let active_slugs: HashSet<String> = units.iter().map(|u| u.slug.clone()).collect();
         let archive_slugs: HashSet<String> = archived.iter().map(|u| u.slug.clone()).collect();
-        for slug in newly_disappeared_slugs(
-            &self.last_applied,
-            &active_slugs,
-            &archive_slugs,
-            &mut self.warned_disappeared,
-        ) {
+        // Everything this cycle SAW joins the known set — whether or not its
+        // status was pushable. See [`LoopState::seen_slugs`] for why the
+        // apply-memory is the wrong input here.
+        self.seen_slugs.extend(active_slugs.iter().cloned());
+        // **The detector may only run on a COMPLETE picture of both dirs.**
+        //
+        // "Disappeared" is a claim about ABSENCE, and both scans report absence
+        // and failure with the same short vector. The ref arm already refuses
+        // the WHOLESALE failure (a failed listing or every blob failing is an
+        // `Err` and the cycle returns above), but a PARTIAL one — one blob that
+        // will not read or is not UTF-8, one unstattable tree entry, one
+        // unreadable archived file — comes back `Ok` and short. Run unguarded,
+        // that makes every slug it skipped look vanished, and
+        // `newly_disappeared_slugs` INSERTS each into `warned_disappeared`,
+        // which is warn-once **per process** — so the detector goes
+        // permanently blind for those slugs, and the restart that would clear
+        // it is forbidden by served policy `production-and-cost`
+        // `runner-lifecycle`. Only the scan's own `complete` flag
+        // distinguishes a short read from a short directory.
+        if active_scan_complete && archive_scan_complete {
+            for slug in newly_disappeared_slugs(
+                &self.seen_slugs,
+                &active_slugs,
+                &archive_slugs,
+                &mut self.warned_disappeared,
+            ) {
+                tracing::warn!(
+                    slug = %slug,
+                    "plan adapter: work-unit slug disappeared from the active dir and is absent \
+                     from the archive dir; leaving the unit untouched (terminal state is owned by \
+                     coord's derive engine — the adapter never pushes shipped/archived)"
+                );
+            }
+        } else {
+            // One line per CYCLE, not per slug — the per-fault detail was
+            // already logged by the scan itself.
             tracing::warn!(
-                slug = %slug,
-                "plan adapter: work-unit slug disappeared from the active dir and is absent \
-                 from the archive dir; leaving the unit untouched (terminal state is owned by \
-                 coord's derive engine — the adapter never pushes shipped/archived)"
+                active_scan_complete,
+                archive_scan_complete,
+                known_slugs = self.seen_slugs.len(),
+                "plan adapter: disappeared-slug detection SKIPPED this cycle — a plan scan \
+                 was incomplete, so an absent slug is UNKNOWN rather than gone"
             );
         }
     }
@@ -4097,11 +4622,21 @@ mod tests {
         let got =
             super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
                 .expect("listing succeeded");
-        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
         // Sorted, markdown only, the unreadable one dropped. `notes.txt` never
         // appears, and NOTHING from a subdirectory can appear because the
         // listing itself is depth 1.
         assert_eq!(names, vec!["a.md", "b.md"]);
+        // ...and the skip is REPORTED. `bad.md` is in the ref; the read just
+        // could not produce it, so a caller reasoning about absence must not
+        // take the short set as "`bad.md` is gone".
+        //
+        // Neuter check: drop `complete = false` from `read_ref_dir`'s
+        // per-blob `Err` arm and this fails.
+        assert!(
+            !got.complete,
+            "a blob the listing named but the read could not produce is a GAP"
+        );
     }
 
     #[test]
@@ -4184,8 +4719,12 @@ mod tests {
         let got =
             super::super::ref_scan::read_ref_dir(&git, Path::new("/repo"), "origin/main", "plans")
                 .expect("listing succeeded");
-        let names: Vec<_> = got.iter().map(|f| f.name.as_str()).collect();
+        let names: Vec<_> = got.files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["real.md"]);
+        assert!(
+            got.complete,
+            "a name that is not a plan is excluded, not skipped — the read is whole"
+        );
     }
 
     /// **The commit's headline claim, and the one nothing asserted before:**
@@ -4233,9 +4772,10 @@ mod tests {
         )
         .expect("the ref arm reads");
 
-        assert_eq!(tree.len(), 1, "the fixture holds exactly one plan");
+        assert_eq!(tree.units.len(), 1, "the fixture holds exactly one plan");
+        assert!(tree.complete && refd.complete, "both reads were whole");
         assert_eq!(
-            tree, refd,
+            tree.units, refd.units,
             "same bytes must parse to the same unit, or the source move churns coord"
         );
     }
@@ -5296,9 +5836,11 @@ mod tests {
     fn read_ref_dir_over_real_git_keeps_markdown_and_an_empty_plan() {
         let tmp = ref_scan_fixture();
         let clone = tmp.path().join("clone");
-        let files =
+        let read =
             super::super::ref_scan::read_ref_dir(&ProcessGit, &clone, "origin/main", "plans")
                 .expect("a real plans dir reads");
+        assert!(read.complete, "every listed plan blob read");
+        let files = read.files;
         let names: Vec<_> = files.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
@@ -5353,7 +5895,8 @@ mod tests {
         real_git(&clone, &["commit", "-q", "-m", "parked"], None);
 
         let units = read_plans_for_cycle(&plans, &PlanConvention::operator_default(), &ProcessGit)
-            .expect("a healthy clone scans");
+            .expect("a healthy clone scans")
+            .units;
         let slugs: Vec<_> = units.iter().map(|u| u.slug.as_str()).collect();
         assert!(
             !slugs.contains(&"2026-01-09-only-on-the-parked-branch"),
@@ -6468,6 +7011,21 @@ mod tests {
         unit_with_deps(slug, status, vec![])
     }
 
+    /// A unit carrying PROVENANCE — the fields an upsert refreshes and a
+    /// skipped push freezes: `title` and `source_path`.
+    fn unit_with_provenance(
+        slug: &str,
+        status: &str,
+        title: &str,
+        source_path: &str,
+    ) -> ParsedWorkUnit {
+        ParsedWorkUnit {
+            title: Some(title.to_string()),
+            source_path: source_path.to_string(),
+            ..unit(slug, status)
+        }
+    }
+
     fn unit_with_deps(slug: &str, status: &str, depends_on: Vec<String>) -> ParsedWorkUnit {
         ParsedWorkUnit {
             slug: slug.to_string(),
@@ -6493,10 +7051,31 @@ mod tests {
     #[derive(Default)]
     struct FakeSink {
         statuses: Mutex<HashMap<String, String>>,
+        /// Transitions that SUCCEEDED. Deliberately incremented after the
+        /// `deny_status` check, because it doubles as "what coord now holds".
+        ///
+        /// **Never assert on this to prove a request was NOT SENT.** A denied
+        /// transition leaves it unmoved, so an `assert_eq!(transitions, N)` is
+        /// blind to exactly the request a write-suppression fix exists to
+        /// suppress — use [`FakeSink::transition_attempts`].
         transitions: Mutex<u64>,
+        /// Every `transition` call that reached the sink, counted BEFORE the
+        /// deny check — the door-level twin of `status_upsert_calls`.
+        ///
+        /// This is the ONLY counter that can see a re-issued DENIED transition,
+        /// and `Transition` is the one door a permanent retirement actually
+        /// suppresses: for a coord-derived status `settable_status` already
+        /// withdraws the word from `UpsertWithStatus`, so the retirement's
+        /// forcing of `action = RefreshOnly` is load-bearing here and nowhere
+        /// else.
+        transition_attempts: Mutex<u64>,
         /// Configured `by_actor` of every unit's latest history row (default
         /// None ⇒ no history ⇒ no owner to defer to).
         last_actor: Option<String>,
+        /// Total `last_actor` reads. Paired with `current_status_calls`, this
+        /// is what makes "a stable deferral costs TWO reads per cycle per
+        /// slug" measurable rather than asserted in prose.
+        last_actor_calls: Mutex<u64>,
         deps_behavior: DepsBehavior,
         /// Slug whose `current_status` read should hard-error, so the backfill's
         /// per-unit failure path is reachable without live HTTP.
@@ -6525,9 +7104,30 @@ mod tests {
         /// READ-shaped `ForbiddenByCoord`. Both shapes reach the same `Err` arm
         /// and a `403` must retire the slug from EITHER.
         upsert_write_status: Option<u16>,
+        /// Body served with `upsert_write_status`. Defaults to the
+        /// `self_attestation_forbidden` denial the existing tests assume; a test
+        /// exercising coord's `terminality` hint supplies its own.
+        upsert_write_body: Option<String>,
+        /// `(status, http status, body)`: a write that carries THIS status —
+        /// an upsert's `status` field or a transition's `to_status` — fails
+        /// with that answer, while every other write succeeds.
+        ///
+        /// Models what `upsert_write_status` cannot: coord's denials are scoped
+        /// to the `(slug, status)` PAIR, so a sink that refuses every write
+        /// regardless of what it carries can never show whether the client's
+        /// retirement is keyed as narrowly as the server's permanence.
+        deny_status: Option<(String, u16, String)>,
         /// Total `upsert` calls received, so a test can prove a retired slug
         /// stops making the HTTP call at all — not merely stops logging.
         upsert_calls: Mutex<u64>,
+        /// Of those, the ones that carried a STATUS — counted BEFORE any
+        /// simulated failure, so a refused write is counted too.
+        ///
+        /// `upsert_calls` alone cannot answer "was the refused request
+        /// re-issued?": a permanently-retired `(slug, status)` pair still emits
+        /// one status-LESS provenance upsert per cycle by design, so the count
+        /// that must stay pinned is this one.
+        status_upsert_calls: Mutex<u64>,
         /// Every upsert body seen, so the archive scan can be asserted to write
         /// `metadata.archive_path` with no status.
         upserts: Mutex<Vec<UpsertBody>>,
@@ -6583,11 +7183,15 @@ mod tests {
         }
         async fn last_actor(&self, _slug: &str) -> Result<Option<String>> {
             self.record("last_actor");
+            *self.last_actor_calls.lock().unwrap() += 1;
             Ok(self.last_actor.clone())
         }
         async fn upsert(&self, body: &UpsertBody) -> Result<()> {
             self.record("upsert");
             *self.upsert_calls.lock().unwrap() += 1;
+            if body.status.is_some() {
+                *self.status_upsert_calls.lock().unwrap() += 1;
+            }
             if self.fail_upsert_for.as_deref() == Some(body.slug.as_str()) {
                 anyhow::bail!("simulated work-unit upsert failure");
             }
@@ -6599,12 +7203,26 @@ mod tests {
                     },
                 ));
             }
+            if let Some((denied, http, deny_body)) = &self.deny_status {
+                if body.status.as_deref() == Some(denied.as_str()) {
+                    return Err(crate::plan_workunit_adapter::push::CoordWriteError {
+                        op: "upsert",
+                        slug: body.slug.clone(),
+                        status: Some(*http),
+                        body: deny_body.clone(),
+                    }
+                    .into());
+                }
+            }
             if let Some(status) = self.upsert_write_status {
                 return Err(crate::plan_workunit_adapter::push::CoordWriteError {
                     op: "upsert",
                     slug: body.slug.clone(),
                     status: Some(status),
-                    body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    body: self
+                        .upsert_write_body
+                        .clone()
+                        .unwrap_or_else(|| r#"{"error":"self_attestation_forbidden"}"#.to_string()),
                 }
                 .into());
             }
@@ -6626,6 +7244,20 @@ mod tests {
         }
         async fn transition(&self, slug: &str, body: &TransitionBody) -> Result<()> {
             self.record("transition");
+            // BEFORE the deny check: a refused transition is still a request
+            // that went out. See `transition_attempts`.
+            *self.transition_attempts.lock().unwrap() += 1;
+            if let Some((denied, http, deny_body)) = &self.deny_status {
+                if body.to_status == *denied {
+                    return Err(crate::plan_workunit_adapter::push::CoordWriteError {
+                        op: "transition",
+                        slug: slug.to_string(),
+                        status: Some(*http),
+                        body: deny_body.clone(),
+                    }
+                    .into());
+                }
+            }
             *self.transitions.lock().unwrap() += 1;
             self.statuses
                 .lock()
@@ -6645,12 +7277,22 @@ mod tests {
                 }),
                 DepsBehavior::TableNotMigrated => Ok(SetDepsOutcome::TableNotMigrated),
                 DepsBehavior::Error => anyhow::bail!("simulated deps endpoint failure"),
-                DepsBehavior::Forbidden => Err(anyhow::Error::new(
-                    crate::plan_workunit_adapter::push::ForbiddenByCoord {
-                        route: "POST /coord/work-units/:slug/deps",
-                        detail: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
-                    },
-                )),
+                // The shape `HttpWorkUnitSink::set_deps` ACTUALLY produces for
+                // a 403: it builds a `CoordWriteError` for every non-2xx and
+                // never a `ForbiddenByCoord` (only `classify_failure`, on the
+                // two READ routes, builds that one). This fixture used to
+                // synthesise the read shape, which is why the deps arm's
+                // downcast could be unreachable in production and still test
+                // green.
+                DepsBehavior::Forbidden => {
+                    Err(crate::plan_workunit_adapter::push::CoordWriteError {
+                        op: "set_deps",
+                        slug: slug.to_string(),
+                        status: Some(403),
+                        body: r#"{"error":"self_attestation_forbidden"}"#.to_string(),
+                    }
+                    .into())
+                }
             }
         }
     }
@@ -6661,7 +7303,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let units = vec![unit("a", "vetted"), unit("b", "draft")];
 
@@ -6702,7 +7344,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
@@ -6755,7 +7397,7 @@ mod tests {
         // COLD: exactly the state `run_loop` builds on every runner start.
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
@@ -6807,7 +7449,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
@@ -6836,7 +7478,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
@@ -6870,7 +7512,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
@@ -6918,7 +7560,7 @@ mod tests {
             .insert("a".to_string(), "shipped".to_string());
         let metrics = AdapterMetrics::default();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         // Primed exactly as run_loop primes it, from the bulk read.
         let mut mem: HashMap<String, String> = [("a".to_string(), "shipped".to_string())]
@@ -7003,7 +7645,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let units = vec![unit("a", "vetted")];
 
@@ -7047,7 +7689,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         // Establish last-applied=vetted (create; UpsertWithStatus is never gated).
@@ -7115,7 +7757,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
@@ -7150,7 +7792,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         reconcile_once(
@@ -7184,7 +7826,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string(), "p2".to_string()]);
 
@@ -7213,7 +7855,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s = reconcile_once(
@@ -7238,7 +7880,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
@@ -7292,7 +7934,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
@@ -7337,7 +7979,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
@@ -7377,7 +8019,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         let s1 = reconcile_once(
@@ -7433,13 +8075,17 @@ mod tests {
     #[tokio::test]
     async fn a_write_shaped_403_retires_the_slug_too() {
         let sink = FakeSink {
+            // No `terminality` in the body: the coord builds that predate the
+            // hint, whose 403s are exactly the log-flood this retirement
+            // closed. UNKNOWN must not silently re-open it, so this arm still
+            // retires — principal-wide.
             upsert_write_status: Some(403),
             ..Default::default()
         };
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         for cycle in 0..3 {
@@ -7462,39 +8108,616 @@ mod tests {
             "the refused slug must be asked exactly once, not once per cycle"
         );
         assert_eq!(metrics.snapshot().forbidden_total, 1);
+        assert_eq!(
+            forb.retirement_for("a", "any-other-status"),
+            Some(RetirementReason::ForbiddenPrincipal),
+            "a permission verdict is about the PRINCIPAL, so it retires every status"
+        );
     }
 
-    /// ...and the retirement stays narrow on the write shape too: a `422` is a
-    /// structural refusal the classifier reports, NOT a permission verdict, so
-    /// it must keep retrying rather than freeze the unit.
+    /// Run `cycles` reconciles of the same one-unit corpus against `sink`,
+    /// returning each cycle's summary. The retirement tests below differ only
+    /// in the corpus and the sink, and a seven-argument call per cycle buries
+    /// what they assert.
+    struct Reconciler {
+        metrics: AdapterMetrics,
+        mem: HashMap<String, String>,
+        deps: HashMap<String, Vec<String>>,
+        forb: RetiredSlugs,
+        forb_deps: HashSet<String>,
+    }
+    impl Reconciler {
+        fn new() -> Self {
+            Self {
+                metrics: AdapterMetrics::default(),
+                mem: HashMap::new(),
+                deps: HashMap::new(),
+                forb: RetiredSlugs::default(),
+                forb_deps: HashSet::new(),
+            }
+        }
+        async fn cycle(&mut self, sink: &FakeSink, units: &[ParsedWorkUnit]) -> ReconcileSummary {
+            reconcile_once(
+                units,
+                &mut self.mem,
+                &mut self.deps,
+                &mut self.forb,
+                &mut self.forb_deps,
+                sink,
+                &self.metrics,
+            )
+            .await
+        }
+    }
+
+    /// **A write-shaped `422` is retired iff coord says `terminality:
+    /// "permanent"` — and then only for the `(slug, status)` pair.**
+    ///
+    /// This replaces `a_write_shaped_422_is_not_retired`, which pinned the
+    /// defect: its fixture carried no terminality, and the arm it guarded
+    /// retried EVERY 422 forever, including the ones coord had marked
+    /// permanent (15,541 `status_is_derived` refusals across 186 slugs on the
+    /// operator box, 40.7% of a core). The narrow half of that test is kept
+    /// below: a 422 with NO permanent hint is still retried every cycle.
     #[tokio::test]
-    async fn a_write_shaped_422_is_not_retired() {
-        let sink = FakeSink {
+    async fn a_write_shaped_422_is_retired_only_when_coord_says_permanent() {
+        // Permanent: asked once, then the status write is withheld.
+        let permanent = FakeSink {
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string()),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+        for _ in 0..3 {
+            let s = r.cycle(&permanent, &[unit("a", "vetted")]).await;
+            assert_eq!(s.errors, 0, "a permanent denial is not a retryable error");
+            assert_eq!(s.forbidden, 0, "...nor a permission verdict");
+            assert_eq!(s.retired_permanent, 1);
+        }
+        assert_eq!(
+            *permanent.status_upsert_calls.lock().unwrap(),
+            1,
+            "the permanently-refused status write is sent exactly ONCE"
+        );
+        assert_eq!(
+            r.forb.retirement_for("a", "vetted"),
+            Some(RetirementReason::PermanentForStatus)
+        );
+        assert_eq!(r.forb.retirement_for("a", "draft"), None, "pair, not slug");
+
+        // No hint (an older coord, or a structural refusal coord gave no retry
+        // semantics for): UNKNOWN retries, exactly as before.
+        let unknown = FakeSink {
             upsert_write_status: Some(422),
             ..Default::default()
         };
-        let metrics = AdapterMetrics::default();
-        let mut mem = HashMap::new();
-        let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
-        let mut forb_deps: HashSet<String> = HashSet::new();
-
+        let mut r = Reconciler::new();
         for _ in 0..3 {
-            let s = reconcile_once(
-                &[unit("a", "vetted")],
-                &mut mem,
-                &mut deps,
-                &mut forb,
-                &mut forb_deps,
-                &sink,
-                &metrics,
-            )
-            .await;
+            let s = r.cycle(&unknown, &[unit("a", "vetted")]).await;
             assert_eq!(s.errors, 1);
             assert_eq!(s.forbidden, 0);
+            assert_eq!(s.retired_permanent, 0);
+        }
+        assert_eq!(*unknown.upsert_calls.lock().unwrap(), 3);
+        assert!(r.forb.is_empty());
+    }
+
+    /// coord ships a `terminality` hint on every work-unit write denial
+    /// precisely so a client stops re-issuing a request that can never
+    /// succeed. `permanent` retires the `(slug, status)` pair coord scoped it
+    /// to: one status write, one WARN, then silence for as long as the file
+    /// keeps parsing to that status.
+    ///
+    /// Adapted from runner#1474 onto main's cold-start seed: the FIRST cycle
+    /// pays one `current_status` read (the per-slug seed, since this process
+    /// has no memory of the slug), and a retired pair is never seeded again —
+    /// which is what keeps the per-cycle read count flat after the denial.
+    #[tokio::test]
+    async fn a_permanent_terminality_retires_the_pair_and_logs_once() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            upsert_write_status: Some(422),
+            upsert_write_body: Some(r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string()),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+
+        let first = r.cycle(&sink, &[unit("a", "vetted")]).await;
+        assert_eq!(first.retired_permanent, 1);
+        assert_eq!(first.errors, 0);
+        assert_eq!(first.forbidden, 0);
+        let after_first = logs.text();
+        // Assert on the STRUCTURED FIELDS a log consumer filters on; the WARN's
+        // prose deliberately does not repeat the token.
+        assert!(
+            after_first.contains(r#"terminality="permanent""#),
+            "the retirement must carry the structured terminality field: {after_first}"
+        );
+        assert!(
+            after_first.contains(r#"retirement_scope="slug+status""#),
+            "...and must say how NARROWLY it retired: {after_first}"
+        );
+        assert!(
+            after_first.contains("attempted_status=vetted"),
+            "...naming the status the retirement is keyed on: {after_first}"
+        );
+        let reads_after_first = *sink.current_status_calls.lock().unwrap();
+        assert_eq!(
+            reads_after_first, 1,
+            "cycle 1 pays the cold-start seed only"
+        );
+
+        for cycle in 1..4 {
+            let s = r.cycle(&sink, &[unit("a", "vetted")]).await;
+            assert_eq!(s.retired_permanent, 1, "cycle {cycle} counts it once");
+            assert_eq!(s.errors, 0, "cycle {cycle} must not re-error");
+        }
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            1,
+            "the permanently-refused pair must be asked exactly ONCE, not once per cycle"
+        );
+        assert_eq!(*sink.transitions.lock().unwrap(), 0);
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            reads_after_first,
+            "a retired pair is neither re-seeded nor conflict-checked: no GET per cycle"
+        );
+        let snap = r.metrics.snapshot();
+        assert_eq!(snap.retired_permanent_total, 1, "one increment per pair");
+        assert_eq!(
+            snap.forbidden_total, 0,
+            "a plan-file verdict is not a grant verdict"
+        );
+        assert_eq!(snap.errors_total, 0);
+        assert_eq!(
+            logs.text(),
+            after_first,
+            "cycles 2..4 must emit NO further log output at all"
+        );
+    }
+
+    /// **The retirement key is the scope coord ASSERTED, and not one word
+    /// broader.** `DenialTerminality::Permanent` is scoped to the `(slug,
+    /// status)` pair, so the moment the file's parsed status changes the
+    /// request is not identical any more and coord's permanence does not
+    /// reach it.
+    ///
+    /// The failure this pins is the ORDINARY path: a plan is stamped `vetted`,
+    /// lands, and someone edits the stamp to `shipped`. The transition 422s
+    /// `permanent`. Keyed on the SLUG, that would retire the unit for the life
+    /// of the process and silently drop every later edit — with no way back
+    /// short of a runner restart, which served policy `production-and-cost`
+    /// `runner-lifecycle` forbids.
+    #[tokio::test]
+    async fn a_permanent_retirement_is_keyed_on_the_pair_and_clears_when_the_file_changes() {
+        let sink = FakeSink {
+            deny_status: Some(("shipped".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+
+        // 1. The plan is `vetted`. It lands.
+        let s1 = r.cycle(&sink, &[unit("a", "vetted")]).await;
+        assert_eq!(s1.errors, 0);
+        assert_eq!(r.mem.get("a").map(String::as_str), Some("vetted"));
+
+        // 2. Edited to `shipped`: the transition carries the derived word,
+        //    coord refuses it PERMANENTLY, and the pair retires.
+        let s2 = r.cycle(&sink, &[unit("a", "shipped")]).await;
+        assert_eq!(s2.retired_permanent, 1);
+        assert_eq!(
+            r.forb.retirement_for("a", "shipped"),
+            Some(RetirementReason::PermanentForStatus)
+        );
+        assert_eq!(
+            r.forb.retirement_for("a", "in_progress"),
+            None,
+            "coord refused `shipped`; it said nothing about any other status"
+        );
+        assert_eq!(
+            r.mem.get("a").map(String::as_str),
+            Some("vetted"),
+            "a REFUSED transition applied nothing, so the memory must not move"
+        );
+        let status_writes_after_denial = *sink.status_upsert_calls.lock().unwrap();
+        let reads_after_denial = *sink.current_status_calls.lock().unwrap();
+        let attempts_after_denial = *sink.transition_attempts.lock().unwrap();
+        assert_eq!(attempts_after_denial, 1, "one transition ATTEMPT — refused");
+        assert_eq!(
+            *sink.transitions.lock().unwrap(),
+            0,
+            "...and none SUCCEEDED"
+        );
+
+        // 3. Still `shipped`: the identical request is not re-issued.
+        let s3 = r.cycle(&sink, &[unit("a", "shipped")]).await;
+        assert_eq!(s3.retired_permanent, 1);
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            status_writes_after_denial,
+            "a still-`shipped` file must issue NO further status write"
+        );
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            attempts_after_denial,
+            "...nor a transition — asserted on the ATTEMPT counter, the only one \
+             that can see a re-issued DENIED request"
+        );
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            reads_after_denial,
+            "...nor the conflict-check GET that a status write would arm"
+        );
+
+        // 4. THE POINT. Demoted to `in_progress` — a DIFFERENT request, which
+        //    coord never refused. Pushed on the very next cycle, no restart.
+        let s4 = r.cycle(&sink, &[unit("a", "in_progress")]).await;
+        assert_eq!(
+            s4.errors, 0,
+            "the edited file must not be treated as retired"
+        );
+        assert_eq!(s4.retired_permanent, 0);
+        assert_eq!(s4.transitions, 1);
+        assert_eq!(r.mem.get("a").map(String::as_str), Some("in_progress"));
+
+        // 5. ...and the pair is still remembered, so a file edited BACK to the
+        //    refused word costs no status write either.
+        let status_writes = *sink.status_upsert_calls.lock().unwrap();
+        let attempts = *sink.transition_attempts.lock().unwrap();
+        let s5 = r.cycle(&sink, &[unit("a", "shipped")]).await;
+        assert_eq!(s5.retired_permanent, 1);
+        assert_eq!(*sink.status_upsert_calls.lock().unwrap(), status_writes);
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            attempts,
+            "the refused request is not even ATTEMPTED again"
+        );
+        assert_eq!(r.metrics.snapshot().retired_permanent_total, 1, "one WARN");
+    }
+
+    /// **A permanent denial retires the STATUS WRITE, never the unit.** The
+    /// status-less metadata upsert is a different request, which coord
+    /// accepts, so a retired pair's provenance (`title`, `source_path`) keeps
+    /// reaching coord.
+    ///
+    /// Neuter checks: restore a `continue` in `reconcile_once`'s
+    /// `PermanentForStatus` arm and the provenance assertions fail; delete
+    /// `if status_retired { action = PushAction::RefreshOnly; }` from
+    /// `push_work_unit_with_status_write` and the `transition_attempts`
+    /// assertion fails — every other assertion stays green, because a denied
+    /// transition still emits the status-less provenance upsert first.
+    #[tokio::test]
+    async fn a_permanently_retired_pair_still_pushes_its_provenance_every_cycle() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            deny_status: Some(("shipped".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+
+        r.cycle(
+            &sink,
+            &[unit_with_provenance(
+                "a",
+                "vetted",
+                "Original",
+                "plans/a.md",
+            )],
+        )
+        .await;
+        let s2 = r
+            .cycle(
+                &sink,
+                &[unit_with_provenance(
+                    "a",
+                    "shipped",
+                    "Original",
+                    "plans/a.md",
+                )],
+            )
+            .await;
+        assert_eq!(s2.retired_permanent, 1);
+        let status_writes = *sink.status_upsert_calls.lock().unwrap();
+        let reads = *sink.current_status_calls.lock().unwrap();
+        let attempts = *sink.transition_attempts.lock().unwrap();
+        assert_eq!(attempts, 1, "one attempt, refused");
+        let log_at_retirement = logs.text();
+
+        // The plan keeps being EDITED while its stamp stays `shipped`.
+        for (title, path) in [
+            ("Renamed once", "plans/a.md"),
+            ("Renamed twice", "plans/archive-candidates/a.md"),
+        ] {
+            let s = r
+                .cycle(&sink, &[unit_with_provenance("a", "shipped", title, path)])
+                .await;
+            assert_eq!(s.retired_permanent, 1, "counted ONCE per cycle, not twice");
+            assert_eq!(s.errors, 0);
+        }
+        {
+            let upserts = sink.upserts.lock().unwrap();
+            assert!(
+                upserts
+                    .iter()
+                    .any(|u| u.title.as_deref() == Some("Renamed once")),
+                "the retitle must reach coord: {upserts:?}"
+            );
+            let last = upserts.last().expect("at least one upsert");
+            assert_eq!(last.title.as_deref(), Some("Renamed twice"));
+            assert_eq!(
+                last.metadata.as_ref().expect("metadata")["source_path"],
+                "plans/archive-candidates/a.md",
+                "a moved plan's provenance must follow it"
+            );
+            assert_eq!(last.status, None, "...carried by a status-LESS upsert");
+        }
+        assert_eq!(*sink.status_upsert_calls.lock().unwrap(), status_writes);
+        assert_eq!(
+            *sink.transition_attempts.lock().unwrap(),
+            attempts,
+            "the permanently-refused transition must not be RE-ISSUED"
+        );
+        assert_eq!(*sink.current_status_calls.lock().unwrap(), reads);
+        assert_eq!(logs.text(), log_at_retirement, "still ONE WARN per pair");
+        assert_eq!(
+            r.mem.get("a").map(String::as_str),
+            Some("vetted"),
+            "nothing was applied, so the memory still names what coord accepted"
+        );
+    }
+
+    /// **A conflicted `RefreshOnly` must CONVERGE, not warn forever.**
+    /// Reporting the OBSERVED REMOTE as applied makes the next cycle a real
+    /// edge, which goes through the deferral and the CAS guard. This pins the
+    /// UNOWNED branch (no `last_actor`), where the file wins on cycle 3.
+    ///
+    /// Neuter check: report `Some(u.status)` again from the conflicted
+    /// `RefreshOnly` arm — cycle 3 emits no transition and the divergence
+    /// WARN count climbs with every cycle.
+    #[tokio::test]
+    async fn a_conflicted_refresh_converges_when_no_real_actor_owns_the_unit() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink::default();
+        let mut r = Reconciler::new();
+        let file = [unit("a", "vetted")];
+
+        let s1 = r.cycle(&sink, &file).await;
+        assert_eq!(s1.conflicts, 0);
+        assert_eq!(r.mem.get("a").map(String::as_str), Some("vetted"));
+
+        // A REAL agent transitions the unit in coord, out of band.
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "in_progress".to_string());
+
+        let s2 = r.cycle(&sink, &file).await;
+        assert_eq!(s2.conflicts, 1, "the divergence is real and is announced");
+        assert_eq!(s2.transitions, 0);
+        assert_eq!(
+            r.mem.get("a").map(String::as_str),
+            Some("in_progress"),
+            "the memory must record what coord HOLDS"
+        );
+
+        let s3 = r.cycle(&sink, &file).await;
+        assert_eq!(s3.transitions, 1, "cycle 3 issues in_progress -> vetted");
+        assert_eq!(s3.conflicts, 0);
+        assert_eq!(
+            sink.statuses.lock().unwrap().get("a").map(String::as_str),
+            Some("vetted"),
+            "the file actually won"
+        );
+        for cycle in 4..7 {
+            let s = r.cycle(&sink, &file).await;
+            assert_eq!(s.conflicts, 0, "cycle {cycle}");
+            assert_eq!(s.transitions, 0, "cycle {cycle}");
+        }
+        assert_eq!(
+            logs.text().matches("diverged from last-applied").count(),
+            1,
+            "the override is announced ONCE; got: {}",
+            logs.text()
+        );
+        assert_eq!(r.metrics.snapshot().conflicts_total, 1);
+    }
+
+    /// **The OWNED branch of a conflicted refresh is a STABLE DEFERRAL, not
+    /// convergence** — and it is the dominant one, because a conflict means a
+    /// non-adapter writer moved the unit and `coord::derive_worker` counts as a
+    /// real actor. Its steady-state price is pinned: TWO reads per cycle per
+    /// slug. What the change bought is that the `file wins (loud override)`
+    /// WARN fires ONCE, on the event, instead of once per cycle forever.
+    #[tokio::test]
+    async fn a_conflicted_refresh_defers_stably_when_a_real_actor_owns_the_unit() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            last_actor: Some("coord::derive_worker".to_string()),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+        let file = [unit("a", "vetted")];
+
+        let s1 = r.cycle(&sink, &file).await;
+        assert_eq!(s1.deferred, 0, "a create is never gated");
+        assert_eq!(r.mem.get("a").map(String::as_str), Some("vetted"));
+
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "shipped".to_string());
+        let s2 = r.cycle(&sink, &file).await;
+        assert_eq!(s2.conflicts, 1);
+        assert_eq!(r.mem.get("a").map(String::as_str), Some("shipped"));
+
+        let reads_before = *sink.current_status_calls.lock().unwrap();
+        let actor_reads_before = *sink.last_actor_calls.lock().unwrap();
+        for cycle in 3..7 {
+            let s = r.cycle(&sink, &file).await;
+            assert_eq!(s.transitions, 0, "cycle {cycle}: the owner is deferred to");
+            assert_eq!(s.deferred, 1, "cycle {cycle}");
+            assert_eq!(s.conflicts, 0, "cycle {cycle}");
+            assert_eq!(r.mem.get("a").map(String::as_str), Some("shipped"));
+        }
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap() - reads_before,
+            4,
+            "one `current_status` per deferred cycle"
+        );
+        assert_eq!(
+            *sink.last_actor_calls.lock().unwrap() - actor_reads_before,
+            4,
+            "...plus one `last_actor` — TWO reads, not one"
+        );
+        assert_eq!(*sink.transition_attempts.lock().unwrap(), 0);
+        assert_eq!(
+            logs.text().matches("diverged from last-applied").count(),
+            1,
+            "the divergence WARN fires once per EVENT; got: {}",
+            logs.text()
+        );
+        assert_eq!(r.metrics.snapshot().conflicts_total, 1);
+    }
+
+    /// **A status the adapter never sent must never be recorded as applied**
+    /// — and on main's cold-start seed, the derived-status path converges to
+    /// ZERO reads per cycle rather than re-seeding forever.
+    ///
+    /// coord holds nothing for the slug at first, so cycle 1 is a create whose
+    /// `shipped` is WITHDRAWN (metadata-only upsert, nothing applied, nothing
+    /// recorded). coord then derives its own status out of band; cycle 2
+    /// seeds it, emits the edge onto `shipped`, and coord refuses that
+    /// transition `permanent` — retiring the pair. Every later cycle is one
+    /// status-less upsert and nothing else.
+    ///
+    /// Recording the parsed `shipped` anywhere in that sequence would arm the
+    /// conflict check (a `current_status` GET per cycle) and make it announce
+    /// `file wins (loud override)` forever, for a race this writer withdrew
+    /// from.
+    #[tokio::test]
+    async fn a_withdrawn_derived_status_is_never_recorded_and_arms_no_conflict_check() {
+        let logs = CapturedLogs::start();
+        let sink = FakeSink {
+            deny_status: Some(("shipped".to_string(), 422, r#"{"error":"status_is_derived","message":"status `shipped` is derived (coord-computed from a predicate), not directly settable","terminality":"permanent"}"#.to_string())),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+        let file = [unit("a", "shipped")];
+
+        let s1 = r.cycle(&sink, &file).await;
+        assert_eq!(s1.errors, 0, "the metadata-only create lands");
+        assert!(
+            !r.mem.contains_key("a"),
+            "the filtered status never went on the wire, so it is not last-applied"
+        );
+
+        // coord derives a status of its own for the unit.
+        sink.statuses
+            .lock()
+            .unwrap()
+            .insert("a".to_string(), "in_progress".to_string());
+        let s2 = r.cycle(&sink, &file).await;
+        assert_eq!(
+            s2.retired_permanent, 1,
+            "the edge onto `shipped` is refused"
+        );
+        let reads = *sink.current_status_calls.lock().unwrap();
+        assert_eq!(
+            reads, 2,
+            "one cold-start seed per cycle so far, nothing more"
+        );
+
+        for cycle in 3..6 {
+            let s = r.cycle(&sink, &file).await;
+            assert_eq!(s.errors, 0, "cycle {cycle}");
+            assert_eq!(s.conflicts, 0, "cycle {cycle}");
+        }
+        assert!(
+            !r.mem.contains_key("a"),
+            "still nothing recorded: {:?}",
+            r.mem
+        );
+        assert_eq!(
+            *sink.current_status_calls.lock().unwrap(),
+            reads,
+            "a retired pair costs no GET per cycle"
+        );
+        assert_eq!(
+            *sink.status_upsert_calls.lock().unwrap(),
+            0,
+            "no cycle ever put the derived word on an upsert"
+        );
+        assert_eq!(r.metrics.snapshot().conflicts_total, 0);
+        assert!(
+            !logs.text().contains("diverged from last-applied"),
+            "the adapter must not report itself the winner of a race it withdrew from: {}",
+            logs.text()
+        );
+    }
+
+    /// The retirement stays NARROW: `state_dependent` is terminal only until
+    /// the unit's own recorded state changes out of band, so retiring on it
+    /// would suppress a denial a later cycle could legitimately clear. Served
+    /// at coord's REAL `(status, body)` pair — `owner_unresolved` is a 403.
+    #[tokio::test]
+    async fn a_state_dependent_terminality_is_not_retired() {
+        let sink = FakeSink {
+            upsert_write_status: Some(403),
+            upsert_write_body: Some(
+                r#"{"error":"owner_unresolved","message":"the unit has no recorded owner","terminality":"state_dependent"}"#
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let mut r = Reconciler::new();
+        for cycle in 0..3 {
+            let s = r.cycle(&sink, &[unit("a", "vetted")]).await;
+            assert_eq!(s.errors, 1, "cycle {cycle}");
+            assert_eq!(s.forbidden, 0, "cycle {cycle}");
         }
         assert_eq!(*sink.upsert_calls.lock().unwrap(), 3);
-        assert!(forb.is_empty());
+        assert!(
+            r.forb.is_empty(),
+            "a 403 coord gave a clearing condition for must not retire anything"
+        );
+    }
+
+    /// `actor_dependent` likewise, and so does a hint this build does not
+    /// recognise — a future coord word is UNKNOWN, and UNKNOWN retries. Each
+    /// case is served at the `(status, body)` pair coord actually emits.
+    #[tokio::test]
+    async fn actor_dependent_and_unrecognized_terminalities_are_not_retired() {
+        for (http, body) in [
+            (
+                403,
+                r#"{"error":"self_attestation_forbidden","terminality":"actor_dependent"}"#,
+            ),
+            (
+                403,
+                r#"{"error":"attester_unresolved","terminality":"actor_dependent"}"#,
+            ),
+            (
+                422,
+                r#"{"error":"something_new","terminality":"a_word_coord_adds_in_2027"}"#,
+            ),
+            (422, r#"{"error":"status_is_derived"}"#),
+        ] {
+            let sink = FakeSink {
+                upsert_write_status: Some(http),
+                upsert_write_body: Some(body.to_string()),
+                ..Default::default()
+            };
+            let mut r = Reconciler::new();
+            for _ in 0..2 {
+                let s = r.cycle(&sink, &[unit("a", "vetted")]).await;
+                assert_eq!(s.errors, 1, "{http} body={body}");
+                assert_eq!(s.forbidden, 0, "{http} body={body}");
+                assert_eq!(s.retired_permanent, 0, "{http} body={body}");
+            }
+            assert_eq!(*sink.upsert_calls.lock().unwrap(), 2, "{http} body={body}");
+            assert!(r.forb.is_empty(), "{http} body={body}");
+        }
     }
 
     /// The retirement is narrow: an ORDINARY failure still retries every cycle.
@@ -7509,7 +8732,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
 
         for _ in 0..3 {
@@ -7551,7 +8774,7 @@ mod tests {
         let metrics = AdapterMetrics::default();
         let mut mem = HashMap::new();
         let mut deps = HashMap::new();
-        let mut forb: HashSet<String> = HashSet::new();
+        let mut forb = RetiredSlugs::default();
         let mut forb_deps: HashSet<String> = HashSet::new();
         let u = unit_with_deps("p4", "vetted", vec!["p1".to_string()]);
 
@@ -7813,15 +9036,12 @@ mod tests {
         assert_eq!(*sink.transitions.lock().unwrap(), 0);
     }
 
-    /// Disappeared-slug rule (D4): a slug we applied that is gone from the active
+    /// Disappeared-slug rule (D4): a slug we SAW that is gone from the active
     /// dir AND absent from the archive dir is surfaced ONCE per process, and the
     /// detection never transitions (it only warns — no sink call at all).
     #[test]
     fn disappeared_slug_warns_once_and_never_transitions() {
-        let mut known: HashMap<String, String> = HashMap::new();
-        known.insert("a".to_string(), "in_progress".to_string());
-        known.insert("b".to_string(), "vetted".to_string());
-        known.insert("c".to_string(), "shipped".to_string());
+        let known: HashSet<String> = ["a", "b", "c"].into_iter().map(String::from).collect();
 
         // `a` still active, `b` moved to archive, `c` vanished from both.
         let active: HashSet<String> = ["a".to_string()].into_iter().collect();
@@ -8066,6 +9286,12 @@ mod tests {
             let buf = writer.0.clone();
             let subscriber = tracing_subscriber::fmt()
                 .with_writer(writer)
+                // Deterministic field rendering: with ANSI on, the formatter
+                // wraps field NAMES in escape sequences, so an assertion on a
+                // structured field (`terminality="permanent"`) would match or
+                // not depending on the build's colour support rather than on
+                // the field being emitted.
+                .with_ansi(false)
                 .with_max_level(tracing::Level::INFO)
                 .finish();
             let guard = tracing::subscriber::set_default(subscriber);
@@ -8962,12 +10188,433 @@ Body.
     /// set suppresses it.
     #[test]
     fn archived_slug_is_not_disappeared() {
-        let mut known: HashMap<String, String> = HashMap::new();
-        known.insert("done".to_string(), "shipped".to_string());
+        let known: HashSet<String> = ["done".to_string()].into_iter().collect();
         let active: HashSet<String> = HashSet::new();
         let archive: HashSet<String> = ["done".to_string()].into_iter().collect();
         let mut warned: HashSet<String> = HashSet::new();
         assert!(newly_disappeared_slugs(&known, &active, &archive, &mut warned).is_empty());
         assert!(warned.is_empty());
+    }
+
+    /// **The disappeared-slug detector must be fed what was SCANNED, not what
+    /// was APPLIED.** A coord-DERIVED stamp is withdrawn from the wire, so the
+    /// unit never enters the apply-memory — and a `shipped` plan swept up by a
+    /// consolidation is the headline case D4 exists for.
+    ///
+    /// Neuter check: feed `newly_disappeared_slugs` `last_applied`'s keys
+    /// again — the WARN never fires and this fails.
+    #[tokio::test]
+    async fn a_scanned_slug_is_reported_when_its_file_vanishes_even_if_nothing_was_applied() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("2026-03-03-consolidated-plan.md");
+        std::fs::write(&plan, "# Consolidated\n\n> **Status: SHIPPED**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            *sink.upsert_calls.lock().unwrap(),
+            1,
+            "the plan WAS scanned and pushed (metadata-only)"
+        );
+        assert!(
+            state.last_applied.is_empty(),
+            "...and nothing was applied — which is precisely why the apply-memory \
+             cannot be the detector's input"
+        );
+
+        std::fs::remove_file(&plan).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert!(
+            logged.contains("disappeared from the active dir"),
+            "the vanished plan must be surfaced; got: {logged}"
+        );
+        assert!(logged.contains("2026-03-03-consolidated-plan"));
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            1,
+            "a disappeared slug is surfaced at most once per process"
+        );
+    }
+
+    /// **A scan must say whether it was COMPLETE — an empty or short vector
+    /// cannot.** The partial case is the one a cheap `units.is_empty()` guard
+    /// would miss entirely.
+    #[test]
+    fn a_plan_dir_scan_reports_whether_it_was_complete() {
+        let conv = PlanConvention::operator_default();
+
+        // 1. Healthy.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("2026-01-01-a.md"),
+            "# A\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let scan = scan_plan_dir(dir.path(), &conv);
+        assert_eq!(scan.units.len(), 1);
+        assert!(scan.complete);
+
+        // 2. A failed `read_dir` — empty AND incomplete.
+        let gone = scan_plan_dir(Path::new("/definitely/not/a/dir/xyz"), &conv);
+        assert!(gone.units.is_empty());
+        assert!(
+            !gone.complete,
+            "a directory that could not be READ must never read as EMPTY"
+        );
+
+        // 3. PARTIAL: listed, but `read_to_string` refuses it (invalid UTF-8 is
+        //    the portable spelling of that failure).
+        std::fs::write(dir.path().join("2026-01-02-b.md"), [0xff, 0xfe, 0xfd]).unwrap();
+        let partial = scan_plan_dir(dir.path(), &conv);
+        assert_eq!(
+            partial.units.len(),
+            1,
+            "the readable plan is still returned"
+        );
+        assert!(!partial.complete, "...but the scan is PARTIAL and says so");
+
+        // 4. UNSTATTABLE: listed, and `stat` refuses it — the arm
+        //    `Path::is_file()` swallowed. A dangling symlink is the portable
+        //    spelling. Its OWN tempdir: reusing case 3's leaves that case's
+        //    unreadable file behind, which clears `complete` by itself and
+        //    makes this case prove nothing.
+        //
+        //    Neuter check: restore `if !path.is_file() { continue; }` and the
+        //    `complete` assertion below fails.
+        let dir4 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir4.path().join("2026-01-03-c.md"),
+            "# C\n\n> **Status: DRAFT**\n",
+        )
+        .unwrap();
+        let dangling = dir4.path().join("2026-01-04-d.md");
+        match try_symlink(Path::new("no-such-target.md"), &dangling) {
+            Ok(()) => {
+                assert!(
+                    std::fs::metadata(&dangling).is_err(),
+                    "precondition: the link must be UNSTATTABLE"
+                );
+                let unstattable = scan_plan_dir(dir4.path(), &conv);
+                assert_eq!(unstattable.units.len(), 1);
+                assert!(
+                    !unstattable.complete,
+                    "an entry the OS LISTED but could not STAT is a gap, not a silent skip"
+                );
+            }
+            Err(e) => {
+                // Not a pass: an explicit, printed inability to run this case.
+                eprintln!(
+                    "SKIPPED case 4 (unstattable entry): this platform refused to create a \
+                     symlink ({e}). The Err arm is pinned by \
+                     `an_entry_that_cannot_be_statted_is_a_gap_not_a_skip` instead."
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    /// **A `stat` that FAILS is a gap; a `stat` that succeeds on a DIRECTORY is
+    /// a skip.** Pinned with no filesystem privilege in the way.
+    ///
+    /// Neuter check: fold the `Err` arm into `PlanEntry::NotAPlan` (which is
+    /// exactly what `is_file()` did) and the third assertion fails.
+    #[test]
+    fn an_entry_that_cannot_be_statted_is_a_gap_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.md");
+        std::fs::write(&file, "x").unwrap();
+        assert!(matches!(
+            classify_plan_entry(file.metadata()),
+            PlanEntry::Read
+        ));
+        assert!(
+            matches!(
+                classify_plan_entry(dir.path().metadata()),
+                PlanEntry::NotAPlan
+            ),
+            "a DIRECTORY named `*.md` is resolved and genuinely not a plan"
+        );
+        assert!(
+            matches!(
+                classify_plan_entry(Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "EACCES",
+                ))),
+                PlanEntry::Unstattable(_)
+            ),
+            "a REFUSED stat is a hole in the scan, never `not a plan`"
+        );
+    }
+
+    /// **A PARTIAL active scan must produce ZERO disappearance warnings, and
+    /// must poison nothing.** `warned_disappeared` is warn-once PER PROCESS,
+    /// so a false fire burns the slug for the life of the process. Cycle 3 is
+    /// the poisoning half: a slug the PARTIAL cycle could not see, and which
+    /// then genuinely vanishes, must still be surfaced.
+    ///
+    /// Neuter check: drop the `active_scan_complete && archive_scan_complete`
+    /// guard in `LoopState::tick` — cycle 2's zero-warning assertion fails.
+    #[tokio::test]
+    async fn a_partial_active_scan_reports_no_disappearance_and_poisons_nothing() {
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("2026-02-01-a.md");
+        let b = dir.path().join("2026-02-02-b.md");
+        std::fs::write(&a, "# A\n\n> **Status: DRAFT**\n").unwrap();
+        std::fs::write(&b, "# B\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(state.seen_slugs.len(), 2, "both plans were scanned");
+
+        // `b` becomes unreadable IN PLACE: nothing disappeared.
+        std::fs::write(&b, [0xff, 0xfe, 0xfd]).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a PARTIAL scan must claim nothing about absence; got: {}",
+            logs.text()
+        );
+        assert!(state.warned_disappeared.is_empty(), "...and poison nothing");
+        assert!(
+            logs.text().contains("disappeared-slug detection SKIPPED"),
+            "the skip is stated out loud; got: {}",
+            logs.text()
+        );
+
+        std::fs::remove_file(&b).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-02-02-b"));
+    }
+
+    /// **The same property on main's REF scan.** A blob the listing names but
+    /// the read cannot produce (corrupt, or not UTF-8) comes back `Ok` and
+    /// SHORT — `read_ref_dir` refuses only the wholesale failure. Before the
+    /// `complete` flag reached the tick, that short read was indistinguishable
+    /// from the plan leaving the ref, and burned the slug into the warn-once
+    /// set.
+    ///
+    /// Neuter check: make `read_plans_for_cycle`'s ref arm return
+    /// `complete: true` unconditionally — cycle 2 warns falsely and cycle 3
+    /// then says nothing.
+    #[tokio::test]
+    async fn a_partial_ref_read_reports_no_disappearance_and_poisons_nothing() {
+        struct SwitchableGit(Mutex<FakeGit>);
+        impl GitRefReader for SwitchableGit {
+            fn work_tree_root(&self, dir: &Path) -> Result<Option<PathBuf>, String> {
+                self.0.lock().unwrap().work_tree_root(dir)
+            }
+            fn default_ref(&self, repo_root: &Path) -> Result<String, String> {
+                self.0.lock().unwrap().default_ref(repo_root)
+            }
+            fn rev_parse(&self, repo_root: &Path, rev: &str) -> Result<String, String> {
+                self.0.lock().unwrap().rev_parse(repo_root, rev)
+            }
+            fn count_behind_ahead(
+                &self,
+                repo_root: &Path,
+                reference: &str,
+                head: &str,
+            ) -> Result<(u64, u64), String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .count_behind_ahead(repo_root, reference, head)
+            }
+            fn ref_refresh_stamps(
+                &self,
+                repo_root: &Path,
+                default_ref: &str,
+                ref_sha: &str,
+            ) -> Vec<Result<Option<i64>, String>> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .ref_refresh_stamps(repo_root, default_ref, ref_sha)
+            }
+            fn fetch_default(&self, repo_root: &Path, default_ref: &str) -> Result<(), String> {
+                self.0.lock().unwrap().fetch_default(repo_root, default_ref)
+            }
+            fn list_ref_dir(
+                &self,
+                repo_root: &Path,
+                ref_name: &str,
+                rel_dir: &str,
+            ) -> Result<Vec<RefDirEntry>, String> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .list_ref_dir(repo_root, ref_name, rel_dir)
+            }
+            fn read_blobs(&self, repo_root: &Path, ids: &[String]) -> Vec<Result<String, String>> {
+                self.0.lock().unwrap().read_blobs(repo_root, ids)
+            }
+        }
+
+        let logs = CapturedLogs::start();
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |name: &str, id: &str| RefDirEntry {
+            name: name.into(),
+            id: id.into(),
+        };
+        let git = std::sync::Arc::new(SwitchableGit(Mutex::new(FakeGit {
+            root: Ok(Some(dir.path().to_path_buf())),
+            ref_dir: Ok(vec![
+                entry("2026-05-01-a.md", "ida"),
+                entry("2026-05-02-b.md", "idb"),
+            ]),
+            blobs: [
+                (
+                    "ida".to_string(),
+                    Ok("# A\n\n> **Status: DRAFT**\n".to_string()),
+                ),
+                (
+                    "idb".to_string(),
+                    Ok("# B\n\n> **Status: DRAFT**\n".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..FakeGit::healthy(0, 0)
+        })));
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = plans_dir_input(dir.path());
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = LoopState::new(reader, None, std::sync::Arc::new(|| true) as CaptureGate)
+            .with_git(git.clone());
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            state.seen_slugs.len(),
+            2,
+            "both plans were read off the ref"
+        );
+
+        // `b` is still LISTED at the ref, but its blob will not read.
+        git.0
+            .lock()
+            .unwrap()
+            .blobs
+            .insert("idb".to_string(), Err("corrupt object".to_string()));
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "a PARTIAL ref read must claim nothing about absence; got: {}",
+            logs.text()
+        );
+        assert!(state.warned_disappeared.is_empty(), "...and poison nothing");
+        assert!(logs.text().contains("disappeared-slug detection SKIPPED"));
+
+        // Now `b` genuinely leaves the ref.
+        git.0.lock().unwrap().ref_dir = Ok(vec![entry("2026-05-01-a.md", "ida")]);
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is surfaced exactly once; got: {logged}"
+        );
+        assert!(logged.contains("2026-05-02-b"));
+    }
+
+    /// **The ARCHIVE scan gets the same guard — and it is the likelier
+    /// shape.** The archive set is the only thing that SUPPRESSES a warning,
+    /// so an archive scan that fails on its own false-fires every plan that
+    /// was scanned active and has since been consolidated into the archive.
+    ///
+    /// Neuter check: drop `archive_scan_complete` from the guard in
+    /// `LoopState::tick` — cycle 2 warns falsely and cycle 4 then says nothing.
+    #[tokio::test]
+    async fn a_partial_archive_scan_never_false_fires_the_disappearance_detector() {
+        let logs = CapturedLogs::start();
+        let active = tempfile::tempdir().unwrap();
+        let archive = tempfile::tempdir().unwrap();
+        let plan = active.path().join("2026-04-04-consolidated.md");
+        let archived = archive.path().join("2026-04-04-consolidated.md");
+        std::fs::write(&plan, "# C\n\n> **Status: DRAFT**\n").unwrap();
+        let (cell, reader) = switchable_paths();
+        *cell.lock().unwrap() = PathInputs {
+            plans_dir: Some(active.path().to_string_lossy().to_string()),
+            plans_archive_dir: Some(archive.path().to_string_lossy().to_string()),
+            ..PathInputs::default()
+        };
+        let sink = FakeSink::default();
+        let metrics = AdapterMetrics::default();
+        let mut state = tick_state(reader);
+
+        state.tick(&sink, &metrics).await;
+        assert_eq!(state.seen_slugs.len(), 1);
+
+        // Moved into the archive — where THIS cycle cannot read it.
+        std::fs::remove_file(&plan).unwrap();
+        std::fs::write(&archived, [0xff, 0xfe, 0xfd]).unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "an unreadable ARCHIVE cannot license a disappearance claim; got: {}",
+            logs.text()
+        );
+        assert!(state.warned_disappeared.is_empty(), "nothing poisoned");
+
+        // The archive copy reads fine now: archived, not lost.
+        std::fs::write(&archived, "# C\n\n> **Status: SHIPPED**\n").unwrap();
+        state.tick(&sink, &metrics).await;
+        assert_eq!(
+            logs.text()
+                .matches("disappeared from the active dir")
+                .count(),
+            0,
+            "an archived plan is not a disappeared one"
+        );
+
+        // Now it really is gone from both dirs.
+        std::fs::remove_file(&archived).unwrap();
+        state.tick(&sink, &metrics).await;
+        let logged = logs.text();
+        assert_eq!(
+            logged.matches("disappeared from the active dir").count(),
+            1,
+            "the real disappearance is still detectable; got: {logged}"
+        );
+        assert!(logged.contains("2026-04-04-consolidated"));
     }
 }

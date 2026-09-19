@@ -57,8 +57,9 @@ pub use push::{push_work_unit, HttpWorkUnitSink, PushOutcome, PushOutcomeKind, W
 pub use trigger::{
     adapter_metrics, backfill_work_units_once, measure_scan_divergence, newly_disappeared_slugs,
     read_device_binding_count, read_plan_dir, reconcile_archive_once, reconcile_once,
-    resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir, spawn_if_configured,
-    work_unit_write_posture, ArchiveSummary, BindingCountReading, GitRefReader, MetricsSnapshot,
-    PathInputs, PathReader, ProcessGit, ReconcileSummary, ScanDivergence, ScanDivergenceState,
+    resolve_plans_archive_dir, resolve_plans_dir, resolve_prompts_dir, scan_plan_dir,
+    spawn_if_configured, work_unit_write_posture, ArchiveSummary, BindingCountReading,
+    GitRefReader, MetricsSnapshot, PathInputs, PathReader, PlanDirScan, ProcessGit,
+    ReconcileSummary, RetiredSlugs, RetirementReason, ScanDivergence, ScanDivergenceState,
     WorkUnitBackfillSummary, WorkUnitWritePosture,
 };
