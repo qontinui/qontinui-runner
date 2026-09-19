@@ -1517,7 +1517,13 @@ mod tests {
         let s = dir.to_string_lossy();
         assert!(s.contains("runner"), "lives under ~/.qontinui/runner");
         assert!(s.ends_with("session-restore"));
-        assert!(!s.contains(".claude"), "NEVER under the user's ~/.claude");
+        // A path COMPONENT, not a substring: the isolated home lives under
+        // the box's temp dir, and a `.claude-<account>` segment there (the
+        // multi-account config-dir convention) is not the user's ~/.claude.
+        assert!(
+            !dir.components().any(|c| c.as_os_str() == ".claude"),
+            "NEVER under the user's ~/.claude: {s}"
+        );
     }
 
     /// Only [`STOP_HOOK_SCRIPT`] may name a carrier FILE in its own header.
