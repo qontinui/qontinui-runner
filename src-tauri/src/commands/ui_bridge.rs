@@ -393,32 +393,55 @@ pub async fn ui_bridge_discover_states_from_fingerprints(
     .map_err(String::from)
 }
 
-/// Reload the runner's webview.
+/// Reload the runner's main webview.
 ///
-/// Calls `location.reload()` on the webview to recover from frozen states
-/// (e.g., loading screen stuck after Vite fails to mount).
+/// A native `ICoreWebView2::Reload()` on Windows (an `eval` of
+/// `location.reload()` elsewhere), through the same
+/// [`crate::webview_recovery::reload_main_webview`] the recovery ladder's rung 1
+/// uses. The `eval` this used to be is `ExecuteScript` into the main frame, and
+/// after a render-process crash that frame holds Chromium's error page, where
+/// an injected `location.reload()` does nothing — so a watchdog "hard reload"
+/// through this command could not recover the very failure it exists for (plan
+/// `2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it`
+/// Phase 2).
+///
+/// Waits briefly for WebView2's answer to the `Reload()` call, so a refusal is
+/// an `Err` rather than a false "triggered". Accepted still means only
+/// ACCEPTED: this command does not wait for the reloaded page to pong. The
+/// verified path — reload, watch for a main-window pong, escalate to recreate
+/// — is the recovery ladder (`POST /ui/recover`).
 ///
 /// # Returns
-/// * `Ok(CommandResponse)` - Success if reload was triggered
-/// * `Err(String)` - Error if reload could not be initiated
+/// * `Ok(CommandResponse)` - the reload was dispatched and (on Windows)
+///   accepted, or not yet answered within the wait (`data.accepted: null`)
+/// * `Err(String)` - no main window, a dispatch error, or WebView2 refused it
 #[tauri::command]
 pub async fn ui_bridge_reload_webview(app: tauri::AppHandle) -> Result<CommandResponse, String> {
-    info!("UI Bridge: Reloading webview");
-
-    // Get all webview windows and reload the main one
-    if let Some(window) = app.get_webview_window(qontinui_runner_lib::get_main_window_label()) {
-        window
-            .eval("location.reload()")
-            .map_err(|e| String::from(AppError::from(e)))?;
-        Ok(CommandResponse {
-            success: true,
-            message: Some("Webview reload triggered".to_string()),
-            data: None,
-        })
-    } else {
-        Err("Main webview window not found".to_string())
-    }
+    info!("UI Bridge: Reloading the main webview (native reload)");
+    let dispatch = crate::webview_recovery::reload_main_webview(&app)?;
+    let accepted = dispatch
+        .accepted_within(std::time::Duration::from_millis(
+            UI_BRIDGE_RELOAD_ACCEPT_WAIT_MS,
+        ))
+        .await?;
+    Ok(CommandResponse {
+        success: true,
+        message: Some(
+            match accepted {
+                Some(()) => "Webview reload accepted",
+                None => "Webview reload dispatched (no answer from WebView2 yet)",
+            }
+            .to_string(),
+        ),
+        data: Some(serde_json::json!({ "accepted": accepted.map(|()| true) })),
+    })
 }
+
+/// How long [`ui_bridge_reload_webview`] waits for WebView2 to run (or refuse)
+/// the dispatched `Reload()`. The UI thread runs it within a frame when it is
+/// pumping; a longer silence is reported as UNKNOWN (`accepted: null`), never
+/// as a refusal.
+const UI_BRIDGE_RELOAD_ACCEPT_WAIT_MS: u64 = 2_000;
 
 /// Configuration for UI Bridge exploration
 #[derive(Debug, Clone, Serialize, Deserialize)]

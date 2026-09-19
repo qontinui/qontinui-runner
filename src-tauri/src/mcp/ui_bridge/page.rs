@@ -1186,9 +1186,17 @@ pub(crate) fn navigate_rejection_response(
 ///    outright so a caller cannot smuggle one in through `evaluate`.
 ///
 /// The honest reload door already exists and is deliberately out of band from
-/// this HTTP surface: the `ui_bridge_reload_webview` Tauri command (and
-/// `webview_recovery`'s rung 1) eval `location.reload()` into the webview
-/// from the Rust side, which is where "recover a wedged webview" belongs.
+/// this HTTP surface: the `ui_bridge_reload_webview` Tauri command and
+/// `webview_recovery`'s rung 1 both call
+/// `webview_recovery::reload_main_webview`, a native
+/// `ICoreWebView2::Reload()` issued from the Rust side (an `eval` of
+/// `location.reload()` only off Windows) — which is where "recover a wedged
+/// webview" belongs. Native, not `eval`, because after a render-process crash
+/// the main frame holds Chromium's error page and an injected
+/// `location.reload()` there does nothing (plan
+/// `2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it`).
+/// The ladder's rung additionally verifies the reload by a main-window pong
+/// and escalates to recreating the window when none arrives.
 ///
 /// `hard` is kept on the wire rather than dropped so a client reading
 /// `data.hard` gets an accurate `false` instead of `undefined`.
