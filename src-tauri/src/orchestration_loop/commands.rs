@@ -111,7 +111,12 @@ pub struct StartOrchestrationRunArgs {
     pub tick_interval_secs: Option<u64>,
 }
 
-fn run_config_from_args(args: &StartOrchestrationRunArgs) -> OrchestrationRunConfig {
+/// The ONE place `StartOrchestrationRunArgs` becomes an
+/// [`OrchestrationRunConfig`], shared by both doors that start a run (this
+/// Tauri command and the HTTP `POST /orchestration/runs`). It is `pub(crate)`
+/// for exactly that reason: the HTTP door used to re-implement the same
+/// defaults and clamps inline, so a clamp added here would not have reached it.
+pub(crate) fn run_config_from_args(args: &StartOrchestrationRunArgs) -> OrchestrationRunConfig {
     let mut cfg = OrchestrationRunConfig::default();
     if let Some(c) = args.concurrency_cap {
         cfg.concurrency_cap = c.max(1);

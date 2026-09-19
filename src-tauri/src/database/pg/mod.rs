@@ -1093,6 +1093,9 @@ impl PgDb {
         // (see `database/pg/completion_reports.rs`); `produced_by` is the
         // elaborating parent task_id (null for DESIGN-origin rows) and is the
         // idempotent splice key used by progressive elaboration (Phase 4).
+        // `runs.status_reason` is why a run left `running` (fatal error, stall
+        // pattern, DESIGN failure, stop request) — written by the conductor's
+        // every terminal exit so the row never lies `running` for a dead run.
         conn.batch_execute(
             "CREATE SCHEMA IF NOT EXISTS orchestration; \
              CREATE TABLE IF NOT EXISTS orchestration.runs ( \
@@ -1101,9 +1104,11 @@ impl PgDb {
                  recipe     TEXT, \
                  phases     TEXT[] NOT NULL DEFAULT '{}', \
                  status     TEXT NOT NULL, \
+                 status_reason TEXT, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
              ); \
+             ALTER TABLE orchestration.runs ADD COLUMN IF NOT EXISTS status_reason TEXT; \
              CREATE TABLE IF NOT EXISTS orchestration.subtasks ( \
                  task_id         TEXT NOT NULL, \
                  run_id          UUID NOT NULL REFERENCES orchestration.runs(run_id) ON DELETE CASCADE, \
@@ -1331,17 +1336,35 @@ impl PgDb {
         &self.pool
     }
 
-    /// Blocking helper for tests: create a PgDb using DATABASE_URL.
-    /// Panics if PG is not available.
+    /// The PG fixture URL for tests: `DATABASE_URL`, else the local default.
+    #[cfg(test)]
+    fn test_database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string())
+    }
+
+    /// Blocking helper for SYNCHRONOUS (`#[test]`) tests: create a PgDb using
+    /// DATABASE_URL. Panics if PG is not available. It builds its own tokio
+    /// runtime, so calling it from inside a `#[tokio::test]` body panics with
+    /// "Cannot start a runtime from within a runtime" — use
+    /// [`new_for_test`](Self::new_for_test) there.
     #[cfg(test)]
     pub fn new_blocking_for_test() -> std::sync::Arc<Self> {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://localhost:5432/qontinui_test".to_string());
+        let url = Self::test_database_url();
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
         std::sync::Arc::new(
             rt.block_on(Self::new(&url))
                 .expect("PgDb connection for test"),
         )
+    }
+
+    /// Async twin of [`new_blocking_for_test`](Self::new_blocking_for_test)
+    /// for `#[tokio::test]` bodies: connects on the test's own runtime.
+    /// Panics if PG is not available.
+    #[cfg(test)]
+    pub async fn new_for_test() -> std::sync::Arc<Self> {
+        let url = Self::test_database_url();
+        std::sync::Arc::new(Self::new(&url).await.expect("PgDb connection for test"))
     }
 
     /// Test-only: create a PgDb with a pool that will error on any actual

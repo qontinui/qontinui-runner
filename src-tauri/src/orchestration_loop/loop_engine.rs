@@ -509,7 +509,9 @@ pub async fn cleanup_finished_loops(states: SharedLoopStates) {
 // Approach-D Conductor (Phase 3) — orchestration-run management
 // ============================================================================
 
-use super::conductor::{self, AiSessionDispatcher, ManagerSignalSource, OrchestrationRunConfig};
+use super::conductor::{
+    self, AiSessionDispatcher, ManagerSignalSource, OrchestrationRunConfig, RunExit,
+};
 use super::ledger::Run;
 use crate::database::pg::PgDb;
 use qontinui_runner_lib::wedge_diagnostics::spawn_blocking_tracked;
@@ -531,9 +533,11 @@ pub struct OrchestrationRunStatus {
 /// in the [`MultiLoopManager`] keyed by `run_id`, and spawn the stateless
 /// reconciler background task ([`conductor::run_orchestration`]).
 ///
-/// `goal`/`recipe`/`phases` seed the `orchestration.runs` row. The caller is
-/// expected to have already persisted the DESIGN-origin subtasks (Phase 5's
-/// `/orchestrate` does this); a run with no subtasks simply ticks to `done`.
+/// `goal`/`recipe`/`phases` seed the `orchestration.runs` row. A run that
+/// already has subtasks (Phase 5's `/orchestrate` pre-seeded it, or a restart
+/// re-entered here) skips the DESIGN pass; one with none runs it, and a DESIGN
+/// failure marks the run `failed` with the error and returns `Err` — it is
+/// never launched to tick an empty DAG to `complete`.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_orchestration_run(
     states: SharedLoopStates,
@@ -565,13 +569,29 @@ pub async fn start_orchestration_run(
 
     // DESIGN bootstrap (Phase 4): a run with no subtasks yet runs the Planning
     // phase's design pass to produce the initial org-chart, written via the
-    // SAME `splice_org_chart` path harvest uses (`produced_by = None`). This is
-    // idempotent + best-effort: a run that already has subtasks (Phase-5
-    // `/orchestrate` pre-seeded it, or a restart re-entered here) skips the
-    // pass; a design failure leaves the run with zero subtasks and the
-    // conductor simply ticks to `done` (the operator can re-issue).
+    // SAME `splice_org_chart` path harvest uses (`produced_by = None`). It is
+    // idempotent: a run that already has subtasks (Phase-5 `/orchestrate`
+    // pre-seeded it, or a restart re-entered here) skips the pass. A design
+    // FAILURE is a failed run — the row is written `failed` with the design
+    // error and the conductor is never spawned. (It used to be swallowed and
+    // the empty run ticked to `complete`, which told the operator the opposite
+    // of what happened.)
     if let Err(e) = run_design_bootstrap(&app_handle, &pg, run_id, goal, phases).await {
-        warn!("start_orchestration_run: DESIGN bootstrap for {run_id} failed (continuing with whatever subtasks exist): {e}");
+        let exit = RunExit::design_failed(&e);
+        error!(
+            "start_orchestration_run: run {run_id} {}: {e}",
+            exit.status()
+        );
+        if let Err(w) = pg
+            .set_run_status(run_id, exit.status(), exit.reason())
+            .await
+        {
+            error!(
+                "start_orchestration_run: run {run_id} could not persist status={}: {w}",
+                exit.status()
+            );
+        }
+        return Err(format!("Orchestration run {run_id} failed: {e}"));
     }
 
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -609,8 +629,11 @@ pub async fn start_orchestration_run(
             mgr.loops.remove(&loop_id);
             mgr.metadata.remove(&loop_id);
         }
-        let _ = pg.set_run_status(run_id, "failed").await;
-        return Err("start_orchestration_run: SessionManager state not available".to_string());
+        let reason = "start_orchestration_run: SessionManager state not available";
+        let _ = pg
+            .set_run_status(run_id, RunExit::STATUS_FAILED, Some(reason))
+            .await;
+        return Err(reason.to_string());
     };
 
     let dispatcher = AiSessionDispatcher {
@@ -720,14 +743,33 @@ pub async fn stop_orchestration_run(
             let _ = tx.send(true);
         }
     }
-    // Best-effort run-row status (the reconciler also flips its own phase).
-    let _ = pg.set_run_status(run_id, "stopped").await;
+    // Best-effort run-row status (the reconciler also flips its own phase) —
+    // CONDITIONAL on the run still being `running`. A run that already exited
+    // `stalled` or `failed` keeps that verdict and its reason: the operator can
+    // still press Stop on a listed terminal run, and an unconditional write
+    // would destroy exactly the diagnosis the conductor persists.
+    match pg
+        .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+        .await
+    {
+        Ok(true) => info!("stop_orchestration_run: run {run_id} marked stopped"),
+        Ok(false) => info!(
+            "stop_orchestration_run: run {run_id} was already terminal — \
+             keeping its status and reason (stop signalled anyway)"
+        ),
+        Err(e) => warn!("stop_orchestration_run: run {run_id} status write failed: {e}"),
+    }
     Ok(())
 }
 
 /// Status of a conductor run: the run row, its subtasks, and the live loop
 /// phase (if the reconciler is still registered). Reads the durable ledger so
-/// it works even after the background task has exited.
+/// it works even after the background task has exited: the terminal phase is
+/// derived from `run.status` and `error` carries `run.status_reason` (the
+/// fatal error, the stall evidence, the DESIGN failure). Per-subtask blocks are
+/// on the rows themselves — `gate_status = coord_unreachable` ("blocked: coord
+/// unreachable") and `coord_error` ("blocked: coord call failing") are the two
+/// typed blocks a UI renders.
 pub async fn orchestration_run_status(
     states: SharedLoopStates,
     pg: &Arc<PgDb>,
@@ -757,7 +799,9 @@ pub async fn orchestration_run_status(
             None => {
                 let phase = match run.status.as_str() {
                     "complete" => LoopPhase::Complete,
-                    "failed" => LoopPhase::Error,
+                    // A stall is an `Error` phase whose reason names the
+                    // pattern (the shared `LoopPhase` has no `Stalled`).
+                    "failed" | "stalled" => LoopPhase::Error,
                     "stopped" => LoopPhase::Stopped,
                     _ => LoopPhase::Idle,
                 };
@@ -765,6 +809,9 @@ pub async fn orchestration_run_status(
             }
         }
     };
+    // The durable reason outlives the in-memory loop state (and is the only
+    // copy once the process that ran the reconciler is gone).
+    let error = error.or_else(|| run.status_reason.clone());
 
     Ok(OrchestrationRunStatus {
         run,

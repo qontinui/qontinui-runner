@@ -52,7 +52,7 @@ impl PgDb {
                 INSERT INTO orchestration.runs
                     (run_id, goal, recipe, phases, status)
                 VALUES ($1, $2, $3, $4, $5)
-                RETURNING run_id, goal, recipe, phases, status, created_at, updated_at
+                RETURNING run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 "#,
                 &[&run_id, &goal, &recipe, &phases_owned, &status],
             )
@@ -73,7 +73,7 @@ impl PgDb {
         let row = conn
             .query_opt(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 FROM orchestration.runs
                 WHERE run_id = $1
                 "#,
@@ -96,7 +96,7 @@ impl PgDb {
         let rows = conn
             .query(
                 r#"
-                SELECT run_id, goal, recipe, phases, status, created_at, updated_at
+                SELECT run_id, goal, recipe, phases, status, status_reason, created_at, updated_at
                 FROM orchestration.runs
                 ORDER BY created_at DESC
                 "#,
@@ -108,9 +108,28 @@ impl PgDb {
         Ok(rows.iter().map(Self::run_from_row).collect())
     }
 
-    /// Update a run's `status` (e.g. `running` → `complete`/`failed`/`stopped`).
+    /// Update a run's `status` (e.g. `running` → `complete` / `failed` /
+    /// `stalled` / `stopped`) together with the reason it left `running`
+    /// (`status_reason`; `None` clears it — a `complete` run carries no reason).
     /// Returns `Err` if no row matched `run_id`.
-    pub async fn set_run_status(&self, run_id: Uuid, status: &str) -> Result<(), String> {
+    ///
+    /// **UNCONDITIONAL — it overwrites whatever the row says, including a
+    /// terminal status another writer just wrote.** That is why the conductor
+    /// does NOT use it: its exits go through
+    /// [`Self::set_run_status_if_running`], which loses to whoever left
+    /// `running` first, because the reconciler and `stop_orchestration_run`
+    /// race one tick wide and an operator's `stopped` must not be clobbered by
+    /// a `stalled` decided before the Stop was pressed.
+    ///
+    /// Use this one only where the caller is the run's sole writer at that
+    /// moment — creating the row, or a path that has already established the
+    /// run is not being reconciled.
+    pub async fn set_run_status(
+        &self,
+        run_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
         let conn = self
             .pool
             .get()
@@ -122,10 +141,11 @@ impl PgDb {
                 r#"
                 UPDATE orchestration.runs
                 SET status = $2,
+                    status_reason = $3,
                     updated_at = now()
                 WHERE run_id = $1
                 "#,
-                &[&run_id, &status],
+                &[&run_id, &status, &reason],
             )
             .await
             .map_err(|e| crate::database::pg::pg_err("set_run_status", &e))?;
@@ -134,6 +154,45 @@ impl PgDb {
             return Err(format!("set_run_status: no run {}", run_id));
         }
         Ok(())
+    }
+
+    /// Move a run out of `running` ONLY IF it is still `running`, returning
+    /// whether the row moved. The guard is in the SQL (`AND status = 'running'`)
+    /// so it is atomic against the reconciler's own terminal write.
+    ///
+    /// This is what a stop must use. An unconditional `stopped` write overwrote
+    /// the terminal diagnosis a run had already reached: a run that exited
+    /// `stalled` (or `failed` on a DAG cycle) is still listed, the operator
+    /// presses Stop, and the row becomes `stopped` / "stop requested" — erasing
+    /// the reason the run ended, which is the whole point of persisting it.
+    /// `false` means the run was already terminal and keeps the status it has.
+    pub async fn set_run_status_if_running(
+        &self,
+        run_id: Uuid,
+        status: &str,
+        reason: Option<&str>,
+    ) -> Result<bool, String> {
+        let conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| format!("PG pool error: {}", e))?;
+
+        let n = conn
+            .execute(
+                r#"
+                UPDATE orchestration.runs
+                SET status = $2,
+                    status_reason = $3,
+                    updated_at = now()
+                WHERE run_id = $1 AND status = 'running'
+                "#,
+                &[&run_id, &status, &reason],
+            )
+            .await
+            .map_err(|e| crate::database::pg::pg_err("set_run_status_if_running", &e))?;
+
+        Ok(n > 0)
     }
 
     /// Insert-or-update a subtask keyed on `(run_id, task_id)`. Used by the
@@ -434,8 +493,9 @@ impl PgDb {
             recipe: row.get(2),
             phases: row.get(3),
             status: row.get(4),
-            created_at: row.get::<_, DateTime<Utc>>(5),
-            updated_at: row.get::<_, DateTime<Utc>>(6),
+            status_reason: row.get(5),
+            created_at: row.get::<_, DateTime<Utc>>(6),
+            updated_at: row.get::<_, DateTime<Utc>>(7),
         }
     }
 
@@ -564,7 +624,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs PG fixture (DATABASE_URL); orchestration schema self-heals at PgDb::new"]
     async fn run_and_subtask_dag_round_trip() {
-        let pg = PgDb::new_blocking_for_test();
+        let pg = PgDb::new_for_test().await;
         let run_id = Uuid::new_v4();
 
         // 1. Create the run.
@@ -588,6 +648,49 @@ mod tests {
         assert_eq!(run.recipe.as_deref(), Some("approach-d"));
         assert_eq!(run.phases, phases);
         assert_eq!(run.status, "running");
+        assert_eq!(run.status_reason, None, "a fresh run carries no reason");
+
+        // set_run_status writes status AND reason; get_run reads both back.
+        pg.set_run_status(run_id, "stalled", Some("Stall detected: x"))
+            .await
+            .expect("set_run_status stalled");
+        let stalled = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(stalled.status, "stalled");
+        assert_eq!(stalled.status_reason.as_deref(), Some("Stall detected: x"));
+        // A STOP must not erase a terminal diagnosis: the conditional write
+        // refuses to move a run that already left `running`.
+        let moved = pg
+            .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+            .await
+            .expect("conditional write");
+        assert!(!moved, "a stalled run is not moved by a stop");
+        let still = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(still.status, "stalled", "the terminal status survives Stop");
+        assert_eq!(
+            still.status_reason.as_deref(),
+            Some("Stall detected: x"),
+            "and so does the reason the run ended"
+        );
+
+        pg.set_run_status(run_id, "running", None)
+            .await
+            .expect("set_run_status running");
+        let back = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(back.status, "running");
+        assert_eq!(back.status_reason, None, "None clears the reason");
+
+        // The same call on a run that IS running does move it.
+        let moved = pg
+            .set_run_status_if_running(run_id, "stopped", Some("stop requested"))
+            .await
+            .expect("conditional write");
+        assert!(moved, "a running run is stopped");
+        let stopped = pg.get_run(run_id).await.expect("get_run").expect("row");
+        assert_eq!(stopped.status, "stopped");
+        assert_eq!(stopped.status_reason.as_deref(), Some("stop requested"));
+        pg.set_run_status(run_id, "running", None)
+            .await
+            .expect("back to running for the rest of the test");
 
         // 2. Upsert a small DAG: A (root), B depends on A, C depends on A+B.
         let a = mk_subtask(run_id, "A", 0, vec![], true);

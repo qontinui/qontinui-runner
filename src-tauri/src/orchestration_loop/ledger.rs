@@ -92,7 +92,17 @@ pub struct Run {
     /// (`plan` is the phase that runs the DESIGN step which emits the org-chart;
     /// `design` is the step name, not a phase name — contract §3.)
     pub phases: Vec<String>,
+    /// Lifecycle status of the run as the conductor last wrote it:
+    /// `running` | `complete` | `failed` | `stalled` | `stopped`. Every
+    /// terminal exit of the reconciler writes this column — a run whose
+    /// reconciler is gone reads its true outcome from here, not from the
+    /// in-memory loop phase (which dies with the process).
     pub status: String,
+    /// Why the run left `running`: the fatal error (a DAG cycle, a DESIGN
+    /// failure), the stall pattern, or the stop request. `None` while the run
+    /// is `running` and for a `complete` run. Surfaced as `error` on the run
+    /// status payload when the reconciler is no longer registered.
+    pub status_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -131,9 +141,23 @@ pub struct Subtask {
     /// reconciler treats it as not-dispatchable. This column is the DURABLE record
     /// a restart re-attaches to (it resumes polling, never re-registers).
     pub gate_id: Option<String>,
-    /// Phase 6: the last-polled coord gate verdict (`open` | `cleared` | `failed`).
-    /// `None` until the gate is first polled. `cleared` ⇒ unblock + dispatch;
-    /// `failed` ⇒ the subtask is failed.
+    /// Phase 6: the last-polled coord gate verdict (`open` | `cleared` |
+    /// `failed`), or one of the two runner-side typed block tokens when the
+    /// runner has no coord ANSWER about this row —
+    /// [`GATE_STATUS_COORD_UNREACHABLE`](super::coord_gate::GATE_STATUS_COORD_UNREACHABLE)
+    /// (`coord_unreachable`: it could not ask — no device credential, a dead
+    /// transport, a 401/408/429/5xx) and
+    /// [`GATE_STATUS_COORD_ERROR`](super::coord_gate::GATE_STATUS_COORD_ERROR)
+    /// (`coord_error`: coord answered and refused the call, or sent a verdict
+    /// this build does not understand). `None` until the gate is first polled.
+    /// `cleared` ⇒ unblock + dispatch; `failed` ⇒ the subtask is failed (coord's
+    /// `withdrawn` / `misconfigured` verdicts land here too — a gate that will
+    /// never clear); either coord-block token ⇒ the call is retried every tick
+    /// and the row COUNTS toward the run's stall fingerprint (it is not
+    /// legitimately waiting on anything coord said). The full token set is
+    /// `open | cleared | failed | coord_unreachable | coord_error`; the column
+    /// is plain nullable `text` with no CHECK, so this doc and the matching
+    /// comment in `atlas/schema.hcl` are the only enumeration there is.
     pub gate_status: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
