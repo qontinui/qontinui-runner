@@ -166,6 +166,18 @@ const TIER3_DEBOUNCE_MS = 600;
 // subprocess call on. Below this, Tier-1 fuzzy carries the response.
 const TIER3_MIN_CHARS = 3;
 
+/**
+ * Whether Tier 3 would be asked about `query` at all: long enough, and not
+ * already resolved exactly by Tier 1 or matched by a Tier-2 pattern. One
+ * predicate for the debounced fire and for the no-match Enter branch, so the
+ * two cannot disagree about which lines are still awaiting an answer.
+ */
+function tier3Eligible(query: string, recents: Parameters<typeof resolve>[1]): boolean {
+  if (query.trim().length < TIER3_MIN_CHARS) return false;
+  if (resolve(query, recents).some((m) => m.exact)) return false;
+  return !matchPattern(query);
+}
+
 const PLACEHOLDER_EXAMPLES = [
   "/spawn-ai 3 best",
   "/spawn 2",
@@ -285,6 +297,10 @@ export function CommandBar() {
   // subprocess call is debounced + async, not a pure function of query.
   const [tier3Match, setTier3Match] = useState<InterpretMatch | null>(null);
   const [interpreting, setInterpreting] = useState(false);
+  // The query Tier 3 last ANSWERED for (match or no match). Until it equals
+  // the current query, a Tier-3-eligible line has not been judged by every
+  // tier yet — see the no-match Enter branch.
+  const [tier3SettledFor, setTier3SettledFor] = useState<string | null>(null);
 
   // Re-render when actions register / unregister.
   useRegistrySnapshot();
@@ -399,20 +415,14 @@ export function CommandBar() {
   // meaningful, fire the claude subprocess. Result lands in
   // `tier3Match` and prepends to the dropdown above.
   useEffect(() => {
-    const trimmed = query.trim();
     // Clear any previous result whenever the query changes — operator
     // is mid-typing or starting over, the prior Tier-3 hit no longer
     // applies.
     setTier3Match(null);
 
-    if (trimmed.length < TIER3_MIN_CHARS) {
-      setInterpreting(false);
-      return;
-    }
-    // Skip if Tier-1 / Tier-2 already nailed it — Tier-3 would burn a
-    // subprocess on a query that's already resolved.
-    const tier1Exact = resolve(query, recents).find((m) => m.exact);
-    if (tier1Exact || matchPattern(query)) {
+    // Skip below the length floor, and when Tier-1 / Tier-2 already nailed
+    // it — Tier-3 would burn a subprocess on a query that's already resolved.
+    if (!tier3Eligible(query, recents)) {
       setInterpreting(false);
       return;
     }
@@ -422,11 +432,14 @@ export function CommandBar() {
       setInterpreting(true);
       try {
         const result = await interpretCommand(query, { signal: controller.signal });
-        if (!controller.signal.aborted) {
-          setTier3Match(result);
-        }
+        if (!controller.signal.aborted) setTier3Match(result);
       } finally {
-        if (!controller.signal.aborted) setInterpreting(false);
+        if (!controller.signal.aborted) {
+          setInterpreting(false);
+          // Settled on a throw too, or a failed call would leave Enter inert
+          // on this line for good.
+          setTier3SettledFor(query);
+        }
       }
     }, TIER3_DEBOUNCE_MS);
 
@@ -645,6 +658,11 @@ export function CommandBar() {
         // true on both paths.
         const typed = query.trim();
         if (!typed) return;
+        // …but not while Tier 3 has yet to answer for this very line: during
+        // the debounce window or the subprocess call, "no match" is a verdict
+        // from two of three tiers, and the AI match can land under the error a
+        // moment later. Enter stays inert there, as it always was.
+        if (interpreting || (tier3Eligible(query, recents) && tier3SettledFor !== query)) return;
         persistHistory(query);
         setHistoryIdx(-1);
         setStatus({
@@ -664,7 +682,19 @@ export function CommandBar() {
         return;
       }
     },
-    [matches.length, query, selectedMatch, execute, history, historyIdx, historyMode, persistHistory],
+    [
+      matches.length,
+      query,
+      selectedMatch,
+      execute,
+      history,
+      historyIdx,
+      historyMode,
+      persistHistory,
+      interpreting,
+      recents,
+      tier3SettledFor,
+    ],
   );
 
   // Typing anything by hand leaves history-browsing mode — the recalled

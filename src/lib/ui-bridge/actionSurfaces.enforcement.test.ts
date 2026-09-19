@@ -355,6 +355,46 @@ describe("UI Bridge action surfaces — the falsification", () => {
   );
 
   it(
+    "handlers hidden from a naive property scan still turn this red",
+    () => {
+      // Found by the pre-PR review of the port: each of these read the bag
+      // while the scan reported nothing.
+      const found = scanFixture(
+        "hiddenHandlers.ts",
+        [
+          "const acts = { probe: { id: 'p', handler: (p: unknown) => p } };",
+          "export const bad = {",
+          "  actions: [",
+          "    // a zero-parameter function that reads `arguments`",
+          '    { id: "probe-arguments", handler: function () { return arguments[0]; } },',
+          "    // a computed-but-literal key",
+          '    { id: "probe-computed", ["handler"]: (p: unknown) => p },',
+          "    // a registered entry whose handler arrives in a spread",
+          '    { id: "probe-spread", ...{ handler: (p: unknown) => p } },',
+          "    // a METHOD that shares the guard's name is not the guard",
+          '    { id: "probe-method", handler: x.guardedHandler("probe-method", {}, (a) => a) },',
+          "  ],",
+          "};",
+          "export const el = { customActions: acts };",
+        ].join("\n"),
+      );
+      expect(
+        violations(found)
+          .map((v) => v.id ?? `(customActions @${v.line})`)
+          .sort(),
+      ).toEqual([
+        "(customActions @14)",
+        "p",
+        "probe-arguments",
+        "probe-computed",
+        "probe-method",
+        "probe-spread",
+      ]);
+    },
+    WALK_TIMEOUT,
+  );
+
+  it(
     "a guard binding against a DIFFERENT schema than the action publishes turns this red",
     () => {
       // Registration/handler drift, one level down: the wire advertises one
