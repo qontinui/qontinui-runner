@@ -10,16 +10,24 @@
 //! `timeout-minutes: 90`. `cargo test` compiles *and* executes, so that single
 //! bound covered (dependency compile + workspace codegen + test-binary link +
 //! test execution) — while the step's own documenting comment reasoned almost
-//! entirely about **test** durations and test **hangs**. Measured on the
-//! windows leg 2026-09-17: the suite reports `finished in 117.72s` and the step
-//! median is ~50 min, so roughly 92% of what the bound bounded was `rustc`.
+//! entirely about **test** durations and test **hangs**. Measured across both
+//! attempts of run `35043646051` (windows leg): the whole test RUN phase is
+//! **5m26s**, while compilation is ~37 min on a healthy attempt and 86m07s on
+//! the bad one. The bound was named for the 5 minutes and spent on the rest.
 //!
-//! On run `35043646051` attempt 1 that produced the failure this test exists to
-//! stop recurring: the step expired at exactly 90 minutes **two minutes after**
-//! the suite had reported `test result: ok. 1354 passed; 0 failed`, so a
-//! branch-protection-required check went red on a PR whose tests had passed. A
-//! bound sized against the wrong quantity cannot be tuned correctly and cannot
-//! attribute its own expiry.
+//! On attempt 1 the step expired at exactly 90 minutes, **mid-suite**. Be
+//! precise about that, because the obvious reading is wrong and this file
+//! carried it for one revision: the `test result: ok. 1354 passed` line two
+//! minutes before the kill is **one binary of 29**, not the suite. The largest
+//! binary (9905 tests) started at 02:58:22, was still emitting `ok` lines at
+//! 03:00:25, and never reported at all — the run was ~62% complete, and 7112
+//! of the suite's 11,486 tests reached coord. Nothing about that run says the
+//! tests passed.
+//!
+//! A bound sized against the wrong quantity cannot be tuned correctly and
+//! cannot attribute its own expiry. Measured on that same attempt, the split
+//! would have held: build 86m07s under a 90-minute build bound (3m53s of
+//! slack), run 5m26s under a 20-minute one.
 //!
 //! The remedy is structural rather than numeric, which is exactly the kind of
 //! property a workflow-shape test can hold and a comment cannot: two steps, two
@@ -260,7 +268,8 @@ fn the_run_step_is_the_one_that_writes_the_coord_ingest_log() {
 
     // The ingest itself must be told the gating step's outcome (Phase 4a), or a
     // timed-out job's rows land in coord.test_results unqualified — the #1545
-    // shape, 7112 passing rows recorded against a `failure` job.
+    // shape, where 7112 rows of a suite that was only ~62% through were
+    // recorded against a `failure` job with nothing marking either fact.
     let ingest = find_step(&steps, "Report test results to coord (best-effort)");
     let ingest_run = command_lines(ingest, "Report test results to coord (best-effort)");
     assert!(
@@ -274,6 +283,54 @@ fn the_run_step_is_the_one_that_writes_the_coord_ingest_log() {
         "`--gating-outcome` must be fed from the RUN step's own `outcome`, not \
          from a literal or from the job status"
     );
+}
+
+#[test]
+fn every_consumer_of_a_step_outcome_names_an_id_that_exists() {
+    // Pinning the `id:` DEFINITIONS (above) is half the contract. The other
+    // half is that nothing references an id that is not defined: a GitHub
+    // expression naming an unknown step is not an error, it expands to the
+    // EMPTY STRING — so a typo in a CONSUMER is silent, and every downstream
+    // arm then reads UNKNOWN forever while every other test in this file stays
+    // green. Scan the whole job rather than the three consumers known today,
+    // so a fourth added later is covered without editing this test.
+    let doc = ci_workflow();
+    let steps = job_steps(&doc, "test");
+
+    let defined: Vec<String> = steps
+        .iter()
+        .filter_map(|s| s.get("id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+
+    // `${{ steps.<id>.outcome }}` / `.conclusion` / `.outputs.…`
+    let re = regex::Regex::new(r"steps\.([A-Za-z_][A-Za-z0-9_-]*)\.")
+        .expect("the reference pattern compiles");
+
+    let mut referenced: Vec<String> = Vec::new();
+    for step in &steps {
+        for key in ["run", "if"] {
+            if let Some(text) = step.get(key).and_then(|v| v.as_str()) {
+                for cap in re.captures_iter(text) {
+                    referenced.push(cap[1].to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        !referenced.is_empty(),
+        "no `steps.<id>.` reference found anywhere in job `test` — this test \
+         would then be vacuous, and the split's three consumers should all \
+         match it"
+    );
+
+    for id in &referenced {
+        assert!(
+            defined.contains(id),
+            "job `test` references `steps.{id}.` but no step carries `id: {id}`. \
+             GitHub expands an unknown step reference to the EMPTY STRING rather \
+             than failing, so this typo is silent in CI. Defined ids: {defined:?}"
+        );
+    }
 }
 
 #[test]
@@ -396,8 +453,12 @@ fn the_memory_sampler_is_gated_to_the_windows_leg() {
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| panic!("the memory sampler must carry an `if:` condition"));
 
+    // The full `== 'windows-latest'` substring, not just the platform name: a
+    // `!=` would satisfy a bare `contains("windows-latest")` while inverting
+    // the gate and running powershell on ubuntu only.
     assert!(
-        cond.contains("windows-latest"),
-        "the memory sampler's `if:` must gate on the windows leg, got `{cond}`"
+        cond.contains("matrix.platform == 'windows-latest'"),
+        "the memory sampler's `if:` must gate on \
+         `matrix.platform == 'windows-latest'`, got `{cond}`"
     );
 }
