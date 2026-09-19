@@ -2621,10 +2621,13 @@ impl ContinuationRegistry {
     ///
     /// **Accepted residual, stated rather than hidden:** on this arm the
     /// migrating session's anchor is held by a STRANGER's permit, and if that
-    /// stranger RELEASES WITHOUT SPAWNING — its `Drop` on any non-spawn exit —
-    /// the anchor goes into neither half and the original double-spawn window
-    /// is back for the rest of the respawn. Only that path. A stranger that
-    /// settles through [`AnchorReservation::handed_to_registry`] inserts a
+    /// stranger RELEASES WITHOUT INSERTING A LIVE ROW the anchor goes into
+    /// neither half and the original double-spawn window is back for the rest
+    /// of the respawn. Two paths do that: the permit's `Drop` on any non-spawn
+    /// exit, and [`AnchorReservation::release`], the headless arm, which frees
+    /// the anchor deliberately *after* a successful spawn because headless
+    /// sessions are outside P3/P4. What does NOT do it is a stranger settling
+    /// through [`AnchorReservation::handed_to_registry`]: that inserts a
     /// LIVE row for the anchor under the same lock that frees the pending
     /// entry, so P3's live scan still answers `DuplicateAnchor(Live)` and no
     /// window opens.
@@ -2633,11 +2636,18 @@ impl ContinuationRegistry {
     /// the reason a by-key steal is wrong: [`Self::release_owned`] is the only
     /// remover and it compares the token, so a displaced stranger's own later
     /// removal is a NO-OP, never a steal of a third holder's entry. The real
-    /// cost of displacing is simpler and worse — it overwrites the registry's
-    /// only record that the stranger holds this anchor, so the migration's own
-    /// settle would then free an anchor a still-in-flight stranger believes it
-    /// holds, and the next dispatch would pass P3 and spawn alongside it. The
-    /// `warn!` is what makes the residual visible either way.
+    /// cost of displacing is that it overwrites the registry's only record
+    /// that the stranger holds this anchor, leaving the migration's permit as
+    /// the sole entry. Note it is NOT the migration's *settle* that then hurts
+    /// — `handed_to_registry` inserts a live row on the anchor from BOTH arms
+    /// of the respawn match, so after a settle the anchor reads `Live`, just
+    /// as it does for the stranger's own settle two paragraphs up. The harm is
+    /// one step further out: any path where the migration's permit drops
+    /// WITHOUT settling — the RAII panic backstop, or a future early exit
+    /// inside the window, which is exactly what the paired `GUARD:` markers in
+    /// `migrate_session` exist to forbid — frees an anchor a still-in-flight
+    /// stranger believes it holds, and the next dispatch spawns alongside it.
+    /// The `warn!` is what makes the residual visible either way.
     ///
     /// The carried `anchor_key` survives that arm because
     /// [`restore_continuation_registration`] re-pins from the
@@ -2859,9 +2869,11 @@ enum AnchorHolder {
     /// P3 critical section — or a session mid-account-migration, whose lift
     /// holds the anchor across the respawn
     /// ([`ContinuationRegistry::take_live_reserving_anchor`]). No terminal
-    /// exists yet in the first case and the old one is being torn down in the
-    /// second, so there is nothing to
-    /// focus; the row is deferred exactly as for a live holder and re-delivery
+    /// The variant carries no `terminal_id` either way, so there is nothing to
+    /// focus — not because no terminal exists (during a migration the OLD pane
+    /// is untouched and still running at its limit prompt; it is closed only
+    /// after the re-pin), but because a permit names an anchor and not a tab.
+    /// The row is deferred exactly as for a live holder and re-delivery
     /// finds either the registered session or a released anchor.
     Reserved,
 }
