@@ -733,6 +733,42 @@ ALTER SEQUENCE agent.memory_query_cache_id_seq OWNED BY agent.memory_query_cache
 
 
 --
+-- Name: plan_scan_root_observations; Type: TABLE; Schema: agent; Owner: -
+--
+
+CREATE TABLE agent.plan_scan_root_observations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    organization_id uuid,
+    device_id uuid NOT NULL,
+    state text NOT NULL,
+    plans_dir text,
+    repo_root text,
+    source_repo text,
+    default_ref text,
+    ref_sha text,
+    head_sha text,
+    behind bigint,
+    ahead bigint,
+    ref_age_secs bigint,
+    counts_are_floors boolean NOT NULL,
+    detail text,
+    observed_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_report_applied boolean DEFAULT true NOT NULL,
+    last_report_observed_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    ref_census jsonb,
+    ref_census_digest text,
+    work_tree_census jsonb,
+    work_tree_census_digest text,
+    census_ref_sha text,
+    census_observed_at timestamp with time zone,
+    CONSTRAINT ck_plan_scan_root_observations_counts_nonnegative CHECK ((((behind IS NULL) OR (behind >= 0)) AND ((ahead IS NULL) OR (ahead >= 0)) AND ((ref_age_secs IS NULL) OR (ref_age_secs >= 0)))),
+    CONSTRAINT ck_plan_scan_root_observations_state CHECK ((state = ANY (ARRAY['measured'::text, 'not_scanning'::text, 'not_a_git_work_tree'::text, 'unknown'::text])))
+);
+
+
+--
 -- Name: session_artifacts; Type: TABLE; Schema: agent; Owner: -
 --
 
@@ -928,6 +964,22 @@ CREATE SEQUENCE auth.audit_logs_id_seq
 --
 
 ALTER SEQUENCE auth.audit_logs_id_seq OWNED BY auth.audit_logs.id;
+
+
+--
+-- Name: claude_account_profiles; Type: TABLE; Schema: auth; Owner: -
+--
+
+CREATE TABLE auth.claude_account_profiles (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    user_id uuid NOT NULL,
+    account_key character varying(100) NOT NULL,
+    shortcut character varying(20) NOT NULL,
+    email character varying(320),
+    dir_name character varying(200),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
 
 
 --
@@ -1353,6 +1405,8 @@ CREATE TABLE coord.agent_questions (
     responded_by_operator text,
     tenant_id uuid NOT NULL,
     audience text DEFAULT 'operator'::text NOT NULL,
+    alert_id bigint,
+    alert_key text,
     CONSTRAINT coord_agent_questions_audience_check CHECK ((audience = ANY (ARRAY['operator'::text, 'agent'::text])))
 );
 
@@ -1462,6 +1516,8 @@ CREATE TABLE coord.agent_worktrees (
     trigger_signal text,
     work_unit_id uuid,
     retention text DEFAULT 'auto'::text NOT NULL,
+    dispatch_source text,
+    credentialed_at timestamp with time zone,
     CONSTRAINT agent_worktrees_status_chk CHECK ((status = ANY (ARRAY['allocated'::text, 'active'::text, 'merging'::text, 'merged'::text, 'abandoned'::text]))),
     CONSTRAINT coord_agent_worktrees_retention_check CHECK ((retention = ANY (ARRAY['auto'::text, 'pinned'::text])))
 );
@@ -1488,6 +1544,9 @@ CREATE TABLE coord.alerts (
     tenant_id uuid,
     resolution_action text,
     resolution_by uuid,
+    claimed_by text,
+    claimed_at timestamp with time zone,
+    claim_expires_at timestamp with time zone,
     CONSTRAINT alerts_severity_chk CHECK ((severity = ANY (ARRAY['info'::text, 'warning'::text, 'critical'::text])))
 );
 
@@ -1509,6 +1568,24 @@ CREATE SEQUENCE coord.alerts_id_seq
 --
 
 ALTER SEQUENCE coord.alerts_id_seq OWNED BY coord.alerts.id;
+
+
+--
+-- Name: attach_grants; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.attach_grants (
+    jti uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    source_device_id uuid NOT NULL,
+    target_device_id uuid NOT NULL,
+    target_session_id uuid NOT NULL,
+    terminal_id text,
+    source_user_id uuid,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    consumed_at timestamp with time zone
+);
 
 
 --
@@ -1658,6 +1735,297 @@ CREATE TABLE coord.ci_dispatches (
 
 
 --
+-- Name: ci_job_observations; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_job_observations (
+    repo text NOT NULL,
+    job_id bigint NOT NULL,
+    run_id bigint NOT NULL,
+    run_attempt integer DEFAULT 1 NOT NULL,
+    workflow_name text NOT NULL,
+    job_name text NOT NULL,
+    head_sha text,
+    head_branch text,
+    runner_name text,
+    runner_labels text[] DEFAULT '{}'::text[] NOT NULL,
+    self_hosted boolean NOT NULL,
+    conclusion text,
+    started_at timestamp with time zone,
+    completed_at timestamp with time zone,
+    duration_secs integer,
+    step_count integer,
+    failed_step_count integer,
+    outcome text NOT NULL,
+    duration_band text,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE ci_job_observations; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.ci_job_observations IS 'One row per completed GitHub Actions job, keyed (repo, job_id). Written and retained (30 days) by the coord module ci_job_sampler, which reads each completed run attempt in coord.ci_runs once through the paced GitHub App client and classifies every job with ci_job_outcome. Read by ci_runner_poison (the per-host detector) and ci_runner_probe (the restore canary). Plan 2026-09-14-a-poison-ci-runner-takes-every-job-and-no-detector-sees-it, Phase 1.';
+
+
+--
+-- Name: COLUMN ci_job_observations.job_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.job_id IS 'GitHub job id. Equals coord.pr_check_runs.check_id for an Actions-created check run. A re-run attempt is a new job id.';
+
+
+--
+-- Name: COLUMN ci_job_observations.run_attempt; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.run_attempt IS 'Attempt number of the run this job belongs to, from the jobs endpoint read with filter=all. Default 1.';
+
+
+--
+-- Name: COLUMN ci_job_observations.runner_name; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.runner_name IS 'GitHub runner_name of the job. NULL = unknown: the field was absent or null in the wire, which is not evidence of no runner. An empty string is stored as read and classified unknown.';
+
+
+--
+-- Name: COLUMN ci_job_observations.runner_labels; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.runner_labels IS 'The runs-on labels of the job as GitHub reports them. The detector derives a host peer set from these: hosts that ran jobs with the same label set in the same repos and window.';
+
+
+--
+-- Name: COLUMN ci_job_observations.self_hosted; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.self_hosted IS 'True when runner_labels contains self-hosted. ix_ci_job_obs_runner_completed is partial on it: a hosted job is never a host outcome.';
+
+
+--
+-- Name: COLUMN ci_job_observations.step_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.step_count IS 'Number of steps in the job. NULL when the wire carried no steps field at all; 0 when it carried an empty array. Only an absent steps field makes the outcome unknown.';
+
+
+--
+-- Name: COLUMN ci_job_observations.failed_step_count; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.failed_step_count IS 'Steps that concluded failure or timed_out. NULL when steps was absent from the wire. Zero failed steps on a failed job is the infra-shaped signal.';
+
+
+--
+-- Name: COLUMN ci_job_observations.outcome; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.outcome IS 'Classification by ci_job_outcome: pass | content_fail | infra_shaped | neutral | unknown. Text with no CHECK, as coord.notifications.kind is, so a new class is a Rust change rather than a migration. unknown rows never count toward a host share.';
+
+
+--
+-- Name: COLUMN ci_job_observations.duration_band; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_job_observations.duration_band IS 'For infra_shaped only: fast (under 60 s) | reaper_plateau (590 to 625 s or 890 to 925 s, the GitHub abandoned-job reaper and lost-communication timeout) | mid. NULL for every other outcome. No CHECK.';
+
+
+--
+-- Name: ci_pool_eligibility_baselines; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_pool_eligibility_baselines (
+    tenant_id uuid NOT NULL,
+    repo text NOT NULL,
+    pool text NOT NULL,
+    max_eligible_registrations integer NOT NULL,
+    max_observed_at timestamp with time zone NOT NULL,
+    last_eligible_registrations integer NOT NULL,
+    last_observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    alert_open boolean DEFAULT false NOT NULL,
+    CONSTRAINT ci_pool_eligibility_baselines_last_nonnegative_check CHECK ((last_eligible_registrations >= 0)),
+    CONSTRAINT ci_pool_eligibility_baselines_max_nonnegative_check CHECK ((max_eligible_registrations >= 0)),
+    CONSTRAINT ci_pool_eligibility_baselines_pool_nonempty_check CHECK ((pool <> ''::text)),
+    CONSTRAINT ci_pool_eligibility_baselines_repo_lowercase_check CHECK ((repo = lower(repo))),
+    CONSTRAINT ci_pool_eligibility_baselines_repo_nonempty_check CHECK ((repo <> ''::text))
+);
+
+
+--
+-- Name: TABLE ci_pool_eligibility_baselines; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.ci_pool_eligibility_baselines IS 'Per (tenant, repo, pool) high-water mark of eligible CI runner registrations, written by the coord pool-eligibility tick and read by the ci_pool_eligibility_declined alert. Persisted so a deploy or leader change does not re-seed the baseline at a post-incident value. Writers set last_observed_at explicitly on every update: there is no trigger.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.tenant_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.tenant_id IS 'Owning tenant. FK to coord.tenants ON DELETE CASCADE, so a deleted tenant leaves no baseline behind to be misread if its id is ever reused.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.repo IS 'GitHub repository as owner/name, lowercased by the writer. GitHub treats owner/name case-insensitively, so two spellings would split one baseline in two; the repo_lowercase CHECK rejects an unnormalised write.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.pool; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.pool IS 'Pool key: the runs-on label set, lowercased, sorted, joined with a comma. Rendered by one shared writer function; two spellings would split one pool into two baselines.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.max_eligible_registrations; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.max_eligible_registrations IS 'High-water mark of eligible registrations, online or not. Decays to the current count once max_observed_at is older than 7 days.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.max_observed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.max_observed_at IS 'When the high-water mark was last set. Starts the 7-day decay window. No default: the tick decides it.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.last_eligible_registrations; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.last_eligible_registrations IS 'Eligible registrations at the most recent tick that could count the pool. An uncountable pool is not written, so this is never a stand-in zero.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.last_observed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.last_observed_at IS 'When the last count was taken. The default covers INSERT only; every ON CONFLICT DO UPDATE must set it explicitly.';
+
+
+--
+-- Name: COLUMN ci_pool_eligibility_baselines.alert_open; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_pool_eligibility_baselines.alert_open IS 'True while ci_pool_eligibility_declined is raised for this pool, so the alert is raised once per transition across leader changes.';
+
+
+--
+-- Name: ci_runner_probes; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_runner_probes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    runner_name text NOT NULL,
+    repo text NOT NULL,
+    probe_label text NOT NULL,
+    quarantine_id uuid,
+    dispatched_at timestamp with time zone DEFAULT now() NOT NULL,
+    run_id bigint,
+    job_id bigint,
+    outcome text DEFAULT 'dispatched'::text NOT NULL,
+    duration_secs integer,
+    resolved_at timestamp with time zone
+);
+
+
+--
+-- Name: TABLE ci_runner_probes; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.ci_runner_probes IS 'One row per canary dispatch against a host probe label, written by the coord module ci_runner_probe: it dispatches the coord-runner-canary workflow against probe_label and resolves the row from the observation ci_job_sampler lands for the canary job. Unused until Phase 3 of plan 2026-09-14-a-poison-ci-runner-takes-every-job-and-no-detector-sees-it; created here so that phase needs no migration.';
+
+
+--
+-- Name: COLUMN ci_runner_probes.quarantine_id; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_probes.quarantine_id IS 'The coord.ci_runner_quarantines decision this probe serves. NULL = a calibration probe. Plain column, no FK.';
+
+
+--
+-- Name: COLUMN ci_runner_probes.outcome; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_probes.outcome IS 'dispatched | pass | infra_shaped | content_fail | inconclusive | not_acquired | wrong_runner | dispatch_failed | host_offline. Text with no CHECK; the closed set lives in the Rust enum that writes it.';
+
+
+--
+-- Name: ci_runner_quarantines; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.ci_runner_quarantines (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    runner_name text NOT NULL,
+    routing_label text NOT NULL,
+    state text NOT NULL,
+    refusal text,
+    alert_key text NOT NULL,
+    evidence jsonb NOT NULL,
+    repos text[] DEFAULT '{}'::text[] NOT NULL,
+    decided_at timestamp with time zone DEFAULT now() NOT NULL,
+    acted_at timestamp with time zone,
+    restored_at timestamp with time zone,
+    restored_by text,
+    requarantine_count integer DEFAULT 0 NOT NULL,
+    adjudication text DEFAULT 'pending'::text NOT NULL,
+    adjudicated_at timestamp with time zone,
+    adjudication_basis jsonb,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: TABLE ci_runner_quarantines; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.ci_runner_quarantines IS 'Decision ledger of the poison-runner detector: one row per decision about a host, written by the coord module ci_runner_poison. Phase 2 writes shadow rows only (shadow_would_act, shadow_refused) with no GitHub write path; Phase 4 adds active and the restore states. ux_ci_rq_active keeps at most one active row per (tenant_id, runner_name, routing_label). Plan 2026-09-14-a-poison-ci-runner-takes-every-job-and-no-detector-sees-it, Phase 2.';
+
+
+--
+-- Name: COLUMN ci_runner_quarantines.state; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_quarantines.state IS 'shadow_would_act | shadow_refused | active | restored | released_by_operator | released_out_of_band | abandoned. Text with no CHECK, as coord.notifications.kind is; the closed set lives in the Rust enum that writes it.';
+
+
+--
+-- Name: COLUMN ci_runner_quarantines.refusal; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_quarantines.refusal IS 'Which guard refused, for shadow_refused and for a refused act. NULL when nothing refused.';
+
+
+--
+-- Name: COLUMN ci_runner_quarantines.evidence; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_quarantines.evidence IS 'The detector inputs behind the decision: n, k, share, peer share, paired keys, duration bands and the job ids they came from.';
+
+
+--
+-- Name: COLUMN ci_runner_quarantines.adjudication; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_quarantines.adjudication IS 'pending | confirmed | false_positive | unknown, written by the adjudicator once the decision is 24h old, from later observations; the basis is in adjudication_basis. No CHECK. Unknowns are reported and excluded from the false-positive denominator.';
+
+
+--
+-- Name: COLUMN ci_runner_quarantines.updated_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runner_quarantines.updated_at IS 'The default covers INSERT only; there is no trigger, so every UPDATE must set it explicitly.';
+
+
+--
 -- Name: ci_runs; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -1672,8 +2040,16 @@ CREATE TABLE coord.ci_runs (
     conclusion text,
     cancel_in_progress boolean,
     concurrency_group text,
-    observed_at timestamp with time zone DEFAULT now() NOT NULL
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    run_attempt integer
 );
+
+
+--
+-- Name: COLUMN ci_runs.run_attempt; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.ci_runs.run_attempt IS 'GitHub run_attempt of this workflow run, written by the coord module ci_runs_watcher from both of its ingest paths: the workflow_run webhook and the 60 s poll backstop. NULL = written before this column existed, or by a path that does not know the attempt; ci_job_sampler treats NULL as attempt 1. Nullable with no default so the column add rewrites no row.';
 
 
 --
@@ -2202,6 +2578,22 @@ CREATE TABLE coord.correlation_topics (
 
 
 --
+-- Name: create_grants; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.create_grants (
+    jti uuid NOT NULL,
+    tenant_id uuid NOT NULL,
+    source_device_id uuid NOT NULL,
+    target_device_id uuid NOT NULL,
+    source_user_id uuid,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    consumed_at timestamp with time zone
+);
+
+
+--
 -- Name: dependency_observations; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -2572,6 +2964,23 @@ CREATE TABLE coord.device_resource_samples (
     saturation_source text,
     thread_count integer,
     active_terminal_sessions integer,
+    disk_inodes_total bigint,
+    disk_inodes_free bigint,
+    swap_shmem_bytes bigint,
+    sock_probe_port integer,
+    sock_close_wait_local integer,
+    sock_close_wait_remote integer,
+    sock_established_local integer,
+    sock_time_wait_local integer,
+    sock_source text,
+    readiness_safe boolean,
+    readiness_reason text,
+    readiness_blocking integer,
+    readiness_finished integer,
+    wind_down_candidates integer,
+    wind_down_exit_stuck integer,
+    wind_down_sessions jsonb,
+    blocking_lanes jsonb,
     CONSTRAINT ck_device_resource_samples_lane CHECK ((lane = ANY (ARRAY['host'::text, 'wsl'::text, 'container'::text]))),
     CONSTRAINT ck_device_resource_samples_lane_instance_nonempty CHECK (((lane_instance IS NULL) OR (lane_instance <> ''::text)))
 );
@@ -2659,6 +3068,125 @@ COMMENT ON COLUMN coord.device_resource_samples.thread_count IS 'OS thread count
 --
 
 COMMENT ON COLUMN coord.device_resource_samples.active_terminal_sessions IS 'Live terminal sessions on this device at sample time. The EXPLANATORY signal carried alongside thread_count, deliberately NOT the trip condition: a machine can carry N sessions comfortably or N sessions each leaking a stuck spawn_blocking call, and only the thread count separates those. It is here so an operator (and the next incident''s forensics) can read both "how many sessions are live" and "how many threads that cost" — the same discipline EffectiveFloor/SampleVerdict already apply by always carrying the threshold AND the raw value. NULL = not probed, never 0: a fabricated 0 reads as "this machine is doing nothing", which is exactly the state an admission controller rewards with more work. Read together with thread_count; neither is interpretable alone.';
+
+
+--
+-- Name: COLUMN device_resource_samples.disk_inodes_total; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.disk_inodes_total IS 'Inode ceiling of the mount named by disk_mount — statfs(2) f_files, the same O(1) superblock read qontinui-claude-config''s scripts/tmpfs-inode-probe.sh already makes. NULL means NO CEILING IS MEASURABLE, which is a real filesystem fact and not only a failed probe: btrfs, xfs and zfs allocate inodes dynamically and report f_files = 0. Both cases must render UNKNOWN. NEVER fabricate a value: a ratio consumer must NULLIF this divisor (no CHECK forbids a 0, for the same reason threads_max = 0 is allowed — forbidding it would make an oddly-reporting machine unable to report at all), and a substituted 0-used-of-0 would compute the HEALTHIEST possible reading on exactly the filesystems where nothing is measurable. Measured 1,048,576 on merytshost''s /tmp tmpfs (nr_inodes=), the mount that exhausted sixteen times.';
+
+
+--
+-- Name: COLUMN device_resource_samples.disk_inodes_free; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.disk_inodes_free IS 'Free inodes on disk_mount — statfs(2) f_ffree. With disk_inodes_total this is the fleet''s THIRD pressure axis, orthogonal to both memory and the task table: a box can read 0 percent on pressure and 0 percent on saturation and still refuse every open(O_CREAT). It composes into the dispatcher''s GREATEST(pressure, saturation) ASC NULLS LAST as a third argument — rank by the worst axis, unmeasured last — and is a RANKING input only: headroom ranks and never excludes (headroom_is_a_ranking_input_and_never_a_filter). An exclusion threshold would be a drain predicate, a different mechanism. NULL = not probed or no cap; never 0, which reads as fully exhausted. Measured 300,880 free of 1,048,576 (71.3 percent used) at 2026-09-04 04:12Z while df -h on the same mount said 37 percent and MemAvailable said 77 percent free.';
+
+
+--
+-- Name: COLUMN device_resource_samples.swap_shmem_bytes; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.swap_shmem_bytes IS 'How much of swap_used_bytes is SHMEM (cold tmpfs pages) rather than process anonymous memory. Exists because the Linux lanes publish pressure = swap_used / swap_total, and on 2026-09-04 that ratio read 0.727 on a box with 283.7 GiB (77 percent) of memory available: 62.6 GiB of the 73.5 GiB in use was cold tmpfs, and the largest single process VmSwap on the box was 0.23 GiB. That 0.727 feeds GREATEST(pressure, saturation) in ci_dispatch and ranks the machine near-last for CI dispatch PERMANENTLY, because a tmpfs full of cold files never drains. NULL = not decomposed; never 0, which asserts that none of swap is shmem. HONEST BOUND: /proc/meminfo exposes no counter for swapped-out tmpfs — Shmem is RESIDENT tmpfs and SwapCached is something else again — so this number is an INFERENCE whose instrument matters (a per-mount statfs difference, or swap_used minus the sum of VmSwap over /proc/[0-9]*/status). This column is OBSERVABILITY FIRST: it does NOT authorise changing lane_pressure''s formula to net out shmem, which is a live behaviour change to dispatch ranking on every Linux box and needs its own vetted plan once this column has served long enough to show what the corrected ratio would be.';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_probe_port; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_probe_port IS 'The single listener port this row''s socket census was taken on — 9876 (primary runner), 9877 / 9878 (secondaries). Every sock_* count on the row is scoped to THIS port and is meaningless without it. NULL = the row carries no socket census at all, which is every row until a publisher ships. A NULL port with non-NULL counts is malformed (counts with no subject) and a consumer must read it as unmeasured rather than guess a port. A device censusing two listeners emits two rows on the existing (device_id, lane, lane_instance) anchor; this adds no anchor dimension. INTEGER: coord reads it as Option<i32>, like every other INTEGER on this table (cpu_cores, build_slots_*, ci_jobs_running).';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_close_wait_local; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_close_wait_local IS 'Sockets in CLOSE_WAIT where sock_probe_port is the LOCAL port — i.e. SERVER-side, the listener''s own process owns the descriptor. The peer sent FIN and this side has not yet closed its fd. A TRANSIENT count here is ORDINARY - bare TCP probes (a port check that sends no request) produce it one-for-one and it drains sub-second; full HTTP request/response cycles produce none. Only a count that PERSISTS across samples indicts the listener. The 2026-08-31 reading of 148 was NOT such a leak - vetting refuted it by measurement, and an earlier plan had already recorded the same signal as transient. NULL = not probed (no ss, no netstat, or a publisher predating the probe). NEVER a fabricated 0 — a MEASURED 0 is the healthy baseline this plan''s growth figure is taken against, so 0 and NULL are different facts and only a publisher that actually ran a probe may write the 0. REPORTING ONLY: this must not gate dispatch or feed lane_pressure / lane_saturation / headroom.';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_close_wait_remote; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_close_wait_remote IS 'Sockets in CLOSE_WAIT where sock_probe_port is the REMOTE port — i.e. CLIENT-side, some probe process on this box owns the descriptor, not the listener. Split from sock_close_wait_local because the two name different culprits in different processes while a summed column reads identically for both: a client-side leak does not starve the listener''s accept path at all. The split is what makes a loopback census legible, since a probe on the same host as the listener sees BOTH ends of every 127.0.0.1 connection. Not comparable with the *_local columns and must never be summed into them. NULL = not probed, never a fabricated 0.';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_established_local; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_established_local IS 'Sockets in ESTABLISHED where sock_probe_port is the LOCAL port. A control, not a symptom: it is the denominator that turns a raw CLOSE_WAIT count into a verdict about the LISTENER rather than about traffic volume. Same side as sock_close_wait_local and sock_time_wait_local, so the three are comparable with each other. NULL = not probed, never a fabricated 0.';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_time_wait_local; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_time_wait_local IS 'Sockets in TIME_WAIT where sock_probe_port is the LOCAL port. The second control: TIME_WAIT is the normal terminal state of a connection the SERVER closed, so it distinguishes a listener churning connections healthily from one that has stopped reaping them. A high CLOSE_WAIT beside a near-zero TIME_WAIT is the signature of the 2026-08-31 fault; a high CLOSE_WAIT beside a high TIME_WAIT is ordinary load. NULL = not probed, never a fabricated 0.';
+
+
+--
+-- Name: COLUMN device_resource_samples.sock_source; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.sock_source IS 'Which instrument produced the sock_* counts: ss | netstat | unavailable, or NULL when unrecorded. Not bookkeeping — ss reads the kernel''s sockets over netlink sock_diag while Windows netstat is a different implementation with different truncation behaviour under load, and it is the only one available on this fleet''s host lane, so a publisher that tries ss, fails and falls back emits numbers on a different footing with nothing else in the row saying so (the hazard saturation_source exists for, one lane over). The value ''unavailable'' is a MEASUREMENT, not an absence: it means the publisher ran and neither instrument was reachable, which is strictly more informative than NULL (nothing said anything) — so a row may carry sock_source = ''unavailable'' with all four counts NULL. Free text, NOT CHECKed: the set is open (a Windows-native GetExtendedTcpTable arm or a /proc/net/tcp reader are plausible additions) and a CHECK violation would fail the whole best-effort INSERT, discarding the memory, disk and saturation metrics on the row over a provenance label. Validated app-side at the door, the same split as this table''s CHECKed lane vs free-text source.';
+
+
+--
+-- Name: COLUMN device_resource_samples.readiness_safe; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.readiness_safe IS 'The publishing runner''s own GET /restart-readiness safe_to_restart verdict at sample time (plan 2026-09-13-drained-runner-never-reaches-idle, D8). NULL = UNKNOWN (a runner build that predates the field, or a readiness probe that failed) and must NEVER be defaulted to true or false: true tells an operator a runner with live work is safe to restart, false fabricates a refusal nothing measured. A consumer renders a sample older than 3 minutes as UNKNOWN too, never as its last verdict.';
+
+
+--
+-- Name: COLUMN device_resource_samples.readiness_reason; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.readiness_reason IS 'The runner''s reason string for readiness_safe, verbatim. NULL = not probed. Free text with no CHECK: an unrecognised reason must reach the operator rather than fail the best-effort INSERT and discard the other metrics on this row.';
+
+
+--
+-- Name: COLUMN device_resource_samples.readiness_blocking; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.readiness_blocking IS 'Sessions on the publishing runner that block a restart at sample time. NULL = not probed, NEVER 0: a fabricated 0 reads as nothing in the way, which is exactly the state that invites a restart. INTEGER because coord reads this counter group as Option<i32>.';
+
+
+--
+-- Name: COLUMN device_resource_samples.readiness_finished; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.readiness_finished IS 'Sessions on the publishing runner whose coord session_status is finished at sample time. finished is a DECLARATION, never an inference (plan D4). NULL = not probed, never 0. INTEGER, read as Option<i32>.';
+
+
+--
+-- Name: COLUMN device_resource_samples.wind_down_candidates; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.wind_down_candidates IS 'Sessions the drain wind-down is considering at sample time: finished AND idle, close-eligible or still inside the grace period (plan D4). NULL = not probed, NEVER 0; a runner that is probed and not draining reports 0. INTEGER, read as Option<i32>.';
+
+
+--
+-- Name: COLUMN device_resource_samples.wind_down_exit_stuck; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.wind_down_exit_stuck IS 'Sessions whose graceful /exit did not end claude within the deadline and were LEFT RUNNING, never killed (plan D5). Each one still blocks a restart and needs an operator. NULL = not probed, NEVER 0: a fabricated 0 hides the sessions that need a human. INTEGER, read as Option<i32>.';
+
+
+--
+-- Name: COLUMN device_resource_samples.wind_down_sessions; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.wind_down_sessions IS 'Bounded JSONB array of per-session wind-down state, each {claude_code_session_id, blocks_restart, idle_state, close_eligible_at?, exit_stuck} (plan D8). NULL = not probed; [] = probed and nothing is winding down; the two are different facts. Length is bounded by design by the runner continuation-session cap (default 64, operator-overridable) and ENFORCED at coord ingest; truncation is stated in the payload, never silent. No CHECK on length, which would fail the whole best-effort INSERT. Growth over time is bounded by coord prune_samples (default 7-day rolling window on sampled_at).';
+
+
+--
+-- Name: COLUMN device_resource_samples.blocking_lanes; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.device_resource_samples.blocking_lanes IS 'Per-spawning-runtime in-flight tracked-blocking-body counts on the publishing runner at sample time, from wedge_diagnostics::tracked_blocking_by_thread() (plan 2026-09-16-runner-blocking-lane-telemetry-to-coord). Meaningful only on the host lane, the same row that carries thread_count / active_terminal_sessions (lasac_01) — a non-host lane row has no value for it, for the same reason it has none for those. NULL = NOT REPORTED (a runner build that predates this field, or a probe that failed this cycle) and must NEVER be read as "no blocking lanes are active" — that inverts the signal exactly as a fabricated thread_count = 0 would. {} (empty object) = reported, and every tracked lane''s in-flight count was zero everywhere; NULL and {} are different facts and must stay distinct, the same discipline wind_down_sessions (drr_01) established. A non-empty object is {lane_name: in_flight_count}, e.g. {"tokio-rt-worker": 3, "fleet-pub-rt": 1} — bounded to at most MAX_BLOCKING_LANES (15) plus one overflow lane by the runner''s own LaneTable, so no CHECK is needed here. Growth over time is bounded by coord prune_samples (default 7-day rolling window on sampled_at).';
 
 
 --
@@ -2757,6 +3285,10 @@ CREATE TABLE coord.devices (
     served_commits_behind integer,
     reaped_at timestamp with time zone,
     max_concurrent_ci_jobs integer,
+    accept_remote_attach text DEFAULT 'same_user'::text NOT NULL,
+    accept_remote_create text DEFAULT 'off'::text NOT NULL,
+    CONSTRAINT coord_devices_accept_remote_attach_check CHECK ((accept_remote_attach = ANY (ARRAY['same_user'::text, 'tenant'::text, 'off'::text]))),
+    CONSTRAINT coord_devices_accept_remote_create_check CHECK ((accept_remote_create = ANY (ARRAY['off'::text, 'same_user'::text, 'tenant'::text]))),
     CONSTRAINT devices_role_chk CHECK (((role IS NULL) OR (role = ANY (ARRAY['agent'::text, 'build'::text, 'cache'::text, 'coord'::text])))),
     CONSTRAINT devices_state_chk CHECK ((state = ANY (ARRAY['healthy'::text, 'degraded'::text, 'partitioned'::text, 'abandoned'::text])))
 );
@@ -2781,6 +3313,85 @@ COMMENT ON COLUMN coord.devices.reaped_at IS 'When coord retired this device row
 --
 
 COMMENT ON COLUMN coord.devices.max_concurrent_ci_jobs IS 'How many CI jobs this device will run concurrently, as advertised by qontinui-runner. Read ONLY by coord ci_dispatch, for devices matching capabilities @> ''["ci_node"]''. NULL = no publisher has asserted a CI slot count; coord floors the read at 1 (GREATEST(COALESCE(...,0),1)) so a NULL or a stale 0 still admits one job — the capability is a 30s heartbeat signal while this column is written by a 600s republisher, and ANDing the two is what silenced the shadow lane for six days on 2026-07-28. Do NOT confuse with max_concurrent_builds, which is build-POOL slots, is owned by qontinui-supervisor, and is read only by build_dispatcher: one column meaning both is the defect this split exists to end.';
+
+
+--
+-- Name: displaced_pr_rows; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.displaced_pr_rows (
+    repo text NOT NULL,
+    pr_number integer NOT NULL,
+    branch text,
+    base_branch text,
+    head_sha text,
+    pr_state text,
+    close_cause text,
+    merge_commit_sha text,
+    merged_at timestamp with time zone,
+    touched_files text[],
+    source text NOT NULL,
+    displaced_by_pr_number integer,
+    displaced_at timestamp with time zone DEFAULT now() NOT NULL,
+    last_refreshed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT displaced_pr_rows_source_check CHECK ((source = ANY (ARRAY['rebind'::text, 'first_observation'::text])))
+);
+
+
+--
+-- Name: TABLE displaced_pr_rows; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.displaced_pr_rows IS 'Last-known coord.repo_branches row of a PR whose (repo, branch) key was taken by a later PR, plus first observations of such PRs. Keyed per PR because repo_branches is keyed per branch and a rebind otherwise destroys the earlier PR record. Readers prefer a live repo_branches row for the same (repo, pr_number) and fall back here. Writers set last_refreshed_at explicitly on every update: there is no trigger.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.repo IS 'Same value as coord.repo_branches.repo for the displaced row.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.pr_number; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.pr_number IS 'The displaced PR. With repo, the key: one row per PR, never per branch.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.branch; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.branch IS 'Head branch the PR was on. NULL when unknown, as for a first observation sourced from a coord land event alone.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.source; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.source IS 'Which writer produced the row. rebind: copied from repo_branches in the statement that rebound its branch key to another PR. first_observation: the first record of a PR displaced before rebind archiving existed.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.displaced_by_pr_number; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.displaced_by_pr_number IS 'The PR that took the (repo, branch) key. NULL for a first_observation row.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.displaced_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.displaced_at IS 'When the row was first archived. Not moved on refresh.';
+
+
+--
+-- Name: COLUMN displaced_pr_rows.last_refreshed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.displaced_pr_rows.last_refreshed_at IS 'When a writer last wrote this row. The default covers INSERT only; every ON CONFLICT DO UPDATE must set it explicitly.';
 
 
 --
@@ -2919,7 +3530,9 @@ CREATE TABLE coord.findings (
     artifact_refs jsonb DEFAULT '{}'::jsonb NOT NULL,
     supersedes uuid,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    expires_at timestamp with time zone NOT NULL
+    expires_at timestamp with time zone NOT NULL,
+    triaged_at timestamp with time zone,
+    triaged_by text
 );
 
 
@@ -4183,6 +4796,7 @@ CREATE TABLE coord.merge_proposals (
     requeue_count integer DEFAULT 0 NOT NULL,
     land_route text,
     failure_class text,
+    candidate_ci_observed_at timestamp with time zone,
     CONSTRAINT merge_proposals_status_chk CHECK ((status = ANY (ARRAY['queued'::text, 'dry-rebasing'::text, 'awaiting-ci'::text, 'landing'::text, 'blocked-by-overlap'::text, 'conflict'::text, 'merged'::text, 'cancelled'::text, 'shadow-landed'::text, 'speculative-ci'::text])))
 );
 
@@ -4577,6 +5191,23 @@ CREATE TABLE coord.outbound_budget_observations (
 
 
 --
+-- Name: overlap_detections; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.overlap_detections (
+    event_id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid,
+    agent_a uuid NOT NULL,
+    agent_b uuid NOT NULL,
+    session_a uuid,
+    session_b uuid,
+    overlapping_paths text[] NOT NULL,
+    trigger text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
 -- Name: page_spec_paths; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4659,6 +5290,31 @@ COMMENT ON COLUMN coord.policy_clauses.category IS 'Denormalized copy of the par
 
 
 --
+-- Name: policy_rule_proposals; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.policy_rule_proposals (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    policy_id uuid NOT NULL,
+    field text NOT NULL,
+    from_value text NOT NULL,
+    to_value text NOT NULL,
+    direction text NOT NULL,
+    rationale text NOT NULL,
+    proposed_by text NOT NULL,
+    notification_ref uuid,
+    status text DEFAULT 'pending'::text NOT NULL,
+    decided_by text,
+    decided_at timestamp with time zone,
+    decision_note text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_policy_rule_proposals_direction CHECK ((direction = ANY (ARRAY['tightening'::text, 'loosening'::text]))),
+    CONSTRAINT ck_policy_rule_proposals_status CHECK ((status = ANY (ARRAY['pending'::text, 'approved'::text, 'rejected'::text])))
+);
+
+
+--
 -- Name: policy_rule_resolutions; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4678,6 +5334,20 @@ CREATE TABLE coord.policy_rule_resolutions (
     requester_device_id uuid,
     outcome_labeled_at timestamp with time zone,
     CONSTRAINT policy_rule_resolutions_outcome_category_check CHECK (((outcome_category IS NULL) OR (outcome_category = ANY (ARRAY['confirmed'::text, 'surprise'::text, 'failure'::text, 'contradiction'::text, 'partial'::text]))))
+);
+
+
+--
+-- Name: policy_rule_seed_undo; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.policy_rule_seed_undo (
+    revision text NOT NULL,
+    policy_id uuid NOT NULL,
+    disposition text NOT NULL,
+    prior jsonb,
+    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT policy_rule_seed_undo_disposition_check CHECK ((disposition = ANY (ARRAY['inserted'::text, 'updated'::text])))
 );
 
 
@@ -4708,6 +5378,7 @@ CREATE TABLE coord.policy_rules (
     payload jsonb,
     default_source text,
     overrides_system_rule_id uuid,
+    deleted_at timestamp with time zone,
     CONSTRAINT policy_rules_mode_kind_check CHECK (((((mode = 'deterministic'::text) AND (kind IS NOT NULL) AND (kind = ANY (ARRAY['baseline_waiver'::text, 'block_override'::text, 'escalation_rule'::text, 'question_auto_answer'::text, 'session_conflict_rule'::text]))) OR ((mode = ANY (ARRAY['guidance'::text, 'data_driven'::text])) AND ((kind IS NULL) OR (kind = ANY (ARRAY['baseline_waiver'::text, 'block_override'::text, 'escalation_rule'::text, 'question_auto_answer'::text, 'session_conflict_rule'::text]))))) AND ((decision_domain IS NULL) OR (decision_domain <> ''::text))))
 );
 
@@ -4870,6 +5541,45 @@ CREATE TABLE coord.pr_unlandable_attempts (
 
 
 --
+-- Name: prepaid_balances; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prepaid_balances (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    device_id uuid NOT NULL,
+    provider text NOT NULL,
+    label text,
+    currency text,
+    balance_micros bigint,
+    granted_micros bigint,
+    topped_up_micros bigint,
+    is_available boolean,
+    error text,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: primary_tree_branch_events; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.primary_tree_branch_events (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    device_id uuid NOT NULL,
+    repo text NOT NULL,
+    branch text NOT NULL,
+    agent_session_id text,
+    created_via text NOT NULL,
+    observed_created_at timestamp with time zone DEFAULT now() NOT NULL,
+    terminal_outcome text,
+    terminal_pr_number integer,
+    terminal_observed_at timestamp with time zone
+);
+
+
+--
 -- Name: primary_trees; Type: TABLE; Schema: coord; Owner: -
 --
 
@@ -4961,6 +5671,26 @@ CREATE TABLE coord.process_sessions (
     exit_code integer,
     state text DEFAULT 'running'::text NOT NULL,
     error_count integer DEFAULT 0 NOT NULL
+);
+
+
+--
+-- Name: prompt_document_claim_states; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.prompt_document_claim_states (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    tenant_id uuid NOT NULL,
+    kind text NOT NULL,
+    name text NOT NULL,
+    claim_id text NOT NULL,
+    anchor jsonb NOT NULL,
+    state text NOT NULL,
+    observed_at timestamp with time zone DEFAULT now() NOT NULL,
+    verified_at timestamp with time zone,
+    verified_against text,
+    detail jsonb DEFAULT '{}'::jsonb NOT NULL,
+    CONSTRAINT prompt_document_claim_states_state_check CHECK ((state = ANY (ARRAY['confirmed'::text, 'contradicted'::text, 'unknown'::text])))
 );
 
 
@@ -5101,7 +5831,6 @@ CREATE TABLE coord.prompt_document_versions (
     edited_by text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     agent_write_tier text,
-    agent_writable boolean,
     loosening boolean,
     notification_ref uuid,
     upstream_publication_version integer,
@@ -5116,13 +5845,6 @@ CREATE TABLE coord.prompt_document_versions (
 --
 
 COMMENT ON COLUMN coord.prompt_document_versions.agent_write_tier IS 'Snapshot of the parent''s agent_write_tier at this version. Carried forward by every version write including append, so a tier change is attributable to the operator via this row''s edited_by — which the parent''s mutable updated_by cannot be, since the next agent append overwrites it. A record, not a restore source: restoring an old body deliberately does not restore that version''s tier.';
-
-
---
--- Name: COLUMN prompt_document_versions.agent_writable; Type: COMMENT; Schema: coord; Owner: -
---
-
-COMMENT ON COLUMN coord.prompt_document_versions.agent_writable IS 'Snapshot of the parent''s agent_writable at this version. Carried forward by every version write including append, so a flip is attributable to the operator via this row''s edited_by — which the parent''s mutable updated_by cannot be, since the next agent append overwrites it.';
 
 
 --
@@ -5171,7 +5893,6 @@ CREATE TABLE coord.prompt_documents (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     attrs jsonb,
     agent_write_tier text,
-    agent_writable boolean,
     upstream_publication_version integer,
     upstream_tracking text DEFAULT 'track'::text NOT NULL,
     CONSTRAINT ck_prompt_documents_agent_write_tier CHECK (((agent_write_tier IS NULL) OR (agent_write_tier = ANY (ARRAY['deny'::text, 'allow'::text, 'allow_with_notification'::text])))),
@@ -5186,13 +5907,6 @@ CREATE TABLE coord.prompt_documents (
 --
 
 COMMENT ON COLUMN coord.prompt_documents.agent_write_tier IS 'May an agent write this document via coord_write_prompt_document, and on what terms? deny / allow / allow_with_notification, or NULL = no operator opinion — fall through to the per-(tenant, kind) setting in coord.prompt_document_kind_tiers, then to coord''s compile-time AGENT_UNWRITABLE_DOCUMENTS default. NULL is NOT deny. Replaces the agent_writable BOOLEAN (pdaw_01), whose true/false map to allow/deny. Operator-settable only, via the admin-gated PATCH /coord/prompt-documents/{kind}/{name}; coord_write_prompt_document has no argument that can reach it, which is what keeps the control non-circular. It cannot lift the compiled-in kind-wide FLOOR (is_kind_wide_agent_deny), which sits ABOVE it in the resolution order — claude_settings stays denied whatever this column says.';
-
-
---
--- Name: COLUMN prompt_documents.agent_writable; Type: COMMENT; Schema: coord; Owner: -
---
-
-COMMENT ON COLUMN coord.prompt_documents.agent_writable IS 'May an agent write this document via coord_write_prompt_document? TRUE = allow, FALSE = deny, NULL = no operator opinion — fall back to coord''s compile-time AGENT_UNWRITABLE_DOCUMENTS default (the three meta-policies deny, every other document allows). NULL is NOT false. Operator-settable only, via the admin-gated PATCH /coord/prompt-documents/{kind}/{name}; coord_write_prompt_document has no argument that can reach it, which is what keeps the control non-circular.';
 
 
 --
@@ -5322,7 +6036,8 @@ CREATE TABLE coord.repo_branches (
     required_checks_non_passing jsonb,
     required_checks_walk_at timestamp with time zone,
     required_checks_walk_truncated boolean,
-    required_checks_walk_head_sha text
+    required_checks_walk_head_sha text,
+    touched_files_authoritative_at timestamp with time zone
 );
 
 
@@ -5338,6 +6053,13 @@ COMMENT ON COLUMN coord.repo_branches.base_branch IS 'The branch this branch''s 
 --
 
 COMMENT ON COLUMN coord.repo_branches.pr_state IS 'open | draft | merged | closed | unknown';
+
+
+--
+-- Name: COLUMN repo_branches.touched_files_authoritative_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.repo_branches.touched_files_authoritative_at IS 'Set by coord''s citation re-enrich pass when touched_files on a TERMINAL PR row was hydrated from GitHub''s PR-files API; a stamped row is never re-selected.';
 
 
 --
@@ -5613,6 +6335,63 @@ CREATE SEQUENCE coord.schema_drift_events_id_seq
 --
 
 ALTER SEQUENCE coord.schema_drift_events_id_seq OWNED BY coord.schema_drift_events.id;
+
+
+--
+-- Name: schema_read_surfaces; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.schema_read_surfaces (
+    repo text NOT NULL,
+    branch text NOT NULL,
+    sha text NOT NULL,
+    surfaces jsonb NOT NULL,
+    pushed_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT ck_schema_read_surfaces_nonempty_array CHECK (((jsonb_typeof(surfaces) = 'array'::text) AND (jsonb_array_length(surfaces) > 0))),
+    CONSTRAINT ck_schema_read_surfaces_sha_40hex CHECK ((sha ~ '^[0-9a-f]{40}$'::text))
+);
+
+
+--
+-- Name: TABLE schema_read_surfaces; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON TABLE coord.schema_read_surfaces IS 'The durable `main` half of the coord column-drop guard: for each (repo, branch), the coord.* columns the code at `sha` reads, pushed by coord CI on every land and served by GET /coord/schema/read-surfaces. Latest row per (repo, branch), replaced on every land; not a history. Authored by qontinui-web alembic (schrs_01); coord reads and UPSERTs it but never authors DDL against it.';
+
+
+--
+-- Name: COLUMN schema_read_surfaces.repo; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.schema_read_surfaces.repo IS 'GitHub full_name of the producing repo (e.g. qontinui/qontinui-coord), in the coord.repo_branches.repo spelling so the ingest can join on it. Half of the primary key: one row per (repo, branch), replaced on every land — NOT a sha-keyed history.';
+
+
+--
+-- Name: COLUMN schema_read_surfaces.branch; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.schema_read_surfaces.branch IS 'Branch the read surfaces were extracted on. The guard''s reader always asks for ''main''; other branches are permitted but nothing reads them.';
+
+
+--
+-- Name: COLUMN schema_read_surfaces.sha; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.schema_read_surfaces.sha IS 'Full 40-hex commit the surfaces were extracted at. The ingest rejects a push whose sha is not coord.repo_branches.head_sha for this (repo, branch), so a stored row is never stale relative to what coord knows has landed; the reader still serves main: null plus a reason rather than a stale 200 if they disagree at read time.';
+
+
+--
+-- Name: COLUMN schema_read_surfaces.surfaces; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.schema_read_surfaces.surfaces IS 'JSON array of [table, column, source] triples naming every coord.* column the code at `sha` reads; `source` is file:line. Non-empty by CHECK: an empty manifest would read as ''main reads nothing'' and authorise every drop.';
+
+
+--
+-- Name: COLUMN schema_read_surfaces.pushed_at; Type: COMMENT; Schema: coord; Owner: -
+--
+
+COMMENT ON COLUMN coord.schema_read_surfaces.pushed_at IS 'When this row was last written by coord CI''s main-push workflow. Plain column default, evaluated per row at INSERT; the ingest''s UPSERT sets it explicitly on conflict.';
 
 
 --
@@ -6054,6 +6833,7 @@ CREATE TABLE coord.tenant_merge_settings (
     merge_paused boolean DEFAULT false NOT NULL,
     ff_land_head_sync_enabled boolean,
     require_review boolean,
+    auto_fix_pr boolean,
     CONSTRAINT ck_tms_credibility_weighted_pass_min_range CHECK (((credibility_weighted_pass_min IS NULL) OR ((credibility_weighted_pass_min >= (0)::double precision) AND (credibility_weighted_pass_min <= (1)::double precision))))
 );
 
@@ -6103,7 +6883,7 @@ CREATE TABLE coord.tenant_repo_profiles (
     post_merge_followup_code_paths text[],
     require_review_override boolean,
     CONSTRAINT ck_trp_credibility_weighted_pass_min_override_range CHECK (((credibility_weighted_pass_min_override IS NULL) OR ((credibility_weighted_pass_min_override >= (0)::double precision) AND (credibility_weighted_pass_min_override <= (1)::double precision)))),
-    CONSTRAINT tenant_repo_profiles_source_check CHECK ((profile_source = ANY (ARRAY['audit'::text, 'user_edit'::text, 'drift_accept'::text, 'manual'::text, 'preset'::text])))
+    CONSTRAINT tenant_repo_profiles_source_check CHECK ((profile_source = ANY (ARRAY['audit'::text, 'user_edit'::text, 'drift_accept'::text, 'manual'::text, 'preset'::text, 'preset_provisional'::text])))
 );
 
 
@@ -6130,6 +6910,18 @@ CREATE TABLE coord.tenant_repos (
     role text DEFAULT 'owner'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tenant_repos_role_check CHECK ((role = ANY (ARRAY['owner'::text, 'observer'::text])))
+);
+
+
+--
+-- Name: tenant_slug_history; Type: TABLE; Schema: coord; Owner: -
+--
+
+CREATE TABLE coord.tenant_slug_history (
+    old_slug text NOT NULL,
+    tenant_id uuid NOT NULL,
+    renamed_at timestamp with time zone DEFAULT now() NOT NULL,
+    renamed_by text
 );
 
 
@@ -6470,7 +7262,8 @@ CREATE TABLE coord.work_unit_pr_citations (
     pr_number integer,
     commit_sha text,
     source text NOT NULL,
-    cited_at timestamp with time zone DEFAULT now() NOT NULL
+    cited_at timestamp with time zone DEFAULT now() NOT NULL,
+    delivery_scope jsonb
 );
 
 
@@ -16565,6 +17358,14 @@ ALTER TABLE ONLY agent.memory_query_cache
 
 
 --
+-- Name: plan_scan_root_observations plan_scan_root_observations_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
+--
+
+ALTER TABLE ONLY agent.plan_scan_root_observations
+    ADD CONSTRAINT plan_scan_root_observations_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: session_artifacts session_artifacts_pkey; Type: CONSTRAINT; Schema: agent; Owner: -
 --
 
@@ -16610,6 +17411,14 @@ ALTER TABLE ONLY auth.analytics_events
 
 ALTER TABLE ONLY auth.audit_logs
     ADD CONSTRAINT audit_logs_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: claude_account_profiles claude_account_profiles_pkey; Type: CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.claude_account_profiles
+    ADD CONSTRAINT claude_account_profiles_pkey PRIMARY KEY (id);
 
 
 --
@@ -16698,6 +17507,22 @@ ALTER TABLE ONLY auth.storage_usage
 
 ALTER TABLE ONLY auth.team_members
     ADD CONSTRAINT team_members_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: claude_account_profiles uq_claude_account_profiles_user_key; Type: CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.claude_account_profiles
+    ADD CONSTRAINT uq_claude_account_profiles_user_key UNIQUE (user_id, account_key);
+
+
+--
+-- Name: claude_account_profiles uq_claude_account_profiles_user_shortcut; Type: CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.claude_account_profiles
+    ADD CONSTRAINT uq_claude_account_profiles_user_shortcut UNIQUE (user_id, shortcut);
 
 
 --
@@ -16829,6 +17654,14 @@ ALTER TABLE ONLY coord.alerts
 
 
 --
+-- Name: attach_grants attach_grants_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.attach_grants
+    ADD CONSTRAINT attach_grants_pkey PRIMARY KEY (jti);
+
+
+--
 -- Name: attempt_audits attempt_audits_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -16882,6 +17715,38 @@ ALTER TABLE ONLY coord.ci_baselines
 
 ALTER TABLE ONLY coord.ci_dispatches
     ADD CONSTRAINT ci_dispatches_pkey PRIMARY KEY (dispatch_id);
+
+
+--
+-- Name: ci_job_observations ci_job_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_job_observations
+    ADD CONSTRAINT ci_job_observations_pkey PRIMARY KEY (repo, job_id);
+
+
+--
+-- Name: ci_pool_eligibility_baselines ci_pool_eligibility_baselines_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_pool_eligibility_baselines
+    ADD CONSTRAINT ci_pool_eligibility_baselines_pkey PRIMARY KEY (tenant_id, repo, pool);
+
+
+--
+-- Name: ci_runner_probes ci_runner_probes_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_runner_probes
+    ADD CONSTRAINT ci_runner_probes_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: ci_runner_quarantines ci_runner_quarantines_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_runner_quarantines
+    ADD CONSTRAINT ci_runner_quarantines_pkey PRIMARY KEY (id);
 
 
 --
@@ -17061,6 +17926,14 @@ ALTER TABLE ONLY coord.correlation_topics
 
 
 --
+-- Name: create_grants create_grants_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.create_grants
+    ADD CONSTRAINT create_grants_pkey PRIMARY KEY (jti);
+
+
+--
 -- Name: dependency_observations dependency_observations_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -17154,6 +18027,14 @@ ALTER TABLE ONLY coord.device_status
 
 ALTER TABLE ONLY coord.devices
     ADD CONSTRAINT devices_pkey PRIMARY KEY (device_id);
+
+
+--
+-- Name: displaced_pr_rows displaced_pr_rows_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.displaced_pr_rows
+    ADD CONSTRAINT displaced_pr_rows_pkey PRIMARY KEY (repo, pr_number);
 
 
 --
@@ -17669,6 +18550,14 @@ ALTER TABLE ONLY coord.outbound_budget_observations
 
 
 --
+-- Name: overlap_detections overlap_detections_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.overlap_detections
+    ADD CONSTRAINT overlap_detections_pkey PRIMARY KEY (event_id);
+
+
+--
 -- Name: page_spec_paths page_spec_paths_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -17741,11 +18630,27 @@ ALTER TABLE ONLY coord.policy_clauses
 
 
 --
+-- Name: policy_rule_proposals policy_rule_proposals_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.policy_rule_proposals
+    ADD CONSTRAINT policy_rule_proposals_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: policy_rule_resolutions policy_rule_resolutions_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
 ALTER TABLE ONLY coord.policy_rule_resolutions
     ADD CONSTRAINT policy_rule_resolutions_pkey PRIMARY KEY (resolution_id);
+
+
+--
+-- Name: policy_rule_seed_undo policy_rule_seed_undo_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.policy_rule_seed_undo
+    ADD CONSTRAINT policy_rule_seed_undo_pkey PRIMARY KEY (revision, policy_id);
 
 
 --
@@ -17813,6 +18718,22 @@ ALTER TABLE ONLY coord.pr_unlandable_attempts
 
 
 --
+-- Name: prepaid_balances prepaid_balances_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prepaid_balances
+    ADD CONSTRAINT prepaid_balances_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: primary_tree_branch_events primary_tree_branch_events_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.primary_tree_branch_events
+    ADD CONSTRAINT primary_tree_branch_events_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: primary_trees primary_trees_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -17842,6 +18763,22 @@ ALTER TABLE ONLY coord.process_session_output
 
 ALTER TABLE ONLY coord.process_sessions
     ADD CONSTRAINT process_sessions_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: prompt_document_claim_states prompt_document_claim_states_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_document_claim_states
+    ADD CONSTRAINT prompt_document_claim_states_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: prompt_document_claim_states prompt_document_claim_states_tenant_id_kind_name_claim_id_key; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prompt_document_claim_states
+    ADD CONSTRAINT prompt_document_claim_states_tenant_id_kind_name_claim_id_key UNIQUE (tenant_id, kind, name, claim_id);
 
 
 --
@@ -18010,6 +18947,14 @@ ALTER TABLE ONLY coord.scheduler_ticks
 
 ALTER TABLE ONLY coord.schema_drift_events
     ADD CONSTRAINT schema_drift_events_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: schema_read_surfaces schema_read_surfaces_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.schema_read_surfaces
+    ADD CONSTRAINT schema_read_surfaces_pkey PRIMARY KEY (repo, branch);
 
 
 --
@@ -18221,6 +19166,14 @@ ALTER TABLE ONLY coord.tenant_repos
 
 
 --
+-- Name: tenant_slug_history tenant_slug_history_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_slug_history
+    ADD CONSTRAINT tenant_slug_history_pkey PRIMARY KEY (old_slug);
+
+
+--
 -- Name: tenant_warm_bytes tenant_warm_bytes_pkey; Type: CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -18322,6 +19275,14 @@ ALTER TABLE ONLY coord.fleet_runtime_policy_versions
 
 ALTER TABLE ONLY coord.policy_clauses
     ADD CONSTRAINT uq_policy_clauses_document_clause UNIQUE (document_id, clause_id);
+
+
+--
+-- Name: prepaid_balances uq_prepaid_balances_identity; Type: CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.prepaid_balances
+    ADD CONSTRAINT uq_prepaid_balances_identity UNIQUE (tenant_id, device_id, provider);
 
 
 --
@@ -21568,6 +22529,13 @@ CREATE INDEX ix_work_artifacts_work_unit_slug ON agent.work_artifacts USING btre
 
 
 --
+-- Name: uq_plan_scan_root_observations_identity; Type: INDEX; Schema: agent; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_plan_scan_root_observations_identity ON agent.plan_scan_root_observations USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), device_id);
+
+
+--
 -- Name: uq_session_artifacts_identity; Type: INDEX; Schema: agent; Owner: -
 --
 
@@ -21601,6 +22569,13 @@ CREATE UNIQUE INDEX uq_work_artifact_versions_doc_version ON agent.work_artifact
 --
 
 CREATE UNIQUE INDEX uq_work_artifacts_identity ON agent.work_artifacts USING btree (COALESCE(organization_id, '00000000-0000-0000-0000-000000000000'::uuid), kind, slug, COALESCE(source_repo, ''::text));
+
+
+--
+-- Name: idx_claude_account_profiles_user; Type: INDEX; Schema: auth; Owner: -
+--
+
+CREATE INDEX idx_claude_account_profiles_user ON auth.claude_account_profiles USING btree (user_id);
 
 
 --
@@ -22325,6 +23300,20 @@ CREATE INDEX idx_agent_worktrees_agent_session ON coord.agent_worktrees USING bt
 
 
 --
+-- Name: idx_agent_worktrees_dispatch_inflight_device; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_dispatch_inflight_device ON coord.agent_worktrees USING btree (device_id, created_at) WHERE (dispatch_source IS NOT NULL);
+
+
+--
+-- Name: idx_agent_worktrees_dispatch_inflight_tenant; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_agent_worktrees_dispatch_inflight_tenant ON coord.agent_worktrees USING btree (tenant_id, created_at) WHERE (dispatch_source IS NOT NULL);
+
+
+--
 -- Name: idx_agent_worktrees_machine_status; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22374,6 +23363,13 @@ CREATE INDEX idx_alerts_active_severity ON coord.alerts USING btree (severity, l
 
 
 --
+-- Name: idx_alerts_claim_expiry; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_alerts_claim_expiry ON coord.alerts USING btree (claim_expires_at) WHERE ((resolved_at IS NULL) AND (claimed_by IS NOT NULL));
+
+
+--
 -- Name: idx_alerts_paged; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22392,6 +23388,13 @@ CREATE INDEX idx_alerts_red_main_flake_healed ON coord.alerts USING btree (kind)
 --
 
 CREATE INDEX idx_alerts_tenant_id ON coord.alerts USING btree (tenant_id) WHERE (tenant_id IS NOT NULL);
+
+
+--
+-- Name: idx_attach_grants_target_expires; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_attach_grants_target_expires ON coord.attach_grants USING btree (target_device_id, expires_at);
 
 
 --
@@ -22518,6 +23521,13 @@ CREATE INDEX idx_claims_audit_machine ON coord.claims_audit USING btree (device_
 --
 
 CREATE INDEX idx_claims_audit_resource ON coord.claims_audit USING btree (claim_kind, resource_key, occurred_at DESC);
+
+
+--
+-- Name: idx_client_telemetry_observations_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_client_telemetry_observations_observed_at ON coord.client_telemetry_observations USING btree (observed_at);
 
 
 --
@@ -22668,6 +23678,13 @@ CREATE INDEX idx_correlation_topics_id ON coord.correlation_topics USING btree (
 
 
 --
+-- Name: idx_create_grants_target_expires; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_create_grants_target_expires ON coord.create_grants USING btree (target_device_id, expires_at);
+
+
+--
 -- Name: idx_csd_instance; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22794,6 +23811,13 @@ CREATE INDEX idx_error_observations_surface_window ON coord.error_observations U
 
 
 --
+-- Name: idx_error_observations_window_start; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_error_observations_window_start ON coord.error_observations USING btree (window_start);
+
+
+--
 -- Name: idx_events_created; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -22847,6 +23871,13 @@ CREATE INDEX idx_findings_tenant_recent ON coord.findings USING btree (tenant_id
 --
 
 CREATE INDEX idx_findings_topic ON coord.findings USING btree (topic) WHERE (topic IS NOT NULL);
+
+
+--
+-- Name: idx_findings_untriaged; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_findings_untriaged ON coord.findings USING btree (tenant_id, created_at) WHERE (triaged_at IS NULL);
 
 
 --
@@ -23095,6 +24126,13 @@ CREATE INDEX idx_infra_drift_observations_provenance_observed ON coord.infra_dri
 
 
 --
+-- Name: idx_infra_health_observations_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_infra_health_observations_observed_at ON coord.infra_health_observations USING btree (observed_at);
+
+
+--
 -- Name: idx_infra_health_observations_resource_observed_at; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -23214,6 +24252,13 @@ CREATE INDEX idx_memories_tenant_id ON coord.memories USING btree (tenant_id) WH
 
 
 --
+-- Name: idx_memory_anchor_observations_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_anchor_observations_observed_at ON coord.memory_anchor_observations USING btree (observed_at);
+
+
+--
 -- Name: idx_memory_anchor_observations_tenant_observed; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -23239,6 +24284,13 @@ CREATE INDEX idx_memory_links_tenant_source ON coord.memory_links USING btree (t
 --
 
 CREATE INDEX idx_memory_links_tenant_target ON coord.memory_links USING btree (tenant_id, target_id);
+
+
+--
+-- Name: idx_memory_observations_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_memory_observations_observed_at ON coord.memory_observations USING btree (observed_at);
 
 
 --
@@ -23466,6 +24518,27 @@ CREATE INDEX idx_origin_resolution_observations_domain_path_observed_at ON coord
 
 
 --
+-- Name: idx_origin_resolution_observations_observed_at; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_origin_resolution_observations_observed_at ON coord.origin_resolution_observations USING btree (observed_at);
+
+
+--
+-- Name: idx_overlap_det_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_overlap_det_created ON coord.overlap_detections USING btree (created_at);
+
+
+--
+-- Name: idx_overlap_det_tenant_created; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_overlap_det_tenant_created ON coord.overlap_detections USING btree (tenant_id, created_at);
+
+
+--
 -- Name: idx_page_spec_paths_repo_head_path; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -23505,6 +24578,20 @@ CREATE INDEX idx_pie_source ON coord.prompt_injection_events USING btree (tenant
 --
 
 CREATE INDEX idx_pie_tenant_created ON coord.prompt_injection_events USING btree (tenant_id, created_at DESC);
+
+
+--
+-- Name: idx_policy_rule_proposals_policy; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_policy_rule_proposals_policy ON coord.policy_rule_proposals USING btree (policy_id, created_at DESC);
+
+
+--
+-- Name: idx_policy_rule_proposals_tenant_status; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_policy_rule_proposals_tenant_status ON coord.policy_rule_proposals USING btree (tenant_id, status, created_at DESC);
 
 
 --
@@ -23722,6 +24809,27 @@ CREATE INDEX idx_process_sessions_config_id ON coord.process_sessions USING btre
 --
 
 CREATE INDEX idx_process_sessions_started_at ON coord.process_sessions USING btree (started_at);
+
+
+--
+-- Name: idx_prompt_document_claim_states_doc; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_prompt_document_claim_states_doc ON coord.prompt_document_claim_states USING btree (tenant_id, kind, name);
+
+
+--
+-- Name: idx_ptbe_device_repo_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ptbe_device_repo_observed ON coord.primary_tree_branch_events USING btree (device_id, repo, observed_created_at DESC);
+
+
+--
+-- Name: idx_ptbe_open; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_ptbe_open ON coord.primary_tree_branch_events USING btree (repo, branch) WHERE (terminal_outcome IS NULL);
 
 
 --
@@ -24166,6 +25274,13 @@ CREATE INDEX idx_tenant_repos_by_repo ON coord.tenant_repos USING btree (repo);
 
 
 --
+-- Name: idx_tenant_slug_history_tenant_id; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_tenant_slug_history_tenant_id ON coord.tenant_slug_history USING btree (tenant_id);
+
+
+--
 -- Name: idx_test_coverage_map_files_touched; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -24215,10 +25330,17 @@ CREATE INDEX idx_test_results_repo_head ON coord.test_results USING btree (repo,
 
 
 --
--- Name: idx_test_results_repo_test; Type: INDEX; Schema: coord; Owner: -
+-- Name: idx_test_results_repo_observed; Type: INDEX; Schema: coord; Owner: -
 --
 
-CREATE INDEX idx_test_results_repo_test ON coord.test_results USING btree (repo, test_id);
+CREATE INDEX idx_test_results_repo_observed ON coord.test_results USING btree (repo, observed_at DESC);
+
+
+--
+-- Name: idx_test_results_repo_test_observed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX idx_test_results_repo_test_observed ON coord.test_results USING btree (repo, test_id, observed_at DESC);
 
 
 --
@@ -24481,6 +25603,34 @@ CREATE INDEX ix_agent_action_reports_tenant_created ON coord.agent_action_report
 
 
 --
+-- Name: ix_ci_job_obs_completed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_ci_job_obs_completed ON coord.ci_job_observations USING btree (completed_at);
+
+
+--
+-- Name: ix_ci_job_obs_key; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_ci_job_obs_key ON coord.ci_job_observations USING btree (repo, head_sha, job_name);
+
+
+--
+-- Name: ix_ci_job_obs_run; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_ci_job_obs_run ON coord.ci_job_observations USING btree (repo, run_id, run_attempt);
+
+
+--
+-- Name: ix_ci_job_obs_runner_completed; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_ci_job_obs_runner_completed ON coord.ci_job_observations USING btree (runner_name, completed_at) WHERE self_hosted;
+
+
+--
 -- Name: ix_ci_runs_inflight; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -24705,6 +25855,13 @@ CREATE INDEX ix_pr_check_runs_repo_head_branch ON coord.pr_check_runs USING btre
 
 
 --
+-- Name: ix_prepaid_balances_tenant_updated; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE INDEX ix_prepaid_balances_tenant_updated ON coord.prepaid_balances USING btree (tenant_id, updated_at DESC);
+
+
+--
 -- Name: ix_primary_trees_app_id; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -24789,6 +25946,13 @@ CREATE INDEX replica_presence_heartbeat_at_idx ON coord.replica_presence USING b
 
 
 --
+-- Name: uq_agent_questions_open_alert_episode; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_agent_questions_open_alert_episode ON coord.agent_questions USING btree (tenant_id, alert_id) WHERE ((alert_id IS NOT NULL) AND (responded_at IS NULL));
+
+
+--
 -- Name: uq_agent_registry_tenant_agent; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -24859,6 +26023,13 @@ CREATE UNIQUE INDEX uq_operator_touches_idempotency_key ON coord.operator_touche
 
 
 --
+-- Name: uq_policy_rule_proposals_pending; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX uq_policy_rule_proposals_pending ON coord.policy_rule_proposals USING btree (tenant_id, policy_id, field) WHERE (status = 'pending'::text);
+
+
+--
 -- Name: uq_policy_rules_tenant_override; Type: INDEX; Schema: coord; Owner: -
 --
 
@@ -24919,6 +26090,13 @@ CREATE UNIQUE INDEX uq_tenants_is_system ON coord.tenants USING btree (is_system
 --
 
 CREATE UNIQUE INDEX uq_work_unit_pr_citations_dedupe ON coord.work_unit_pr_citations USING btree (work_unit_id, repo, pr_number, commit_sha) NULLS NOT DISTINCT;
+
+
+--
+-- Name: ux_ci_rq_active; Type: INDEX; Schema: coord; Owner: -
+--
+
+CREATE UNIQUE INDEX ux_ci_rq_active ON coord.ci_runner_quarantines USING btree (tenant_id, runner_name, routing_label) WHERE (state = 'active'::text);
 
 
 --
@@ -31480,6 +32658,14 @@ ALTER TABLE ONLY auth.audit_logs
 
 
 --
+-- Name: claude_account_profiles claude_account_profiles_user_id_fkey; Type: FK CONSTRAINT; Schema: auth; Owner: -
+--
+
+ALTER TABLE ONLY auth.claude_account_profiles
+    ADD CONSTRAINT claude_account_profiles_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
 -- Name: device_sessions device_sessions_user_id_fkey; Type: FK CONSTRAINT; Schema: auth; Owner: -
 --
 
@@ -31693,6 +32879,14 @@ ALTER TABLE ONLY coord.build_events
 
 ALTER TABLE ONLY coord.build_events
     ADD CONSTRAINT build_events_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.devices(device_id) ON DELETE CASCADE;
+
+
+--
+-- Name: ci_pool_eligibility_baselines ci_pool_eligibility_baselines_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.ci_pool_eligibility_baselines
+    ADD CONSTRAINT ci_pool_eligibility_baselines_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
@@ -32080,6 +33274,14 @@ ALTER TABLE ONLY coord.policy_clauses
 
 
 --
+-- Name: policy_rule_proposals policy_rule_proposals_policy_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.policy_rule_proposals
+    ADD CONSTRAINT policy_rule_proposals_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES coord.policy_rules(policy_id) ON DELETE CASCADE;
+
+
+--
 -- Name: policy_rules policy_rules_overrides_system_rule_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
 --
 
@@ -32109,6 +33311,14 @@ ALTER TABLE ONLY coord.pr_events
 
 ALTER TABLE ONLY coord.pr_labels
     ADD CONSTRAINT pr_labels_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE SET NULL;
+
+
+--
+-- Name: primary_tree_branch_events primary_tree_branch_events_device_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.primary_tree_branch_events
+    ADD CONSTRAINT primary_tree_branch_events_device_id_fkey FOREIGN KEY (device_id) REFERENCES coord.devices(device_id) ON DELETE CASCADE;
 
 
 --
@@ -32317,6 +33527,14 @@ ALTER TABLE ONLY coord.tenant_repo_profiles
 
 ALTER TABLE ONLY coord.tenant_repos
     ADD CONSTRAINT tenant_repos_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
+
+
+--
+-- Name: tenant_slug_history tenant_slug_history_tenant_id_fkey; Type: FK CONSTRAINT; Schema: coord; Owner: -
+--
+
+ALTER TABLE ONLY coord.tenant_slug_history
+    ADD CONSTRAINT tenant_slug_history_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES coord.tenants(tenant_id) ON DELETE CASCADE;
 
 
 --
