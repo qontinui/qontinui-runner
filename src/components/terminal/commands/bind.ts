@@ -168,7 +168,8 @@ export interface CoercedArgs {
  * Fields whose declared type is TEXT — a `paramSchema` sentence that starts
  * with `string`.
  *
- * A caller that NAMES its arguments (a UI Bridge action, `callRegistry`) and
+ * A caller that NAMES its arguments (a UI Bridge action, `callRegistry`, the
+ * Tier-3 model's JSON) and
  * sends a JSON string for one of these meant that exact text. `coerceToken`
  * turning `"007"` into `7` — which `textArg` then reads back as `"7"` — would
  * save a profile under a different name or type a different command into a
