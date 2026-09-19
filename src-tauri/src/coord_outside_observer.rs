@@ -138,40 +138,27 @@
 //! than of a coord field that could itself be renamed next, and it rides
 //! [`LedgerRead::unobserved_reason`] into predicate (iv).
 //!
-//! **What that covers, and the half it does NOT.** `unclassified` covers rows
-//! that are PRESENT and UNREADABLE. It cannot cover rows that are ABSENT
-//! while `non_nominal_workers_truncated` reads `false`, because there is no
-//! row to fail. An executed counterexample: coord emits `counts.dead = 12`,
-//! `non_nominal_workers: []`, `non_nominal_workers_truncated: false` —
-//! `classification_is_underread()` is `false` (no rows, so nothing
-//! unclassified), `dead_is_underread()` is `false` (the flag is `false`),
-//! `dead_unaccounted()` is 12, `unobserved_reason()` is `None`, and 500
-//! probes raise no card while twelve workers are dead. That is the F1 defect
-//! class verbatim in a third response shape, and **the gap is OPEN**: a
-//! silently SHORT list beside a `false` truncation flag is covered by neither
-//! defense in this module.
+//! **Rows that never arrived.** `unclassified` covers rows that are PRESENT
+//! and UNREADABLE. It cannot cover rows that are ABSENT while
+//! `non_nominal_workers_truncated` reads `false`, because there is no row to
+//! fail: coord emits `counts.dead = 12`, `non_nominal_workers: []`,
+//! `non_nominal_workers_truncated: false`, and neither the classifier nor the
+//! truncation-gated [`LedgerRead::dead_is_underread`] has anything to say.
+//! Not reachable against coord as it stands (the list and the flag are
+//! computed from the same `non_nominal` vector in the same function), but
+//! reachable the moment anyone filters the listed rows — authorization
+//! scoping, a dedupe, a `name.is_some()` guard — without touching the flag's
+//! formula.
 //!
-//! Two things bound it and neither closes it. It is **not a regression** —
-//! the behaviour is identical at `197d6811`, before `unclassified` existed.
-//! And it is **not reachable against coord as it stands**: `Dead` implies
-//! `nominal: false`, and `non_nominal_workers` and
-//! `non_nominal_workers_truncated` are computed from the same `non_nominal`
-//! vector in the same function, so the list and the flag cannot disagree
-//! today. It becomes reachable the moment anyone adds a filter to the listed
-//! rows — authorization scoping, a dedupe, a `name.is_some()` guard —
-//! without touching the flag's formula.
-//!
-//! The field that would close it is **`counts.non_nominal`**, compared
-//! against [`LedgerRead::listed_rows`] on an untruncated read. That is the
-//! defense [`LedgerRead::unclassified`]'s own doc declines in favour of the
-//! classifier, and the two are **complementary, not competing**:
-//! `unclassified` catches a whole list this build cannot READ, a
-//! `listed_rows` shortfall catches a list coord did not SEND, and neither
-//! shape is a subset of the other. This module ships the first and
-//! deliberately not the second, for the shape-dependency reason recorded
-//! there. So, stated exactly: the count governs firing, the classifier
-//! governs the observability of rows that ARRIVED, and the observability of
-//! rows that never arrived is unclosed — named here rather than assumed away.
+//! [`LedgerRead::rows_absent`] closes it: `counts.non_nominal` against
+//! [`LedgerRead::listed_rows`] on an untruncated read. The two defenses are
+//! **complementary, not competing** — `unclassified` catches a whole list this
+//! build cannot READ, a `listed_rows` shortfall catches a list coord did not
+//! SEND, and neither shape is a subset of the other. Both ride
+//! [`LedgerRead::unobserved_reason`] into predicate (iv). So, stated exactly:
+//! the count governs firing, the classifier governs the observability of rows
+//! that ARRIVED, and the shortfall governs the observability of rows that
+//! did not.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -464,27 +451,19 @@ pub struct LedgerRead {
     ///   while `non_nominal_workers_truncated` read `false` — a truncation-
     ///   gated under-read predicate cannot see either.
     ///
-    /// Chosen over the other sufficient defense (compare `listed.len()`
-    /// against `counts.non_nominal` on an untruncated read) because that one
-    /// catches the retype and MISSES the rename outright: a renamed `status`
-    /// leaves the list complete, so `listed.len() == counts.non_nominal`
-    /// exactly while nothing in it classifies. It also would have made this
-    /// module depend on one more coord field whose absence it must then treat
-    /// as UNKNOWN — a second shape dependency on the response this defense
-    /// exists to be robust against.
-    ///
-    /// **Chosen over, not instead of.** The two defenses are complementary:
-    /// this one catches a list that ARRIVED and could not be read, and the
-    /// `listed.len()` vs `counts.non_nominal` one catches a list that arrived
-    /// SHORT with coord's truncation flag reading `false`. This module covers
-    /// the first shape only, and the module doc's "What that covers, and the
-    /// half it does NOT" records the second as an open gap — unreachable
-    /// against coord as it stands, and reachable the moment anyone filters
-    /// the listed rows without touching the flag's formula.
+    /// Not replaceable by [`Self::rows_absent`]: a renamed `status` or a
+    /// retyped `leader_gated` leaves the list COMPLETE, so
+    /// `listed_rows == counts.non_nominal` exactly while nothing in it
+    /// classifies. The two are complementary — this one catches a list that
+    /// ARRIVED and could not be read, `rows_absent` a list that arrived SHORT
+    /// with coord's truncation flag reading `false`.
     pub unclassified: Vec<String>,
     /// How many rows `non_nominal_workers` carried, for a report that can say
     /// "N of M" rather than "N".
     pub listed_rows: u64,
+    /// `components.counts.non_nominal`, verbatim — how many rows coord's list
+    /// SHOULD carry before its cap. Read only by [`Self::rows_absent`].
+    pub counts_non_nominal: u64,
     /// coord's own `components.non_nominal_workers_truncated`.
     ///
     /// The list is capped at `QUERY_WORKERS_MAX_LISTED` (40) by
@@ -640,6 +619,22 @@ impl LedgerRead {
         !self.unclassified.is_empty()
     }
 
+    /// Non-nominal rows coord COUNTED but did not LIST, on a read whose
+    /// truncation flag says nothing was cut — the rows that never arrived.
+    ///
+    /// Zero on a truncated read: there the shortfall is the cap, already
+    /// reported by coord's own flag and covered by [`Self::dead_is_underread`].
+    /// On an untruncated read coord builds the list and `counts.non_nominal`
+    /// from the same vector, so any shortfall means rows were dropped between
+    /// the two — a filter added to one and not the other — and predicate
+    /// (ii), which reads its population off the list, did not see them.
+    pub fn rows_absent(&self) -> u64 {
+        if self.list_truncated {
+            return 0;
+        }
+        self.counts_non_nominal.saturating_sub(self.listed_rows)
+    }
+
     /// The unclassified labels, bounded for a headline — see
     /// [`UNCLASSIFIED_IN_SUMMARY`]. The remainder is COUNTED rather than
     /// dropped, so the summary never understates the blind spot, and
@@ -659,8 +654,8 @@ impl LedgerRead {
     ///
     /// Only (ii) can reach here. (iii) is settled either way by
     /// [`Self::counts_not_leader_here`]: a zero is a leader, a non-zero is
-    /// predicate (iii) itself. (ii) is unobserved on two shapes, and they are
-    /// independent:
+    /// predicate (iii) itself. (ii) is unobserved on three shapes, and they
+    /// are independent:
     ///
     /// 1. **the classifier failed** — at least one listed row was unreadable,
     ///    so (ii)'s population was never fully assembled. Gated on nothing
@@ -668,7 +663,9 @@ impl LedgerRead {
     ///    retype, a `status` rename) leave the list whole and coord's flag
     ///    `false`; gated only on [`Self::observed_nothing_else`], so it never
     ///    contradicts a verdict this same read produced;
-    /// 2. **the cap ate them all** — the truncated list named NONE of the
+    /// 2. **rows never arrived** — [`Self::rows_absent`]: an untruncated list
+    ///    shorter than `counts.non_nominal`. Gated the same way as (1);
+    /// 3. **the cap ate them all** — the truncated list named NONE of the
     ///    dead workers coord counted, after the rows this read DID classify
     ///    (kept, excluded, or dropped as follower-plane) are subtracted. A
     ///    read that named one has already put a `WorkerDead` card up and the
@@ -682,6 +679,16 @@ impl LedgerRead {
                 self.unclassified.len(),
                 self.listed_rows,
                 self.unclassified_summary(),
+            ));
+        }
+        if self.rows_absent() > 0 && self.observed_nothing_else() {
+            return Some(format!(
+                "coord answered and counted {} non-nominal worker(s) but its untruncated \
+                 `non_nominal_workers` list carried only {} — predicate (ii)'s population is \
+                 read off those rows, so the {} absent row(s) were not observed on this cycle",
+                self.counts_non_nominal,
+                self.listed_rows,
+                self.rows_absent(),
             ));
         }
         if self.dead_leader_gated.is_empty() && self.dead_is_underread() {
@@ -788,8 +795,8 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
             ),
         };
     };
-    // ABSENT is not ZERO. Both keys are emitted unconditionally by coord's
-    // no-arg arm, so a missing one means this build is reading a shape it does
+    // ABSENT is not ZERO. All three counts are emitted unconditionally by
+    // coord's no-arg arm, so a missing one means this build is reading a shape it does
     // not understand — and defaulting either to 0 would make every truncation
     // predicate below read `false` and report a permanently clean fleet.
     let Some(counts_dead) = counts.get("dead").and_then(JsonValue::as_u64) else {
@@ -805,6 +812,14 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
             reason: "coord answered but `components.counts` carried no readable \
                  `not_leader_here` — this runner build cannot read this response shape, and \
                  without that count a truncated list cannot be told from a fleet with a leader"
+                .to_string(),
+        };
+    };
+    let Some(counts_non_nominal) = counts.get("non_nominal").and_then(JsonValue::as_u64) else {
+        return ProbeOutcome::Unusable {
+            reason: "coord answered but `components.counts` carried no readable `non_nominal` — \
+                 this runner build cannot read this response shape, and without that count a \
+                 list missing rows cannot be told from a complete one"
                 .to_string(),
         };
     };
@@ -861,6 +876,7 @@ pub fn classify_ledger(tool: &JsonValue) -> ProbeOutcome {
     let mut read = LedgerRead {
         counts_dead,
         counts_not_leader_here,
+        counts_non_nominal,
         list_truncated,
         listed_rows: listed.len() as u64,
         ..LedgerRead::default()
@@ -1384,6 +1400,8 @@ fn render_read(read: &LedgerRead) -> String {
         "dead_dropped_as_follower_plane": read.dead_follower_plane,
         "non_nominal_workers_truncated": read.list_truncated,
         "listed_rows": read.listed_rows,
+        "counts_non_nominal": read.counts_non_nominal,
+        "rows_absent_from_an_untruncated_list": read.rows_absent(),
         "rows_this_build_could_not_classify": read.unclassified,
         "dead_unaccounted_for_in_the_list": read.dead_unaccounted(),
         "not_leader_here_unaccounted_for_in_the_list": read.leaderless_unaccounted(),
@@ -1816,6 +1834,20 @@ impl CoordOutsideObserver {
                      A renamed `status` or a retyped `leader_gated` wants a runner upgrade."
                 );
             }
+            // The fourth shape: rows coord counted and never sent, on a list
+            // its own flag says was not cut. Warned for the same reason as
+            // the line above — beside a named dead worker no report carries it.
+            if read.rows_absent() > 0 {
+                warn!(
+                    counts_non_nominal = read.counts_non_nominal,
+                    listed_rows = read.listed_rows,
+                    absent = read.rows_absent(),
+                    "coord outside observer: coord counted more non-nominal workers than its \
+                     UNTRUNCATED non_nominal_workers list carried — predicate (ii) is UNKNOWN for \
+                     the absent rows, not clear. Call coord_query_workers with a `name` for the \
+                     per-replica rows."
+                );
+            }
         }
         let coord_answered = !matches!(outcome, ProbeOutcome::Unreachable { .. });
         let reports = {
@@ -1867,7 +1899,12 @@ mod tests {
 
     /// A canned `coord_query_workers` no-arg body, shaped exactly as
     /// `qontinui-coord`'s `query_workers_handler` emits it.
+    ///
+    /// `counts.non_nominal` is DERIVED from the list, as coord derives both
+    /// from one vector — a hardcoded value would make every multi-row body a
+    /// short list and every test of [`LedgerRead::rows_absent`] vacuous.
     fn ledger_body(counts_dead: u64, non_nominal: JsonValue) -> JsonValue {
+        let listed = non_nominal.as_array().map_or(0, Vec::len);
         json!({
             "instance": "workers",
             "drift_class": "active_negation",
@@ -1881,7 +1918,7 @@ mod tests {
             "components": {
                 "counts": {
                     "total": 19, "alive": 18, "stale": 0,
-                    "dead": counts_dead, "not_leader_here": 0, "non_nominal": 1
+                    "dead": counts_dead, "not_leader_here": 0, "non_nominal": listed
                 },
                 "non_nominal_workers": non_nominal,
                 "non_nominal_workers_truncated": false,
@@ -1895,6 +1932,8 @@ mod tests {
     fn truncated_ledger_body(counts_dead: u64, non_nominal: JsonValue) -> JsonValue {
         let mut body = ledger_body(counts_dead, non_nominal);
         body["components"]["non_nominal_workers_truncated"] = json!(true);
+        // coord sets the flag only when its count passes the 40-row cap.
+        body["components"]["counts"]["non_nominal"] = json!(41);
         body
     }
 
@@ -2543,6 +2582,95 @@ mod tests {
         );
     }
 
+    /// The rows-that-never-arrived shape the classifier cannot see: coord
+    /// counts twelve dead workers, sends an EMPTY list, and its truncation
+    /// flag reads `false`. Before [`LedgerRead::rows_absent`] this reached
+    /// `unobserved_reason() == None` and 500 probes raised no card.
+    #[test]
+    fn an_untruncated_list_short_of_counts_non_nominal_reaches_predicate_four() {
+        let mut body = ledger_body(12, json!([]));
+        body["components"]["counts"]["non_nominal"] = json!(12);
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(!read.list_truncated);
+        assert!(
+            !read.classification_is_underread() && !read.dead_is_underread(),
+            "neither older defense can see a row that is not there"
+        );
+        assert_eq!(read.rows_absent(), 12);
+        let reason = read
+            .unobserved_reason()
+            .expect("a list missing rows settles nothing about (ii)");
+        assert!(reason.contains("carried only 0"), "{reason}");
+
+        let outcome = ProbeOutcome::Read(read);
+        let mut state = ObserverState::default();
+        let mut fired = Vec::new();
+        for _ in 0..3 {
+            fired.extend(state.observe(&outcome));
+        }
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].class, FaultClass::LivenessUnknown);
+        assert!(fired[0]
+            .raw
+            .contains("\"rows_absent_from_an_untruncated_list\": 12"));
+    }
+
+    /// The shortfall is only a signal when coord says NOTHING was cut. On a
+    /// truncated list it is the cap, and `dead_is_underread` owns that.
+    #[test]
+    fn a_short_list_is_not_rows_absent_when_coord_says_it_truncated() {
+        let body = truncated_ledger_body(0, json!([dead_row("follower.loop", false, false)]));
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert!(read.counts_non_nominal > read.listed_rows);
+        assert_eq!(read.rows_absent(), 0);
+        assert_eq!(read.unobserved_reason(), None);
+    }
+
+    /// Gated like the classifier arm: a read that named a dead worker has a
+    /// `WorkerDead` card up, and "I have no verdict" beside it is false. The
+    /// shortfall still travels in the card's body.
+    #[test]
+    fn rows_absent_beside_a_named_dead_worker_does_not_claim_no_verdict() {
+        let mut body = ledger_body(3, json!([dead_row("merge_dispatch", true, false)]));
+        body["components"]["counts"]["non_nominal"] = json!(3);
+        let ProbeOutcome::Read(read) = classify_ledger(&body) else {
+            panic!("expected a Read");
+        };
+        assert_eq!(read.rows_absent(), 2);
+        assert_eq!(read.unobserved_reason(), None);
+        let fired = ObserverState::default().observe(&ProbeOutcome::Read(read));
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(fired[0].class, FaultClass::WorkerDead);
+        assert!(fired[0]
+            .raw
+            .contains("\"rows_absent_from_an_untruncated_list\": 2"));
+    }
+
+    /// `UNCLASSIFIED_IN_SUMMARY` bounds a HEADLINE; the remainder is counted,
+    /// never dropped. Unpinned, a bound of 0 passed every other test and
+    /// rendered `"; and 7 more"`.
+    #[test]
+    fn the_unclassified_summary_is_bounded_and_counts_the_remainder() {
+        let label = |i: usize| format!("`w{i}`: status `x` is outside this build's vocabulary");
+        let mut read = LedgerRead {
+            unclassified: (0..UNCLASSIFIED_IN_SUMMARY + 2).map(label).collect(),
+            ..LedgerRead::default()
+        };
+        let summary = read.unclassified_summary();
+        let shown: Vec<String> = (0..UNCLASSIFIED_IN_SUMMARY).map(label).collect();
+        assert_eq!(summary, format!("{}; and 2 more", shown.join("; ")));
+        assert!(!summary.contains(&label(UNCLASSIFIED_IN_SUMMARY)));
+
+        read.unclassified.truncate(UNCLASSIFIED_IN_SUMMARY);
+        assert_eq!(read.unclassified_summary(), shown.join("; "));
+        read.unclassified.truncate(1);
+        assert_eq!(read.unclassified_summary(), label(0));
+    }
+
     /// The other half of F1's fix, so it cannot be "hardened" into a predicate
     /// that pages on every ordinary fleet: a leader-gated `stale` or `alive`
     /// row is CLASSIFIED. This module deliberately holds no predicate over
@@ -2897,7 +3025,7 @@ mod tests {
 
     #[test]
     fn counts_missing_either_count_this_module_reads_is_unusable() {
-        for key in ["dead", "not_leader_here"] {
+        for key in ["dead", "not_leader_here", "non_nominal"] {
             let mut body = ledger_body(0, json!([]));
             body["components"]["counts"]
                 .as_object_mut()
