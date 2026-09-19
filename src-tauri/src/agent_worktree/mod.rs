@@ -642,6 +642,18 @@ async fn heartbeat_loop<F>(
                     on_stolen(None, true);
                     return;
                 }
+                Ok(HeartbeatTickOutcome::NotHeld) => {
+                    warn!(
+                        "claim-heartbeat: claim lapsed (expired, nobody holds it) kind={kind_owned} key={resource_clone} — re-acquire before further work"
+                    );
+                    // `on_stolen` is the "we no longer hold this claim" callback,
+                    // and it already received `None` for this case while coord
+                    // spelled an expiry `stolen` with a null holder — so passing
+                    // `None` here keeps every consumer's behaviour identical
+                    // across the wire change.
+                    on_stolen(None);
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         "claim-heartbeat: tick failed kind={kind_owned} key={resource_clone}: {e}"
