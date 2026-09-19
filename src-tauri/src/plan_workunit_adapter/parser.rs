@@ -1327,8 +1327,15 @@ mod tests {
     fn phases_name_ranks_list_titles_over_report_sentences() {
         let body = "# T\n\n## Divergent design for B\n\n| Phase | Work |\n|---|---|\n| 1 | the design not taken |\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 1 | the real phase |\n\n- **Phase 2 — remove engineering**\n\n## Phase 2 execution record (2026-08-16)\n";
         let p = parse(body);
-        let got: Vec<(u32, &str)> = p.phases.iter().map(|x| (x.index, x.name.as_str())).collect();
-        assert_eq!(got, vec![(1, "the real phase"), (2, "Phase 2 — remove engineering")]);
+        let got: Vec<(u32, &str)> = p
+            .phases
+            .iter()
+            .map(|x| (x.index, x.name.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, "the real phase"), (2, "Phase 2 — remove engineering")]
+        );
         let body = "# T\n\n## Phase 4 execution record\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n";
         assert_eq!(indices(body), vec![4]);
     }
