@@ -308,9 +308,8 @@ static PHASE_LIST_HEADING: Lazy<Regex> = Lazy::new(|| {
 });
 
 /// One leading section enumerator on a heading: `4.`, `6.1`, `4)`, `§3`, `a.`.
-static HEADING_ENUMERATOR: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^(?:§?\d+(?:\.\d+)*[.)]?|[a-z][.)])\s+").expect("valid regex")
-});
+static HEADING_ENUMERATOR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^(?:§?\d+(?:\.\d+)*[.)]?|[a-z][.)])\s+").expect("valid regex"));
 
 /// A heading that is itself a single phase (`Phase 2 — push client`), which
 /// never opens a phase-LIST section.
@@ -789,7 +788,8 @@ mod tests {
     /// phases: the sub-heading ends the phase list's direct body.
     #[test]
     fn phases_arm_c_steps_under_a_phase_subheading_are_not_phases() {
-        let body = "# T\n\n## 5. Phases\n\n### Phase 1 — the guard\n\n1. hook\n2. prefilter\n3. message\n";
+        let body =
+            "# T\n\n## 5. Phases\n\n### Phase 1 — the guard\n\n1. hook\n2. prefilter\n3. message\n";
         assert_eq!(indices(body), vec![1]);
     }
 
@@ -849,10 +849,12 @@ mod tests {
         let dir = std::env::var("QONTINUI_PHASE_CENSUS_DIR")
             .expect("set QONTINUI_PHASE_CENSUS_DIR to a plans/ directory");
         let (mut plans, mut zero, mut one, mut many) = (0u32, 0u32, 0u32, 0u32);
-        for entry in std::fs::read_dir(&dir).expect("readable plans dir").flatten() {
+        for entry in std::fs::read_dir(&dir)
+            .expect("readable plans dir")
+            .flatten()
+        {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".md") || authored_at_from_stem(&name[..name.len() - 3]).is_none()
-            {
+            if !name.ends_with(".md") || authored_at_from_stem(&name[..name.len() - 3]).is_none() {
                 continue;
             }
             let Ok(body) = std::fs::read_to_string(entry.path()) else {
