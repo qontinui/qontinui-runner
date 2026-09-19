@@ -3385,8 +3385,15 @@ fn collect_claude_accounts_from(
 // bash, so calling them here would park a blocking-pool worker on every tick
 // for a reading the doctor already gives. The deep check is
 // `qontinui-claude-config/scripts/capability-doctor.sh` (the plan's Phase 2);
-// what this section publishes is the render each installer leaves on disk,
-// which is what `--check` itself compares against.
+// what this section publishes is the PER-MACHINE render each installer leaves
+// on disk, which is what `--check` itself compares against — never the
+// tracked source it copies from, which is identical on every clone and so can
+// show no drift. Where an installer leaves no per-machine render at all (the
+// Claude Code hooks half of `install-guard-hooks.sh`, whose settings.json is
+// tracked and machine-independent) the key is named for what it measures
+// (`root_settings_hooks`) rather than as `installer_*`. The one git question
+// (`core.hooksPath`, linked worktrees) is answered from file reads that mirror
+// `git rev-parse --git-path hooks` — see `git_hooks_dir`.
 //
 // **`plans_dir_relative` is root-RELATIVE, never the absolute path.** An
 // absolute path differs on every box by construction (`C:\qontinui-root` vs
@@ -3533,35 +3540,24 @@ fn normalize_lexical(p: &Path) -> String {
     s.trim_end_matches('/').to_string()
 }
 
-/// Where a link's literal target points, as an absolute path: an absolute
-/// target as-is, a relative one against the link's own parent (which is how
-/// the OS resolves it).
-fn link_target_absolute(link: &Path, raw_target: &Path) -> PathBuf {
-    if raw_target.is_absolute() {
-        raw_target.to_path_buf()
-    } else {
-        link.parent()
-            .map(|p| p.join(raw_target))
-            .unwrap_or_else(|| raw_target.to_path_buf())
-    }
-}
-
 /// Classify one harness link. **Pure over [`PathShape`] — unit-tested.**
 ///
-/// - `present`: a link (symlink or junction) resolving to `expected`, or a
+/// - `present`: a link (symlink or junction) that RESOLVES to `expected`, or a
 ///   plain file whose contents `plain_file_ok` accepts — the README's two
 ///   non-link forms (`@qontinui-claude-config/CLAUDE.md`, and the
 ///   `dev-start.ps1` forwarding shim a box without elevation carries).
 /// - `absent`: nothing at the path.
 /// - `foreign`: something is there but it is not the harness's — a link
-///   elsewhere, a dangling link, a real directory, a file with other contents.
+///   elsewhere, a dangling link (even one whose literal target is the right
+///   relative path: the plan defines `present` as "present and resolving",
+///   and the doctor and the bootstrap both read a dangling link as broken —
+///   a session at that root loads nothing through it), a real directory, a
+///   file with other contents.
 /// - `unknown`: the path could not be stat'd or read; not asserted either way.
-fn link_state(
-    link: &Path,
-    shape: &PathShape,
-    expected: &Path,
-    plain_file_ok: fn(&str) -> bool,
-) -> &'static str {
+///
+/// The literal link text (`raw_target`) is never consulted for the verdict;
+/// the collector logs it beside a dangling link so the intent stays readable.
+fn link_state(shape: &PathShape, expected: &Path, plain_file_ok: fn(&str) -> bool) -> &'static str {
     match shape {
         PathShape::Missing => "absent",
         PathShape::Unreadable => "unknown",
@@ -3576,15 +3572,14 @@ fn link_state(
                 "foreign"
             }
         }
+        // Dangling: nothing is served through it, whatever it was meant to
+        // point at. Same reading as `invariant_class`'s dangling arm.
+        PathShape::Link { resolved: None, .. } => "foreign",
         PathShape::Link {
-            resolved,
-            raw_target,
+            resolved: Some(target),
+            ..
         } => {
-            let target = match resolved {
-                Some(r) => r.clone(),
-                None => link_target_absolute(link, raw_target),
-            };
-            if same_place(&target, expected) {
+            if same_place(target, expected) {
                 "present"
             } else {
                 "foreign"
@@ -3603,11 +3598,27 @@ fn claude_md_plain_ok(text: &str) -> bool {
     )
 }
 
-/// A plain-file `dev-start.ps1` is the harness's when it forwards to the
-/// tracked script (either separator spelling).
+/// A plain-file `dev-start.ps1` is the harness's when some line of it is the
+/// README's forwarding shim: first non-blank character `&` (PowerShell's call
+/// operator), then an opening quote, and the tracked script's path on that
+/// same line (either separator spelling). The same predicate the capability
+/// doctor's `harness_links` row greps for
+/// (`^[[:space:]]*&[[:space:]]*["'].*qontinui-claude-config[\/]scripts[\/]dev-start\.ps1`),
+/// so the two never disagree about a shim. A file that merely MENTIONS the
+/// path — a comment, a copy of the real script that names itself — is not a
+/// forwarder and reads `foreign`.
 fn dev_start_plain_ok(text: &str) -> bool {
-    text.contains("qontinui-claude-config\\scripts\\dev-start.ps1")
-        || text.contains("qontinui-claude-config/scripts/dev-start.ps1")
+    text.lines().any(|line| {
+        let Some(rest) = line.trim_start().strip_prefix('&') else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        if !(rest.starts_with('"') || rest.starts_with('\'')) {
+            return false;
+        }
+        rest.contains("qontinui-claude-config\\scripts\\dev-start.ps1")
+            || rest.contains("qontinui-claude-config/scripts/dev-start.ps1")
+    })
 }
 
 /// `.claude` has no plain-file form: the umbrella link is load-bearing (the
@@ -3655,24 +3666,13 @@ fn plans_dir_relative(root: &Path, reading: &PlansDirReading) -> String {
         PlansDirReading::Read(None) => return PLANS_DIR_UNSET.to_string(),
         PlansDirReading::Read(Some(p)) => Path::new(p),
     };
-    if !configured.is_absolute() {
+    if !is_absolute_any_platform(configured) {
         // Already a relative rendering; publish it normalized. The setting is
         // documented as absolute, so this arm is defensive rather than a
         // supported spelling.
         let rel = normalize_lexical(configured);
         return rel.trim_start_matches("./").to_string();
     }
-    // Canonical when both sides resolve (so `D:` vs `C:` subst aliases and
-    // case differences do not fake an `outside-workspace`), lexical otherwise
-    // (a configured directory that does not exist yet is still comparable).
-    let (root_n, cfg_n) = match (
-        std::fs::canonicalize(root),
-        std::fs::canonicalize(configured),
-    ) {
-        (Ok(r), Ok(c)) => (normalize_lexical(&r), normalize_lexical(&c)),
-        _ => (normalize_lexical(root), normalize_lexical(configured)),
-    };
-    let prefix = format!("{root_n}/");
     let same = |a: &str, b: &str| {
         if cfg!(windows) {
             a.eq_ignore_ascii_case(b)
@@ -3680,19 +3680,78 @@ fn plans_dir_relative(root: &Path, reading: &PlansDirReading) -> String {
             a == b
         }
     };
-    let under = cfg_n
-        .get(..prefix.len())
-        .map(|head| same(head, &prefix))
-        .unwrap_or(false);
-    if under {
-        cfg_n[prefix.len()..].to_string()
-    } else if same(&cfg_n, &root_n) {
-        // The root itself as the plans dir: the relative rendering would be
-        // empty, which reads as unset. Name it.
-        ".".to_string()
-    } else {
-        PLANS_DIR_OUTSIDE.to_string()
+    // Render `cfg_n` against one spelling of the root: the relative path when
+    // it is under it, `.` for the root itself, `None` otherwise.
+    let render_under = |root_n: &str, cfg_n: &str| -> Option<String> {
+        let prefix = format!("{root_n}/");
+        let under = cfg_n
+            .get(..prefix.len())
+            .map(|head| same(head, &prefix))
+            .unwrap_or(false);
+        if under {
+            Some(cfg_n[prefix.len()..].to_string())
+        } else if same(cfg_n, root_n) {
+            // The root itself as the plans dir: the relative rendering would
+            // be empty, which reads as unset. Name it.
+            Some(".".to_string())
+        } else {
+            None
+        }
+    };
+    let root_lex = normalize_lexical(root);
+    let root_canon = std::fs::canonicalize(root)
+        .ok()
+        .map(|r| normalize_lexical(&r));
+    match std::fs::canonicalize(configured) {
+        // Both sides canonical: `D:` vs `C:` subst aliases and case
+        // differences cannot fake an `outside-workspace`. (When the ROOT does
+        // not canonicalise but the configured path does, the lexical root is
+        // the only spelling there is; the canonical configured path is still
+        // the right side to compare, since a lexical configured path would be
+        // the operator's own spelling of a place the root may spell otherwise.)
+        Ok(c) => {
+            let cfg_n = normalize_lexical(&c);
+            render_under(root_canon.as_deref().unwrap_or(&root_lex), &cfg_n)
+                .unwrap_or_else(|| PLANS_DIR_OUTSIDE.to_string())
+        }
+        // The configured directory does not exist (yet), so it has no
+        // canonical form. Compare it lexically against BOTH spellings of the
+        // root — the one `workspace_root()` resolved (which is what a typed
+        // setting usually copies) and the canonical one — and render it
+        // inside if either matches. The honest caveat: a not-yet-existing path spelled
+        // through a THIRD alias of the root (a `subst` drive neither the
+        // configured root nor its canonical form uses) reads
+        // `outside-workspace` here although it would resolve inside once
+        // created. Chosen over publishing `unknown` because a plans dir that
+        // does not exist is, for the scan, a dir with no plans in it either
+        // way — the reading a peer box compares against is where the operator
+        // POINTED it, and two spellings cover every way this fleet's boxes
+        // actually spell their roots.
+        Err(_) => {
+            let cfg_n = normalize_lexical(configured);
+            render_under(&root_lex, &cfg_n)
+                .or_else(|| {
+                    root_canon
+                        .as_deref()
+                        .and_then(|rc| render_under(rc, &cfg_n))
+                })
+                .unwrap_or_else(|| PLANS_DIR_OUTSIDE.to_string())
+        }
     }
+}
+
+/// `Path::is_absolute` is platform-bound: on Windows `/foo` and `\foo` are
+/// "root-anchored but drive-relative" and read as NOT absolute, so a
+/// POSIX-spelled setting (a WSL path, a setting copied from a Linux box)
+/// would be published VERBATIM as if it were a relative rendering. Anything
+/// beginning with a separator is absolute for this section's purpose on every
+/// platform: it is never a path under the workspace root.
+fn is_absolute_any_platform(p: &Path) -> bool {
+    if p.is_absolute() {
+        return true;
+    }
+    let s = p.to_string_lossy();
+    s.starts_with('/') || s.starts_with('\\')
 }
 
 /// `present` / `absent` for a plain existence probe.
@@ -3704,12 +3763,25 @@ fn presence(exists: bool) -> &'static str {
     }
 }
 
-/// The guard installer's render: `<config repo>/.claude/settings.json` with a
-/// non-empty `hooks` object. What `install-guard-hooks.sh --check` verifies is
-/// that render against its manifest; existence of the render is the
-/// file-observable half.
-fn guard_hooks_installed(config_repo: &Path) -> bool {
-    let path = config_repo.join(".claude").join("settings.json");
+/// `root_settings_hooks`: the `settings.json` a Claude Code session rooted at
+/// the workspace root actually loads — `<root>/.claude/settings.json`, read
+/// THROUGH whatever `.claude` is at the root — declares a non-empty `hooks`
+/// object.
+///
+/// **Why this is not `installer_guard_hooks`.** `install-guard-hooks.sh`'s
+/// Claude-Code-hooks half leaves NO per-machine render: since 2026-08-16 the
+/// manifest addresses every hook as `${CLAUDE_PROJECT_DIR}/…`, expanded by
+/// the harness at invocation time, so the `settings.json` it merges into is
+/// the config repo's TRACKED one and is byte-identical and correct on every
+/// checkout (`hooks.json` `_workspace_root`). Reading it as "installer state"
+/// therefore read `present` on every fresh clone and could never show drift.
+/// The installer's only per-machine output is its `_git_hooks` half, which
+/// `installer_git_hooks` covers. What CAN differ per box is which tree the
+/// root's `.claude` serves — absent, a foreign link, a stale copied
+/// directory — and that is what this key measures: it is the same file
+/// `install-guard-hooks.sh --check` reads (`$ROOT/.claude/settings.json`).
+fn root_settings_hooks(root: &Path) -> bool {
+    let path = root.join(".claude").join("settings.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return false;
     };
@@ -3722,13 +3794,208 @@ fn guard_hooks_installed(config_repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The agent-skills installer's render: at least one skill directory under
-/// `<config repo>/.agents/skills`.
-fn agent_skills_installed(config_repo: &Path) -> bool {
-    std::fs::read_dir(config_repo.join(".agents").join("skills"))
-        .map(|rd| {
-            rd.flatten()
-                .any(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+/// Skill directory names under `<config repo>/.agents/skills` the installer
+/// enumerates: real directories whose name does not start with `_` or `.`
+/// (`install-agent-skills.ps1`: "not skills, matching the convention the
+/// command files and .claude/skills/ already use for shared assets").
+fn agent_skill_sources(config_repo: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(config_repo.join(".agents").join("skills")) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            !(name.starts_with('_') || name.starts_with('.'))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// The agent-skills installer's render. `install-agent-skills.ps1` installs
+/// INTO the user level — `~/.agents/skills/<name>` (its default
+/// `-Destination` is `$env:USERPROFILE\.agents\skills`), one junction per
+/// skill pointing at `<config repo>/.agents/skills/<name>` — because project
+/// `.agents` discovery stops at the git repo root and a session inside
+/// `qontinui-coord` never sees a workspace-root copy. The repo directory is
+/// the SOURCE it copies from, tracked on every clone, so probing it read
+/// `present` everywhere and measured nothing.
+///
+/// `present` when at least one skill the repo source enumerates is wired at
+/// the install root the way `-Check` accepts it: a link at
+/// `<home>/.agents/skills/<name>` resolving to that source directory. A real
+/// directory there is what `-Check` calls MISPOINTED and does not count; a
+/// link to another checkout's copy does not count either (that is the drift
+/// this key exists to show). No home dir, or no source to compare against,
+/// is `absent` — the installer itself refuses to report green on an empty
+/// source enumeration.
+fn agent_skills_installed(config_repo: &Path, home: Option<&Path>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    let install_root = home.join(".agents").join("skills");
+    agent_skill_sources(config_repo).into_iter().any(|src| {
+        let Some(name) = src.file_name() else {
+            return false;
+        };
+        match path_shape(&install_root.join(name)) {
+            PathShape::Link {
+                resolved: Some(target),
+                ..
+            } => same_place(&target, &src),
+            _ => false,
+        }
+    })
+}
+
+/// The directory git runs hooks out of for the checkout at `repo`, resolved
+/// with `git rev-parse --git-path hooks` semantics from FILE READS ONLY — the
+/// capture loop never shells out (section header). `install-guard-hooks.sh`
+/// asks git itself; this mirrors the answer for the shapes on this fleet:
+///
+/// 1. `<repo>/.git` is a directory (a primary checkout) → that is the git
+///    dir; a FILE (a linked worktree) holds `gitdir: <path>`, relative to the
+///    repo dir when relative.
+/// 2. A linked worktree's git dir carries a `commondir` file naming the MAIN
+///    repository's `.git` (relative to the git dir when relative); hooks live
+///    under the COMMON dir, which is why one install covers a repo and every
+///    worktree off it.
+/// 3. `core.hooksPath` overrides the whole thing. Read from the repo's own
+///    config (`<common>/config`, plus `<gitdir>/config.worktree` when
+///    `extensions.worktreeConfig` is on) and then the user's global config
+///    (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` or `~/.config/git/config`),
+///    local winning over global as git's precedence has it. A relative
+///    `hooksPath` is relative to the worktree top level; `~/` expands to the
+///    home dir. The SYSTEM config (`/etc/gitconfig`, the Git-for-Windows
+///    install's) is not read: a `core.hooksPath` there is not a shape this
+///    fleet has, and a wrong-but-honest miss here shows as `absent`, which
+///    the doctor's live `git rev-parse` then corrects.
+///
+/// `None` when `<repo>/.git` is neither a dir nor a parseable gitdir file.
+fn git_hooks_dir(repo: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let dot_git = repo.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let target = text
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("gitdir:"))?
+            .trim();
+        if target.is_empty() {
+            return None;
+        }
+        let target = Path::new(target);
+        if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo.join(target)
+        }
+    };
+    let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => {
+            let t = text.trim();
+            if t.is_empty() {
+                git_dir.clone()
+            } else if Path::new(t).is_absolute() {
+                PathBuf::from(t)
+            } else {
+                git_dir.join(t)
+            }
+        }
+        Err(_) => git_dir.clone(),
+    };
+
+    // core.hooksPath, most specific source first.
+    let mut hooks_path: Option<String> = None;
+    let local_cfg = std::fs::read_to_string(common_dir.join("config")).unwrap_or_default();
+    if git_config_bool(&local_cfg, "extensions", "worktreeconfig") {
+        let wt_cfg = std::fs::read_to_string(git_dir.join("config.worktree")).unwrap_or_default();
+        hooks_path = git_config_value(&wt_cfg, "core", "hookspath");
+    }
+    if hooks_path.is_none() {
+        hooks_path = git_config_value(&local_cfg, "core", "hookspath");
+    }
+    if hooks_path.is_none() {
+        if let Some(home) = home {
+            let xdg = std::env::var_os("XDG_CONFIG_HOME")
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| home.join(".config"));
+            for global in [home.join(".gitconfig"), xdg.join("git").join("config")] {
+                if let Ok(text) = std::fs::read_to_string(&global) {
+                    hooks_path = git_config_value(&text, "core", "hookspath");
+                    if hooks_path.is_some() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(match hooks_path {
+        Some(hp) => {
+            let hp = match (hp.strip_prefix("~/"), home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ => PathBuf::from(&hp),
+            };
+            if hp.is_absolute() {
+                hp
+            } else {
+                repo.join(hp)
+            }
+        }
+        None => common_dir.join("hooks"),
+    })
+}
+
+/// The last `<section>.<key> = value` in a git config text, keys compared
+/// case-insensitively as git does (section and key names are; subsections are
+/// not, and none is asked for here). Minimal on purpose: `[section]` headers,
+/// `key = value` lines, `#`/`;` comment lines, surrounding quotes stripped.
+/// Includes (`[include] path = …`) are not followed — a `core.hooksPath`
+/// reached only through one reads as absent, same honest miss as the system
+/// config in [`git_hooks_dir`].
+fn git_config_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    let mut found = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[') {
+            let header = header.split(']').next().unwrap_or("").trim();
+            // `[core]` matches; `[core "sub"]` is a subsection and does not.
+            in_section = header.eq_ignore_ascii_case(section);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if !k.trim().eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let v = v.trim();
+        let v = v
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .unwrap_or(v);
+        found = Some(v.to_string());
+    }
+    found
+}
+
+/// A git config boolean (`true` / `yes` / `on` / `1`, case-insensitive).
+fn git_config_bool(text: &str, section: &str, key: &str) -> bool {
+    git_config_value(text, section, key)
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v == "true" || v == "yes" || v == "on" || v == "1"
         })
         .unwrap_or(false)
 }
@@ -3786,20 +4053,25 @@ pub fn collect_harness() -> Option<Section> {
         None => PlansDirReading::Unread,
     };
     let config_root = dirs::config_dir();
+    let home = dirs::home_dir();
     Some(collect_harness_under(
         &root,
         &plans_dir,
         config_root.as_deref(),
+        home.as_deref(),
     ))
 }
 
 /// Injectable core of [`collect_harness`]: `root` is the workspace root,
 /// `plans_dir` the settings door's answer, `config_root` the platform config
-/// dir the accounts roster lives under. Every value is a `Value::String`.
+/// dir the accounts roster lives under, `home` the user's home dir (the
+/// agent-skills install root and the global git config live under it). Every
+/// value is a `Value::String`.
 fn collect_harness_under(
     root: &Path,
     plans_dir: &PlansDirReading,
     config_root: Option<&Path>,
+    home: Option<&Path>,
 ) -> Section {
     let config_repo = root.join(HARNESS_CONFIG_REPO_DIR);
     let mut section = Section::new();
@@ -3829,7 +4101,20 @@ fn collect_harness_under(
     for (key, name, expected, plain_ok) in links {
         let link = root.join(name);
         let shape = path_shape(&link);
-        put(&mut section, key, link_state(&link, &shape, &expected, plain_ok));
+        if let PathShape::Link {
+            resolved: None,
+            raw_target,
+        } = &shape
+        {
+            // The verdict is `foreign` (nothing is served through it); the
+            // literal target is the one thing that says what was intended.
+            warn!(
+                "env_agent: harness capture — {} is a dangling link (literal target {}); a session at this root loads nothing through it",
+                link.display(),
+                raw_target.display()
+            );
+        }
+        put(&mut section, key, link_state(&shape, &expected, plain_ok));
     }
 
     // The harness repo itself — a `.git` dir (canonical checkout) or file
@@ -3837,26 +4122,38 @@ fn collect_harness_under(
     let git_marker = config_repo.join(".git");
     put(&mut section, "config_repo", presence(git_marker.exists()));
 
-    // Installer renders — file-observable state only, never `--check`.
+    // What the root's `.claude` actually serves (see `root_settings_hooks`
+    // for why this is not an `installer_*` key).
     put(
         &mut section,
-        "installer_guard_hooks",
-        presence(guard_hooks_installed(&config_repo)),
+        "root_settings_hooks",
+        presence(root_settings_hooks(root)),
     );
+
+    // Installer renders — the per-machine state each installer leaves,
+    // file-observable only, never `--check`. Never tracked source: a key that
+    // reads the clone reads `present` on every box and can show no drift.
     put(
         &mut section,
         "installer_agent_skills",
-        presence(agent_skills_installed(&config_repo)),
+        presence(agent_skills_installed(&config_repo, home)),
     );
     put(
         &mut section,
         "installer_claude_accounts",
         presence(claude_accounts_installed(config_root)),
     );
+    // The `_git_hooks` half of install-guard-hooks.sh: the trailer hook in the
+    // hooks dir git would actually run it from (`core.hooksPath`, linked
+    // worktrees), resolved by `git_hooks_dir` without shelling out.
     put(
         &mut section,
         "installer_git_hooks",
-        presence(git_marker.join("hooks").join("prepare-commit-msg").is_file()),
+        presence(
+            git_hooks_dir(&config_repo, home)
+                .map(|d| d.join("prepare-commit-msg").is_file())
+                .unwrap_or(false),
+        ),
     );
 
     // The runner's plans dir, root-relative.
@@ -4038,8 +4335,7 @@ mod tests {
         }
         let wt_path = root.join("qontinui-runner-wt-something");
         let opts = git2::WorktreeAddOptions::new();
-        r.worktree("wt-something", &wt_path, Some(&opts))
-            .unwrap();
+        r.worktree("wt-something", &wt_path, Some(&opts)).unwrap();
         // Guard the guard: if this ever stops being a worktree, the exclusion
         // test below is vacuous and must fail loudly rather than quietly pass.
         assert!(
@@ -6338,14 +6634,25 @@ dependencies = [
         }
     }
 
+    /// The fake home dir the harness tests hand in as `home`: under `root` so
+    /// one `remove_dir_all` cleans it, named so a leaked one is findable.
+    fn harness_home(root: &Path) -> PathBuf {
+        root.join("_home")
+    }
+
     /// A compliant harness under `root`: the config repo with its `.git`, the
-    /// three links, the guard-hooks render, one agent skill, the git hook, the
-    /// tracked plan corpus. Returns false when the box cannot create links.
+    /// three links, the tracked settings.json with hooks, one agent skill
+    /// SOURCE plus its user-level junction under the fake home (what
+    /// `install-agent-skills.ps1` leaves), the git hook, the tracked plan
+    /// corpus. Returns false when the box cannot create links.
     fn compliant_harness(root: &Path) -> bool {
         let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
         std::fs::create_dir_all(cfg.join(".git").join("hooks")).unwrap();
-        std::fs::write(cfg.join(".git").join("hooks").join("prepare-commit-msg"), "#!/bin/sh\n")
-            .unwrap();
+        std::fs::write(
+            cfg.join(".git").join("hooks").join("prepare-commit-msg"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(cfg.join(".claude")).unwrap();
         std::fs::write(
             cfg.join(".claude").join("settings.json"),
@@ -6355,8 +6662,11 @@ dependencies = [
         std::fs::write(cfg.join("CLAUDE.md"), "# guidelines\n").unwrap();
         std::fs::create_dir_all(cfg.join("scripts")).unwrap();
         std::fs::write(cfg.join("scripts").join("dev-start.ps1"), "param()\n").unwrap();
-        std::fs::create_dir_all(cfg.join(".agents").join("skills").join("coord")).unwrap();
+        let skill_src = cfg.join(".agents").join("skills").join("coord");
+        std::fs::create_dir_all(&skill_src).unwrap();
         std::fs::create_dir_all(root.join(HARNESS_PLANS_REPO_DIR).join("plans")).unwrap();
+        let skills_root = harness_home(root).join(".agents").join("skills");
+        std::fs::create_dir_all(&skills_root).unwrap();
 
         make_link(&root.join(".claude"), &cfg.join(".claude"), true)
             && make_link(&root.join("CLAUDE.md"), &cfg.join("CLAUDE.md"), false)
@@ -6365,6 +6675,7 @@ dependencies = [
                 &cfg.join("scripts").join("dev-start.ps1"),
                 false,
             )
+            && make_link(&skills_root.join("coord"), &skill_src, true)
     }
 
     fn harness_value<'a>(section: &'a Section, key: &str) -> &'a str {
@@ -6391,20 +6702,33 @@ dependencies = [
             .join("plans")
             .display()
             .to_string();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(Some(plans)), None);
+        let home = harness_home(&root);
+        let section = collect_harness_under(
+            &root,
+            &PlansDirReading::Read(Some(plans)),
+            None,
+            Some(&home),
+        );
 
         for (k, v) in &section {
-            assert!(v.is_string(), "envelope contract: {k} must be a string, got {v:?}");
+            assert!(
+                v.is_string(),
+                "envelope contract: {k} must be a string, got {v:?}"
+            );
         }
         assert_eq!(harness_value(&section, "link_claude_dir"), "present");
         assert_eq!(harness_value(&section, "link_claude_md"), "present");
         assert_eq!(harness_value(&section, "link_dev_start"), "present");
         assert_eq!(harness_value(&section, "config_repo"), "present");
-        assert_eq!(harness_value(&section, "installer_guard_hooks"), "present");
+        // Read THROUGH the root's `.claude` link, not from the clone.
+        assert_eq!(harness_value(&section, "root_settings_hooks"), "present");
         assert_eq!(harness_value(&section, "installer_agent_skills"), "present");
         assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
         // No config root handed in → the roster cannot be read → absent.
-        assert_eq!(harness_value(&section, "installer_claude_accounts"), "absent");
+        assert_eq!(
+            harness_value(&section, "installer_claude_accounts"),
+            "absent"
+        );
         assert_eq!(
             harness_value(&section, "plans_dir_relative"),
             "qontinui-dev-notes/plans"
@@ -6419,13 +6743,13 @@ dependencies = [
     #[test]
     fn harness_bare_root_reads_absent_everywhere() {
         let root = harness_root("bare");
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
         for key in [
             "link_claude_dir",
             "link_claude_md",
             "link_dev_start",
             "config_repo",
-            "installer_guard_hooks",
+            "root_settings_hooks",
             "installer_agent_skills",
             "installer_claude_accounts",
             "installer_git_hooks",
@@ -6448,7 +6772,7 @@ dependencies = [
         std::fs::create_dir_all(&tracked).unwrap();
 
         if make_link(&root.join("plans"), &tracked, true) {
-            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+            let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
             assert_eq!(harness_value(&section, "invariant_class"), "(b)");
             // Remove the link only (never the target). On Windows a directory
             // symlink/junction is removed as a directory.
@@ -6462,7 +6786,7 @@ dependencies = [
 
         std::fs::create_dir_all(root.join("plans")).unwrap();
         std::fs::write(root.join("plans").join("stray.md"), "# a second corpus\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
         assert_eq!(harness_value(&section, "invariant_class"), "(c)");
         assert!(
             root.join("plans").join("stray.md").is_file(),
@@ -6485,7 +6809,7 @@ dependencies = [
             let _ = std::fs::remove_dir_all(&root);
             return;
         }
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6496,20 +6820,24 @@ dependencies = [
     #[test]
     fn harness_plain_file_forms() {
         let root = harness_root("plain");
-        std::fs::write(root.join("CLAUDE.md"), "\n@qontinui-claude-config/CLAUDE.md\n\n").unwrap();
+        std::fs::write(
+            root.join("CLAUDE.md"),
+            "\n@qontinui-claude-config/CLAUDE.md\n\n",
+        )
+        .unwrap();
         std::fs::write(
             root.join("dev-start.ps1"),
             "# forwarder\n& \"$PSScriptRoot\\qontinui-claude-config\\scripts\\dev-start.ps1\" @args\n",
         )
         .unwrap();
         std::fs::create_dir_all(root.join(".claude")).unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
         assert_eq!(harness_value(&section, "link_claude_md"), "present");
         assert_eq!(harness_value(&section, "link_dev_start"), "present");
         assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
 
         std::fs::write(root.join("CLAUDE.md"), "# my own guidelines\n").unwrap();
-        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None);
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
         assert_eq!(harness_value(&section, "link_claude_md"), "foreign");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -6517,33 +6845,47 @@ dependencies = [
     /// Pure classification over shapes this box may not be able to create.
     #[test]
     fn harness_link_state_is_pure_over_shapes() {
-        let root = Path::new(if cfg!(windows) {
-            "C:\\ws"
-        } else {
-            "/ws"
-        });
-        let link = root.join(".claude");
+        let root = Path::new(if cfg!(windows) { "C:\\ws" } else { "/ws" });
         let expected = root.join(HARNESS_CONFIG_REPO_DIR).join(".claude");
         assert_eq!(
-            link_state(&link, &PathShape::Missing, &expected, never_plain_ok),
+            link_state(&PathShape::Missing, &expected, never_plain_ok),
             "absent"
         );
         assert_eq!(
-            link_state(&link, &PathShape::Dir, &expected, never_plain_ok),
+            link_state(&PathShape::Dir, &expected, never_plain_ok),
             "foreign"
         );
         assert_eq!(
-            link_state(&link, &PathShape::Unreadable, &expected, never_plain_ok),
+            link_state(&PathShape::Unreadable, &expected, never_plain_ok),
             "unknown"
         );
-        // A dangling link whose LITERAL target is the right relative path —
-        // the config repo is not cloned yet — still judges by where it points.
+        // A dangling link is `foreign` EVEN WHEN its literal target is the
+        // right relative path (the config repo not cloned yet): `present`
+        // means "present and resolving" (plan Phase 2), and the doctor and
+        // the bootstrap both read a dangling link as broken. Review round 1
+        // finding 10 — the previous reading was `present`.
         let dangling_right = PathShape::Link {
             resolved: None,
             raw_target: PathBuf::from(HARNESS_CONFIG_REPO_DIR).join(".claude"),
         };
         assert_eq!(
-            link_state(&link, &dangling_right, &expected, never_plain_ok),
+            link_state(&dangling_right, &expected, never_plain_ok),
+            "foreign"
+        );
+        let dangling_wrong = PathShape::Link {
+            resolved: None,
+            raw_target: PathBuf::from("nowhere/.claude"),
+        };
+        assert_eq!(
+            link_state(&dangling_wrong, &expected, never_plain_ok),
+            "foreign"
+        );
+        let resolved_right = PathShape::Link {
+            resolved: Some(expected.clone()),
+            raw_target: PathBuf::from(HARNESS_CONFIG_REPO_DIR).join(".claude"),
+        };
+        assert_eq!(
+            link_state(&resolved_right, &expected, never_plain_ok),
             "present"
         );
         let resolved_elsewhere = PathShape::Link {
@@ -6551,24 +6893,17 @@ dependencies = [
             raw_target: PathBuf::from("other/.claude"),
         };
         assert_eq!(
-            link_state(&link, &resolved_elsewhere, &expected, never_plain_ok),
+            link_state(&resolved_elsewhere, &expected, never_plain_ok),
             "foreign"
         );
         // Plain-file acceptance is the caller's predicate, not the shape's.
         let file = PathShape::File {
             contents: Some("@qontinui-claude-config/CLAUDE.md\n".into()),
         };
-        assert_eq!(
-            link_state(&link, &file, &expected, claude_md_plain_ok),
-            "present"
-        );
-        assert_eq!(
-            link_state(&link, &file, &expected, never_plain_ok),
-            "foreign"
-        );
+        assert_eq!(link_state(&file, &expected, claude_md_plain_ok), "present");
+        assert_eq!(link_state(&file, &expected, never_plain_ok), "foreign");
         assert_eq!(
             link_state(
-                &link,
                 &PathShape::File { contents: None },
                 &expected,
                 never_plain_ok
@@ -6577,15 +6912,66 @@ dependencies = [
         );
     }
 
+    /// A REAL dangling link on disk — the shape `path_shape` reads for a link
+    /// whose target was never cloned — is `foreign`, not `present`, through
+    /// the whole collector. A junction (the README's Windows arm) is created
+    /// without its target existing, which is exactly how a bootstrap that
+    /// linked before cloning leaves a box.
+    #[test]
+    fn harness_dangling_link_is_foreign() {
+        let root = harness_root("dangling");
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        // NOT created: the link's target does not exist.
+        if !make_link(&root.join(".claude"), &cfg.join(".claude"), true) {
+            eprintln!("skipping: this box cannot create a dangling symlink or junction");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        let shape = path_shape(&root.join(".claude"));
+        assert!(
+            matches!(shape, PathShape::Link { resolved: None, .. }),
+            "expected a dangling link shape, got {shape:?}"
+        );
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        assert_eq!(harness_value(&section, "link_claude_dir"), "foreign");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `dev-start.ps1` plain-file predicate accepts only a forwarding
+    /// LINE — first non-blank char `&`, a quote, the tracked path — matching
+    /// the capability doctor's grep. A file that merely mentions the path
+    /// (a comment; the real script naming itself) is a stale copy, `foreign`.
+    #[test]
+    fn harness_dev_start_shim_predicate_matches_the_doctor() {
+        assert!(dev_start_plain_ok(
+            "& \"$PSScriptRoot\\qontinui-claude-config\\scripts\\dev-start.ps1\" @args\n"
+        ));
+        assert!(dev_start_plain_ok(
+            "# forwarder\n   &  '$PSScriptRoot/qontinui-claude-config/scripts/dev-start.ps1' @args\r\n"
+        ));
+        assert!(
+            !dev_start_plain_ok("# see qontinui-claude-config/scripts/dev-start.ps1\nparam()\n"),
+            "a comment naming the path is not a forwarder"
+        );
+        assert!(
+            !dev_start_plain_ok("Write-Host qontinui-claude-config\\scripts\\dev-start.ps1\n"),
+            "the path on a non-call line is not a forwarder"
+        );
+        assert!(
+            !dev_start_plain_ok("& \"$PSScriptRoot\\other\\dev-start.ps1\" @args\n"),
+            "a call to some other script is not the harness's"
+        );
+        assert!(
+            !dev_start_plain_ok("& qontinui-claude-config/scripts/dev-start.ps1\n"),
+            "the doctor's predicate needs the opening quote"
+        );
+    }
+
     /// Pure invariant classification, including the two arms a filesystem
     /// test cannot easily stage (a dangling link; a link to a foreign corpus).
     #[test]
     fn harness_invariant_class_is_pure_over_shapes() {
-        let root = Path::new(if cfg!(windows) {
-            "C:\\ws"
-        } else {
-            "/ws"
-        });
+        let root = Path::new(if cfg!(windows) { "C:\\ws" } else { "/ws" });
         let tracked = root.join(HARNESS_PLANS_REPO_DIR).join("plans");
         assert_eq!(invariant_class(&PathShape::Missing, &tracked), "(a)");
         assert_eq!(invariant_class(&PathShape::Dir, &tracked), "(c)");
@@ -6713,20 +7099,393 @@ dependencies = [
         let _ = std::fs::remove_dir_all(&cfg_root);
     }
 
-    /// Guard-hooks render: an empty `hooks` object is NOT an install (the
-    /// uninstall arm leaves exactly that behind).
+    /// `root_settings_hooks` reads the ROOT's `.claude/settings.json` — what a
+    /// session there loads — and an empty `hooks` object is not wired (the
+    /// uninstall arm leaves exactly that behind). The clone's own tracked
+    /// settings.json is deliberately NOT consulted: it carries hooks on every
+    /// checkout and would read `present` on a box with no `.claude` at all
+    /// (review round 1 finding 11).
     #[test]
-    fn harness_guard_hooks_render_needs_a_non_empty_hooks_object() {
+    fn harness_root_settings_hooks_reads_the_root_not_the_clone() {
         let root = harness_root("guard");
         let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
         std::fs::create_dir_all(cfg.join(".claude")).unwrap();
-        let settings = cfg.join(".claude").join("settings.json");
+        std::fs::write(
+            cfg.join(".claude").join("settings.json"),
+            r#"{"hooks":{"Stop":[]}}"#,
+        )
+        .unwrap();
+        assert!(
+            !root_settings_hooks(&root),
+            "the clone's tracked hooks are not the root's"
+        );
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        let settings = root.join(".claude").join("settings.json");
         std::fs::write(&settings, r#"{"hooks":{}}"#).unwrap();
-        assert!(!guard_hooks_installed(&cfg));
+        assert!(!root_settings_hooks(&root));
         std::fs::write(&settings, r#"{"permissions":{}}"#).unwrap();
-        assert!(!guard_hooks_installed(&cfg));
+        assert!(!root_settings_hooks(&root));
         std::fs::write(&settings, r#"{"hooks":{"Stop":[]}}"#).unwrap();
-        assert!(guard_hooks_installed(&cfg));
+        assert!(root_settings_hooks(&root));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `installer_agent_skills` reads the INSTALL ROOT (`<home>/.agents/skills`)
+    /// the way `install-agent-skills.ps1 -Check` does, never the tracked
+    /// source: a clone with skills and no install is `absent`; a real
+    /// directory at the install root is MISPOINTED, not wired; a link to some
+    /// other checkout's copy is drift, not wired; a link to the source is
+    /// wired; `_`/`.`-prefixed source dirs are not skills (review round 1
+    /// finding 11).
+    #[test]
+    fn harness_agent_skills_read_the_install_root_not_the_source() {
+        let root = harness_root("skills");
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        let src = cfg.join(".agents").join("skills");
+        std::fs::create_dir_all(src.join("coord")).unwrap();
+        std::fs::create_dir_all(src.join("_shared")).unwrap();
+        std::fs::create_dir_all(src.join(".hidden")).unwrap();
+        let home = harness_home(&root);
+        let install = home.join(".agents").join("skills");
+        std::fs::create_dir_all(&install).unwrap();
+
+        let names: Vec<String> = agent_skill_sources(&cfg)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["coord".to_string()],
+            "prefixed dirs are not skills"
+        );
+
+        assert!(
+            !agent_skills_installed(&cfg, None),
+            "no home, no install root"
+        );
+        assert!(
+            !agent_skills_installed(&cfg, Some(&home)),
+            "a tracked source with nothing installed is absent"
+        );
+
+        std::fs::create_dir_all(install.join("coord")).unwrap();
+        assert!(
+            !agent_skills_installed(&cfg, Some(&home)),
+            "a real directory at the install root is MISPOINTED, not wired"
+        );
+        std::fs::remove_dir(install.join("coord")).unwrap();
+
+        let other = root
+            .join("other-checkout")
+            .join(".agents")
+            .join("skills")
+            .join("coord");
+        std::fs::create_dir_all(&other).unwrap();
+        if !make_link(&install.join("coord"), &other, true) {
+            eprintln!("skipping the link arms: this box cannot create symlinks or junctions");
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        }
+        assert!(
+            !agent_skills_installed(&cfg, Some(&home)),
+            "a link to another checkout's copy is drift, not wired"
+        );
+        #[cfg(windows)]
+        std::fs::remove_dir(install.join("coord")).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(install.join("coord")).unwrap();
+
+        assert!(make_link(&install.join("coord"), &src.join("coord"), true));
+        assert!(agent_skills_installed(&cfg, Some(&home)));
+
+        // A `_`-prefixed source wired alone does not count: it is not a skill.
+        #[cfg(windows)]
+        std::fs::remove_dir(install.join("coord")).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(install.join("coord")).unwrap();
+        assert!(make_link(
+            &install.join("_shared"),
+            &src.join("_shared"),
+            true
+        ));
+        assert!(!agent_skills_installed(&cfg, Some(&home)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `git_hooks_dir` mirrors `git rev-parse --git-path hooks` from file
+    /// reads: a `.git` directory, a linked worktree's `.git` FILE (`gitdir:`)
+    /// plus its `commondir`, and `core.hooksPath` in the repo's config
+    /// (absolute, relative to the worktree, `~/`-expanded) or the global one,
+    /// local winning (review round 1 finding 12).
+    #[test]
+    fn harness_git_hooks_dir_honours_hookspath_and_linked_worktrees() {
+        // The global-config arm reads `$XDG_CONFIG_HOME/git/config`; pin it
+        // under the fake home so a real one on this box cannot answer.
+        let _env_lock = env_lock();
+        let saved_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let root = harness_root("hooksdir");
+        let home = harness_home(&root);
+        std::fs::create_dir_all(&home).unwrap();
+        let xdg = home.join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &xdg);
+
+        // No `.git` at all.
+        let bare = root.join("not-a-repo");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(git_hooks_dir(&bare, Some(&home)), None);
+
+        // A primary checkout: `<repo>/.git/hooks`.
+        let primary = root.join("primary");
+        std::fs::create_dir_all(primary.join(".git").join("hooks")).unwrap();
+        std::fs::write(
+            primary.join(".git").join("config"),
+            "[core]\n\tbare = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(primary.join(".git").join("hooks"))
+        );
+
+        // A linked worktree: `.git` is a FILE naming the admin dir, whose
+        // `commondir` names the main `.git`; hooks live under the COMMON dir.
+        let admin = primary.join(".git").join("worktrees").join("wt1");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let linked = root.join("linked");
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        let got = git_hooks_dir(&linked, Some(&home)).expect("gitdir file parses");
+        assert!(
+            same_place(&got, &primary.join(".git").join("hooks")),
+            "linked worktree must resolve to the MAIN checkout's hooks dir, got {}",
+            got.display()
+        );
+
+        // A malformed gitdir file is None, not a guess.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join(".git"), "not a gitdir line\n").unwrap();
+        assert_eq!(git_hooks_dir(&broken, Some(&home)), None);
+
+        // core.hooksPath, absolute.
+        let custom = root.join("custom-hooks");
+        std::fs::write(
+            primary.join(".git").join("config"),
+            format!(
+                "[core]\n\tbare = false\n\thooksPath = {}\n",
+                custom.display().to_string().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+        let got = git_hooks_dir(&primary, Some(&home)).unwrap();
+        assert_eq!(normalize_lexical(&got), normalize_lexical(&custom));
+        // ...and the linked worktree follows the common config too.
+        let got = git_hooks_dir(&linked, Some(&home)).unwrap();
+        assert_eq!(normalize_lexical(&got), normalize_lexical(&custom));
+
+        // core.hooksPath, relative: relative to the worktree top level.
+        std::fs::write(
+            primary.join(".git").join("config"),
+            "[core]\n\thooksPath = .githooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(primary.join(".githooks"))
+        );
+
+        // core.hooksPath, `~/`-expanded; quoted value; last occurrence wins.
+        std::fs::write(
+            primary.join(".git").join("config"),
+            "[core]\n\thooksPath = .githooks\n\thooksPath = \"~/git-hooks\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(home.join("git-hooks"))
+        );
+
+        // Global config applies when the repo sets nothing — the XDG file
+        // when `~/.gitconfig` is silent, `~/.gitconfig` first when both speak
+        // — and local wins over either.
+        std::fs::write(primary.join(".git").join("config"), "[user]\n\tname = x\n").unwrap();
+        std::fs::write(
+            xdg.join("git").join("config"),
+            "[core]\n\thooksPath = ~/xdg-hooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(home.join("xdg-hooks"))
+        );
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\n\thooksPath = ~/global-hooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(home.join("global-hooks"))
+        );
+        std::fs::write(
+            primary.join(".git").join("config"),
+            "[core]\n\thooksPath = .local-hooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&primary, Some(&home)),
+            Some(primary.join(".local-hooks"))
+        );
+
+        // extensions.worktreeConfig: the admin dir's config.worktree wins.
+        std::fs::write(
+            primary.join(".git").join("config"),
+            "[extensions]\n\tworktreeConfig = true\n[core]\n\thooksPath = .local-hooks\n",
+        )
+        .unwrap();
+        std::fs::write(
+            admin.join("config.worktree"),
+            "[core]\n\thooksPath = .wt-hooks\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_hooks_dir(&linked, Some(&home)),
+            Some(linked.join(".wt-hooks"))
+        );
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The minimal git-config reader: section headers case-insensitive, a
+    /// subsection does not match its parent, comments skipped, quotes
+    /// stripped, last value wins.
+    #[test]
+    fn harness_git_config_value_reads_the_shapes_git_writes() {
+        let text = "; comment\n[Core]\n# comment\n\tHooksPath = a\n[core \"sub\"]\n\thooksPath = b\n[core]\n\thooksPath = \"c d\"\n";
+        assert_eq!(
+            git_config_value(text, "core", "hookspath").as_deref(),
+            Some("c d")
+        );
+        assert_eq!(git_config_value(text, "core", "bare"), None);
+        assert_eq!(git_config_value("", "core", "hookspath"), None);
+        assert!(git_config_bool(
+            "[extensions]\n\tworktreeConfig = True\n",
+            "extensions",
+            "worktreeconfig"
+        ));
+        assert!(!git_config_bool(
+            "[extensions]\n\tworktreeConfig = false\n",
+            "extensions",
+            "worktreeconfig"
+        ));
+        assert!(!git_config_bool("", "extensions", "worktreeconfig"));
+    }
+
+    /// `installer_git_hooks` through the collector follows `core.hooksPath`:
+    /// a hook sitting in `.git/hooks` while the repo's config points git
+    /// elsewhere is NOT installed where git would run it.
+    #[test]
+    fn harness_installer_git_hooks_follows_hookspath() {
+        let root = harness_root("githook");
+        let cfg = root.join(HARNESS_CONFIG_REPO_DIR);
+        std::fs::create_dir_all(cfg.join(".git").join("hooks")).unwrap();
+        std::fs::write(
+            cfg.join(".git").join("hooks").join("prepare-commit-msg"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
+
+        std::fs::write(
+            cfg.join(".git").join("config"),
+            "[core]\n\thooksPath = .githooks\n",
+        )
+        .unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        assert_eq!(
+            harness_value(&section, "installer_git_hooks"),
+            "absent",
+            "the hook in .git/hooks is not where git runs hooks from here"
+        );
+        std::fs::create_dir_all(cfg.join(".githooks")).unwrap();
+        std::fs::write(
+            cfg.join(".githooks").join("prepare-commit-msg"),
+            "#!/bin/sh\n",
+        )
+        .unwrap();
+        let section = collect_harness_under(&root, &PlansDirReading::Read(None), None, None);
+        assert_eq!(harness_value(&section, "installer_git_hooks"), "present");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `plans_dir_relative` edge cases (review round 1 finding 13): a
+    /// root-anchored POSIX spelling is absolute on Windows too and is never
+    /// published verbatim as a relative path; a configured dir that does not
+    /// exist is compared against BOTH spellings of the root; a genuinely
+    /// relative spelling still renders as itself.
+    #[test]
+    fn harness_plans_dir_relative_absolute_edge_cases() {
+        let root = harness_root("plansdir-edges");
+        for anchored in ["/somewhere/plans", "\\somewhere\\plans"] {
+            let rendered =
+                plans_dir_relative(&root, &PlansDirReading::Read(Some(anchored.to_string())));
+            assert_eq!(
+                rendered, "outside-workspace",
+                "{anchored:?} is root-anchored, never a path under the root"
+            );
+        }
+        assert!(is_absolute_any_platform(Path::new("/x")));
+        assert!(is_absolute_any_platform(Path::new("\\x")));
+        assert!(!is_absolute_any_platform(Path::new("x/y")));
+        assert!(!is_absolute_any_platform(Path::new("./x")));
+
+        // A genuinely relative value is published normalized, as before.
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some("./qontinui-dev-notes\\plans".to_string()))
+            ),
+            "qontinui-dev-notes/plans"
+        );
+
+        // Not existing yet, spelled with the CANONICAL root: inside.
+        if let Ok(canon) = std::fs::canonicalize(&root) {
+            let planned = canon.join("qontinui-dev-notes").join("plans-later");
+            assert_eq!(
+                plans_dir_relative(
+                    &root,
+                    &PlansDirReading::Read(Some(planned.display().to_string()))
+                ),
+                "qontinui-dev-notes/plans-later"
+            );
+        }
+        // Not existing yet, spelled with the root as handed in: inside.
+        let planned = root.join("qontinui-dev-notes").join("plans-later");
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(planned.display().to_string()))
+            ),
+            "qontinui-dev-notes/plans-later"
+        );
+        // The root itself, existing.
+        assert_eq!(
+            plans_dir_relative(
+                &root,
+                &PlansDirReading::Read(Some(root.display().to_string()))
+            ),
+            "."
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
