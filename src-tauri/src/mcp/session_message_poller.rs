@@ -38,10 +38,15 @@
 //!   QUEUES the message when the session is `Processing`
 //!   (`claude_session/session.rs`), so it is safe by construction and never
 //!   clobbers a turn.
-//! - **PTY / `WorkerSession`** — `submit_prompt` writes raw bracketed-paste +
-//!   CR with NO state check, so injecting mid-turn corrupts the running turn.
-//!   We FIRST check the idle gate (`TerminalSession::looks_idle_quiescent`,
-//!   over `looping_agent::idle::snapshot_looks_idle`); only inject when
+//! - **PTY** — a registered `WorkerSession` (the coordinator's `Worker N`
+//!   PTYs) OR a typed interactive terminal known only to the lifecycle store
+//!   (an operator opened a terminal and typed `claude`; it has a
+//!   `TerminalManager` PTY and a `record_open` row but NEVER a
+//!   `WorkerSession`, because `worker_sessions` has one production writer,
+//!   `spawn_worker_session`). Both inject through
+//!   `TerminalSession::submit_prompt`, which writes raw bracketed-paste + CR
+//!   with NO state check, so injecting mid-turn corrupts the running turn.
+//!   We FIRST check the idle gate ([`idle_gate`]); only inject when
 //!   the terminal is quiescent and showing its input prompt. If not idle we
 //!   SKIP this tick (leave the message unacked; retry next poll).
 //!
@@ -59,12 +64,23 @@
 //!   against a double-inject within a tick or before the ack lands. A
 //!   per-`to_session` cooldown debounces a flapping source so it cannot spam a
 //!   session.
-//! - **Blocked-delivery surfacing.** A `priority="blocking"` message that
-//!   stays undeliverable (target not live, or PTY never idle) past
-//!   `RUNNER_BLOCKING_MSG_SURFACE_SECS` is reported to coord via a fail-open
-//!   `delivery-blocked` POST — evidence for the stall-watchdog supervisor,
-//!   never a change to delivery behavior. Gated (default ON) by
-//!   `RUNNER_DELIVERY_SURFACING_ENABLED`.
+//! - **Non-delivery is never silent.** A message of ANY priority that cannot
+//!   be delivered this tick (target not live, PTY never idle, or the inject
+//!   itself refused) is logged at `info` — on first sighting, again past
+//!   `RUNNER_MSG_SURFACE_SECS` (default 60 s), then once per
+//!   `RUNNER_MSG_SURFACE_REPEAT_SECS` (default 1800 s), so a 10 s poll does
+//!   not spam. A `blocking` message ([`posts_to_coord`]) is also reported to
+//!   coord via a fail-open `delivery-blocked` POST: past the 60 s threshold
+//!   for `target_not_live`, past the repeat window for `pty_never_idle` (a busy
+//!   live recipient) — evidence for the
+//!   stall-watchdog supervisor, never a change to delivery behavior. Gated
+//!   (default ON) by `RUNNER_DELIVERY_SURFACING_ENABLED`.
+//! - **Push evidence that survives a pull.** Every miss and every inject bumps
+//!   a process-local counter family exposed on `GET /health` as
+//!   `data.sessionMessages` ([`health_snapshot`]). A recipient that drains
+//!   its mailbox by hand (`coord_inbox`) removes the row from `pending`, which
+//!   erases the surfacing tracker's clock for it — the counter is what is
+//!   left to say "push missed N times" after that.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -185,34 +201,68 @@ impl DeliveryGuard {
 }
 
 // ===========================================================================
-// Delivery-blocked surfacing (lost-wakeup fixes 2-3,
-// plan 2026-07-03-subagent-stall-watchdog)
+// Non-delivery reporting (lost-wakeup fixes 2-3,
+// plan 2026-07-03-subagent-stall-watchdog; widened to every priority by
+// plan 2026-09-07-session-message-delivery-is-blind-and-park-collection-
+// resolves-on-a-guess, Phase 4)
 // ===========================================================================
 //
-// A `priority="blocking"` message that cannot be delivered used to fail
-// SILENTLY forever: an unresolvable `to_session` just logged-and-waited (until
-// the 14d TTL), and a PTY that never passes the idle gate deferred injection
-// on every tick with no aging signal. Both are exactly the invisible-stall
-// class the stall-watchdog plan exists to kill, so once a blocking message has
-// been blocked past `RUNNER_BLOCKING_MSG_SURFACE_SECS` we POST a typed
-// delivery-failure to coord (`.../delivery-blocked`) as EVIDENCE for coord's
-// expectation supervisor. Delivery behavior itself is UNCHANGED — the POST is
-// reporting-only, fail-open, and fired at most once per threshold window per
-// message.
+// A message that cannot be delivered used to fail SILENTLY forever: an
+// unresolvable `to_session` just logged-and-waited (until the 14d TTL), and a
+// PTY that never passes the idle gate deferred injection on every tick with
+// no aging signal. Both are exactly the invisible-stall class the
+// stall-watchdog plan exists to kill. Two reporting arms: the local one for
+// EVERY priority, the coord POST for `blocking` only — the original `priority="blocking"` gate hid a controlled
+// contrast measured on 2026-09-07 (a `normal` message: 0 log lines; the same
+// failure at `blocking`: 9), and the 1800 s threshold below it was never
+// reached because the recipient drained the mailbox by hand first:
+//
+// 1. An `info` log line (and the `/health` counter) for every priority: the
+//    first sighting logs immediately, again at the threshold, then once per
+//    repeat window, so a miss is visible in the runner log at once.
+// 2. For a `blocking` message, once it has been blocked past
+//    `RUNNER_MSG_SURFACE_SECS` (`target_not_live`) or the repeat window
+//    (`pty_never_idle`, a live recipient that is merely busy) we POST
+//    a typed delivery-failure to coord (`.../delivery-blocked`) as EVIDENCE
+//    for coord's expectation supervisor — then at most once per
+//    `RUNNER_MSG_SURFACE_REPEAT_SECS` window per message; coord keys its
+//    alert per `message_id`, so a repeat is idempotent, but its
+//    `delivery_blocked{reason}` counter is not, which is why the repeat
+//    spacing is a separate, longer knob than the first-fire threshold.
+//
+// Delivery behavior itself is UNCHANGED — both arms are reporting-only and
+// the POST is fail-open.
 
 /// Flag gating the surfacing POSTs (fixes 2-3). **Default ON** — they are
 /// reporting-only (no mutation, no injection change; plan vet decision).
-/// `0`/`false`/`no`/`off` disables the POSTs (blocked-time tracking still
-/// runs; it is cheap and keeps `blocked_since` honest if re-enabled).
+/// `0`/`false`/`no`/`off` disables the POSTs (blocked-time tracking, the info
+/// log and the counters still run; they are cheap and keep `blocked_since`
+/// honest if re-enabled).
 const SURFACING_ENABLED_ENV: &str = "RUNNER_DELIVERY_SURFACING_ENABLED";
 
-/// How long a blocking message must be continuously undeliverable before the
-/// first surfacing POST, and the minimum spacing between POSTs for the same
-/// message thereafter (once per window). Seconds; env-tunable.
-const SURFACE_SECS_ENV: &str = "RUNNER_BLOCKING_MSG_SURFACE_SECS";
+/// How long a message must be continuously undeliverable before the second
+/// info-log line and, for a blocking `target_not_live` message, the FIRST
+/// surfacing POST. Seconds; env-tunable.
+const SURFACE_SECS_ENV: &str = "RUNNER_MSG_SURFACE_SECS";
 
-/// Default surfacing threshold: 30 minutes.
-const SURFACE_SECS_DEFAULT: u64 = 1800;
+/// Default first-fire threshold: 60 s — six consecutive 10 s misses, above any
+/// transient (a mid-turn PTY, a session between prompts) and short enough
+/// that a live recipient does not routinely beat it by draining the mailbox
+/// by hand. The previous 1800 s was reachable only if nothing collected the
+/// message for 30 minutes, which an attentive recipient never allows.
+const SURFACE_SECS_DEFAULT: u64 = 60;
+
+/// Minimum spacing between REPEAT surfacing POSTs for one message after the
+/// first has fired. Deliberately separate from the first-fire threshold: at
+/// 60 s a message stranded to its 14 d TTL would POST ~20,000 times and
+/// coord's `delivery_blocked{reason}` counter would start counting poll
+/// ticks. Seconds; env-tunable.
+const SURFACE_REPEAT_SECS_ENV: &str = "RUNNER_MSG_SURFACE_REPEAT_SECS";
+
+/// Default repeat spacing: 30 minutes (the pre-2026-09-07 single threshold,
+/// which was a fine cadence for repeats — it was only wrong as a first-fire
+/// delay).
+const SURFACE_REPEAT_SECS_DEFAULT: u64 = 1800;
 
 /// Resolve the surfacing flag from a raw env value. Pure for unit tests.
 /// Absent ⇒ ON (default); only an explicit falsy value disables.
@@ -232,7 +282,7 @@ fn surfacing_enabled() -> bool {
 }
 
 /// Resolve the surfacing threshold from a raw env value. Pure for unit tests.
-/// Unset / non-numeric ⇒ the 1800s default.
+/// Unset / non-numeric ⇒ the 60 s default.
 fn resolve_surface_threshold(raw: Option<&str>) -> Duration {
     Duration::from_secs(
         raw.and_then(|v| v.trim().parse::<u64>().ok())
@@ -240,22 +290,42 @@ fn resolve_surface_threshold(raw: Option<&str>) -> Duration {
     )
 }
 
-/// The configured surfacing threshold (env override, else 1800s).
+/// The configured first-fire threshold (env override, else 60 s).
 fn surface_threshold() -> Duration {
     resolve_surface_threshold(std::env::var(SURFACE_SECS_ENV).ok().as_deref())
 }
 
-/// Why a blocking message could not be delivered — the typed `reason` the
-/// surfacing POST carries.
+/// Resolve the repeat spacing from a raw env value. Pure for unit tests.
+/// Unset / non-numeric ⇒ the 1800 s default.
+fn resolve_surface_repeat(raw: Option<&str>) -> Duration {
+    Duration::from_secs(
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(SURFACE_REPEAT_SECS_DEFAULT),
+    )
+}
+
+/// The configured repeat spacing (env override, else 1800 s).
+fn surface_repeat() -> Duration {
+    resolve_surface_repeat(std::env::var(SURFACE_REPEAT_SECS_ENV).ok().as_deref())
+}
+
+/// Why a message could not be delivered — the typed `reason` the surfacing
+/// POST carries (coord validates the two values) and the key of the
+/// `push_miss` counter on `/health`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum BlockReason {
-    /// Fix 2: `to_session` does not resolve to a live local session.
+    /// Fix 2: `to_session` does not resolve to a live local session — or it
+    /// resolved, but the terminal is gone from `TerminalManager` / refused
+    /// the inject (its process exited).
     TargetNotLive,
     /// Fix 3: the target PTY keeps failing the idle gate, deferring injection.
     PtyNeverIdle,
 }
 
 impl BlockReason {
+    /// Every reason, for rendering the counter family with no series absent.
+    const ALL: [BlockReason; 2] = [BlockReason::TargetNotLive, BlockReason::PtyNeverIdle];
+
     /// The wire value for the POST body's `reason` field.
     fn as_str(self) -> &'static str {
         match self {
@@ -265,19 +335,140 @@ impl BlockReason {
     }
 }
 
+// ===========================================================================
+// Push counters — the evidence that survives a recipient-side drain
+// ===========================================================================
+//
+// Process-local, monotonic since boot, exposed on `GET /health` as
+// `data.sessionMessages`. Bumped on EVERY miss and EVERY inject, whether or
+// not the row later leaves coord's `pending` set: a `coord_inbox` drain stamps
+// `delivered_at`, the next `pending` pull omits the row, and
+// `SurfacingTracker::retain_pending` forgets it — so the tracker's clock can
+// never reach the threshold for a message that was pulled by hand. These
+// counters are what is left to prove push missed.
+
+/// Which injection primitive actually carried a delivered message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveredArm {
+    /// SDK `ClaudeSession::send_user_message` (queues when Processing).
+    Sdk,
+    /// A registered `WorkerSession` — `send_user_message` → `submit_prompt`.
+    WorkerPty,
+    /// A lifecycle-recorded typed terminal with no `WorkerSession` —
+    /// `TerminalSession::submit_prompt` directly.
+    Terminal,
+}
+
+impl DeliveredArm {
+    /// Every arm, for rendering the counter family with no series absent.
+    const ALL: [DeliveredArm; 3] = [
+        DeliveredArm::Sdk,
+        DeliveredArm::WorkerPty,
+        DeliveredArm::Terminal,
+    ];
+
+    /// The `/health` key and the log label for this arm.
+    fn as_str(self) -> &'static str {
+        match self {
+            DeliveredArm::Sdk => "sdk",
+            DeliveredArm::WorkerPty => "worker_pty",
+            DeliveredArm::Terminal => "terminal",
+        }
+    }
+}
+
+/// Slot layout of [`push_counters`]: `push_ok`, one per [`BlockReason`], one
+/// per [`DeliveredArm`].
+const PUSH_OK_SLOT: usize = 0;
+const PUSH_MISS_SLOT_BASE: usize = 1;
+const DELIVERED_ARM_SLOT_BASE: usize = PUSH_MISS_SLOT_BASE + BlockReason::ALL.len();
+const PUSH_COUNTER_SLOTS: usize = DELIVERED_ARM_SLOT_BASE + DeliveredArm::ALL.len();
+
+fn push_counters() -> &'static [std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; PUSH_COUNTER_SLOTS]> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(|| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)))
+}
+
+fn miss_slot(reason: BlockReason) -> usize {
+    PUSH_MISS_SLOT_BASE
+        + BlockReason::ALL
+            .iter()
+            .position(|r| *r == reason)
+            .expect("every BlockReason is in BlockReason::ALL")
+}
+
+fn arm_slot(arm: DeliveredArm) -> usize {
+    DELIVERED_ARM_SLOT_BASE
+        + DeliveredArm::ALL
+            .iter()
+            .position(|a| *a == arm)
+            .expect("every DeliveredArm is in DeliveredArm::ALL")
+}
+
+/// One more tick on which a message could not be pushed, for `reason`.
+fn record_push_miss(reason: BlockReason) {
+    push_counters()[miss_slot(reason)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// One more successful inject, through `arm`. Bumps `push_ok` and the arm's
+/// own series.
+fn record_push_ok(arm: DeliveredArm) {
+    push_counters()[PUSH_OK_SLOT].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    push_counters()[arm_slot(arm)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `data.sessionMessages` block of `GET /health`:
+///
+/// ```json
+/// { "push_ok": n,
+///   "push_miss": { "target_not_live": n, "pty_never_idle": n },
+///   "delivered_arm": { "sdk": n, "worker_pty": n, "terminal": n } }
+/// ```
+///
+/// Every series is present even at zero — an absent key would read as "this
+/// never happens", which is the ambiguity the family exists to remove.
+pub(crate) fn health_snapshot() -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let counters = push_counters();
+    let mut push_miss = serde_json::Map::new();
+    for reason in BlockReason::ALL {
+        push_miss.insert(
+            reason.as_str().to_string(),
+            serde_json::json!(counters[miss_slot(reason)].load(Relaxed)),
+        );
+    }
+    let mut delivered_arm = serde_json::Map::new();
+    for arm in DeliveredArm::ALL {
+        delivered_arm.insert(
+            arm.as_str().to_string(),
+            serde_json::json!(counters[arm_slot(arm)].load(Relaxed)),
+        );
+    }
+    serde_json::json!({
+        "push_ok": counters[PUSH_OK_SLOT].load(Relaxed),
+        "push_miss": serde_json::Value::Object(push_miss),
+        "delivered_arm": serde_json::Value::Object(delivered_arm),
+    })
+}
+
 /// Pure surfacing decision: should a POST fire NOW for a message first seen
 /// blocked at `first_seen`, last surfaced at `last_posted`?
 ///
 /// - Disabled flag ⇒ never.
 /// - Blocked for less than `threshold` ⇒ not yet.
-/// - Never posted ⇒ fire.
-/// - Already posted ⇒ fire again only after a full `threshold` cooldown window
-///   since the last POST (at most one POST per message per window).
+/// - Never posted ⇒ fire (the FIRST fire, gated on `threshold`).
+/// - Already posted ⇒ fire again only after a full `repeat` window since the
+///   last POST. `repeat` is deliberately its own knob: the first-fire delay
+///   is sized so a live recipient cannot beat it (60 s), the repeat spacing
+///   so a message stranded to its TTL does not turn coord's counter into a
+///   poll-tick counter (1800 s).
 fn should_surface(
     first_seen: Instant,
     last_posted: Option<Instant>,
     now: Instant,
     threshold: Duration,
+    repeat: Duration,
     enabled: bool,
 ) -> bool {
     if !enabled {
@@ -288,7 +479,23 @@ fn should_surface(
     }
     match last_posted {
         None => true,
-        Some(at) => now.duration_since(at) >= threshold,
+        Some(at) => now.duration_since(at) >= repeat,
+    }
+}
+
+/// Pure log-rate decision: should the info line for a blocked message be
+/// written NOW, given when it was last written?
+///
+/// - Never logged ⇒ log (the first sighting is always visible at once).
+/// - Logged within the last `window` ⇒ quiet.
+/// - A full `window` since the last line ⇒ log again.
+///
+/// Independent of the surfacing flag: the log is local evidence and costs
+/// nothing coord-side, so disabling the POSTs never silences it.
+fn should_log(last_logged: Option<Instant>, now: Instant, window: Duration) -> bool {
+    match last_logged {
+        None => true,
+        Some(at) => now.duration_since(at) >= window,
     }
 }
 
@@ -300,9 +507,24 @@ struct BlockEntry {
     first_seen_wall: chrono::DateTime<chrono::Utc>,
     /// Monotonic time of the last surfacing POST attempt (None = never).
     last_posted: Option<Instant>,
+    /// Monotonic time of the last info log line for this entry (None =
+    /// never). Rate-limits the log to once per window per message.
+    last_logged: Option<Instant>,
 }
 
-/// Tracks how long each blocking message has been undeliverable, per reason.
+/// What [`SurfacingTracker::note_blocked`] decided for one sighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockedVerdict {
+    /// Write the info log line now (first sighting, or a window has turned).
+    log_now: bool,
+    /// Fire the surfacing POST now, carrying this `blocked_since`.
+    surface_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// How long until the next log line may be written, for the log text.
+    next_log_in: Duration,
+}
+
+/// Tracks how long each undeliverable message has been blocked, per reason,
+/// for every priority.
 ///
 /// IN-PROCESS ONLY (restart caveat): a runner restart resets the clock, which
 /// only DELAYS surfacing by up to one threshold window — it can never spam,
@@ -313,17 +535,21 @@ struct SurfacingTracker {
 }
 
 impl SurfacingTracker {
-    /// Record that `message_id` is blocked for `reason` as of `now`. Returns
-    /// `Some(blocked_since)` when a surfacing POST should fire (and stamps the
-    /// cooldown so the same window never fires twice), else `None`.
+    /// Record that `message_id` is blocked for `reason` as of `now`. The
+    /// verdict says whether to log now (first sighting, again at `threshold`,
+    /// then once per `repeat`) and whether a surfacing POST should fire (first
+    /// past `threshold`, or past `repeat` for `pty_never_idle`, then once per
+    /// `repeat` window) — both stamps are
+    /// taken here so the same window never logs or fires twice.
     fn note_blocked(
         &mut self,
         message_id: &str,
         reason: BlockReason,
         now: Instant,
         threshold: Duration,
+        repeat: Duration,
         enabled: bool,
-    ) -> Option<chrono::DateTime<chrono::Utc>> {
+    ) -> BlockedVerdict {
         let entry = self
             .entries
             .entry((message_id.to_string(), reason))
@@ -331,14 +557,54 @@ impl SurfacingTracker {
                 first_seen: now,
                 first_seen_wall: chrono::Utc::now(),
                 last_posted: None,
+                last_logged: None,
             });
-        if should_surface(entry.first_seen, entry.last_posted, now, threshold, enabled) {
-            // Stamp BEFORE the (fail-open) POST attempt: at most one attempt
-            // per window even if the POST errors — never a retry storm.
+        // First sighting, then once more at the threshold (when a blocking
+        // message also posts), then once per `repeat`: a message stranded for
+        // its whole TTL must not write a line every `threshold`.
+        let log_window = match entry.last_logged {
+            Some(t) if t != entry.first_seen => repeat,
+            _ => threshold,
+        };
+        let log_now = should_log(entry.last_logged, now, log_window);
+        if log_now {
+            entry.last_logged = Some(now);
+        }
+        // The window that applies to the NEXT line, for the log text.
+        let next_log_in = match entry.last_logged {
+            Some(t) if t != entry.first_seen => repeat,
+            _ => threshold,
+        };
+        // `pty_never_idle` means a LIVE recipient is busy: a long turn, a
+        // draft in the box, an open dialog. Those are ordinary for well past
+        // 60 s, and coord's alert is per message and never resolved, so the
+        // first POST for that reason waits the repeat window (the
+        // pre-2026-09-07 threshold). `target_not_live` keeps the short
+        // threshold: nothing on this device can deliver it.
+        let post_threshold = match reason {
+            BlockReason::PtyNeverIdle => threshold.max(repeat),
+            BlockReason::TargetNotLive => threshold,
+        };
+        let surface_since = if should_surface(
+            entry.first_seen,
+            entry.last_posted,
+            now,
+            post_threshold,
+            repeat,
+            enabled,
+        ) {
+            // Stamp BEFORE the (fail-open) POST attempt: at most one
+            // attempt per window even if the POST errors — never a retry
+            // storm.
             entry.last_posted = Some(now);
             Some(entry.first_seen_wall)
         } else {
             None
+        };
+        BlockedVerdict {
+            log_now,
+            surface_since,
+            next_log_in,
         }
     }
 
@@ -355,32 +621,86 @@ impl SurfacingTracker {
     }
 }
 
-/// Fire the delivery-blocked surfacing POST for `message_id` if it has been
-/// blocked past the threshold (once per window). **Fail-open by contract**:
-/// any error / non-2xx — including 404 while the coord route (shipped in the
-/// plan's PR 3) hasn't landed — is a debug log; delivery behavior is never
-/// affected.
+/// The coord door the surfacing POST goes through — the same client, base
+/// and device-JWT bearer the poller's `pending` / `mark-delivered` calls use,
+/// read once per tick in `deliver_once`.
+struct SurfaceCtx<'a> {
+    client: &'a reqwest::Client,
+    base: &'a str,
+    token: &'a str,
+}
+
+/// Does this miss warrant coord's durable delivery-blocked alert, or only the
+/// local counter and log line?
 ///
-/// Auth: the same device-JWT bearer the poller's `pending` / `mark-delivered`
-/// calls use (the `token` threaded from `deliver_once`).
+/// Only a `blocking` message does: its sender is waiting on it. coord opens
+/// one alert per message and nothing resolves it, so a non-blocking message
+/// must not post, whatever the reason. `target_not_live` is the EXPECTED
+/// outcome for a message to a session closed on this device (it is collected
+/// on the recipient's next `coord_inbox` drain), and `pty_never_idle` covers
+/// normal states of a live session: a turn longer than the threshold, a draft
+/// in the input box, an open dialog. Non-blocking misses stay fully visible
+/// locally, as the counter on `/health` and the rate-limited log line.
+fn posts_to_coord(priority: &str, _reason: BlockReason) -> bool {
+    priority == "blocking"
+}
+
+/// Report one tick on which `msg` could not be pushed to `to_session`, for
+/// `reason` — for EVERY priority:
+///
+/// 1. bump the `push_miss` counter (always — this is the evidence that
+///    survives a recipient-side drain);
+/// 2. write the info log line, once per message per window;
+/// 3. fire the delivery-blocked surfacing POST once the message has been
+///    blocked past the threshold (once per window), when [`posts_to_coord`]
+///    says the miss is unexpected.
+///
+/// The POST is **fail-open by contract**: any error / non-2xx is a debug
+/// log; delivery behavior is never affected.
+///
+/// `detail` is the human-readable specific ("prompt row not empty", "terminal
+/// gone from TerminalManager", the inject error) behind the coarse
+/// coord-validated `reason`; it goes on the log line only.
 async fn surface_blocked_delivery(
-    client: &reqwest::Client,
-    base: &str,
-    token: &str,
+    ctx: &SurfaceCtx<'_>,
     tracker: &mut SurfacingTracker,
-    message_id: &str,
+    msg: &PendingMessage,
+    to_session: &str,
     reason: BlockReason,
+    detail: &str,
     now: Instant,
 ) {
-    let Some(blocked_since) = tracker.note_blocked(
+    record_push_miss(reason);
+    let message_id = msg.message_id.as_str();
+    let verdict = tracker.note_blocked(
         message_id,
         reason,
         now,
         surface_threshold(),
+        surface_repeat(),
         surfacing_enabled(),
-    ) else {
+    );
+    if verdict.log_now {
+        info!(
+            "session_message_poller: msg {message_id} (priority={}) for session {to_session} \
+             not pushed — reason={} ({detail}); stays pending (retried every {}s, next log \
+             line in {}s)",
+            if msg.priority.is_empty() {
+                "normal"
+            } else {
+                msg.priority.as_str()
+            },
+            reason.as_str(),
+            POLL_INTERVAL.as_secs(),
+            verdict.next_log_in.as_secs(),
+        );
+    }
+    let Some(blocked_since) = verdict.surface_since else {
         return;
     };
+    if !posts_to_coord(&msg.priority, reason) {
+        return;
+    }
     let Some(device_id) = crate::agent_runtime::load_local_device_id() else {
         debug!(
             "session_message_poller: delivery-blocked surfacing for msg {message_id} \
@@ -388,17 +708,22 @@ async fn surface_blocked_delivery(
         );
         return;
     };
-    let url = format!("{base}/coord/session-messages/{message_id}/delivery-blocked");
+    let url = format!(
+        "{}/coord/session-messages/{message_id}/delivery-blocked",
+        ctx.base
+    );
     let body = serde_json::json!({
         "device_id": device_id.to_string(),
         "reason": reason.as_str(),
         "blocked_since": blocked_since.to_rfc3339(),
     });
-    // coord-auth-exempt(device-jwt-required): `token` is the device JWT the
-    // caller already verified is present; the tick is skipped when it is not.
-    match client
+    // coord-auth-exempt(device-jwt-required): `ctx.token` is the device JWT
+    // the caller already verified is present; the tick is skipped when it is
+    // not.
+    match ctx
+        .client
         .post(&url)
-        .bearer_auth(token)
+        .bearer_auth(ctx.token)
         .json(&body)
         .send()
         .await
@@ -428,20 +753,263 @@ async fn surface_blocked_delivery(
 }
 
 // ===========================================================================
+// PTY idle gate
+// ===========================================================================
+
+/// Typed-terminal arm: may text be pasted into this screen now? Delegates to
+/// [`crate::terminal::graceful_exit::input_prompt_ready`], which shares every
+/// check with the `/exit` readiness check graceful exit uses: the `❯` on the
+/// CURSOR row, the shared turn-complete predicate
+/// (`looping_agent::idle::snapshot_looks_idle`), the cursor at the start of the
+/// input, nothing typed but the `Try "…"` placeholder, and no numbered choice
+/// or dialog chrome showing. It differs from that check only in not refusing
+/// prose that happens to read like a dialog ("Do you want me to…?"), because
+/// this check is retried against an unchanging idle screen.
+///
+/// This is a conjunct applied ON TOP of the shared predicate, only for a
+/// terminal an operator may be typing into. It is not a change to that
+/// predicate: "is anyone typing" is a question only an injector asks, so
+/// wind-down, the looping-agent supervisor and graceful exit keep reading the
+/// predicate unchanged.
+fn typed_prompt_ready(screen: &crate::terminal::graceful_exit::ScreenText) -> Result<(), GateMiss> {
+    crate::terminal::graceful_exit::input_prompt_ready(screen).map_err(|_| GateMiss::PromptNotEmpty)
+}
+
+/// Typed-terminal arm: is a `claude` process live in this pane AND reading its
+/// terminal right now?
+///
+/// A typed terminal's PTY is the operator's SHELL. After `/exit` its lifecycle
+/// record stays `open` until the liveness poll notices, and a `❯` shell prompt
+/// (starship, oh-my-posh) is an empty `❯` line with the cursor on it, which
+/// passes every screen check. Without this check, a message pasted there is
+/// run line by line as shell commands. So we require process evidence: a
+/// `claude` image in the pane's inclusive subtree that `is_foreground` says
+/// owns the terminal. A claude that exists but does not read the terminal (one
+/// suspended with Ctrl-Z, or started with `&`) leaves the shell prompt showing,
+/// so existence alone is not enough. An unreadable process table says nothing
+/// either way, so it is treated as not live and the message stays pending.
+/// Deferring is recoverable; typing into a shell is not.
+fn claude_live(
+    probe: &crate::terminal::graceful_exit::ClaudeProbe,
+    is_foreground: impl Fn(u32) -> bool,
+) -> Result<(), GateMiss> {
+    match probe {
+        crate::terminal::graceful_exit::ClaudeProbe::Readable(p)
+            if p.subtree_claude.iter().any(|id| is_foreground(id.pid)) =>
+        {
+            Ok(())
+        }
+        _ => Err(GateMiss::ClaudeNotLive),
+    }
+}
+
+/// Does `pid` belong to the foreground process group of its controlling
+/// terminal, and is it not stopped? Read from `/proc/<pid>/stat`; an
+/// unreadable file is `false` (fail closed).
+#[cfg(target_os = "linux")]
+fn pid_reads_its_terminal(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map(|stat| stat_says_foreground(&stat))
+        .unwrap_or(false)
+}
+
+/// Windows has no job control: a process in the pane cannot be suspended or
+/// backgrounded away from the console the way a Unix shell does it, so
+/// existence in the subtree is the whole answer there.
+#[cfg(windows)]
+fn pid_reads_its_terminal(_pid: u32) -> bool {
+    true
+}
+
+/// Other Unixes (macOS) have job control but no `/proc/<pid>/stat` to read the
+/// foreground group from, so foreground cannot be established: fail closed.
+/// (Today the process probe itself is `Unreadable` there, so the typed arm
+/// never delivers on macOS either way; this keeps that true if the probe is
+/// ever made to work.)
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_reads_its_terminal(_pid: u32) -> bool {
+    false
+}
+
+/// Parse a `/proc/<pid>/stat` line: `true` when the state is not stopped
+/// (`T`/`t`) and the process group (field 5) is the terminal's foreground
+/// process group (field 8, `tpgid`). The fields are read after the LAST `)`,
+/// because the command name in field 2 may itself contain spaces or `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn stat_says_foreground(stat: &str) -> bool {
+    let Some(close) = stat.rfind(')') else {
+        return false;
+    };
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After `)`: [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr [5]=tpgid
+    let (Some(state), Some(pgrp), Some(tpgid)) = (fields.first(), fields.get(2), fields.get(5))
+    else {
+        return false;
+    };
+    if matches!(*state, "T" | "t") {
+        return false;
+    }
+    match (pgrp.parse::<i64>(), tpgid.parse::<i64>()) {
+        (Ok(pgrp), Ok(tpgid)) => tpgid > 0 && pgrp == tpgid,
+        _ => false,
+    }
+}
+
+/// Why the idle gate did not admit an injection this tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateMiss {
+    /// No `TerminalManager` in Tauri state — a runner-substrate absence, not
+    /// a property of the target. Every PTY message on the tick stays pending
+    /// uncounted; `deliver_once` warns ONCE per tick so it is never silent.
+    NoManager,
+    /// The manager holds no terminal under that id: the target is not live.
+    Gone,
+    /// The terminal is mid-turn (or not showing its prompt) — defer.
+    NotIdle,
+    /// Typed-terminal arm only: the input box is not an empty, focused prompt
+    /// (an operator's text, a dialog, a numbered choice) — defer rather than
+    /// submit their fragment with ours appended. Counted as `pty_never_idle`
+    /// (coord's reason set has no finer value); the log line names it.
+    PromptNotEmpty,
+    /// Typed-terminal arm only: no `claude` process in the pane's subtree (or
+    /// the process table was unreadable) — the pane may be a bare shell.
+    /// Counted as `target_not_live`.
+    ClaudeNotLive,
+}
+
+impl GateMiss {
+    /// The specific behind the coarse `BlockReason`, for the log line.
+    fn detail(self) -> &'static str {
+        match self {
+            GateMiss::NoManager => "TerminalManager unavailable",
+            GateMiss::Gone => "terminal gone from TerminalManager",
+            GateMiss::NotIdle => "terminal mid-turn or prompt not visible",
+            GateMiss::PromptNotEmpty => {
+                "prompt row not empty or not focused (operator typing, or a dialog)"
+            }
+            GateMiss::ClaudeNotLive => {
+                "no live foreground claude process in the pane (bare shell, or claude suspended)"
+            }
+        }
+    }
+}
+
+/// The PTY idle gate as one step: find the terminal, require
+/// `TerminalSession::looks_idle_quiescent` (the shared predicate plus its
+/// debounce), and for a typed terminal (`typed`) additionally [`claude_live`]
+/// and then [`typed_prompt_ready`] on a fresh read taken after the probe, so
+/// the last check before the paste is the screen as it is now. Hands back
+/// the live terminal, which the `Terminal` arm injects into directly; the `Pty`
+/// arm ignores it and goes through `send_message_to_worker_via_handle`, which
+/// does its own lookup so the worker's `STATE_PROCESSING` stamp is kept.
+async fn idle_gate(
+    terminal_manager: Option<&Arc<crate::terminal::TerminalManager>>,
+    terminal_id: &str,
+    typed: bool,
+) -> Result<Arc<crate::terminal::session::TerminalSession>, GateMiss> {
+    let tm = terminal_manager.ok_or(GateMiss::NoManager)?;
+    let term = tm.get(terminal_id).ok_or(GateMiss::Gone)?;
+    if !term.looks_idle_quiescent(IDLE_QUIESCENCE_DEBOUNCE).await {
+        return Err(GateMiss::NotIdle);
+    }
+    if typed {
+        // Process probe FIRST, screen check LAST: the probe can take seconds
+        // (a process-table snapshot is a PowerShell/CIM call on Windows), and
+        // anything the operator types or any `/exit` in that window must be
+        // seen by the check that immediately precedes the paste. Same order
+        // as `graceful_exit::drive` (probe, then screen, then write).
+        let probe =
+            crate::terminal::graceful_exit::probe_claude_under(term.child_pid(), Vec::new()).await;
+        claude_live(&probe, pid_reads_its_terminal)?;
+        typed_prompt_ready(&term.grid_screen())?;
+    }
+    Ok(term)
+}
+
+// ===========================================================================
 // Session resolution
 // ===========================================================================
 
 /// Where a `to_session` resolved to, and how to inject into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedTarget {
     /// SDK `ClaudeSession` — inject immediately; it queues if Processing.
-    /// Carries the runner `task_run_id` to pass to `send_message_to_worker`.
+    /// Carries the runner `task_run_id` to pass to
+    /// `send_message_to_worker_via_handle`.
     Sdk { task_run_id: String },
-    /// PTY/Worker — gate on idle first. Carries the worker's `task_run_id`
-    /// (for `send_message_to_worker`) and `terminal_id` (for the grid read).
+    /// A registered `WorkerSession` PTY — gate on idle first. Carries the
+    /// worker's `task_run_id` (for `send_message_to_worker_via_handle`, which
+    /// dispatches through `WorkerSession::send_user_message` and so keeps the
+    /// worker's `STATE_PROCESSING` stamp) and `terminal_id` (for the grid
+    /// read).
     Pty {
         task_run_id: String,
         terminal_id: String,
     },
+    /// A typed interactive terminal the lifecycle store records as `open`
+    /// but that has NO `WorkerSession` (the typed plane never registers
+    /// one) — gate on idle first, then inject straight through
+    /// `TerminalSession::submit_prompt`. `terminal_id` is the record's own
+    /// binding, 1:1 — nothing is guessed; `claude_session_id` is carried for
+    /// the log line.
+    Terminal {
+        terminal_id: String,
+        claude_session_id: String,
+    },
+}
+
+/// Resolve an `open` lifecycle record to its live PTY: a registered
+/// `WorkerSession` on that terminal wins (`Pty`), else the terminal itself
+/// (`Terminal`). A record in any other state resolves nothing — a closed
+/// session's terminal may already host someone else.
+fn resolve_open_record(
+    session_manager: &crate::claude_session::SessionManager,
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+) -> Option<ResolvedTarget> {
+    if rec.state != "open" {
+        return None;
+    }
+    if let Some(worker) = session_manager.find_worker_by_terminal_id(&rec.terminal_id) {
+        return Some(ResolvedTarget::Pty {
+            task_run_id: worker.task_run_id().to_string(),
+            terminal_id: rec.terminal_id.clone(),
+        });
+    }
+    if !typed_record_is_bound(rec) {
+        return None;
+    }
+    Some(ResolvedTarget::Terminal {
+        terminal_id: rec.terminal_id.clone(),
+        claude_session_id: rec.claude_session_id.clone(),
+    })
+}
+
+/// May a typed terminal's record route a message by itself, with no
+/// `WorkerSession` to corroborate it? Only when its binding is KNOWN and a
+/// provider actually started there:
+///
+/// - `origin` is `authoritative` (the runner knows the id exactly) or
+///   `observed` (a process-start-anchored, uniquely correlated transcript
+///   bind). A `reconciled` row, or one with no origin (read as reconciled), is
+///   an mtime guess that "may name a foreign session" — routing on it would
+///   inject into whichever session owns the terminal and ack the message as
+///   delivered, so the real recipient never sees it.
+/// - `confirmed_at` is set: a provider's SessionStart hook proved a real
+///   session started in this terminal. Every PTY gets a provisional `open`
+///   record at spawn, including a plain shell that never runs `claude`.
+///
+/// A record that fails either test resolves nothing, so the message stays
+/// pending (counted `target_not_live`) and is collected on the recipient's
+/// next `coord_inbox` drain.
+fn typed_record_is_bound(
+    rec: &crate::session::session_lifecycle_store::TerminalSessionRecord,
+) -> bool {
+    use crate::session::session_lifecycle_store::{ORIGIN_AUTHORITATIVE, ORIGIN_OBSERVED};
+    let origin_known = matches!(
+        rec.origin.as_deref(),
+        Some(ORIGIN_AUTHORITATIVE) | Some(ORIGIN_OBSERVED)
+    );
+    origin_known && rec.confirmed_at.is_some()
 }
 
 /// Resolve coord's `to_session` to a live local session, or `None` if this
@@ -452,8 +1020,15 @@ enum ResolvedTarget {
 /// against, in order:
 ///
 /// 1. The durable lifecycle store (`claude_session_id -> terminal_id`, the
-///    proven `session_bus` path) — the terminal_id then finds a live
-///    WorkerSession (PTY) via `SessionManager::find_worker_by_terminal_id`.
+///    proven `session_bus` path). An `open` record resolves to the
+///    `WorkerSession` on that terminal when one is registered (`Pty`), and
+///    otherwise to the terminal itself (`Terminal`). The second outcome is
+///    the whole typed interactive plane: `worker_sessions` has exactly one
+///    production writer (`commands/productivity.rs` `spawn_worker_session`),
+///    so a terminal the operator opened and typed `claude` into has a
+///    lifecycle record and a `TerminalManager` PTY but never a worker — it
+///    used to resolve `None` here and the message stayed pending forever
+///    while the session was demonstrably alive.
 /// 2. A direct SDK `SessionManager::get(to_session)` — covers a session whose
 ///    runner `task_run_id` IS what coord addressed (SDK sessions).
 /// 3. The `AiCoordRegistrar` forward index (coord UUIDv7 → the registered
@@ -461,10 +1036,11 @@ enum ResolvedTarget {
 ///    plane), if `to_session` parses as a coord session UUID — covers agentic
 ///    SDK sessions, PTY workers, and (fabric Phase 3) sniffed interactive
 ///    sessions, whose index value resolves through the lifecycle store like
-///    arm (1).
+///    arm (1) — `Pty` or `Terminal` by the same rule.
 ///
-/// SDK matches win over PTY (the SDK queue is clobber-safe), so we probe (2)/(3)
-/// before falling back to the PTY terminal from (1).
+/// Precedence: SDK matches win (the SDK queue is clobber-safe), then a
+/// registered worker, then the bare terminal — so we probe (2)/(3) before
+/// falling back to the lifecycle record from (1).
 fn resolve_target(
     session_manager: &crate::claude_session::SessionManager,
     registrar: Option<&crate::claude_session::coord_register::AiCoordRegistrar>,
@@ -499,15 +1075,8 @@ fn resolve_target(
                 // exactly like arm (1) — coord-id addressing then reaches
                 // the same PTY that csid addressing already could.
                 if let Some(rec) = lifecycle_store.get(&task_run_id) {
-                    if rec.state == "open" {
-                        if let Some(worker) =
-                            session_manager.find_worker_by_terminal_id(&rec.terminal_id)
-                        {
-                            return Some(ResolvedTarget::Pty {
-                                task_run_id: worker.task_run_id().to_string(),
-                                terminal_id: rec.terminal_id.clone(),
-                            });
-                        }
+                    if let Some(target) = resolve_open_record(session_manager, &rec) {
+                        return Some(target);
                     }
                 }
             }
@@ -515,15 +1084,10 @@ fn resolve_target(
     }
 
     // (1) Lifecycle store: claude_session_id == to_session → terminal_id →
-    // live WorkerSession (PTY). This is the proven `session_bus` resolution.
+    // the WorkerSession on it, else the terminal itself.
     if let Some(rec) = lifecycle_store.get(to_session) {
-        if rec.state == "open" {
-            if let Some(worker) = session_manager.find_worker_by_terminal_id(&rec.terminal_id) {
-                return Some(ResolvedTarget::Pty {
-                    task_run_id: worker.task_run_id().to_string(),
-                    terminal_id: rec.terminal_id.clone(),
-                });
-            }
+        if let Some(target) = resolve_open_record(session_manager, &rec) {
+            return Some(target);
         }
     }
 
@@ -777,12 +1341,73 @@ async fn poller_loop(api_state: Arc<ApiState>, mut shutdown_rx: watch::Receiver<
     }
 }
 
+/// The injectable form of a resolved target once the idle gate has run:
+/// SDK and worker sessions inject by `task_run_id` through
+/// `send_message_to_worker_via_handle`; a typed terminal injects into the
+/// very `TerminalSession` the gate admitted. Folding the gate result into the
+/// variant is what makes "a `Terminal` target with no admitted terminal"
+/// unrepresentable rather than an `Err` arm that would count a substrate bug
+/// as `target_not_live`.
+enum Inject {
+    Sdk(String),
+    Worker(String),
+    Terminal(Arc<crate::terminal::session::TerminalSession>),
+}
+
+/// Report one idle-gate miss for `msg`: the substrate case (`NoManager`) is
+/// warned once per tick via `no_manager_warned` and NOT counted (it is not a
+/// property of the target); `Gone` / `ClaudeNotLive` count as
+/// `target_not_live`; `NotIdle` / `PromptNotEmpty` count as `pty_never_idle`,
+/// with the specific on the log.
+#[allow(clippy::too_many_arguments)]
+async fn report_gate_miss(
+    ctx: &SurfaceCtx<'_>,
+    tracker: &mut SurfacingTracker,
+    msg: &PendingMessage,
+    to_session: &str,
+    terminal_id: &str,
+    miss: GateMiss,
+    now: Instant,
+    no_manager_warned: &mut bool,
+) {
+    let reason = match miss {
+        GateMiss::NoManager => {
+            if !*no_manager_warned {
+                warn!(
+                    "session_message_poller: TerminalManager unavailable this tick — every \
+                     PTY-targeted message stays pending (first: msg {} for session \
+                     {to_session})",
+                    msg.message_id
+                );
+                *no_manager_warned = true;
+            }
+            return;
+        }
+        GateMiss::Gone | GateMiss::ClaudeNotLive => BlockReason::TargetNotLive,
+        GateMiss::NotIdle | GateMiss::PromptNotEmpty => BlockReason::PtyNeverIdle,
+    };
+    debug!(
+        "session_message_poller: terminal {terminal_id}: {} — msg {} stays pending",
+        miss.detail(),
+        msg.message_id
+    );
+    // Fix 2 / fix 3: reported for every priority — counter, one info line
+    // per window, and past the threshold the surfacing POST (once per repeat
+    // window, fail-open). Injection behavior is unchanged: we still defer.
+    surface_blocked_delivery(ctx, tracker, msg, to_session, reason, miss.detail(), now).await;
+}
+
 /// One delivery pass: pull pending → resolve → (idle-gate for PTY) → inject via
 /// the in-process primitive → mark delivered. Returns `Err` only for a
 /// tick-level failure (no JWT, coord unreachable, decode) — a per-message
-/// resolution miss or idle-skip is normal and silent, except that a BLOCKING
-/// message blocked past the surfacing threshold fires a (fail-open, once per
-/// window) delivery-blocked POST via `tracker`.
+/// resolution miss, idle-skip or refused inject leaves the message pending
+/// and is reported through [`surface_blocked_delivery`] for EVERY priority:
+/// the `push_miss` counter, an info line once per window, and past the
+/// surfacing threshold a (fail-open, once per window) delivery-blocked POST
+/// via `tracker`. One substrate fault sits between those two classes: a
+/// missing `TerminalManager` (`GateMiss::NoManager`) leaves every PTY message
+/// on the tick pending and UNCOUNTED — it is not a property of any target —
+/// so it is `warn`ed once per tick rather than per message or silently.
 async fn deliver_once(
     api_state: &Arc<ApiState>,
     guard: &mut DeliveryGuard,
@@ -803,6 +1428,11 @@ async fn deliver_once(
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?;
+    let ctx = SurfaceCtx {
+        client: &client,
+        base: &base,
+        token: &token,
+    };
 
     // 1. Pull undelivered messages for this device's sessions (device from JWT).
     let pending_url = format!("{base}/coord/session-messages/pending");
@@ -848,6 +1478,8 @@ async fn deliver_once(
 
     let now = Instant::now();
     let mut delivered = 0usize;
+    // `GateMiss::NoManager` is a per-tick substrate fault, warned once.
+    let mut no_manager_warned = false;
 
     for msg in &pending.messages {
         // Idempotency: never re-inject an already-acked message (covers
@@ -876,88 +1508,131 @@ async fn deliver_once(
         ) else {
             // Not live on this device. Leave pending — delivered on its next
             // open (its spawn preamble pulls coord_inbox), or by another
-            // device hosting it.
-            if msg.priority == "blocking" {
-                info!(
-                    "session_message_poller: BLOCKING msg {} for session {to_session} not live \
-                     here — pending until it next opens",
-                    msg.message_id
-                );
-                // Fix 2: a blocking message unresolvable past the threshold is
-                // surfaced to coord (once per window, fail-open).
-                surface_blocked_delivery(
-                    &client,
-                    &base,
-                    &token,
-                    tracker,
-                    &msg.message_id,
-                    BlockReason::TargetNotLive,
-                    now,
-                )
-                .await;
-            } else {
-                debug!(
-                    "session_message_poller: msg {} target {to_session} not live — pending",
-                    msg.message_id
-                );
-            }
+            // device hosting it. Reported for every priority: counter, one
+            // info line per window, and past the threshold the surfacing POST
+            // (fix 2; once per repeat window, fail-open).
+            surface_blocked_delivery(
+                &ctx,
+                tracker,
+                msg,
+                to_session,
+                BlockReason::TargetNotLive,
+                "no live session on this device",
+                now,
+            )
+            .await;
             continue;
         };
 
-        // Turn arbitration: SDK queues safely; PTY must be idle.
-        let task_run_id = match &target {
-            ResolvedTarget::Sdk { task_run_id } => task_run_id.clone(),
+        // Turn arbitration: SDK queues safely; a PTY — worker or typed
+        // terminal alike — must be idle, and a typed terminal's input box
+        // must also be EMPTY (an operator may be typing into it). The gate's
+        // result is folded into the injectable form so the `Terminal` arm
+        // carries the very terminal it was admitted on.
+        let inject = match &target {
+            ResolvedTarget::Sdk { task_run_id } => Inject::Sdk(task_run_id.clone()),
             ResolvedTarget::Pty {
                 task_run_id,
                 terminal_id,
-            } => {
-                let Some(tm) = terminal_manager.as_ref() else {
-                    debug!("session_message_poller: TerminalManager unavailable — skip PTY inject");
-                    continue;
-                };
-                let Some(term) = tm.get(terminal_id) else {
-                    debug!(
-                        "session_message_poller: terminal {terminal_id} gone — skip msg {}",
-                        msg.message_id
-                    );
-                    continue;
-                };
-                if !term.looks_idle_quiescent(IDLE_QUIESCENCE_DEBOUNCE).await {
-                    debug!(
-                        "session_message_poller: terminal {terminal_id} not idle — deferring msg {}",
-                        msg.message_id
-                    );
-                    // Fix 3: a blocking message whose PTY never quiesces past
-                    // the threshold is surfaced to coord as evidence for the
-                    // stuck-not-dead classifier (once per window, fail-open).
-                    // Injection behavior is unchanged — we still just defer.
-                    if msg.priority == "blocking" {
-                        surface_blocked_delivery(
-                            &client,
-                            &base,
-                            &token,
-                            tracker,
-                            &msg.message_id,
-                            BlockReason::PtyNeverIdle,
-                            now,
-                        )
-                        .await;
-                    }
+            } => match idle_gate(terminal_manager.as_ref(), terminal_id, false).await {
+                Ok(_admitted) => Inject::Worker(task_run_id.clone()),
+                Err(miss) => {
+                    report_gate_miss(
+                        &ctx,
+                        tracker,
+                        msg,
+                        to_session,
+                        terminal_id,
+                        miss,
+                        now,
+                        &mut no_manager_warned,
+                    )
+                    .await;
                     continue;
                 }
-                task_run_id.clone()
+            },
+            ResolvedTarget::Terminal { terminal_id, .. } => {
+                match idle_gate(terminal_manager.as_ref(), terminal_id, true).await {
+                    Ok(term) => Inject::Terminal(term),
+                    Err(miss) => {
+                        report_gate_miss(
+                            &ctx,
+                            tracker,
+                            msg,
+                            to_session,
+                            terminal_id,
+                            miss,
+                            now,
+                            &mut no_manager_warned,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
             }
         };
 
-        // 3. Inject via the in-process primitive (reuses the SDK queue / PTY
-        // submit dispatch — no second injection primitive).
+        // 3. Inject. SDK sessions and registered workers go through the
+        // in-process primitive (`send_message_to_worker_via_handle` — the
+        // SDK queue / `WorkerSession::send_user_message`); a typed terminal
+        // has no worker to dispatch through, so it takes the primitive that
+        // `send_user_message` itself delegates to, `submit_prompt`, on the
+        // terminal the idle gate just admitted. `submit_prompt` is
+        // liveness-gated (TERMINAL_EXITED) — a refusal leaves the message
+        // pending rather than marking a keystroke that reached no process as
+        // delivered.
         let framed = frame_message(msg);
-        crate::claude_session::worker_message::send_message_to_worker(
-            api_state,
-            &task_run_id,
-            &framed,
-        )
-        .await;
+        let injected: Result<DeliveredArm, String> = match inject {
+            Inject::Sdk(task_run_id) => {
+                crate::claude_session::worker_message::send_message_to_worker_via_handle(
+                    &api_state.app_handle,
+                    &task_run_id,
+                    &framed,
+                )
+                .await
+                .map(|()| DeliveredArm::Sdk)
+            }
+            Inject::Worker(task_run_id) => {
+                crate::claude_session::worker_message::send_message_to_worker_via_handle(
+                    &api_state.app_handle,
+                    &task_run_id,
+                    &framed,
+                )
+                .await
+                .map(|()| DeliveredArm::WorkerPty)
+            }
+            Inject::Terminal(term) => term
+                .submit_prompt(
+                    &framed,
+                    crate::terminal::session::PtyWriteCaller::SessionMessagePoller,
+                )
+                .map(|_payload| DeliveredArm::Terminal),
+        };
+        let arm = match injected {
+            Ok(arm) => arm,
+            Err(e) => {
+                // debug, not warn: this repeats every poll tick while the
+                // refusal lasts, and `surface_blocked_delivery` below already
+                // writes the rate-limited info line naming `e`.
+                debug!(
+                    "session_message_poller: inject of msg {} into session {to_session} \
+                     ({target:?}) refused: {e} — stays pending",
+                    msg.message_id
+                );
+                surface_blocked_delivery(
+                    &ctx,
+                    tracker,
+                    msg,
+                    to_session,
+                    BlockReason::TargetNotLive,
+                    &format!("inject refused: {e}"),
+                    now,
+                )
+                .await;
+                continue;
+            }
+        };
+        record_push_ok(arm);
 
         // 4. Mark delivered. Record locally FIRST (cooldown + delivered-set)
         // so even if the ack POST fails we won't re-inject within the TTL.
@@ -976,16 +1651,18 @@ async fn deliver_once(
             .await
         {
             warn!(
-                "session_message_poller: injected msg {} but mark-delivered failed: {e} \
+                "session_message_poller: injected msg {} via {} but mark-delivered failed: {e} \
                  (local delivered-set prevents re-inject for {}s)",
                 msg.message_id,
+                arm.as_str(),
                 DELIVERED_SET_TTL.as_secs()
             );
         } else {
             delivered += 1;
             info!(
-                "session_message_poller: delivered msg {} to session {to_session}",
-                msg.message_id
+                "session_message_poller: delivered msg {} to session {to_session} via {}",
+                msg.message_id,
+                arm.as_str()
             );
         }
     }
@@ -1316,7 +1993,10 @@ mod tests {
 
     // ---- delivery-blocked surfacing (fixes 2-3) ---------------------------
 
-    const THRESH: Duration = Duration::from_secs(1800);
+    /// The shipped defaults, spelled as literals so the tests pin them rather
+    /// than borrow them: first fire at 60 s, repeats no closer than 1800 s.
+    const THRESH: Duration = Duration::from_secs(60);
+    const REPEAT: Duration = Duration::from_secs(1800);
 
     // NOTE: all instants below are built ADDITIVELY from a fresh `Instant::now()`
     // base (`base + offset`), never `Instant::now() - big_offset` — `Instant`
@@ -1326,27 +2006,74 @@ mod tests {
     #[test]
     fn surfacing_disabled_flag_never_fires() {
         let first_seen = Instant::now();
-        let now = first_seen + THRESH * 3;
-        assert!(!should_surface(first_seen, None, now, THRESH, false));
+        let now = first_seen + REPEAT * 3;
+        assert!(!should_surface(
+            first_seen, None, now, THRESH, REPEAT, false
+        ));
     }
 
     #[test]
     fn surfacing_waits_for_threshold() {
         let first_seen = Instant::now();
         // Just became blocked — not yet.
-        assert!(!should_surface(first_seen, None, first_seen, THRESH, true));
+        assert!(!should_surface(
+            first_seen, None, first_seen, THRESH, REPEAT, true
+        ));
         // Blocked one second short of the threshold — still not yet.
         let now = first_seen + THRESH - Duration::from_secs(1);
-        assert!(!should_surface(first_seen, None, now, THRESH, true));
+        assert!(!should_surface(first_seen, None, now, THRESH, REPEAT, true));
         // Past the threshold, never posted — fire.
         let now = first_seen + THRESH + Duration::from_secs(1);
-        assert!(should_surface(first_seen, None, now, THRESH, true));
+        assert!(should_surface(first_seen, None, now, THRESH, REPEAT, true));
+    }
+
+    #[test]
+    fn surfacing_repeat_is_spaced_by_repeat_not_threshold() {
+        // The first POST fires at the 60 s threshold; the SECOND must wait the
+        // full 1800 s repeat window, not another 60 s — otherwise a message
+        // stranded to its 14 d TTL POSTs ~20,000 times and coord's counter
+        // counts poll ticks.
+        let first_seen = Instant::now();
+        let first_fire = first_seen + THRESH;
+        assert!(should_surface(
+            first_seen, None, first_fire, THRESH, REPEAT, true
+        ));
+        // Another threshold window later: still inside the repeat window.
+        let now = first_fire + THRESH;
+        assert!(!should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
+        // One second short of the repeat window: still no.
+        let now = first_fire + REPEAT - Duration::from_secs(1);
+        assert!(!should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
+        // A full repeat window since the last POST — fires again.
+        let now = first_fire + REPEAT;
+        assert!(should_surface(
+            first_seen,
+            Some(first_fire),
+            now,
+            THRESH,
+            REPEAT,
+            true
+        ));
     }
 
     #[test]
     fn surfacing_cooldown_is_once_per_window() {
         let first_seen = Instant::now();
-        let now = first_seen + THRESH * 3;
+        let now = first_seen + REPEAT * 3;
         // Posted moments ago — the same window must NOT fire again.
         let just_posted = now - Duration::from_secs(5);
         assert!(!should_surface(
@@ -1354,15 +2081,17 @@ mod tests {
             Some(just_posted),
             now,
             THRESH,
+            REPEAT,
             true
         ));
-        // A full window since the last POST — fires again (next window).
-        let window_ago = now - THRESH;
+        // A full repeat window since the last POST — fires again.
+        let window_ago = now - REPEAT;
         assert!(should_surface(
             first_seen,
             Some(window_ago),
             now,
             THRESH,
+            REPEAT,
             true
         ));
     }
@@ -1373,21 +2102,33 @@ mod tests {
         let t0 = Instant::now();
         // First sighting: entry created, nothing fires (below threshold).
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true)
+            .surface_since
             .is_none());
         // Past the threshold: fires exactly once...
         let t1 = t0 + THRESH + Duration::from_secs(1);
-        let since = t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true);
+        let since = t
+            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
+            .surface_since;
         assert!(since.is_some(), "first over-threshold sighting must fire");
-        // ...and the immediate next tick is in cooldown.
+        // ...and the immediate next tick is in cooldown, as is a whole
+        // threshold window later (repeats are spaced by REPEAT).
         let t2 = t1 + Duration::from_secs(10);
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t2, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t2, THRESH, REPEAT, true)
+            .surface_since
             .is_none());
-        // A full window later it fires again, carrying the SAME blocked_since
-        // (first-seen is never reset by a POST).
-        let t3 = t1 + THRESH;
-        let again = t.note_blocked("m1", BlockReason::TargetNotLive, t3, THRESH, true);
+        let t2b = t1 + THRESH;
+        assert!(t
+            .note_blocked("m1", BlockReason::TargetNotLive, t2b, THRESH, REPEAT, true)
+            .surface_since
+            .is_none());
+        // A full repeat window later it fires again, carrying the SAME
+        // blocked_since (first-seen is never reset by a POST).
+        let t3 = t1 + REPEAT;
+        let again = t
+            .note_blocked("m1", BlockReason::TargetNotLive, t3, THRESH, REPEAT, true)
+            .surface_since;
         assert_eq!(
             again, since,
             "blocked_since must remain the first-seen time"
@@ -1400,34 +2141,70 @@ mod tests {
         let t0 = Instant::now();
         let t1 = t0 + THRESH + Duration::from_secs(1);
         // target_not_live aged past the threshold...
-        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         assert!(t
-            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            .note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
+            .surface_since
             .is_some());
         // ...but a FRESH pty_never_idle sighting of the same message starts
         // its own clock and does not fire yet.
         assert!(t
-            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, true)
+            .note_blocked("m1", BlockReason::PtyNeverIdle, t1, THRESH, REPEAT, true)
+            .surface_since
             .is_none());
+    }
+
+    #[test]
+    fn a_busy_live_recipient_waits_the_repeat_window_before_the_first_post() {
+        // A long turn, a draft or a dialog is ordinary well past 60 s, and
+        // coord's alert is never resolved: `pty_never_idle` first-POSTs only
+        // after the repeat window, though it still LOGS at the threshold.
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, REPEAT, true);
+        let at_thresh = t.note_blocked(
+            "m1",
+            BlockReason::PtyNeverIdle,
+            t0 + THRESH,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(at_thresh.log_now);
+        assert!(at_thresh.surface_since.is_none());
+        assert_eq!(at_thresh.next_log_in, REPEAT);
+        assert!(t
+            .note_blocked(
+                "m1",
+                BlockReason::PtyNeverIdle,
+                t0 + REPEAT,
+                THRESH,
+                REPEAT,
+                true
+            )
+            .surface_since
+            .is_some());
     }
 
     #[test]
     fn successful_delivery_clears_tracking() {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, true);
-        t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, true);
+        t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
+        t.note_blocked("m1", BlockReason::PtyNeverIdle, t0, THRESH, REPEAT, true);
+        t.note_blocked("m2", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
         t.clear_message("m1");
         // m1's clocks restart from scratch; m2 is untouched.
         let t1 = t0 + THRESH + Duration::from_secs(1);
         assert!(
-            t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, true)
+            t.note_blocked("m1", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
+                .surface_since
                 .is_none(),
             "delivery must reset m1's first-seen clock"
         );
         assert!(
-            t.note_blocked("m2", BlockReason::TargetNotLive, t1, THRESH, true)
+            t.note_blocked("m2", BlockReason::TargetNotLive, t1, THRESH, REPEAT, true)
+                .surface_since
                 .is_some(),
             "m2's clock must be unaffected by m1's delivery"
         );
@@ -1437,8 +2214,8 @@ mod tests {
     fn retain_pending_drops_vanished_messages() {
         let mut t = SurfacingTracker::default();
         let t0 = Instant::now();
-        t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, true);
-        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, true);
+        t.note_blocked("gone", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
+        t.note_blocked("kept", BlockReason::PtyNeverIdle, t0, THRESH, REPEAT, true);
         let pending: std::collections::HashSet<&str> = ["kept"].into_iter().collect();
         t.retain_pending(&pending);
         assert!(!t
@@ -1459,16 +2236,32 @@ mod tests {
         assert!(!resolve_surfacing_enabled(Some("false")));
         assert!(!resolve_surfacing_enabled(Some("No")));
         assert!(!resolve_surfacing_enabled(Some(" off ")));
-        // Threshold: default 1800s, numeric override, garbage ⇒ default.
-        assert_eq!(resolve_surface_threshold(None), Duration::from_secs(1800));
+        // Threshold: default 60 s (six 10 s misses), numeric override,
+        // garbage ⇒ default.
+        assert_eq!(resolve_surface_threshold(None), Duration::from_secs(60));
         assert_eq!(
-            resolve_surface_threshold(Some("60")),
-            Duration::from_secs(60)
+            resolve_surface_threshold(Some("1800")),
+            Duration::from_secs(1800)
         );
         assert_eq!(
             resolve_surface_threshold(Some("nope")),
+            Duration::from_secs(60)
+        );
+        // The env name the operator sets — no longer `BLOCKING_`, because the
+        // arm is no longer blocking-only.
+        assert_eq!(SURFACE_SECS_ENV, "RUNNER_MSG_SURFACE_SECS");
+        // Repeat spacing: its own knob, default 1800 s, numeric override,
+        // garbage ⇒ default.
+        assert_eq!(resolve_surface_repeat(None), Duration::from_secs(1800));
+        assert_eq!(
+            resolve_surface_repeat(Some("300")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_surface_repeat(Some("nope")),
             Duration::from_secs(1800)
         );
+        assert_eq!(SURFACE_REPEAT_SECS_ENV, "RUNNER_MSG_SURFACE_REPEAT_SECS");
     }
 
     #[test]
@@ -1476,5 +2269,612 @@ mod tests {
         // Pins the coord route contract (`POST .../delivery-blocked` body).
         assert_eq!(BlockReason::TargetNotLive.as_str(), "target_not_live");
         assert_eq!(BlockReason::PtyNeverIdle.as_str(), "pty_never_idle");
+    }
+
+    // ---- typed-terminal resolution (plan 2026-09-07-session-message-
+    // delivery-is-blind-…, Phase 1) ------------------------------------------
+    //
+    // `worker_sessions` has one production writer (`spawn_worker_session`),
+    // so a typed interactive terminal has a lifecycle record and a PTY but
+    // never a `WorkerSession`. Every arm of `resolve_target` used to end in
+    // `find_worker_by_terminal_id` over that map, so a live typed session
+    // resolved `None` and its messages stayed pending forever. These fixtures
+    // use a real `SessionLifecycleStore` in a tempdir, an empty
+    // `SessionManager`, and no registrar — the substrate arm (1) reads.
+
+    use crate::claude_session::worker_session::WorkerSession;
+    use crate::claude_session::SessionManager;
+    use crate::session::session_lifecycle_store::{
+        SessionLifecycleStore, TerminalSessionRecord, DEFAULT_PROVIDER,
+    };
+    use crate::terminal::TerminalManager;
+
+    fn lifecycle_fixture() -> (tempfile::TempDir, SessionLifecycleStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionLifecycleStore::open(dir.path().join("terminal-sessions.json"))
+            .expect("open lifecycle store in tempdir");
+        (dir, store)
+    }
+
+    /// A typed interactive session's record: `open`, bound to `terminal_id`
+    /// authoritatively, and confirmed by a provider's SessionStart hook.
+    fn open_record(claude_session_id: &str, terminal_id: &str) -> TerminalSessionRecord {
+        TerminalSessionRecord {
+            claude_session_id: claude_session_id.to_string(),
+            config_dir: None,
+            working_dir: Some("/repo".to_string()),
+            page_id: "default".to_string(),
+            zone_index: 0,
+            title: Some("operator-box-prompt".to_string()),
+            terminal_id: terminal_id.to_string(),
+            opened_at: 0,
+            last_seen_at: 0,
+            state: "open".to_string(),
+            closed_at: None,
+            close_reason: None,
+            provider: DEFAULT_PROVIDER.to_string(),
+            origin: Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE.to_string()),
+            restore_pending_at: None,
+            confirmed_at: Some(1),
+            handle: None,
+            account_label: None,
+            account_wrapper: None,
+            session_name: None,
+            name_source: None,
+            tenant_id: None,
+            task_run_id: None,
+            bypass_permissions: None,
+            restored_from_boot_at: None,
+            restore_tier: None,
+            finished_at: None,
+            finish_reason: None,
+            finish_synced: false,
+        }
+    }
+
+    #[test]
+    fn open_record_with_no_worker_resolves_terminal() {
+        // (a) The spaceship measurement: a live, refreshed `open` row whose
+        // terminal has no WorkerSession. Must resolve to the record's own
+        // terminal — nothing guessed — not to `None`.
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("f0a5755d-csid", "7a977da8-term"));
+        let sm = SessionManager::new();
+        let target = resolve_target(&sm, None, &store, "f0a5755d-csid");
+        assert_eq!(
+            target,
+            Some(ResolvedTarget::Terminal {
+                terminal_id: "7a977da8-term".to_string(),
+                claude_session_id: "f0a5755d-csid".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_typed_record_routes_only_when_its_binding_is_known_and_confirmed() {
+        // With no WorkerSession to corroborate it, the record alone decides
+        // where a message goes, so a guess must not route one.
+        use crate::session::session_lifecycle_store::{ORIGIN_OBSERVED, ORIGIN_RECONCILED};
+        let sm = SessionManager::new();
+        let cases: [(Option<&str>, Option<i64>, bool); 5] = [
+            (Some(ORIGIN_OBSERVED), Some(1), true),
+            // An mtime guess may name a foreign session.
+            (Some(ORIGIN_RECONCILED), Some(1), false),
+            // No origin reads as reconciled.
+            (None, Some(1), false),
+            // Provisional: every PTY gets one at spawn, shells included.
+            (
+                Some(crate::session::session_lifecycle_store::ORIGIN_AUTHORITATIVE),
+                None,
+                false,
+            ),
+            (Some(ORIGIN_OBSERVED), None, false),
+        ];
+        for (i, (origin, confirmed, routes)) in cases.into_iter().enumerate() {
+            let (_dir, store) = lifecycle_fixture();
+            let mut rec = open_record("csid-g", "term-g");
+            rec.origin = origin.map(str::to_string);
+            rec.confirmed_at = confirmed;
+            store.record_open(rec);
+            let got = resolve_target(&sm, None, &store, "csid-g");
+            assert_eq!(
+                got.is_some(),
+                routes,
+                "case {i}: origin={origin:?} confirmed={confirmed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn open_record_with_registered_worker_resolves_pty() {
+        // (b) Precedence: a WorkerSession registered on the record's terminal
+        // still wins over the bare terminal, keyed by the worker's own
+        // task_run_id (the `send_message_to_worker` key).
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-w", "term-w"));
+        let sm = SessionManager::new();
+        let tm = Arc::new(TerminalManager::new());
+        sm.register_worker(Arc::new(WorkerSession::new(
+            "task-w".to_string(),
+            "term-w".to_string(),
+            "Worker 1".to_string(),
+            tm,
+        )))
+        .expect("register worker");
+        let target = resolve_target(&sm, None, &store, "csid-w");
+        assert_eq!(
+            target,
+            Some(ResolvedTarget::Pty {
+                task_run_id: "task-w".to_string(),
+                terminal_id: "term-w".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn closed_record_resolves_none() {
+        // (c) A closed session's terminal may already host someone else — a
+        // record in any state but `open` must resolve nothing, worker or not.
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-c", "term-c"));
+        store.record_close("csid-c", "test");
+        assert_eq!(
+            store.get("csid-c").map(|r| r.state),
+            Some("closed".to_string()),
+            "fixture: record_close must leave the row closed"
+        );
+        let sm = SessionManager::new();
+        assert_eq!(resolve_target(&sm, None, &store, "csid-c"), None);
+    }
+
+    #[test]
+    fn absent_record_resolves_none() {
+        // A session this device has never recorded is not ours to inject
+        // into — the message stays pending for whichever device hosts it.
+        let (_dir, store) = lifecycle_fixture();
+        store.record_open(open_record("csid-here", "term-here"));
+        let sm = SessionManager::new();
+        assert_eq!(resolve_target(&sm, None, &store, "csid-elsewhere"), None);
+    }
+
+    // ---- non-delivery reporting at every priority (Phase 4) ---------------
+
+    #[test]
+    fn blocked_log_fires_on_first_sighting_then_once_per_window() {
+        // The info line is what makes a miss visible in the runner log at
+        // once; the window keeps a 10 s poll from writing it every tick.
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let v0 = t.note_blocked("m1", BlockReason::TargetNotLive, t0, THRESH, REPEAT, true);
+        assert!(v0.log_now, "the first sighting must log immediately");
+        assert!(
+            v0.surface_since.is_none(),
+            "…but not POST below the threshold"
+        );
+        // The next poll tick, inside the window: quiet.
+        let v1 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + POLL_INTERVAL,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(!v1.log_now, "a 10 s poll must not log every tick");
+        // One second short of the window: still quiet.
+        let v2 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH - Duration::from_secs(1),
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(!v2.log_now);
+        // The window turns: logs again, and (past the threshold) POSTs.
+        let v3 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(
+            v3.log_now,
+            "a full window since the last line must log again"
+        );
+        assert!(v3.surface_since.is_some());
+        // After the threshold line the log backs off to the repeat window, so
+        // a message stranded for its whole TTL does not write a line every
+        // threshold: two threshold windows later it is quiet and does not POST.
+        let v4 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH * 2,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(
+            !v4.log_now,
+            "after the threshold line the cadence is the repeat window"
+        );
+        assert!(
+            v4.surface_since.is_none(),
+            "a repeat POST must wait the repeat window"
+        );
+        // One repeat window after the threshold line: both fire again.
+        let v5 = t.note_blocked(
+            "m1",
+            BlockReason::TargetNotLive,
+            t0 + THRESH + REPEAT,
+            THRESH,
+            REPEAT,
+            true,
+        );
+        assert!(v5.log_now);
+        assert!(v5.surface_since.is_some());
+    }
+
+    #[test]
+    fn blocked_log_is_independent_of_the_surfacing_flag() {
+        // Disabling the POSTs never silences the local log line.
+        let mut t = SurfacingTracker::default();
+        let t0 = Instant::now();
+        let v = t.note_blocked(
+            "m1",
+            BlockReason::PtyNeverIdle,
+            t0 + THRESH * 2,
+            THRESH,
+            REPEAT,
+            false,
+        );
+        assert!(v.log_now);
+        assert!(v.surface_since.is_none(), "flag off ⇒ no POST");
+        assert!(should_log(None, t0, THRESH));
+        assert!(!should_log(Some(t0), t0 + Duration::from_secs(1), THRESH));
+        assert!(should_log(Some(t0), t0 + THRESH, THRESH));
+    }
+
+    /// The push counters are process-global statics. Every test that bumps
+    /// or asserts an exact delta on them takes this lock, so the parallel
+    /// test runner cannot interleave two bumps between one test's
+    /// `before` and `after` reads. Poison-tolerant: a failed test must not
+    /// cascade into the next one's lock.
+    static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn counter_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[tokio::test]
+    async fn normal_priority_miss_reaches_surfacing_and_the_counter() {
+        // Defect 2's controlled contrast: a `normal` message used to produce
+        // zero log lines and never enter the tracker. Now the same call the
+        // delivery loop makes for every miss tracks it, and bumps the
+        // push-miss counter, regardless of priority. Below the threshold no
+        // POST is attempted, so this needs no coord.
+        let _serial = counter_test_guard();
+        let client = reqwest::Client::new();
+        let ctx = SurfaceCtx {
+            client: &client,
+            base: "http://127.0.0.1:9",
+            token: "test-token",
+        };
+        let mut tracker = SurfacingTracker::default();
+        let msg = PendingMessage {
+            message_id: "m-normal".to_string(),
+            to_session: Some("sess-n".to_string()),
+            from_session: None,
+            kind: "directed".to_string(),
+            priority: "normal".to_string(),
+            body: "hello".to_string(),
+        };
+        let before = health_snapshot()["push_miss"]["target_not_live"]
+            .as_u64()
+            .expect("counter is a u64");
+        surface_blocked_delivery(
+            &ctx,
+            &mut tracker,
+            &msg,
+            "sess-n",
+            BlockReason::TargetNotLive,
+            "no live session on this device",
+            Instant::now(),
+        )
+        .await;
+        assert!(
+            tracker
+                .entries
+                .contains_key(&("m-normal".to_string(), BlockReason::TargetNotLive)),
+            "a normal-priority miss must be tracked like a blocking one"
+        );
+        let after = health_snapshot()["push_miss"]["target_not_live"]
+            .as_u64()
+            .expect("counter is a u64");
+        assert_eq!(
+            after,
+            before + 1,
+            "push_miss.target_not_live must bump exactly once on the miss"
+        );
+    }
+
+    #[test]
+    fn delivery_loop_reports_every_priority() {
+        // Grep-shaped guard on the delivery loop itself (the async loop needs
+        // a live `ApiState` and cannot be driven from a unit test): the
+        // `priority == "blocking"` gate that hid every normal-priority miss
+        // must not come back, and every miss site must route through
+        // `surface_blocked_delivery` — the one door that counts, logs and
+        // surfaces.
+        let src = include_str!("session_message_poller.rs");
+        let start = src
+            .find("async fn deliver_once(")
+            .expect("deliver_once is defined in this file");
+        let end = src[start..]
+            .find("pub mod commands")
+            .map(|i| start + i)
+            .expect("the commands module follows deliver_once");
+        let loop_src = &src[start..end];
+        assert!(
+            !loop_src.contains("\"blocking\""),
+            "deliver_once must not gate reporting on priority"
+        );
+        // Two miss sites report directly (target not live, inject refused);
+        // the idle-gate misses of the worker and typed-terminal arms route
+        // through `report_gate_miss`, which is the same door one call up.
+        let direct_sites = loop_src.matches("surface_blocked_delivery(").count();
+        let gate_sites = loop_src.matches("report_gate_miss(").count();
+        assert!(
+            direct_sites >= 2,
+            "expected the two direct miss sites (target not live, inject refused) \
+             to report; found {direct_sites}"
+        );
+        assert!(
+            gate_sites >= 2,
+            "expected both PTY arms (worker, typed terminal) to report gate misses; \
+             found {gate_sites}"
+        );
+    }
+
+    // ---- /health counter family --------------------------------------------
+
+    #[test]
+    fn health_snapshot_has_exactly_the_documented_keys_and_bumps_are_visible() {
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        };
+        let snap = health_snapshot();
+        assert_eq!(keys(&snap), ["delivered_arm", "push_miss", "push_ok"]);
+        assert_eq!(
+            keys(&snap["push_miss"]),
+            ["pty_never_idle", "target_not_live"]
+        );
+        assert_eq!(
+            keys(&snap["delivered_arm"]),
+            ["sdk", "terminal", "worker_pty"]
+        );
+
+        // A bump moves exactly its own series. Exact deltas on a
+        // process-global counter are only sound under the serial lock —
+        // every test that bumps a counter takes it.
+        let _serial = counter_test_guard();
+        let before = health_snapshot();
+        record_push_miss(BlockReason::PtyNeverIdle);
+        record_push_ok(DeliveredArm::Terminal);
+        let after = health_snapshot();
+        let u = |v: &serde_json::Value, path: &[&str]| -> u64 {
+            let mut cur = v;
+            for p in path {
+                cur = &cur[*p];
+            }
+            cur.as_u64().expect("counter is a u64")
+        };
+        assert_eq!(
+            u(&after, &["push_miss", "pty_never_idle"]),
+            u(&before, &["push_miss", "pty_never_idle"]) + 1
+        );
+        assert_eq!(u(&after, &["push_ok"]), u(&before, &["push_ok"]) + 1);
+        assert_eq!(
+            u(&after, &["delivered_arm", "terminal"]),
+            u(&before, &["delivered_arm", "terminal"]) + 1
+        );
+        assert_eq!(
+            u(&after, &["delivered_arm", "sdk"]),
+            u(&before, &["delivered_arm", "sdk"]),
+            "an inject through one arm must not move another"
+        );
+    }
+
+    #[test]
+    fn delivered_arm_labels_match_health_keys() {
+        assert_eq!(DeliveredArm::Sdk.as_str(), "sdk");
+        assert_eq!(DeliveredArm::WorkerPty.as_str(), "worker_pty");
+        assert_eq!(DeliveredArm::Terminal.as_str(), "terminal");
+    }
+
+    // ---- typed-terminal gate ------------------------------------------------
+    //
+    // `submit_prompt` bracket-pastes onto whatever is in the input box and
+    // presses CR. On a worker PTY nobody types, so the shared "turn complete"
+    // predicate is enough. On a typed terminal an operator may be mid-prompt,
+    // and the pane's root is their SHELL, which may be showing a `❯` prompt of
+    // its own after `/exit`. So the typed arm adds two conjuncts on top of the
+    // shared predicate: an empty, focused Claude Code input box, and a live
+    // `claude` process in the pane.
+
+    fn screen(
+        rows: &[&str],
+        cursor_row: u16,
+        cursor_col: u16,
+    ) -> crate::terminal::graceful_exit::ScreenText {
+        crate::terminal::graceful_exit::ScreenText {
+            lines: lines(rows),
+            cursor_row,
+            cursor_col,
+        }
+    }
+
+    const BOX_TOP: &str = "╭──────────────────────────────────────────╮";
+    const BOX_BOTTOM: &str = "╰──────────────────────────────────────────╯";
+
+    #[test]
+    fn typed_prompt_ready_admits_an_empty_or_placeholder_box() {
+        // `│ ❯ `: the marker is char 2, so input starts at column 4.
+        let empty = screen(
+            &[
+                "finished turn output",
+                BOX_TOP,
+                "│ ❯                                        │",
+                BOX_BOTTOM,
+            ],
+            2,
+            4,
+        );
+        assert_eq!(typed_prompt_ready(&empty), Ok(()));
+        let placeholder = screen(
+            &[
+                "finished turn output",
+                BOX_TOP,
+                "│ ❯ Try \"how do I log an error?\"          │",
+                BOX_BOTTOM,
+            ],
+            2,
+            4,
+        );
+        assert_eq!(typed_prompt_ready(&placeholder), Ok(()));
+    }
+
+    #[test]
+    fn typed_prompt_ready_refuses_a_half_typed_prompt_that_the_shared_predicate_admits() {
+        let rows = [
+            "finished turn output",
+            BOX_TOP,
+            "│ ❯ hello                                  │",
+            BOX_BOTTOM,
+        ];
+        // The shared predicate (worker arm) calls this a completed turn...
+        assert!(qontinui_runner_lib::looping_agent::idle::snapshot_looks_idle(&lines(&rows), 2));
+        // ...but the typed arm must not paste onto the operator's text.
+        assert_eq!(
+            typed_prompt_ready(&screen(&rows, 2, 9)),
+            Err(GateMiss::PromptNotEmpty)
+        );
+        // A prompt that merely starts with the word `Try` is not the
+        // placeholder.
+        let try_typed = screen(
+            &[
+                "out",
+                BOX_TOP,
+                "│ ❯ Try running the tests                   │",
+                BOX_BOTTOM,
+            ],
+            2,
+            4,
+        );
+        assert_eq!(
+            typed_prompt_ready(&try_typed),
+            Err(GateMiss::PromptNotEmpty)
+        );
+    }
+
+    #[test]
+    fn typed_prompt_ready_refuses_a_selected_numbered_choice() {
+        // A permission dialog with the choice under the cursor: pressing
+        // Enter here would answer it.
+        let dialog = screen(&["Do you want to proceed?", "❯ 1. Yes", "  2. No"], 1, 2);
+        assert_eq!(typed_prompt_ready(&dialog), Err(GateMiss::PromptNotEmpty));
+    }
+
+    #[test]
+    fn a_bare_shell_prompt_passes_the_screen_but_not_the_process_check() {
+        // After `/exit`, a starship shell prompt `❯ ` with the cursor on it is
+        // indistinguishable on screen from an empty Claude input line. The
+        // screen checks cannot refuse it; the process check must.
+        let shell = screen(&["~/repo on main", "❯ "], 1, 2);
+        assert_eq!(typed_prompt_ready(&shell), Ok(()));
+        use crate::terminal::graceful_exit::{ClaudeProbe, PaneProcesses, ProcIdentity};
+        let no_claude = ClaudeProbe::Readable(PaneProcesses {
+            subtree_claude: vec![],
+            top_level_children: 0,
+            tracked_alive: vec![],
+        });
+        assert_eq!(
+            claude_live(&no_claude, |_| true),
+            Err(GateMiss::ClaudeNotLive)
+        );
+        // An unreadable process table proves nothing, so it defers too.
+        assert_eq!(
+            claude_live(&ClaudeProbe::Unreadable("x".into()), |_| true),
+            Err(GateMiss::ClaudeNotLive)
+        );
+        let live = ClaudeProbe::Readable(PaneProcesses {
+            subtree_claude: vec![ProcIdentity {
+                pid: 42,
+                started_at: 1,
+            }],
+            top_level_children: 0,
+            tracked_alive: vec![],
+        });
+        assert_eq!(claude_live(&live, |_| true), Ok(()));
+        // A claude that exists but does not own the terminal (Ctrl-Z, `&`)
+        // leaves the shell prompt showing: refused.
+        assert_eq!(claude_live(&live, |_| false), Err(GateMiss::ClaudeNotLive));
+    }
+
+    #[test]
+    fn stat_foreground_parse() {
+        // pid (comm) state ppid pgrp session tty_nr tpgid ...
+        assert!(stat_says_foreground(
+            "4242 (claude) S 100 4242 100 34816 4242 4194304 0"
+        ));
+        // Background job: pgrp is not the terminal's foreground group.
+        assert!(!stat_says_foreground(
+            "4242 (claude) S 100 4242 100 34816 100 4194304 0"
+        ));
+        // Stopped by Ctrl-Z.
+        assert!(!stat_says_foreground(
+            "4242 (claude) T 100 4242 100 34816 4242 4194304 0"
+        ));
+        // No controlling terminal.
+        assert!(!stat_says_foreground(
+            "4242 (claude) S 100 4242 100 0 -1 4194304 0"
+        ));
+        // A command name with spaces and `)` is skipped by the last `)`.
+        assert!(stat_says_foreground("7 (we ird) name) R 1 7 1 34816 7 0"));
+        assert!(!stat_says_foreground("garbage"));
+    }
+
+    #[test]
+    fn only_a_blocking_miss_opens_a_coord_alert() {
+        // Blocking: always surfaced, the sender is waiting.
+        assert!(posts_to_coord("blocking", BlockReason::TargetNotLive));
+        assert!(posts_to_coord("blocking", BlockReason::PtyNeverIdle));
+        // Anything else: counter and log only. coord's alert is per message
+        // and never resolved, and both reasons are ordinary states here.
+        assert!(!posts_to_coord("normal", BlockReason::TargetNotLive));
+        assert!(!posts_to_coord("", BlockReason::TargetNotLive));
+        assert!(!posts_to_coord("normal", BlockReason::PtyNeverIdle));
+    }
+
+    #[test]
+    fn gate_miss_details_name_the_typed_cases() {
+        // The once-per-window log line names the specific behind the coarse
+        // coord reason.
+        assert!(GateMiss::PromptNotEmpty
+            .detail()
+            .contains("prompt row not empty"));
+        assert!(GateMiss::ClaudeNotLive
+            .detail()
+            .contains("no live foreground claude"));
+        assert_ne!(
+            GateMiss::PromptNotEmpty.detail(),
+            GateMiss::NotIdle.detail()
+        );
     }
 }
