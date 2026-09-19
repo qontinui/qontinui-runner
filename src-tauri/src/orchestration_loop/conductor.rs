@@ -4741,6 +4741,33 @@ mod tests {
     /// LANDED are listed; a side effect that was attempted and failed is an
     /// `apply_failures` entry, which `tick_exit` turns into a fingerprint entry
     /// rather than into evidence of life.
+    /// The two designs this type merged disagree only on WHICH failures are
+    /// transient, and every caller reads that through one accessor: `apply_tick`
+    /// to decide `transient_failures` vs `apply_failures`, and `tick_exit` to
+    /// decide whether the row keeps its stall-fingerprint key. A drain deferral
+    /// is as transient as a full fan-out bound — in both the row is queued and
+    /// will dispatch once a condition OUTSIDE this run clears — so counting
+    /// either as stuck stalls a healthy run.
+    #[test]
+    fn a_drain_deferral_is_as_transient_as_a_full_fanout_bound() {
+        assert!(
+            DispatchError::DeferredByDrain("drained".to_string()).transient(),
+            "a device drain lifts on its own; the subtask stays Submitted"
+        );
+        assert!(
+            DispatchError::Transient("bound full".to_string()).transient(),
+            "the fleet-wide fan-out bound frees on its own"
+        );
+        assert!(
+            !DispatchError::Failed("worktree acquisition failed".to_string()).transient(),
+            "everything else re-decides identically forever and must accrue stall time"
+        );
+        assert!(
+            !DispatchError::from("a bare string is a hard failure".to_string()).transient(),
+            "From<String> maps to Failed, so an untyped error is never forgiven"
+        );
+    }
+
     #[test]
     fn an_outcome_lists_what_landed_and_names_what_did_not() {
         let empty = TickOutcome::default();
@@ -5318,10 +5345,9 @@ mod tests {
         let plan = compute_tick(&rows, &FakeSignals(Map::new()), &mut timers, &c, 0);
         assert_eq!(plan.to_dispatch, vec!["A".to_string()], "A is ready");
 
-        let dispatcher =
-            FakeDispatcher::dispatch_failing(DispatchError::Failed(
-                "worktree acquisition failed".to_string(),
-            ));
+        let dispatcher = FakeDispatcher::dispatch_failing(DispatchError::Failed(
+            "worktree acquisition failed".to_string(),
+        ));
         let gate = FakeCoordGateClient::with_gate_id("g-1");
         let outcome = apply_tick(
             &plan,
