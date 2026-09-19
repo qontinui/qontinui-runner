@@ -366,7 +366,22 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
     // cycle: every lifecycle-hosted session is an operator terminal session
     // running under the device's DEFAULT binding (coord-spawned agent
     // sessions publish through their own agent identity, not this walker).
-    let tenant_id = crate::fleet::resolve_tenant_id();
+    // GATED once per cycle: the WIP payload below DECLARES this tenant, so it
+    // is derived from the same scope that selects the bearer, and that scope is
+    // `Owned` only when this device holds a usable credential for the tenant.
+    // The raw `resolve_tenant_id()` it replaced put `machine.json`'s default
+    // straight onto the wire, so a device whose default slot was expired or
+    // absent attributed every WIP row to that tenant on an unauthenticated
+    // request. `declared_tenant()` is `None` for an unbacked default, and coord
+    // then resolves the row's tenant server-side instead of trusting the body.
+    let tenant_scope = crate::auth::TenantScope::for_bound_device_default(
+        crate::fleet::resolve_tenant_id(),
+        // UNCACHED on purpose: this resolves once per cycle and every POST in
+        // the loop below reuses the scope, so there is no burst for the memo to
+        // collapse — it would only widen the staleness window.
+        &crate::auth::device_holds_usable_binding,
+    );
+    let tenant_id = tenant_scope.declared_tenant();
 
     // The workspace directory names every transcript path is anchored on.
     // Resolved ONCE per cycle, next to the tenant, rather than per file path:
@@ -493,15 +508,17 @@ pub async fn run_attribution_cycle() -> Result<(), String> {
             // unauthenticated (never another tenant's JWT) — see
             // `auth::select_device_bearer`.
             //
-            // `for_device_default`, not `for_session`: this is a machine-wide
-            // WIP scan whose declared tenant IS the device's own binding
-            // (`fleet::resolve_tenant_id`). A machine that names no default is
-            // the legitimate single-tenant shape, so its absence is `Device` —
-            // nothing failed to resolve, and degrading a whole-device scan to
-            // unauthenticated would buy nothing.
+            // `for_bound_device_default`, not `for_session`: this is a
+            // machine-wide WIP scan whose declared tenant IS the device's own
+            // binding (`fleet::resolve_tenant_id`). A machine that names no
+            // default is the legitimate single-tenant shape, so its absence is
+            // `Device` — nothing failed to resolve, and degrading a whole-device
+            // scan to unauthenticated would buy nothing. An unbacked default,
+            // by contrast, declares nothing: see the resolution above, which is
+            // where `payload.tenant_id` comes from.
             match crate::auth::attach_device_auth_for(
                 client.post(&url).json(&payload),
-                crate::auth::TenantScope::for_device_default(tenant_id),
+                tenant_scope,
             )
             .send()
             .await
