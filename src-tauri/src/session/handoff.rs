@@ -628,8 +628,13 @@ async fn run_all_catchups(
             // into the table the backend relay's terminal handlers enforce
             // against.
             CatchupKind::Attach => {
-                super::attach::run_catchup(http, coord_url, device_id, super::attach::CATCHUP_TIMEOUT)
-                    .await
+                super::attach::run_catchup(
+                    http,
+                    coord_url,
+                    device_id,
+                    super::attach::CATCHUP_TIMEOUT,
+                )
+                .await
             }
             // The remote-CREATE grants beside them (plan
             // `2026-09-11-headless-runner-parity-from-a-headed-runner`, Phase

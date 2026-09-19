@@ -1650,24 +1650,41 @@ where
 /// allowlist refusals, `SessionNotLocal` and `TerminalMismatch`. Widening this
 /// points a coord-round-trip-per-refused-frame lever at coord; narrowing it to
 /// none reinstates the directive/frame race as a permanent failure.
-pub fn refusal_warrants_a_coord_reread(code: &str) -> bool {
-    // BOTH grant families race the same way: coord publishes the directive
-    // before it answers the source's mint, the directive rides NATS and the
-    // frame rides the source's HTTP round-trip plus the relay socket, and
-    // nothing orders the two. An attach that loses that race used to wait for
-    // the 60 s catch-up poll, which made it unwinnable in practice — every
-    // retry mints a FRESH jti, so the grant the target learns is never the one
-    // the next frame presents.
-    code == CreateRefusal::GrantUnknown.code() || code == AttachRefusal::GrantUnknown.code()
+pub fn refusal_warrants_a_coord_reread(family: GrantFamily, code: &str) -> bool {
+    // Family-aware, so the argument is load-bearing rather than decorative: a
+    // frame coded for one family must never spend the OTHER family's budget or
+    // send this device to the wrong coord list. Unreachable today — each
+    // handler only ever emits its own family's codes — which is exactly why it
+    // is cheap to make structurally impossible now.
+    match family {
+        GrantFamily::Create => code == CreateRefusal::GrantUnknown.code(),
+        GrantFamily::Attach => code == AttachRefusal::GrantUnknown.code(),
+    }
 }
 
 /// Minimum gap between two on-demand coord re-reads, whatever jti asked.
 ///
 /// The re-read is `await`ed on the backend relay's read loop, which is serial:
 /// every one of them stalls terminal input, output and every other relay frame
-/// for as long as the coord GET takes (up to its 10 s timeout). Unthrottled,
-/// that is a liveness lever a compromised relay can pull at will by forwarding
-/// a stream of creates carrying invented jtis.
+/// for as long as the coord GET takes — bounded by [`GRANT_REREAD_TIMEOUT`],
+/// NOT by the background catch-up's 10 s. Unthrottled, that is a liveness
+/// lever a compromised relay can pull at will by forwarding a stream of
+/// frames carrying invented jtis.
+///
+/// ⚠️ **This lever became reachable BY DEFAULT when the attach path gained the
+/// re-read, and that is a deliberate, recorded trade.** Create could never
+/// reach it on a stock device: `AcceptRemoteCreate` defaults `Off`, so
+/// `admit_terminal_create` returns the FINAL `Disabled` before it can emit
+/// `remote_create_grant_unknown`. `AcceptRemoteAttach` defaults `SameUser`, so
+/// the attach arm is live on every device. A compromised relay streaming
+/// invented jtis therefore costs a stock device one bounded stall per cooldown
+/// — a ~25% duty cycle at these values — where previously it cost nothing
+/// unless an operator had opted into remote create. Accepted because without
+/// the re-read remote attach fails PERMANENTLY rather than flakily (every
+/// retry mints a fresh jti, so the 60 s poll never catches up), and
+/// engineering-priorities ranks capability above robustness. The attacker must
+/// already control the relay, which by then forwards every terminal byte.
+/// Revisit this constant before widening anything else onto this budget.
 ///
 /// Three seconds is chosen against the thing being raced — the gap between
 /// coord publishing the `create_request` directive and the relay's frame
@@ -1723,9 +1740,9 @@ fn grant_reread_state() -> &'static Mutex<(u64, HashMap<(GrantFamily, String), u
 ///   attacker would choose.
 ///
 /// Calling this RECORDS the attempt, so it is not a pure predicate and must be
-/// called once per decision. `grant_expires_hint` bounds how long the per-jti
-/// memory is kept; a create grant lives 15 minutes, so an hour is a generous
-/// upper bound for a jti nobody can name an expiry for.
+/// called once per decision. The per-jti memory is kept for
+/// `UNKNOWN_JTI_MEMORY_SECS`; a grant lives 15 minutes, so an hour is a
+/// generous upper bound for a jti nobody can name an expiry for.
 pub fn claim_grant_reread(family: GrantFamily, grant_jti: &str, now: u64) -> bool {
     const UNKNOWN_JTI_MEMORY_SECS: u64 = 3600;
     let Ok(mut state) = grant_reread_state().lock() else {
@@ -1772,7 +1789,7 @@ pub fn reread_decision(frame: &Value, family: GrantFamily, now: u64) -> Option<S
     let worth_it = frame
         .get("code")
         .and_then(|c| c.as_str())
-        .is_some_and(refusal_warrants_a_coord_reread);
+        .is_some_and(|c| refusal_warrants_a_coord_reread(family, c));
     if !worth_it {
         return None;
     }
@@ -5069,12 +5086,23 @@ mod grant_gate_tests {
     #[test]
     fn only_an_unknown_grant_warrants_a_coord_reread() {
         assert!(refusal_warrants_a_coord_reread(
+            GrantFamily::Create,
             CreateRefusal::GrantUnknown.code()
         ));
         assert!(
-            refusal_warrants_a_coord_reread(AttachRefusal::GrantUnknown.code()),
+            refusal_warrants_a_coord_reread(GrantFamily::Attach, AttachRefusal::GrantUnknown.code()),
             "the attach path races the directive exactly as create does"
         );
+        // The family is load-bearing: one family's code must not satisfy the
+        // other's predicate, or a frame could spend the wrong feed's budget.
+        assert!(!refusal_warrants_a_coord_reread(
+            GrantFamily::Create,
+            AttachRefusal::GrantUnknown.code()
+        ));
+        assert!(!refusal_warrants_a_coord_reread(
+            GrantFamily::Attach,
+            CreateRefusal::GrantUnknown.code()
+        ));
         for final_attach_refusal in [
             AttachRefusal::GrantExpired,
             AttachRefusal::TerminalMismatch,
@@ -5082,7 +5110,7 @@ mod grant_gate_tests {
             AttachRefusal::SessionNotLocal,
         ] {
             assert!(
-                !refusal_warrants_a_coord_reread(final_attach_refusal.code()),
+                !refusal_warrants_a_coord_reread(GrantFamily::Attach, final_attach_refusal.code()),
                 "{final_attach_refusal:?} is final — coord has nothing to add"
             );
         }
@@ -5095,32 +5123,68 @@ mod grant_gate_tests {
             CreateRefusal::IntentRepoNotAllowed,
         ] {
             assert!(
-                !refusal_warrants_a_coord_reread(final_refusal.code()),
+                !refusal_warrants_a_coord_reread(GrantFamily::Create, final_refusal.code()),
                 "{final_refusal:?} is final — coord has nothing to add"
             );
         }
         // An unrecognised code is final too: an unknown refusal must not be a
         // way to make this device call coord.
-        assert!(!refusal_warrants_a_coord_reread("something_else"));
-        assert!(!refusal_warrants_a_coord_reread(""));
+        assert!(!refusal_warrants_a_coord_reread(GrantFamily::Create, "something_else"));
+        assert!(!refusal_warrants_a_coord_reread(GrantFamily::Create, ""));
     }
 
 
-
-    /// A final refusal never reaches the throttle at all, whatever jti it
-    /// carries — the cheap refusals an attacker can provoke must cost nothing.
+    /// The decision seam is unit-tested; its WIRING is not observable from any
+    /// behavioural test in this process, and the wiring is exactly where a
+    /// copy-paste lands. The attach block was produced by copying the create
+    /// block, so the likeliest defect in the whole change is the attach site
+    /// asking coord's CREATE feed, or passing `GrantFamily::Create` — either of
+    /// which makes the fix a silent no-op that still costs a coord round-trip
+    /// per race, with every unit test green. Pinned at the source level, the
+    /// same shape as the frontend's `FleetSessionPicker.wiring.test.ts`.
     #[test]
-    fn a_final_refusal_never_reaches_coord() {
-        let base = 9_700_000u64;
-        for final_code in [
-            AttachRefusal::Disabled.code(),
-            AttachRefusal::SessionNotLocal.code(),
-            AttachRefusal::TerminalMismatch.code(),
-            AttachRefusal::GrantExpired.code(),
-        ] {
-            let frame = serde_json::json!({ "code": final_code, "grant_jti": "final-probe" });
-            assert_eq!(reread_decision(&frame, GrantFamily::Attach, base), None);
+    fn each_relay_handler_rereads_its_own_feed_with_its_own_family() {
+        const RELAY: &str = include_str!("backend_relay.rs");
+
+        fn handler_body<'a>(src: &'a str, sig: &str) -> &'a str {
+            let start = src
+                .find(sig)
+                .unwrap_or_else(|| panic!("handler `{sig}` not found — did it get renamed?"));
+            let rest = &src[start + sig.len()..];
+            let end = rest.find("\nasync fn ").unwrap_or(rest.len());
+            &rest[..end]
         }
+
+        let create = handler_body(RELAY, "async fn handle_terminal_create(");
+        assert!(create.contains("GrantFamily::Create"), "create handler lost its family");
+        assert!(
+            create.contains("crate::session::create::catch_up_now_within("),
+            "create handler must re-read the CREATE feed"
+        );
+        assert!(
+            !create.contains("crate::session::attach::catch_up_now_within("),
+            "create handler must not consult the attach feed"
+        );
+
+        let attach = handler_body(RELAY, "async fn handle_terminal_attach(");
+        assert!(
+            attach.contains("GrantFamily::Attach"),
+            "attach handler must claim against the ATTACH family, or a create \
+             refusal silently suppresses its re-read"
+        );
+        assert!(
+            attach.contains("crate::session::attach::catch_up_now_within("),
+            "attach handler must re-read the ATTACH feed"
+        );
+        assert!(
+            !attach.contains("crate::session::create::catch_up_now_within("),
+            "attach handler must not consult the create feed — that is the \
+             copy-paste this test exists to catch"
+        );
+        assert!(
+            !attach.contains("GrantFamily::Create"),
+            "attach handler must not spend the create family's budget"
+        );
     }
 
     /// **The re-read is throttled on two independent axes**, because it is
@@ -5139,13 +5203,18 @@ mod grant_gate_tests {
 
         // One per window: the first distinct jti in a window wins, the next
         // does not, and the window reopens after the cooldown.
-        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-a"), base));
+        assert!(claim_grant_reread(
+            GrantFamily::Create,
+            &format!("{tag}-a"),
+            base
+        ));
         assert!(
             !claim_grant_reread(GrantFamily::Create, &format!("{tag}-b"), base),
             "a DIFFERENT jti inside the cooldown must not slip past — a flood of distinct jtis \
              is the shape an attacker would choose"
         );
-        assert!(claim_grant_reread(GrantFamily::Create, 
+        assert!(claim_grant_reread(
+            GrantFamily::Create,
             &format!("{tag}-b"),
             base + GRANT_REREAD_COOLDOWN_SECS
         ));
@@ -5166,7 +5235,11 @@ mod grant_gate_tests {
         // …unless the re-read FOUND it, which clears the memory: a legitimate
         // grant that lost the directive race must not hold a slot for an hour.
         clear_grant_reread(GrantFamily::Create, &format!("{tag}-a"));
-        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-a"), base + 900));
+        assert!(claim_grant_reread(
+            GrantFamily::Create,
+            &format!("{tag}-a"),
+            base + 900
+        ));
 
         // The cooldown is sized against the directive race (milliseconds), not
         // against the grant's 900 s life.
@@ -5189,7 +5262,11 @@ mod grant_gate_tests {
         // Fails against a build without that call: the second claim succeeds
         // there, because `finished - stall` is exactly one cooldown.
         let stall = base + 100_000;
-        assert!(claim_grant_reread(GrantFamily::Create, &format!("{tag}-stall-a"), stall));
+        assert!(claim_grant_reread(
+            GrantFamily::Create,
+            &format!("{tag}-stall-a"),
+            stall
+        ));
         let finished = stall + GRANT_REREAD_COOLDOWN_SECS;
         finish_grant_reread(finished);
         assert!(
@@ -5197,13 +5274,14 @@ mod grant_gate_tests {
             "a second stall must not begin the instant the first one ends"
         );
         assert!(
-            claim_grant_reread(GrantFamily::Create, 
+            claim_grant_reread(
+                GrantFamily::Create,
                 &format!("{tag}-stall-b"),
                 finished + GRANT_REREAD_COOLDOWN_SECS
             ),
             "…and the window reopens a cooldown AFTER the previous one finished"
         );
-    
+
         // ---- folded in deliberately: everything below mutates the SAME
         // process-global throttle, and cargo test runs test fns in parallel.
         // As separate #[test] fns these stamped the global cooldown clock at
@@ -5263,7 +5341,11 @@ mod grant_gate_tests {
             "grant_jti": format!("  {pad_jti}  "),
         });
         assert_eq!(
-            reread_decision(&padded, GrantFamily::Attach, trim + GRANT_REREAD_COOLDOWN_SECS),
+            reread_decision(
+                &padded,
+                GrantFamily::Attach,
+                trim + GRANT_REREAD_COOLDOWN_SECS
+            ),
             Some(pad_jti.to_string()),
             "the TRIMMED jti is what coord is asked about"
         );
@@ -5280,7 +5362,29 @@ mod grant_gate_tests {
             None,
             "re-padding the same jti must not mint a fresh throttle key"
         );
-}
+
+        // A final refusal must never reach the throttle AT ALL -- the cheap
+        // refusals an attacker can provoke must cost nothing. Asserting only
+        // that `reread_decision` returns None does NOT test that: reorder it to
+        // claim before checking the code and every such assertion still passes
+        // while each final refusal burns the global cooldown. So prove the
+        // throttle was UNTOUCHED, by claiming at the same `now` afterwards.
+        let final_at = trim + GRANT_REREAD_COOLDOWN_SECS * 8;
+        for final_code in [
+            AttachRefusal::Disabled.code(),
+            AttachRefusal::SessionNotLocal.code(),
+            AttachRefusal::TerminalMismatch.code(),
+            AttachRefusal::GrantExpired.code(),
+        ] {
+            let frame = serde_json::json!({ "code": final_code, "grant_jti": "final-probe" });
+            assert_eq!(reread_decision(&frame, GrantFamily::Attach, final_at), None);
+        }
+        assert!(
+            claim_grant_reread(GrantFamily::Attach, "post-final-probe", final_at),
+            "a final refusal must not have spent the cooldown -- a claim at the \
+             SAME instant must still succeed"
+        );
+    }
 
     /// An unauthorised caller must not learn this device's directory and repo
     /// allowlists. The grant lookup therefore runs BEFORE the two resolutions,
