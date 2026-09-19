@@ -1023,8 +1023,9 @@ jobs:
       #
       # Both are EDGE ids on plan artifact `ae8b3f39-1bc6-47ab-adbf-2fe607462b3c`,
       # NOT artifact ids — read them back at
-      # `GET /api/v1/plan-library/followups` (they key on `edge_id`, with
-      # `to_id: null` because an unowned follow-up is the point). A review of
+      # `GET /api/v1/plan-library/followups` (they key on `edge_id`; the feed
+      # carries no `to_id` column at all, which is consistent with it listing
+      # only OPEN follow-ups — an owned one has left it). A review of
       # this change probed `GET /api/v1/plan-library/<edge id>` — the ARTIFACT
       # route — got a 404 and reported the ids as unresolvable, so the door is
       # named here to stop the next reader repeating it.
@@ -1033,11 +1034,16 @@ jobs:
       # enough and a second review caught the same class of miss one level
       # down. Measured 2026-09-19: `limit 50`, `total 134`,
       # `ordering: oldest_first`, and these two rows sit at index 130-131 — so
-      # page 1 is a well-formed 200 carrying neither. Worse, the route ignores
-      # no unknown parameter: `?from_id=…`, `?artifact_id=…` and `?slug=…` each
-      # return **zero items** rather than the unfiltered page, so a guessed
-      # filter reads as "the follow-up does not exist". Page it and match
-      # client-side:
+      # page 1 is a well-formed 200 carrying neither. The route REFUSES an
+      # unknown parameter rather than ignoring it — `?from_id=…`,
+      # `?artifact_id=…` and `?slug=…` each answer **HTTP 422
+      # `unknown_query_parameter`** naming the rejected key and
+      # `accepted: ["limit","offset"]` — so a guessed filter fails loudly
+      # instead of looking like an empty result, and `limit`/`offset` are the
+      # only knobs. (This comment first described that as a silent zero-item
+      # page; a review re-probed it and the door answers 422, with a message
+      # that reads as though the refusal landed for exactly this reason.
+      # Corrected rather than quietly dropped.) Page it and match client-side:
       #   GET /api/v1/plan-library/followups?offset=100
       # then select on `from_id == ae8b3f39-…`. Read `total` and keep paging;
       # the index will drift as other plans record follow-ups.

@@ -74,16 +74,19 @@
  * `eff25606-d3e0-4307-9e9c-3ddbceb2b0aa` rather than implied to be covered.
  * That is an EDGE id on plan artifact `ae8b3f39-1bc6-47ab-adbf-2fe607462b3c`,
  * not an artifact id: read it back at `GET /api/v1/plan-library/followups`
- * (keyed `edge_id`, `to_id: null`). `GET /api/v1/plan-library/<edge id>` is
+ * (keyed `edge_id`; the feed carries no `to_id` column, consistent with it
+ * listing only OPEN follow-ups). `GET /api/v1/plan-library/<edge id>` is
  * the ARTIFACT route and correctly 404s — a review of this change probed it
  * and reported the id unresolvable, so the door is named here.
  *
  * ⚠️ And the feed is PAGINATED AND UNFILTERED: measured 2026-09-19 it serves
- * `limit 50` of `total 134` oldest-first, this row sits at index 131, and an
- * unknown query parameter (`?from_id=…`, `?slug=…`) returns ZERO items rather
- * than the unfiltered page — so a guessed filter reads as "no such follow-up".
- * Use `?offset=100` (and keep paging against `total`), then match `from_id`
- * client-side.
+ * `limit 50` of `total 134` oldest-first, and this row sits at index 131, so
+ * the bare URL above is a 200 carrying neither id. `limit` and `offset` are
+ * the ONLY parameters it implements — an unknown one (`?from_id=…`,
+ * `?slug=…`) is REFUSED with HTTP 422 `unknown_query_parameter` naming the
+ * accepted set, so a guessed filter fails loudly rather than looking like an
+ * empty result. Use `?offset=100`, keep paging against `total`, and match
+ * `from_id` client-side.
  *
  * WHY IT CANNOT DO MORE, verified at source on `qontinui-coord` `origin/main`
  * 2026-09-19 (`crates/coord/src/test_run_effects.rs`). There is nowhere for a
