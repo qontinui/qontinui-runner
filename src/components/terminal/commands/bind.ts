@@ -169,11 +169,10 @@ export interface CoercedArgs {
  * with `string`.
  *
  * A caller that NAMES its arguments (a UI Bridge action, `callRegistry`, the
- * Tier-3 model's JSON) and
- * sends a JSON string for one of these meant that exact text. `coerceToken`
- * turning `"007"` into `7` — which `textArg` then reads back as `"7"` — would
- * save a profile under a different name or type a different command into a
- * PTY. So these keep the caller's string. Typed routes are unaffected: there
+ * Tier-3 model's JSON) and sends a JSON string for one of these meant that
+ * exact text. `coerceToken` turning `"007"` into `7` — which `textArg` then
+ * reads back as `"7"` — would save a profile under a different name or type a
+ * different command into a PTY. So these keep the caller's string. Typed routes are unaffected: there
  * a token has no declared type until binding reads one, which is why they
  * coerce.
  */
