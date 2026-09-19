@@ -791,9 +791,11 @@ pub fn migrate_session(
             gate_identity: carried_gate_identity,
         },
     );
-    // GUARD: anchor-held window CLOSES here — both arms below settle the
-    // permit the lift took. See the matching GUARD marker at the lift for what
-    // may not appear between the two.
+    // GUARD: anchor-held window closes at the `restore_continuation_registration`
+    // call INSIDE each arm below, not at this line — an early exit added in
+    // the `Ok` arm before that call would still drop the permit and free the
+    // anchor. This marker is where the two arms diverge; see the matching
+    // GUARD marker at the lift for what may not appear anywhere in between.
     let new_terminal_id = match spawned {
         Ok((terminal_id, _coord_session_id)) => {
             // Re-pin the continuation onto the terminal that now hosts it, so

@@ -2615,12 +2615,24 @@ impl ContinuationRegistry {
     /// `warn!` names the anchor so a state nobody expects announces itself.
     ///
     /// **Accepted residual, stated rather than hidden:** on this arm the
-    /// migrating session's anchor is held by a STRANGER's permit, so if that
-    /// stranger settles mid-hop the anchor goes free and the original
-    /// double-spawn window is back for the rest of the respawn. Leaving the
-    /// foreign token alone is still correct — displacing it is strictly worse,
-    /// since it frees the stranger's own later removal to take a third
-    /// holder's entry — and the `warn!` is what makes the residual visible.
+    /// migrating session's anchor is held by a STRANGER's permit, and if that
+    /// stranger RELEASES WITHOUT SPAWNING — its `Drop` on any non-spawn exit —
+    /// the anchor goes into neither half and the original double-spawn window
+    /// is back for the rest of the respawn. Only that path. A stranger that
+    /// settles through [`AnchorReservation::handed_to_registry`] inserts a
+    /// LIVE row for the anchor under the same lock that frees the pending
+    /// entry, so P3's live scan still answers `DuplicateAnchor(Live)` and no
+    /// window opens.
+    ///
+    /// Leaving the foreign token alone is still correct, though **not** for
+    /// the reason a by-key steal is wrong: [`Self::release_owned`] is the only
+    /// remover and it compares the token, so a displaced stranger's own later
+    /// removal is a NO-OP, never a steal of a third holder's entry. The real
+    /// cost of displacing is simpler and worse — it overwrites the registry's
+    /// only record that the stranger holds this anchor, so the migration's own
+    /// settle would then free an anchor a still-in-flight stranger believes it
+    /// holds, and the next dispatch would pass P3 and spawn alongside it. The
+    /// `warn!` is what makes the residual visible either way.
     ///
     /// The carried `anchor_key` survives that arm because
     /// [`restore_continuation_registration`] re-pins from the
@@ -2641,8 +2653,11 @@ impl ContinuationRegistry {
                         anchor = %anchor,
                         terminal_id = %terminal_id,
                         "continuation lift found the anchor already reserved by another holder — \
-                         leaving that reservation intact and carrying no permit across the hop \
-                         (unreachable under P3; if this fires, the guard's ordering changed)"
+                         leaving that reservation intact and carrying no permit across the hop. \
+                         The dispatch path cannot produce this (P3's live scan precedes its \
+                         reservation arm), so look instead for a live row inserted past \
+                         pending_anchors — register_continuation_session does that — or for two \
+                         overlapping lifts on one anchor"
                     );
                     AnchorReservation::none()
                 }
@@ -2832,9 +2847,15 @@ enum AnchorHolder {
     /// A registered, running continuation session — its `terminal_id`, so the
     /// operator can be pointed at the tab that is doing the work.
     Live(String),
-    /// A dispatch that passed this guard and has not yet spawned (or given
-    /// up): the reservation [`evaluate_continuation_guard`] takes inside its
-    /// P3 critical section. No terminal exists yet, so there is nothing to
+    /// The anchor is held by a `pending_anchors` permit rather than a live
+    /// row. TWO holders reach this, and the variant does not say which:
+    /// a dispatch that passed this guard and has not yet spawned (or given
+    /// up) — the reservation [`evaluate_continuation_guard`] takes inside its
+    /// P3 critical section — or a session mid-account-migration, whose lift
+    /// holds the anchor across the respawn
+    /// ([`ContinuationRegistry::take_live_reserving_anchor`]). No terminal
+    /// exists yet in the first case and the old one is being torn down in the
+    /// second, so there is nothing to
     /// focus; the row is deferred exactly as for a live holder and re-delivery
     /// finds either the registered session or a released anchor.
     Reserved,
@@ -2847,8 +2868,9 @@ enum ContinuationGuard {
     /// under cap.
     Proceed,
     /// This `anchor_key` is already taken (P3): skip the spawn (re-cleared gate
-    /// / duplicate). Carries WHO holds it — a live session, or a dispatch still
-    /// between the guard and its spawn.
+    /// / duplicate). Carries WHO holds it — a live session, or a permit holder
+    /// (a dispatch still between the guard and its spawn, or a session
+    /// mid-account-migration; see [`AnchorHolder::Reserved`]).
     DuplicateAnchor(AnchorHolder),
     /// The machine is out of THREADS, not out of slots: the spawn gate's thread
     /// lane ([`crate::resource_guard::thread_pressure`]) returned something
@@ -3321,9 +3343,11 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
     lock_recover(continuation_sessions(), "continuation_sessions").release_owned(anchor, token);
 }
 
-/// The same-anchor reservation a `Proceed` from [`evaluate_continuation_guard`]
-/// leaves in [`ContinuationRegistry::pending_anchors`], carried by
-/// [`run_gate_continuation_inner`] from the guard through the spawn.
+/// A same-anchor reservation in [`ContinuationRegistry::pending_anchors`].
+/// Two producers: a `Proceed` from [`evaluate_continuation_guard`], carried by
+/// [`run_gate_continuation_inner`] from the guard through the spawn; and
+/// [`ContinuationRegistry::take_live_reserving_anchor`], carried by the
+/// account-migration hop from the lift through the respawn to the re-pin.
 ///
 /// RAII rather than a release call on each exit: the path from the guard to a
 /// registered session crosses an authorization check, the coord consume claim
@@ -3337,8 +3361,10 @@ fn release_anchor_reservation(held: Option<(&str, AnchorReservationToken)>) {
 /// **It is the only thing that can release the anchor it names, and it can
 /// release nothing else.** The entry it owns carries the
 /// [`AnchorReservationToken`] minted with it, every removal compares that
-/// token, and the reservation itself can only be MINTED by
-/// [`evaluate_continuation_guard`] alongside the entry — there is no
+/// token, and the reservation itself can only be MINTED alongside the entry —
+/// by [`evaluate_continuation_guard`] or by
+/// [`ContinuationRegistry::take_live_reserving_anchor`], each inside the
+/// critical section that inserts it. There is no
 /// constructor that takes a bare key, so no caller can fabricate a permit for
 /// an anchor it did not reserve. The two exits that do not simply drop are
 /// [`Self::handed_to_registry`] (the terminal arm: insert the live entry and
@@ -3370,8 +3396,10 @@ impl AnchorReservation {
         Self { held: None }
     }
 
-    /// Take custody of the entry [`evaluate_continuation_guard`] just inserted
-    /// for `anchor_key` under `token`. Minted with the entry and never from a
+    /// Take custody of the `pending_anchors` entry the caller just inserted
+    /// for `anchor_key` under `token` — [`evaluate_continuation_guard`] on the
+    /// dispatch path, [`ContinuationRegistry::take_live_reserving_anchor`] on
+    /// the migration lift. Minted with the entry and never from a
     /// key alone, which is what makes ownership checkable.
     fn owning(anchor_key: String, token: AnchorReservationToken) -> Self {
         Self {
@@ -4884,7 +4912,7 @@ fn spawn_authorization_stamp_reason(label: &str) -> String {
 ///
 /// | reason | stamped by | constructor |
 /// |---|---|---|
-/// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| an in-flight dispatch has reserved it | [`duplicate_anchor_stamp_reason`] |
+/// | `duplicate_anchor:<terminal_id>` \| `duplicate_anchor:reserved` | a live session already owns the anchor \| a permit holder has reserved it (an in-flight dispatch, or a session mid-account-migration) | [`duplicate_anchor_stamp_reason`] |
 /// | `thread_pressure:<severity>:<observed>_over_<limit>` | the machine is out of OS threads (`severity` = `warn` \| `critical`) | [`thread_pressure_stamp_reason`] |
 /// | `at_cap:<cap>` | the continuation concurrency cap | [`at_cap_stamp_reason`] |
 /// | `spawn_authorization_<label>` | the agent registry refused the spawn | [`spawn_authorization_stamp_reason`] |
