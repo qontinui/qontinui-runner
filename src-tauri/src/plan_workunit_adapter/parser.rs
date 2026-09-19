@@ -325,9 +325,8 @@ static PHASE_LIST_HEADING_NAMES_PHASES: Lazy<Regex> = Lazy::new(|| {
 
 /// Text in a phase-list section's introduction that says its list is not
 /// this plan's phases (`Under Option B, Phases 1–4 do not exist`).
-static NOT_A_PHASE_LIST: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bdo(?:es)? not exist\b|\bsuperseded\b").expect("valid regex")
-});
+static NOT_A_PHASE_LIST: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bdo(?:es)? not exist\b|\bsuperseded\b").expect("valid regex"));
 
 /// One leading section enumerator on a heading: `4.`, `6.1`, `4)`, `§3`, `a.`.
 static HEADING_ENUMERATOR: Lazy<Regex> =
@@ -375,9 +374,8 @@ static PHASE_TABLE_CELL: Lazy<Regex> = Lazy::new(|| {
 
 /// A range in a phase-table cell — `4 – 6`, `4—6`, `Phase 4 - 6` — names
 /// several phases at once and is not a declaration of its first.
-static PHASE_TABLE_RANGE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)^\**(?:Phase\s+|P)?\d+\s*[–—-]\s*\d").expect("valid regex")
-});
+static PHASE_TABLE_RANGE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)^\**(?:Phase\s+|P)?\d+\s*[–—-]\s*\d").expect("valid regex"));
 
 /// A table's separator-row cell: `---`, `:---`, `---:`, `:-:`.
 static TABLE_SEPARATOR_CELL: Lazy<Regex> =
@@ -681,7 +679,9 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     Some(caps) => (caps[1].parse().ok(), !caps[2].is_empty()),
                     None => (ordinal, false),
                 };
-                let struck_title = bold.as_deref().is_some_and(|b| STRUCK_PHASE_TITLE.is_match(b));
+                let struck_title = bold
+                    .as_deref()
+                    .is_some_and(|b| STRUCK_PHASE_TITLE.is_match(b));
                 if is_struck(content) || struck_title || NOT_DELIVERED_MARKER.is_match(content) {
                     refuse(index, lettered);
                     continue;
@@ -738,7 +738,8 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     };
                     let index: Option<u32> = caps[1].parse().ok();
                     let name_cell = cells.get(name_col).copied().unwrap_or("");
-                    if is_struck(first) || is_struck(name_cell) || NOT_DELIVERED_MARKER.is_match(t) {
+                    if is_struck(first) || is_struck(name_cell) || NOT_DELIVERED_MARKER.is_match(t)
+                    {
                         refuse(index, !caps[2].is_empty());
                         continue;
                     }
@@ -750,7 +751,8 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                     // `3 (coord)` is named `coord`, not `coord)`.
                     let matched = caps[0].len() - usize::from(caps[0].ends_with('('));
                     let after = clean(&first[matched..]);
-                    let after = after.trim_matches(|c: char| c.is_whitespace() || "—–:-".contains(c));
+                    let after =
+                        after.trim_matches(|c: char| c.is_whitespace() || "—–:-".contains(c));
                     let after = match after.strip_prefix('(').and_then(|a| a.strip_suffix(')')) {
                         Some(inner) if !inner.contains(['(', ')']) => inner.trim(),
                         _ => after,
@@ -1322,10 +1324,7 @@ mod tests {
             }
             let indices: Vec<String> = got.iter().map(|p| p.index.to_string()).collect();
             let names: Vec<&str> = got.iter().map(|p| p.name.as_str()).collect();
-            println!(
-                "phase_census_row\t{name}\t{}\t{names:?}",
-                indices.join(",")
-            );
+            println!("phase_census_row\t{name}\t{}\t{names:?}", indices.join(","));
         }
         println!(
             "phase_census plans={plans} skipped={skipped} zero={zero} one={one} two_or_more={many}"
