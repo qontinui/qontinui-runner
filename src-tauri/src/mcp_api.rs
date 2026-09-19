@@ -3618,7 +3618,7 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 ///
 /// The NOTIFY half of the operator's principle stays where policy already puts it:
 /// `escalation-bar` `do-reversible-mechanical-work` obliges the calling session to
-/// post it, and `coord_post_notification` / `coord_post_finding` are both already on
+/// post it, and `coord_notify_sensitive_action` / `coord_post_finding` are both already on
 /// this list. Enforcing the notification AT THIS DOOR is a separate design decision
 /// (would a failed notification block the write?), surfaced as a held fork in the
 /// plan rather than decided here.
@@ -3682,20 +3682,36 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 /// `2026-08-24-headless-box-has-no-working-coord-credential-door`, whose cited PRs
 /// are provably on `origin/main` by content while `delivery.shipped` stayed false.
 ///
-/// `coord_post_notification` is IN because withholding it would withhold a
+/// `coord_notify_sensitive_action` is IN because withholding it would withhold a
 /// REPORT, never an action. It is the notify half of NOTIFY-AFTER-ACTION
 /// (`escalation-bar` `do-reversible-mechanical-work`, operator-revised
 /// 2026-08-30): a session that publishes a version or force-pushes a ref does so
 /// through its own shell, not through coord, so filtering the tool cannot stop
-/// the irreversible step — it can only stop the operator from hearing about it.
+/// the step — it can only stop the operator from hearing about it.
 /// Authority-wise it is the twin of `coord_post_finding`, already granted here:
 /// an append-only, self-attributed row about the caller's own action, whose
 /// `kind` is hard-coded coord-side and whose `actor` is derived from the
-/// credential, so it cannot forge a coord-internal notification. Added with the
-/// tool itself (plan
-/// `2026-08-30-agent-emitted-notifications-and-configurable-push` Phase 2b)
-/// rather than after a session tripped over `-32601`, which is how the three
-/// drift instances above were each found.
+/// credential, so it cannot forge a coord-internal notification.
+///
+/// Until plan `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`
+/// Phase 4 this line named `coord_post_notification` — a name never served on main.
+/// Coord's tool was `coord_notify_irreversible_action`, so the entry allowed
+/// nothing and the real tool answered `-32601` from every runner-proxied session:
+/// the self-report door was unreachable while this list read as if it were open.
+/// Coord renames its tool to `coord_notify_sensitive_action` in the same phase,
+/// and this entry carries the NEW name only — the old name is on no path a
+/// runner session should be steered toward.
+///
+/// `coord_alert_queue`, `coord_alert_claim` and `coord_alert_release` are IN
+/// because alerts are AGENTS' work (same plan, Phase 2): coord routes each alert
+/// kind to a responder domain, and the queue is how a steward session reads its
+/// domain's open alerts, leases one before acting so two sessions do not work the
+/// same condition, and hands the lease back. The queue is a read; claim and
+/// release write only a lease on the alert row — claiming never RESOLVES
+/// (resolution stays with coord's own re-observation), so an agent cannot mark
+/// fixed a condition coord still sees. Coord grants all three on the device floor
+/// (`agent_tool_access.rs` `DEVICE_DEFAULT_TOOLS`); withheld here, the queue the
+/// phase builds would be unreachable from exactly the sessions it exists for.
 ///
 /// `coord_memory_supersede` is IN because withholding it would leave the memory
 /// surface able to INSERT but never CORRECT, and that is worse than withholding
@@ -3754,6 +3770,9 @@ const COORD_MCP_ALLOWED_METHODS: &[&str] = &[
 const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_ack_message",
     "coord_agent_registry_effective",
+    "coord_alert_claim",
+    "coord_alert_queue",
+    "coord_alert_release",
     "coord_am_i_clear",
     "coord_ask_question",
     "coord_attest_gate",
@@ -3807,9 +3826,9 @@ const COORD_MCP_ALLOWED_TOOLS: &[&str] = &[
     "coord_merge_order",
     "coord_migration_queue",
     "coord_mute_gate",
+    "coord_notify_sensitive_action",
     "coord_orient",
     "coord_post_finding",
-    "coord_post_notification",
     "coord_pr_status",
     "coord_predict_resource_collisions",
     "coord_recent_errors",
@@ -13622,8 +13641,16 @@ mod coord_mcp_body_gate_tests {
             // runs in the session's own shell either way — so a filter here
             // only costs the operator the notification that
             // `escalation-bar` `do-reversible-mechanical-work` makes the
-            // compensating control for the gate it removed.
-            "coord_post_notification",
+            // compensating control for the gate it removed. (It stood here as
+            // `coord_post_notification` — a name never served on main — until
+            // plan 2026-09-18-notifications-are-agent-actions-and-alerts-are-
+            // agent-work Phase 4.)
+            "coord_notify_sensitive_action",
+            // The agent alert queue (same plan, Phase 2): read the domain's
+            // open alerts, lease one before acting, hand the lease back.
+            "coord_alert_queue",
+            "coord_alert_claim",
+            "coord_alert_release",
         ] {
             assert!(
                 gate(serde_json::json!({

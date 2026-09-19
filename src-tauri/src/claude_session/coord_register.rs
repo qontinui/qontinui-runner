@@ -637,6 +637,50 @@ impl AiCoordRegistrar {
         }
     }
 
+    /// Sensitive-action notification (plan
+    /// `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`,
+    /// Phase 9). Enqueue an `agent_notification` outbox row whose payload is
+    /// the `POST /coord/agent-notifications` body, verbatim — built by
+    /// [`crate::terminal::commit_report::DetectedAction::body`].
+    ///
+    /// `lane` is the outbox seq lane
+    /// ([`crate::terminal::commit_report::agent_notification_lane`]): one per
+    /// transcript, so a session's notifications drain in the order its actions
+    /// happened. Coord never reads it.
+    ///
+    /// Best-effort and gated on `QONTINUI_AGENT_ACTION_NOTIFY` (default ON); a
+    /// disabled gate or an outbox write error is a logged no-op.
+    pub fn report_agent_notification(&self, lane: Uuid, body: serde_json::Value) {
+        if !crate::terminal::commit_report::action_notify_enabled() {
+            return;
+        }
+        let action = body
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let artifact = body
+            .get("artifact")
+            .and_then(|a| a.as_str())
+            .unwrap_or("?")
+            .to_string();
+        match self.inner.outbox.record(
+            self.inner.machine_id,
+            lane,
+            SessionEventKind::AgentNotification,
+            body,
+        ) {
+            Ok(_) => info!(
+                "ai_coord_register: enqueued agent notification ({} {})",
+                action, artifact
+            ),
+            Err(e) => warn!(
+                "ai_coord_register: outbox AgentNotification write failed for {} {} (best-effort; the action already happened): {}",
+                action, artifact, e
+            ),
+        }
+    }
+
     /// R3 — emit a coord heartbeat for the AI session backing `task_run_id`,
     /// driven by **operator interaction** (called from `send_user_message`).
     /// This is the ONLY heartbeat these sessions ever get, so an idle session
@@ -2185,6 +2229,46 @@ mod tests {
         reg.report_commits("o/r", "main", vec!["a".into()]);
         assert!(reg.inner.outbox.pending().unwrap().is_empty());
         std::env::remove_var("QONTINUI_COMMIT_LINEAGE_REPORT");
+    }
+
+    /// Phase 9 of plan
+    /// `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`:
+    /// the notification body rides the outbox VERBATIM on the lane it was
+    /// given — coord's body is `deny_unknown_fields`, so nothing may be added.
+    #[test]
+    fn report_agent_notification_enqueues_the_body_verbatim() {
+        let _env = env_lock();
+        std::env::remove_var("QONTINUI_AGENT_ACTION_NOTIFY");
+        let (reg, _dir) = registrar();
+        let lane = Uuid::new_v4();
+        let body = json!({
+            "action": "force_push",
+            "artifact": "feat/x",
+            "reversible": "restore",
+            "repo": "o/r",
+            "undo": "1a2b3c4",
+        });
+
+        reg.report_agent_notification(lane, body.clone());
+
+        let pending = reg.inner.outbox.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event_kind,
+            SessionEventKind::AgentNotification.as_str()
+        );
+        assert_eq!(pending[0].session_id, lane);
+        assert_eq!(pending[0].payload, body);
+    }
+
+    #[test]
+    fn report_agent_notification_disabled_gate_is_noop() {
+        let _env = env_lock();
+        std::env::set_var("QONTINUI_AGENT_ACTION_NOTIFY", "off");
+        let (reg, _dir) = registrar();
+        reg.report_agent_notification(Uuid::new_v4(), json!({"action": "publish"}));
+        assert!(reg.inner.outbox.pending().unwrap().is_empty());
+        std::env::remove_var("QONTINUI_AGENT_ACTION_NOTIFY");
     }
 
     #[test]

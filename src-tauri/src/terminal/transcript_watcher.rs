@@ -104,6 +104,9 @@ pub fn start_transcript_watcher(
         "transcript_watcher: starting with {} workspace path(s)",
         workspace_paths.len()
     );
+    // Phase 9 (plan 2026-09-18-notifications-are-agent-actions-and-alerts-are-
+    // agent-work): record the notifier gate's value once per process.
+    super::commit_report::log_action_notify_gate();
 
     // Spawn the orchestrator on the tokio runtime. It owns the channel, the
     // watcher, and the per-session task map.
@@ -498,6 +501,19 @@ async fn tail_session(
         .ok()
         .and_then(AgentLogEmitter::start);
 
+    // ── Sensitive-action notifier (plan
+    // `2026-09-18-notifications-are-agent-actions-and-alerts-are-agent-work`,
+    // Phase 9) ─────────────────────────────────────────────────────────────
+    //
+    // The pending map that pairs a Bash `tool_use` (force-push, ref delete,
+    // release, publish) with its `tool_result`, which lands in a LATER `user`
+    // record. Owned by this tail — one per transcript, lock-free, bounded
+    // (256 entries, 10-minute expiry) — and dropped with it. The gate is read
+    // once per tail rather than per line.
+    let notify_actions = registrar.is_some() && super::commit_report::action_notify_enabled();
+    let mut action_tracker = super::commit_report::SensitiveActionTracker::new();
+    let action_lane = super::commit_report::agent_notification_lane(&session_id);
+
     debug!(
         "transcript_watcher: tail started for {} at offset {} ({})",
         session_id,
@@ -629,6 +645,22 @@ async fn tail_session(
                 let pushes = super::commit_report::parse_line_for_pushes(&line);
                 for obs in pushes {
                     super::commit_report::dispatch_push_observation(obs, reg.clone());
+                }
+
+                // Sensitive agent actions (Phase 9): a `tool_use` line parks
+                // its classification; the `tool_result` line that proves it
+                // succeeded releases it here. The tracker is pure — repo
+                // lookup (git) and the outbox write happen on the same
+                // bounded worker the push report uses.
+                if notify_actions {
+                    for detected in action_tracker.observe_line(&line, std::time::Instant::now()) {
+                        // Refusals are WARNed inside, as lost notifications.
+                        super::commit_report::dispatch_detected_tool_use(
+                            detected,
+                            action_lane,
+                            reg.clone(),
+                        );
+                    }
                 }
             }
 
