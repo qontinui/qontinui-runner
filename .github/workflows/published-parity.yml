@@ -130,6 +130,7 @@ jobs:
         run: |
           powershell -File scripts/tests/test-parity-diff.ps1
           powershell -File scripts/tests/test-invoke-ps51-detached.ps1
+          powershell -File scripts/tests/test-installed-runner.ps1
         shell: bash
 
       # Every script below is run by `powershell -File` -- Windows PowerShell
@@ -148,7 +149,7 @@ jobs:
         run: |
           set -euo pipefail
           status=0
-          for f in scripts/published-parity.ps1 scripts/contract-smoke.ps1 scripts/lib/*.ps1 scripts/tests/test-parity-diff.ps1 scripts/tests/test-invoke-ps51-detached.ps1; do
+          for f in scripts/published-parity.ps1 scripts/contract-smoke.ps1 scripts/lib/*.ps1 scripts/tests/test-parity-diff.ps1 scripts/tests/test-invoke-ps51-detached.ps1 scripts/tests/test-installed-runner.ps1; do
             [ "$(head -c3 "$f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] && continue
             # grep's exit 2 (no PCRE, unreadable file) must not read as "clean".
             rc=0; LC_ALL=C grep -nP '[^\x00-\x7F]' "$f" || rc=$?
@@ -162,7 +163,7 @@ jobs:
           done
           powershell -NoProfile -Command '
             $bad = 0
-            foreach ($f in @("scripts/published-parity.ps1", "scripts/contract-smoke.ps1", "scripts/tests/test-parity-diff.ps1", "scripts/tests/test-invoke-ps51-detached.ps1") + @(Get-ChildItem scripts/lib -Filter *.ps1 | ForEach-Object { $_.FullName })) {
+            foreach ($f in @("scripts/published-parity.ps1", "scripts/contract-smoke.ps1", "scripts/tests/test-parity-diff.ps1", "scripts/tests/test-invoke-ps51-detached.ps1", "scripts/tests/test-installed-runner.ps1") + @(Get-ChildItem scripts/lib -Filter *.ps1 | ForEach-Object { $_.FullName })) {
               $tokens = $null; $errors = $null
               [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors)
               if ($errors -and $errors.Count -gt 0) {
@@ -407,7 +408,7 @@ jobs:
           # (a service-account runner with no profile) contributes no candidate
           # rather than a Join-Path binding error.
           $candidates = foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
-            if ($base) { Join-Path $base 'Qontinui Runner\Qontinui Runner.exe' }
+            if ($base) { Join-Path $base 'Qontinui Runner\qontinui-runner.exe' }
           }
           $installed = $false
           for ($i = 1; $i -le 60; $i++) {
@@ -421,8 +422,17 @@ jobs:
           # Diagnostic only. The locator in scripts/lib/installed-runner.ps1 is
           # what actually finds the exe, and it throws naming every path probed
           # rather than falling back to anything.
+          # The install dir's top-level entries, not a name filter: on run
+          # 35429143803 a filter for 'Qontinui Runner*' printed the directory
+          # and nothing else, which is how the exe's real name (the cargo
+          # binary name, qontinui-runner.exe -- Tauri 2 does not rename it to
+          # productName) stayed unmeasured for one more run.
           foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles)) {
-            if ($base) { Get-ChildItem -LiteralPath $base -Depth 1 -Filter 'Qontinui Runner*' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName } }
+            $dir = if ($base) { Join-Path $base 'Qontinui Runner' } else { $null }
+            if ($dir -and (Test-Path -LiteralPath $dir)) {
+              Write-Host "Install dir ${dir}:"
+              Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue | ForEach-Object { Write-Host ("  {0}{1}" -f $_.Name, $(if ($_.PSIsContainer) { '\' } else { '' })) }
+            }
           }
         shell: pwsh
 
@@ -435,10 +445,16 @@ jobs:
       # name — never `node.exe`, never `powershell.exe`, never a process-tree
       # flag. Do not copy this step onto a developer or operator machine; the
       # fleet's runner-lifecycle rule forbids exactly that.
+      # The image name is the cargo binary name on both builds (Tauri 2 does
+      # not rename it to productName), so the installed one is told apart by
+      # its path: never anything under a cargo target/ directory.
       - name: Stop any auto-launched published runner
         run: |
-          powershell -NoProfile -Command "Get-Process -Name 'Qontinui Runner' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0"
-        shell: bash
+          Get-Process -Name 'qontinui-runner' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -and $_.Path -notlike '*\target\*' } |
+            ForEach-Object { Write-Host "stopping pid $($_.Id) $($_.Path)"; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+          exit 0
+        shell: pwsh
         continue-on-error: true
 
       # -----------------------------------------------------------------------
