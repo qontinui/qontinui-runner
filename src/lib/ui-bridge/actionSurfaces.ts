@@ -301,7 +301,47 @@ function propName(p: ts.ObjectLiteralElementLike): string | null {
   if (!n) return null;
   if (ts.isIdentifier(n)) return n.text;
   if (ts.isStringLiteral(n)) return n.text;
+  // `["handler"]: …` — a computed key that is still a literal name. Without
+  // this a handler spelled that way had no `handler` property as far as the
+  // scan could tell, and was never judged.
+  if (ts.isComputedPropertyName(n) && ts.isStringLiteralLike(n.expression)) {
+    return n.expression.text;
+  }
   return null;
+}
+
+/**
+ * The GUARD's name, only when it is called as a bare identifier. A method that
+ * happens to be called `guardedHandler` (`x.guardedHandler(…)`) is not the
+ * guard and must not be credited as one.
+ */
+function guardCallee(expr: ts.Expression): string | null {
+  if (ts.isCallExpression(expr) && ts.isIdentifier(expr.expression)) {
+    const name = expr.expression.text;
+    return (GUARD_BUILDERS as readonly string[]).includes(name) ? name : null;
+  }
+  return null;
+}
+
+/**
+ * How many arguments an inline function can READ. Its declared parameters —
+ * or at least one when a non-arrow function's body uses `arguments`, which
+ * reads the caller's bag with a parameter list of zero.
+ */
+function readableArity(fn: ts.FunctionLikeDeclaration): number {
+  if (fn.parameters.length > 0 || ts.isArrowFunction(fn) || !fn.body) {
+    return fn.parameters.length;
+  }
+  let usesArguments = false;
+  const look = (n: ts.Node): void => {
+    if (usesArguments) return;
+    if (ts.isIdentifier(n) && n.text === "arguments") usesArguments = true;
+    // A nested non-arrow function has its own `arguments`.
+    if (n !== fn && (ts.isFunctionExpression(n) || ts.isFunctionDeclaration(n))) return;
+    ts.forEachChild(n, look);
+  };
+  look(fn.body);
+  return usesArguments ? 1 : 0;
 }
 
 /** The name of the function a call expression targets, however it is reached. */
@@ -342,6 +382,8 @@ interface LiteralFacts {
   effect: string | null;
   /** `slash` is what distinguishes a registry `CommandAction` from a surface. */
   hasSlash: boolean;
+  /** The literal spreads another object, which may carry the handler. */
+  hasSpread: boolean;
 }
 
 function normalised(node: ts.Node): string {
@@ -360,7 +402,9 @@ function readLiteral(obj: ts.ObjectLiteralExpression): LiteralFacts {
   let guardSchemaEmpty = false;
   let effect: string | null = null;
   let hasSlash = false;
+  let hasSpread = false;
   for (const p of obj.properties) {
+    if (ts.isSpreadAssignment(p)) hasSpread = true;
     const name = propName(p);
     if (name === null) continue;
     if (name === "paramSchema") {
@@ -379,13 +423,12 @@ function readLiteral(obj: ts.ObjectLiteralExpression): LiteralFacts {
     if (name !== "handler") continue;
     hasHandler = true;
     if (ts.isMethodDeclaration(p)) {
-      handlerArity = p.parameters.length;
+      handlerArity = readableArity(p);
     } else if (ts.isPropertyAssignment(p)) {
       const init = p.initializer;
       handlerArity =
-        ts.isArrowFunction(init) || ts.isFunctionExpression(init) ? init.parameters.length : null;
-      const callee = calleeName(init);
-      if (callee && (GUARD_BUILDERS as readonly string[]).includes(callee)) {
+        ts.isArrowFunction(init) || ts.isFunctionExpression(init) ? readableArity(init) : null;
+      if (guardCallee(init)) {
         guarded = true;
         const schemaArg = (init as ts.CallExpression).arguments[1];
         if (schemaArg) {
@@ -411,6 +454,7 @@ function readLiteral(obj: ts.ObjectLiteralExpression): LiteralFacts {
     guardSchemaEmpty,
     effect,
     hasSlash,
+    hasSpread,
   };
 }
 
@@ -422,7 +466,16 @@ function verdictForLiteral(
   facts: LiteralFacts,
   position: ActionSurface["position"],
 ): string | null {
-  if (facts.handlerArity === undefined) return null;
+  if (facts.handlerArity === undefined) {
+    // A REGISTERED entry with no handler of its own that spreads another
+    // object: the handler may be in the spread, where this scan cannot see
+    // it. Undecidable fails closed. (A free literal the shape pass found is
+    // not held to this — `{...tab, id}` is everywhere and is not an action.)
+    if (facts.hasSpread && position !== "free") {
+      return "entry spreads another object and declares no handler of its own — its handler cannot be decided here; write it as handler: guardedHandler(id, paramSchema, run)";
+    }
+    return null;
+  }
   if (facts.guarded) {
     if (facts.guardSchemaText === null) {
       return "guardedHandler(id, paramSchema, run) is called without a schema argument";
@@ -639,6 +692,28 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           hasParamSchema: false,
           effect: null,
           violation: null,
+        });
+      } else if (
+        name === "customActions" &&
+        !ts.isCallExpression(node.initializer) &&
+        !ts.isObjectLiteralExpression(node.initializer)
+      ) {
+        // `customActions: acts` / `customActions: live ? {…} : {}` — the map
+        // is built somewhere this pass cannot follow, and element custom
+        // actions carry no `id`, so the shape pass cannot find them either.
+        // Undecidable fails CLOSED.
+        out.push({
+          file: rel,
+          line: at(node.initializer),
+          pass: "position",
+          position: "element",
+          form: "literal",
+          id: null,
+          handlerArity: null,
+          hasParamSchema: false,
+          effect: null,
+          violation:
+            "customActions is neither an object literal nor a factory call — its handlers cannot be enumerated; write the map inline",
         });
       } else if (name === "customActions" && ts.isCallExpression(node.initializer)) {
         // `customActions: buildTerminalPaneCustomActions(…)` — the whole map

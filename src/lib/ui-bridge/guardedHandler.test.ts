@@ -105,6 +105,36 @@ describe("guardedHandler", () => {
     expect(() => handler("")).toThrow("arguments must be an object (got string)");
   });
 
+  it("a TEXT field keeps the caller's exact string; a number field still coerces", () => {
+    // `coerceToken` + `textArg` is lossy: "007" -> 7 -> "7". A profile named
+    // "01" would have been saved as "1"; a command "1.10" typed as "1.1".
+    const effect = vi.fn();
+    const handler = guardedHandler("probe", { name: "string", count: "number (>= 1)" }, (args) =>
+      effect(args),
+    );
+    handler({ name: "007", count: "2" });
+    handler({ name: "1.10" });
+    handler({ name: "12345678901234567890" });
+    expect(effect.mock.calls.map((c) => c[0])).toEqual([
+      { name: "007", count: 2 },
+      { name: "1.10" },
+      { name: "12345678901234567890" },
+    ]);
+  });
+
+  it("an undeclared key is refused even when its value is null", () => {
+    // Null drops a DECLARED key as absent; it must not launder an undeclared
+    // one past the gate.
+    const effect = vi.fn();
+    const handler = guardedHandler("probe", { count: "number" }, () => effect());
+    expect(() => handler({ zzz: null })).toThrow('probe: takes no argument named "zzz"');
+    expect(() => handler(JSON.parse('{"__proto__": null}'))).toThrow(
+      'probe: takes no argument named "__proto__"',
+    );
+    handler({ count: null });
+    expect(effect).toHaveBeenCalledTimes(1);
+  });
+
   it("`__proto__` is refused as an undeclared key, not silently dropped", () => {
     const handler = guardedHandler("probe", { count: "number" }, () => 1);
     expect(() => handler(JSON.parse('{"__proto__": "x"}'))).toThrow(
