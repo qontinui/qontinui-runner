@@ -15,6 +15,8 @@ import {
   type ZoneProfile,
   type ZoneSessionInfo,
 } from "./zoneProfileStorage";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { textArg } from "./commands";
 
 interface ZoneProfilePickerProps {
   currentLayoutId: string;
@@ -33,6 +35,18 @@ interface ZoneProfilePickerProps {
 }
 
 const MAX_PROFILES = 10;
+
+/**
+ * One declaration for all three name-taking profile actions, read by both the
+ * registration and its guarded handler.
+ *
+ * They each used to inline `{ name: "string" }` at the registration and then
+ * re-type `{name?: string}` in a cast inside the handler — three copies of a
+ * contract nothing checked. `{name: {}}` satisfied every one of them.
+ * `scripts/capture-component-effect-fixture.cjs` resolves a same-file
+ * top-level `const`, so the boundary fixture still carries this schema.
+ */
+const PROFILE_NAME_SCHEMA = { name: "string" } as const;
 
 export function ZoneProfilePicker({
   currentLayoutId,
@@ -226,15 +240,18 @@ export function ZoneProfilePicker({
         id: "load-profile",
         label: "Load Profile",
         description: "Apply a saved zone profile (layout, labels, sessions) by name.",
-        paramSchema: { name: "string" },
+        paramSchema: PROFILE_NAME_SCHEMA,
         // `destructive` — `useApplyZoneProfile` REPLACES the live layout, labels, notes,
         // pins and `autoApprovePatterns` (an agent auto-approval allow-list) with the
         // profile's, spawns terminals to fill its zones, and queues `claude --resume` into
         // them. Dim 1: the arrangement it overwrites was never saved anywhere. Dim 3: it
         // widens or narrows auto-approval silently, which is the worst quadrant.
         effect: "destructive",
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        // `{name: {}}` used to reach the "Profile not found" sentence as
+        // `Profile not found: "[object Object]"` — an operator-facing message
+        // quoting a stringified object back as though it had been typed.
+        handler: guardedHandler("load-profile", PROFILE_NAME_SCHEMA, (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("load-profile requires { name: string }");
           const profile = profiles[name];
           if (!profile)
@@ -242,7 +259,7 @@ export function ZoneProfilePicker({
               `Profile not found: "${name}". Available: ${Object.keys(profiles).join(", ") || "none"}`,
             );
           handleLoad(name);
-        },
+        }),
       },
       {
         id: "save-profile",
@@ -260,13 +277,18 @@ export function ZoneProfilePicker({
           "auto-approve patterns and Claude session bindings as a named profile, and " +
           "make it the page's ACTIVE profile (a later boot re-applies it). " +
           "OVERWRITES an existing profile of the same name without confirmation.",
-        paramSchema: { name: "string" },
+        paramSchema: PROFILE_NAME_SCHEMA,
         // `destructive` — writing to an EXISTING name overwrites that profile with no
         // confirmation and no copy of what it replaced (dim 1 + dim 3), and it also makes
         // the profile active — see the description above, which used to omit that.
         effect: "destructive",
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        // THE SHARPEST ONE ON THIS PAGE. `{name: {}}` is truthy, so it passed
+        // `if (!name)`, became the COMPUTED KEY `"[object Object]"` in the
+        // saved map, and was then handed to React as a child: two `setting_set`
+        // writes landed and the tree crashed to the error boundary with
+        // minified React error #31. Binding refuses it with zero writes.
+        handler: guardedHandler("save-profile", PROFILE_NAME_SCHEMA, (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("save-profile requires { name: string }");
           if (profileNames.length >= MAX_PROFILES && !profiles[name]) {
             throw new Error(`Cannot save: maximum of ${MAX_PROFILES} profiles reached`);
@@ -299,22 +321,23 @@ export function ZoneProfilePicker({
           saveProfilesToDb(updated, pageId);
           setActiveProfileName(name);
           saveActiveProfileToDb(name, pageId);
-        },
+        }),
       },
       {
         id: "delete-profile",
         label: "Delete Profile",
         description: "Remove a saved profile by name. Clears active-profile if it matches.",
-        paramSchema: { name: "string" },
+        paramSchema: PROFILE_NAME_SCHEMA,
         // `destructive` — removes a saved profile from the page's persisted settings.
         // There is no undo and no recycle bin.
         effect: "destructive",
-        handler: (params?: unknown) => {
-          const { name } = (params ?? {}) as { name?: string };
+        // Same stringify-into-the-message defect as `load-profile`.
+        handler: guardedHandler("delete-profile", PROFILE_NAME_SCHEMA, (args) => {
+          const name = textArg(args, "name");
           if (!name) throw new Error("delete-profile requires { name: string }");
           if (!profiles[name]) throw new Error(`Profile not found: "${name}"`);
           handleDelete(name);
-        },
+        }),
       },
       {
         id: "list-profiles",

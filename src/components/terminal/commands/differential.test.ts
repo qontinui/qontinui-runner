@@ -42,12 +42,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import {
-  buildAiProbes,
-  buildCorpus,
-  buildDirectProbes,
-  type CorpusTier,
-} from "./corpus.testkit";
+import { buildAiProbes, buildCorpus, buildDirectProbes, type CorpusTier } from "./corpus.testkit";
 import {
   captureSnapshot,
   captureTier,
@@ -254,10 +249,7 @@ describe("differential harness — corpus sweep", () => {
     );
 
     if (SNAPSHOT_OUT) {
-      const out =
-        SNAPSHOT_TIER === SWEEP_TIER
-          ? snap
-          : await captureTier(base, SNAPSHOT_TIER);
+      const out = SNAPSHOT_TIER === SWEEP_TIER ? snap : await captureTier(base, SNAPSHOT_TIER);
       mkdirSync(dirname(resolvePath(SNAPSHOT_OUT)), { recursive: true });
       writeFileSync(resolvePath(SNAPSHOT_OUT), formatSnapshot(out, SNAPSHOT_TIER), "utf8");
       // eslint-disable-next-line no-console

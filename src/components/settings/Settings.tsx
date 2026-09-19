@@ -8,6 +8,8 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { useUIComponent } from "@qontinui/ui-bridge";
 import { instanceStorage } from "@/lib/instance-storage";
+import { guardedHandler } from "@/lib/ui-bridge/guardedHandler";
+import { textArg } from "@/components/terminal/commands/parse";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
@@ -57,6 +59,13 @@ interface SettingsProps {
 }
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
+
+/**
+ * Hoisted so the registration and its guarded handler read one declaration.
+ * `scripts/capture-component-effect-fixture.cjs` resolves a same-file
+ * top-level `const`, so the boundary fixture still carries this schema.
+ */
+const SWITCH_TAB_SCHEMA = { tabId: "string (one of the ids from list-tabs)" } as const;
 
 const VALID_TABS = VALID_SETTINGS_TABS;
 
@@ -177,7 +186,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         id: "switch-tab",
         label: "Switch settings tab",
         description: "Select a settings sub-tab by id (use list-tabs to enumerate).",
-        paramSchema: { tabId: "string (one of the ids from list-tabs)" },
+        paramSchema: SWITCH_TAB_SCHEMA,
         // Mutates UI state (the active sub-tab) but nothing irreversible —
         // `write`, not `destructive`. Together with `list-tabs` below this is
         // the PROBE FIXTURE for the effect boundary: `scripts/capture-component-
@@ -188,9 +197,11 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
         // red — that is deliberate (plan 2026-09-04-effect-calculus-joins-the-
         // component-action-registry, Phase 1).
         effect: "write",
-        handler: (params?: unknown) => {
-          const { tabId } = (params ?? {}) as { tabId?: string };
-          if (!tabId || typeof tabId !== "string") {
+        // The `typeof` check caught a non-scalar, and an undeclared key was
+        // dropped without a word. Binding makes both refusals.
+        handler: guardedHandler("switch-tab", SWITCH_TAB_SCHEMA, (args) => {
+          const tabId = textArg(args, "tabId");
+          if (!tabId) {
             throw new Error("switch-tab requires { tabId: string }");
           }
           const tab = SETTINGS_TABS.find((t) => t.id === tabId);
@@ -201,7 +212,7 @@ export function Settings({ defaultTab, onLog, onDebugModeChange }: SettingsProps
           }
           setActiveTab(tab.id);
           return { switched: true, activeTab: tab.id };
-        },
+        }),
       },
       {
         id: "list-tabs",

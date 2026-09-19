@@ -245,6 +245,10 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/terminal/TerminalInstance.tsx":
     "xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped. Inventoried " +
     "in KNOWN_KEY_CLAIMS.",
+  "components/terminal/TerminalPageTabBar.tsx":
+    "Alt+←/→ reorders the FOCUSED page tab — the non-drag alternative WCAG 2.5.7 " +
+    "requires for drag-to-reorder. An ELEMENT-scoped `onKeyDown` on the tab button, " +
+    "inventoried in KNOWN_KEY_CLAIMS.",
   "components/terminal/ZoneControlPanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/terminal/ZoneGrid.tsx":
     "Ctrl/Cmd+CLICK multi-selects a zone. A pointer modifier, not a key chord.",
@@ -254,6 +258,9 @@ const MODIFIER_FIELD_ROSTER: Record<string, string> = {
   "components/ui-bridge/NaturalLanguagePanel.tsx": "textarea: Enter submits, Shift+Enter newlines",
   "components/widgets/ai-conversation/MessageInput.tsx":
     "textarea: Enter sends, Shift+Enter newlines",
+  "hooks/ui-bridge-events/keyEventInit.test.ts":
+    "unit test asserting which modifiers a synthesized `KeyboardEventInit` carries. " +
+    "Reads the fields of a value it built; claims nothing.",
   "hooks/useElementDrag.ts":
     "Alt held during a DRAG selects move-vs-link. A pointer modifier, not a key chord.",
   "lib/globalChords.enforcement.test.ts":
@@ -335,6 +342,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/findings/UserInputPanel.tsx",
   "components/gui-automation/AutomationToolkitSidebar.tsx",
   "components/hooks/HookActionConfig.tsx",
+  "components/knowledge/KnowledgeBrowser.tsx",
   "components/library/CheckGroupsPage.tsx",
   "components/library/ChecksPage.tsx",
   "components/library/ContextsPage.tsx",
@@ -356,7 +364,6 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/pipeline-events/PipelineEventsTimeline.tsx",
   "components/process-manager/ProcessManagerTab.tsx",
   "components/productivity/CoordinatorDashboard.tsx",
-  "components/productivity/KnowledgeBrowser.tsx",
   "components/productivity/SpawnFromPlanModal.tsx",
   "components/productivity/coordinatorApi.ts",
   "components/projects/FrontPageAddress.tsx",
@@ -368,6 +375,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/run-recap/TestsTab.tsx",
   "components/scheduler/SchedulerTaskList.tsx",
   "components/settings/AdvancedSettings.tsx",
+  "components/settings/AllowedOriginsSettings.tsx",
   "components/settings/BackupSettings.tsx",
   "components/settings/DevenvEnrollSettings.tsx",
   "components/settings/DiscoverySettings.tsx",
@@ -382,20 +390,24 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/specs/SpecExperimentationDashboard.tsx",
   "components/terminal/BatchActions.tsx",
   "components/terminal/CommandPalette.tsx",
+  "components/terminal/FleetSessionPicker.tsx",
   "components/terminal/KeyboardShortcutsOverlay.tsx",
   "components/terminal/LaunchMenu.tsx",
   "components/terminal/OutputSearchBar.tsx",
   "components/terminal/PromptModal.tsx",
   "components/terminal/SessionCard.tsx",
   "components/terminal/SessionInfoDropdown.tsx",
+  "components/terminal/TerminalBridgeProxies.test.tsx",
+  "components/terminal/TerminalBridgeProxies.tsx",
   "components/terminal/TerminalFindingsPanel.tsx",
-  "components/terminal/TerminalPageTabBar.tsx",
   "components/terminal/ZoneDiffOverlay.tsx",
   "components/terminal/ZoneHoverActions.tsx",
   "components/terminal/ZoneProfilePicker.tsx",
+  "components/terminal/aiSessionSpawnEnvelope.ts",
   "components/terminal/approveAll.test.ts",
   "components/terminal/approveAll.ts",
   "components/terminal/backends/webglContextLru.ts",
+  "components/terminal/bracketedPasteById.ts",
   "components/terminal/commands/bind.ts",
   "components/terminal/commands/corpus.test.ts",
   "components/terminal/commands/corpus.testkit.ts",
@@ -412,11 +424,17 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "components/terminal/commands/useTerminalCommands.ts",
   "components/terminal/commands/verdict.test.ts",
   "components/terminal/commands/verdict.ts",
+  "components/terminal/preparePaste.test.ts",
+  "components/terminal/remoteCreate.test.ts",
+  "components/terminal/remoteCreate.ts",
   "components/terminal/result-card/ResultCardMount.tsx",
   "components/terminal/resumeVerification.ts",
   "components/terminal/suggestions/useSuggestions.tsx",
   "components/terminal/terminalKeySequence.test.ts",
   "components/terminal/terminalKeySequence.ts",
+  "components/terminal/terminalScrollbackParams.test.ts",
+  "components/terminal/terminalScrollbackParams.ts",
+  "components/terminal/terminalTextPayload.ts",
   "components/terminal/terminalWriteResult.test.ts",
   "components/terminal/terminalWriteResult.ts",
   "components/terminal/useKeyboardShortcuts.ts",
@@ -487,6 +505,7 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "hooks/ui-bridge-events/recoveryScope.ts",
   "hooks/ui-bridge-events/useAISearchEvents.ts",
   "hooks/ui-bridge-events/useControlEvents.ts",
+  "hooks/ui-bridge-events/utils.ts",
   "hooks/useArchitecture.ts",
   "hooks/useTutorialKeyboard.ts",
   "hooks/useUIBridgeDiscovery.ts",
@@ -496,6 +515,9 @@ const KEY_FIELD_ROSTER: readonly string[] = [
   "lib/step-output-handlers/command-handler.ts",
   "lib/step-output-handlers/prompt-handler.ts",
   "lib/ui-bridge/actionSurfaces.ts",
+  "lib/ui-bridge/guardedHandler.test.ts",
+  "lib/ui-bridge/guardedHandler.ts",
+  "lib/ui-bridge/use-discovered-specs.ts",
   "lib/workflow-builder/buildSpecWorkflow.ts",
   "pages/specs/ApiOverview.tsx",
   "pages/specs/ConnectionBar.tsx",
@@ -659,6 +681,9 @@ const KNOWN_KEY_CLAIMS: Record<string, string[]> = {
   // xterm `attachCustomKeyEventHandler` — clipboard + find, PTY-scoped.
   // Bare F3 / Shift+F3 also handled there; a bare key is not a chord claim.
   "components/terminal/TerminalInstance.tsx": ["ctrl+c", "ctrl+f", "ctrl+shift+c", "ctrl+v"],
+  // Alt+←/→ reorders the focused page tab (WCAG 2.5.7 non-drag alternative).
+  // Element-scoped: fires only while that tab button has focus.
+  "components/terminal/TerminalPageTabBar.tsx": ["alt+arrowleft", "alt+arrowright"],
   // VS Code-parity scrollback navigation, consumed by `TerminalInstance`'s
   // xterm handler. THE EIGHT CLAIMS THE OLD SCANNER COULD NOT SEE: the file
   // holds no listener of its own, so no selection rule reached it, and its
