@@ -5,15 +5,16 @@
 //! worker session's task. A task may have multiple review rows (re-review
 //! after a `needs_fix` cycle); the latest by `created_at` is operative.
 //!
-//! Confidence is on `[0, 1]`. The Coordinator's Rule D consumes these rows
-//! and decides whether the work auto-merges (`approved` AND
-//! `confidence >= 0.85`), queues for user approval (`approved` AND
-//! `0.7 <= confidence < 0.85`), is re-assigned (`needs_fix`, bounded retries
-//! via [`PgDb::count_needs_fix_for_task`]), or escalates.
+//! Confidence is on `[0, 1]`. The Coordinator's Rule D used to consume these
+//! rows and decide auto-merge / user-approval / re-assignment; it went with
+//! the Productivity scheduler in Phase 4 of
+//! `2026-09-12-consolidate-local-orchestration-onto-conductor`. What reads
+//! them today is `mcp::reviews` — the review-submission route plus the
+//! recent-reviews and latest-review-for-session reads.
 //!
 //! UUID columns are cast to/from TEXT in queries because the runner does
 //! not enable tokio-postgres `with-uuid-1`. Same convention as
-//! `pg::plans` / `pg::tasks` / `pg::coordinator_decisions`.
+//! `pg::tasks` / `pg::coordinator_decisions`.
 //!
 //! ## Schema authority — the runner authors this table
 //!
@@ -51,9 +52,12 @@ pub struct ReviewRow {
     pub reasoning: String,
     pub diff_summary: Option<serde_json::Value>,
     pub test_results: Option<serde_json::Value>,
-    /// `approved` when the user accepts the recommendation; `rejected` when
-    /// they decline; `null` until the user has acted (or for high-confidence
-    /// auto-merges that bypass the recommendations queue entirely).
+    /// `approved` when the user accepted the recommendation; `rejected` when
+    /// they declined. Always `null` on rows written today: the
+    /// recommendations queue that set it was the plan/task board's, deleted
+    /// by Phase 4 of
+    /// `2026-09-12-consolidate-local-orchestration-onto-conductor`. The
+    /// columns are kept so existing rows keep their history.
     pub user_decision: Option<String>,
     pub user_decided_at: Option<String>,
     pub created_at: String,
@@ -61,8 +65,9 @@ pub struct ReviewRow {
 
 /// Input shape for [`PgDb::insert_review`]. The DB allocates the UUID and
 /// stamps `created_at`. `user_decision`/`user_decided_at` are not settable
-/// on insert — they're updated later via
-/// [`PgDb::record_review_user_decision`].
+/// on insert, and nothing writes them any more — the recommendations queue
+/// that did went with the plan/task board in Phase 4 of
+/// `2026-09-12-consolidate-local-orchestration-onto-conductor`.
 #[derive(Debug, Clone)]
 pub struct InsertReviewInput<'a> {
     pub task_id: &'a str,
@@ -200,30 +205,6 @@ impl PgDb {
         Ok(row_to_review(&row))
     }
 
-    /// Look up a single review by id.
-    pub async fn get_review_by_id(&self, review_id: &str) -> Result<Option<ReviewRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let review_uuid =
-            Uuid::parse_str(review_id).map_err(|e| format!("invalid review_id uuid: {}", e))?;
-        let row = conn
-            .query_opt(
-                &format!(
-                    "SELECT {} FROM project.reviews WHERE id = $1::uuid",
-                    SELECT_COLS
-                ),
-                &[&review_uuid],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to get review", &e))?;
-
-        Ok(row.as_ref().map(row_to_review))
-    }
-
     /// Latest review for a worker session (by `reviewed_session_id`). Used
     /// by `ReviewBadge`'s 30-second poll fallback and the `/sessions/<id>/
     /// latest-review` HTTP endpoint.
@@ -259,39 +240,10 @@ impl PgDb {
         Ok(row.as_ref().map(row_to_review))
     }
 
-    /// All reviews for a task, ordered newest-first. The first row is the
-    /// operative verdict; older rows are the historical re-review trail.
-    pub async fn get_reviews_for_task(&self, task_id: &str) -> Result<Vec<ReviewRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let task_uuid =
-            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
-        let rows = conn
-            .query(
-                &format!(
-                    r#"
-                    SELECT {}
-                    FROM project.reviews
-                    WHERE task_id = $1::uuid
-                    ORDER BY created_at DESC
-                    "#,
-                    SELECT_COLS
-                ),
-                &[&task_uuid],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to list reviews for task", &e))?;
-
-        Ok(rows.iter().map(row_to_review).collect())
-    }
-
     /// Reviews created within the last `within_seconds` seconds, newest-first,
-    /// capped at `limit`. Used by `/coordinate` Rule D to scan the latest
-    /// iteration's reviews and decide whether to merge / re-assign / escalate.
+    /// capped at `limit`. Backs `GET /reviews/recent`. Its in-product reader
+    /// was `/coordinate` Rule D, deleted by Phase 4 of
+    /// `2026-09-12-consolidate-local-orchestration-onto-conductor`.
     pub async fn list_recent_reviews(
         &self,
         within_seconds: i64,
@@ -321,109 +273,6 @@ impl PgDb {
             .map_err(|e| crate::database::pg::pg_err("Failed to list recent reviews", &e))?;
 
         Ok(rows.iter().map(row_to_review).collect())
-    }
-
-    /// Count how many `needs_fix` rows exist for a task. Used by Rule D to
-    /// enforce the 3-retry cap before escalating.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "legacy Row::get — migrate to try_get; dossier row-get-panic-kills-spawned-loop"
-    )]
-    pub async fn count_needs_fix_for_task(&self, task_id: &str) -> Result<i64, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let task_uuid =
-            Uuid::parse_str(task_id).map_err(|e| format!("invalid task_id uuid: {}", e))?;
-        let row = conn
-            .query_one(
-                r#"
-                SELECT COUNT(*)::bigint
-                FROM project.reviews
-                WHERE task_id = $1::uuid AND verdict = 'needs_fix'
-                "#,
-                &[&task_uuid],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to count needs_fix reviews", &e))?;
-
-        Ok(row.get(0))
-    }
-
-    /// Reviews in the auto-merge gate band (`approved`, `0.7 <= confidence
-    /// < 0.85`) that the user has not yet decided on. Used by the
-    /// Recommendations queue on the Coordinator dashboard.
-    pub async fn list_pending_recommendations(&self) -> Result<Vec<ReviewRow>, String> {
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let rows = conn
-            .query(
-                &format!(
-                    r#"
-                    SELECT {}
-                    FROM project.reviews
-                    WHERE verdict = 'approved'
-                      AND confidence >= 0.7
-                      AND confidence < 0.85
-                      AND user_decision IS NULL
-                    ORDER BY created_at DESC
-                    "#,
-                    SELECT_COLS
-                ),
-                &[],
-            )
-            .await
-            .map_err(|e| {
-                crate::database::pg::pg_err("Failed to list pending recommendations", &e)
-            })?;
-
-        Ok(rows.iter().map(row_to_review).collect())
-    }
-
-    /// Record a user's approve/reject decision on a recommendation. Returns
-    /// `true` if the row updated (existed and was not already decided).
-    pub async fn record_review_user_decision(
-        &self,
-        review_id: &str,
-        decision: &str,
-    ) -> Result<bool, String> {
-        if !matches!(decision, "approved" | "rejected") {
-            return Err(format!(
-                "invalid user decision '{}' (expected approved|rejected)",
-                decision
-            ));
-        }
-
-        let conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("PG pool error: {}", e))?;
-
-        let review_uuid =
-            Uuid::parse_str(review_id).map_err(|e| format!("invalid review_id uuid: {}", e))?;
-        let n = conn
-            .execute(
-                r#"
-                UPDATE project.reviews
-                SET user_decision = $2,
-                    user_decided_at = NOW()
-                WHERE id = $1::uuid
-                  AND user_decision IS NULL
-                "#,
-                &[&review_uuid, &decision],
-            )
-            .await
-            .map_err(|e| crate::database::pg::pg_err("Failed to record review decision", &e))?;
-
-        Ok(n > 0)
     }
 }
 

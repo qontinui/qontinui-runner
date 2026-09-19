@@ -115,7 +115,7 @@ describe("coordDisabledCopy — tooltip agrees with the body", () => {
 describe("runCoordDisabledAction", () => {
   it("dismisses the host BEFORE navigating", () => {
     // Ordering is the whole contract: the action's host may be a
-    // `fixed inset-0` overlay (SpawnFromPlanModal), so navigating first
+    // `fixed inset-0` overlay (a modal host), so navigating first
     // switches a tab that stays hidden behind it — the exact "clicked and
     // nothing happened" failure this notice exists to remove.
     const calls: string[] = [];

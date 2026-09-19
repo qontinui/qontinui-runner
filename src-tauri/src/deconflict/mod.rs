@@ -11,10 +11,9 @@
 //! `coordinator-decision-created` Tauri event so the in-session banner
 //! can pick it up.
 //!
-//! The deconflicter never assigns or merges — its allow-list is hard-
-//! capped at `advise-with-text` by `must_advise_only` (which gates on the
-//! `deconflicter-` session-id prefix; see `coordinator::act::must_advise_only`). The HTTP layer
-//! 403s any deconflicter session that tries a richer action.
+//! The deconflicter never assigns or merges — the only action it ever
+//! records is `advise-with-text`, and it writes the decision row itself
+//! rather than through any HTTP action route.
 //!
 //! ## Rate limiting (plan §4.1)
 //!
@@ -57,10 +56,13 @@ pub struct TouchEvent {
     pub file_path: String,
 }
 
-/// Reserved session-id prefix for the Rust deconflicter. Any decision row
-/// whose `session_id` matches this is restricted to `advise-with-text`
-/// only by `act::must_advise_only`. UUID v4 strings never start with
-/// `deconflicter-`, so the prefix is effectively a reserved namespace.
+/// Reserved session-id prefix for the Rust deconflicter. The
+/// `act::must_advise_only` gate that used to restrict such rows to
+/// `advise-with-text` went with the scheduler in Phase 4 of
+/// `2026-09-12-consolidate-local-orchestration-onto-conductor`; the loop is
+/// now the only writer and records nothing else. UUID v4 strings never start
+/// with `deconflicter-`, so the prefix is effectively a reserved namespace,
+/// and it is what the in-session banner and log readers key on.
 pub const DECONFLICTER_SESSION_ID: &str = "deconflicter-rust";
 
 /// How far back to look for "other recent toucher" rows. Tunable seed
@@ -452,9 +454,10 @@ mod tests {
 
     #[test]
     fn deconflicter_session_id_prefix_reserved() {
-        // The `must_advise_only` gate keys on the `deconflicter-` prefix
-        // (see `coordinator::act`). Defend the prefix here so a future rename of
-        // `DECONFLICTER_SESSION_ID` doesn't silently break the gate.
+        // The in-session banner and log readers key on the `deconflicter-`
+        // prefix to tell an advisory from any other decision row. Defend the
+        // prefix here so a future rename of `DECONFLICTER_SESSION_ID`
+        // doesn't silently break that.
         assert!(DECONFLICTER_SESSION_ID.starts_with("deconflicter-"));
     }
 }

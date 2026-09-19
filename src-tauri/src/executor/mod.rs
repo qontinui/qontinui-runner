@@ -22,7 +22,6 @@ pub mod state;
 pub mod step_adapter;
 pub mod traits;
 pub mod unified_execution;
-pub mod upcoming_file_registry;
 pub mod url_lock;
 
 pub use bridge_helpers::{

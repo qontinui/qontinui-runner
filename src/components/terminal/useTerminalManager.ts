@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { TerminalExitEvent, TerminalInfo } from "@qontinui/shared-types/tauri-events";
-import type { CommandResponse } from "./types";
+import type { CommandResponse, TerminalSessionRecord } from "./types";
 import {
   buildSessionCloseArgs,
   type FrontendSessionCloseReason,
@@ -11,6 +11,14 @@ import {
 import { createLogger } from "@/lib/logger";
 import { spawnWithResourceGuard } from "@/lib/resourceGuard";
 import { applyRemoteMark, type RemoteTabIdentity } from "./remoteTabs";
+import {
+  EMPTY_HIDDEN_WORKER_STATE,
+  beginRestore,
+  forgetAdoptedWorker,
+  hideWorker,
+  recordRestoreMisses,
+  type HiddenWorkerState,
+} from "./hiddenWorkerReducer";
 
 const logger = createLogger("TerminalManager");
 
@@ -68,13 +76,33 @@ export interface TerminalTab {
   /** Claude config dir for the session (set on resume). */
   claudeConfigDir?: string;
   /**
-   * Coordinator `task_run_id` for tabs backed by a registered `WorkerSession`.
-   * Presence is the worker marker — `ZoneGrid::onTitleChange` skips the local
-   * `renameTab` + backend `terminal_set_title` invoke so worker tabs stay
-   * pinned at `Worker N` in the tab strip. Mirrors the Phase 1 backend gate
-   * (`set_title_unless_worker`) on the frontend side.
+   * Orchestration `task_run_id`, copied from the `TerminalSessionRecord` of a
+   * Conductor worker (`dispatch_subtask` in
+   * `orchestration_loop/ai_session_executor.rs`). `workerTabFromRecord` is
+   * its only writer and always sets {@link sessionBacked} beside it, so a tab
+   * carrying this is a worker view and never a pty tab.
+   *
+   * It is an identity, not a behaviour switch: `WorkerSessionCell` keys the
+   * conversation and steering channels on it, and `closeTerminal` records it
+   * so a hidden worker can be found again. The `Worker N` title pin is NOT
+   * enforced from here — see `ZoneGrid::onTitleChange`, which no longer tests
+   * this field because a worker never mounts the `TerminalInstance` that
+   * reports OSC titles.
    */
   taskRunId?: string;
+  /**
+   * True when this tab is backed by an in-process stream-json
+   * `ClaudeSession` registered in the Rust `SessionManager` — a Conductor
+   * worker (`dispatch_subtask`) — and NOT by a PTY. `id === taskRunId`, `pid`
+   * is null, and there is no terminal process to attach to: `terminal_list`
+   * never lists it, `terminal_close` cannot kill it, and `terminal-output`
+   * never carries its text. The grid renders it through `WorkerSessionCell`
+   * (conversation via `ai-output` / `claude-session-state`, steering via
+   * `send_user_message`) instead of `TerminalInstance`; `reconcileTabsWithBackend`
+   * keeps it across `terminal_list` re-syncs; `closeTerminal` drops the tab
+   * without touching the worker, whose lifetime the Conductor owns.
+   */
+  sessionBacked?: boolean;
   /**
    * True when the PTY child runs Claude with tool permissions bypassed
    * (`--dangerously-skip-permissions` or `--permission-mode bypassPermissions`).
@@ -107,12 +135,6 @@ export interface TerminalTab {
    * real tab.
    */
   __synthetic?: boolean;
-}
-
-/** Tauri event payload from `commands::productivity::spawn_worker_session`. */
-interface WorkerRegisteredPayload {
-  terminalId: string;
-  taskRunId: string;
 }
 
 /**
@@ -184,10 +206,17 @@ export function shouldIngestCreatedTerminal(
 /**
  * Pure helper: fold a `terminal-created` payload into the existing tab list.
  * Returns the next tabs array — the SAME identity when the terminal already
- * exists (dedup), otherwise a new array with the tab appended. `pendingTaskRunId`
- * is the worker mark drained from the race buffer by the caller (or `undefined`);
- * `pendingBypass` is the bypass-permissions mark drained the same way (a
- * `terminal-bypass-permissions` event that arrived before this `terminal-created`).
+ * exists (dedup), otherwise a new array with the tab appended. `pendingBypass`
+ * is the bypass-permissions mark drained from the race buffer by the caller (a
+ * `terminal-bypass-permissions` event that arrived before this
+ * `terminal-created`); `pendingRemote` is the remote identity drained the same
+ * way.
+ *
+ * This path never stamps a `taskRunId`. Every tab it builds is a PTY tab, and
+ * the only worker mark it ever carried came from the event-based marking drain
+ * that went with the Productivity scheduler — a Conductor worker's tab is
+ * built by `workerTabFromRecord` instead, off a durable
+ * `TerminalSessionRecord`.
  *
  * Exported so `useTerminalManager.test.ts` can drive the ingest + dedup contract
  * without booting React.
@@ -195,7 +224,6 @@ export function shouldIngestCreatedTerminal(
 export function reduceCreatedTerminal(
   tabs: TerminalTab[],
   info: TerminalInfo,
-  pendingTaskRunId: string | undefined,
   pendingBypass = false,
   pendingRemote?: RemoteTabIdentity,
 ): TerminalTab[] {
@@ -210,7 +238,6 @@ export function reduceCreatedTerminal(
       exitCode: info.exitCode ?? null,
       workingDir: info.workingDir || undefined,
       createdAt: info.createdAt,
-      taskRunId: pendingTaskRunId,
       bypassPermissions: pendingBypass || undefined,
       remote: pendingRemote,
     },
@@ -236,33 +263,11 @@ export function nextActiveIdAfterIngest(info: TerminalInfo, isNewTab: boolean): 
 
 /**
  * Pure helper: decide whether `tabs` should be replaced when applying a
- * worker mark for `terminalId`. Returns the next tabs array (same identity
- * if no change), and a `buffered` flag the caller uses to record the mark
- * in `pendingWorkerMarks` when the tab record hasn't arrived yet.
- *
- * Exported so `useTerminalManager.test.ts` can drive the race-safety + idempotency
- * contract without booting React.
- */
-export function applyWorkerMark(
-  tabs: TerminalTab[],
-  terminalId: string,
-  taskRunId: string,
-): { tabs: TerminalTab[]; buffered: boolean } {
-  const idx = tabs.findIndex((t) => t.id === terminalId);
-  if (idx < 0) return { tabs, buffered: true };
-  if (tabs[idx].taskRunId === taskRunId) return { tabs, buffered: false };
-  const next = tabs.slice();
-  next[idx] = { ...tabs[idx], taskRunId };
-  return { tabs: next, buffered: false };
-}
-
-/**
- * Pure helper: decide whether `tabs` should be replaced when applying a
  * bypass-permissions mark for `terminalId`. Returns the next tabs array (same
  * identity if no change), and a `buffered` flag the caller uses to record the
  * mark in `pendingBypassMarks` when the tab record hasn't arrived yet.
  *
- * Mirrors `applyWorkerMark` — the `terminal-bypass-permissions` event can
+ * Sibling of `applyRemoteMark` — the `terminal-bypass-permissions` event can
  * arrive before OR after `terminal-created` lands the tab in React state.
  * Exported so `useTerminalManager.test.ts` can drive the race-safety +
  * idempotency contract without booting React.
@@ -292,6 +297,130 @@ export const RESYNC_CREATE_GRACE_MS = 5_000;
 
 /** Shared empty set, so the default argument allocates nothing per call. */
 const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Build the grid tab for a Conductor worker's lifecycle record. Pure.
+ *
+ * Returns `null` for a record that is not a worker (no `taskRunId`) — the
+ * caller then takes the ordinary PTY restore path. A worker tab is keyed by
+ * the record's `terminalId` (which `dispatch_subtask` sets equal to the task
+ * run id), carries `sessionBacked: true` so every PTY-only code path skips it,
+ * and is `isAlive` because the record is an OPEN one — the cell reads the
+ * session's real state from the SessionManager once mounted.
+ */
+export function workerTabFromRecord(
+  rec: Pick<
+    TerminalSessionRecord,
+    "claudeSessionId" | "terminalId" | "taskRunId" | "title" | "workingDir" | "openedAt"
+  >,
+  now: number = Date.now(),
+): TerminalTab | null {
+  if (!rec.taskRunId) return null;
+  return {
+    id: rec.terminalId || rec.taskRunId,
+    title: rec.title?.trim() || `worker:${rec.taskRunId.slice(0, 8)}`,
+    pid: null,
+    isAlive: true,
+    exitCode: null,
+    workingDir: rec.workingDir || undefined,
+    createdAt: rec.openedAt || now,
+    claudeSessionId: rec.claudeSessionId,
+    taskRunId: rec.taskRunId,
+    sessionBacked: true,
+  };
+}
+
+/**
+ * Pick the worker record for `taskRunId` on `pageId` out of a
+ * `terminal_session_list_open` payload. Pure. A record on another page is
+ * NOT this page's to adopt; a non-worker record with a coincidentally equal
+ * id is never matched because `taskRunId` (not `claudeSessionId`) is the
+ * worker marker.
+ */
+export function findWorkerRecord(
+  sessions: readonly TerminalSessionRecord[],
+  taskRunId: string,
+  pageId: string,
+): TerminalSessionRecord | undefined {
+  return sessions.find(
+    (rec) => rec.taskRunId === taskRunId && (rec.pageId || "default") === pageId,
+  );
+}
+
+/**
+ * Spacing between `terminal_session_list_open` probes for the SAME
+ * not-yet-adopted task run id, by how many probes have already missed. The
+ * trigger events (`ai-output`, `claude-session-state`) fire per streamed
+ * line, and a worker's record is written AFTER its first state events
+ * (`dispatch_subtask` records the worker once the spawn joins), so the first
+ * probe can legitimately miss and a later one must be allowed — but not one
+ * per line, and not forever: an AI session that is NOT a worker on this page
+ * (a Process Manager "Fix with AI" chat) streams the same events, and every
+ * page's manager hears them. Backs off 3 s → 9 s → 27 s → 60 s (capped).
+ */
+export const WORKER_ADOPT_PROBE_BASE_MS = 3_000;
+export const WORKER_ADOPT_PROBE_MAX_MS = 60_000;
+
+export function workerAdoptProbeDelayMs(misses: number): number {
+  return Math.min(WORKER_ADOPT_PROBE_MAX_MS, WORKER_ADOPT_PROBE_BASE_MS * 3 ** Math.max(0, misses));
+}
+
+export interface WorkerProbeEntry {
+  at: number;
+  misses: number;
+}
+
+/**
+ * How long a probe entry outlives its last probe before being evicted. An
+ * entry is only ever DELETED on successful adoption, and every page's manager
+ * hears every AI session's events on the box — so without this a long-lived
+ * run page accumulated one entry per FOREIGN session it would never adopt,
+ * forever. Ten times the backoff ceiling: long enough that a live session's
+ * entry (refreshed every probe) is never evicted, short enough that a session
+ * which stopped talking stops costing memory.
+ */
+export const WORKER_PROBE_ENTRY_TTL_MS = WORKER_ADOPT_PROBE_MAX_MS * 10;
+
+/**
+ * Drop probe entries whose last probe is older than `ttlMs`. Mutates and
+ * returns the map (it is ref-held state). Pure enough to test.
+ *
+ * Evicting resets that id's backoff, which is harmless: the eviction can only
+ * fire for an id that has produced no event for `ttlMs`, and an id producing
+ * events keeps its `at` fresh.
+ */
+export function pruneWorkerProbes(
+  probes: Map<string, WorkerProbeEntry>,
+  now: number,
+  ttlMs: number = WORKER_PROBE_ENTRY_TTL_MS,
+): Map<string, WorkerProbeEntry> {
+  for (const [id, entry] of probes) {
+    if (now - entry.at > ttlMs) probes.delete(id);
+  }
+  return probes;
+}
+
+/**
+ * A worker view the operator closed on this page, kept so the close is
+ * REVERSIBLE. Closing a worker cell hides a view of a still-running worker;
+ * without a way back the operator had to restart the app to see it again,
+ * which is the opposite of the supervision this cell exists to provide.
+ */
+export interface HiddenWorker {
+  /** The tab id the view had (the worker's terminal id). */
+  tabId: string;
+  /** The worker's task run id, when the tab carried one. */
+  taskRunId: string | null;
+  /** The title the tab had, so the affordance can name it. */
+  title: string;
+  hiddenAtMs: number;
+  /**
+   * Set when an explicit "show" could not bring the worker back — its record
+   * is no longer listed open. The affordance says so rather than silently
+   * doing nothing.
+   */
+  restoreMissedAtMs?: number;
+}
 
 /**
  * Pure: reconcile the local tab list against the BACKEND's authoritative
@@ -324,7 +453,7 @@ const EMPTY_ID_SET: ReadonlySet<string> = new Set<string>();
  *    a re-sync must not clobber them.
  *
  * Returns the SAME array reference when nothing changed, so the caller can skip
- * a render (same contract as `applyWorkerMark` / `reconcilePages`).
+ * a render (same contract as `applyBypassMark` / `reconcilePages`).
  *
  * `backendTerminals` MUST already be filtered to this page — the caller owns
  * that filter because it also owns the `pageId || "default"` normalization.
@@ -349,6 +478,9 @@ export function reconcileTabsWithBackend(
     // Tabs the backend structurally cannot list.
     if (t.type === "plan" || t.id.startsWith("plan-")) return true;
     if (t.__synthetic) return true;
+    // A Conductor worker has no PTY; `terminal_list` is the wrong census for
+    // it (its liveness is the SessionManager's, read by `WorkerSessionCell`).
+    if (t.sessionBacked) return true;
     // The runner has already announced this terminal's exit, so its absence
     // from the list is a real teardown, not a create the snapshot predates.
     if (settledIds.has(t.id)) return false;
@@ -466,20 +598,12 @@ export function useTerminalManager(
   const nextTitleNum = useRef(1);
   const [initialized, setInitialized] = useState(false);
   /**
-   * Worker marks (`terminalId → taskRunId`) received from the Rust side
-   * before their tab record exists in React state. The Tauri command path
-   * emits `terminal-created` then `worker-registered` in order, but their
-   * arrival order at the webview is not strictly guaranteed; on reconnect
-   * we also call `list_workers` while `terminal_list` is mid-flight, so a
-   * buffer is the simplest race-safe shape.
-   */
-  const pendingWorkerMarks = useRef<Map<string, string>>(new Map());
-  /**
    * Bypass-permissions marks (`terminalId`) received from the Rust
    * `terminal-bypass-permissions` event before their tab record exists in
-   * React state. Same race shape as `pendingWorkerMarks`: the event is emitted
-   * right after `terminal-created`, but arrival order at the webview is not
-   * strictly guaranteed (and reconnect rebuilds tabs without re-firing it).
+   * React state. The event is emitted right after `terminal-created`, but
+   * arrival order at the webview is not strictly guaranteed (and reconnect
+   * rebuilds tabs without re-firing it), so a buffer is the simplest
+   * race-safe shape.
    */
   const pendingBypassMarks = useRef<Set<string>>(new Set());
   /**
@@ -514,15 +638,163 @@ export function useTerminalManager(
    */
   const settledIdsRef = useRef<Set<string>>(new Set());
 
-  const markAsWorker = useCallback((terminalId: string, taskRunId: string) => {
+  /**
+   * Add the grid tab for a Conductor worker's lifecycle record. Idempotent:
+   * a tab with the same id (or the same `taskRunId`) is left untouched.
+   * Never steals `activeId` — a run page fills as workers dispatch, and the
+   * operator's focus should not jump each time one lands. Returns the tab id,
+   * or `null` when the record is not a worker's.
+   */
+  const adoptWorkerTab = useCallback((rec: TerminalSessionRecord): string | null => {
+    const tab = workerTabFromRecord(rec);
+    if (!tab) return null;
     setTabs((prev) => {
-      const result = applyWorkerMark(prev, terminalId, taskRunId);
-      if (result.buffered) {
-        pendingWorkerMarks.current.set(terminalId, taskRunId);
-      }
-      return result.tabs;
+      if (prev.some((t) => t.id === tab.id || t.taskRunId === tab.taskRunId)) return prev;
+      return [...prev, tab];
     });
+    return tab.id;
   }, []);
+
+  // Tabs snapshot for the adoption probe below (reads outside setState).
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+  const workerProbeRef = useRef<Map<string, WorkerProbeEntry>>(new Map());
+  /**
+   * Worker views the operator CLOSED on this page since it mounted. A closed
+   * worker keeps streaming (`closeTerminal` never touches the worker itself),
+   * so without this set the live-adoption probe below would re-add the tab
+   * on its very next `ai-output` line and "close" would be a three-second
+   * hide.
+   *
+   * It is no longer write-only: every id in here is mirrored by a
+   * `hiddenWorkers` entry, and `restoreHiddenWorkers` clears it. That is the
+   * whole reversal — an automatic expiry (on the worker's next state
+   * transition, say) would restore exactly the three-second hide this set
+   * exists to prevent, so the way back is an EXPLICIT operator action.
+   *
+   * The dismissal set and the chip's rows are ONE value
+   * (`HiddenWorkerState`), transitioned by the pure functions in
+   * `hiddenWorkerReducer.ts` — a dismissal without a row is a worker the
+   * operator can never get back, and a row without a dismissal is a chip entry
+   * for a cell about to reappear on its own, so the two never move apart.
+   */
+  const hiddenWorkerStateRef = useRef<HiddenWorkerState>(EMPTY_HIDDEN_WORKER_STATE);
+  /** The rows, mirrored into React state for the "show worker" chip. */
+  const [hiddenWorkers, setHiddenWorkers] = useState<readonly HiddenWorker[]>([]);
+  const applyHiddenWorkerState = useCallback((next: HiddenWorkerState) => {
+    if (next === hiddenWorkerStateRef.current) return;
+    hiddenWorkerStateRef.current = next;
+    setHiddenWorkers(next.hidden);
+  }, []);
+
+  /**
+   * Live-adopt a Conductor worker the moment it starts talking. The restore
+   * path (`useTerminalInitialization`) runs ONCE per page, so a worker
+   * dispatched after the run page initialised would otherwise have no tab
+   * until the next boot. Any `ai-output` / `claude-session-state` event for a
+   * task run this page has no tab for triggers ONE throttled read of the
+   * durable records; a record on this page with that `taskRunId` becomes a
+   * tab. A failed read is logged and retried on the next event — never
+   * treated as "no such worker".
+   */
+  const maybeAdoptWorker = useCallback(
+    async (taskRunId: string): Promise<boolean> => {
+      if (hiddenWorkerStateRef.current.dismissed.has(taskRunId)) return false;
+      if (tabsRef.current.some((t) => t.id === taskRunId || t.taskRunId === taskRunId)) return false;
+      const now = Date.now();
+      // Bound the probe ledger: this manager hears EVERY AI session's events,
+      // not just its own workers', and an entry is otherwise only removed on
+      // a successful adoption that will never come for a foreign session.
+      pruneWorkerProbes(workerProbeRef.current, now);
+      const probe = workerProbeRef.current.get(taskRunId) ?? { at: 0, misses: 0 };
+      if (now - probe.at < workerAdoptProbeDelayMs(probe.misses)) return false;
+      workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses });
+      let sessions: TerminalSessionRecord[] | undefined;
+      try {
+        const resp = await invoke<CommandResponse>("terminal_session_list_open");
+        sessions = (resp?.data as { sessions?: TerminalSessionRecord[] } | undefined)?.sessions;
+      } catch (err) {
+        // A failed read is not "no such worker": retry on the base cadence.
+        logger.warn(`worker adoption probe for ${taskRunId} failed (will retry): ${err}`);
+        return false;
+      }
+      if (!Array.isArray(sessions)) return false;
+      const rec = findWorkerRecord(sessions, taskRunId, pageId);
+      if (!rec) {
+        workerProbeRef.current.set(taskRunId, { at: now, misses: probe.misses + 1 });
+        return false;
+      }
+      workerProbeRef.current.delete(taskRunId);
+      const tabId = adoptWorkerTab(rec);
+      if (tabId) {
+        logger.info(`Adopted Conductor worker ${taskRunId} onto page ${pageId}`);
+        // The worker is on screen again, so it is no longer hidden — drop any
+        // "could not be re-opened" entry left over from a failed restore.
+        applyHiddenWorkerState(
+          forgetAdoptedWorker(hiddenWorkerStateRef.current, tabId, taskRunId),
+        );
+      }
+      return tabId !== null;
+    },
+    [pageId, adoptWorkerTab, applyHiddenWorkerState],
+  );
+
+  /**
+   * Bring closed worker views back. With no argument, all of them.
+   *
+   * Clears the dismissal, drops the probe throttle so the adoption read
+   * happens NOW rather than on the worker's next event (a quiet worker would
+   * otherwise stay invisible after an explicit "show"), and re-lists anything
+   * that could not be adopted with `restoreMissedAtMs` set — a click that
+   * silently does nothing is the failure this whole finding is about.
+   */
+  const restoreHiddenWorkers = useCallback(
+    async (tabIds?: readonly string[]) => {
+      const begun = beginRestore(hiddenWorkerStateRef.current, tabIds);
+      if (begun.restoring.length === 0) return;
+      for (const key of begun.probeKeys) workerProbeRef.current.delete(key);
+      applyHiddenWorkerState(begun.state);
+      const outcomes = await Promise.all(
+        begun.restoring.map(async (w) => ({
+          worker: w,
+          adopted: await maybeAdoptWorker(w.taskRunId ?? w.tabId),
+        })),
+      );
+      const missed = outcomes.filter((o) => !o.adopted).map((o) => o.worker);
+      if (missed.length === 0) return;
+      // Note: the DISMISSAL stays cleared (see `beginRestore`). If the miss was
+      // transient (a failed `terminal_session_list_open`, or a record not yet
+      // written), the live adoption probe brings the worker in on its next
+      // event and `forgetAdoptedWorker` clears the entry re-listed here.
+      applyHiddenWorkerState(
+        recordRestoreMisses(hiddenWorkerStateRef.current, missed, Date.now()),
+      );
+    },
+    [maybeAdoptWorker, applyHiddenWorkerState],
+  );
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const attach = (fn: () => void) => {
+      if (disposed) fn();
+      else unlisteners.push(fn);
+    };
+    listen<{ taskRunId?: string | null }>("ai-output", (event) => {
+      const id = event.payload?.taskRunId;
+      if (id) void maybeAdoptWorker(id);
+    }).then(attach);
+    listen<{ taskRunId?: string | null }>("claude-session-state", (event) => {
+      const id = event.payload?.taskRunId;
+      if (id) void maybeAdoptWorker(id);
+    }).then(attach);
+    return () => {
+      disposed = true;
+      for (const fn of unlisteners) fn();
+    };
+  }, [maybeAdoptWorker]);
 
   const markAsBypass = useCallback((terminalId: string) => {
     setTabs((prev) => {
@@ -583,10 +855,6 @@ export function useTerminalManager(
       // Drain the race buffer OUTSIDE the reducer so the `setTabs` updater
       // stays pure (React StrictMode double-invokes updaters in dev; a
       // delete-inside-reducer would miss on the second pass).
-      const pendingTaskRunId = pendingWorkerMarks.current.get(info.id);
-      if (pendingTaskRunId !== undefined) {
-        pendingWorkerMarks.current.delete(info.id);
-      }
       const pendingBypass = pendingBypassMarks.current.has(info.id);
       if (pendingBypass) {
         pendingBypassMarks.current.delete(info.id);
@@ -605,7 +873,7 @@ export function useTerminalManager(
       const wasNew = !ingestedIds.current.has(info.id);
       const selectId = nextActiveIdAfterIngest(info, wasNew);
       setTabs((prev) =>
-        reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+        reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
       );
       if (selectId !== null) {
         ingestedIds.current.add(info.id);
@@ -626,25 +894,6 @@ export function useTerminalManager(
       unlisten?.();
     };
   }, [pageId]);
-
-  // Mirror the Phase 1 backend worker gate on the frontend. The Rust side
-  // emits `worker-registered` right after `SessionManager::register_worker`
-  // succeeds in `commands::productivity::spawn_worker_session`; consuming
-  // it here lets `ZoneGrid::onTitleChange` skip OSC 0/2 `renameTab` for
-  // worker pty tabs.
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    listen<WorkerRegisteredPayload>("worker-registered", (event) => {
-      const { terminalId, taskRunId } = event.payload;
-      if (!terminalId || !taskRunId) return;
-      markAsWorker(terminalId, taskRunId);
-    }).then((fn) => {
-      unlisten = fn;
-    });
-    return () => {
-      unlisten?.();
-    };
-  }, [markAsWorker]);
 
   // Bypass-aware needs-input detection (plan
   // `2026-06-07-runner-continuation-defer-and-phantom-needs-input.md`).
@@ -697,14 +946,12 @@ export function useTerminalManager(
             const terminals = (result.data as { terminals: TerminalInfo[] }).terminals;
             const info = terminals.find((t) => t.id === id);
             if (!info) return;
-            const pendingTaskRunId = pendingWorkerMarks.current.get(id);
-            if (pendingTaskRunId !== undefined) pendingWorkerMarks.current.delete(id);
             const pendingBypass = pendingBypassMarks.current.has(id);
             if (pendingBypass) pendingBypassMarks.current.delete(id);
             const pendingRemote = pendingRemoteMarks.current.get(id);
             if (pendingRemote !== undefined) pendingRemoteMarks.current.delete(id);
             setTabs((prev) =>
-              reduceCreatedTerminal(prev, info, pendingTaskRunId, pendingBypass, pendingRemote),
+              reduceCreatedTerminal(prev, info, pendingBypass, pendingRemote),
             );
             ingestedIds.current.add(id);
             setActiveId(id);
@@ -835,30 +1082,12 @@ export function useTerminalManager(
       // Select the last tab (most recently created)
       setActiveId(reconnectedTabs[reconnectedTabs.length - 1].id);
 
-      // Backfill the Phase 2 worker marker for reconnected tabs. The Rust
-      // `SessionManager` keeps `WorkerSession` registrations across reloads
-      // of the React tree, so a `worker-registered` event won't re-fire for
-      // these tabs — we have to ask. Fire-and-forget; if it fails the
-      // worker tabs simply lose the gate on the frontend (backend gate
-      // still holds).
-      invoke<Array<{ terminal_id: string; task_run_id: string }>>("list_workers")
-        .then((workers) => {
-          for (const w of workers) {
-            if (w.terminal_id && w.task_run_id) {
-              markAsWorker(w.terminal_id, w.task_run_id);
-            }
-          }
-        })
-        .catch((err) => {
-          logger.warn(`list_workers backfill failed: ${err}`);
-        });
-
       return reconnectedTabs.map((t) => t.id);
     } catch (err) {
       console.error("[TerminalManager] Failed to reconnect:", err);
       return null;
     }
-  }, [pageId, markAsWorker]);
+  }, [pageId]);
 
   /** Mark a tab as having completed reconnection (buffer replayed). */
   const markReconnected = useCallback((id: string) => {
@@ -1083,10 +1312,31 @@ export function useTerminalManager(
     // updater's `prev` without mutating inside the updater (StrictMode double-
     // invokes updaters in dev).
     let closeRecord: ReturnType<typeof buildSessionCloseRecord> = null;
+    // A Conductor worker's tab is a VIEW: closing it hides the cell and
+    // nothing more. The Conductor owns the worker's lifetime, and its durable
+    // record must stay open so the next restore brings the cell back while
+    // the worker is still live. No close record, no `terminal_close` (there
+    // is no PTY to close), no re-sync. Read off the tabs snapshot rather than
+    // inside the updater, which React may run later than this handler.
+    const closingTab = tabsRef.current.find((t) => t.id === id);
+    const sessionBacked = closingTab?.sessionBacked === true;
+    if (sessionBacked) {
+      // Record the dismissal AND the chip row together, so the close is
+      // reversible (`restoreHiddenWorkers`) — see `HiddenWorker`. The worker
+      // keeps running either way.
+      applyHiddenWorkerState(
+        hideWorker(hiddenWorkerStateRef.current, {
+          tabId: id,
+          taskRunId: closingTab?.taskRunId ?? null,
+          title: closingTab?.title ?? id,
+          hiddenAtMs: Date.now(),
+        }),
+      );
+    }
     // Update React state immediately so the UI is responsive.
     // The Rust-side close (process kill + thread join) runs in the background.
     setTabs((prev) => {
-      closeRecord = buildSessionCloseRecord(prev, id);
+      closeRecord = sessionBacked ? null : buildSessionCloseRecord(prev, id);
       const next = prev.filter((t) => t.id !== id);
       setActiveId((currentActive) => {
         if (currentActive !== id) return currentActive;
@@ -1104,8 +1354,9 @@ export function useTerminalManager(
       });
     }
 
-    // Only invoke Rust close for terminal tabs (plan tabs have no PTY)
-    if (!id.startsWith("plan-")) {
+    // Only invoke Rust close for terminal tabs (plan tabs and worker views
+    // have no PTY)
+    if (!id.startsWith("plan-") && !sessionBacked) {
       invoke<CommandResponse>("terminal_close", { terminalId: id })
         .catch(() => {
           // Terminal may already be gone (e.g. removed out-of-band by
@@ -1122,7 +1373,7 @@ export function useTerminalManager(
           void resyncTabs();
         });
     }
-  }, [resyncTabs]);
+  }, [resyncTabs, applyHiddenWorkerState]);
 
   const renameTab = useCallback((id: string, title: string) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? { ...t, title } : t)));
@@ -1169,8 +1420,15 @@ export function useTerminalManager(
      */
     resyncTabs,
     markReconnected,
-    markAsWorker,
     markAsBypass,
     markAsRemote,
+    adoptWorkerTab,
+    /**
+     * Worker views the operator closed on this page — the input to the
+     * "N hidden worker(s)" chip. Empty when none are hidden.
+     */
+    hiddenWorkers,
+    /** Bring hidden worker views back (all of them, or the named tab ids). */
+    restoreHiddenWorkers,
   };
 }

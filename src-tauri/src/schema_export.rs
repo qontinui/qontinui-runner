@@ -511,15 +511,6 @@ pub fn export_all_schemas() -> Value {
     // `tauri_event_payloads` to be visible to this lib-side aggregator. ──
     add!("DevSeedFindingPayload", tep::DevSeedFindingPayload);
 
-    // ── runner-local: review-approved / review-rejected payloads
-    // (`commands::productivity::approve_recommendation` /
-    // `reject_recommendation`). Same shape on both channels — only the
-    // `user_decision` string ("approved" | "rejected") differs. ──
-    add!(
-        "RecommendationReviewDecisionPayload",
-        tep::RecommendationReviewDecisionPayload
-    );
-
     // ── qontinui-types: ticket_system ──
     add!("TicketSource", qts::TicketSource);
     add!("TicketState", qts::TicketState);
@@ -915,10 +906,13 @@ mod tests {
         // AgentTextUnitFile, AgentTextUnitError — plan
         // 2026-08-20-fleet-served-agent-skills Phase 1) = 548
         // + the 1 embedded-default type (AgentTextUnitDefault — plan
-        // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1) = 549.
+        // 2026-08-31-runner-publishes-embedded-command-defaults Phase 1) = 549
+        // - the 1 recommendation-review payload (RecommendationReviewDecisionPayload,
+        // deleted with the plan/task board by Phase 4 of
+        // 2026-09-12-consolidate-local-orchestration-onto-conductor) = 548.
         // Independently corroborated by the codegen, which reports
-        // "Processing 549 top-level types" and emits 549 .d.ts files.
-        assert_eq!(obj.len(), 549, "Expected 549 schema entries");
+        // "Processing 548 top-level types" and emits 548 .d.ts files.
+        assert_eq!(obj.len(), 548, "Expected 548 schema entries");
 
         // Sanity-check that qontinui_types re-exports are present
         assert!(

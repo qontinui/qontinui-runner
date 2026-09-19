@@ -5,7 +5,6 @@ import { useApiReady, useRenderPerformance } from "@/hooks";
 import { getApiPort } from "@/lib/runner-api";
 import { instanceStorage } from "@/lib/instance-storage";
 import type { MainTabId } from "./tab-types";
-import type { ProductivityView } from "@/components/productivity/types";
 import {
   ACTIVE_TAB_STORAGE_KEY,
   resolveExternalTabId,
@@ -29,8 +28,6 @@ export const PAGE_TO_TAB: Record<string, MainTabId> = {
   terminal: "terminal",
   "orchestration-loop": "orchestration-loop",
   productivity: "productivity",
-  "productivity-plans": "productivity",
-  "productivity-coordinator": "productivity",
   "productivity-knowledge": "productivity",
   // Observe
   runs: "runs",
@@ -271,70 +268,14 @@ export function useAppNavigation(): UseAppNavigationReturn {
     setActiveTab(correct);
   }, [isApiReady, isEnabled, isTerminalPopout, productMode]);
 
-  // When a `productivity-*` alias is requested, the main tab is `productivity`
-  // but the sub-view (plans/coordinator/knowledge) needs to be surfaced to the
-  // Productivity page. Dispatch a window event the page listens for. Pattern
-  // mirrors the Settings `defaultTab` flow but goes via an event because the
-  // PAGE_TO_TAB map collapses all three aliases into a single tab id.
-  //
-  // Timing: we just called `setActiveTabAndPersist`, but React hasn't mounted
-  // the ProductivityPage yet, so its `productivity-set-view` listener isn't
-  // attached. Dispatching synchronously drops the event. Instead we await
-  // ProductivityPage's mount-promise: it sets `__qontinuiProductivityReady`
-  // and dispatches `productivity-page-mounted` from inside its mount effect.
-  // A 250ms timeout fires the dispatch anyway as a defensive guard against
-  // the page never mounting (e.g. user navigated to a different tab right
-  // after this call).
-  const dispatchProductivitySubView = useCallback((page: string) => {
-    let view: ProductivityView | null = null;
-    if (page === "productivity-plans" || page === "productivity") {
-      view = "plans";
-    } else if (page === "productivity-coordinator") {
-      view = "coordinator";
-    } else if (page === "productivity-knowledge") {
-      view = "knowledge";
-    }
-    if (!view) return;
-    const targetView = view;
-    const fire = () => {
-      window.dispatchEvent(
-        new CustomEvent("productivity-set-view", { detail: { view: targetView } }),
-      );
-    };
-    const ready = (window as unknown as Record<string, unknown>).__qontinuiProductivityReady;
-    if (ready === true) {
-      fire();
-      return;
-    }
-    let fired = false;
-    const onMounted = () => {
-      if (fired) return;
-      fired = true;
-      window.removeEventListener("productivity-page-mounted", onMounted);
-      clearTimeout(timeoutId);
-      fire();
-    };
-    window.addEventListener("productivity-page-mounted", onMounted);
-    const timeoutId = window.setTimeout(() => {
-      if (fired) return;
-      fired = true;
-      window.removeEventListener("productivity-page-mounted", onMounted);
-      console.warn(
-        `[useAppNavigation] productivity-page-mounted timeout (250ms) for view="${targetView}"; firing dispatch anyway`,
-      );
-      fire();
-    }, 250);
-  }, []);
-
   useEffect(() => {
     registerNavigate((page: string) => {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
         setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
-        dispatchProductivitySubView(page);
       }
     });
-  }, [registerNavigate, dispatchProductivitySubView, setActiveTabTracked]);
+  }, [registerNavigate, setActiveTabTracked]);
 
   useEffect(() => {
     const handler = (e: WindowEventMap["ui-bridge-navigate"]) => {
@@ -342,7 +283,6 @@ export function useAppNavigation(): UseAppNavigationReturn {
       const tabId = PAGE_TO_TAB[page];
       if (tabId) {
         setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
-        dispatchProductivitySubView(page);
       }
     };
     // Direct tab setter (bypasses PAGE_TO_TAB for navigate_tab endpoint).
@@ -366,7 +306,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
       window.removeEventListener("ui-bridge-navigate", handler);
       window.removeEventListener("ui-bridge-set-tab", directHandler as EventListener);
     };
-  }, [dispatchProductivitySubView, setActiveTabTracked]);
+  }, [setActiveTabTracked]);
 
   // Tauri-native listener for the `ui-bridge:activate-tab` event emitted by
   // `POST /ui-bridge/control/activate-tab/{tab_id}`. This is intentionally
@@ -421,7 +361,6 @@ export function useAppNavigation(): UseAppNavigationReturn {
           if (page === "state-machine") {
             setTimeout(() => window.dispatchEvent(new Event("sm-show-exploration")), 200);
           }
-          dispatchProductivitySubView(page);
         } else {
           console.warn(`[APP] Unknown page for navigation: ${page}`);
         }
@@ -435,7 +374,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         unlisten();
       }
     };
-  }, [dispatchProductivitySubView, setActiveTabTracked]);
+  }, [setActiveTabTracked]);
 
   useEffect(() => {
     const handleNavigateToErrorMonitor = (
@@ -551,7 +490,6 @@ export function useAppNavigation(): UseAppNavigationReturn {
         const tabId = PAGE_TO_TAB[path];
         if (tabId) {
           setActiveTabAndPersist(setActiveTabTracked, instanceStorage, tabId);
-          dispatchProductivitySubView(path);
           return;
         }
         // Fall back: the path may itself be a tab id (or a legacy alias for
@@ -574,7 +512,7 @@ export function useAppNavigation(): UseAppNavigationReturn {
         delete g2.navigateHandler;
       }
     };
-  }, [setActiveTabTracked, dispatchProductivitySubView]);
+  }, [setActiveTabTracked]);
 
   return {
     activeTab,

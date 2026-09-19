@@ -119,8 +119,15 @@ impl PgDb {
         Ok(row_from_pg(&row))
     }
 
-    /// All snapshot rows for a session, ordered by `taken_at` ascending.
-    /// Used by `/rewind-session` to walk the rollback set.
+    /// All snapshot rows for a session, ordered by `taken_at` then `file_path`
+    /// ascending. Used by `/rewind-session` to walk the rollback set and by
+    /// `GET /sessions/<id>/file-changes` to order its candidates.
+    ///
+    /// The `file_path` tiebreak is load-bearing for the second caller: rows
+    /// written inside one statement share a `taken_at`, so `taken_at` alone
+    /// leaves their order up to the planner and two reads could disagree about
+    /// which of them falls either side of the `FILE_CHANGE_MAX_FILES` cut. The
+    /// same tiebreak is why `get_files_touched` orders this way.
     pub async fn get_snapshots_for_session(
         &self,
         session_id: &str,
@@ -138,7 +145,7 @@ impl PgDb {
                     SELECT {}
                     FROM project.session_file_snapshots
                     WHERE session_id = $1
-                    ORDER BY taken_at ASC
+                    ORDER BY taken_at ASC, file_path ASC
                     "#,
                     SELECT_COLUMNS
                 ),

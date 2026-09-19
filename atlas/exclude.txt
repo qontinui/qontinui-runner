@@ -59,6 +59,7 @@ project.conflict_logs
 project.contradiction_resolutions
 project.contradiction_resolutions_id_seq
 project.convergence_snapshots
+project.coordinator_shadow_decisions
 project.coverage_snapshots
 project.cross_run_patterns
 project.curated_examples
@@ -525,6 +526,7 @@ coord.operators
 coord.origin_resolution_observations
 coord.origin_resolution_observations_id_seq
 coord.outbound_budget_observations
+coord.overlap_detections
 coord.page_spec_paths
 coord.pending_installations
 coord.pending_pr_dependencies
@@ -598,6 +600,7 @@ coord.tenant_policies
 coord.tenant_repo_profiles
 coord.tenant_repo_unenrollments
 coord.tenant_repos
+coord.tenant_slug_history
 coord.tenant_warm_bytes
 coord.tenants
 coord.test_coverage_map

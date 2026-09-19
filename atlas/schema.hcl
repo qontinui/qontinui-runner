@@ -2,9 +2,10 @@
 //
 // Source of truth for the table/index/FK definitions the runner's
 // Rust code used to create imperatively via `database/pg/mod.rs::PgDb::new`
-// (regression_* tables) and `database/pg/coordinator_shadow_decisions.rs::
-// ensure_shadow_decisions_table` (project.coordinator_shadow_decisions,
-// re-homed from coord.* by P3 of the embedded-PG parity plan).
+// (regression_* tables). `project.coordinator_shadow_decisions` was declared
+// here until Phase 4 of `2026-09-12-consolidate-local-orchestration-onto-
+// conductor` deleted the scheduler that wrote it; the table is no longer
+// created anywhere and is EXCLUDED (never dropped) on databases that have it.
 //
 // Row 3 schema-half pilot per
 // `plans/2026-05-14-branch-per-agent-bottlenecks-tracker.md` Row 3 schema-half.
@@ -13,8 +14,7 @@
 // idiomatic bootstrap-vs-schema split.
 //
 // Tables ALSO covered by historical alembic migrations
-// (project.regression_* by f9d3e8a4c1b6, the retired coord.coordinator_shadow_decisions
-// implicit via earlier coord migrations). The alembic files stay in
+// (project.regression_* by f9d3e8a4c1b6). The alembic files stay in
 // `qontinui-web/backend/alembic/versions/` as frozen history; new alembic
 // autogenerate runs exclude these tables via the env.py include_object
 // filter so the two systems can't drift.
@@ -384,86 +384,6 @@ table "proposal_events" {
     }
     on {
       column = column.at
-      desc   = true
-    }
-  }
-}
-
-// ---------------------------------------------------------------
-// project.coordinator_shadow_decisions — soak comparison of shadow vs live
-// scheduler decisions. This HCL is the source of truth; the runner also
-// self-heals the same shape in `database/pg/mod.rs`
-// (MACHINE_LOCAL_TABLES_DDL) so a fresh PG without Atlas applied boots.
-//
-// RE-HOMED coord -> project by P3 of plan
-// `2026-08-18-runner-embedded-pg-parity-and-coord-http-migration`: this is
-// machine-local runner state, and `coord.*` is authored solely by
-// qontinui-web alembic, which never runs on an end-user box where the
-// runner's bundled PostgreSQL is the production database.
-// ---------------------------------------------------------------
-
-table "coordinator_shadow_decisions" {
-  schema = schema.project
-  column "id" {
-    null    = false
-    type    = uuid
-    default = sql("gen_random_uuid()")
-  }
-  column "instance_id" {
-    null = false
-    type = text
-  }
-  column "iteration" {
-    null = false
-    type = bigint
-  }
-  column "observation_hash" {
-    null = false
-    type = text
-  }
-  column "rule" {
-    null = false
-    type = text
-  }
-  column "action" {
-    null = false
-    type = text
-  }
-  column "target_id" {
-    null = true
-    type = text
-  }
-  column "reasoning" {
-    null = false
-    type = text
-  }
-  column "would_have_acted" {
-    null = false
-    type = boolean
-  }
-  column "taken_at" {
-    null    = false
-    type    = timestamptz
-    default = sql("now()")
-  }
-  primary_key {
-    columns = [column.id]
-  }
-  index "idx_csd_taken_at" {
-    on {
-      column = column.taken_at
-      desc   = true
-    }
-  }
-  index "idx_csd_obs_hash" {
-    columns = [column.observation_hash]
-  }
-  index "idx_csd_instance" {
-    on {
-      column = column.instance_id
-    }
-    on {
-      column = column.taken_at
       desc   = true
     }
   }

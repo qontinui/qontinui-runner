@@ -41,6 +41,7 @@ import { SuggestionsProvider } from "./suggestions";
 import { StatusStrip } from "./StatusStrip";
 import { ConductorStatusStrip } from "./ConductorStatusStrip";
 import { UnzonedChip } from "./UnzonedChip";
+import { HiddenWorkersChip } from "./HiddenWorkersChip";
 import { pickLayout } from "./useZoneLayout";
 import { buildCreatePlainTerminalAction } from "./createPlainTerminalAction";
 import {
@@ -154,6 +155,9 @@ function TerminalPageInner({
     updateTab,
     reconnectToExistingSessions,
     createPlanTab,
+    adoptWorkerTab,
+    hiddenWorkers,
+    restoreHiddenWorkers,
     pageId,
     zoneLayout,
     terminalRefs,
@@ -1022,6 +1026,7 @@ function TerminalPageInner({
     reconnectToExistingSessions,
     createTerminal,
     createPlanTab,
+    adoptWorkerTab,
     setInitialized,
     updateTab,
     zoneLayout,
@@ -1486,6 +1491,12 @@ function TerminalPageInner({
           unassignedCount={zoneLayout.unassignedTabIds.length}
           onOpen={() => dispatch({ type: "SET_SHOW_CONTROL_PANEL", payload: true })}
         />
+        {/* The way back from closing a Conductor worker's cell. Renders
+            nothing when no worker view is hidden. */}
+        <HiddenWorkersChip
+          hidden={hiddenWorkers}
+          onRestoreAll={() => void restoreHiddenWorkers()}
+        />
 
         {showDocFinder && (
           <DocFinderModal
@@ -1701,8 +1712,9 @@ function TerminalPageInner({
                 advisory banner that surfaces `project.coordinator_decisions`
                 rows fired by the Rust deconflicter loop. Gated on
                 `claudeSessionId` per `proj_holding_banner_pty_gate` — the
-                emergent-task wiring (commands/productivity.rs:1082 +
-                ai_session register sites) ensures every AI tab has one.
+                emergent-task wiring (the `create_emergent_task` calls in
+                `commands/ai_session.rs` and `mcp/ai_session.rs`) ensures
+                every AI tab has one.
                 Lives below the lock-yield banners by document order so
                 they stack instead of overlapping. */}
             {activeTab?.claudeSessionId && (

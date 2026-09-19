@@ -31,6 +31,16 @@ export interface TerminalSessionRecord {
   title?: string;
   /** Ephemeral terminal/tab id at the time the record was last written. */
   terminalId: string;
+  /**
+   * Orchestration task-run id — present ONLY on a Conductor worker record
+   * (`dispatch_subtask` in `orchestration_loop/ai_session_executor.rs`). A
+   * worker is an in-process stream-json `ClaudeSession`, not a PTY: its
+   * `terminalId` equals this value and names no terminal process, so the
+   * restore path must never `terminal_create` a shell for it. The grid renders
+   * such a record through `WorkerSessionCell` (`useTerminalManager`
+   * `adoptWorkerTab`).
+   */
+  taskRunId?: string;
   /** Epoch ms the session was first recorded open. */
   openedAt: number;
   /** Epoch ms the record was last refreshed. */

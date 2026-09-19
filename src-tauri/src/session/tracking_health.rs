@@ -29,7 +29,7 @@
 //!    Their child PIDs are registered here via
 //!    [`register_headless_claude_pid`] for the child's lifetime.
 //! 2. **Headless AI-session / task-run plane** (`ClaudeSession::spawn`,
-//!    inline PIDs, pty workers) — restore rides the task-run DB plane via a
+//!    inline PIDs) — restore rides the task-run DB plane via a
 //!    pinned `--session-id <task_run_id>`, not the terminal store. Their PIDs
 //!    come from `SessionManager::list_all_with_state()` at check time.
 //!

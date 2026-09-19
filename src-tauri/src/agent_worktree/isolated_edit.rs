@@ -6,7 +6,7 @@
 //! WITHOUT having to resolve coord URL, `device_id`, canonical paths,
 //! and `parent_sha` themselves.
 //!
-//! Phase 2 wires this into `terminal_create` and `spawn_worker_session`;
+//! Phase 2 wires this into `terminal_create`;
 //! Phase 3 wires the same shape into the skill orchestrators
 //! (`/manual-test-loop`, `/manual-test`, `/implement-plan`) through this
 //! in-process facade directly (the former `/agents/allocate-local` HTTP
@@ -700,8 +700,7 @@ impl IsolatedEditContext {
 }
 
 /// Convenience helper for the runner terminal-spawn entry points
-/// (`commands/terminal.rs::terminal_create`, `commands/productivity.rs::
-/// spawn_worker_session` + `launch_coordinator_session`,
+/// (`commands/terminal.rs::terminal_create`,
 /// `mcp/terminals.rs::handle_terminal_create`, `mcp/tauri_proxy.rs::
 /// "terminal_create"`, `mcp/backend_relay.rs::handle_terminal_create`).
 /// Given the caller's `intent_repo` + `purpose` + original `working_dir`,
@@ -718,8 +717,7 @@ impl IsolatedEditContext {
 /// - `intent_repo == Some(_)` and worktree mode is on, allocate fails →
 ///   returns `(working_dir, None)`. Failure is logged as a warning;
 ///   the spawn flow falls back to the primary checkout (this matches
-///   the in-place Phase 2 wireup of `terminal_create` and
-///   `spawn_worker_session`).
+///   the in-place Phase 2 wireup of `terminal_create`).
 ///
 /// `spawn_tenant` is the tenant the caller chose for this session (plan
 /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P5b).

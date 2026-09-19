@@ -238,8 +238,7 @@ impl Transport for ExternalTransport {
     /// No tap: an external mirror owns no process. The real terminal belongs
     /// to the legacy path, which attaches its OWN pipe to it via
     /// [`super::SessionRegistry::attach_output_pipe`]
-    /// (`commands::terminal::create_terminal_session_backend` and
-    /// `commands::productivity::spawn_worker_session` both do this). Tapping
+    /// (`commands::terminal::create_terminal_session_backend` does this). Tapping
     /// again from here would attach a second pipe to the same terminal and
     /// double-publish every chunk to coord under the same session id.
     fn tap_output(

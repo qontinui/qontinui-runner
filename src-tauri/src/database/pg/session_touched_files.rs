@@ -72,8 +72,7 @@ const MIN_RETENTION_DAYS: u32 = crate::projects::snapshot::SESSION_WINDOW_DAYS a
 /// | `deconflict` (`RECENT_TOUCH_WINDOW_MINUTES`) | 15 minutes |
 /// | `commands::ai_session::recent_session_touched_files` (the heatmap panel) | caller-supplied `window_secs`; the UI default is 30 s and its widest fixed option is 24 h |
 /// | [`PgDb::hot_files`] / [`PgDb::hot_sessions`] via `GET /file-activity/heatmap` | caller-supplied, **clamped to 86 400 s** (24 h) by the handler |
-/// | `coordinator::observe` | 3600 s for `hot_sessions`; unbounded for [`PgDb::get_files_touched`], but scoped to sessions that are live right now |
-/// | Commit-time enumeration ([`PgDb::get_files_touched`] from `mcp::ai_session::commit_session_progress`, `unified_workflow_executor::task_lifecycle::auto_commit_on_success`, `mcp::sessions`, `productivity::review`) | unbounded query, but bounded in practice by one session's lifetime — and each of those call sites calls [`PgDb::clear_files_touched`] on success |
+/// | Commit-time enumeration ([`PgDb::get_files_touched`] from `mcp::ai_session::commit_session_progress`, `unified_workflow_executor::task_lifecycle::auto_commit_on_success`, `mcp::sessions`) | unbounded query, but bounded in practice by one session's lifetime — and each of those call sites calls [`PgDb::clear_files_touched`] on success |
 /// | [`PgDb::get_sessions_for_files`] (the worktree-merge and file-registry guards) | unbounded query over currently-dirty files |
 /// | **`projects::snapshot::fetch_touched_rows`** (the saved-projects dashboard) | **`SESSION_WINDOW_DAYS` = 90 days** |
 ///

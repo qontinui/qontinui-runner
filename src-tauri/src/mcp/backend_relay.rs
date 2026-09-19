@@ -2854,10 +2854,10 @@ async fn relay_http_to_base(base: &str, data: &Value) -> Value {
     // Since round 4 this is a TOTAL ALLOWLIST, not a denylist of dangerous
     // prefixes: round 3's `GUARDED_PREFIXES` still let this arm reach
     // `POST /execute-python`, `POST /sessions/spawn` + `/sessions/{id}/message`
-    // and `POST /ui-bridge/invoke/{get_coord_device_token,spawn_worker_session}`
+    // and `POST /ui-bridge/invoke/{get_coord_device_token,terminal_create}`
     // — arbitrary code, a process in any directory with its stdin, the coord
-    // device JWT, and a Claude-backed PTY — because nobody had thought to name
-    // them. An unlisted path is now refused whatever it is and whenever it was
+    // device JWT, and a PTY — because nobody had thought to name them. An
+    // unlisted path is now refused whatever it is and whenever it was
     // added. The refusal is decided on a NORMALISED path and the request is
     // forwarded verbatim; see `mcp::relay_path_policy` for the list and how it
     // was derived from the two real clients.
@@ -5428,10 +5428,10 @@ mod tests {
                 "/ui-bridge/invoke/get_coord_device_token",
                 "{}".to_string(),
             ),
-            // A Claude-backed PTY (`commands::productivity::spawn_worker_session`).
+            // A PTY spawn (`commands::terminal::terminal_create`).
             (
                 "POST",
-                "/ui-bridge/invoke/spawn_worker_session",
+                "/ui-bridge/invoke/terminal_create",
                 "{}".to_string(),
             ),
             // Spawn a process in a caller-chosen directory (`mcp::sessions`)…
