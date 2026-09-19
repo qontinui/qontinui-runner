@@ -143,6 +143,18 @@ pub struct RefPlanFile {
     pub body: String,
 }
 
+/// What one [`read_ref_dir`] produced: the plans it could read, and whether it
+/// read EVERY plan the listing named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefDirRead {
+    pub files: Vec<RefPlanFile>,
+    /// `false` when at least one listed `*.md` blob was skipped (unreadable,
+    /// or not UTF-8). A short `files` is then NOT evidence that the skipped
+    /// plans are absent from the ref — see
+    /// [`super::trigger::PlanDirScan::complete`], which this feeds.
+    pub complete: bool,
+}
+
 /// Read every depth-1 `*.md` of `rel_dir` at `ref_name`.
 ///
 /// Two `git` invocations for the whole directory — one listing, one batched
@@ -153,25 +165,34 @@ pub struct RefPlanFile {
 ///
 /// A file whose blob will not read is SKIPPED with a warning, exactly as the
 /// working-tree walk skips an unreadable file: one bad entry must not discard
-/// the other 1,099.
+/// the other 1,099. The skip clears [`RefDirRead::complete`], because it is
+/// the same partial-read shape the tree walk reports: the returned set is
+/// short, and the plans it lacks were NOT shown absent from the ref.
 pub fn read_ref_dir(
     git: &dyn GitRefReader,
     repo_root: &Path,
     ref_name: &str,
     rel_dir: &str,
-) -> Result<Vec<RefPlanFile>, String> {
+) -> Result<RefDirRead, String> {
     let entries = git.list_ref_dir(repo_root, ref_name, rel_dir)?;
     let wanted: Vec<_> = entries
         .into_iter()
         .filter(|e| is_plan_file(&e.name))
         .collect();
     if wanted.is_empty() {
-        return Ok(Vec::new());
+        // A listing with no `*.md` in it: genuinely empty, and complete.
+        return Ok(RefDirRead {
+            files: Vec::new(),
+            complete: true,
+        });
     }
     let asked = wanted.len();
     let ids: Vec<String> = wanted.iter().map(|e| e.id.clone()).collect();
     let bodies = git.read_blobs(repo_root, &ids);
     let mut out = Vec::with_capacity(wanted.len());
+    // `read_blobs` answers one slot per id asked; a short answer is itself a
+    // gap (the `zip` below would silently drop the unanswered tail).
+    let mut complete = bodies.len() == asked;
     for (entry, body) in wanted.into_iter().zip(bodies) {
         match body {
             Ok(b) => out.push(RefPlanFile {
@@ -183,8 +204,10 @@ pub fn read_ref_dir(
                     name = %entry.name,
                     id = %entry.id,
                     error = %e,
-                    "plan adapter: skipping a plan whose blob could not be read at the ref"
+                    "plan adapter: skipping a plan whose blob could not be read at the ref; \
+                     scan is PARTIAL"
                 );
+                complete = false;
             }
         }
     }
@@ -204,7 +227,10 @@ pub fn read_ref_dir(
     // `ls-tree` already emits in tree order, which is byte order on the name —
     // sorted anyway so a dry-run report is reproducible across git versions.
     out.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(out)
+    Ok(RefDirRead {
+        files: out,
+        complete,
+    })
 }
 
 /// The ref arm's `*.md` predicate.
