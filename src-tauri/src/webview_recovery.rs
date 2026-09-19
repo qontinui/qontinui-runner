@@ -91,8 +91,8 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// ponging (plan `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`
 /// Phase 2).
 ///
-/// **Recreate-scoped, and deliberately so.** The predicate is "a pong stamped
-/// strictly AFTER the recreate finished" ([`classify_recreate_pong`]) — never a
+/// **Rung-scoped, and deliberately so.** The predicate is "a MAIN-window pong
+/// stamped strictly AFTER the recreate finished" ([`classify_rung_pong`]) — never a
 /// relaxation of the global `last_pong > 0` guard in
 /// [`crate::ui_error::ui_stale`]. That guard is what keeps a headless
 /// server-mode runner (which never mounts a webview at all) and every runner's
@@ -105,8 +105,26 @@ const LABEL_RELEASE_POLL_MS: u64 = 50;
 /// unconditionally every 3s, so this is ten consecutive missed pings.
 pub const RECREATE_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
 
-/// Poll interval while watching for that pong.
-const RECREATE_PONG_POLL_MS: u64 = 250;
+/// How long a reloaded main webview has to prove it is running a UI again, by
+/// ponging (plan
+/// `2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it`
+/// Phase 2).
+///
+/// `ICoreWebView2::Reload()` returning `S_OK` means only that WebView2
+/// ACCEPTED the navigation — the same "posted, not done" contract the `eval`
+/// it replaced had, which is how the 2026-09-18 crash was "recovered" by a
+/// no-op for five hours. So a reload is credited only when a main-labeled pong
+/// lands strictly after the reload was dispatched ([`classify_rung_pong`]);
+/// without one inside this deadline the same call escalates to recreate.
+///
+/// Same calibration as [`RECREATE_PONG_DEADLINE_MS`] (a reload re-runs the
+/// same bundle boot a rebuilt window does), but a separate constant: the two
+/// rungs are free to be retuned independently, and each is its own term in
+/// [`RECOVERY_WEDGE_AFTER_MS`].
+pub const RELOAD_PONG_DEADLINE_MS: u64 = crate::ui_error::UI_STALE_AFTER_MS;
+
+/// Poll interval while watching for a post-rung pong (either rung).
+const RUNG_PONG_POLL_MS: u64 = 250;
 
 /// How long the single-flight latch may be held before the run holding it is
 /// reported **wedged** rather than merely overlapping.
@@ -138,6 +156,9 @@ const RECREATE_PONG_POLL_MS: u64 = 250;
 ///   [`GuardDecision::Backoff`] before it acts.
 /// * [`WINDOW_LABEL_RELEASE_TIMEOUT_MS`] — the bounded label-release poll.
 /// * [`RECREATE_PONG_DEADLINE_MS`] — the bounded post-recreate pong watch.
+/// * [`RELOAD_PONG_DEADLINE_MS`] — the bounded post-reload pong watch. A run
+///   that reloads, hears nothing and escalates pays it IN FULL before the
+///   recreate's own costs above, all under the one latch.
 /// * a second [`RECOVERY_BACKOFF_MAX_MS`] as the allowance for the *unbounded*
 ///   `build_main_window` probe: a cold WebView2 profile on a loaded box is slow
 ///   but healthy, so this bound has to be generous rather than tight — the
@@ -150,6 +171,7 @@ const RECREATE_PONG_POLL_MS: u64 = 250;
 pub const RECOVERY_WEDGE_AFTER_MS: u64 = RECOVERY_BACKOFF_MAX_MS
     + WINDOW_LABEL_RELEASE_TIMEOUT_MS
     + RECREATE_PONG_DEADLINE_MS
+    + RELOAD_PONG_DEADLINE_MS
     + RECOVERY_BACKOFF_MAX_MS;
 
 /// Browser args for the main window's WebView2 host.
@@ -625,8 +647,11 @@ impl RecoveryReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryAction {
-    /// `location.reload()` into the existing webview — the cheap rung. Right
-    /// for a renderer-only failure; **useless when the browser process is
+    /// A native `ICoreWebView2::Reload()` of the existing webview (`eval` of
+    /// `location.reload()` off Windows) — the cheap rung, and the recovery the
+    /// WebView2 docs prescribe for `RENDER_PROCESS_EXITED`. Verified by a
+    /// main-window pong and escalated to [`RecoveryAction::Recreate`] inside
+    /// the same call when none arrives. **Useless when the browser process is
     /// gone**, so it is never selected for [`ProcessFailureKind::BrowserExited`].
     Reload,
     /// Destroy and rebuild the main `WebviewWindow`.
@@ -637,25 +662,38 @@ pub enum RecoveryAction {
 
 /// Choose the rung for `reason` on 0-indexed `attempt`.
 ///
-/// Escalation happens **across attempts**, not inside one call — and the two
-/// rungs are verified differently, which this doc used to flatten into "this
-/// module deliberately does not read `ui_bridge_last_pong`". That is no longer
-/// true of the recreate rung:
+/// This picks the rung a run STARTS on. Both rungs are verified by a
+/// main-window pong, and a reload that is not verified escalates to recreate
+/// inside the same call — so escalation happens both within a call (reload →
+/// recreate) and across attempts (a repeat trigger starts on recreate):
 ///
-/// * **Reload is still unverified.** Nothing here can observe whether
-///   `location.reload()` took, so the cheap rung is tried once and any
-///   subsequent request for the same incident escalates. A failed `eval` is
-///   hard evidence and escalates immediately inside the call — see
-///   [`trigger_ui_recovery`].
+/// * **Reload is verified**, since plan
+///   `2026-09-19-runner-render-process-crash-recovery-is-a-no-op-and-popout-pongs-mask-it`
+///   Phase 2. It is a native `ICoreWebView2::Reload()` (the WebView2-documented
+///   recovery for `RENDER_PROCESS_EXITED`; an injected `location.reload()` is
+///   inert on the error page a dead renderer leaves behind), and
+///   [`trigger_ui_recovery`] then requires a main-labeled pong stamped strictly
+///   after the dispatch, within [`RELOAD_PONG_DEADLINE_MS`]. A dispatch error,
+///   a WebView2 refusal, or no pong all escalate to recreate IN THE SAME CALL.
+///   The old "second trigger" escalation could not be relied on: a
+///   render-process crash raises exactly one `ProcessFailed`.
 /// * **Recreate IS verified**, since Phase 2 of plan
 ///   `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`.
 ///   [`trigger_ui_recovery`] reads `ui_bridge_last_pong` after a successful
 ///   rebuild and requires a pong stamped **strictly after** it
-///   ([`classify_recreate_pong`]), so a window that rebuilds blank reports
+///   ([`classify_rung_pong`]), so a window that rebuilds blank reports
 ///   `Failed` and lets this ladder escalate instead of claiming success
-///   forever. That read is **recreate-scoped**: it compares against the
-///   recreate's own completion instant and never relaxes the global
-///   `last_pong > 0` guard in [`crate::ui_error::ui_stale`].
+///   forever.
+///
+/// Both reads are **rung-scoped**: each compares against its own rung's
+/// instant and never relaxes the global `last_pong > 0` guard in
+/// [`crate::ui_error::ui_stale`]. And both read a MAIN-scoped stamp —
+/// `ui_bridge_last_pong` advances only on pongs labeled with the main
+/// window's label (`crate::ui_error::ingest_window_pong`), so a live pop-out
+/// cannot verify a rung that left the main window dead.
+///
+/// `attempt >= 1` → `Recreate` stays: it is the path for the heartbeat
+/// backstop and manual pokes re-entering an incident whose reload was spent.
 pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
     match reason {
         // The browser process is gone: the CoreWebView2 is unusable, so the
@@ -672,9 +710,9 @@ pub fn plan_action(reason: RecoveryReason, attempt: u32) -> RecoveryAction {
         // is not a gap in this ladder — it is a property of the failure, and
         // both rungs were checked against the source rather than assumed:
         //
-        // * **Reload** is `window.eval("location.reload()")`
-        //   ([`reload_main_webview`]), which dispatches through the very loop
-        //   that is wedged.
+        // * **Reload** is `with_webview` → `ICoreWebView2::Reload()`
+        //   ([`reload_main_webview`]), and `with_webview` dispatches onto the
+        //   very loop that is wedged.
         // * **Recreate** is `destroy()` + rebuild, and `destroy()` only
         //   *enqueues* onto that same loop; [`recreate_main_window`]'s
         //   label-release poll would then burn its full
@@ -1332,10 +1370,24 @@ pub enum RecoveryOutcome {
     /// string (server mode, no window was ever built, a run already in flight,
     /// or a failure class WebView2 handles itself).
     Skipped { why: &'static str },
-    /// `location.reload()` was dispatched into the live webview.
-    Reloaded,
-    /// The main window was destroyed and rebuilt.
-    Recreated,
+    /// The main webview was reloaded in place.
+    ///
+    /// `verified: true` — a main-labeled pong landed strictly after the reload
+    /// was dispatched: the reloaded UI is demonstrably live. `verified: false`
+    /// — the pong stamp is not readable in this process (no managed
+    /// `AppState`), so the reload is UNKNOWN, deliberately not a failure, the
+    /// same stance recreate takes. A reload that was dispatched and heard
+    /// NOTHING never reports this variant: it escalates to recreate, whose
+    /// outcome then carries `escalated_from_reload`.
+    Reloaded { verified: bool },
+    /// The main window was destroyed and rebuilt, and (unless unverifiable)
+    /// the rebuilt UI ponged. `escalated_from_reload` is `Some` when this run
+    /// started on the reload rung and handed over because the reload did not
+    /// take — the fact that tells "reload dispatched, no pong, escalated" apart
+    /// from a run that planned recreate from the start.
+    Recreated {
+        escalated_from_reload: Option<ReloadEscalation>,
+    },
     /// The attempt budget for this incident is spent. Terminal — the caller
     /// must not retry.
     Exhausted { attempts: u32 },
@@ -1351,16 +1403,52 @@ pub enum RecoveryOutcome {
     /// steals the latch.
     #[serde(rename = "recovery_wedged")]
     Wedged { in_flight_ms: u64 },
-    /// A rung was attempted and failed.
-    Failed { detail: String },
+    /// A rung was attempted and failed. `escalated_from_reload` as for
+    /// [`RecoveryOutcome::Recreated`]: `Some` when a reload was tried first in
+    /// this same run and did not take.
+    Failed {
+        detail: String,
+        escalated_from_reload: Option<ReloadEscalation>,
+    },
+}
+
+/// Why a run that started on the reload rung escalated to recreate inside the
+/// same call. Carried on the recreate's outcome so every surface (`/ui/recover`,
+/// the recovery log) says which rung actually did the work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "why", rename_all = "snake_case")]
+pub enum ReloadEscalation {
+    /// The reload could not even be dispatched (no main window, a
+    /// `with_webview` error, or an `eval` error off Windows). Hard evidence.
+    DispatchFailed { detail: String },
+    /// WebView2 ran the dispatch and REFUSED it: `CoreWebView2()` or
+    /// `Reload()` returned an error on the UI thread, or the dispatched
+    /// closure was dropped without running.
+    Refused { detail: String },
+    /// The reload was accepted, but no main-window pong landed within
+    /// `deadline_ms` of the dispatch — the reloaded page is not running a UI.
+    NoPong { deadline_ms: u64 },
+}
+
+impl ReloadEscalation {
+    /// One-line human rendering for logs.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::DispatchFailed { detail } => format!("reload could not be dispatched: {detail}"),
+            Self::Refused { detail } => format!("WebView2 refused the reload: {detail}"),
+            Self::NoPong { deadline_ms } => {
+                format!("reload accepted, but no main-window pong within {deadline_ms}ms")
+            }
+        }
+    }
 }
 
 impl RecoveryOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Skipped { .. } => "skipped",
-            Self::Reloaded => "reloaded",
-            Self::Recreated => "recreated",
+            Self::Reloaded { .. } => "reloaded",
+            Self::Recreated { .. } => "recreated",
             Self::Exhausted { .. } => "exhausted",
             Self::Wedged { .. } => "recovery_wedged",
             Self::Failed { .. } => "failed",
@@ -1507,19 +1595,54 @@ pub async fn trigger_ui_recovery(
     );
 
     // ── Rung 1: reload. Cheap, in-place, keeps the window and its geometry.
+    //
+    //    Verified, not assumed (plan 2026-09-19-runner-render-process-crash-
+    //    recovery-is-a-no-op-and-popout-pongs-mask-it, Phase 2): a render-
+    //    process crash raises ONE `ProcessFailed`, so a reload that silently
+    //    does nothing used to end the ladder — 5 h of sad tab on 2026-09-18.
+    //    Anything short of a main-window pong after the dispatch escalates to
+    //    recreate right here, in this call.
+    let mut escalated_from_reload: Option<ReloadEscalation> = None;
     if action == RecoveryAction::Reload {
-        match reload_main_webview(app) {
-            Ok(()) => {
-                info!("UI recovery: reload dispatched into the existing webview");
-                return RecoveryOutcome::Reloaded;
+        let reload_dispatched_ms = now_ms();
+        let escalation = match reload_main_webview(app) {
+            Ok(dispatch) => {
+                info!(
+                    deadline_ms = RELOAD_PONG_DEADLINE_MS,
+                    "UI recovery: reload dispatched into the existing webview — waiting for the \
+                     reloaded UI to pong"
+                );
+                match verify_reload_took(app, reload_dispatched_ms, dispatch).await {
+                    RungWatch::Settled(RungPongVerdict::Live) => {
+                        info!("UI recovery: main webview reloaded and the reloaded UI has ponged");
+                        return RecoveryOutcome::Reloaded { verified: true };
+                    }
+                    RungWatch::Settled(RungPongVerdict::Unverifiable) => {
+                        // UNKNOWN is not failure — same stance as recreate.
+                        warn!(
+                            "UI recovery: reload dispatched, but the pong stamp is not readable \
+                             in this process — reload reported as done (UNKNOWN, deliberately \
+                             not a failure)"
+                        );
+                        return RecoveryOutcome::Reloaded { verified: false };
+                    }
+                    // The watch resolves `Waiting` itself; matched, not assumed.
+                    RungWatch::Settled(RungPongVerdict::NoPong | RungPongVerdict::Waiting) => {
+                        ReloadEscalation::NoPong {
+                            deadline_ms: RELOAD_PONG_DEADLINE_MS,
+                        }
+                    }
+                    RungWatch::Aborted(detail) => ReloadEscalation::Refused { detail },
+                }
             }
-            Err(e) => {
-                // A failed `eval` is hard evidence the webview is beyond a
-                // reload — escalate inside this same call rather than waiting
-                // for another trigger.
-                warn!(error = %e, "UI recovery: reload failed — escalating to recreate");
-            }
-        }
+            // A dispatch error is hard evidence the webview is beyond a reload.
+            Err(detail) => ReloadEscalation::DispatchFailed { detail },
+        };
+        warn!(
+            escalation = %escalation.describe(),
+            "UI recovery: the reload did not take — escalating to recreate in this same call"
+        );
+        escalated_from_reload = Some(escalation);
     }
 
     // ── Rung 2: recreate.
@@ -1528,17 +1651,21 @@ pub async fn trigger_ui_recovery(
             // Phase 2 (plan
             // `2026-08-06-runner-webview-recovery-wedge-and-disk-pressure`).
             // `Ok` here means the window was rebuilt and HAS a webview — it
-            // does NOT mean a UI is running inside it. Require a pong stamped
-            // strictly after this instant, so a rebuild that comes up blank
-            // reports `Failed` and lets the loop guard escalate on the next
-            // trigger, instead of claiming `Recreated` over a dead window.
+            // does NOT mean a UI is running inside it. Require a main-window
+            // pong stamped strictly after this instant, so a rebuild that comes
+            // up blank reports `Failed` and lets the loop guard escalate on the
+            // next trigger, instead of claiming `Recreated` over a dead window.
             let recreate_done_ms = now_ms();
-            match verify_recreate_took(app, recreate_done_ms).await {
-                RecreatePongVerdict::Live => {
+            match watch_for_main_pong(app, recreate_done_ms, RECREATE_PONG_DEADLINE_MS, || None)
+                .await
+            {
+                RungWatch::Settled(RungPongVerdict::Live) => {
                     info!("UI recovery: main window recreated and the rebuilt UI has ponged");
-                    RecoveryOutcome::Recreated
+                    RecoveryOutcome::Recreated {
+                        escalated_from_reload,
+                    }
                 }
-                RecreatePongVerdict::Unverifiable => {
+                RungWatch::Settled(RungPongVerdict::Unverifiable) => {
                     // UNKNOWN is not failure: with no managed `AppState` there
                     // is no pong stamp to read, and inventing a verdict from
                     // that absence would fail every healthy recreate.
@@ -1547,24 +1674,33 @@ pub async fn trigger_ui_recovery(
                          readable in this process — recreate reported as done (UNKNOWN, \
                          deliberately not a failure)"
                     );
-                    RecoveryOutcome::Recreated
+                    RecoveryOutcome::Recreated {
+                        escalated_from_reload,
+                    }
                 }
-                // The watch loop resolves `Waiting` itself; it only ever
-                // returns a settled verdict. Matched rather than assumed.
-                RecreatePongVerdict::NoPong | RecreatePongVerdict::Waiting => {
+                // The watch loop resolves `Waiting` itself, and this watch has
+                // no abort source; both matched rather than assumed.
+                RungWatch::Settled(RungPongVerdict::NoPong | RungPongVerdict::Waiting)
+                | RungWatch::Aborted(_) => {
                     let detail = format!(
-                        "main window rebuilt, but no UI-Bridge pong arrived within \
+                        "main window rebuilt, but no main-window UI-Bridge pong arrived within \
                          {RECREATE_PONG_DEADLINE_MS}ms of the recreate — the rebuilt window \
                          has no live UI"
                     );
                     error!(detail = %detail, "UI recovery: the recreate produced no live UI");
-                    RecoveryOutcome::Failed { detail }
+                    RecoveryOutcome::Failed {
+                        detail,
+                        escalated_from_reload,
+                    }
                 }
             }
         }
         Err(e) => {
             error!(error = %e, "UI recovery: main window recreate FAILED");
-            RecoveryOutcome::Failed { detail: e }
+            RecoveryOutcome::Failed {
+                detail: e,
+                escalated_from_reload,
+            }
         }
     }
 }
@@ -1607,30 +1743,36 @@ fn report_recovery_wedge(refused: RecoveryReason, in_flight_ms: u64) {
     );
 }
 
-/// Verdict of the post-recreate pong watch.
+/// Verdict of a post-rung pong watch (reload or recreate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecreatePongVerdict {
-    /// A pong stamped strictly after the recreate landed — the rebuilt webview
-    /// is demonstrably running a UI.
+pub enum RungPongVerdict {
+    /// A main-window pong stamped strictly after the rung landed — the main
+    /// webview is demonstrably running a UI again.
     Live,
     /// No qualifying pong yet, and the deadline has not passed: keep waiting.
-    /// Only [`classify_recreate_pong`] returns this; the watch loop resolves it.
+    /// Only [`classify_rung_pong`] returns this; the watch loop resolves it.
     Waiting,
-    /// The deadline passed with no pong after the recreate.
+    /// The deadline passed with no pong after the rung.
     NoPong,
     /// The pong stamp could not be read in this process. UNKNOWN — never a
     /// failure. Only the watch loop returns this.
     Unverifiable,
 }
 
-/// Did the recreate produce a live UI? Pure, so it is testable without an
-/// `AppHandle` (there is no way to build one in a unit test — see
-/// `server_mode_makes_recovery_inert`).
+/// Did the rung (a reload or a recreate) produce a live main-window UI? Pure,
+/// so it is testable without an `AppHandle` (there is no way to build one in a
+/// unit test — see `server_mode_makes_recovery_inert`).
 ///
-/// # Recreate-scoped, and why that matters
+/// `last_pong_ms` is `AppState::ui_bridge_last_pong`, which only a pong
+/// labeled with the MAIN window's label advances
+/// (`crate::ui_error::ingest_window_pong`). That scoping is load-bearing here:
+/// before it, a live pop-out terminal window's pong verified a rung that had
+/// left the main window dead.
 ///
-/// The predicate is `last_pong_ms > recreate_done_ms` — **strictly** after. A
-/// pong from before the `destroy()` proves nothing about the window that
+/// # Rung-scoped, and why that matters
+///
+/// The predicate is `last_pong_ms > rung_done_ms` — **strictly** after. A pong
+/// from before the rung proves nothing about the page (or window) that
 /// replaced it, and a `>=` would let one land on the same millisecond boundary.
 ///
 /// This is deliberately NOT a relaxation of the global `last_pong > 0` guard in
@@ -1639,56 +1781,125 @@ pub enum RecreatePongVerdict {
 /// runner's boot window from reading as dead, and
 /// `ui_stale_never_seen_is_not_stale_headless_server_mode_guard` pins it. Here,
 /// `last_pong_ms == 0` simply fails the strict comparison like any other stamp
-/// older than the recreate: it waits, and then reports `NoPong`. That is the
-/// honest answer in this scope only, because reaching it means a window was
-/// just rebuilt in a process that is not in server mode (hard gate 1 of
+/// older than the rung: it waits, and then reports `NoPong`. That is the
+/// honest answer in this scope only, because reaching it means a rung was just
+/// run in a process that is not in server mode (hard gate 1 of
 /// [`trigger_ui_recovery`]) and that had a recorded [`MainWindowSpec`]
 /// (hard gate 2).
 ///
 /// `elapsed_ms` is measured on the MONOTONIC clock ([`latch_now_ms`]), not from
 /// two wall-clock reads: an NTP step backwards during the watch would otherwise
 /// saturate the age to 0 and wait forever.
-pub fn classify_recreate_pong(
+pub fn classify_rung_pong(
     last_pong_ms: u64,
-    recreate_done_ms: u64,
+    rung_done_ms: u64,
     elapsed_ms: u64,
     deadline_ms: u64,
-) -> RecreatePongVerdict {
-    if last_pong_ms > recreate_done_ms {
-        return RecreatePongVerdict::Live;
+) -> RungPongVerdict {
+    if last_pong_ms > rung_done_ms {
+        return RungPongVerdict::Live;
     }
     if elapsed_ms >= deadline_ms {
-        return RecreatePongVerdict::NoPong;
+        return RungPongVerdict::NoPong;
     }
-    RecreatePongVerdict::Waiting
+    RungPongVerdict::Waiting
 }
 
-/// Watch `ui_bridge_last_pong` for [`RECREATE_PONG_DEADLINE_MS`] and settle
-/// [`classify_recreate_pong`].
+/// How a post-rung pong watch ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RungWatch {
+    /// [`classify_rung_pong`] settled (never `Waiting`), or the stamp was
+    /// unreadable (`Unverifiable`).
+    Settled(RungPongVerdict),
+    /// The watch's abort source reported hard evidence the rung failed before
+    /// the deadline — for the reload rung, WebView2 refusing the `Reload()`.
+    Aborted(String),
+}
+
+/// Watch `ui_bridge_last_pong` (MAIN-window pongs only) for `deadline_ms` and
+/// settle [`classify_rung_pong`] against `rung_done_ms`.
 ///
-/// Runs inside the recovery latch, which is accounted for: the bounded cost of
-/// this wait is one of the four terms in [`RECOVERY_WEDGE_AFTER_MS`].
-async fn verify_recreate_took(
+/// `abort` is polled on every tick the verdict is still `Waiting`; `Some`
+/// ends the watch early with that detail, so a rung that has provably failed
+/// does not sit out its whole deadline before escalating.
+///
+/// Runs inside the recovery latch, which is accounted for: each rung's
+/// deadline is its own term in [`RECOVERY_WEDGE_AFTER_MS`].
+async fn watch_for_main_pong(
     app: &tauri::AppHandle,
-    recreate_done_ms: u64,
-) -> RecreatePongVerdict {
+    rung_done_ms: u64,
+    deadline_ms: u64,
+    mut abort: impl FnMut() -> Option<String>,
+) -> RungWatch {
     let Some(last_pong) = ui_bridge_last_pong(app) else {
-        return RecreatePongVerdict::Unverifiable;
+        return RungWatch::Settled(RungPongVerdict::Unverifiable);
     };
     let started_ms = latch_now_ms();
     loop {
-        match classify_recreate_pong(
+        match classify_rung_pong(
             last_pong.load(Ordering::Relaxed),
-            recreate_done_ms,
+            rung_done_ms,
             latch_now_ms().saturating_sub(started_ms),
-            RECREATE_PONG_DEADLINE_MS,
+            deadline_ms,
         ) {
-            RecreatePongVerdict::Waiting => {
-                tokio::time::sleep(std::time::Duration::from_millis(RECREATE_PONG_POLL_MS)).await;
+            RungPongVerdict::Waiting => {
+                if let Some(detail) = abort() {
+                    return RungWatch::Aborted(detail);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(RUNG_PONG_POLL_MS)).await;
             }
-            settled => return settled,
+            settled => return RungWatch::Settled(settled),
         }
     }
+}
+
+/// What WebView2's answer to a dispatched `Reload()` means for the watch.
+///
+/// Pure over the `try_recv` result so every arm is testable without a webview.
+/// `(abort_detail, stop_polling)`: `stop_polling` is true once an answer has
+/// been consumed — a oneshot receiver reads `Closed` after its value is taken,
+/// which must not then be misread as "dropped unrun".
+fn reload_acceptance_signal(
+    polled: Result<Result<(), String>, tokio::sync::oneshot::error::TryRecvError>,
+) -> (Option<String>, bool) {
+    use tokio::sync::oneshot::error::TryRecvError;
+    match polled {
+        // Not run yet — keep watching.
+        Err(TryRecvError::Empty) => (None, false),
+        // Accepted: stop polling and let the pong decide.
+        Ok(Ok(())) => (None, true),
+        Ok(Err(detail)) => (Some(detail), true),
+        Err(TryRecvError::Closed) => (Some(RELOAD_DROPPED_UNRUN.to_string()), true),
+    }
+}
+
+/// The detail recorded when the dispatched reload closure was dropped without
+/// ever running (its sender went away unsent).
+const RELOAD_DROPPED_UNRUN: &str =
+    "the reload closure was dropped without running — the webview never executed it";
+
+/// [`watch_for_main_pong`] for the reload rung, with WebView2's own answer to
+/// the `Reload()` call as the abort source.
+async fn verify_reload_took(
+    app: &tauri::AppHandle,
+    reload_dispatched_ms: u64,
+    dispatch: ReloadDispatch,
+) -> RungWatch {
+    let mut accepted = dispatch.accepted;
+    watch_for_main_pong(
+        app,
+        reload_dispatched_ms,
+        RELOAD_PONG_DEADLINE_MS,
+        move || {
+            let rx = accepted.as_mut()?;
+            let (abort, stop_polling) = reload_acceptance_signal(rx.try_recv());
+            if stop_polling {
+                accepted = None;
+            }
+            abort
+        },
+    )
+    .await
 }
 
 /// The `ui_bridge_last_pong` stamp, or `None` when this process has no managed
@@ -1716,15 +1927,99 @@ impl Drop for InProgressGuard {
     }
 }
 
-fn reload_main_webview(app: &tauri::AppHandle) -> Result<(), String> {
+/// A reload that has been dispatched to the main webview.
+///
+/// `accepted` resolves once WebView2 has run the `Reload()` call on its UI
+/// thread: `Ok` = accepted (NOT "the page is back" — only a pong says that),
+/// `Err` = refused. `None` off Windows, where the `eval` fallback has no such
+/// answer.
+pub struct ReloadDispatch {
+    accepted: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+}
+
+impl ReloadDispatch {
+    /// Wait up to `timeout` for WebView2's answer to the `Reload()` call.
+    ///
+    /// `Ok(Some(()))` = accepted; `Ok(None)` = no answer inside `timeout` (the
+    /// UI thread has not run it yet — UNKNOWN, not a refusal) or no answer
+    /// exists on this platform; `Err` = refused, or the dispatch was dropped
+    /// unrun.
+    pub async fn accepted_within(self, timeout: std::time::Duration) -> Result<Option<()>, String> {
+        let Some(rx) = self.accepted else {
+            return Ok(None);
+        };
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(()))) => Ok(Some(())),
+            Ok(Ok(Err(detail))) => Err(detail),
+            Ok(Err(_)) => Err(RELOAD_DROPPED_UNRUN.to_string()),
+            Err(_) => Ok(None),
+        }
+    }
+}
+
+/// Reload the main webview in place — the recovery ladder's rung 1, and the
+/// body of the `ui_bridge_reload_webview` command.
+///
+/// On Windows this is the native `ICoreWebView2::Reload()`, dispatched onto the
+/// WebView2 UI thread through `with_webview` — the recovery the WebView2 docs
+/// prescribe for `RENDER_PROCESS_EXITED`, and what the sad-tab page's own
+/// Refresh button does. The `window.eval("location.reload()")` it replaces is
+/// `ExecuteScript` into the main frame, which after a render-process crash
+/// holds Chromium's error page: the injected script does not reload the app
+/// (measured 2026-09-18 — `POST /ui/recover` answered `reloaded` and the UI
+/// Bridge still timed out). Off Windows `eval` remains the only lever.
+///
+/// `Ok` means DISPATCHED. `with_webview` is asynchronous, so WebView2's answer
+/// arrives on [`ReloadDispatch`]; and even an accepted reload proves nothing
+/// until the reloaded page pongs — which is why [`trigger_ui_recovery`]
+/// verifies it. `Err` (no main window, a dispatch error) is hard evidence.
+pub fn reload_main_webview(app: &tauri::AppHandle) -> Result<ReloadDispatch, String> {
     use tauri::Manager;
     let label = qontinui_runner_lib::get_main_window_label();
     let window = app
         .get_webview_window(label)
         .ok_or_else(|| format!("main window '{label}' not found"))?;
+    dispatch_reload(&window)
+}
+
+#[cfg(windows)]
+fn dispatch_reload(window: &tauri::WebviewWindow) -> Result<ReloadDispatch, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    window
+        .with_webview(move |wv| {
+            // SAFETY: two COM calls into WebView2 — `CoreWebView2()` (an
+            // out-param getter on the controller) and `Reload()` (a no-argument
+            // method). `with_webview` runs this closure on the WebView2 UI
+            // thread, which is the thread these objects belong to, and the
+            // controller is kept alive by the `PlatformWebview` for the whole
+            // closure. Same plumbing and same `windows 0.61` type family as
+            // `attach_process_failed` (the webview2-com re-exports), obtained
+            // the same way: `wv.controller().CoreWebView2()`.
+            let result: Result<(), String> = (|| unsafe {
+                let core = wv
+                    .controller()
+                    .CoreWebView2()
+                    .map_err(|e| format!("CoreWebView2(): {e}"))?;
+                core.Reload()
+                    .map_err(|e| format!("ICoreWebView2::Reload(): {e}"))
+            })();
+            if let Err(e) = &result {
+                warn!(error = %e, "UI reload: WebView2 refused the native reload");
+            }
+            // The receiver may already be gone (the caller stopped watching);
+            // the log line above is the record in that case.
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("with_webview (native reload dispatch): {e}"))?;
+    Ok(ReloadDispatch { accepted: Some(rx) })
+}
+
+#[cfg(not(windows))]
+fn dispatch_reload(window: &tauri::WebviewWindow) -> Result<ReloadDispatch, String> {
     window
         .eval("location.reload()")
-        .map_err(|e| format!("eval(location.reload()): {e}"))
+        .map_err(|e| format!("eval(location.reload()): {e}"))?;
+    Ok(ReloadDispatch { accepted: None })
 }
 
 /// Destroy the (dead) main window and rebuild it from the recorded
@@ -2227,14 +2522,247 @@ mod tests {
 
     #[test]
     fn render_process_failures_try_reload_first_then_escalate() {
+        // The rung a run STARTS on. Attempt 0 is the (now native, pong-verified)
+        // reload; an unverified reload escalates to recreate inside that same
+        // call (`trigger_ui_recovery`), so escalation no longer waits on a
+        // second `ProcessFailed` a render-process crash never raises. The
+        // attempt >= 1 → Recreate branch stays for the heartbeat backstop and
+        // manual pokes re-entering the same incident.
         for kind in [
             ProcessFailureKind::RenderExited,
             ProcessFailureKind::RenderUnresponsive,
         ] {
             let reason = RecoveryReason::ProcessFailed(kind);
             assert_eq!(plan_action(reason, 0), RecoveryAction::Reload, "{kind:?}");
-            assert_eq!(plan_action(reason, 1), RecoveryAction::Recreate, "{kind:?}");
+            for attempt in 1..MAX_RECOVERY_ATTEMPTS + 2 {
+                assert_eq!(
+                    plan_action(reason, attempt),
+                    RecoveryAction::Recreate,
+                    "{kind:?} attempt {attempt}"
+                );
+            }
         }
+    }
+
+    // ── Phase 2 (2026-09-19 plan): the reload rung is verified ──────────
+
+    /// A reload that finished dispatching at `T0`.
+    const RELOAD_DISPATCHED: u64 = T0;
+
+    #[test]
+    fn the_reload_rung_is_verified_by_the_same_rung_scoped_classifier() {
+        // Generalised, not copied: the reload watch uses `classify_rung_pong`
+        // with its own deadline.
+        assert_eq!(
+            classify_rung_pong(
+                RELOAD_DISPATCHED + 1,
+                RELOAD_DISPATCHED,
+                0,
+                RELOAD_PONG_DEADLINE_MS
+            ),
+            RungPongVerdict::Live
+        );
+        // A pong from the page the reload replaced (or the crashed renderer's
+        // last one) proves nothing — strictly after, as for recreate.
+        for stale in [0, RELOAD_DISPATCHED - 1, RELOAD_DISPATCHED] {
+            assert_eq!(
+                classify_rung_pong(stale, RELOAD_DISPATCHED, 0, RELOAD_PONG_DEADLINE_MS),
+                RungPongVerdict::Waiting
+            );
+            assert_eq!(
+                classify_rung_pong(
+                    stale,
+                    RELOAD_DISPATCHED,
+                    RELOAD_PONG_DEADLINE_MS,
+                    RELOAD_PONG_DEADLINE_MS
+                ),
+                RungPongVerdict::NoPong,
+                "no pong by the reload deadline must escalate, never read as reloaded"
+            );
+        }
+    }
+
+    /// Plan step 3: a NON-main pong landing after the rung instant must not
+    /// verify it. `ui_bridge_last_pong` is main-scoped at its only writer, so
+    /// a pop-out's pong never reaches the stamp the classifier reads.
+    #[test]
+    fn a_non_main_pong_after_the_rung_yields_no_pong() {
+        let rung_done = 1_000_000;
+        let last_pong = AtomicU64::new(rung_done - 500);
+        for deadline in [RECREATE_PONG_DEADLINE_MS, RELOAD_PONG_DEADLINE_MS] {
+            // A pop-out (and an unlabeled caller) ponging after the rung.
+            crate::ui_error::ingest_window_pong_at(
+                &last_pong,
+                Some("terminal-1"),
+                true,
+                "main",
+                rung_done + 10,
+            );
+            crate::ui_error::ingest_window_pong_at(&last_pong, None, false, "main", rung_done + 20);
+            assert_eq!(
+                classify_rung_pong(
+                    last_pong.load(Ordering::Relaxed),
+                    rung_done,
+                    deadline,
+                    deadline
+                ),
+                RungPongVerdict::NoPong,
+                "a pop-out pong must not verify a rung that left the main window dead"
+            );
+        }
+        // …and the main window's own pong does.
+        crate::ui_error::ingest_window_pong_at(
+            &last_pong,
+            Some("main"),
+            false,
+            "main",
+            rung_done + 30,
+        );
+        assert_eq!(
+            classify_rung_pong(
+                last_pong.load(Ordering::Relaxed),
+                rung_done,
+                0,
+                RELOAD_PONG_DEADLINE_MS
+            ),
+            RungPongVerdict::Live
+        );
+    }
+
+    #[test]
+    fn reload_acceptance_signal_reads_every_webview2_answer() {
+        use tokio::sync::oneshot::error::TryRecvError;
+        // Not run yet: keep watching, keep polling.
+        assert_eq!(
+            reload_acceptance_signal(Err(TryRecvError::Empty)),
+            (None, false)
+        );
+        // Accepted: no abort (the pong decides), and stop polling — a consumed
+        // receiver reads `Closed` next, which must not become a false refusal.
+        assert_eq!(reload_acceptance_signal(Ok(Ok(()))), (None, true));
+        // Refused on the UI thread: abort with WebView2's own words.
+        assert_eq!(
+            reload_acceptance_signal(Ok(Err("Reload(): E_FAIL".to_string()))),
+            (Some("Reload(): E_FAIL".to_string()), true)
+        );
+        // Dropped unrun: hard evidence too.
+        assert_eq!(
+            reload_acceptance_signal(Err(TryRecvError::Closed)),
+            (Some(RELOAD_DROPPED_UNRUN.to_string()), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_dispatch_acceptance_is_waited_for_and_classified() {
+        let accepted = |r: Option<Result<(), String>>| {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if let Some(r) = r {
+                tx.send(r).unwrap();
+            } else {
+                drop(tx);
+            }
+            ReloadDispatch { accepted: Some(rx) }
+        };
+        let t = std::time::Duration::from_millis(50);
+        assert_eq!(
+            accepted(Some(Ok(()))).accepted_within(t).await,
+            Ok(Some(()))
+        );
+        assert_eq!(
+            accepted(Some(Err("nope".to_string())))
+                .accepted_within(t)
+                .await,
+            Err("nope".to_string())
+        );
+        assert_eq!(
+            accepted(None).accepted_within(t).await,
+            Err(RELOAD_DROPPED_UNRUN.to_string())
+        );
+        // No answer inside the timeout is UNKNOWN, not a refusal.
+        let (_tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+        assert_eq!(
+            ReloadDispatch { accepted: Some(rx) }
+                .accepted_within(t)
+                .await,
+            Ok(None)
+        );
+        // The eval fallback has no answer to wait for.
+        assert_eq!(
+            ReloadDispatch { accepted: None }.accepted_within(t).await,
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn the_outcome_distinguishes_a_verified_reload_from_an_escalated_one() {
+        // "reload dispatched and UI ponged"
+        let reloaded = serde_json::to_value(RecoveryOutcome::Reloaded { verified: true }).unwrap();
+        assert_eq!(reloaded["outcome"], "reloaded");
+        assert_eq!(reloaded["verified"], true);
+
+        // "reload dispatched, no pong, escalated" — the recreate's outcome
+        // names the reload that did not take.
+        let escalated = serde_json::to_value(RecoveryOutcome::Recreated {
+            escalated_from_reload: Some(ReloadEscalation::NoPong {
+                deadline_ms: RELOAD_PONG_DEADLINE_MS,
+            }),
+        })
+        .unwrap();
+        assert_eq!(escalated["outcome"], "recreated");
+        assert_eq!(escalated["escalated_from_reload"]["why"], "no_pong");
+        assert_eq!(
+            escalated["escalated_from_reload"]["deadline_ms"],
+            RELOAD_PONG_DEADLINE_MS
+        );
+
+        // A run that PLANNED recreate says so with an explicit null, not an
+        // absent key a reader could mistake for an older build.
+        let planned = serde_json::to_value(RecoveryOutcome::Recreated {
+            escalated_from_reload: None,
+        })
+        .unwrap();
+        assert!(planned["escalated_from_reload"].is_null());
+        assert!(planned
+            .as_object()
+            .unwrap()
+            .contains_key("escalated_from_reload"));
+
+        // Every escalation reason has its own stable tag, and a failed
+        // recreate after a refused reload carries both facts.
+        let failed = serde_json::to_value(RecoveryOutcome::Failed {
+            detail: "rebuilt blank".to_string(),
+            escalated_from_reload: Some(ReloadEscalation::Refused {
+                detail: "Reload(): E_FAIL".to_string(),
+            }),
+        })
+        .unwrap();
+        assert_eq!(failed["outcome"], "failed");
+        assert_eq!(failed["escalated_from_reload"]["why"], "refused");
+        let dispatch = serde_json::to_value(ReloadEscalation::DispatchFailed {
+            detail: "main window 'main' not found".to_string(),
+        })
+        .unwrap();
+        assert_eq!(dispatch["why"], "dispatch_failed");
+    }
+
+    #[test]
+    fn recover_ui_response_flattens_the_escalation_onto_the_wire() {
+        // `/ui/recover` is where an operator reads it; the flatten must carry
+        // the new fields rather than swallowing them.
+        let resp = RecoverUiResponse {
+            reason: RecoveryReason::Manual.as_str(),
+            result: RecoveryOutcome::Recreated {
+                escalated_from_reload: Some(ReloadEscalation::NoPong { deadline_ms: 7 }),
+            },
+            attempts: 1,
+            exhausted: false,
+            server_mode: false,
+            ui_recovery: classify_latch(None),
+            window_swap: classify_latch(None),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["outcome"], "recreated");
+        assert_eq!(json["escalated_from_reload"]["why"], "no_pong");
     }
 
     #[test]
@@ -2748,12 +3276,15 @@ mod tests {
         // These strings reach logs, `/ui/recover` and the breadcrumb grep.
         let all = [
             RecoveryOutcome::Skipped { why: "server_mode" },
-            RecoveryOutcome::Reloaded,
-            RecoveryOutcome::Recreated,
+            RecoveryOutcome::Reloaded { verified: true },
+            RecoveryOutcome::Recreated {
+                escalated_from_reload: None,
+            },
             RecoveryOutcome::Exhausted { attempts: 3 },
             RecoveryOutcome::Wedged { in_flight_ms: 1 },
             RecoveryOutcome::Failed {
                 detail: "x".to_string(),
+                escalated_from_reload: None,
             },
         ];
         for (i, a) in all.iter().enumerate() {
@@ -2773,7 +3304,13 @@ mod tests {
         // reported wedges (or the reverse).
 
         // The bounded costs a single healthy run can pay, summed.
+        //
+        // The worst healthy run starts on the reload rung, sits out the whole
+        // reload pong watch, escalates IN THE SAME CALL, and then pays every
+        // recreate cost — so the reload deadline is a term of its own, not
+        // absorbed into any other.
         let bounded = RECOVERY_BACKOFF_MAX_MS      // longest single-run backoff
+            + RELOAD_PONG_DEADLINE_MS              // post-reload pong watch, then escalate
             + WINDOW_LABEL_RELEASE_TIMEOUT_MS      // label-release poll
             + RECREATE_PONG_DEADLINE_MS; // post-recreate pong watch
         assert!(
@@ -2804,6 +3341,11 @@ mod tests {
             crate::ui_error::UI_STALE_AFTER_MS
         );
         assert!(RECREATE_PONG_DEADLINE_MS < crate::ui_error::UI_DEAD_AFTER_MS);
+        // Same for the reload watch — and it must stay under the dead rung,
+        // or the heartbeat backstop would fire a SECOND trigger into an
+        // incident whose first run is still waiting on its reload.
+        assert_eq!(RELOAD_PONG_DEADLINE_MS, crate::ui_error::UI_STALE_AFTER_MS);
+        assert!(RELOAD_PONG_DEADLINE_MS < crate::ui_error::UI_DEAD_AFTER_MS);
     }
 
     // ── Phase 2: did the recreate actually produce a live UI? ───────────
@@ -2814,22 +3356,22 @@ mod tests {
     #[test]
     fn a_pong_after_the_recreate_proves_the_rebuilt_ui_is_live() {
         assert_eq!(
-            classify_recreate_pong(
+            classify_rung_pong(
                 RECREATE_DONE + 1,
                 RECREATE_DONE,
                 0,
                 RECREATE_PONG_DEADLINE_MS
             ),
-            RecreatePongVerdict::Live
+            RungPongVerdict::Live
         );
         assert_eq!(
-            classify_recreate_pong(
+            classify_rung_pong(
                 RECREATE_DONE + 4_000,
                 RECREATE_DONE,
                 4_100,
                 RECREATE_PONG_DEADLINE_MS
             ),
-            RecreatePongVerdict::Live
+            RungPongVerdict::Live
         );
     }
 
@@ -2840,18 +3382,18 @@ mod tests {
         // not credited.
         for stale in [0, 1, RECREATE_DONE - 1, RECREATE_DONE] {
             assert_eq!(
-                classify_recreate_pong(stale, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
-                RecreatePongVerdict::Waiting,
+                classify_rung_pong(stale, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
+                RungPongVerdict::Waiting,
                 "last_pong {stale} must not count as proof of the rebuilt window"
             );
             assert_eq!(
-                classify_recreate_pong(
+                classify_rung_pong(
                     stale,
                     RECREATE_DONE,
                     RECREATE_PONG_DEADLINE_MS,
                     RECREATE_PONG_DEADLINE_MS
                 ),
-                RecreatePongVerdict::NoPong,
+                RungPongVerdict::NoPong,
                 "last_pong {stale} at the deadline is a failed recreate"
             );
         }
@@ -2861,8 +3403,8 @@ mod tests {
     fn the_recreate_watch_waits_out_its_deadline_before_failing() {
         for elapsed in [0, 1, RECREATE_PONG_DEADLINE_MS - 1] {
             assert_eq!(
-                classify_recreate_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
-                RecreatePongVerdict::Waiting,
+                classify_rung_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
+                RungPongVerdict::Waiting,
                 "elapsed {elapsed}"
             );
         }
@@ -2872,8 +3414,8 @@ mod tests {
             u64::MAX,
         ] {
             assert_eq!(
-                classify_recreate_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
-                RecreatePongVerdict::NoPong,
+                classify_rung_pong(0, RECREATE_DONE, elapsed, RECREATE_PONG_DEADLINE_MS),
+                RungPongVerdict::NoPong,
                 "elapsed {elapsed}"
             );
         }
@@ -2908,17 +3450,17 @@ mod tests {
         // (hard gates 1 and 2 of `trigger_ui_recovery`) — never from staleness
         // alone, and never before its own deadline.
         assert_eq!(
-            classify_recreate_pong(0, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
-            RecreatePongVerdict::Waiting
+            classify_rung_pong(0, RECREATE_DONE, 0, RECREATE_PONG_DEADLINE_MS),
+            RungPongVerdict::Waiting
         );
         assert_eq!(
-            classify_recreate_pong(
+            classify_rung_pong(
                 0,
                 RECREATE_DONE,
                 RECREATE_PONG_DEADLINE_MS,
                 RECREATE_PONG_DEADLINE_MS
             ),
-            RecreatePongVerdict::NoPong
+            RungPongVerdict::NoPong
         );
         // A server-mode runner cannot reach this code at all: gate 1 returns
         // first, and under `cargo test` gate 2 does.
@@ -2934,8 +3476,15 @@ mod tests {
         // would report success over a blank window forever.
         let failed = RecoveryOutcome::Failed {
             detail: "no pong".to_string(),
+            escalated_from_reload: None,
         };
-        assert_ne!(failed.as_str(), RecoveryOutcome::Recreated.as_str());
+        assert_ne!(
+            failed.as_str(),
+            RecoveryOutcome::Recreated {
+                escalated_from_reload: None
+            }
+            .as_str()
+        );
         // Recreate is the rung a repeat trigger lands on, so the escalation is
         // real rather than nominal.
         assert_eq!(
