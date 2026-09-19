@@ -34,10 +34,11 @@
 # processes created since the launch are listed by name, pid and creation time
 # -- that listing is the diagnostic for the next hang, and it prints on the
 # happy path too, so a quiet run is evidence rather than silence -- and the
-# product images among them (`qontinui-runner.exe`, `Qontinui Runner.exe`) are
-# stopped so the NEXT leg boots on a clean box. Only those two names, never a
-# tree flag, never `node` or `powershell`: this runs on an ephemeral hosted
-# image and nowhere else.
+# product image among them (`qontinui-runner.exe` -- the dev build and the
+# installed build share it, since Tauri 2 keeps the cargo binary name) is
+# stopped so the NEXT leg boots on a clean box. Only that name, never a tree
+# flag, never `node` or `powershell`: this runs on an ephemeral hosted image
+# and nowhere else.
 #
 # The exit code is the 5.1 script's own (`exit N` under `-File` is the host's
 # exit code, and `cmd /c` returns its last command's), so a step's
@@ -159,7 +160,7 @@ if ($survivors.Count -eq 0) {
     # supervisor restart of the primary, and neither is this script's to stop.
     # The listing above is printed everywhere; the stop needs the CI marker.
     if ($env:GITHUB_ACTIONS -eq 'true') {
-        foreach ($s in @($survivors | Where-Object { $_.Name -in @('qontinui-runner.exe', 'Qontinui Runner.exe') })) {
+        foreach ($s in @($survivors | Where-Object { $_.Name -eq 'qontinui-runner.exe' })) {
             Write-Host "  stopping product image pid $($s.ProcessId) ($($s.Name))"
             Stop-Process -Id $s.ProcessId -Force -ErrorAction SilentlyContinue
         }

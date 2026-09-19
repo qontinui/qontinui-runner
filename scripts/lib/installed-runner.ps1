@@ -12,15 +12,26 @@
 # BOTH legs enforce it identically. Two copies would be two conventions, and the
 # weaker one would decide what the parity report says.
 #
-# The published artifact is NOT named like the dev binary:
+# The published artifact has the SAME leaf name as the dev binary, and a
+# different PARENT:
 #
-#   dev build        target/debug/qontinui-runner.exe
-#                      <- the cargo package name (default-run = "qontinui-runner")
-#   published build  "<install dir>/Qontinui Runner.exe"
-#                      <- tauri.conf.json productName "Qontinui Runner", with NO
-#                         mainBinaryName override to rename it back
+#   dev build        <checkout>/target/debug/qontinui-runner.exe
+#   published build  "<install dir>/Qontinui Runner/qontinui-runner.exe"
+#                      <- install dir from tauri.conf.json productName
+#                         "Qontinui Runner"; exe from the cargo package name,
+#                         because Tauri 2 "uses the output binary from cargo"
+#                         unless mainBinaryName overrides it (tauri-utils 2.9.2,
+#                         Config.main_binary_name), and this repo sets none.
 #
-# THE INSTALLED NAME CONTAINS A SPACE. Every path this script hands to
+# Until 2026-09-19 this file said the installed exe was "Qontinui Runner.exe"
+# -- a Tauri 1 rule (productName renamed the binary) that nothing had measured.
+# The v1.0.11 installer, listed with `7z l Qontinui.Runner_1.0.11_x64-setup.exe`,
+# carries ONE main binary and it is `qontinui-runner.exe` (320 MB); no file
+# named "Qontinui Runner.exe" exists in it. Parity run 35429143803 had already
+# shown the shape: `%LOCALAPPDATA%\Qontinui Runner` created by the installer,
+# and every probe for "Qontinui Runner.exe" inside it refused.
+#
+# THE INSTALL DIRECTORY CONTAINS A SPACE. Every path this script hands to
 # Test-Path / Resolve-Path / Start-Process travels as a single argument
 # (-LiteralPath / -FilePath) and is never spliced into a command string, so the
 # space needs no quoting -- but any new call site must keep that property.
@@ -36,21 +47,26 @@
 # THIS FUNCTION MUST NEVER FALL BACK TO A DEV BINARY. A parity harness that
 # failed to find the installed exe and quietly re-ran target/debug would compare
 # the dev build against itself and report PERFECT PARITY -- which is precisely
-# the blindness the published-build parity gate exists to end. That is made
-# structural rather than conventional:
+# the blindness the published-build parity gate exists to end. The leaf name
+# cannot carry that property any more (both builds are qontinui-runner.exe),
+# so it is carried by the PARENT DIRECTORY, structurally:
 #
-#   1. Every candidate this function builds ends in $InstalledExeName. The
-#      string "qontinui-runner.exe" does not appear in any of them, and the
-#      function has no reference to $DirectExe or to a build directory, so
-#      there is no expression by which it could return the dev binary.
-#   2. Assert-InstalledRunnerExe re-checks the leaf name AND refuses any path
-#      under a cargo build dir (target/debug, target/release) even when the
-#      caller pointed -InstallRoot straight at one.
-#   3. On no match it THROWS, naming every path it probed. There is no return
+#   1. Every candidate this function builds is `<base>\$InstalledDirName\
+#      $InstalledExeName` -- the exe directly inside a directory named after
+#      the product. The function has no reference to $DirectExe or to a build
+#      directory, so there is no expression by which it could return the dev
+#      binary; a checkout's target/debug is not named "Qontinui Runner".
+#   2. Assert-InstalledRunnerExe re-checks the leaf name, REQUIRES the parent
+#      directory's leaf to be $InstalledDirName, and refuses any path under a
+#      cargo build dir (target/debug, target/release) even when the caller
+#      pointed -InstallRoot straight at one.
+#   3. On no match it THROWS, naming every path it probed and listing what the
+#      install directory actually holds when it exists, so the next rename is
+#      measured on the first run rather than guessed at. There is no return
 #      path that yields $null, so a caller cannot mistake "not found" for a
 #      usable exe.
 # ---------------------------------------------------------------------------
-$InstalledExeName = 'Qontinui Runner.exe'
+$InstalledExeName = 'qontinui-runner.exe'
 $InstalledDirName = 'Qontinui Runner'
 
 function Assert-InstalledRunnerExe {
@@ -58,9 +74,16 @@ function Assert-InstalledRunnerExe {
 
     $leaf = Split-Path -Leaf $Path
     if ($leaf -ne $InstalledExeName) {
-        throw ("Refusing '$Path': the installed runner is named '$InstalledExeName', not '$leaf'. " +
-               "The published-build parity leg must never run the dev binary -- that would compare " +
-               "the dev build against itself and report perfect parity.")
+        throw ("Refusing '$Path': the installed runner is named '$InstalledExeName', not '$leaf'.")
+    }
+    # The parent directory is what separates the installed exe from the dev one
+    # now that both are qontinui-runner.exe.
+    $parentLeaf = Split-Path -Leaf (Split-Path -Parent $Path)
+    if ($parentLeaf -ne $InstalledDirName) {
+        throw ("Refusing '$Path': the installed runner lives directly under a '$InstalledDirName' " +
+               "directory, and this one is under '$parentLeaf'. The published-build parity leg must " +
+               "never run the dev binary -- that would compare the dev build against itself and " +
+               "report perfect parity.")
     }
     # Normalize separators so the build-dir guard is not defeated by forward slashes.
     $norm = ($Path -replace '/', '\')
@@ -78,6 +101,8 @@ function Find-InstalledRunnerExe {
 
     if ($InstallRoot) {
         # An explicit root may name the install DIRECTORY or the exe itself.
+        # Either shape still has to pass Assert-InstalledRunnerExe's parent-dir
+        # check, so an explicit root cannot smuggle target/debug in.
         if ($InstallRoot -like '*.exe') {
             $candidates.Add($InstallRoot)
         } else {
@@ -114,6 +139,16 @@ function Find-InstalledRunnerExe {
     $lines += "Probed, in order:"
     foreach ($c in $candidates) { $lines += "  $c" }
     foreach ($n in $notes) { $lines += $n }
+    # An install directory that exists without the exe is the measurement the
+    # next rename needs: say what is actually in it.
+    foreach ($dir in @($candidates | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)) {
+        if ((Split-Path -Leaf $dir) -eq $InstalledDirName -and (Test-Path -LiteralPath $dir -PathType Container)) {
+            $lines += "Directory '$dir' EXISTS; its top-level entries:"
+            foreach ($e in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+                $lines += ("  {0}{1}" -f $e.Name, $(if ($e.PSIsContainer) { '\' } else { '' }))
+            }
+        }
+    }
     $lines += ""
     $lines += "Install the published bundle first, or pass -InstallRoot <dir> naming the"
     $lines += "directory the installer wrote '$InstalledExeName' into."

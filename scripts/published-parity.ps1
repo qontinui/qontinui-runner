@@ -109,7 +109,7 @@
 # build compares it against itself and reports PERFECT PARITY -- the exact
 # blindness this plan exists to end. That is made structural, not conventional,
 # by reusing Phase 6's locator verbatim (scripts/lib/installed-runner.ps1):
-# every candidate it builds ends in 'Qontinui Runner.exe', it refuses any path
+# every candidate it builds sits directly under a 'Qontinui Runner' install directory, it refuses any path
 # under target\debug or target\release, and it has NO null-returning path -- on
 # no match it THROWS, naming every path probed. This script adds nothing of its
 # own that could reach a build directory: $DevExe and $PublishedExe are resolved
@@ -286,7 +286,7 @@ function Stop-ParityProcessTree {
 function Start-ParityRunner {
     param([string]$ExePath, [int]$Port, [string]$Label)
 
-    # -LiteralPath: the published exe is "Qontinui Runner.exe" under
+    # -LiteralPath: the published exe is "qontinui-runner.exe" under
     # "...\Qontinui Runner\". The space is harmless, but a wildcard
     # metacharacter in a user-controlled install dir would make -Path glob.
     $resolved = (Resolve-Path -LiteralPath $ExePath -ErrorAction Stop).Path
