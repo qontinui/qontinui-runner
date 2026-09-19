@@ -357,8 +357,9 @@ static STRUCK_PHASE_TITLE: Lazy<Regex> =
 /// `(optional, later)`); declaring one would leave coord a phase that can
 /// never be covered. Arm A — an explicit `Phase N` heading — is NOT filtered:
 /// that is the author naming a phase, and whether it was deferred is its
-/// delivery state, not whether it exists (filtering it too dropped
-/// currently-declared phases in 73 of 1792 corpus plans, measured 2026-09-19).
+/// delivery state, not whether it exists (filtering headings too removed
+/// currently-declared phases from dozens of corpus plans, because these words
+/// also occur in ordinary phase titles).
 static NOT_DELIVERED_MARKER: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)not scheduled|not this plan|not built|not needed|\(defer|\bdeferred\b|\bdelegated\b|\bdropped\b|\bwithdrawn\b|\bsplit (?:out|to|into)\b|follow-?up plan|separate plan|\bits own plan\b|\bown plan, own vet\b|\bdischarged\b|\bmoot\b|\(optional\b|\bstretch\b|\bskip if\b|\bseparately\b|\(separate\)|\balready exists?\b",
@@ -737,6 +738,7 @@ fn detect_phases(body: &str) -> Vec<ParsedPhase> {
                         if NOT_DELIVERED_MARKER.is_match(t) || NOT_A_PHASE_LIST.is_match(t) =>
                     {
                         list = PhaseList::Off;
+                        in_section = false;
                     }
                     PhaseList::Armed => intro = t.to_string(),
                     PhaseList::InList { .. } => list = PhaseList::Off,
@@ -1318,6 +1320,11 @@ mod tests {
     fn phases_an_enumerated_lettered_heading_does_not_declare() {
         let body = "# T\n\n### A. Phase 1e: extend Phase 1d\n\n## 2. Phase 2 — real\n";
         assert_eq!(indices(body), vec![2]);
+        // Scope: only an ENUMERATED heading is affected. An un-enumerated
+        // `### Phase 1e` declares 1, as it always has; an enumerated lettered
+        // phase of the plan's own is a miss, the accepted direction.
+        assert_eq!(indices("# T\n\n### Phase 1e — x\n"), vec![1]);
+        assert!(indices("# T\n\n## 3. Phase 2b — x\n").is_empty());
     }
 
     /// A phase list's own title outranks a later report heading ABOUT the
@@ -1338,6 +1345,13 @@ mod tests {
         );
         let body = "# T\n\n## Phase 4 execution record\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n";
         assert_eq!(indices(body), vec![4]);
+        // The rename does not cost the heading's protection: a section row
+        // renames phase 4, a later table refuses it, and it stays — declared by
+        // a heading, whatever name won (`by_heading`, not the name's rank).
+        let body = "# T\n\n## Phase 4 execution record\n\n## Phases\n\n| Phase | Work |\n|---|---|\n| 4 | tests |\n\n## Later\n\n| Phase | Outcome |\n|---|---|\n| 4 | deferred |\n";
+        let p = parse(body);
+        let got: Vec<(u32, &str)> = p.phases.iter().map(|x| (x.index, x.name.as_str())).collect();
+        assert_eq!(got, vec![(4, "tests")]);
     }
 
     /// Regression for the measured unit (`cf9ae0b2`): the parser used to
@@ -1370,7 +1384,7 @@ mod tests {
     /// row lines. Point `QONTINUI_PHASE_CENSUS_DIR` at a `plans/` directory and
     /// run `cargo test -- phase_census --ignored --nocapture`.
     #[test]
-    #[ignore = "reads a plans directory named by QONTINUI_PHASE_CENSUS_DIR"]
+    #[ignore = "measuring tool: reads QONTINUI_PHASE_CENSUS_DIR, prints and returns when it is unset"]
     fn phase_census() {
         let Ok(dir) = std::env::var("QONTINUI_PHASE_CENSUS_DIR") else {
             println!("phase_census: set QONTINUI_PHASE_CENSUS_DIR to a plans/ directory");
