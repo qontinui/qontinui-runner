@@ -707,8 +707,11 @@ pub fn migrate_session(
     // continuation dispatched during the hop is deferred by P3 rather than
     // spawned alongside this one.
     //
-    // GUARD: anchor-held window OPENS here and closes at the matching GUARD
-    // marker on `match spawned` below. NOTHING between the two may exit early
+    // GUARD: anchor-held window OPENS here and closes at the
+    // `restore_continuation_registration` call INSIDE each arm of the
+    // `match spawned` below — see the matching GUARD marker there, which is
+    // where the arms diverge, not where the window ends. NOTHING between the
+    // lift and those two calls may exit early
     // — no `?`, no `return`, no `unwrap`/`expect` you add. Every fallible step
     // of this function is deliberately ABOVE this line (the `working_dir` and
     // three `try_state` lookups, `copy_transcript`, and the trust-gate
