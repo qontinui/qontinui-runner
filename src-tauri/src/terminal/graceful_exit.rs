@@ -174,10 +174,42 @@ fn is_box_edge(line: &str) -> bool {
     !t.is_empty() && t.chars().all(|c| "─━╭╮╰╯┌┐└┘│".contains(c))
 }
 
+/// Dialog text that is Claude Code's own CHROME rather than prose: the key
+/// hints a dialog prints under its choices. Unlike `do you want` / `allow`,
+/// these do not turn up in an ordinary finished turn ("Do you want me to run
+/// the tests?", "the allowlist"), so a check that must ADMIT the common idle
+/// screen can scan for them without refusing it.
+const DIALOG_CHROME_MARKERS: &[&str] = &["esc to cancel", "enter to confirm"];
+
 /// May `/exit` be typed now? `Ok` only for an idle screen whose cursor sits at
 /// the start of an empty `❯` input line with no dialog showing. The `Err`
 /// names what was seen.
+///
+/// Scans for the full [`DIALOG_MARKERS`] list, including prose-shaped
+/// phrases. That errs toward refusing, which is right for `/exit`: a refusal
+/// only postpones a wind-down.
 pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
+    prompt_ready_with(screen, DIALOG_MARKERS)
+}
+
+/// May a message be PASTED into the input box now? The same checks as
+/// [`exit_prompt_ready`] — cursor-row `❯`, the shared turn-complete predicate,
+/// cursor at the input start, nothing typed but the placeholder, no numbered
+/// choice in the box region — but the dialog-text scan looks only for
+/// [`DIALOG_CHROME_MARKERS`].
+///
+/// The difference is deliberate. The session message poller re-checks every
+/// 10 s for as long as a message is pending, and an idle screen does not
+/// change, so a check that refuses a common idle screen (a turn that ended
+/// "Do you want me to …?") would hold every message to that session until
+/// the operator next typed. A real permission dialog is still refused: its
+/// selected choice sits on the cursor row as a numbered option, and it prints
+/// the chrome hints.
+pub fn input_prompt_ready(screen: &ScreenText) -> Result<(), String> {
+    prompt_ready_with(screen, DIALOG_CHROME_MARKERS)
+}
+
+fn prompt_ready_with(screen: &ScreenText, dialog_markers: &[&str]) -> Result<(), String> {
     let Some(line) = prompt_line(screen) else {
         return Err("no `❯` input prompt on the cursor row".to_string());
     };
@@ -237,7 +269,7 @@ pub fn exit_prompt_ready(screen: &ScreenText) -> Result<(), String> {
             ));
         }
         let lower = text.to_lowercase();
-        if let Some(marker) = DIALOG_MARKERS.iter().find(|m| lower.contains(*m)) {
+        if let Some(marker) = dialog_markers.iter().find(|m| lower.contains(*m)) {
             return Err(format!("dialog marker `{marker}` on row {r}"));
         }
     }
@@ -601,6 +633,41 @@ mod tests {
             2,
             2,
         )
+    }
+
+    /// An idle screen whose finished turn ended with a question to the
+    /// operator, directly above the empty input box.
+    fn turn_ending_in_a_question() -> ScreenText {
+        screen(
+            vec![
+                "● Done. The build is green. Do you want me to run the tests?".to_string(),
+                "  (the allowlist was left unchanged)".to_string(),
+                edge(),
+                "❯\u{a0}Try \"write a test for <filepath>\"".to_string(),
+                edge(),
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents".to_string(),
+            ],
+            3,
+            2,
+        )
+    }
+
+    #[test]
+    fn input_prompt_ready_admits_a_turn_that_ended_in_a_question() {
+        // The two checks differ ONLY in the dialog-text scan: `/exit` refuses
+        // prose-shaped markers (a postponed wind-down is cheap), a message
+        // paste must not (the idle screen would refuse every retry).
+        let s = turn_ending_in_a_question();
+        assert!(exit_prompt_ready(&s).is_err());
+        assert_eq!(input_prompt_ready(&s), Ok(()));
+        // Everything else is shared: the empty prompt passes both, and a
+        // draft, a real permission dialog and a chrome hint refuse both.
+        assert_eq!(input_prompt_ready(&empty_prompt()), Ok(()));
+        assert!(input_prompt_ready(&draft_prompt()).is_err());
+        assert!(input_prompt_ready(&permission_dialog()).is_err());
+        let mut hinted = empty_prompt();
+        hinted.lines[0] = "  Enter to confirm · Esc to cancel".to_string();
+        assert!(input_prompt_ready(&hinted).is_err());
     }
 
     fn draft_prompt() -> ScreenText {

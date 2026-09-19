@@ -1418,6 +1418,15 @@ async fn health(
         // with a serving emitter used to be diagnosable only by log grep on
         // the emitting box.
         "transportRung": transport_rung_health_snapshot(),
+        // Session-message push evidence (plan
+        // 2026-09-07-session-message-delivery-is-blind-and-park-collection-
+        // resolves-on-a-guess, Phase 4): every tick the poller could not push
+        // a directed message (`push_miss{reason}`) and every inject it made
+        // (`push_ok`, by `delivered_arm`), since this process booted. Bumped
+        // whether or not the row later leaves coord's `pending` set — a
+        // recipient that drains its mailbox by hand erases the surfacing
+        // tracker's clock, and this is what is left to say push missed.
+        "sessionMessages": crate::mcp::session_message_poller::health_snapshot(),
         // Where the coord-mcp rotation-forensics JSONL actually is (plan
         // 2026-08-20-coord-mcp-reconnect-dcr-and-restart-orphaning Phase 3).
         // It resolves through `paths::get_dev_logs_dir` — settings override,
