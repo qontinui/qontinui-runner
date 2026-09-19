@@ -412,11 +412,16 @@ describe("UI Bridge action surfaces — the falsification", () => {
           '    { id: "probe-late-spread", handler: guardedHandler("probe-late-spread", {}, () => 1), ...probe },',
           "  ],",
           "};",
+          "export const f = {",
+          "  actions: [",
+          '    { id: "probe-cast-late-spread", handler: guardedHandler("probe-cast-late-spread", {}, () => 1), ...probe },',
+          "  ] as const,",
+          "};",
           "// Negative control: a cast around an inline map is still inline.",
           "export const e = { customActions: { ok: { handler: () => 1 } } as const };",
         ].join("\n"),
       );
-      expect(violations(found).map((v) => v.line)).toEqual([3, 4, 5, 8]);
+      expect(violations(found).map((v) => v.line)).toEqual([3, 4, 5, 8, 13]);
     },
     WALK_TIMEOUT,
   );

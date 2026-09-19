@@ -661,9 +661,12 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
     }
     if (ts.isPropertyAssignment(node)) {
       const name = propName(node);
-      if (name === "actions" && ts.isArrayLiteralExpression(node.initializer)) {
-        if (isVerbList(node.initializer)) {
-          for (const el of node.initializer.elements) {
+      if (name === "actions" && ts.isArrayLiteralExpression(unwrap(node.initializer))) {
+        // `unwrap`: `actions: [...] as const` is the same registration, and
+        // must not fall through to the shape pass's laxer `free` verdict.
+        const list = unwrap(node.initializer) as ts.ArrayLiteralExpression;
+        if (isVerbList(list)) {
+          for (const el of list.elements) {
             if (!ts.isStringLiteralLike(el)) continue;
             out.push({
               file: rel,
@@ -681,7 +684,7 @@ export function scanActionSurfaces(text: string, file: string): ActionSurface[] 
           ts.forEachChild(node, visit);
           return;
         }
-        for (const el of node.initializer.elements) {
+        for (const el of list.elements) {
           if (ts.isSpreadElement(el)) {
             out.push({
               file: rel,

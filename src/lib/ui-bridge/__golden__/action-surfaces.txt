@@ -4,13 +4,13 @@
 #   pnpm exec vitest run src/lib/ui-bridge/actionSurfaces.enforcement.test.ts
 # after setting UPDATE_ACTION_SURFACE_GOLDEN=1.
 #
-# total: 173
+# total: 174
 #   guarded: 22
 #   literal: 54
 #   registry: 41
 #   delegated: 9
 #   builtin: 15
-#   fixture: 32
+#   fixture: 33
 
 src/App.tsx:213	literal	component	complete	schema=no	arity=0	effect=write
 src/App.tsx:229	guarded	component	go-to-step	schema=yes	arity=-	effect=read
@@ -122,6 +122,7 @@ src/components/terminal/commands/uibridge.test.ts:252	fixture	free	test.hotkey	s
 src/components/terminal/commands/uibridge.test.ts:270	fixture	free	test.bare	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:300	fixture	free	test.proto	schema=yes	arity=0	effect=-
 src/components/terminal/commands/uibridge.test.ts:330	fixture	free	test.flagged	schema=yes	arity=0	effect=-
+src/components/terminal/commands/uibridge.test.ts:404	fixture	free	test.ai-text	schema=yes	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:77	fixture	free	terminal.help	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.test.ts:105	fixture	free	terminal.doc-finder	schema=no	arity=0	effect=-
 src/components/terminal/commands/usePromptLibraryCommands.ts:118	registry	free	-	schema=yes	arity=0	effect=-

@@ -396,3 +396,24 @@ describe("bindSchemaBag — the gate for a surface with no registry action", () 
     );
   });
 });
+
+describe("bindCommand — the AI tier keeps a declared text field's exact string", () => {
+  it('binds {command: "1.10"} as "1.10", and still coerces a number field', () => {
+    // The model NAMES its arguments, like a direct caller; `coerceToken`
+    // would have turned "1.10" into 1.1 and `textArg` read it back as "1.1".
+    const action = {
+      id: "test.ai-text",
+      slash: "/ai-text",
+      label: "AI text",
+      description: "test",
+      paramSchema: { command: "string (typed verbatim)", count: "number" },
+      handler: async () => ({ ok: true as const, value: null }),
+    };
+    const bound = bindCommand(
+      { kind: "ai", action, modelArgs: { command: "1.10", count: "2" }, confidence: 0.9 },
+      "run 1.10 twice",
+    );
+    expect(bound?.refusal).toBeNull();
+    expect(bound?.args).toEqual({ command: "1.10", count: 2 });
+  });
+});
