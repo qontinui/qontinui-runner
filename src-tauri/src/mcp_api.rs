@@ -2222,6 +2222,19 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
         "client_assertion_overridden".to_string(),
         serde_json::json!(client_assertion_overridden_counter().load(Ordering::Relaxed)),
     );
+    let by_door: serde_json::Map<String, serde_json::Value> = AttributedDoor::ALL
+        .iter()
+        .map(|door| {
+            (
+                door.label().to_string(),
+                serde_json::json!(attributed_door_counters()[door.index()].load(Ordering::Relaxed)),
+            )
+        })
+        .collect();
+    obj.insert(
+        "forwards_by_door".to_string(),
+        serde_json::Value::Object(by_door),
+    );
     let no_terminal = terminal_leg_no_terminal_counter().load(Ordering::Relaxed);
     let engaged: u64 = TERMINAL_LEG_OUTCOMES
         .iter()
@@ -2283,7 +2296,7 @@ pub(crate) fn self_id_health_snapshot() -> serde_json::Value {
 /// a *new* session that reused the same on-disk nonce + workdir. Recomputing
 /// every call reads the live session set and is always correct.
 fn resolve_caller_session_id(
-    state: &Arc<ApiState>,
+    app: &tauri::AppHandle,
     nonce: Option<&str>,
     client_asserted: Option<uuid::Uuid>,
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
@@ -2297,7 +2310,7 @@ fn resolve_caller_session_id(
     // situations, and collapsing them into one `None` is what let a
     // terminal-known miss inherit a SIBLING terminal's id off the shared
     // workdir — see [`TerminalLeg`].
-    match resolve_caller_via_terminal(state, nonce) {
+    match resolve_caller_via_terminal(app, nonce) {
         TerminalLeg::Resolved(sid) => return (Some(sid), SelfIdOutcome::InjectedViaTerminal),
         // Several open rows on one terminal: the live session is the one
         // that can say which row is its own. Still a terminal-leg verdict
@@ -2318,16 +2331,14 @@ fn resolve_caller_session_id(
     let Some(workdir) = crate::coord_mcp::workdir_for_nonce(nonce) else {
         return (None, SelfIdOutcome::NoWorkdir);
     };
-    let task_run_id = state
-        .app_handle
+    let task_run_id = app
         .try_state::<Arc<crate::claude_session::SessionManager>>()
         .and_then(|sm| sm.task_run_id_for_workdir(&workdir));
     match task_run_id {
         // Primary chain hit.
         Some(task_run_id) => {
-            let Some(registrar) = state
-                .app_handle
-                .try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
+            let Some(registrar) =
+                app.try_state::<Arc<crate::claude_session::coord_register::AiCoordRegistrar>>()
             else {
                 return (None, SelfIdOutcome::NoSession);
             };
@@ -2349,7 +2360,7 @@ fn resolve_caller_session_id(
         // plane never has one), so resolve through the durable lifecycle
         // store instead: workdir → the single admitted open record → its own
         // anchor. Every miss arrives already typed as the gate that rejected.
-        None => resolve_caller_via_lifecycle(state, &workdir, client_asserted),
+        None => resolve_caller_via_lifecycle(app, &workdir, client_asserted),
     }
 }
 
@@ -2492,6 +2503,130 @@ fn note_client_assertion_disagreement(
     }
 }
 
+/// Which nonce-gated forwarder asked for a caller-session attribution — the
+/// denominator split for the `selfId` outcome family.
+///
+/// Until this split existed only the JSON-RPC `/coord-mcp` proxy resolved a
+/// caller session. The REST forwarders beside it present the SAME nonce, yet
+/// went upstream with no `X-Coord-Caller-Session` — while coord reads that
+/// header on exactly the routes they front: `register_agent_gate` and
+/// `register_unit_gate` stamp it as the new gate's author session,
+/// `attest_gate` feeds it to the separation-of-duties check
+/// (`live_provenance_session`), and the agent prompt-document door records it
+/// as the policy read's `claude_session_id`. So a gate registered through
+/// `/gate`'s REST door was authorless — and coord's own doc says a gate with a
+/// NULL session grain can never satisfy tier 5 afterwards — and a policy read
+/// through the read forwarder counted as `unavailable`. The client-asserted
+/// tie-break (qontinui-runner#1492) was likewise reachable on the JSON-RPC door
+/// only.
+///
+/// Every door runs the ONE chain ([`resolve_caller_session_id`]) and records
+/// into the one outcome family: the chain bumps its own side series from the
+/// inside (`terminal_leg.no_terminal`, the `recent_misses` ring), so a door
+/// that resolved without recording its outcome would make those disagree with
+/// the outcome counters. This split is what keeps a reading comparable across
+/// builds — every `selfId` measurement taken before it (e.g. 2026-09-12,
+/// `ambiguous_workdir = 178`) was JSON-RPC-proxy-only, which is
+/// `forwards_by_door.mcp_proxy` now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttributedDoor {
+    /// `POST /coord-mcp` — the JSON-RPC proxy, device principal only (an
+    /// agent principal records `non_device_principal` and is not counted
+    /// here).
+    McpProxy,
+    /// The REST write forwarder, on the targets coord attributes
+    /// ([`CoordWriteTarget::carries_caller_session`]).
+    CoordWrite,
+    /// The REST read forwarder, on the targets coord attributes
+    /// ([`CoordReadTarget::carries_caller_session`]).
+    CoordRead,
+}
+
+impl AttributedDoor {
+    /// Every door, in counter-slot order — `ALL[i].index() == i`.
+    const ALL: [Self; 3] = [Self::McpProxy, Self::CoordWrite, Self::CoordRead];
+
+    const fn index(self) -> usize {
+        match self {
+            Self::McpProxy => 0,
+            Self::CoordWrite => 1,
+            Self::CoordRead => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::McpProxy => "mcp_proxy",
+            Self::CoordWrite => "coord_write",
+            Self::CoordRead => "coord_read",
+        }
+    }
+}
+
+/// Attribution attempts per door, indexed by [`AttributedDoor::index`].
+/// Rendered as `forwards_by_door` in `GET /health` `selfId`.
+fn attributed_door_counters() -> &'static [std::sync::atomic::AtomicU64; 3] {
+    static COUNTERS: std::sync::OnceLock<[std::sync::atomic::AtomicU64; 3]> =
+        std::sync::OnceLock::new();
+    COUNTERS.get_or_init(Default::default)
+}
+
+/// The UNCOUNTED half of [`attribute_forward`]: the id the chain resolves for
+/// this forward, if any, and the outcome naming why.
+///
+/// Split out so the no-runtime rule is testable without touching the
+/// process-global outcome counters, which
+/// `every_outcome_counts_into_its_own_slot` asserts EXACT deltas on under the
+/// parallel test runner. With `app` present the chain still bumps its own side
+/// series from the inside; tests never pass one.
+fn resolve_forward_attribution(
+    app: Option<&tauri::AppHandle>,
+    nonce: Option<&str>,
+    client_asserted: Option<uuid::Uuid>,
+) -> (Option<uuid::Uuid>, SelfIdOutcome) {
+    match app {
+        Some(app) => resolve_caller_session_id(app, nonce, client_asserted),
+        None => (None, SelfIdOutcome::ResolverStateMissing),
+    }
+}
+
+/// Resolve, record and return the caller-session id one nonce-gated forward
+/// carries upstream — the single path every attributing door takes, so the
+/// tie-break rule ([`settle_ambiguity`]), the outcome counters and the
+/// disagreement falsifier cannot drift apart between doors.
+///
+/// `app` is `None` only where no Tauri runtime exists. The REST doors read the
+/// process-global handle, which `main.rs` sets in `setup()` before it spawns
+/// the API server, and which a `cargo test` process never sets; that case
+/// reports [`SelfIdOutcome::ResolverStateMissing`] — the arm that must read 0
+/// in production — rather than a quiet `None`.
+///
+/// Callers must already have passed their nonce gate, and must never forward
+/// the client's own copy of the header: the id returned here is the only one
+/// that goes upstream.
+fn attribute_forward(
+    app: Option<&tauri::AppHandle>,
+    nonce: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    door: AttributedDoor,
+) -> Option<uuid::Uuid> {
+    let client_asserted = client_asserted_session(headers);
+    let (resolved, outcome) = resolve_forward_attribution(app, nonce, client_asserted);
+    record_self_id_outcome(outcome);
+    attributed_door_counters()[door.index()].fetch_add(1, Ordering::Relaxed);
+    if note_client_assertion_disagreement(resolved, client_asserted) {
+        tracing::debug!(
+            "{}: caller-session header carries the runner's {:?} ({}), not the \
+             client's asserted {:?}",
+            door.label(),
+            resolved,
+            outcome.label(),
+            client_asserted
+        );
+    }
+    resolved
+}
+
 /// The three genuinely different things leg 1 can say. Collapsing them into
 /// an `Option` is the FALLTHROUGH DEFECT: a `None` meant both "no terminal on
 /// this binding, use the workdir chain" and "this terminal's record was
@@ -2583,7 +2718,7 @@ impl TerminalMiss {
 /// terminal is known and we cannot check it, so refusing is the honest answer
 /// (counted as [`SelfIdOutcome::ResolverStateMissing`], which should read 0 —
 /// the store is managed at `main.rs:2786`).
-fn resolve_caller_via_terminal(state: &Arc<ApiState>, nonce: &str) -> TerminalLeg {
+fn resolve_caller_via_terminal(app: &tauri::AppHandle, nonce: &str) -> TerminalLeg {
     let terminal_id = crate::coord_mcp::terminal_id_for_nonce(nonce);
     if terminal_id.is_none() {
         // Same verdict [`terminal_leg`] would give, taken BEFORE the store
@@ -2592,9 +2727,8 @@ fn resolve_caller_via_terminal(state: &Arc<ApiState>, nonce: &str) -> TerminalLe
         // second clone of the same set.
         return TerminalLeg::NoTerminal;
     }
-    let Some(store) = state
-        .app_handle
-        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    let Some(store) =
+        app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     else {
         return TerminalLeg::Miss(SelfIdOutcome::ResolverStateMissing);
     };
@@ -2707,13 +2841,12 @@ fn select_terminal_caller(
 /// Tauri app; this function only supplies the store snapshot and records the
 /// sample when the result is still a miss.
 fn resolve_caller_via_lifecycle(
-    state: &Arc<ApiState>,
+    app: &tauri::AppHandle,
     workdir: &str,
     client_asserted: Option<uuid::Uuid>,
 ) -> (Option<uuid::Uuid>, SelfIdOutcome) {
-    let Some(store) = state
-        .app_handle
-        .try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
+    let Some(store) =
+        app.try_state::<Arc<crate::session::session_lifecycle_store::SessionLifecycleStore>>()
     else {
         return (None, SelfIdOutcome::ResolverStateMissing);
     };
@@ -5663,25 +5796,21 @@ async fn coord_mcp_proxy_handler(
     // header, and the runner honours it only when its own resolution ended
     // in several candidates it could not rank, and the asserted id is one of
     // them. It never adds an identity the runner does not already vouch for
-    // on that key — see `settle_ambiguity`. Read once, here, so the strip in
-    // the forwarding loop stays unconditional.
-    let client_asserted = client_asserted_session(&headers);
-    let (caller_session_id, self_id_outcome) =
-        if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
-            resolve_caller_session_id(&state, nonce.as_deref(), client_asserted)
-        } else {
-            (None, SelfIdOutcome::NonDevicePrincipal)
-        };
-    record_self_id_outcome(self_id_outcome);
-    if note_client_assertion_disagreement(caller_session_id, client_asserted) {
-        tracing::debug!(
-            "coord-mcp proxy: caller-session header carries the runner's {:?} \
-             ({}), not the client's asserted {:?}",
-            caller_session_id,
-            self_id_outcome.label(),
-            client_asserted
-        );
-    }
+    // on that key — see `settle_ambiguity`. Read once, inside
+    // `attribute_forward`, so the strip in the forwarding loop stays
+    // unconditional. The REST forwarders beside this door go through the same
+    // helper — see `AttributedDoor`.
+    let caller_session_id = if matches!(&principal, crate::coord_mcp::ProxyPrincipal::Device) {
+        attribute_forward(
+            Some(&state.app_handle),
+            nonce.as_deref(),
+            &headers,
+            AttributedDoor::McpProxy,
+        )
+    } else {
+        record_self_id_outcome(SelfIdOutcome::NonDevicePrincipal);
+        None
+    };
 
     // Shared client: connect fast-fail, generous overall timeout (coord MCP
     // tool calls can legitimately run long).
@@ -6564,6 +6693,8 @@ async fn coord_claims_read_proxy_handler(
         upstream_authenticates,
         headers,
         raw_query,
+        // coord's claims reads carry no caller-session attribution.
+        None,
     )
     .await
 }
@@ -6593,6 +6724,7 @@ async fn nonce_gated_coord_get(
     upstream_authenticates: bool,
     headers: axum::http::HeaderMap,
     raw_query: Option<String>,
+    attribute: Option<AttributedDoor>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -6696,6 +6828,17 @@ async fn nonce_gated_coord_get(
         }
     };
 
+    // Attribution, after the gate and the segment check, and only when the
+    // caller's target is one coord attributes — see [`AttributedDoor`].
+    let caller_session = attribute.and_then(|attributed| {
+        attribute_forward(
+            crate::tauri_app_handle::current().as_ref(),
+            nonce.as_deref(),
+            &headers,
+            attributed,
+        )
+    });
+
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = read_upstream_url(&coord_base, &coord_path, raw_query.as_deref());
     forward_coord_get(
@@ -6708,6 +6851,7 @@ async fn nonce_gated_coord_get(
         // slot whose bearer we just presented.
         session_tenant,
         upstream_authenticates,
+        caller_session,
     )
     .await
 }
@@ -6734,6 +6878,7 @@ async fn forward_claims_get(
         "coord-mcp claims proxy",
         tenant,
         upstream_authenticates,
+        None,
     )
     .await
 }
@@ -6753,6 +6898,7 @@ async fn forward_coord_get(
     tenant: Option<uuid::Uuid>,
     // Does coord verify the bearer at this upstream route (C1)?
     upstream_authenticates: bool,
+    caller_session: Option<uuid::Uuid>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -6779,7 +6925,13 @@ async fn forward_coord_get(
 
     let upstream = {
         let _in_flight = egress::in_flight(EG);
-        client.get(url).bearer_auth(bearer).send().await
+        let mut req = client.get(url).bearer_auth(bearer);
+        // The RUNNER-resolved caller session only — see
+        // [`forward_coord_write_post`]; no request header is passed through.
+        if let Some(sid) = caller_session {
+            req = req.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string());
+        }
+        req.send().await
     };
     let upstream = match upstream {
         Ok(resp) => resp,
@@ -7009,6 +7161,29 @@ fn pr_number_is_valid(number: &str) -> bool {
 }
 
 impl CoordReadTarget {
+    /// Whether coord reads `X-Coord-Caller-Session` on this target's route, so
+    /// the forward must carry the runner-resolved caller session
+    /// ([`attribute_forward`]). Only the prompt-document door does: its
+    /// `record_agent_door_read` stamps the read's `claude_session_id`, which the
+    /// policy-compliance reconciler reads as "did this session pull policy?".
+    /// The other reads carry no attribution, so resolving for them would only
+    /// inflate the `selfId` counters.
+    ///
+    /// Exhaustive — no wildcard — so a new target is a compile error until
+    /// someone decides whether coord attributes it.
+    const fn carries_caller_session(&self) -> bool {
+        match self {
+            CoordReadTarget::PromptDocuments | CoordReadTarget::PromptDocument { .. } => true,
+            CoordReadTarget::WorkUnits
+            | CoordReadTarget::WorkUnit { .. }
+            | CoordReadTarget::WorkUnitHistory { .. }
+            | CoordReadTarget::Gates
+            | CoordReadTarget::PrMergeVerdict { .. }
+            | CoordReadTarget::PrMergeEvents { .. }
+            | CoordReadTarget::PrMergeEconomics => false,
+        }
+    }
+
     /// The allowlisted upstream path. Callers MUST have called [`Self::validate`]
     /// first (the handler does); this builder assumes every segment is safe, and
     /// the constant templates mean plain interpolation cannot alter the path
@@ -7111,6 +7286,9 @@ async fn coord_read_proxy_handler(
         true,
         headers,
         raw_query,
+        target
+            .carries_caller_session()
+            .then_some(AttributedDoor::CoordRead),
     )
     .await
 }
@@ -7411,6 +7589,30 @@ fn write_upstream_url(base: &str, target: &CoordWriteTarget) -> String {
     }
 }
 
+impl CoordWriteTarget {
+    /// Whether coord reads `X-Coord-Caller-Session` on this target's route, so
+    /// the forward must carry the runner-resolved caller session
+    /// ([`attribute_forward`]).
+    ///
+    /// Exhaustive — no wildcard — so a new target is a compile error until
+    /// someone decides whether coord attributes it.
+    const fn carries_caller_session(&self) -> bool {
+        match self {
+            // `register_agent_gate` stamps it as the gate's author session.
+            CoordWriteTarget::RegisterGate => true,
+            // `attest_gate` feeds it to `live_provenance_session`, the
+            // separation-of-duties check an attest is decided on.
+            CoordWriteTarget::AttestGate { .. } => true,
+            // `register_unit_gate` stamps it as the gate's author session.
+            CoordWriteTarget::WorkUnitRegisterGate { .. } => true,
+            // coord's work-unit registry writes read no caller session.
+            CoordWriteTarget::WorkUnitUpsert
+            | CoordWriteTarget::WorkUnitTransition { .. }
+            | CoordWriteTarget::WorkUnitSetDeps { .. } => false,
+        }
+    }
+}
+
 /// `POST /coord-mcp/gates/register` +
 /// `POST /coord-mcp/gates/{gate_id}/attest` +
 /// `POST /coord-mcp/work-units/{upsert | {slug}/transition |
@@ -7568,8 +7770,31 @@ async fn coord_write_proxy_handler(
     // the leg unit-testable: it takes the plan as a plain parameter, so a test
     // supplies its own tempdir-backed spool without installing a process
     // global.
-    let (body, spool_plan) =
+    let (body, mut spool_plan) =
         plan_gate_registration_spool(&target, body, crate::session::closeout_spool::global());
+
+    // Attribution, after the gate and the segment check so neither an
+    // unauthenticated nor a malformed request is resolved or counted. Only on
+    // the targets coord attributes; see [`AttributedDoor`] for why this door
+    // used to forward authorless gate writes.
+    let caller_session = if target.carries_caller_session() {
+        attribute_forward(
+            crate::tauri_app_handle::current().as_ref(),
+            nonce.as_deref(),
+            &headers,
+            AttributedDoor::CoordWrite,
+        )
+    } else {
+        None
+    };
+
+    // A register-gate that has to spool replays later from the `CoordSync`
+    // drain, which has no request to resolve from — so the resolved id rides
+    // in the spooled row, or the offline path would still land an authorless
+    // gate.
+    if let Some(plan) = spool_plan.as_mut() {
+        plan.caller_session = caller_session;
+    }
 
     let (coord_base, coord_base_source) = crate::coord_mcp::coord_base_url_with_source();
     let url = write_upstream_url(&coord_base, &target);
@@ -7580,6 +7805,7 @@ async fn coord_write_proxy_handler(
         coord_base_source,
         spool_plan.as_ref(),
         session_tenant,
+        caller_session,
     )
     .await
 }
@@ -7597,6 +7823,11 @@ struct GateSpoolPlan {
     body: serde_json::Map<String, serde_json::Value>,
     /// The caller-supplied `work_unit_upsert` bootstrap, when it sent one.
     upsert: Option<serde_json::Value>,
+    /// The RUNNER-resolved caller session ([`attribute_forward`]), so a
+    /// replayed gate carries the same author the live forward would have
+    /// sent. `None` from [`plan_gate_registration_spool`]; the handler sets it
+    /// once attribution has run, which is after the plan is built.
+    caller_session: Option<uuid::Uuid>,
 }
 
 /// Decide whether this write is spoolable, and hand back the bytes to forward.
@@ -7654,6 +7885,7 @@ fn plan_gate_registration_spool(
             slug: slug.clone(),
             body: input.body,
             upsert: input.work_unit_upsert,
+            caller_session: None,
         }),
     )
 }
@@ -7695,21 +7927,22 @@ fn gate_spool_response(
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
 
-    let spooled =
-        match plan
-            .spool
-            .spool_gate_registration(&plan.slug, &plan.body, plan.upsert.clone())
-        {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(
-                    "coord-mcp write proxy: register-gate for {} could not reach coord ({cause}) \
+    let spooled = match plan.spool.spool_gate_registration(
+        &plan.slug,
+        &plan.body,
+        plan.upsert.clone(),
+        plan.caller_session,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                "coord-mcp write proxy: register-gate for {} could not reach coord ({cause}) \
                  AND the outbox write failed ({e}) — the gate is LOST",
-                    plan.slug
-                );
-                return None;
-            }
-        };
+                plan.slug
+            );
+            return None;
+        }
+    };
     warn!(
         slug = %plan.slug,
         seq = spooled.seq,
@@ -7748,6 +7981,7 @@ async fn forward_coord_write_post(
     // this forwarder is a real coord WRITE behind a real guard, so there is no
     // `upstream_authenticates` question here — the answer is always yes.
     tenant: Option<uuid::Uuid>,
+    caller_session: Option<uuid::Uuid>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -7772,13 +8006,17 @@ async fn forward_coord_write_post(
         let _in_flight = egress::in_flight(EG);
         // coord-auth-exempt(forwarder): write-forwarder hop — `bearer` is the
         // caller-resolved credential passed in by the handler, not this device's.
-        client
+        let mut req = client
             .post(url)
             .bearer_auth(bearer)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(body.to_vec())
-            .send()
-            .await
+            .header(axum::http::header::CONTENT_TYPE, "application/json");
+        // The RUNNER-resolved caller session only. The client's own copy of
+        // the header never reaches here: this leg builds its headers from
+        // scratch rather than passing the request's through.
+        if let Some(sid) = caller_session {
+            req = req.header(crate::coord_mcp::CALLER_SESSION_HEADER, sid.to_string());
+        }
+        req.body(body.to_vec()).send().await
     };
     let upstream = match upstream {
         Ok(resp) => resp,
@@ -11747,7 +11985,124 @@ mod self_id_chain_tests {
             obj["client_assertion_overridden"].is_u64(),
             "the resolved-vs-asserted disagreement counter must be a series of its own"
         );
-        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 3);
+        // The per-door denominator: every attributing door, and only those.
+        let by_door = obj["forwards_by_door"]
+            .as_object()
+            .expect("GET /health selfId.forwards_by_door must be an object");
+        for door in super::AttributedDoor::ALL {
+            assert!(
+                by_door[door.label()].is_u64(),
+                "forwards_by_door is missing `{}`",
+                door.label()
+            );
+        }
+        assert_eq!(by_door.len(), super::AttributedDoor::ALL.len());
+        assert_eq!(obj.len(), SelfIdOutcome::ALL.len() + 4);
+    }
+
+    /// The door slots are a compiler-checked `match`, and `ALL` is in slot
+    /// order — the same pin [`SelfIdOutcome`] carries.
+    #[test]
+    fn attributed_door_slots_match_their_declaration_order() {
+        for (i, door) in super::AttributedDoor::ALL.iter().enumerate() {
+            assert_eq!(door.index(), i, "{} is out of slot order", door.label());
+        }
+    }
+
+    /// The REST targets that attribute are EXACTLY the coord routes that read
+    /// `X-Coord-Caller-Session` (qontinui-coord `gate_routes.rs`
+    /// `register_agent_gate` / `register_unit_gate` / `attest_gate`;
+    /// `prompt_documents.rs` `get_agent_list` / `get_agent_one`). Resolving for
+    /// any other target would only inflate the `selfId` counters; missing one
+    /// of these forwards an authorless gate or an unattributed policy read.
+    #[test]
+    fn the_rest_targets_that_attribute_are_the_ones_coord_reads_the_header_on() {
+        use super::{CoordReadTarget, CoordWriteTarget};
+        let slug = || "2026-07-03-some-unit".to_string();
+        let gate_id = "123e4567-e89b-12d3-a456-426614174000".to_string();
+        for (target, carries) in [
+            (CoordWriteTarget::RegisterGate, true),
+            (CoordWriteTarget::AttestGate { gate_id }, true),
+            (
+                CoordWriteTarget::WorkUnitRegisterGate { slug: slug() },
+                true,
+            ),
+            (CoordWriteTarget::WorkUnitUpsert, false),
+            (CoordWriteTarget::WorkUnitTransition { slug: slug() }, false),
+            (CoordWriteTarget::WorkUnitSetDeps { slug: slug() }, false),
+        ] {
+            assert_eq!(target.carries_caller_session(), carries, "{target:?}");
+        }
+        let pr = || {
+            (
+                "qontinui".to_string(),
+                "qontinui-runner".to_string(),
+                "1".to_string(),
+            )
+        };
+        let (owner, repo, number) = pr();
+        let (owner2, repo2, number2) = pr();
+        for (target, carries) in [
+            (CoordReadTarget::PromptDocuments, true),
+            (
+                CoordReadTarget::PromptDocument {
+                    kind: "policy".to_string(),
+                    name: "coordination".to_string(),
+                },
+                true,
+            ),
+            (CoordReadTarget::WorkUnits, false),
+            (CoordReadTarget::WorkUnit { slug: slug() }, false),
+            (CoordReadTarget::WorkUnitHistory { slug: slug() }, false),
+            (CoordReadTarget::Gates, false),
+            (
+                CoordReadTarget::PrMergeVerdict {
+                    owner,
+                    repo,
+                    number,
+                },
+                false,
+            ),
+            (
+                CoordReadTarget::PrMergeEvents {
+                    owner: owner2,
+                    repo: repo2,
+                    number: number2,
+                },
+                false,
+            ),
+            (CoordReadTarget::PrMergeEconomics, false),
+        ] {
+            assert_eq!(target.carries_caller_session(), carries, "{target:?}");
+        }
+    }
+
+    /// With no Tauri runtime there is no chain to run: the attribution is
+    /// `None` and NAMES its gap as `resolver_state_missing` (the arm that must
+    /// read 0 in production) rather than vanishing — and a client assertion
+    /// cannot stand in for the missing chain.
+    ///
+    /// Asserted on the UNCOUNTED half on purpose: a bump of the process-global
+    /// outcome counters here would race `every_outcome_counts_into_its_own_slot`,
+    /// which asserts exact deltas under the parallel runner.
+    #[test]
+    fn attribution_without_a_tauri_runtime_names_its_gap_and_adds_no_identity() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::coord_mcp::CALLER_SESSION_HEADER,
+            axum::http::HeaderValue::from_static(ANCHOR_A),
+        );
+        let asserted = super::client_asserted_session(&headers);
+        assert_eq!(asserted, Some(uuid_of(ANCHOR_A)));
+        assert_eq!(
+            super::resolve_forward_attribution(None, Some("some-nonce"), asserted),
+            (None, SelfIdOutcome::ResolverStateMissing),
+            "an assertion must never become an identity without the runner's chain"
+        );
+        assert_eq!(
+            super::resolve_forward_attribution(None, None, None),
+            (None, SelfIdOutcome::ResolverStateMissing)
+        );
     }
 
     #[test]
@@ -14786,7 +15141,15 @@ mod coord_claims_proxy_tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("")
                             .to_string();
-                        axum::Json(serde_json::json!({"echo_query": q, "echo_auth": auth}))
+                        let caller = headers
+                            .get("x-coord-caller-session")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        axum::Json(serde_json::json!({
+                            "echo_query": q,
+                            "echo_auth": auth,
+                            "echo_caller": caller,
+                        }))
                     },
                 ),
             )
@@ -14826,6 +15189,8 @@ mod coord_claims_proxy_tests {
             "repo=qontinui-runner&resource=src%2Fmain.rs"
         );
         assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
+        // coord's claims reads carry no attribution, so this door sends none.
+        assert!(v["echo_caller"].is_null(), "{v}");
 
         // Non-200 coord verdict: status + body verbatim, not reshaped.
         let url = claims_upstream_url(&base, ClaimsReadTarget::ByResource, None);
@@ -15430,7 +15795,15 @@ mod coord_read_proxy_tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("")
                             .to_string();
-                        axum::Json(serde_json::json!({"echo_query": q, "echo_auth": auth}))
+                        let caller = headers
+                            .get("x-coord-caller-session")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        axum::Json(serde_json::json!({
+                            "echo_query": q,
+                            "echo_auth": auth,
+                            "echo_caller": caller,
+                        }))
                     },
                 ),
             )
@@ -15458,12 +15831,32 @@ mod coord_read_proxy_tests {
             "test",
             None,
             true,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
         let v = body_json(resp).await;
         assert_eq!(v["echo_query"], "kind=policy");
         assert_eq!(v["echo_auth"], "Bearer synthetic-device-jwt");
+        assert!(v["echo_caller"].is_null(), "no session, no header: {v}");
+
+        // A resolved session rides upstream — the header coord's agent
+        // prompt-document door records as the policy read's session.
+        let sid = uuid::Uuid::parse_str("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap();
+        let resp = forward_coord_get(
+            &url,
+            "synthetic-device-jwt",
+            qontinui_runner_lib::profiles::CoordBaseSource::DevLocalhostFallback,
+            ReadProxyCodes::COORD_READ,
+            "test",
+            None,
+            true,
+            Some(sid),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["echo_caller"], sid.to_string());
 
         // A non-200 coord verdict is passed through VERBATIM — never reshaped
         // into a runner error, or the caller cannot tell coord's answer from
@@ -15477,6 +15870,7 @@ mod coord_read_proxy_tests {
             "test",
             None,
             true,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 403);
@@ -15494,6 +15888,7 @@ mod coord_read_proxy_tests {
             "test",
             None,
             true,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 502);
@@ -16315,10 +16710,15 @@ mod coord_write_proxy_tests {
                             .unwrap_or("")
                             .to_string();
                         let body = String::from_utf8_lossy(&body).to_string();
+                        let caller = headers
+                            .get("x-coord-caller-session")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
                         axum::Json(serde_json::json!({
                             "echo_auth": auth,
                             "echo_ct": ct,
                             "echo_body": body,
+                            "echo_caller": caller,
                         }))
                     },
                 ),
@@ -16352,6 +16752,7 @@ mod coord_write_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 200);
@@ -16359,6 +16760,25 @@ mod coord_write_proxy_tests {
         assert_eq!(v["echo_auth"], "Bearer test-device-jwt");
         assert_eq!(v["echo_ct"], "application/json");
         assert_eq!(v["echo_body"], r#"{"resource_key":"work-units/u"}"#);
+        // No resolved session → no header at all, never an empty one.
+        assert!(v["echo_caller"].is_null(), "{v}");
+
+        // A resolved session rides upstream as `X-Coord-Caller-Session` —
+        // the header coord's `register_unit_gate` stamps as the gate's author.
+        let sid = uuid::Uuid::parse_str("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap();
+        let resp = forward_coord_write_post(
+            &url,
+            "test-device-jwt",
+            axum::body::Bytes::from_static(br#"{"resource_key":"work-units/u"}"#),
+            qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
+            None,
+            Some(sid),
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let v = body_json(resp).await;
+        assert_eq!(v["echo_caller"], sid.to_string());
 
         // Non-200 coord verdict: status + body verbatim, not reshaped.
         let url = write_upstream_url(
@@ -16372,6 +16792,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
+            None,
             None,
             None,
         )
@@ -16406,6 +16827,7 @@ mod coord_write_proxy_tests {
             "test-device-jwt",
             axum::body::Bytes::new(),
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
+            None,
             None,
             None,
         )
@@ -16543,17 +16965,23 @@ mod coord_write_proxy_tests {
 
         let target = register_gate_target();
         let url = write_upstream_url(&format!("http://127.0.0.1:{port}"), &target);
-        let (bytes, plan) = plan_gate_registration_spool(
+        let (bytes, mut plan) = plan_gate_registration_spool(
             &target,
             axum::body::Bytes::from_static(REGISTER_GATE_BODY_WITH_HINT),
             Some(spool.clone()),
         );
+        // What the handler does once attribution has run.
+        let sid = uuid::Uuid::parse_str("0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b").unwrap();
+        plan.as_mut()
+            .expect("register-gate is spoolable")
+            .caller_session = Some(sid);
         let resp = forward_coord_write_post(
             &url,
             "test-device-jwt",
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::TierDefault,
             plan.as_ref(),
+            None,
             None,
         )
         .await;
@@ -16579,6 +17007,11 @@ mod coord_write_proxy_tests {
         assert_eq!(row.payload["predicate"]["kind"], "unit_ready");
         // The bootstrap the 404 recovery needs survived the spool.
         assert_eq!(row.payload["work_unit_upsert"]["title"], "Closeout store");
+        // …and so did the attribution, or the replay would land authorless.
+        assert_eq!(
+            row.payload[crate::session::closeout_spool::GATE_CALLER_SESSION_KEY],
+            sid.to_string()
+        );
         assert_eq!(row.seq, v["spooled_seq"].as_i64().unwrap());
     }
 
@@ -16633,6 +17066,7 @@ mod coord_write_proxy_tests {
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
             None,
+            None,
         )
         .await;
         assert_eq!(resp.status(), 422);
@@ -16660,6 +17094,7 @@ mod coord_write_proxy_tests {
             bytes,
             qontinui_runner_lib::profiles::CoordBaseSource::Profile,
             plan.as_ref(),
+            None,
             None,
         )
         .await;
