@@ -39,6 +39,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use super::*;
 use crate::mcp::app_registry::REGISTRATION_TTL_MS;
 use crate::mcp::origin_guard::{self, NormOrigin, OriginGuard};
+use crate::mcp::relay_binding::BINDING_TOMBSTONE_MS;
 
 const GOOD: &str = "https://good.example";
 const EVIL: &str = "https://evil.example";
@@ -1115,13 +1116,19 @@ fn a_multi_origin_flood_cannot_prevent_a_victims_reservation() {
         Some(good),
         "a multi-origin flood silently PREVENTED the victim's reservation"
     );
-    // And the eviction is observable, not silent.
+    // And the eviction is observable, not silent — on its OWN /health field,
+    // never under `rules`, where a shadow box would report it as a refusal.
     assert!(
-        binding.health_json()["rules"]["R5-tombstoneEvicted"]["refused"]
+        binding.health_json()["tombstoneEvictions"]
             .as_u64()
             .unwrap_or(0)
             >= 1,
-        "the ceiling arm must be counted on /health: {}",
+        "the ceiling must be counted on /health: {}",
+        binding.health_json()
+    );
+    assert!(
+        binding.health_json()["rules"]["R5-tombstoneEvicted"].is_null(),
+        "an eviction is an operational event, not a rule verdict: {}",
         binding.health_json()
     );
 }
@@ -1161,6 +1168,404 @@ async fn a_foreign_socket_cannot_refresh_an_http_row_it_does_not_hold() {
             .await,
         "a foreign socket refreshed an HTTP row it does not hold"
     );
+}
+
+/// H-1: the operator-trust carve-out on the ROW reservation.
+///
+/// `tombstone_until` has always exempted operator trust — an agent's id is
+/// free the moment its registration ends. When the reservation moved onto the
+/// row, that carve-out had to move with it, and did not. An agent registering
+/// with `keepAliveSecs: 3600` and then stopping would otherwise lock a
+/// legitimate browser page out of the id for 60 s past a ONE-HOUR TTL, and
+/// only when the sweeper had not yet run — the same timing dependence the row
+/// reservation exists to delete, sign flipped.
+///
+/// `agent_flow_unchanged` never covered this: it covers operator trust
+/// DISPLACING, never an expired operator-trust row being re-taken.
+#[tokio::test]
+async fn an_expired_operator_trust_row_does_not_reserve_the_id() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "app", "appName": "Synthetic", "appType": "web",
+                    "transport": "http", "baseUrl": "http://127.0.0.1:65535",
+                    "keepAliveSecs": 3600 }),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Past its (one hour) TTL, and deliberately NOT swept.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", 3_600_000 + 1_000)
+            .await
+    );
+    assert!(
+        s.relay.app_registry.get("app").await.is_some(),
+        "precondition: the row is retained, which is what makes it a reservation"
+    );
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Page", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "an expired operator-trust row reserved the id against a browser: {body}"
+    );
+}
+
+/// H-1's other half: the row reservation must hold for a BROWSER holder with
+/// no sweep at all, which is the window the attacker actually polls.
+#[tokio::test]
+async fn an_expired_browser_row_reserves_the_id_with_no_sweep() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+
+    // No sweep. The row is retained through its reservation, so the id is
+    // held even though it has already left /ui-bridge/apps/registered.
+    assert!(s
+        .relay
+        .app_registry
+        .list_live()
+        .await
+        .iter()
+        .all(|e| e.app.app_id != "app"));
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+
+    // Once the reservation itself lapses, the id is free again — the accepted
+    // squatting non-goal, not a permanent lock.
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", BINDING_TOMBSTONE_MS + 1_000)
+            .await
+    );
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 200, "the reservation never lapsed: {body}");
+}
+
+/// The structural fix itself: `sweep` retains a row through its RESERVATION,
+/// not merely its TTL, so a sweep landing inside that window leaves the id
+/// held — and writes no tombstone, because the ROW is the reservation.
+///
+/// This is what makes R5 independent of WHEN the sweeper runs. The previous
+/// shape (sweep at the TTL, then write a tombstone) left a gap the sweeper's
+/// 15 s tick could not cover, while `list_live` had already dropped the row
+/// from `/ui-bridge/apps/registered` — the attacker's signal — so polling at
+/// 1 Hz won it roughly 14 times in 15.
+#[tokio::test]
+async fn a_sweep_inside_the_reservation_window_leaves_the_id_held() {
+    let s = spawn(BindingConfig::default()).await;
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(GOOD),
+            json!({ "appId": "app", "appName": "Victim", "appType": "web",
+                    "transport": "http", "baseUrl": GOOD, "origin": GOOD }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("app", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+
+    // The sweeper runs, inside the reservation window.
+    assert_eq!(
+        s.relay.app_registry.sweep(&s.relay.binding).await,
+        0,
+        "a row inside its reservation window must be retained"
+    );
+    assert!(
+        s.relay.app_registry.get("app").await.is_some(),
+        "the row IS the reservation"
+    );
+    assert!(
+        s.relay
+            .binding
+            .tombstone_holder(&crate::mcp::relay_binding::app_tombstone_key("app"))
+            .is_none(),
+        "expiry writes no tombstone any more — there is no collect-then-write \
+         ordering for a queued writer to slip into"
+    );
+
+    let (status, body) = s
+        .post(
+            "/ui-bridge/apps/register",
+            browser(EVIL),
+            json!({ "appId": "app", "appName": "Squatter", "appType": "web",
+                    "transport": "http", "baseUrl": EVIL, "origin": EVIL }),
+        )
+        .await;
+    assert_eq!(status, 409, "a swept row freed the id: {body}");
+    assert_eq!(code(&body), Some("UIB_REGISTRATION_HELD"), "{body}");
+}
+
+/// H-1 / H-2: routing must NOT follow a row that is retained only as a
+/// reservation. Retention answers "who holds this id", not "is this app
+/// reachable", and conflating them would have extended the window in which a
+/// dispatch targets an app that stopped heartbeating.
+#[tokio::test]
+async fn a_reserved_but_expired_row_is_not_dispatchable() {
+    let s = spawn(BindingConfig::default()).await;
+    let app = Router::new().route(
+        "/dispatch",
+        post(|| async { Json(json!({ "reached": true })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stub_port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let (status, _) = s
+        .post(
+            "/ui-bridge/apps/register",
+            agent(),
+            json!({ "appId": "stub", "appName": "Stub", "appType": "web",
+                    "transport": "http",
+                    "baseUrl": format!("http://127.0.0.1:{stub_port}") }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, body) = s.app_dispatch("stub").await.unwrap();
+    assert_eq!(status, 200, "precondition: a fresh row dispatches: {body}");
+
+    assert!(
+        s.relay
+            .app_registry
+            .test_age_entry("stub", REGISTRATION_TTL_MS + 1_000)
+            .await
+    );
+    assert!(
+        s.relay.app_registry.get("stub").await.is_some(),
+        "the row is retained as a reservation"
+    );
+    let (status, body) = s.app_dispatch("stub").await.unwrap();
+    assert_ne!(
+        status, 200,
+        "a reservation-only row was still routed to: {body}"
+    );
+}
+
+/// H-3, shape A, measured by the reviewer: 1023 attacker origins holding ONE
+/// reservation each. Every bucket ties, so "evict the largest bucket" fell out
+/// of `HashMap` order and the victim went after ~888 further writes.
+#[test]
+fn a_small_and_numerous_flood_cannot_evict_a_victims_single_reservation() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    let victim = app_tombstone_key("victim-app");
+    binding.tombstone(victim.clone(), &good);
+
+    for i in 0..(MAX_TOMBSTONES * 2) {
+        let p = Principal::Browser {
+            class: crate::mcp::origin_guard::OriginClass::Foreign,
+            origin: NormOrigin::parse(&format!("https://s{i}.evil.example")).unwrap(),
+        };
+        binding.tombstone(app_tombstone_key(&format!("squat-{i}")), &p);
+    }
+
+    assert_eq!(
+        binding.tombstone_holder(&victim),
+        Some(good),
+        "a one-reservation-per-origin flood evicted the victim's single reservation"
+    );
+}
+
+/// H-3, shape B, measured by the reviewer: the victim legitimately holds the
+/// LARGEST bucket (a multi-app origin), and "evict the largest bucket" landed
+/// on it deterministically, every time. Bucket size is attacker-chosen, so
+/// ranking by raw size is the same shape of flaw as ranking by "do I hold
+/// any".
+#[test]
+fn a_victim_holding_the_largest_bucket_is_not_the_eviction_target() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    // A plausible multi-app origin: more reservations than any attacker
+    // origin, but well under its fair share of the map.
+    let victim_keys: Vec<String> = (0..33)
+        .map(|i| app_tombstone_key(&format!("victim-app-{i}")))
+        .collect();
+    for k in &victim_keys {
+        binding.tombstone(k.clone(), &good);
+    }
+
+    for o in 0..31 {
+        let p = Principal::Browser {
+            class: crate::mcp::origin_guard::OriginClass::Foreign,
+            origin: NormOrigin::parse(&format!("https://s{o}.evil.example")).unwrap(),
+        };
+        for i in 0..32 {
+            binding.tombstone(app_tombstone_key(&format!("squat-{o}-{i}")), &p);
+        }
+    }
+
+    let survived = victim_keys
+        .iter()
+        .filter(|k| binding.tombstone_holder(k).is_some())
+        .count();
+
+    // What fair share actually guarantees, stated exactly rather than
+    // wished for: a bucket keeps its SHARE. With 32 buckets and a 1024-entry
+    // map that is 32, so a victim legitimately holding 33 may lose the one
+    // reservation it holds ABOVE its share — and nothing beyond it. That is
+    // materially different from the rule this replaced, under which the
+    // victim was the target deterministically and lost reservation after
+    // reservation while every attacker bucket kept all 32 of its own.
+    let share = MAX_TOMBSTONES / 32;
+    assert!(
+        survived >= share,
+        "the victim was stripped below its fair share: {survived} of \
+         {} survived, share is {share}",
+        victim_keys.len()
+    );
+    assert!(
+        survived >= victim_keys.len() - 1,
+        "the victim lost more than its above-share surplus: {survived} of {}",
+        victim_keys.len()
+    );
+}
+
+/// H-3, the decisive arm: at a FULL map where every bucket sits at exactly its
+/// fair share, the principal doing the writing pays — not whichever bucket a
+/// size comparison happens to rank first.
+///
+/// This is the case that separates fair-share-plus-self-eviction from "evict
+/// the largest bucket". With every bucket tied, a size ranking has to fall
+/// back on iteration order and takes a reservation from a bucket that did
+/// nothing, while the writer's own bucket — already at its full share — is
+/// untouched. `a_victim_holding_the_largest_bucket_is_not_the_eviction_target`
+/// does NOT distinguish the two rules once ties break deterministically; this
+/// one does.
+#[test]
+fn at_a_saturated_map_the_writer_pays_not_a_bystander() {
+    let binding = RelayBinding::new(BindingConfig::default());
+    let buckets = 32usize;
+    let per = MAX_TOMBSTONES / buckets; // exactly the fair share
+    let origin = |n: usize| Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(&format!("https://b{n:02}.example")).unwrap(),
+    };
+    let key = |n: usize, i: usize| app_tombstone_key(&format!("b{n:02}-{i}"));
+
+    for n in 0..buckets {
+        for i in 0..per {
+            binding.tombstone(key(n, i), &origin(n));
+        }
+    }
+    assert_eq!(
+        binding.health_json()["tombstones"].as_u64().unwrap() as usize,
+        MAX_TOMBSTONES,
+        "precondition: the map is exactly full, every bucket at its share"
+    );
+
+    // b31 is the bystander a size ranking would pick: with every bucket tied,
+    // `max_by_key` keeps the LAST maximum in key order.
+    let bystander_before = (0..per)
+        .filter(|i| binding.tombstone_holder(&key(31, *i)).is_some())
+        .count();
+    assert_eq!(bystander_before, per);
+
+    // b05 — already at its full share — asks for one more.
+    binding.tombstone(app_tombstone_key("b05-extra"), &origin(5));
+
+    let bystander_after = (0..per)
+        .filter(|i| binding.tombstone_holder(&key(31, *i)).is_some())
+        .count();
+    assert_eq!(
+        bystander_after, per,
+        "a bystander bucket at its fair share lost a reservation to someone \
+         else's write"
+    );
+    let writer_after = (0..per)
+        .filter(|i| binding.tombstone_holder(&key(5, *i)).is_some())
+        .count();
+    assert_eq!(
+        writer_after,
+        per - 1,
+        "the writer, already at its share, must have paid for its own extra \
+         reservation"
+    );
+    assert!(binding
+        .tombstone_holder(&app_tombstone_key("b05-extra"))
+        .is_some());
+}
+
+/// M-c: a bucket is a quota, so it has to cost something to mint. A keyed tab
+/// principal (Phase 2) is 32 client-side random bytes — unlimited `log_key`s
+/// for free — so everything without a verified origin shares ONE bucket.
+#[test]
+fn principals_with_no_verified_origin_share_one_tombstone_bucket() {
+    let a = Principal::TabKey {
+        digest: key_digest("key-a"),
+    };
+    let b = Principal::TabKey {
+        digest: key_digest("key-b"),
+    };
+    assert_ne!(a.log_key_for_test(), b.log_key_for_test());
+    assert_eq!(a.tombstone_bucket(), b.tombstone_bucket());
+    assert_eq!(
+        Principal::Opaque {
+            class: crate::mcp::origin_guard::OriginClass::Foreign
+        }
+        .tombstone_bucket(),
+        a.tombstone_bucket()
+    );
+    // …while a verified origin is its own bucket, and the loopback aliases
+    // that are ONE principal are deliberately separate buckets: a bucket is a
+    // quota, not an identity.
+    let good = Principal::Browser {
+        class: crate::mcp::origin_guard::OriginClass::Foreign,
+        origin: NormOrigin::parse(GOOD).unwrap(),
+    };
+    assert_eq!(good.tombstone_bucket(), GOOD);
+    assert_ne!(good.tombstone_bucket(), a.tombstone_bucket());
 }
 
 /// R7.
