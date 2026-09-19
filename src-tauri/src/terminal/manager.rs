@@ -309,6 +309,9 @@ impl TerminalManager {
             .is_some_and(command_implies_bypass_permissions);
 
         let emitter = app_handle.clone();
+        // W-B: taken BEFORE the spawn, so the spawn-default stamp below can tell
+        // a record this spawn created from one a resume/restore re-opened.
+        let spawn_started_ms = chrono::Utc::now().timestamp_millis();
         let session = TerminalSession::spawn(
             id.clone(),
             title,
@@ -373,6 +376,29 @@ impl TerminalManager {
                         ..Default::default()
                     },
                 );
+                // W-B (plan 2026-09-10-spawn-tenant-never-reaches-the-session-
+                // coord-credential): the device default the identity seam read
+                // for THIS spawn, made durable so a restart compares a restored
+                // tenant-less session against it rather than against whatever
+                // the default is at restore. Set-once, and only onto a record
+                // this spawn created.
+                if let Some(sample) = crate::coord_mcp::terminal_spawn_default_tenant(&info.id) {
+                    use crate::coord_mcp::SpawnDefaultSample;
+                    store.record_spawn_device_default(
+                        &info.id,
+                        crate::session::session_lifecycle_store::SpawnDeviceDefault {
+                            tenant_id: match sample {
+                                SpawnDefaultSample::Named(t) => Some(t.to_string()),
+                                SpawnDefaultSample::NoDefault
+                                | SpawnDefaultSample::Unresolvable => None,
+                            },
+                            // An unreadable pin is recorded as UNKNOWN, not as
+                            // "no default".
+                            unresolvable: sample == SpawnDefaultSample::Unresolvable,
+                        },
+                        spawn_started_ms,
+                    );
+                }
             }
         }
 

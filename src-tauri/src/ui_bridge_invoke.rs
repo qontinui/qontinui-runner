@@ -578,15 +578,16 @@ pub const UI_BRIDGE_COMMANDS: &[ProxyableCommand] = &[
     ProxyableCommand {
         name: "get_coord_device_token",
         dispatch: Dispatch::InProcess,
-        description: "Return this runner's coord DEVICE JWT (the token in AuthManager's access_token slot), or null when the runner is unpaired. The eval-free credential door: POST /ui-bridge/control/page/evaluate cannot mint on a CSP-enforcing build. This is a PROBE and does NOT check `exp` -- validate the token's expiry before use and treat an expired one as no credential. A credential-store read error is a 500 (pairing state UNKNOWN), never null.",
-        args_schema: r#"{"type":"object","properties":{},"additionalProperties":false}"#,
+        description: "Return a coord DEVICE JWT this runner holds, or null when it holds none for what was asked. Args: {\"tenantId\": \"<uuid>\"} returns THAT tenant's token (its own slot, or the default slot only when it is the default binding -- never another tenant's; null when unpaired for it). With no tenantId: the default slot (AuthManager's access_token), EXCEPT on a runner holding more than one tenant slot, where it is a 409 get_coord_device_token:tenant_required (kill switch QONTINUI_DEVICE_TOKEN_DOOR_DEFAULT_SLOT=1). The eval-free credential door: POST /ui-bridge/control/page/evaluate cannot mint on a CSP-enforcing build. The no-tenant arm is a PROBE and does NOT check `exp` -- validate expiry before use and treat an expired token as no credential. A credential-store read error is a 500 (UNKNOWN), never null.",
+        args_schema: r#"{"type":"object","properties":{"tenantId":{"type":["string","null"]}},"additionalProperties":false}"#,
         response_schema: r#"{"type":["string","null"]}"#,
         // The startup probe is a FRONTEND-transport probe: it emits
         // `ui-bridge:invoke-request` for every entry regardless of `dispatch`
         // (`ui_bridge_invoke_probe.rs`). Probing this one would therefore route
         // a live device JWT through the React frontend and back over IPC on
-        // every boot -- for a command that takes no args, so there is no
-        // required key that could be missing and no schema drift to detect. On
+        // every boot -- for a command whose only arg (`tenantId`) is optional,
+        // so there is no required key that could be missing and no schema drift
+        // to detect. On
         // a headless runner it would simply sit out the 10 s probe timeout.
         // Opt out, as both other `Dispatch::InProcess` entries do.
         probe_with_empty_args: false,

@@ -1240,6 +1240,7 @@ pub fn terminal_session_record_open(
         finished_at: None,
         finish_reason: None,
         finish_synced: false,
+        spawn_device_default: None,
     };
     let session_id = record.claude_session_id.clone();
     store.record_open(record);
@@ -2495,6 +2496,7 @@ async fn poll_and_record_session<F>(
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             };
             store.record_open(record);
             info!(
@@ -2584,6 +2586,7 @@ pub(crate) fn record_pinned_session_open(
         finished_at: None,
         finish_reason: None,
         finish_synced: false,
+        spawn_device_default: None,
     });
     info!(
         terminal_id = %terminal_id,
@@ -2777,6 +2780,7 @@ mod tests {
             finished_at: None,
             finish_reason: None,
             finish_synced: false,
+            spawn_device_default: None,
         }
     }
 

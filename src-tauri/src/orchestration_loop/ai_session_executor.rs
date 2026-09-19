@@ -491,6 +491,7 @@ pub async fn dispatch_subtask(
                 finished_at: None,
                 finish_reason: None,
                 finish_synced: false,
+                spawn_device_default: None,
             },
         );
         info!(

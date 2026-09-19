@@ -45,6 +45,39 @@ the whole variable is unset the row is `<n/a>`, not `<none>` — with no context
 there is no briefing to have provenance for, and `<none>` would assert a runner
 build this card never saw.
 
+**Line 3, where present, is the COORD-CREDENTIAL line** —
+`[coord-credential: <posture> since <RFC3339>]`, with `<posture>` one of
+`expiring`, `expired`, `absent`, `unrefreshable` or `dark`
+(`terminal/mod.rs`, `coord_credential_briefing_line()`; plan
+`2026-09-12-runner-loads-with-an-expired-coord-credential-and-tells-nobody`).
+It is a statement about **the runner's own coord device JWT**, not about this
+session's `.mcp.json`, not about its proxy nonce, and not about coord — all
+three can be perfect while this line reads `expired`, and that combination is
+the whole reason the line exists. When it is present, every `coord_*` call this
+session makes through the runner's forwarder comes back
+`401 {"code":"runner_credential_<posture>"}` and the runner drops the matching
+`RUNNER_CREDENTIAL_<POSTURE>` reason into `.coord-mcp-status` beside a
+perfectly valid `.mcp.json`; the doors that still answer are the ones carrying
+their own credential (`/coord-revive`'s L4 and L5), a re-provision fixes
+nothing, and a new session fixes nothing either because every session on the box
+shares that runner.
+
+**Its ABSENCE is three-way and must never be printed as health.** The runner
+emits no line 3 when the posture is `live`, when no refresher pass has concluded
+yet (UNKNOWN — a posture printed here would be invented), and on any build
+predating the line. This card cannot separate those from the variable alone, so
+it reports the absence as exactly that ambiguity — the same reading an absent
+`.coord-mcp-status` breadcrumb gets. `expiring` DOES print, unlike the
+breadcrumb and the local 401, which fire only when the credential cannot answer
+at all.
+
+`GET :9876/health`'s `coordCredential` is what separates the three, and it never
+answers `null`: `mcp_api.rs` unwraps a `None` posture into
+`{"posture":"unknown","state":"unknown","reason":…}`, so the runner's own
+UNKNOWN arrives as the **value** `unknown` rather than as a missing object. An
+absent `coordCredential` key therefore means a build predating the field, and
+nothing else.
+
 Three things this card exists to stop you concluding:
 
 1. **A `:9876` probe is not an identity test.** It answers "is the runner API up
@@ -121,7 +154,7 @@ PLANS_DIR="$(printenv QONTINUI_PLANS_DIR 2>/dev/null)"
 # runner that has one, is the provenance line. The briefing body itself is not
 # printed. Parse with parameter expansion - no awk field references, which the
 # harness would rewrite (lint check #18).
-SPAWN_VER=""; SPAWN_SHA=""; BRIEFING=""; CLAUSE=""
+SPAWN_VER=""; SPAWN_SHA=""; BRIEFING=""; CLAUSE=""; CREDENTIAL=""
 if [ -n "$CTX" ]; then
   MARKER="$(printf '%s\n' "$CTX" | head -n 1)"
   case "$MARKER" in
@@ -158,6 +191,15 @@ if [ -n "$CTX" ]; then
   case "$LINE2" in
     *"[clause: "*) CLAUSE="${LINE2#*\[clause: }"; CLAUSE="${CLAUSE%%]*}" ;;
   esac
+  # LINE 3 IS OPTIONAL AND PREFIX-MATCHED, never positional. The runner emits it
+  # only when there is something to say, so on every healthy spawn - and on any
+  # build predating it - line 3 is the FIRST LINE OF THE BRIEFING BODY instead.
+  # Taking `sed -n '3p'` as the credential row would print briefing prose as a
+  # posture; the `[coord-credential: ` guard is what makes the absence readable.
+  LINE3="$(printf '%s\n' "$CTX" | sed -n '3p')"
+  case "$LINE3" in
+    "[coord-credential: "*) CREDENTIAL="${LINE3#\[coord-credential: }"; CREDENTIAL="${CREDENTIAL%%]*}" ;;
+  esac
 fi
 
 # Three states for the briefing row, not two. With NO context at all there is no
@@ -178,12 +220,23 @@ elif [ -n "$CLAUSE" ]; then CLAUSE_ROW="$CLAUSE"
 elif [ -n "$BRIEFING" ]; then CLAUSE_ROW="<absent - plan-capture dial is off>"
 else CLAUSE_ROW="<n/a - runner predates briefing provenance>"; fi
 
+# THE ABSENCE IS THE POINT, so it is spelled out rather than left blank. A
+# present line names a runner whose coord credential cannot answer; an absent one
+# is `live` OR UNKNOWN (no refresher pass has concluded) OR a build that predates
+# the line, and this card cannot tell those apart from the variable alone.
+# Printing `live` or `ok` here would be the exact fabrication the plan behind
+# this row exists to end.
+if [ -z "$CTX" ]; then CREDENTIAL_ROW="<n/a - no runner context>"
+elif [ -n "$CREDENTIAL" ]; then CREDENTIAL_ROW="$CREDENTIAL  <-- the RUNNER's coord credential cannot answer; your .mcp.json and nonce are FINE. Use /coord-revive's L4/L5 bearer doors; a re-provision, a new session and a runner restart all fix nothing"
+else CREDENTIAL_ROW="<absent - live, UNKNOWN (no refresher pass concluded), or a build predating the line. NOT evidence of health: confirm with GET http://127.0.0.1:9876/health .coordCredential>"; fi
+
 if [ -n "$CTX" ]; then INSIDE="YES"; else INSIDE="NO (or a headless spawn - see note 3)"; fi
 printf 'inside runner : %s\n' "$INSIDE"
 printf 'runner id     : %s\n' "${RUNNER_ID:-<unset>}"
 printf 'context       : version %s sha %s\n' "${SPAWN_VER:-<unparsed>}" "${SPAWN_SHA:-<unparsed>}"
 printf 'briefing      : %s\n' "$BRIEFING_ROW"
 printf 'clause        : %s\n' "$CLAUSE_ROW"
+printf 'coord cred    : %s\n' "$CREDENTIAL_ROW"
 printf 'tier          : %s\n' "${TIER:-<unset>}"
 printf 'terminal id   : %s\n' "${TERMINAL_ID:-<unset>}"
 printf 'worktree mode : %s\n' "${WT_MODE:-<unset>}"
@@ -495,6 +548,64 @@ esac
 [ "$LIVE_SHA" = "unknown" ] && LIVE_SHA=""
 [ "$SPAWN_SHA" = "unknown" ] && SPAWN_SHA=""
 
+# THE LIVE HALF OF THE CREDENTIAL ROW, from the body already fetched - no second
+# request. The IDENTITY block reports what the runner said at SPAWN; this reports
+# what it says NOW, and they differ in both directions (a credential that expired
+# after spawn, or one that has since healed).
+#
+# DO NOT ASSUME A KEY ORDER INSIDE THE OBJECT. `CoordCredentialStatus::to_json`
+# builds it with `serde_json::json!`, and serde_json is pinned at 1.0.149 with
+# NO `indexmap` dependency, so `preserve_order` is off and its `Map` is a
+# `BTreeMap`: the keys serialize SORTED, and `posture` is nowhere near the
+# front. A pattern anchored on `{"posture":` reads NOTHING from a real body, and
+# the first cut of this block did exactly that; it looked like it worked only
+# because the UNKNOWN body carries just posture/reason/state, which sorts
+# `posture` first.
+#
+# DELIBERATELY NO KEY LIST HERE. One stood in this comment for a day and was
+# already stale: `attributable` landed in `CoordCredentialStatus` and, sorting
+# ahead of `canAnswer`, moved `posture` from ninth of thirteen to tenth of
+# fourteen. A transcribed roster of a sibling repo's field names is the drift
+# class this fleet keeps paying for, and no checker reaches this one -- so what
+# is written down is the PROPERTY the reader depends on, which does not move:
+# the object's fields are all SCALARS (string, bool, integer or null), so the
+# first `}` after the key IS the object's close and bounds the read, and within
+# that bound the FIRST `"posture":"` is the value regardless of how many keys
+# precede it or what they are called. A new scalar key cannot break this;
+# measured against the fourteen-key body on 2026-09-16.
+LIVE_CRED=""
+CRED_PRESENT=""
+case "$LIVE_BUILD" in
+  *'"coordCredential":'*)
+    CRED_PRESENT=1
+    CRED_SEG="${LIVE_BUILD#*\"coordCredential\":}"
+    CRED_SEG="${CRED_SEG%%\}*}"
+    case "$CRED_SEG" in
+      *'"posture":"'*)
+        LIVE_CRED="${CRED_SEG#*\"posture\":\"}"
+        LIVE_CRED="${LIVE_CRED%%\"*}"
+        ;;
+    esac
+    ;;
+esac
+# THREE absences, and each names only what it can. `posture: "unknown"` is a
+# VALUE here, not an absence: the runner never serves `coordCredential: null` --
+# `mcp_api.rs` unwraps a `None` posture into {"posture":"unknown","state":
+# "unknown","reason":...}, so UNKNOWN arrives through the row above and prints
+# as `unknown`.
+if [ -z "$LIVE_BUILD" ]; then
+  printf 'coord cred (now)   UNKNOWN - /health did not answer; nothing here observed the credential\n'
+elif [ -n "$LIVE_CRED" ]; then
+  printf 'coord cred (now)   %s\n' "$LIVE_CRED"
+elif [ -n "$CRED_PRESENT" ]; then
+  # The key IS present - the case above established it - so "the build predates
+  # the field" is the ONE explanation ruled out on this path, and printing it
+  # would be the fabrication this row exists to prevent.
+  printf 'coord cred (now)   UNKNOWN - coordCredential is present but this reader could not parse a posture out of it (shape changed, or the body was truncated)\n'
+else
+  printf 'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)\n'
+fi
+
 if [ -z "$SPAWN_SHA" ] || [ -z "$LIVE_SHA" ]; then
   printf 'build cross-check  UNKNOWN (spawn=%s live=%s)\n' "${SPAWN_SHA:-?}" "${LIVE_SHA:-?}"
 elif [ "$SPAWN_SHA" = "$LIVE_SHA" ]; then
@@ -515,13 +626,117 @@ far the running build is behind `origin/main`. A runner can be many commits
 behind and still AGREE here, because AGREE means "the binary that spawned me is
 the binary I am talking to", not "the binary is current".
 
+## Step 5 — TENANCY: which tenant each half of this session acts as
+
+A session has **three** tenants, decided by three different mechanisms, and they
+can disagree (plan
+`2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P0; served
+by a runner build carrying qontinui-runner PR #1558):
+
+| Half | What decides it | Field in the runner's census |
+|---|---|---|
+| **row** | the tenant the spawn picker / `--tenant` stamped on the session | `tenancy.row.tenantId` |
+| **data plane** | the tenant the runner's own work-scoped coord writes present | `tenancy.dataPlane` |
+| **credential** | the tenant this session's coord-mcp key actually selects — where its memory, prompt-document and gate writes land | `tenancy.credential` |
+
+A session labelled B whose credential resolves to A writes to A and gets a
+`201` for it; this card is where that is visible. Read it from the runner's own
+census, `GET /control/sessions/info`, for the entry whose `identity.terminalId`
+is `$QONTINUI_TERMINAL_ID`, and print what it says **verbatim**, reasons
+included — never pick one tenant as "the" tenant.
+
+`divergence` is the comparison verdict: `diverged`, `agree`, or `unknown` (a
+tenant-less session whose spawn-time device default was not recorded — after a
+runner restart on a build that does not persist it — cannot be compared, and
+`unknown` is NOT agreement). Which fields answer depends on the runner BUILD:
+
+- a build carrying the runner P2/P3 change (same plan) serves `divergence`,
+  `row.spawnDeviceDefaultStatus` and `row.spawnDeviceDefaultReason`;
+- a build carrying qontinui-runner PR #1558 (P0/P1) but not that change serves
+  the `tenancy` block with only the boolean `diverged`, whose `false` also covers
+  "could not compare" — so the card reports
+  `unknown (runner predates the divergence field)`, never `agree`;
+- a build with neither serves **no `tenancy` block at all**: the whole tenancy
+  row is UNKNOWN (absent field), never agreement.
+
+This is a REACHABILITY-class read (it needs the runner up right now) about an
+IDENTITY-class fact, so it prints under its own header, after both blocks.
+
+```bash
+# Re-derived - shell state does not survive between Bash tool calls (Step 2).
+API_PORT="$(printenv QONTINUI_RUNNER_API_PORT 2>/dev/null)"
+TERM_ID="$(printenv QONTINUI_TERMINAL_ID 2>/dev/null)"
+echo '=== TENANCY (read from the runner now) ==='
+if [ -z "$TERM_ID" ]; then
+  echo 'tenancy        UNKNOWN - $QONTINUI_TERMINAL_ID is unset, so the census cannot name this session (not a runner-spawned terminal, or a headless spawn)'
+  exit 0
+fi
+BODY="$(mktemp)"; trap 'rm -f "$BODY"' EXIT
+# Native curl.exe / python.exe open the path themselves, so hand them the
+# Windows spelling where cygpath exists (MSYS_NO_PATHCONV - see Step 3).
+BODYP="$BODY"
+command -v cygpath >/dev/null 2>&1 && BODYP="$(cygpath -w "$BODY")"
+CODE="$(curl -s --connect-timeout 3 -m 20 -o "$BODYP" -w '%{http_code}' "http://127.0.0.1:${API_PORT:-9876}/control/sessions/info" 2>/dev/null)"
+RC=$?
+if [ "$RC" = "7" ]; then echo 'tenancy        UNKNOWN - runner DOWN (connection refused)'; exit 0; fi
+if [ "$RC" != "0" ] || [ "$CODE" != "200" ]; then
+  echo "tenancy        UNKNOWN - census did not answer 200 (curl exit $RC, HTTP ${CODE:-none}); not evidence of anything"
+  exit 0
+fi
+if command -v jq >/dev/null 2>&1; then
+  jq -r --arg term "$TERM_ID" '
+    def v(x): if x == null then "<null>" else (x | tostring) end;
+    if (.data | type) != "object" then "tenancy        UNKNOWN - census envelope has no data object"
+    elif .data.status != "ok" then "tenancy        UNKNOWN - census unavailable: \(v(.data.reason))"
+    else ([.data.sessions[]? | select(.identity.terminalId? == $term)] | first) as $s
+    | if $s == null then "tenancy        UNKNOWN - terminal \($term) is not in the census (not an OPEN session on this runner)"
+      elif ($s.tenancy | type) != "object" then "tenancy        UNKNOWN - no tenancy block (runner build predates it; absent field, NOT agreement)"
+      else $s.tenancy as $t
+      | "row            tenant \(v($t.row.tenantId))  spawn-default \(v($t.row.spawnDeviceDefaultTenantId)) [\(v($t.row.spawnDeviceDefaultStatus)) \(v($t.row.spawnDeviceDefaultReason))]  current-default \(v($t.row.currentDeviceDefaultTenantId)) (context only)",
+        "data plane     \(v($t.dataPlane.status))  tenant \(v($t.dataPlane.tenantId))  reason \(v($t.dataPlane.reason))",
+        "credential     \(v($t.credential.status))  tenant \(v($t.credential.tenantId))  slot \(v($t.credential.slot))  reason \(v($t.credential.reason))",
+        "slot posture   \(v($t.credential.posture.status))  value \(v($t.credential.posture.value))  canAnswer \(v($t.credential.posture.canAnswer))  reason \(v($t.credential.posture.reason))",
+        (if ($t | has("divergence")) then "divergence     \($t.divergence)"
+         else "divergence     unknown (runner predates the divergence field; its diverged=\(v($t.diverged)) cannot say \"could not compare\")" end)
+      end
+    end' < "$BODY"  # envelope-ok: a predicate search over the census; every absent key prints <null> or a named UNKNOWN line, never an inferred tenant
+else
+  PY="$(command -v python3 || command -v python)"
+  if [ -z "$PY" ]; then echo 'tenancy        UNKNOWN - neither jq nor python can read the census (LOCAL fault, not a verdict)'; exit 0; fi
+  TERM_ID="$TERM_ID" "$PY" -c 'import json,os,sys
+d=json.load(open(sys.argv[1]))  # envelope-ok: every absent key below prints a named UNKNOWN line or <null>, never an inferred tenant
+v=lambda x: "<null>" if x is None else str(x)
+data=d.get("data") if isinstance(d,dict) else None
+if not isinstance(data,dict): print("tenancy        UNKNOWN - census envelope has no data object"); sys.exit(0)
+if data.get("status")!="ok": print("tenancy        UNKNOWN - census unavailable: %s" % v(data.get("reason"))); sys.exit(0)
+rows=[r for r in (data.get("sessions") or []) if isinstance(r,dict) and (r.get("identity") or {}).get("terminalId")==os.environ["TERM_ID"]]
+if not rows: print("tenancy        UNKNOWN - terminal %s is not in the census" % os.environ["TERM_ID"]); sys.exit(0)
+t=rows[0].get("tenancy")
+if not isinstance(t,dict): print("tenancy        UNKNOWN - no tenancy block (runner build predates it; absent field, NOT agreement)"); sys.exit(0)
+g=lambda o,k: (o or {}).get(k)
+row,dp,cr=t.get("row"),t.get("dataPlane"),t.get("credential")
+po=g(cr,"posture")
+print("row            tenant %s  spawn-default %s [%s %s]  current-default %s (context only)" % (v(g(row,"tenantId")),v(g(row,"spawnDeviceDefaultTenantId")),v(g(row,"spawnDeviceDefaultStatus")),v(g(row,"spawnDeviceDefaultReason")),v(g(row,"currentDeviceDefaultTenantId"))))
+print("data plane     %s  tenant %s  reason %s" % (v(g(dp,"status")),v(g(dp,"tenantId")),v(g(dp,"reason"))))
+print("credential     %s  tenant %s  slot %s  reason %s" % (v(g(cr,"status")),v(g(cr,"tenantId")),v(g(cr,"slot")),v(g(cr,"reason"))))
+print("slot posture   %s  value %s  canAnswer %s  reason %s" % (v(g(po,"status")),v(g(po,"value")),v(g(po,"canAnswer")),v(g(po,"reason"))))
+print("divergence     %s" % (t["divergence"] if "divergence" in t else "unknown (runner predates the divergence field; its diverged=%s cannot say \"could not compare\")" % v(t.get("diverged"))))' "$BODYP"  # envelope-ok: the same predicate search as the jq arm
+fi
+```
+
+Read the rows, do not summarise them away: a `credential` tenant that differs
+from the `row` tenant is the wrong-tenant-write condition itself, and
+`current-default` is context only — after an operator switches the device
+default every running session legitimately differs from it. An `unknown`
+anywhere names its reason; carry the reason into the one-sentence summary.
+
 ## Fallback when bash hangs
 
 msys `bash` has been observed hanging on this box where PowerShell works — switch
 rather than retrying. This one block carries the **whole** card: Step 1's IDENTITY
 rows, Step 2's port probes and Step 4's build cross-check.
 
-**What it does NOT carry is Step 3's proxy sweep** — that sweep needs a JSON
+**What it does NOT carry is Step 3's proxy sweep, nor Step 5's tenancy read** — that sweep needs a JSON
 reader, a private header file and a per-candidate POST, and there is no
 PowerShell twin of it here. Print the proxy row as `not swept`, exactly as Step 3
 itself instructs when you skip it. An unswept row is not a dead one, and a
@@ -624,6 +839,29 @@ foreach ($probe in @(@{ Role = 'runner'; Port = $port }, @{ Role = 'supervisor';
   }
 }
 'live coord proxy   not swept (Step 3 has no PowerShell twin - not a verdict)'
+'tenancy            not read (Step 5 has no PowerShell twin - UNKNOWN, not agreement)'
+
+# The live credential row, from the body already fetched - the pwsh twin of the
+# bash block above, with the same three absences and the same refusal to assume
+# a key order. `[^}]*` is the regex spelling of that bash block's "bound the read
+# to the object": serde_json serializes this object's keys SORTED (BTreeMap --
+# 1.0.149, no `indexmap`, so `preserve_order` is off), so `posture` arrives deep
+# inside the object and an anchor on `\{\s*"posture"` matches nothing on a real
+# body. The bound holds for the reason the bash comment gives -- every field is
+# a scalar, so no nested `}` can end it early -- and NOT because of any
+# particular key list, which is why neither comment carries one.
+$liveCred = ''
+$credPresent = "$runnerBody" -cmatch '"coordCredential"\s*:'
+if ("$runnerBody" -cmatch '"coordCredential"\s*:\s*\{[^}]*"posture"\s*:\s*"([^"]*)"') { $liveCred = $Matches[1] }
+if (-not "$runnerBody") {
+  'coord cred (now)   UNKNOWN - /health did not answer; nothing here observed the credential'
+} elseif ($liveCred) {
+  "coord cred (now)   $liveCred"
+} elseif ($credPresent) {
+  'coord cred (now)   UNKNOWN - coordCredential is present but this reader could not parse a posture out of it (shape changed, or the body was truncated)'
+} else {
+  'coord cred (now)   UNKNOWN - no coordCredential key in this /health body (build predates the field)'
+}
 
 # Step 4, from the /health body already fetched above - no second request.
 # `data.gitSha`, NOT the top-level `buildId`: see the long note in Step 4 for
@@ -663,7 +901,8 @@ Two limitations of this block, stated rather than left to be inferred:
 
 ## Output shape
 
-Print exactly two labelled blocks, in this order, with the fixed half first:
+Print the two labelled blocks, in this order, with the fixed half first, then
+the TENANCY block from Step 5:
 
 ```
 === IDENTITY (fixed for this session) ===
@@ -683,7 +922,17 @@ runner  :9876       up (HTTP 200)
 supervisor :9875    DOWN (connection refused)
 live coord proxy    <path/to/.mcp.json>  (nonce#<fp>) | not swept
 build cross-check   AGREE | DISAGREE | UNKNOWN
+
+=== TENANCY (read from the runner now) ===
+row            tenant <uuid|<null>>  spawn-default <uuid|<null>> [<recorded|unknown> <reason>]  current-default <uuid> (context only)
+data plane     <owned|device|unresolved|unknown>  tenant <uuid|<null>>  reason <reason|<null>>
+credential     <resolved|unknown>  tenant <uuid|<null>>  slot <tenant|default|<null>>  reason <reason|<null>>
+slot posture   <observed|unknown>  value <live|expiring|expired|...>  canAnswer <bool>  reason <reason|<null>>
+divergence     diverged | agree | unknown[ (why)]
 ```
+
+or a single `tenancy  UNKNOWN - <reason>` line when the census cannot be read,
+the terminal is not in it, or the runner predates the block.
 
 Then one sentence naming anything that came back UNKNOWN and why it is not a
 "no". Do not merge the blocks, and do not let a reachability result rewrite an

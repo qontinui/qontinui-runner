@@ -200,6 +200,18 @@ pub(crate) struct NonceBinding {
     /// may fail closed, so the distinction has to survive in the binding
     /// rather than being reconstructed later (it cannot be).
     session_pin: crate::session::tenant_pin::TenantPin,
+    /// Whether [`Self::session_pin`] was CHOSEN for this session or SAMPLED from
+    /// the machine (plan
+    /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`,
+    /// review follow-up W-C). Both freeze a `Pinned(t)`, and both keep writing to
+    /// `t` for the life of the key. They differ in what a LATER tenant-less
+    /// provision into the same shared cwd may do: an explicit pin belongs to a
+    /// session that named its tenant and is never displaced by one that did not
+    /// ([`cwd_key_pinned_away_from_machine`]); a machine-sampled pin only recorded
+    /// what the device default was then, so after the operator switches the
+    /// default a tenant-less provision re-mints the cwd key under the new one —
+    /// "a switch re-points FUTURE sessions". Persisted beside the pin.
+    pin_origin: PinOrigin,
     /// The runner TERMINAL this nonce was provisioned for, frozen at mint time
     /// (same pattern and lifetime as `session_tenant`).
     ///
@@ -268,6 +280,65 @@ pub(crate) struct NonceBinding {
     /// because every subsequent snapshot persists a real time for every
     /// binding minted since.
     minted_at: std::time::SystemTime,
+}
+
+/// See [`NonceBinding::pin_origin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PinOrigin {
+    /// A spawn picker / `--tenant` / provision-session `tenant_id` named it.
+    Explicit,
+    /// The mint read the machine's pin because the caller named nothing (also
+    /// every Unpinned/Unresolvable binding, and an adopted `.mcp.json` nonce).
+    MachineSampled,
+}
+
+impl From<PinOrigin> for crate::secure_storage::StoredPinOrigin {
+    fn from(o: PinOrigin) -> Self {
+        match o {
+            PinOrigin::Explicit => Self::Explicit,
+            PinOrigin::MachineSampled => Self::MachineSampled,
+        }
+    }
+}
+
+impl PinOrigin {
+    /// The origin a restored binding carries. A persisted TENANT with no
+    /// persisted ORIGIN was written by a build that stored the pin but not its
+    /// provenance, and is read as [`PinOrigin::Explicit`] — the conservative arm:
+    /// wrongly treating an explicit pin as machine-sampled would let a
+    /// tenant-less provision evict a tenant-B session's key (the C1 defect),
+    /// while the opposite error only leaves a pre-switch key in place, which is
+    /// exactly the behaviour before W-C. No persisted tenant is machine-sampled.
+    pub(crate) fn restored(
+        session_tenant: Option<Uuid>,
+        stored: Option<crate::secure_storage::StoredPinOrigin>,
+    ) -> Self {
+        use crate::secure_storage::StoredPinOrigin;
+        match (session_tenant, stored) {
+            (None, _) => PinOrigin::MachineSampled,
+            (Some(_), Some(StoredPinOrigin::MachineSampled)) => PinOrigin::MachineSampled,
+            (Some(_), Some(StoredPinOrigin::Explicit) | None) => PinOrigin::Explicit,
+        }
+    }
+}
+
+/// What a mint freezes as the binding's pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MintPin {
+    /// Sample the machine now ([`PinOrigin::MachineSampled`]).
+    MachineNow,
+    /// A tenant the caller chose ([`PinOrigin::Explicit`]).
+    Explicit(Uuid),
+    /// A pin carried verbatim from a key this mint REPLACES (the boot reconcile's
+    /// rewrite on a moved port, W-A), with the origin it had.
+    Carried(Uuid, PinOrigin),
+}
+
+impl MintPin {
+    /// `Some(t)` is an explicit choice; `None` samples the machine.
+    pub(crate) fn from_chosen(session_tenant: Option<Uuid>) -> Self {
+        session_tenant.map_or(MintPin::MachineNow, MintPin::Explicit)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1748,6 +1819,9 @@ struct GracedNonce {
     /// it was issued for rather than to whatever the machine reads now (plan
     /// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P1).
     session_tenant: Option<Uuid>,
+    /// The evicted binding's [`PinOrigin`], so a rewrite that carries a graced
+    /// key's pin keeps a machine-sampled pin machine-sampled (review nit on W-A).
+    pin_origin: PinOrigin,
 }
 
 /// Transient grace registry: an evicted DEVICE nonce → its expiry and the
@@ -1800,6 +1874,7 @@ fn grace_evicted_device_nonces(evicted: &[(String, NonceBinding)]) {
                 workdir: b.workdir.clone(),
                 terminal_id: b.terminal_id.clone(),
                 session_tenant: b.session_pin.pinned(),
+                pin_origin: b.pin_origin,
             },
         );
     }
@@ -1846,6 +1921,7 @@ fn graced_nonce_snapshot() -> HashMap<String, crate::secure_storage::StoredGrace
                     terminal_id: g.terminal_id.clone(),
                     grace_until_unix: minted_at_to_unix(g.grace_until),
                     session_tenant: g.session_tenant,
+                    session_tenant_origin: g.session_tenant.map(|_| g.pin_origin.into()),
                 },
             )
         })
@@ -1886,6 +1962,7 @@ fn restore_graced_nonces(
                     workdir: g.workdir.clone(),
                     terminal_id: g.terminal_id.clone(),
                     session_tenant: g.session_tenant,
+                    pin_origin: PinOrigin::restored(g.session_tenant, g.session_tenant_origin),
                 },
             );
             restored.push((nonce, g.workdir, g.terminal_id, grace_until));
@@ -3097,6 +3174,8 @@ fn device_nonce_snapshot(
                     // P1). Unpinned / Unresolvable mints persist nothing and
                     // restore as before.
                     session_tenant: b.session_pin.pinned(),
+                    // W-C: the pin's provenance, only beside a pin.
+                    session_tenant_origin: b.session_pin.pinned().map(|_| b.pin_origin.into()),
                 },
             )
         })
@@ -4418,6 +4497,10 @@ fn restore_proxy_nonces_from(store: &crate::secure_storage::SecureStorage) -> No
                     .session_tenant
                     .map(crate::session::tenant_pin::TenantPin::Pinned)
                     .unwrap_or(restore_time_pin),
+                pin_origin: PinOrigin::restored(
+                    binding.session_tenant,
+                    binding.session_tenant_origin,
+                ),
                 // The terminal IS carried, since plan 2026-08-20 Phase 4
                 // widened the store to hold it. It is not an identity claim —
                 // the PTY it names died with the previous runner process, so
@@ -4508,12 +4591,18 @@ fn register_proxy_nonce(
     terminal_id: Option<&str>,
     session_tenant: Option<Uuid>,
 ) -> String {
-    let (nonce, snapshot) = mint_and_register_nonce(
+    register_proxy_nonce_with(workdir, terminal_id, MintPin::from_chosen(session_tenant))
+}
+
+/// [`register_proxy_nonce`] with the pin spelled out — the boot reconcile's
+/// rewrite carries a replaced key's pin ([`MintPin::Carried`]).
+fn register_proxy_nonce_with(workdir: &str, terminal_id: Option<&str>, pin: MintPin) -> String {
+    let (nonce, snapshot) = mint_and_register_nonce_with(
         workdir,
         ProxyPrincipal::Device,
         NonceLifetime::Persistent,
         terminal_id,
-        session_tenant,
+        pin,
     );
     persist_proxy_nonces(&snapshot);
     nonce
@@ -4558,13 +4647,23 @@ fn register_proxy_nonce(
 /// terminal to name, and caller self-identification falls back to the workdir
 /// leg for these nonces. Do not invent one here — a fabricated terminal id would
 /// resolve confidently to somebody else's session.
-fn register_session_proxy_nonce(workdir: &str) -> String {
+///
+/// # `session_tenant`
+///
+/// The tenant the CALLER named in the mint request (plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2), frozen
+/// as `Pinned(t)` exactly as the identity seam freezes a spawn tenant (P1) — see
+/// [`mint_and_register_nonce`]. `None` keeps the machine pin. Validation is the
+/// caller's ([`provision_session_proxy_config`]): this is the mint, not the gate.
+/// Nothing about the tenant needs persisting — an ephemeral binding never reaches
+/// the store.
+fn register_session_proxy_nonce(workdir: &str, session_tenant: Option<Uuid>) -> String {
     let (nonce, _snapshot) = mint_and_register_nonce(
         workdir,
         ProxyPrincipal::Device,
         NonceLifetime::ephemeral(),
         None,
-        None,
+        session_tenant,
     );
     nonce
 }
@@ -4660,6 +4759,23 @@ fn mint_and_register_nonce(
     terminal_id: Option<&str>,
     session_tenant: Option<Uuid>,
 ) -> (String, HashMap<String, NonceBinding>) {
+    mint_and_register_nonce_with(
+        workdir,
+        principal,
+        lifetime,
+        terminal_id,
+        MintPin::from_chosen(session_tenant),
+    )
+}
+
+/// [`mint_and_register_nonce`] with the pin spelled out as a [`MintPin`].
+fn mint_and_register_nonce_with(
+    workdir: &str,
+    principal: ProxyPrincipal,
+    lifetime: NonceLifetime,
+    terminal_id: Option<&str>,
+    pin: MintPin,
+) -> (String, HashMap<String, NonceBinding>) {
     // Two v4 UUIDs (~244 bits of randomness) — v4, NOT v7: the v7 prefix is a
     // timestamp, which would gut the entropy this nonce exists to provide.
     let nonce = format!(
@@ -4688,9 +4804,19 @@ fn mint_and_register_nonce(
     // the same rule `commands::tenant` states for switching the active tenant:
     // a switch re-points FUTURE sessions only, so a running (or restored)
     // session keeps the tenant it was spawned under.
-    let session_pin = match session_tenant {
-        Some(t) => crate::session::tenant_pin::TenantPin::Pinned(t),
-        None => crate::session::tenant_pin::resolve_tenant_pin(),
+    //
+    // A key REPLACING another (the boot reconcile's port-moved rewrite) carries
+    // that key's pin and origin verbatim rather than re-sampling (W-A).
+    let (session_pin, pin_origin) = match pin {
+        MintPin::Explicit(t) => (
+            crate::session::tenant_pin::TenantPin::Pinned(t),
+            PinOrigin::Explicit,
+        ),
+        MintPin::Carried(t, origin) => (crate::session::tenant_pin::TenantPin::Pinned(t), origin),
+        MintPin::MachineNow => (
+            crate::session::tenant_pin::resolve_tenant_pin(),
+            PinOrigin::MachineSampled,
+        ),
     };
     // Forensics cause resolved BEFORE `principal` is moved into the map.
     let mint_cause = match (&principal, ephemeral) {
@@ -4761,6 +4887,7 @@ fn mint_and_register_nonce(
                 principal,
                 lifetime,
                 session_pin,
+                pin_origin,
                 // Frozen at mint time, exactly like `session_pin`. This is
                 // the deterministic leg of caller self-identification — see
                 // [`NonceBinding::terminal_id`] / [`terminal_id_for_nonce`].
@@ -5664,6 +5791,7 @@ pub(crate) mod teardown_poison_tests {
             principal: ProxyPrincipal::Agent { agent_id },
             lifetime: NonceLifetime::Persistent,
             session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            pin_origin: PinOrigin::MachineSampled,
             terminal_id: None,
             minted_at: std::time::SystemTime::now(),
         }
@@ -6336,14 +6464,21 @@ fn live_cwd_device_binding(workdir: &str, bound_port: u16) -> Option<(String, No
     Some((nonce, binding))
 }
 
-/// The tenant a usable cwd key is pinned to, when that tenant is NOT the one
-/// this machine would mint for a spawn that chose none — i.e. the cwd belongs
-/// to another tenant's session (a tenant-B worktree on an A machine).
+/// The tenant a usable cwd key is EXPLICITLY pinned to, when that tenant is NOT
+/// the one this machine would mint for a spawn that chose none — i.e. the cwd
+/// belongs to another tenant's session (a tenant-B worktree on an A machine).
+///
+/// Only an [`PinOrigin::Explicit`] pin counts (W-C). A MACHINE-SAMPLED pin to
+/// another tenant is a key minted under an older device default in a shared
+/// cwd; nothing chose it, so a tenant-less provision may re-mint it under the
+/// current default — the pre-P1 "a switch re-points future sessions" semantic.
+/// The replaced key rides the ordinary supersede grace, so a session already
+/// holding it keeps writing to its tenant until it reconnects.
 fn cwd_key_pinned_away_from_machine(workdir: &str, bound_port: u16) -> Option<Uuid> {
     use crate::session::tenant_pin::TenantPin;
     let (_, binding) = live_cwd_device_binding(workdir, bound_port)?;
-    match binding.session_pin {
-        TenantPin::Pinned(t)
+    match (binding.session_pin, binding.pin_origin) {
+        (TenantPin::Pinned(t), PinOrigin::Explicit)
             if crate::session::tenant_pin::resolve_tenant_pin() != TenantPin::Pinned(t) =>
         {
             Some(t)
@@ -6386,7 +6521,45 @@ pub(crate) fn write_coord_mcp_proxy_config(
     bound_port: u16,
     session_tenant: Option<Uuid>,
 ) {
-    let nonce = register_proxy_nonce(primary_wt, None, session_tenant);
+    write_coord_mcp_proxy_config_with(primary_wt, bound_port, MintPin::from_chosen(session_tenant));
+}
+
+/// The pin a rewrite of `<workdir>/.mcp.json` must carry from the key it
+/// REPLACES (review follow-up W-A of plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential`).
+///
+/// The boot reconcile rewrites a config whose port moved. Minting that
+/// replacement from the machine's pin turned a tenant-B worktree's key into an
+/// A key at the first restart that moved the port — the labelled-B-writes-A
+/// defect, re-entered through the self-heal. So the old nonce's pin and origin
+/// are carried: from its live binding, else from its grace entry (which records
+/// the origin too; a grace entry persisted before it did restores as
+/// [`PinOrigin::Explicit`], the conservative arm — see [`PinOrigin::restored`]).
+/// A key with no pin, or none at all, samples the machine as before.
+fn carried_pin_for_rewrite(old_nonce: Option<&str>) -> MintPin {
+    use crate::session::tenant_pin::TenantPin;
+    let Some(old) = old_nonce.filter(|n| !n.is_empty()) else {
+        return MintPin::MachineNow;
+    };
+    if let Some(binding) = live_binding(old) {
+        return match binding.session_pin {
+            TenantPin::Pinned(t) => MintPin::Carried(t, binding.pin_origin),
+            _ => MintPin::MachineNow,
+        };
+    }
+    let now = std::time::Instant::now();
+    graced_nonces()
+        .lock()
+        .expect("graced nonce map poisoned")
+        .get(old)
+        .filter(|g| g.expires_at > now)
+        .and_then(|g| g.session_tenant.map(|t| MintPin::Carried(t, g.pin_origin)))
+        .unwrap_or(MintPin::MachineNow)
+}
+
+/// [`write_coord_mcp_proxy_config`] with the pin spelled out.
+fn write_coord_mcp_proxy_config_with(primary_wt: &str, bound_port: u16, pin: MintPin) {
+    let nonce = register_proxy_nonce_with(primary_wt, None, pin);
     write_mcp_json(
         primary_wt,
         &coord_mcp_proxy_config_json(
@@ -9002,13 +9175,38 @@ struct TerminalDeliveryRecord {
     /// minted key's pin is. Switching the active tenant later re-points future
     /// sessions only, so this, not the live default, is what such a session is
     /// compared against.
-    spawn_default_tenant: Option<Uuid>,
+    spawn_default_tenant: SpawnDefaultSample,
+}
+
+/// What the machine's default-tenant pin read AT SPAWN (review nit, plan
+/// `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` W-B).
+/// Three states, because "no default" and "the pin could not be read" are
+/// different facts: the second is recorded as UNKNOWN, never as a null default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnDefaultSample {
+    /// The machine named this default tenant.
+    Named(Uuid),
+    /// The machine named no default (an unpinned install).
+    NoDefault,
+    /// `machine.json` could not state a tenant (`TenantPin::Unresolvable`).
+    Unresolvable,
+}
+
+impl From<crate::session::tenant_pin::TenantPin> for SpawnDefaultSample {
+    fn from(pin: crate::session::tenant_pin::TenantPin) -> Self {
+        use crate::session::tenant_pin::TenantPin;
+        match pin {
+            TenantPin::Pinned(t) => SpawnDefaultSample::Named(t),
+            TenantPin::Unpinned => SpawnDefaultSample::NoDefault,
+            TenantPin::Unresolvable => SpawnDefaultSample::Unresolvable,
+        }
+    }
 }
 
 fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDelivery) {
     let record = TerminalDeliveryRecord {
         delivery,
-        spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().pinned(),
+        spawn_default_tenant: crate::session::tenant_pin::resolve_tenant_pin().into(),
     };
     terminal_coord_mcp_deliveries()
         .lock()
@@ -9016,10 +9214,9 @@ fn record_terminal_coord_mcp_delivery(terminal_id: &str, delivery: CoordMcpDeliv
         .insert(terminal_id.to_string(), record);
 }
 
-/// The default tenant the seam read when it spawned `terminal_id`: `None` when
-/// this process never recorded the terminal, `Some(None)` when the machine
-/// named no default then.
-pub(crate) fn terminal_spawn_default_tenant(terminal_id: &str) -> Option<Option<Uuid>> {
+/// The default-tenant pin the seam read when it spawned `terminal_id`: `None`
+/// when this process never recorded the terminal.
+pub(crate) fn terminal_spawn_default_tenant(terminal_id: &str) -> Option<SpawnDefaultSample> {
     terminal_coord_mcp_deliveries()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -9100,8 +9297,13 @@ pub(crate) fn declared_workdir_key(workdir: &str, bound_port: Option<u16>) -> De
     }
 }
 
-/// How to give a runner a credential for a tenant it holds none for. Named in
-/// every refusal so the operator is handed the heal, not only the fault.
+/// How to give a runner a credential for a tenant it holds none for — the
+/// heal every tenant refusal names (a spawn, the provision-session mint route,
+/// the device-token door), so the operator is handed the fix, not only the fault.
+pub(crate) const PAIR_DEVICE_FOR_TENANT_HINT: &str =
+    "pair this device for that tenant (`qontinui_profile device pair --tenant-id <uuid>`)";
+
+/// [`PAIR_DEVICE_FOR_TENANT_HINT`] as a spawn refusal words it.
 pub(crate) const SPAWN_TENANT_PAIRING_HINT: &str =
     "pair this device for that tenant (`qontinui_profile device pair --tenant-id <uuid>`), \
      or spawn without a tenant";
@@ -9201,7 +9403,9 @@ impl std::fmt::Display for SpawnTenantRefusal {
 /// The admitted set is the tenants holding a device-JWT slot
 /// ([`crate::auth::AuthManager::try_list_tenant_device_jwt_tenants`]) plus the
 /// device's default binding, whose JWT may live only in the legacy
-/// `access_token` slot — the same two routes
+/// `access_token` slot — and only when that token's `tenant_id` claim names it
+/// (or, on a runner MEASURED to hold a single binding, the token carries no claim; see
+/// [`crate::auth::legacy_token_serves_tenant`]) — the same two routes
 /// [`crate::auth::select_device_bearer`] can serve a tenant from. Membership,
 /// not liveness: a dead slot for a paired tenant is the refresher's to heal, and
 /// the proxy's per-request gate ([`runner_credential_local_refusal`]) already
@@ -9209,37 +9413,29 @@ impl std::fmt::Display for SpawnTenantRefusal {
 pub(crate) fn validate_spawn_tenant(tenant: Uuid) -> Result<(), SpawnTenantRefusal> {
     spawn_tenant_admission(
         tenant,
-        crate::auth::AuthManager::new()
-            .try_list_tenant_device_jwt_tenants()
-            .map_err(|e| format!("{e:#}")),
-        crate::auth::default_binding_tenant_probe(),
+        &crate::auth::HeldDeviceTenants::read(&crate::auth::AuthManager::new()),
     )
 }
 
-/// Pure core of [`validate_spawn_tenant`].
+/// Pure core of [`validate_spawn_tenant`], over the SAME held-tenants definition
+/// the device-token door counts ([`crate::auth::HeldDeviceTenants`]).
 ///
-/// "Not paired" is a claim that BOTH routes were read and neither holds the
-/// tenant. An unreadable slot store or an unreadable default-binding file
-/// establishes nothing, so either one refuses as
-/// [`SpawnTenantRefusal::CredentialStoreUnreadable`] — the heal differs, and an
-/// operator sent to pair a tenant that is already paired would be sent wrong.
+/// "Not paired" is a claim that every route was read and none holds the tenant.
+/// An unreadable slot store, default-binding file or default slot establishes
+/// nothing, so each refuses as [`SpawnTenantRefusal::CredentialStoreUnreadable`]
+/// — the heal differs, and an operator sent to pair a tenant that is already
+/// paired would be sent wrong.
 fn spawn_tenant_admission(
     tenant: Uuid,
-    held: Result<Vec<Uuid>, String>,
-    default_binding: crate::auth::BindingTenantRead,
+    held: &crate::auth::HeldDeviceTenants,
 ) -> Result<(), SpawnTenantRefusal> {
-    use crate::auth::BindingTenantRead;
-    if default_binding == BindingTenantRead::Bound(tenant) {
-        return Ok(());
-    }
-    match (held, default_binding) {
-        (Ok(slots), _) if slots.contains(&tenant) => Ok(()),
-        (Err(error), _) => Err(SpawnTenantRefusal::CredentialStoreUnreadable { tenant, error }),
-        (Ok(_), BindingTenantRead::Unknown) => Err(SpawnTenantRefusal::CredentialStoreUnreadable {
+    match held.holds(tenant) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(SpawnTenantRefusal::NotPaired { tenant }),
+        Err(unknown) => Err(SpawnTenantRefusal::CredentialStoreUnreadable {
             tenant,
-            error: "the default-binding record (paired_user.json) could not be read".to_string(),
+            error: unknown.to_string(),
         }),
-        (Ok(_), _) => Err(SpawnTenantRefusal::NotPaired { tenant }),
     }
 }
 
@@ -9568,9 +9764,8 @@ fn deliver_terminal_coord_mcp_unrecorded(
 /// Mint coord identity for a session the runner did NOT spawn: the
 /// `--mcp-config` document a bare terminal's launcher can hand to `claude`
 /// (plan 2026-07-17 §1). Returns the same document shape the identity seam
-/// delivers, via the same [`mint_device_proxy_config`] core — the nonce is
-/// DEVICE-principal, bound to `workdir`, [`NonceLifetime::Ephemeral`], and
-/// never persisted.
+/// delivers — the nonce is DEVICE-principal, bound to `workdir`,
+/// [`NonceLifetime::Ephemeral`], and never persisted.
 ///
 /// **The caller MUST have passed [`session_identity_gate`] first.** This
 /// function does not gate — it is the mint, and the route
@@ -9579,8 +9774,21 @@ fn deliver_terminal_coord_mcp_unrecorded(
 /// denial can carry an actionable HTTP status + reason instead of degrading to
 /// an untyped `None` that is indistinguishable from an unresolvable port.
 ///
-/// `None` = the bound port is unresolvable ⇒ the route must 503 rather than mint
-/// a nonce paired with a port nothing is listening on.
+/// `Ok(None)` = the bound port is unresolvable ⇒ the route must 503 rather than
+/// mint a nonce paired with a port nothing is listening on. `bound_port` is
+/// injected (the route passes [`resolve_bound_api_port`]) so every arm is
+/// drivable by a test without a listening API.
+///
+/// # `session_tenant` (plan `2026-09-10-spawn-tenant-never-reaches-the-session-coord-credential` P2)
+///
+/// The tenant the caller named, already passed through the kill switch
+/// ([`credential_spawn_tenant`]). It gets the identity seam's P1 treatment
+/// exactly: validated against the tenants this runner can present a credential
+/// for ([`validate_spawn_tenant`]) BEFORE the port is resolved and before
+/// anything is minted, then frozen into the binding as `Pinned(t)`. A tenant the
+/// runner cannot present is `Err` and registers nothing — never a silent fallback
+/// to the machine pin, which is the labelled-B-writes-A defect that plan closes.
+/// `None` is byte-identical to the route before P2.
 ///
 /// Passes `terminal_id: None` — this route serves BARE sessions the runner did
 /// not spawn, so there is no terminal to bind (see
@@ -9595,15 +9803,32 @@ fn deliver_terminal_coord_mcp_unrecorded(
 /// as `PROVISION_SHAPE_UNRECOGNISED` and silently kill that rung on every
 /// machine the day the gate opened - the route is pinned to
 /// [`http_proxy_config_json`] and a test holds it there.
-pub(crate) fn provision_session_proxy_config(workdir: &str) -> Option<serde_json::Value> {
-    let bound_port = resolve_bound_api_port()?;
-    Some(provision_session_proxy_config_at(workdir, bound_port))
+pub(crate) fn provision_session_proxy_config(
+    workdir: &str,
+    session_tenant: Option<Uuid>,
+    bound_port: Option<u16>,
+) -> Result<Option<serde_json::Value>, SpawnTenantRefusal> {
+    if let Some(t) = session_tenant {
+        validate_spawn_tenant(t)?;
+    }
+    let Some(bound_port) = bound_port else {
+        return Ok(None);
+    };
+    Ok(Some(provision_session_proxy_config_at(
+        workdir,
+        session_tenant,
+        bound_port,
+    )))
 }
 
-/// [`provision_session_proxy_config`] over an explicit bound port (the part a
-/// test can reach without a listening API).
-fn provision_session_proxy_config_at(workdir: &str, bound_port: u16) -> serde_json::Value {
-    let nonce = register_session_proxy_nonce(workdir);
+/// [`provision_session_proxy_config`]'s mint over an explicit bound port, for a
+/// tenant the caller has ALREADY validated.
+fn provision_session_proxy_config_at(
+    workdir: &str,
+    session_tenant: Option<Uuid>,
+    bound_port: u16,
+) -> serde_json::Value {
+    let nonce = register_session_proxy_nonce(workdir, session_tenant);
     http_proxy_config_json(bound_port, &nonce, false)
 }
 
@@ -10069,6 +10294,7 @@ fn adopt_on_disk_nonce(
                 // an agent-scoped config is not adoptable as Device, and this
                 // field is the consumer half of that pair.
                 session_pin: crate::session::tenant_pin::resolve_tenant_pin(),
+                pin_origin: PinOrigin::MachineSampled,
                 // Same reason for the terminal: a `.mcp.json` carries only URL
                 // + nonce, so the terminal the file was originally provisioned
                 // for is unrecoverable — and that terminal's PTY died with the
@@ -10374,10 +10600,13 @@ fn reconcile_root_config_at(root_dir: &Path, bound_port: u16) -> RootReconcileAc
             if !coord_mcp_safe_to_write(&root, IntendedWrite::Device) {
                 return RootReconcileAction::Leave;
             }
-            write_coord_mcp_proxy_config(&root, bound_port, None);
+            // W-A: the replacement keeps the replaced key's tenant pin.
+            let pin = carried_pin_for_rewrite(on_disk_nonce.as_deref());
+            write_coord_mcp_proxy_config_with(&root, bound_port, pin);
             info!(
                 "coord_mcp: boot self-heal rewrote root {root}/.mcp.json to bound \
-                 port :{bound_port} (fresh nonce — port moved or no on-disk nonce)"
+                 port :{bound_port} (fresh nonce — port moved or no on-disk nonce; \
+                 pin {pin:?})"
             );
             RootReconcileAction::Rewrite
         }
@@ -10697,7 +10926,13 @@ where
                     // touch.)
                     continue;
                 }
-                write_coord_mcp_proxy_config(&workdir, bound_port, None);
+                // W-A: a moved port must not move the key's tenant — carry the
+                // replaced nonce's pin and origin into the fresh one.
+                write_coord_mcp_proxy_config_with(
+                    &workdir,
+                    bound_port,
+                    carried_pin_for_rewrite(on_disk_nonce.as_deref()),
+                );
                 counts.rewritten += 1;
                 info!("coord_mcp: reconciled {workdir}/.mcp.json to bound port :{bound_port}");
             }
@@ -11336,7 +11571,7 @@ mod tests {
         // A live PTY terminal's nonce for this cwd (runner-spawn class).
         let pty_nonce = register_proxy_nonce(&wd, None, None);
         // A bare session mints for the SAME cwd (mint-route class).
-        let bare_nonce = register_session_proxy_nonce(&wd);
+        let bare_nonce = register_session_proxy_nonce(&wd, None);
         assert_ne!(pty_nonce, bare_nonce);
 
         // The bare mint did NOT evict the PTY nonce — an unprivileged mint-route
@@ -11380,7 +11615,7 @@ mod tests {
         );
 
         // Both mint DEVICE principals — the route can never elevate to agent.
-        let bare_again = register_session_proxy_nonce(&wd);
+        let bare_again = register_session_proxy_nonce(&wd, None);
         assert!(matches!(
             proxy_nonces()
                 .lock()
@@ -11433,6 +11668,7 @@ mod tests {
                         expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                     },
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
                 },
@@ -11447,6 +11683,7 @@ mod tests {
                             + std::time::Duration::from_secs(3600),
                     },
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
                 },
@@ -11491,6 +11728,7 @@ mod tests {
                     expires_at: std::time::Instant::now() - std::time::Duration::from_secs(1),
                 },
                 session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                pin_origin: PinOrigin::MachineSampled,
                 terminal_id: None,
                 minted_at: std::time::SystemTime::now(),
             },
@@ -11645,7 +11883,7 @@ mod tests {
         let wd = format!("D:/persist-test/{}", uuid::Uuid::now_v7());
 
         let persistent = register_proxy_nonce(&wd, None, None);
-        let ephemeral = register_session_proxy_nonce(&wd);
+        let ephemeral = register_session_proxy_nonce(&wd, None);
 
         let snapshot = proxy_nonces().lock().unwrap().clone();
         persist_proxy_nonces_with_store(&store, &snapshot);
@@ -11703,7 +11941,7 @@ mod tests {
         let wd = dir.to_string_lossy().to_string();
 
         assert!(
-            provision_session_proxy_config(&wd).is_none(),
+            matches!(provision_session_proxy_config(&wd, None, None), Ok(None)),
             "no bound port ⇒ the mint route refuses to mint (fail-closed, shared with the seam)"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -11846,6 +12084,7 @@ mod tests {
             terminal_id: terminal_id.map(str::to_string),
             minted_at_unix,
             session_tenant: None,
+            session_tenant_origin: None,
         }
     }
 
@@ -12263,7 +12502,7 @@ mod tests {
                 interpreter: std::path::PathBuf::from("/usr/bin/python3"),
                 shim,
             }));
-        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), 9876);
+        let doc = provision_session_proxy_config_at(tmp.path().to_str().unwrap(), None, 9876);
         let entry = &doc["mcpServers"]["coord-mcp"];
         assert_ne!(
             entry["type"], "stdio",
@@ -14044,6 +14283,7 @@ mod tests {
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
                 },
@@ -14874,6 +15114,7 @@ mod tests {
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: Some(format!("term-{i}")),
                     minted_at: base + std::time::Duration::from_secs(i as u64),
                 },
@@ -14962,6 +15203,7 @@ mod tests {
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: Some(format!("term-{secs}")),
                     minted_at: minted_at_from_unix(Some(secs)),
                 },
@@ -15065,6 +15307,7 @@ mod tests {
             principal: ProxyPrincipal::Device,
             lifetime: NonceLifetime::Persistent,
             session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            pin_origin: PinOrigin::MachineSampled,
             terminal_id: Some(format!("term-{i}")),
             minted_at,
         };
@@ -16684,6 +16927,7 @@ mod tests {
                 workdir: "D:/grace-expired-wt".to_string(),
                 terminal_id: None,
                 session_tenant: None,
+                pin_origin: PinOrigin::MachineSampled,
             },
         );
         assert!(
@@ -16747,7 +16991,7 @@ mod tests {
         // ephemeral device nonce (grace checks only expiry, so gracing one
         // would bypass the session-identity kill switch for the whole window).
         let ewd = format!("D:/grace-ttl-ephemeral-wt-{}", uuid::Uuid::now_v7());
-        let e = register_session_proxy_nonce(&ewd);
+        let e = register_session_proxy_nonce(&ewd, None);
         evict_proxy_nonces_for_workdir(&ewd);
         assert!(
             !graced_nonces().lock().unwrap().contains_key(&e),
@@ -17076,6 +17320,7 @@ mod tests {
                     principal: ProxyPrincipal::Device,
                     lifetime: NonceLifetime::Persistent,
                     session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+                    pin_origin: PinOrigin::MachineSampled,
                     terminal_id: None,
                     minted_at: std::time::SystemTime::now(),
                 },
@@ -17885,6 +18130,7 @@ mod agent_binding_census_tests {
             principal,
             lifetime: NonceLifetime::Persistent,
             session_pin: crate::session::tenant_pin::TenantPin::Unpinned,
+            pin_origin: PinOrigin::MachineSampled,
             terminal_id: terminal_id.map(str::to_owned),
             minted_at: std::time::SystemTime::UNIX_EPOCH
                 + std::time::Duration::from_secs(1_700_000_000),
@@ -19004,6 +19250,7 @@ mod reject_row_workdir_sentinel_tests {
                         terminal_id: None,
                         grace_until_unix: now.saturating_sub(60),
                         session_tenant: None,
+                        session_tenant_origin: None,
                     },
                 )]),
             )
@@ -20490,26 +20737,57 @@ mod spawn_tenant_credential_tests {
         // The entry-point early-out refuses identically, before any allocation.
         let early = precheck_spawn_tenant(Some(tenant_b())).expect_err("precheck refuses too");
         assert!(early.starts_with("terminal:tenant_not_paired:"), "{early}");
-        // The device's default binding is admitted even with no tenant slot.
-        use crate::auth::BindingTenantRead;
+        // The device's default binding is admitted with no tenant slot when the
+        // legacy slot holds its credential — and NOT when it holds none.
+        use crate::auth::{BindingTenantRead, HeldDeviceTenants};
+        let held = |slots: Result<Vec<Uuid>, String>, binding, legacy: Result<bool, String>| {
+            HeldDeviceTenants {
+                slots,
+                default_binding: binding,
+                legacy_slot: legacy,
+            }
+        };
         assert_eq!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Bound(tenant_b())),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Bound(tenant_b()), Ok(true))
+            ),
             Ok(())
+        );
+        assert_eq!(
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Bound(tenant_b()), Ok(false))
+            ),
+            Err(SpawnTenantRefusal::NotPaired { tenant: tenant_b() })
         );
         // An unreadable store is UNKNOWN, refused rather than guessed.
         assert!(matches!(
-            spawn_tenant_admission(tenant_b(), Err("io".into()), BindingTenantRead::Unbound),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Err("io".into()), BindingTenantRead::Unbound, Ok(false))
+            ),
             Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
         ));
         // S4 (review): so is an unreadable DEFAULT-BINDING record — "not paired"
         // would send the operator to pair a tenant that may already be paired.
         assert!(matches!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![]), BindingTenantRead::Unknown),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(Ok(vec![]), BindingTenantRead::Unknown, Ok(true))
+            ),
             Err(SpawnTenantRefusal::CredentialStoreUnreadable { .. })
         ));
         // ...while a slot for the tenant admits it whatever the binding file says.
         assert_eq!(
-            spawn_tenant_admission(tenant_b(), Ok(vec![tenant_b()]), BindingTenantRead::Unknown),
+            spawn_tenant_admission(
+                tenant_b(),
+                &held(
+                    Ok(vec![tenant_b()]),
+                    BindingTenantRead::Unknown,
+                    Err("io".into())
+                )
+            ),
             Ok(())
         );
     }
@@ -20726,7 +21004,7 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Unknown,
-            None,
+            crate::commands::session_info::SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -20753,7 +21031,7 @@ mod spawn_tenant_credential_tests {
             None,
             &refused,
             crate::auth::BindingTenantRead::Unknown,
-            None,
+            crate::commands::session_info::SpawnDefaultRead::NotRecorded("not_recorded"),
             None,
             None,
         );
@@ -20817,11 +21095,16 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Bound(tenant_a()),
-            terminal_spawn_default_tenant(&term).flatten(),
+            crate::commands::session_info::SpawnDefaultRead::from(
+                terminal_spawn_default_tenant(&term).expect("the seam recorded this spawn"),
+            ),
             crate::session::tenant_pin::resolve_tenant_pin().pinned(),
             None,
         );
-        assert_eq!(terminal_spawn_default_tenant(&term), Some(Some(tenant_a())));
+        assert_eq!(
+            terminal_spawn_default_tenant(&term),
+            Some(SpawnDefaultSample::Named(tenant_a()))
+        );
         assert!(
             report.diverged,
             "a B credential on an A-default session must diverge"
@@ -20929,7 +21212,9 @@ mod spawn_tenant_credential_tests {
             None,
             &credential,
             crate::auth::BindingTenantRead::Bound(tenant_a()),
-            terminal_spawn_default_tenant(&term).flatten(),
+            crate::commands::session_info::SpawnDefaultRead::from(
+                terminal_spawn_default_tenant(&term).expect("the seam recorded this spawn"),
+            ),
             crate::session::tenant_pin::resolve_tenant_pin().pinned(),
             None,
         );
@@ -21006,6 +21291,310 @@ mod spawn_tenant_credential_tests {
             session_credential_tenant(&unprovisioned, Some(&wd)),
             CredentialTenantRead::NoNonce,
             "a terminal the seam did not hand the cwd file must not report that file's key"
+        );
+    }
+
+    /// Every nonce the registry holds bound to `wd`, whatever its class.
+    fn nonces_bound_to(wd: &str) -> usize {
+        proxy_nonces()
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.workdir == wd || b.workdir == normalize_binding_workdir(wd))
+            .count()
+    }
+
+    fn nonce_of(doc: &serde_json::Value) -> String {
+        proxy_nonce_from_config_doc(doc).expect("the provision document carries the nonce")
+    }
+
+    /// P2 acceptance 1. `{cwd, tenant_id: B}` on a machine pinned to A mints an
+    /// ephemeral binding frozen to `Pinned(B)`, and the proxy resolves B for it.
+    #[test]
+    fn a_provision_session_tenant_pins_the_minted_session_nonce() {
+        let amb = crate::test_env::isolated_ambient();
+        let _marker = MarkerOverride::set(true);
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_b());
+        let wd = workdir(&amb, "p2-pin");
+
+        let doc = provision_session_proxy_config(&wd, Some(tenant_b()), Some(PORT))
+            .expect("a paired tenant is admitted")
+            .expect("a bound port mints a document");
+        let nonce = nonce_of(&doc);
+
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(session_tenant_or_refuse(Some(&nonce)), Ok(Some(tenant_b())));
+        assert!(
+            live_binding(&nonce).is_some_and(|b| b.lifetime.is_ephemeral()),
+            "the mint route's class is unchanged by the tenant: ephemeral"
+        );
+    }
+
+    /// P2 acceptance 2. A tenant this runner holds no credential for is a typed
+    /// refusal, decided BEFORE the port — so even with no bound port it is the
+    /// refusal, not a quiet `Ok(None)` — and nothing is registered for the cwd.
+    #[test]
+    fn an_unpaired_provision_session_tenant_is_refused_and_mints_nothing() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        pair(tenant_a());
+        let wd = workdir(&amb, "p2-unpaired");
+
+        for port in [Some(PORT), None] {
+            assert_eq!(
+                provision_session_proxy_config(&wd, Some(tenant_b()), port),
+                Err(SpawnTenantRefusal::NotPaired { tenant: tenant_b() }),
+                "port {port:?}"
+            );
+        }
+        assert_eq!(nonces_bound_to(&wd), 0, "a refusal must mint nothing");
+    }
+
+    /// P2 acceptance 3. `{cwd}` alone is today's mint: the http document shape
+    /// verbatim, an ephemeral device binding, and the MACHINE's pin.
+    #[test]
+    fn a_tenantless_provision_session_is_unchanged() {
+        let amb = crate::test_env::isolated_ambient();
+        let _marker = MarkerOverride::set(true);
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "p2-none");
+
+        let doc = provision_session_proxy_config(&wd, None, Some(PORT))
+            .unwrap()
+            .unwrap();
+        let nonce = nonce_of(&doc);
+        assert_eq!(doc, http_proxy_config_json(PORT, &nonce, false));
+        assert_eq!(
+            proxy_session_pin_for_nonce(&nonce),
+            TenantPin::Pinned(tenant_a())
+        );
+        assert_eq!(nonces_bound_to(&wd), 1);
+    }
+
+    /// The two hint strings cannot drift: the spawn wording is the shared heal
+    /// plus the spawn-only alternative.
+    #[test]
+    fn the_spawn_pairing_hint_is_the_shared_heal() {
+        assert!(SPAWN_TENANT_PAIRING_HINT.starts_with(PAIR_DEVICE_FOR_TENANT_HINT));
+    }
+
+    fn device_jwt() -> String {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        format!(
+            "h.{}.s",
+            URL_SAFE_NO_PAD.encode(br#"{"sub_type":"device"}"#)
+        )
+    }
+
+    /// W-C. A MACHINE-SAMPLED key pinned to an older device default does not
+    /// stop a tenant-less provision in a shared cwd: after the default switches
+    /// A→B the cwd key is re-minted under B (the pre-P1 "a switch re-points
+    /// future sessions" semantic), and the replaced A key rides grace — still
+    /// resolving A — for the session that holds it. Before W-C the C1 guard
+    /// treated every pin alike and wrote nothing.
+    #[test]
+    fn a_tenantless_provision_re_mints_a_machine_sampled_key_from_an_older_default() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let wd = workdir(&amb, "wc-sampled");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        let mcp = Path::new(&wd).join(".mcp.json");
+        let old = read_proxy_nonce(&mcp).unwrap();
+        assert_eq!(
+            live_binding(&old).unwrap().pin_origin,
+            PinOrigin::MachineSampled
+        );
+
+        amb.write_active_tenant_id(tenant_b());
+        let outcome = provision_coord_mcp_with_jwt(&wd, &device_jwt(), Some(PORT), None);
+
+        assert_eq!(outcome, CoordMcpDelivery::Provisioned);
+        let new = read_proxy_nonce(&mcp).unwrap();
+        assert_ne!(new, old, "the machine-sampled key must be re-minted");
+        assert_eq!(
+            proxy_session_pin_for_nonce(&new),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert!(
+            live_binding(&old).is_none() && proxy_nonce_is_valid(&old),
+            "the replaced key rides grace rather than 401ing its holder"
+        );
+    }
+
+    /// W-C. An EXPLICIT pin keeps the C1 protection, and the origin survives a
+    /// persist → restore round trip. A store entry that carries a tenant but no
+    /// origin (written before the field) restores as explicit — the
+    /// conservative arm — so C1 still protects it.
+    #[test]
+    fn the_pin_origin_survives_a_restart_and_a_legacy_entry_reads_explicit() {
+        use crate::secure_storage::{StoredNonceBinding, StoredPinOrigin};
+        let amb = crate::test_env::isolated_ambient();
+        let _serial = tests::restore_forensics_lock();
+        amb.write_active_tenant_id(tenant_a());
+        let (_store_dir, store) = tests::temp_store("wc-origin");
+        let wd = workdir(&amb, "wc-origin");
+
+        let (explicit, _) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some("t-explicit"),
+            Some(tenant_b()),
+        );
+        let (sampled, snapshot) = mint_and_register_nonce(
+            &wd,
+            ProxyPrincipal::Device,
+            NonceLifetime::Persistent,
+            Some("t-sampled"),
+            None,
+        );
+        persist_proxy_nonces_with_store(&store, &snapshot);
+        let loaded = store.load_coord_mcp_nonces();
+        assert_eq!(
+            loaded.get(&explicit).and_then(|b| b.session_tenant_origin),
+            Some(StoredPinOrigin::Explicit)
+        );
+        assert_eq!(
+            loaded.get(&sampled).and_then(|b| b.session_tenant_origin),
+            Some(StoredPinOrigin::MachineSampled)
+        );
+
+        proxy_nonces().lock().unwrap().remove(&explicit);
+        proxy_nonces().lock().unwrap().remove(&sampled);
+        restore_proxy_nonces_from(&store);
+        assert_eq!(
+            live_binding(&explicit).unwrap().pin_origin,
+            PinOrigin::Explicit
+        );
+        assert_eq!(
+            live_binding(&sampled).unwrap().pin_origin,
+            PinOrigin::MachineSampled
+        );
+
+        // The legacy shape: tenant present, origin absent.
+        let legacy: StoredNonceBinding = serde_json::from_value(
+            serde_json::json!({"workdir": wd, "session_tenant": tenant_b()}),
+        )
+        .unwrap();
+        assert_eq!(legacy.session_tenant, Some(tenant_b()));
+        assert_eq!(legacy.session_tenant_origin, None);
+        assert_eq!(
+            PinOrigin::restored(legacy.session_tenant, legacy.session_tenant_origin),
+            PinOrigin::Explicit
+        );
+        assert_eq!(PinOrigin::restored(None, None), PinOrigin::MachineSampled);
+    }
+
+    /// W-A. The boot reconcile's port-moved REWRITE carries the replaced key's
+    /// pin and origin into the fresh key — for the root config and for a session
+    /// workdir — instead of minting from the machine pin (which turned a
+    /// tenant-B worktree's key into an A key at the first restart that moved the
+    /// port). A key with no pin still samples the machine.
+    #[test]
+    fn a_port_moved_rewrite_keeps_the_replaced_keys_tenant_pin() {
+        let amb = crate::test_env::isolated_ambient();
+        amb.write_active_tenant_id(tenant_a());
+        let empty_root = amb.dir().join("wa-empty-root");
+        std::fs::create_dir_all(&empty_root).unwrap();
+        std::env::set_var("QONTINUI_ROOT", &empty_root);
+
+        // Root config: explicit B key on the old port.
+        let root = amb.dir().join("wa-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_s = root.to_string_lossy().to_string();
+        write_coord_mcp_proxy_config(&root_s, PORT, Some(tenant_b()));
+        assert_eq!(
+            reconcile_root_config_at(&root, PORT + 7),
+            RootReconcileAction::Rewrite
+        );
+        let fresh = read_proxy_nonce(&root.join(".mcp.json")).unwrap();
+        assert_eq!(read_proxy_port(&root_s), Some(PORT + 7));
+        assert_eq!(
+            proxy_session_pin_for_nonce(&fresh),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(
+            live_binding(&fresh).unwrap().pin_origin,
+            PinOrigin::Explicit
+        );
+
+        // Session workdir: a machine-sampled B key (minted while B was the
+        // default) keeps B — and its origin — across the rewrite even though
+        // the machine now reads A.
+        amb.write_active_tenant_id(tenant_b());
+        let wd = workdir(&amb, "wa-session");
+        write_coord_mcp_proxy_config(&wd, PORT, None);
+        amb.write_active_tenant_id(tenant_a());
+        let counts = reconcile_session_configs(vec![wd.clone()], PORT + 7);
+        assert_eq!(counts.rewritten, 1);
+        let fresh = read_proxy_nonce(&Path::new(&wd).join(".mcp.json")).unwrap();
+        assert_eq!(
+            proxy_session_pin_for_nonce(&fresh),
+            TenantPin::Pinned(tenant_b())
+        );
+        assert_eq!(
+            live_binding(&fresh).unwrap().pin_origin,
+            PinOrigin::MachineSampled
+        );
+
+        // Review nit: a GRACED key keeps its origin too. Supersede a
+        // machine-sampled B key (minted while B was the default); the carried
+        // pin for the graced nonce is B, still machine-sampled.
+        amb.write_active_tenant_id(tenant_b());
+        let wd_g = workdir(&amb, "wa-graced");
+        write_coord_mcp_proxy_config(&wd_g, PORT, None);
+        let graced = read_proxy_nonce(&Path::new(&wd_g).join(".mcp.json")).unwrap();
+        amb.write_active_tenant_id(tenant_a());
+        write_coord_mcp_proxy_config(&wd_g, PORT, None); // evicts + graces `graced`
+        assert!(live_binding(&graced).is_none() && graced_nonce_is_valid(&graced));
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&graced)),
+            MintPin::Carried(tenant_b(), PinOrigin::MachineSampled)
+        );
+
+        // No key to carry from: the machine's pin, as before.
+        assert_eq!(carried_pin_for_rewrite(None), MintPin::MachineNow);
+        assert_eq!(
+            carried_pin_for_rewrite(Some("never-minted")),
+            MintPin::MachineNow
+        );
+    }
+
+    /// Nit (re-review): a graced key persisted with a MachineSampled origin is
+    /// restored MachineSampled, and one persisted with a tenant but no origin
+    /// restores Explicit (the conservative arm).
+    #[test]
+    fn restore_graced_nonces_reloads_the_stored_pin_origin() {
+        use crate::secure_storage::{StoredGracedNonce, StoredPinOrigin};
+        let _amb = crate::test_env::isolated_ambient();
+        let until = minted_at_to_unix(std::time::SystemTime::now()) + 3_600;
+        let sampled = format!("graced-sampled-{}", Uuid::new_v4().simple());
+        let legacy = format!("graced-legacy-{}", Uuid::new_v4().simple());
+        let entry = |origin| StoredGracedNonce {
+            workdir: "D:/graced-origin".to_string(),
+            terminal_id: None,
+            grace_until_unix: until,
+            session_tenant: Some(tenant_b()),
+            session_tenant_origin: origin,
+        };
+        restore_graced_nonces(HashMap::from([
+            (
+                sampled.clone(),
+                entry(Some(StoredPinOrigin::MachineSampled)),
+            ),
+            (legacy.clone(), entry(None)),
+        ]));
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&sampled)),
+            MintPin::Carried(tenant_b(), PinOrigin::MachineSampled)
+        );
+        assert_eq!(
+            carried_pin_for_rewrite(Some(&legacy)),
+            MintPin::Carried(tenant_b(), PinOrigin::Explicit)
         );
     }
 
